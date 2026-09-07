@@ -1059,6 +1059,224 @@ def test_live_corporate_action_lookup_is_counted_in_the_usage_proxy(tmp_path, mo
     assert run_state["usage_proxy"]["finance_calls_attempted"] == tickers_scanned + 1
 
 
+def test_cache_served_corporate_action_lookup_is_not_counted_in_the_usage_proxy(tmp_path, monkeypatch):
+    """A persist-before-compute replay's frozen finance provider (see
+    run_dca._build_frozen_providers_from_raw's _persisted_corporate_action_factor)
+    can answer an armed latch's query straight from an already-persisted
+    corporate_action_SYMBOL.json cache hit, without ever reaching the external
+    connector. That marks itself via a ``served_from_cache`` attribute on the
+    lookup callable -- the wiring must honor it and skip the count, unlike the
+    genuine live query counted above (Codex review: "Exclude persisted cache
+    hits from finance-call counts")."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+
+    # Day 1/2: arm and resolve a cycle, so a dormant rearm_reference_close
+    # latch exists going into day 3, exactly as in the live-call test above.
+    _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1")
+    _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
+
+    # Day 3: the finance provider's get_corporate_action_factor is a bare
+    # function (not a bound method) carrying served_from_cache=True, mirroring
+    # exactly what _persisted_corporate_action_factor sets on itself when it
+    # answers from the persisted file rather than calling through to _live.
+    trading_day = TEST_DATES[2]
+    now = datetime.combine(trading_day, time(15, 45), tzinfo=EASTERN)
+    fin = _FixedPriceData(prev_close=100.0, decision_price=99.0, source=SourceName.FINANCE)
+
+    def _cache_served_lookup(ticker, since, as_of):
+        return 1.0, as_of
+
+    _cache_served_lookup.served_from_cache = True
+    fin.get_corporate_action_factor = _cache_served_lookup
+
+    rh = _FixedPriceData(prev_close=100.0, decision_price=99.0, source=SourceName.ROBINHOOD)
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 99.0})
+    result = run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(
+            artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon",
+        ),
+    )
+    with open(cast(str, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    tickers_scanned = run_state["usage_proxy"]["tickers_scanned"]
+    assert run_state["usage_proxy"]["finance_calls_attempted"] == tickers_scanned
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [RuntimeError("transient connector outage"), KeyError("bad payload"), IndexError("missing field")],
+)
+def test_direct_corporate_action_lookup_failure_holds_only_that_tickers_latch(
+    tmp_path, monkeypatch, caplog, failure
+):
+    """A direct (non-frozen) provider whose live corporate-action lookup RAISES
+    -- a transient connector error, or a KeyError/IndexError from decoding a
+    malformed third-party payload, neither of which is part of any connector's
+    advertised API -- must be contained to this one ticker: the scheduled run
+    completes, the latch is held byte-for-byte (an unconfirmed action window
+    never evaluates recovery), and the failure is logged so an operator can
+    tell it apart from a provider that merely could not confirm (Codex review:
+    "Contain failures from custom action providers"; PR #1357: "Fix corporate
+    action isolation and state update races")."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    monkeypatch.setenv("DCA_TICKER_HISTORY_DIR", str(tmp_path / "missing_ticker_data"))
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1")
+    _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
+
+    tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
+    before = json.loads(tracker_path.read_text())
+    assert before["rearm_reference_close"] == pytest.approx(100.0)
+
+    def _raising_lookup(ticker, since, as_of):
+        raise failure
+
+    trading_day = TEST_DATES[2]
+    fin = _FixedPriceData(prev_close=110.0, decision_price=110.0, source=SourceName.FINANCE)
+    fin.get_corporate_action_factor = _raising_lookup
+    rh = _FixedPriceData(prev_close=110.0, decision_price=110.0, source=SourceName.ROBINHOOD)
+    with caplog.at_level("WARNING", logger="near_close_dca"):
+        result = run_daily_compact(
+            datetime.combine(trading_day, time(15, 45), tzinfo=EASTERN),
+            config,
+            state,
+            fin,
+            rh,
+            DryRunBroker(cash=500.0, reference_prices={"AAPL": 110.0}),
+            options=CompactRunOptions(
+                artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon"
+            ),
+        )
+
+    # The run completed normally (no exception escaped the per-ticker loop) ...
+    assert result["run_state_path"]
+    # ... the latch was held, not evaluated against the stale reference ...
+    assert json.loads(tracker_path.read_text()) == before
+    # ... and the raise was surfaced, not swallowed silently.
+    assert any(
+        "corporate-action lookup failed for AAPL" in record.message for record in caplog.records
+    )
+
+
+class _ArchiveFallbackProviderWithPersistHook(_LiveCorporateActionData):
+    """A live-capable provider whose live lookup cannot confirm (returns
+    None) and that ALSO carries the ``persist_archive_corporate_action_factor``
+    hook run_dca._build_frozen_providers_from_raw attaches to the frozen
+    persist-before-compute provider, so the archive fallback's evidence can be
+    frozen to the raw snapshot before the strategy acts on it."""
+
+    def __init__(self, *args, hook_result=True, hook_calls=None, **kwargs):
+        super().__init__(*args, corporate_action_result=None, **kwargs)
+        self._hook_result = hook_result
+        self.hook_calls = hook_calls if hook_calls is not None else []
+
+    def persist_archive_corporate_action_factor(self, ticker, since, as_of, result):
+        self.hook_calls.append((ticker, since, as_of, result))
+        if isinstance(self._hook_result, BaseException):
+            raise self._hook_result
+        return self._hook_result
+
+
+def _arm_a_dormant_latch_with_a_confirming_archive(tmp_path, monkeypatch):
+    """Shared setup: a 2-for-1 split recorded in the ticker-history archive on
+    TEST_DATES[1] (plus TEST_DATES[2]'s own row, so the archive's cursor
+    reaches the evaluation day), and a cycle armed on day 1 / resolved on day
+    2 so a dormant rearm_reference_close latch of 100.0 exists going into day
+    3. Returns the tracker path and its pre-day-3 contents."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    monkeypatch.setenv("DCA_TICKER_HISTORY_DIR", str(tmp_path / "ticker_data"))
+    (tmp_path / "ticker_data").mkdir()
+    (tmp_path / "ticker_data" / "AAPL.csv").write_text(
+        "Date,Close,Adj Close,Stock Splits,Dividends\n"
+        f"{TEST_DATES[1].isoformat()},50,50,2.0,0.0\n"
+        f"{TEST_DATES[2].isoformat()},49,49,0.0,0.0\n",
+        encoding="utf-8",
+    )
+    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    state = StrategyState()
+    _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1")
+    _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
+    tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
+    before = json.loads(tracker_path.read_text())
+    assert before["rearm_reference_close"] == pytest.approx(100.0)
+    return config, state, tracker_path, before
+
+
+def _evaluate_day3_with(fin, tmp_path, config, state):
+    trading_day = TEST_DATES[2]
+    now = datetime.combine(trading_day, time(15, 45), tzinfo=EASTERN)
+    rh = _FixedPriceData(prev_close=49.0, decision_price=49.0, source=SourceName.ROBINHOOD)
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 49.0})
+    return run_daily_compact(
+        now, config, state, fin, rh, broker,
+        options=CompactRunOptions(
+            artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon",
+        ),
+    )
+
+
+def test_archive_fallback_evidence_is_frozen_through_the_provider_hook_before_use(tmp_path, monkeypatch):
+    """When the live lookup cannot confirm and the mutable ticker-history
+    archive does, that archive evidence is about to move a durable latch --
+    but the frozen persist-before-compute provider only ever snapshots LIVE
+    answers under raw/, so a replay of this run could not reproduce the
+    decision. The wiring must hand the exact (ticker, since, as_of, evidence)
+    tuple to the provider's persist_archive_corporate_action_factor hook FIRST,
+    and only then rebase the latch (PR #1357: "Fix corporate action isolation
+    and state update races"; Codex review: "Persist corporate-action evidence
+    before using it")."""
+    config, state, tracker_path, before = _arm_a_dormant_latch_with_a_confirming_archive(
+        tmp_path, monkeypatch
+    )
+    fin = _ArchiveFallbackProviderWithPersistHook(
+        prev_close=49.0, decision_price=49.0, source=SourceName.FINANCE, hook_result=True,
+    )
+    _evaluate_day3_with(fin, tmp_path, config, state)
+
+    assert len(fin.hook_calls) == 1
+    ticker, since, as_of, evidence = fin.hook_calls[0]
+    assert ticker == "AAPL"
+    # The window handed to the hook is exactly the one the archive was asked
+    # to cover: from the latch's persisted cursor through the evaluation day.
+    assert since == date.fromisoformat(before["rearm_last_seen_day"])
+    assert as_of == TEST_DATES[2]
+    assert evidence[0] == pytest.approx(2.0)
+    assert evidence[1] == TEST_DATES[2]
+    # The hook accepted the evidence, so the latch rebased onto the post-split
+    # scale exactly as the plain archive-fallback path does.
+    after = json.loads(tracker_path.read_text())
+    assert after["rearm_reference_close"] == pytest.approx(50.0)
+    assert after["rearm_last_seen_day"] == TEST_DATES[2].isoformat()
+
+
+@pytest.mark.parametrize("hook_result", [False, OSError("raw snapshot not writable")])
+def test_archive_fallback_evidence_that_cannot_be_frozen_holds_the_rearm_latch(
+    tmp_path, monkeypatch, hook_result
+):
+    """If the persist hook reports it could not validate or write the archive
+    evidence (False), or itself raises, the strategy must NOT act on evidence
+    no replay of the raw snapshot can ever see: the latch is held byte-for-
+    byte, the same fail-closed direction an unconfirmed window takes, and the
+    run still completes for every other ticker (PR #1357: "Fix corporate
+    action isolation and state update races")."""
+    config, state, tracker_path, before = _arm_a_dormant_latch_with_a_confirming_archive(
+        tmp_path, monkeypatch
+    )
+    fin = _ArchiveFallbackProviderWithPersistHook(
+        prev_close=49.0, decision_price=49.0, source=SourceName.FINANCE, hook_result=hook_result,
+    )
+    result = _evaluate_day3_with(fin, tmp_path, config, state)
+
+    assert result["run_state_path"]
+    assert len(fin.hook_calls) == 1
+    assert json.loads(tracker_path.read_text()) == before
+
+
 @pytest.mark.parametrize(
     "invalid_result",
     [

@@ -662,6 +662,22 @@ def test_finance_provider_catches_a_failure_raised_while_iterating_rows():
     assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
 
 
+@pytest.mark.parametrize("failure", [KeyError("bad payload"), IndexError("missing field")])
+def test_finance_provider_isolates_unexpected_connector_failures(failure):
+    # An injected connector decoding a malformed third-party payload raises
+    # exception types that are not part of its advertised API (KeyError,
+    # IndexError, ...). The provider boundary must fail closed on ANY of them
+    # -- the narrower (OSError, RuntimeError, TypeError, ValueError,
+    # OverflowError) catch this method used to have let these escape and
+    # abort the whole scheduled scan over one ticker's evidence lookup
+    # (PR #1357: "Fix corporate action isolation and state update races").
+    def _failed_lookup(*_args):
+        raise failure
+
+    prov = FinanceDataProvider(bars_fn=_failed_lookup, previous_close_fn=lambda *a: 100.0)
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
+
+
 def test_finance_provider_parses_an_offset_iso_action_timestamp_in_eastern():
     # 2026-08-18T02:00:00Z is 2026-08-17 22:00 Eastern -- the textual prefix
     # ("2026-08-18") must not be used directly, or the row misfiles onto the

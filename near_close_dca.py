@@ -34009,7 +34009,7 @@ def _evaluate_inverse_martingale_candidates(
                                 live_action_lookup(im_ticker, im_split_since, trading_day),
                                 trading_day,
                             )
-                        except (OSError, RuntimeError, TypeError, ValueError, OverflowError):
+                        except Exception as action_exc:  # noqa: BLE001 - isolate each ticker/provider
                             # A custom provider passed directly to
                             # run_daily_compact (not routed through run_dca.py's
                             # frozen persist-before-compute wrapper, which never
@@ -34023,7 +34023,23 @@ def _evaluate_inverse_martingale_candidates(
                             # ticker's latch the same way every other
                             # "cannot confirm" outcome here already does (Codex
                             # review: "Contain failures from custom action
-                            # providers").
+                            # providers"). Deliberately the broadest catch, not
+                            # the (OSError, RuntimeError, TypeError, ValueError,
+                            # OverflowError) tuple this used to name: a provider
+                            # decoding a malformed third-party payload raises
+                            # KeyError/IndexError and the like, which are not
+                            # part of any connector's advertised API and would
+                            # have escaped that list to abort the whole
+                            # scheduled scan (PR #1357: "Fix corporate action
+                            # isolation and state update races"). Logged rather
+                            # than swallowed silently, so an operator can tell
+                            # a held-because-the-lookup-raised latch apart from
+                            # one the provider merely could not confirm.
+                            logger.warning(
+                                "inverse-Martingale corporate-action lookup failed for %s: %s",
+                                im_ticker,
+                                action_exc,
+                            )
                             im_split_lookup = None
                         # Checked AFTER the call, not before: a frozen/replay
                         # provider (run_dca.py's persisted-corporate-action
@@ -34072,6 +34088,56 @@ def _evaluate_inverse_martingale_candidates(
                                 and im_split_lookup[1] != trading_day
                             ):
                                 im_split_lookup = None
+                            if im_split_lookup is not None:
+                                # The archive just supplied evidence the live
+                                # query could not, and that evidence is about
+                                # to move a durable latch's reference/cursor
+                                # and thereby authorize a fire. The frozen
+                                # persist-before-compute provider (run_dca.
+                                # _build_frozen_providers_from_raw) snapshots
+                                # every LIVE answer under raw/ before handing
+                                # it back, but never sees this fallback: the
+                                # ticker-history archive is a mutable file
+                                # tree refreshed on its own schedule, so a
+                                # replay of this run's raw snapshot could not
+                                # reproduce or audit the decision it just
+                                # made. Hand the evidence to the provider's
+                                # persist_archive_corporate_action_factor hook
+                                # (attached to the frozen provider; absent on
+                                # plain/test providers, which have no raw
+                                # snapshot to keep consistent) so it is frozen
+                                # to raw/ FIRST -- and fail closed, holding the
+                                # latch exactly as an unconfirmed window does
+                                # below, when the hook reports it could not
+                                # validate or write the evidence, rather than
+                                # act on data no replay can ever see (PR #1357:
+                                # "Fix corporate action isolation and state
+                                # update races"; Codex review: "Persist
+                                # corporate-action evidence before using it").
+                                persist_archive_evidence = getattr(
+                                    finance_data, "persist_archive_corporate_action_factor", None
+                                )
+                                if callable(persist_archive_evidence):
+                                    try:
+                                        archive_evidence_frozen = bool(
+                                            persist_archive_evidence(
+                                                im_ticker, im_split_since, trading_day, im_split_lookup
+                                            )
+                                        )
+                                    except Exception as persist_exc:  # noqa: BLE001 - isolate each ticker/provider
+                                        # Same per-ticker isolation as the live
+                                        # lookup above: a hook that raises must
+                                        # hold only this ticker's latch, never
+                                        # abort the scheduled scan.
+                                        logger.warning(
+                                            "inverse-Martingale archive corporate-action evidence could not "
+                                            "be persisted for %s: %s",
+                                            im_ticker,
+                                            persist_exc,
+                                        )
+                                        archive_evidence_frozen = False
+                                    if not archive_evidence_frozen:
+                                        im_split_lookup = None
                     else:
                         im_split_lookup = archived_split_factor(
                             im_ticker, since=im_split_since, as_of=trading_day

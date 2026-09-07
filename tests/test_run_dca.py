@@ -6187,6 +6187,134 @@ def test_run_pipeline_manifest_refresh_skips_a_concurrently_modified_run_state(
     assert "skipping raw-input manifest refresh" in caplog.text
 
 
+def test_run_pipeline_manifest_refresh_holds_run_state_lock(tmp_path, monkeypatch):
+    """The manifest refresh's read/modify/replace of run_state.json must all
+    happen under the same ``run_state.json.lock`` sidecar write_run_artifacts
+    itself takes for the primary publication -- a byte-comparison CAS guard
+    alone (see the concurrent-modification test above) still leaves a window
+    between its final compare and os.replace that a concurrent retry can win
+    (PR #1357: "Fix corporate action isolation and state update races").
+    Proven by observing the refresh's own CSV-byte sizing read -- the call that
+    sits between its read of run_state.json and its rewrite -- and requiring
+    that it ran with the lock held, pinned to the refresh (not some other lock
+    site) by only counting reads made after the post-compute rescan and before
+    the on-disk manifest lists the compute-time file."""
+    import json as _json
+    from contextlib import contextmanager
+
+    import run_dca
+    import scripts.file_lock as file_lock
+
+    config = load_strategy_config(approved_test_dates=frozenset({_now().date()}), dry_run=False)
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
+    broker = DryRunBroker(account=config.target_account_number)
+
+    good_inputs = {
+        "quotes_batch1.json": {"results": [{"quote": {"symbol": "AAPL"}}]},
+        "historicals_batch1.json": {"results": [{"symbol": "AAPL", "interval": 5, "items": []}]},
+        "finance_bars_batch1.json": {"results": [{"ticker": "AAPL", "interval_minutes": 5, "bars": []}]},
+        "finance_close_batch1.json": {"results": [{"ticker": "AAPL", "previous_close": 149.0}]},
+    }
+
+    real_run_daily_compact = run_dca.run_daily_compact
+
+    def compute_time_writer(*args, **kwargs):
+        # Simulate a live corporate-action lookup persisting new evidence
+        # mid-compute, so the post-compute rescan finds a changed manifest
+        # and the refresh's read-modify-write actually runs.
+        raw_dir = scheduled_dir / "raw"
+        (raw_dir / "corporate_action_AAPL.json").write_text(
+            _json.dumps(
+                {
+                    "ticker": "AAPL", "since": "2026-07-05", "as_of": "2026-07-06",
+                    "factor": 1.0, "cursor": "2026-07-06",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return real_run_daily_compact(*args, **kwargs)
+
+    monkeypatch.setattr(run_dca, "run_daily_compact", compute_time_writer)
+
+    # run_dca imports cross_process_lock at call time from scripts.file_lock,
+    # so patching the module attribute is what its manifest refresh sees.
+    # The real lock is still taken underneath -- only the held-state of the
+    # run_state.json sidecar is tracked on top of it.
+    real_lock = file_lock.cross_process_lock
+    run_state_lock_depth = 0
+
+    @contextmanager
+    def observed_lock(path, *args, **kwargs):
+        nonlocal run_state_lock_depth
+        is_run_state_lock = Path(path).name == "run_state.json.lock"
+        with real_lock(path, *args, **kwargs):
+            if is_run_state_lock:
+                run_state_lock_depth += 1
+            try:
+                yield
+            finally:
+                if is_run_state_lock:
+                    run_state_lock_depth -= 1
+
+    monkeypatch.setattr(file_lock, "cross_process_lock", observed_lock)
+
+    real_build_persistence_state = run_dca.build_raw_persistence_state
+    rescans = 0
+
+    def counting_build_persistence_state(*args, **kwargs):
+        nonlocal rescans
+        rescans += 1
+        return real_build_persistence_state(*args, **kwargs)
+
+    monkeypatch.setattr(run_dca, "build_raw_persistence_state", counting_build_persistence_state)
+
+    real_existing_csv_artifacts = run_dca._existing_csv_artifacts
+    observations = []
+
+    def csv_artifacts_observing_lock(run_dir):
+        run_state_path = run_dir / "run_state.json"
+        try:
+            on_disk = _json.loads(run_state_path.read_bytes())
+        except (OSError, ValueError):
+            on_disk = {}
+        observations.append(
+            {
+                "locked": run_state_lock_depth > 0,
+                # The initial pre-compute manifest capture is rescan 1; the
+                # post-compute refresh is rescan 2.
+                "after_refresh_rescan": rescans >= 2,
+                "manifest_lists_action": (
+                    "corporate_action_AAPL.json" in on_disk.get("raw_inputs_saved", [])
+                ),
+            }
+        )
+        return real_existing_csv_artifacts(run_dir)
+
+    monkeypatch.setattr(run_dca, "_existing_csv_artifacts", csv_artifacts_observing_lock)
+
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        cast(Any, broker), artifacts_dir=scheduled_dir,
+        raw_connector_inputs=good_inputs,
+    )
+    assert "raw_persistence_error" not in result
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = _json.load(handle)
+    # The refresh really ran and published the compute-time file.
+    assert "corporate_action_AAPL.json" in run_state["raw_inputs_saved"]
+    # Its sizing read happened after the rescan, before the manifest was
+    # rewritten -- i.e. inside the refresh's read-modify-write -- and every
+    # such read held run_state.json.lock.
+    refresh_reads = [
+        o for o in observations if o["after_refresh_rescan"] and not o["manifest_lists_action"]
+    ]
+    assert refresh_reads, observations
+    assert all(o["locked"] for o in refresh_reads), observations
+    # Nothing leaked the lock past the pipeline's return.
+    assert run_state_lock_depth == 0
+
+
 def test_run_pipeline_skips_post_processing_when_ownership_not_verified(
     tmp_path, monkeypatch, caplog
 ):

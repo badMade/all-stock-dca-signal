@@ -5317,7 +5317,16 @@ class FinanceDataProvider:
                     probe_day += timedelta(days=1)
             elif cursor is not None:
                 cursor = None
-        except (OSError, RuntimeError, TypeError, ValueError, OverflowError):
+        except Exception:  # noqa: BLE001 - provider boundary must fail closed
+            # Injected connectors also decode/iterate third-party payloads here.
+            # A malformed response may raise exceptions such as KeyError or
+            # IndexError that are not part of the connector's advertised API;
+            # no provider failure may abort evaluation of the remaining tickers
+            # (PR #1357: "Fix corporate action isolation and state update
+            # races"). The narrower (OSError, RuntimeError, TypeError,
+            # ValueError, OverflowError) tuple this used to catch let exactly
+            # those payload-shape errors escape past the strategy's own
+            # per-ticker isolation and abort the whole scheduled scan.
             return None
         if cursor is None or cursor != as_of or not math.isfinite(factor) or factor <= 0:
             return None
