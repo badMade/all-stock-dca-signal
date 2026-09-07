@@ -297,7 +297,11 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     resolved-address check before it is followed.
     """
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: PLR0913
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Signature dictated by urllib.request.HTTPRedirectHandler: keep it explicit
+        # and name-for-name with the base class so keyword callers and super() keep
+        # working (a *args collapse broke both -- Antigravity review on PR #1348).
+        # PLR0913 is not in this repo's ruff rule set, so no noqa marker is needed.
         try:
             assert_safe_destination(newurl)
         except UnsafeDestinationError as exc:

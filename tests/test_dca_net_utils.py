@@ -1,4 +1,5 @@
 import http.client
+import inspect
 import ipaddress
 import socket
 import urllib.error
@@ -153,6 +154,69 @@ def test_pinned_http_handler_proxied_request():
     with patch.object(handler, "do_open") as mock_do_open:
         handler.http_open(req)
         mock_do_open.assert_called_once_with(http.client.HTTPConnection, req)
+
+
+# -- SafeRedirectHandler.redirect_request signature ---------------------------------
+#
+# PR #1348 briefly collapsed the override to ``def redirect_request(self, *args)`` to
+# dodge PLR0913. That broke keyword callers with TypeError, turned an arity mistake
+# into a ValueError at the tuple unpack, and drifted from the base class's explicit
+# signature (Antigravity review). These pin the explicit, urllib-dictated signature
+# and prove the safety check still runs however the arguments arrive. Hermetic: the
+# public-host case fakes DNS through the resolve_ips seam (as the tests above do) and
+# the blocked case uses a literal loopback address, which needs no resolution at all.
+
+_PUBLIC_IP = ipaddress.ip_address("93.184.216.34")
+
+
+def test_redirect_request_signature_matches_urllib_base_class():
+    ours = inspect.signature(dca_net_utils.SafeRedirectHandler.redirect_request)
+    base = inspect.signature(urllib.request.HTTPRedirectHandler.redirect_request)
+    assert list(ours.parameters) == list(base.parameters)
+    assert list(ours.parameters) == ["self", "req", "fp", "code", "msg", "headers", "newurl"]
+
+
+def test_redirect_request_keyword_call_blocks_loopback_target():
+    handler = dca_net_utils.SafeRedirectHandler()
+    req = urllib.request.Request("https://hc.example/start")
+    with pytest.raises(urllib.error.HTTPError, match="blocked unsafe redirect destination") as excinfo:
+        handler.redirect_request(
+            req=req, fp=None, code=302, msg="Found", headers={}, newurl="http://127.0.0.1/secret"
+        )
+    # The urllib-facing HTTPError must still be chained from the real reason.
+    assert isinstance(excinfo.value.__cause__, dca_net_utils.UnsafeDestinationError)
+
+
+def test_redirect_request_keyword_call_allows_public_target():
+    handler = dca_net_utils.SafeRedirectHandler()
+    req = urllib.request.Request("https://hc.example/start")
+    with patch("dca_net_utils.resolve_ips", return_value={_PUBLIC_IP}):
+        new_req = handler.redirect_request(
+            req=req, fp=None, code=302, msg="Found", headers={}, newurl="https://hc.example/elsewhere"
+        )
+    assert isinstance(new_req, urllib.request.Request)
+    assert new_req.full_url == "https://hc.example/elsewhere"
+
+
+def test_redirect_request_positional_call_still_enforces_safe_destination():
+    handler = dca_net_utils.SafeRedirectHandler()
+    req = urllib.request.Request("https://hc.example/start")
+    with pytest.raises(urllib.error.HTTPError, match="blocked unsafe redirect destination"):
+        handler.redirect_request(req, None, 302, "Found", {}, "http://127.0.0.1/secret")
+    with patch("dca_net_utils.resolve_ips", return_value={_PUBLIC_IP}):
+        new_req = handler.redirect_request(req, None, 302, "Found", {}, "https://hc.example/elsewhere")
+    assert isinstance(new_req, urllib.request.Request)
+    assert new_req.full_url == "https://hc.example/elsewhere"
+
+
+def test_redirect_request_missing_argument_is_a_type_error():
+    # An arity mistake must surface as Python's own TypeError from argument
+    # binding -- the way it does for the stock urllib method -- not as a
+    # ValueError from an internal ``args[:6]`` unpack.
+    handler = dca_net_utils.SafeRedirectHandler()
+    req = urllib.request.Request("https://hc.example/start")
+    with pytest.raises(TypeError):
+        handler.redirect_request(req, None, 302, "Found", {})
 
 
 def test_redact_url_with_port():
