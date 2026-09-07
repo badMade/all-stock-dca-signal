@@ -816,3 +816,63 @@ def test_a_blocked_run_with_only_broker_outcome_evidence_is_retained():
         )
         is True
     )
+
+def test_aggregate_usage_empty_run_states():
+    from dca_cost_tracker import aggregate_usage
+    agg = aggregate_usage([], month_label="2026-06")
+    assert agg["run_count"] == 0
+    assert agg["manual_recovery_runs"] == 0
+    assert agg["estimated_total_proxy_units"] == 0.0
+
+def test_aggregate_usage_all_zero_usage():
+    from dca_cost_tracker import aggregate_usage
+    run_states = [{"usage_proxy": {}}]
+    agg = aggregate_usage(run_states, month_label="2026-06")
+    assert agg["run_count"] == 1
+    assert agg["estimated_total_proxy_units"] == 0.0
+
+def test_aggregate_usage_manual_recovery_and_totals():
+    from dca_cost_tracker import aggregate_usage
+    run_states = [
+        {
+            "usage_proxy": {
+                "tickers_scanned": 10.0,
+                "finance_calls_attempted": 5.0,
+                "manual_recovery_required": True,
+            }
+        },
+        {
+            "usage_proxy": {
+                "tickers_scanned": 5.0,
+                "robinhood_calls_attempted": 2.0,
+                "manual_recovery_required": False,
+            }
+        }
+    ]
+    agg = aggregate_usage(run_states, month_label="2026-06")
+    assert agg["run_count"] == 2
+    assert agg["manual_recovery_runs"] == 1
+    assert agg["totals"]["tickers_scanned"] == 15.0
+    assert agg["totals"]["finance_calls_attempted"] == 5.0
+    assert agg["totals"]["robinhood_calls_attempted"] == 2.0
+
+    # Check that estimated_total_proxy_units is correctly calculated based on the weights
+    # Component weights from COMPONENT_DEFINITIONS:
+    # tickers_scanned is NOT in COMPONENT_DEFINITIONS, so it contributes 0 to the estimate.
+    # finance_calls_attempted -> finance_data (weight: 1.0) => 5.0 * 1.0 = 5.0
+    # robinhood_calls_attempted -> robinhood_data (weight: 1.0) => 2.0 * 1.0 = 2.0
+    # Expected estimated_total_proxy_units: 5.0 + 2.0 = 7.0
+    assert agg["estimated_total_proxy_units"] == 7.0
+
+def test_aggregate_usage_invalid_usage_fallback():
+    from dca_cost_tracker import aggregate_usage
+    # Covers fallback path
+    run_states = [
+        {
+            "counts": {"evaluated": 10}
+        }
+    ]
+    agg = aggregate_usage(run_states, month_label="2026-06")
+    assert agg["run_count"] == 1
+    assert agg["totals"]["tickers_scanned"] == 10.0
+    assert agg["totals"]["signal_rows_written"] == 10.0
