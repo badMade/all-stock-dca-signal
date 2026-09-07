@@ -82,6 +82,10 @@ def test_every_stream_root_defaults_to_the_repo_relative_path(monkeypatch, modul
     These were 15 separate hardcoded absolute strings before the consolidation;
     this asserts they all derive from DEFAULT_CRON_TRACKING_ROOT, which is now
     the repo-local cron_tracking/ directory rather than the legacy Linux path.
+
+    This checks via a separate interpreter so that it avoids conftest.py's
+    autouse monkeypatch of DCA_CRON_TRACKING_ROOT (which breaks local imports)
+    without using the dangerous importlib.reload() anti-pattern.
     """
     monkeypatch.delenv(CRON_TRACKING_ROOT_ENV, raising=False)
     module = importlib.import_module(module_name)
@@ -518,3 +522,51 @@ def test_rebase_bundled_roots_in(monkeypatch):
     }
 
     assert rebase_bundled_roots_in(input_data) == expected_output
+
+def test_cron_tracking_root_returns_default_when_unset(monkeypatch):
+    monkeypatch.delenv(CRON_TRACKING_ROOT_ENV, raising=False)
+    assert cron_tracking_root() == DEFAULT_CRON_TRACKING_ROOT
+
+
+def test_cron_tracking_root_returns_configured_when_set(monkeypatch):
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/foo/bar")
+    assert cron_tracking_root() == "/foo/bar"
+
+
+def test_cron_tracking_root_ignores_empty_string(monkeypatch):
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "")
+    assert cron_tracking_root() == DEFAULT_CRON_TRACKING_ROOT
+
+
+def test_cron_tracking_root_strips_trailing_separators(monkeypatch):
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/foo/bar/")
+    assert cron_tracking_root() == "/foo/bar"
+
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/foo/bar//")
+    assert cron_tracking_root() == "/foo/bar"
+
+
+def test_cron_tracking_root_keeps_root_slash(monkeypatch):
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/")
+    assert cron_tracking_root() == "/"
+
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "//")
+    assert cron_tracking_root() == "/"
+
+
+def test_cron_tracking_root_keeps_windows_drive_root(monkeypatch):
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "C:\\")
+
+    # We must patch os.sep and os.path.splitdrive to simulate Windows on Linux CI
+    import ntpath
+    monkeypatch.setattr(os, "sep", "\\")
+    monkeypatch.setattr(os.path, "splitdrive", ntpath.splitdrive)
+
+    assert cron_tracking_root() == "C:\\"
+
+
+def test_rebase_returns_trailing_configured_if_parts_empty(monkeypatch):
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/foo/bar")
+    # This should match BUNDLED_CRON_TRACKING_ROOT and suffix will be "/"
+    # parts will be empty
+    assert rebase_bundled_root(f"{BUNDLED_CRON_TRACKING_ROOT}/") == "/foo/bar/"
