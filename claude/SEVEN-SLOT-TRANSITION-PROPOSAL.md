@@ -338,7 +338,7 @@ def gate_sole_executor(
         # placed_agent can be unhashable (a dict or list of connector
         # metadata), and `x in a_frozenset` raises TypeError on an unhashable
         # x rather than returning False -- escaping every existing caller's
-        # exception handling (_evaluate_gate_4_sole_executor()/assess() catch
+        # exception handling (assess()'s Gate 4 block catches
         # only AttributeError/ValueError, and execute_plan()'s own Gate 4
         # wrapper is no different), not just this function's callers (Codex
         # review: "Classify unhashable agent metadata as rogue"). An unusable

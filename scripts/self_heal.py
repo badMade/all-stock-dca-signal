@@ -64,7 +64,10 @@ def step_2():
 
 
 def step_3():
-    run_cmd([sys.executable, "-m", "pip", "install", "types-requests", "types-PyYAML", "types-beautifulsoup4"])
+    # Pinned, from the same file CI installs: this job holds write permissions
+    # and an unpinned install here bypassed every pin in requirements-dev.txt
+    # (2026-09-07 diagnostic, S:CI-02).
+    run_cmd([sys.executable, "-m", "pip", "install", "-r", "requirements-dev.txt"])
 
 
 def step_4():

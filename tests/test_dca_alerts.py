@@ -6,13 +6,20 @@ import ipaddress
 import json
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
 
 import dca_alerts
 import dca_net_utils
+
+# Imported eagerly on purpose: dca_alerts._redacted() imports near_close_dca
+# lazily, and several tests below monkeypatch DCA_CRON_TRACKING_ROOT. If that
+# first import happened under the patched root, every import-time artifact
+# root in near_close_dca/morning_dca would be pinned to a temporary directory
+# for the rest of the session (CLAUDE.md: "Read at import time").
+import near_close_dca  # noqa: F401
 from dca_alerts import GuardedRunConfig, alert_failure, guarded_run, heartbeat_url, send_heartbeat
 
 _PUBLIC_IP = ipaddress.ip_address("93.184.216.34")
@@ -1043,3 +1050,148 @@ def test_ensure_log_handler_creates_handler():
             root_logger.removeHandler(handler)
         for handler in original_handlers:
             root_logger.addHandler(handler)
+
+
+# --- 2026-09-07 diagnostic: S:NET-01 redaction, T:F08 durable alert file ---
+
+
+def _raise_with_account_context():
+    raise RuntimeError("MCP call failed for account_number=123456789 via https://user:tok3n@broker.example/orders")
+
+
+def _exception_with_traceback():
+    try:
+        _raise_with_account_context()
+    except RuntimeError as exc:
+        return exc
+    raise AssertionError("unreachable")
+
+
+def test_alert_failure_redacts_account_and_credential_text_from_message_and_traceback(monkeypatch, captured_requests):
+    """S:NET-01. alert_failure built the Slack payload from the raw str(exc)
+    and traceback while the strategy core redacts the same text at twenty
+    sites; MCP/transport exceptions routinely echo the account number and
+    URLs carrying tokens, and both were POSTed to a third-party webhook."""
+    _clear_alert_env(monkeypatch)
+    monkeypatch.setenv("DCA_ALERT_SLACK_WEBHOOK", "https://hooks.example/alert")
+    exc = _exception_with_traceback()
+    assert alert_failure("morning", exc, context="account_number=123456789 in context") is True
+    (request,) = captured_requests
+    text = json.loads(request.data.decode("utf-8"))["text"]
+    assert "123456789" not in text
+    assert "tok3n" not in text
+    assert "[REDACTED]" in text
+    assert "RuntimeError" in text  # the classification survives
+
+
+def test_write_failed_start_marker_redacts_error_message_and_traceback(tmp_path):
+    exc = _exception_with_traceback()
+    path = dca_alerts.write_failed_start_marker(
+        "morning", exc, triggered_at_utc=datetime(2026, 9, 8, 14, 30, tzinfo=timezone.utc), root=str(tmp_path)
+    )
+    marker = json.loads(path.read_bytes())
+    assert "123456789" not in marker["error_message"]
+    assert "123456789" not in marker["traceback"]
+    assert "tok3n" not in marker["traceback"]
+    assert marker["error_class"] == "RuntimeError"
+
+
+def test_write_alert_file_lands_where_the_alert_digest_reads(monkeypatch, tmp_path):
+    """T:F08. The Gate 9 'repo alert file' channel had no in-code writer at
+    all: every prompt hand-rolled the path, four of them with a literal
+    fallback root the digest never reads. One helper resolves the root
+    through dca_paths and writes <stream dir>/alerts/<day>-<slot>-<gate>.txt."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path))
+    path = dca_alerts.write_alert_file(
+        "morning",
+        slot="1030",
+        gate="gate5",
+        body="Gate 5 failed: no signals for account_number=123456789",
+        trading_day=date(2026, 9, 8),
+    )
+    assert path == tmp_path / "morning_dca" / "alerts" / "2026-09-08-1030-gate5.txt"
+    body = path.read_text(encoding="utf-8")
+    assert "Gate 5 failed" in body
+    assert "123456789" not in body
+    # Every stream maps to its own artifact directory; the afternoon keeps the legacy root.
+    afternoon = dca_alerts.write_alert_file("afternoon", slot="1530", gate="gate7", body="x", trading_day=date(2026, 9, 8))
+    assert afternoon == tmp_path / "ce16ba6b" / "alerts" / "2026-09-08-1530-gate7.txt"
+
+
+def test_write_alert_file_never_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "file-not-dir"))
+    (tmp_path / "file-not-dir").write_text("occupied", encoding="utf-8")
+    assert dca_alerts.write_alert_file("morning", slot="1030", gate="gate5", body="x", trading_day=date(2026, 9, 8)) is None
+
+
+def test_guarded_run_structured_failure_writes_a_durable_alert_file(monkeypatch, tmp_path):
+    """A class-based stream that fails closed via a structured result produced
+    no alert through any in-code channel on a default deployment (Slack and
+    heartbeats are env-gated off, and the failed-start marker is written only
+    for an escaping exception). The durable alert file is the one channel that
+    needs no configuration."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path))
+    monkeypatch.setattr(dca_alerts, "send_heartbeat", lambda stream, *, ok=True, **kw: None)
+    result = guarded_run(
+        "midday",
+        lambda: {"status": "blocked", "skip_reason": "buying-power lookup failed for account_number=123456789"},
+        config=GuardedRunConfig(result_ok=lambda r: r.get("status") != "blocked", alert_slot="1230"),
+    )
+    assert result["status"] == "blocked"
+    alerts_dir = tmp_path / "midday_dca" / "alerts"
+    (written,) = list(alerts_dir.iterdir())
+    assert written.name.endswith("-1230-gate9.txt")
+    body = written.read_text(encoding="utf-8")
+    assert "buying-power lookup failed" in body
+    assert "123456789" not in body
+
+
+def test_guarded_run_success_writes_no_alert_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path))
+    monkeypatch.setattr(dca_alerts, "send_heartbeat", lambda stream, *, ok=True, **kw: None)
+    guarded_run("midday", lambda: {"status": "ok"}, config=GuardedRunConfig(result_ok=lambda r: True, alert_slot="1230"))
+    assert not (tmp_path / "midday_dca").exists()
+
+
+def test_guarded_run_default_alert_filename_parses_as_a_roster_slot_and_gate(monkeypatch, tmp_path):
+    """Copilot review of PR #1394: the two production guarded_run callers set
+    neither ``alert_slot`` nor ``alert_gate``, so the file was named
+    ``<day>-intraday-structured-failure.txt``. scripts/alert_digest.py needs a
+    roster slot token and a ``gate<N>`` token in that filename to count the
+    alert toward a per-slot gate streak; a stream word and a hyphenated gate
+    lose both. Single-slot streams resolve their slot from the roster, the
+    intraday executor passes its own slot, and the gate defaults to Gate 9,
+    the evidence-and-alerting gate this channel belongs to."""
+    from scripts.alert_digest import load_alert_files
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path))
+    monkeypatch.setattr(dca_alerts, "send_heartbeat", lambda stream, *, ok=True, **kw: None)
+    monkeypatch.setattr(dca_alerts, "_trading_day_et", lambda now=None: "2026-09-08")
+    failing = GuardedRunConfig(result_ok=lambda r: False)
+    guarded_run("morning", lambda: {"status": "blocked"}, config=failing)
+    guarded_run("afternoon", lambda: {"status": "blocked"}, config=failing)
+    guarded_run("intraday", lambda: {"status": "blocked"}, config=GuardedRunConfig(result_ok=lambda r: False, alert_slot="1330"))
+
+    assert (tmp_path / "morning_dca" / "alerts" / "2026-09-08-1030-gate9.txt").exists()
+    assert (tmp_path / "ce16ba6b" / "alerts" / "2026-09-08-1530-gate9.txt").exists()
+    assert (tmp_path / "intraday_dca" / "alerts" / "2026-09-08-1330-gate9.txt").exists()
+
+    records = {record.slot: record for record in load_alert_files(tmp_path)}
+    assert set(records) == {"1030", "1530", "1330"}
+    for record in records.values():
+        assert record.slot_evidence == "filename"
+        assert record.gate == "Gate 9"
+
+
+def test_intraday_default_alert_slot_is_the_roster_slot_nearest_to_now():
+    """With no ``alert_slot`` supplied for a multi-slot stream the file still
+    needs a roster token; the slot nearest to the wall clock is the one that
+    fired."""
+    from zoneinfo import ZoneInfo
+
+    et = ZoneInfo("America/New_York")
+    assert dca_alerts._resolve_alert_slot("intraday", datetime(2026, 9, 8, 13, 31, tzinfo=et)) == "1330"
+    assert dca_alerts._resolve_alert_slot("intraday", datetime(2026, 9, 8, 11, 29, tzinfo=et)) == "1130"
+    assert dca_alerts._resolve_alert_slot("intraday-1430", datetime(2026, 9, 8, 11, 29, tzinfo=et)) == "1430"
+    assert dca_alerts._resolve_alert_slot("market_open") == "0935"
+    assert dca_alerts._resolve_alert_slot("weird-stream") == "weird-stream"

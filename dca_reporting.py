@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from dca_fileio import atomic_open_w, atomic_write_text
+from dca_paths import STREAM_ARTIFACT_DIRS
 
 
 def load_run_state(path: str | Path) -> Dict[str, Any]:
@@ -798,13 +799,7 @@ def _model_usage_log_helper():
 # scripts/foreground_primary.py, which is standard-library-only by contract)
 # so a foreground pointer's declared stream can be checked against the root
 # it is actually supposed to live under.
-_FOREGROUND_STREAM_SUBDIRS = {
-    "market_open": "market_open_dca",
-    "morning": "morning_dca",
-    "midday": "midday_dca",
-    "intraday": "intraday_dca",
-    "afternoon": "ce16ba6b",
-}
+_FOREGROUND_STREAM_SUBDIRS = dict(STREAM_ARTIFACT_DIRS)
 
 
 def _foreground_expected_roots() -> Dict[str, str]:

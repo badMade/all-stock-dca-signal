@@ -129,6 +129,14 @@ py-modules = [
     # this module to aggregate and write them. Without it here it only
     # imports from a source checkout, not an installed wheel.
     "dca_average_cost_snapshot",
+    # The live-DCA-side boundary module a second sizing suggester imports to
+    # combine adjustment files (docs/repo_map.md, dca-sizing-signals/README.md).
+    # No in-repo caller by design, which is exactly why nothing noticed it
+    # shipped in no wheel (2026-09-07 diagnostic P:PACKAGING-02).
+    "sizing_adjustment_reader",
+    # Deliberately NOT listed: dca_console, dca_console_data, dca_console_jobs,
+    # dca_console_octopus (and the from.py launcher) are the local developer
+    # console and only ever run from a source checkout.
 ]
 # scripts/run_classification.py is the run-classification contract used by both
 # the live artifact writer (near_close_dca.build_run_artifacts) and readers
@@ -169,6 +177,12 @@ packages = ["scripts"]
     # to defaults (both modes fully off) for a checkout that intended them active.
     "config/inverse_martingale.json",
     "config/ml_sizing_adjustment.json",
+    # Read by dca_config.load_near_close_overrides for the afternoon task; a
+    # missing file yields {} silently, so an installed wheel ignored every
+    # override a checkout honoured. tests/test_config_invariants.py now derives
+    # this list from dca_config's own _read_json call sites (2026-09-07
+    # diagnostic, P:PACKAGING-01).
+    "config/near_close_dca.json",
 ]
 
 # Browser assets for the 3D market graph, resolved at runtime by

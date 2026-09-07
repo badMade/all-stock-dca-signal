@@ -247,7 +247,7 @@ tickers get their chance, not how a failure itself is handled.
 | Entry point | Where | Behavior |
 |---|---|---|
 | `dca_runner.execute_plan` (Gate 7, reported at Gate 9) | placement loop | **Changed 2026-08-24.** Was `break` on the first failure. Now records a `PlacementFailure` in `result.failures` and continues — for failures that PROVE nothing was accepted (see "Isolation is not unconditional" below) |
-| `MorningDCAExecutor._place_broker_orders` (morning/midday/market-open/intraday) | placement loop | Already isolated: every duplicate-check, tradability, spread, review, and placement failure records a per-ticker outcome and `continue`s. Now pinned by `test_a_rejected_ticker_does_not_stop_the_executor_batch` / `..._a_tradability_refusal_...` so it stays that way |
+| `MorningDCAExecutor._place_broker_orders` (morning/midday/market-open/intraday) | placement loop | Already isolated: every duplicate-check, tradability, spread, review, and placement failure records a per-ticker outcome and `continue`s. Now pinned by `test_definitive_placement_rejection_continues_the_batch` / `..._a_tradability_refusal_...` so it stays that way |
 | `near_close_dca._process_buy_candidates_batch` (3:30 PM canonical) | candidate loop | See 9a — including why a raise *after* an accepted order fails the run instead |
 
 Isolation is not unconditional. `execute_plan` still stops the batch outright

@@ -127,6 +127,7 @@ from near_close_dca import (
     warn_if_window_expiring,
 )
 from scripts.file_lock import cross_process_lock
+from scripts.idempotency import same_stream_ref_id_prefixes
 from scripts.model_usage_log import log_model_usage
 from scripts.run_classification import (
     BLOCKED_BY_SPREAD_GATE,
@@ -141,6 +142,7 @@ from scripts.run_classification import (
     ORDER_SUBMIT_STATUS_ERROR,
     ORDER_SUBMIT_STATUS_NO_ORDERS,
     ORDER_SUBMIT_STATUS_SUBMITTED,
+    PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES,
     RUN_CLASSIFICATION_COMPLETED_NO_ORDERS,
     RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION,
     RUN_CLASSIFICATION_STARTUP_FAILED,
@@ -2340,9 +2342,7 @@ def _raw_envelope_reports_failure(envelope: Dict[str, Any]) -> bool:
 #: retry double-place on top of a fill that actually went through (Codex
 #: review, PR #1300: recognize potentially_submitted wherever an order status
 #: is filtered/counted/aggregated).
-_ORDER_BEARING_CANDIDATE_STATUSES = frozenset(
-    {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
-)
+_ORDER_BEARING_CANDIDATE_STATUSES = PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES  # canonical set (P:DUP-03)
 
 #: Broader than _ORDER_BEARING_CANDIDATE_STATUSES: also admits "failed" --
 #: mirrors near_close_dca._PRIOR_ALLOCATION_ATTEMPT_STATUSES, which counts a
@@ -3207,7 +3207,6 @@ def morning_preflight_eligible_tickers(
     preflight_run_state_root: Optional[str] = None,
     preflight_forbidden_roots: Sequence[str] = (),
     preflight_bounded_recovery: bool = True,
-    manual: bool = False,
 ) -> tuple[List[str], Dict[str, Any]]:
     """Restrict ``tickers`` to the same-day 9:45 pre-flight verdict.
 
@@ -5029,7 +5028,6 @@ class MorningDCAExecutor(DCAExecutor):
             preflight_run_state_root=self.config.preflight_run_state_root,
             preflight_forbidden_roots=self.config.preflight_forbidden_roots,
             preflight_bounded_recovery=self.config.preflight_bounded_recovery,
-            manual=manual,
         )
         self.preflight_gate = gate
         return admitted
@@ -8881,6 +8879,10 @@ class MorningDCAExecutor(DCAExecutor):
                 # discussion_r3660858010 (the afternoon call already had this
                 # probe; this call never did).
                 run_artifact_written=run_artifact_written,
+                # The intraday executor names its own slot; every other stream
+                # has exactly one, resolved by guarded_run from the roster
+                # (Copilot review, PR #1394).
+                alert_slot=getattr(self, "slot", None),
                 # A run is NOT ok -- must ping a FAILED heartbeat, never clear
                 # the dead-man's switch -- when any of three structured
                 # failure signals is present on the returned artifacts, none
@@ -10375,16 +10377,19 @@ def _same_stream_order_exists(
     - A retry where the first attempt already placed the topup variant.
     Manual fills use {stream}-dca-manual-{date}-{ticker} (see ref_id construction
     in _place_broker_orders) and therefore never collide with either prefix here.
+
+    The prefixes come from ``scripts.idempotency.same_stream_ref_id_prefixes``,
+    which also names the SAME slot's ref ids as the other two entry points
+    write them (``graded-dca-{stream}-...`` from run_dca.run_slot() and
+    ``dca-runner-{slot}-...``), so a retry of this slot through a different
+    entry point is recognized too (2026-09-07 diagnostic, C:F5).
     """
     checker = getattr(broker, "same_day_strategy_order_exists_with_ref_id_prefix", None)
     if checker is None:
         raise RuntimeError(
             "broker does not support same-stream ref-id duplicate checks for guarded top-ups"
         )
-    prefixes = (
-        f"{stream}-dca-topup-{trading_day.isoformat()}-{ticker}",
-        f"{stream}-dca-{trading_day.isoformat()}-{ticker}",
-    )
+    prefixes = same_stream_ref_id_prefixes(stream, trading_day, ticker)
     result = checker(ticker, trading_day, prefixes)
     if not isinstance(result, dict):
         # Normalize legacy boolean adapters: False/None → None (no duplicate).

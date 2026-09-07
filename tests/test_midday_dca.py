@@ -1716,3 +1716,26 @@ def test_unconfigured_state_root_resolves_at_executor_construction_time():
         check=True,
     )
     assert out.stdout.strip() == "/srv/midday-fallback-probe/midday_dca", out.stdout
+
+
+def test_load_midday_config_with_an_unresolvable_account_pins_none_and_warns(tmp_path, monkeypatch, caplog):
+    """2026-09-07 diagnostic T:F13. The allow_unpinned_account branch must set
+    target_account_number to None EXPLICITLY (the dataclass default is the
+    import-time module constant, a real account on a configured machine) and
+    say so, so the live run records account_pinning_failed rather than trading
+    an unintended account."""
+    import logging
+
+    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+    (tmp_path / "midday_dca.json").write_text(
+        json.dumps({"live_task": {"broker_account": "robinhood:${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}"}}),
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING):
+        cfg = load_midday_config(str(tmp_path), allow_unpinned_account=True)
+    assert cfg.target_account_number is None
+    assert "fail closed" in caplog.text
+    from dca_config import MissingConfigEnvError
+
+    with pytest.raises(MissingConfigEnvError):
+        load_midday_config(str(tmp_path), allow_unpinned_account=False)

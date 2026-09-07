@@ -30,7 +30,7 @@ import json
 import re
 import shutil
 import subprocess
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -660,6 +660,11 @@ def test_pyproject_ships_every_live_stream_module_and_config():
         # ticker-history update/calibration scripts.
         "dca_intraday_archive",
         "dca_ticker_paths",
+        # sizing_adjustment_reader is the live-DCA-side boundary module a
+        # second sizing suggester imports (docs/repo_map.md); it has no
+        # in-repo caller by design, so nothing else in the suite would notice
+        # it missing from the wheel (2026-09-07 diagnostic P:PACKAGING-02).
+        "sizing_adjustment_reader",
     ):
         assert module in py_modules, f"{module} must be listed in [tool.setuptools] py-modules"
 
@@ -1408,7 +1413,7 @@ _SYNTHETIC_ACCOUNT_VALUES = frozenset({FIXTURE_ACCOUNT_NUMBER, "123456789"})
 # vendored file cannot inherit the exemption without someone deciding it should.
 _ALLOWED = {
     "historical_stock_data.csv",
-    "market_open_raw_data.json",
+    "claude/_agent_scratch/market_open_raw_data.json",
     "analysis/2026-06-29-revised-ladder/dca_revised_ladder_backtest_decisions.csv",
     "viz/vendor/three.min.js",
     # Tracked release archive; .tar.gz is skipped as binary and therefore needs
@@ -3877,3 +3882,104 @@ def test_every_placing_prompt_refreshes_buying_power_at_final_reapply():
     for name, text in _live_mirror_placing_prompt_texts().items():
         assert "Refresh buying power after the final history scan" in text, name
     assert "Refresh buying power after the final history scan" in _midday_live_mirror_text()
+
+
+# --- The in-code approved-date fallback tracks config/trading_window.json ----
+#
+# 2026-09-07 diagnostic T:F02: config/trading_window.json is the authoritative
+# live window (extended to 2026-10-30 on 2026-07-26 with a documented DST
+# rationale), but near_close_dca.APPROVED_TEST_DATES -- the fallback a bare
+# StrategyConfig() and load_strategy_config() with an absent config dir both
+# use -- still ended on the original 2026-08-28, and config/scheduled_tasks.json's
+# 10ce362c trigger_window text said the same. Past that date every path that
+# never saw the JSON blocked with a no-trade date gate while the JSON-driven
+# paths kept trading: the "some paths see the JSON and some do not" drift
+# CLAUDE.md's parity invariant exists to catch.
+
+
+def test_in_code_approved_dates_cover_the_configured_trading_window():
+    from near_close_dca import APPROVED_TEST_DATES, MARKET_HOLIDAYS
+
+    window = _load("trading_window.json")
+    start = date.fromisoformat(window["start_date"])
+    end = date.fromisoformat(window["end_date"])
+    assert max(APPROVED_TEST_DATES) == end, (
+        f"near_close_dca.APPROVED_TEST_DATES ends {max(APPROVED_TEST_DATES)} but "
+        f"config/trading_window.json ends {end}; extend the in-code fallback with the JSON"
+    )
+    cursor = start
+    while cursor <= end:
+        if cursor.weekday() < 5 and cursor not in MARKET_HOLIDAYS:
+            assert cursor in APPROVED_TEST_DATES, f"{cursor} is inside the configured window but not approved in code"
+        cursor += timedelta(days=1)
+
+
+def test_final_task_trigger_window_defers_to_trading_window_json():
+    # The sibling live tasks (2ba19526, 7be82b97) already phrase their
+    # trigger_window as "within config/trading_window.json's approved_test_dates
+    # window"; the canonical 3:30 PM task must not carry a literal end date
+    # that the JSON has since moved past.
+    tasks = {t["id"]: t for t in _load("scheduled_tasks.json")["tasks"]}
+    window = tasks["10ce362c"]["trigger_window"]
+    assert "config/trading_window.json" in window
+    assert "2026-08-28" not in window
+
+
+def test_every_config_file_dca_config_opens_is_shipped_in_the_wheel():
+    """2026-09-07 diagnostic P:PACKAGING-01. config/near_close_dca.json is read
+    at runtime by dca_config.load_near_close_overrides (a missing file yields
+    {} silently), but was absent from [tool.setuptools.data-files], so an
+    installed wheel ignored every afternoon override a checkout honoured.
+    Derived from dca_config's own _read_json call sites so the list cannot
+    drift again."""
+    import re
+    import tomllib
+
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    shipped = set(pyproject["tool"]["setuptools"]["data-files"]["share/all-stock-dca/config"])
+    source = (REPO_ROOT / "dca_config.py").read_text(encoding="utf-8")
+    opened = set(re.findall(r'_read_json\(config_dir / "([^"]+\.json)"\)', source))
+    assert opened, "expected dca_config to open at least one config file via _read_json"
+    missing = {f"config/{name}" for name in opened} - shipped
+    assert not missing, f"read at runtime by dca_config but not in [tool.setuptools.data-files]: {sorted(missing)}"
+
+
+def test_placed_or_in_flight_status_set_has_one_definition():
+    """2026-09-07 diagnostic P:DUP-03. The deployed/order-bearing status set
+    was hand-copied into five modules; every name is now an alias of
+    scripts.run_classification.PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES."""
+    import dca_cost_tracker
+    import dca_risk
+    import morning_dca
+    import near_close_dca
+    from scripts.run_classification import _PLACED_OR_IN_FLIGHT_STATUSES, PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES
+
+    assert PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES == frozenset(
+        {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
+    )
+    for alias in (
+        _PLACED_OR_IN_FLIGHT_STATUSES,
+        near_close_dca._PRIOR_ALLOCATION_STATUSES,
+        morning_dca._ORDER_BEARING_CANDIDATE_STATUSES,
+        dca_risk.DEPLOYED_CANDIDATE_STATUSES,
+        dca_cost_tracker._ORDER_BEARING_STATUSES,
+    ):
+        assert alias is PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES
+
+
+def test_mirror_constants_are_sourced_from_their_canonical_definitions():
+    """P:DUP-04 / P:DUP-05: terminal and live broker state sets come from
+    scripts/broker_reconciliation, the executed-quantity columns from
+    scripts/run_classification, and the account-number shape regex in
+    near_close_dca (which cannot import dca_config without a cycle) must stay
+    identical to dca_config.ACCOUNT_NUMBER_SHAPE."""
+    import dca_config
+    import near_close_dca
+    from scripts.broker_reconciliation import _LIVE_ORDER_STATES, _TERMINAL_ORDER_STATES
+    from scripts.run_classification import EXECUTED_QUANTITY_COLS
+
+    assert near_close_dca._TERMINAL_BROKER_ORDER_STATES == _TERMINAL_ORDER_STATES
+    assert near_close_dca._TERMINAL_NON_FILL_STATES == _TERMINAL_ORDER_STATES
+    assert near_close_dca._WORKING_BROKER_ORDER_STATES == _LIVE_ORDER_STATES
+    assert near_close_dca._EXECUTED_QUANTITY_COLS is EXECUTED_QUANTITY_COLS
+    assert near_close_dca._ACCOUNT_NUMBER_SHAPE.pattern == dca_config.ACCOUNT_NUMBER_SHAPE.pattern

@@ -43,6 +43,11 @@ from zoneinfo import ZoneInfo
 
 from near_close_dca import StrategyConfig, kill_switch_engaged
 
+try:  # pragma: no cover - import shim for flat sys.path (see classify_stream)
+    from scripts.run_classification import PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES
+except ImportError:  # pragma: no cover
+    from run_classification import PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES  # type: ignore
+
 logger = logging.getLogger("near_close_dca.risk")
 
 EASTERN = ZoneInfo("America/New_York")
@@ -71,9 +76,10 @@ EVIDENCE_WINDOW_DAYS = max(BURN_WINDOW_DAYS, KILL_SWITCH_WINDOW_DAYS)
 # or ``unconfirmed`` when the broker has not yet echoed a terminal state) --
 # matching scripts.scheduled_artifacts.ORDER_ATTEMPT_STATUSES minus
 # "not_submitted_confirmation_required" (which never reached the broker, per
-# that module's own docstring). Defined locally rather than imported: this
-# module is deliberately standard-library-only downstream of near_close_dca,
-# and the set is small and stable enough not to need a shared source of truth.
+# that module's own docstring). An alias of scripts.run_classification's
+# canonical PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES (2026-09-07 diagnostic,
+# P:DUP-03): the set was hand-copied into five modules and the last status
+# added had to be applied to each by hand.
 # A same-slot retry that restores a prior attempt's "filled"/"pending"/
 # "unconfirmed" candidate (near_close_dca.run_daily_compact's merge)
 # previously left it invisible to this module's deployment accounting,
@@ -86,19 +92,7 @@ EVIDENCE_WINDOW_DAYS = max(BURN_WINDOW_DAYS, KILL_SWITCH_WINDOW_DAYS)
 # those restored orders and could authorize further purchases on top of capital
 # already at the broker (Codex review: "Apply restored statuses in claim-date
 # accounting").
-# "potentially_submitted" (an ambiguous placement connector failure -- see
-# near_close_dca.OrderPlacementAmbiguousError) is included too: without it,
-# an artifact whose only buy_candidates row is ambiguous values that
-# possibly-live notional at $0 in deployed_usd(), and a present (non-empty)
-# buy_candidates list suppresses this function's own budget fallback -- so
-# the reservation vanishes from the rolling 7-day deployment total entirely
-# and can leave the kill switch disengaged while later orders consume
-# headroom that should have stayed reserved (Codex review, PR #1300
-# discussion_r3920344732: "Reserve ambiguous orders in deployment risk").
-DEPLOYED_CANDIDATE_STATUSES = frozenset(
-    {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
-)
-
+#
 # Candidate statuses that represent committed broker-order evidence and
 # therefore deployed capital in risk accounting.
 # "potentially_submitted" (an ambiguous placement connector failure -- see
@@ -110,9 +104,7 @@ DEPLOYED_CANDIDATE_STATUSES = frozenset(
 # and can leave the kill switch disengaged while later orders consume
 # headroom that should have stayed reserved (Codex review, PR #1300
 # discussion_r3920344732: "Reserve ambiguous orders in deployment risk").
-DEPLOYED_CANDIDATE_STATUSES = frozenset(
-    {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
-)
+DEPLOYED_CANDIDATE_STATUSES = PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES
 
 # Recognized deployment streams. Only SCHEDULED (afternoon live) is the trading
 # stream that funds the kill-switch; the others are tracked separately so they

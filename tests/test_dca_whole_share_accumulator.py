@@ -6154,3 +6154,19 @@ def test_tied_sub_share_contributions_track_only_their_own_credit(tmp_path):
         "B's retry must not spend D's contribution -- B's own tied credit "
         "was already fully consumed by C's withdrawal"
     )
+
+
+def test_compute_virtual_contribution_usd_keeps_its_strategy_config_annotation():
+    """2026-09-07 diagnostic X:OWN-04: PR #1312 replaced the TYPE_CHECKING-guarded
+    ``StrategyConfig`` import with ``config: Any`` to silence an unused-import
+    lint, erasing the type on this module's one public entry point. ruff never
+    flags a TYPE_CHECKING import that an annotation uses, so the guard costs
+    nothing at runtime (``near_close_dca`` still imports this module first, so
+    the import must stay behind the guard to avoid the cycle) and keeps a wrong
+    object passed as ``config`` visible to static checkers."""
+    import inspect
+
+    annotation = inspect.signature(compute_virtual_contribution_usd).parameters["config"].annotation
+    assert annotation == "StrategyConfig", (
+        f"config must be annotated as StrategyConfig behind a TYPE_CHECKING import, got {annotation!r}"
+    )

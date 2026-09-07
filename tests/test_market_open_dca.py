@@ -446,3 +446,23 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# --- 2026-09-07 diagnostic T:F13 ---------------------------------------------
+def test_market_open_default_config_tolerates_an_unresolvable_account_and_fails_closed(tmp_path, monkeypatch):
+    """MarketOpenDCAExecutor._load_default_config is the override that decides
+    how the 9:35 stream behaves when no explicit config is passed and the live
+    account cannot be resolved: it must construct (allow_unpinned_account) and
+    then fail closed at run time with blocked evidence, never raise before an
+    executor exists and leave the slot with no artifact at all."""
+    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+    (tmp_path / "market_open_dca.json").write_text(
+        json.dumps({
+            "live_task": {"broker_account": "robinhood:${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}"},
+            "artifact_paths": {"live_run_state_root": str(tmp_path / "market_open")},
+        }),
+        encoding="utf-8",
+    )
+    ex = MarketOpenDCAExecutor(config_dir=str(tmp_path))
+    assert ex.config.target_account_number is None
+    assert ex.config.live_execution_enabled is False  # ships disabled, and a missing key must not flip it

@@ -45,6 +45,7 @@ import math
 import os
 import re
 import sys
+import time as time_module
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
@@ -54,6 +55,12 @@ from zoneinfo import ZoneInfo
 
 from dca_config import get_config_dir
 from dca_fileio import atomic_open_w
+from dca_live_adapters import (
+    _FILL_EVIDENCE_EXPLICIT_ZERO,
+    _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE,
+    _PLACEMENT_EXECUTION_FIELDS,
+    _combined_fill_evidence,
+)
 from dca_live_adapters import _LIVE_ORDER_STATES as _CANONICAL_LIVE_ORDER_STATES
 from dca_paths import stream_root
 from near_close_dca import _TERMINAL_NON_FILL_STATES as _CANONICAL_TERMINAL_ORDER_STATES
@@ -893,7 +900,14 @@ class BrokerOrder:
     side: str
     dollar_amount: float
     created_at: datetime
-    placed_agent: str = "agentic"
+    # None, not "agentic": "agentic" is exactly the provenance the Gate 4
+    # grace path treats as the compatible executor, so a default of "agentic"
+    # made every row from a history wrapper that never populates provenance
+    # (a manual app order included) look compatible during a grace window,
+    # contradicting gate_sole_executor's own "a manual order is still a second
+    # writer" contract. Adapters that KNOW the provenance set it explicitly;
+    # unknown fails closed as rogue (2026-09-07 diagnostic, C:F3).
+    placed_agent: str | None = None
     state: str = "filled"
     executed_dollar_amount: float | None = None
 
@@ -4066,129 +4080,13 @@ def _accepted_state_reported(envelopes: list) -> bool:
     return False
 
 
-def _combined_fill_evidence(envelopes: list) -> str:
-    """``_fill_evidence`` over several envelopes, combined conservatively.
-
-    Any envelope reporting a positive or unreadable figure settles it for the
-    whole response -- that is real (or unruled-out) spend no matter which
-    level carried it. An explicit zero is only the verdict when no envelope
-    contradicts it, and "nothing reported" survives only when no envelope
-    said anything at all, so each call site's own reading of silence (see the
-    ``_FILL_EVIDENCE_*`` comment) is unchanged.
-    """
-    verdict = _FILL_EVIDENCE_NONE_REPORTED
-    for envelope in envelopes:
-        evidence = _fill_evidence(envelope)
-        if evidence == _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE:
-            return evidence
-        if evidence == _FILL_EVIDENCE_EXPLICIT_ZERO:
-            verdict = evidence
-    return verdict
-
-
-# Fill-evidence keys a terminal placement response may carry. Quantity and
-# notional are both checked because a whole-share (quantity) order and a
-# fractional (notional) order report their fill in different units, and a
-# wrapper may normalize either name.
-_PARTIAL_FILL_EVIDENCE_KEYS = (
-    "cumulative_quantity",
-    "executed_quantity",
-    "filled_quantity",
-    "quantity_filled",
-    "executed_notional",
-    "executed_dollar_amount",
-    "filled_notional",
-)
-
-
-# Tri-state verdicts from _fill_evidence(). The two call sites need the SAME
-# reading of the figures and DIFFERENT readings of their absence, which a bool
-# cannot express: with an order id, "nothing readable" leaves an accepted
-# order's execution unresolved and must halt; without one, "nothing readable"
-# is just an ordinary refusal and must isolate.
-_FILL_EVIDENCE_POSITIVE_OR_UNREADABLE = "positive_or_unreadable"
-_FILL_EVIDENCE_EXPLICIT_ZERO = "explicit_zero"
-_FILL_EVIDENCE_NONE_REPORTED = "none_reported"
-
-
-def _is_finite_zero(value: float | int) -> bool:
-    """Whether a number is a readable, finite zero.
-
-    ``math.isfinite`` converts to float first, so an arbitrarily large JSON
-    integer -- Python ints are unbounded, and a hostile or malformed broker
-    response can carry ``10**1000`` -- raises ``OverflowError`` rather than
-    answering. That exception would escape ``_fill_evidence`` and, through it,
-    ``_placement_response_may_hold_a_live_order``, which ``execute_plan`` calls
-    OUTSIDE its placement ``try``: the whole run would then die and take its
-    ``ExecutionResult`` with it, losing the record of every order already
-    submitted earlier in the batch (Codex review, PR #786: "Treat oversized
-    fill integers as unreadable").
-
-    An unreadable figure is never "nothing filled", so this answers False and
-    the caller's own conservative branch takes over.
-    """
-    try:
-        return math.isfinite(value) and value == 0
-    except (OverflowError, TypeError, ValueError):
-        return False
-
-
-def _fill_evidence(order: dict) -> str:
-    """What a placement response says about how much of the order executed.
-
-    Returns one of the three ``_FILL_EVIDENCE_*`` verdicts above.
-
-    **Every supplied figure must rule execution out**, not merely the first one
-    read. A quantity field and a notional field describe the same fill in
-    different units, and a wrapper can populate one while leaving the other at
-    its default -- ``{"cumulative_quantity": 0, "executed_dollar_amount": 5}``
-    is a real $5 fill whose share count was never filled in (Codex review,
-    PR #786: "Inspect all fill fields before ruling out execution"). So a
-    positive or unreadable value settles it immediately, while a zero only
-    records that SOME figure was readable and the scan keeps going.
-
-    Deliberately asymmetric in the same direction as
-    ``BrokerOrder.counts_toward_budget``: a malformed figure (NaN, a negative,
-    a boolean, a dict, an unparseable string) is "cannot rule it out", never
-    "nothing filled". An explicit ``None`` or a blank string is "not reported",
-    exactly like an omitted key -- it neither proves nor spoils a zero.
-    """
-    saw_explicit_zero = False
-    for key in _PARTIAL_FILL_EVIDENCE_KEYS:
-        if key not in order:
-            continue
-        value = order[key]
-        if value is None:
-            continue
-        if isinstance(value, bool):
-            # Checked before the numeric branch: float(True) is 1.0, and a
-            # boolean is not a fill figure either way.
-            return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-        if isinstance(value, (int, float)):
-            if _is_finite_zero(value):
-                saw_explicit_zero = True
-                continue
-            return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-        if isinstance(value, str):
-            text = value.strip()
-            if not text:
-                continue
-            try:
-                numeric = float(text)
-            except (ValueError, OverflowError):
-                # OverflowError as well as ValueError: a decimal string too
-                # large for a float ("1" followed by 400 zeroes) raises rather
-                # than returning inf, and an unreadable figure is never
-                # "nothing filled".
-                return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-            if _is_finite_zero(numeric):
-                saw_explicit_zero = True
-                continue
-            return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-        # A dict, list, or anything else here is not a fill figure this can
-        # read; the conservative reading is that a fill may have happened.
-        return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
-    return _FILL_EVIDENCE_EXPLICIT_ZERO if saw_explicit_zero else _FILL_EVIDENCE_NONE_REPORTED
+# The fill-evidence classifiers are dca_live_adapters' -- one implementation
+# for every entry point, so the gate-sequence runner and the executors/afternoon
+# path read a placement response's fill fields identically. This module used to
+# carry AST-identical copies of them (2026-09-07 diagnostic, P:DUP-01), the
+# duplicated-logic drift CLAUDE.md warns about; the PR #786 rationale for the
+# oversized-integer handling lives on the adapter's _is_finite_zero.
+_PARTIAL_FILL_EVIDENCE_KEYS = tuple(sorted(_PLACEMENT_EXECUTION_FIELDS))
 
 
 def _terminal_order_may_have_filled(envelopes: list, identities: list) -> bool:
@@ -4354,6 +4252,12 @@ class ExecutionResult:
     placement_enabled: bool = False
     failures: list["PlacementFailure"] = field(default_factory=list)
     attempt_records: list[BrokerOrder] = field(default_factory=list)
+    # Dry-run only: the refusal _validate_execute_plan would have raised on
+    # the live path, so a rehearsal of the exact live call surfaces a plan
+    # the live run will refuse instead of returning an empty, clean-looking
+    # result (2026-09-07 diagnostic, C:F13). None when validation passed or
+    # when the live-path arguments were not supplied at all.
+    validation_failure: str | None = None
 
 
 # Broker response states that mean "no live order actually exists". Sourced
@@ -4945,7 +4849,7 @@ def _now_fn_clock_failure(
     trading_day: date,
     slot: SlotSpec,
     slot_id: str,
-    orders_fetched_at: datetime,
+    orders_fetched_at: datetime | None,
 ) -> tuple[datetime | None, str | None]:
     """Sample ``now_fn()`` and return its valid reading and any halt reason.
 
@@ -4959,15 +4863,17 @@ def _now_fn_clock_failure(
     clock fails").
 
     The order-history freshness check (``orders_fetched_at`` within
-    ``MAX_ORDERS_FETCH_AGE_SECONDS`` of "now") is rerun against THIS same
-    fresh reading too, not just the stale pre-loop ``now``: an empty history
-    fetched at, say, 09:31 and checked once against a pre-loop ``now`` of
-    09:31 stays "fresh" for the rest of the batch even once the real clock
-    (as ``now_fn()`` reports before a later order) has moved to 09:59,
-    letting nearly half an hour of intervening manual or scheduled buys go
-    unrepresented in the duplicate/aggregate-cap checks that same stale
-    history feeds (Codex review: "Measure history freshness against the
-    fresh placement clock").
+    ``MAX_ORDERS_FETCH_AGE_SECONDS`` of "now") runs against THIS fresh
+    reading, not only the caller-supplied pre-loop ``now``, when
+    ``orders_fetched_at`` is given: a history fetched at 09:31 and checked
+    against a stale pre-loop ``now`` of 09:31 would otherwise read as fresh
+    even if the real clock had already moved on (Codex review: "Measure
+    history freshness against the fresh placement clock"). ``execute_plan``
+    runs that check once before the first placement and again before every
+    placement in the loop: the 2026-09-07 diagnostic (C:F7) briefly made it
+    pre-loop only so a slow batch could finish, but that let every later
+    placement run on an unbounded-age snapshot; halting the remainder is the
+    fail-closed outcome (Copilot review, PR #1394).
     """
     try:
         fresh_now = now_fn()
@@ -5004,13 +4910,14 @@ def _now_fn_clock_failure(
             f"{slot.window_end_et[0]:02d}:{slot.window_end_et[1]:02d} ET acceptance "
             "window has closed before this order could be placed"
         )
-    orders_age_seconds = (fresh_now - orders_fetched_at).total_seconds()
-    if orders_age_seconds < 0 or orders_age_seconds > MAX_ORDERS_FETCH_AGE_SECONDS:
-        return None, (
-            f"now_fn reports orders_fetched_at is {orders_age_seconds:.1f}s away from the "
-            f"fresh clock, outside the {MAX_ORDERS_FETCH_AGE_SECONDS}s freshness window; "
-            "refetch order history before continuing this batch"
-        )
+    if orders_fetched_at is not None:
+        orders_age_seconds = (fresh_now - orders_fetched_at).total_seconds()
+        if orders_age_seconds < 0 or orders_age_seconds > MAX_ORDERS_FETCH_AGE_SECONDS:
+            return None, (
+                f"now_fn reports orders_fetched_at is {orders_age_seconds:.1f}s away from the "
+                f"fresh clock, outside the {MAX_ORDERS_FETCH_AGE_SECONDS}s freshness window; "
+                "refetch order history before starting this batch"
+            )
     return fresh_now, None
 
 
@@ -5424,7 +5331,18 @@ def _validate_execute_plan(
             "execute_plan refuses to place: candidates are malformed, cannot verify tier: "
             f"{type(exc).__name__}"
         ) from exc
-    fresh_candidates = [c for c in parsed_candidates if c.ticker not in bought_today]
+    # Mirrors assess(): whether a same-day repeat is refused outright is the
+    # config/budgets.json order_rules.one_order_per_ticker_per_day decision,
+    # not a hardcoded one. With the switch off, same_day_top_up_policy governs
+    # and scripts/same_day_top_up_gate.py resizes the repeat; assess() then
+    # PROCEEDs with the bought-today ticker still in plan.to_place, and this
+    # function applied the exclusion unconditionally, so the recomputed
+    # expected plan never matched and the WHOLE batch was refused -- every
+    # other ticker lost its buy for the day too (2026-09-07 diagnostic, C:F2).
+    if ONE_ORDER_PER_TICKER_PER_DAY:
+        fresh_candidates = [c for c in parsed_candidates if c.ticker not in bought_today]
+    else:
+        fresh_candidates = list(parsed_candidates)
     valid_candidates, planned_spend_usd, high_multiplier_signal_count = _tier_selection_inputs(
         fresh_candidates
     )
@@ -5687,7 +5605,7 @@ def _validate_execute_plan(
                 f"execute_plan refuses a plan containing the same ticker twice: {order.ticker!r}"
             )
         tickers_seen.add(ticker)
-        if ticker in bought_today:
+        if ONE_ORDER_PER_TICKER_PER_DAY and ticker in bought_today:
             raise ValueError(
                 f"execute_plan refuses a plan containing {order.ticker!r}: broker history "
                 "shows it was already bought today"
@@ -6143,6 +6061,43 @@ def execute_plan(
     placement_enabled = broker.enable_live_orders is True and broker.dry_run is False
     result = ExecutionResult(placement_enabled=placement_enabled)
     if not placement_enabled:
+        # Rehearse the live path's own validation when the caller supplied
+        # everything it needs, so a dry run can surface a plan the live call
+        # would refuse (a stale snapshot, a wrong tier, a same-day repeat
+        # under one_order_per_ticker_per_day). Reported, never raised: a dry
+        # run places nothing, and its callers read the result. A bare dry run
+        # without the live-path arguments stays silent as before.
+        if (
+            trading_day is not None
+            and slot_id is not None
+            and orders_fetched_at is not None
+            and now_fn is not None
+        ):
+            try:
+                _validate_execute_plan(
+                    plan,
+                    broker,
+                    run_id,
+                    snapshot,
+                    tier,
+                    trading_day,
+                    orders,
+                    weekly_cap_usd,
+                    weekly_rollover_reserve_usd,
+                    weekly_rollover_reserve_week_key,
+                    finalized_budget_days,
+                    submitted_notional_by_week,
+                    buying_power_usd,
+                    orders_account_number,
+                    now,
+                    slot_id,
+                    orders_fetched_at,
+                    now_fn,
+                    candidates,
+                    sole_executor_grace_period_active,
+                )
+            except ValueError as exc:
+                result.validation_failure = str(exc)
         return result
     slot, bought_today = _validate_execute_plan(
         plan,
@@ -6173,6 +6128,24 @@ def execute_plan(
         or now_fn is None
     ):
         raise ValueError("trading_day, slot_id, orders_fetched_at, and now_fn are required")
+    # History freshness is proven here, before the first placement, against
+    # the fresh clock (the caller-supplied `now` cannot mask a fetch that is
+    # already stale) and again before EVERY placement inside the loop: Gate 4
+    # only checked the initial snapshot, so a manual order or another
+    # executor landing during a slow batch would otherwise let later orders
+    # run on arbitrarily stale totals and exceed the caps. A batch that
+    # outlives MAX_ORDERS_FETCH_AGE_SECONDS halts with the remainder unplaced,
+    # the fail-closed outcome (Copilot review, PR #1394: "Preserve order-
+    # history freshness validation throughout placement batches", revisiting
+    # the 2026-09-07 diagnostic's C:F7).
+    if plan.to_place:
+        _fresh_now, fetch_failure = _now_fn_clock_failure(
+            now_fn, trading_day, slot, slot_id, orders_fetched_at
+        )
+        if fetch_failure is not None:
+            result.halted_on = _normalize_ticker(plan.to_place[0].ticker)
+            result.failure_reason = fetch_failure
+            return result
     # Consecutive, not cumulative -- see the breaker at the bottom of the loop.
     consecutive_failures = 0
     for order in plan.to_place:
@@ -6521,91 +6494,6 @@ def _validate_weekly_rollover_reserve(weekly_rollover_reserve_usd: float) -> Non
             "assess: weekly_rollover_reserve_usd must be a finite, non-negative number, "
             f"got {weekly_rollover_reserve_usd!r}"
         )
-
-
-def _evaluate_gate_0_market_day(trading_day: date, slot) -> tuple[str, str] | None:
-    try:
-        status = market_day_status(trading_day)
-    except CalendarCoverageError as exc:
-        # A stale scheduler firing in a year the calendar doesn't cover must
-        # still produce an ABORT payload so Gate 9 can alert and write run
-        # evidence, not raise past the caller (Codex review: "Convert
-        # calendar coverage failures into an abort verdict").
-        return "ABORT", f"market calendar unavailable, cannot confirm trading day: {exc}"
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        # market_day_status() reads market_calendar.json off disk and indexes
-        # into it directly; a missing file (OSError/FileNotFoundError),
-        # malformed JSON (ValueError -- json.JSONDecodeError is a subclass),
-        # bad encoding (ValueError -- UnicodeDecodeError is a subclass), or a
-        # missing/wrong-shaped key (KeyError/TypeError) all mean the same
-        # thing Gate 0 already handles for CalendarCoverageError: the
-        # calendar cannot be trusted. Without this, a deployment/config
-        # failure would raise past assess() before Gate 9 could write
-        # evidence or alert (Codex review: "Convert unreadable calendar
-        # files into an abort verdict").
-        return "ABORT", f"market calendar unavailable, cannot confirm trading day: {exc}"
-    if status.slot_should_end_silently(slot):
-        why = "exchange closed" if status.is_closed else "early close, slot is after 13:00 ET"
-        return "END_SILENTLY", why
-    return None
-
-
-def _evaluate_gate_3_trading_window(trading_day: date) -> str | None:
-    try:
-        in_window = gate_trading_window(trading_day)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        # gate_trading_window() reads config/trading_window.json and parses
-        # its dates directly; a missing file, malformed JSON, or an invalid
-        # date string all mean the same thing Gate 0 already handles for
-        # market_calendar.json: the config cannot be trusted, and this
-        # deployment/configuration failure must not raise past assess()
-        # before Gate 9 can write evidence or alert (Codex review: "Convert
-        # trading-window config failures into ABORT").
-        return f"trading window configuration unavailable, cannot confirm date: {exc}"
-    if not in_window:
-        return f"{trading_day} is outside the approved trading window"
-    return None
-
-
-def _materialize_orders(orders) -> tuple[list | None, str | None]:
-    try:
-        orders_list = list(orders)
-    except Exception as exc:
-        # exc's own message is broker/wrapper-defined and can embed an
-        # account number, an access token, or other connector context; this
-        # ABORT reason is exactly what the executor prompts persist as run
-        # evidence and may send through alert channels. Only a safe
-        # classification, the exception's type name, is recorded here --
-        # never its message -- matching the same fix already applied to the
-        # placement path's own raised exceptions (Codex review: "Redact
-        # broker-history exceptions before returning evidence").
-        return None, f"order history could not be materialized: {type(exc).__name__}"
-    try:
-        _reject_non_broker_order_rows(orders_list)
-    except ValueError as exc:
-        return None, f"broker order history contains a malformed row: {exc}"
-    return orders_list, None
-
-
-def _evaluate_gate_4_sole_executor(orders: list, slot, trading_day: date, slot_id: str) -> tuple[str | None, dict | None]:
-    try:
-        collisions = gate_sole_executor(orders, slot, trading_day)
-    except (AttributeError, ValueError) as exc:
-        # ValueError: a naive created_at raised by _require_aware(). AttributeError:
-        # a malformed row itself -- None, a raw dict, or anything else without a
-        # .created_at attribute -- raises AttributeError from gate_sole_executor's
-        # own `o.created_at` access, before _require_aware() ever runs (Codex
-        # review: "Convert malformed history rows into ABORT"). Either way this
-        # must produce an ABORT payload, not escape assess()'s documented
-        # never-raises contract before Gate 9 can write evidence or alert (Codex
-        # review: "Convert malformed broker timestamps into an abort verdict").
-        return f"broker order history contains a malformed row or timestamp: {exc}", None
-    if collisions:
-        return (
-            f"orders already present in the {slot_id} ET window, a second executor may be live",
-            {"colliding_orders": [_redact_malformed_symbol(o.symbol) for o in collisions]},
-        )
-    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -9098,19 +8986,40 @@ def _state_lock_path(path: Path) -> Path:
 
 
 _LOCK_IS_WINDOWS: bool = os.name == "nt"
+# Bounded like scripts.file_lock.cross_process_lock (the lock every other
+# reliability engine here uses): a waiter that cannot take the strategy-state
+# lock within this window raises TimeoutError and the slot fails closed with
+# evidence, instead of blocking forever behind a HUNG holder -- the documented
+# wiring holds this lock around the whole run_pipeline() call, i.e. across
+# every broker/MCP call, so an indefinite block wedged every later slot's
+# process for the day silently (2026-09-07 diagnostic, C:F4). A crashed holder
+# never wedges either backend: the kernel releases a POSIX flock and Windows
+# releases a region lock when the process exits.
+_STATE_LOCK_TIMEOUT_SECONDS: float = 30.0
+_STATE_LOCK_POLL_SECONDS: float = 0.02
 
 
-def _acquire_exclusive_lock(lock_file) -> None:
-    """Block until an exclusive, cross-process OS lock on ``lock_file`` is held.
+def _acquire_exclusive_lock(lock_file, timeout_seconds: float = _STATE_LOCK_TIMEOUT_SECONDS) -> None:
+    """Take an exclusive, cross-process OS lock on ``lock_file`` or raise ``TimeoutError``.
 
-    POSIX uses ``fcntl.flock``, which blocks indefinitely until the lock is
-    free. The standard library has no equivalent on Windows: ``msvcrt.locking``
-    only offers a lock call that retries internally for roughly ten seconds
-    and then raises ``PermissionError`` instead of blocking forever, so this
-    loops that call until it succeeds -- matching ``fcntl.flock(LOCK_EX)``'s
-    indefinite-block behavior using only the standard library on either
-    platform (Codex review: "Provide a portable state-lock backend").
+    Both platforms poll a NON-blocking lock call against this function's own
+    monotonic deadline, so ``timeout_seconds`` is honoured exactly: POSIX
+    ``fcntl.flock(LOCK_EX | LOCK_NB)`` and Windows ``msvcrt.locking(LK_NBLCK)``.
+    The first cut of this bound kept ``LK_LOCK`` on Windows, which retries
+    inside msvcrt for roughly ten seconds per attempt, so a caller-supplied
+    deadline shorter than that was never honoured there (Copilot review, PR
+    #1394: "Use nonblocking Windows locking"). Only the documented contention
+    signal is retried -- ``BlockingIOError`` from ``LOCK_NB``,
+    ``PermissionError`` (EACCES) from ``LK_NBLCK``; every other ``OSError`` (a
+    bad descriptor, a filesystem or I/O failure) is permanent and propagates
+    immediately so ``state_transaction()`` fails closed with the real cause
+    instead of sleeping on it and misreporting a timeout (Copilot review, PR
+    #1394: "Retry only lock contention"; Codex review: "Stop retrying permanent
+    Windows lock errors"). One bounded contract using only the standard
+    library on either platform (Codex review: "Provide a portable state-lock
+    backend").
     """
+    deadline = time_module.monotonic() + timeout_seconds
     if _LOCK_IS_WINDOWS:
         import msvcrt
 
@@ -9118,26 +9027,29 @@ def _acquire_exclusive_lock(lock_file) -> None:
         lock_file.seek(0)
         while True:
             try:
-                win_msvcrt.locking(lock_file.fileno(), win_msvcrt.LK_LOCK, 1)
+                win_msvcrt.locking(lock_file.fileno(), win_msvcrt.LK_NBLCK, 1)
                 return
             except PermissionError:
-                # PermissionError is the documented transient-contention
-                # condition described above -- msvcrt.locking's internal
-                # ~10s retry window expired without acquiring the lock, not
-                # a permanent failure. A bare `except OSError` also caught
-                # every OTHER OSError (a bad descriptor, a permanent
-                # filesystem/I/O failure), looping forever -- potentially
-                # without delay, since a non-contention OSError can raise
-                # immediately rather than after msvcrt's own ~10s internal
-                # wait -- instead of propagating so state_transaction() can
-                # fail closed and the scheduled run can persist evidence and
-                # alert (Codex review: "Stop retrying permanent Windows lock
-                # errors").
-                continue
+                if time_module.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"could not acquire the strategy-state lock {lock_file.name} "
+                        f"within {timeout_seconds:g}s"
+                    ) from None
+                time_module.sleep(_STATE_LOCK_POLL_SECONDS)
     else:
         import fcntl
 
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if time_module.monotonic() > deadline:
+                    raise TimeoutError(
+                        f"could not acquire the strategy-state lock {lock_file.name} "
+                        f"within {timeout_seconds:g}s"
+                    ) from None
+                time_module.sleep(_STATE_LOCK_POLL_SECONDS)
 
 
 def _release_exclusive_lock(lock_file) -> None:
@@ -9177,7 +9089,7 @@ def _exception_group(message: str, errors: list[BaseException]) -> BaseException
 
 
 @contextmanager
-def state_transaction(path=None):
+def state_transaction(path=None, *, lock_timeout_seconds: float = _STATE_LOCK_TIMEOUT_SECONDS):
     """Hold an exclusive, cross-process lock across a load-mutate-save cycle.
 
     ``load_strategy_state()``/``save_strategy_state()`` are each individually
@@ -9238,7 +9150,7 @@ def state_transaction(path=None):
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = _state_lock_path(resolved_path)
     with open(lock_path, "w", encoding="utf-8") as lock_file:
-        _acquire_exclusive_lock(lock_file)
+        _acquire_exclusive_lock(lock_file, lock_timeout_seconds)
         try:
             state = load_strategy_state(resolved_path)
             # Reconciliation spans the run artifact and this ledger.  Expose a

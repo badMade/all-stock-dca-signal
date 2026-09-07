@@ -1067,11 +1067,12 @@ def test_a_rejection_is_isolated_and_the_rest_of_the_batch_still_places():
 def test_the_window_closing_mid_batch_halts_the_remainder():
     """"No trading outside regular market hours" is rechecked before EVERY
     placement, not once per batch: a slow multi-order batch could otherwise
-    straddle the close."""
+    straddle the close. (The first reading is the batch's one-time history
+    freshness check; each placement then samples the clock again.)"""
     cands = _cands(3)
     plan = dca_runner.plan_orders(cands, dca_runner.budget_snapshot([], TRADING_DAY), NORMAL_TIER)
     calls, place_fn = _recorder()
-    clock = iter([NOW_0935, datetime(2026, 7, 28, 16, 5, tzinfo=ET)])
+    clock = iter([NOW_0935, NOW_0935, datetime(2026, 7, 28, 16, 5, tzinfo=ET)])
 
     result = _execute(
         plan,

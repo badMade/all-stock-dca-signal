@@ -22,6 +22,7 @@ NOT change any live ref id on its own; a runner must adopt it explicitly.
 from __future__ import annotations
 
 import uuid
+from datetime import date
 from typing import Any, Dict, Optional
 from urllib.parse import quote, unquote
 
@@ -108,8 +109,74 @@ def parse_idempotency_key(key: Any) -> Optional[Dict[str, str]]:
     }
 
 
+# The dca_runner slot ids each stream fires under (mirrors dca_runner.SLOTS'
+# labels; tests/test_dca_runner.py pins the two to each other). Kept here
+# rather than imported so this module stays importable by every entry point
+# without pulling the runner in.
+STREAM_SLOT_IDS = {
+    "market_open": ("0935",),
+    "morning": ("1030",),
+    "intraday": ("1130", "1330", "1430"),
+    "midday": ("1230",),
+    "afternoon": ("1530",),
+}
+
+
+def _graded_dca_prefix(stream: str, kind: str = "") -> str:
+    # Mirrors near_close_dca._graded_dca_ref_id_prefix: the afternoon keeps the
+    # unprefixed legacy "graded-dca[-kind]" literal that the 10ce362c task's
+    # own order history depends on; any other stream gets a stream token.
+    parts = ["graded-dca"]
+    if stream and stream != "afternoon":
+        parts.append(stream)
+    if kind:
+        parts.append(kind)
+    return "-".join(parts)
+
+
+def same_stream_ref_id_prefixes(stream: str, trading_day: date, ticker: str) -> tuple:
+    """Every ref-id prefix a scheduled order for ``stream``/``trading_day``/
+    ``ticker`` can carry, across all three entry points.
+
+    Three incompatible ref-id families coexist for the same slot (2026-09-07
+    diagnostic, C:F5): the class-based executors write
+    ``{stream}-dca[-topup]-{day}-{ticker}``, the afternoon engine behind
+    ``run_dca.run_slot()`` writes ``graded-dca[-{stream}][-topup]-{day}-{ticker}``,
+    and ``dca_runner`` writes ``dca-runner-{slot}-{day}-{ticker}``. Each path's
+    own same-stream duplicate check recognized only its own family, so a retry
+    or recovery of the same slot through a different entry point derived a
+    different key and could submit the same buy twice. Both duplicate checks
+    now ask for this whole set.
+
+    Manual (``-manual-``) and inverse-Martingale (``-imart-``) kinds are
+    deliberately NOT included: a manual fill never collides with a scheduled
+    retry by contract, and the two existing checks never matched them either.
+    Nothing here changes which ref id any path EMITS.
+    """
+    day = trading_day.isoformat()
+    prefixes = [
+        f"{stream}-dca-topup-{day}-{ticker}",
+        f"{stream}-dca-{day}-{ticker}",
+        f"{_graded_dca_prefix(stream, 'topup')}-{day}-{ticker}",
+        f"{_graded_dca_prefix(stream)}-{day}-{ticker}",
+    ]
+    # IntradayDCAExecutor passes its slot-qualified namespace ("intraday-1330")
+    # rather than the bare stream, so the runner family is resolved for that
+    # one slot; a bare multi-slot stream still covers every slot (Copilot
+    # review, PR #1394: "Normalize slot-qualified intraday streams").
+    base, _, qualifier = stream.partition("-")
+    if qualifier and qualifier in STREAM_SLOT_IDS.get(base, ()):
+        runner_slots: tuple = (qualifier,)
+    else:
+        runner_slots = STREAM_SLOT_IDS.get(stream, ())
+    prefixes.extend(f"dca-runner-{slot}-{day}-{ticker}" for slot in runner_slots)
+    return tuple(prefixes)
+
+
 __all__ = [
+    "STREAM_SLOT_IDS",
     "build_idempotency_key",
     "deterministic_ref_id",
     "parse_idempotency_key",
+    "same_stream_ref_id_prefixes",
 ]

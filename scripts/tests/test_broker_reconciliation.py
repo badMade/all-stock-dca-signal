@@ -1014,3 +1014,17 @@ def test_filled_order_without_price_or_notional_fails_closed():
     snap = same_day_order_snapshot(orders_fn, account_number="ACCT", created_at_gte="2026-07-23")
     assert not snap.complete
     assert "f0" in snap.unknown_exposure_order_ids
+
+
+def test_to_float_and_order_id_cleaning_survive_hostile_json_shapes():
+    """2026-09-07 diagnostic C:F14. float() of an oversized JSON integer raises
+    OverflowError, which escaped normalize_order outside the try that wraps
+    orders_fn and crashed same_day_order_snapshot instead of returning
+    complete=False; a non-string order id crashed _clean_order_ids on
+    .strip()."""
+    from scripts.broker_reconciliation import _clean_order_ids, _to_float
+
+    assert _to_float(10**400) is None
+    assert _to_float(True) is None
+    assert _to_float("12.5") == 12.5
+    assert _clean_order_ids([123, " a ", None, "-", "", "a", True]) == ["123", "a"]

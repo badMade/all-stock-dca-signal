@@ -65,11 +65,24 @@ STATE_SCHEMA_VERSION_V2 = "run-classification-v2-preauthorized"
 # identities with the runtime validator").
 MARKET_OPEN_LIVE_SCHEMA_VERSION = "market-open-live-v1"
 INTRADAY_LIVE_SCHEMA_VERSION = "intraday-live-v1"
+# The class-based morning/midday executors (morning_dca.MorningDCAExecutor in
+# live mode, midday_dca.MiddayDCAExecutor) are the same situation: they stamp
+# their own version (mirrored from MORNING_LIVE_SCHEMA_VERSION /
+# MIDDAY_LIVE_SCHEMA_VERSION in those modules) and their own run_type and
+# run_id shape, alongside the same cron ids and slot windows the roster's
+# run_slot() identities use. Only the roster shape was registered here until
+# the 2026-09-07 diagnostic (T:F01), so every scheduled 10:30/12:30 run the
+# class-based executors wrote failed validate_classification() on version
+# alone and dca_risk.classify_stream() filed it as STREAM_OTHER.
+MORNING_LIVE_SCHEMA_VERSION = "morning-live-v2-preauthorized"
+MIDDAY_LIVE_SCHEMA_VERSION = "midday-live-v1"
 ACCEPTED_STATE_SCHEMA_VERSIONS = (
     STATE_SCHEMA_VERSION,
     STATE_SCHEMA_VERSION_V2,
     MARKET_OPEN_LIVE_SCHEMA_VERSION,
     INTRADAY_LIVE_SCHEMA_VERSION,
+    MORNING_LIVE_SCHEMA_VERSION,
+    MIDDAY_LIVE_SCHEMA_VERSION,
 )
 # run_origin of a pass that recovers a FAILED scheduled slot into its own
 # directory (e.g. the Jul 27 2026 12:30 pass, config/scheduled_tasks.json ->
@@ -409,6 +422,14 @@ MARKET_OPEN_LIVE_SCHEDULED_WINDOW_END_ET = "09:50"
 INTRADAY_STREAM = "intraday"
 INTRADAY_LIVE_CRON_ID = "7be82b97"
 INTRADAY_LIVE_RUN_TYPE = "intraday_dca_live"
+# The class-based morning/midday executors' own run_type (mirrored from
+# morning_dca.MORNING_LIVE_RUN_TYPE / midday_dca.MIDDAY_LIVE_RUN_TYPE). They
+# share MORNING_SLOT_STREAM/MIDDAY_SLOT_STREAM, the cron ids and the slot
+# windows with the roster identities above, so validate_classification()
+# dispatches on run_type WITHIN those two streams: this value selects the
+# executor-native identity check, anything else the roster check.
+MORNING_LIVE_RUN_TYPE = "morning_dca_live"
+MIDDAY_LIVE_RUN_TYPE = "midday_dca_live"
 # Date the retime took effect, as the same zero-padded YYYYMMDD string used in
 # run_id (so it can be compared lexicographically without a date parse). The
 # legacy identity tuple is accepted ONLY for a run_id dated strictly before
@@ -472,6 +493,9 @@ LEGACY_SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_([0-9]{8})_1520ET$")
 MORNING_SLOT_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1030ET$")
 MIDDAY_SLOT_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1230ET$")
 MARKET_OPEN_LIVE_RUN_ID_RE = re.compile(r"^market_open_live_[0-9]{8}_0935ET$")
+# morning_dca.MorningDCAExecutor.run_id(): '<scheduled_run_id_prefix>_YYYYMMDD_<folder_suffix>'.
+MORNING_LIVE_RUN_ID_RE = re.compile(r"^morning_live_[0-9]{8}_1030ET$")
+MIDDAY_LIVE_RUN_ID_RE = re.compile(r"^midday_live_[0-9]{8}_1230ET$")
 # Keyed by scheduled_for_et: intraday is a single stream shared across all
 # three fire times (morning_dca.MorningDCAExecutor.run_id() stamps the slot
 # into both scheduled_window_start_et/end_et and run_id via the profile's
@@ -1468,6 +1492,61 @@ class ValidationResult:
         return self.ok
 
 
+def _validate_class_based_slot_identity(
+    rc: Mapping[str, Any],
+    errors: List[str],
+    *,
+    label: str,
+    cron_id: str,
+    schema_version: str,
+    scheduled_for_et: str,
+    window_start_et: str,
+    window_end_et: str,
+    run_id_re: "re.Pattern[str]",
+    run_id_shape: str,
+) -> None:
+    """Identity checks shared by the class-based morning/midday executors.
+
+    Mirrors the market_open branch of :func:`validate_classification`: cron
+    id, no afternoon lineage marker, the executor's own state_schema_version,
+    the slot window, and a coherent (scheduled_for_et, window start, run_id)
+    tuple. ``valid_afternoon_evidence`` is the executor's own key (the roster
+    branches check ``valid_afternoon_scheduled_evidence`` instead) and must be
+    False so a native block can never be read as afternoon evidence.
+    """
+    if rc.get("cron_id") != cron_id:
+        errors.append(f"{label} scheduled run must have cron_id={cron_id!r}")
+    if rc.get("supersedes_cron_id") is not None:
+        errors.append(
+            f"{label} scheduled run must not carry supersedes_cron_id "
+            "(that names the afternoon task's lineage)"
+        )
+    if rc.get("state_schema_version") != schema_version:
+        errors.append(
+            f"{label} executor scheduled run must have state_schema_version={schema_version!r}, "
+            f"got {rc.get('state_schema_version')!r}"
+        )
+    if rc.get("scheduled_window_end_et") != window_end_et:
+        errors.append(f"{label} scheduled_window_end_et must be {window_end_et!r}")
+    if rc.get("valid_afternoon_evidence") is not False:
+        errors.append(f"{label} executor scheduled run must have valid_afternoon_evidence=false")
+    run_id = rc.get("run_id")
+    run_id_is_str = isinstance(run_id, str)
+    is_coherent = (
+        rc.get("scheduled_for_et") == scheduled_for_et
+        and rc.get("scheduled_window_start_et") == window_start_et
+        and run_id_is_str
+        and bool(run_id_re.match(run_id))
+    )
+    if run_id_is_str and not is_coherent:
+        errors.append(
+            f"{label} scheduled_for_et, scheduled_window_start_et, and run_id must form the "
+            f"coherent {label} executor tuple ({scheduled_for_et!r}, {window_start_et!r}, "
+            f"{run_id_shape!r}); got scheduled_for_et={rc.get('scheduled_for_et')!r}, "
+            f"scheduled_window_start_et={rc.get('scheduled_window_start_et')!r}, run_id={run_id!r}"
+        )
+
+
 def validate_classification(rc: Optional[Mapping[str, Any]]) -> ValidationResult:
     """Validate a run_classification block against the contract.
 
@@ -1619,6 +1698,37 @@ def validate_classification(rc: Optional[Mapping[str, Any]]) -> ValidationResult
                         f"'intraday_live_YYYYMMDD_{scheduled_for_et.replace(':', '')}ET'); "
                         f"got scheduled_window_start_et={window_start_et!r}, run_id={run_id!r}"
                     )
+        elif stream == MORNING_SLOT_STREAM and rc.get("run_type") == MORNING_LIVE_RUN_TYPE:
+            # The class-based MorningDCAExecutor's own live identity (see
+            # MORNING_LIVE_RUN_TYPE above): same stream, cron id and slot
+            # window as the roster's 1030ET, but its own run_type, run_id
+            # shape and state_schema_version, checked as one coherent tuple
+            # exactly like the market_open/intraday branches above.
+            _validate_class_based_slot_identity(
+                rc,
+                errors,
+                label="morning",
+                cron_id=MORNING_SLOT_CRON_ID,
+                schema_version=MORNING_LIVE_SCHEMA_VERSION,
+                scheduled_for_et=MORNING_SLOT_SCHEDULED_FOR_ET,
+                window_start_et=MORNING_SLOT_SCHEDULED_WINDOW_START_ET,
+                window_end_et=MORNING_SLOT_SCHEDULED_WINDOW_END_ET,
+                run_id_re=MORNING_LIVE_RUN_ID_RE,
+                run_id_shape="morning_live_YYYYMMDD_1030ET",
+            )
+        elif stream == MIDDAY_SLOT_STREAM and rc.get("run_type") == MIDDAY_LIVE_RUN_TYPE:
+            _validate_class_based_slot_identity(
+                rc,
+                errors,
+                label="midday",
+                cron_id=MIDDAY_SLOT_CRON_ID,
+                schema_version=MIDDAY_LIVE_SCHEMA_VERSION,
+                scheduled_for_et=MIDDAY_SLOT_SCHEDULED_FOR_ET,
+                window_start_et=MIDDAY_SLOT_SCHEDULED_WINDOW_START_ET,
+                window_end_et=MIDDAY_SLOT_SCHEDULED_WINDOW_END_ET,
+                run_id_re=MIDDAY_LIVE_RUN_ID_RE,
+                run_id_shape="midday_live_YYYYMMDD_1230ET",
+            )
         elif stream == MORNING_SLOT_STREAM:
             if rc.get("run_type") != SCHEDULED_RUN_TYPE:
                 errors.append(f"morning scheduled run_type must be {SCHEDULED_RUN_TYPE!r}")
@@ -2946,7 +3056,10 @@ _PRICE_COLS = (
 # the broker-native shape, so it is not an executed column; only
 # quantity_filled / cumulative_quantity are (Codex review: "Prefer cumulative
 # quantity over requested quantity").
-_EXECUTED_QUANTITY_COLS = ("quantity_filled", "cumulative_quantity")
+EXECUTED_QUANTITY_COLS = ("quantity_filled", "cumulative_quantity")
+# near_close_dca._EXECUTED_QUANTITY_COLS is an alias of this tuple (2026-09-07
+# diagnostic, P:DUP-05), not a mirror.
+_EXECUTED_QUANTITY_COLS = EXECUTED_QUANTITY_COLS
 # `quantity` stays a LAST-RESORT alias for the recovery artifact shape, which
 # records the filled amount there and carries no cumulative_quantity column.
 _QUANTITY_COLS = (*_EXECUTED_QUANTITY_COLS, "quantity")
@@ -3207,9 +3320,18 @@ def _row_number(row: Mapping[str, Any], cols: Iterable[str]) -> Optional[float]:
 # prior notional for a still-live manual order and submit it again (Codex
 # review, PR #1300 discussion_r3920912119: "Retain reconciled in-flight
 # manual orders").
-_PLACED_OR_IN_FLIGHT_STATUSES = frozenset(
+# THE canonical set. It used to be hand-copied into near_close_dca
+# (_PRIOR_ALLOCATION_STATUSES and an inline literal), morning_dca
+# (_ORDER_BEARING_CANDIDATE_STATUSES), dca_risk (DEPLOYED_CANDIDATE_STATUSES)
+# and dca_cost_tracker (_ORDER_BEARING_STATUSES), each carrying its own
+# "recognize potentially_submitted everywhere" review note -- proof the last
+# status added had to be applied by hand in every copy. Those names are now
+# aliases of this one (2026-09-07 diagnostic, P:DUP-03); this module is
+# standard-library-only and imported by all of them, so it is the safe home.
+PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES = frozenset(
     {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
 )
+_PLACED_OR_IN_FLIGHT_STATUSES = PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES
 
 
 def _rows_from_buy_candidates(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -4325,6 +4447,12 @@ __all__ = [
     "STATE_SCHEMA_VERSION",
     "STATE_SCHEMA_VERSION_V2",
     "ACCEPTED_STATE_SCHEMA_VERSIONS",
+    "EXECUTED_QUANTITY_COLS",
+    "PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES",
+    "MORNING_LIVE_SCHEMA_VERSION",
+    "MIDDAY_LIVE_SCHEMA_VERSION",
+    "MORNING_LIVE_RUN_TYPE",
+    "MIDDAY_LIVE_RUN_TYPE",
     "is_preauthorized_v2",
     "CRON_ID",
     "SUPERSEDES_CRON_ID",

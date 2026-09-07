@@ -50906,3 +50906,97 @@ def test_repeated_failed_calls_with_reused_state_each_consume_a_daily_slot():
     assert state.buys_today("AAPL", day) == 2
     assert state.day_notional(day) == 0.0
     assert state.own_orders_recorded == set()
+
+
+def test_unproven_placement_scan_still_reads_an_artifact_whose_keys_use_json_unicode_escapes(tmp_path):
+    """2026-09-07 diagnostic P:PERF-02. The historical scan in
+    _reconcile_prior_unproven_fractional_placements now skips the JSON parse
+    for any artifact whose raw bytes contain neither key literal it is
+    looking for. A spec-valid encoder may spell an ASCII character inside
+    those keys as a \\u escape, so the pre-filter must fall through to a full
+    parse whenever the file contains any such escape -- otherwise a genuinely
+    incomplete-evidence artifact would be silently dropped."""
+    import near_close_dca
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    trading_day_iso = now.date().isoformat()
+    history_root = tmp_path / "history"
+    escaped_dir = history_root / "scheduled_runs" / "escaped"
+    escaped_dir.mkdir(parents=True)
+    # "placement_evidence_incomplete" with its 'o' spelled as o: no literal
+    # match for the key, but the parsed document carries it.
+    (escaped_dir / "run_state.json").write_text(
+        '{"trading_day": "%s", "placement_evidence_inc\\u006fmplete": true, "broker_outcomes": null}'
+        % trading_day_iso,
+        encoding="utf-8",
+    )
+    current_dir = tmp_path / "current"
+    current_dir.mkdir()
+
+    class Broker(DryRunBroker):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            raise AssertionError("malformed storage cannot be reconciled")
+
+    ctx = near_close_dca.RunContext(
+        now=now,
+        config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
+        state=state,
+        finance_data=fin,
+        robinhood_data=rh,
+        broker=Broker(cash=500.0),
+        artifacts_dir=current_dir,
+        deployment_history_root=str(history_root),
+    )
+    with pytest.raises(near_close_dca.UnresolvedPlacementError, match="malformed"):
+        near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+
+
+def test_unproven_placement_scan_skips_artifacts_without_either_evidence_key_without_parsing(tmp_path, monkeypatch):
+    import json as json_module
+
+    import near_close_dca
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    history_root = tmp_path / "history"
+    clean_dir = history_root / "scheduled_runs" / "clean"
+    clean_dir.mkdir(parents=True)
+    (clean_dir / "run_state.json").write_text(
+        json_module.dumps({"trading_day": now.date().isoformat(), "broker_outcomes": {}}), encoding="utf-8"
+    )
+    current_dir = tmp_path / "current"
+    current_dir.mkdir()
+    parsed = []
+    real_loads = json_module.loads
+
+    def counting_loads(payload, *args, **kwargs):
+        parsed.append(payload)
+        return real_loads(payload, *args, **kwargs)
+
+    monkeypatch.setattr(near_close_dca.json, "loads", counting_loads)
+    ctx = near_close_dca.RunContext(
+        now=now,
+        config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
+        state=state,
+        finance_data=fin,
+        robinhood_data=rh,
+        broker=DryRunBroker(cash=500.0),
+        artifacts_dir=current_dir,
+        deployment_history_root=str(history_root),
+    )
+    assert near_close_dca._reconcile_prior_unproven_fractional_placements(ctx) == {}
+    assert not any(b"broker_outcomes" in (p if isinstance(p, bytes) else p.encode()) for p in parsed)
+
+
+def test_same_stream_order_exists_recognizes_the_other_entry_points_ref_ids_for_the_same_slot():
+    """2026-09-07 diagnostic C:F5. The afternoon engine's same-stream check
+    asked only for its own graded-dca[-stream][-topup] family, so an order the
+    class-based executor (morning-dca-...) or dca_runner (dca-runner-1030-...)
+    placed for the SAME slot was invisible to a retry through this engine."""
+    trading_day = date(2026, 6, 29)
+    for foreign_ref in ("morning-dca-2026-06-29-AAPL", "dca-runner-1030-2026-06-29-AAPL"):
+        broker = _RefIdTrackingBroker()
+        broker._orders.append(("AAPL", foreign_ref, 1.0, "ORDER-FOREIGN"))
+        found = _same_stream_order_exists(broker, "AAPL", trading_day, "morning")
+        assert found is not None and found["id"] == "ORDER-FOREIGN", foreign_ref
+        # Still scoped to the slot: the midday engine does not claim it.
+        assert _same_stream_order_exists(broker, "AAPL", trading_day, "midday") is None

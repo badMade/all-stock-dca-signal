@@ -42,12 +42,21 @@ import re
 from dataclasses import dataclass, replace
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, TypeVar
 from uuid import uuid4
 
 from dca_fileio import atomic_write_text
 from dca_paths import stream_root
 from scripts.file_lock import cross_process_lock
+
+if TYPE_CHECKING:
+    # Type-only: near_close_dca imports this module at load time, so a runtime
+    # import here would be circular (see the module docstring). PR #1312 once
+    # dropped this guard for ``config: Any`` to silence an unused-import lint
+    # that ruff never actually raises for an annotation-only import; the
+    # annotation is what lets a static checker catch a wrong object passed
+    # as ``config`` (2026-09-07 diagnostic X:OWN-04).
+    from near_close_dca import StrategyConfig
 
 _log = logging.getLogger(__name__)
 
@@ -104,7 +113,7 @@ def compute_virtual_contribution_usd(
     decision_price: float,
     previous_close: float,
     previous_low: Optional[float],
-    config: Any,
+    config: StrategyConfig,
 ) -> tuple[float, str]:
     """Return the dollar amount today's graded ladder would have bought.
 

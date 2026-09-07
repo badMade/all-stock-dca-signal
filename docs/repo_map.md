@@ -8,7 +8,7 @@ rest of the repo combined:
 
 | File | Lines | Read it only when |
 |---|---:|---|
-| `near_close_dca.py` | 40,110 | You are changing signal, ladder, budget, or safeguard logic itself |
+| `near_close_dca.py` | ~42,000 | You are changing signal, ladder, budget, or safeguard logic itself |
 | `morning_dca.py` | 9,996 | You are changing executor-class behavior shared by all four streams |
 | `dca_runner.py` | 9,302 | You are changing a gate in the live gate sequence |
 | `dca_live_adapters.py` | 8,104 | You are changing the injected-callable broker/data boundary |
@@ -212,7 +212,7 @@ Everything else in this section is research output. Nothing else here is wired i
 | `dca_inverse_martingale.py` | Opt-in deferred accumulation: tracks dip-tier amounts, fires once on recovery | opt-in, **off by default** (`docs/inverse_martingale.md`) |
 | `dca_whole_share_accumulator.py` | Whole-share accumulation for non-fractional tickers (built for BYDDY) | **yes, 3:30 PM stream only** (`docs/whole_share_accumulation.md`) |
 | `dca_cumulative.py` | Cumulative sub-dollar credit ledger | yes |
-| `run_market_open_signals.py`, `build_raw_data.py`, `snap.py` | One-off 9:35 signal reproduction from static data | no, harness/scratch |
+| `claude/_agent_scratch/run_market_open_signals.py`, `build_raw_data.py`, `snap.py` (moved out of the repo root 2026-09-07) | One-off 9:35 signal reproduction from static data | no, harness/scratch |
 
 ### 3.3 Sibling subprojects (own `requirements.txt`, own `tests/`, own CI job)
 

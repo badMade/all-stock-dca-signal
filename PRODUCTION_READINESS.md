@@ -15,10 +15,40 @@ The production gaps are mostly **around** the code rather than in it:
 1. Live execution authority lives in scheduler task text outside version control.
 2. Durable state is an unlocked, non-atomically-written JSON file tree on one machine.
 3. Failure visibility is convention-driven (task text + env-gated Slack), not guaranteed by code.
-4. The trading calendar is a hardcoded pilot window that ends 2026-08-28.
+4. The trading calendar is a hardcoded pilot window (extended to 2026-10-30 in
+   `config/trading_window.json` on 2026-07-26; the in-code fallback caught up on 2026-09-07).
 
 Every incident in the July 2026 log (13th, 16th, 17th, 20th, 21st — see
 `config/scheduled_tasks.json`) originated in those four areas, not in the strategy math.
+
+**Status, 2026-09-07 — diagnostic remediation pass.** A read-only sweep across correctness,
+security, performance and test coverage produced 66 findings (4 High, 27 Medium, 34 Low), and
+the same-day remediation branch closed the following, each with a regression test that failed
+before its fix:
+
+- Fail-closed broker adapter: a live `RobinhoodBroker` now refuses an unwired buying-power,
+  tradability or order-history lookup instead of degrading to the dry-run defaults; placement
+  responses must describe the requested symbol, side, ref id and size; booleans and non-finite
+  strings never parse as numbers; the live gate requires the literal `True` on every path.
+- Runtime classification accepts the class-based morning/midday executors' own
+  `state_schema_version`, so their scheduled runs count as `STREAM_SCHEDULED`.
+- `dca_runner`: the bought-today refusal follows `one_order_per_ticker_per_day` like `assess()`,
+  unknown order provenance fails the Gate 4 grace path closed, the strategy-state lock is bounded
+  (30 s, `TimeoutError`), history freshness is bounded before every placement, a dry run rehearses the live
+  validation, and four uncalled gate helpers are gone.
+- Redaction everywhere text leaves the process: broker payloads in adapter logs and exception
+  text, Slack alert bodies, attempt-log markers, `raw/orders_after_place.json`.
+- A durable Gate 9 alert file writer (`dca_alerts.write_alert_file`), used automatically by
+  `guarded_run` for structured failures and named by the live-mirror prompts.
+- One canonical definition each for the deployed-status set, the terminal and live broker state
+  sets, the executed-quantity columns, and the same-slot ref-id prefix families across all three
+  entry points; `config/near_close_dca.json` ships in the wheel.
+
+Still open from that sweep, each needing its own design and acceptance run: broker-history
+cap seeding for the executor and afternoon paths (the three entry points still read caps from
+three sources), the per-run artifact corpus index, the `run_daily_compact` extraction, wiring
+`scripts/scheduler_lease.py`, SHA-pinning third-party actions, and the git-history account
+number (a repository-owner decision).
 
 ## What is already strong
 
@@ -133,7 +163,7 @@ real store (SQLite is enough).
 ### 3. Failure visibility
 
 - Two `except Exception` blocks with **no logging** in the same-day allocation guard
-  (`near_close_dca.py`, orders-CSV parsing in `_load_orders_csv_fills` and
+  (`near_close_dca.py`, orders-CSV parsing in `_orders_csv_fills` and
   `_orders_csv_submitted_notionals`): a corrupt/partial CSV silently reads as "no prior allocation",
   which can double-deploy capital — the same drift class as the 2026-07-16 incident — with zero log
   line. (Phase 1.)

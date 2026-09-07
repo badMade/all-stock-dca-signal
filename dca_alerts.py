@@ -35,7 +35,7 @@ import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
 
@@ -52,7 +52,8 @@ from dca_net_utils import (
 from dca_net_utils import (
     sanitize_exception as _sanitize_exception,
 )
-from dca_paths import stream_root
+from dca_paths import stream_artifact_dir, stream_root
+from scripts.idempotency import STREAM_SLOT_IDS
 
 logger = logging.getLogger("near_close_dca.alerts")
 
@@ -174,6 +175,87 @@ def send_heartbeat(
         return False
 
 
+def _redacted(text: str) -> str:
+    """Account-number/credential redaction for text that leaves the process.
+
+    The strategy core applies ``near_close_dca._redacted_diagnostic_text`` at
+    every site that persists or transmits exception text; this module POSTed
+    raw ``str(exc)`` plus a traceback to a third-party webhook and wrote both
+    to the attempt_log marker unredacted, and MCP/transport exceptions
+    routinely echo the account number and token-bearing URLs (2026-09-07
+    diagnostic, S:NET-01). Imported lazily: ``near_close_dca`` is the heavy
+    strategy module and this one must stay importable on its own.
+    """
+    from near_close_dca import _redacted_diagnostic_text
+
+    return _redacted_diagnostic_text(text)
+
+
+def _trading_day_et(now: Optional[datetime] = None) -> str:
+    from zoneinfo import ZoneInfo
+
+    moment = now or datetime.now(timezone.utc)
+    return moment.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+
+
+def _resolve_alert_slot(stream: str, now: Optional[datetime] = None) -> str:
+    """The roster slot token for ``stream``'s Gate 9 alert filename.
+
+    ``scripts/alert_digest.py`` counts an alert toward a per-slot gate streak
+    only when the filename's slot field is a roster slot (``0935`` ...
+    ``1530``); a stream word there loses the file's authoritative slot. A
+    single-slot stream resolves from :data:`scripts.idempotency.STREAM_SLOT_IDS`;
+    a slot-qualified namespace such as ``intraday-1330`` names its own slot;
+    a multi-slot stream with no qualifier takes the roster slot nearest to
+    the wall clock, which is the slot that fired. An unknown stream keeps its
+    own name (Copilot review, PR #1394: "Supply parser-compatible slot and
+    gate tokens for structured-failure filenames").
+    """
+    base, _, qualifier = stream.partition("-")
+    slots = STREAM_SLOT_IDS.get(base, ())
+    if qualifier and qualifier in slots:
+        return qualifier
+    if len(slots) == 1:
+        return slots[0]
+    if not slots:
+        return stream
+    from zoneinfo import ZoneInfo
+
+    moment = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo("America/New_York"))
+    minute_of_day = moment.hour * 60 + moment.minute
+    return min(slots, key=lambda slot: abs(int(slot[:2]) * 60 + int(slot[2:]) - minute_of_day))
+
+
+def write_alert_file(
+    stream: str,
+    *,
+    slot: str,
+    gate: str,
+    body: str,
+    trading_day: Optional[date] = None,
+) -> Optional[Path]:
+    """Write the durable Gate 9 alert file ``scripts/alert_digest.py`` reads.
+
+    ``<cron root>/<stream artifact dir>/alerts/<YYYY-MM-DD>-<slot>-<gate>.txt``,
+    with the root resolved through ``dca_paths`` exactly like every other
+    artifact writer -- never a bare repo-relative ``artifacts/`` directory
+    (gitignored; 23 of the 2026-08 alerts were lost that way, see
+    ``docs/alert_digest.md``) and never a literal fallback root. Until the
+    2026-09-07 diagnostic (T:F08) this channel had no in-code writer at all:
+    every executor prompt hand-rolled the path. ``body`` is redacted. Never
+    raises; returns the path written, or ``None`` on failure (logged).
+    """
+    day = trading_day.isoformat() if trading_day is not None else _trading_day_et()
+    path = Path(stream_root(stream_artifact_dir(stream), "alerts", f"{day}-{slot}-{gate}.txt"))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, _redacted(body).rstrip("\n") + "\n")
+    except Exception as exc:  # noqa: BLE001 - an alert-file failure must not mask the run failure
+        logger.warning("alert file for %s could not be written (%s): %s", stream, path, _sanitize_exception(exc))
+        return None
+    return path
+
+
 def alert_failure(
     stream: str,
     exc: BaseException,
@@ -192,12 +274,12 @@ def alert_failure(
     )
     if url is None:
         return False
-    trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    trace = _redacted("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
     if len(trace) > _TRACEBACK_CHAR_LIMIT:
         trace = "…" + trace[-_TRACEBACK_CHAR_LIMIT:]
-    lines = [f":rotating_light: DCA {stream} live run FAILED: {type(exc).__name__}: {exc}"]
+    lines = [f":rotating_light: DCA {stream} live run FAILED: {type(exc).__name__}: {_redacted(str(exc))}"]
     if context:
-        lines.append(context)
+        lines.append(_redacted(context))
     lines.append(f"```{trace}```")
     payload = json.dumps({"text": "\n".join(lines)}).encode("utf-8")
     request = urllib.request.Request(
@@ -280,13 +362,13 @@ def write_failed_start_marker(
         log_root = root or os.environ.get(ATTEMPT_LOG_ROOT_ENV) or stream_root("attempt_log")
         day_dir = Path(log_root) / triggered.strftime("%Y%m%d")
         day_dir.mkdir(parents=True, exist_ok=True)
-        trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        trace = _redacted("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
         if len(trace) > _TRACEBACK_CHAR_LIMIT:
             trace = "…" + trace[-_TRACEBACK_CHAR_LIMIT:]
         marker = {
             "stream": stream,
             "error_class": type(exc).__name__,
-            "error_message": str(exc),
+            "error_message": _redacted(str(exc)),
             "traceback": trace,
             "triggered_at_utc": triggered.strftime("%Y-%m-%dT%H:%M:%SZ"),
             # See run_artifact_written above: 'before_run_artifact' is the
@@ -361,6 +443,14 @@ class GuardedRunConfig:
     result_ok: Optional[Callable[[Any], bool]] = None
     attempt_log_root: Optional[str] = None
     run_artifact_written: Optional[Callable[[], bool]] = None
+    # Slot label for the durable alert file written when ``result_ok`` says the
+    # returned result is a structured failure (see :func:`write_alert_file`);
+    # resolved from the stream's roster slot when unset (the intraday executor
+    # passes its own slot). ``alert_gate`` is the file's gate token; Gate 9 is
+    # the evidence-and-alerting gate this channel belongs to, and the digest
+    # needs a ``gate<N>`` token to file the alert under a gate at all.
+    alert_slot: Optional[str] = None
+    alert_gate: str = "gate9"
 
 
 def guarded_run(
@@ -455,6 +545,18 @@ def guarded_run(
         except Exception:  # noqa: BLE001 - fail closed: a broken predicate must not report healthy
             logger.exception("result_ok predicate raised for %s; pinging failed heartbeat", stream)
             ok = False
+    if not ok:
+        # The one channel that needs no configuration: Slack and heartbeats
+        # are env-gated off on a default deployment and the failed-start
+        # marker is written only for an ESCAPING exception, so a class-based
+        # stream that failed closed via a structured result was silent
+        # everywhere in code (2026-09-07 diagnostic, T:F08).
+        write_alert_file(
+            stream,
+            slot=config.alert_slot or _resolve_alert_slot(stream),
+            gate=config.alert_gate,
+            body=f"{stream} run returned a structured failure result\n{repr(result)[:4000]}",
+        )
     try:
         if not ok:
             logger.warning(

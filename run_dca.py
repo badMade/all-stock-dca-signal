@@ -75,6 +75,7 @@ from near_close_dca import (
     StrategyState,
     _earlier_selected_base,
     _existing_csv_artifacts,
+    _redacted_diagnostic_text,
     _settle_usage_bytes,
     _write_and_validate_scheduled_contract,
     build_broker,
@@ -2093,6 +2094,25 @@ def _log_pipeline_model_usage(
     )
 
 
+def _redacted_strings(node: Any) -> Any:
+    """Copy of ``node`` with every string value AND every string key passed
+    through :func:`near_close_dca._redacted_diagnostic_text`; containers
+    recurse, other scalars pass through unchanged. Keys too: a broker payload
+    can carry the identifier in a key (``{"account_number=<n>": ...}``), and
+    scrubbing values alone left it in ``raw/orders_after_place.json`` (Copilot
+    review, PR #1394)."""
+    if isinstance(node, str):
+        return _redacted_diagnostic_text(node)
+    if isinstance(node, dict):
+        return {
+            (_redacted_diagnostic_text(key) if isinstance(key, str) else key): _redacted_strings(value)
+            for key, value in node.items()
+        }
+    if isinstance(node, list):
+        return [_redacted_strings(value) for value in node]
+    return node
+
+
 def run_pipeline(
     now: datetime,
     config: StrategyConfig,
@@ -2300,17 +2320,16 @@ def run_slot(
     slot_tickers = config.tickers
     preflight_gate: Optional[Dict[str, Any]] = None
     if stream_name == MORNING_STREAM:
-        # The 10:30 slot must not scan the configured universe unconditionally:
-        # config/morning_dca.json's live_task.preflight_artifact_resolution
-        # requires a missing or invalid same-day 9:45 pre-flight artifact to
-        # reduce the eligible universe to ZERO, the same fail-closed contract
-        # MorningDCAExecutor._apply_preflight_gate() enforces for its own,
-        # separate morning-live entry point. Routed only through the generic
-        # pipeline, run_slot("1030ET") never called that gate at all, so a
-        # missing/invalid preflight artifact silently let it scan every
-        # configured ticker and place live orders without the required morning
-        # eligibility evidence (Codex review: "Route the morning slot through
-        # its required preflight gate"). allow_unpinned_account=True: this
+        # The 10:30 slot admits its universe through the SAME
+        # morning_preflight_eligible_tickers() MorningDCAExecutor.
+        # _apply_preflight_gate() uses, so the two entry points cannot drift on
+        # ticker admission. Its contract is NON-BLOCKING as of 2026-08-02 (see
+        # the branch below): a missing, forbidden-root or empty same-day 9:45
+        # preflight artifact degrades to the full configured universe with a
+        # recorded warning, not to zero. Routed only through the generic
+        # pipeline, run_slot("1030ET") once skipped the gate entirely (Codex
+        # review: "Route the morning slot through its required preflight
+        # gate"). allow_unpinned_account=True: this
         # call only needs the preflight root/forbidden-roots/bounded-recovery
         # fields, not an account -- the broker/account this slot actually
         # trades through is the caller-supplied ``broker`` above.
@@ -2323,7 +2342,6 @@ def run_slot(
             preflight_run_state_root=morning_config.preflight_run_state_root,
             preflight_forbidden_roots=morning_config.preflight_forbidden_roots,
             preflight_bounded_recovery=morning_config.preflight_bounded_recovery,
-            manual=False,
         )
         if preflight_gate.get("warning"):
             # NON-BLOCKING as of 2026-08-02: morning_preflight_eligible_
@@ -4293,7 +4311,15 @@ def _run_pipeline_impl(
                     for o in prior_orders
                     if (o.get("order_id") or o.get("id")) not in new_ids
                 ]
-                atomic_write_text(oap_path, json.dumps({"orders": merged}, indent=2) + "\n")
+                # The rows spread the broker's whole order dict (**order in
+                # RobinhoodBroker.place_market_buy), which can echo the account
+                # number and account URLs; this file lives under cron_tracking/
+                # and is synced onward by reporting tooling, so every string in
+                # it goes through the same redaction the run artifacts get
+                # (2026-09-07 diagnostic, S:ADP-05).
+                atomic_write_text(
+                    oap_path, json.dumps({"orders": _redacted_strings(merged)}, indent=2) + "\n"
+                )
                 result["orders_after_place_path"] = str(oap_path)
 
             # Codex review (finding: "Keep ownership through the downstream

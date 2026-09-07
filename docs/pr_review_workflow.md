@@ -70,12 +70,11 @@ naming the specific thing that drifted, if any of them regress.
 
 ## Bootstrapping note
 
-`workflow_run` only fires for a consumer workflow that already exists on the
-default branch. Until the two-workflow split itself is merged, the privileged
-post-workflow will not run for PRs against this branch -- the analyze
-workflow still runs and uploads artifacts, but nothing consumes them yet. This
-is expected, not a regression: the same PR that introduces this split cannot
-receive a privileged review of itself.
+The two-workflow split is live on the default branch (see
+`.github/workflows/antigravity-pr-review.yml`'s own header), so the privileged
+post-workflow now runs for every PR. `workflow_run` only fires for a consumer
+workflow that already exists on the default branch, which is why the PR that
+introduced the split could not receive a privileged review of itself.
 
 ## Visible changes
 

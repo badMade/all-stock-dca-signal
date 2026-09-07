@@ -122,6 +122,7 @@ from dca_whole_share_accumulator import (
     apply_contribution,
 )
 from scripts.file_lock import cross_process_lock
+from scripts.idempotency import same_stream_ref_id_prefixes
 
 try:  # pragma: no cover - import shim for flat sys.path
     from scripts.run_classification import (
@@ -131,11 +132,13 @@ try:  # pragma: no cover - import shim for flat sys.path
         ERROR_CLASS_PARTIAL_PLACEMENT_FAILURE,
         ERROR_CLASS_POST_SUBMISSION_FAILURE,
         ERROR_CLASS_STARTUP_FAILURE,
+        EXECUTED_QUANTITY_COLS,
         ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED,
         ORDER_SUBMIT_STATUS_ERROR,
         ORDER_SUBMIT_STATUS_NO_CANDIDATES,
         ORDER_SUBMIT_STATUS_NO_ORDERS,
         ORDER_SUBMIT_STATUS_SUBMITTED,
+        PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES,
         RUN_CLASSIFICATION_COMPLETED_NO_ORDERS,
         RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION,
         RUN_CLASSIFICATION_MANUAL_PLACEMENT_FAILED,
@@ -154,11 +157,13 @@ except ImportError:  # pragma: no cover
         ERROR_CLASS_PARTIAL_PLACEMENT_FAILURE,
         ERROR_CLASS_POST_SUBMISSION_FAILURE,
         ERROR_CLASS_STARTUP_FAILURE,
+        EXECUTED_QUANTITY_COLS,
         ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED,
         ORDER_SUBMIT_STATUS_ERROR,
         ORDER_SUBMIT_STATUS_NO_CANDIDATES,
         ORDER_SUBMIT_STATUS_NO_ORDERS,
         ORDER_SUBMIT_STATUS_SUBMITTED,
+        PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES,
         RUN_CLASSIFICATION_COMPLETED_NO_ORDERS,
         RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION,
         RUN_CLASSIFICATION_MANUAL_PLACEMENT_FAILED,
@@ -339,16 +344,25 @@ def _weekday_range(start: date, end: date) -> set:
 MARKET_HOLIDAYS = frozenset({date(2026, 7, 3)})
 
 # Approved live-test window. The original pilot dates (Jun 29 - Jul 1 2026) plus
-# the canonical live window of weekdays 2026-07-02 through 2026-08-28 inclusive
-# (minus market holidays), matching the ce16ba6b/10ce362c trigger_window in
-# config/scheduled_tasks.json. Without this, run_once()'s date gate would mark
-# every scheduled run in the live window blocked/no-trade. Callers normally
-# override this default via ``config/trading_window.json``
-# (``dca_config.load_approved_dates``); ``nyse_holidays()`` still applies on
-# top of whichever set is active.
+# the canonical live window of weekdays 2026-07-02 through 2026-10-30 inclusive
+# (minus market holidays), matching config/trading_window.json's start_date/
+# end_date (the authoritative window, extended from 2026-08-28 to 2026-10-30 on
+# 2026-07-26; see that file's own description for the DST reason it stops
+# there). Without this, run_once()'s date gate would mark every scheduled run
+# in the live window blocked/no-trade. Callers normally override this default
+# via ``config/trading_window.json`` (``dca_config.load_approved_dates``), but
+# a bare ``StrategyConfig()`` and ``load_strategy_config`` with an absent
+# config dir both fall back to THIS set, so it must track the JSON: the
+# 2026-09-07 diagnostic (T:F02) found it still ending on 2026-08-28, i.e.
+# every JSON-blind path blocked with a no-trade date gate from 2026-08-31 on
+# while the JSON-driven paths kept trading.
+# tests/test_config_invariants.py pins the two to each other.
+# ``nyse_holidays()`` still applies on top of whichever set is active, which
+# is why the Labor Day inside the extended range is not listed in the
+# hand-maintained MARKET_HOLIDAYS above.
 APPROVED_TEST_DATES = (
     {date(2026, 6, 29), date(2026, 6, 30), date(2026, 7, 1)}
-    | _weekday_range(date(2026, 7, 2), date(2026, 8, 28))
+    | _weekday_range(date(2026, 7, 2), date(2026, 10, 30))
 ) - MARKET_HOLIDAYS
 
 
@@ -5584,17 +5598,13 @@ def _inverse_martingale_reset_if_disabled_mid_cycle(
 #: expired order looking indeterminate -- so its lease was preserved forever even
 #: though the order can no longer execute (Codex review: "Treat expired broker
 #: orders as settled").
-_TERMINAL_BROKER_ORDER_STATES = frozenset(
-    {"cancelled", "canceled", "rejected", "failed", "voided", "expired"}
-)
-
-#: Order states whose executed amount is FINAL and will not change again --
-#: the failure states above, plus a completed fill. Every other state
-#: (``new``/``queued``/``confirmed``/``unconfirmed``/``partially_filled``) is a
-#: working order that can still execute more, so its executed amount so far is
-#: not something a settlement decision may be based on. See
-#: :func:`_recovered_broker_notional`.
-_SETTLED_BROKER_ORDER_STATES = _TERMINAL_BROKER_ORDER_STATES | {"filled"}
+#:
+#: Bound to the canonical set below (``_TERMINAL_NON_FILL_STATES``, sourced from
+#: scripts/broker_reconciliation by ``_load_terminal_order_states``) rather than
+#: re-declared: the "mirror" comment above was exactly the hand-copy pattern
+#: that loader was written to eliminate (2026-09-07 diagnostic, P:DUP-04).
+#: ``_TERMINAL_BROKER_ORDER_STATES`` and ``_SETTLED_BROKER_ORDER_STATES`` are
+#: assigned right after that loader runs, further down this module.
 
 
 @dataclass(frozen=True)
@@ -9728,9 +9738,7 @@ def _write_csv(
 # planned amount until reconciliation proves whether capital moved -- see
 # _UNRESOLVED_ORDER_ATTEMPT_STATUSES below, which admits the same status for
 # the analogous canonical-CSV reconstruction path.
-_PRIOR_ALLOCATION_STATUSES = frozenset(
-    {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
-)
+_PRIOR_ALLOCATION_STATUSES = PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES  # canonical set (P:DUP-03)
 # Broader than _PRIOR_ALLOCATION_STATUSES above: also admits "failed" rows
 # (near_close_dca's own placement-exception path, e.g. a broker API error --
 # _process_buy_candidate's "except Exception" branch) into the aggregation
@@ -10141,6 +10149,35 @@ def _load_terminal_order_states() -> frozenset:
 
 
 _TERMINAL_NON_FILL_STATES = _load_terminal_order_states()
+#: See the comment block above ``_load_terminal_order_states``'s first use
+#: (near ``_SETTLED_BROKER_ORDER_STATES``'s docs): one canonical terminal set.
+_TERMINAL_BROKER_ORDER_STATES = _TERMINAL_NON_FILL_STATES
+#: Order states whose executed amount is FINAL and will not change again --
+#: the terminal failure states, plus a completed fill. Every other state
+#: (``new``/``queued``/``confirmed``/``unconfirmed``/``partially_filled``) is a
+#: working order that can still execute more, so its executed amount so far is
+#: not something a settlement decision may be based on. See
+#: :func:`_recovered_broker_notional`.
+_SETTLED_BROKER_ORDER_STATES = _TERMINAL_BROKER_ORDER_STATES | {"filled"}
+
+
+def _load_live_order_states() -> frozenset:
+    """The canonical broker live/working-state set, from broker_reconciliation.
+
+    Same shape as :func:`_load_terminal_order_states`: sourced rather than
+    re-declared, with the literal only as an import-failure fallback kept
+    identical to the canonical set (2026-09-07 diagnostic, P:DUP-05).
+    """
+    try:
+        from scripts.broker_reconciliation import _LIVE_ORDER_STATES
+    except ImportError:  # pragma: no cover - exercised via the scripts/ path
+        try:
+            from broker_reconciliation import _LIVE_ORDER_STATES  # type: ignore
+        except ImportError:
+            return frozenset(
+                {"new", "queued", "confirmed", "unconfirmed", "partially_filled", "filled"}
+            )
+    return frozenset(_LIVE_ORDER_STATES)
 
 # Every placed/in-flight (non-terminal, non-fill) STATUS a canonical
 # submitted_orders.csv row can carry, per scripts.scheduled_artifacts.
@@ -10203,7 +10240,7 @@ _FILL_PRICE_COLS = ("avg_fill_price", "average_fill_price")
 # request was retained as prior allocation, suppressing a legitimate later
 # top-up; partially filled rows were overstated the same way (Codex review:
 # "Prefer cumulative quantity over requested quantity").
-_EXECUTED_QUANTITY_COLS = ("quantity_filled", "cumulative_quantity")
+_EXECUTED_QUANTITY_COLS = EXECUTED_QUANTITY_COLS  # canonical tuple, scripts.run_classification (P:DUP-05)
 # `quantity` remains a LAST-RESORT alias, used only when neither executed column
 # is present at all. That is the recovery artifact shape recorded in
 # config/scheduled_tasks.json -> recovery_context_run_outcomes, whose `quantity`
@@ -14361,7 +14398,7 @@ def _load_deployment_history_states(
         _blocked_candidates = data.get("buy_candidates") if isinstance(data, dict) else None
         _has_deployed_evidence = isinstance(_blocked_candidates, list) and any(
             isinstance(c, dict)
-            and c.get("status") in {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
+            and c.get("status") in _PRIOR_ALLOCATION_STATUSES
             for c in _blocked_candidates
         )
         if isinstance(data, dict) and (
@@ -15638,10 +15675,12 @@ def _same_stream_order_exists(
         raise RuntimeError(
             "broker does not support same-stream ref-id duplicate checks for guarded top-ups"
         )
-    prefixes = (
-        f"{_graded_dca_ref_id_prefix(stream, 'topup')}-{trading_day.isoformat()}-{ticker}",
-        f"{_graded_dca_ref_id_prefix(stream)}-{trading_day.isoformat()}-{ticker}",
-    )
+    # Every family the SAME slot can have used, not only this engine's own
+    # graded-dca[-stream][-topup] pair: the class-based executor's
+    # {stream}-dca[-topup]-... and dca_runner's dca-runner-{slot}-... too, so
+    # a retry of this slot through a different entry point is recognized
+    # (2026-09-07 diagnostic, C:F5; see scripts.idempotency).
+    prefixes = same_stream_ref_id_prefixes(stream, trading_day, ticker)
     result = checker(ticker, trading_day, prefixes)
     if not isinstance(result, dict):
         # Normalize legacy boolean adapters: False/None -> None (no duplicate),
@@ -25470,9 +25509,7 @@ _DECLINED_BROKER_ORDER_STATES = frozenset({"rejected", "failed", "voided"})
 #: exactly that shape (Codex review, PR #786: "Require a recognized state
 #: before booking the order"). Booking fabricates deployment and resets the
 #: failure streak; leaving it unknown costs a manual reconciliation.
-_WORKING_BROKER_ORDER_STATES = frozenset(
-    {"new", "queued", "confirmed", "unconfirmed", "partially_filled", "filled"}
-)
+_WORKING_BROKER_ORDER_STATES = _load_live_order_states()
 
 
 def _unwrap_fill_alias_value(value: Any) -> Any:
@@ -28607,10 +28644,27 @@ def _reconcile_prior_unproven_fractional_placements(
     # same-directory preservation check, but do not make an unrelated live
     # artifact elsewhere in that corpus abort a simulation.
     if not ctx.config.dry_run and history_root is not None and history_root.exists():
+        # The only per-run scan that fully JSON-parsed the whole artifact
+        # corpus (measured 0.27 s at a 2000-file history, linear). An artifact
+        # can only contribute below through a truthy placement_outcome_unproven
+        # row or placement_evidence_incomplete=true, so a file whose raw bytes
+        # carry NEITHER key literal is skipped before json.loads -- the same
+        # substring pre-filter _load_deployment_history_states applies, with
+        # the same escape guard: a spec-valid encoder may spell an ASCII
+        # character inside a key as a \u escape, so any file containing one
+        # falls through to a full parse (2026-09-07 diagnostic, P:PERF-02;
+        # .jules/bolt.md 2025-01-20 / 2026-07-21).
+        evidence_needles = (b"placement_outcome_unproven", b"placement_evidence_incomplete")
         for state_path in sorted(history_root.rglob("run_state.json")):
             try:
-                payload = json.loads(state_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                raw_bytes = state_path.read_bytes()
+            except OSError:
+                continue
+            if b"\\u" not in raw_bytes and not any(needle in raw_bytes for needle in evidence_needles):
+                continue
+            try:
+                payload = json.loads(raw_bytes)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                 continue
             # A dry-run/demo artifact never placed a real broker order --
             # config.dry_run is stamped onto every persisted run_state.json

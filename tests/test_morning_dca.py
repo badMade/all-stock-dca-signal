@@ -104,6 +104,38 @@ from scripts.file_lock import cross_process_lock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+# C:F1 (2026-09-07 diagnostic): a LIVE RobinhoodBroker now refuses to answer a
+# lookup whose callable is unwired (simulated buying power, "tradable", "no
+# order today" are dry-run defaults only), so fixtures that exercise placement
+# wire the three lookups explicitly with permissive stubs.
+def _no_orders_today(**_kwargs):
+    # An explicit, provable empty page (an ``orders`` list), not a bare
+    # ``results`` page: a live broker now refuses a page shape it cannot
+    # recognize instead of reading it as "no order today" (2026-09-07 mock
+    # beta run of the executor classes).
+    return {"orders": [], "next": None}
+
+
+def _all_tradable(**kwargs):
+    return {
+        "results": [
+            {"symbol": symbol, "tradeable": True, "state": "active", "fractional_tradability": "tradable"}
+            for symbol in kwargs.get("symbols", ())
+        ]
+    }
+
+
+def _ample_buying_power(**_kwargs):
+    return {"buying_power": "300"}
+
+
+_LIVE_LOOKUP_STUBS = {
+    "buying_power_fn": _ample_buying_power,
+    "orders_fn": _no_orders_today,
+    "tradability_fn": _all_tradable,
+}
+
+
 def _now_live():
     """Decision timestamp for the 10:30 AM ET live execution mode."""
     return datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=EASTERN)
@@ -10651,7 +10683,7 @@ def test_persisting_broker_adapter_preserves_submitted_order_when_persist_write_
     # already-completed broker action being treated as if it never happened (see PR
     # #560 review discussion r3816306601).
     placed = {"order": {"id": "order-456", "state": "confirmed"}}
-    broker = RobinhoodBroker(place_fn=lambda **kwargs: placed, enable_live_orders=True)
+    broker = RobinhoodBroker(place_fn=lambda **kwargs: placed, enable_live_orders=True, **_LIVE_LOOKUP_STUBS)
     recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
     wrapped = _PersistingBrokerAdapter(broker, recorder)
 
@@ -11644,7 +11676,7 @@ def test_scheduled_live_run_fails_the_heartbeat_when_a_trading_failure_is_record
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    broker = RobinhoodBroker(place_fn=_reject_for_small, enable_live_orders=True)
+    broker = RobinhoodBroker(place_fn=_reject_for_small, enable_live_orders=True, **_LIVE_LOOKUP_STUBS)
 
     res = ex.run(_now_live(), data, broker=broker)
 
@@ -11732,7 +11764,12 @@ def test_scheduled_live_run_blocks_when_production_broker_swallows_buying_power_
     def _raising_buying_power_fn(**kwargs):
         raise ConnectionError("broker temporarily unavailable")
 
-    broker = RobinhoodBroker(buying_power_fn=_raising_buying_power_fn, enable_live_orders=True)
+    broker = RobinhoodBroker(
+        buying_power_fn=_raising_buying_power_fn,
+        orders_fn=_no_orders_today,
+        tradability_fn=_all_tradable,
+        enable_live_orders=True,
+    )
 
     res = ex.run(_now_live(), data, broker=broker)
 
@@ -12716,6 +12753,7 @@ def test_raising_placement_connector_retains_ambiguous_broker_outcome(tmp_path):
     broker = RobinhoodBroker(
         place_fn=_raise_after_possible_submission,
         enable_live_orders=True,
+        **_LIVE_LOOKUP_STUBS,
     )
 
     res = ex.run(_now_live(), data, broker=broker)
@@ -12763,7 +12801,7 @@ def test_definitive_placement_rejection_continues_the_batch(tmp_path):
 
     ex = _live_executor(tmp_path, ("AAPL", "NVDA"))
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.10, "NVDA": 0.10})
-    broker = RobinhoodBroker(place_fn=_place_fn, enable_live_orders=True)
+    broker = RobinhoodBroker(place_fn=_place_fn, enable_live_orders=True, **_LIVE_LOOKUP_STUBS)
 
     # Sanity-check the adapter itself raises the specific type this test relies on.
     with pytest.raises(OrderPlacementRejectedError):
@@ -12810,6 +12848,8 @@ def test_terminal_partial_fill_is_booked_before_continuing_batch(tmp_path):
     broker = RobinhoodBroker(
         place_fn=_place_fn,
         buying_power_fn=lambda **_kwargs: {"buying_power": "15"},
+        orders_fn=_no_orders_today,
+        tradability_fn=_all_tradable,
         enable_live_orders=True,
     )
 
@@ -12871,6 +12911,8 @@ def test_terminal_rejection_with_unreadable_quantity_halts_the_batch(tmp_path):
     broker = RobinhoodBroker(
         place_fn=_place_fn,
         buying_power_fn=lambda **_kwargs: {"buying_power": "1000"},
+        orders_fn=_no_orders_today,
+        tradability_fn=_all_tradable,
         enable_live_orders=True,
     )
 
@@ -12917,6 +12959,8 @@ def test_terminal_rejection_with_positive_quantity_and_no_usable_price_halts_the
     broker = RobinhoodBroker(
         place_fn=_place_fn,
         buying_power_fn=lambda **_kwargs: {"buying_power": "1000"},
+        orders_fn=_no_orders_today,
+        tradability_fn=_all_tradable,
         enable_live_orders=True,
     )
 
@@ -12964,6 +13008,8 @@ def test_terminal_partial_fill_response_is_archived_for_raw_replay(tmp_path):
     broker = RobinhoodBroker(
         place_fn=_place_fn,
         buying_power_fn=lambda **_kwargs: {"buying_power": "15"},
+        orders_fn=_no_orders_today,
+        tradability_fn=_all_tradable,
         enable_live_orders=True,
     )
 
@@ -13000,7 +13046,7 @@ def test_scheduled_live_run_drains_placement_responses_onto_the_callers_broker(t
 
     ex = _live_executor(tmp_path, ("NVDA",))
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
-    broker = RobinhoodBroker(place_fn=_place_fn, enable_live_orders=True)
+    broker = RobinhoodBroker(place_fn=_place_fn, enable_live_orders=True, **_LIVE_LOOKUP_STUBS)
 
     # Sanity check: nothing recorded on the caller's own instance before the run.
     assert broker.get_raw_placement_responses() == []
@@ -15508,3 +15554,24 @@ def test_submitted_keys_counts_potentially_submitted_outcomes():
 
 
 
+
+
+def test_same_stream_order_exists_asks_for_every_entry_points_family(tmp_path):
+    """2026-09-07 diagnostic C:F5, executor side: the check must name the
+    run_dca.run_slot() engine's graded-dca-{stream}-... and dca_runner's
+    dca-runner-{slot}-... ref ids alongside its own {stream}-dca-... pair."""
+    from scripts.idempotency import same_stream_ref_id_prefixes
+
+    asked = []
+
+    class _Recorder:
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            asked.append(tuple(ref_id_prefixes))
+            return {"id": "ORD-1", "ref_id": "graded-dca-morning-2026-07-08-AAPL"}
+
+    found = _same_stream_order_exists(_Recorder(), "AAPL", date(2026, 7, 8), "morning")
+    assert found == {"id": "ORD-1", "ref_id": "graded-dca-morning-2026-07-08-AAPL"}
+    assert asked == [same_stream_ref_id_prefixes("morning", date(2026, 7, 8), "AAPL")]
+    assert "graded-dca-morning-2026-07-08-AAPL" in asked[0]
+    assert "dca-runner-1030-2026-07-08-AAPL" in asked[0]
+    assert "morning-dca-manual-2026-07-08-AAPL" not in asked[0]

@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from dca_common import USAGE_PROXY_NUMERIC_FIELDS, _num
 from dca_fileio import atomic_write_text
+from scripts.run_classification import PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES
 
 logger = logging.getLogger("near_close_dca.cost_tracker")
 
@@ -77,9 +78,7 @@ def _month_prefix(year: int, month: int) -> str:
 #: dropped, losing the real connector/API cost of a possibly-live order from
 #: the monthly rollup (Codex review, PR #1300: recognize potentially_submitted
 #: everywhere order statuses are filtered/counted/aggregated).
-_ORDER_BEARING_STATUSES = frozenset(
-    {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
-)
+_ORDER_BEARING_STATUSES = PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES  # canonical set (P:DUP-03)
 
 
 def _is_empty_blocked_stub(data: Dict[str, Any]) -> bool:

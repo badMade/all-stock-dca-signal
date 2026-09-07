@@ -233,7 +233,7 @@ jobs:
              exit 1
           fi
 
-          if git diff --cached --name-only | grep -E '(\.github/workflows/ci\.yml|\.env|secrets/|src/.*/migrations/)'; then
+          if git diff --cached --name-only | grep -E '(\.github/workflows/|\.env|secrets/|src/.*/migrations/)'; then
              echo "Forbidden files modified, aborting PR."
              exit 1
           fi

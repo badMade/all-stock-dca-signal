@@ -30,7 +30,7 @@ python -m pip install --upgrade pip && pip install -r requirements-dev.txt
 # Lint (ruff, line-length 120, rules E,F,I,B; E501 ignored)
 ruff check .
 
-# Tests — ~3,500 tests, ~45s for the whole suite. Tests live under tests/ (2026-08-23:
+# Tests — ~8,300 tests, ~5 min for the whole suite. Tests live under tests/ (2026-08-23:
 # moved out of the repo root, which used to hold one test_<module>.py flat beside every
 # module); pyproject.toml's pythonpath = [".", "tests"] keeps both `import near_close_dca`
 # and cross-test imports (e.g. `from test_morning_dca import ...`) resolving from there.
@@ -88,7 +88,7 @@ see `ticker-market-breadth/README.md`) suites each in their own job. Dev tool ve
 | Visualization | `dca_market_graph.py` + `viz/` (the 3D market graph, "The Ocean" — the only pixel output here; `viz/vendor/three.min.js` is the repo's only vendored third-party asset, browser-side only, never imported by Python — see `docs/market_graph.md`) |
 | Reliability engines | `scripts/broker_reconciliation.py`, `run_state_machine.py`, `run_ledger.py`, `idempotency.py`, `scheduler_lease.py`, `reason_codes.py`, `correlation.py`, `same_day_pointer.py`, `same_day_top_up_gate.py`, `file_lock.py` |
 | Ops utilities | `scripts/run_classification.py`, `drift_detection.py`, `backup_strategy.py`, `run_ticker_maintenance.py`, `daily_per_ticker_calibration.py`, `generate_per_ticker_sizing.py`, `workflow_policy.py` |
-| Data contracts | `config/` (17 JSON files) validated against `schemas/` (21 JSON schemas) |
+| Data contracts | `config/*.json` validated against `schemas/*.json` (`tests/test_config_invariants.py` is the gate) |
 
 ### Three entry points coexist — know which one you are editing
 
@@ -102,8 +102,12 @@ A fix applied to one does **not** propagate to the others. Full detail in `docs/
 
 Consequences to internalize before changing anything:
 
-- **Duplicated logic drifts silently.** `run_slot()` carries its own copy of the morning
-  preflight gate. Fixing `_apply_preflight_gate()` will not reach `run_slot()`, or vice versa.
+- **Duplicated logic drifts silently.** The three entry points seed their daily/weekly caps
+  from three different sources: `dca_runner`'s Gate 6 sums broker order history, the
+  executor classes scan same-day run artifacts, and `near_close_dca.within_caps` reads
+  `StrategyState` plus artifact seeding. A cap fix applied to one does not reach the others.
+  (The morning preflight gate used to be the example here; both callers now share
+  `morning_preflight_eligible_tickers()`.)
 - **"No in-repo caller" ≠ dead code.** The executor classes, `dca_runner.py`,
   `dca_cost_tracker.py`, `dca_weekly_dashboard.py`, and `scripts/same_day_top_up_gate.py`
   have zero in-repo callers *by design*. Deleting them breaks live automation this repo
@@ -146,7 +150,7 @@ These are enforced by tests or by fail-closed runtime code. Violating one fails 
 | Variable | Default | Effect |
 |---|---|---|
 | `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` | — | Required for live runs; not needed for `--demo` or tests |
-| `DCA_CRON_TRACKING_ROOT` | `/home/user/workspace/cron_tracking` | Root of the whole per-stream artifact tree. Read at import time |
+| `DCA_CRON_TRACKING_ROOT` | `<checkout>/cron_tracking` (production exports the shared tree explicitly) | Root of the whole per-stream artifact tree. Read at import time |
 | `DCA_CONFIG_DIR` | `config/` beside the modules | Where `config/*.json` is loaded from |
 | `DCA_ATTEMPT_LOG_ROOT` | `<cron root>/attempt_log` | Failed-start marker tree; read at call time |
 | `DCA_INTRADAY_LIVE_STATE_ROOT`, `DCA_MARKET_OPEN_LIVE_STATE_ROOT` | derived | *Replace* (not extend) recovery/prior-allocation search roots |

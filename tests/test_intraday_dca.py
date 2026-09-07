@@ -502,3 +502,36 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# --- 2026-09-07 diagnostic T:F06: the intraday pointer contract ---------------
+def test_intraday_scheduled_run_writes_only_its_own_pointer(tmp_path):
+    """The one stream that fires three times a day had no test pinning that a
+    scheduled run writes latest_intraday_run.json and never another stream's
+    pointer (market_open, midday and morning each have this pair)."""
+    root = tmp_path / "intraday"
+    ex = IntradayDCAExecutor(_cfg(tmp_path, live_execution_enabled=False), slot="1130")
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.05})
+    res = ex.run(_now_slot("1130"), data, broker=_Broker())
+    assert "latest_intraday_run" in res["paths"]
+    pointer = root / "latest_intraday_run.json"
+    assert pointer.exists()
+    pdata = json.loads(pointer.read_bytes())
+    assert pdata["stream"] == "intraday"
+    assert pdata["trading_day"] == TRADING_DAY.isoformat()
+    for other in ("latest_morning_run.json", "latest_midday_run.json", "latest_market_open_run.json", "latest_scheduled_run.json"):
+        assert not (root / other).exists()
+        assert not (tmp_path / other).exists()
+
+
+def test_intraday_manual_run_never_touches_the_pointer(tmp_path):
+    root = tmp_path / "intraday"
+    ex = IntradayDCAExecutor(_cfg(tmp_path, live_execution_enabled=False), slot="1330")
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.05})
+    res = ex.run(_now_slot("1330"), data, broker=_Broker(), manual=True)
+    rc = res["artifacts"]["run_classification"]
+    assert rc["run_origin"] == "manual"
+    assert rc["manual_run"] is True
+    assert rc["run_id"].startswith("manual_intraday_live_")
+    assert "latest_intraday_run" not in res["paths"]
+    assert not (root / "latest_intraday_run.json").exists()

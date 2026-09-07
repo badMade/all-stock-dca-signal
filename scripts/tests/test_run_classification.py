@@ -15,7 +15,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -5423,3 +5423,80 @@ def test_manual_exclusion_subroots_has_no_duplicate_entries():
     # NO_RUN_ID rows within a single pass, so a repeated entry double-counts
     # every matching run.
     assert len(MANUAL_EXCLUSION_SUBROOTS) == len(set(MANUAL_EXCLUSION_SUBROOTS))
+
+
+def _executor_native_scheduled_block(executor, now: datetime) -> dict:
+    """The run_classification block a class-based executor actually writes for a
+    scheduled live run, built by the executor itself rather than a hand-typed
+    literal so this test cannot drift from the executor."""
+    return executor.run_classification(now, manual=False)
+
+
+def test_validate_classification_accepts_the_class_based_morning_and_midday_executor_identities():
+    """2026-09-07 diagnostic T:F01: morning_dca.MorningDCAExecutor (live mode) and
+    midday_dca.MiddayDCAExecutor stamp their OWN run_type, run_id shape and
+    state_schema_version ('morning-live-v2-preauthorized', 'midday-live-v1'),
+    exactly as the market_open/intraday executors do (see the test above), but
+    only the roster's run_slot() shapes for stream='morning'/'midday' were
+    registered here. Every scheduled 10:30/12:30 run the class-based executors
+    wrote therefore failed on version alone, and dca_risk.classify_stream()
+    filed it under STREAM_OTHER instead of STREAM_SCHEDULED.
+    """
+    from dca_risk import STREAM_SCHEDULED, classify_stream
+    from midday_dca import MiddayConfig, MiddayDCAExecutor
+    from morning_dca import MORNING_LIVE_MODE, MorningConfig, MorningDCAExecutor
+
+    now = datetime(2026, 9, 8, 14, 30, tzinfo=timezone.utc)  # 10:30 ET
+    morning = _executor_native_scheduled_block(
+        MorningDCAExecutor(MorningConfig(tickers=("AAPL",)), mode=MORNING_LIVE_MODE), now
+    )
+    assert morning["state_schema_version"] == "morning-live-v2-preauthorized"
+    assert morning["run_id"] == "morning_live_20260908_1030ET"
+    res = validate_classification(morning)
+    assert res.ok, res.errors
+    assert is_scheduled_state({"run_classification": morning}) is True
+    assert classify_stream({"run_classification": morning}) == STREAM_SCHEDULED
+
+    midday_now = datetime(2026, 9, 8, 16, 30, tzinfo=timezone.utc)  # 12:30 ET
+    midday = _executor_native_scheduled_block(MiddayDCAExecutor(MiddayConfig(tickers=("AAPL",))), midday_now)
+    assert midday["state_schema_version"] == "midday-live-v1"
+    assert midday["run_id"] == "midday_live_20260908_1230ET"
+    res = validate_classification(midday)
+    assert res.ok, res.errors
+    assert classify_stream({"run_classification": midday}) == STREAM_SCHEDULED
+
+    # The roster shapes for the same streams (run_dca.run_slot()'s 1030ET/1230ET,
+    # run_type='scheduled_live_test', run_id='scheduled_..._1030ET') stay valid.
+    roster_morning = build_scheduled_classification(
+        "2026-09-08",
+        "2026-09-08T14:30:01Z",
+        stream="morning",
+        cron_id="42173154",
+        supersedes_cron_id=None,
+        scheduled_for_et="10:30",
+        scheduled_window_start_et="10:25",
+        scheduled_window_end_et="10:35",
+        run_id="scheduled_20260908_1030ET",
+        valid_afternoon_scheduled_evidence=False,
+    )
+    assert validate_classification(roster_morning).ok, validate_classification(roster_morning).errors
+
+    # Adversarial: the executor-native identity must be coherent, not merely
+    # version-whitelisted. Mixing the native run_type with the roster's run_id
+    # shape, a foreign cron id, or the wrong slot window is rejected.
+    mixed_run_id = dict(morning)
+    mixed_run_id["run_id"] = "scheduled_20260908_1030ET"
+    assert not validate_classification(mixed_run_id).ok
+
+    wrong_cron = dict(midday)
+    wrong_cron["cron_id"] = "42173154"
+    assert not validate_classification(wrong_cron).ok
+
+    wrong_window = dict(morning)
+    wrong_window["scheduled_window_end_et"] = "12:35"
+    assert not validate_classification(wrong_window).ok
+
+    # A native block must never pass as AFTERNOON evidence.
+    afternoon_claim = dict(morning)
+    afternoon_claim["stream"] = "afternoon"
+    assert not validate_classification(afternoon_claim).ok

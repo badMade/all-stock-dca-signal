@@ -8717,3 +8717,42 @@ def test_run_drift_check_with_drift(monkeypatch, tmp_path):
     assert (tmp_path / "drift_report.json").exists()
     assert (tmp_path / "drift_report.md").exists()
     assert len(slack_calls) == 1
+
+
+def test_redacted_strings_scrubs_account_shaped_values_in_persisted_placement_rows():
+    """2026-09-07 diagnostic S:ADP-05. raw/orders_after_place.json spreads the
+    broker's whole order dict per row; account identifiers echoed by the
+    broker were persisted verbatim under cron_tracking/ and synced onward."""
+    import json
+
+    from run_dca import _redacted_strings
+
+    rows = [
+        {
+            "ticker": "AAPL",
+            "order_id": "ORD-1",
+            "account_number": "123456789",
+            "account": "https://api.broker.example/accounts/123456789/",
+            "dollar_amount": 2.0,
+            "nested": {"note": "account_number=123456789"},
+            "tags": ["account_number: 123456789", 7],
+        }
+    ]
+    scrubbed = _redacted_strings(rows)
+    assert scrubbed[0]["ticker"] == "AAPL"
+    assert scrubbed[0]["dollar_amount"] == 2.0
+    assert scrubbed[0]["tags"][1] == 7
+    assert "123456789" not in json.dumps(scrubbed)
+    assert "123456789" in json.dumps(rows)  # the input is not mutated
+
+
+def test_redacted_strings_scrubs_account_shaped_dictionary_keys_too():
+    """Copilot review of PR #1394: only VALUES were scrubbed, so a broker
+    payload whose key carries the identifier ({"account_number=<n>": ...})
+    still leaked it into raw/orders_after_place.json."""
+    from run_dca import _redacted_strings
+
+    synthetic_account = "123456789"  # synthetic, allow-listed account-shaped value
+    scrubbed = _redacted_strings({f"account_number={synthetic_account}": {f"nested {synthetic_account}": "v"}})
+    assert synthetic_account not in repr(scrubbed)
+    assert len(scrubbed) == 1 and len(next(iter(scrubbed.values()))) == 1

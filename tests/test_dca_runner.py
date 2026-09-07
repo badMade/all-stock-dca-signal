@@ -2655,6 +2655,7 @@ def _fake_msvcrt(locking_side_effects):
     fake: Any = types.ModuleType("msvcrt")
     fake.locking = locking
     fake.LK_LOCK = 1
+    fake.LK_NBLCK = 2
     fake.LK_UNLCK = 0
     fake.calls = calls
     return fake
@@ -2687,6 +2688,73 @@ def test_acquire_exclusive_lock_retries_only_the_documented_windows_contention_e
 
     dca_runner._acquire_exclusive_lock(_FakeLockFile())
     assert len(fake.calls) == 3
+    # Copilot review of PR #1394: LK_LOCK blocks inside msvcrt for roughly ten
+    # seconds per attempt, so a caller-supplied deadline shorter than that was
+    # never honoured on Windows; every attempt must be the non-blocking mode
+    # and the polling loop alone owns the deadline.
+    assert {mode for _fd, mode, _n in fake.calls} == {fake.LK_NBLCK}
+
+
+def test_acquire_exclusive_lock_honours_a_sub_second_deadline_on_windows(monkeypatch):
+    """Copilot review of PR #1394: with LK_LOCK, a 0.2 s deadline could not be
+    honoured because each attempt blocked ~10 s inside msvcrt. With LK_NBLCK
+    the deadline is enforced by this function's own clock."""
+    monkeypatch.setattr(dca_runner, "_LOCK_IS_WINDOWS", True)
+    fake = _fake_msvcrt([PermissionError() for _ in range(1000)])
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+
+    class _FakeLockFile:
+        name = "state.lock"
+
+        def seek(self, offset):
+            pass
+
+        def fileno(self):
+            return 3
+
+    started = time_module.monotonic()
+    with pytest.raises(TimeoutError):
+        dca_runner._acquire_exclusive_lock(_FakeLockFile(), timeout_seconds=0.2)
+    assert time_module.monotonic() - started < 2.0
+    assert 1 < len(fake.calls) < 1000
+
+
+def test_acquire_exclusive_lock_retries_only_posix_contention_not_every_oserror(monkeypatch):
+    """Copilot review of PR #1394: the POSIX branch caught every OSError, so a
+    permanent failure (a bad descriptor, a filesystem error) was slept on and
+    misreported as a lock timeout. Only BlockingIOError, the LOCK_NB
+    contention signal, is contention; anything else surfaces immediately."""
+    import errno
+    import fcntl
+
+    monkeypatch.setattr(dca_runner, "_LOCK_IS_WINDOWS", False)
+    attempts = []
+
+    def bad_descriptor(fd, flags):
+        attempts.append(flags)
+        raise OSError(errno.EBADF, "Bad file descriptor")
+
+    monkeypatch.setattr(fcntl, "flock", bad_descriptor)
+
+    class _FakeLockFile:
+        name = "state.lock"
+
+    with pytest.raises(OSError) as excinfo:
+        dca_runner._acquire_exclusive_lock(_FakeLockFile(), timeout_seconds=0.5)
+    assert not isinstance(excinfo.value, TimeoutError)
+    assert excinfo.value.errno == errno.EBADF
+    assert len(attempts) == 1  # never retried
+
+    attempts.clear()
+
+    def contended(fd, flags):
+        attempts.append(flags)
+        raise BlockingIOError(errno.EWOULDBLOCK, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(fcntl, "flock", contended)
+    with pytest.raises(TimeoutError):
+        dca_runner._acquire_exclusive_lock(_FakeLockFile(), timeout_seconds=0.1)
+    assert len(attempts) > 1
 
 
 def test_acquire_exclusive_lock_propagates_a_non_contention_windows_error(monkeypatch):
@@ -7358,12 +7426,15 @@ def test_execute_plan_requires_orders_when_placement_is_enabled():
         )
 
 
-def test_execute_plan_refuses_a_ticker_already_bought_today_per_broker_history():
+def test_execute_plan_refuses_a_ticker_already_bought_today_per_broker_history(monkeypatch):
     """BudgetSnapshot carries only totals, not per-ticker identities: without
     independently reverifying against broker history, a caller-built Plan
     naming a ticker already bought earlier today would pass every other
     check and submit a second same-day buy (Codex review: "Recheck same-day
-    ticker history before placement")."""
+    ticker history before placement"). Like assess(), the refusal applies
+    only while config/budgets.json's one_order_per_ticker_per_day is True
+    (2026-09-07 diagnostic, C:F2)."""
+    monkeypatch.setattr(dca_runner, "ONE_ORDER_PER_TICKER_PER_DAY", True)
     calls = []
     broker = dca_runner.build_runner_broker(
         place_fn=lambda **kw: calls.append(kw) or {"id": "ok"},
@@ -7425,13 +7496,14 @@ def test_execute_plan_allows_a_ticker_not_bought_today_alongside_unrelated_histo
     assert result.submitted == ["AAPL"]
 
 
-def test_execute_plan_still_blocks_a_ticker_whose_earlier_buy_today_was_cancelled():
+def test_execute_plan_still_blocks_a_ticker_whose_earlier_buy_today_was_cancelled(monkeypatch):
     """A cancelled/rejected buy with no fill still consumed the day's
     one-order-per-ticker attempt, even though it consumed no budget:
     ``counts_toward_budget`` is False for a fill-less dead order, but the
     same-day dedup must use the broader ``is_buy_attempt`` instead, or a
     rejected order would make its ticker eligible again the same day (Codex
     review: "Keep canceled orders in the daily ticker interlock")."""
+    monkeypatch.setattr(dca_runner, "ONE_ORDER_PER_TICKER_PER_DAY", True)
     calls = []
     broker = dca_runner.build_runner_broker(
         place_fn=lambda **kw: calls.append(kw) or {"id": "ok"},
@@ -10414,9 +10486,11 @@ def test_execute_plan_recheck_the_clock_halts_the_remainder_when_the_window_clos
         snapshot=snapshot,
         tier=tier,
     )
-    # The 0935 slot's window is 09:30-10:00 ET (see SLOTS); the first now_fn
-    # call (before AAPL) is still inside it, the second (before MSFT) is not.
+    # The 0935 slot's window is 09:30-10:00 ET (see SLOTS); the first two
+    # now_fn calls (the one-time freshness check, then before AAPL) are still
+    # inside it, the third (before MSFT) is not.
     clock_readings = iter([
+        datetime(2026, 7, 28, 9, 43, tzinfo=ET),
         datetime(2026, 7, 28, 9, 43, tzinfo=ET),
         datetime(2026, 7, 28, 10, 5, tzinfo=ET),
     ])
@@ -10459,10 +10533,12 @@ def test_execute_plan_now_fn_raising_halts_the_remainder_without_propagating():
         snapshot=snapshot,
         tier=tier,
     )
-    clock_readings = iter([datetime(2026, 7, 28, 9, 43, tzinfo=ET)])
+    # One reading for the one-time freshness check, one for AAPL's own
+    # placement; MSFT's call then raises.
+    clock_readings = iter([datetime(2026, 7, 28, 9, 43, tzinfo=ET)] * 2)
 
     def _now_fn():
-        return next(clock_readings)  # raises StopIteration on the second call
+        return next(clock_readings)  # raises StopIteration on the third call
 
     result = dca_runner.execute_plan(
         plan, broker, run_id="test-run-2026-07-28", snapshot=snapshot,
@@ -10562,50 +10638,6 @@ def test_now_fn_returning_a_malformed_value_is_redacted_to_its_type():
     assert secret_account_number not in result.failure_reason
     assert "shh" not in result.failure_reason
     assert "dict" in result.failure_reason
-
-
-def test_execute_plan_recheck_the_clock_catches_history_going_stale_mid_batch():
-    """The pre-loop orders_fetched_at freshness check only proves the
-    history was fresh when the batch started. now_fn's fresh reading is
-    rechecked against orders_fetched_at before every placement too, so
-    history that goes stale partway through a slow or large batch halts the
-    remainder instead of letting a later order rely on order history that no
-    longer represents an intervening manual or scheduled buy (Codex review:
-    "Measure history freshness against the fresh placement clock")."""
-    calls = []
-    broker = dca_runner.build_runner_broker(
-        place_fn=lambda **kw: calls.append(kw["symbol"]) or {"id": "ok"},
-        enable_live_orders=True,
-        dry_run=False,
-        account_number=TEST_ACCOUNT_NUMBER,
-    )
-    snapshot = dca_runner.budget_snapshot([], date(2026, 7, 28))
-    tier = BudgetTier("normal", 180.0, 900.0)
-    candidates = [dca_runner.Candidate("AAPL", 2.0), dca_runner.Candidate("MSFT", 2.0)]
-    plan = dca_runner.plan_orders(candidates=candidates, snapshot=snapshot, tier=tier)
-    orders_fetched_at = datetime(2026, 7, 28, 9, 35, tzinfo=ET)
-    # Both readings stay inside the 0935 slot's 09:30-10:00 ET window, so
-    # only the orders-freshness check (not the window check) can be why the
-    # second order halts. The second reading is 130s past orders_fetched_at,
-    # just over MAX_ORDERS_FETCH_AGE_SECONDS (120s).
-    clock_readings = iter([
-        datetime(2026, 7, 28, 9, 36, tzinfo=ET),
-        datetime(2026, 7, 28, 9, 37, 10, tzinfo=ET),
-    ])
-    result = dca_runner.execute_plan(
-        plan, broker, run_id="test-run-2026-07-28", snapshot=snapshot,
-        trading_day=date(2026, 7, 28), orders=[], tier=tier, buying_power_usd=TEST_BUYING_POWER_USD,
-        orders_account_number=TEST_ACCOUNT_NUMBER,
-        now=datetime(2026, 7, 28, 9, 36, tzinfo=ET),
-        slot_id="0935",
-        orders_fetched_at=orders_fetched_at,
-        candidates=candidates,
-        now_fn=lambda: next(clock_readings),
-    )
-    assert calls == ["AAPL"]  # MSFT never attempted
-    assert result.submitted == ["AAPL"]
-    assert result.halted_on == "MSFT"
-    assert "freshness window" in result.failure_reason
 
 
 def test_execute_plan_submits_sequentially_never_in_parallel():
@@ -14358,3 +14390,258 @@ def test_a_same_id_sibling_with_an_unreadable_state_is_unaccounted():
     # ABSENT is unchanged: an echo that simply does not restate the state
     # says nothing, exactly like an echo that omits `dollar_amount`.
     assert halts({"data": primary, "orders": [{"id": "A"}]}) is False
+
+
+# ===========================================================================
+# 2026-09-07 diagnostic: dca_runner gate-sequence findings C:F2, C:F3, C:F4,
+# C:F7, C:F12, C:F13
+# ===========================================================================
+
+
+def _live_runner_broker(calls):
+    return dca_runner.build_runner_broker(
+        place_fn=lambda **kw: calls.append(kw["symbol"]) or {"id": f"ok-{kw['symbol']}"},
+        enable_live_orders=True,
+        dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+
+
+def _execute_bought_today_plan(broker, earlier):
+    plan = dca_runner.Plan(to_place=[dca_runner.PlannedOrder("AAPL", 2.0)])
+    return dca_runner.execute_plan(
+        plan,
+        broker,
+        run_id="test-run-2026-07-28",
+        snapshot=dca_runner.budget_snapshot(earlier, date(2026, 7, 28)),
+        tier=BudgetTier("normal", 180.0, 900.0),
+        trading_day=date(2026, 7, 28),
+        orders=earlier,
+        orders_account_number=TEST_ACCOUNT_NUMBER,
+        now=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        now_fn=lambda: datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        slot_id="0935",
+        orders_fetched_at=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        buying_power_usd=TEST_BUYING_POWER_USD,
+        candidates=[("AAPL", 2.0)],
+    )
+
+
+def test_execute_plan_bought_today_refusal_follows_one_order_per_ticker_per_day_like_assess(monkeypatch):
+    """C:F2. assess() only excludes a ticker bought earlier today when
+    ONE_ORDER_PER_TICKER_PER_DAY is True (config/budgets.json ships False, and
+    the same-day top-up gate handles repeats); _validate_execute_plan applied
+    the exclusion unconditionally, so whenever any candidate had been bought
+    in an earlier slot the WHOLE batch was refused and no other ticker got its
+    buy either. The two halves must read the same switch."""
+    earlier = [_order("AAPL", 2.0, _utc(2026, 7, 28, 13, 0))]  # 09:00 ET, before the 0935 window
+
+    monkeypatch.setattr(dca_runner, "ONE_ORDER_PER_TICKER_PER_DAY", False)
+    calls = []
+    result = _execute_bought_today_plan(_live_runner_broker(calls), earlier)
+    assert calls == ["AAPL"]
+    assert result.submitted == ["AAPL"]
+
+    monkeypatch.setattr(dca_runner, "ONE_ORDER_PER_TICKER_PER_DAY", True)
+    calls = []
+    with pytest.raises(ValueError, match="already bought today"):
+        _execute_bought_today_plan(_live_runner_broker(calls), earlier)
+    assert calls == []
+
+
+def test_assess_gate4_grace_period_treats_missing_provenance_as_rogue():
+    """C:F3. BrokerOrder.placed_agent defaulted to 'agentic', the exact value
+    the grace path treats as the compatible executor, so a broker-history
+    wrapper that never populates provenance made every collision (a manual
+    app order included) look compatible during a grace window. Unknown
+    provenance must fail closed like any other non-agentic writer."""
+    unattributed = dca_runner.BrokerOrder(
+        symbol="AAPL", side="buy", dollar_amount=2.0, created_at=_utc(2026, 7, 28, 13, 45)
+    )
+    assert unattributed.placed_agent is None
+    r = dca_runner.assess(
+        **_clean_kwargs(
+            orders=[unattributed],
+            candidates=[("MSFT", 2.0)],
+            sole_executor_grace_period_active=True,
+        )
+    )
+    assert r["verdict"] == "ABORT"
+    assert "second executor" in r["reason"]
+
+
+def test_state_transaction_fails_closed_instead_of_blocking_on_a_held_lock(tmp_path):
+    """C:F4. state_transaction() took the strategy-state lock with a blocking
+    flock and no timeout, so one hung holder wedged every later slot's
+    process for the day with no evidence and no alert, while every other
+    reliability engine in the repo bounds its wait and raises."""
+    import fcntl
+
+    state_path = tmp_path / "strategy_state.json"
+    lock_path = dca_runner._state_lock_path(state_path)
+    with open(lock_path, "w", encoding="utf-8") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+        started = time_module.monotonic()
+        with pytest.raises(TimeoutError):
+            with dca_runner.state_transaction(state_path, lock_timeout_seconds=0.2):
+                pass  # pragma: no cover - must not be reached
+        assert time_module.monotonic() - started < 5.0
+
+
+def test_execute_plan_halts_a_batch_whose_history_ages_past_the_freshness_window():
+    """Copilot review of PR #1394, revisiting C:F7. Proving freshness once
+    before the first placement and then passing ``orders_fetched_at=None``
+    disabled the bound for every later placement: Gate 4 only checked the
+    initial snapshot, so a manual order or another executor landing during a
+    slow batch would have let later orders run on arbitrarily stale totals
+    and exceed the caps. The bound is checked before EVERY placement again;
+    a batch that outlives it halts with the remainder unplaced (the
+    fail-closed outcome) and names the freshness window as the reason."""
+    calls = []
+    broker = _live_runner_broker(calls)
+    snapshot = dca_runner.budget_snapshot([], date(2026, 7, 28))
+    tier = BudgetTier("normal", 180.0, 900.0)
+    candidates = [dca_runner.Candidate("AAPL", 2.0), dca_runner.Candidate("MSFT", 2.0)]
+    plan = dca_runner.plan_orders(candidates=candidates, snapshot=snapshot, tier=tier)
+    orders_fetched_at = datetime(2026, 7, 28, 9, 35, tzinfo=ET)
+    common = dict(
+        run_id="test-run-2026-07-28",
+        snapshot=snapshot,
+        trading_day=date(2026, 7, 28),
+        orders=[],
+        tier=tier,
+        buying_power_usd=TEST_BUYING_POWER_USD,
+        orders_account_number=TEST_ACCOUNT_NUMBER,
+        now=datetime(2026, 7, 28, 9, 36, tzinfo=ET),
+        slot_id="0935",
+        orders_fetched_at=orders_fetched_at,
+        candidates=candidates,
+    )
+
+    # Readings: pre-loop proof at 60 s, first placement at 95 s (fresh),
+    # second placement at 130 s (past MAX_ORDERS_FETCH_AGE_SECONDS = 120).
+    ticks = []
+
+    def slow_clock():
+        ticks.append(None)
+        return datetime(2026, 7, 28, 9, 36, tzinfo=ET) + timedelta(seconds=35 * (len(ticks) - 1))
+
+    result = dca_runner.execute_plan(plan, broker, now_fn=slow_clock, **common)
+    assert calls == ["AAPL"]
+    assert result.halted_on == "MSFT"
+    assert "freshness window" in result.failure_reason
+
+    # A fetch that is ALREADY stale on the fresh clock still halts before
+    # the first placement: the caller-supplied `now` cannot mask it.
+    calls.clear()
+    stale = iter([datetime(2026, 7, 28, 9, 37, 10, tzinfo=ET)])
+    result = dca_runner.execute_plan(plan, broker, now_fn=lambda: next(stale), **common)
+    assert calls == []
+    assert result.submitted == []
+    assert result.halted_on == "AAPL"
+    assert "freshness window" in result.failure_reason
+
+
+def test_execute_plan_dry_run_still_validates_the_plan_it_would_have_placed(monkeypatch):
+    """C:F13. With placement disabled execute_plan returned an empty result
+    before _validate_execute_plan ever ran, so a dry-run rehearsal of the
+    exact live call could not surface a plan the live call would refuse.
+    Validation now runs whenever the live-path arguments are supplied and its
+    refusal is reported on the result instead of raised."""
+    monkeypatch.setattr(dca_runner, "ONE_ORDER_PER_TICKER_PER_DAY", True)
+    calls = []
+    broker = dca_runner.build_runner_broker(
+        place_fn=lambda **kw: calls.append(kw["symbol"]) or {"id": "ok"},
+        enable_live_orders=False,
+        dry_run=True,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    earlier = [_order("AAPL", 2.0, _utc(2026, 7, 28, 13, 0))]  # 09:00 ET, before the 0935 window
+    result = _execute_bought_today_plan(broker, earlier)
+    assert calls == []
+    assert result.placement_enabled is False
+    assert result.failure_reason is None
+    assert result.validation_failure is not None
+    assert "already bought today" in result.validation_failure
+
+    # A bare dry run with none of the live-path arguments stays silent, as before.
+    bare = dca_runner.execute_plan(dca_runner.Plan(to_place=[dca_runner.PlannedOrder("AAPL", 2.0)]), broker)
+    assert bare.placement_enabled is False
+    assert bare.validation_failure is None
+
+
+def test_runner_and_adapter_agree_on_fill_evidence_for_every_shape():
+    """2026-09-07 diagnostic P:DUP-01. dca_runner carried its own copies of
+    dca_live_adapters' fill-evidence classifiers; the two entry points must
+    read a placement response's fill fields identically, so the runner now
+    imports the adapter's helpers and this pins the shared verdicts."""
+    import dca_live_adapters
+
+    assert dca_runner._combined_fill_evidence is dca_live_adapters._combined_fill_evidence
+    assert dca_runner._FILL_EVIDENCE_EXPLICIT_ZERO is dca_live_adapters._FILL_EVIDENCE_EXPLICIT_ZERO
+    assert set(dca_runner._PARTIAL_FILL_EVIDENCE_KEYS) == set(dca_live_adapters._PLACEMENT_EXECUTION_FIELDS)
+    for envelope, expected in (
+        ({"executed_notional": " "}, "none_reported"),
+        ({"executed_notional": None}, "none_reported"),
+        ({"cumulative_quantity": "0", "executed_dollar_amount": "0.0"}, "explicit_zero"),
+        ({"cumulative_quantity": 0, "executed_dollar_amount": 5}, "positive_or_unreadable"),
+        ({"filled_quantity": True}, "positive_or_unreadable"),
+        ({"filled_quantity": "abc"}, "positive_or_unreadable"),
+        ({}, "none_reported"),
+    ):
+        assert dca_live_adapters._fill_evidence(envelope) == expected, envelope
+        assert dca_runner._combined_fill_evidence([envelope]) == expected, envelope
+
+
+def test_idempotency_stream_slot_ids_match_the_runner_roster():
+    """scripts.idempotency.STREAM_SLOT_IDS mirrors dca_runner.SLOTS' labels
+    (kept as a literal there so every entry point can import it without the
+    runner); this pins the two together."""
+    from scripts.idempotency import STREAM_SLOT_IDS
+
+    # The runner labels the 3:30 PM slot "final"; every stream contract calls it "afternoon".
+    label_to_stream = {"market-open": "market_open", "final": "afternoon"}
+    by_label: dict[str, list[str]] = {}
+    for slot_id, spec in dca_runner.SLOTS.items():
+        by_label.setdefault(label_to_stream.get(spec.label, spec.label), []).append(slot_id)
+    assert {k: tuple(sorted(v)) for k, v in by_label.items()} == {
+        k: tuple(sorted(v)) for k, v in STREAM_SLOT_IDS.items()
+    }
+
+
+def test_a_same_slot_second_run_aborts_at_gate_4_with_the_first_runs_orders_in_history():
+    """2026-09-07 diagnostic T:F12. The 2026-08-07 suspected same-task double
+    fire (eight 'agentic' orders overlapping the slot's own lastRunAt) had no
+    regression test: with the first run's placements in broker history, a
+    second assess() for the same slot and day must ABORT at Gate 4 with zero
+    placements, and execute_plan must refuse the same plan."""
+    first = dca_runner.assess(**_clean_kwargs(candidates=[("AAPL", 2.0), ("MSFT", 2.0)]))
+    assert first["verdict"] == "PROCEED"
+    placed_at = _utc(2026, 7, 28, 13, 44)  # 09:44 ET, inside the 0935 slot window
+    history = [_order(o["ticker"], o["amount_usd"], placed_at, placed_agent="agentic") for o in first["plan"]["to_place"]]
+
+    second = dca_runner.assess(**_clean_kwargs(orders=history, candidates=[("AAPL", 2.0), ("MSFT", 2.0)]))
+    assert second["verdict"] == "ABORT"
+    assert "second executor" in second["reason"]
+    assert second["plan"]["to_place"] == [] if "plan" in second else True
+
+    calls = []
+    plan = dca_runner.Plan(to_place=[dca_runner.PlannedOrder("AAPL", 2.0), dca_runner.PlannedOrder("MSFT", 2.0)])
+    with pytest.raises(ValueError, match="second executor"):
+        dca_runner.execute_plan(
+            plan,
+            _live_runner_broker(calls),
+            run_id="test-run-2026-07-28",
+            snapshot=dca_runner.budget_snapshot(history, date(2026, 7, 28)),
+            tier=BudgetTier("normal", 180.0, 900.0),
+            trading_day=date(2026, 7, 28),
+            orders=history,
+            orders_account_number=TEST_ACCOUNT_NUMBER,
+            now=datetime(2026, 7, 28, 9, 45, tzinfo=ET),
+            now_fn=lambda: datetime(2026, 7, 28, 9, 45, tzinfo=ET),
+            slot_id="0935",
+            orders_fetched_at=datetime(2026, 7, 28, 9, 45, tzinfo=ET),
+            buying_power_usd=TEST_BUYING_POWER_USD,
+            candidates=[("AAPL", 2.0), ("MSFT", 2.0)],
+        )
+    assert calls == []

@@ -98,11 +98,16 @@ def _response_failure(response: Any) -> Optional[str]:
 
 def _to_float(value: Any) -> Optional[float]:
     """Best-effort float parse; returns None for missing/non-finite/non-numeric."""
-    if value is None or value == "" or value == "-":
+    if value is None or isinstance(value, bool) or value == "" or value == "-":
         return None
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError too: float() of an oversized JSON integer raises rather
+        # than returning inf, and it escaped normalize_order outside the try
+        # that wraps orders_fn, crashing same_day_order_snapshot instead of
+        # returning complete=False (2026-09-07 diagnostic, C:F14; the same
+        # sweep dca_live_adapters._to_float already had).
         return None
     if result != result or result in (float("inf"), float("-inf")):  # NaN/inf
         return None
@@ -406,7 +411,9 @@ def _clean_order_ids(order_ids: Iterable[str]) -> List[str]:
         order_ids = [order_ids]
     seen: Dict[str, None] = {}
     for oid in order_ids or []:
-        text = oid.strip()
+        if oid is None or isinstance(oid, bool):
+            continue
+        text = str(oid).strip()
         if text and text != "-":
             seen.setdefault(text, None)
     return list(seen)

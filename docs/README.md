@@ -47,11 +47,13 @@ environment (see the repository README).
 
 ## Key facts (quick reference)
 
-- **Active universe:** 57 tickers (includes `GFUZ`, `TXN`, `RKLB`, the
+- **Active universe:** 59 tickers (includes `GFUZ`, `TXN`, `RKLB`, the
   2026-08-02 additions `GE`, `VRT`, `CAT`, `QQQ`, `QCOM`, `ABBV`, `JPM`, the
-  2026-08-04 addition `VT`, and the 2026-08-16 additions `QBUT`,
-  `RVI`, `VCX`, `TRLV` — all whitelisted without a broker instrument search, so
-  unverified until their first live run);
+  2026-08-04 addition `VT`, the 2026-08-16 additions `QBUT`,
+  `RVI`, `VCX`, `TRLV`, and the 2026-09-05 additions `LLY`, `TSLA` — all
+  whitelisted without a broker instrument search, so unverified until their
+  first live run; `near_close_dca.ACTIVE_TICKERS` and `config/tickers.json`
+  are the count of record and `tests/test_config_invariants.py` pins them);
   `BYDDY` and `RVII` are whole-share tickers, not excluded (fractional-tradability; `RVII` moved
   out of the active list 2026-08-24 — see [whole_share_accumulation.md](whole_share_accumulation.md)); `IRDMI→IRDM`, `GLWR→GLW`; `GFUZ` uses
   Robinhood primary data (finance `NOT_FOUND`).
@@ -62,14 +64,8 @@ environment (see the repository README).
   Stress $360/$1,800 (daily/weekly); weekly rollover reserve capped at $900.
 - **Live execution:** the prior Perplexity-run three-stream model
   (`2ba19526`/`42173154`/`7be82b97`/`a6239dae`/`10ce362c`) is still the
-  account's ONLY currently-functioning live execution. A seven-slot
-  Claude-executed roster (weekdays 9:35 AM through 3:30 PM ET) is the
-  intended eventual replacement, but every one of those seven prompts
-  hard-aborts at Gate 5 (no signal-generation entry point exists yet; see
-  `PRODUCTION_READINESS.md`), so it runs alongside the five Perplexity-era
-  tasks, not instead of them, until Gate 5 is wired. See
-  [safeguards.md](safeguards.md#live-execution-roster) for the current
-  roster. Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>` only; Alpaca read-only.
+  account's ONLY currently-functioning live execution. A seven-slot Claude-executed roster (weekdays 9:35 AM through 3:30 PM ET) is the intended eventual replacement. Its Gate 5 (the repo's own signal generation) has had a real, tested entry point per slot since 2026-08-26 (`PRODUCTION_READINESS.md`, "Status, 2026-08-26"), and placement was authorized for all seven slots on 2026-09-02; the earlier "hard-aborts at Gate 5" wording in this and other docs described the state before that. [safeguards.md](safeguards.md#live-execution-roster) is authoritative for what is live today.
+  Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>` only; Alpaca read-only.
   The **5:00 PM ET** task is analytics (slippage + Notion sync; retimed
   2026-08-02 from 3:35 PM ET).
 - **Run classification:** each currently-functioning stream writes under its OWN
@@ -79,16 +75,14 @@ environment (see the repository README).
   (`a6239dae`) under `midday_dca/` + `latest_midday_run.json`, intraday
   (`7be82b97`) under `intraday_dca/` + `latest_intraday_run.json`; only the final
   afternoon stream (`10ce362c`) uses `scheduled_runs/YYYYMMDD_1530ET/` and
-  `latest_scheduled_run.json` (under the legacy `ce16ba6b` root). The proposed
-  seven-slot Claude roster mirrors this for its own six non-final slots
-  (`scheduled_runs/YYYYMMDD_<slot HHMM>ET/`, under a plain, un-prefixed root --
-  audit-only today, no reader wired). Those six slots share that one
-  `scheduled_runs/` namespace, so each updates its OWN slot-specific pointer
-  filename, `latest_scheduled_run_<slot HHMM>ET.json` (e.g.
-  `latest_scheduled_run_0935ET.json`), never the bare, unqualified
-  `latest_scheduled_run.json` a later slot would otherwise silently overwrite
-  (Codex review: "Give each slot an unambiguous latest-run pointer"; "Name
-  slot-specific pointers in the overview"). Its 3:30 PM slot writes to its own
+  `latest_scheduled_run.json` (under the legacy `ce16ba6b` root). The
+  canonical live-mirror prompts (`claude/dca-executor-prompts/live-mirror/`)
+  write exactly these five stream pointers, the ones
+  `scripts/same_day_pointer.py` maps; the slot-suffixed
+  `latest_scheduled_run_<slot HHMM>ET.json` names and the `claude_roster_1530/`
+  root appear only in the SUPERSEDED prompt generation
+  (`claude/dca-executor-prompts/1-…6-executor-*.txt`) and are never written or
+  read by any Python in the repo. Its 3:30 PM slot writes to its own
   separate `claude_roster_1530/` root
   (never the legacy `ce16ba6b` one, to avoid colliding with `10ce362c`'s real
   evidence). Manual runs write under each stream's own `manual_runs/<timestamp>/`
