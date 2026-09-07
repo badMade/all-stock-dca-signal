@@ -11,6 +11,7 @@ environment (see the repository README).
 
 | File | Contents |
 |---|---|
+| [local_console.md](local_console.md) | `python3 from.py`: local interface, demo launcher, daily summaries, timing and Octopus predictions |
 | [reliability_spec.md](reliability_spec.md) | Formal run-state, reconciliation, and artifact-contract spec + honest implementation-status matrix |
 | [strategy.md](strategy.md) | Strategy overview, ticker universe, latest sizing ladder, budgets |
 | [ticker_advisory.md](ticker_advisory.md) | The `ticker-advisor/` tool: scores candidate tickers, proposes universe additions for manual review |

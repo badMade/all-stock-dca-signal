@@ -70,6 +70,18 @@ pip install -r trading-strategies/requirements.txt
 
 ## Usage
 
+### Local interface and single-command demo
+
+```bash
+python3 from.py
+```
+
+Opens a local control panel with daily summaries, the ET schedule, job progress,
+and Wondrous Octopus forecasts and historical-period comparisons. Startup runs
+an isolated synthetic demo. Use `python3 from.py --local` to inspect existing output, or
+`python3 from.py --once` for a headless test. Research dependencies and all
+launcher options are documented in [the local console guide](docs/local_console.md).
+
 ### CLI dry run
 
 ```bash

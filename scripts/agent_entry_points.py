@@ -49,6 +49,18 @@ class EntryPoint:
 
 ENTRY_POINTS: tuple[EntryPoint, ...] = (
     EntryPoint(
+        need="Launch the local DCA interface with daily summaries, timing, and Octopus research",
+        command="python3 from.py [--local --root <cron-root> --octopus-run <run-dir>] [--once] [--check]",
+        exists_path="from.py",
+        doc_ref="docs/local_console.md",
+        notes=(
+            "Default launches isolated DCA and Octopus demos plus a loopback browser UI. "
+            "--local observes existing artifacts; --once emits a summary and exits. "
+            "No live orders or automatic external scheduler registration. "
+            "--run test-signals exercises all seven existing candidate entry points."
+        ),
+    ),
+    EntryPoint(
         need="Dry-run the full DCA pipeline for one slot, no broker/network calls",
         command="python run_dca.py --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir <dir>",
         exists_path="run_dca.py",
