@@ -536,18 +536,10 @@ class CombinedCsvLoader:
             return []
         seen = set()
         with self.csv_path.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.reader(handle)
-            header = next(reader, None)
-            if header is not None:
-                try:
-                    ticker_idx = header.index("ticker")
-                    for row in reader:
-                        if len(row) > ticker_idx:
-                            symbol = row[ticker_idx].strip().upper()
-                            if symbol:
-                                seen.add(symbol)
-                except ValueError:
-                    pass
+            for row in csv.DictReader(handle):
+                symbol = str(row.get("ticker") or "").strip().upper()
+                if symbol:
+                    seen.add(symbol)
         return sorted(seen)
 
     def load(
@@ -562,33 +554,16 @@ class CombinedCsvLoader:
         wanted = _wanted(tickers)
         grouped: Dict[str, List[Bar]] = {}
         with self.csv_path.open("r", encoding="utf-8", newline="") as handle:
-            reader = csv.reader(handle)
-            header = next(reader, None)
-            if header is not None:
-                t_idx = header.index("ticker") if "ticker" in header else -1
-                d_idx = header.index("date") if "date" in header else -1
-                o_idx = header.index("open") if "open" in header else -1
-                h_idx = header.index("high") if "high" in header else -1
-                l_idx = header.index("low") if "low" in header else -1
-                c_idx = header.index("close") if "close" in header else -1
-                v_idx = header.index("volume") if "volume" in header else -1
-                for row in reader:
-                    symbol = ""
-                    if t_idx != -1 and len(row) > t_idx:
-                        symbol = row[t_idx].strip().upper()
-                    if not symbol or (wanted is not None and symbol not in wanted):
-                        continue
-
-                    d_val = row[d_idx] if d_idx != -1 and len(row) > d_idx else None
-                    o_val = row[o_idx] if o_idx != -1 and len(row) > o_idx else None
-                    h_val = row[h_idx] if h_idx != -1 and len(row) > h_idx else None
-                    l_val = row[l_idx] if l_idx != -1 and len(row) > l_idx else None
-                    c_val = row[c_idx] if c_idx != -1 and len(row) > c_idx else None
-                    v_val = row[v_idx] if v_idx != -1 and len(row) > v_idx else None
-
-                    bar = _bar_from_values(d_val, o_val, h_val, l_val, c_val, v_val)
-                    if bar is not None:
-                        grouped.setdefault(symbol, []).append(bar)
+            for row in csv.DictReader(handle):
+                symbol = str(row.get("ticker") or "").strip().upper()
+                if not symbol or (wanted is not None and symbol not in wanted):
+                    continue
+                bar = _bar_from_values(
+                    row.get("date"), row.get("open"), row.get("high"),
+                    row.get("low"), row.get("close"), row.get("volume"),
+                )
+                if bar is not None:
+                    grouped.setdefault(symbol, []).append(bar)
         return _collect(grouped, self.name, start, end)
 
 
@@ -667,30 +642,15 @@ class TickerArchiveLoader:
         for symbol in symbols:
             bars: List[Bar] = []
             with paths[symbol].open("r", encoding="utf-8", newline="") as handle:
-                reader = csv.reader(handle)
-                header = next(reader, None)
-                if header is not None:
-                    d_idx = header.index("Date") if "Date" in header else -1
-                    o_idx = header.index("Open") if "Open" in header else -1
-                    h_idx = header.index("High") if "High" in header else -1
-                    l_idx = header.index("Low") if "Low" in header else -1
-                    c_idx = header.index("Close") if "Close" in header else -1
-                    v_idx = header.index("Volume") if "Volume" in header else -1
-                    ac_idx = header.index("Adj Close") if "Adj Close" in header else -1
-                    for row in reader:
-                        d_val = row[d_idx] if d_idx != -1 and len(row) > d_idx else None
-                        o_val = row[o_idx] if o_idx != -1 and len(row) > o_idx else None
-                        h_val = row[h_idx] if h_idx != -1 and len(row) > h_idx else None
-                        l_val = row[l_idx] if l_idx != -1 and len(row) > l_idx else None
-                        c_val = row[c_idx] if c_idx != -1 and len(row) > c_idx else None
-                        v_val = row[v_idx] if v_idx != -1 and len(row) > v_idx else None
-                        ac_val = row[ac_idx] if ac_idx != -1 and len(row) > ac_idx else None
-
-                        bar = _bar_from_values(d_val, o_val, h_val, l_val, c_val, v_val)
-                        if bar is None:
-                            continue
-                        bar = _split_adjusted(bar, c_val, ac_val)
-                        bars.append(bar)
+                for row in csv.DictReader(handle):
+                    bar = _bar_from_values(
+                        row.get("Date"), row.get("Open"), row.get("High"),
+                        row.get("Low"), row.get("Close"), row.get("Volume"),
+                    )
+                    if bar is None:
+                        continue
+                    bar = _split_adjusted(bar, row.get("Close"), row.get("Adj Close"))
+                    bars.append(bar)
             if bars:
                 grouped[symbol] = bars
         return _collect(grouped, self.name, start, end)
