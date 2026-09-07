@@ -10821,6 +10821,29 @@ def test_same_day_ticker_deployment_already_recorded(tmp_path):
     )
 
 
+def test_same_day_ticker_deployment_already_recorded_recognizes_filled_status(tmp_path):
+    # Codex review ("Recognize filled gated rows during ordinary retry
+    # deduplication"): _persist_gated_whole_share_recovery persists a
+    # confirmed terminal fill with status="filled", not "submitted" -- this
+    # dedup check must recognize that row as already-recorded capital too,
+    # or an ordinary gate-passing retry republishes the same order's
+    # notional a second time.
+    from near_close_dca import _same_day_ticker_deployment_already_recorded
+
+    history_root = os.path.join(str(tmp_path), "runs")
+    trading_day = date(2026, 7, 21)
+
+    _write_scheduled_afternoon_artifact(
+        history_root,
+        trading_day,
+        [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 5.0}],
+    )
+    assert (
+        _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root)
+        is True
+    )
+
+
 def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
     # No prior-day history is needed: two same-day candidates each priced at
     # $3 (1.5x the $2 base on the 2% drop below) with a $5.00 monthly allocation
@@ -19100,6 +19123,101 @@ def test_scheduled_contract_excludes_dry_run_orders_from_submitted_orders(tmp_pa
     assert rows == []  # header only -- no simulated dry-run orders recorded
 
 
+def test_scheduled_contract_excludes_ordinary_settlement_adjustments_from_submitted_orders(tmp_path):
+    """Codex review ("Exclude ordinary settlement deltas from submission
+    reporting"): an ordinary (non-gated) settlement-adjustment outcome
+    corrects an ALREADY-recorded order's dollar figure -- it is not a new
+    placement this run made. Including it in submitted_orders.csv would
+    write a second row for the same order_id even though this run
+    submitted nothing new.
+    """
+    import csv as _csv
+    from pathlib import Path
+
+    from near_close_dca import _write_and_validate_scheduled_contract
+
+    artifacts = {
+        "run_id": "2026-06-29-152000",
+        "trading_day": "2026-06-29",
+        "generated_at": "2026-06-29T15:20:00-04:00",
+        "broker": "robinhood",
+        "dry_run": False,
+        "order_submit_status": "submitted",
+        "run_classification": {"run_origin": "scheduled", "manual_run": False},
+        "buy_candidates": [
+            {
+                "ticker": "BYDDY",
+                "planned_amount_usd": 2.0,
+                "status": "submitted",
+                "order_id": "RH-ADJ-1",
+                "whole_share_settlement_adjustment": True,
+            }
+        ],
+    }
+    d = Path(tmp_path)
+    (d / "run_state.json").write_text(json.dumps(artifacts), encoding="utf-8")
+    (d / "signals.csv").write_text("ticker\nBYDDY\n", encoding="utf-8")
+
+    _write_and_validate_scheduled_contract(artifacts, d)
+    rows = list(_csv.DictReader((d / "submitted_orders.csv").open()))
+    assert rows == []
+
+
+def test_apply_no_order_classification_corrects_nested_counts_for_adjustment_only_runs(tmp_path):
+    """Codex review ("Update ordinary counts when excluding
+    adjustments"): counts["submitted"]/counts["buy_candidates"] are seeded
+    from the RAW candidate list before this function runs, including a
+    whole_share_settlement_adjustment row -- the same bookkeeping-only
+    correction orders_submitted_count already excludes.
+    dca_weekly_dashboard.build_performance_snapshot() prefers these nested
+    counts over the top-level order count, so they must be corrected too.
+    """
+    from near_close_dca import _apply_no_order_classification
+
+    artifacts = {
+        "buy_candidates": [
+            {
+                "ticker": "BYDDY",
+                "status": "submitted",
+                "order_id": "RH-ADJ-1",
+                "whole_share_settlement_adjustment": True,
+            }
+        ],
+        "counts": {"submitted": 1, "buy_candidates": 1},
+    }
+    outcomes = {
+        "BYDDY": {
+            "status": "submitted",
+            "order_id": "RH-ADJ-1",
+            "whole_share_settlement_adjustment": True,
+        }
+    }
+    _apply_no_order_classification(artifacts, outcomes)
+    assert artifacts["orders_submitted_count"] == 0
+    assert artifacts["counts"]["submitted"] == 0
+    assert artifacts["counts"]["buy_candidates"] == 0
+
+
+def test_apply_no_order_classification_excludes_settlement_adjustments_from_submitted_count(tmp_path):
+    """Codex review ("Exclude ordinary settlement deltas from submission
+    reporting"): a whole_share_settlement_adjustment outcome must not be
+    counted toward orders_submitted_count -- it corrects a PRIOR run's own
+    submitted order, it is not a fresh placement in this run.
+    """
+    from near_close_dca import _apply_no_order_classification
+
+    artifacts = {"buy_candidates": []}
+    outcomes = {
+        "BYDDY": {
+            "status": "submitted",
+            "order_id": "RH-ADJ-1",
+            "whole_share_settlement_adjustment": True,
+        }
+    }
+    _apply_no_order_classification(artifacts, outcomes)
+    assert artifacts["orders_submitted_count"] == 0
+
+
 def test_contract_failure_persists_invalid_evidence_marker(tmp_path):
     # A contract-rejected scheduled run must be marked invalid IN the run_state, so
     # consumers that discover the file directly (not via the pointer) also exclude
@@ -22646,9 +22764,15 @@ def test_every_broker_quantity_parse_survives_an_overflowing_figure():
     # dropping the count again, from four to two. One more direct terminal-fill
     # parse was then replaced by the same helper during merge-conflict
     # resolution for the direct matched-order branch, dropping the count from
-    # two to one. The remaining parse is exactly what this test still needs to
-    # guard.
-    assert len(parses) >= 1, f"fixture must find the broker-quantity parse, got {parses}"
+    # two to one. The last one -- the live/working match branch's submitted-
+    # quantity parse -- went the same way when PR #1359 merged: it now routes
+    # through `_parse_terminal_share_quantity` too, so a negative or
+    # fractional live-order quantity is rejected instead of truncated into
+    # the booked notional (Codex review: "Reject fractional live-order
+    # quantities before truncation"), and this scan legitimately finds no
+    # raw parse at all. The loop below is what still matters: a raw
+    # `int(float(...))` over broker data added later must carry the guard
+    # or fail the build here.
     for i in parses:
         # The handler sits within a couple of lines of the parse in every case.
         window = "\n".join(lines[i:i + 4])
@@ -39233,6 +39357,63 @@ def test_load_prior_same_day_includes_scheduled_morning_live_allocation(tmp_path
     assert allocations["AAPL"].source == "scheduled"
 
 
+def test_load_prior_same_day_applies_a_negative_settlement_adjustment(tmp_path):
+    """Codex review ("Apply negative settlement deltas when loading prior
+    allocations"): a gated provisional recovery estimated at $10, later
+    corrected DOWNWARD by a settlement adjustment row (-$4, e.g. a $6
+    actual fill). The adjustment's amount is <= 0, but it must still be
+    applied to the aggregated allocation -- the loader's own amount <= 0
+    skip (meant for a row with no real contribution) previously dropped
+    this correction entirely, leaving the stale $10 estimate as if it
+    were still fully deployed.
+    """
+    root = os.path.join(tmp_path, "cron_tracking", "morning_dca")
+    _write_prior_run(
+        root,
+        "20260629_0945ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T09:45:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "morning_dca_live",
+                "stream": "morning",
+                "run_id": "morning_live_20260629_0945ET",
+            },
+            "buy_candidates": [
+                {"ticker": "BYDDY", "status": "submitted", "planned_amount_usd": 10.0, "order_id": "RH-1"},
+            ],
+        },
+    )
+    _write_prior_run(
+        root,
+        "20260629_1030ET",
+        {
+            "trading_day": "2026-06-29",
+            "generated_at": "2026-06-29T10:30:00-04:00",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "run_type": "morning_dca_live",
+                "stream": "morning",
+                "run_id": "morning_live_20260629_1030ET",
+            },
+            "buy_candidates": [
+                {
+                    "ticker": "BYDDY",
+                    "status": "submitted",
+                    "planned_amount_usd": -4.0,
+                    "order_id": "RH-1",
+                    "whole_share_settlement_adjustment": True,
+                },
+            ],
+        },
+    )
+
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
+
+    assert allocations["BYDDY"].amount_usd == pytest.approx(6.0)
+
+
 @pytest.mark.parametrize("status", ["pending", "unconfirmed"])
 def test_load_prior_same_day_includes_a_placed_or_in_flight_allocation(tmp_path, status):
     """Regression for "Admit in-flight statuses in prior-allocation loading".
@@ -44823,6 +45004,37 @@ def test_blocked_stub_refreshes_the_latest_scheduled_pointer(tmp_path):
     # A market-closed day proves the slot fired but is never scheduled evidence.
     assert pointer["valid_scheduled_evidence"] is False
     assert pointer["pointer_status"] == "pending"
+
+
+def test_blocked_stub_populates_a_base_amount_for_the_weekly_dashboard(tmp_path):
+    """Codex review ("Keep gated recoveries from breaking weekly
+    dashboards"): a bare blocked stub never itself has a graded-ladder run
+    to report a real base amount for, but once a gated whole-share
+    RECOVERY appends a submitted candidate row here (see
+    _persist_gated_whole_share_recovery), dca_weekly_dashboard's
+    _has_submitted_evidence() retains this artifact, and
+    build_graded_vs_fixed()/_require_base_amount() then need SOME base
+    amount to compute the fixed-1x-baseline comparison column against.
+    Without budget.base_amount_usd here, that raised ValueError and
+    aborted the entire weekly dashboard build over one blocked day's
+    recovery. StrategyConfig's own class-level default closes the gap.
+    """
+    from near_close_dca import StrategyConfig, _write_blocked_run_stub
+
+    artifacts_dir = pathlib.Path(tmp_path) / "runs" / "2026-07-01"
+    _write_blocked_run_stub(date(2026, 7, 1), artifacts_dir)
+
+    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    assert run_state["budget"]["base_amount_usd"] == StrategyConfig.base_buy_amount_usd
+
+    from dca_weekly_dashboard import build_graded_vs_fixed
+
+    run_state["buy_candidates"] = [
+        {"ticker": "BYDDY", "status": "submitted", "planned_amount_usd": 15.0}
+    ]
+    # Must not raise -- this is the regression: previously ValueError aborted
+    # the whole dashboard build for a day with a recovered whole-share order.
+    build_graded_vs_fixed([run_state])
 
 
 def test_blocked_stub_withholds_the_pointer_when_the_contract_fails(tmp_path, caplog):

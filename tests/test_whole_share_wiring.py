@@ -9,6 +9,7 @@ this env var is the only isolation lever).
 """
 
 import csv
+import inspect
 import logging
 from contextlib import contextmanager
 from dataclasses import replace
@@ -21,6 +22,7 @@ import near_close_dca as _near_close_dca
 from dca_whole_share_accumulator import WholeShareAccumulationLedger
 from near_close_dca import (
     EASTERN,
+    MISSING_FILL_EXECUTION_GAP,
     NORMAL_WEEKLY_CAP_USD,
     Action,
     Bar,
@@ -282,6 +284,9 @@ def test_ordinary_success_path_defers_settlement_for_a_still_live_order(
     # An accepted-but-unfilled order still gets a real execution record, so
     # fill-coverage reporting doesn't treat it as though nothing happened.
     assert len(run_result.execution_records) == 1
+    assert run_result.execution_records[0].status == "submitted"
+    assert run_result.execution_records[0].quantity_filled is None
+    assert run_result.loop_block_reasons["BYDDY"] == MISSING_FILL_EXECUTION_GAP
 
     ledger = WholeShareAccumulationLedger()
     # Still deducted (a real order was placed) but NOT settled -- the claim
@@ -1369,6 +1374,58 @@ def test_placement_failure_preserves_pending_and_counts_an_error(tmp_path, monke
     assert ledger.pending_usd("BYDDY") == 10.0
 
 
+def test_placement_failure_restores_credit_only_after_both_order_history_checks(tmp_path, monkeypatch):
+    """A definite no-order result must precede restoration after placement raises.
+
+    The live lookup catches an accepted order that is still working, while the
+    any-state lookup catches one that filled or terminated before reconciliation.
+    Restoring the claim before both exact-ref-id checks report no match could
+    make already-spent credit available on a later trading day.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+    calls = []
+
+    class _RejectedBeforeAcceptanceBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            calls.append(("place", ref_id))
+            raise RuntimeError("rejected before acceptance")
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            calls.append(("live", ref_id_prefixes))
+            return None
+
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            calls.append(("any_state", ref_id_prefixes))
+            return None
+
+    broker = _RejectedBeforeAcceptanceBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+
+    real_preserve_pending = WholeShareAccumulationLedger.preserve_pending
+
+    def _spy_preserve_pending(self, ticker, trading_day, deducted_usd, **kwargs):
+        calls.append(("preserve_pending", ticker))
+        return real_preserve_pending(self, ticker, trading_day, deducted_usd, **kwargs)
+
+    monkeypatch.setattr(WholeShareAccumulationLedger, "preserve_pending", _spy_preserve_pending)
+    outcome, _, _, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=10.0, target_price=10.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    ref_id = "graded-dca-wholeshare-2026-08-16-BYDDY"
+    assert calls == [
+        ("place", ref_id),
+        ("live", (ref_id,)),
+        ("any_state", (ref_id,)),
+        ("preserve_pending", "BYDDY"),
+    ]
+    assert outcome["status"] == "failed"
+    assert errors == 1
+    assert WholeShareAccumulationLedger().pending_usd("BYDDY") == 10.0
+
+
 def test_ambiguous_connector_failure_leaves_the_claim_reserved_instead_of_restoring_credit(
     tmp_path, monkeypatch
 ):
@@ -1455,58 +1512,6 @@ def test_ambiguous_whole_share_placement_books_the_reserved_notional(tmp_path, m
     assert running_deployed_7d == 10.0
 
 
-def test_placement_failure_restores_credit_only_after_both_order_history_checks(tmp_path, monkeypatch):
-    """A definite no-order result must precede restoration after placement raises.
-
-    The live lookup catches an accepted order that is still working, while the
-    any-state lookup catches one that filled or terminated before reconciliation.
-    Restoring the claim before both exact-ref-id checks report no match could
-    make already-spent credit available on a later trading day.
-    """
-    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
-    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
-    calls = []
-
-    class _RejectedBeforeAcceptanceBroker(DryRunBroker):
-        def place_whole_share_buy(self, ticker, quantity, ref_id):
-            calls.append(("place", ref_id))
-            raise RuntimeError("rejected before acceptance")
-
-        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-            calls.append(("live", ref_id_prefixes))
-            return None
-
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
-            calls.append(("any_state", ref_id_prefixes))
-            return None
-
-    broker = _RejectedBeforeAcceptanceBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
-
-    real_preserve_pending = WholeShareAccumulationLedger.preserve_pending
-
-    def _spy_preserve_pending(self, ticker, trading_day, deducted_usd, **kwargs):
-        calls.append(("preserve_pending", ticker))
-        return real_preserve_pending(self, ticker, trading_day, deducted_usd, **kwargs)
-
-    monkeypatch.setattr(WholeShareAccumulationLedger, "preserve_pending", _spy_preserve_pending)
-    outcome, _, _, errors, _ = _process_buy_candidate(
-        _decision(suggested_amount_usd=10.0, target_price=10.0),
-        ctx=_ctx(config, broker),
-        running_deployed_7d=0.0,
-    )
-
-    ref_id = "graded-dca-wholeshare-2026-08-16-BYDDY"
-    assert calls == [
-        ("place", ref_id),
-        ("live", (ref_id,)),
-        ("any_state", (ref_id,)),
-        ("preserve_pending", "BYDDY"),
-    ]
-    assert outcome["status"] == "failed"
-    assert errors == 1
-    assert WholeShareAccumulationLedger().pending_usd("BYDDY") == 10.0
-
-
 def test_ambiguous_placement_failure_reconciles_via_ref_id_instead_of_restoring_credit(tmp_path, monkeypatch):
     """Codex review ("Reconcile ambiguous placement failures before
     restoring credit"): place_whole_share_buy() can raise AFTER the broker
@@ -1584,6 +1589,7 @@ def test_ambiguous_placement_failure_with_a_failed_reconciliation_lookup_leaves_
 
     assert outcome["status"] == "blocked"
     assert "reconciliation lookup also failed" in outcome["skip_reason"]
+    assert outcome["whole_share_settlement_reconciliation_needed"] is True
     assert outcome["skip_reason"] == (
         "whole-share placement failed: RuntimeError; reconciliation lookup also failed: "
         "RuntimeError; claim left reserved pending manual reconciliation"
@@ -1595,6 +1601,98 @@ def test_ambiguous_placement_failure_with_a_failed_reconciliation_lookup_leaves_
     # Neither restored (would free credit for an order that may be live) nor
     # settled (no order id was ever confirmed) -- left exactly as
     # record_contribution's own deduction left it.
+    assert ledger.pending_usd("BYDDY") == 0.0
+    assert ledger.shares_purchased_total("BYDDY") == 0
+
+
+def test_ambiguous_placement_failure_rejects_a_negative_fractional_terminal_quantity(tmp_path, monkeypatch):
+    """Codex review ("Check negativity before truncating terminal
+    quantities"): this module's OTHER copy of the terminal-quantity parse
+    (the placement-failure/terminal-inclusive reconciliation branch inside
+    _process_whole_share_candidate, duplicated from
+    _reconcile_unresolved_whole_share_claim per this module's own "three
+    entry points"/duplicated-logic caution) has the identical truncation
+    gap: a negative FRACTIONAL cumulative_quantity like "-0.5" truncates to
+    0 under int(float(...)), indistinguishable from an ordinary explicit
+    zero. Falling through to the zero-fill release here would restore the
+    claim's entire reservation on malformed broker evidence. Uses
+    WholeSharePlacementTerminalError's own carried order payload, which
+    this branch reconciles WITHOUT a separate any-state lookup.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+
+    class _NegativeFractionalTerminalBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise WholeSharePlacementTerminalError(
+                "rejected",
+                {"id": "RH-NEG-FRAC-TERMINAL-1", "state": "rejected", "cumulative_quantity": "-0.5"},
+            )
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None
+
+    broker = _NegativeFractionalTerminalBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+
+    outcome, _, _, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=10.0, target_price=10.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "blocked"
+    # "-0.5" is BOTH negative and fractional -- the fractional-integrality
+    # check now catches it first (as "unknown"), before the value is even
+    # classified as negative; either malformed-data branch is correct here,
+    # since both leave the claim reserved rather than releasing it.
+    assert "negative" in outcome["skip_reason"] or "unknown" in outcome["skip_reason"]
+    assert errors == 1
+    ledger = WholeShareAccumulationLedger()
+    # Left exactly as record_contribution's own deduction left it -- a
+    # negative quantity is not zero-fill evidence, so the $10 stays
+    # deducted (reserved), not restored back to pending.
+    assert ledger.pending_usd("BYDDY") == 0.0
+    assert ledger.shares_purchased_total("BYDDY") == 0
+
+
+def test_ambiguous_placement_failure_rejects_a_positive_fractional_terminal_quantity(tmp_path, monkeypatch):
+    """Codex review ("Reject fractional terminal quantities before
+    truncation"): this module's OTHER copy of the terminal-quantity parse
+    (the placement-failure/terminal-inclusive reconciliation branch, same
+    site the negative-fractional sibling test above already covers) has
+    the identical fractional-truncation gap: a POSITIVE fractional
+    cumulative_quantity like "0.5" truncates to 0 under int(float(...)),
+    wrongly reading as a confirmed zero fill and restoring the claim's
+    entire reservation on malformed broker evidence.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+
+    class _PositiveFractionalTerminalBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise WholeSharePlacementTerminalError(
+                "filled",
+                {"id": "RH-POS-FRAC-TERMINAL-1", "state": "filled", "cumulative_quantity": "0.5"},
+            )
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None
+
+    broker = _PositiveFractionalTerminalBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+
+    outcome, _, _, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=10.0, target_price=10.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "blocked"
+    assert "unknown" in outcome["skip_reason"]
+    assert errors == 1
+    ledger = WholeShareAccumulationLedger()
+    # Left exactly as record_contribution's own deduction left it -- a
+    # fractional quantity is not zero-fill evidence, so the $10 stays
+    # deducted (reserved), not restored back to pending.
     assert ledger.pending_usd("BYDDY") == 0.0
     assert ledger.shares_purchased_total("BYDDY") == 0
 
@@ -3127,6 +3225,85 @@ def test_pre_roll_live_order_recovery_books_the_actual_submitted_quantity_when_c
     assert ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY") is not None
 
 
+def test_pre_roll_live_order_recovery_rejects_a_negative_submitted_quantity(tmp_path, monkeypatch):
+    """Codex review ("Reject negative live-order quantities before
+    booking"): a still-live matched order's own "quantity" field can be
+    malformed (e.g. "-1", or a fractional "-0.5" that int() truncates to an
+    indistinguishable 0). Booking a negative or zero-from-truncation
+    planned_notional_usd here would create false cap/kill-switch headroom
+    for later candidates in the batch even though a real, unresolved
+    broker order exists. Must fall back to the claim's own unclamped
+    shares_to_buy, same as an absent/unparseable quantity already does.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    ledger = WholeShareAccumulationLedger()
+    # $30 pending at a cached $10.00/share price plans 3 shares.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-15", 30.0, 10.0, stream="afternoon",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
+    )
+
+    class _NegativeQuantityStillLiveBroker(DryRunBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {"id": "RH-NEG-QTY-LIVE", "state": "confirmed", "quantity": "-0.5", "cumulative_quantity": "0"}
+
+    ctx = _ctx(
+        StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False),
+        _NegativeQuantityStillLiveBroker(cash=500.0, reference_prices={"BYDDY": 10.0}),
+    )
+    _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    deployed = _reconcile_cross_day_whole_share_claims_for_batch(ctx, 0.0)
+
+    # Falls back to the claim's own unclamped 3-share/$30 plan, never a
+    # negative or zero notional from the malformed quantity.
+    assert deployed == pytest.approx(30.0)
+    outcome = _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]["BYDDY"]
+    assert outcome["submitted_amount_usd"] == pytest.approx(30.0)
+    assert outcome["whole_share_quantity"] == 3
+    assert ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY") is not None
+
+
+def test_pre_roll_live_order_recovery_rejects_a_positive_fractional_submitted_quantity(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Reject fractional live-order quantities before
+    truncation"): this path places WHOLE-share orders only, so a positive
+    but FRACTIONAL submitted quantity like "0.5" is just as malformed as a
+    negative one -- int() truncates it to 0, silently understating the
+    booked notional to zero for a real, still-live broker order. Must fall
+    back to the claim's own unclamped shares_to_buy, same as a negative or
+    unparseable quantity already does.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    ledger = WholeShareAccumulationLedger()
+    # $30 pending at a cached $10.00/share price plans 3 shares.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-15", 30.0, 10.0, stream="afternoon",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
+    )
+
+    class _FractionalQuantityStillLiveBroker(DryRunBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {"id": "RH-FRAC-QTY-LIVE", "state": "confirmed", "quantity": "0.5", "cumulative_quantity": "0"}
+
+    ctx = _ctx(
+        StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False),
+        _FractionalQuantityStillLiveBroker(cash=500.0, reference_prices={"BYDDY": 10.0}),
+    )
+    _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    deployed = _reconcile_cross_day_whole_share_claims_for_batch(ctx, 0.0)
+
+    # Falls back to the claim's own unclamped 3-share/$30 plan, never a
+    # zero notional from the truncated fractional quantity.
+    assert deployed == pytest.approx(30.0)
+    outcome = _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]["BYDDY"]
+    assert outcome["submitted_amount_usd"] == pytest.approx(30.0)
+    assert outcome["whole_share_quantity"] == 3
+    assert ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY") is not None
+
+
 def test_a_still_live_recovered_order_already_recorded_on_a_later_day_is_not_rebooked(
     tmp_path, monkeypatch
 ):
@@ -3431,6 +3608,77 @@ def test_a_terminally_filled_recovery_publishes_the_delta_from_an_earlier_provis
     assert ctx.state.day_order_count(claim_trading_day) == 0
 
 
+def test_an_ambiguous_legacy_breakdown_skips_the_reconciliation_delta_instead_of_assuming_zero(
+    tmp_path, monkeypatch
+):
+    """discussion_r3838771875: a legacy artifact's breakdown can aggregate
+    TWO orders for the same claim date with NEITHER entry carrying an
+    order_id (written before order_id was added to breakdown entries) --
+    the settling order's own order_id then matches nothing, and the
+    trading-day-only fallback is itself ambiguous (two entries share that
+    date). Treating that ambiguity as "nothing was recorded" (the prior
+    behavior: recorded_amount stays 0.0) would publish the ENTIRE fill as
+    a fresh reconciliation delta, double-counting whichever of the two
+    legacy entries actually already covered this order's own provisional
+    amount. The conservative outcome is to skip the adjustment entirely.
+    """
+    from test_near_close_dca import _write_scheduled_afternoon_artifact
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    ledger = WholeShareAccumulationLedger()
+    claim_trading_day = date(2026, 8, 15)
+    ledger.record_contribution(
+        "BYDDY", claim_trading_day.isoformat(), 10.0, 10.0, stream="afternoon",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
+    )
+
+    history_root = str(tmp_path / "runs")
+    _write_scheduled_afternoon_artifact(
+        history_root,
+        date(2026, 8, 16),
+        [{
+            "ticker": "BYDDY", "status": "submitted", "order_id": "RH-DELTA-FILL-1",
+            "planned_amount_usd": 30.0,
+            "whole_share_order_ids": ["RH-OTHER-ORDER", "RH-DELTA-FILL-1"],
+            # Legacy shape: neither breakdown entry carries an order_id, and
+            # both share the SAME claim date -- ambiguous by construction.
+            "whole_share_claim_breakdown": [
+                {"trading_day": "2026-08-15", "amount_usd": 20.0},
+                {"trading_day": "2026-08-15", "amount_usd": 10.0},
+            ],
+        }],
+    )
+
+    class _FilledAboveCachedPriceBroker(DryRunBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {"id": "RH-DELTA-FILL-1", "state": "filled", "quantity": "1", "average_price": "12.00"}
+
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+    ctx = ProcessCandidateContext(
+        config=config,
+        state=StrategyState(),
+        broker=_FilledAboveCachedPriceBroker(cash=500.0, reference_prices={"BYDDY": 10.0}),
+        robinhood_data=None,
+        now=datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN),
+        trading_day=date(2026, 8, 17),
+        guard_active=False,
+        prior_same_day_allocations={},
+        scheduled=True,
+        run_result=None,
+        deployment_history_root=history_root,
+    )
+    _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    deployed = _reconcile_cross_day_whole_share_claims_for_batch(ctx, 0.0)
+
+    assert ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY") is None
+    # No adjustment is published -- neither the full $12 (which would
+    # double-count whichever legacy entry already covered this order) nor
+    # any other guessed delta.
+    assert deployed == 0.0
+    assert "BYDDY" not in _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]
+
+
 def test_a_terminally_filled_recovery_below_the_provisional_amount_is_not_republished(
     tmp_path, monkeypatch
 ):
@@ -3698,6 +3946,57 @@ def test_reconcile_rejects_a_negative_fractional_terminal_fill_quantity(tmp_path
     assert ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY") is not None
 
 
+@pytest.mark.parametrize("terminal_quantity", [None, "", "not-a-number", "0.5"])
+def test_reconcile_books_an_any_state_terminal_order_with_an_unknown_quantity(
+    tmp_path, monkeypatch, terminal_quantity
+):
+    """Codex review ("Reject fractional terminal quantities before
+    truncation"): a POSITIVE fractional cumulative_quantity such as
+    ``"0.5"`` on a terminal order truncates to ``0`` under
+    ``int(float(...))``, wrongly reading as a confirmed zero fill and
+    restoring the claim's entire reservation on the strength of a value
+    that was never actually zero. Only a genuine whole number is
+    trustworthy evidence; a malformed or absent value must leave the claim
+    exactly as reserved for a later retry. The matched terminal order is
+    still real broker-attempt evidence, so reconciliation must return a
+    conservative booking shape for the caller's risk accounting.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    ledger = WholeShareAccumulationLedger()
+    ledger.record_contribution(
+        "BYDDY", "2026-08-15", 10.0, 10.0, stream="afternoon",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
+    )
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY")
+    assert unresolved is not None
+
+    class _UnknownTerminalQuantityBroker:
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None
+
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            return {
+                "id": "RH-UNKNOWN-TERMINAL-QTY-1",
+                "state": "rejected",
+                "cumulative_quantity": terminal_quantity,
+            }
+
+    reconciled = _near_close_dca._reconcile_unresolved_whole_share_claim(
+        ledger, cast(Any, _UnknownTerminalQuantityBroker()), "BYDDY", "afternoon", "afternoon-BYDDY",
+        "2026-08-15", unresolved,
+    )
+
+    assert reconciled == {
+        "live_order_found": True,
+        "order_id": "RH-UNKNOWN-TERMINAL-QTY-1",
+        "planned_notional_usd": 10.0,
+        "planned_quantity": 1,
+    }
+    # Left exactly as reserved -- malformed or absent quantity is not
+    # confirmed zero-fill evidence.
+    assert ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY") is not None
+
+
 def test_reconcile_falls_back_to_submitted_quantity_when_cumulative_quantity_is_unparseable(
     tmp_path, monkeypatch
 ):
@@ -3781,6 +4080,94 @@ def test_reconcile_rejects_a_negative_fractional_fill_from_the_live_match_branch
 
     assert reconciled is not None
     assert reconciled["shares_purchased"] == 1
+
+
+def test_reconcile_rejects_a_positive_fractional_fill_from_the_live_match_branch(tmp_path, monkeypatch):
+    """Codex review ("Reject fractional terminal quantities before
+    truncation"): the DIRECT matched_order/"filled" branch's negative-only
+    guard let a POSITIVE fractional cumulative_quantity like "0.5" through
+    -- int() truncates it to 0, which _settle_whole_share_claim() reads as
+    a legitimate confirmed zero fill, restoring the claim's FULL
+    reservation on malformed data despite nonzero fill evidence. Must fall
+    back to the order's own submitted quantity (1, clamped from the
+    2-share claim), same as a negative or unparseable value already does.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    ledger = WholeShareAccumulationLedger()
+    ledger.record_contribution(
+        "BYDDY", "2026-08-15", 20.0, 10.0, stream="afternoon",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
+    )
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY")
+    assert unresolved["shares_to_buy"] == 2
+
+    class _PositiveFractionalLiveMatchBroker:
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {
+                "id": "RH-POS-FRAC-LIVE-1",
+                "state": "filled",
+                "cumulative_quantity": "0.5",
+                "quantity": "1",
+                "average_price": "10.00",
+            }
+
+    reconciled = _near_close_dca._reconcile_unresolved_whole_share_claim(
+        ledger, _PositiveFractionalLiveMatchBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-15",
+        unresolved,
+    )
+
+    assert reconciled is not None
+    assert reconciled["shares_purchased"] == 1
+
+
+@pytest.mark.parametrize("submitted_quantity", ["0.5", "1.5"])
+def test_reconcile_rejects_a_fractional_submitted_quantity_fallback(
+    tmp_path, monkeypatch, submitted_quantity
+):
+    """Codex review ("Validate submitted-quantity fallbacks before
+    truncation"): when a terminal "filled" match has no usable
+    cumulative_quantity, the DIRECT matched_order branch falls back to the
+    order's own "quantity" field -- but that fallback lacked the same
+    finite/nonnegative/whole-number guard already applied to
+    cumulative_quantity. A malformed positive fractional "quantity" like
+    "0.5" would truncate to 0, settling the claim as a confirmed zero fill
+    (restoring the FULL reservation) despite nonzero fill evidence. The
+    malformed terminal evidence cannot establish the actual fill, so
+    reconciliation must leave the claim unresolved rather than guessing
+    the fill, while conservatively returning the claim's planned quantity
+    so callers still book the real broker attempt against risk limits.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    ledger = WholeShareAccumulationLedger()
+    ledger.record_contribution(
+        "BYDDY", "2026-08-15", 20.0, 10.0, stream="afternoon",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
+    )
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY")
+    assert unresolved["shares_to_buy"] == 2
+
+    class _FractionalSubmittedQuantityBroker:
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {
+                "id": "RH-FRAC-SUBMITTED-1",
+                "state": "filled",
+                "cumulative_quantity": None,
+                "quantity": submitted_quantity,
+                "average_price": "10.00",
+            }
+
+    reconciled = _near_close_dca._reconcile_unresolved_whole_share_claim(
+        ledger, _FractionalSubmittedQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-15",
+        unresolved,
+    )
+
+    assert reconciled == {
+        "live_order_found": True,
+        "order_id": "RH-FRAC-SUBMITTED-1",
+        "planned_notional_usd": 20.0,
+        "planned_quantity": 2,
+    }
+    assert ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY") is not None
 
 
 def test_reconcile_does_not_release_claim_for_negative_fractional_live_fill_without_submitted_quantity(
@@ -3908,6 +4295,84 @@ def test_merge_whole_share_outcomes_retains_recovered_order_id_after_no_id_failu
     assert merged["whole_share_order_ids"] == ["recovered-fill"]
 
 
+def test_merge_whole_share_outcomes_keeps_deployed_order_id_on_mixed_failure_with_own_id():
+    """discussion_r3838771868: unlike the no-ID case above, a FAILED
+    attempt can still carry its OWN broker order id (e.g. a confirmed
+    rejected/zero-fill order) -- the prior fallback only fired when the
+    new side's scalar id was falsy, so it left the top-level ``order_id``
+    at the failed order's id even though ``status``/``submitted_amount_usd``
+    describe the recovered (existing) side's real deployment. Terminal-
+    order-id filtering keys off that top-level id, so leaving it on the
+    failed order would make load_prior_same_day_allocations() skip the
+    whole aggregate and erase the recovered spend along with it.
+    """
+    recovered = {
+        "status": "submitted",
+        "order_id": "recovered-fill",
+        "submitted_amount_usd": 25.0,
+        "whole_share_quantity": 2,
+    }
+    failed_with_own_id = {
+        "status": "failed",
+        "order_id": "rejected-order",
+        "submitted_amount_usd": 40.0,
+        "whole_share_quantity": 0,
+    }
+
+    merged = _near_close_dca._merge_whole_share_submission_outcomes(recovered, failed_with_own_id)
+
+    assert merged["status"] == "submitted"
+    assert merged["submitted_amount_usd"] == pytest.approx(25.0)
+    # The scalar id must track the order whose notional was actually
+    # retained -- the recovered/existing side, not the failed newcomer.
+    assert merged["order_id"] == "recovered-fill"
+    # Both broker orders are still individually discoverable for audit.
+    assert set(merged["whole_share_order_ids"]) == {"recovered-fill", "rejected-order"}
+
+
+def test_publish_or_merge_whole_share_outcome_merges_a_prior_zero_fill_recovery():
+    """Codex review ("Merge zero-fill evidence before later submitted
+    recoveries"): a confirmed zero-fill recovery publishes "status":
+    "failed" (see _book_reconciled_whole_share_order's own
+    zero_fill_attempt branch -- nothing was purchased), so the merge
+    gate's old ``existing.status == "submitted"`` check alone missed it.
+    When the SAME cross-day pre-pass then reconciles a LATER, separate
+    claim for the SAME ticker as genuinely submitted,
+    _publish_or_merge_whole_share_outcome must MERGE with that zero-fill
+    evidence, not silently overwrite and lose it -- its order id and
+    attempt-breakdown entry represent a real attempt already counted via
+    record_buy(..., 0.0).
+    """
+    _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "BYDDY": {
+            "status": "failed",
+            "order_id": "RH-ZERO-FILL-1",
+            "whole_share_zero_fill_attempt": True,
+            "whole_share_claim_breakdown": [
+                {"trading_day": "2026-08-15", "order_id": "RH-ZERO-FILL-1", "amount_usd": 0.0}
+            ],
+        }
+    }
+
+    _near_close_dca._publish_or_merge_whole_share_outcome(
+        "BYDDY",
+        {
+            "status": "submitted",
+            "order_id": "RH-SUBMITTED-1",
+            "submitted_amount_usd": 10.0,
+            "whole_share_quantity": 1,
+            "whole_share_claim_breakdown": [
+                {"trading_day": "2026-08-16", "order_id": "RH-SUBMITTED-1", "amount_usd": 10.0}
+            ],
+        },
+    )
+
+    merged = _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]["BYDDY"]
+    assert merged["status"] == "submitted"
+    # The zero-fill order's id survives the merge, not just the new one's.
+    assert set(merged["whole_share_order_ids"]) == {"RH-ZERO-FILL-1", "RH-SUBMITTED-1"}
+
+
 def test_batch_keeps_submission_published_during_candidate_processing(monkeypatch):
     """A late reconciliation publication must beat a returned accumulating outcome."""
     config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
@@ -3989,6 +4454,36 @@ def test_batch_pre_pass_aggregates_two_recovered_claims_for_the_same_ticker(tmp_
     assert outcome["submitted_amount_usd"] == pytest.approx(20.0)
     assert outcome["whole_share_quantity"] == 2
     assert set(outcome["whole_share_order_ids"]) == {"RH-CLAIM-14", "RH-CLAIM-15"}
+
+
+def test_whole_share_submission_merge_preserves_ids_from_both_aggregates():
+    """Nested aggregation must not discard order IDs already carried by the newer outcome."""
+    existing = {
+        "status": "submitted",
+        "order_id": "RH-CLAIM-2",
+        "whole_share_order_ids": ["RH-CLAIM-1", "RH-CLAIM-2"],
+        "submitted_amount_usd": 20.0,
+        "whole_share_quantity": 2,
+    }
+    new = {
+        "status": "submitted",
+        "order_id": "RH-CLAIM-4",
+        "whole_share_order_ids": ["RH-CLAIM-3", "RH-CLAIM-4"],
+        "submitted_amount_usd": 20.0,
+        "whole_share_quantity": 2,
+    }
+
+    merged = _near_close_dca._merge_whole_share_submission_outcomes(existing, new)
+
+    assert merged["submitted_amount_usd"] == 40.0
+    assert merged["whole_share_quantity"] == 4
+    assert merged["order_id"] == "RH-CLAIM-4"
+    assert merged["whole_share_order_ids"] == [
+        "RH-CLAIM-1",
+        "RH-CLAIM-2",
+        "RH-CLAIM-3",
+        "RH-CLAIM-4",
+    ]
 
 
 def test_batch_pre_pass_reconciles_cross_day_claims_before_any_candidate_places(tmp_path, monkeypatch):
@@ -4607,6 +5102,23 @@ def test_batch_preserves_a_recovered_zero_fill_attempt_over_todays_own_non_submi
     assert outcome.get("whole_share_zero_fill_attempt") is True
 
 
+def test_same_call_capture_recognizes_recovered_zero_fill_attempt():
+    """The same-call recovery merge must recognize countable zero fills.
+
+    Keep this source-level guard alongside the end-to-end batch regression:
+    self-publishing candidate paths can replace the in-flight entry before
+    the outer batch loop gets a chance to inspect it.
+    """
+    source = inspect.getsource(_near_close_dca._process_whole_share_candidate)
+
+    capture_start = source.index("_candidate_from_reconciliation is not _pre_reconciliation_outcome")
+    capture_end = source.index("_recovered_before_todays_processing = _candidate_from_reconciliation")
+    capture_guard = source[capture_start:capture_end]
+
+    assert 'get("status") == "submitted"' in capture_guard
+    assert 'get("whole_share_zero_fill_attempt")' in capture_guard
+
+
 def test_pre_roll_recovered_spend_is_carried_into_the_candidate_batch(tmp_path, monkeypatch):
     """Codex review ("Preserve pre-roll recovered spend for the candidate
     batch"): the pre-roll cross-day reconciliation pass runs before
@@ -4743,19 +5255,24 @@ def test_whole_share_claim_is_reconciled_even_when_the_date_gate_blocks_the_run(
     # were never spent.
     assert state.day_notional(claim_trading_day) == pytest.approx(10.0)
 
-    # Unlike the fractional-placement gated pass (which persists its
-    # recovery into run_state.json and then refreshes run_summary.json/
-    # submitted_orders.csv/buy_candidates.csv to match, via
-    # _refresh_blocked_run_companions), _book_reconciled_whole_share_order_durably
-    # only books the DURABLE half into in-memory StrategyState -- asserted
-    # above. It writes nothing to the blocked run's own run_state.json, so
-    # the companion artifacts _write_blocked_run_stub() wrote stay at their
-    # original zero-order snapshot. That is a real gap (scripts/drift_detection.py
-    # and scripts/purchase_history.py read submitted_orders.csv, not
-    # StrategyState), tracked separately from the account-pinning safety
-    # property this module's regression suite otherwise covers -- not
-    # something to paper over with an assertion the current implementation
-    # cannot satisfy.
+    # Companion artifacts must be refreshed to match, not left at the
+    # zero-order stub _write_blocked_run_stub() wrote before the recovery
+    # was persisted -- scripts/drift_detection.py and
+    # scripts/purchase_history.py read submitted_orders.csv, not
+    # run_state.json's own buy_candidates (Codex review: "Refresh companion
+    # artifacts after gated recoveries").
+    artifacts_dir = tmp_path / "artifacts"
+    summary = _near_close_dca.json.loads((artifacts_dir / "run_summary.json").read_bytes())
+    assert summary["orders_submitted_count"] == 1
+
+    import csv
+
+    with (artifacts_dir / "submitted_orders.csv").open(newline="", encoding="utf-8") as fh:
+        order_rows = list(csv.DictReader(fh))
+    assert len(order_rows) == 1
+    assert order_rows[0]["ticker"] == "BYDDY"
+    assert order_rows[0]["order_id"] == "RH-GATED-1"
+    assert order_rows[0]["submitted_amount_usd"] == "10.0"
 
 
 def test_gated_reconciliation_refuses_a_mismatched_broker_account(tmp_path, monkeypatch):
@@ -4859,7 +5376,9 @@ def test_whole_share_claim_is_reconciled_on_the_gated_path_for_a_ticker_removed_
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    # Reconciliation evidence belongs to the older afternoon claim even when
+    # this blocked retry happens before the ordinary 14:30 ET evidence floor.
+    now = datetime(2026, 8, 16, 10, 0, tzinfo=EASTERN)
     # BYDDY is no longer enrolled in whole_share_tickers at all -- an
     # operator removed it after the claim was recorded.
     config = StrategyConfig(

@@ -2846,6 +2846,42 @@ class WholeShareAccumulationLedger:
                     # distinguish terminal placement history from an
                     # in-flight placement" alternative).
                     cached["placing"] = False
+                    # EXCEPT when shares_purchased is EXACTLY zero -- an
+                    # explicit, broker-confirmed zero fill (e.g. a terminal
+                    # "filled" order whose own cumulative_quantity is 0, or
+                    # an ambiguous-placement lookup that turns up zero real
+                    # shares) bought NOTHING, so "placed" no longer reflects
+                    # a real purchase worth keeping as terminal history --
+                    # the reasoning above only holds when THIS call's own
+                    # settlement represents an actual, non-zero purchase.
+                    # Leaving "placed" set here blocked every later
+                    # zero-contribution retry under this same idempotency
+                    # slot from ever redispatching the fully-restored credit
+                    # (the resolved-and-not-"placed" gate in
+                    # record_contribution()/cached_fire_decision() never
+                    # opened), even though every dollar was already restored
+                    # by the shortfall math just below (discussion_r3838771878,
+                    # "Release placed claims for explicit zero fills").
+                    if float(shares_purchased) == 0:
+                        cached["placed"] = False
+                    else:
+                        # A CONFIRMED positive fill must mark "placed"
+                        # True explicitly, not merely leave it at
+                        # whatever it already was: a process killed after
+                        # the broker accepted the order but before
+                        # execute_claimed() persisted "placed" leaves the
+                        # durable claim at placing=true, placed=false. A
+                        # later reconciliation's settle() call already
+                        # clears "placing" above -- if "placed" is left
+                        # untouched here, the claim now reads
+                        # resolved=true, placed=false, placing=false,
+                        # which is exactly the shape record_contribution()/
+                        # cached_fire_decision()'s zero-contribution
+                        # redispatch gate treats as "safe to retry", even
+                        # though real shares were just confirmed bought
+                        # (Codex review: "Mark recovered positive fills as
+                        # placed").
+                        cached["placed"] = True
                     resolved_by_this_call = True
                     # This call is the one winning the claim -- fire the
                     # caller's hook now, still inside the lock and strictly

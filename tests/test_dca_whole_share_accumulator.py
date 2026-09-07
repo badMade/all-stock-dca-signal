@@ -2186,9 +2186,15 @@ def test_reconcile_unresolved_whole_share_claim_does_not_fall_back_to_quantity_f
         "2026-08-16", unresolved,
     )
 
-    # No cumulative_quantity, and "quantity" is not trusted for a
-    # non-filled terminal order -- nothing settled.
-    assert reconciled is None
+    # No cumulative_quantity, and "quantity" is not trusted as a fill for a
+    # non-filled terminal order. Nothing settles, but the attempt remains
+    # conservatively bookable for risk accounting.
+    assert reconciled == {
+        "live_order_found": True,
+        "order_id": "RH-CANCELED-ANY-STATE-1",
+        "planned_notional_usd": 10.0,
+        "planned_quantity": 1,
+    }
     assert ledger.shares_purchased_total("BYDDY") == 0
 
 
@@ -2234,9 +2240,14 @@ def test_reconcile_unresolved_whole_share_claim_does_not_treat_requested_quantit
         unresolved,
     )
 
-    # Nothing was settled, and nothing was released either -- an unknown
-    # quantity leaves the claim exactly as record_contribution left it.
-    assert reconciled is None
+    # Nothing was settled or released. The claim stays unresolved while the
+    # real broker attempt is returned for conservative risk accounting.
+    assert reconciled == {
+        "live_order_found": True,
+        "order_id": "RH-REJECTED-NO-FILL-INFO-1",
+        "planned_notional_usd": 20.0,
+        "planned_quantity": 2,
+    }
     assert ledger.shares_purchased_total("BYDDY") == 0
     assert ledger.pending_usd("BYDDY") == 0.0
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
@@ -2347,7 +2358,12 @@ def test_reconcile_unresolved_whole_share_claim_leaves_the_claim_reserved_when_t
         now_iso="2026-08-16T15:45:00-04:00",  # 1 second after claimed_at -- not stale
     )
 
-    assert reconciled is None
+    assert reconciled == {
+        "live_order_found": True,
+        "order_id": "RH-CANCELLED-1",
+        "planned_notional_usd": 10.0,
+        "planned_quantity": 1,
+    }
     assert ledger.shares_purchased_total("BYDDY") == 0
     # NOT released -- the claim is left exactly as record_contribution left it.
     assert ledger.pending_usd("BYDDY") == 0.0
@@ -3060,6 +3076,111 @@ def test_settle_with_a_clamped_smaller_notional_auto_restores_the_shortfall(tmp_
     )
     assert ledger.shares_purchased_total("BYDDY") == 1
     assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_settle_releases_placed_for_an_explicit_zero_fill(tmp_path):
+    """discussion_r3838771878: a claim marked "placed" (execute_claimed()
+    durably recorded a broker submission) that settles with EXACTLY ZERO
+    shares purchased -- a confirmed terminal zero-fill, e.g. a "filled"
+    order whose own cumulative_quantity is 0 -- must release "placed", not
+    just "placing". Unlike a real (non-zero) settlement, where "placed"
+    staying True is accurate terminal history of a genuine purchase, a
+    zero-fill claim's shortfall restores its ENTIRE deduction (nothing was
+    ever actually bought), so leaving "placed" set here would permanently
+    block every later zero-contribution retry under this same idempotency
+    slot from redispatching that fully-restored credit -- the ledger.settle()
+    docstring's OWN example scenario.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    decision = ledger.record_contribution("BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1")
+    assert decision.shares_to_buy == 1
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    # execute_claimed() durably marks "placing" before the broker call, and
+    # "placed" once the broker confirms acceptance -- simulate that here by
+    # directly claiming the pending fire the same way execute_claimed()
+    # would (the exact call is exercised elsewhere; this test is scoped to
+    # settle()'s own release behavior).
+    ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", None, lambda: "RH-ZERO-FILL-1",
+        claim_token=decision.claim_token,
+    )
+
+    # The broker order terminally confirmed a ZERO fill -- nothing was
+    # actually purchased -- so settle() restores the entire $10 deduction.
+    ledger.settle(
+        "BYDDY", "2026-08-16", 0, 0.0, stream="morning", idempotency_key="slot-1",
+        claim_token=decision.claim_token,
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    # "placed" must be released -- a later zero-contribution retry under
+    # this SAME slot must be free to redispatch the fully-restored credit.
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T16:05:00-04:00"
+    )
+    assert retry.shares_to_buy == 1
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+
+def test_settle_marks_placed_true_for_a_recovered_positive_fill(tmp_path):
+    """Codex review ("Mark recovered positive fills as placed"): if the
+    process dies after the broker accepts an order but before
+    execute_claimed() persists its post-call update, the durable claim is
+    left at placing=true, placed=false. A LATER reconciliation that
+    confirms a positive terminal fill calls settle(), which clears
+    "placing" but -- before this fix -- never touched "placed", leaving it
+    at its stale False. That shape (resolved=true, placed=false,
+    placing=false) is exactly what the zero-contribution redispatch gate
+    treats as safe to retry, so a claim that ALREADY bought shares could
+    be redispatched a second time. settle() must mark "placed" True for
+    any confirmed non-zero fill, not just leave it untouched.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    decision = ledger.record_contribution("BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1")
+    assert decision.shares_to_buy == 1
+
+    ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", None, lambda: "RH-CRASH-1",
+        claim_token=decision.claim_token,
+    )
+
+    # Simulate the crash window: execute_claimed() above durably set
+    # "placed" True on success -- roll it back to False here (leaving
+    # "placing" cleared, exactly as execute_claimed() itself already
+    # leaves it) to reproduce a process that died before the "placed"
+    # write landed.
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    assert entry["placed"] is True
+    entry["placed"] = False
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    # A later reconciliation confirms the order actually filled for 1 share.
+    # The full $10 deduction is fully accounted for by the fill (shortfall
+    # is 0), so this alone leaves no money in the pool to redispatch.
+    ledger.settle(
+        "BYDDY", "2026-08-16", 1, 10.0, stream="morning", idempotency_key="slot-1",
+        claim_token=decision.claim_token,
+    )
+
+    # An UNRELATED later contribution (a different idempotency_key) adds
+    # new money to BYDDY's shared pool without fully consuming it (price
+    # too high to afford a share) -- this is the money the bug lets a
+    # stale, already-placed claim wrongly redispatch against.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 5.0, 100.0, idempotency_key="slot-2", recorded_at="2026-08-16T16:00:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 5.0
+
+    # A zero-contribution retry under the OLD slot-1 (already placed and
+    # settled with a REAL fill) must stay blocked -- it must not redispatch
+    # using the unrelated money slot-2 just added to the shared pool.
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 5.0, idempotency_key="slot-1", recorded_at="2026-08-16T16:05:00-04:00"
+    )
+    assert retry.shares_to_buy == 0
 
 
 def test_settle_shortfall_uses_the_ledgers_own_rounded_price_not_submitted_notional(tmp_path):

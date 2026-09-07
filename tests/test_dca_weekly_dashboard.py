@@ -47,6 +47,52 @@ def test_build_graded_vs_fixed_uses_per_candidate_dynamic_base():
     assert "$5.00" in report  # fixed: 1 (own base) + 2 (own base) + 2 (fallback), not 2 * 3 = 6
 
 
+def test_build_graded_vs_fixed_excludes_adjustment_rows_from_candidate_count_and_fixed_baseline():
+    # Codex review ("Exclude adjustment rows from candidate analytics"): a
+    # whole_share_settlement_adjustment row corrects an ALREADY-counted
+    # physical candidate, not a second one -- counting it here (and giving
+    # it its own fixed-baseline 1x allocation) inflates both the candidate
+    # count and the fixed baseline for one physical order. Its dollar delta
+    # ($2) is still real deployed capital and stays in the graded total.
+    run_states = [
+        {
+            "trading_day": "2026-07-24",
+            "budget": {"base_amount_usd": 2.0},
+            "buy_candidates": [
+                {"ticker": "BYDDY", "planned_amount_usd": 10.0, "selected_base_amount_usd": 2.0},
+                {
+                    "ticker": "BYDDY",
+                    "planned_amount_usd": 2.0,
+                    "whole_share_settlement_adjustment": True,
+                },
+            ],
+        }
+    ]
+    report = build_graded_vs_fixed(run_states)
+    assert "$12.00" in report  # graded: 10 + 2 (the adjustment's real delta)
+    assert "$2.00" in report  # fixed: only the ORIGINAL candidate's own $2 base
+    assert "| 2026-07-24 | 1 |" in report  # candidate count: 1, not 2
+
+
+def test_build_sector_matrix_excludes_adjustment_rows_from_candidate_count():
+    # Codex review ("Exclude adjustment rows from candidate analytics"):
+    # same exclusion as build_graded_vs_fixed's sibling test, applied to
+    # the sector matrix's own candidate/notional aggregation.
+    run_states = [
+        {
+            "trading_day": "2026-07-24",
+            "buy_candidates": [
+                {"ticker": "BYDDY", "planned_amount_usd": 10.0},
+                {
+                    "ticker": "BYDDY",
+                    "planned_amount_usd": 2.0,
+                    "whole_share_settlement_adjustment": True,
+                },
+            ],
+        }
+    ]
+    report = build_sector_matrix(run_states, {"BYDDY": "Consumer"})
+    assert "| Consumer | 1 | $12.00 |" in report
 def test_build_performance_snapshot_empty_states():
     report = build_performance_snapshot([])
     assert "| Run days | 0 |" in report

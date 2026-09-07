@@ -9011,6 +9011,39 @@ def _apply_no_order_classification(
     # recorded as an ordinary success with no error class (Codex review).
     # Same rule as the morning runner.
     artifacts["orders_submitted_count"] = submitted
+    # counts.submitted/counts.buy_candidates were seeded, before this
+    # function ever ran, from the RAW candidate list -- including any
+    # whole_share_settlement_adjustment row, the same bookkeeping-only
+    # correction `submitted` above already excludes. dca_weekly_dashboard's
+    # build_performance_snapshot() prefers these NESTED counts over
+    # orders_submitted_count, so leaving them uncorrected reports a
+    # submitted order/candidate for a run that placed nothing new (Codex
+    # review: "Update ordinary counts when excluding adjustments").
+    #
+    # Clamped with min(), never assigned outright: run_daily_compact's
+    # reinjection path recomputes counts.submitted BEFORE calling here via
+    # _grouped_submission_rows_by_represented_order(), where two partially
+    # overlapping aggregates ({A, B} + {B, C}) count 3 physical orders, while
+    # `submitted` above sums each row's own merged_submission_count (4) with
+    # no overlap knowledge. Overwriting that grouped figure regressed
+    # "Count unique IDs across overlapping aggregates" (PR #1169). This
+    # correction only ever REMOVES adjustment rows the seed wrongly
+    # included, so it can only lower a nested count, never raise one.
+    counts = artifacts.get("counts")
+    if isinstance(counts, dict):
+        _seeded_submitted = counts.get("submitted")
+        if isinstance(_seeded_submitted, int) and not isinstance(_seeded_submitted, bool):
+            counts["submitted"] = min(_seeded_submitted, submitted)
+        _seeded_buy_candidates = counts.get("buy_candidates")
+        if isinstance(_seeded_buy_candidates, int) and not isinstance(_seeded_buy_candidates, bool):
+            counts["buy_candidates"] = min(
+                _seeded_buy_candidates,
+                sum(
+                    1
+                    for c in (artifacts.get("buy_candidates") or [])
+                    if isinstance(c, dict) and not c.get("whole_share_settlement_adjustment")
+                ),
+            )
     if submitted:
         if failed or connector_errors or placement_halted:
             # A partially submitted batch: some orders landed and another ticker
@@ -12105,7 +12138,23 @@ def load_prior_same_day_allocations(
                         unreconstructable_sink.append(ticker)
                     continue
                 amount = today_breakdown + (amount - total_breakdown)
-            if amount <= 0:
+            # A whole_share_settlement_adjustment row's amount is a
+            # (possibly negative) DELTA correcting an already-aggregated
+            # prior allocation, not a fresh dollar contribution of its
+            # own -- a downward correction (e.g. a $10 provisional
+            # estimate settling at $6, or a full zero-fill reversal of
+            # -$10) MUST still be applied via entry["amount"] += amount
+            # below, or this loader keeps treating the stale, higher
+            # provisional estimate as still deployed. Neither of the two
+            # nonpositive handlings just below fits it: a bare `continue`
+            # silently drops the correction, and the "unreconstructable"
+            # poisoning below is for an ORDER-bearing row whose amount
+            # cannot be nonpositive -- an adjustment's can, by design.
+            # Either way, same-day top-up decisions and cross-stream weekly
+            # cap reconstruction would go on suppressing valid buys against
+            # money that was never actually spent (Codex review: "Apply
+            # negative settlement deltas when loading prior allocations").
+            if amount <= 0 and not _is_settlement_adjustment:
                 # Two genuinely legitimate zero shapes, neither corruption:
                 # (1) a claim breakdown can zero out TODAY's own bucket
                 # entirely when the row's whole amount is attributed to
@@ -13846,7 +13895,24 @@ def _write_blocked_run_stub(
         # The calendar gate stopped this before any slot could execute, so the
         # artifact is well-formed and attributable but never scheduled evidence.
         "scheduled_evidence_denied": True,
-        "budget": {"budget_tier": "normal", "daily_cap_usd": 0, "weekly_cap_usd": 0},
+        # base_amount_usd is StrategyConfig's own class-level default -- this
+        # stub never has a live StrategyConfig to read the ACTUAL configured
+        # value from, but a blocked-gate day has no graded-ladder run to
+        # report a real base amount for anyway. Without it, a later gated
+        # whole-share RECOVERY that appends a submitted row here (see
+        # _persist_gated_whole_share_recovery) makes
+        # dca_weekly_dashboard._has_submitted_evidence() retain this stub,
+        # and its own build_graded_vs_fixed()/_require_base_amount() then
+        # raise ValueError on the missing field -- aborting the entire
+        # weekly dashboard build over one blocked day's whole-share recovery
+        # (Codex review: "Keep gated recoveries from breaking weekly
+        # dashboards").
+        "budget": {
+            "budget_tier": "normal",
+            "daily_cap_usd": 0,
+            "weekly_cap_usd": 0,
+            "base_amount_usd": StrategyConfig.base_buy_amount_usd,
+        },
         "counts": {"evaluated": 0, "buy_candidates": 0, "submitted": 0},
         "buy_candidates": [],
         "signal_rows": [],
@@ -14692,10 +14758,18 @@ def _same_day_ticker_deployment_already_recorded(
         if not isinstance(candidates, list):
             continue
         for candidate in candidates:
+            # "filled" (a confirmed terminal fill persisted by
+            # _persist_gated_whole_share_recovery -- "Mark confirmed gated
+            # fills as filled") is exactly as real a physical attempt as
+            # "submitted" here -- excluding it let an ordinary gate-passing
+            # retry fail to recognize a gated recovery that already landed
+            # and durably booked, republishing the same order's notional a
+            # second time (Codex review: "Recognize filled gated rows
+            # during ordinary retry deduplication").
             if (
                 isinstance(candidate, dict)
                 and candidate.get("ticker") == ticker
-                and candidate.get("status") == "submitted"
+                and candidate.get("status") in _PRIOR_ALLOCATION_STATUSES
             ):
                 return True
     return False
@@ -14984,6 +15058,7 @@ def _write_and_validate_scheduled_contract(
         }
         for c in artifacts.get("buy_candidates", [])
         if c.get("status") != "dry_run"
+        and not c.get("whole_share_settlement_adjustment")
         and (c.get("status") in ORDER_ATTEMPT_STATUSES or c.get("order_id"))
     ]
     # Computed in-memory, BEFORE the write -- never read back from disk
@@ -15919,11 +15994,11 @@ def _reconcile_unresolved_whole_share_claim(
     purchase to book -- Codex review: "Count pre-roll zero-fill orders
     toward the attempt cap"), ``{"live_order_found": True, "order_id",
     "planned_notional_usd", "planned_quantity"}`` when a live/working match
-    was found but has not yet reached a terminal state (the ledger claim
-    stays reserved for a later reconciliation attempt, but the caller must
-    still book the claim's own planned notional/quantity as submitted/
-    unfilled -- Codex review: "Book live orders discovered during claim
-    recovery"), else ``None``. The caller is responsible for booking a
+    was found or a terminal match has malformed quantity evidence (the
+    ledger claim stays reserved for a later reconciliation attempt, but the
+    caller must still book a conservative planned notional/quantity as
+    submitted/unfilled -- Codex review: "Keep malformed terminal orders in
+    risk accounting"), else ``None``. The caller is responsible for booking a
     non-``None`` result into ``ctx.state``/``running_deployed_7d``/
     execution records (Codex review: "Book reconciled orders into the
     strategy budget state") -- this function only touches the whole-share
@@ -15951,9 +16026,10 @@ def _reconcile_unresolved_whole_share_claim(
       permanently overstates purchased shares while withholding the unfilled
       credit forever (Codex review: "Defer settling recovered orders until
       they are terminal"). A non-terminal match therefore leaves the claim
-      reserved and returns ``None`` -- exactly like "no match found" -- so a
-      LATER reconciliation attempt (once the order actually settles) can
-      complete it correctly.
+      reserved and returns structured live-order evidence so the caller can
+      book the submitted attempt without settling it; a LATER reconciliation
+      attempt (once the order actually settles) can complete the ledger
+      correctly.
     - Falls back to the claim's own UNCLAMPED ``shares_to_buy`` only when
       the matched (now-filled) order carries no usable quantity field at
       all -- a per-order-ceiling clamp at placement time would otherwise
@@ -16007,8 +16083,9 @@ def _reconcile_unresolved_whole_share_claim(
 
     No-op (returns ``None`` without settling) if ``claim["shares_to_buy"]``
     isn't positive, ``claim_trading_day_iso`` doesn't parse as a date, no
-    exact ref_id match is found, the match is not yet in a terminal state,
-    or a concurrent caller already resolved this claim first.
+    exact ref_id match is found, or a concurrent caller already resolved this
+    claim first. A nonterminal exact match instead returns structured
+    ``live_order_found`` evidence.
     """
     if not isinstance(claim, dict) or claim.get("shares_to_buy", 0) <= 0:
         return None
@@ -16018,6 +16095,19 @@ def _reconcile_unresolved_whole_share_claim(
         return None
     ref_id = f"{_graded_dca_ref_id_prefix(stream, 'wholeshare')}-{claim_trading_day_iso}-{ticker}"
     matched_order = broker.same_day_strategy_order_exists_with_ref_id_prefix(ticker, claim_trading_day_date, (ref_id,))
+
+    def bookable_unresolved_order(order: Mapping[str, Any]) -> Dict[str, Any]:
+        """Conservatively book real broker evidence whose fill is unknown."""
+        planned_quantity = int(claim.get("shares_to_buy", 0))
+        return {
+            "live_order_found": True,
+            "order_id": str(order.get("id") or order.get("order_id") or "") or None,
+            "planned_notional_usd": round(
+                planned_quantity * float(claim.get("current_share_price_usd", 0.0)), 2
+            ),
+            "planned_quantity": planned_quantity,
+        }
+
     if not matched_order:
         # The live-only lookup above deliberately excludes a genuinely
         # TERMINAL order (cancelled/rejected/expired -- see
@@ -16113,6 +16203,14 @@ def _reconcile_unresolved_whole_share_claim(
             # stays False, so the claim is left exactly as record_contribution
             # wrote it, reserved for better evidence -- never guessed at zero.
             filled_shares, quantity_is_known = _parse_terminal_share_quantity(raw_terminal_quantity)
+            # Derived separately because the shared parser above folds a
+            # negative quantity into its "unknown" answer, and the two
+            # need DIFFERENT handling just below: unknown is still real
+            # broker-attempt evidence worth booking conservatively, while
+            # negative is malformed data that must not become evidence of
+            # anything (Codex review: "Keep malformed terminal orders in
+            # risk accounting").
+            quantity_is_negative = _share_quantity_is_negative(raw_terminal_quantity)
             if filled_shares > 0:
                 # Routed through `_normalized_order_id`, not the bare
                 # `str(_first_usable_order_id_alias(...) or "") or None`
@@ -16132,12 +16230,20 @@ def _reconcile_unresolved_whole_share_claim(
                     fill_price_usd=_usable_positive_float(terminal_order.get("average_price")),
                     before_settle=before_settle,
                 )
+            if quantity_is_negative:
+                # Negative broker quantities are invalid rather than an
+                # unknown nonnegative fill; preserve the existing rejection
+                # posture instead of treating them as bookable evidence.
+                return None
             if not quantity_is_known:
                 # Terminal, but with no parseable evidence of what (if
                 # anything) executed -- leave the claim exactly as
                 # record_contribution left it, for a later attempt once
                 # better evidence is available, rather than guessing zero.
-                return None
+                # The terminal order is nevertheless real broker-attempt
+                # evidence, so return a conservative booking result to keep
+                # its possible fill in the caller's risk accounting.
+                return bookable_unresolved_order(terminal_order)
             # A confirmed EXPLICIT zero fill (a clean rejection/cancellation
             # before any execution) is definitive -- no need to wait for
             # staleness, unlike the "found nothing at all" case below, which
@@ -16355,14 +16461,29 @@ def _reconcile_unresolved_whole_share_claim(
         raw_submitted_quantity = matched_order.get("quantity")
         planned_quantity = int(claim.get("shares_to_buy", 0))
         if raw_submitted_quantity is not None:
-            try:
-                planned_quantity = int(float(raw_submitted_quantity))
-            except (TypeError, ValueError, OverflowError):
-                # OverflowError as well -- see the terminal-quantity parse
-                # above. Falls back to the claim's own shares_to_buy, which
-                # is already this branch's documented no-usable-quantity
-                # answer, rather than escaping as an unhandled raise.
-                pass
+            # A malformed submitted quantity must not flow into
+            # planned_notional_usd -- the caller adds this straight into
+            # running_deployed_7d/record_buy() as this order's booked
+            # notional, so a bad value here would create false cap/
+            # kill-switch headroom for later candidates in the same batch
+            # even though a real, unresolved broker order exists. Negative,
+            # non-finite, or unparseable is rejected outright (Codex review:
+            # "Reject negative live-order quantities before booking"), and a
+            # POSITIVE but FRACTIONAL value (e.g. "0.5") is equally malformed
+            # -- this path places WHOLE-share orders only, so truncating it
+            # to 0 would silently understate the booked notional to zero for
+            # a real live order the SAME way a negative value would (Codex
+            # review: "Reject fractional live-order quantities before
+            # truncation"). Only a genuine positive WHOLE number is
+            # trustworthy; anything else falls back to the claim's own
+            # shares_to_buy, same as an absent quantity field already does
+            # (_parse_terminal_share_quantity applies exactly that guard,
+            # OverflowError included).
+            parsed_submitted_quantity, submitted_quantity_is_known = _parse_terminal_share_quantity(
+                raw_submitted_quantity
+            )
+            if submitted_quantity_is_known and parsed_submitted_quantity > 0:
+                planned_quantity = parsed_submitted_quantity
         planned_notional = round(planned_quantity * float(claim.get("current_share_price_usd", 0.0)), 2)
         return {
             "live_order_found": True,
@@ -16383,6 +16504,19 @@ def _reconcile_unresolved_whole_share_claim(
         if submitted_quantity_is_known:
             shares_purchased = submitted_quantity
             quantity_is_known = True
+        elif raw_submitted_quantity is not None:
+            # Unlike an ABSENT field (which falls through to the claim's own
+            # shares_to_buy, this branch's documented no-usable-quantity
+            # answer), an explicitly malformed value -- negative or
+            # fractional, e.g. "0.5"/"-0.5" -- is evidence that the terminal
+            # fill count is unknown: truncating it would settle the claim for
+            # the wrong share count. Leave the claim unresolved rather than
+            # guessing, but still hand the caller a conservative, bookable
+            # live-order shape so the real broker attempt stays inside every
+            # in-batch risk limit while the claim stays open (Codex review:
+            # "Validate submitted-quantity fallbacks before truncation";
+            # "Keep malformed terminal orders in risk accounting").
+            return bookable_unresolved_order(matched_order)
     return _settle_whole_share_claim(
         ledger, ticker, claim, claim_trading_day_iso, shares_purchased, stream, idempotency_key,
         order_id=_normalized_order_id(_first_usable_order_id_alias(matched_order)),
@@ -16438,6 +16572,24 @@ def _parse_terminal_share_quantity(raw: Any) -> "Tuple[int, bool]":
     except (InvalidOperation, TypeError, ValueError):
         pass
     return int(qty), True
+
+
+def _share_quantity_is_negative(raw: Any) -> bool:
+    """Whether a broker quantity parses as a NEGATIVE number.
+
+    Companion to :func:`_parse_terminal_share_quantity`, which deliberately
+    folds a negative quantity into its ``quantity_is_known=False`` answer.
+    The terminal-order branch of :func:`_reconcile_unresolved_whole_share_claim`
+    needs the sign on its own: an unknown quantity is still a real broker
+    attempt worth booking conservatively, but a negative one is malformed
+    data that must not be turned into evidence of anything.
+    """
+    if raw is None:
+        return False
+    try:
+        return float(raw) < 0
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _usable_positive_float(raw: Any) -> Optional[float]:
@@ -18719,7 +18871,10 @@ def _process_whole_share_candidate(
             # WRONG at worst (e.g. leftover module-global state from an
             # unrelated earlier call in the same process).
             and _candidate_from_reconciliation is not _pre_reconciliation_outcome
-            and _candidate_from_reconciliation.get("status") == "submitted"
+            and (
+                _candidate_from_reconciliation.get("status") == "submitted"
+                or _candidate_from_reconciliation.get("whole_share_zero_fill_attempt")
+            )
         ):
             _recovered_before_todays_processing = _candidate_from_reconciliation
 
@@ -19931,6 +20086,11 @@ def _process_whole_share_candidate(
                     "reviewed_order": reviewed_order,
                     "submitted_amount_usd": order_notional,
                     "whole_share_planned_notional_usd": planned_order_notional,
+                    # Machine-readable counterpart to the blocked status and
+                    # skip_reason: artifact consumers must not interpret this
+                    # as an ordinary placement rejection whose claim can be
+                    # released automatically.
+                    "whole_share_settlement_reconciliation_needed": True,
                     **spread_fields,
                 }
                 logger.error(
@@ -20998,7 +21158,26 @@ def _process_whole_share_candidate(
             ticker, candidate_outcome, _recovered_before_todays_processing
         )
         if ctx.run_result is not None:
-            _log_execution(ctx.run_result, decision, order_id or "", ctx.broker, notional_usd=order_notional)
+            # The exact-ref lookup above is the authoritative observation for
+            # this branch: the order is not filled yet (or is not visible at
+            # all).  Do not call _log_execution here because that helper asks
+            # the adapter for fill details again; a stale/inconsistent adapter
+            # response could then turn this deliberately unfilled submission
+            # into a ``filled`` execution record.  Persist the accepted order
+            # directly as submitted so the ledger and coverage artifacts agree.
+            ctx.run_result.execution_records.append(
+                build_execution_record(
+                    ticker=decision.ticker,
+                    target_price=decision.target_price,
+                    target_price_source=decision.target_price_source,
+                    target_quote_time=decision.target_quote_time,
+                    decision_bar_close=decision.decision_bar_close,
+                    notional_usd=order_notional,
+                    action_reason=decision.reason,
+                    order_id=order_id or "",
+                )
+            )
+            ctx.run_result.loop_block_reasons[decision.ticker] = MISSING_FILL_EXECUTION_GAP
         return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
     # Confirmed filled -- use the broker's own REAL executed quantity/price,
