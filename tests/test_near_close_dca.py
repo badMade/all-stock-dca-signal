@@ -10330,7 +10330,7 @@ def test_apply_deployment_history_keeps_future_uncertain_evidence_during_a_repla
     assert kill_switch_engaged(guarded) is True
 
 
-def test_apply_deployment_history_ignores_future_only_uncertain_claims_during_a_replay(monkeypatch):
+def test_apply_deployment_history_ignores_explicit_future_only_uncertain_claims_during_a_replay(monkeypatch):
     """A later claim must not suppress sizing for capital not yet deployed."""
     import near_close_dca
     from near_close_dca import _apply_deployment_history, kill_switch_engaged
@@ -10370,7 +10370,10 @@ def test_apply_deployment_history_ignores_future_only_uncertain_claims_during_a_
             {
                 "ticker": "MSFT",
                 "status": "submitted",
-                "planned_amount_usd": "NaN",
+                "planned_amount_usd": 10.0,
+                "whole_share_claim_breakdown": [
+                    {"trading_day": later_day.isoformat(), "amount_usd": "NaN"}
+                ],
             },
         ],
     }
@@ -10381,6 +10384,301 @@ def test_apply_deployment_history_ignores_future_only_uncertain_claims_during_a_
 
     assert guarded.deployed_last_7d_usd == 10.0
     assert kill_switch_engaged(guarded) is False
+
+
+def test_apply_deployment_history_rejects_future_artifact_day_without_matching_provenance(monkeypatch):
+    """A forged future top-level day cannot hide corrupt replay-day evidence."""
+    import near_close_dca
+    from near_close_dca import _apply_deployment_history, kill_switch_engaged
+    from scripts.run_classification import (
+        CRON_ID,
+        SCHEDULED_FOR_ET,
+        SCHEDULED_RUN_TYPE,
+        SCHEDULED_WINDOW_END_ET,
+        SCHEDULED_WINDOW_START_ET,
+    )
+
+    replay_day = date(2026, 7, 21)
+    forged_artifact_day = replay_day + timedelta(days=1)
+    state = {
+        "trading_day": forged_artifact_day.isoformat(),
+        "generated_at": f"{replay_day.isoformat()}T15:45:00-04:00",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "run_type": SCHEDULED_RUN_TYPE,
+            "cron_id": CRON_ID,
+            "scheduled_for_et": SCHEDULED_FOR_ET,
+            "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
+            "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
+            "manual_run": False,
+            "run_id": f"scheduled_{replay_day.strftime('%Y%m%d')}_1530ET",
+            "triggered_at_utc": f"{replay_day.isoformat()}T19:45:00Z",
+            "state_schema_version": "run-classification-v1",
+        },
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 10.0,
+                "whole_share_claim_breakdown": [
+                    {"trading_day": forged_artifact_day.isoformat(), "amount_usd": "NaN"}
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr(near_close_dca, "_load_deployment_history_states", lambda *_: [state])
+
+    config = StrategyConfig(monthly_cash_allocation_usd=1000.0, kill_switch_7d_deploy_fraction=0.40)
+    guarded = _apply_deployment_history(config, replay_day, "unused")
+
+    assert kill_switch_engaged(guarded) is True
+
+
+def test_apply_deployment_history_keeps_undated_future_artifact_uncertainty(monkeypatch):
+    """An artifact-day fallback is not an explicitly dated future claim."""
+    import near_close_dca
+    from near_close_dca import _apply_deployment_history, kill_switch_engaged
+    from scripts.run_classification import (
+        CRON_ID,
+        SCHEDULED_FOR_ET,
+        SCHEDULED_RUN_TYPE,
+        SCHEDULED_WINDOW_END_ET,
+        SCHEDULED_WINDOW_START_ET,
+    )
+
+    replay_day = date(2026, 7, 21)
+    later_day = replay_day + timedelta(days=1)
+    state = {
+        "trading_day": later_day.isoformat(),
+        "run_classification": {
+            "run_origin": "scheduled",
+            "run_type": SCHEDULED_RUN_TYPE,
+            "cron_id": CRON_ID,
+            "scheduled_for_et": SCHEDULED_FOR_ET,
+            "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
+            "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
+            "manual_run": False,
+            "run_id": f"scheduled_{later_day.strftime('%Y%m%d')}_1530ET",
+            "triggered_at_utc": f"{later_day.isoformat()}T19:45:00Z",
+            "state_schema_version": "run-classification-v1",
+        },
+        "generated_at": f"{later_day.isoformat()}T15:45:00",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 10.0,
+                "whole_share_claim_breakdown": [{"amount_usd": "NaN"}],
+            },
+            {
+                "ticker": "MSFT",
+                "status": "submitted",
+                "planned_amount_usd": 1.0,
+                "whole_share_claim_breakdown": [
+                    {"trading_day": replay_day.isoformat(), "amount_usd": 1.0}
+                ],
+            },
+            {
+                # This explicit unusable claim has the same deduplicated date
+                # as AAPL's artifact-day fallback.  It must not lend its
+                # provenance to AAPL and make that fallback future-only.
+                "ticker": "NVDA",
+                "status": "submitted",
+                "planned_amount_usd": 1.0,
+                "whole_share_claim_breakdown": [
+                    {"trading_day": later_day.isoformat(), "amount_usd": "NaN"}
+                ],
+            },
+        ],
+    }
+    monkeypatch.setattr(near_close_dca, "_load_deployment_history_states", lambda *_: [state])
+
+    config = StrategyConfig(monthly_cash_allocation_usd=1000.0, kill_switch_7d_deploy_fraction=0.40)
+    guarded = _apply_deployment_history(config, replay_day, "unused")
+
+    assert kill_switch_engaged(guarded) is True
+
+
+def test_apply_deployment_history_rejects_claim_after_its_artifact_day(monkeypatch):
+    """A future-dated claim in a current artifact is corrupt, not harmless."""
+    import near_close_dca
+    from near_close_dca import _apply_deployment_history, kill_switch_engaged
+    from scripts.run_classification import (
+        CRON_ID,
+        SCHEDULED_FOR_ET,
+        SCHEDULED_RUN_TYPE,
+        SCHEDULED_WINDOW_END_ET,
+        SCHEDULED_WINDOW_START_ET,
+    )
+
+    replay_day = date(2026, 7, 21)
+    state = {
+        "trading_day": replay_day.isoformat(),
+        "generated_at": f"{replay_day.isoformat()}T15:45:00",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "run_type": SCHEDULED_RUN_TYPE,
+            "cron_id": CRON_ID,
+            "scheduled_for_et": SCHEDULED_FOR_ET,
+            "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
+            "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
+            "manual_run": False,
+            "run_id": f"scheduled_{replay_day.strftime('%Y%m%d')}_1530ET",
+            "triggered_at_utc": f"{replay_day.isoformat()}T19:45:00Z",
+            "state_schema_version": "run-classification-v1",
+        },
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "NaN",
+                "whole_share_claim_breakdown": [
+                    {"trading_day": (replay_day + timedelta(days=1)).isoformat(), "amount_usd": 10.0}
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr(near_close_dca, "_load_deployment_history_states", lambda *_: [state])
+
+    config = StrategyConfig(monthly_cash_allocation_usd=1000.0, kill_switch_7d_deploy_fraction=0.40)
+    guarded = _apply_deployment_history(config, replay_day, "unused")
+
+    assert kill_switch_engaged(guarded) is True
+
+
+def test_apply_deployment_history_handles_an_oversized_future_claim_amount(monkeypatch):
+    """An explicitly future-dated breakdown amount encoded as a JSON integer
+    too large for float() must not abort the run. _amount_is_unusable
+    (dca_risk.py) already treats an OverflowError from float() as "unusable"
+    rather than raising -- _valid_future_artifact_claim's own float(amount)
+    call did the same conversion without the same protection, so
+    _apply_deployment_history raised OverflowError instead of applying the
+    risk gate (Codex review: "Handle oversized future claim amounts without
+    conversion failure")."""
+    import near_close_dca
+    from near_close_dca import _apply_deployment_history, kill_switch_engaged
+    from scripts.run_classification import (
+        CRON_ID,
+        SCHEDULED_FOR_ET,
+        SCHEDULED_RUN_TYPE,
+        SCHEDULED_WINDOW_END_ET,
+        SCHEDULED_WINDOW_START_ET,
+    )
+
+    replay_day = date(2026, 7, 21)
+    later_day = replay_day + timedelta(days=1)
+    state = {
+        "trading_day": later_day.isoformat(),
+        "generated_at": f"{later_day.isoformat()}T15:45:00",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "run_type": SCHEDULED_RUN_TYPE,
+            "cron_id": CRON_ID,
+            "scheduled_for_et": SCHEDULED_FOR_ET,
+            "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
+            "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
+            "manual_run": False,
+            "run_id": f"scheduled_{later_day.strftime('%Y%m%d')}_1530ET",
+            "triggered_at_utc": f"{later_day.isoformat()}T19:45:00Z",
+            "state_schema_version": "run-classification-v1",
+        },
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 10.0,
+                "whole_share_claim_breakdown": [
+                    # A valid JSON integer float() cannot represent.
+                    {"trading_day": later_day.isoformat(), "amount_usd": 10**400}
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr(near_close_dca, "_load_deployment_history_states", lambda *_: [state])
+
+    config = StrategyConfig(monthly_cash_allocation_usd=1000.0, kill_switch_7d_deploy_fraction=0.40)
+    # Must not raise OverflowError.
+    guarded = _apply_deployment_history(config, replay_day, "unused")
+
+    assert kill_switch_engaged(guarded) is False
+
+
+def test_apply_deployment_history_ignores_a_future_only_overfilled_breakdown(monkeypatch):
+    """A breakdown whose individually-valid amounts sum past the row's own
+    total is corruption, but when every contributing entry is dated after
+    replay_day (and at or before the artifact's own day), that corruption is
+    future-only and cannot have affected historical deployment.
+    _valid_future_artifact_claim only recognized an individually unusable
+    entry as a valid future claim source, so this legitimately-future overfill
+    unnecessarily kept the replay kill switch engaged (Codex review: "Exclude
+    future-only overfilled breakdowns during replay")."""
+    import near_close_dca
+    from near_close_dca import _apply_deployment_history, kill_switch_engaged
+    from scripts.run_classification import (
+        CRON_ID,
+        SCHEDULED_FOR_ET,
+        SCHEDULED_RUN_TYPE,
+        SCHEDULED_WINDOW_END_ET,
+        SCHEDULED_WINDOW_START_ET,
+    )
+
+    replay_day = date(2026, 7, 21)
+    later_day = replay_day + timedelta(days=1)
+    state = {
+        "trading_day": later_day.isoformat(),
+        "generated_at": f"{later_day.isoformat()}T15:45:00",
+        "run_classification": {
+            "run_origin": "scheduled",
+            "run_type": SCHEDULED_RUN_TYPE,
+            "cron_id": CRON_ID,
+            "scheduled_for_et": SCHEDULED_FOR_ET,
+            "scheduled_window_start_et": SCHEDULED_WINDOW_START_ET,
+            "scheduled_window_end_et": SCHEDULED_WINDOW_END_ET,
+            "manual_run": False,
+            "run_id": f"scheduled_{later_day.strftime('%Y%m%d')}_1530ET",
+            "triggered_at_utc": f"{later_day.isoformat()}T19:45:00Z",
+            "state_schema_version": "run-classification-v1",
+        },
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 5.0,
+                # Individually valid ($10), but sums past the row's own $5
+                # total -- corrupt, yet dated entirely after replay_day.
+                "whole_share_claim_breakdown": [
+                    {"trading_day": later_day.isoformat(), "amount_usd": 10.0}
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr(near_close_dca, "_load_deployment_history_states", lambda *_: [state])
+
+    config = StrategyConfig(monthly_cash_allocation_usd=1000.0, kill_switch_7d_deploy_fraction=0.40)
+    guarded = _apply_deployment_history(config, replay_day, "unused")
+
+    assert kill_switch_engaged(guarded) is False
+
+
+def test_valid_future_artifact_claim_fails_closed_on_malformed_candidates():
+    """A malformed (non-list) buy_candidates in the artifact under scan must
+    not raise TypeError from iteration -- nothing can be corroborated without
+    a real list, so the date is not treated as a safely-excludable future
+    claim (Codex review: "Validate candidate collections before
+    iterating")."""
+    from near_close_dca import _valid_future_artifact_claim
+
+    replay_day = date(2026, 7, 21)
+    later_day = replay_day + timedelta(days=1)
+    state = {
+        "trading_day": later_day.isoformat(),
+        "generated_at": f"{later_day.isoformat()}T15:45:00",
+        "buy_candidates": None,
+    }
+
+    # fallback_days deliberately empty: this exercises the collection-shape
+    # guard directly, independent of the separate fallback-provenance check.
+    assert _valid_future_artifact_claim(state, later_day, replay_day, set()) is False
 
 
 def test_apply_deployment_history_leaves_a_healthy_total_alone(tmp_path):

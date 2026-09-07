@@ -576,28 +576,25 @@ def _amount_is_unusable(raw: Any) -> bool:
     return amount <= 0.0 and not raw_is_genuine_number
 
 
-def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date]]:
-    """The trading day(s) unusable deployed-notional evidence in this state
-    would attribute to, if any -- ``None`` standing in for "no attributable
-    date available" (fail-closed: a caller scoping this to a specific window
-    must treat ``None`` as potentially inside it, the same "unknown means
-    possibly relevant" convention ``_load_states_with_evidence``'s
-    ``_relevant()`` already uses).
+def _unusable_deployed_notional_date_evidence(
+    state: Dict[str, Any],
+) -> Tuple[Set[Optional[date]], Set[Optional[date]]]:
+    """Return unusable dates and the subset inferred from artifact fallback.
 
-    ``has_unusable_deployed_notional(state)`` is exactly ``bool(this)`` --
-    kept in one place so a caller that needs to know WHICH day(s) carry
-    unusable evidence (e.g. to check that day against a specific trailing
-    window rather than trusting a state-wide flag, as
-    ``near_close_dca._apply_deployment_history`` must: an unusable candidate
-    whose ``whole_share_claim_breakdown`` attributes it entirely outside the
-    kill-switch's trailing window cannot move ``deployed_last_7d_usd``, yet
-    the old state-wide predicate poisoned that figure anyway just because
-    SOME candidate elsewhere in the file was unusable -- Codex review:
-    "Scope unusable notionals to the kill-switch window") does not re-derive
-    this per-candidate/per-breakdown-entry logic separately and risk it
-    drifting out of sync with the rest of this function's checks.
+    The first set is exactly what :func:`unusable_deployed_notional_dates`
+    returns. The second is the subset of it recorded IN PLACE OF an explicit
+    claim date: the artifact's own ``trading_day`` (or ``None`` when even
+    that is unavailable) standing in for a missing/malformed breakdown date,
+    a malformed candidate collection, an unusable ``budget`` fallback, or an
+    unusable row total whose breakdown may omit a merged fresh submission. A
+    breakdown entry's own explicitly-dated day is never a fallback, even
+    when it happens to equal the artifact day. Both sets are built in this
+    ONE pass so the two views cannot drift apart -- see
+    :func:`unusable_deployed_notional_fallback_dates` for why the split
+    matters to ``near_close_dca._valid_future_artifact_claim``.
     """
     dates: Set[Optional[date]] = set()
+    fallback_dates: Set[Optional[date]] = set()
     candidates = state.get("buy_candidates")
     if not isinstance(candidates, list):
         if "buy_candidates" in state:
@@ -611,13 +608,17 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
             # review: "Reject malformed candidate collections as risk
             # evidence"). Fails closed unconditionally, without inspecting
             # the budget fallback.
-            dates.add(_trading_day(state))
-            return dates
+            artifact_day = _trading_day(state)
+            dates.add(artifact_day)
+            fallback_dates.add(artifact_day)
+            return dates, fallback_dates
         budget = state.get("budget")
         if isinstance(budget, dict) and "day_notional_usd" in budget:
             if _amount_is_unusable(budget.get("day_notional_usd")):
-                dates.add(_trading_day(state))
-        return dates
+                artifact_day = _trading_day(state)
+                dates.add(artifact_day)
+                fallback_dates.add(artifact_day)
+        return dates, fallback_dates
     artifact_day = _trading_day(state)
     for c in candidates:
         if not isinstance(c, dict) or not (
@@ -645,6 +646,7 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
             for entry in breakdown:
                 if not isinstance(entry, dict):
                     dates.add(artifact_day)
+                    fallback_dates.add(artifact_day)
                     row_unusable = True
                     has_unusable_claim_date = True
                     continue
@@ -658,11 +660,19 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
                 if entry_day is None:
                     has_unusable_claim_date = True
                 if _amount_is_unusable(entry.get("amount_usd")):
-                    dates.add(entry_day if entry_day is not None else artifact_day)
+                    if entry_day is None:
+                        # No explicit date to attribute the unusable amount
+                        # to -- the artifact day is standing in for it, so
+                        # it is fallback provenance, not an explicit claim.
+                        dates.add(artifact_day)
+                        fallback_dates.add(artifact_day)
+                    else:
+                        dates.add(entry_day)
                     row_unusable = True
                     continue
                 if entry_day is None and artifact_day is None:
                     dates.add(None)
+                    fallback_dates.add(None)
                     row_unusable = True
                     continue
                 amt = _non_negative_finite_usd(entry.get("amount_usd"))
@@ -705,6 +715,7 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
                     # too (Codex review: "Preserve artifact-day uncertainty
                     # in malformed breakdowns").
                     dates.add(artifact_day)
+                    fallback_dates.add(artifact_day)
                 elif planned is None or accounted_usd < planned - 1e-9:
                     # planned is None means the top-level notional itself
                     # could not be parsed as a number at all (e.g. the
@@ -715,6 +726,7 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
                     # "Preserve uncertainty for an unaccounted breakdown
                     # remainder").
                     dates.add(artifact_day)
+                    fallback_dates.add(artifact_day)
                 continue
             row_amount = _non_negative_finite_usd(c.get("planned_amount_usd"))
             if row_amount is not None and accounted_usd > row_amount + 1e-9:
@@ -768,6 +780,7 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
                 # have usable dates, so a current evidence window fails closed.
                 if has_unusable_claim_date or not claim_dates:
                     dates.add(artifact_day)
+                    fallback_dates.add(artifact_day)
                 continue
             if row_unusable:
                 # Top-level total is usable and the breakdown is not
@@ -786,10 +799,46 @@ def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date
                 and accounted_usd < row_amount - 1e-9
             ):
                 dates.add(None)
+                fallback_dates.add(None)
                 continue
         elif row_notional_unusable:
             dates.add(artifact_day)
-    return dates
+            fallback_dates.add(artifact_day)
+    return dates, fallback_dates
+
+
+def unusable_deployed_notional_dates(state: Dict[str, Any]) -> Set[Optional[date]]:
+    """The trading day(s) unusable deployed-notional evidence in this state
+    would attribute to, if any -- ``None`` standing in for "no attributable
+    date available" (fail-closed: a caller scoping this to a specific window
+    must treat ``None`` as potentially inside it, the same "unknown means
+    possibly relevant" convention ``_load_states_with_evidence``'s
+    ``_relevant()`` already uses).
+
+    ``has_unusable_deployed_notional(state)`` is exactly ``bool(this)`` --
+    kept in one place so a caller that needs to know WHICH day(s) carry
+    unusable evidence (e.g. to check that day against a specific trailing
+    window rather than trusting a state-wide flag, as
+    ``near_close_dca._apply_deployment_history`` must: an unusable candidate
+    whose ``whole_share_claim_breakdown`` attributes it entirely outside the
+    kill-switch's trailing window cannot move ``deployed_last_7d_usd``, yet
+    the old state-wide predicate poisoned that figure anyway just because
+    SOME candidate elsewhere in the file was unusable -- Codex review:
+    "Scope unusable notionals to the kill-switch window") does not re-derive
+    this per-candidate/per-breakdown-entry logic separately and risk it
+    drifting out of sync with the rest of this function's checks.
+    """
+    return _unusable_deployed_notional_date_evidence(state)[0]
+
+
+def unusable_deployed_notional_fallback_dates(state: Dict[str, Any]) -> Set[Optional[date]]:
+    """Dates inferred from artifact-day fallback rather than explicit claims.
+
+    Kept separate from :func:`unusable_deployed_notional_dates` so callers do
+    not let an explicit claim on one candidate erase the conservative fallback
+    provenance of a different candidate after date deduplication.
+    """
+    return _unusable_deployed_notional_date_evidence(state)[1]
 
 
 def has_unusable_deployed_notional(state: Dict[str, Any]) -> bool:

@@ -14163,6 +14163,7 @@ def _apply_deployment_history(
         deployed_by_day,
         is_afternoon_scheduled_evidence,
         unusable_deployed_notional_dates,
+        unusable_deployed_notional_fallback_dates,
     )
 
     prior_states = _load_deployment_history_states(trading_day, deployment_history_root)
@@ -14206,6 +14207,15 @@ def _apply_deployment_history(
             # future day cannot have affected historical deployment.
             unusable_day is None
             or _within_kill_switch_window(unusable_day, trading_day)
+            or (
+                unusable_day > trading_day
+                and not _valid_future_artifact_claim(
+                    state,
+                    unusable_day,
+                    trading_day,
+                    unusable_deployed_notional_fallback_dates(state),
+                )
+            )
             for unusable_day in unusable_deployed_notional_dates(state)
         )
         for state in prior_states
@@ -14218,6 +14228,150 @@ def _apply_deployment_history(
             # so advance by one representable value instead.
             config = replace(config, deployed_last_7d_usd=math.nextafter(threshold, math.inf))
     return config
+
+
+def _valid_future_artifact_claim(
+    state: Dict[str, Any],
+    claim_day: date,
+    replay_day: date,
+    fallback_days: Set[Optional[date]],
+) -> bool:
+    """Whether a future claim can be safely excluded from a historical replay.
+
+    Reconciliation may legitimately be recorded after ``replay_day``, but it
+    cannot claim deployment after the artifact that records it. A future claim
+    in a current/older artifact, or beyond a later artifact's own date, is
+    corrupt evidence and must therefore fail closed.
+    """
+    # Date sets deliberately deduplicate their values, so the same artifact
+    # day can represent both an explicit future claim and an undated fallback
+    # from a different candidate.  Never let the explicit row validate that
+    # separate fallback occurrence as future-only.
+    if claim_day in fallback_days:
+        return False
+
+    raw_artifact_day = state.get("trading_day")
+    if not isinstance(raw_artifact_day, str):
+        return False
+    try:
+        artifact_day = date.fromisoformat(raw_artifact_day[:10])
+    except ValueError:
+        return False
+    if not (artifact_day > replay_day and claim_day <= artifact_day):
+        return False
+
+    # The top-level day is not part of validate_classification()'s scheduled
+    # identity contract.  Do not let that untrusted field, by itself, move an
+    # otherwise current-day artifact into the future and make corrupt evidence
+    # disappear from a historical replay.  At least one independent piece of
+    # scheduled provenance must place the artifact on that day.
+    if not _artifact_day_matches_scheduled_provenance(state, artifact_day):
+        return False
+
+    # ``unusable_deployed_notional_dates`` uses the artifact day as a
+    # conservative fallback for missing/malformed claim dates and for an
+    # unusable row total whose breakdown may omit a merged fresh submission.
+    # Do not mistake that fallback for an explicitly future-dated claim.  A
+    # date is safe to exclude only when a usable row total has a breakdown
+    # entry that explicitly supplies the same date and the entry itself is the
+    # source of the unusable amount.
+    #
+    # ``buy_candidates`` can itself be malformed (``null``, a scalar, ...) in
+    # a replay-loaded future artifact whose OWN unusable-row detection is what
+    # made this function get called in the first place -- iterating that
+    # directly raised ``TypeError`` and aborted ``_apply_deployment_history``
+    # instead of enforcing the kill switch (Codex review: "Validate candidate
+    # collections before iterating"). Nothing here can be corroborated
+    # without a real list, so fail closed (this specific date is not a valid,
+    # excludable future claim) rather than raising.
+    candidates = state.get("buy_candidates")
+    if not isinstance(candidates, list):
+        return False
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        if candidate.get("deployed_notional_uncertain") or not isinstance(
+            candidate.get("planned_amount_usd"), (int, float)
+        ) or isinstance(candidate.get("planned_amount_usd"), bool):
+            continue
+        breakdown = candidate.get("whole_share_claim_breakdown")
+        if not isinstance(breakdown, list):
+            continue
+        # A single pass over the breakdown both (a) looks for an individually
+        # unusable entry dated to claim_day -- the original check -- and (b)
+        # accumulates every individually-VALID dated entry's amount so an
+        # "overfilled" row (breakdown sums past its own row total, dca_risk.py's
+        # own accounted_usd > row_amount check) can be recognized too: a claim
+        # dated after replay_day that is part of an overfill is future-only
+        # corruption that cannot affect historical deployment, just like an
+        # individually-unusable one, even though its own amount is otherwise
+        # readable (Codex review: "Exclude future-only overfilled breakdowns
+        # during replay").
+        accounted_usd = 0.0
+        valid_entry_days: List[date] = []
+        for entry in breakdown:
+            if not isinstance(entry, dict) or not isinstance(entry.get("trading_day"), str):
+                continue
+            try:
+                entry_day = date.fromisoformat(entry["trading_day"][:10])
+            except ValueError:
+                continue
+            amount = entry.get("amount_usd")
+            try:
+                # float() on an oversized-but-valid JSON integer can raise
+                # OverflowError, not just TypeError/ValueError -- treat that
+                # the same as any other unusable amount rather than letting it
+                # propagate and abort the caller (Codex review: "Handle
+                # oversized future claim amounts without conversion failure").
+                amount_val = None if isinstance(amount, bool) else float(amount)
+            except (TypeError, ValueError, OverflowError):
+                amount_val = None
+            entry_unusable = (
+                amount_val is None or not math.isfinite(amount_val) or amount_val < 0
+            )
+            if entry_day == claim_day and entry_unusable:
+                return True
+            if not entry_unusable:
+                accounted_usd += amount_val
+                valid_entry_days.append(entry_day)
+        row_amount = float(candidate["planned_amount_usd"])
+        if accounted_usd > row_amount + 1e-9 and claim_day in valid_entry_days:
+            return True
+    return False
+
+
+def _artifact_day_matches_scheduled_provenance(state: Dict[str, Any], artifact_day: date) -> bool:
+    """Whether scheduled identity or timestamp corroborates ``artifact_day``."""
+    classification = state.get("run_classification")
+    if isinstance(classification, dict):
+        run_id = classification.get("run_id")
+        if isinstance(run_id, str):
+            match = re.match(r"^scheduled_([0-9]{8})_", run_id)
+            if match:
+                try:
+                    if datetime.strptime(match.group(1), "%Y%m%d").date() == artifact_day:
+                        return True
+                except ValueError:
+                    pass
+
+    timestamp_values = [state.get("generated_at"), state.get("triggered_at_utc")]
+    if isinstance(classification, dict):
+        timestamp_values.append(classification.get("triggered_at_utc"))
+    for raw_timestamp in timestamp_values:
+        if not isinstance(raw_timestamp, str):
+            continue
+        normalized = raw_timestamp.strip()
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        try:
+            timestamp = datetime.fromisoformat(normalized)
+        except ValueError:
+            continue
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.astimezone(EASTERN)
+        if timestamp.date() == artifact_day:
+            return True
+    return False
 
 
 def _within_kill_switch_window(claim_day: date, trading_day: date) -> bool:
