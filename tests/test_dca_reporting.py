@@ -409,6 +409,45 @@ def test_missing_fills_keeps_a_no_id_candidate_missing_beside_an_id_bearing_reco
     assert {m["ticker"] for m in missing} == {"AAPL"}
 
 
+def test_missing_fills_no_id_candidate_is_covered_by_an_unidentified_fill_beside_a_recovery():
+    """Pins the "genuinely undisambiguated on both sides" fallback when a
+    ticker carries BOTH kinds of fill. A no-ID candidate sits beside an
+    id-bearing recovery fill (which must not cover it, see the test above)
+    AND a fill that also carries no order_id -- that second fill still
+    satisfies the ticker fallback. Added with the O(1) per-ticker rewrite of
+    build_missing_fills (Antigravity review of PR #1377) so the
+    "any same-ticker fill without an id" set is exercised on its true path,
+    not only its false one.
+    """
+    buy_candidates = [{"ticker": "AAPL", "planned_amount_usd": 10.0, "status": "submitted"}]
+    fills = [
+        {"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": "recovered-order"},
+        {"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": None},
+    ]
+    missing = build_missing_fills(buy_candidates, fills)
+    assert missing == []
+
+
+def test_missing_fills_id_bearing_candidate_stays_missing_despite_an_unidentified_same_ticker_fill():
+    """The converse of the test above: once the candidate has an order_id and
+    at least one same-ticker fill does too, matching is exact-id only. A
+    same-ticker fill with NO order_id must not rescue the candidate through
+    the ticker fallback -- that would let an unidentified fill mask a
+    genuinely missing, identifiable order. Pins that the unidentified-fill
+    set introduced by the PR #1377 rewrite is consulted only on the no-ID
+    candidate branch.
+    """
+    buy_candidates = [
+        {"ticker": "AAPL", "planned_amount_usd": 10.0, "status": "submitted", "order_id": "current-order"}
+    ]
+    fills = [
+        {"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": "recovered-order"},
+        {"ticker": "AAPL", "fill_price": 100.0, "filled_qty": 1.0, "order_id": None},
+    ]
+    missing = build_missing_fills(buy_candidates, fills)
+    assert {m["ticker"] for m in missing} == {"AAPL"}
+
+
 def test_compute_slippage_rows_keeps_a_no_id_candidate_uncovered_beside_an_id_bearing_recovery():
     buy_candidates = [
         {"ticker": "AAPL", "planned_amount_usd": 10.0, "target_price": 100.0, "status": "blocked"}

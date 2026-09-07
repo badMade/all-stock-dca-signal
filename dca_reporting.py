@@ -433,24 +433,45 @@ def build_missing_fills(
     neither side has an order_id to disambiguate with.
     """
     filled_tickers = {f.get("ticker") or f.get("symbol") for f in fills}
-    fills_by_ticker: Dict[Any, List[Dict[str, Any]]] = {}
+
+    # ⚡ Bolt Optimization: pre-compute, once per call, the only two facts the
+    # candidate loop needs about a ticker's fills -- the set of normalized
+    # order ids its fills carry, and whether any of its fills carries NO id --
+    # so each candidate below costs O(1) set lookups instead of a linear scan.
+    # Bolt round 1 pre-normalized the ids but kept them in per-ticker
+    # (fill, id) tuple lists, so the loop still rebuilt a list per candidate
+    # that was only ever tested as a boolean, scanned the tuples linearly for
+    # membership, and carried a fill dict it never read (Antigravity review of
+    # PR #1377: "eliminate the per-candidate list allocation", "remove the
+    # unused dict", "use O(1) set lookups per ticker"). A ticker gets an entry
+    # in ``fill_order_ids_by_ticker`` only when at least one of its fills
+    # carries an id, so the set is never empty and its mere presence is
+    # exactly the "at least one same-ticker fill carries an order_id" test.
+    fill_order_ids_by_ticker: Dict[Any, set[str]] = {}
+    tickers_with_unidentified_fill: set[Any] = set()
     for f in fills:
-        fills_by_ticker.setdefault(f.get("ticker") or f.get("symbol"), []).append(f)
+        ticker = f.get("ticker") or f.get("symbol")
+        nid = _normalize_order_id(f.get("order_id"))
+        if nid:
+            fill_order_ids_by_ticker.setdefault(ticker, set()).add(nid)
+        else:
+            tickers_with_unidentified_fill.add(ticker)
+
     missing: List[Dict[str, Any]] = []
     for candidate in buy_candidates:
         if candidate.get("top_up_skipped"):
             continue
         ticker = candidate.get("ticker")
         candidate_order_ids = _candidate_order_ids(candidate)
-        ticker_fills_with_order_id = [
-            f for f in fills_by_ticker.get(ticker, []) if _normalize_order_id(f.get("order_id"))
-        ]
-        if candidate_order_ids and ticker_fills_with_order_id:
-            covered = any(
-                _normalize_order_id(f.get("order_id")) in candidate_order_ids
-                for f in ticker_fills_with_order_id
-            )
-        elif not candidate_order_ids and ticker_fills_with_order_id:
+        ticker_fill_order_ids = fill_order_ids_by_ticker.get(ticker)
+        if candidate_order_ids and ticker_fill_order_ids:
+            # Exact-id mode: covered iff any of the candidate's ids (scalar
+            # order_id plus aggregated whole_share_order_ids) is among this
+            # ticker's fill ids. A no-id same-ticker fill deliberately does
+            # NOT rescue an id-bearing candidate here -- once both sides can
+            # disambiguate, only an exact match counts.
+            covered = not ticker_fill_order_ids.isdisjoint(candidate_order_ids)
+        elif not candidate_order_ids and ticker_fill_order_ids:
             # This candidate has no order_id of its own (e.g. failed or
             # blocked before placement ever assigned one), but at least one
             # same-ticker fill carries one -- an ID-bearing fill belongs to a
@@ -460,10 +481,7 @@ def build_missing_fills(
             # missing beside recoveries"). Only a fill that ALSO carries no
             # order_id -- genuinely undisambiguated on both sides -- can
             # still satisfy the ticker fallback.
-            covered = any(
-                not _normalize_order_id(f.get("order_id"))
-                for f in fills_by_ticker.get(ticker, [])
-            )
+            covered = ticker in tickers_with_unidentified_fill
         else:
             covered = ticker in filled_tickers
         if covered:
