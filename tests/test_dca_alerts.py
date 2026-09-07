@@ -1020,3 +1020,26 @@ def test_morning_run_manual_failure_does_not_ping(monkeypatch):
     with pytest.raises(RuntimeError):
         executor.run(datetime(2026, 7, 23, 10, 30), data=None, manual=True)
     assert pings == []
+
+def test_ensure_log_handler_creates_handler():
+    import logging
+    # Remove all root logger handlers to start clean
+    root_logger = logging.getLogger()
+    original_handlers = root_logger.handlers[:]
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    try:
+        assert len(root_logger.handlers) == 0
+
+        dca_alerts.ensure_log_handler()
+
+        assert len(root_logger.handlers) > 0
+        handler = root_logger.handlers[0]
+        assert isinstance(handler, logging.StreamHandler)
+    finally:
+        # Restore original handlers
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+        for handler in original_handlers:
+            root_logger.addHandler(handler)
