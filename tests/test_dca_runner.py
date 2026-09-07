@@ -7970,7 +7970,7 @@ def test_execute_plan_redacts_a_string_mismatched_client_reference(ref_id_field)
             "state": "queued",
             "symbol": "AAPL",
             "side": "buy",
-            ref_id_field: f"{secret_account_number}-token_xxxxxxxxxxxxxxxxxxxxxxxx",
+            ref_id_field: f"{secret_account_number}-token_{'x' * 24}",
         },
         enable_live_orders=True,
         dry_run=False,
@@ -7999,7 +7999,7 @@ def test_execute_plan_redacts_a_string_mismatched_client_reference(ref_id_field)
     )
     assert [f.ticker for f in result.failures] == ["AAPL"]
     assert secret_account_number not in result.failures[0].reason
-    assert "token_xxxxxxxxxxxxxxxxxxxxxxxx" not in result.failures[0].reason
+    assert f"token_{'x' * 24}" not in result.failures[0].reason
     assert "[REDACTED-TOKEN]" in result.failures[0].reason
 
 
