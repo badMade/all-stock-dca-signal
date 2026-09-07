@@ -1204,7 +1204,7 @@ def _fills_from_orders_csv(orders_csv: Path) -> List[Dict[str, Any]]:
                 continue
             fill_price = (row.get("avg_fill_price") or "").strip()
             filled_qty = (row.get("quantity_filled") or "").strip()
-            if fill_price in ("", "-") or filled_qty in ("", "-"):
+            if fill_price == "" or fill_price == "-" or filled_qty == "" or filled_qty == "-":
                 continue
             fills.append(
                 {
