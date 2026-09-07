@@ -7727,6 +7727,53 @@ def test_this_run_submitted_notional_rejects_non_finite_broker_only_amount():
     }
     assert _this_run_submitted_notional(usable_outcome_only) == 7.0
 
+def test_build_weekly_dashboard_renders_all_sections_correctly():
+    # Covers the top-level composition function, which lacked direct tests.
+    run_states = [
+        {
+            "status": "completed",
+            "trading_day": "2026-07-24",
+            "counts": {"buy_candidates": 1},
+            "budget": {
+                "base_amount_usd": 2.0,
+                "hypothetical_day_spend_usd": 4.0,
+                "week_notional_usd": 4.0,
+                "weekly_cap_usd": 100.0,
+            },
+            "orders_submitted_count": 1,
+            "buy_candidates": [
+                {"ticker": "AAA", "status": "filled", "planned_amount_usd": 4.0},
+            ],
+            "broker_outcomes": {"AAA": {"status": "filled", "submitted_amount_usd": 4.0}},
+        }
+    ]
+    summaries = [
+        {
+            "trading_day": "2026-07-24",
+            "coverage": {"buy_candidates": 1, "fills": 1, "coverage_pct": 100.0, "missing_fills": 0},
+            "execution_quality": {"priced_fills": 1, "target_price_missing": 0, "avg_slippage_pct": 0.1, "max_slippage_pct": 0.1, "worst_ticker": "AAA"},
+        }
+    ]
+    sector_map = {"AAA": "Tech"}
+
+    report = build_weekly_dashboard(run_states, summaries, sector_map, week_label="2026-W30")
+
+    # Expected headers
+    assert "# Weekly Performance Dashboard — 2026-W30" in report
+    assert "## Performance snapshot" in report
+    assert "## Graded DCA vs fixed daily DCA" in report
+    assert "## Sector performance matrix" in report
+    assert "## Budget and reserve effectiveness" in report
+    assert "## Execution quality" in report
+    assert "## Coverage and missed opportunities" in report
+    assert "## Weekly review notes" in report
+
+    # Check some content from the components
+    assert "Tech" in report  # Sector matrix
+    assert "100.0%" in report # Coverage
+    assert "0.1%" in report # Execution quality
+
+
 def test_build_sector_matrix():
     run_states = [
         {
