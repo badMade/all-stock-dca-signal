@@ -84,7 +84,7 @@ from typing import (
 )
 from zoneinfo import ZoneInfo
 
-from dca_common import build_top_up_outcome
+from dca_common import TopUpContext, build_top_up_outcome
 from dca_cumulative import CumulativeCreditLedger, apply_cumulative_credit
 from dca_fileio import atomic_open_w, atomic_write_text, order_csv_covers
 from dca_intraday_archive import (
@@ -7203,7 +7203,7 @@ def evaluate_top_up_guard(
         cumulative_credit_decline_usd: Optional[float] = None,
         discarded_pending_credit_usd: Optional[float] = None,
     ) -> TopUpGuardOutcome:
-        return build_top_up_outcome(
+        ctx = TopUpContext(
             outcome_cls=TopUpGuardOutcome,
             ticker=decision.ticker,
             desired_amount=desired,
@@ -7217,6 +7217,7 @@ def evaluate_top_up_guard(
             cumulative_credit_decline_usd=cumulative_credit_decline_usd,
             discarded_pending_credit_usd=discarded_pending_credit_usd,
         )
+        return build_top_up_outcome(ctx)
 
     def _flush_or_discard_existing_credit(
         fallback_incremental: float, fallback_result: str

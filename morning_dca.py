@@ -63,7 +63,7 @@ from pathlib import Path
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 from dca_alerts import GuardedRunConfig, artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
-from dca_common import build_top_up_outcome
+from dca_common import TopUpContext, build_top_up_outcome
 from dca_config import (
     ACCOUNT_NUMBER_SHAPE,
     DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES,
@@ -3792,7 +3792,7 @@ class MorningDCAExecutor(DCAExecutor):
             manual_review: bool = False,
             cumulative_credit_decline_usd: Optional[float] = None,
         ) -> TopUpOutcome:
-            return build_top_up_outcome(
+            ctx = TopUpContext(
                 outcome_cls=TopUpOutcome,
                 ticker=signal.ticker,
                 desired_amount=desired,
@@ -3805,6 +3805,7 @@ class MorningDCAExecutor(DCAExecutor):
                 manual_review=manual_review,
                 cumulative_credit_decline_usd=cumulative_credit_decline_usd,
             )
+            return build_top_up_outcome(ctx)
 
         # A zero-dollar placeholder with explicit notional uncertainty is
         # evidence of an order, not evidence that no prior run occurred.
