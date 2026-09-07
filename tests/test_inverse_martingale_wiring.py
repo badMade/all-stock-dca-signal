@@ -1298,6 +1298,7 @@ def test_direct_live_corporate_action_lookup_rejects_invalid_results(
     latch past the window that a corrected provider response must revisit.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    monkeypatch.setenv("DCA_TICKER_HISTORY_DIR", str(tmp_path / "missing_ticker_data"))
     config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
     state = StrategyState()
     _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1")
