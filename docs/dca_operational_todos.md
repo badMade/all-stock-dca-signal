@@ -1,4 +1,4 @@
-# DCA Operational TODOs
+# DCA Operational Notes
 
 This file tracks follow-up work from live DCA incidents so the same failure modes are not lost in chat history.
 

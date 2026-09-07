@@ -475,6 +475,29 @@ def test_tickers_schema_rejects_a_malformed_ticker_symbol():
         jsonschema.validate(document, schema)
 
 
+@pytest.mark.parametrize("placeholder", ["TODO", "TBD", "N/A", "null", ""])
+def test_tickers_schema_rejects_a_placeholder_data_source_note(placeholder):
+    """`data_source_notes` values are documented as "non-empty, non-placeholder
+    text" and enforced by a `not: {enum: [...]}` blocklist introduced with the
+    GFUZ addition (#75, a review finding). PR #1321 ("Clean up TODO markers")
+    dropped "TODO" from that blocklist -- a repo-wide TODO sweep that mistook
+    a validation rule for a stale marker -- which LOOSENED the schema: a
+    literal "TODO" note would then validate, exactly the placeholder the rule
+    exists to reject. The change was reverted; this test pins every entry in
+    the blocklist so a future sweep cannot quietly weaken it again. The
+    positive control first proves the same document validates with real
+    text, so the rejection below is attributable to the value alone."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "tickers.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("tickers.json")))  # deep copy
+    first_ticker = document["active"][0]
+    document["data_source_notes"][first_ticker] = "Resolved on Robinhood; finance connector unverified."
+    jsonschema.validate(document, schema)  # positive control: must not raise
+    document["data_source_notes"][first_ticker] = placeholder
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
 def test_trading_window_schema_rejects_a_malformed_decision_time():
     """decision_time_et is constrained to HH:MM (00-29 hour digit family
     aside, the real constraint the pattern enforces is two-digit,
