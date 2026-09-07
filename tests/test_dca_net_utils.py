@@ -167,3 +167,32 @@ def test_file_handler_blocked():
 def test_ftp_handler_blocked():
     with pytest.raises(urllib.error.URLError, match="ftp:// scheme is blocked for security"):
         urllib.request.urlopen("ftp://example.com")
+
+
+@pytest.mark.parametrize(
+    "ip_str, expected",
+    [
+        # Allowed
+        ("8.8.8.8", False),
+        ("2001:4860:4860::8888", False),
+        # Disallowed: Private
+        ("192.168.1.1", True),
+        ("10.0.0.1", True),
+        ("fc00::1", True),
+        # Disallowed: Loopback
+        ("127.0.0.1", True),
+        ("::1", True),
+        # Disallowed: CGNAT
+        ("100.64.0.1", True),
+        # Disallowed: Multicast
+        ("224.0.0.1", True),
+        ("ff02::1", True),
+        # Disallowed: Reserved
+        ("240.0.0.1", True),
+        # Disallowed: Site-local
+        ("fec0::1", True),
+    ]
+)
+def test_is_disallowed_ip(ip_str, expected):
+    ip = ipaddress.ip_address(ip_str)
+    assert dca_net_utils.is_disallowed_ip(ip) is expected
