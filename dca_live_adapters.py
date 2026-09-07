@@ -4738,6 +4738,7 @@ HistoricalsFn = Callable[..., Dict[str, Any]]  # (symbols, start_time, end_time,
 QuotesFn = Callable[..., Dict[str, Any]]        # (symbols) -> dict
 BarsFn = Callable[..., Any]                     # generic finance bars -> iterable of bar-like mappings
 PrevCloseFn = Callable[..., Any]                # generic finance previous close -> price or mapping
+QuoteFn = Callable[..., Any]                    # generic finance quote -> price or mapping
 
 
 class RobinhoodDataProvider:
@@ -5034,11 +5035,20 @@ class FinanceDataProvider:
     The reconciliation logic in :mod:`near_close_dca` compares a finance-side and a
     Robinhood-side signal before ordering, so the finance provider should be a genuinely
     independent source (e.g. yfinance/Yahoo, a vendor OHLCV API, or a second Robinhood
-    query at a different granularity). Wire it with two callables:
+    query at a different granularity). Wire it with two required callables and
+    an optional quote callable:
 
     * ``bars_fn(ticker, start, end, interval_minutes) -> iterable`` yielding bar-like
       mappings with ``timestamp`` (datetime or ISO string) and ``open/high/low/close/volume``.
     * ``previous_close_fn(ticker, as_of) -> float | mapping`` returning the prior close.
+    * ``quote_fn(ticker, as_of) -> float | mapping`` returning a current quote when
+      the connector supports one; omitting it preserves completed-bar semantics.
+      Keyword-only, and added after ``supports_corporate_actions`` rather than
+      before it, so an existing positional caller of
+      ``FinanceDataProvider(bars_fn, previous_close_fn, False)`` keeps setting
+      ``supports_corporate_actions`` rather than silently reinterpreting that
+      boolean as ``quote_fn`` (Codex review: "Preserve the existing third
+      positional argument").
 
     Keys are matched leniently (``close``/``close_price``, ``timestamp``/``begins_at``/``t``)
     so most vendor payloads work without a bespoke adapter.
@@ -5068,10 +5078,37 @@ class FinanceDataProvider:
         bars_fn: BarsFn,
         previous_close_fn: PrevCloseFn,
         supports_corporate_actions: bool = True,
+        *,
+        quote_fn: Optional[QuoteFn] = None,
     ) -> None:
         self._bars_fn = bars_fn
         self._previous_close_fn = previous_close_fn
+        self._quote_fn = quote_fn
         self.supports_corporate_actions = supports_corporate_actions
+
+    def get_quote(self, ticker: str, as_of: datetime) -> Optional[Tuple[float, Optional[datetime]]]:
+        """Return the connector quote when the Finance wiring supplies one."""
+        if self._quote_fn is None:
+            return None
+        result = self._quote_fn(ticker, as_of)
+        if result is None:
+            return None
+        if isinstance(result, dict):
+            raw_price = result.get("price") or result.get("last_trade_price")
+            timestamp = _parse_rfc3339(result.get("as_of") or result.get("timestamp"))
+        else:
+            raw_price = result
+            timestamp = as_of
+        # bool is an int subclass, so float(True) == 1.0 would otherwise sail
+        # through _to_float as an ordinary $1.00 quote. A malformed connector
+        # response like {"price": true, "as_of": ...} would then be accepted
+        # as a positive price and could turn an ordinary stock into a
+        # maximum-drop BUY signal (Codex review: "Reject boolean Finance quote
+        # prices").
+        if isinstance(raw_price, bool):
+            return None
+        price = _to_float(raw_price)
+        return (price, timestamp) if price > 0 else None
 
     def get_intraday_bars(
         self,

@@ -111,6 +111,11 @@ def test_no_prior_same_day_buy_authorizes_the_full_desired_amount():
     d = _by_ticker(r)["SPCX"]
     assert d["buy_usd"] == pytest.approx(1.00)
     assert d["reason"] == FIRST_ALLOCATION
+    # No qualifying same-day fill exists to attribute a reference price to, so
+    # reference_source must not falsely claim broker_fill provenance (Codex
+    # review: "Report no source when no reference exists").
+    assert d["reference_price"] is None
+    assert d["reference_source"] is None
 
 
 def test_a_lower_price_and_a_larger_desired_amount_buys_only_the_difference():
@@ -343,6 +348,9 @@ def test_a_logged_reference_price_blocks_a_topup_the_fill_price_would_permit():
     )
     d = _by_ticker(r)["TRIN"]
     assert d["reference_price"] == pytest.approx(100.00)
+    assert d["reference_order_id"] == "o1"
+    assert d["reference_source"] == "logged"
+    assert d["logged_reference_bound"] is True
     assert d["buy_usd"] == pytest.approx(0.0)
     assert d["reason"] == NO_LOWER_PRICE
 
@@ -420,6 +428,9 @@ def test_a_logged_reference_price_unbound_to_the_latest_order_is_ignored():
     )
     d_stale_id = _by_ticker(r_stale_id)["TRIN"]
     assert d_stale_id["reference_price"] == pytest.approx(90.00)
+    assert d_stale_id["reference_order_id"] == "o2"
+    assert d_stale_id["reference_source"] == "broker_fill"
+    assert d_stale_id["logged_reference_bound"] is False
     assert d_stale_id["reason"] == NO_LOWER_PRICE
     assert d_stale_id["buy_usd"] == pytest.approx(0.0)
 

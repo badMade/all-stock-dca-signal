@@ -518,6 +518,7 @@ class Action(str, Enum):
 class SourceName(str, Enum):
     FINANCE = "finance"
     ROBINHOOD = "robinhood"
+    YFINANCE_FALLBACK = "yahoo_finance_yfinance"
 
 
 class BrokerName(str, Enum):
@@ -695,6 +696,10 @@ class PriorSameDayAllocation:
     # pick the ticker's MOST RECENT valid same-day reference (canonical rule item
     # 9) rather than the lowest. None when unresolved/unavailable.
     reference_ts: Optional[datetime] = None
+    # Broker order that owns ``reference_price``.  This is intentionally None
+    # for legacy/CSV-only evidence that cannot bind a logged decision price to
+    # one physical order.  Live callers must fail closed rather than infer it.
+    reference_order_id: Optional[str] = None
     # The first same-day allocation's selected_base_amount_usd ($1 or $2), when the
     # contributing artifact recorded one. None for older artifacts that predate this
     # field, or when it could not be resolved -- never treat that as $0. A caller with
@@ -11624,6 +11629,7 @@ def load_prior_same_day_allocations(
                                 "amount": 0.0,
                                 "reference_price": None,
                                 "reference_ts": None,
+                                "reference_order_id": None,
                                 "run_id": run_id,
                                 "source": source,
                                 "selected_base_amount_usd": None,
@@ -11658,6 +11664,7 @@ def load_prior_same_day_allocations(
                         elif _ref is None:
                             _entry["reference_price"] = None
                             _entry["reference_ts"] = None
+                            _entry["reference_order_id"] = None
                             _entry["reference_price_unknown"] = True
                         else:
                             if (
@@ -11666,6 +11673,9 @@ def load_prior_same_day_allocations(
                             ):
                                 _entry["reference_price"] = _ref
                                 _entry["reference_ts"] = run_ts
+                                # Aggregated CSV readers do not preserve a
+                                # one-to-one reference/order binding.
+                                _entry["reference_order_id"] = None
                         # This CSV-reconstructed shape carries no base info -- if
                         # this is the ticker's first contributing entry, lock the
                         # base permanently unknown (Codex review: "Do not infer a
@@ -11791,6 +11801,7 @@ def load_prior_same_day_allocations(
                     "amount": 0.0,
                     "reference_price": None,
                     "reference_ts": None,
+                    "reference_order_id": None,
                     "run_id": run_id,
                     "source": source,
                     "selected_base_amount_usd": None,
@@ -12303,6 +12314,7 @@ def load_prior_same_day_allocations(
             elif reference_price is None:
                 entry["reference_price"] = None
                 entry["reference_ts"] = None
+                entry["reference_order_id"] = None
                 entry["reference_price_unknown"] = True
             else:
                 # Most-recent reference wins: overwrite when this run is at least as
@@ -12311,6 +12323,7 @@ def load_prior_same_day_allocations(
                 if entry["reference_price"] is None or run_ts >= entry["reference_ts"]:
                     entry["reference_price"] = reference_price
                     entry["reference_ts"] = run_ts
+                    entry["reference_order_id"] = _cand_oid or None
             # Only the ticker's FIRST contributing entry sets the base (_parsed_runs
             # is processed in chronological, parsed-generated_at order -- see above)
             # -- gated on a "seen" flag, not on the stored value being None, so a
@@ -12336,6 +12349,7 @@ def load_prior_same_day_allocations(
             run_id=entry["run_id"],
             source=entry["source"],
             reference_ts=entry["reference_ts"],
+            reference_order_id=entry.get("reference_order_id"),
             selected_base_amount_usd=entry.get("selected_base_amount_usd"),
             selected_base_amount_usd_at=entry.get("selected_base_amount_usd_at"),
             attempt_count=entry.get("attempt_count", 0),
@@ -12403,6 +12417,7 @@ def load_prior_same_day_allocations_multi(
             if existing.reference_price is None or alloc.reference_price is None:
                 ref = None
                 ref_ts = None
+                ref_order_id = None
                 ref_run_id = alloc.run_id or existing.run_id
                 ref_source = alloc.source or existing.source
             else:
@@ -12414,6 +12429,7 @@ def load_prior_same_day_allocations_multi(
                 if alloc_ts >= existing_ts:
                     ref = alloc.reference_price
                     ref_ts = alloc.reference_ts
+                    ref_order_id = alloc.reference_order_id
                     # The run/source that actually supplied the winning reference
                     # price must be recorded together with it, not whichever side
                     # happens to be scanned last -- otherwise a top-up audit trail
@@ -12423,6 +12439,7 @@ def load_prior_same_day_allocations_multi(
                 else:
                     ref = existing.reference_price
                     ref_ts = existing.reference_ts
+                    ref_order_id = existing.reference_order_id
                     ref_run_id = existing.run_id or alloc.run_id
                     ref_source = existing.source or alloc.source
             # Pick the chronologically FIRST allocation's base -- state_roots is
@@ -12548,6 +12565,7 @@ def load_prior_same_day_allocations_multi(
                 run_id=ref_run_id,
                 source=ref_source,
                 reference_ts=ref_ts,
+                reference_order_id=ref_order_id,
                 selected_base_amount_usd=base,
                 selected_base_amount_usd_at=base_at,
                 attempt_count=merged_attempt_count,
@@ -16535,7 +16553,7 @@ def _reconcile_unresolved_whole_share_claim(
     shares_purchased = int(claim["shares_to_buy"])
     quantity_is_known = False
     raw_terminal_quantity = matched_order.get("cumulative_quantity")
-    if raw_terminal_quantity is not None:
+    if not _is_blank_broker_field(raw_terminal_quantity):
         parsed_terminal_quantity, quantity_is_known = _parse_terminal_share_quantity(raw_terminal_quantity)
         if quantity_is_known:
             shares_purchased = parsed_terminal_quantity

@@ -2229,6 +2229,115 @@ def _market_open_live_mirror_text() -> str:
     ).read_text(encoding="utf-8")
 
 
+def test_market_open_live_mirror_fail_closes_reviewed_placement_boundaries():
+    text = _market_open_live_mirror_text()
+
+    # A recovered quote may remain below both session references while moving to
+    # a shallower ladder tier; retaining the anchor-sized amount would oversize it.
+    assert "fresh price is GREATER than the row's Gate 5 current_price, DROP it" in text
+    # Logged target/decision references must stay bound to the actual prior order.
+    assert "prior_logged_reference_price and prior_logged_reference_order_id" in text
+    assert "exactly matches the latest same-day broker order" in text
+    assert text.index("Keep the survivors in memory") < text.index("After enrichment")
+    assert text.index("After enrichment") < text.index("python3 -m scripts.same_day_top_up_gate")
+    assert "Do not invoke the CLI against an earlier version of the file" in text
+    assert "ONLY when the fully paginated broker history likewise has no qualifying prior same-day filled buy" in text
+    assert "manual or broker-UI buys with no run artifact" in text
+    assert text.index("Resolve EVERY root") < text.index("Fetch today's order history")
+    assert text.index("Fetch today's order history") < text.index("re-fetch each surviving candidate's current quote")
+    # A slow recursive scan makes all shared safety snapshots stale. Refresh the
+    # clock, sole-executor classification, shared caps, and buying power after it.
+    scan_refresh = text[text.index("The completed scan invalidates") : text.index("Fetch today's order history")]
+    assert "repeat Gate 1's ET time-sanity check" in scan_refresh
+    assert "repeat Gate 4 in full" in scan_refresh
+    assert "reclassify EVERY in-window order" in scan_refresh
+    assert "repeat Gate 6 in full" in scan_refresh
+    assert "shared daily and ISO-week spend" in scan_refresh
+    assert "freshly fetched buying power" in scan_refresh
+    assert "no second budget pass is needed" not in text
+    # Placement rechecks the clock/interlock for every order, without classifying
+    # this run's already-submitted broker order IDs as newly rogue activity.
+    gate_7 = text[text.index("GATE 7 - PLACE THE ORDERS") : text.index("GATE 8 - CONFIRM")]
+    assert "Immediately before EACH sequential placement" in gate_7
+    assert "repeat Gate 1's ET wall-clock check" in gate_7
+    assert "Gate 4's fully paginated, classify-every-order sole-executor interlock" in gate_7
+    assert "Fetch all pages again before every order" in gate_7
+    assert "broker order IDs successfully submitted earlier by THIS run" in gate_7
+    assert "in-memory successfully-submitted-ID set" in gate_7
+    assert "Do not exclude orders merely because their ticker or deterministic ref_id matches" in gate_7
+    assert "inspect its CURRENT broker state" in gate_7
+    assert "transitioned to rejected, canceled/cancelled, failed, voided" in gate_7
+    assert "missing from otherwise complete history" in gate_7
+    assert "new qualifying same-day manual, broker-UI, `user`, `recurring`, or `drip` buy" in gate_7
+    assert "DROP that ticker for manual review" in gate_7
+    assert "exact history snapshot that Gate 6.5 consumed" in gate_7
+    assert "repeat Gate 6 IN FULL for EACH placement" in gate_7
+    assert "newly fetched buying-power value" in gate_7
+    assert "batch boundary for the entire remaining batch" in gate_7
+    assert "circuit_breakers.max_orders_per_day" in gate_7
+    assert "BrokerOrder.is_buy_attempt" in gate_7
+    assert "canceled/cancelled and rejected attempts consume the shared limit" in gate_7
+    assert "submit no remaining orders once the fresh count has reached it" in gate_7
+    assert "skip the rest rather than submitting a ninth attempt" in gate_7
+    assert "ISO week's Monday at 00:00 ET" in gate_7
+    assert "fully paginate it before EACH placement" in gate_7
+    assert "fetch a NEW current bid/ask" in gate_7
+    assert "strictly later than the placement-history snapshot" in gate_7
+    assert "equal/pre-snapshot (cached/stale), or future timestamp" in gate_7
+    assert "Extract a fresh finite, positive decision price from that same quote" in gate_7
+    assert "Reapply Gate 6.5's price eligibility to that fresh decision price" in gate_7
+    assert "no greater than the row's saved Gate 5 decision price" in gate_7
+    assert "strictly below `reference_price`" in gate_7
+    assert "never submit using the older Gate 6.5 `current_price`" in gate_7
+    assert "reapply Gate 6.7 in full" in gate_7
+    assert "never use Gate 6.7's earlier quote" in gate_7
+    assert "submit no remaining orders" in gate_7
+    assert "AFTER pagination and classification finish" in gate_7
+    assert "immediately before calling place_equity_order" in gate_7
+    assert "pre-fetch clock result is never placement authorization" in gate_7
+    assert "same fail-closed checks as dca_runner._placement_failure_reason" in gate_7
+    assert "symbol, side, dollar amount, account number, or client reference" in gate_7
+    assert "only AFTER all of these checks pass" in gate_7
+    assert "logged_reference_bound is true" in text
+    assert "reference_source is logged" in text
+    # Reference discovery is delegated to the canonical tested entry point.
+    assert "python3 -m scripts.prior_reference_bindings" in text
+    assert "near_close_dca.load_prior_same_day_allocations_multi" in text
+    assert "never re-derive those private rules" in text
+    assert "scan_complete is not true" in text
+    # The 09:35 stream never inherits the final stream's dynamic cap escalation.
+    assert "use the NORMAL tier unconditionally for this slot" in text
+    assert "Do NOT run config/budgets.json's dynamic tier selection" in text
+    # Invalid/crossed quotes cannot pass through a negative or non-finite spread.
+    assert "near_close_dca._quote_bid_ask()" in text
+    assert "ask must be at or above the bid" in text
+    # Concurrent fires use the same broker-side idempotency key.
+    assert "dca-runner-0935-<YYYY-MM-DD>-<TICKER>" in text
+
+
+def test_midday_live_mirror_requires_qualifying_in_window_afternoon_evidence():
+    text = _midday_live_mirror_text()
+
+    assert "is_afternoon_evidence = dca_risk.is_afternoon_scheduled_evidence(state)" in text
+    assert "if is_validated_evidence and window_start <= trading_day < today and scheduled_for in ('14:30', '15:30'):" in text
+    assert "if missing_pairs:" in text
+
+
+def test_market_open_and_midday_gate_5_fetch_configured_yfinance_fallback():
+    """Prompt-driven fetches must satisfy the stream candidate fallback contract."""
+    prompts = {
+        "market open": _market_open_live_mirror_text(),
+        "midday": _midday_live_mirror_text(),
+    }
+    for slot, text in prompts.items():
+        gate_5 = text[text.index("GATE 5 - BUY LIST") : text.index("GATE 6 - BUDGET")]
+        assert "If Finance is unavailable, stale, incomplete, or unresolved" in gate_5, slot
+        assert "fetch yfinance evidence for EVERY ordinary ticker" in gate_5, slot
+        assert 'sources.yahoo_finance_yfinance' in gate_5, slot
+        assert '"yahoo_finance_yfinance": []' in gate_5, slot
+        assert "before invoking the generator" in gate_5, slot
+
+
 def test_market_open_gate_5_hands_rich_candidates_to_gate_6_5():
     text = _market_open_live_mirror_text()
     gate_5 = text[text.index("GATE 5 - BUY LIST") : text.index("GATE 6 - BUDGET")]
@@ -2558,6 +2667,28 @@ def test_no_prompt_still_treats_gate4_expected_overlap_as_silent():
             f"{filename}: GATE4_EXPECTED_OVERLAP must not be documented as "
             "silent -- it alerts on every fire it triggers, as of 2026-07-30"
         )
+
+
+def test_market_open_prompt_requires_canonical_and_fresh_budget_plans():
+    """The live 09:35 handoff must never place raw signal-order candidates.
+
+    Small orders can exhaust the account-wide attempt limit without exhausting
+    the dollar cap, and account headroom can change during the post-budget
+    gates.  Pin both canonical planner calls so prompt edits cannot silently
+    restore either unsafe shortcut.
+    """
+    text = (
+        PROMPTS_DIR / "live-mirror" / "0935ET-935-am-dca-morning-buy.txt"
+    ).read_text()
+
+    assert "The canonical planner is MANDATORY" in text
+    assert "NEVER fall back to the raw `cands` list" in text
+    assert "must never be passed directly to `budget_snapshot()`" in text
+    assert "ONLY that normalized `BrokerOrder` list" in text
+    assert "call `dca_runner.plan_orders()` again" in text
+    assert "amount_usd=buy_usd" in text
+    assert "Do not pass survivor dictionaries to `plan_orders()`" in text
+    assert "Discard the earlier plan" in text
 
 
 def test_every_executor_prompt_declares_the_correct_gate1_time_window():

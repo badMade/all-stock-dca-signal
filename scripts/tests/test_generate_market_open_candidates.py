@@ -41,6 +41,7 @@ import market_open_dca  # noqa: E402
 from market_open_dca import MarketOpenConfig, MarketOpenDCAExecutor  # noqa: E402
 from near_close_dca import Action  # noqa: E402
 from scripts import stream_candidates  # noqa: E402
+from scripts.refresh_market_open_candidates import refresh_market_open_candidates  # noqa: E402
 
 ET = ZoneInfo("America/New_York")
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -77,13 +78,24 @@ def _previous_close_bar(close: float, low: float) -> dict:
     return _bar(datetime.combine(PREVIOUS_SESSION, time(16, 0), tzinfo=ET), close, low=low)
 
 
-def _intraday_bars(price: float, *, start: time = time(9, 30), end: time = DECISION_ET) -> list:
+def _intraday_bars(
+    price: float, *, start: time = time(9, 30), end: time = DECISION_ET, step_minutes: int = 15
+) -> list:
+    """Bars spaced ``step_minutes`` apart, start-stamped.
+
+    Defaults to 15 minutes -- ``MARKET_OPEN_SPEC.source_interval_minutes`` --
+    since every fixture in this file feeds the Finance-labeled 'sources.finance'
+    map unless it is explicitly built as GFUZ's Robinhood override payload
+    (``step_minutes=5``, ``config.interval_minutes``'s native cadence). Bars
+    spaced any tighter than the cadence the scoring config resolves to are
+    rejected by ``stream_candidates._require_bars_match_configured_cadence``.
+    """
     bars = []
     cur = datetime.combine(DAY, start, tzinfo=ET)
     stop = datetime.combine(DAY, end, tzinfo=ET)
     while cur <= stop:
         bars.append(_bar(cur, price))
-        cur += timedelta(minutes=5)
+        cur += timedelta(minutes=step_minutes)
     return bars
 
 
@@ -94,21 +106,26 @@ def _ticker_payload(
     previous_low: float,
     quote: dict | None = None,
     start: time = time(9, 30),
+    step_minutes: int = 15,
 ) -> dict:
     payload: dict[str, Any] = {
         "previous_close_bar": _previous_close_bar(previous_close, previous_low),
-        "intraday_bars": _intraday_bars(price, start=start),
+        "intraday_bars": _intraday_bars(price, start=start, step_minutes=step_minutes),
     }
-    if quote is not None:
-        payload["quote"] = quote
+    if quote is None:
+        quote = {
+            "price": price,
+            "as_of": datetime.combine(DAY, time(9, 49), tzinfo=ET).isoformat(),
+        }
+    payload["quote"] = quote
     return payload
 
 
 def _market_data(**per_ticker: dict) -> dict:
     return {
-        "sources": {"robinhood": dict(per_ticker)},
+        "sources": {"finance": dict(per_ticker)},
         "source_errors": [],
-        "ticker_errors": {"robinhood": []},
+        "ticker_errors": {"finance": []},
     }
 
 
@@ -154,7 +171,7 @@ def _run(
     return gmoc.generate_market_open_candidates(
         trading_day=DAY,
         config=_config() if config is None else config,
-        market_data=market_data["sources"]["robinhood"],
+        market_data=market_data["sources"]["finance"],
         source_errors=source_errors,
         ticker_errors=ticker_errors,
         already_covered_tickers=already_covered_tickers,
@@ -226,12 +243,10 @@ def test_trend_exemption_marks_the_buy_auto_buy_eligible():
     assert row["trend_validated"] is None
 
 
-def test_a_fresh_quote_becomes_the_decision_price():
-    """A signal-time quote within one interval of the decision moment wins over
-    the completed bar's close, exactly as the live RobinhoodDataProvider's quote
-    path does -- so Gate 6.5's price comparisons see the same number the live
-    executor would have used."""
-    quote_time = datetime.combine(DAY, time(9, 34), tzinfo=ET)
+def test_finance_primary_uses_fresh_finance_quote_at_the_live_window_anchor():
+    """At the 09:50 evaluation boundary, Finance's own fresh quote -- never
+    the broker context quote -- is the decision price."""
+    quote_time = datetime.combine(DAY, time(9, 49), tzinfo=ET)
     data = _market_data(
         TEST=_ticker_payload(
             price=99.0,
@@ -245,7 +260,21 @@ def test_a_fresh_quote_becomes_the_decision_price():
     assert row["drop_vs_previous_close_pct"] == pytest.approx(6.0)
 
 
-def test_a_stale_quote_falls_back_to_the_completed_bar():
+def test_finance_quote_obtained_after_nominal_time_is_accepted_inside_live_window():
+    quote_time = datetime.combine(DAY, time(9, 38), tzinfo=ET)
+    data = _market_data(
+        TEST=_ticker_payload(
+            price=99.0,
+            previous_close=100.0,
+            previous_low=97.0,
+            quote={"price": 94.0, "as_of": quote_time.isoformat()},
+        )
+    )
+    row = _only(_run(data))
+    assert row["target_price"] == pytest.approx(94.0)
+
+
+def test_a_stale_finance_quote_falls_back_to_the_now_completed_0930_bar():
     """A quote too old to be verified as the decision moment's price is treated
     exactly like no quote at all, falling back to a decision bar already known
     to be fresh -- never trusted as-is (Codex review, 1530ET module: "Reject
@@ -260,7 +289,132 @@ def test_a_stale_quote_falls_back_to_the_completed_bar():
         )
     )
     row = _only(_run(data))
+    assert row["action"] == Action.BUY.value
     assert row["target_price"] == pytest.approx(99.0)
+
+
+def test_gfuz_uses_robinhood_primary_when_finance_omits_it():
+    config = _config(tickers=("GFUZ",))
+    robinhood = _ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0, step_minutes=5)
+    document = gmoc.generate_market_open_candidates(
+        trading_day=DAY,
+        config=config,
+        market_data={},
+        alternate_market_data={"GFUZ": robinhood},
+        check_planner_compatibility=False,
+    )
+    row = _only(document, "GFUZ")
+    assert row["source"] == "robinhood"
+    assert row["action"] == Action.BUY.value
+    assert document["ticker_source_overrides_applied"] == {"GFUZ": "robinhood"}
+
+
+def test_gfuz_nominal_time_snapshot_remains_usable_during_delayed_evaluation():
+    """GFUZ is fetched from Robinhood at the nominal fire, not at the end of
+    Finance's accepted live window, so its own five-minute executor must keep
+    the nominal completed-bar anchor."""
+    config = _config(tickers=("GFUZ",))
+    nominal = datetime.combine(DAY, DECISION_ET, tzinfo=ET)
+    robinhood = _ticker_payload(
+        price=95.0,
+        previous_close=100.0,
+        previous_low=97.0,
+        quote={"price": 95.0, "as_of": nominal.isoformat()},
+        step_minutes=5,
+    )
+
+    document = gmoc.generate_market_open_candidates(
+        trading_day=DAY,
+        config=config,
+        market_data={},
+        alternate_market_data={"GFUZ": robinhood},
+        check_planner_compatibility=False,
+    )
+
+    row = _only(document, "GFUZ")
+    assert row["source"] == "robinhood"
+    assert row["action"] == Action.BUY.value
+    assert row["target_price"] == pytest.approx(95.0)
+
+
+def test_gfuz_does_not_fall_through_to_finance_when_robinhood_omits_it():
+    config = _config(tickers=("GFUZ",))
+    finance = _ticker_payload(price=90.0, previous_close=100.0, previous_low=97.0)
+    document = gmoc.generate_market_open_candidates(
+        trading_day=DAY,
+        config=config,
+        market_data={"GFUZ": finance},
+        alternate_market_data={},
+        check_planner_compatibility=False,
+    )
+    row = _only(document, "GFUZ")
+    assert row["source"] == "robinhood"
+    assert row["action"] == Action.NO_DATA.value
+    assert document["cands"] == []
+
+
+def test_gfuz_is_withheld_when_robinhood_source_is_marked_failed():
+    config = _config(tickers=("GFUZ",))
+    robinhood = _ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0, step_minutes=5)
+    document = gmoc.generate_market_open_candidates(
+        trading_day=DAY,
+        config=config,
+        market_data={},
+        alternate_market_data={"GFUZ": robinhood},
+        source_errors=("robinhood",),
+        check_planner_compatibility=False,
+    )
+    row = _only(document, "GFUZ")
+    assert row["action"] == Action.NO_DATA.value
+    assert "GFUZ" in document["provider_error_tickers"]
+
+
+def test_gfuz_errored_override_with_no_payload_is_reported_as_a_provider_error():
+    """A Robinhood fetch that RAISED for GFUZ is reported via
+    alternate_ticker_errors with no payload to retain -- fabricating one would
+    misrepresent what was actually fetched. Skipping the override provider
+    entirely for that shape routed GFUZ to the empty Finance provider instead,
+    where it scored as a quiet NO_DATA with provider_error=false and no entry
+    in provider_error_tickers -- indistinguishable from GFUZ's normal,
+    harmless Finance-omission case rather than a failed fetch Gate 9 needs to
+    see (Codex review: "Route errored overrides even when their payload is
+    absent")."""
+    config = _config(tickers=("GFUZ",))
+    document = gmoc.generate_market_open_candidates(
+        trading_day=DAY,
+        config=config,
+        market_data={},
+        alternate_market_data={},
+        alternate_ticker_errors=("GFUZ",),
+        check_planner_compatibility=False,
+    )
+    row = _only(document, "GFUZ")
+    assert row["action"] == Action.NO_DATA.value
+    assert row["provider_error"] is True
+    assert "GFUZ" in document["provider_error_tickers"]
+
+
+def test_cadence_guard_skips_an_errored_override_instead_of_aborting_the_run():
+    """A badly-spaced payload for an override ticker whose fetch is already
+    marked failed must not abort the whole run -- StreamMarketData raises on
+    access for it regardless, and the executor reports the documented
+    NO_DATA/provider_error result, same as any other errored ticker (Codex
+    review: "Skip errored overrides in cadence validation")."""
+    config = _config(tickers=("GFUZ",))
+    robinhood = _ticker_payload(
+        price=95.0, previous_close=100.0, previous_low=97.0, step_minutes=1
+    )
+    document = gmoc.generate_market_open_candidates(
+        trading_day=DAY,
+        config=config,
+        market_data={},
+        alternate_market_data={"GFUZ": robinhood},
+        source_errors=("robinhood",),
+        check_planner_compatibility=False,
+    )
+    row = _only(document, "GFUZ")
+    assert row["action"] == Action.NO_DATA.value
+    assert "GFUZ" in document["provider_error_tickers"]
 
 
 # --- reuse, not reimplementation -------------------------------------------
@@ -280,7 +434,7 @@ def test_document_matches_the_executor_called_directly():
 
     provider = stream_candidates.StreamMarketData(
         gmoc.MARKET_OPEN_SOURCE,
-        data["sources"]["robinhood"],
+        data["sources"]["finance"],
         quote_staleness_minutes=config.interval_minutes,
         trading_day=DAY,
     )
@@ -306,9 +460,49 @@ def test_document_identifies_the_slot_and_stream_it_speaks_for():
     assert document["runner_slot_id"] == "0935"
     assert document["stream"] == "market_open"
     assert document["cron_id"] == "2ba19526"
-    assert document["decision_time_et"] == "09:35"
+    assert document["decision_time_et"] == "09:50"
     assert document["trading_day"] == DAY.isoformat()
-    assert document["source"] == "robinhood"
+    assert document["source"] == "finance"
+
+
+def test_evaluation_time_reports_the_full_live_window_anchor():
+    """MARKET_OPEN_SPEC.evaluation_delay_minutes=15 mutates the executor's
+    actual decision anchor from 09:35 to 09:50 -- quote acceptance,
+    completed-bar selection and sizing all evaluate at 09:50 -- so both
+    persisted timestamps should expose that effective anchor."""
+    data = _market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0))
+    document = _run(data)
+    assert document["decision_time_et"] == "09:50"
+    assert document["evaluation_time_et"] == "09:50"
+
+
+def test_quote_from_the_end_of_the_live_window_is_accepted():
+    quote = {"price": 95.0, "as_of": datetime.combine(DAY, time(9, 49), tzinfo=ET).isoformat()}
+    data = _market_data(TEST=_ticker_payload(price=99.0, previous_close=100.0, previous_low=97.0, quote=quote))
+    row = _only(_run(data))
+    assert row["action"] == Action.BUY.value
+    assert row["target_price"] == pytest.approx(95.0)
+
+
+def test_quote_just_before_nominal_fire_is_accepted_during_delayed_evaluation():
+    quote = {"price": 95.0, "as_of": datetime.combine(DAY, time(9, 34, 50), tzinfo=ET).isoformat()}
+    payload = _ticker_payload(price=99.0, previous_close=100.0, previous_low=97.0, quote=quote)
+    payload["intraday_bars"] = []
+    row = _only(_run(_market_data(TEST=payload)))
+    assert row["action"] == Action.BUY.value
+    assert row["target_price"] == pytest.approx(95.0)
+
+
+def test_boolean_finance_quote_is_not_coerced_to_a_price():
+    payload = _ticker_payload(price=99.0, previous_close=100.0, previous_low=97.0)
+    payload["intraday_bars"] = []
+    payload["quote"] = {
+        "price": True,
+        "as_of": datetime.combine(DAY, time(9, 49), tzinfo=ET).isoformat(),
+    }
+    row = _only(_run(_market_data(TEST=payload)))
+    assert row["action"] == Action.NO_DATA.value
+    assert row["target_price"] is None
 
 
 def test_live_execution_enabled_is_reported_but_does_not_suppress_candidates():
@@ -338,7 +532,7 @@ def test_unknown_prior_low_is_published_with_its_conservative_base_rule():
     cands")."""
     data = _market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0))
     # low=0.0 is the sentinel: accepted by the parser for previous_close_bar only.
-    data["sources"]["robinhood"]["TEST"]["previous_close_bar"]["low"] = 0.0
+    data["sources"]["finance"]["TEST"]["previous_close_bar"]["low"] = 0.0
     document = _run(data)
     row = _only(document)
     assert row["action"] == Action.BUY.value
@@ -365,6 +559,126 @@ def test_top_up_rows_carry_the_shape_the_top_up_gate_requires():
     data = _market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0))
     rows = _run(data)["same_day_top_up_candidates"]
     assert rows == [{"ticker": "TEST", "desired_usd": pytest.approx(5.0), "current_price": pytest.approx(95.0)}]
+
+
+def test_post_anchor_refresh_regrades_recovered_candidate():
+    """A quote after 09:35 must be sized directly, not rejected by the signal anchor."""
+    candidate = _run(
+        _market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=99.0))
+    )["cands"][0]
+    result = refresh_market_open_candidates(
+        [candidate],
+        {"TEST": {"price": 98.0, "as_of": "2026-08-05T09:41:00-04:00"}},
+        _config(),
+        trading_day=date(2026, 8, 5),
+        placement_time=datetime.fromisoformat("2026-08-05T09:42:00-04:00"),
+    )
+    assert result["dropped"] == []
+    assert result["cands"][0]["current_price"] == pytest.approx(98.0)
+    assert result["cands"][0]["desired_usd"] < candidate["desired_usd"]
+
+
+def test_post_anchor_refresh_drops_full_base_candidate_that_recovers_above_prior_low():
+    candidate = _run(
+        _market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0))
+    )["cands"][0]
+    assert candidate["selected_base_amount_usd"] == pytest.approx(2.0)
+
+    result = refresh_market_open_candidates(
+        [candidate],
+        {"TEST": {"price": 98.0, "as_of": "2026-08-05T09:41:00-04:00"}},
+        _config(),
+        trading_day=date(2026, 8, 5),
+        placement_time=datetime.fromisoformat("2026-08-05T09:42:00-04:00"),
+    )
+
+    assert result["cands"] == []
+    assert result["dropped"] == [{"ticker": "TEST", "reason": "base_no_longer_supported"}]
+
+
+@pytest.mark.parametrize("price", [True, False])
+def test_post_anchor_refresh_rejects_boolean_prices(price):
+    candidate = _run(
+        _market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=99.0))
+    )["cands"][0]
+
+    result = refresh_market_open_candidates(
+        [candidate],
+        {"TEST": {"price": price, "as_of": "2026-08-05T09:41:00-04:00"}},
+        _config(),
+        trading_day=date(2026, 8, 5),
+        placement_time=datetime.fromisoformat("2026-08-05T09:42:00-04:00"),
+    )
+
+    assert result["cands"] == []
+    assert result["dropped"] == [{"ticker": "TEST", "reason": "invalid_refresh_quote"}]
+
+
+def test_post_anchor_refresh_never_increases_authorized_size():
+    candidate = _run(
+        _market_data(TEST=_ticker_payload(price=98.0, previous_close=100.0, previous_low=99.0))
+    )["cands"][0]
+    result = refresh_market_open_candidates(
+        [candidate],
+        {"TEST": {"price": 95.0, "as_of": "2026-08-05T09:41:00-04:00"}},
+        _config(),
+        trading_day=date(2026, 8, 5),
+        placement_time=datetime.fromisoformat("2026-08-05T09:42:00-04:00"),
+    )
+    assert result["cands"] == []
+    assert result["dropped"] == [{"ticker": "TEST", "reason": "refresh_would_increase_size"}]
+
+
+@pytest.mark.parametrize(
+    "as_of",
+    ["2026-08-04T15:59:00-04:00", "2026-08-05T09:34:59-04:00", "2026-08-05T09:41:31-04:00"],
+)
+def test_post_anchor_refresh_rejects_quotes_outside_placement_freshness_window(as_of):
+    candidate = _run(
+        _market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=99.0))
+    )["cands"][0]
+    result = refresh_market_open_candidates(
+        [candidate],
+        {"TEST": {"price": 98.0, "as_of": as_of}},
+        _config(),
+        trading_day=date(2026, 8, 5),
+        placement_time=datetime.fromisoformat("2026-08-05T09:41:00-04:00"),
+    )
+    assert result["cands"] == []
+    assert result["dropped"] == [{"ticker": "TEST", "reason": "stale_refresh_quote"}]
+
+
+def test_refresh_cli_does_not_require_broker_account_environment(tmp_path):
+    candidates = tmp_path / "candidates.json"
+    quotes = tmp_path / "quotes.json"
+    candidates.write_text("[]", encoding="utf-8")
+    quotes.write_text("{}", encoding="utf-8")
+    env = os.environ.copy()
+    env.pop("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", None)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "scripts.refresh_market_open_candidates",
+            "--trading-day",
+            "2026-08-05",
+            "--placement-time",
+            "2026-08-05T09:41:00-04:00",
+            "--candidates",
+            str(candidates),
+            "--quotes",
+            str(quotes),
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {"cands": [], "dropped": []}
 
 
 def test_top_up_rows_survive_a_planner_incompatible_calibrated_ladder():
@@ -430,7 +744,7 @@ def test_source_error_aborts_instead_of_emitting_a_quiet_tape():
     the prompt's "error or no output file: abort and alert" branch instead."""
     data = _market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0))
     with pytest.raises(ValueError, match="source_errors"):
-        _run(data, source_errors=("robinhood",))
+        _run(data, source_errors=("finance",))
 
 
 def test_an_unrecognized_source_error_marker_is_rejected():
@@ -439,7 +753,7 @@ def test_an_unrecognized_source_error_marker_is_rejected():
     zero-candidate document that reads as a quiet tape."""
     data = _market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0))
     with pytest.raises(ValueError, match="unsupported source"):
-        _run(data, source_errors=("robinhood ",))
+        _run(data, source_errors=("finance ",))
 
 
 def test_unverified_planner_rows_are_withheld_and_named():
@@ -511,7 +825,7 @@ def test_stale_previous_close_bar_is_rejected():
     other than the immediately previous market session would be used as the
     BUY-grading and $1/$2 base-selection baseline as if it were fresh."""
     data = _market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0))
-    data["sources"]["robinhood"]["TEST"]["previous_close_bar"] = _bar(
+    data["sources"]["finance"]["TEST"]["previous_close_bar"] = _bar(
         datetime.combine(date(2026, 7, 20), time(16, 0), tzinfo=ET), 100.0, low=97.0
     )
     with pytest.raises(ValueError, match="immediately previous market session"):
@@ -525,7 +839,7 @@ def test_non_finite_or_non_positive_prices_are_rejected(bad_price):
     a 0/negative placeholder from a failed fetch grades as a 100%+ drop and
     would size a maximum-multiplier buy."""
     data = _market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0))
-    data["sources"]["robinhood"]["TEST"]["intraday_bars"][0]["close"] = (
+    data["sources"]["finance"]["TEST"]["intraday_bars"][0]["close"] = (
         float(bad_price) if isinstance(bad_price, str) else bad_price
     )
     with pytest.raises(ValueError):
@@ -578,10 +892,11 @@ def test_cli_end_to_end(tmp_path, monkeypatch):
     """argument parsing -> generate_market_open_candidates -> one JSON document
     on stdout, which is exactly what the executor prompt's Gate 5 consumes."""
     path = tmp_path / "market_data_0935ET.json"
-    path.write_text(
-        json.dumps(_market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0))),
-        encoding="utf-8",
-    )
+    payload = _market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0))
+    payload["sources"]["robinhood"] = {
+        "TEST": _ticker_payload(price=90.0, previous_close=100.0, previous_low=97.0)
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
     document = _cli(
         [
             "--trading-day", DAY.isoformat(),
@@ -594,13 +909,200 @@ def test_cli_end_to_end(tmp_path, monkeypatch):
     assert document["buy_count"] == 1
     assert document["same_day_top_up_candidates"][0]["ticker"] == "TEST"
     assert document["planner_config_mismatch"] is False
+    assert document["source"] == "finance"
+    assert document["validation_context_sources_present"] == ["robinhood"]
+    # The materially different broker price was retained as context, not used
+    # to replace the Finance-primary $5 candidate with a deeper signal.
+    assert document["cands"][0]["current_price"] == pytest.approx(95.0)
+
+
+def test_cli_uses_labeled_yfinance_fallback_when_finance_is_unavailable(tmp_path, monkeypatch):
+    payload = _market_data()
+    fallback = _ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0)
+    fallback["intraday_bars"] = []
+    payload["sources"]["yahoo_finance_yfinance"] = {"TEST": fallback}
+    payload["source_errors"] = ["finance"]
+    payload["ticker_errors"]["yahoo_finance_yfinance"] = []
+    path = tmp_path / "market_data_0935ET.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    document = _cli(
+        ["--trading-day", DAY.isoformat(), "--market-data", str(path), "--config-dir", str(REAL_CONFIG_DIR)],
+        monkeypatch,
+    )
+
+    assert document["source"] == "yahoo_finance_yfinance"
+    assert _only(document)["source"] == "yahoo_finance_yfinance"
+    assert document["buy_count"] == 1
+    assert document["validation_context_sources_present"] == ["finance"]
+    assert _only(document)["target_price"] == pytest.approx(95.0)
+
+
+def test_cli_uses_fallback_when_finance_omits_an_ordinary_scored_ticker(tmp_path, monkeypatch):
+    payload = _market_data()
+    payload["sources"]["yahoo_finance_yfinance"] = {
+        "TEST": _ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0)
+    }
+    payload["ticker_errors"]["yahoo_finance_yfinance"] = []
+    path = tmp_path / "market_data_0935ET.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    document = _cli(
+        ["--trading-day", DAY.isoformat(), "--market-data", str(path), "--config-dir", str(REAL_CONFIG_DIR)],
+        monkeypatch,
+    )
+
+    assert document["source"] == "yahoo_finance_yfinance"
+    assert _only(document)["action"] == Action.BUY.value
+
+
+def test_cli_uses_fallback_when_finance_evidence_is_stale(tmp_path, monkeypatch):
+    payload = _market_data(TEST=_ticker_payload(price=99.0, previous_close=100.0, previous_low=97.0))
+    payload["sources"]["finance"]["TEST"]["intraday_bars"] = []
+    payload["sources"]["finance"]["TEST"]["quote"]["as_of"] = datetime.combine(
+        PREVIOUS_SESSION, time(15, 59), tzinfo=ET
+    ).isoformat()
+    payload["sources"]["yahoo_finance_yfinance"] = {
+        "TEST": _ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0)
+    }
+    payload["ticker_errors"]["yahoo_finance_yfinance"] = []
+    path = tmp_path / "market_data_0935ET.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    document = _cli(
+        ["--trading-day", DAY.isoformat(), "--market-data", str(path), "--config-dir", str(REAL_CONFIG_DIR)],
+        monkeypatch,
+    )
+
+    assert document["source"] == "yahoo_finance_yfinance"
+    assert _only(document)["target_price"] == pytest.approx(95.0)
+
+
+def test_cli_ignores_finance_error_for_robinhood_override(tmp_path, monkeypatch):
+    config = _config(tickers=("TEST", "GFUZ"))
+    payload = _market_data(
+        TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0)
+    )
+    payload["sources"]["robinhood"] = {
+        "GFUZ": _ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0, step_minutes=5)
+    }
+    payload["ticker_errors"]["finance"] = ["GFUZ"]
+    payload["ticker_errors"]["robinhood"] = []
+    path = tmp_path / "market_data_0935ET.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    document = _cli(
+        ["--trading-day", DAY.isoformat(), "--market-data", str(path), "--config-dir", str(REAL_CONFIG_DIR)],
+        monkeypatch,
+        config,
+    )
+
+    assert document["source"] == "finance"
+    assert _only(document, "TEST")["action"] == Action.BUY.value
+    assert _only(document, "GFUZ")["source"] == "robinhood"
+
+
+def test_cli_ignores_primary_errors_for_already_covered_tickers(tmp_path, monkeypatch):
+    payload = _market_data()
+    payload["ticker_errors"]["finance"] = ["TEST"]
+    path = tmp_path / "market_data_0935ET.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    document = _cli(
+        [
+            "--trading-day", DAY.isoformat(),
+            "--market-data", str(path),
+            "--config-dir", str(REAL_CONFIG_DIR),
+            "--already-covered-tickers", "TEST",
+        ],
+        monkeypatch,
+    )
+
+    assert document["source"] == "finance"
+    assert document["candidates"] == []
+    assert document["already_covered_tickers"] == ["TEST"]
+
+
+def test_cli_does_not_substitute_yfinance_for_a_robinhood_primary_spec(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        gmoc,
+        "MARKET_OPEN_SPEC",
+        dataclasses.replace(gmoc.MARKET_OPEN_SPEC, source=stream_candidates.SourceName.ROBINHOOD),
+    )
+    _patch_config(monkeypatch)
+    payload = {
+        "sources": {
+            "robinhood": {},
+            "yahoo_finance_yfinance": {
+                "TEST": _ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0)
+            },
+        },
+        "source_errors": ["robinhood"],
+        "ticker_errors": {"robinhood": [], "yahoo_finance_yfinance": []},
+    }
+    path = tmp_path / "market_data_0935ET.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="robinhood.*source_errors"):
+        gmoc.main(
+            ["--trading-day", DAY.isoformat(), "--market-data", str(path), "--config-dir", str(REAL_CONFIG_DIR)]
+        )
+
+
+def test_cli_accepts_quote_only_finance_snapshot_at_market_open(tmp_path, monkeypatch):
+    payload = _ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0)
+    payload["intraday_bars"] = []
+    payload["quote"]["as_of"] = datetime.combine(DAY, time(9, 49), tzinfo=ET).isoformat()
+    path = tmp_path / "market_data_0935ET.json"
+    path.write_text(json.dumps(_market_data(TEST=payload)), encoding="utf-8")
+
+    document = _cli(
+        ["--trading-day", DAY.isoformat(), "--market-data", str(path), "--config-dir", str(REAL_CONFIG_DIR)],
+        monkeypatch,
+    )
+
+    assert document["source"] == "finance"
+    assert document["buy_count"] == 1
+    assert _only(document)["target_price"] == pytest.approx(95.0)
+
+
+def test_cli_refreshed_decision_time_recomputes_desired_size(tmp_path, monkeypatch):
+    """A pre-placement rerun must not retain the amount sized at 09:35."""
+    ticker = _ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0)
+    ticker["intraday_bars"].append(_bar(datetime.combine(DAY, time(9, 45), tzinfo=ET), 95.0))
+    ticker["quote"] = {
+        "price": 98.0,
+        "as_of": datetime.combine(DAY, time(9, 54), tzinfo=ET).isoformat(),
+    }
+    path = tmp_path / "market_data_0935ET.json"
+    path.write_text(json.dumps(_market_data(TEST=ticker)), encoding="utf-8")
+
+    initial = _cli(
+        ["--trading-day", DAY.isoformat(), "--market-data", str(path), "--config-dir", str(REAL_CONFIG_DIR)],
+        monkeypatch,
+    )
+    refreshed = _cli(
+        [
+            "--trading-day", DAY.isoformat(),
+            "--decision-time-et", "09:40:00",
+            "--market-data", str(path),
+            "--config-dir", str(REAL_CONFIG_DIR),
+        ],
+        monkeypatch,
+    )
+
+    assert initial["cands"][0]["current_price"] == 95.0
+    assert refreshed["cands"][0]["current_price"] == 98.0
+    assert initial["decision_time_et"] == "09:50"
+    assert refreshed["decision_time_et"] == "09:55"
+    assert refreshed["cands"][0]["desired_usd"] < initial["cands"][0]["desired_usd"]
 
 
 def test_cli_rejects_a_second_market_data_source(tmp_path, monkeypatch):
     """The executor evaluates ONE provider. A Finance payload would be silently
     discarded, leaving a caller believing a dual-source cross-check happened."""
     payload = _market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0))
-    payload["sources"]["finance"] = {}
+    payload["sources"]["alpaca"] = {}
     path = tmp_path / "market_data.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     _patch_config(monkeypatch)
@@ -622,13 +1124,13 @@ def test_cli_rejects_a_missing_sources_key(tmp_path, monkeypatch):
         )
 
 
-def test_cli_rejects_an_omitted_robinhood_source(tmp_path, monkeypatch):
+def test_cli_rejects_an_omitted_finance_source(tmp_path, monkeypatch):
     """An empty `sources` object is a failed fetch spelled the ambiguous way;
     a real one is spelled in source_errors, which aborts loudly."""
     path = tmp_path / "market_data.json"
     path.write_text(json.dumps({"sources": {}}), encoding="utf-8")
     _patch_config(monkeypatch)
-    with pytest.raises(ValueError, match="missing the required 'robinhood'"):
+    with pytest.raises(ValueError, match="missing the required 'finance'"):
         gmoc.main(
             ["--trading-day", DAY.isoformat(), "--market-data", str(path), "--config-dir", str(REAL_CONFIG_DIR)]
         )
@@ -639,7 +1141,7 @@ def test_cli_rejects_duplicate_keys_in_the_market_data_file(tmp_path, monkeypatc
     discarding a conflicting snapshot before validation ever sees it."""
     path = tmp_path / "market_data.json"
     path.write_text(
-        '{"sources": {"robinhood": {"TEST": {}, "TEST": {}}}}',
+        '{"sources": {"finance": {"TEST": {}, "TEST": {}}}}',
         encoding="utf-8",
     )
     _patch_config(monkeypatch)
@@ -724,9 +1226,50 @@ def test_incomplete_payload_for_a_present_ticker_is_rejected(payload):
     exactly the zero-candidate document Gate 5 ends silently on (Codex review:
     "Reject incomplete payloads for attempted tickers").
     """
-    data = {"sources": {"robinhood": {"TEST": payload}}}
+    data = {"sources": {"finance": {"TEST": payload}}}
     with pytest.raises(ValueError, match="incomplete payload"):
         _run(data)
+
+
+def test_finance_payload_bars_finer_than_the_configured_cadence_are_rejected():
+    """MARKET_OPEN_SPEC resolves to a 15-minute Finance cadence
+    (``source_interval_minutes=15``). Neither ``StreamMarketData`` nor the
+    executor's own bar-window checks validate the SPACING between bars, only
+    that enough of them fall inside the window -- so a caller who instead
+    fetches 5-minute bars could satisfy those checks on a slice of the window
+    far narrower than they were calibrated for, with nothing downstream
+    noticing (Codex review, PR #917 discussion on
+    ``scripts/generate_midday_candidates.py``: "Reject five-minute bars under
+    the Finance cadence"). This is the runtime guard that closes that gap.
+    """
+    data = _market_data(
+        TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0, step_minutes=5)
+    )
+    with pytest.raises(
+        ValueError, match="closer together than this stream's configured 15-minute cadence"
+    ):
+        _run(data)
+
+
+def test_gfuz_robinhood_override_bars_finer_than_five_minutes_are_rejected():
+    """GFUZ's Robinhood override is graded at the base config's native
+    (Robinhood) cadence, not the resolved Finance one -- so the guard must
+    check its bars against ``config.interval_minutes`` (5 here), not against
+    MARKET_OPEN_SPEC's 15-minute Finance cadence."""
+    config = _config(tickers=("GFUZ",))
+    robinhood = _ticker_payload(
+        price=95.0, previous_close=100.0, previous_low=97.0, step_minutes=1
+    )
+    with pytest.raises(
+        ValueError, match="closer together than this stream's configured 5-minute cadence"
+    ):
+        gmoc.generate_market_open_candidates(
+            trading_day=DAY,
+            config=config,
+            market_data={},
+            alternate_market_data={"GFUZ": robinhood},
+            check_planner_compatibility=False,
+        )
 
 
 def test_absent_ticker_is_still_the_supported_not_covered_shape():
@@ -899,7 +1442,7 @@ def test_public_helper_rejects_a_mismatched_config_dir(tmp_path):
         gmoc.generate_market_open_candidates(
             trading_day=DAY,
             config=_config(),
-            market_data=data["sources"]["robinhood"],
+            market_data=data["sources"]["finance"],
             config_dir=other,
             check_planner_compatibility=False,
         )
@@ -945,7 +1488,7 @@ def test_build_document_rejects_a_deployment_figure_this_slot_does_not_accept():
             gmoc.MARKET_OPEN_SPEC,
             trading_day=DAY,
             config=_config(),
-            market_data=data["sources"]["robinhood"],
+            market_data=data["sources"]["finance"],
             deployed_last_7d_usd=100000.0,
             config_dir=REAL_CONFIG_DIR,
             check_planner_compatibility=False,

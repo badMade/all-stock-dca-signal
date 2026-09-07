@@ -98,7 +98,15 @@ MIDDAY_SPEC = StreamSpec(
     config_loader=load_midday_config,
     live_mode=MIDDAY_LIVE_MODE,
     stream_config_filename="midday_dca.json",
-    source=SourceName.ROBINHOOD,
+    # config/scheduled_tasks.json makes Finance the signal source; Robinhood is
+    # validation/context and the execution broker, never the universal scorer.
+    source=SourceName.FINANCE,
+    # Finance bars are start-stamped on a 15-minute cadence. Four completed
+    # observations fill the same 60-minute trend sample as the executor's six
+    # minimum 5-minute broker observations.
+    source_interval_minutes=15,
+    trend_min_bars=4,
+    ticker_source_overrides={"GFUZ": SourceName.ROBINHOOD},
     # See the module docstring: required by this slot's own producer contract.
     requires_deployed_last_7d_usd=True,
     doc_ref="docs/midday_signal_entry.md",
@@ -113,9 +121,11 @@ def generate_midday_candidates(
     trading_day,
     config,
     market_data: Mapping[str, Mapping[str, Any]],
+    alternate_market_data: Optional[Mapping[str, Mapping[str, Any]]] = None,
     deployed_last_7d_usd: float,
     source_errors: Sequence[str] = (),
     ticker_errors: Sequence[str] = (),
+    alternate_ticker_errors: Sequence[str] = (),
     already_covered_tickers: Sequence[str] = (),
     config_dir=None,
     check_planner_compatibility: bool = True,
@@ -126,8 +136,10 @@ def generate_midday_candidates(
         trading_day=trading_day,
         config=config,
         market_data=market_data,
+        alternate_market_data=alternate_market_data,
         source_errors=source_errors,
         ticker_errors=ticker_errors,
+        alternate_ticker_errors=alternate_ticker_errors,
         already_covered_tickers=already_covered_tickers,
         deployed_last_7d_usd=deployed_last_7d_usd,
         config_dir=config_dir,

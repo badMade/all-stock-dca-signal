@@ -108,7 +108,18 @@ MARKET_OPEN_SPEC = StreamSpec(
     config_loader=load_market_open_config,
     live_mode=MARKET_OPEN_LIVE_MODE,
     stream_config_filename="market_open_dca.json",
-    source=SourceName.ROBINHOOD,
+    # Signal policy is Finance-primary. Robinhood remains execution-only here
+    # and may be supplied to the CLI as validation/context evidence.
+    source=SourceName.FINANCE,
+    # Finance publishes start-stamped 15-minute bars. At 09:35 its 09:30 bar
+    # is still open, so the completed anchor is 09:15 and a fresh Finance quote
+    # (not that incomplete bar) supplies the decision price.
+    source_interval_minutes=15,
+    # Gate checks may finish after 09:35. Grade the connector snapshot at the
+    # configured 09:50 live-window boundary so an obtainable in-window quote is
+    # not rejected merely because it arrived after the nominal schedule time.
+    evaluation_delay_minutes=15,
+    ticker_source_overrides={"GFUZ": SourceName.ROBINHOOD},
     # See the module docstring: deliberately off for this slot.
     requires_deployed_last_7d_usd=False,
     doc_ref="docs/market_open_signal_entry.md",
@@ -125,11 +136,14 @@ def generate_market_open_candidates(
     trading_day,
     config,
     market_data: Mapping[str, Mapping[str, Any]],
+    alternate_market_data: Optional[Mapping[str, Mapping[str, Any]]] = None,
     source_errors: Sequence[str] = (),
     ticker_errors: Sequence[str] = (),
+    alternate_ticker_errors: Sequence[str] = (),
     already_covered_tickers: Sequence[str] = (),
     config_dir=None,
     check_planner_compatibility: bool = True,
+    decision_time_et=None,
 ) -> dict:
     """Run the market-open executor's own evaluation and return the Gate 5 document."""
     return build_document(
@@ -137,11 +151,14 @@ def generate_market_open_candidates(
         trading_day=trading_day,
         config=config,
         market_data=market_data,
+        alternate_market_data=alternate_market_data,
         source_errors=source_errors,
         ticker_errors=ticker_errors,
+        alternate_ticker_errors=alternate_ticker_errors,
         already_covered_tickers=already_covered_tickers,
         config_dir=config_dir,
         check_planner_compatibility=check_planner_compatibility,
+        decision_time_et=decision_time_et,
     )
 
 

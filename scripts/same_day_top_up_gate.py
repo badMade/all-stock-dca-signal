@@ -284,6 +284,22 @@ def _most_recent_reference(orders: Sequence[BrokerOrder]) -> "tuple[Optional[flo
     return latest_price, latest_order_id
 
 
+def _reference_source(logged_reference_bound: bool, reference_price: Optional[float]) -> Optional[str]:
+    """Report where a decision's reference price actually came from.
+
+    ``reference_price`` is ``None`` on a ticker's first same-day allocation --
+    there is no qualifying prior broker fill and no logged reference to bind,
+    so labeling it ``broker_fill`` would claim provenance from a fill that
+    never happened, making this audit field unreliable for downstream
+    reporting (Codex review: "Report no source when no reference exists").
+    """
+    if logged_reference_bound:
+        return "logged"
+    if reference_price is None:
+        return None
+    return "broker_fill"
+
+
 def _most_recent_reference_price(orders: Sequence[BrokerOrder]) -> Optional[float]:
     """This policy's comparison reference: the most recent valid same-day buy.
 
@@ -437,6 +453,7 @@ def evaluate_slot(
             logged_reference_price = None
         logged_reference_order_id = candidate.get("prior_logged_reference_order_id")
         reference_price = broker_reference_price
+        logged_reference_bound = False
         if (
             logged_reference_price is not None
             and logged_reference_order_id
@@ -448,6 +465,7 @@ def evaluate_slot(
             # buy -- safe to prefer it over the (possibly fill-price-inflated)
             # broker reference for this order.
             reference_price = logged_reference_price
+            logged_reference_bound = True
         # Normalize effective_prior_usd to cents BEFORE it feeds the desired -
         # prior subtraction below. Reconstructing dollars from cumulative_quantity
         # * average_price (both broker-reported at share/price precision) lands a
@@ -499,6 +517,9 @@ def evaluate_slot(
                     "current_price": None,
                     "effective_prior_usd": prior.effective_prior_usd,
                     "reference_price": prior.reference_price,
+                    "reference_order_id": broker_reference_order_id,
+                    "reference_source": _reference_source(logged_reference_bound, prior.reference_price),
+                    "logged_reference_bound": logged_reference_bound,
                     "buy_usd": 0.0,
                     "reason": MISSING_CURRENT_PRICE,
                     "manual_review": True,
@@ -518,6 +539,9 @@ def evaluate_slot(
                 "current_price": current_price,
                 "effective_prior_usd": prior.effective_prior_usd,
                 "reference_price": prior.reference_price,
+                "reference_order_id": broker_reference_order_id,
+                "reference_source": _reference_source(logged_reference_bound, prior.reference_price),
+                "logged_reference_bound": logged_reference_bound,
                 "buy_usd": buy_usd,
                 "reason": decision.reason,
                 "manual_review": decision.reason in _MANUAL_REVIEW_REASONS,

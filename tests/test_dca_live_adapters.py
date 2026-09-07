@@ -813,6 +813,85 @@ def test_finance_provider_accepts_close_price_and_c_aliases_for_dividends():
         assert cursor == date(2026, 8, 18), key
 
 
+def test_finance_provider_get_quote_returns_none_without_a_quote_fn():
+    prov = FinanceDataProvider(bars_fn=lambda *a: [], previous_close_fn=lambda *a: 100.0)
+    assert prov.get_quote("AAPL", _decision_dt()) is None
+
+
+def test_finance_provider_get_quote_accepts_a_mapping():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [],
+        previous_close_fn=lambda *a: 100.0,
+        quote_fn=lambda *a: {"price": 95.5, "as_of": "2026-07-02T15:44:00-04:00"},
+    )
+    price, as_of = prov.get_quote("AAPL", _decision_dt())
+    assert price == pytest.approx(95.5)
+    assert as_of == datetime(2026, 7, 2, 15, 44, tzinfo=EASTERN)
+
+
+def test_finance_provider_get_quote_accepts_a_bare_scalar():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [], previous_close_fn=lambda *a: 100.0, quote_fn=lambda *a: 95.5
+    )
+    price, as_of = prov.get_quote("AAPL", _decision_dt())
+    assert price == pytest.approx(95.5)
+    assert as_of == _decision_dt()
+
+
+def test_finance_provider_get_quote_rejects_a_boolean_price():
+    """Python makes bool a subclass of int, so float(True) == 1.0: an
+    unguarded _to_float(raw_price) would accept a malformed connector
+    response like {"price": true, ...} as an ordinary $1.00 quote, which
+    could turn an ordinary stock into a maximum-drop BUY signal (Codex
+    review: "Reject boolean Finance quote prices")."""
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [],
+        previous_close_fn=lambda *a: 100.0,
+        quote_fn=lambda *a: {"price": True, "as_of": "2026-07-02T15:44:00-04:00"},
+    )
+    assert prov.get_quote("AAPL", _decision_dt()) is None
+
+
+def test_finance_provider_get_quote_rejects_a_boolean_bare_scalar():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [], previous_close_fn=lambda *a: 100.0, quote_fn=lambda *a: False
+    )
+    assert prov.get_quote("AAPL", _decision_dt()) is None
+
+
+def test_finance_provider_get_quote_rejects_a_non_positive_price():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [],
+        previous_close_fn=lambda *a: 100.0,
+        quote_fn=lambda *a: {"price": 0.0, "as_of": "2026-07-02T15:44:00-04:00"},
+    )
+    assert prov.get_quote("AAPL", _decision_dt()) is None
+
+
+def test_finance_provider_get_quote_returns_none_when_the_quote_fn_yields_nothing():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [], previous_close_fn=lambda *a: 100.0, quote_fn=lambda *a: None
+    )
+    assert prov.get_quote("AAPL", _decision_dt()) is None
+
+
+def test_finance_provider_third_positional_argument_still_sets_supports_corporate_actions():
+    """A caller wiring ``FinanceDataProvider(bars_fn, previous_close_fn, False)``
+    predates ``quote_fn`` and must keep setting ``supports_corporate_actions``,
+    not silently reinterpret that boolean as the quote callable (which would
+    also leave ``supports_corporate_actions`` stuck at its True default and
+    later crash ``get_quote()`` calling a bare ``False``) (Codex review:
+    "Preserve the existing third positional argument")."""
+    prov = FinanceDataProvider(lambda *a: [], lambda *a: 100.0, False)
+    assert prov.supports_corporate_actions is False
+    assert prov.get_quote("AAPL", _decision_dt()) is None
+
+
+def test_finance_provider_quote_fn_is_keyword_only():
+    with pytest.raises(TypeError):
+        FinanceDataProvider(lambda *a: [], lambda *a: 100.0, True, lambda *a: 95.5)
+
+
 def test_finance_provider_accepts_capitalized_date_alias():
     prov = FinanceDataProvider(
         bars_fn=lambda *a: [{"Date": "2026-08-18", "Stock Splits": 2.0, "Dividends": 0.0}],

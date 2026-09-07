@@ -26,6 +26,19 @@ Characteristics of this generation:
 * The account is addressed directly rather than through the environment: the
   live text hard-codes it at each call site (here shown redacted), instead of
   reading it from `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` at run time.
+* The `0935` copy is likewise AHEAD of live, for Gates 5 and 7: as of
+  2026-08-26 `scripts/generate_market_open_candidates.py` exists, so that
+  copy's Gate 5 names the command to run (see the Gate 5 bullet below for the
+  whole slot-to-producer table) instead of pointing at "the repo's own signal
+  generation" -- which, for this slot, was an entry point that did not exist,
+  so every fire produced no buy list at all. Gate 7 also adds the final
+  placement-boundary price-eligibility refresh and restarts the complete
+  per-order revalidation sequence whenever that final quote expires. Gates 6,
+  6.5 and 6.7 are unchanged there. Same caveat as the 1230 copy below: until a
+  human applies that body through `update_scheduled_task` and the mirror is
+  re-captured, the ACTUAL live 9:35 task still carries the older Gates 5 and 7,
+  still cannot produce a buy list, and lacks Gate 7's new placement-boundary
+  price safety check. See `docs/market_open_signal_entry.md`.
 * Live placement is authorized for all seven slots as of 2026-09-02, per
   Geoff's explicit direction that order placement be on for all scheduled
   buy runs. The 1230 slot was the one exception up to that point, and its

@@ -118,18 +118,30 @@ def test_require_parseable_stream_config_validations(tmp_path):
     with pytest.raises(ValueError, match="has no 'multiplier'"):
         _require_parseable_stream_config(cfg_file, "morning")
 
-    # 9. trend_min_bars validation
+    # 9. trend_min_bars validation. The field is REQUIRED, not merely validated
+    # when present: every loader applies `int(raw["trend_min_bars"])` with a
+    # hardcoded default behind it, so an absent key silently validates the
+    # 60-minute downtrend on the fallback bar count rather than the checked-in
+    # one (PR #898, "Require explicit trend bar minimum").
     valid_base["sizing_ladder"]["tiers"] = [{"min_drop_pct": 1.0, "multiplier": 1.0}]
+    trend_min_bars_message = "'trend_min_bars' must be present and be an integer of at least 1"
     valid_base["trend_min_bars"] = True
     cfg_file.write_text(json.dumps(valid_base), encoding="utf-8")
-    with pytest.raises(ValueError, match="'trend_min_bars' must be an integer of at least 1"):
+    with pytest.raises(ValueError, match=trend_min_bars_message):
         _require_parseable_stream_config(cfg_file, "morning")
 
     valid_base["trend_min_bars"] = 0
     cfg_file.write_text(json.dumps(valid_base), encoding="utf-8")
-    with pytest.raises(ValueError, match="'trend_min_bars' must be an integer of at least 1"):
+    with pytest.raises(ValueError, match=trend_min_bars_message):
         _require_parseable_stream_config(cfg_file, "morning")
+
     del valid_base["trend_min_bars"]
+    cfg_file.write_text(json.dumps(valid_base), encoding="utf-8")
+    with pytest.raises(ValueError, match=trend_min_bars_message):
+        _require_parseable_stream_config(cfg_file, "morning")
+    # A valid minimum from here on, so the ledger checks below are reached
+    # rather than short-circuited by the presence requirement just proven.
+    valid_base["trend_min_bars"] = 6
 
     # 10. budget_ledger not a dict
     valid_base["budget_ledger"] = "not_a_dict"

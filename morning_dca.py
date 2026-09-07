@@ -4655,7 +4655,12 @@ class MorningDCAExecutor(DCAExecutor):
         trend cannot be validated is flagged ``manual_review_candidate`` and is
         not auto-bought. The watchlist scan places no orders.
         """
-        source = getattr(getattr(data, "source", None), "value", "unknown")
+        source_for_ticker = getattr(data, "source_for_ticker", None)
+        source = (
+            source_for_ticker(ticker)
+            if callable(source_for_ticker)
+            else getattr(getattr(data, "source", None), "value", "unknown")
+        )
         now_et = now.astimezone(EASTERN)
         trading_day = now_et.date()
         decision_dt = datetime.combine(trading_day, self.decision_time, tzinfo=EASTERN)
@@ -4910,6 +4915,11 @@ class MorningDCAExecutor(DCAExecutor):
         poll as a time series (see :mod:`dca_intraday_archive`).
         """
         bar_anchor = completed_bar_anchor(decision_dt, self.config.interval_minutes, self._sizing_config)
+        # Candidate generators that deliberately evaluate a snapshot after the
+        # nominal fire may widen the quote window back to that nominal
+        # snapshot. Live executors do not set this attribute and retain the
+        # completed-bar anchor as their lower bound.
+        quote_window_start = getattr(self, "quote_window_start", bar_anchor)
         bar = latest_bar_at_or_before(bars, bar_anchor)
 
         def _record(**fields: Any) -> None:
@@ -4951,7 +4961,7 @@ class MorningDCAExecutor(DCAExecutor):
                         quote_price=_finite_float_or_none(quote[0]),
                         quote_time=quote_time if isinstance(quote_time, datetime) else None,
                     )
-                    if isinstance(quote_time, datetime) and bar_anchor <= quote_time <= decision_dt:
+                    if isinstance(quote_time, datetime) and quote_window_start <= quote_time <= decision_dt:
                         quote_price = float(quote[0])
                         if quote_price > 0:
                             _record(price_source="quote", price_as_of=quote_time)
@@ -8448,37 +8458,32 @@ class MorningDCAExecutor(DCAExecutor):
         if not manual and now is not None:
             existing = self._existing_submitted_run_state(now)
             if existing is not None:
-                # Matches _PRESERVABLE_ORDER_STATUSES, not just the literal
-                # "submitted" string: a row reconciled to "pending"/
-                # "unconfirmed", or an ambiguous "potentially_submitted"
-                # placement, is real prior-notional evidence too. If the
-                # legacy duplicate checker below later returns True with no
-                # order payload, its dup_amount fallback chain reaches
-                # prior_submitted_amounts before the freshly recomputed
-                # (possibly smaller, once this retry's own prior-allocation
-                # total has shifted) top-up amount -- excluding an ambiguous
-                # row here let that fallback skip straight to the smaller
-                # figure, understating cap usage for an order that may
-                # already be live (Codex review, PR #1300
+                # Not just the literal "submitted" string: a row a broker
+                # refresh advanced to "filled", or an ambiguous
+                # "potentially_submitted" placement, is real prior-notional
+                # evidence too. If the legacy duplicate checker below later
+                # returns True with no order payload, its dup_amount fallback
+                # chain reaches prior_submitted_amounts before the freshly
+                # recomputed (possibly smaller, once this retry's own
+                # prior-allocation total has shifted) top-up amount --
+                # excluding an ambiguous row here let that fallback skip
+                # straight to the smaller figure, understating cap usage for
+                # an order that may already be live at the notional THIS
+                # executor itself sent (Codex review, PR #1300
                 # discussion_r3920826583: "Preserve ambiguous amounts when
                 # retry dedup lacks broker details").
                 for row in existing["artifacts"].get("buy_candidates", []):
-                    # The SAME order-bearing status set _existing_submitted_run_state()
-                    # itself admits the artifact on ("submitted", "filled",
-                    # "pending", "unconfirmed") -- restricting this population to
-                    # literally "submitted" let a broker refresh that had already
-                    # advanced the row to "filled" (or a still-live
-                    # pending/unconfirmed acceptance) fall through unseen, so the
-                    # same-stream top-up-duplicate path below recomputed a
-                    # smaller fresh incremental amount instead of preserving what
-                    # was actually placed, understating the cap this retry seeds
-                    # against (Codex review: "Recover prior amounts for every
-                    # order-bearing status").
-                    if (
-                        not isinstance(row, dict)
-                        or not isinstance(row.get("status"), str)
-                        or row["status"] not in _ORDER_BEARING_CANDIDATE_STATUSES
-                    ):
+                    # Keep the SAME order-bearing status admission gate
+                    # _existing_submitted_run_state() uses
+                    # (_ORDER_BEARING_CANDIDATE_STATUSES), so retry evidence
+                    # still carries every placed-or-in-flight row. Amount
+                    # preservation below is intentionally narrower than that
+                    # gate: pending/unconfirmed keep the row as evidence but
+                    # their captured dollars are not guaranteed final.
+                    if not isinstance(row, dict) or not isinstance(row.get("status"), str):
+                        continue
+                    row_status = row["status"]
+                    if row_status not in _ORDER_BEARING_CANDIDATE_STATUSES:
                         continue
                     row_ticker = row.get("ticker")
                     # A bare truthiness check passes for an unhashable
@@ -8509,7 +8514,32 @@ class MorningDCAExecutor(DCAExecutor):
                     # totals instead of treating the prior notional as
                     # unreconstructable (Codex review: "Reject non-finite
                     # amounts from newly admitted statuses").
-                    if math.isfinite(amt_float) and amt_float > 0:
+                    # pending/unconfirmed prove the order exists and must keep
+                    # the row in evidence. Their captured dollars are the
+                    # notional THIS executor sent before a broker refresh
+                    # reclassified the row; the broker's eventual figure can
+                    # only be at or below that for a notional market buy, never
+                    # above it. So the sent amount is the CONSERVATIVE figure
+                    # for cap accounting and is preserved here too. Dropping
+                    # it used to let the duplicate fallback below re-persist a
+                    # SMALLER freshly recomputed retry amount into the fixed
+                    # dated-slot run_state path, understating the day's spend
+                    # and freeing cap headroom that had already been consumed
+                    # (Codex review, PR #1364 discussion_r3946703223:
+                    # "Preserve amounts for pending retry orders" -- an $8
+                    # pending order re-persisted as $4 let a later $2 order
+                    # pass an $8 daily cap). "potentially_submitted" is the
+                    # same shape from the other direction: the notional is
+                    # exactly what was sent before the placement call went
+                    # ambiguous, and dropping it is the understated-cap
+                    # failure PR #1300 (above) closed. Only a row whose amount
+                    # is absent/non-finite/non-positive falls through to the
+                    # fresh computed amount for this retry.
+                    if (
+                        row_status in _RETRY_PRESERVED_AMOUNT_STATUSES
+                        and math.isfinite(amt_float)
+                        and amt_float > 0
+                    ):
                         prior_submitted_amounts[row_ticker] = amt_float
         # Snapshotted lazily (see below) so adapters that immediately reflect
         # placed orders don't cause double-subtraction (reserved_buying_power
@@ -10510,6 +10540,16 @@ def _same_stream_order_exists(
         # sufficient for settle()'s own per-order_id dedup set.
         return {"id": f"legacy-bool-dup:{stream}:{trading_day.isoformat()}:{ticker}"}
     return result
+
+
+# Statuses whose persisted submitted_amount_usd is carried into a same-stream
+# retry's duplicate fallback instead of the freshly recomputed (possibly
+# smaller) notional. See the comment at the single read site in
+# _place_broker_orders for why pending/unconfirmed belong here (Codex review,
+# PR #1364: "Preserve amounts for pending retry orders").
+_RETRY_PRESERVED_AMOUNT_STATUSES = frozenset(
+    {"submitted", "filled", "potentially_submitted", "pending", "unconfirmed"}
+)
 
 
 def _stable_broker_order_id(order: Optional[Dict[str, Any]]) -> Optional[str]:

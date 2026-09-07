@@ -9008,6 +9008,122 @@ def test_morning_scheduled_top_up_duplicate_preserves_original_submitted_amount(
     assert on_disk_rows["NVDA"].get("planned_amount_usd") == pytest.approx(15.0)
 
 
+@pytest.mark.parametrize("carried_status", ["pending", "unconfirmed"])
+def test_morning_scheduled_duplicate_with_pending_prior_preserves_sent_amount(tmp_path, carried_status):
+    # Codex review, PR #1364 discussion_r3946703223 ("Preserve amounts for
+    # pending retry orders"): a pending/unconfirmed carried row proves the
+    # order exists, and the dollars persisted alongside are the notional this
+    # executor SENT. The broker's eventual figure can only be at or below
+    # that, so the sent amount is the conservative one for cap accounting.
+    # This test used to assert the opposite (that a duplicate-check response
+    # without a notional falls back to the retry's fresh, smaller amount);
+    # that let an $8 pending order be re-persisted as $4 into the fixed
+    # dated-slot run_state path and freed cap headroom already consumed.
+    class _DuplicateWithoutAmountBroker(_RefIdTrackingBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            for t, rid in self._ref_ids:
+                if t == ticker and any(rid.startswith(p) for p in ref_id_prefixes):
+                    return {"id": f"ORDER-{ticker}"}
+            return None
+
+    live_root = tmp_path / "live"
+    prior_root = tmp_path / "prior"
+    prior_root.mkdir(parents=True, exist_ok=True)
+    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        base_buy_amount_usd=3.0,
+        max_per_order_usd=15.0,
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(prior_root),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _DuplicateWithoutAmountBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+
+    first = ex.run(_now_live(), data, broker=broker)
+    run_state_path = Path(first["paths"]["run_state"])
+    prior = json.loads(run_state_path.read_bytes())
+    row = prior["buy_candidates"][0]
+    row["status"] = carried_status
+    sent_amount = 14.0
+    row["planned_amount_usd"] = sent_amount
+    row["submitted_amount_usd"] = sent_amount
+    prior["broker_outcomes"]["NVDA"]["status"] = carried_status
+    prior["broker_outcomes"]["NVDA"]["submitted_amount_usd"] = sent_amount
+    run_state_path.write_text(json.dumps(prior), encoding="utf-8")
+
+    # Force the retry's fresh incremental down to $12.00 (15 target minus a new
+    # $3 prior allocation), so a fallback to the recomputed amount would be
+    # visibly SMALLER than what was actually sent.
+    _seed_prior(prior_root, "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=2.0)
+
+    retry = ex.run(_now_live() + timedelta(minutes=1), data, broker=broker)
+    nvda_outcome = retry["artifacts"].get("broker_outcomes", {}).get("NVDA", {})
+    assert nvda_outcome.get("status") == "submitted", nvda_outcome
+    retry_row = next(
+        row for row in retry["artifacts"].get("buy_candidates", []) if row["ticker"] == "NVDA"
+    )
+    # The persisted duplicate carries the $14 that was sent, not the $12 the
+    # retry recomputed, so the dated-slot artifact never understates spend;
+    # the candidate row is rewritten to the same preserved figure.
+    assert nvda_outcome.get("submitted_amount_usd") == pytest.approx(sent_amount)
+    assert retry_row["planned_amount_usd"] == pytest.approx(sent_amount)
+    assert nvda_outcome.get("submitted_amount_usd") != pytest.approx(12.0)
+    assert nvda_outcome.get("duplicate_preserved") is True
+
+
+def test_morning_scheduled_duplicate_with_pending_prior_without_amount_uses_fresh_amount(tmp_path):
+    # The one case that still falls through to the retry's recomputed amount:
+    # the carried pending row has NO usable amount at all, so there is nothing
+    # sent to preserve. Kept as the boundary for the parametrized test above.
+    class _DuplicateWithoutAmountBroker(_RefIdTrackingBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            for t, rid in self._ref_ids:
+                if t == ticker and any(rid.startswith(p) for p in ref_id_prefixes):
+                    return {"id": f"ORDER-{ticker}"}
+            return None
+
+    live_root = tmp_path / "live"
+    prior_root = tmp_path / "prior"
+    prior_root.mkdir(parents=True, exist_ok=True)
+    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        base_buy_amount_usd=3.0,
+        max_per_order_usd=15.0,
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(prior_root),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _DuplicateWithoutAmountBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+
+    first = ex.run(_now_live(), data, broker=broker)
+    run_state_path = Path(first["paths"]["run_state"])
+    prior = json.loads(run_state_path.read_bytes())
+    row = prior["buy_candidates"][0]
+    row["status"] = "pending"
+    row.pop("planned_amount_usd", None)
+    row["submitted_amount_usd"] = None
+    prior["broker_outcomes"]["NVDA"]["status"] = "pending"
+    prior["broker_outcomes"]["NVDA"]["submitted_amount_usd"] = None
+    run_state_path.write_text(json.dumps(prior), encoding="utf-8")
+    _seed_prior(prior_root, "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=2.0)
+
+    retry = ex.run(_now_live() + timedelta(minutes=1), data, broker=broker)
+    nvda_outcome = retry["artifacts"].get("broker_outcomes", {}).get("NVDA", {})
+    assert nvda_outcome.get("status") == "submitted", nvda_outcome
+    retry_row = next(
+        row for row in retry["artifacts"].get("buy_candidates", []) if row["ticker"] == "NVDA"
+    )
+    assert nvda_outcome.get("submitted_amount_usd") == pytest.approx(retry_row["planned_amount_usd"])
+
+
 def test_morning_scheduled_duplicate_check_preserved_when_cap_fully_consumed(tmp_path):
     # Codex review (PR #88): "Preserve submitted evidence when a cap-seeded
     # retry is full". The daily/weekly cap check used to run BEFORE the
