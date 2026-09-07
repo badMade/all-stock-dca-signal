@@ -1162,6 +1162,69 @@ def test_load_json_files_survives_a_non_mapping_budget(tmp_path):
     assert "$5.00" in report
 
 
+
+def test_build_budget_reserve_effectiveness_basic_rendering():
+    from dca_weekly_dashboard import build_budget_reserve_effectiveness
+
+    run_states = [
+        {
+            "trading_day": "2026-07-20",
+            "budget": {
+                "budget_tier": "conservative",
+                "day_notional_usd": 150.50,
+                "daily_cap_usd": 200.00,
+                "weekly_rollover_reserve_usd": 50.25,
+                "remaining_spend_today_usd": 49.50,
+            },
+        },
+        {
+            "trading_day": "2026-07-21",
+            "budget": {
+                "budget_tier": "aggressive",
+                "day_notional_usd": 300.00,
+                "daily_cap_usd": 500.00,
+                "weekly_rollover_reserve_usd": 100.00,
+                "remaining_spend_today_usd": 200.00,
+            },
+        },
+        {
+            # Missing budget tier, should render 'n/a'
+            "trading_day": "2026-07-22",
+            "budget": {
+                "day_notional_usd": 50.00,
+                "daily_cap_usd": 100.00,
+                "weekly_rollover_reserve_usd": 0.00,
+                "remaining_spend_today_usd": 50.00,
+            },
+        },
+        {
+            # Fallback legacy fields
+            "trading_day": "2026-07-23",
+            "budget": {
+                "budget_tier": "legacy",
+                "day_notional_usd": 100.00,
+                "daily_base_cap_usd": 150.00,
+                "carry_forward_reserve_usd": 25.00,
+                "remaining_spend_today_usd": 50.00,
+            },
+        },
+        {
+            # Missing fields should default to 0.00
+            "trading_day": "2026-07-24",
+        }
+    ]
+
+    report = build_budget_reserve_effectiveness(run_states)
+
+    assert "## Budget and reserve effectiveness" in report
+    assert "| Day | Tier | Spent $ | Daily cap $ | Rollover reserve $ | Remaining $ |" in report
+    assert "| 2026-07-20 | conservative | $150.50 | $200.00 | $50.25 | $49.50 |" in report
+    assert "| 2026-07-21 | aggressive | $300.00 | $500.00 | $100.00 | $200.00 |" in report
+    assert "| 2026-07-22 | n/a | $50.00 | $100.00 | $0.00 | $50.00 |" in report
+    assert "| 2026-07-23 | legacy | $100.00 | $150.00 | $25.00 | $50.00 |" in report
+    assert "| 2026-07-24 | n/a | $0.00 | $0.00 | $0.00 | $0.00 |" in report
+
+
 def test_build_budget_reserve_effectiveness_survives_a_non_mapping_budget():
     # Codex review, PR #1300 discussion_r3920988296 ("Normalize malformed
     # budget containers before accumulation"): a truthy non-dict budget
