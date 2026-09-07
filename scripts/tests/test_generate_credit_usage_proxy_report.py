@@ -3774,18 +3774,19 @@ def test_redaction_handles_credentials_embedded_in_url_paths(tmp_path):
 
 
 def test_url_embedded_credential_is_redacted_end_to_end(tmp_path):
+    slack_tail = "X" * 24
     _write_json(
         tmp_path / "market_open_dca" / "20260727_0935ET" / "run_state.json",
         _run_state(
             blocking_reason=(
                 "broker rejected: https://hooks.slack.com/services/"
-                "T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"
+                f"T00000000/B00000000/{slack_tail}"
             )
         ),
     )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    assert "XXXXXXXXXXXXXXXXXXXXXXXX" not in json.dumps(report)
-    assert "XXXXXXXXXXXXXXXXXXXXXXXX" not in render_markdown(report)
+    assert slack_tail not in json.dumps(report)
+    assert slack_tail not in render_markdown(report)
 
 
 def test_partial_slippage_output_set_is_a_failed_invocation(tmp_path):
