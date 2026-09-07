@@ -611,10 +611,14 @@ class SECCollector:
 
     FILING_TYPES = ["8-K", "10-K", "10-Q"]
     MAX_FILINGS = 3  # filings per form type (9 total per ticker)
-    HEADERS = {
-        "User-Agent": "SentimentMonitor/1.0 (contact@example.com)",
-        "Accept-Encoding": "gzip, deflate",
-    }
+
+    @property
+    def headers(self) -> dict:
+        import os
+        return {
+            "User-Agent": os.environ.get("SEC_EDGAR_USER_AGENT", "SentimentMonitor/1.0 (contact@example.com)"),
+            "Accept-Encoding": "gzip, deflate",
+        }
 
     def fetch_filings(self, ticker: str) -> List[Dict]:
         """
@@ -641,7 +645,7 @@ class SECCollector:
                 resp = requests.get(
                     url,
                     params=params,
-                    headers=self.HEADERS,
+                    headers=self.headers,
                     timeout=15,
                 )
                 resp.raise_for_status()

@@ -83,7 +83,7 @@ SEC_EFTS_URL = "https://efts.sec.gov/LATEST/search-index"
 
 # SEC requires a descriptive User-Agent per their policy:
 # https://www.sec.gov/developer
-SEC_USER_AGENT = "MondaySentimentBot/1.0 contact@example.com"
+SEC_USER_AGENT = os.environ.get("SEC_EDGAR_USER_AGENT", "MondaySentimentBot/1.0 contact@example.com")
 
 # FinBERT model from HuggingFace
 FINBERT_MODEL = "ProsusAI/finbert"
