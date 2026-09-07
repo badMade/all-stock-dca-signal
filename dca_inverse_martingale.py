@@ -2765,9 +2765,10 @@ def _validate_tier_crossing_fields(
     #     "dipping" recovery-offset danger above.
     # (Codex review: "Require complete snapshots for active trackers").
     if status in (STATUS_DIPPING, STATUS_FIRING):
-        for required_field in ("cycle_reference_close", "lowest_drop_seen"):
-            if data.get(required_field) is None:
-                raise _corrupted(required_field, data.get(required_field))
+        if data.get("cycle_reference_close") is None:
+            raise _corrupted("cycle_reference_close", None)
+        if data.get("lowest_drop_seen") is None:
+            raise _corrupted("lowest_drop_seen", None)
     if status == STATUS_DIPPING and (not isinstance(crossed, list) or not crossed):
         raise _corrupted("crossed_tier_thresholds", crossed)
 
