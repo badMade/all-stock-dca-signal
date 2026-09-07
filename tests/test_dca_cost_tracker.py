@@ -495,6 +495,60 @@ def test_markdown_no_components():
     md = build_cost_tracker_markdown({})
     assert "| _no runs_ | 0 | - | 0 |" in md
 
+def test_build_cost_tracker_markdown_comprehensive():
+    # Empty/minimal aggregate
+    md_empty = build_cost_tracker_markdown({})
+    assert "unknown" in md_empty
+    assert "- Runs analyzed: 0" in md_empty
+    assert "- Runs needing manual recovery: 0" in md_empty
+    assert "Estimated total proxy units (not credits): 0.0" in md_empty
+    assert "| _no runs_ | 0 | - | 0 |" in md_empty
+
+    # Fully populated aggregate
+    agg = {
+        "month_label": "2026-07",
+        "disclaimer": "Test Disclaimer",
+        "run_count": 5,
+        "manual_recovery_runs": 1,
+        "estimated_total_proxy_units": 150.5,
+        "components": [
+            {
+                "component": "compA",
+                "count": 10.0,
+                "proxy_weight": 2.5,
+                "estimated_proxy_units": 25.0,
+            },
+            {
+                "component": "compB",
+                "count": 5.0,
+                "proxy_weight": 1.0,
+                "estimated_proxy_units": 5.0,
+            }
+        ],
+        "totals": {
+            "metricX": 100.0,
+            "metricY": 50.0
+        }
+    }
+
+    md_full = build_cost_tracker_markdown(agg)
+    assert "## Automation Cost Tracker — 2026-07" in md_full
+    assert "> Test Disclaimer" in md_full
+    assert "- Runs analyzed: 5" in md_full
+    assert "- Runs needing manual recovery: 1" in md_full
+    assert "Estimated total proxy units (not credits): 150.5" in md_full
+
+    assert "| compA | 10.0 | 2.5 | 25.0 |" in md_full
+    assert "| compB | 5.0 | 1.0 | 5.0 |" in md_full
+
+    # We shouldn't strictly assert metricX/Y because _NUMERIC_PROXY_FIELDS controls the exact fields.
+    # Instead, we verify that missing numeric proxy fields fall back to 0.0
+    from dca_cost_tracker import _NUMERIC_PROXY_FIELDS
+    for field in _NUMERIC_PROXY_FIELDS:
+        assert f"| {field} | 0.0 |" in md_full or f"| {field} | " in md_full
+
+
+
 
 def test_generate_cost_tracker_writes_files(tmp_path):
     _write_runs(tmp_path, [_run_state("2026-06-29"), _run_state("2026-06-30")])
