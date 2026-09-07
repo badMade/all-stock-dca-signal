@@ -16248,7 +16248,22 @@ def _reconcile_unresolved_whole_share_claim(
             # sourced terminal evidence (see
             # _executed_quantity_is_explicit_zero's docstring).
             raw_terminal_quantity = terminal_order.get("cumulative_quantity")
-            if raw_terminal_quantity is None and terminal_order_state == "filled":
+            # ``_is_blank_broker_field``, not a bare ``is None``: a broker
+            # spells an absent cumulative_quantity as ``None``, ``""``, OR
+            # whitespace, and an identity check catches only the first of the
+            # three. A blank STRING pinned raw_terminal_quantity to that
+            # unusable value, so a genuinely "filled" order reporting its size
+            # ONLY in ``quantity`` never reached this fallback: it parsed as
+            # unknown and returned the unresolved live-order shape instead of
+            # settling, leaving a real executed purchase unbooked and its
+            # already-spent credit reserved indefinitely. This is the same
+            # blank-vs-absent distinction the sibling submitted-quantity
+            # branch below already draws, and that
+            # ``_process_whole_share_candidate``'s own copy of THIS fallback
+            # has always drawn with this helper -- the two copies had drifted
+            # (Codex review: "Treat whitespace-only cumulative quantities as
+            # absent"; "Use requested quantity for any-state filled orders").
+            if _is_blank_broker_field(raw_terminal_quantity) and terminal_order_state == "filled":
                 raw_terminal_quantity = terminal_order.get("quantity")
             # _parse_terminal_share_quantity rejects non-finite, negative, and
             # non-integral values (not just unparseable ones): a raw

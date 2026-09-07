@@ -2153,6 +2153,61 @@ def test_reconcile_unresolved_whole_share_claim_falls_back_to_quantity_for_a_fil
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is None
 
 
+@pytest.mark.parametrize("blank_cumulative", ["", " "])
+def test_reconcile_falls_back_to_quantity_for_a_filled_any_state_match_with_a_blank_cumulative(
+    tmp_path, blank_cumulative
+):
+    """The test above, but with a BLANK cumulative_quantity rather than an
+    absent key -- the broker's other spelling of "this field says nothing".
+
+    The any-state "filled" fallback used a bare ``is None`` check to decide
+    whether to read ``quantity`` instead, so only the absent-key spelling
+    reached that fallback. An empty or whitespace-only string pinned
+    raw_terminal_quantity to a value that parses as unknown, and the filled
+    order was booked as an unresolved live order rather than settled -- its
+    real, already-executed purchase left permanently uncredited while the
+    claim stayed reserved. ``_process_whole_share_candidate``'s own copy of
+    this fallback has always used ``_is_blank_broker_field`` here; the two
+    copies had drifted (Codex review: "Treat whitespace-only cumulative
+    quantities as absent").
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="afternoon-BYDDY", recorded_at=recorded_at
+    )
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+
+    class _FilledViaAnyStateBlankCumulativeBroker:
+        def account_number(self) -> str:
+            return "test-account"
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None  # live-only lookup missed the (eventually consistent) order
+
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            # Filled, and the executed size is reported ONLY in "quantity" --
+            # cumulative_quantity is present but blank, which says nothing.
+            return {
+                "id": "RH-FILLED-ANY-STATE-BLANK-1",
+                "state": "filled",
+                "cumulative_quantity": blank_cumulative,
+                "quantity": "1",
+            }
+
+    assert unresolved is not None
+    reconciled = _reconcile_unresolved_whole_share_claim(
+        ledger, _FilledViaAnyStateBlankCumulativeBroker(), "BYDDY", "afternoon", "afternoon-BYDDY",
+        "2026-08-16", unresolved,
+    )
+
+    assert reconciled == {
+        "order_id": "RH-FILLED-ANY-STATE-BLANK-1", "shares_purchased": 1, "order_notional_usd": 10.0
+    }
+    assert ledger.shares_purchased_total("BYDDY") == 1
+    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is None
+
+
 def test_reconcile_unresolved_whole_share_claim_does_not_fall_back_to_quantity_for_a_canceled_any_state_match(
     tmp_path,
 ):

@@ -6523,6 +6523,110 @@ def test_morning_duplicate_recovery_settles_the_preserved_credit(tmp_path):
     assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.45
 
 
+def test_morning_duplicate_recovery_settles_once_for_an_order_with_no_id(tmp_path):
+    """A recovered duplicate whose broker dict carries NO usable id must still
+    be settled exactly once.
+
+    Two independent fixes settle a recovered duplicate: _process_candidate's
+    own call (keyed on recovered_order_id) and the post-loop credit pass's
+    (keyed on outcome["order_id"]). The post-loop guard -- top_up present,
+    cumulative_credit_decline_usd present, incremental_order_amount > 0 -- is a
+    strict SUBSET of _process_candidate's, so it fired on every recovery that
+    had already settled. For an order dict carrying a real id the ledger's
+    order-id dedup absorbed the repeat, but when the dict has no id the two
+    disagree: _process_candidate falls back to the synthetic "legacy-dup-..."
+    key while the post-loop pass passes order_id=None, which disables
+    settle()'s `if order_id:` dedup entirely and subtracts the amount from the
+    shared pending pool a second time -- consuming credit that never funded
+    this order (Codex review: "Make duplicate-recovery settlement idempotent";
+    "Require an ID for idempotent duplicate settlement").
+
+    The ``duplicate_credit_settled`` flag closed that gap, but its own
+    regression tests all use a duplicate carrying a REAL order id, where the
+    ledger's dedup masks a second settle() and only the audit event goes
+    wrong. This case is the one where the flag is load-bearing for the
+    BALANCE: without it the repeat is not deduped at all and real credit is
+    destroyed, so pin it separately.
+    """
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
+
+    class _IdlessDuplicateBroker(FakeLiveBroker):
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            # A real order dict, but with no "id"/"order_id" field at all.
+            return {"dollar_amount": 1.0}
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):  # pragma: no cover
+            raise AssertionError("a duplicate must never place a second order")
+
+    cfg = MorningConfig(tickers=("AAPL",), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+    ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.30, stream="morning")
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.0,
+        previous_close=100.0,
+        drop_pct=1.0,
+        multiplier=1.0,
+        hypothetical_amount_usd=1.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcome = TopUpOutcome(
+        ticker="AAPL",
+        desired_amount=1.30,
+        decision_price=99.0,
+        prior_same_day_amount=1.0,
+        prior_same_day_reference_price=100.0,
+        prior_same_day_run_id="morning_am",
+        prior_same_day_source="morning",
+        incremental_order_amount=1.0,
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        top_up_skipped=False,
+        effective_base_amount_usd=1.0,
+        cumulative_credit_decline_usd=0.30,
+    )
+    broker = _IdlessDuplicateBroker()
+    outcomes = ex._place_broker_orders(
+        [signal], trading_day, broker, {"AAPL": outcome}, remaining_daily=180.0, remaining_weekly=900.0
+    )
+
+    assert outcomes["AAPL"]["duplicate_preserved"] is True
+    assert outcomes["AAPL"]["order_id"] is None
+    # Settled exactly once: the $0.30 that funded the real order is cleared,
+    # and the settlement is recorded as such rather than as an ignored repeat.
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+    assert ex.credit_ledger.events(trading_day.isoformat())[-1]["decision"] == "settled"
+
+    # Another stream's fresh credit must survive this recovery -- the second,
+    # unkeyed settle() used to consume it.
+    ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.45, stream="midday")
+    ex._place_broker_orders(
+        [signal], trading_day, broker, {"AAPL": outcome}, remaining_daily=180.0, remaining_weekly=900.0
+    )
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.45
+
+
 def test_morning_original_settlement_is_keyed_so_the_first_recovery_is_deduped(tmp_path):
     # The order-scoped guard has to be written by the attempt that PLACED the
     # order, not only by the recovery that rediscovers it. Writing it from the
