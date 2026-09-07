@@ -1504,6 +1504,7 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
             "genuinely failed fetch is spelled by listing it in source_errors (which aborts), "
             "never by omitting the key"
         )
+    source_payload = sources[spec.source.value]
     source_errors = payload.get("source_errors", [])
     if (
         source_errors is None
@@ -1541,12 +1542,22 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
     # $ROBINHOOD_AGENTIC_ACCOUNT_NUMBER to be exported just to GENERATE a
     # candidate list would block Gate 5 on a credential Gate 5 does not use.
     config = spec.config_loader(args.config_dir, allow_unpinned_account=True)
+    covered = set(args.already_covered_tickers)
+    remaining_tickers = [
+        t for t in config.tickers if t not in config.excluded_tickers and t not in covered
+    ]
+    if remaining_tickers and not source_payload:
+        raise ValueError(
+            f"--market-data has no usable 'sources.{spec.source.value}' payload "
+            "(absent, empty, or listed in 'source_errors'); this slot has exactly one "
+            "market-data source, so this is a data-evidence failure to abort on, not a quiet tape"
+        )
 
     document = build_document(
         spec,
         trading_day=trading_day,
         config=config,
-        market_data=sources[spec.source.value],
+        market_data=source_payload,
         source_errors=source_errors,
         ticker_errors=ticker_errors,
         already_covered_tickers=args.already_covered_tickers,

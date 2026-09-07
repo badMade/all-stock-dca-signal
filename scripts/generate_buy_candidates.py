@@ -1417,17 +1417,27 @@ def _validate_risk_guard_config(config: StrategyConfig) -> None:
     allocation = config.monthly_cash_allocation_usd
     if not math.isfinite(allocation):
         raise ValueError(f"config.monthly_cash_allocation_usd must be finite, got {allocation!r}")
-    # kill_switch_engaged() treats ANY non-positive allocation as the
-    # documented "operator left it unset" escape hatch (allocation <= 0 ->
-    # guard disabled), so a directly-constructed StrategyConfig carrying a
-    # NEGATIVE allocation -- corrupted data, not an intentional unset --
-    # would silently take that same escape hatch and disable the 7-day
-    # deployment kill switch without raising anything here. Zero is still
-    # the legitimate, documented unset value and must keep working
-    # (Antigravity/Codex review: "Reject negative monthly allocations in
-    # the public helper").
+    # Finite is not the whole story. kill_switch_engaged() treats ANY
+    # non-positive allocation as the documented "operator left it unset"
+    # escape hatch (allocation <= 0 -> guard disabled). ZERO is that
+    # legitimate, documented unset value and must keep working; NEGATIVE --
+    # corrupted data, not an intentional unset -- takes the same branch and
+    # disables the 7-day deployment kill switch identically, while being
+    # outside schemas/budgets.schema.json's own `minimum: 0` -- so it buys the
+    # escape hatch's behaviour without being the case the escape hatch
+    # documents (Antigravity/Codex review: "Reject negative monthly
+    # allocations in the public helper"). The check and its message are kept
+    # identical to MorningDCAExecutor.apply_deployment_risk_guard, whose
+    # docstring names this function as the validator it mirrors: fixing one
+    # and not the other would make that claim false and leave the two
+    # boundaries disagreeing about what a valid allocation is (Codex review:
+    # "Reject negative monthly allocation values").
     if allocation < 0:
-        raise ValueError(f"config.monthly_cash_allocation_usd must be non-negative, got {allocation!r}")
+        raise ValueError(
+            "config.monthly_cash_allocation_usd must be non-negative (0 is the documented "
+            f"'allocation unset' escape hatch), got {allocation!r}; a negative allocation "
+            "disables the deployment kill switch"
+        )
     fraction = config.kill_switch_7d_deploy_fraction
     if not 0 <= fraction <= 1:
         raise ValueError(f"config.kill_switch_7d_deploy_fraction must be within [0, 1], got {fraction!r}")

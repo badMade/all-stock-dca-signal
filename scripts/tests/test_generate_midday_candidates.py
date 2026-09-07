@@ -227,6 +227,24 @@ def test_flat_tape_is_a_quiet_tape_not_an_error():
     assert _only(document)["action"] == Action.SKIP.value
 
 
+def test_source_wide_missing_previous_close_aborts_despite_healthy_prices():
+    """Regression for partial source outages that still resolve current prices.
+
+    Start from a fully valid BUY payload and remove only the previous-close bar:
+    trend inputs and decision prices remain present, but evaluate_signal still
+    cannot produce a trade decision and every ticker degrades to NO_DATA.
+    """
+    data = _market_data(
+        TEST=_ticker_payload(
+            early_price=99.0, late_price=95.0, previous_close=100.0, previous_low=97.0
+        )
+    )
+    del data["sources"]["robinhood"]["TEST"]["previous_close_bar"]
+
+    with pytest.raises(ValueError, match="incomplete payload"):
+        _run(data)
+
+
 # --- the kill switch --------------------------------------------------------
 
 
@@ -520,6 +538,53 @@ def test_cli_end_to_end(tmp_path, monkeypatch):
     assert document["buy_count"] == 1
     assert document["cands"][0]["prior_close"] == pytest.approx(100.0)
     assert document["kill_switch_evaluated"] is True
+
+
+@pytest.mark.parametrize(
+    ("payload", "match"),
+    [
+        ({"sources": {}, "source_errors": []}, "missing the required"),
+        ({"sources": {"robinhood": {}}, "source_errors": ["robinhood"]}, "source_errors"),
+        ({"sources": {"robinhood": {}}, "source_errors": []}, "sources.robinhood"),
+    ],
+    ids=["absent", "declared-outage", "undeclared-empty"],
+)
+def test_cli_aborts_when_robinhood_payload_is_unusable(tmp_path, payload, match):
+    path = tmp_path / "market_data.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
+        gmc.main(
+            [
+                "--trading-day", DAY.isoformat(),
+                "--market-data", str(path),
+                "--config-dir", str(REAL_CONFIG_DIR),
+                "--deployed-last-7d-usd", "0",
+            ]
+        )
+
+
+def test_cli_all_covered_universe_allows_an_empty_robinhood_payload(tmp_path, monkeypatch):
+    _patch_config(monkeypatch)
+    path = tmp_path / "market_data.json"
+    path.write_text(
+        json.dumps({"sources": {"robinhood": {}}, "source_errors": [], "ticker_errors": {"robinhood": []}}),
+        encoding="utf-8",
+    )
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        exit_code = gmc.main(
+            [
+                "--trading-day", DAY.isoformat(),
+                "--market-data", str(path),
+                "--config-dir", str(REAL_CONFIG_DIR),
+                "--deployed-last-7d-usd", "0",
+                "--already-covered-tickers", "TEST",
+            ]
+        )
+    assert exit_code == 0
+    document = json.loads(stdout.getvalue())
+    assert document["buy_count"] == 0
+    assert document["cands"] == []
 
 
 @pytest.mark.parametrize("raw_value", ["-1", "NaN", "not-a-number"])
