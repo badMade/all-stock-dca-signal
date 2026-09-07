@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
+from dca_common import _num
 from dca_fileio import atomic_write_text
 
 # Placed-or-in-flight order statuses per
@@ -5367,13 +5368,6 @@ def _backfill_planned_amount(row: Optional[Dict[str, Any]], amount: Optional[flo
                 existing_planned = None
     if existing_planned is None:
         row["planned_amount_usd"] = amount
-
-
-def _num(value: Any) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
 
 
 def _finite_float(value: Any) -> Optional[float]:

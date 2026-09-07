@@ -541,10 +541,10 @@ def test_build_cost_tracker_markdown_comprehensive():
     assert "| compA | 10.0 | 2.5 | 25.0 |" in md_full
     assert "| compB | 5.0 | 1.0 | 5.0 |" in md_full
 
-    # We shouldn't strictly assert metricX/Y because _NUMERIC_PROXY_FIELDS controls the exact fields.
+    # We shouldn't strictly assert metricX/Y because USAGE_PROXY_NUMERIC_FIELDS controls the exact fields.
     # Instead, we verify that missing numeric proxy fields fall back to 0.0
-    from dca_cost_tracker import _NUMERIC_PROXY_FIELDS
-    for field in _NUMERIC_PROXY_FIELDS:
+    from dca_common import USAGE_PROXY_NUMERIC_FIELDS
+    for field in USAGE_PROXY_NUMERIC_FIELDS:
         assert f"| {field} | 0.0 |" in md_full or f"| {field} | " in md_full
 
 

@@ -32,6 +32,7 @@ if str(pathlib.Path(__file__).resolve().parent.parent) not in sys.path:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from conftest import FIXTURE_ACCOUNT_NUMBER
+from dca_common import USAGE_PROXY_FIELDS
 from dca_cumulative import CumulativeCreditLedger, MinimumOrderDiscard
 from dca_whole_share_accumulator import WholeShareAccumulationLedger
 from near_close_dca import (
@@ -52,7 +53,6 @@ from near_close_dca import (
     TOP_UP_MISSING_PRIOR_PRICE,
     TOP_UP_NO_PRIOR_RUN,
     TOP_UP_NOT_LOWER_OR_NO_DELTA,
-    USAGE_PROXY_FIELDS,
     WHOLE_SHARE_TICKERS,
     Action,
     AlpacaBroker,
@@ -33114,7 +33114,7 @@ def test_an_unresolved_halt_flags_manual_recovery_required(tmp_path):
     assert usage["errors_count"] >= 1
     # Every documented field is present, so a consumer need not special-case
     # the failure artifact.
-    for field in near_close_dca.USAGE_PROXY_FIELDS:
+    for field in USAGE_PROXY_FIELDS:
         assert field in usage
 
 

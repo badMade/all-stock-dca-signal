@@ -26,6 +26,7 @@ import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from dca_common import USAGE_PROXY_NUMERIC_FIELDS, _num
 from dca_fileio import atomic_write_text
 
 logger = logging.getLogger("near_close_dca.cost_tracker")
@@ -36,23 +37,6 @@ PROXY_DISCLAIMER = (
     "Estimates only — derived from local activity proxies (call/row/order/byte "
     "counts), not exact credit or dollar spend. Relative proxy weights are unitless "
     "and exist only to rank which components dominate automation load."
-)
-
-# Numeric usage-proxy fields summed across a month. ``manual_recovery_required`` is
-# a per-run boolean handled separately; ``cost_control_notes`` is non-numeric.
-_NUMERIC_PROXY_FIELDS = (
-    "tickers_scanned",
-    "finance_calls_attempted",
-    "robinhood_calls_attempted",
-    "signal_rows_written",
-    "buy_candidates_written",
-    "order_reviews_attempted",
-    "orders_placed_count",
-    "state_file_bytes",
-    "csv_artifact_count",
-    "total_artifact_bytes",
-    "notifications_sent",
-    "errors_count",
 )
 
 # Component -> (usage-proxy fields feeding its count, unitless proxy weight).
@@ -67,13 +51,6 @@ COMPONENT_DEFINITIONS: tuple[tuple[str, tuple[str, ...], float], ...] = (
     ("artifact_io_kb", ("total_artifact_bytes",), 0.001),
     ("errors_recovery", ("errors_count",), 1.0),
 )
-
-
-def _num(value: Any) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
 
 
 def find_run_state_files(root: str | Path) -> List[Path]:
@@ -311,7 +288,7 @@ def aggregate_usage(
     :func:`_fallback_usage_proxy` can derive a conservative one from evaluated
     signal counts -- see its own docstring.
     """
-    totals: Dict[str, float] = {field: 0.0 for field in _NUMERIC_PROXY_FIELDS}
+    totals: Dict[str, float] = {field: 0.0 for field in USAGE_PROXY_NUMERIC_FIELDS}
     manual_recovery_runs = 0
 
     valid_usages = []
@@ -328,7 +305,7 @@ def aggregate_usage(
 
     # Field-wise sum() is retained here (rather than a manual nested loop) because
     # it benchmarks faster for the larger record counts this rollup sees in practice.
-    for field in _NUMERIC_PROXY_FIELDS:
+    for field in USAGE_PROXY_NUMERIC_FIELDS:
         totals[field] = sum(_num(u.get(field)) for u in valid_usages)
 
     components: List[Dict[str, Any]] = []
@@ -394,7 +371,7 @@ def build_cost_tracker_markdown(aggregate: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("| Proxy metric | Total |")
     lines.append("| --- | --- |")
-    for field in _NUMERIC_PROXY_FIELDS:
+    for field in USAGE_PROXY_NUMERIC_FIELDS:
         lines.append(f"| {field} | {totals.get(field, 0.0)} |")
     lines.append("")
     return "\n".join(lines)

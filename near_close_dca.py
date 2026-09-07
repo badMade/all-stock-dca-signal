@@ -193,26 +193,6 @@ _ACCOUNT_NUMBER_SHAPE = re.compile(r"^[0-9]{6,12}$")
 _env_account = os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER")
 ROBINHOOD_AGENTIC_ACCOUNT_NUMBER = _env_account or _UNSET_ACCOUNT_SENTINEL
 
-# Lightweight usage-proxy fields logged to each live run's run_state so the monthly
-# cost tracker can aggregate automation load without any exact credit accounting.
-# All numbers are activity proxies (call/row/byte counts), never real credit spend.
-USAGE_PROXY_FIELDS = (
-    "tickers_scanned",
-    "finance_calls_attempted",
-    "robinhood_calls_attempted",
-    "signal_rows_written",
-    "buy_candidates_written",
-    "order_reviews_attempted",
-    "orders_placed_count",
-    "state_file_bytes",
-    "csv_artifact_count",
-    "total_artifact_bytes",
-    "notifications_sent",
-    "errors_count",
-    "manual_recovery_required",
-    "cost_control_notes",
-)
-
 # Default cost-control notes recorded on the compact daily live path. They document
 # the work deliberately NOT done daily so the choice is auditable from the artifact.
 DAILY_COST_CONTROL_NOTES = (
