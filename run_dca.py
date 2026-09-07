@@ -2025,6 +2025,74 @@ def _accepted_order_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
 
 
+def _pipeline_result_ok(result: Any) -> bool:
+    """Predicate for guarded_run to determine if a pipeline run succeeded.
+
+    The raw-persistence failure path and the preflight-blocked path
+    both report their failure as a returned result (each with its own
+    targeted alert) instead of raising; either must ping a FAILED
+    heartbeat, not clear the dead-man's switch (Codex review: "Route
+    the preflight-blocked result through guarded_run"). A directory-
+    ownership conflict (an overlapping invocation or a different
+    account claimed the shared artifacts directory) is the same
+    shape of silent failure: _run_pipeline_impl returns a normal-
+    looking result with directory_ownership_verified=False and
+    otherwise no error field this predicate already checks, so
+    without this clause a scheduled live run whose artifact
+    publication was rejected -- any live placements possibly
+    surviving only in a manual-reconciliation sidecar -- still
+    cleared the success heartbeat and sent no failure alert (Codex
+    review: "Fail the heartbeat on directory ownership conflicts").
+    """
+    return not (
+        isinstance(result, dict)
+        and (
+            result.get("raw_persistence_error")
+            or result.get("error_class") == ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT
+            or result.get("directory_ownership_verified") is False
+        )
+    )
+
+
+def _log_pipeline_model_usage(
+    result: Dict[str, Any],
+    now: datetime,
+    scheduled: bool,
+    cron_id: str,
+    model_usage_log_root: Optional[str | Path],
+    model_usage_model_requested: Optional[str],
+    model_usage_model_actual: Optional[str],
+    model_usage_model_routing_mode: Optional[str],
+    model_usage_reason_for_premium_model: Optional[str],
+) -> None:
+    """Extract run_id from run_state_path and log model usage."""
+    run_state_path = result.get("run_state_path")
+    run_id = None
+    if run_state_path:
+        try:
+            run_id = json.loads(
+                # ⚡ Bolt Optimization: Keep I/O in binary; json.loads accepts bytes and decodes internally before parsing
+                Path(run_state_path).read_bytes()
+            ).get("run_id")
+        except (OSError, json.JSONDecodeError):
+            run_id = None
+    routing_overrides = {
+        "model_requested": model_usage_model_requested,
+        "model_actual": model_usage_model_actual,
+        "model_routing_mode": model_usage_model_routing_mode,
+        "reason_for_premium_model": model_usage_reason_for_premium_model,
+    }
+    log_model_usage(
+        root=model_usage_log_root,
+        run_id=run_id,
+        cron_id=cron_id,
+        run_origin="scheduled" if scheduled else "manual",
+        artifact_path=run_state_path,
+        triggered_at_utc=now.astimezone(timezone.utc),
+        **{k: v for k, v in routing_overrides.items() if v is not None},
+    )
+
+
 def run_pipeline(
     now: datetime,
     config: StrategyConfig,
@@ -2125,30 +2193,16 @@ def run_pipeline(
             stream=stream_name,
             preflight_gate=preflight_gate,
         )
-        run_state_path = result.get("run_state_path")
-        run_id = None
-        if run_state_path:
-            try:
-                run_id = json.loads(
-                    # ⚡ Bolt Optimization: Keep I/O in binary; json.loads accepts bytes and decodes internally before parsing
-                    Path(run_state_path).read_bytes()
-                ).get("run_id")
-            except (OSError, json.JSONDecodeError):
-                run_id = None
-        routing_overrides = {
-            "model_requested": model_usage_model_requested,
-            "model_actual": model_usage_model_actual,
-            "model_routing_mode": model_usage_model_routing_mode,
-            "reason_for_premium_model": model_usage_reason_for_premium_model,
-        }
-        log_model_usage(
-            root=model_usage_log_root,
-            run_id=run_id,
-            cron_id=cron_id,
-            run_origin="scheduled" if scheduled else "manual",
-            artifact_path=run_state_path,
-            triggered_at_utc=now.astimezone(timezone.utc),
-            **{k: v for k, v in routing_overrides.items() if v is not None},
+        _log_pipeline_model_usage(
+            result,
+            now,
+            scheduled,
+            cron_id,
+            model_usage_log_root,
+            model_usage_model_requested,
+            model_usage_model_actual,
+            model_usage_model_routing_mode,
+            model_usage_reason_for_premium_model,
         )
         return result
 
@@ -2190,14 +2244,7 @@ def run_pipeline(
             # surviving only in a manual-reconciliation sidecar -- still
             # cleared the success heartbeat and sent no failure alert (Codex
             # review: "Fail the heartbeat on directory ownership conflicts").
-            result_ok=lambda result: not (
-                isinstance(result, dict)
-                and (
-                    result.get("raw_persistence_error")
-                    or result.get("error_class") == ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT
-                    or result.get("directory_ownership_verified") is False
-                )
-            ),
+            result_ok=_pipeline_result_ok,
         ),
     )
 
