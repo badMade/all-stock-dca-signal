@@ -464,3 +464,36 @@ def test_bundled_config_paths_rebase_onto_the_repo_default(monkeypatch):
 def test_an_explicit_unrelated_absolute_path_is_still_untouched(monkeypatch):
     monkeypatch.delenv(CRON_TRACKING_ROOT_ENV, raising=False)
     assert rebase_bundled_root("/srv/elsewhere/midday_dca") == "/srv/elsewhere/midday_dca"
+def test_rebase_bundled_roots_in(monkeypatch):
+    """Test rebase_bundled_roots_in correctly rewrites paths recursively."""
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/new_root")
+
+    input_data = {
+        "path1": f"{BUNDLED_CRON_TRACKING_ROOT}/test1",
+        "path2": f"{BUNDLED_CRON_TRACKING_ROOT}/test2",
+        "nested": {
+            "path3": f"{BUNDLED_CRON_TRACKING_ROOT}/test3",
+            "not_a_path": "just a string",
+            "number": 42,
+        },
+        "list_paths": [
+            f"{BUNDLED_CRON_TRACKING_ROOT}/test4",
+            "another string"
+        ]
+    }
+
+    expected_output = {
+        "path1": "/new_root/test1",
+        "path2": "/new_root/test2",
+        "nested": {
+            "path3": "/new_root/test3",
+            "not_a_path": "just a string",
+            "number": 42,
+        },
+        "list_paths": [
+            "/new_root/test4",
+            "another string"
+        ]
+    }
+
+    assert rebase_bundled_roots_in(input_data) == expected_output
