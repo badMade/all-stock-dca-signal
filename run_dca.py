@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import concurrent.futures
 import csv
 import json
 import logging
@@ -34,6 +33,7 @@ import math
 import os
 import shutil
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -1408,7 +1408,7 @@ def _refresh_fills_from_broker(
             return oid, tkr, row_status, None
 
     if getattr(broker, "supports_concurrent_fill_lookup", False):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=10) as executor:
             # Use map to preserve the order of elements from queries
             results = list(executor.map(_fetch, queries))
     else:
