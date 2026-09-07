@@ -7726,3 +7726,43 @@ def test_this_run_submitted_notional_rejects_non_finite_broker_only_amount():
         },
     }
     assert _this_run_submitted_notional(usable_outcome_only) == 7.0
+
+def test_build_sector_matrix():
+    run_states = [
+        {
+            "buy_candidates": [
+                {"ticker": "AAPL", "planned_amount_usd": 150.0},
+                {"ticker": "MSFT", "planned_amount_usd": 250.0},
+                {"ticker": "V", "planned_amount_usd": 100.0},
+                {"ticker": "AAPL", "planned_amount_usd": 50.0, "reason": "settlement_adjustment"}
+            ]
+        },
+        {
+            "buy_candidates": [
+                {"ticker": "JPM", "planned_amount_usd": 200.0},
+                {"ticker": "UNKNOWN", "planned_amount_usd": 50.0}
+            ]
+        }
+    ]
+
+    sector_map = {
+        "AAPL": "Technology",
+        "MSFT": "Technology",
+        "V": "Financials",
+        "JPM": "Financials"
+    }
+
+    report = build_sector_matrix(run_states, sector_map)
+
+    assert "| Financials | 2 | $300.00 |" in report
+    assert "| Technology | 3 | $450.00 |" in report
+    assert "| Unclassified | 1 | $50.00 |" in report
+
+def test_build_sector_matrix_empty():
+    run_states = [
+        {
+            "buy_candidates": []
+        }
+    ]
+    report = build_sector_matrix(run_states)
+    assert "| _no candidates_ | 0 | $0.00 |" in report
