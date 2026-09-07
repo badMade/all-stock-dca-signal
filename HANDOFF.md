@@ -1,6 +1,7 @@
 # Handoff: local DCA console and project memory
 
-Saved after the 2026-09-06 implementation and memory sessions.
+Saved after the 2026-09-06 implementation and memory sessions; refreshed in the
+current worktree at the user's request.
 
 ## User intent and completed work
 
@@ -16,11 +17,17 @@ and limitations. `AGENTS.md` points future project sessions to these resources.
 
 ## Working-tree state
 
-Branch at handoff: `main`.
-Base HEAD: `40a35dbe96b7e9b2592ad4a4ceb3ec338a071b97`.
+Current checkout: `/Users/geoffreyplymale/.codex/worktrees/012d/all-stock-dca`.
+Branch at this handoff: `codex/fix-cost-chart`.
+Current HEAD: `9eee9fe39561ebb25baa7ab6b3ce92f350ebc001`.
 
-All session changes remain **uncommitted**; no commit, push or PR was requested.
-Preserve this working tree when resuming.
+The console implementation, memory, and previous handoff are already tracked in
+this checkout. The worktree was clean before this handoff refresh; this refresh
+is an uncommitted documentation edit. No commit, push or PR was performed for
+this request. Resume work here, not in the original Documents/Git checkout.
+
+Original pre-console baseline, referenced by the historical verification below:
+`40a35dbe96b7e9b2592ad4a4ceb3ec338a071b97`.
 
 | Files | Changes |
 | --- | --- |
@@ -60,7 +67,7 @@ repository `.venv` for jobs. Research needs NumPy/pandas/scikit-learn; the neura
 Octopus action also needs PyTorch. All were detected in the local environment
 during implementation. `--research-python` can select another environment.
 
-At handoff, `http://127.0.0.1:8765/api/health` returned
+During the original checkout's session, `http://127.0.0.1:8765/api/health` returned
 `{"status":"ok","mode":"demo"}`. The process was launched with:
 
 ```bash
@@ -69,7 +76,9 @@ python3 from.py --no-browser --port 8765 --output-dir /tmp/dca-console-browser
 
 Its demo artifacts and summaries are below `/tmp/dca-console-browser`. This is
 a disposable test-output location, not a production path. Verify that the
-process and files still exist before relying on them. If the port is occupied,
+process and files still exist before relying on them. That process was launched
+from the original checkout; it is not evidence that this worktree is being served.
+No server was started or verified during this handoff refresh. If the port is occupied,
 inspect the existing console or use `--port 0`; do not blindly kill another
 process. Default output otherwise follows `dca_paths.stream_root('console')`.
 
@@ -108,8 +117,10 @@ the console; do not attribute them to this change or silently suppress them.
 No fix to that strategy behavior was attempted in this task.
 
 The memory/handoff changes are documentation only. The full-suite result above
-comes from the immediately preceding memory turn; this handoff records that
-evidence rather than claiming another full-suite run.
+comes from the original checkout's memory turn; this handoff records that
+evidence rather than claiming another full-suite run in the new worktree.
+This location-only refresh was checked with `git diff --check`; runtime tests
+were not repeated because it changes no executable code.
 
 ## Boundaries and remaining setup
 
