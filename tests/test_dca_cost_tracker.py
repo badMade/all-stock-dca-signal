@@ -569,6 +569,152 @@ def test_find_run_state_files(tmp_path):
     assert find_run_state_files(empty_dir) == []
 
 
+
+def test_collect_retains_blocked_run_with_unparseable_evaluated_count(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "counts": {"evaluated": "not-a-number"}
+            }
+        ),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 2
+
+def test_collect_retains_blocked_run_with_invalid_evaluated_count(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "counts": {"evaluated": float("nan")}
+            }
+        ),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 2
+
+def test_collect_retains_blocked_run_with_signal_rows(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "signal_rows": [{"ticker": "AAPL"}]
+            }
+        ),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 2
+
+def test_collect_retains_blocked_run_with_unparseable_submitted_count(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "orders_submitted_count": "not-a-number"
+            }
+        ),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 2
+
+def test_collect_retains_blocked_run_with_outcome_bearing_status(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "broker_outcomes": {"AAA": {"status": "submitted"}}
+            }
+        ),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 2
+
+def test_collect_skips_malformed_candidate(tmp_path):
+    # Tests line 205 (malformed candidate list)
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "buy_candidates": ["not-a-dict"]
+            }
+        ),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    # The malformed candidate should be skipped by the loop in _is_empty_blocked_stub,
+    # meaning the loop finishes and returns True (it IS an empty blocked stub),
+    # so the run state is DROPPED from states.
+    assert len(states) == 1
+
+def test_collect_retains_blocked_run_with_candidate_order_id(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "buy_candidates": [{"order_id": "ORD123"}]
+            }
+        ),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 2
+
+
+
+def test_collect_skips_missing_trading_day(tmp_path):
+    # Needs the prefix in the text to pass the fast substring filter
+    (tmp_path / "runs").mkdir()
+    (tmp_path / "runs/run_state.json").write_text(
+        json.dumps({"some_key": "2026-06-something", "status": "ok"}),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 0
+
+def test_collect_skips_mismatched_trading_day_type(tmp_path):
+    (tmp_path / "runs").mkdir()
+    (tmp_path / "runs/run_state.json").write_text(
+        json.dumps({"trading_day": 20260630, "some_string": "2026-06-30"}),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 0
+
+
 def _run_all():
     import inspect
 
