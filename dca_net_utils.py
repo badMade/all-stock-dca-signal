@@ -20,12 +20,12 @@ Entry points:
     redirect hop so an initially-allowed URL cannot 302 its way past it.
 """
 
-import http.client
 import ipaddress
 import logging
 import socket
 import urllib.error
 import urllib.request
+from http.client import HTTPConnection, HTTPSConnection
 from typing import Optional
 from urllib.parse import urlsplit
 
@@ -149,7 +149,7 @@ def assert_safe_destination(url: str) -> None:
         raise UnsafeDestinationError("host resolves to a disallowed address")
 
 
-def connect_pinned(conn: "http.client.HTTPConnection") -> None:
+def connect_pinned(conn: "HTTPConnection") -> None:
     """Resolve ``conn.host``, validate every resolved address, and connect to
     one of the validated addresses -- all in one step.
 
@@ -184,7 +184,7 @@ def connect_pinned(conn: "http.client.HTTPConnection") -> None:
     raise last_exc if last_exc is not None else OSError("no address to connect to")
 
 
-class PinnedHTTPConnection(http.client.HTTPConnection):
+class PinnedHTTPConnection(HTTPConnection):
     """An HTTP connection that pins its socket to a validated address (see
     :func:`_connect_pinned`) instead of independently re-resolving ``host``.
     """
@@ -193,7 +193,7 @@ class PinnedHTTPConnection(http.client.HTTPConnection):
         connect_pinned(self)
 
 
-class PinnedHTTPSConnection(http.client.HTTPSConnection):
+class PinnedHTTPSConnection(HTTPSConnection):
     """The HTTPS equivalent of :class:`_PinnedHTTPConnection`.
 
     ``HTTPSConnection.connect()`` calls ``super().connect()`` to obtain the
@@ -243,7 +243,7 @@ class PinnedHTTPHandler(urllib.request.HTTPHandler):
 
     def http_open(self, req):
         if request_is_proxied(req):
-            return self.do_open(http.client.HTTPConnection, req)
+            return self.do_open(HTTPConnection, req)
         return self.do_open(PinnedHTTPConnection, req)
 
 
@@ -258,7 +258,7 @@ class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
         # Only pass context, not check_hostname: on Python 3.12+,
         # HTTPSHandler.__init__ folds check_hostname into the SSL context
         # and no longer sets self._check_hostname at all, and
-        # http.client.HTTPSConnection.__init__ no longer accepts a
+        # HTTPSConnection.__init__ no longer accepts a
         # check_hostname argument either -- accessing/forwarding it here
         # raised AttributeError/TypeError on every real HTTPS request under
         # 3.12+ (Codex review on this PR). This handler is always
@@ -267,7 +267,7 @@ class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
         # making this identical in practice to the stock 3.11 behavior.
         context = getattr(self, "_context", None)
         if request_is_proxied(req):
-            return self.do_open(http.client.HTTPSConnection, req, context=context)
+            return self.do_open(HTTPSConnection, req, context=context)
         return self.do_open(PinnedHTTPSConnection, req, context=context)
 
 
