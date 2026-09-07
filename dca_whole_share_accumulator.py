@@ -962,6 +962,743 @@ class WholeShareAccumulationLedger:
             if entry.is_dir() and _SYMBOL_PATTERN.match(entry.name)
         )
 
+    def _redispatch_resolved_or_placed_claim(
+        self,
+        state: Dict[str, Any],
+        day_dir: Path,
+        state_path: Path,
+        dedup_key: str,
+        cached: Dict[str, Any],
+        trading_day: str,
+        contribution_usd: float,
+        current_share_price_usd: float,
+        stream: str,
+        recorded_at: Optional[str],
+    ) -> WholeShareAccumulationDecision:
+        # A cached entry currently marked "placed" (broker
+        # accepted the order via execute_claimed(), settle() has
+        # not yet run) is NOT eligible for the redispatch fix
+        # below even if it happens to also be "resolved" from a
+        # PRIOR fire under this same slot -- reclaiming or
+        # redispatching a live, in-flight broker submission here
+        # would let a retry act on a SECOND fire while the first
+        # is still being settled, double-spending the same
+        # dedup_key (Codex review discussion_r3804235552, "Reject
+        # already-placed claims"; mirrored here on the
+        # record_contribution side of that same fix -- the
+        # execute_claimed()-side half rejects an in-flight
+        # placement, this half stops a retry from ever reaching
+        # it in the first place).
+        #
+        # "placing" (set by execute_claimed() durably BEFORE it
+        # calls the broker, cleared once it writes "placed" or
+        # once the claim is later resolved via settle()/
+        # preserve_pending()) means "a submission for this claim
+        # was attempted, but this ledger does not yet know
+        # whether it succeeded" -- e.g. the owning process was
+        # SIGKILLed between the broker accepting the order and
+        # this ledger recording that fact. Treating a
+        # "placing"-only entry as freely reclaimable here would
+        # let this retry pass execute_claimed()'s own checks (the
+        # OS lock the crashed owner held has already released)
+        # and submit the SAME fire a second time while the first
+        # order may still be genuinely live and simply not yet
+        # visible in eventually-consistent broker history (Codex
+        # review discussion_r3818217230, "Persist placement
+        # intent before invoking the broker"). Unlike an
+        # ordinary unresolved-and-reclaimable claim, a
+        # "placing"-only entry is NOT resolved here -- it stays
+        # exactly as-is (falls through to the flat "nothing to
+        # do" return below, mirroring the resolved/placed case)
+        # until a caller reconciles it against actual broker
+        # order history and calls settle()/preserve_pending()
+        # (both of which clear "placing" as part of resolving
+        # the claim). It remains discoverable for that
+        # reconciliation the whole time: unresolved_claim()/
+        # unresolved_claims_any_day() key off "resolved" alone,
+        # not "placed"/"placing", so a "placing" claim is never
+        # invisible to the existing reconciliation machinery.
+        if (
+            cached.get("resolved")
+            and not cached.get("placed")
+            and not cached.get("placing")
+            and contribution_usd <= 0
+        ):
+            # A ZERO-contribution retry against an already-resolved
+            # slot -- e.g. the preserved-fire redispatch loop in
+            # _run_once_impl, re-checking a ticker whose earlier fire
+            # was blocked by a transient gate (ceiling/cap/spread/
+            # review) and restored via preserve_pending -- must not
+            # be flattened to "nothing to do" forever just because
+            # THIS exact (trading_day, idempotency_key) slot already
+            # resolved once. preserve_pending's restoration already
+            # put that fire's full notional back into
+            # state["pending_usd"]; if that restored balance ALONE
+            # (no new money added -- contribution_usd is 0) now
+            # covers a share at the CURRENT price, this is a
+            # genuinely NEW, actionable fire the caller should act
+            # on, not a duplicate of the one already resolved. The
+            # old unconditional zero-shares return stranded that
+            # restored balance until some LATER day's signal
+            # happened to be a fresh BUY again, with no bound on how
+            # long that might take (Codex review: "Allow same-day
+            # redispatch of preserved fires"). A NONZERO
+            # contribution_usd here (a genuine fresh BUY signal, not
+            # a redispatch) is intentionally left out of scope --
+            # re-opening a resolved slot for new money risks
+            # double-counting the original contribution and is a
+            # separate concern from this narrow redispatch case.
+            # Also gated (above) on NOT "placed" -- a "placed"
+            # entry is a live/just-settled broker submission, not
+            # a preserve_pending() restoration, so there is no
+            # freed balance here that redispatching should act on
+            # (Codex review discussion_r3804235552).
+            restored_credit = _redispatchable_credit_usd(
+                cached, state["pending_usd"], float(state.get(_WITHDRAWN_TOTAL_FIELD, 0.0))
+            )
+            redispatch = apply_contribution(restored_credit, 0.0, current_share_price_usd)
+            if redispatch.shares_to_buy > 0:
+                # Off the CAPPED decision, before the replace()
+                # below rewrites the balances to the full pool's:
+                # what this claim did not spend of its OWN credit,
+                # not what unrelated contributions left behind.
+                claim_remainder = redispatch.pending_after_usd
+                total_pending = state["pending_usd"]
+                redispatch = replace(
+                    redispatch,
+                    pending_before_usd=total_pending,
+                    pending_after_usd=round(total_pending - redispatch.order_notional_usd, 2),
+                )
+                # A redispatched fire is just as actionable as a
+                # fresh or reclaimed one, so it needs the SAME
+                # fencing: without a fresh token here, every
+                # caller wired for claim_token ownership checks
+                # (still_claimed/preserve_pending/settle) would
+                # see claim_token=None for this decision and fall
+                # back to timestamp-only matching, losing the
+                # same-timestamp reclaim protection this PR adds
+                # for every other positive decision (Codex
+                # review: "Issue an ownership token for
+                # redispatched fires").
+                redispatch = replace(redispatch, claim_token=uuid4().hex)
+                cached["resolved"] = False
+                cached["claimed_at"] = recorded_at
+                cached["claim_token"] = redispatch.claim_token
+                # A fresh claim_token means a genuinely NEW fire
+                # attempt -- settle()'s shares_credited marker
+                # (see its own docstring) is scoped to the
+                # PHYSICAL order a specific claim_token
+                # represents, not to this reusable dedup_key
+                # entry across its whole lifetime. Left set from
+                # the PRIOR (already-settled) fire this slot
+                # resolved, a genuinely new physical purchase
+                # placed under this redispatch would silently
+                # never get counted into shares_purchased_total
+                # (Codex review: "Reset the credit marker when
+                # redispatching a new fire").
+                cached["shares_credited"] = False
+                cached["placed"] = False
+                cached["pending_before_usd"] = redispatch.pending_before_usd
+                cached["contribution_usd"] = 0.0
+                cached["current_share_price_usd"] = redispatch.current_share_price_usd
+                cached["shares_to_buy"] = redispatch.shares_to_buy
+                cached["order_notional_usd"] = redispatch.order_notional_usd
+                cached["pending_after_usd"] = redispatch.pending_after_usd
+                _record_withdrawal(state, redispatch.order_notional_usd)
+                cached[_CLAIM_REMAINDER_FIELD] = claim_remainder
+                # Snapshotted AFTER this fire's own withdrawal, so
+                # a claim never writes off its own remainder. The
+                # tie offset (see _allocate_credit_tie_offset())
+                # naturally comes back $0 here in the ordinary
+                # case -- this fire's own withdrawal just moved
+                # the counter, starting a fresh batch -- but
+                # routing it through the same helper as every
+                # other write site (rather than a bare counter
+                # read) still protects the rare case where
+                # ANOTHER claim's snapshot already ties at this
+                # exact post-withdrawal instant (Codex review:
+                # "Avoid charging one withdrawal to every restored
+                # claim").
+                cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = _allocate_credit_tie_offset(
+                    state, claim_remainder, dedup_key=dedup_key, field=_CLAIM_REMAINDER_FIELD
+                )
+                cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
+                # The order was sized off restored_credit, but the
+                # balance fields above now report the whole pool.
+                # A reclaim of this still-unresolved fire must
+                # re-size from the CAP, never from those reported
+                # balances -- see _claim_sizing_basis_usd().
+                cached[_CLAIM_SIZING_BASIS_FIELD] = restored_credit
+                recorded_keys = state.setdefault("recorded_idempotency_keys", {})
+                recorded_keys[dedup_key] = cached
+                state["pending_usd"] = redispatch.pending_after_usd
+                state["events"].append(
+                    {
+                        "trading_day": trading_day,
+                        "stream": stream,
+                        "recorded_at": recorded_at,
+                        "pending_before_usd": redispatch.pending_before_usd,
+                        "contribution_usd": 0.0,
+                        "current_share_price_usd": redispatch.current_share_price_usd,
+                        "shares_to_buy": redispatch.shares_to_buy,
+                        "order_notional_usd": redispatch.order_notional_usd,
+                        "pending_after_usd": redispatch.pending_after_usd,
+                        "decision": "redispatch_fire",
+                    }
+                )
+                day_dir.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+                return redispatch
+        # contribution_usd is 0.0, not the original cached
+        # amount -- this call makes NO new contribution (the
+        # ledger already reflects that original contribution;
+        # pending_usd is untouched here). Reporting the ORIGINAL
+        # positive amount double-counted it: a caller (see
+        # _process_whole_share_candidate) persists this field as
+        # "what THIS call contributed" for run-artifact
+        # reporting, so a resolved-slot retry (e.g. after a
+        # below-threshold accumulation, or a blocked fire that
+        # was preserved) would otherwise describe a contribution
+        # that never actually happened on this call (Codex
+        # review: "Report zero contribution for resolved slot
+        # retries").
+        return WholeShareAccumulationDecision(
+            pending_before_usd=cached["pending_before_usd"],
+            contribution_usd=0.0,
+            current_share_price_usd=cached["current_share_price_usd"],
+            shares_to_buy=0,
+            order_notional_usd=0.0,
+            pending_after_usd=state["pending_usd"],
+        )
+
+    def _reprice_unresolved_claim(
+        self,
+        state: Dict[str, Any],
+        state_path: Path,
+        dedup_key: str,
+        cached: Dict[str, Any],
+        trading_day: str,
+        current_share_price_usd: float,
+        stream: str,
+        recorded_at: Optional[str],
+    ) -> WholeShareAccumulationDecision:
+        # Reclaim immediately -- no wall-clock staleness wait. PR #515
+        # replaced the former UNRESOLVED_CLAIM_STALE_SECONDS lease
+        # (which used to gate this branch on elapsed time) with
+        # ownership enforced by execute_claimed()'s cross-process
+        # lock, which spans both the final ownership check and the
+        # actual irreversible broker call: a caller that is genuinely
+        # still live and about to place through execute_claimed()
+        # either already holds that lock (this call blocks until it
+        # releases) or, if this call reclaims first, will itself fail
+        # execute_claimed()'s own ownership check once it gets there
+        # and abstain -- so an immediate reclaim here can never let
+        # two callers both submit the same fire. A crashed owner's
+        # claim is reclaimed on the very next retry instead of making
+        # every retry wait out a fixed lease. Re-price it against the
+        # CURRENT quote (this call's own current_share_price_usd
+        # argument), not
+        # the original attempt's stale cached price: a fire claimed
+        # at $10 and reclaimed after the price moved to $20 would
+        # otherwise still hand back a decision sized (quantity AND
+        # notional) for the stale $10 price -- and the caller passes
+        # that STALE current_share_price_usd straight into
+        # _whole_share_risk_gates for the max_per_order_usd ceiling
+        # check, letting a one-share order that actually costs ~$20
+        # pass a $10-per-order ceiling as if it only cost $10 (Codex
+        # review: "Reprice reclaimed stale fires before placement").
+        # The total dollars already committed (pending_before_usd +
+        # contribution_usd from the ORIGINAL call) is unaffected by
+        # price -- only how many shares that total buys, and how
+        # much remains pending, changes with the fresh price.
+        # Read BEFORE the reprice is sized, not after. The claim can
+        # only command what it still OWNS: the money already reserved
+        # in its outstanding order, plus whatever of its own remainder
+        # survives in the pool. Sizing off the frozen
+        # basis + contribution alone assumes the original remainder is
+        # still exclusively its own, and the balance check further down
+        # only asks whether the POOL can cover the increase -- which it
+        # can, out of somebody else's money. A fires $16 from a $20
+        # basis leaving $4, B consumes that $4, C later contributes $4,
+        # and reclaiming A at a price that raises its order to $20
+        # swallowed C's whole contribution (Codex review: "Cap
+        # repricing by the claim's surviving remainder").
+        #
+        # Charged against the counter as it stands BEFORE this reclaim's
+        # own withdrawal, so a claim is never made to write off its own
+        # draw.
+        surviving_remainder = _claim_credit_remainder_usd(
+            cached, state["pending_usd"], float(state.get(_WITHDRAWN_TOTAL_FIELD, 0.0))
+        )
+        had_prior_remainder = _CLAIM_REMAINDER_FIELD in cached
+        reserved_usd = _finite_non_negative(cached.get("order_notional_usd")) or 0.0
+        frozen_total = _claim_sizing_basis_usd(cached) + float(cached["contribution_usd"])
+        if had_prior_remainder:
+            # An entry with no remainder field predates it; there is
+            # nothing to age, so it keeps the frozen total it has always
+            # used.
+            reprice_total = min(frozen_total, reserved_usd + surviving_remainder)
+        else:
+            reprice_total = frozen_total
+        repriced = apply_contribution(
+            reprice_total, 0.0, current_share_price_usd
+        )
+        # Reconcile the repriced remainder against the ledger's
+        # CURRENT balance, not an absolute snapshot -- mirroring
+        # preserve_pending's own established convention. A DIFFERENT
+        # idempotency key can have recorded its own contribution
+        # (advancing state["pending_usd"]) any time between this
+        # fire's original claim and its reclaim here; overwriting
+        # state["pending_usd"] with repriced.pending_after_usd
+        # outright would silently discard that later activity (e.g.
+        # a $15 fire at $10 leaves $5 pending; a later $4
+        # contribution under another key makes it $9; reclaiming the
+        # first fire at $20 must write $9 + ($15 repriced remainder -
+        # $5 original remainder) = $19, not a bare $15) (Codex
+        # review: "Preserve newer ledger activity while repricing
+        # stale claims").
+        # Expressed as the change in what this claim RESERVES from the
+        # pool, not as the difference between two remainders. The two
+        # are identical whenever the sizing basis and the reported
+        # balance are the same figure, but a capped redispatch makes
+        # them diverge -- its cached remainder is pool-level while the
+        # repriced remainder is basis-level, and subtracting one from
+        # the other would move the pool by an amount neither reserved.
+        pending_delta = cached["order_notional_usd"] - repriced.order_notional_usd
+        # A DOWNWARD reprice (the price dropped) can make
+        # pending_delta more negative than the currently available,
+        # unreserved balance: the reclaim's total is recomputed from
+        # the ORIGINAL frozen pending_before_usd/contribution_usd,
+        # which assumes the full original remainder is still
+        # exclusively this claim's -- but if a DIFFERENT key already
+        # spent part of that shared pool (its own fire, funded in
+        # part by this claim's original remainder), only what is
+        # CURRENTLY unspent is actually safe to draw further from.
+        # Applying the delta anyway would drive state["pending_usd"]
+        # negative and hand back an actionable decision that spends
+        # more than what remains (Codex review: "Prevent downward
+        # repricing from overdrawing pending credit"). Defer instead:
+        # leave this claim exactly as-is (unresolved, untouched) and
+        # return the same "nothing to do" decision the still-reserved
+        # branch above returns -- a later retry, once the pool holds
+        # enough balance again, can complete the reclaim safely.
+        # An UPWARD reprice (pending_delta negative) draws further
+        # from the pool, but the pool-level check above is silent
+        # about WHOSE money that draw spends. If a DIFFERENT claim
+        # already consumed part of what this claim's own remainder
+        # left behind, the pool as a whole can still cover the draw
+        # -- the pool-level check alone passes -- while none of what
+        # remains is genuinely this claim's: A leaves a $5
+        # remainder, B spends it, C then contributes $2 (pool now
+        # $2), and an upward reprice drawing $2 more would pass the
+        # pool-level check even though A's own surviving remainder
+        # is $0 -- spending C's $2 instead (Codex review: "Cap
+        # reprice draws at the surviving claim remainder"). The
+        # remainder check is skipped for a release (pending_delta
+        # >= 0): a release never spends anyone else's money, and
+        # _claim_credit_remainder_usd() is not cheap to call for the
+        # common no-op case.
+        # The remainder cap above (reprice_total = min(frozen_total,
+        # reserved_usd + surviving_remainder)) already bounds this
+        # reprice by what the claim genuinely owns, so `repriced` --
+        # sized off that capped total -- can never ask for anyone
+        # else's money: a reprice that wanted to draw MORE than this
+        # claim owns (A leaves a $5 remainder, B spends it, C
+        # contributes $2, and reclaiming A upward would spend C's $2
+        # off the UNCAPPED basis) instead produces a smaller,
+        # genuinely-owned order once capped (Codex review: "Cap
+        # repricing by the claim's surviving remainder"). When that
+        # capped total is not even enough for one share
+        # (repriced.shares_to_buy == 0), the whole reservation this
+        # claim still owns is released back rather than left
+        # deferred and stranded: an earlier version of this branch
+        # deferred instead, leaving the reservation neither placed
+        # nor released until the price happened to fall back to what
+        # the (now permanently smaller, after B's withdrawal) capped
+        # total could afford -- money the claim could otherwise have
+        # redispatched immediately (Codex review: "Release the
+        # surviving reservation after a zero-share reprice"). Only a
+        # genuine POOL-level liquidity shortfall -- the pool itself
+        # cannot currently cover even this already-capped reprice --
+        # still defers; that is not an ownership question and cannot
+        # be resolved by capping the claim's own share any further.
+        overdraws_pool = state["pending_usd"] + pending_delta < 0
+        if overdraws_pool:
+            return WholeShareAccumulationDecision(
+                pending_before_usd=cached["pending_before_usd"],
+                contribution_usd=0.0,
+                current_share_price_usd=cached["current_share_price_usd"],
+                shares_to_buy=0,
+                order_notional_usd=0.0,
+                pending_after_usd=state["pending_usd"],
+            )
+        # Read above, before the reprice was sized -- see there.
+        prior_remainder_aged = surviving_remainder
+        cached["claimed_at"] = recorded_at
+        cached["claim_token"] = uuid4().hex
+        # Same reasoning as the redispatch branch above: a fresh
+        # claim_token is a genuinely NEW attempt, so any
+        # shares_credited marker left by a fenced-out caller's own
+        # earlier genuine placement against this SAME dedup_key
+        # (settle() still counts that caller's real shares even
+        # when it cannot mark the entry "resolved" -- see settle()'s
+        # docstring) must not suppress crediting THIS reclaim's own,
+        # different physical purchase once it settles.
+        cached["shares_credited"] = False
+        cached["current_share_price_usd"] = repriced.current_share_price_usd
+        cached["shares_to_buy"] = repriced.shares_to_buy
+        cached["order_notional_usd"] = repriced.order_notional_usd
+        cached["pending_after_usd"] = repriced.pending_after_usd
+        # Only the INCREASE counts: a downward reprice hands money
+        # back to the pool, it does not draw on it. Taken from
+        # pending_delta, computed ABOVE against the pre-reprice
+        # notional -- cached["order_notional_usd"] has already been
+        # overwritten by this point, so subtracting it here would
+        # always yield exactly zero and the counter would miss every
+        # upward reprice (Codex review: "Record the pre-assignment
+        # reprice withdrawal delta").
+        _record_withdrawal(state, -pending_delta)
+        # Carried forward from the AGED previous remainder, not rebuilt
+        # from the frozen sizing basis alone. repriced.pending_after_usd
+        # is recomputed from pending_before_usd/contribution_usd as they
+        # were when this claim was first recorded, so it silently
+        # resurrects entitlement that another claim has since withdrawn
+        # -- and re-snapshotting at the current counter then makes that
+        # intervening withdrawal look OLDER than the remainder, so the
+        # preserve fold can hand this claim credit that replenished the
+        # pool afterwards (Codex review discussion_r3867623115, "Retain
+        # remainder aging when reclaiming a claim").
+        #
+        # ``prior_remainder_aged + pending_delta`` is the claim's own
+        # entitlement moved by this reprice: a reprice UPWARD releases
+        # its own reservation back (positive delta, entitlement grows by
+        # exactly what it released), a reprice DOWNWARD draws more out
+        # (negative delta). The basis-level figure stays an upper bound,
+        # so the two agree exactly when nothing interfered and the aged
+        # one wins when something did -- under-crediting costs the claim
+        # a later retry, over-crediting spends money that was never its.
+        #
+        # An entry with no remainder field at all predates the field;
+        # aging from a phantom 0.0 would write off credit it never had
+        # recorded, so it keeps the basis-level figure it always used.
+        if had_prior_remainder:
+            reclaimed_remainder = round(
+                max(
+                    0.0,
+                    min(repriced.pending_after_usd, prior_remainder_aged + pending_delta),
+                ),
+                2,
+            )
+        else:
+            reclaimed_remainder = repriced.pending_after_usd
+        # Captured BEFORE _CLAIM_REMAINDER_FIELD is overwritten below:
+        # when this reclaim's own withdrawal delta is zero (a
+        # same-price or release-only reprice -- _record_withdrawal()
+        # above no-ops on that), the withdrawal counter has not
+        # moved, so this is NOT a fresh batch: the claim's PRIOR
+        # remainder registration is still live in the CURRENT batch.
+        # Re-allocating the new reclaimed_remainder on top of it
+        # unconditionally would count the unchanged (or barely
+        # changed) portion of this claim's own money a second time,
+        # inflating the shared batch and letting a DIFFERENT claim
+        # reclaiming/redispatching at this same instant be charged
+        # for a withdrawal this claim's own money already covers
+        # (Codex review: "Do not re-register an unchanged remainder
+        # on reclaim"). As with preserve_pending()'s identical fix,
+        # simply reusing the old offset unchanged is not safe either
+        # -- another claim can have registered into this same batch
+        # instant since -- so the old registration is undone via
+        # _retire_credit_tie_interval() first (which also shifts any
+        # OTHER claim's already-registered offset that landed after
+        # this one, rather than blindly shrinking the width -- see
+        # that helper's docstring, Codex review: "Keep later tie
+        # offsets valid when moving a remainder"), then
+        # reclaimed_remainder is allocated fresh, landing this claim
+        # at wherever the batch currently stands.
+        recorded_keys = state.setdefault("recorded_idempotency_keys", {})
+        prior_remainder_as_of = _finite_non_negative(cached.get(_CLAIM_REMAINDER_AS_OF_FIELD))
+        if prior_remainder_as_of == float(state[_WITHDRAWN_TOTAL_FIELD]):
+            prior_remainder_registered = _finite_non_negative(cached.get(_CLAIM_REMAINDER_FIELD)) or 0.0
+            prior_remainder_offset = _finite_non_negative(cached.get(_CLAIM_REMAINDER_TIE_OFFSET_FIELD)) or 0.0
+            _retire_credit_tie_interval(
+                state, recorded_keys, prior_remainder_as_of, prior_remainder_offset, prior_remainder_registered
+            )
+        cached[_CLAIM_REMAINDER_FIELD] = reclaimed_remainder
+        # Tie offset via _allocate_credit_tie_offset() (Codex review:
+        # "Avoid charging one withdrawal to every restored claim") --
+        # naturally $0 in the ordinary case, since this reprice's own
+        # withdrawal delta (recorded just above) already moved the
+        # counter and starts a fresh batch, but still protects the
+        # narrower case of a DIFFERENT claim reclaiming at the exact
+        # same counter value with no real draw of its own in between.
+        #
+        # Allocated exactly ONCE here, against reclaimed_remainder --
+        # NOT allocated again below when this same figure is folded
+        # into restored_credit_usd. Calling _allocate_credit_tie_offset
+        # a second time for the SAME dollars would widen the shared
+        # batch by reclaimed_remainder twice for money that only
+        # entered the pool once, handing the restored-credit
+        # registration an offset inflated by its own amount --
+        # protecting it from aging it should not be exempt from, so a
+        # later claim reclaiming/redispatching credit at this exact
+        # counter value could still be charged for a withdrawal this
+        # claim's own restored money already covered (Codex review:
+        # "Avoid registering the reclaimed credit twice"). Reused
+        # verbatim below instead: relabeling this claim's remainder as
+        # restored credit does not change WHERE its interval sits on
+        # the withdrawal axis, so the SAME offset value describes both.
+        claim_remainder_tie_offset = _allocate_credit_tie_offset(
+            state, reclaimed_remainder, dedup_key=dedup_key, field=_CLAIM_REMAINDER_FIELD
+        )
+        cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = claim_remainder_tie_offset
+        cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
+        # A reprice that lands on 0 shares (the price rose enough that
+        # the original committed total no longer buys even one share)
+        # has nothing left for any caller to place or settle -- the
+        # whole committed amount was just folded back into
+        # state["pending_usd"] above as ordinary accumulated balance.
+        # Mark it resolved here, mirroring the ORIGINAL decision
+        # path's own "resolved": shares_to_buy == 0 rule just below,
+        # so a LATER stale-claim check on this same key returns the
+        # already-resolved branch (a zero-shares decision reflecting
+        # the CURRENT balance, no delta) instead of reclaiming again.
+        # Left unresolved, a second reclaim would recompute
+        # apply_contribution from the SAME frozen
+        # pending_before_usd/contribution_usd, treating dollars this
+        # reclaim already restored as still owed -- if a different key
+        # had meanwhile spent that restored balance down, the second
+        # reclaim's delta could drive state["pending_usd"] negative
+        # (Codex review: "Prevent old claims from re-spending
+        # consumed credit"). A positive shares_to_buy, in contrast,
+        # is a genuine actionable fire that still needs a caller to
+        # place and settle/preserve it, so it stays unresolved.
+        cached["resolved"] = repriced.shares_to_buy == 0
+        if cached["resolved"]:
+            # The reprice bought nothing, so the claim's whole
+            # entitlement went back into state["pending_usd"] above and
+            # nothing of it is outstanding -- structurally the same
+            # position preserve_pending() leaves a claim in, and it has
+            # to record the same thing.
+            #
+            # Without this the entry resolves having never written
+            # restored_credit_usd, so a later zero-contribution
+            # redispatch falls through _redispatchable_credit_usd()'s
+            # missing-field branch to order_notional_usd -- which this
+            # very reprice just overwrote with 0. The cap reads $0 and
+            # the released credit is stranded permanently, even though
+            # the ledger still holds it (Codex review
+            # discussion_r3867623112, "Preserve credit when a reclaim
+            # reprices to zero shares").
+            #
+            # Recorded as the aged entitlement computed above, not the
+            # raw basis-level total, so a claim cannot recover credit
+            # another claim withdrew while this fire sat unresolved.
+            # The remainder is then zeroed, exactly as both preserve
+            # paths do: it has been folded into the restored credit and
+            # would otherwise be counted a second time.
+            cached[_RESTORED_CREDIT_FIELD] = reclaimed_remainder
+            # Reuses claim_remainder_tie_offset rather than calling
+            # _allocate_credit_tie_offset() again -- see that call
+            # site's own comment above for why a second allocation of
+            # the SAME reclaimed_remainder would double-widen the
+            # shared batch for money that only entered the pool once.
+            cached[_RESTORED_CREDIT_TIE_OFFSET_FIELD] = claim_remainder_tie_offset
+            cached[_RESTORED_CREDIT_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
+            # The offset value above was only ever audited under
+            # _CLAIM_REMAINDER_FIELD's own audit key (from the
+            # _allocate_credit_tie_offset() call above) -- relabeling
+            # it onto _RESTORED_CREDIT_FIELD here needs its OWN audit
+            # entry too, or _read_state() finds no audit record for
+            # (claim, restored_credit_usd, this snapshot) and trusts
+            # ANY value stored there unconditionally, including a
+            # later hand-edited one (Codex review: "Record an audit
+            # for relabeled restored credits"). Written directly
+            # (not through _allocate_credit_tie_offset(), which would
+            # double-widen the batch per the comment above) since the
+            # interval's position on the withdrawal axis is unchanged
+            # -- only which field describes it is.
+            _restored_audit = state.setdefault(_CREDIT_TIE_OFFSET_AUDIT_FIELD, {})
+            if not isinstance(_restored_audit, dict):
+                _restored_audit = {}
+                state[_CREDIT_TIE_OFFSET_AUDIT_FIELD] = _restored_audit
+            _restored_audit[
+                _tie_offset_audit_key(dedup_key, _RESTORED_CREDIT_FIELD, state[_WITHDRAWN_TOTAL_FIELD])
+            ] = claim_remainder_tie_offset
+            # The remainder's interval was just relabeled onto
+            # restored_credit_usd above (audited under ITS key) --
+            # the remainder field is reset to $0 at this SAME
+            # snapshot, so its own now-superseded audit entry (still
+            # holding claim_remainder_tie_offset) must be forgotten,
+            # or it mismatches this reset the instant this loads
+            # again (Codex review: "Retire the remainder audit when
+            # relabeling credit").
+            _forget_tie_offset_audit(
+                state, dedup_key, _CLAIM_REMAINDER_FIELD, state[_WITHDRAWN_TOTAL_FIELD]
+            )
+            cached[_CLAIM_REMAINDER_FIELD] = 0.0
+            cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = 0.0
+            cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
+        recorded_keys[dedup_key] = cached
+        state["pending_usd"] = round(state["pending_usd"] + pending_delta, 2)
+        # A reclaim mutates the cached quantity/notional/resolution
+        # state and the global pending balance exactly like a fresh
+        # contribution does, but -- unlike the fresh-contribution
+        # branch below, which always appends to state["events"] --
+        # this branch used to persist silently. events() and the
+        # on-disk audit trail then retained only the ORIGINAL stale
+        # fire, with nothing explaining the later balance adjustment
+        # or repriced decision, making operator reconciliation of
+        # the recovery path incorrect (Codex review: "Record
+        # stale-claim repricing in the ledger event history").
+        state["events"].append(
+            {
+                "trading_day": trading_day,
+                "stream": stream,
+                "recorded_at": recorded_at,
+                "pending_before_usd": cached["pending_before_usd"],
+                "contribution_usd": cached["contribution_usd"],
+                "current_share_price_usd": repriced.current_share_price_usd,
+                "shares_to_buy": repriced.shares_to_buy,
+                "order_notional_usd": repriced.order_notional_usd,
+                "pending_after_usd": state["pending_usd"],
+                "decision": "reclaim_reprice",
+            }
+        )
+        atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+        return WholeShareAccumulationDecision(
+            pending_before_usd=cached["pending_before_usd"],
+            contribution_usd=cached["contribution_usd"],
+            current_share_price_usd=repriced.current_share_price_usd,
+            shares_to_buy=repriced.shares_to_buy,
+            order_notional_usd=repriced.order_notional_usd,
+            # The RECONCILED state["pending_usd"] just persisted above,
+            # not the isolated repriced.pending_after_usd -- when a
+            # DIFFERENT idempotency key changed the balance since this
+            # claim was recorded, those two differ by exactly
+            # pending_delta (Codex review: "Return the reconciled
+            # pending balance after a stale reprice"). A caller (see
+            # _process_whole_share_candidate) persists this field as
+            # whole_share_pending_usd when the reprice yields 0
+            # shares, so returning the pre-reconciliation value would
+            # report a stale balance to run artifacts even though the
+            # ledger itself now holds the correct, reconciled one.
+            pending_after_usd=state["pending_usd"],
+            claim_token=cached["claim_token"],
+        )
+
+    def _record_fresh_contribution(
+        self,
+        state: Dict[str, Any],
+        day_dir: Path,
+        state_path: Path,
+        dedup_key: Optional[str],
+        trading_day: str,
+        contribution_usd: float,
+        current_share_price_usd: float,
+        stream: str,
+        recorded_at: Optional[str],
+    ) -> WholeShareAccumulationDecision:
+        pending = state["pending_usd"]
+        decision = apply_contribution(pending, contribution_usd, current_share_price_usd)
+        state["pending_usd"] = decision.pending_after_usd
+        _record_withdrawal(state, decision.order_notional_usd)
+        if dedup_key is not None:
+            claim_token = uuid4().hex if decision.shares_to_buy > 0 else None
+            # This claim's OWN newly-owned credit. A claim that FIRED
+            # (shares_to_buy > 0) drew on the whole pool "by right" --
+            # the same convention _claim_sizing_basis_usd() documents --
+            # and its own withdrawal just moved the counter, so it always
+            # starts a brand new tie batch with no sibling to share it
+            # with; decision.pending_after_usd (the whole resulting pool)
+            # is genuinely its own remainder in that case, unchanged from
+            # before this fix. A claim that did NOT fire (still pending,
+            # shares_to_buy == 0), though, can be tied at the exact same
+            # withdrawal-counter instant as ANOTHER un-fired claim, and
+            # decision.pending_after_usd there mixes in every EARLIER
+            # tied claim's own still-pending money too: two $10 sub-share
+            # contributions tied at the same instant would otherwise
+            # record batch widths of $10 then $20 for a pool that only
+            # ever holds $20, and the SAME cumulative figure written into
+            # the remainder field below would let the second claim
+            # believe it still owns $20 of it. A withdrawal that later
+            # drains the whole $20 pool, followed by an unrelated $10
+            # replenishment, then reports the second claim as still
+            # owning $10 of the REPLENISHING claim's money instead of the
+            # $0 its own $10 share actually has left (Codex review:
+            # "Track only newly owned credit in the tie batch"). Using
+            # just this claim's own contribution there instead (its
+            # order_notional_usd is always exactly $0 when nothing
+            # fired) keeps the batch's total width equal to the pool's
+            # real total and gives every tied claim only its own
+            # non-overlapping slice of the withdrawal axis.
+            own_added_usd = (
+                decision.pending_after_usd
+                if decision.shares_to_buy > 0
+                else decision.contribution_usd
+            )
+            # Snapshotted AFTER this fire's own withdrawal above. The tie
+            # offset (see _allocate_credit_tie_offset()) protects a
+            # zero-order sub-share contribution here from a DIFFERENT
+            # claim's own zero-order contribution landing at this exact
+            # same instant (Codex review: "Avoid charging one withdrawal
+            # to every restored claim").
+            remainder_tie_offset = _allocate_credit_tie_offset(
+                state, own_added_usd, dedup_key=dedup_key, field=_CLAIM_REMAINDER_FIELD
+            )
+            recorded_keys = state.setdefault("recorded_idempotency_keys", {})
+            recorded_keys[dedup_key] = {
+                "pending_before_usd": decision.pending_before_usd,
+                "contribution_usd": decision.contribution_usd,
+                "current_share_price_usd": decision.current_share_price_usd,
+                "shares_to_buy": decision.shares_to_buy,
+                "order_notional_usd": decision.order_notional_usd,
+                "pending_after_usd": decision.pending_after_usd,
+                # This claim's own non-overlapping credit -- see
+                # own_added_usd's own comment above for why this is not
+                # decision.pending_after_usd -- folded back into
+                # restored_credit_usd if the order is ever preserved, so
+                # the claim keeps reach over its own change and nothing
+                # more.
+                _CLAIM_REMAINDER_FIELD: own_added_usd,
+                _CLAIM_REMAINDER_AS_OF_FIELD: state[_WITHDRAWN_TOTAL_FIELD],
+                _CLAIM_REMAINDER_TIE_OFFSET_FIELD: remainder_tie_offset,
+                # A fresh fire draws on the whole pool by right, so its
+                # reported balance and its sizing basis are the same
+                # figure. Only a CAPPED redispatch makes the two diverge.
+                _CLAIM_SIZING_BASIS_FIELD: decision.pending_before_usd,
+                # A decision with 0 shares never needs settle()/
+                # preserve_pending() to resolve it -- nothing was
+                # deducted -- so it starts already resolved; only a real
+                # fire (shares_to_buy > 0) needs a later settle/preserve
+                # call to flip this.
+                "resolved": decision.shares_to_buy == 0,
+                # Only meaningful while unresolved --
+                # when a real fire happens, this reserves the key against
+                # a second overlapping caller until settle()/preserve_pending()
+                # resolves it or a retry takes ownership.
+                "claimed_at": recorded_at,
+                "claim_token": claim_token,
+            }
+            if claim_token is not None:
+                decision = WholeShareAccumulationDecision(**{**decision.__dict__, "claim_token": claim_token})
+        state["events"].append(
+            {
+                "trading_day": trading_day,
+                "stream": stream,
+                "recorded_at": recorded_at,
+                "pending_before_usd": decision.pending_before_usd,
+                "contribution_usd": decision.contribution_usd,
+                "current_share_price_usd": decision.current_share_price_usd,
+                "shares_to_buy": decision.shares_to_buy,
+                "order_notional_usd": decision.order_notional_usd,
+                "pending_after_usd": decision.pending_after_usd,
+                "decision": "fire" if decision.shares_to_buy > 0 else "pending",
+            }
+        )
+        day_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+        return decision
+
     def record_contribution(
         self,
         ticker: str,
@@ -1018,701 +1755,39 @@ class WholeShareAccumulationLedger:
             if dedup_key is not None and dedup_key in recorded_keys:
                 cached = recorded_keys[dedup_key]
                 if cached.get("resolved") or cached.get("placed") or cached.get("placing"):
-                    # A cached entry currently marked "placed" (broker
-                    # accepted the order via execute_claimed(), settle() has
-                    # not yet run) is NOT eligible for the redispatch fix
-                    # below even if it happens to also be "resolved" from a
-                    # PRIOR fire under this same slot -- reclaiming or
-                    # redispatching a live, in-flight broker submission here
-                    # would let a retry act on a SECOND fire while the first
-                    # is still being settled, double-spending the same
-                    # dedup_key (Codex review discussion_r3804235552, "Reject
-                    # already-placed claims"; mirrored here on the
-                    # record_contribution side of that same fix -- the
-                    # execute_claimed()-side half rejects an in-flight
-                    # placement, this half stops a retry from ever reaching
-                    # it in the first place).
-                    #
-                    # "placing" (set by execute_claimed() durably BEFORE it
-                    # calls the broker, cleared once it writes "placed" or
-                    # once the claim is later resolved via settle()/
-                    # preserve_pending()) means "a submission for this claim
-                    # was attempted, but this ledger does not yet know
-                    # whether it succeeded" -- e.g. the owning process was
-                    # SIGKILLed between the broker accepting the order and
-                    # this ledger recording that fact. Treating a
-                    # "placing"-only entry as freely reclaimable here would
-                    # let this retry pass execute_claimed()'s own checks (the
-                    # OS lock the crashed owner held has already released)
-                    # and submit the SAME fire a second time while the first
-                    # order may still be genuinely live and simply not yet
-                    # visible in eventually-consistent broker history (Codex
-                    # review discussion_r3818217230, "Persist placement
-                    # intent before invoking the broker"). Unlike an
-                    # ordinary unresolved-and-reclaimable claim, a
-                    # "placing"-only entry is NOT resolved here -- it stays
-                    # exactly as-is (falls through to the flat "nothing to
-                    # do" return below, mirroring the resolved/placed case)
-                    # until a caller reconciles it against actual broker
-                    # order history and calls settle()/preserve_pending()
-                    # (both of which clear "placing" as part of resolving
-                    # the claim). It remains discoverable for that
-                    # reconciliation the whole time: unresolved_claim()/
-                    # unresolved_claims_any_day() key off "resolved" alone,
-                    # not "placed"/"placing", so a "placing" claim is never
-                    # invisible to the existing reconciliation machinery.
-                    if (
-                        cached.get("resolved")
-                        and not cached.get("placed")
-                        and not cached.get("placing")
-                        and contribution_usd <= 0
-                    ):
-                        # A ZERO-contribution retry against an already-resolved
-                        # slot -- e.g. the preserved-fire redispatch loop in
-                        # _run_once_impl, re-checking a ticker whose earlier fire
-                        # was blocked by a transient gate (ceiling/cap/spread/
-                        # review) and restored via preserve_pending -- must not
-                        # be flattened to "nothing to do" forever just because
-                        # THIS exact (trading_day, idempotency_key) slot already
-                        # resolved once. preserve_pending's restoration already
-                        # put that fire's full notional back into
-                        # state["pending_usd"]; if that restored balance ALONE
-                        # (no new money added -- contribution_usd is 0) now
-                        # covers a share at the CURRENT price, this is a
-                        # genuinely NEW, actionable fire the caller should act
-                        # on, not a duplicate of the one already resolved. The
-                        # old unconditional zero-shares return stranded that
-                        # restored balance until some LATER day's signal
-                        # happened to be a fresh BUY again, with no bound on how
-                        # long that might take (Codex review: "Allow same-day
-                        # redispatch of preserved fires"). A NONZERO
-                        # contribution_usd here (a genuine fresh BUY signal, not
-                        # a redispatch) is intentionally left out of scope --
-                        # re-opening a resolved slot for new money risks
-                        # double-counting the original contribution and is a
-                        # separate concern from this narrow redispatch case.
-                        # Also gated (above) on NOT "placed" -- a "placed"
-                        # entry is a live/just-settled broker submission, not
-                        # a preserve_pending() restoration, so there is no
-                        # freed balance here that redispatching should act on
-                        # (Codex review discussion_r3804235552).
-                        restored_credit = _redispatchable_credit_usd(
-                            cached, state["pending_usd"], float(state.get(_WITHDRAWN_TOTAL_FIELD, 0.0))
-                        )
-                        redispatch = apply_contribution(restored_credit, 0.0, current_share_price_usd)
-                        if redispatch.shares_to_buy > 0:
-                            # Off the CAPPED decision, before the replace()
-                            # below rewrites the balances to the full pool's:
-                            # what this claim did not spend of its OWN credit,
-                            # not what unrelated contributions left behind.
-                            claim_remainder = redispatch.pending_after_usd
-                            total_pending = state["pending_usd"]
-                            redispatch = replace(
-                                redispatch,
-                                pending_before_usd=total_pending,
-                                pending_after_usd=round(total_pending - redispatch.order_notional_usd, 2),
-                            )
-                            # A redispatched fire is just as actionable as a
-                            # fresh or reclaimed one, so it needs the SAME
-                            # fencing: without a fresh token here, every
-                            # caller wired for claim_token ownership checks
-                            # (still_claimed/preserve_pending/settle) would
-                            # see claim_token=None for this decision and fall
-                            # back to timestamp-only matching, losing the
-                            # same-timestamp reclaim protection this PR adds
-                            # for every other positive decision (Codex
-                            # review: "Issue an ownership token for
-                            # redispatched fires").
-                            redispatch = replace(redispatch, claim_token=uuid4().hex)
-                            cached["resolved"] = False
-                            cached["claimed_at"] = recorded_at
-                            cached["claim_token"] = redispatch.claim_token
-                            # A fresh claim_token means a genuinely NEW fire
-                            # attempt -- settle()'s shares_credited marker
-                            # (see its own docstring) is scoped to the
-                            # PHYSICAL order a specific claim_token
-                            # represents, not to this reusable dedup_key
-                            # entry across its whole lifetime. Left set from
-                            # the PRIOR (already-settled) fire this slot
-                            # resolved, a genuinely new physical purchase
-                            # placed under this redispatch would silently
-                            # never get counted into shares_purchased_total
-                            # (Codex review: "Reset the credit marker when
-                            # redispatching a new fire").
-                            cached["shares_credited"] = False
-                            cached["placed"] = False
-                            cached["pending_before_usd"] = redispatch.pending_before_usd
-                            cached["contribution_usd"] = 0.0
-                            cached["current_share_price_usd"] = redispatch.current_share_price_usd
-                            cached["shares_to_buy"] = redispatch.shares_to_buy
-                            cached["order_notional_usd"] = redispatch.order_notional_usd
-                            cached["pending_after_usd"] = redispatch.pending_after_usd
-                            _record_withdrawal(state, redispatch.order_notional_usd)
-                            cached[_CLAIM_REMAINDER_FIELD] = claim_remainder
-                            # Snapshotted AFTER this fire's own withdrawal, so
-                            # a claim never writes off its own remainder. The
-                            # tie offset (see _allocate_credit_tie_offset())
-                            # naturally comes back $0 here in the ordinary
-                            # case -- this fire's own withdrawal just moved
-                            # the counter, starting a fresh batch -- but
-                            # routing it through the same helper as every
-                            # other write site (rather than a bare counter
-                            # read) still protects the rare case where
-                            # ANOTHER claim's snapshot already ties at this
-                            # exact post-withdrawal instant (Codex review:
-                            # "Avoid charging one withdrawal to every restored
-                            # claim").
-                            cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = _allocate_credit_tie_offset(
-                                state, claim_remainder, dedup_key=dedup_key, field=_CLAIM_REMAINDER_FIELD
-                            )
-                            cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
-                            # The order was sized off restored_credit, but the
-                            # balance fields above now report the whole pool.
-                            # A reclaim of this still-unresolved fire must
-                            # re-size from the CAP, never from those reported
-                            # balances -- see _claim_sizing_basis_usd().
-                            cached[_CLAIM_SIZING_BASIS_FIELD] = restored_credit
-                            recorded_keys[dedup_key] = cached
-                            state["pending_usd"] = redispatch.pending_after_usd
-                            state["events"].append(
-                                {
-                                    "trading_day": trading_day,
-                                    "stream": stream,
-                                    "recorded_at": recorded_at,
-                                    "pending_before_usd": redispatch.pending_before_usd,
-                                    "contribution_usd": 0.0,
-                                    "current_share_price_usd": redispatch.current_share_price_usd,
-                                    "shares_to_buy": redispatch.shares_to_buy,
-                                    "order_notional_usd": redispatch.order_notional_usd,
-                                    "pending_after_usd": redispatch.pending_after_usd,
-                                    "decision": "redispatch_fire",
-                                }
-                            )
-                            day_dir.mkdir(parents=True, exist_ok=True)
-                            atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
-                            return redispatch
-                    # contribution_usd is 0.0, not the original cached
-                    # amount -- this call makes NO new contribution (the
-                    # ledger already reflects that original contribution;
-                    # pending_usd is untouched here). Reporting the ORIGINAL
-                    # positive amount double-counted it: a caller (see
-                    # _process_whole_share_candidate) persists this field as
-                    # "what THIS call contributed" for run-artifact
-                    # reporting, so a resolved-slot retry (e.g. after a
-                    # below-threshold accumulation, or a blocked fire that
-                    # was preserved) would otherwise describe a contribution
-                    # that never actually happened on this call (Codex
-                    # review: "Report zero contribution for resolved slot
-                    # retries").
-                    return WholeShareAccumulationDecision(
-                        pending_before_usd=cached["pending_before_usd"],
-                        contribution_usd=0.0,
-                        current_share_price_usd=cached["current_share_price_usd"],
-                        shares_to_buy=0,
-                        order_notional_usd=0.0,
-                        pending_after_usd=state["pending_usd"],
+                    return self._redispatch_resolved_or_placed_claim(
+                        state,
+                        day_dir,
+                        state_path,
+                        dedup_key,
+                        cached,
+                        trading_day,
+                        contribution_usd,
+                        current_share_price_usd,
+                        stream,
+                        recorded_at,
                     )
-                # Reclaim immediately -- no wall-clock staleness wait. PR #515
-                # replaced the former UNRESOLVED_CLAIM_STALE_SECONDS lease
-                # (which used to gate this branch on elapsed time) with
-                # ownership enforced by execute_claimed()'s cross-process
-                # lock, which spans both the final ownership check and the
-                # actual irreversible broker call: a caller that is genuinely
-                # still live and about to place through execute_claimed()
-                # either already holds that lock (this call blocks until it
-                # releases) or, if this call reclaims first, will itself fail
-                # execute_claimed()'s own ownership check once it gets there
-                # and abstain -- so an immediate reclaim here can never let
-                # two callers both submit the same fire. A crashed owner's
-                # claim is reclaimed on the very next retry instead of making
-                # every retry wait out a fixed lease. Re-price it against the
-                # CURRENT quote (this call's own current_share_price_usd
-                # argument), not
-                # the original attempt's stale cached price: a fire claimed
-                # at $10 and reclaimed after the price moved to $20 would
-                # otherwise still hand back a decision sized (quantity AND
-                # notional) for the stale $10 price -- and the caller passes
-                # that STALE current_share_price_usd straight into
-                # _whole_share_risk_gates for the max_per_order_usd ceiling
-                # check, letting a one-share order that actually costs ~$20
-                # pass a $10-per-order ceiling as if it only cost $10 (Codex
-                # review: "Reprice reclaimed stale fires before placement").
-                # The total dollars already committed (pending_before_usd +
-                # contribution_usd from the ORIGINAL call) is unaffected by
-                # price -- only how many shares that total buys, and how
-                # much remains pending, changes with the fresh price.
-                # Read BEFORE the reprice is sized, not after. The claim can
-                # only command what it still OWNS: the money already reserved
-                # in its outstanding order, plus whatever of its own remainder
-                # survives in the pool. Sizing off the frozen
-                # basis + contribution alone assumes the original remainder is
-                # still exclusively its own, and the balance check further down
-                # only asks whether the POOL can cover the increase -- which it
-                # can, out of somebody else's money. A fires $16 from a $20
-                # basis leaving $4, B consumes that $4, C later contributes $4,
-                # and reclaiming A at a price that raises its order to $20
-                # swallowed C's whole contribution (Codex review: "Cap
-                # repricing by the claim's surviving remainder").
-                #
-                # Charged against the counter as it stands BEFORE this reclaim's
-                # own withdrawal, so a claim is never made to write off its own
-                # draw.
-                surviving_remainder = _claim_credit_remainder_usd(
-                    cached, state["pending_usd"], float(state.get(_WITHDRAWN_TOTAL_FIELD, 0.0))
+                return self._reprice_unresolved_claim(
+                    state,
+                    state_path,
+                    dedup_key,
+                    cached,
+                    trading_day,
+                    current_share_price_usd,
+                    stream,
+                    recorded_at,
                 )
-                had_prior_remainder = _CLAIM_REMAINDER_FIELD in cached
-                reserved_usd = _finite_non_negative(cached.get("order_notional_usd")) or 0.0
-                frozen_total = _claim_sizing_basis_usd(cached) + float(cached["contribution_usd"])
-                if had_prior_remainder:
-                    # An entry with no remainder field predates it; there is
-                    # nothing to age, so it keeps the frozen total it has always
-                    # used.
-                    reprice_total = min(frozen_total, reserved_usd + surviving_remainder)
-                else:
-                    reprice_total = frozen_total
-                repriced = apply_contribution(
-                    reprice_total, 0.0, current_share_price_usd
-                )
-                # Reconcile the repriced remainder against the ledger's
-                # CURRENT balance, not an absolute snapshot -- mirroring
-                # preserve_pending's own established convention. A DIFFERENT
-                # idempotency key can have recorded its own contribution
-                # (advancing state["pending_usd"]) any time between this
-                # fire's original claim and its reclaim here; overwriting
-                # state["pending_usd"] with repriced.pending_after_usd
-                # outright would silently discard that later activity (e.g.
-                # a $15 fire at $10 leaves $5 pending; a later $4
-                # contribution under another key makes it $9; reclaiming the
-                # first fire at $20 must write $9 + ($15 repriced remainder -
-                # $5 original remainder) = $19, not a bare $15) (Codex
-                # review: "Preserve newer ledger activity while repricing
-                # stale claims").
-                # Expressed as the change in what this claim RESERVES from the
-                # pool, not as the difference between two remainders. The two
-                # are identical whenever the sizing basis and the reported
-                # balance are the same figure, but a capped redispatch makes
-                # them diverge -- its cached remainder is pool-level while the
-                # repriced remainder is basis-level, and subtracting one from
-                # the other would move the pool by an amount neither reserved.
-                pending_delta = cached["order_notional_usd"] - repriced.order_notional_usd
-                # A DOWNWARD reprice (the price dropped) can make
-                # pending_delta more negative than the currently available,
-                # unreserved balance: the reclaim's total is recomputed from
-                # the ORIGINAL frozen pending_before_usd/contribution_usd,
-                # which assumes the full original remainder is still
-                # exclusively this claim's -- but if a DIFFERENT key already
-                # spent part of that shared pool (its own fire, funded in
-                # part by this claim's original remainder), only what is
-                # CURRENTLY unspent is actually safe to draw further from.
-                # Applying the delta anyway would drive state["pending_usd"]
-                # negative and hand back an actionable decision that spends
-                # more than what remains (Codex review: "Prevent downward
-                # repricing from overdrawing pending credit"). Defer instead:
-                # leave this claim exactly as-is (unresolved, untouched) and
-                # return the same "nothing to do" decision the still-reserved
-                # branch above returns -- a later retry, once the pool holds
-                # enough balance again, can complete the reclaim safely.
-                # An UPWARD reprice (pending_delta negative) draws further
-                # from the pool, but the pool-level check above is silent
-                # about WHOSE money that draw spends. If a DIFFERENT claim
-                # already consumed part of what this claim's own remainder
-                # left behind, the pool as a whole can still cover the draw
-                # -- the pool-level check alone passes -- while none of what
-                # remains is genuinely this claim's: A leaves a $5
-                # remainder, B spends it, C then contributes $2 (pool now
-                # $2), and an upward reprice drawing $2 more would pass the
-                # pool-level check even though A's own surviving remainder
-                # is $0 -- spending C's $2 instead (Codex review: "Cap
-                # reprice draws at the surviving claim remainder"). The
-                # remainder check is skipped for a release (pending_delta
-                # >= 0): a release never spends anyone else's money, and
-                # _claim_credit_remainder_usd() is not cheap to call for the
-                # common no-op case.
-                # The remainder cap above (reprice_total = min(frozen_total,
-                # reserved_usd + surviving_remainder)) already bounds this
-                # reprice by what the claim genuinely owns, so `repriced` --
-                # sized off that capped total -- can never ask for anyone
-                # else's money: a reprice that wanted to draw MORE than this
-                # claim owns (A leaves a $5 remainder, B spends it, C
-                # contributes $2, and reclaiming A upward would spend C's $2
-                # off the UNCAPPED basis) instead produces a smaller,
-                # genuinely-owned order once capped (Codex review: "Cap
-                # repricing by the claim's surviving remainder"). When that
-                # capped total is not even enough for one share
-                # (repriced.shares_to_buy == 0), the whole reservation this
-                # claim still owns is released back rather than left
-                # deferred and stranded: an earlier version of this branch
-                # deferred instead, leaving the reservation neither placed
-                # nor released until the price happened to fall back to what
-                # the (now permanently smaller, after B's withdrawal) capped
-                # total could afford -- money the claim could otherwise have
-                # redispatched immediately (Codex review: "Release the
-                # surviving reservation after a zero-share reprice"). Only a
-                # genuine POOL-level liquidity shortfall -- the pool itself
-                # cannot currently cover even this already-capped reprice --
-                # still defers; that is not an ownership question and cannot
-                # be resolved by capping the claim's own share any further.
-                overdraws_pool = state["pending_usd"] + pending_delta < 0
-                if overdraws_pool:
-                    return WholeShareAccumulationDecision(
-                        pending_before_usd=cached["pending_before_usd"],
-                        contribution_usd=0.0,
-                        current_share_price_usd=cached["current_share_price_usd"],
-                        shares_to_buy=0,
-                        order_notional_usd=0.0,
-                        pending_after_usd=state["pending_usd"],
-                    )
-                # Read above, before the reprice was sized -- see there.
-                prior_remainder_aged = surviving_remainder
-                cached["claimed_at"] = recorded_at
-                cached["claim_token"] = uuid4().hex
-                # Same reasoning as the redispatch branch above: a fresh
-                # claim_token is a genuinely NEW attempt, so any
-                # shares_credited marker left by a fenced-out caller's own
-                # earlier genuine placement against this SAME dedup_key
-                # (settle() still counts that caller's real shares even
-                # when it cannot mark the entry "resolved" -- see settle()'s
-                # docstring) must not suppress crediting THIS reclaim's own,
-                # different physical purchase once it settles.
-                cached["shares_credited"] = False
-                cached["current_share_price_usd"] = repriced.current_share_price_usd
-                cached["shares_to_buy"] = repriced.shares_to_buy
-                cached["order_notional_usd"] = repriced.order_notional_usd
-                cached["pending_after_usd"] = repriced.pending_after_usd
-                # Only the INCREASE counts: a downward reprice hands money
-                # back to the pool, it does not draw on it. Taken from
-                # pending_delta, computed ABOVE against the pre-reprice
-                # notional -- cached["order_notional_usd"] has already been
-                # overwritten by this point, so subtracting it here would
-                # always yield exactly zero and the counter would miss every
-                # upward reprice (Codex review: "Record the pre-assignment
-                # reprice withdrawal delta").
-                _record_withdrawal(state, -pending_delta)
-                # Carried forward from the AGED previous remainder, not rebuilt
-                # from the frozen sizing basis alone. repriced.pending_after_usd
-                # is recomputed from pending_before_usd/contribution_usd as they
-                # were when this claim was first recorded, so it silently
-                # resurrects entitlement that another claim has since withdrawn
-                # -- and re-snapshotting at the current counter then makes that
-                # intervening withdrawal look OLDER than the remainder, so the
-                # preserve fold can hand this claim credit that replenished the
-                # pool afterwards (Codex review discussion_r3867623115, "Retain
-                # remainder aging when reclaiming a claim").
-                #
-                # ``prior_remainder_aged + pending_delta`` is the claim's own
-                # entitlement moved by this reprice: a reprice UPWARD releases
-                # its own reservation back (positive delta, entitlement grows by
-                # exactly what it released), a reprice DOWNWARD draws more out
-                # (negative delta). The basis-level figure stays an upper bound,
-                # so the two agree exactly when nothing interfered and the aged
-                # one wins when something did -- under-crediting costs the claim
-                # a later retry, over-crediting spends money that was never its.
-                #
-                # An entry with no remainder field at all predates the field;
-                # aging from a phantom 0.0 would write off credit it never had
-                # recorded, so it keeps the basis-level figure it always used.
-                if had_prior_remainder:
-                    reclaimed_remainder = round(
-                        max(
-                            0.0,
-                            min(repriced.pending_after_usd, prior_remainder_aged + pending_delta),
-                        ),
-                        2,
-                    )
-                else:
-                    reclaimed_remainder = repriced.pending_after_usd
-                # Captured BEFORE _CLAIM_REMAINDER_FIELD is overwritten below:
-                # when this reclaim's own withdrawal delta is zero (a
-                # same-price or release-only reprice -- _record_withdrawal()
-                # above no-ops on that), the withdrawal counter has not
-                # moved, so this is NOT a fresh batch: the claim's PRIOR
-                # remainder registration is still live in the CURRENT batch.
-                # Re-allocating the new reclaimed_remainder on top of it
-                # unconditionally would count the unchanged (or barely
-                # changed) portion of this claim's own money a second time,
-                # inflating the shared batch and letting a DIFFERENT claim
-                # reclaiming/redispatching at this same instant be charged
-                # for a withdrawal this claim's own money already covers
-                # (Codex review: "Do not re-register an unchanged remainder
-                # on reclaim"). As with preserve_pending()'s identical fix,
-                # simply reusing the old offset unchanged is not safe either
-                # -- another claim can have registered into this same batch
-                # instant since -- so the old registration is undone via
-                # _retire_credit_tie_interval() first (which also shifts any
-                # OTHER claim's already-registered offset that landed after
-                # this one, rather than blindly shrinking the width -- see
-                # that helper's docstring, Codex review: "Keep later tie
-                # offsets valid when moving a remainder"), then
-                # reclaimed_remainder is allocated fresh, landing this claim
-                # at wherever the batch currently stands.
-                prior_remainder_as_of = _finite_non_negative(cached.get(_CLAIM_REMAINDER_AS_OF_FIELD))
-                if prior_remainder_as_of == float(state[_WITHDRAWN_TOTAL_FIELD]):
-                    prior_remainder_registered = _finite_non_negative(cached.get(_CLAIM_REMAINDER_FIELD)) or 0.0
-                    prior_remainder_offset = _finite_non_negative(cached.get(_CLAIM_REMAINDER_TIE_OFFSET_FIELD)) or 0.0
-                    _retire_credit_tie_interval(
-                        state, recorded_keys, prior_remainder_as_of, prior_remainder_offset, prior_remainder_registered
-                    )
-                cached[_CLAIM_REMAINDER_FIELD] = reclaimed_remainder
-                # Tie offset via _allocate_credit_tie_offset() (Codex review:
-                # "Avoid charging one withdrawal to every restored claim") --
-                # naturally $0 in the ordinary case, since this reprice's own
-                # withdrawal delta (recorded just above) already moved the
-                # counter and starts a fresh batch, but still protects the
-                # narrower case of a DIFFERENT claim reclaiming at the exact
-                # same counter value with no real draw of its own in between.
-                #
-                # Allocated exactly ONCE here, against reclaimed_remainder --
-                # NOT allocated again below when this same figure is folded
-                # into restored_credit_usd. Calling _allocate_credit_tie_offset
-                # a second time for the SAME dollars would widen the shared
-                # batch by reclaimed_remainder twice for money that only
-                # entered the pool once, handing the restored-credit
-                # registration an offset inflated by its own amount --
-                # protecting it from aging it should not be exempt from, so a
-                # later claim reclaiming/redispatching credit at this exact
-                # counter value could still be charged for a withdrawal this
-                # claim's own restored money already covered (Codex review:
-                # "Avoid registering the reclaimed credit twice"). Reused
-                # verbatim below instead: relabeling this claim's remainder as
-                # restored credit does not change WHERE its interval sits on
-                # the withdrawal axis, so the SAME offset value describes both.
-                claim_remainder_tie_offset = _allocate_credit_tie_offset(
-                    state, reclaimed_remainder, dedup_key=dedup_key, field=_CLAIM_REMAINDER_FIELD
-                )
-                cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = claim_remainder_tie_offset
-                cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
-                # A reprice that lands on 0 shares (the price rose enough that
-                # the original committed total no longer buys even one share)
-                # has nothing left for any caller to place or settle -- the
-                # whole committed amount was just folded back into
-                # state["pending_usd"] above as ordinary accumulated balance.
-                # Mark it resolved here, mirroring the ORIGINAL decision
-                # path's own "resolved": shares_to_buy == 0 rule just below,
-                # so a LATER stale-claim check on this same key returns the
-                # already-resolved branch (a zero-shares decision reflecting
-                # the CURRENT balance, no delta) instead of reclaiming again.
-                # Left unresolved, a second reclaim would recompute
-                # apply_contribution from the SAME frozen
-                # pending_before_usd/contribution_usd, treating dollars this
-                # reclaim already restored as still owed -- if a different key
-                # had meanwhile spent that restored balance down, the second
-                # reclaim's delta could drive state["pending_usd"] negative
-                # (Codex review: "Prevent old claims from re-spending
-                # consumed credit"). A positive shares_to_buy, in contrast,
-                # is a genuine actionable fire that still needs a caller to
-                # place and settle/preserve it, so it stays unresolved.
-                cached["resolved"] = repriced.shares_to_buy == 0
-                if cached["resolved"]:
-                    # The reprice bought nothing, so the claim's whole
-                    # entitlement went back into state["pending_usd"] above and
-                    # nothing of it is outstanding -- structurally the same
-                    # position preserve_pending() leaves a claim in, and it has
-                    # to record the same thing.
-                    #
-                    # Without this the entry resolves having never written
-                    # restored_credit_usd, so a later zero-contribution
-                    # redispatch falls through _redispatchable_credit_usd()'s
-                    # missing-field branch to order_notional_usd -- which this
-                    # very reprice just overwrote with 0. The cap reads $0 and
-                    # the released credit is stranded permanently, even though
-                    # the ledger still holds it (Codex review
-                    # discussion_r3867623112, "Preserve credit when a reclaim
-                    # reprices to zero shares").
-                    #
-                    # Recorded as the aged entitlement computed above, not the
-                    # raw basis-level total, so a claim cannot recover credit
-                    # another claim withdrew while this fire sat unresolved.
-                    # The remainder is then zeroed, exactly as both preserve
-                    # paths do: it has been folded into the restored credit and
-                    # would otherwise be counted a second time.
-                    cached[_RESTORED_CREDIT_FIELD] = reclaimed_remainder
-                    # Reuses claim_remainder_tie_offset rather than calling
-                    # _allocate_credit_tie_offset() again -- see that call
-                    # site's own comment above for why a second allocation of
-                    # the SAME reclaimed_remainder would double-widen the
-                    # shared batch for money that only entered the pool once.
-                    cached[_RESTORED_CREDIT_TIE_OFFSET_FIELD] = claim_remainder_tie_offset
-                    cached[_RESTORED_CREDIT_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
-                    # The offset value above was only ever audited under
-                    # _CLAIM_REMAINDER_FIELD's own audit key (from the
-                    # _allocate_credit_tie_offset() call above) -- relabeling
-                    # it onto _RESTORED_CREDIT_FIELD here needs its OWN audit
-                    # entry too, or _read_state() finds no audit record for
-                    # (claim, restored_credit_usd, this snapshot) and trusts
-                    # ANY value stored there unconditionally, including a
-                    # later hand-edited one (Codex review: "Record an audit
-                    # for relabeled restored credits"). Written directly
-                    # (not through _allocate_credit_tie_offset(), which would
-                    # double-widen the batch per the comment above) since the
-                    # interval's position on the withdrawal axis is unchanged
-                    # -- only which field describes it is.
-                    _restored_audit = state.setdefault(_CREDIT_TIE_OFFSET_AUDIT_FIELD, {})
-                    if not isinstance(_restored_audit, dict):
-                        _restored_audit = {}
-                        state[_CREDIT_TIE_OFFSET_AUDIT_FIELD] = _restored_audit
-                    _restored_audit[
-                        _tie_offset_audit_key(dedup_key, _RESTORED_CREDIT_FIELD, state[_WITHDRAWN_TOTAL_FIELD])
-                    ] = claim_remainder_tie_offset
-                    # The remainder's interval was just relabeled onto
-                    # restored_credit_usd above (audited under ITS key) --
-                    # the remainder field is reset to $0 at this SAME
-                    # snapshot, so its own now-superseded audit entry (still
-                    # holding claim_remainder_tie_offset) must be forgotten,
-                    # or it mismatches this reset the instant this loads
-                    # again (Codex review: "Retire the remainder audit when
-                    # relabeling credit").
-                    _forget_tie_offset_audit(
-                        state, dedup_key, _CLAIM_REMAINDER_FIELD, state[_WITHDRAWN_TOTAL_FIELD]
-                    )
-                    cached[_CLAIM_REMAINDER_FIELD] = 0.0
-                    cached[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = 0.0
-                    cached[_CLAIM_REMAINDER_AS_OF_FIELD] = state[_WITHDRAWN_TOTAL_FIELD]
-                recorded_keys[dedup_key] = cached
-                state["pending_usd"] = round(state["pending_usd"] + pending_delta, 2)
-                # A reclaim mutates the cached quantity/notional/resolution
-                # state and the global pending balance exactly like a fresh
-                # contribution does, but -- unlike the fresh-contribution
-                # branch below, which always appends to state["events"] --
-                # this branch used to persist silently. events() and the
-                # on-disk audit trail then retained only the ORIGINAL stale
-                # fire, with nothing explaining the later balance adjustment
-                # or repriced decision, making operator reconciliation of
-                # the recovery path incorrect (Codex review: "Record
-                # stale-claim repricing in the ledger event history").
-                state["events"].append(
-                    {
-                        "trading_day": trading_day,
-                        "stream": stream,
-                        "recorded_at": recorded_at,
-                        "pending_before_usd": cached["pending_before_usd"],
-                        "contribution_usd": cached["contribution_usd"],
-                        "current_share_price_usd": repriced.current_share_price_usd,
-                        "shares_to_buy": repriced.shares_to_buy,
-                        "order_notional_usd": repriced.order_notional_usd,
-                        "pending_after_usd": state["pending_usd"],
-                        "decision": "reclaim_reprice",
-                    }
-                )
-                atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
-                return WholeShareAccumulationDecision(
-                    pending_before_usd=cached["pending_before_usd"],
-                    contribution_usd=cached["contribution_usd"],
-                    current_share_price_usd=repriced.current_share_price_usd,
-                    shares_to_buy=repriced.shares_to_buy,
-                    order_notional_usd=repriced.order_notional_usd,
-                    # The RECONCILED state["pending_usd"] just persisted above,
-                    # not the isolated repriced.pending_after_usd -- when a
-                    # DIFFERENT idempotency key changed the balance since this
-                    # claim was recorded, those two differ by exactly
-                    # pending_delta (Codex review: "Return the reconciled
-                    # pending balance after a stale reprice"). A caller (see
-                    # _process_whole_share_candidate) persists this field as
-                    # whole_share_pending_usd when the reprice yields 0
-                    # shares, so returning the pre-reconciliation value would
-                    # report a stale balance to run artifacts even though the
-                    # ledger itself now holds the correct, reconciled one.
-                    pending_after_usd=state["pending_usd"],
-                    claim_token=cached["claim_token"],
-                )
-            pending = state["pending_usd"]
-            decision = apply_contribution(pending, contribution_usd, current_share_price_usd)
-            state["pending_usd"] = decision.pending_after_usd
-            _record_withdrawal(state, decision.order_notional_usd)
-            if dedup_key is not None:
-                claim_token = uuid4().hex if decision.shares_to_buy > 0 else None
-                # This claim's OWN newly-owned credit. A claim that FIRED
-                # (shares_to_buy > 0) drew on the whole pool "by right" --
-                # the same convention _claim_sizing_basis_usd() documents --
-                # and its own withdrawal just moved the counter, so it always
-                # starts a brand new tie batch with no sibling to share it
-                # with; decision.pending_after_usd (the whole resulting pool)
-                # is genuinely its own remainder in that case, unchanged from
-                # before this fix. A claim that did NOT fire (still pending,
-                # shares_to_buy == 0), though, can be tied at the exact same
-                # withdrawal-counter instant as ANOTHER un-fired claim, and
-                # decision.pending_after_usd there mixes in every EARLIER
-                # tied claim's own still-pending money too: two $10 sub-share
-                # contributions tied at the same instant would otherwise
-                # record batch widths of $10 then $20 for a pool that only
-                # ever holds $20, and the SAME cumulative figure written into
-                # the remainder field below would let the second claim
-                # believe it still owns $20 of it. A withdrawal that later
-                # drains the whole $20 pool, followed by an unrelated $10
-                # replenishment, then reports the second claim as still
-                # owning $10 of the REPLENISHING claim's money instead of the
-                # $0 its own $10 share actually has left (Codex review:
-                # "Track only newly owned credit in the tie batch"). Using
-                # just this claim's own contribution there instead (its
-                # order_notional_usd is always exactly $0 when nothing
-                # fired) keeps the batch's total width equal to the pool's
-                # real total and gives every tied claim only its own
-                # non-overlapping slice of the withdrawal axis.
-                own_added_usd = (
-                    decision.pending_after_usd
-                    if decision.shares_to_buy > 0
-                    else decision.contribution_usd
-                )
-                # Snapshotted AFTER this fire's own withdrawal above. The tie
-                # offset (see _allocate_credit_tie_offset()) protects a
-                # zero-order sub-share contribution here from a DIFFERENT
-                # claim's own zero-order contribution landing at this exact
-                # same instant (Codex review: "Avoid charging one withdrawal
-                # to every restored claim").
-                remainder_tie_offset = _allocate_credit_tie_offset(
-                    state, own_added_usd, dedup_key=dedup_key, field=_CLAIM_REMAINDER_FIELD
-                )
-                recorded_keys[dedup_key] = {
-                    "pending_before_usd": decision.pending_before_usd,
-                    "contribution_usd": decision.contribution_usd,
-                    "current_share_price_usd": decision.current_share_price_usd,
-                    "shares_to_buy": decision.shares_to_buy,
-                    "order_notional_usd": decision.order_notional_usd,
-                    "pending_after_usd": decision.pending_after_usd,
-                    # This claim's own non-overlapping credit -- see
-                    # own_added_usd's own comment above for why this is not
-                    # decision.pending_after_usd -- folded back into
-                    # restored_credit_usd if the order is ever preserved, so
-                    # the claim keeps reach over its own change and nothing
-                    # more.
-                    _CLAIM_REMAINDER_FIELD: own_added_usd,
-                    _CLAIM_REMAINDER_AS_OF_FIELD: state[_WITHDRAWN_TOTAL_FIELD],
-                    _CLAIM_REMAINDER_TIE_OFFSET_FIELD: remainder_tie_offset,
-                    # A fresh fire draws on the whole pool by right, so its
-                    # reported balance and its sizing basis are the same
-                    # figure. Only a CAPPED redispatch makes the two diverge.
-                    _CLAIM_SIZING_BASIS_FIELD: decision.pending_before_usd,
-                    # A decision with 0 shares never needs settle()/
-                    # preserve_pending() to resolve it -- nothing was
-                    # deducted -- so it starts already resolved; only a real
-                    # fire (shares_to_buy > 0) needs a later settle/preserve
-                    # call to flip this.
-                    "resolved": decision.shares_to_buy == 0,
-                    # Only meaningful while unresolved --
-                    # when a real fire happens, this reserves the key against
-                    # a second overlapping caller until settle()/preserve_pending()
-                    # resolves it or a retry takes ownership.
-                    "claimed_at": recorded_at,
-                    "claim_token": claim_token,
-                }
-                if claim_token is not None:
-                    decision = WholeShareAccumulationDecision(**{**decision.__dict__, "claim_token": claim_token})
-            state["events"].append(
-                {
-                    "trading_day": trading_day,
-                    "stream": stream,
-                    "recorded_at": recorded_at,
-                    "pending_before_usd": decision.pending_before_usd,
-                    "contribution_usd": decision.contribution_usd,
-                    "current_share_price_usd": decision.current_share_price_usd,
-                    "shares_to_buy": decision.shares_to_buy,
-                    "order_notional_usd": decision.order_notional_usd,
-                    "pending_after_usd": decision.pending_after_usd,
-                    "decision": "fire" if decision.shares_to_buy > 0 else "pending",
-                }
+            return self._record_fresh_contribution(
+                state,
+                day_dir,
+                state_path,
+                dedup_key,
+                trading_day,
+                contribution_usd,
+                current_share_price_usd,
+                stream,
+                recorded_at,
             )
-            day_dir.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
-        return decision
 
     def preserve_pending(
         self,
