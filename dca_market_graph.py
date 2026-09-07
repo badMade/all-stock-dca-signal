@@ -814,28 +814,39 @@ class ProviderLoader:
             else datetime.now(EASTERN)
         )
         grouped: Dict[str, List[Bar]] = {}
-        for symbol in symbols:
-            bars = self.provider.get_intraday_bars(
-                symbol, window_start, window_end, self.interval_minutes
+        if hasattr(self.provider, "get_batch_intraday_bars"):
+            batch_result = self.provider.get_batch_intraday_bars(
+                symbols, window_start, window_end, self.interval_minutes
             )
-            # Re-sanitize through _bar_from_values rather than trusting the provider's
-            # own parsing. RobinhoodDataProvider legitimately emits bars with zero
-            # open/high/low -- a quote-derived prior close stamps low=0.0 to mean
-            # "unknown" -- and taken literally build_payload() reads that as a ~-100%
-            # move, which then sets the shared percentile scale for the whole scene.
-            # The CSV paths already get this treatment; the provider path was the only
-            # one trusting its input.
-            usable = []
-            for bar in bars or []:
-                if bar is None:
-                    continue
-                cleaned = _bar_from_values(
-                    bar.timestamp, bar.open, bar.high, bar.low, bar.close, bar.volume
+            for symbol in symbols:
+                bars = batch_result.get(symbol, [])
+                usable = []
+                for bar in bars:
+                    if bar is None:
+                        continue
+                    cleaned = _bar_from_values(
+                        bar.timestamp, bar.open, bar.high, bar.low, bar.close, bar.volume
+                    )
+                    if cleaned is not None:
+                        usable.append(cleaned)
+                if usable:
+                    grouped[symbol] = usable
+        else:
+            for symbol in symbols:
+                bars = self.provider.get_intraday_bars(
+                    symbol, window_start, window_end, self.interval_minutes
                 )
-                if cleaned is not None:
-                    usable.append(cleaned)
-            if usable:
-                grouped[symbol] = usable
+                usable = []
+                for bar in bars or []:
+                    if bar is None:
+                        continue
+                    cleaned = _bar_from_values(
+                        bar.timestamp, bar.open, bar.high, bar.low, bar.close, bar.volume
+                    )
+                    if cleaned is not None:
+                        usable.append(cleaned)
+                if usable:
+                    grouped[symbol] = usable
         return _collect(grouped, self.name, start, end)
 
 

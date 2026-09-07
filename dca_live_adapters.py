@@ -4808,6 +4808,56 @@ class RobinhoodDataProvider:
         )
         return self._parse_bars(response, ticker)
 
+
+    def get_batch_intraday_bars(
+        self,
+        tickers: List[str],
+        start: datetime,
+        end: datetime,
+        interval_minutes: int,
+    ) -> Dict[str, List[Bar]]:
+        interval = _rh_interval(interval_minutes)
+        response = self._historicals_fn(
+            symbols=tickers,
+            start_time=_to_utc_iso(start),
+            end_time=_to_utc_iso(end),
+            interval=interval,
+            bounds=self._bounds,
+            adjustment_type=self._adjustment_type,
+        )
+        data = _unwrap(response)
+        results = data.get("results") or []
+        grouped = {}
+        for result in results:
+            symbol = result.get("symbol")
+            if not symbol or symbol not in tickers:
+                continue
+
+            bars = []
+            for raw in result.get("bars") or []:
+                if raw.get("interpolated"):
+                    continue
+                timestamp = _parse_rfc3339(raw.get("begins_at"))
+                if timestamp is None:
+                    continue
+                close = _to_float(raw.get("close_price"), default=-1.0)
+                if close <= 0:
+                    logger.warning("dropping %s bar with invalid close_price=%r", symbol, raw.get("close_price"))
+                    continue
+                bars.append(
+                    Bar(
+                        timestamp=timestamp,
+                        open=_to_float(raw.get("open_price")),
+                        high=_to_float(raw.get("high_price")),
+                        low=_to_float(raw.get("low_price")),
+                        close=close,
+                        volume=_to_float(raw.get("volume")),
+                    )
+                )
+            if bars:
+                grouped[symbol] = bars
+        return grouped
+
     def get_previous_close_bar(self, ticker: str, as_of: datetime) -> Optional[Bar]:
         if self._quotes_fn is not None:
             bar = self._previous_close_from_quote(ticker, as_of)
