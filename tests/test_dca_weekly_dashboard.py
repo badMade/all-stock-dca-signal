@@ -8166,3 +8166,44 @@ def test_write_weekly_dashboard_creates_file_and_directories(tmp_path):
 
     assert "Weekly Performance Dashboard — Week 42" in content
     assert "2026-07-20" in content
+def test_build_coverage_missed_happy_path():
+    run_states = [
+        {
+            "trading_day": "2023-10-01",
+            "counts": {"buy_candidates": 5},
+            "manual_review_tickers": ["AAPL", "GOOG"],
+        },
+    ]
+    summaries = [
+        {
+            "trading_day": "2023-10-01",
+            "coverage": {
+                "buy_candidates": 5,
+                "fills": 4,
+                "coverage_pct": 80.0,
+                "missing_fills": 1,
+            }
+        }
+    ]
+    result = build_coverage_missed(run_states, summaries)
+    assert "## Coverage and missed opportunities" in result
+    assert "| 2023-10-01 | 5 | 4 | 80.0% | 1 | 2 |" in result
+
+
+def test_build_coverage_missed_missing_data():
+    run_states = [
+        {
+            # No trading_day
+            "counts": {"buy_candidates": 3},
+            "manual_review_tickers": [],
+        },
+        {
+            "trading_day": "2023-10-03",
+            # missing counts and manual review
+        }
+    ]
+    summaries = []
+
+    result = build_coverage_missed(run_states, summaries)
+    assert "| ? | 3 | n/a | n/a | n/a | 0 |" in result
+    assert "| 2023-10-03 | 0 | n/a | n/a | n/a | 0 |" in result
