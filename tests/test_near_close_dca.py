@@ -29977,7 +29977,7 @@ def test_retry_reconciliation_replaces_each_groups_own_row_by_ref_id(tmp_path):
         broker=Broker(cash=500.0),
         artifacts_dir=artifacts_dir,
     )
-    near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
+    recovered = near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
     saved = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
     aapl_rows = [r for r in saved["buy_candidates"] if r["ticker"] == "AAPL"]
@@ -29987,6 +29987,21 @@ def test_retry_reconciliation_replaces_each_groups_own_row_by_ref_id(tmp_path):
     assert all(r["status"] == "submitted" for r in aapl_rows)
     order_ids = {r["order_id"] for r in aapl_rows}
     assert order_ids == {"ORD-PLAIN", "ORD-TOPUP"}
+    # The fresh-run handoff is independently keyed by placement reference,
+    # too.  It is not enough for the old artifact to retain both orders: if
+    # this mapping collapses them back to one ticker-level key, the fresh
+    # run_state written by the caller loses one order and future deployment-
+    # history scans undercount its exposure.
+    assert set(recovered) == {
+        "AAPL#fractional-recovery:afternoon-AAPL-proof",
+        "AAPL#fractional-recovery:afternoon-AAPL-topup-proof",
+    }
+    assert {row["order_id"] for row in recovered.values()} == {
+        "ORD-PLAIN",
+        "ORD-TOPUP",
+    }
+    assert state.day_notional(now.date()) == 5.0
+    assert state.day_order_count(now.date()) == 2
 
 
 def test_retry_reconciliation_collapses_retries_sharing_one_reference(tmp_path):
