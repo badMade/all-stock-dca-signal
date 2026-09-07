@@ -9280,12 +9280,33 @@ def state_transaction(path=None):
                 # fails").
                 errors: list[BaseException] = []
                 for callback in callbacks:
-                    try:
-                        callback()
-                    except BaseException as exc:  # noqa: BLE001 - collected, not
-                        # swallowed: re-raised below once every callback has
-                        # had its own chance to run.
-                        errors.append(exc)
+                    # A callback that fails on a TRANSIENT artifact read/write
+                    # error (e.g. a momentary filesystem hiccup) leaves its
+                    # underlying record_buy() durably saved above but its
+                    # state_booked marker unwritten -- for a still-live order
+                    # claim, the ledger claim stays unresolved (settle()/
+                    # preserve_pending_if_claimed() only ever resolve
+                    # terminal/zero-fill claims), so the next invocation's
+                    # _gated_whole_share_recovery_already_recorded() reads
+                    # state_booked=False and books the SAME notional and
+                    # attempt into StrategyState again. Retrying the marker
+                    # write a few times, immediately, closes the transient
+                    # case without changing behavior for a durable failure
+                    # (which will exhaust the retries and still surface below
+                    # exactly as before) (review: "Repair failed marker writes
+                    # before rebooking live claims").
+                    last_exc: BaseException | None = None
+                    for _attempt in range(3):
+                        try:
+                            callback()
+                            last_exc = None
+                            break
+                        except BaseException as exc:  # noqa: BLE001 - collected, not
+                            # swallowed: re-raised below once every callback has
+                            # had its own chance to run.
+                            last_exc = exc
+                    if last_exc is not None:
+                        errors.append(last_exc)
                 if errors:
                     # A `raise` executed from this `finally` block REPLACES
                     # whatever exception is already propagating out of the

@@ -229,7 +229,10 @@ def test_whole_share_ledger_settles_only_the_confirmed_fill(tmp_path, monkeypatc
     assert ledger.pending_usd("BYDDY") == 10.0
 
 
-def test_ordinary_success_path_defers_settlement_for_a_still_live_order(tmp_path, monkeypatch):
+@pytest.mark.parametrize("working_state", ["new", "confirmed", "partially_filled"])
+def test_ordinary_success_path_defers_settlement_for_a_still_live_order(
+    tmp_path, monkeypatch, working_state
+):
     """Codex review ("Keep ordinary nonterminal submissions unresolved" and
     "Record accepted nonterminal orders as submitted"): when
     place_whole_share_buy returns WITHOUT raising, that only means the
@@ -253,7 +256,13 @@ def test_ordinary_success_path_defers_settlement_for_a_still_live_order(tmp_path
     class _StillLiveAfterPlacementBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
-                return {"id": "RH-STILL-LIVE-1", "state": "confirmed", "cumulative_quantity": "0"}
+                return {
+                    "id": "RH-STILL-LIVE-1",
+                    "state": working_state,
+                    # A partial cumulative fill is deliberately not final
+                    # while any of these working states can still advance.
+                    "cumulative_quantity": "1" if working_state == "partially_filled" else "0",
+                }
             return None
 
     broker = _StillLiveAfterPlacementBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
@@ -268,6 +277,7 @@ def test_ordinary_success_path_defers_settlement_for_a_still_live_order(tmp_path
     assert outcome["status"] == "submitted"
     assert outcome["whole_share_settlement_reconciliation_needed"] is True
     assert top_up is None
+    assert errors == 0
     assert running_deployed_7d == 10.0
     # An accepted-but-unfilled order still gets a real execution record, so
     # fill-coverage reporting doesn't treat it as though nothing happened.
@@ -311,6 +321,7 @@ def test_ordinary_success_path_defers_settlement_when_order_not_yet_visible(tmp_
     assert outcome["status"] == "submitted"
     assert outcome["whole_share_settlement_reconciliation_needed"] is True
     assert top_up is None
+    assert errors == 0
     assert running_deployed_7d == 10.0
 
     ledger = WholeShareAccumulationLedger()
@@ -1444,6 +1455,58 @@ def test_ambiguous_whole_share_placement_books_the_reserved_notional(tmp_path, m
     assert running_deployed_7d == 10.0
 
 
+def test_placement_failure_restores_credit_only_after_both_order_history_checks(tmp_path, monkeypatch):
+    """A definite no-order result must precede restoration after placement raises.
+
+    The live lookup catches an accepted order that is still working, while the
+    any-state lookup catches one that filled or terminated before reconciliation.
+    Restoring the claim before both exact-ref-id checks report no match could
+    make already-spent credit available on a later trading day.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+    calls = []
+
+    class _RejectedBeforeAcceptanceBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            calls.append(("place", ref_id))
+            raise RuntimeError("rejected before acceptance")
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            calls.append(("live", ref_id_prefixes))
+            return None
+
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            calls.append(("any_state", ref_id_prefixes))
+            return None
+
+    broker = _RejectedBeforeAcceptanceBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+
+    real_preserve_pending = WholeShareAccumulationLedger.preserve_pending
+
+    def _spy_preserve_pending(self, ticker, trading_day, deducted_usd, **kwargs):
+        calls.append(("preserve_pending", ticker))
+        return real_preserve_pending(self, ticker, trading_day, deducted_usd, **kwargs)
+
+    monkeypatch.setattr(WholeShareAccumulationLedger, "preserve_pending", _spy_preserve_pending)
+    outcome, _, _, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=10.0, target_price=10.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    ref_id = "graded-dca-wholeshare-2026-08-16-BYDDY"
+    assert calls == [
+        ("place", ref_id),
+        ("live", (ref_id,)),
+        ("any_state", (ref_id,)),
+        ("preserve_pending", "BYDDY"),
+    ]
+    assert outcome["status"] == "failed"
+    assert errors == 1
+    assert WholeShareAccumulationLedger().pending_usd("BYDDY") == 10.0
+
+
 def test_ambiguous_placement_failure_reconciles_via_ref_id_instead_of_restoring_credit(tmp_path, monkeypatch):
     """Codex review ("Reconcile ambiguous placement failures before
     restoring credit"): place_whole_share_buy() can raise AFTER the broker
@@ -1714,7 +1777,8 @@ def test_a_later_trading_day_reconciles_an_unresolved_claim_from_an_earlier_day(
             return None
 
     broker = _CrossDayConfirmingBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
-    ctx = _ctx(config, broker)
+    run_result = RunResult(trading_day=date(2026, 8, 16), decisions=[])
+    ctx = _ctx(config, broker, run_result=run_result)
 
     # TODAY's own candidate is a fresh, below-threshold accumulation --
     # unrelated to yesterday's stranded claim.
@@ -1733,7 +1797,11 @@ def test_a_later_trading_day_reconciles_an_unresolved_claim_from_an_earlier_day(
     # state"): the reconciled $10 purchase must be booked into
     # ctx.state/running_deployed_7d, not just the whole-share ledger.
     assert ("BYDDY", date(2026, 8, 15)) in ctx.state.own_orders_recorded
+    assert ctx.state.day_notional(date(2026, 8, 15)) == 10.0
     assert running_deployed_7d == 10.0
+    assert len(run_result.execution_records) == 1
+    assert run_result.execution_records[0].order_id == "RH-YESTERDAY-1"
+    assert run_result.execution_records[0].notional_usd == 10.0
 
 
 def test_a_reconciled_order_outside_the_7day_window_is_not_booked_as_current_deployment(tmp_path, monkeypatch):
@@ -1877,7 +1945,8 @@ def test_a_stale_confirmed_rejected_claim_is_released(tmp_path, monkeypatch):
     assert ledger2.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is None
 
 
-def test_a_nonterminal_ambiguous_match_leaves_the_claim_reserved(tmp_path, monkeypatch):
+@pytest.mark.parametrize("order_state", ["new", "confirmed", "partially_filled"])
+def test_a_nonterminal_ambiguous_match_leaves_the_claim_reserved(tmp_path, monkeypatch, order_state):
     """Codex review ("Keep nonterminal ambiguous orders reserved", "Book
     matched live orders before continuing"): the immediate placement-error
     branch's own ref-id reconciliation lookup can find a match that is
@@ -1904,7 +1973,17 @@ def test_a_nonterminal_ambiguous_match_leaves_the_claim_reserved(tmp_path, monke
             raise RuntimeError("response timeout")
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-            return {"id": "RH-STILL-WORKING-1", "state": "confirmed"}
+            matched_order = {
+                "id": "RH-STILL-WORKING-1",
+                "state": order_state,
+                "cumulative_quantity": "0",
+            }
+            if order_state == "partially_filled":
+                # "0" is truthy and quantity is positive, but neither value
+                # may settle a live order; the entire claim remains reserved
+                # until the order reaches a terminal state.
+                matched_order["quantity"] = "1"
+            return matched_order
 
     broker = _NonterminalMatchBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
 
@@ -1987,6 +2066,11 @@ def test_immediate_placement_failure_settles_a_partial_fill_found_via_terminal_l
     assert errors == 0
     ledger = WholeShareAccumulationLedger()
     assert ledger.shares_purchased_total("BYDDY") == 1
+    # settle() restores only the three unfilled shares at the cached $4
+    # claim price.  The filled share's $4 credit remains consumed even
+    # though its actual execution notional ($4.25) is used for reporting.
+    assert ledger.pending_usd("BYDDY") == 12.0
+    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is None
     assert running_deployed_7d == 4.25
     # Ownership enforcement is only meaningful when this terminal-inclusive
     # recovery passes the actionable decision's rotated claim token.
@@ -2105,7 +2189,10 @@ def test_terminal_placement_error_logs_execution_from_its_own_payload_without_re
     assert record.quantity_filled == 1.0
 
 
-def test_immediate_placement_failure_books_a_still_live_order_found_via_terminal_lookup(tmp_path, monkeypatch):
+@pytest.mark.parametrize("working_state", ["new", "confirmed", "partially_filled"])
+def test_immediate_placement_failure_books_a_still_live_order_found_via_terminal_lookup(
+    tmp_path, monkeypatch, working_state
+):
     """Codex review ("Verify terminal state after the any-state fallback",
     "Book live failure-envelope orders before continuing"): the immediate
     placement-failure branch's terminal-inclusive fallback carries no state
@@ -2135,7 +2222,7 @@ def test_immediate_placement_failure_books_a_still_live_order_found_via_terminal
 
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # The SAME order is now visible, still working -- not terminal.
-            return {"id": "RH-RACE-IMMEDIATE-1", "state": "confirmed", "cumulative_quantity": "1"}
+            return {"id": "RH-RACE-IMMEDIATE-1", "state": working_state, "cumulative_quantity": "1"}
 
     broker = _RaceConditionStillLiveBroker(cash=500.0, reference_prices={"BYDDY": 4.0})
 
@@ -2155,6 +2242,60 @@ def test_immediate_placement_failure_books_a_still_live_order_found_via_terminal
     ledger = WholeShareAccumulationLedger()
     # Still deducted (a real order was placed) but NOT settled -- the claim
     # stays unresolved for a later reconciliation attempt.
+    assert ledger.shares_purchased_total("BYDDY") == 0
+    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
+
+
+def test_live_order_carried_by_placement_failure_envelope_is_booked_without_history_lookup(
+    tmp_path, monkeypatch
+):
+    """A live inner order preserved by the adapter's failure-envelope error
+    is authoritative acceptance evidence even when order history has not
+    indexed it yet.
+
+    The caller must book the attempted notional and retain the unresolved
+    claim instead of reporting a blocked candidate that is invisible to the
+    remaining batch risk gates.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(
+        whole_share_tickers=frozenset({"BYDDY"}), dry_run=False, max_per_order_usd=10.0
+    )
+
+    class _LiveFailureEnvelopeBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise WholeSharePlacementTerminalError(
+                "outer failure carried an accepted inner order",
+                order={
+                    "id": "RH-LIVE-ENVELOPE-1",
+                    "state": "partially_filled",
+                    "cumulative_quantity": "1",
+                },
+            )
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            raise AssertionError("the failure envelope already supplied the order evidence")
+
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            raise AssertionError("the failure envelope already supplied the order evidence")
+
+    ctx = _ctx(config, _LiveFailureEnvelopeBroker(cash=500.0, reference_prices={"BYDDY": 4.0}))
+
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=16.0, target_price=4.0),
+        ctx=ctx,
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    assert outcome["order_id"] == "RH-LIVE-ENVELOPE-1"
+    assert outcome["submitted_amount_usd"] == pytest.approx(8.0)
+    assert outcome["whole_share_settlement_reconciliation_needed"] is True
+    assert running_deployed_7d == pytest.approx(8.0)
+    assert errors == 1
+    assert ctx.state.day_order_count(date(2026, 8, 16)) == 1
+    assert ctx.state.day_notional(date(2026, 8, 16)) == pytest.approx(8.0)
+    ledger = WholeShareAccumulationLedger()
     assert ledger.shares_purchased_total("BYDDY") == 0
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
 
@@ -2328,16 +2469,18 @@ def test_immediate_placement_failure_books_a_still_live_order_found_via_live_onl
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
 
 
-def test_immediate_placement_failure_leaves_the_claim_reserved_when_terminal_quantity_is_absent(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("terminal_quantity", [None, "not-a-number"])
+def test_immediate_placement_failure_leaves_the_claim_reserved_when_terminal_quantity_is_unknown(
+    tmp_path, monkeypatch, terminal_quantity
 ):
     """Codex review ("Keep terminal claims reserved when fill quantity is
     absent"): the immediate placement-failure branch's own terminal-
     inclusive lookup used to default filled_shares to 0 whenever
     cumulative_quantity was absent -- indistinguishable from an EXPLICIT
     zero -- and then unconditionally restored the full planned notional.
-    An absent quantity on a cancelled/rejected order proves nothing about
-    what actually executed; the claim must stay reserved instead.
+    An absent or malformed quantity on a cancelled/rejected order proves
+    nothing about what actually executed; the claim must stay reserved
+    instead.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     config = StrategyConfig(
@@ -2352,7 +2495,10 @@ def test_immediate_placement_failure_leaves_the_claim_reserved_when_terminal_qua
             return None
 
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
-            return {"id": "RH-NO-QTY-1", "state": "cancelled"}  # no cumulative_quantity field
+            order = {"id": "RH-NO-QTY-1", "state": "cancelled"}
+            if terminal_quantity is not None:
+                order["cumulative_quantity"] = terminal_quantity
+            return order
 
     broker = _TerminalNoQuantityBroker(cash=500.0, reference_prices={"BYDDY": 4.0})
 
@@ -2870,6 +3016,75 @@ def test_pre_roll_live_order_recovery_books_the_planned_notional_and_leaves_the_
     assert ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY") is not None
 
 
+def test_pre_roll_live_order_recovery_queues_a_post_commit_state_booked_marker(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Mark committed ordinary live recoveries"): the
+    ORDINARY (gate-passing) live_order_found publish tested above never
+    sets state_booked itself, and its claim stays unresolved in the
+    ledger exactly like a gated live_order_found row -- so a LATER gated
+    reconciliation of the SAME still-live claim needs a way to know
+    record_buy() above actually committed, or it double-books the same
+    order every time. A marker callback must be queued on
+    ``ctx.state.pending_durable_commit_callbacks`` (mirroring the gated
+    path's own identical queuing), and once fired against the row this
+    run eventually persists, must mark it state_booked=True.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    ledger = WholeShareAccumulationLedger()
+    ledger.record_contribution(
+        "BYDDY", "2026-08-15", 10.0, 10.0, stream="afternoon",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
+    )
+
+    class _StillLiveBroker(DryRunBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {"id": "RH-QUEUED-MARKER-ORDINARY", "state": "confirmed", "cumulative_quantity": "0"}
+
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir()
+    state = StrategyState()
+    ctx = ProcessCandidateContext(
+        config=StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False),
+        state=state,
+        broker=_StillLiveBroker(cash=500.0, reference_prices={"BYDDY": 10.0}),
+        robinhood_data=None,
+        now=datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN),
+        trading_day=date(2026, 8, 16),
+        guard_active=False,
+        prior_same_day_allocations={},
+        scheduled=True,
+        run_result=None,
+        artifacts_dir=str(artifacts_dir),
+    )
+    _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    _reconcile_cross_day_whole_share_claims_for_batch(ctx, 0.0)
+
+    assert len(state.pending_durable_commit_callbacks) == 1
+
+    # Simulate what run_pipeline()'s own reporting would have flushed this
+    # in-flight outcome into by the time state_transaction()'s callback
+    # actually fires (well after run_pipeline() itself has returned).
+    _near_close_dca.atomic_write_text(
+        artifacts_dir / "run_state.json",
+        _near_close_dca.json.dumps({
+            "buy_candidates": [{
+                "ticker": "BYDDY",
+                "status": "submitted",
+                "order_id": "RH-QUEUED-MARKER-ORDINARY",
+                "whole_share_settlement_reconciliation_needed": True,
+                "whole_share_claim_breakdown": [{"trading_day": "2026-08-15", "amount_usd": 10.0}],
+            }]
+        }),
+    )
+    for callback in state.pending_durable_commit_callbacks:
+        callback()
+
+    persisted = _near_close_dca.json.loads((artifacts_dir / "run_state.json").read_bytes())
+    assert persisted["buy_candidates"][0]["state_booked"] is True
+
+
 def test_pre_roll_live_order_recovery_books_the_actual_submitted_quantity_when_clamped(
     tmp_path, monkeypatch
 ):
@@ -3158,8 +3373,17 @@ def test_a_terminally_filled_recovery_publishes_the_delta_from_an_earlier_provis
         date(2026, 8, 16),
         [{
             "ticker": "BYDDY", "status": "submitted", "order_id": "RH-DELTA-FILL-1",
-            "planned_amount_usd": 10.0,
-            "whole_share_claim_breakdown": [{"trading_day": "2026-08-15", "amount_usd": 10.0}],
+            # One persisted row can aggregate multiple broker orders.  Both
+            # claims deliberately share a date, so reconciliation must use
+            # the order_id carried by each breakdown entry rather than
+            # attributing the row total (or the first same-date entry) to the
+            # order that just settled.
+            "planned_amount_usd": 30.0,
+            "whole_share_order_ids": ["RH-OTHER-ORDER", "RH-DELTA-FILL-1"],
+            "whole_share_claim_breakdown": [
+                {"trading_day": "2026-08-15", "order_id": "RH-OTHER-ORDER", "amount_usd": 20.0},
+                {"trading_day": "2026-08-15", "order_id": "RH-DELTA-FILL-1", "amount_usd": 10.0},
+            ],
         }],
     )
 
@@ -3655,6 +3879,35 @@ def test_merge_whole_share_submission_outcomes_preserves_settlement_state():
     assert merged["whole_share_settlement_shortfall_usd"] == pytest.approx(4.0)
 
 
+def test_merge_whole_share_outcomes_retains_recovered_order_id_after_no_id_failure():
+    """Codex review ("Retain the recovered order ID after a no-ID failure"):
+    ``merged = dict(new)`` keeps only NEW's own top-level ``order_id`` -- if
+    today's fresh placement fails without ever obtaining a broker order id,
+    that scalar silently becomes None even though the recovered side's real
+    order id is still present. build_usage_proxy only counts a submitted
+    outcome toward orders-placed via this top-level field, so a merged row
+    would otherwise report zero orders for a run that in fact recovered one.
+    """
+    recovered = {
+        "status": "submitted",
+        "order_id": "recovered-fill",
+        "submitted_amount_usd": 25.0,
+        "whole_share_quantity": 2,
+    }
+    failed_no_id = {
+        "status": "failed",
+        "order_id": None,
+        "submitted_amount_usd": 40.0,
+        "whole_share_quantity": 0,
+    }
+
+    merged = _near_close_dca._merge_whole_share_submission_outcomes(recovered, failed_no_id)
+
+    assert merged["status"] == "submitted"
+    assert merged["order_id"] == "recovered-fill"
+    assert merged["whole_share_order_ids"] == ["recovered-fill"]
+
+
 def test_batch_keeps_submission_published_during_candidate_processing(monkeypatch):
     """A late reconciliation publication must beat a returned accumulating outcome."""
     config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
@@ -3746,9 +3999,8 @@ def test_batch_pre_pass_reconciles_cross_day_claims_before_any_candidate_places(
     across the kill-switch threshold was then invisible to any candidate
     sorted BEFORE the whole-share ticker. _reconcile_cross_day_whole_share_
     claims_for_batch runs this reconciliation as a pre-pass over every
-    whole-share ticker in buy_candidates, so the returned running_deployed_7d
-    already reflects recovered spend before the main batch loop starts,
-    regardless of sort order.
+    configured whole-share ticker, so every call into the candidate processor
+    already receives the recovered deployment, regardless of sort order.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     ledger = WholeShareAccumulationLedger()
@@ -3783,15 +4035,23 @@ def test_batch_pre_pass_reconciles_cross_day_claims_before_any_candidate_places(
     other_decision = _decision(action=Action.BUY, suggested_amount_usd=3.0, target_price=10.0)
     other_decision = replace(other_decision, ticker="AAPL")
 
-    running_deployed_7d = _reconcile_cross_day_whole_share_claims_for_batch(
-        ctx, running_deployed_7d=0.0, decisions_by_ticker={"AAPL": other_decision}
-    )
+    whole_share_decision = _decision(action=Action.NO_ACTION)
+    deployments_seen = []
+
+    def _capture_candidate_deployment(decision, ctx, running_deployed_7d):
+        deployments_seen.append((decision.ticker, running_deployed_7d))
+        return ({"status": "skipped", "skip_reason": "test"}, None, running_deployed_7d, 0, 0)
+
+    monkeypatch.setattr(_near_close_dca, "_process_buy_candidate", _capture_candidate_deployment)
+    _process_buy_candidates_batch([other_decision, whole_share_decision], ctx)
 
     # The cross-day claim is settled and its $10 notional is already
-    # reflected in the returned figure, BEFORE any candidate has placed.
+    # reflected in the running figure BEFORE the first (alphabetically earlier)
+    # candidate is handed to placement logic. This exercises the batch boundary,
+    # rather than merely proving that the reconciliation helper returns $10.
     assert ledger.shares_purchased_total("BYDDY") == 1
     assert ledger.unresolved_claims_any_day("BYDDY", "afternoon-BYDDY") == []
-    assert running_deployed_7d == 10.0
+    assert deployments_seen == [("AAPL", 10.0), ("BYDDY", 10.0)]
 
 
 def test_batch_pre_pass_reconciles_a_ticker_removed_from_whole_share_config(tmp_path, monkeypatch):
@@ -4183,6 +4443,71 @@ def test_per_candidate_reconciliation_recovery_survives_todays_own_non_submissio
     assert ledger.shares_purchased_total("BYDDY") == 1
 
 
+def test_per_candidate_recovery_is_merged_with_todays_fresh_submission(tmp_path, monkeypatch):
+    """A mid-call recovery and a later fresh order must both reach artifacts.
+
+    This covers the identity-guard variant of the mid-call recovery race: the
+    whole-share success path publishes today's outcome before returning, so
+    the outer batch observes that published object as ``c_outcome``.  The
+    recovery therefore has to be merged at that inner publication point; it
+    cannot be recovered by comparing the post-call published object with the
+    returned object.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    ledger = WholeShareAccumulationLedger()
+    claim_trading_day = date(2026, 8, 15)
+    ledger.record_contribution(
+        "BYDDY", claim_trading_day.isoformat(), 10.0, 10.0, stream="afternoon",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
+    )
+
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+    old_claim_lookups = {"count": 0}
+
+    class _RecoveryThenFreshSubmissionBroker(DryRunBroker):
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            return "RH-FRESH-TODAY"
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-15-BYDDY",):
+                old_claim_lookups["count"] += 1
+                if old_claim_lookups["count"] == 1:
+                    return None
+                return {
+                    "id": "RH-RECOVERED-OLD-CLAIM",
+                    "state": "filled",
+                    "quantity": "1",
+                    "average_price": "10.00",
+                }
+            return {
+                "id": "RH-FRESH-TODAY",
+                "state": "filled",
+                "quantity": "1",
+                "average_price": "10.00",
+            }
+
+    broker = _RecoveryThenFreshSubmissionBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+    _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+
+    candidate_outcomes, _, running_deployed_7d, errors, _ = _process_buy_candidates_batch(
+        [_decision(suggested_amount_usd=10.0, target_price=10.0)], _ctx(config, broker)
+    )
+
+    assert old_claim_lookups["count"] == 2
+    assert errors == 0
+    assert running_deployed_7d == 20.0
+    outcome = candidate_outcomes["BYDDY"]
+    assert outcome["status"] == "submitted"
+    assert outcome["order_id"] == "RH-FRESH-TODAY"
+    assert outcome["whole_share_order_ids"] == ["RH-RECOVERED-OLD-CLAIM", "RH-FRESH-TODAY"]
+    assert outcome["submitted_amount_usd"] == 20.0
+    assert outcome["whole_share_quantity"] == 2
+    assert ledger.shares_purchased_total("BYDDY") == 2
+
+
 def test_batch_preserves_a_recovered_zero_fill_attempt_over_todays_own_non_submission(tmp_path, monkeypatch):
     """Codex review ("Preserve recovered zero-fill attempts through the
     batch"): the pre-pass's own zero_fill_attempt recovery (see
@@ -4363,7 +4688,12 @@ def test_whole_share_claim_is_reconciled_even_when_the_date_gate_blocks_the_run(
         data,
         rh_data,
         broker,
-        options=CompactRunOptions(artifacts_dir=str(tmp_path / "artifacts")),
+        options=CompactRunOptions(
+            artifacts_dir=str(tmp_path / "artifacts"),
+            # Match run_pipeline's normal layout: the current artifact
+            # directory is nested under the deployment-history scan root.
+            deployment_history_root=tmp_path,
+        ),
     )
 
     assert result["blocked"] is True
@@ -4610,6 +4940,7 @@ def test_whole_share_gated_recovery_keeps_claim_when_evidence_write_fails(tmp_pa
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     claim = ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY")
+    ledger_before = (ledger.root / "BYDDY" / "ledger.json").read_bytes()
 
     class _FilledBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
@@ -4628,6 +4959,11 @@ def test_whole_share_gated_recovery_keeps_claim_when_evidence_write_fails(tmp_pa
         )
     assert ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY") is not None
     assert ledger.shares_purchased_total("BYDDY") == 0
+    # The hook failure must abort the complete ledger transaction, rather
+    # than merely leave an unresolved marker alongside partially-mutated
+    # totals.  Byte equality pins the claim token/timestamps and pending
+    # balance too, all of which a later retry needs to retain ownership.
+    assert (ledger.root / "BYDDY" / "ledger.json").read_bytes() == ledger_before
 
 
 def test_settle_evidence_hook_fires_only_for_the_claim_winner(tmp_path, monkeypatch):
@@ -4790,14 +5126,24 @@ def test_gated_recovery_reverses_provisional_evidence_for_a_zero_fill_terminal(t
     assert zero_fill_row.get("whole_share_settlement_adjustment") is not True
 
 
-def test_persist_gated_whole_share_recovery_corrects_id_less_terminal_result(tmp_path):
+@pytest.mark.parametrize(
+    ("terminal_result", "expected_adjustment"),
+    [
+        ({"order_id": None, "shares_purchased": 1, "order_notional_usd": 12.0}, 2.0),
+        ({"order_id": None, "zero_fill_attempt": True}, -10.0),
+    ],
+    ids=("different-fill", "zero-fill"),
+)
+def test_persist_gated_whole_share_recovery_corrects_id_less_terminal_result(
+    tmp_path, terminal_result, expected_adjustment,
+):
     """Codex review ("Reconcile ID-less terminal results against
     provisional rows"): an id-less live recovery that later reconciles as
-    terminal (at a DIFFERENT amount, still with no order id) must still
-    receive its settlement correction -- (ticker, claim_trading_day_iso)
-    alone is a safe identity to net against, since the ledger can only
-    ever hold ONE unresolved claim per (ticker, trading_day,
-    idempotency_key).
+    terminal (at a DIFFERENT amount or explicitly zero, still with no order
+    id) must still receive its settlement correction -- (ticker,
+    claim_trading_day_iso) alone is a safe identity to net against, since
+    the ledger can only ever hold ONE unresolved claim per (ticker,
+    trading_day, idempotency_key).
     """
     first_dir = tmp_path / "first"
     first_dir.mkdir()
@@ -4817,13 +5163,11 @@ def test_persist_gated_whole_share_recovery_corrects_id_less_terminal_result(tmp
         _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
-        second_dir, "BYDDY", "2026-08-15",
-        {"order_id": None, "shares_purchased": 1, "order_notional_usd": 12.0},
-        date(2026, 8, 17), tmp_path,
+        second_dir, "BYDDY", "2026-08-15", terminal_result, date(2026, 8, 17), tmp_path,
     )
     second_state = _near_close_dca.json.loads((second_dir / "run_state.json").read_bytes())
     correction = second_state["buy_candidates"][0]
-    assert correction["planned_amount_usd"] == pytest.approx(2.0)
+    assert correction["planned_amount_usd"] == pytest.approx(expected_adjustment)
     assert correction["whole_share_settlement_adjustment"] is True
 
 
@@ -5833,6 +6177,46 @@ def test_persist_gated_whole_share_recovery_refuses_ambiguous_legacy_matches(tmp
     assert len(run_state["buy_candidates"]) == 1
 
 
+def test_persist_gated_whole_share_recovery_does_not_reverse_unchanged_fill_in_same_stub(tmp_path):
+    """The current stub must not be counted by both candidate inputs.
+
+    When a provisional recovery and its unchanged terminal fill share an
+    artifact directory, counting the on-disk stub in deployment history in
+    addition to ``extra_candidates`` would compute a -$10 adjustment.  The
+    retry may append a zero-dollar booking marker, but it must preserve the
+    original $10 deployment total.
+    """
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir()
+    _near_close_dca.atomic_write_text(
+        artifacts_dir / "run_state.json",
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+    )
+    recovery = {
+        "live_order_found": True,
+        "order_id": "RH-SAME-STUB-UNCHANGED",
+        "planned_notional_usd": 10.0,
+    }
+    _near_close_dca._persist_gated_whole_share_recovery(
+        artifacts_dir, "BYDDY", "2026-08-15", recovery, date(2026, 8, 16), tmp_path,
+    )
+
+    _near_close_dca._persist_gated_whole_share_recovery(
+        artifacts_dir,
+        "BYDDY",
+        "2026-08-15",
+        {"order_id": recovery["order_id"], "shares_purchased": 1, "order_notional_usd": 10.0},
+        date(2026, 8, 16),
+        tmp_path,
+    )
+
+    run_state = _near_close_dca.json.loads((artifacts_dir / "run_state.json").read_bytes())
+    rows = run_state["buy_candidates"]
+    assert [row["planned_amount_usd"] for row in rows] == pytest.approx([10.0, 0.0])
+    assert sum(row["planned_amount_usd"] for row in rows) == pytest.approx(10.0)
+    assert rows[1]["whole_share_settlement_adjustment"] is True
+
+
 def test_persist_gated_whole_share_recovery_nets_adjustments_across_retries(tmp_path):
     """Codex review ("Make settlement adjustments idempotent across
     retries"): if an EARLIER retry already persisted a partial adjustment
@@ -6085,7 +6469,8 @@ def test_persist_gated_whole_share_recovery_keeps_a_booked_base_from_masking_an_
     assert total == pytest.approx(15.0)
 
 
-def test_stale_no_match_release_reverses_provisional_evidence(tmp_path, monkeypatch):
+@pytest.mark.parametrize("evidence_source", ["placed-flag", "prior-evidence-on-disk"])
+def test_stale_no_match_release_reverses_provisional_evidence(tmp_path, monkeypatch, evidence_source):
     """Codex review ("Reverse live evidence on stale no-match releases"):
     a PRIOR gated run can have persisted this claim provisionally as
     live_order_found (the full planned notional). If a LATER reconciliation
@@ -6095,6 +6480,14 @@ def test_stale_no_match_release_reverses_provisional_evidence(tmp_path, monkeypa
     before_release correction here too, the stale provisional notional
     stays counted in deployment history forever, since no later run can
     ever revisit a resolved claim to reverse it.
+
+    The reversal is only booked when there is real evidence an order
+    reached the broker (review: "Do not count stale no-match releases as
+    broker attempts"), and that evidence can come from EITHER source:
+    the claim's own durable ``placed`` marker (``placed-flag``), or --
+    when the claim record carries neither ``placing`` nor ``placed`` --
+    the prior gated run's own persisted live_order_found row, found via
+    ``deployment_history_root`` (``prior-evidence-on-disk``).
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     from dca_whole_share_accumulator import WholeShareAccumulationLedger
@@ -6126,12 +6519,19 @@ def test_stale_no_match_release_reverses_provisional_evidence(tmp_path, monkeypa
     claim = ledger.unresolved_claim("BYDDY", claim_trading_day.isoformat(), "afternoon-BYDDY")
     assert claim is not None
     # This test's own narrative is a broker call that WAS actually made (a
-    # prior gated run found and persisted a live order) -- mirror the
-    # "placed" marker execute_claimed() would have durably set for that
-    # real attempt, since (Codex review: "Avoid inventing attempts for
-    # stale no-match claims") a stale-release reversal is only booked as
-    # an attempt when real placement evidence exists.
-    claim["placed"] = True
+    # prior gated run found and persisted a live order). In the
+    # "placed-flag" mode, mirror the "placed" marker execute_claimed()
+    # would have durably set for that real attempt, since (Codex review:
+    # "Avoid inventing attempts for stale no-match claims") a stale-release
+    # reversal is only booked as an attempt when real placement evidence
+    # exists. In the "prior-evidence-on-disk" mode the claim record carries
+    # NO such marker and the persisted live_order_found row above is the
+    # only evidence -- which must still be enough, or the provisional
+    # notional it recorded would never be reversed.
+    if evidence_source == "placed-flag":
+        claim["placed"] = True
+    else:
+        assert not claim.get("placed") and not claim.get("placing")
 
     released = []
 
@@ -6143,9 +6543,16 @@ def test_stale_no_match_release_reverses_provisional_evidence(tmp_path, monkeypa
 
     # Far enough past claimed_at to be stale.
     stale_now_iso = "2026-08-20T19:35:00-04:00"
+    # deployment_history_root=tmp_path lets the function see the PRIOR gated
+    # run's own live_order_found evidence persisted above -- this is exactly
+    # the "prior live-order evidence" case the fix for "Do not count stale
+    # no-match releases as broker attempts" still requires before_release to
+    # fire for. Withheld in the "placed-flag" mode so that mode proves the
+    # claim's own marker suffices on its own.
     result = _near_close_dca._reconcile_unresolved_whole_share_claim(
         ledger, broker, "BYDDY", "afternoon", "afternoon-BYDDY",
         "2026-08-15", claim, now_iso=stale_now_iso, before_release=_before_release,
+        deployment_history_root=tmp_path if evidence_source == "prior-evidence-on-disk" else None,
     )
     assert result is None  # nothing to book -- this is a release, not a settlement
     assert released, "expected the stale no-match release to invoke before_release"
@@ -6206,10 +6613,16 @@ def test_stale_no_match_release_does_not_invent_an_attempt_before_placement(tmp_
     result = _near_close_dca._reconcile_unresolved_whole_share_claim(
         ledger, broker, "BYDDY", "afternoon", "afternoon-BYDDY",
         "2026-08-15", claim, now_iso=stale_now_iso, before_release=_before_release,
+        # A deployment-history root with NO persisted evidence for this claim
+        # (unlike test_stale_no_match_release_reverses_provisional_evidence's
+        # "prior-evidence-on-disk" mode) -- the on-disk lookup the fix for "Do
+        # not count stale no-match releases as broker attempts" added must
+        # come back empty here, not invent evidence of its own.
+        deployment_history_root=tmp_path,
     )
     assert result is None
     # before_release must NOT fire -- there is no real attempt to book.
-    assert not released
+    assert not released, "a claim that never reached the broker must not be counted as an attempt"
     # The claim is still released -- the reservation is not stranded.
     assert ledger.unresolved_claim("BYDDY", claim_trading_day.isoformat(), "afternoon-BYDDY") is None
     assert ledger.pending_usd("BYDDY") == 10.0
@@ -6324,6 +6737,7 @@ def test_whole_share_zero_fill_release_hook_failure_leaves_claim_unresolved(tmp_
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     claim = ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY")
+    ledger_before = (ledger.root / "BYDDY" / "ledger.json").read_bytes()
 
     class _ZeroFillBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
@@ -6345,6 +6759,10 @@ def test_whole_share_zero_fill_release_hook_failure_leaves_claim_unresolved(tmp_
 
     assert result is None
     assert ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY") is not None
+    # Reversal persistence is part of the release transaction: if it fails,
+    # even incidental ledger metadata must remain untouched so the exact same
+    # zero-fill claim can be won and reversed by a subsequent invocation.
+    assert (ledger.root / "BYDDY" / "ledger.json").read_bytes() == ledger_before
 
 
 def test_gated_recovery_persists_live_evidence_before_booking_durable_state(tmp_path, monkeypatch):
@@ -6945,13 +7363,25 @@ def test_state_transaction_runs_every_commit_callback_even_after_one_fails(tmp_p
 
     with pytest.raises(RuntimeError, match="first marker write failed"):
         with dca_runner.state_transaction(path=state_path) as state:
+            # Model the booking that each marker vouches for.  The callback
+            # failure is deliberately post-commit, so it must not roll this
+            # mutation back or leave a retry believing the marker failure
+            # also meant the StrategyState save failed.
+            state.record_buy("BYDDY", date(2026, 8, 15), 10.0)
             state.pending_durable_commit_callbacks.append(_failing_first)
             state.pending_durable_commit_callbacks.append(_ok_second)
             state.pending_durable_commit_callbacks.append(_ok_third)
 
     # ALL three ran -- the second and third weren't skipped just because
-    # the first raised.
-    assert ran == ["first", "second", "third"]
+    # the first raised. The first is retried a few times in place (review:
+    # "Repair failed marker writes before rebooking live claims" -- a
+    # transient marker-write failure must not immediately give up and leave
+    # a still-live claim looking unbooked) before its failure is recorded,
+    # so it appears more than once ahead of "second"/"third".
+    assert ran == ["first", "first", "first", "second", "third"]
+    persisted = dca_runner.load_strategy_state(state_path)
+    assert persisted.buys_today("BYDDY", date(2026, 8, 15)) == 1
+    assert persisted.day_notional(date(2026, 8, 15)) == pytest.approx(10.0)
 
 
 def test_gated_marker_write_failure_raises_instead_of_silently_swallowing(tmp_path):
@@ -7087,6 +7517,12 @@ def test_pre_roll_recovered_fill_is_persisted_into_buy_candidates(tmp_path, monk
     # buy_candidates -- a future run's kill-switch seeding depends on it
     # being present and correct here.
     assert byddy_rows[0]["planned_amount_usd"] == pytest.approx(10.0)
+    from dca_risk import deployed_usd
+
+    # Exercise the actual next-run consumer rather than only asserting the
+    # artifact's intermediate shape: the recovered fill must remain visible
+    # after this invocation's in-memory StrategyState is gone.
+    assert deployed_usd(run_state) == pytest.approx(10.0)
 
 
 def test_batch_aggregates_a_recovered_fill_with_todays_own_submission(tmp_path, monkeypatch):
@@ -7733,6 +8169,66 @@ def test_immediate_recovery_does_not_rebook_after_losing_claim_ownership(tmp_pat
     # Nothing was double-booked into THIS run's own state/deployment total.
     assert running_deployed_7d == 0.0
     assert ("BYDDY", date(2026, 8, 16)) not in ctx.state.own_orders_recorded
+
+
+def test_terminal_partial_fill_does_not_rebook_after_losing_claim_ownership(tmp_path, monkeypatch):
+    """The terminal-partial-fill sibling obeys the same ownership result.
+
+    A terminal placement response is authoritative evidence of its partial
+    fill, but it does not make this caller the owner of ledger settlement.
+    When another reconciler wins that transition first, this path must not
+    book or publish the same broker fill a second time.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+
+    class _TerminalPartialFillBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise WholeSharePlacementTerminalError(
+                "order partially filled before cancellation",
+                order={
+                    "id": "RH-WON-BY-SOMEONE-ELSE-2",
+                    "state": "cancelled",
+                    "cumulative_quantity": "1",
+                    "average_price": "10.25",
+                },
+            )
+
+    broker = _TerminalPartialFillBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
+
+    import dca_whole_share_accumulator as wsa_module
+
+    # A stub that unconditionally returns False would pass every assertion
+    # below even if the terminal-partial-fill branch stopped passing
+    # require_claim_ownership=True to settle() -- the real settle() only
+    # skips its shares_purchased_total/audit-event mutations (and thus
+    # returns False without double-booking the ledger) when that flag is
+    # actually set. Capture the kwargs settle() was called with so this
+    # test fails, rather than silently passing, if that argument regresses
+    # (Codex review: "Exercise the real settlement ownership guard").
+    settle_calls = []
+
+    def _lost_the_race_settle(self, *args, **kwargs):
+        settle_calls.append(kwargs)
+        return False  # cleanly resolved elsewhere -- not an exception
+
+    monkeypatch.setattr(wsa_module.WholeShareAccumulationLedger, "settle", _lost_the_race_settle)
+
+    ctx = _ctx(config, broker)
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=20.0, target_price=10.0),
+        ctx=ctx,
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "skipped"
+    assert outcome["order_id"] == "RH-WON-BY-SOMEONE-ELSE-2"
+    assert errors == 0
+    assert running_deployed_7d == 0.0
+    assert ctx.state.day_notional(date(2026, 8, 16)) == 0.0
+    assert ("BYDDY", date(2026, 8, 16)) not in ctx.state.own_orders_recorded
+    assert settle_calls, "the terminal-partial-fill branch never called settle()"
+    assert settle_calls[-1].get("require_claim_ownership") is True
 
 
 def test_confirmation_required_whole_share_placement_is_not_classified_as_failed(tmp_path, monkeypatch):
@@ -9799,6 +10295,45 @@ def test_reconciled_price_uses_the_higher_of_two_agreeing_quotes():
     )
 
     assert _whole_share_redispatch_reconciled_price(disagreeing_decision) is None
+
+
+def test_higher_reconciled_quote_prevents_threshold_and_ceiling_overspend(tmp_path, monkeypatch):
+    """A tolerated quote difference must not make the cheaper source executable.
+
+    Finance's $9.90 quote is within two percent of Robinhood's $10.09 quote,
+    but the order executes at Robinhood.  A $10 contribution therefore cannot
+    fund one share and must remain pending rather than slipping past both the
+    accumulator threshold and the default $10 per-order ceiling.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+    broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 10.09})
+    decision = ReconciledDecision(
+        ticker="BYDDY",
+        action=Action.BUY,
+        reason="finance and Robinhood agree on BUY",
+        finance_signal=_source_signal(SourceName.FINANCE, quote_price=9.90, suggested_amount_usd=10.0),
+        robinhood_signal=_source_signal(SourceName.ROBINHOOD, quote_price=10.09, suggested_amount_usd=10.0),
+        suggested_amount_usd=10.0,
+        selected_base_amount_usd=1.0,
+        target_price=9.90,
+        decision_bar_close=9.90,
+    )
+
+    outcome, _, _, errors, reviews = _process_buy_candidate(
+        decision,
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "skipped"
+    assert "threshold not yet reached" in outcome["skip_reason"]
+    assert outcome["whole_share_pending_usd"] == pytest.approx(10.0)
+    assert errors == 0
+    assert reviews == 0
+    ledger = WholeShareAccumulationLedger()
+    assert ledger.pending_usd("BYDDY") == pytest.approx(10.0)
+    assert ledger.shares_purchased_total("BYDDY") == 0
 
 
 def test_fresh_buy_blocks_when_sources_disagree_on_execution_quote(tmp_path, monkeypatch):

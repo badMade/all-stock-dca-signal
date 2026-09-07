@@ -1852,7 +1852,8 @@ def test_reconcile_unresolved_whole_share_claim_requires_an_exact_ref_id_match(t
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None  # still unresolved
 
 
-def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_order(tmp_path):
+@pytest.mark.parametrize("working_state", ["new", "queued", "confirmed", "partially_filled"])
+def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_order(tmp_path, working_state):
     """Codex review ("Defer settling recovered orders until they are
     terminal"): when the exact matching order is still queued or
     working (not yet terminal), its final filled quantity is not yet
@@ -1872,16 +1873,23 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_order(tmp_pa
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
-    class _StillQueuedBroker:
+    class _StillWorkingBroker:
         def account_number(self) -> str:
             return "test-account"
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-            return {"id": "RH-QUEUED-1", "state": "queued", "cumulative_quantity": "0", "quantity": "1"}
+            return {
+                "id": "RH-WORKING-1",
+                "state": working_state,
+                # In particular, a partial fill is cumulative progress, not
+                # a terminal quantity that is safe to settle yet.
+                "cumulative_quantity": "0.5" if working_state == "partially_filled" else "0",
+                "quantity": "1",
+            }
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _StillQueuedBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, _StillWorkingBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     # Codex review ("Book live orders discovered during claim recovery"):
@@ -1890,7 +1898,7 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_order(tmp_pa
     # LEDGER claim itself stays exactly as reserved/unresolved as before.
     assert reconciled == {
         "live_order_found": True,
-        "order_id": "RH-QUEUED-1",
+        "order_id": "RH-WORKING-1",
         "planned_notional_usd": 10.0,
         "planned_quantity": 1,
     }
@@ -1991,7 +1999,10 @@ def test_reconcile_unresolved_whole_share_claim_settles_a_partial_fill_before_ca
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is None
 
 
-def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_any_state_fallback_match(tmp_path):
+@pytest.mark.parametrize("working_state", ["new", "confirmed", "partially_filled"])
+def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_any_state_fallback_match(
+    tmp_path, working_state
+):
     """Codex review ("Verify terminal state after the any-state fallback"):
     the terminal-inclusive any-state fallback carries no state filter of its
     own, so it can surface a LIVE order that only became visible in the
@@ -2020,7 +2031,11 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_any_state_fa
 
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # The SAME order is now visible, still working -- not terminal.
-            return {"id": "RH-RACE-1", "state": "confirmed", "cumulative_quantity": "0"}
+            return {
+                "id": "RH-RACE-1",
+                "state": working_state,
+                "cumulative_quantity": "1" if working_state == "partially_filled" else "0",
+            }
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
@@ -2539,6 +2554,30 @@ def test_a_claim_repriced_to_zero_shares_is_resolved_and_cannot_re_spend_consume
     )
     assert second_reclaim.shares_to_buy == 0
     assert ledger.pending_usd("BYDDY") == 0.0
+
+    # Even if newer activity subsequently replenishes the shared pool, the
+    # already-resolved slot-1 key cannot redispatch against dollars that
+    # belong to that newer activity: both its read-only preview and a real
+    # retry stay at zero shares and leave the replenished $10 untouched.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 20.0, idempotency_key="slot-3", recorded_at="2026-08-16T15:53:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T16:04:00-04:00", 10.0
+    )
+    assert preview.shares_to_buy == 0
+    assert preview.order_notional_usd == 0.0
+    resolved_retry = ledger.record_contribution(
+        "BYDDY",
+        "2026-08-16",
+        0.0,
+        10.0,
+        idempotency_key="slot-1",
+        recorded_at="2026-08-16T16:04:00-04:00",
+    )
+    assert resolved_retry.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
 
 
 def test_a_zero_share_reclaim_registers_its_credit_in_the_tie_batch_only_once(tmp_path):

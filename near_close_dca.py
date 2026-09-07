@@ -15862,6 +15862,7 @@ def _reconcile_unresolved_whole_share_claim(
     now_iso: Optional[str] = None,
     before_settle: Optional[Callable[[Dict[str, Any]], None]] = None,
     before_release: Optional[Callable[[Dict[str, Any]], None]] = None,
+    deployment_history_root: Optional[str | Path] = None,
 ) -> Optional[Dict[str, Any]]:
     """Settle an unresolved whole-share claim IF the broker confirms this
     EXACT ref_id landed, using the claim's own recorded quantity/price.
@@ -16198,28 +16199,69 @@ def _reconcile_unresolved_whole_share_claim(
             # outcome.
             return zero_fill_result
         if _whole_share_claim_is_stale(claim.get("claimed_at"), now_iso):
-            # This clean no-match is real evidence no order ever landed --
-            # the SAME "confirmed nothing executed" conclusion the atomic
-            # zero-fill branch above reaches, just via absence rather than
-            # an explicit terminal rejection -- so it needs the identical
+            # A PRIOR gated run can have already persisted this exact claim
+            # provisionally as live_order_found (the full planned notional,
+            # since the fill wasn't yet known at the time). This clean
+            # no-match is real evidence no order ever landed -- the SAME
+            # "confirmed nothing executed" conclusion the atomic zero-fill
+            # branch above reaches, just via absence rather than an
+            # explicit terminal rejection -- so it needs the identical
             # before_release correction: without it, preserve_pending()
-            # below restores the FULL reserved credit while the stale
-            # provisional notional stays counted in deployment history/
-            # StrategyState forever, since this releases the claim and no
-            # later run can ever revisit it to write the reversal (Codex
-            # review, PR #715: "Reverse live evidence on stale no-match
-            # releases"). A pre-placement crash (neither "placing" nor
-            # "placed" was ever set) means no broker request was EVER
-            # made -- booking this as a zero_fill_attempt would fabricate
-            # an attempt that never happened, so only a claim with real
-            # placement evidence is entitled to book one here (Codex
-            # review: "Avoid inventing attempts for stale no-match
-            # claims").
+            # below restores the FULL reserved credit (as if nothing was
+            # ever provisionally spent) while the stale provisional
+            # notional stays counted in deployment history/StrategyState
+            # forever, since this releases the claim and no later run can
+            # ever revisit it to write the reversal (Codex review, PR #715:
+            # "Reverse live evidence on stale no-match releases").
+            #
+            # Only count this release as a real broker attempt when there is
+            # actual evidence an order reached the broker for this claim --
+            # either the claim itself is still marked "placed"/"placing" (an
+            # order was submitted or in flight in THIS process), or an
+            # EARLIER gated run already persisted this same claim as
+            # live_order_found (the exact "prior live-order evidence" case
+            # this branch exists to reverse). Otherwise this is the crash
+            # window record_contribution() documents: a pre-placement crash
+            # (neither "placing" nor "placed" was ever set, and nothing
+            # persisted for it) means no broker request was EVER made, so
+            # "no match" here proves nothing was ever attempted. Labeling
+            # THAT as zero_fill_attempt made the gated path's
+            # _persist_and_book_gated_recovery() call record_buy(..., 0.0),
+            # fabricating an attempt that never happened and inflating the
+            # persisted per-ticker/daily attempt counters for an order that
+            # was never placed (Codex review: "Avoid inventing attempts for
+            # stale no-match claims"; PR #1260 review: "Do not count stale
+            # no-match releases as broker attempts").
+            claim_has_broker_evidence = bool(claim.get("placed")) or bool(claim.get("placing"))
+            if not claim_has_broker_evidence and deployment_history_root is not None:
+                try:
+                    claim_trading_day_date_for_evidence = date.fromisoformat(claim_trading_day_iso)
+                except ValueError:
+                    claim_trading_day_date_for_evidence = date.fromisoformat(now_iso[:10]) if now_iso else date.today()
+                # order_id=None: a stale no-match claim has no broker id to
+                # key on, so this is the ticker/claim-day (plus
+                # claim_attempt_id, when the claim carries one) fallback
+                # match. An AMBIGUOUS match -- a row for this claim day
+                # exists but its own same-day breakdown cannot be safely
+                # attributed to this one claim -- is still proof SOMETHING
+                # was persisted for it, so it counts as evidence here too:
+                # the reversal hook's own dedup is what sorts out which row
+                # to net against, whereas skipping the hook would leave
+                # that persisted notional counted forever.
+                _, prior_evidence_found, _, _, prior_evidence_ambiguous = _total_recorded_whole_share_claim_amount(
+                    None,
+                    ticker,
+                    claim_trading_day_iso,
+                    claim_trading_day_date_for_evidence,
+                    deployment_history_root,
+                    [],
+                    claim_attempt_id=claim.get("claim_attempt_id"),
+                )
+                claim_has_broker_evidence = prior_evidence_found or prior_evidence_ambiguous
             stale_no_match_result = {"zero_fill_attempt": True, "order_id": None}
-            has_placement_evidence = bool(claim.get("placing")) or bool(claim.get("placed"))
             on_release = (
                 (lambda: before_release(stale_no_match_result))
-                if before_release is not None and has_placement_evidence
+                if before_release is not None and claim_has_broker_evidence
                 else None
             )
             try:
@@ -17278,8 +17320,21 @@ def _book_reconciled_whole_share_order_durably(
             # overstate unused prior-week capacity and authorize excess
             # stress-tier spend (Codex review: "Invalidate the reserve
             # after correcting prior-week spend").
+            #
+            # Clearing reserve_week_key alone is not enough: _state_from_json
+            # rejects any saved state where weekly_rollover_reserve_usd is
+            # nonzero but reserve_week_key is None (a real reserve is never
+            # legitimately unkeyed), and this gated path returns immediately
+            # after this block -- there is no later roll_weekly_reserve()
+            # call in THIS invocation to re-stamp a fresh key before
+            # save_strategy_state() persists whatever is left here. Zero the
+            # reserve amount in the same statement so the pair stays valid
+            # even if the enclosing transaction commits before any later
+            # roll_weekly_reserve() call recomputes it (review: "Preserve a
+            # valid reserve state when invalidating its week key").
             if iso_week_key(claim_trading_day_date) < iso_week_key(trading_day):
                 state.reserve_week_key = None
+                state.weekly_rollover_reserve_usd = 0.0
         return
     # Mirrors _book_reconciled_whole_share_order's own three-way branch --
     # a live/working match (Codex review: "Book live orders discovered
@@ -17298,9 +17353,14 @@ def _book_reconciled_whole_share_order_durably(
     # Same reserve invalidation as the correction branch above -- a FRESH
     # booking for an earlier ISO week (the common case: a gated recovery's
     # claim_trading_day is almost always a past day) needs it too, not just
-    # a later correction to one.
+    # a later correction to one. Zero weekly_rollover_reserve_usd alongside
+    # the key for the same reason as above: _state_from_json rejects a
+    # nonzero reserve with no week key, and this function returns before any
+    # later roll_weekly_reserve() call could re-stamp a fresh pair (review:
+    # "Preserve a valid reserve state when invalidating its week key").
     if iso_week_key(claim_trading_day_date) < iso_week_key(trading_day):
         state.reserve_week_key = None
+        state.weekly_rollover_reserve_usd = 0.0
 
 
 def _candidate_row_matches_whole_share_claim(
@@ -18358,6 +18418,7 @@ def _reconcile_cross_day_whole_share_claims(
             reconciled = _reconcile_unresolved_whole_share_claim(
                 ledger, ctx.broker, ticker, ctx.stream, idempotency_key, claim_trading_day_iso, claim,
                 now_iso=ctx.now.isoformat(),
+                deployment_history_root=ctx.deployment_history_root,
             )
         except Exception as cross_day_exc:  # noqa: BLE001 - best-effort; must not
             # abort the caller, or any OTHER claim's own reconciliation
@@ -18706,6 +18767,7 @@ def _process_whole_share_candidate(
                     reconciled = _reconcile_unresolved_whole_share_claim(
                         ledger, ctx.broker, ticker, ctx.stream, idempotency_key, trading_day_iso, unresolved,
                         now_iso=ctx.now.isoformat(),
+                        deployment_history_root=ctx.deployment_history_root,
                     )
                     if reconciled is not None:
                         reconciled.setdefault("claim_attempt_id", unresolved.get("claim_token"))
@@ -19923,6 +19985,38 @@ def _process_whole_share_candidate(
         )
             if ctx.run_result is not None:
                 _log_execution(ctx.run_result, decision, order_id or "", ctx.broker, notional_usd=order_notional)
+            # Queue the SAME post-commit marker the gated path (and the
+            # sibling ordinary live_order_found branch above, in
+            # _book_reconciled_whole_share_order) use: this row carries
+            # whole_share_settlement_reconciliation_needed=True with the
+            # ledger claim left deliberately unresolved, so
+            # _total_recorded_whole_share_claim_amount's dedup check treats
+            # it as unbooked until something explicitly marks it. Without
+            # this, a later gated reconciliation of the SAME still-live
+            # order calls record_buy() again for it even after THIS run's
+            # own record_buy() above is fully committed, double-counting the
+            # notional and attempt (review: "Mark every reconciliation-
+            # pending row after committing state"). run_state.json is not
+            # written until run_pipeline() finishes reporting, so the row is
+            # guaranteed to already be on disk by the time this fires.
+            artifacts_dir_for_marker = ctx.artifacts_dir
+            order_id_for_marker = order_id
+            trading_day_for_marker = ctx.trading_day
+
+            def _mark_placement_failure_recovery_booked_after_commit(
+                artifacts_dir: Optional[str | Path] = artifacts_dir_for_marker,
+                ticker: str = ticker,
+                claim_trading_day_iso: str = trading_day_iso,
+                order_id: Optional[str] = order_id_for_marker,
+                trading_day: date = trading_day_for_marker,
+            ) -> None:
+                _mark_gated_whole_share_recovery_state_booked(
+                    artifacts_dir, ticker, claim_trading_day_iso, order_id, trading_day
+                )
+
+            ctx.state.pending_durable_commit_callbacks.append(
+                _mark_placement_failure_recovery_booked_after_commit
+            )
             return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
         if matched_order:
             # The broker DID accept the order despite the exception, and it
@@ -35369,6 +35463,7 @@ def _run_once_impl(
                                 ws_claim_trading_day_iso, ws_claim, now_iso=now.isoformat(),
                                 before_settle=_persist_and_book_gated_recovery,
                                 before_release=_persist_and_book_gated_recovery,
+                                deployment_history_root=deployment_history_root,
                             )
                         except Exception as ws_claim_exc:  # noqa: BLE001 - isolated per
                             # claim, exactly like the ordinary (gate-passing)
