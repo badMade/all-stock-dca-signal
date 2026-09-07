@@ -7934,6 +7934,39 @@ def test_build_sector_matrix_empty():
     ]
     report = build_sector_matrix(run_states)
     assert "| _no candidates_ | 0 | $0.00 |" in report
+def test_build_weekly_review_notes_empty():
+    from dca_weekly_dashboard import build_weekly_review_notes
+    res = build_weekly_review_notes([], [])
+    assert "- Runs analyzed: 0 day(s)." in res
+    assert "- All buy candidates were covered by fills." in res
+    assert "- Add qualitative notes here before the Notion dashboard refresh." in res
+
+def test_build_weekly_review_notes_all_zeros():
+    from dca_weekly_dashboard import build_weekly_review_notes
+    run_states = [{"manual_review_tickers": []}]
+    summaries = [
+        {"coverage": {"missing_fills": 0}, "execution_quality": {"target_price_missing": 0}}
+    ]
+    res = build_weekly_review_notes(run_states, summaries)
+    assert "- Runs analyzed: 1 day(s)." in res
+    assert "- All buy candidates were covered by fills." in res
+
+def test_build_weekly_review_notes_with_issues():
+    from dca_weekly_dashboard import build_weekly_review_notes
+    run_states = [
+        {"manual_review_tickers": ["AAA", "BBB"]},
+        {"manual_review_tickers": ["CCC"]}
+    ]
+    summaries = [
+        {"coverage": {"missing_fills": 2}, "execution_quality": {"target_price_missing": 1}},
+        {"coverage": {"missing_fills": 3}, "execution_quality": {"target_price_missing": 2}}
+    ]
+    res = build_weekly_review_notes(run_states, summaries)
+    assert "- Runs analyzed: 2 day(s)." in res
+    assert "- 5 buy candidate(s) had no fill — review broker rejects / caps." in res
+    assert "- 3 fill(s) lacked a target price; slippage excluded — check signal capture." in res
+    assert "- 3 manual-review flag(s) across the week — reconcile finance vs Robinhood." in res
+
 def test_build_execution_quality():
     from dca_weekly_dashboard import build_execution_quality
     summaries = [
