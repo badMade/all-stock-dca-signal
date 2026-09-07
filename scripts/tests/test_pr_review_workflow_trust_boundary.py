@@ -303,6 +303,11 @@ def test_the_analyzer_diffs_against_the_pinned_base_sha_not_the_moving_branch_ti
     assert '"${BASE_SHA}...HEAD"' in run, (
         f"diff must be computed against the pinned BASE_SHA, not a moving branch ref: {run!r}"
     )
+    assert '"${BASE_SHA}..HEAD"' in run, (
+        "analyzer must fall back to a BASE_SHA-pinned two-dot diff when "
+        "BASE_SHA and HEAD have no merge base"
+    )
+    assert "git merge-base" in run, "analyzer should detect merge-base availability before using triple-dot"
     assert '"origin/${BASE_REF}...HEAD"' not in run, run
 
 

@@ -70,7 +70,16 @@ jobs:
           # metadata.json below (Codex review, PR #219: "Pin and recheck the
           # reviewed base SHA"). fetch-depth: 0 above ensures BASE_SHA's
           # commit is present in this checkout's history.
-          git diff "${BASE_SHA}...HEAD" > review_input/diff.patch
+          # Some PRs come from a history that is disconnected from BASE_SHA
+          # (e.g., after aggressive rebases/force-pushes). In that case
+          # triple-dot fails with "no merge base", so fail closed only on
+          # truly broken git state and fall back to two-dot for artifact
+          # generation (review remains pinned to BASE_SHA either way).
+          if git merge-base "${BASE_SHA}" HEAD >/dev/null 2>&1; then
+            git diff "${BASE_SHA}...HEAD" > review_input/diff.patch
+          else
+            git diff "${BASE_SHA}..HEAD" > review_input/diff.patch
+          fi
           # Metadata is written by a script, not interpolated into a shell
           # heredoc, so a PR number/SHA/ref value can never be treated as
           # shell or JSON syntax -- the standard mitigation for expressions
