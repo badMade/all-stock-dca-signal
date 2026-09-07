@@ -5580,6 +5580,61 @@ def _isolation_signal(ticker):
     )
 
 
+def test_settled_slot_credit_is_deducted_before_the_minimum_order_threshold():
+    """A partial settlement must leave credit pending, not make a $0.60 order."""
+    from near_close_dca import PriorSameDayAllocation
+
+    ex = MorningDCAExecutor(MorningConfig(tickers=("AAPL",)), mode=MORNING_LIVE_MODE)
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.60,
+        previous_close=100.0,
+        drop_pct=0.4,
+        multiplier=1.8,
+        hypothetical_amount_usd=1.8,
+        selected_base_amount_usd=1.0,
+    )
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="prior",
+        source="morning",
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(
+        signal,
+        prior,
+        settled_credit_for_slot_usd=0.40,
+    )
+
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.top_up_skipped is True
+    assert outcome.cumulative_credit_decline_usd == 0.40
+
+
+def test_credit_ledger_read_failure_aborts_top_up_computation(tmp_path):
+    """An unreadable ledger is a run failure, never a normal top-up skip."""
+
+    class _UnreadableLedger:
+        def recorded_decision(self, *args, **kwargs):
+            raise OSError("ledger unavailable")
+
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        prior_allocation_roots=(str(tmp_path / "prior"),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = _UnreadableLedger()
+
+    with pytest.raises(RuntimeError, match="ledger idempotency read failed"):
+        ex._compute_top_up(_now_live(), [_isolation_signal("AAPL")])
+
+
 def test_an_ambiguous_placement_exception_halts_the_executor_batch(tmp_path):
     """A connector may accept an order and then raise before returning its id.
 
@@ -9200,6 +9255,34 @@ def test_persisting_broker_adapter_records_buying_power_and_tradability(tmp_path
         is None
     )
     assert any(name.startswith("orders_since_midnight_AAPL_") for name in recorder.saved_filenames)
+
+
+def test_persisting_broker_keeps_placement_responses_for_final_drain(tmp_path):
+    class BufferedBroker(FakeLiveBroker):
+        def __init__(self):
+            super().__init__()
+            self.responses = [{"id": "order-1", "state": "queued"}]
+
+        def get_raw_placement_responses(self):
+            responses, self.responses = self.responses, []
+            return responses
+
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(cast(Any, BufferedBroker()), recorder)
+    assert wrapped.place_market_buy("AAPL", 5.0, "ref-1")
+    assert wrapped.get_raw_placement_responses() == [{"id": "order-1", "state": "queued"}]
+    assert wrapped.get_raw_placement_responses() == []
+
+
+def test_persisting_broker_preserves_order_id_when_response_drain_fails(tmp_path):
+    class DrainFailureBroker(FakeLiveBroker):
+        def get_raw_placement_responses(self):
+            raise OSError("unavailable")
+
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(cast(Any, DrainFailureBroker()), recorder)
+    assert wrapped.place_market_buy("AAPL", 5.0, "ref-1")
+    assert recorder.error and "drain placement responses" in recorder.error
 
 
 def test_persisting_broker_adapter_records_placement_response(tmp_path):

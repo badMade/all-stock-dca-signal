@@ -1000,6 +1000,29 @@ def test_partial_settlement_does_not_rebuild_paid_preserved_credit(tmp_path):
     assert retry.pending_after_usd == 0.20
 
 
+def test_provenance_snapshot_returns_partially_settled_values_atomically(tmp_path, monkeypatch):
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-11", 0.40, stream="morning")
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.80, idempotency_key="slot-1")
+    ledger.settle("XYZ", "2026-08-11", 1.0, stream="afternoon")
+    reads = 0
+    original_read_state = ledger._read_state
+
+    def counting_read_state(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        return original_read_state(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "_read_state", counting_read_state)
+
+    snapshot = ledger.provenance_snapshot("XYZ", "2026-08-11", "slot-1")
+
+    assert reads == 1
+    assert snapshot.pending_usd == 0.20
+    assert snapshot.preserved_credit_usd == 0.20
+    assert snapshot.settled_credit_usd == 0.60
+
+
 def test_reconcile_preserved_credit_replaces_its_pending_contribution(tmp_path):
     ledger = CumulativeCreditLedger(tmp_path)
     ledger.record("XYZ", "2026-08-11", 0.40, stream="morning")

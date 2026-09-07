@@ -11545,6 +11545,13 @@ def test_run_daily_compact_reinjection_applies_overlap_grouping_before_summing(
     # {A, B} and {B, C} overlap on "B" and represent 3 physical orders,
     # plus the non-overlapping "Z" recovery: 4 total, not 5.
     assert run_state["counts"]["submitted"] == 4
+    # orders_submitted_count specifically (Codex review: "Preserve the
+    # grouped submission count during reclassification") -- the field
+    # _apply_no_order_classification's own UNGROUPED recount overwrites
+    # after this same grouped total was already computed and stamped onto
+    # `counts` above; without restoring it afterward this stayed at the
+    # classifier's own inflated 5.
+    assert run_state["orders_submitted_count"] == 4
     usage_proxy = run_state.get("usage_proxy")
     if isinstance(usage_proxy, dict):
         assert usage_proxy["orders_placed_count"] == 4
@@ -17741,6 +17748,78 @@ def test_run_daily_compact_does_not_mark_a_reinjected_rejection_as_submitted(tmp
     assert run_state["order_submit_status"] != near_close_dca.ORDER_SUBMIT_STATUS_SUBMITTED
 
 
+def test_run_daily_compact_does_not_mark_an_adjustment_only_reinjection_as_submitted(tmp_path):
+    """Regression test for "Keep adjustment-only retries in a no-submission
+    status" (Codex review). This exercises the UNLOCKED prior-candidate
+    reinjection block (fed from a prior run_state.json's own
+    `buy_candidates`, not `broker_outcomes`) -- the sibling of the locked
+    block the earlier `does_not_mark_a_reinjected_rejection_as_submitted`
+    test already covers. A prior candidate that is a settlement-adjustment-
+    only aggregate (`merged_submission_count=0`) is carried into this
+    retry's own buy_candidates because nothing fresh represents its id, and
+    the block's own `orders_submitted_count` correctly sums to 0 for it via
+    `_submitted_orders_in_row` -- but it used to unconditionally stamp
+    `order_submit_status="submitted"` right after, reporting a run that
+    placed nothing as having submitted an order.
+    """
+    import near_close_dca
+
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-adjustment-only-reinject")
+    os.makedirs(artifacts_dir)
+    now, config, state, broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=True, tickers=(), approved_test_dates=config.approved_test_dates,
+    )
+
+    prior_ticker = "BYDDY"  # not in config.tickers, so this run's own scan never touches it.
+    with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
+        json.dump({
+            "trading_day": now.date().isoformat(),
+            "run_classification": {
+                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            },
+            "buy_candidates": [
+                {
+                    "ticker": prior_ticker,
+                    "status": "submitted",
+                    "order_id": "ORD-ADJUSTMENT-ONLY",
+                    "whole_share_order_ids": ["ORD-ADJUSTMENT-ONLY"],
+                    "submitted_amount_usd": 1.14,
+                    # A real settlement-adjustment-only row (see
+                    # _build_buy_candidates's recovered_whole_share_claim
+                    # branch) always carries buy_multiplier=0.0 and a
+                    # planned_amount_usd -- both required by
+                    # _prior_candidate_schema_compatible_for_retry_merge's
+                    # schema check before this row is eligible for
+                    # reinjection at all.
+                    "buy_multiplier": 0.0,
+                    "planned_amount_usd": 1.14,
+                    "merged_submission_count": 0,
+                    "whole_share_settlement_adjustment": True,
+                },
+            ],
+        }, handle)
+
+    result = run_daily_compact(
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
+        options=CompactRunOptions(artifacts_dir=artifacts_dir),
+    )
+    assert result["blocked"] is False
+
+    with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
+        run_state = json.load(handle)
+
+    reinjected = [row for row in run_state["buy_candidates"] if row.get("ticker") == prior_ticker]
+    assert len(reinjected) == 1, "the prior adjustment-only aggregate must still be reinjected"
+    assert run_state["orders_submitted_count"] == 0
+    assert run_state["order_submit_status"] != near_close_dca.ORDER_SUBMIT_STATUS_SUBMITTED
+
+
 def test_run_daily_compact_returns_artifact_paths_created_by_blocked_recovery(tmp_path):
     """A calendar-blocked invocation that accepts a recovered order writes
     buy_candidates.csv (via the companion refresh) and orders.csv (via the
@@ -22260,15 +22339,15 @@ def test_parse_terminal_share_quantity_rejects_non_integral_and_negative_values(
     for bad in (-0.5, 0.5, 2.5, -1, -1.0, float("nan"), float("inf"), float("-inf")):
         assert ncd._parse_terminal_share_quantity(bad) == (0, False), bad
     # String forms of the same bad shapes are rejected the same way.
-    for bad_str in ("-0.5", "0.5", "2.5", "-1", "nan", "inf"):
+    for bad_str in ("-0.5", "0.5", "2.5", "-1", "nan", "inf", "2.0000000000000001"):
         assert ncd._parse_terminal_share_quantity(bad_str) == (0, False), bad_str
     # Genuinely unparseable/absent values were already unknown before this
     # fix and must stay that way.
-    for unparseable in (None, "oops", object()):
+    for unparseable in (None, "oops", object(), True, False):
         assert ncd._parse_terminal_share_quantity(unparseable) == (0, False), unparseable
     # A real whole-share quantity -- in every representation a broker might
     # send it -- is accepted and known, including a genuine explicit zero.
-    for good, expected in ((0, 0), ("0", 0), (0.0, 0), (2, 2), ("3", 3), (4.0, 4), ("5.0", 5)):
+    for good, expected in ((0, 0), ("0", 0), (0.0, 0), (2, 2), ("3", 3), (4.0, 4), ("5.0", 5), ("9007199254740993", 9007199254740993)):
         assert ncd._parse_terminal_share_quantity(good) == (expected, True), good
 
 
@@ -22288,6 +22367,37 @@ def test_a_merged_recovery_counts_every_order_it_represents():
     merged = ncd._merge_whole_share_submission_outcomes(first, second)
     assert merged["merged_submission_count"] == 2
     assert merged["whole_share_order_ids"] == ["ORD-A", "ORD-B"]
+    assert merged["whole_share_order_attributions"] == [
+        {
+            "order_id": "ORD-A",
+            "submitted_amount_usd": 23.36,
+            "planned_amount_usd": None,
+            "whole_share_quantity": 1,
+        },
+        {
+            "order_id": "ORD-B",
+            "submitted_amount_usd": 23.4,
+            "planned_amount_usd": None,
+            "whole_share_quantity": 1,
+        },
+    ]
+
+    # A blocked order can share an aggregate with a submitted order, but it
+    # contributes no deployed notional.  The per-order breakdown is what lets
+    # a later retry trim the blocked id without subtracting the fresh retry's
+    # notional from the unrelated submitted order's carried deployment.
+    submitted_plus_blocked = ncd._merge_whole_share_submission_outcomes(
+        first,
+        {
+            "status": "blocked",
+            "order_id": "ORD-BLOCKED",
+            "broker_placement_failed": True,
+            "submitted_amount_usd": 23.36,
+            "whole_share_quantity": 1,
+        },
+    )
+    assert submitted_plus_blocked["submitted_amount_usd"] == 23.36
+    assert submitted_plus_blocked["whole_share_order_attributions"][1]["submitted_amount_usd"] == 0.0
 
     artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
     ncd._apply_no_order_classification(artifacts, {"BYDDY": merged})
@@ -35098,6 +35208,12 @@ def test_a_failing_afternoon_run_with_broken_companions_denies_its_own_evidence(
                 # regenerates run_summary.json and the stale-summary
                 # mismatch this test exists to exercise never fires.
                 "status": "failed",
+                # Matches _compact_setup's own dry_run=True so the dry-run
+                # backfill signal (Codex review: "Regenerate the summary
+                # after backfilling dry-run mode") does not ALSO trip
+                # state_was_mutated here -- same orthogonality reasoning
+                # as the "status" field just above.
+                "dry_run": True,
                 "run_classification": {
                     "run_origin": "scheduled",
                     "manual_run": False,
@@ -35292,6 +35408,227 @@ def _preserved_state() -> dict[str, Any]:
         ],
         "orders_submitted_count": 1,
     }
+
+
+def test_dry_run_backfill_persists_even_when_nothing_else_is_added(tmp_path):
+    """Regression test for "Persist the dry-run backfill when no order is
+    added" (Codex review). The preserve branch's own `run_state.json`
+    rewrite is guarded by `if added:` -- when THIS invocation has nothing
+    new to fold in (``placed`` empty, or every one of its orders already
+    present), that write never runs, so backfilling `run_state["dry_run"]`
+    only in memory left the ON-DISK file still missing the field. The next
+    same-mode retry then still fails `_orders_csv_same_run` and drops this
+    state's own deployment/execution evidence.
+    """
+    import near_close_dca as _n
+
+    preserved = _preserved_state()
+    assert "dry_run" not in preserved
+
+    out = pathlib.Path(tempfile.mkdtemp()) / "slot"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "run_state.json").write_text(json.dumps(preserved), encoding="utf-8")
+    _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    try:
+        _n._write_afternoon_failure_artifacts(
+            out, _now_et(), RuntimeError("boom"), dry_run=False
+        )
+    finally:
+        _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    on_disk = json.loads((out / "run_state.json").read_bytes())
+    assert on_disk["dry_run"] is False
+
+
+def test_rejects_preserved_state_with_a_conflicting_dry_run_mode(tmp_path):
+    """Regression test for "Reject preserved states with a conflicting
+    dry-run mode" (Codex review). A prior artifact explicitly stamped
+    ``dry_run: True`` (a dry-run slot that reused this directory) must not
+    be treated as usable/mergeable by a LIVE (``dry_run=False``) failure
+    write: merging a real submitted order into it would persist that order
+    under a state whose own "dry_run" field says it never happened, and the
+    next live retry's `_orders_csv_same_run` check -- which DOES compare
+    dry_run -- would then reject the state and drop the order's deployment/
+    execution evidence right back out. Full synthesis (not merge) is the
+    only safe outcome here, exactly like a foreign trading_day/stream.
+    """
+    import near_close_dca as _n
+
+    preserved = _preserved_state()
+    preserved["dry_run"] = True
+
+    out = pathlib.Path(tempfile.mkdtemp()) / "slot"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "run_state.json").write_text(json.dumps(preserved), encoding="utf-8")
+    _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    try:
+        _n._write_afternoon_failure_artifacts(
+            out, _now_et(), RuntimeError("boom"), dry_run=False
+        )
+    finally:
+        _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    on_disk = json.loads((out / "run_state.json").read_bytes())
+    # Full synthesis: this invocation's own failure state, not the
+    # dry-run prior merged/preserved -- proven by the run_id no longer
+    # being the preserved artifact's "earlier" and the earlier order
+    # having been dropped rather than carried forward under a live state.
+    assert on_disk["run_id"] != "earlier"
+    assert on_disk["dry_run"] is False
+    assert not [row for row in on_disk["buy_candidates"] if row.get("ticker") == "AAA"]
+
+
+def test_preserves_a_live_state_when_a_dry_run_retry_fails(tmp_path):
+    """Regression test for "Preserve live evidence when a dry-run retry
+    fails" (Codex review). The OPPOSITE direction from the conflicting-
+    mode test above: a prior artifact explicitly stamped ``dry_run: False``
+    (a LIVE state already holding a real submitted order) must not be
+    replaced via full synthesis by a DRY-RUN (``dry_run=True``) failure --
+    full synthesis unconditionally overwrites run_state.json, which would
+    discard the live state's real order for a dry-run invocation that has
+    no genuine evidence of its own worth that trade. The live state must
+    survive on disk completely untouched.
+    """
+    import near_close_dca as _n
+
+    preserved = _preserved_state()
+    preserved["dry_run"] = False
+
+    out = pathlib.Path(tempfile.mkdtemp()) / "slot"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "run_state.json").write_text(json.dumps(preserved), encoding="utf-8")
+    _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    try:
+        _n._write_afternoon_failure_artifacts(
+            out, _now_et(), RuntimeError("boom"), dry_run=True
+        )
+    finally:
+        _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    on_disk = json.loads((out / "run_state.json").read_bytes())
+    # Untouched: still the live artifact's own run_id, dry_run mode, and
+    # its real order -- none of it replaced by this dry-run failure.
+    assert on_disk["run_id"] == "earlier"
+    assert on_disk["dry_run"] is False
+    assert [row for row in on_disk["buy_candidates"] if row.get("ticker") == "AAA"]
+
+
+def test_dry_run_failure_over_live_state_sidecar_redacts_outcomes(tmp_path):
+    """Regression test for "Redact outcomes before writing the dry-run
+    sidecar" (Codex review). The same-identity LIVE-state-preserving branch
+    sidecars this dry-run invocation's own `placed` outcomes via
+    `_persist_undurable_evidence_sidecar` -- but unlike
+    `_persist_cross_account_unresolved_evidence`'s sibling sidecar just
+    above, it used to pass `placed` through verbatim. A candidate's own
+    diagnostic fields (skip_reason in particular) can carry a raw connector
+    exception with account-number/credential shapes, so this sidecar must
+    redact them the same way before writing to the artifacts directory.
+    """
+    import near_close_dca as _n
+
+    preserved = _preserved_state()
+    preserved["dry_run"] = False
+
+    out = pathlib.Path(tempfile.mkdtemp()) / "slot"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "run_state.json").write_text(json.dumps(preserved), encoding="utf-8")
+    _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
+        "AAPL": {
+            "status": "failed",
+            "order_id": None,
+            "skip_reason": "connection failed for account 123456789, api_key=sk-abcdef123456",
+        }
+    }
+    try:
+        _n._write_afternoon_failure_artifacts(
+            out, _now_et(), RuntimeError("boom"), dry_run=True
+        )
+    finally:
+        _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    [sidecar_path] = sorted(out.glob("dry_run_failure_over_live_state.*.json"))
+    sidecar = json.loads(sidecar_path.read_bytes())
+    outcome = sidecar["broker_outcomes"]["AAPL"]
+    assert "123456789" not in outcome["skip_reason"]
+    assert "sk-abcdef123456" not in outcome["skip_reason"]
+    assert "[REDACTED]" in outcome["skip_reason"]
+    assert outcome["order_id"] is None
+    assert outcome["status"] == "failed"
+
+
+def test_dry_run_backfill_alone_still_regenerates_the_summary(tmp_path):
+    """Regression test for "Regenerate the summary after backfilling
+    dry-run mode" (Codex review). A no-add retry (nothing new to fold in)
+    whose ONLY change to run_state.json is backfilling a previously-absent
+    "dry_run" field must still regenerate run_summary.json -- which mirrors
+    that same field via build_run_summary -- or the two canonical artifacts
+    end up disagreeing (state: False, summary: still absent/None) with
+    nothing else in the state having changed to trip the existing
+    state_was_mutated gate.
+    """
+    import near_close_dca as _n
+
+    preserved = _preserved_state()
+    assert "dry_run" not in preserved
+
+    out = pathlib.Path(tempfile.mkdtemp()) / "slot"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "run_state.json").write_text(json.dumps(preserved), encoding="utf-8")
+    # A stale pre-existing summary with no "dry_run" at all -- exactly what
+    # build_run_summary would have produced from the preserved state before
+    # this backfill -- so a regeneration is the only way it could change.
+    stale_summary = dict(preserved)
+    stale_summary.pop("dry_run", None)
+    (out / "run_summary.json").write_text(json.dumps(stale_summary), encoding="utf-8")
+
+    _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    try:
+        _n._write_afternoon_failure_artifacts(
+            out, _now_et(), RuntimeError("boom"), dry_run=False
+        )
+    finally:
+        _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    on_disk_state = json.loads((out / "run_state.json").read_bytes())
+    on_disk_summary = json.loads((out / "run_summary.json").read_bytes())
+    assert on_disk_state["dry_run"] is False
+    assert on_disk_summary["dry_run"] is False
+
+
+def test_normalizes_a_malformed_dry_run_field_when_preserving_state(tmp_path):
+    """Regression test for "Normalize malformed dry-run fields before
+    preserving state" (Codex review). A same-slot prior state carrying a
+    non-boolean "dry_run" (e.g. a malformed "false" STRING) is treated as
+    unproven/absent by existing_is_usable's own isinstance(..., bool) gate,
+    so it is preserved and merged into rather than rejected -- but a
+    backfill guarded on `is None` left the malformed string unchanged. The
+    next live retry's strict _prior_execution_mode_matches check (unlike
+    this lenient one) then compares it literally against False,
+    "false" != False is True, and rejects the very state this backfill
+    exists to keep recognizable.
+    """
+    import near_close_dca as _n
+
+    preserved = _preserved_state()
+    preserved["dry_run"] = "false"  # malformed: a string, not a bool
+
+    out = pathlib.Path(tempfile.mkdtemp()) / "slot"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "run_state.json").write_text(json.dumps(preserved), encoding="utf-8")
+    _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
+    try:
+        _n._write_afternoon_failure_artifacts(
+            out, _now_et(), RuntimeError("boom"), dry_run=False
+        )
+    finally:
+        _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
+
+    on_disk = json.loads((out / "run_state.json").read_bytes())
+    # Preserved (merged), not fully synthesized -- proven by the run_id
+    # still being the preserved artifact's "earlier" -- but with the
+    # malformed field normalized to a real bool.
+    assert on_disk["run_id"] == "earlier"
+    assert on_disk["dry_run"] is False
 
 
 def test_a_retrys_second_order_for_the_same_ticker_is_not_dropped(tmp_path):
@@ -44568,6 +44905,114 @@ def test_failure_candidate_row_carries_the_aggregate_topup_audit_fields():
     assert ordinary_row["aggregate_minimum_topup_reason"] is None
 
 
+def test_failure_candidate_row_carries_the_order_amount_attribution_map():
+    """Regression test for "Persist the attribution map on candidate rows"
+    (Codex review, PR #1252). ``_merge_whole_share_submission_outcomes``
+    stamps ``_order_amount_usd_by_id`` on the OUTCOME, but a same-slot retry
+    only ever reads it back from a persisted buy_candidates ROW -- built by
+    this failure-path helper for a submitted aggregate that later hits a
+    failure. Dropping the map here silently defeats
+    _unrepresented_prior_candidate_part's per-order attribution and falls
+    back to its legacy (notional-corrupting) subtraction estimate.
+    """
+    from near_close_dca import _failure_candidate_row
+
+    row = _failure_candidate_row(
+        "RVII",
+        {
+            "status": "submitted",
+            "order_id": "B",
+            "submitted_amount_usd": 23.0,
+            "whole_share_order_ids": ["A", "B"],
+            "_order_amount_usd_by_id": {"str:B": 23.0},
+        },
+    )
+    assert row["_order_amount_usd_by_id"] == {"str:B": 23.0}
+
+    # Unconditionally present (defaulted to None), like every other
+    # whole_share_* field this builder mirrors -- _write_csv derives its
+    # header from row 0 alone.
+    ordinary_row = _failure_candidate_row("MSFT", {"status": "submitted", "order_id": "o-2"})
+    assert ordinary_row["_order_amount_usd_by_id"] is None
+
+
+def test_build_buy_candidates_carries_the_order_amount_attribution_map():
+    """Same regression as the failure-path test above, for the ordinary
+    success-path row builder (_build_buy_candidates)."""
+    from near_close_dca import _build_buy_candidates
+
+    decision = ReconciledDecision(
+        ticker="RVII",
+        action=Action.BUY,
+        buy_multiplier=1.0,
+        ladder_multiplier=1.0,
+        reason="ladder buy",
+        selected_base_amount_usd=23.0,
+        suggested_amount_usd=23.0,
+        decision_bar_close=100.0,
+        finance_signal=None,
+        robinhood_signal=None,
+    )
+    outcome = {
+        "status": "submitted",
+        "order_id": "B",
+        "submitted_amount_usd": 23.0,
+        "whole_share_order_ids": ["A", "B"],
+        "_order_amount_usd_by_id": {"str:B": 23.0},
+    }
+    [row] = _build_buy_candidates([decision], {"RVII": outcome}, None)
+    assert row["_order_amount_usd_by_id"] == {"str:B": 23.0}
+
+
+def test_candidate_row_builders_carry_the_order_failure_kind_map():
+    """Regression test for "Persist per-order failure provenance on
+    candidate rows" (Codex review). _merge_whole_share_submission_outcomes
+    stamps _order_failure_kind_by_id on the OUTCOME, but a same-slot retry
+    only ever reads it back from a persisted buy_candidates ROW. Dropping
+    the map at either row-construction site silently defeats
+    _unrepresented_prior_candidate_part's per-id failure/block provenance
+    and falls back to guessing from the aggregate-wide merged_placement_
+    failed marker, which can misattribute a retained non-failed member.
+    """
+    from near_close_dca import _build_buy_candidates, _failure_candidate_row
+
+    failure_kinds = {"str:A": "failed", "str:D": "blocked"}
+
+    row = _failure_candidate_row(
+        "RVII",
+        {
+            "status": "submitted",
+            "order_id": "B",
+            "submitted_amount_usd": 23.0,
+            "whole_share_order_ids": ["A", "B", "D"],
+            "_order_failure_kind_by_id": failure_kinds,
+        },
+    )
+    assert row["_order_failure_kind_by_id"] == failure_kinds
+
+    decision = ReconciledDecision(
+        ticker="RVII",
+        action=Action.BUY,
+        buy_multiplier=1.0,
+        ladder_multiplier=1.0,
+        reason="ladder buy",
+        selected_base_amount_usd=23.0,
+        suggested_amount_usd=23.0,
+        decision_bar_close=100.0,
+        finance_signal=None,
+        robinhood_signal=None,
+    )
+    outcome = {
+        "status": "submitted",
+        "order_id": "B",
+        "submitted_amount_usd": 23.0,
+        "whole_share_order_ids": ["A", "B", "D"],
+        "_order_failure_kind_by_id": failure_kinds,
+    }
+    [built_row] = _build_buy_candidates([decision], {"RVII": outcome}, None)
+    assert built_row["_order_failure_kind_by_id"] == failure_kinds
+
+
 def test_a_placement_outcome_carries_the_multiplier_for_the_failure_path():
     """The failure handlers synthesize candidate rows from outcomes alone, so the
     real multiplier has to travel on the outcome to survive a raise."""
@@ -46071,6 +46516,996 @@ def test_terminal_evidence_applies_per_represented_order_not_per_row(tmp_path):
     )
     assert plain_dead is not None
     assert plain_dead.amount_usd == 0.0
+
+
+def test_merge_attributes_submitted_notional_to_the_id_that_earned_it():
+    """``_merge_whole_share_submission_outcomes`` must record WHICH order a
+    merged aggregate's submitted_amount_usd belongs to, not just the total.
+
+    A blocked/failed leg contributes nothing to submitted_amount_usd (the
+    merge only sums notional from "submitted" sides), so the per-id
+    attribution map it stamps on the merged row must reflect that: only the
+    submitted leg's own id gets credited, never the blocked one.
+    """
+    from near_close_dca import _merge_whole_share_submission_outcomes
+
+    submitted_b = {
+        "ticker": "RVII", "status": "submitted", "order_id": "B",
+        "submitted_amount_usd": 23.0,
+    }
+    blocked_a = {
+        "ticker": "RVII", "status": "blocked", "order_id": "A",
+        "broker_placement_failed": True, "submitted_amount_usd": 0.0,
+    }
+
+    merged = _merge_whole_share_submission_outcomes(blocked_a, submitted_b)
+
+    assert merged["submitted_amount_usd"] == 23.0
+    assert merged["_order_amount_usd_by_id"] == {"str:B": 23.0}
+
+    # A later merge (a second retry) must carry the map forward rather than
+    # re-derive it from the aggregate's own now-combined total.
+    submitted_c = {
+        "ticker": "RVII", "status": "submitted", "order_id": "C",
+        "submitted_amount_usd": 5.0,
+    }
+    twice_merged = _merge_whole_share_submission_outcomes(merged, submitted_c)
+    assert twice_merged["submitted_amount_usd"] == 28.0
+    assert twice_merged["_order_amount_usd_by_id"] == {"str:B": 23.0, "str:C": 5.0}
+
+
+def test_retry_trimming_preserves_notional_for_a_previously_blocked_sibling():
+    """Regression test for "Preserve notional when trimming a previously
+    blocked order" (Codex review, PR #1051, discussion_r3909795645).
+
+    A prior whole-share aggregate combines a SUBMITTED order B ($23) with an
+    unresolved/blocked order A (contributing $0 to submitted_amount_usd,
+    per _merge_whole_share_submission_outcomes's own status gate). A retry
+    resolves A into its own fresh submitted row, so A is now represented in
+    fresh_rows and B is the still-unmatched part of the prior aggregate --
+    B's $23 must survive untouched, not be reduced or zeroed by A's fresh
+    amount.
+    """
+    from near_close_dca import _unrepresented_prior_candidate_part
+
+    prior_aggregate = {
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
+        "whole_share_order_ids": ["A", "B"],
+        "submitted_amount_usd": 23.0,
+        "planned_amount_usd": 23.0,
+        "_order_amount_usd_by_id": {"str:B": 23.0},
+    }
+    # The retry's own fresh row for the now-resolved A, with its OWN
+    # (unrelated) notional -- the exact shape the old subtraction-based
+    # trim conflated with B's carried total.
+    fresh_row_for_a = {
+        "ticker": "RVII", "status": "submitted", "order_id": "A",
+        "submitted_amount_usd": 99.0,
+    }
+
+    trimmed = _unrepresented_prior_candidate_part(prior_aggregate, [fresh_row_for_a])
+
+    assert trimmed is not None
+    assert trimmed["whole_share_order_ids"] == ["B"]
+    assert trimmed["order_id"] == "B"
+    # The finding: B's own $23 must be preserved exactly, not reduced by
+    # A's $99 fresh amount and not zeroed out.
+    assert trimmed["submitted_amount_usd"] == 23.0
+    assert trimmed["planned_amount_usd"] == 23.0
+    assert trimmed["_order_amount_usd_by_id"] == {"str:B": 23.0}
+
+    # A legacy aggregate with NEITHER attribution map (persisted before
+    # either existed) cannot prove which part of its total belongs to the
+    # still-unmatched id -- preserves its full, conservative total rather
+    # than guess by subtracting the fresh retry row's unrelated amount
+    # (Codex review: "Retain exact attribution for legacy aggregate rows" --
+    # the earlier crude-subtraction fallback repeated the very bug this
+    # whole mechanism exists to fix).
+    legacy_aggregate = dict(prior_aggregate)
+    del legacy_aggregate["_order_amount_usd_by_id"]
+    legacy_trimmed = _unrepresented_prior_candidate_part(legacy_aggregate, [fresh_row_for_a])
+    assert legacy_trimmed is not None
+    assert legacy_trimmed["submitted_amount_usd"] == 23.0
+    assert legacy_trimmed["planned_amount_usd"] == 23.0
+
+    # A legacy aggregate that DOES carry the older
+    # whole_share_order_attributions breakdown (a prior revision of this
+    # merge's own per-order record) gets EXACT attribution from it instead
+    # of the conservative fallback.
+    legacy_with_attributions = dict(legacy_aggregate)
+    legacy_with_attributions["whole_share_order_attributions"] = [
+        {"order_id": "A", "submitted_amount_usd": 0.0, "planned_amount_usd": None, "whole_share_quantity": 0},
+        {"order_id": "B", "submitted_amount_usd": 23.0, "planned_amount_usd": 23.0, "whole_share_quantity": 1},
+    ]
+    exact_trimmed = _unrepresented_prior_candidate_part(legacy_with_attributions, [fresh_row_for_a])
+    assert exact_trimmed is not None
+    assert exact_trimmed["submitted_amount_usd"] == 23.0
+    assert exact_trimmed["planned_amount_usd"] == 23.0
+
+
+def test_retry_trimming_preserves_quantity_for_a_previously_blocked_sibling():
+    """Regression test for "Retain quantity from the prior per-order
+    attribution" (Codex review). ``_order_amount_usd_by_id`` never tracked
+    ``whole_share_quantity``, so trimming used to subtract the fresh retry
+    row's own quantity from the prior aggregate's total regardless of
+    whether that fresh order's quantity was ever counted in it -- the exact
+    bug the notional attribution mechanism exists to prevent, just on a
+    different field. Without an exact per-order quantity breakdown
+    (``whole_share_order_attributions``), the prior's full quantity must be
+    preserved rather than guessed at.
+    """
+    from near_close_dca import _unrepresented_prior_candidate_part
+
+    prior_aggregate = {
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
+        "whole_share_order_ids": ["A", "B"],
+        "submitted_amount_usd": 23.0,
+        "planned_amount_usd": 23.0,
+        "whole_share_quantity": 1,
+        "_order_amount_usd_by_id": {"str:B": 23.0},
+    }
+    # Fresh A buys 4 shares -- a quantity that was never part of B's prior
+    # quantity of 1.
+    fresh_row_for_a = {
+        "ticker": "RVII", "status": "submitted", "order_id": "A",
+        "submitted_amount_usd": 99.0, "whole_share_quantity": 4,
+    }
+
+    trimmed = _unrepresented_prior_candidate_part(prior_aggregate, [fresh_row_for_a])
+    assert trimmed is not None
+    # No exact quantity attribution available -- preserve B's own quantity
+    # of 1, not 1 - 4 (clamped) = 0.
+    assert trimmed["whole_share_quantity"] == 1
+
+    # With an exact whole_share_order_attributions breakdown, use it.
+    with_attributions = dict(prior_aggregate)
+    with_attributions["whole_share_order_attributions"] = [
+        {"order_id": "A", "submitted_amount_usd": 0.0, "planned_amount_usd": None, "whole_share_quantity": 0},
+        {"order_id": "B", "submitted_amount_usd": 23.0, "planned_amount_usd": 23.0, "whole_share_quantity": 1},
+    ]
+    exact_trimmed = _unrepresented_prior_candidate_part(with_attributions, [fresh_row_for_a])
+    assert exact_trimmed is not None
+    assert exact_trimmed["whole_share_quantity"] == 1
+
+
+def test_retry_trimming_aggregates_duplicate_legacy_attribution_ids():
+    """Regression test for "Aggregate duplicate quantity attributions before
+    trimming" (Codex review). A legacy ``whole_share_order_attributions``
+    list can carry TWO entries for the same order_id -- a settlement
+    adjustment merged with the physical order it corrects deliberately
+    shares that id. A naive ``{key: item for item in list}`` comprehension
+    keeps only whichever entry appears last (typically the adjustment, with
+    quantity/notional near zero), silently discarding the physical order's
+    own real figures the moment a DIFFERENT sibling in the same aggregate
+    gets trimmed.
+    """
+    from near_close_dca import _unrepresented_prior_candidate_part
+
+    # B's own two attribution entries (order B, quantity 1) plus (a
+    # settlement adjustment on the SAME order_id B, quantity 0) -- exactly
+    # the shape _merge_whole_share_submission_outcomes produces when a
+    # settlement adjustment is merged with the physical order it corrects.
+    prior_aggregate = {
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
+        "whole_share_order_ids": ["A", "B"],
+        "submitted_amount_usd": 24.50,
+        "planned_amount_usd": 24.50,
+        "whole_share_quantity": 1,
+        "whole_share_order_attributions": [
+            {"order_id": "A", "submitted_amount_usd": 0.0, "planned_amount_usd": None, "whole_share_quantity": 0},
+            {"order_id": "B", "submitted_amount_usd": 23.36, "planned_amount_usd": 23.36, "whole_share_quantity": 1},
+            {"order_id": "B", "submitted_amount_usd": 1.14, "planned_amount_usd": 1.14, "whole_share_quantity": 0},
+        ],
+    }
+    fresh_row_for_a = {
+        "ticker": "RVII", "status": "submitted", "order_id": "A",
+        "submitted_amount_usd": 99.0, "whole_share_quantity": 4,
+    }
+
+    trimmed = _unrepresented_prior_candidate_part(prior_aggregate, [fresh_row_for_a])
+    assert trimmed is not None
+    # B's two legacy entries (23.36 + 1.14 = 24.50, quantity 1 + 0 = 1) must
+    # both survive, not just whichever happened to be last in the list.
+    assert trimmed["submitted_amount_usd"] == pytest.approx(24.50)
+    assert trimmed["planned_amount_usd"] == pytest.approx(24.50)
+    assert trimmed["whole_share_quantity"] == 1
+
+
+def test_retry_trimming_drops_refreshed_ids_from_the_legacy_attribution_list():
+    """Regression test for "Remove refreshed IDs from the legacy attribution
+    list" (Codex review). After a partial trim via the legacy
+    ``whole_share_order_attributions`` path, the trimmed row's OWN copy of
+    that list -- inherited unchanged from ``dict(prior)`` unless explicitly
+    overwritten -- must be narrowed to just the still-represented ids. A
+    stale full-aggregate list left standing would get copied verbatim into
+    a LATER `_merge_whole_share_submission_outcomes` call on this trimmed
+    row (its own leg-attribution fallback reads this same field), silently
+    reintroducing a refreshed/dropped id's stale entry into a new aggregate
+    that never actually included it.
+    """
+    from near_close_dca import _unrepresented_prior_candidate_part
+
+    prior_aggregate = {
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
+        "whole_share_order_ids": ["A", "B"],
+        "submitted_amount_usd": 23.0,
+        "planned_amount_usd": 23.0,
+        "whole_share_order_attributions": [
+            {"order_id": "A", "submitted_amount_usd": 0.0},
+            {"order_id": "B", "submitted_amount_usd": 23.0},
+        ],
+    }
+    # A is refreshed by the retry -- B is the trimmed, still-missing part.
+    fresh_row_for_a = {
+        "ticker": "RVII", "status": "submitted", "order_id": "A",
+        "submitted_amount_usd": 99.0,
+    }
+
+    trimmed = _unrepresented_prior_candidate_part(prior_aggregate, [fresh_row_for_a])
+
+    assert trimmed is not None
+    assert trimmed["whole_share_order_ids"] == ["B"]
+    retained_ids = {item["order_id"] for item in trimmed["whole_share_order_attributions"]}
+    assert retained_ids == {"B"}
+
+
+def test_retry_trimming_does_not_promote_a_trimmed_blocked_member_to_submitted():
+    """Regression test for "Avoid promoting trimmed blocked members to
+    submissions" (Codex review). A prior aggregate combines submitted order
+    B ($23) with a blocked/failed order A (contributing $0). A retry
+    republishes B (now represented in fresh_rows), leaving A as the trimmed,
+    still-unmatched part. A itself was never submitted -- the aggregate's
+    overall "submitted" status only reflected B -- so the trimmed row must
+    not report A as an additional submission when a caller later reads it
+    back as a broker outcome.
+    """
+    from near_close_dca import _unrepresented_prior_candidate_part
+
+    prior_aggregate = {
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
+        "whole_share_order_ids": ["A", "B"],
+        "submitted_amount_usd": 23.0,
+        "planned_amount_usd": 23.0,
+        "_order_amount_usd_by_id": {"str:B": 23.0},
+    }
+    fresh_row_for_b = {
+        "ticker": "RVII", "status": "submitted", "order_id": "B",
+        "submitted_amount_usd": 23.0,
+    }
+
+    trimmed = _unrepresented_prior_candidate_part(prior_aggregate, [fresh_row_for_b])
+
+    assert trimmed is not None
+    assert trimmed["whole_share_order_ids"] == ["A"]
+    # A contributed nothing -- proven exactly by the attribution map -- so
+    # it must not be reported as a submission.
+    assert trimmed["status"] != "submitted"
+    assert trimmed["merged_submission_count"] == 0
+    assert trimmed["submitted_amount_usd"] == 0.0
+
+    # Without exact attribution (the conservative-fallback case), the
+    # status cannot be proven either way and must stay "submitted" rather
+    # than risk silently hiding a real one.
+    legacy_aggregate = dict(prior_aggregate)
+    del legacy_aggregate["_order_amount_usd_by_id"]
+    legacy_trimmed = _unrepresented_prior_candidate_part(legacy_aggregate, [fresh_row_for_b])
+    assert legacy_trimmed is not None
+    assert legacy_trimmed["status"] == "submitted"
+
+
+def test_trimming_preserves_failure_type_for_a_proven_non_submitting_member():
+    """Regression test for "Preserve failure type when trimming aggregate
+    members" (Codex review). A prior aggregate combines submitted order B
+    with a genuinely FAILED (not merely policy-blocked) order A, carrying
+    `merged_placement_failed=True`. A retry republishes B, leaving A as the
+    trimmed, proven-zero-attribution part. Downgrading A's status to
+    "blocked" unconditionally lost the failure signal --
+    `_apply_no_order_classification` only honors `merged_placement_failed`
+    for a row whose status stays "submitted" -- so A must become "failed"
+    instead, which that classifier reads directly regardless of status.
+    """
+    from near_close_dca import _unrepresented_prior_candidate_part
+
+    prior_aggregate = {
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
+        "whole_share_order_ids": ["A", "B"],
+        "submitted_amount_usd": 23.0,
+        "planned_amount_usd": 23.0,
+        "merged_placement_failed": True,
+        "_order_amount_usd_by_id": {"str:B": 23.0},
+    }
+    fresh_row_for_b = {
+        "ticker": "RVII", "status": "submitted", "order_id": "B",
+        "submitted_amount_usd": 23.0,
+    }
+
+    trimmed = _unrepresented_prior_candidate_part(prior_aggregate, [fresh_row_for_b])
+
+    assert trimmed is not None
+    assert trimmed["status"] == "failed"
+    assert trimmed["merged_submission_count"] == 0
+
+    # Without the failure marker, the trim still falls back to "blocked"
+    # (an ordinary policy skip), exactly as before this fix.
+    blocked_aggregate = dict(prior_aggregate)
+    del blocked_aggregate["merged_placement_failed"]
+    blocked_trimmed = _unrepresented_prior_candidate_part(blocked_aggregate, [fresh_row_for_b])
+    assert blocked_trimmed is not None
+    assert blocked_trimmed["status"] == "blocked"
+
+
+def test_trimming_drops_a_failure_marker_for_the_refreshed_member():
+    """Regression test for "Drop failure markers for refreshed aggregate
+    members" (Codex review). A prior aggregate combines submitted order B
+    with FAILED order A, carrying merged_placement_failed=True (the marker
+    describes the aggregate as a whole, with no per-id attribution). A
+    retry successfully republishes A -- the FAILED member, not B -- leaving
+    B as the trimmed, still-missing part. B genuinely submitted (proven
+    exactly by the attribution map), so the inherited merged_placement_
+    failed marker can only describe A, which is no longer part of this row;
+    leaving it standing would report the successful retry as a placement
+    failure with a phantom orders_failed_count.
+    """
+    from near_close_dca import _unrepresented_prior_candidate_part
+
+    prior_aggregate = {
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
+        "whole_share_order_ids": ["A", "B"],
+        "submitted_amount_usd": 23.0,
+        "planned_amount_usd": 23.0,
+        "merged_placement_failed": True,
+        "merged_failure_reason": "some earlier connector error",
+        "_order_amount_usd_by_id": {"str:B": 23.0},
+    }
+    # A -- the FAILED member -- is refreshed by the retry this time.
+    fresh_row_for_a = {
+        "ticker": "RVII", "status": "submitted", "order_id": "A",
+        "submitted_amount_usd": 99.0,
+    }
+
+    trimmed = _unrepresented_prior_candidate_part(prior_aggregate, [fresh_row_for_a])
+
+    assert trimmed is not None
+    assert trimmed["whole_share_order_ids"] == ["B"]
+    # B genuinely submitted -- stays "submitted" -- but the failure marker
+    # (which could only ever have described A) must not survive onto it.
+    assert trimmed["status"] == "submitted"
+    assert "merged_placement_failed" not in trimmed
+    assert "merged_failure_reason" not in trimmed
+
+
+def test_trimming_attributes_failure_markers_to_the_right_member():
+    """Regression test for "Attribute failure markers before trimming
+    aggregate members" (Codex review). A three-member aggregate combines
+    submitted B, FAILED A, and non-deliberately BLOCKED D. A retry
+    refreshes A and B -- the failed AND submitted members -- leaving D as
+    the trimmed, still-missing part. D was never the one that failed (it
+    was blocked); the aggregate-wide merged_placement_failed marker
+    (which, without per-id provenance, could be misread as describing
+    ANY non-submitting member) must not be reattributed to D. The
+    _order_failure_kind_by_id map built during merging supplies the real
+    per-id provenance this needs.
+    """
+    from near_close_dca import _merge_whole_share_submission_outcomes, _unrepresented_prior_candidate_part
+
+    submitted_b = {
+        "ticker": "RVII", "status": "submitted", "order_id": "B",
+        "submitted_amount_usd": 23.0,
+    }
+    failed_a = {
+        "ticker": "RVII", "status": "failed", "order_id": "A",
+        "skip_reason": "broker rejected",
+    }
+    blocked_d = {
+        "ticker": "RVII", "status": "blocked", "order_id": "D",
+        "broker_placement_failed": True, "submitted_amount_usd": 0.0,
+    }
+
+    merged_ab = _merge_whole_share_submission_outcomes(failed_a, submitted_b)
+    prior_aggregate = _merge_whole_share_submission_outcomes(merged_ab, blocked_d)
+
+    assert prior_aggregate["merged_placement_failed"] is True
+    assert prior_aggregate["_order_failure_kind_by_id"]["str:A"] == "failed"
+    assert prior_aggregate["_order_failure_kind_by_id"]["str:D"] == "blocked"
+
+    # A and B are refreshed by the retry -- D is the trimmed, still-missing
+    # part, and D was never the failed member.
+    fresh_row_for_a = {
+        "ticker": "RVII", "status": "submitted", "order_id": "A",
+        "submitted_amount_usd": 99.0,
+    }
+    fresh_row_for_b = {
+        "ticker": "RVII", "status": "submitted", "order_id": "B",
+        "submitted_amount_usd": 23.0,
+    }
+
+    trimmed = _unrepresented_prior_candidate_part(
+        prior_aggregate, [fresh_row_for_a, fresh_row_for_b]
+    )
+
+    assert trimmed is not None
+    assert trimmed["whole_share_order_ids"] == ["D"]
+    # D was blocked, never failed -- must read as "blocked", not "failed".
+    assert trimmed["status"] == "blocked"
+
+
+def test_trimming_recomputes_failure_markers_for_a_mixed_retained_set():
+    """Regression test for "Recompute failure markers for mixed retained
+    aggregates" (Codex review). A four-member aggregate combines submitted
+    B and C, FAILED A, and BLOCKED D. A retry refreshes A and C, leaving a
+    MIXED retained set: submitted B plus blocked D. This falls into
+    neither the "every missing id proven non-submitting" branch (B
+    submitted) nor the "every missing id proven submitting" branch (D
+    didn't) -- the merged_placement_failed marker (which really describes
+    the now-refreshed A) must still be dropped, since neither retained
+    member ever failed, while merged_placement_blocked must be set, since
+    D genuinely was blocked.
+    """
+    from near_close_dca import _merge_whole_share_submission_outcomes, _unrepresented_prior_candidate_part
+
+    submitted_b = {
+        "ticker": "RVII", "status": "submitted", "order_id": "B",
+        "submitted_amount_usd": 23.0,
+    }
+    submitted_c = {
+        "ticker": "RVII", "status": "submitted", "order_id": "C",
+        "submitted_amount_usd": 5.0,
+    }
+    failed_a = {
+        "ticker": "RVII", "status": "failed", "order_id": "A",
+        "skip_reason": "broker rejected",
+    }
+    blocked_d = {
+        "ticker": "RVII", "status": "blocked", "order_id": "D",
+        "broker_placement_failed": True, "submitted_amount_usd": 0.0,
+    }
+
+    merged_ab = _merge_whole_share_submission_outcomes(failed_a, submitted_b)
+    merged_abc = _merge_whole_share_submission_outcomes(merged_ab, submitted_c)
+    prior_aggregate = _merge_whole_share_submission_outcomes(merged_abc, blocked_d)
+
+    assert prior_aggregate["merged_placement_failed"] is True
+
+    # A and C are refreshed by the retry -- B and D are the trimmed,
+    # still-missing (mixed) part.
+    fresh_row_for_a = {
+        "ticker": "RVII", "status": "submitted", "order_id": "A",
+        "submitted_amount_usd": 99.0,
+    }
+    fresh_row_for_c = {
+        "ticker": "RVII", "status": "submitted", "order_id": "C",
+        "submitted_amount_usd": 5.0,
+    }
+
+    trimmed = _unrepresented_prior_candidate_part(
+        prior_aggregate, [fresh_row_for_a, fresh_row_for_c]
+    )
+
+    assert trimmed is not None
+    assert set(trimmed["whole_share_order_ids"]) == {"B", "D"}
+    # B genuinely submitted -- status stays "submitted".
+    assert trimmed["status"] == "submitted"
+    # The failed marker (which described the now-refreshed A) must not
+    # survive; the blocked marker (which genuinely describes retained D)
+    # must.
+    assert "merged_placement_failed" not in trimmed
+    assert trimmed["merged_placement_blocked"] is True
+
+
+def test_trimming_excludes_settlement_adjustments_from_the_submission_count():
+    """Regression test for "Keep settlement adjustments out of submission
+    counts" (Codex review). A prior aggregate combines a settlement-
+    ADJUSTMENT id E (a correction to some earlier order, never a NEW
+    physical submission of its own) with blocked order A. A retry
+    refreshes A, leaving E as the trimmed, still-missing part. E carries a
+    real, non-ambiguous dollar amount in _order_amount_usd_by_id (an
+    adjustment's own delta is exact) -- mere key presence there is not
+    enough to prove a new physical submission, so merged_submission_count
+    must stay 0, not become 1.
+    """
+    from near_close_dca import _unrepresented_prior_candidate_part
+
+    prior_aggregate = {
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "E",
+        "whole_share_order_ids": ["A", "E"],
+        "submitted_amount_usd": 1.14,
+        "planned_amount_usd": 1.14,
+        "_order_amount_usd_by_id": {"str:E": 1.14},
+        "_order_adjustment_ids": ["str:E"],
+    }
+    fresh_row_for_a = {
+        "ticker": "RVII", "status": "submitted", "order_id": "A",
+        "submitted_amount_usd": 99.0,
+    }
+
+    trimmed = _unrepresented_prior_candidate_part(prior_aggregate, [fresh_row_for_a])
+
+    assert trimmed is not None
+    assert trimmed["whole_share_order_ids"] == ["E"]
+    # E's own real $1.14 attribution still survives (it's not ambiguous)...
+    assert trimmed["submitted_amount_usd"] == pytest.approx(1.14)
+    # ...but it must not be counted as a NEW physical submission.
+    assert trimmed["merged_submission_count"] == 0
+
+
+def test_merge_keeps_a_shared_adjustment_id_countable_as_a_physical_submission():
+    """Regression test for "Track adjustment-only IDs instead of all
+    adjusted IDs" (Codex review). A settlement adjustment deliberately
+    SHARES its order_id with the physical order it corrects. Marking that
+    shared id as an adjustment (full stop) is wrong: it also represents a
+    real submission, so if a later retry refreshes some OTHER id in the
+    aggregate, the shared id must still count toward
+    merged_submission_count when it is the one retained by trimming --
+    excluding it entirely underreports the physical order.
+    """
+    import near_close_dca as ncd
+
+    # B is submitted for real (a physical order)...
+    physical = {
+        "status": "submitted",
+        "order_id": "B",
+        "submitted_amount_usd": 23.0,
+        "whole_share_order_ids": ["B"],
+    }
+    # ...and also carries a settlement adjustment sharing the SAME id.
+    adjustment = {
+        "status": "submitted",
+        "order_id": "B",
+        "submitted_amount_usd": 1.0,
+        "whole_share_order_ids": ["B"],
+        "whole_share_settlement_adjustment": True,
+    }
+    merged = ncd._merge_whole_share_submission_outcomes(physical, adjustment)
+
+    # B was seen on a genuinely physical, non-adjustment submitted side in
+    # this very merge, so it must NOT end up in the adjustment-only set.
+    assert "str:B" not in (merged.get("_order_adjustment_ids") or [])
+
+    prior_aggregate = {
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
+        "whole_share_order_ids": ["A", "B"],
+        "_order_amount_usd_by_id": {"str:A": 5.0, "str:B": 24.0},
+        "_order_adjustment_ids": merged.get("_order_adjustment_ids") or [],
+    }
+    fresh_row_for_a = {
+        "ticker": "RVII", "status": "submitted", "order_id": "A",
+        "submitted_amount_usd": 99.0,
+    }
+    trimmed = ncd._unrepresented_prior_candidate_part(prior_aggregate, [fresh_row_for_a])
+
+    assert trimmed is not None
+    assert trimmed["whole_share_order_ids"] == ["B"]
+    # B is retained and is NOT adjustment-only, so it still counts as a
+    # real physical submission -- not silently dropped to 0.
+    assert trimmed["merged_submission_count"] == 1
+
+
+def test_merge_preserves_an_adjustment_only_id_across_a_further_remerge():
+    """Regression test for "Preserve adjustment-only IDs across aggregate
+    re-merges" (Codex review). Merging adjustment A with physical B
+    correctly records A in _order_adjustment_ids. Re-merging THAT
+    aggregate (status="submitted", whole_share_settlement_adjustment
+    cleared at the aggregate level even though it still carries an
+    inherited adjustment-only id) with a further physical submission C
+    must not re-classify A as physical just because the aggregate's own
+    top-level flag is unset -- A has to stay adjustment-only across any
+    number of further re-merges.
+    """
+    import near_close_dca as ncd
+
+    adjustment_a = {
+        "status": "submitted",
+        "order_id": "A",
+        "submitted_amount_usd": 1.0,
+        "whole_share_order_ids": ["A"],
+        "whole_share_settlement_adjustment": True,
+    }
+    physical_b = {
+        "status": "submitted",
+        "order_id": "B",
+        "submitted_amount_usd": 23.0,
+        "whole_share_order_ids": ["B"],
+    }
+    aggregate_ab = ncd._merge_whole_share_submission_outcomes(adjustment_a, physical_b)
+    assert aggregate_ab.get("_order_adjustment_ids") == ["str:A"]
+    # The aggregate as a whole is not a pure adjustment row -- it also
+    # represents B's real submission -- so its own top-level flag is unset.
+    assert not aggregate_ab.get("whole_share_settlement_adjustment")
+
+    physical_c = {
+        "status": "submitted",
+        "order_id": "C",
+        "submitted_amount_usd": 11.0,
+        "whole_share_order_ids": ["C"],
+    }
+    aggregate_abc = ncd._merge_whole_share_submission_outcomes(aggregate_ab, physical_c)
+
+    # A must still be adjustment-only, not silently promoted to physical
+    # just because it now rides inside a submitted, unflagged aggregate.
+    assert aggregate_abc.get("_order_adjustment_ids") == ["str:A"]
+
+
+def test_candidate_row_builders_carry_the_order_adjustment_id_list():
+    """Regression test for "Persist adjustment provenance on candidate
+    rows" (Codex review). _order_adjustment_ids is stamped on the merge
+    OUTCOME, but a same-slot retry only ever reads it back from a
+    persisted buy_candidates ROW. Dropping the list at any row-
+    construction site makes trimming see an empty adjustment set for a
+    retained adjustment-only id and count it as a fresh physical
+    submission, producing a phantom order in regenerated metrics.
+    """
+    from near_close_dca import _build_buy_candidates, _failure_candidate_row
+
+    adjustment_ids = ["str:E"]
+
+    row = _failure_candidate_row(
+        "RVII",
+        {
+            "status": "submitted",
+            "order_id": "E",
+            "submitted_amount_usd": 1.14,
+            "whole_share_order_ids": ["A", "E"],
+            "_order_adjustment_ids": adjustment_ids,
+        },
+    )
+    assert row["_order_adjustment_ids"] == adjustment_ids
+
+    decision = ReconciledDecision(
+        ticker="RVII",
+        action=Action.BUY,
+        buy_multiplier=1.0,
+        ladder_multiplier=1.0,
+        reason="ladder buy",
+        selected_base_amount_usd=1.14,
+        suggested_amount_usd=1.14,
+        decision_bar_close=100.0,
+        finance_signal=None,
+        robinhood_signal=None,
+    )
+    outcome = {
+        "status": "submitted",
+        "order_id": "E",
+        "submitted_amount_usd": 1.14,
+        "whole_share_order_ids": ["A", "E"],
+        "_order_adjustment_ids": adjustment_ids,
+    }
+    [built_row] = _build_buy_candidates([decision], {"RVII": outcome}, None)
+    assert built_row["_order_adjustment_ids"] == adjustment_ids
+
+
+def test_trimming_preserves_a_zero_net_submitted_order():
+    """Regression test for "Preserve zero-net submitted orders when
+    trimming aggregates" (Codex review). A settlement adjustment merged
+    with the physical order it corrects deliberately shares the SAME
+    order_id, so that id's own attribution entry can legitimately sum to
+    exactly $0 even though the physical order genuinely submitted and
+    consumed a real attempt. A prior sum-based check ("trimmed amount ==
+    0") could not tell that apart from an id that never submitted at all
+    -- both summed to zero -- and incorrectly downgraded a real submission
+    to "blocked" with merged_submission_count=0, which prior-allocation
+    loading (which excludes "blocked" rows) then silently lost, risking an
+    extra order past max_orders_per_day.
+    """
+    from near_close_dca import _unrepresented_prior_candidate_part
+
+    prior_aggregate = {
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
+        "whole_share_order_ids": ["A", "B"],
+        # A's own entry is present (a real submitted order + full
+        # settlement reversal netted it to $0) -- NOT absent, which is
+        # what a genuinely never-submitted id would look like.
+        "submitted_amount_usd": 23.0,
+        "planned_amount_usd": 23.0,
+        "_order_amount_usd_by_id": {"str:A": 0.0, "str:B": 23.0},
+    }
+    fresh_row_for_b = {
+        "ticker": "RVII", "status": "submitted", "order_id": "B",
+        "submitted_amount_usd": 23.0,
+    }
+
+    trimmed = _unrepresented_prior_candidate_part(prior_aggregate, [fresh_row_for_b])
+
+    assert trimmed is not None
+    assert trimmed["whole_share_order_ids"] == ["A"]
+    # A DID submit (net-zeroed by its own settlement correction, not by
+    # never having submitted) -- must stay "submitted", not be downgraded.
+    assert trimmed["status"] == "submitted"
+    assert trimmed["merged_submission_count"] == 1
+    assert trimmed["submitted_amount_usd"] == 0.0
+
+
+def test_trimming_counts_only_attributed_submissions_in_a_mixed_retained_set():
+    """Regression test for "Count only attributed submissions after a
+    partial trim" (Codex review). A prior aggregate combines never-
+    submitted (blocked) order A with genuinely submitted orders B and C.
+    A retry republishes C, leaving A and B as the retained, MIXED set --
+    neither "every missing id proven non-submitting" (B did submit) nor
+    safe to count as len(missing_ids)=2, which would double-count B as two
+    submissions for the one physical order it represents.
+    """
+    from near_close_dca import _unrepresented_prior_candidate_part
+
+    prior_aggregate = {
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
+        "whole_share_order_ids": ["A", "B", "C"],
+        "submitted_amount_usd": 28.0,
+        "planned_amount_usd": 28.0,
+        "_order_amount_usd_by_id": {"str:B": 23.0, "str:C": 5.0},
+    }
+    fresh_row_for_c = {
+        "ticker": "RVII", "status": "submitted", "order_id": "C",
+        "submitted_amount_usd": 5.0,
+    }
+
+    trimmed = _unrepresented_prior_candidate_part(prior_aggregate, [fresh_row_for_c])
+
+    assert trimmed is not None
+    assert set(trimmed["whole_share_order_ids"]) == {"A", "B"}
+    # B genuinely submitted -- not the "prove all zero" case -- so status
+    # correctly stays "submitted", but the count reflects only the ONE
+    # attributed submission (B), not both retained ids.
+    assert trimmed["status"] == "submitted"
+    assert trimmed["merged_submission_count"] == 1
+    assert trimmed["submitted_amount_usd"] == pytest.approx(23.0)
+
+
+def test_leg_attribution_prefers_legacy_breakdown_over_an_equal_split():
+    """Regression test for "Reuse legacy attribution before splitting
+    aggregate totals" (Codex review). A pre-upgrade aggregate that predates
+    `_order_amount_usd_by_id` but already combines blocked order A with
+    submitted order B ($23) under a forced overall status="submitted" is
+    not a genuinely fresh, never-merged leg -- equally splitting its
+    submitted_amount_usd across BOTH represented ids (A and B) invents
+    $11.50 of notional for A, which never actually contributed anything.
+    Non-zero legacy entries (like B's) are still used exactly whenever the
+    breakdown covers every id -- verified here with a legacy aggregate that
+    has no zero entries at all, so no ambiguity taints the result.
+    """
+    from near_close_dca import _merge_whole_share_submission_outcomes
+
+    legacy_aggregate = {
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
+        "whole_share_order_ids": ["E", "B"],
+        "submitted_amount_usd": 28.0,
+        "whole_share_order_attributions": [
+            {"order_id": "E", "submitted_amount_usd": 5.0},
+            {"order_id": "B", "submitted_amount_usd": 23.0},
+        ],
+    }
+    fresh_order_c = {
+        "ticker": "RVII", "status": "submitted", "order_id": "C",
+        "submitted_amount_usd": 5.0,
+    }
+
+    merged = _merge_whole_share_submission_outcomes(legacy_aggregate, fresh_order_c)
+
+    # The legacy breakdown's real, non-ambiguous split survives -- not an
+    # invented $14 equal share for E and B.
+    assert merged["_order_amount_usd_by_id"]["str:E"] == pytest.approx(5.0)
+    assert merged["_order_amount_usd_by_id"]["str:B"] == pytest.approx(23.0)
+    assert merged["_order_amount_usd_by_id"]["str:C"] == pytest.approx(5.0)
+
+
+def test_leg_attribution_treats_an_ambiguous_legacy_zero_as_unknown_not_proven():
+    """Regression test for "Preserve ambiguous zero legacy submissions"
+    (Codex review). A's own $0 legacy entry is genuinely ambiguous -- it
+    can mean A never submitted (a blocked/failed sibling, correctly zero)
+    or that it submitted and was later fully offset by a settlement
+    reversal (also correctly zero, but a REAL attempt). Simply omitting a
+    zero legacy entry (an earlier revision of this fix) made it
+    indistinguishable from a genuinely never-submitted id's own correct,
+    non-ambiguous omission -- the retry-reinjection trim reads mere key
+    ABSENCE as proof an id was never submitted, so a real net-zero
+    submission would be misclassified as one. The ambiguity must instead
+    poison the WHOLE combined map (same as the multi-id-no-legacy-coverage
+    case), so a later trim falls through to its conservative
+    "preserve the full total" fallback rather than either wrong extreme.
+    """
+    from near_close_dca import _merge_whole_share_submission_outcomes
+
+    legacy_aggregate = {
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
+        "whole_share_order_ids": ["A", "B"],
+        "submitted_amount_usd": 23.0,
+        "whole_share_order_attributions": [
+            {"order_id": "A", "submitted_amount_usd": 0.0},
+            {"order_id": "B", "submitted_amount_usd": 23.0},
+        ],
+    }
+    fresh_order_c = {
+        "ticker": "RVII", "status": "submitted", "order_id": "C",
+        "submitted_amount_usd": 5.0,
+    }
+
+    merged = _merge_whole_share_submission_outcomes(legacy_aggregate, fresh_order_c)
+
+    # No map at all -- not even C's own genuinely exact, single-id
+    # contribution -- since A's ambiguity taints the whole combined map.
+    assert "_order_amount_usd_by_id" not in merged
+
+
+def test_leg_attribution_omits_uncertain_multi_id_aggregates_entirely():
+    """Regression test for "Keep uncertain legacy aggregate attribution
+    conservative" (Codex review). A pre-upgrade aggregate that predates
+    _order_amount_usd_by_id, represents MULTIPLE ids, and has NO (or an
+    incomplete) legacy whole_share_order_attributions breakdown to fall
+    back on must not have its submitted_amount_usd equally split and
+    persisted as if it were exact -- that invents notional for a member
+    that may have contributed nothing. The merged _order_amount_usd_by_id
+    field must be omitted ENTIRELY in that case (not merely missing this
+    leg's own ids), so a later trim falls through to its own conservative
+    "preserve the full total" fallback instead of trusting a partial,
+    partly-guessed map.
+    """
+    from near_close_dca import _merge_whole_share_submission_outcomes
+
+    # No whole_share_order_attributions at all -- genuinely uncertain
+    # which of A/B contributed how much of the $23.
+    uncertain_aggregate = {
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
+        "whole_share_order_ids": ["A", "B"],
+        "submitted_amount_usd": 23.0,
+    }
+    fresh_order_c = {
+        "ticker": "RVII", "status": "submitted", "order_id": "C",
+        "submitted_amount_usd": 5.0,
+    }
+
+    merged = _merge_whole_share_submission_outcomes(uncertain_aggregate, fresh_order_c)
+
+    assert merged["submitted_amount_usd"] == pytest.approx(28.0)
+    # No invented split persisted -- not even a partial map naming only
+    # C's own (genuinely exact, single-id) contribution.
+    assert "_order_amount_usd_by_id" not in merged
+
+
+def test_leg_attribution_clears_an_inherited_map_when_the_other_side_is_ambiguous():
+    """Regression test for "Clear inherited attribution when a leg is
+    ambiguous" (Codex review). `merged = dict(new)` starts by copying
+    `new`'s own fields verbatim -- including an exact `_order_amount_usd_
+    by_id` map, if `new` is itself an already-aggregated outcome (e.g.
+    submitted C=$5 + submitted D=$18, merged earlier with exact per-id
+    attribution). When THIS merge's `existing` side is an uncertain,
+    ambiguous pre-upgrade aggregate (A/B, no exact split), detecting that
+    ambiguity must not merely skip ASSIGNING a fresh combined map -- it
+    must also REMOVE the stale one `new` contributed, or that partial map
+    (naming only C and D, not A/B) survives and gets trusted by a later
+    trim as if it were complete, silently zeroing A/B's real $23 the
+    moment C or D is refreshed.
+    """
+    from near_close_dca import _merge_whole_share_submission_outcomes
+
+    # A newer, already-aggregated outcome with its own EXACT attribution
+    # map (as if a prior merge of two ordinary submitted legs).
+    already_aggregated_cd = {
+        "ticker": "RVII", "status": "submitted", "order_id": "C",
+        "whole_share_order_ids": ["C", "D"],
+        "submitted_amount_usd": 23.0,
+        "_order_amount_usd_by_id": {"str:C": 5.0, "str:D": 18.0},
+    }
+    # An uncertain pre-upgrade aggregate -- no exact split available for
+    # its own A/B members.
+    uncertain_ab = {
+        "ticker": "RVII", "status": "submitted", "order_id": "B",
+        "whole_share_order_ids": ["A", "B"],
+        "submitted_amount_usd": 23.0,
+    }
+
+    # `existing=uncertain_ab` (the ambiguous side), `new=already_aggregated_cd`
+    # (the side whose exact map `merged = dict(new)` copies first) --
+    # exactly the argument order the finding's own example uses.
+    merged = _merge_whole_share_submission_outcomes(uncertain_ab, already_aggregated_cd)
+
+    assert merged["submitted_amount_usd"] == pytest.approx(46.0)
+    # The stale C/D-only map must not survive -- it would otherwise be
+    # trusted as if it covered A/B too.
+    assert "_order_amount_usd_by_id" not in merged
+
+
+def test_merge_sums_notional_when_attribution_ids_collide():
+    """Regression test for "Sum notional when attribution keys collide"
+    (Codex review). A settlement adjustment merged with the physical order
+    it corrects deliberately shares the SAME order_id -- a plain dict
+    spread (`{**existing, **new}`) would silently replace `existing`'s own
+    attributed amount for that id with only `new`'s, understating a later
+    retry's carried deployment for that order.
+    """
+    from near_close_dca import _merge_whole_share_submission_outcomes
+
+    physical_order = {
+        "ticker": "RVII", "status": "submitted", "order_id": "ORD-1",
+        "submitted_amount_usd": 23.36,
+    }
+    adjustment = {
+        "ticker": "RVII", "status": "submitted", "order_id": "ORD-1",
+        "submitted_amount_usd": 1.14,
+        "whole_share_settlement_adjustment": True,
+    }
+
+    merged = _merge_whole_share_submission_outcomes(physical_order, adjustment)
+
+    assert merged["submitted_amount_usd"] == pytest.approx(24.50)
+    assert merged["_order_amount_usd_by_id"] == {"str:ORD-1": pytest.approx(24.50)}
+
+
+def test_build_buy_candidates_carries_deliberate_skip_and_merged_submission_count():
+    """Regression test for "Preserve deliberate-skip markers before
+    reclassification" and "Preserve merged submission counts when seeding
+    outcomes" (Codex review). Both fields must survive onto the persisted
+    buy_candidates row -- a same-slot retry's reinjection block seeds
+    broker_outcomes straight from this row, not the in-memory outcome dict.
+    """
+    from near_close_dca import _build_buy_candidates, _failure_candidate_row
+
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        buy_multiplier=1.0,
+        ladder_multiplier=1.0,
+        reason="ladder buy",
+        selected_base_amount_usd=1.0,
+        suggested_amount_usd=1.0,
+        decision_bar_close=100.0,
+        finance_signal=None,
+        robinhood_signal=None,
+    )
+    blocked_outcome = {
+        "status": "blocked",
+        "deliberate_skip": True,
+        "skip_reason": "cap would be exceeded",
+    }
+    [row] = _build_buy_candidates([decision], {"AAPL": blocked_outcome}, None)
+    assert row["deliberate_skip"] is True
+
+    aggregate_outcome = {
+        "status": "submitted",
+        "order_id": "ORD-1",
+        "submitted_amount_usd": 24.50,
+        "merged_submission_count": 2,
+    }
+    [row2] = _build_buy_candidates(
+        [ReconciledDecision(
+            ticker="RVII", action=Action.BUY, buy_multiplier=1.0, ladder_multiplier=1.0,
+            reason="ladder buy", selected_base_amount_usd=1.0, suggested_amount_usd=1.0,
+            decision_bar_close=100.0, finance_signal=None, robinhood_signal=None,
+        )],
+        {"RVII": aggregate_outcome},
+        None,
+    )
+    assert row2["merged_submission_count"] == 2
+
+    failure_row = _failure_candidate_row("MSFT", {**blocked_outcome, "order_id": None})
+    assert failure_row["deliberate_skip"] is True
+    failure_aggregate_row = _failure_candidate_row("RVII", aggregate_outcome)
+    assert failure_aggregate_row["merged_submission_count"] == 2
 
 
 def test_a_zero_fill_recovery_merges_whatever_order_it_arrives_in():

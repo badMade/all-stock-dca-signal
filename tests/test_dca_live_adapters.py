@@ -29,6 +29,7 @@ from dca_live_adapters import (
     _order_lifecycle_aliases_conflict,
     _order_rows_contradict,
     _parse_rfc3339,
+    _placement_response_has_untrackable_positive_order_id,
     _response_failure,
     _rh_interval,
     _to_float,
@@ -101,6 +102,11 @@ def test_parse_rfc3339_bad_values_return_none():
     assert _parse_rfc3339("not-a-date") is None
     assert _parse_rfc3339("2023-13-45T99:99:99Z") is None
     assert _parse_rfc3339(12345) is None
+
+
+def test_untrackable_order_id_ignores_error_container_diagnostics():
+    rejected = {"success": False, "error": {"id": 10**400, "state": "rejected", "filled_quantity": 0}}
+    assert _placement_response_has_untrackable_positive_order_id(rejected) is False
 
 
 def test_parse_rfc3339_unparseable_timestamp_string_returns_none():

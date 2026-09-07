@@ -50,6 +50,15 @@ class CumulativeCreditDecision:
     final_session: bool
 
 
+@dataclass(frozen=True)
+class CumulativeCreditProvenanceSnapshot:
+    """One locked view of a ticker's balance and one slot's provenance."""
+
+    pending_usd: float
+    preserved_credit_usd: float
+    settled_credit_usd: float
+
+
 _DECISION_FIELDS = (
     "pending_before_usd",
     "incremental_credit_usd",
@@ -731,6 +740,38 @@ class CumulativeCreditLedger:
             if cached is None:
                 return 0.0
             return float(cached.get("settled_credit_usd", 0.0))
+
+    def provenance_snapshot(
+        self, ticker: str, trading_day: str, idempotency_key: Optional[str]
+    ) -> CumulativeCreditProvenanceSnapshot:
+        """Return pending, preserved, and settled credit from one ledger lock.
+
+        Retry calculations must use these three related values from the same
+        state revision.  Reading them separately permits a concurrent
+        settlement to mix a stale pending balance with newer provenance and
+        recreate credit that has already been paid.
+        """
+        symbol = ticker.strip().upper()
+        if not symbol:
+            return CumulativeCreditProvenanceSnapshot(0.0, 0.0, 0.0)
+        day_dir = self.root / trading_day
+        with cross_process_lock(day_dir / "ledger.lock"):
+            state = self._read_state(day_dir / "ledger.json", trading_day)
+            pending = float(state["pending_usd_by_ticker"].get(symbol, 0.0))
+            cached = None
+            if idempotency_key:
+                dedup_key = f"preserve:{symbol}:{idempotency_key}"
+                cached = state.get("recorded_idempotency_keys", {}).get(dedup_key)
+            if cached is None:
+                return CumulativeCreditProvenanceSnapshot(pending, 0.0, 0.0)
+            preserved = 0.0 if cached.get("consumed_by_settlement") else float(
+                cached.get("incremental_credit_usd", 0.0)
+            )
+            return CumulativeCreditProvenanceSnapshot(
+                pending,
+                preserved,
+                float(cached.get("settled_credit_usd", 0.0)),
+            )
 
     def pending_usd(self, ticker: str, trading_day: str) -> float:
         """Return this ticker's current pending same-day credit, or 0.0.

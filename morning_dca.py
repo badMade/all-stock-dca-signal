@@ -2416,6 +2416,8 @@ class _RawInputRecorder:
         if self.error is None:
             self.error = self.fetch_or_normalize_error
 
+    record_connector_error = record_error
+
     def persist(self, kind: str, key: str, payload: Any) -> Any:
         """Persist *payload* and return the representation read back from disk."""
         safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in key)
@@ -2492,6 +2494,11 @@ class _RawInputRecorder:
             return None
         self.saved_filenames.append(filename)
         return persisted
+
+    def record_error(self, detail: str) -> None:
+        """Record a non-write raw-persistence failure without raising it."""
+        if self.error is None:
+            self.error = detail
 
 
 class _PersistingMarketDataProvider:
@@ -2588,7 +2595,7 @@ class _PersistingMarketDataProvider:
                         else None
                     )
                 except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
-                    self._recorder.record_error(_kind, key, exc)
+                    self._recorder.record_connector_error(_kind, key, exc)
                     raise
 
             persisted_connector._raw_recorder = self._recorder  # type: ignore[attr-defined]
@@ -2606,7 +2613,7 @@ class _PersistingMarketDataProvider:
             persisted = self._recorder.persist("prior_close", ticker, bar)
             return _bar_from_raw(persisted) if persisted is not None else None
         except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
-            self._recorder.record_error("prior_close", ticker, exc)
+            self._recorder.record_connector_error("prior_close", ticker, exc)
             raise
 
     def get_intraday_bars(
@@ -2622,7 +2629,7 @@ class _PersistingMarketDataProvider:
             persisted = self._recorder.persist("intraday_bars", ticker, list(bars))
             return [_bar_from_raw(item) for item in persisted] if persisted is not None else []
         except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
-            self._recorder.record_error("intraday_bars", ticker, exc)
+            self._recorder.record_connector_error("intraday_bars", ticker, exc)
             raise
 
     def get_quote(self, ticker: str, as_of: datetime) -> Any:
@@ -2637,7 +2644,7 @@ class _PersistingMarketDataProvider:
             persisted = self._recorder.persist("quote", ticker, quote)
             return _restore_raw_datetimes(persisted)
         except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
-            self._recorder.record_error("quote", ticker, exc)
+            self._recorder.record_connector_error("quote", ticker, exc)
             raise
 
     def get_bid_ask(self, ticker: str, as_of: datetime) -> Any:
@@ -2652,7 +2659,7 @@ class _PersistingMarketDataProvider:
             persisted = self._recorder.persist("bid_ask", ticker, result)
             return _restore_raw_datetimes(persisted)
         except Exception as exc:  # noqa: BLE001 - connectors raise arbitrary errors
-            self._recorder.record_error("bid_ask", ticker, exc)
+            self._recorder.record_connector_error("bid_ask", ticker, exc)
             raise
 
     def __getattr__(self, name: str) -> Any:
@@ -2713,6 +2720,7 @@ class _PersistingBrokerAdapter:
         self._recorder = recorder
         self._account_persisted = False
         self._buying_power_persisted = False
+        self._placement_responses: List[Dict[str, Any]] = []
         self._wrapped_connector_attributes = self._wrap_raw_connectors()
 
     def _wrap_raw_connectors(self) -> set[str]:
@@ -2774,7 +2782,7 @@ class _PersistingBrokerAdapter:
                     # failure stub.  Read-only connector exceptions remain raw-input
                     # failures because those calls supply inputs to the decision.
                     if _kind != "place":
-                        self._recorder.record_error(_kind, str(key), exc)
+                        self._recorder.record_connector_error(_kind, str(key), exc)
                     raise
                 persisted = self._recorder.persist(_kind, str(key), payload)
                 if persisted is None and payload is not None and _kind == "place":
@@ -2881,21 +2889,58 @@ class _PersistingBrokerAdapter:
         return result
 
     def place_market_buy(self, ticker: str, notional_usd: float, ref_id: str) -> str:
-        order_id = self._inner.place_market_buy(ticker, notional_usd, ref_id)
-        self._recorder.persist(
-            "order_response",
-            ticker,
-            {"notional_usd": notional_usd, "ref_id": ref_id, "order_id": order_id},
-        )
+        # Adapters retain the broker's unparsed placement envelopes precisely
+        # so an ambiguous/rejected response remains auditable.  Drain and
+        # persist them even when their parser raises.
+        try:
+            order_id = self._inner.place_market_buy(ticker, notional_usd, ref_id)
+        except Exception:
+            self._persist_placement_responses(ticker, notional_usd, ref_id)
+            raise
+        self._persist_placement_responses(ticker, notional_usd, ref_id, order_id)
         return order_id
+
+    def _persist_placement_responses(
+        self, ticker: str, notional_usd: float, ref_id: str, order_id: Optional[str] = None
+    ) -> None:
+        getter = getattr(self._inner, "get_raw_placement_responses", None)
+        try:
+            responses = getter() if callable(getter) else []
+        except Exception as exc:  # noqa: BLE001
+            # Placement may already have succeeded.  Surface the missing raw
+            # evidence to the run, but never replace a known broker order id
+            # with a synthetic placement failure.
+            self._recorder.record_error(f"failed to drain placement responses: {exc}")
+            return
+        if responses:
+            self._placement_responses.extend(response for response in responses if isinstance(response, dict))
+            for response in responses:
+                self._recorder.persist(
+                    "order_response", ticker,
+                    {"notional_usd": notional_usd, "ref_id": ref_id, "response": response},
+                )
+            return
+        if order_id is not None:
+            self._recorder.persist(
+                "order_response", ticker,
+                {"notional_usd": notional_usd, "ref_id": ref_id, "order_id": order_id},
+            )
 
     def get_order_fill(self, order_id: str):
         return self._inner.get_order_fill(order_id)
 
     def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
+        # ``place_market_buy`` drains the inner adapter to persist its raw
+        # envelopes immediately.  Keep a copy so run_dca's final canonical
+        # drain still receives every placement response.
+        saved, self._placement_responses = self._placement_responses, []
         getter = getattr(self._inner, "get_raw_placement_responses", None)
-        res = getter() if callable(getter) else []
-        return res if isinstance(res, list) else []
+        try:
+            fresh = getter() if callable(getter) else []
+        except Exception as exc:  # noqa: BLE001
+            self._recorder.record_error(f"failed to drain placement responses: {exc}")
+            fresh = []
+        return [*saved, *(fresh if isinstance(fresh, list) else [])]
 
     def __getattr__(self, name: str) -> Any:
         # Forward optional, non-protocol broker methods (e.g.
@@ -3554,12 +3599,9 @@ class MorningDCAExecutor(DCAExecutor):
                     ticker, trading_day.isoformat(), slot_key
                 )
             except Exception as exc:  # noqa: BLE001
-                cached_decision = None
-                _log.warning(
-                    "cumulative credit ledger idempotency read failed for %s: %s",
-                    ticker,
-                    exc,
-                )
+                raise RuntimeError(
+                    f"cumulative credit ledger idempotency read failed for {ticker}"
+                ) from exc
             if cached_decision is not None:
                 # THIS slot's own earlier attempt already durably recorded a
                 # stays-pending decline for this ticker (the only record()
@@ -3600,8 +3642,8 @@ class MorningDCAExecutor(DCAExecutor):
                 )
                 continue
             try:
-                existing_pending_credit_usd = self.credit_ledger.pending_usd(
-                    ticker, trading_day.isoformat()
+                credit_snapshot = self.credit_ledger.provenance_snapshot(
+                    ticker, trading_day.isoformat(), slot_key
                 )
                 # THIS slot's own earlier (blocked) attempt may have already
                 # folded its decline into the durable balance above via
@@ -3614,23 +3656,21 @@ class MorningDCAExecutor(DCAExecutor):
                 # cached final decision here (Codex review: "Recognize
                 # preserved credits before recomputing the slot").
                 existing_pending_credit_usd = max(
-                    0.0,
-                    existing_pending_credit_usd
-                    - self.credit_ledger.preserved_credit_for_slot(
-                        ticker, trading_day.isoformat(), slot_key
-                    ),
+                    0.0, credit_snapshot.pending_usd - credit_snapshot.preserved_credit_usd
                 )
             except Exception as exc:  # noqa: BLE001
-                existing_pending_credit_usd = 0.0
-                _log.warning(
-                    "cumulative credit ledger pending-balance read failed for %s: %s",
-                    ticker,
-                    exc,
-                )
+                # This is an operational failure, not a genuine no-incremental
+                # decision.  Raising routes scheduled runs through the durable
+                # startup-failure artifact writer and prevents a healthy
+                # completed-no-orders classification from masking the outage.
+                raise RuntimeError(
+                    f"cumulative credit ledger balance read failed for {ticker}"
+                ) from exc
             outcome = self._evaluate_top_up(
                 signal,
                 prior_allocations.get(ticker),
                 existing_pending_credit_usd=existing_pending_credit_usd,
+                settled_credit_for_slot_usd=credit_snapshot.settled_credit_usd,
             )
             if (
                 outcome.cumulative_credit_decline_usd is not None
@@ -3710,6 +3750,7 @@ class MorningDCAExecutor(DCAExecutor):
         prior: Optional[PriorSameDayAllocation],
         *,
         existing_pending_credit_usd: float = 0.0,
+        settled_credit_for_slot_usd: float = 0.0,
     ) -> TopUpOutcome:
         """Apply the same-day top-up rule to one live buy candidate.
 
@@ -3732,6 +3773,11 @@ class MorningDCAExecutor(DCAExecutor):
         ``_compute_top_up`` and ``_place_broker_orders``, the only callers
         that read/write the ledger (mirrors
         ``near_close_dca.evaluate_top_up_guard``).
+
+        ``settled_credit_for_slot_usd`` is the portion of this slot's
+        recomputed credit already paid by an earlier attempt. It is deducted
+        before applying the broker-minimum threshold so settlement cannot
+        turn a rounded valid order back into an invalid sub-dollar order.
         """
         desired, effective_base = resolve_top_up_desired_amount_usd(
             prior, signal.multiplier, signal.hypothetical_amount_usd, signal.selected_base_amount_usd
@@ -3796,7 +3842,14 @@ class MorningDCAExecutor(DCAExecutor):
             # never the 3:30 PM final one, so final_session=False -- a credit
             # below 50 cents simply stays pending rather than forcing an order.
             decline_usd = round(max(0.0, prior.reference_price - price), 2)
-            credit_amount_usd = round(max(ladder_incremental, price_step_incremental, decline_usd), 2)
+            credit_amount_usd = round(
+                max(
+                    0.0,
+                    max(ladder_incremental, price_step_incremental, decline_usd)
+                    - settled_credit_for_slot_usd,
+                ),
+                2,
+            )
             decision = apply_cumulative_credit(
                 existing_pending_credit_usd, credit_amount_usd, final_session=False
             )

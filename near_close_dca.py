@@ -63,6 +63,7 @@ import secrets
 import statistics
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
@@ -7958,6 +7959,18 @@ def _build_buy_candidates(
             "order_id": outcome.get("order_id"),
             "status": outcome.get("status", "not_submitted"),
             "skip_reason": outcome.get("skip_reason"),
+            # _apply_no_order_classification distinguishes a DELIBERATE
+            # policy block (cap, spread, buying power, non-tradability --
+            # an ordinary, non-error outcome) from a non-deliberate
+            # "blocked" it counts as a connector error, purely on this
+            # marker. Never copied here before, so a same-slot retry's own
+            # reinjection block -- which seeds broker_outcomes straight from
+            # THIS persisted row, not the in-memory outcome dict -- read a
+            # bare status="blocked" for a routine policy block and
+            # misclassified an otherwise-healthy retry as a connector-error
+            # trading failure (Codex review: "Preserve deliberate-skip
+            # markers before reclassification").
+            "deliberate_skip": outcome.get("deliberate_skip"),
             # Set only by _process_buy_candidates_batch's last-resort net
             # (an unhandled raise while processing this ticker). This
             # function rebuilds each row from an explicit field list, so
@@ -8113,6 +8126,33 @@ def _build_buy_candidates(
         # whole_share_ field above, for the SAME CSV-header-consistency
         # reason.
         candidate_row["whole_share_order_ids"] = outcome.get("whole_share_order_ids")
+        # The per-order-id notional breakdown _merge_whole_share_submission_
+        # outcomes stamps on a merged aggregate. Without copying it here (the
+        # same explicit-field-list trap every other whole_share_* field
+        # above hit), a same-slot retry reading this row back from
+        # run_state.json would find no attribution map and fall back to
+        # _unrepresented_prior_candidate_part's legacy subtraction estimate
+        # -- exactly the notional-corruption bug that map exists to prevent
+        # (Codex review, PR #1252: "Persist the attribution map on candidate
+        # rows").
+        candidate_row["_order_amount_usd_by_id"] = outcome.get("_order_amount_usd_by_id")
+        # Same explicit-field-list trap as _order_amount_usd_by_id just
+        # above: without this, a same-slot retry's own trim finds no
+        # per-id failure provenance and falls back to guessing from the
+        # aggregate-wide merged_placement_failed marker, which can
+        # misattribute a retained non-failed member as "failed" (Codex
+        # review: "Persist per-order failure provenance on candidate
+        # rows").
+        candidate_row["_order_failure_kind_by_id"] = outcome.get("_order_failure_kind_by_id")
+        # Same explicit-field-list trap yet again: without this, a same-slot
+        # retry's trim sees an empty adjustment set for a retained
+        # adjustment-only id and counts it as a physical submission,
+        # producing a phantom order in submission metrics (Codex review, PR
+        # #1252: "Persist adjustment provenance on candidate rows").
+        candidate_row["_order_adjustment_ids"] = outcome.get("_order_adjustment_ids")
+        candidate_row["whole_share_order_attributions"] = outcome.get(
+            "whole_share_order_attributions"
+        )
         candidate_row["whole_share_claim_breakdown"] = outcome.get("whole_share_claim_breakdown")
         # Marks a settlement-adjustment row (see _book_reconciled_whole_
         # share_order's own comment) so load_prior_same_day_allocations can
@@ -8139,6 +8179,17 @@ def _build_buy_candidates(
         # readers fall back to exactly 1 as they always did.
         candidate_row["merged_attempt_days"] = outcome.get("merged_attempt_days")
         candidate_row["merged_attempt_count"] = outcome.get("merged_attempt_count")
+        # How many real broker SUBMISSIONS an aggregate row stands for (see
+        # _merge_whole_share_submission_outcomes's own docstring on this
+        # field). _submitted_orders_in_row/_submission_count read it off the
+        # OUTCOME dict, but a same-slot retry's own reinjection block seeds
+        # broker_outcomes straight from THIS persisted candidate row -- so
+        # an aggregate representing two submitted orders undercounted as
+        # one the moment it was rebuilt from this row alone, the same
+        # explicit-field-list trap every field just above it hit (Codex
+        # review: "Preserve merged submission counts when seeding
+        # outcomes").
+        candidate_row["merged_submission_count"] = outcome.get("merged_submission_count")
         buy_candidates.append(candidate_row)
 
     # A crash lease reconciled to a real broker order is booked and published
@@ -8207,6 +8258,10 @@ def _build_buy_candidates(
                 "order_id": outcome.get("order_id"),
                 "status": outcome.get("status", "not_submitted"),
                 "skip_reason": outcome.get("skip_reason"),
+                # Mirrors the main loop's own copy of this marker just above
+                # (Codex review: "Preserve deliberate-skip markers before
+                # reclassification").
+                "deliberate_skip": outcome.get("deliberate_skip"),
                 "reviewed_order": outcome.get("reviewed_order"),
                 "spread_ok": outcome.get("spread_ok"),
                 "spread_pct": outcome.get("spread_pct"),
@@ -8243,6 +8298,10 @@ def _build_buy_candidates(
                 "whole_share_settlement_reconciliation_needed": None,
                 "whole_share_settlement_shortfall_usd": None,
                 "whole_share_order_ids": None,
+                "_order_amount_usd_by_id": None,
+                "_order_failure_kind_by_id": None,
+                "_order_adjustment_ids": None,
+                "whole_share_order_attributions": None,
                 "whole_share_claim_breakdown": None,
                 "whole_share_settlement_adjustment": False,
                 # See _build_buy_candidates's own note on these two: absent
@@ -8250,6 +8309,7 @@ def _build_buy_candidates(
                 # CSV header's sake.
                 "merged_attempt_days": None,
                 "merged_attempt_count": None,
+                "merged_submission_count": None,
             }
         )
 
@@ -8321,6 +8381,10 @@ def _build_buy_candidates(
                 "order_id": outcome.get("order_id"),
                 "status": outcome.get("status", "not_submitted"),
                 "skip_reason": outcome.get("skip_reason"),
+                # Mirrors the main loop's own copy of this marker (Codex
+                # review: "Preserve deliberate-skip markers before
+                # reclassification").
+                "deliberate_skip": outcome.get("deliberate_skip"),
                 "reviewed_order": outcome.get("reviewed_order"),
                 "spread_ok": outcome.get("spread_ok"),
                 "spread_pct": outcome.get("spread_pct"),
@@ -8345,6 +8409,12 @@ def _build_buy_candidates(
                     "whole_share_settlement_shortfall_usd"
                 ),
                 "whole_share_order_ids": outcome.get("whole_share_order_ids"),
+                "_order_amount_usd_by_id": outcome.get("_order_amount_usd_by_id"),
+                "_order_failure_kind_by_id": outcome.get("_order_failure_kind_by_id"),
+                "_order_adjustment_ids": outcome.get("_order_adjustment_ids"),
+                "whole_share_order_attributions": outcome.get(
+                    "whole_share_order_attributions"
+                ),
                 "whole_share_claim_breakdown": outcome.get("whole_share_claim_breakdown"),
                 "whole_share_settlement_adjustment": outcome.get(
                     "whole_share_settlement_adjustment", False
@@ -8353,6 +8423,10 @@ def _build_buy_candidates(
                 # orphaned-ledger recovery can itself be an aggregate.
                 "merged_attempt_days": outcome.get("merged_attempt_days"),
                 "merged_attempt_count": outcome.get("merged_attempt_count"),
+                # Mirrors the main loop's own copy of this field (Codex
+                # review: "Preserve merged submission counts when seeding
+                # outcomes").
+                "merged_submission_count": outcome.get("merged_submission_count"),
             }
         )
     return buy_candidates
@@ -8805,7 +8879,7 @@ def _apply_no_order_classification(
         # the possibly-live order StrategyState already reserved (Codex
         # review, PR #1300 discussion_r3920344713: "Classify ambiguous
         # near-close attempts as in-flight").
-        if status in ("submitted", "filled", "potentially_submitted"):
+        if status in ("submitted", "filled", "pending", "potentially_submitted"):
             # Orders, not rows -- a merged recovery row can stand for several
             # real broker submissions (see _merge_whole_share_submission_
             # outcomes' merged_submission_count).
@@ -16014,7 +16088,7 @@ def _parse_terminal_share_quantity(raw: Any) -> "Tuple[int, bool]":
     unparseable value: ``quantity_is_known=False``, leaving the claim
     reserved for better evidence rather than guessing.
     """
-    if raw is None:
+    if raw is None or isinstance(raw, bool):
         return 0, False
     try:
         qty = float(raw)
@@ -16024,6 +16098,24 @@ def _parse_terminal_share_quantity(raw: Any) -> "Tuple[int, bool]":
         return 0, False
     if not math.isfinite(qty) or qty < 0 or qty != int(qty):
         return 0, False
+    # Validated above via a binary float, which loses precision beyond
+    # 2**53 -- "9007199254740993" (2**53 + 1) parses as the FLOAT
+    # 9007199254740992.0, passing every check above unchanged, so
+    # returning `int(qty)` here would silently settle the ledger against
+    # one share fewer than the broker actually reported (Codex review:
+    # "Return the exact Decimal quantity"). Re-parsed exactly via
+    # Decimal(str(raw)) -- which does not round -- and that exact value
+    # returned whenever it validates, falling back to the float-derived
+    # `int(qty)` only if the Decimal parse itself is unusable (raw was
+    # never a string/int Decimal can parse exactly, e.g. a math.nan/inf
+    # float already excluded above, or some other non-numeric shape).
+    try:
+        dec = Decimal(str(raw))
+        if not dec.is_finite() or dec < 0 or dec != dec.to_integral_value():
+            return 0, False
+        return int(dec), True
+    except (InvalidOperation, TypeError, ValueError):
+        pass
     return int(qty), True
 
 
@@ -19950,8 +20042,20 @@ def _process_whole_share_candidate(
             # case silently restored the FULL claim as if nothing executed
             # whenever a filled order omitted cumulative_quantity (Codex
             # review: "Use requested quantity for any-state filled orders").
+            # The comment above documented that fallback but the code did
+            # not actually apply it -- still reading cumulative_quantity
+            # alone even for an EXPLICITLY "filled" terminal_order_state --
+            # so a genuine fill reporting quantity but omitting
+            # cumulative_quantity left the claim reserved and reported a
+            # real fill as blocked instead of booking its notional and
+            # attempt (Codex review: "Retain the filled-order quantity
+            # fallback"). Restored specifically for the "filled" state,
+            # exactly like the live matched_state == "filled" branch
+            # already does -- never for a genuinely non-fill terminal
+            # state, where "quantity" is only what was requested, not what
+            # executed.
             raw_terminal_quantity = terminal_order.get("cumulative_quantity")
-            if raw_terminal_quantity is None and terminal_order_state == "filled":
+            if _is_blank_broker_field(raw_terminal_quantity) and terminal_order_state == "filled":
                 raw_terminal_quantity = terminal_order.get("quantity")
             # _parse_terminal_share_quantity rejects non-finite, negative, and
             # non-integral values (not just unparseable ones): a raw
@@ -26903,6 +27007,12 @@ def _failure_candidate_row(ticker: str, outcome: Dict[str, Any]) -> Dict[str, An
             else 0.0
         ),
         "skip_reason": outcome.get("skip_reason"),
+        # Mirrors _build_buy_candidates's own copy of this marker (Codex
+        # review: "Preserve deliberate-skip markers before
+        # reclassification") -- distinguishes a deliberate policy block from
+        # a non-deliberate one _apply_no_order_classification counts as a
+        # connector error.
+        "deliberate_skip": outcome.get("deliberate_skip"),
         # Mirrors _build_buy_candidates's own copy of this marker -- this
         # failure-path rebuild is a SEPARATE artifact-construction path, and
         # is in fact the MORE likely one to carry the marker: a candidate
@@ -26959,6 +27069,16 @@ def _failure_candidate_row(ticker: str, outcome: Dict[str, Any]) -> Dict[str, An
         # whole_share_order_ids, the additional broker order id(s) an
         # aggregated row carries are lost from the artifact entirely.
         "whole_share_order_ids": outcome.get("whole_share_order_ids"),
+        # Mirrors _build_buy_candidates's own copy of this field (Codex
+        # review, PR #1252: "Persist the attribution map on candidate
+        # rows") -- a submitted aggregate that hits a failure path is
+        # rebuilt through THIS helper too, so omitting it here would leave
+        # a same-slot retry's own trim with no attribution map to read back
+        # and falling to the legacy subtraction estimate.
+        "_order_amount_usd_by_id": outcome.get("_order_amount_usd_by_id"),
+        "_order_failure_kind_by_id": outcome.get("_order_failure_kind_by_id"),
+        "_order_adjustment_ids": outcome.get("_order_adjustment_ids"),
+        "whole_share_order_attributions": outcome.get("whole_share_order_attributions"),
         "whole_share_claim_breakdown": outcome.get("whole_share_claim_breakdown"),
         "whole_share_settlement_adjustment": outcome.get("whole_share_settlement_adjustment", False),
         # See _build_buy_candidates's own note on these two: a submitted
@@ -26966,6 +27086,10 @@ def _failure_candidate_row(ticker: str, outcome: Dict[str, Any]) -> Dict[str, An
         # helper, so omitting them here loses the same cap evidence.
         "merged_attempt_days": outcome.get("merged_attempt_days"),
         "merged_attempt_count": outcome.get("merged_attempt_count"),
+        # Mirrors _build_buy_candidates's own copy of this field (Codex
+        # review: "Preserve merged submission counts when seeding
+        # outcomes").
+        "merged_submission_count": outcome.get("merged_submission_count"),
         # Same audit contract as _build_buy_candidates's success-path rows:
         # unconditionally present (defaulted), never conditionally added --
         # _write_csv derives buy_candidates.csv's header from row 0's keys
@@ -27438,6 +27562,455 @@ def _outcome_is_mergeable_recovery(outcome: Dict[str, Any]) -> bool:
     )
 
 
+def _order_id_key(value: Any) -> str:
+    """Stable, JSON-key-safe identity for one broker order id.
+
+    Mirrors the ``(type(value).__name__, str(value).strip())`` identity tuple
+    the retry-reinjection block uses elsewhere in this module, joined into a
+    single string so it can live as a dict key in a persisted JSON artifact.
+    """
+    return f"{type(value).__name__}:{str(value).strip()}"
+
+
+def _leg_order_amount_attribution(side: Mapping[str, Any]) -> Dict[str, Optional[float]]:
+    """Per-order-id ``submitted_amount_usd`` this leg already contributed.
+
+    An aggregate row produced by an earlier merge already carries its own
+    ``_order_amount_usd_by_id`` breakdown -- pass it through unchanged rather
+    than re-deriving it from the aggregate's OWN summed total, which no
+    longer corresponds to any single id. A fresh, never-merged leg has no
+    such map yet: its whole ``submitted_amount_usd`` is attributable to
+    whichever ids it represents (ordinarily one scalar ``order_id``, so the
+    whole amount goes to that one id; an even split is the best available
+    answer for the rare case a never-merged leg already carries more than
+    one id).
+
+    A leg whose status is not ``"submitted"`` contributed nothing, matching
+    the same status gate ``submitted_amount_usd`` itself is summed under
+    just below -- a blocked or failed sibling must not be credited with
+    notional it never moved.
+    """
+    existing_map = side.get("_order_amount_usd_by_id")
+    if isinstance(existing_map, dict):
+        return {
+            str(key): float(value)
+            for key, value in existing_map.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+    if side.get("status") != "submitted":
+        return {}
+    ids = {
+        _order_id_key(value)
+        for value in [side.get("order_id"), *(side.get("whole_share_order_ids") or [])]
+        if value is not None and str(value).strip()
+    }
+    if not ids:
+        return {}
+    # A pre-upgrade aggregate that predates `_order_amount_usd_by_id` (no
+    # existing_map above) but already carries the OLDER
+    # `whole_share_order_attributions` per-order breakdown is not a
+    # genuinely fresh, never-merged leg -- it can already combine a
+    # submitted order with a blocked/failed sibling under one forced
+    # "submitted" status (see this function's own merge caller). Equally
+    # splitting its `submitted_amount_usd` across every represented id
+    # invents notional for members that never actually contributed (e.g.
+    # attributing half of B's $23 to blocked A), and a later trim that
+    # retains only the genuinely-submitted id then understates it (Codex
+    # review: "Reuse legacy attribution before splitting aggregate
+    # totals"). Prefer the legacy breakdown's own exact per-id amounts
+    # whenever it covers every id this leg represents.
+    _legacy_list = side.get("whole_share_order_attributions")
+    if isinstance(_legacy_list, list):
+        _legacy_by_id: Dict[str, float] = {}
+        for _item in _legacy_list:
+            if not isinstance(_item, dict):
+                continue
+            _raw_id = _item.get("order_id")
+            if _raw_id is None or not str(_raw_id).strip():
+                continue
+            _key = _order_id_key(_raw_id)
+            _amt = _item.get("submitted_amount_usd")
+            if isinstance(_amt, (int, float)) and not isinstance(_amt, bool):
+                _legacy_by_id[_key] = _legacy_by_id.get(_key, 0.0) + float(_amt)
+        if ids <= set(_legacy_by_id):
+            # A zero legacy amount is genuinely ambiguous -- it can mean
+            # this id never submitted (a blocked/failed sibling, correctly
+            # zero) or that it submitted and was later fully offset by a
+            # settlement reversal sharing its order_id (also correctly
+            # zero, but a REAL attempt). The legacy list itself carries no
+            # separate "was this id ever submitted" provenance to tell
+            # the two apart. Simply OMITTING a zero entry (an earlier
+            # revision of this fix) made it indistinguishable from a
+            # genuinely never-submitted id's own correct, non-ambiguous
+            # omission -- the caller (the retry-reinjection trim) reads
+            # mere key ABSENCE as proof an id was never submitted, so a
+            # real net-zero submission would be misclassified as one
+            # (Codex review: "Preserve ambiguous zero legacy submissions").
+            # `None` (the same ambiguity sentinel the multi-id-no-legacy-
+            # coverage fallback below already uses) marks it correctly
+            # instead: present, but unknown -- which poisons the WHOLE
+            # combined map for this merge (see this function's own caller),
+            # so the trim falls through to its conservative "preserve the
+            # full total" path rather than either wrong extreme.
+            return {
+                key: (round(_legacy_by_id[key], 2) if _legacy_by_id[key] != 0.0 else None)
+                for key in ids
+            }
+    # No exact source covers every id. A SINGLE id has no split ambiguity
+    # at all -- its whole submitted_amount_usd is unambiguously its own.
+    if len(ids) == 1:
+        return {next(iter(ids)): float(side.get("submitted_amount_usd") or 0.0)}
+    # More than one id with no exact source to split by is exactly the
+    # pre-upgrade-aggregate shape the legacy-preference branch above
+    # exists to catch when it CAN prove the split -- an absent or merely
+    # INCOMPLETE legacy list reaches here just as easily as no legacy list
+    # at all, and persisting an invented equal split as this leg's
+    # "exact" contribution is no more honest than the equal split the
+    # legacy-preference fix above was built to replace: a later trim
+    # retaining only the genuinely-submitted id would still understate it
+    # (Codex review: "Keep uncertain legacy aggregate attribution
+    # conservative"). `None` (not simply omitting these ids) marks them as
+    # AMBIGUOUS rather than proven-zero -- the caller (this merge's own
+    # combining step) must tell that apart from a genuinely never-
+    # submitted leg's id, which is correctly OMITTED entirely (see the
+    # `status != "submitted"` branch above): omitting an ambiguous id here
+    # the same way would make it indistinguishable from "proven never
+    # submitted", and a later trim reading mere key ABSENCE as that proof
+    # would silently misclassify a real, merely un-split submission.
+    return {key: None for key in ids}
+
+
+def _represented_order_ids(row: Mapping[str, Any]) -> set[Tuple[str, str]]:
+    """Stable identities for every broker order a row represents."""
+    values = [row.get("order_id")]
+    aggregate_ids = row.get("whole_share_order_ids")
+    if isinstance(aggregate_ids, list):
+        values.extend(aggregate_ids)
+    return {
+        (type(value).__name__, str(value).strip())
+        for value in values
+        if value is not None and str(value).strip()
+    }
+
+
+def _unrepresented_prior_candidate_part(
+    prior: Mapping[str, Any], fresh_rows: Sequence[Mapping[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Return the portion of a same-slot retry's prior aggregate absent from
+    ``fresh_rows``.
+
+    Retry artifacts can replace only one member of an older whole-share
+    aggregate. In that case an any-overlap dedupe would also erase the
+    aggregate's other broker orders. Retain those IDs and remove the fresh
+    rows' attributable notional/share count from the carried row.
+    """
+    prior_ids = _represented_order_ids(prior)
+    if not prior_ids:
+        return dict(prior)
+    represented = set().union(
+        *(_represented_order_ids(row) for row in fresh_rows)
+    ) if fresh_rows else set()
+    missing_ids = prior_ids - represented
+    if not missing_ids:
+        return None
+    if missing_ids == prior_ids:
+        return dict(prior)
+
+    trimmed = dict(prior)
+    missing_values = {value for _kind, value in missing_ids}
+    trimmed["whole_share_order_ids"] = [
+        value
+        for value in prior.get("whole_share_order_ids") or []
+        if (type(value).__name__, str(value).strip()) in missing_ids
+    ]
+    if not trimmed["whole_share_order_ids"]:
+        trimmed["whole_share_order_ids"] = sorted(missing_values)
+    scalar_id = trimmed.get("order_id")
+    if (type(scalar_id).__name__, str(scalar_id).strip()) not in missing_ids:
+        trimmed["order_id"] = trimmed["whole_share_order_ids"][0]
+
+    # A prior aggregate's submitted_amount_usd only ever summed notional
+    # from SUBMITTED legs (see _merge_whole_share_submission_outcomes) -- a
+    # matched id that was still blocked/failed when this aggregate was last
+    # written contributed nothing to that total. Subtracting the fresh
+    # retry's now-submitted amount for that same id would incorrectly zero
+    # out or shrink a SIBLING order's notional it was never responsible
+    # for. Use the per-order attribution recorded on the merge instead of
+    # guessing from the fresh rows' own amounts (Codex review, PR #1051:
+    # "Preserve notional when trimming a previously blocked order").
+    attribution = prior.get("_order_amount_usd_by_id")
+    attribution = attribution if isinstance(attribution, dict) else None
+    # Computed here (used both by the amount-map trim just below and by
+    # the submission-count computation further down) rather than re-read
+    # per use.
+    _prior_adjustment_ids_raw = prior.get("_order_adjustment_ids")
+    _prior_adjustment_ids = (
+        set(_prior_adjustment_ids_raw) if isinstance(_prior_adjustment_ids_raw, list) else set()
+    )
+    missing_keys = {f"{kind}:{value}" for kind, value in missing_ids}
+    # A legacy aggregate persisted before `_order_amount_usd_by_id` existed
+    # can still carry the OLDER `whole_share_order_attributions` list (a
+    # per-order [{order_id, submitted_amount_usd, planned_amount_usd,
+    # whole_share_quantity}, ...] breakdown a prior revision of this merge
+    # stamped) -- exact attribution, just under a different key and
+    # covering `whole_share_quantity` too, which `_order_amount_usd_by_id`
+    # never tracked. Computed unconditionally (not only when the notional
+    # map above is absent) since it's the ONLY exact source for quantity
+    # (Codex review: "Retain exact attribution for legacy aggregate rows",
+    # "Retain quantity from the prior per-order attribution").
+    _legacy_list = prior.get("whole_share_order_attributions")
+    # Accumulated, not a last-write-wins comprehension: a settlement
+    # adjustment merged with the physical order it corrects deliberately
+    # shares the SAME order_id (see _merge_whole_share_submission_outcomes),
+    # so two list entries can carry that one key -- typically the physical
+    # order's real notional/quantity and the adjustment's own (often zero)
+    # correction. A plain `{key: item for item in ...}` kept only whichever
+    # entry appeared last, discarding the other entirely (Codex review:
+    # "Aggregate duplicate quantity attributions before trimming").
+    _legacy_by_id: Dict[str, Dict[str, Any]] = {}
+    if isinstance(_legacy_list, list):
+        for _item in _legacy_list:
+            if not isinstance(_item, dict):
+                continue
+            _raw_order_id = _item.get("order_id")
+            if _raw_order_id is None or not str(_raw_order_id).strip():
+                continue
+            _key = f"{type(_raw_order_id).__name__}:{str(_raw_order_id).strip()}"
+            _existing_entry = _legacy_by_id.get(_key)
+            if _existing_entry is None:
+                _legacy_by_id[_key] = dict(_item)
+                continue
+            _merged_entry = dict(_existing_entry)
+            for _field in ("submitted_amount_usd", "planned_amount_usd", "whole_share_quantity"):
+                _a, _b = _existing_entry.get(_field), _item.get(_field)
+                if isinstance(_a, (int, float)) and isinstance(_b, (int, float)):
+                    _merged_entry[_field] = _a + _b
+                elif isinstance(_b, (int, float)):
+                    _merged_entry[_field] = _b
+            _legacy_by_id[_key] = _merged_entry
+    _matched_legacy = [_legacy_by_id[key] for key in missing_keys if key in _legacy_by_id]
+    _legacy_fully_matched = bool(_matched_legacy) and len(_matched_legacy) == len(missing_keys)
+    if attribution is not None:
+        trimmed_amount = round(
+            sum(float(attribution.get(key) or 0.0) for key in missing_keys), 2
+        )
+        if isinstance(prior.get("submitted_amount_usd"), (int, float)):
+            trimmed["submitted_amount_usd"] = trimmed_amount
+        if isinstance(prior.get("planned_amount_usd"), (int, float)):
+            trimmed["planned_amount_usd"] = trimmed_amount
+        trimmed["_order_amount_usd_by_id"] = {
+            key: attribution[key] for key in missing_keys if key in attribution
+        }
+        # `_order_failure_kind_by_id` is a per-id map too (see
+        # _merge_whole_share_submission_outcomes) -- narrowed the same way,
+        # so a later merge on this trimmed row does not inherit a
+        # refreshed/dropped id's stale failure/block provenance.
+        _prior_failure_kinds_raw = prior.get("_order_failure_kind_by_id")
+        if isinstance(_prior_failure_kinds_raw, dict):
+            trimmed["_order_failure_kind_by_id"] = {
+                key: _prior_failure_kinds_raw[key]
+                for key in missing_keys
+                if key in _prior_failure_kinds_raw
+            }
+        # `_order_adjustment_ids` narrowed the same way, so a later merge
+        # on this trimmed row does not inherit a refreshed/dropped id's
+        # stale adjustment-only provenance.
+        if _prior_adjustment_ids:
+            _retained_adjustment_ids = sorted(_prior_adjustment_ids & set(missing_keys))
+            if _retained_adjustment_ids:
+                trimmed["_order_adjustment_ids"] = _retained_adjustment_ids
+            else:
+                trimmed.pop("_order_adjustment_ids", None)
+    elif _legacy_fully_matched:
+        for field in ("submitted_amount_usd", "planned_amount_usd"):
+            if not isinstance(prior.get(field), (int, float)):
+                continue
+            _values = [_item.get(field) for _item in _matched_legacy]
+            if all(isinstance(_v, (int, float)) for _v in _values):
+                trimmed[field] = round(sum(float(_v) for _v in _values), 2)
+        # Restricted to just the still-represented ids, not the prior
+        # aggregate's full list (inherited unchanged via `dict(prior)`
+        # above): a later `_merge_whole_share_submission_outcomes` call on
+        # this trimmed row reads this list as its own leg's exact
+        # per-order breakdown, so a refreshed/dropped id's stale entry
+        # left in here would get copied straight into a NEW aggregate that
+        # never actually included it (Codex review: "Remove refreshed IDs
+        # from the legacy attribution list").
+        trimmed["whole_share_order_attributions"] = _matched_legacy
+    # Trimming can leave a row whose remaining ids were NEVER themselves
+    # submitted -- the aggregate's overall status was "submitted" only
+    # because a now-fresh SIBLING (already represented, hence trimmed away)
+    # was the one that actually submitted. Carrying that inherited
+    # "submitted" status/merged_submission_count forward reports the
+    # still-blocked id as an ADDITIONAL submission the moment a caller (the
+    # retry-reinjection block's own outcome-seeding loop) reads this row
+    # back as a broker outcome, double-counting a member that deployed
+    # nothing (Codex review: "Avoid promoting trimmed blocked members to
+    # submissions").
+    #
+    # A zero SUM is not the same proof as a zero attribution: a real
+    # submitted order and a full settlement reversal deliberately share the
+    # SAME order_id (see _merge_whole_share_submission_outcomes), so that
+    # id's own attribution entry can legitimately net to exactly $0 even
+    # though the physical order genuinely submitted and consumed an attempt
+    # (Codex review: "Preserve zero-net submitted orders when trimming
+    # aggregates"). `_leg_order_amount_attribution` only ever OMITS a key
+    # entirely for an id no submitted leg ever attributed anything to --
+    # never for one that submitted and later netted to zero -- so checking
+    # each missing id's KEY PRESENCE in the map (not the summed VALUE)
+    # correctly tells "never submitted" apart from "submitted, net zero".
+    # Restricted to the exact (`_order_amount_usd_by_id`) map only: the
+    # legacy `whole_share_order_attributions` fallback has no equivalent
+    # per-id "ever submitted" signal to check presence against, so it can
+    # never prove non-submission here -- same conservative posture as the
+    # notional/quantity fallback just above.
+    # How many of the still-missing ids the exact map PROVES submitted --
+    # key presence, not a truthy value (see the zero-net-submission
+    # reasoning above). `None` when no exact map is available at all,
+    # matching the conservative fallback below.
+    _attributed_submitting_count = (
+        sum(1 for key in missing_keys if key in attribution) if attribution is not None else None
+    )
+    _missing_keys_absent_from_attribution = _attributed_submitting_count == 0
+    # merged_submission_count specifically excludes ids that are known
+    # settlement-adjustment-ONLY contributions: such an id can carry a
+    # real, non-ambiguous dollar amount in `attribution` (an adjustment's
+    # own delta is exact), so mere key presence there proves an amount
+    # was attributed but NOT that a new physical order was submitted --
+    # the same distinction `_submission_count`/`_submitted_orders_in_row`
+    # already draw for a row that is ENTIRELY an adjustment (Codex
+    # review: "Keep settlement adjustments out of submission counts").
+    _attributed_physical_submission_count = (
+        sum(1 for key in missing_keys if key in attribution and key not in _prior_adjustment_ids)
+        if attribution is not None
+        else None
+    )
+    _proven_non_submitting = _missing_keys_absent_from_attribution and trimmed.get("status") == "submitted"
+    # Computed once, up front, so every branch below (not just the
+    # proven-non-submitting one) can consult exact per-id failure/block
+    # provenance when available.
+    _prior_failure_kinds = prior.get("_order_failure_kind_by_id")
+    _prior_failure_kinds = _prior_failure_kinds if isinstance(_prior_failure_kinds, dict) else None
+    if _proven_non_submitting:
+        # "blocked" is not the only non-submitting shape the trimmed member
+        # can genuinely be: `merged_placement_failed` (inherited unchanged
+        # from `dict(prior)` above) records that a FRESH placement attempt
+        # for this exact id actually FAILED at the broker, not merely that
+        # policy blocked it before ever calling out. Downgrading to
+        # "blocked" unconditionally lost that distinction --
+        # `_apply_no_order_classification` only honors `merged_placement_
+        # failed` for a row whose status remains "submitted" (Codex review:
+        # "Preserve failure type when trimming aggregate members"), so a
+        # caller reading this row back as a broker outcome then reported a
+        # genuinely failed order as an ordinary policy-blocked one:
+        # `orders_failed_count` undercounted, and error_class fell back to
+        # a connector-degradation guess instead of naming a real placement
+        # failure. "failed" is read directly by that same classifier
+        # regardless of status, so it needs no companion marker.
+        # `_order_failure_kind_by_id` (when present) proves WHICH specific
+        # id(s) failed vs. were merely blocked -- checking it against just
+        # the still-missing ids, not the aggregate-wide marker, correctly
+        # tells apart "the failed member IS one of the still-missing ids"
+        # from "the failed member was a DIFFERENT id that got refreshed and
+        # trimmed away" (e.g. a 3-member aggregate of submitted B, failed
+        # A, and blocked D, where a retry refreshes A and B: the retained
+        # D-only row must read as "blocked", not "failed", since D was
+        # never the one that failed -- Codex review: "Attribute failure
+        # markers before trimming aggregate members"). A legacy aggregate
+        # that predates this per-id tracking has no such map; falls back to
+        # the aggregate-wide marker exactly as before for that case.
+        if _prior_failure_kinds is not None:
+            trimmed["status"] = (
+                "failed"
+                if any(_prior_failure_kinds.get(key) == "failed" for key in missing_keys)
+                else "blocked"
+            )
+        else:
+            trimmed["status"] = "failed" if trimmed.get("merged_placement_failed") else "blocked"
+        trimmed["trimmed_from_submitted_aggregate"] = True
+    # A MIXED retained set (e.g. missing = {A failed, B submitted, D
+    # blocked} after a retry refreshes only C) falls into NEITHER branch
+    # above -- not every missing id is proven non-submitting, and not
+    # every missing id is proven submitting either -- yet the inherited
+    # merged_placement_failed/merged_placement_blocked markers (from
+    # `dict(prior)`) still describe SOME member of the ORIGINAL aggregate,
+    # which may no longer be among the missing ids at all (Codex review:
+    # "Recompute failure markers for mixed retained aggregates"). Whenever
+    # exact per-id provenance is available, the markers are recomputed
+    # directly from the still-missing ids' own kinds here -- covering the
+    # mixed case this elif chain alone cannot reach, as well as
+    # subsuming both the all-non-submitting-but-not-proven-status-
+    # downgrade-needed and all-submitting cases the two branches above
+    # already handle for `status`/`trimmed_from_submitted_aggregate`.
+    elif _prior_failure_kinds is not None:
+        _missing_has_failed = any(_prior_failure_kinds.get(key) == "failed" for key in missing_keys)
+        _missing_has_blocked = any(_prior_failure_kinds.get(key) == "blocked" for key in missing_keys)
+        if _missing_has_failed:
+            trimmed["merged_placement_failed"] = True
+        else:
+            trimmed.pop("merged_placement_failed", None)
+        if _missing_has_blocked:
+            trimmed["merged_placement_blocked"] = True
+        else:
+            trimmed.pop("merged_placement_blocked", None)
+        if not _missing_has_failed and not _missing_has_blocked:
+            trimmed.pop("merged_failure_reason", None)
+    # The opposite direction of the same gap, for a LEGACY aggregate with
+    # no per-id provenance at all: `merged_placement_failed`/
+    # `merged_placement_blocked` still describe SOME member, but not
+    # WHICH one. When the exact NOTIONAL map (not the failure-kind one,
+    # unavailable here) proves every STILL-MISSING id genuinely
+    # submitted, the marker cannot describe any of them; it can only
+    # describe a member that WAS represented in `fresh_rows` and got
+    # trimmed away. Leaving it standing reports the genuinely-submitted
+    # retained row as a placement failure too -- a successful retry
+    # persisted as failed_after_partial_submission with a phantom
+    # orders_failed_count (Codex review: "Drop failure markers for
+    # refreshed aggregate members").
+    elif attribution is not None and _attributed_submitting_count == len(missing_ids):
+        trimmed.pop("merged_placement_failed", None)
+        trimmed.pop("merged_placement_blocked", None)
+        trimmed.pop("merged_failure_reason", None)
+    # Neither this merge's own attribution map nor a legacy per-order
+    # breakdown can prove which part of the aggregate's total belongs to
+    # the still-unmatched ids -- subtracting the fresh retry rows' own
+    # amounts here would repeat exactly the bug this whole attribution
+    # mechanism exists to fix (a matched id that contributed $0 to the
+    # total, like a blocked sibling, has its fresh retry amount subtracted
+    # from a total it was never part of). Preserve the prior's full,
+    # conservative total instead of guessing at a smaller one --
+    # overstating carried deployment is far safer here than silently
+    # understating it (Codex review: "...preserve the conservative
+    # aggregate total, to avoid understating deployed capital and
+    # weakening subsequent caps"). Nothing to do here: `trimmed` already
+    # started as `dict(prior)`, so its submitted/planned amounts already
+    # hold that conservative total unless one of the branches above just
+    # replaced them with an exact figure.
+    if isinstance(prior.get("whole_share_quantity"), (int, float)):
+        if _legacy_fully_matched:
+            _qty_values = [_item.get("whole_share_quantity") for _item in _matched_legacy]
+            if all(isinstance(_v, (int, float)) for _v in _qty_values):
+                trimmed["whole_share_quantity"] = sum(float(_v) for _v in _qty_values)
+        # else: no exact per-order quantity available -- preserve the
+        # prior's full quantity (already in `trimmed` via `dict(prior)`)
+        # rather than subtract a fresh sibling's own quantity from a total
+        # it may never have contributed to (same reasoning as the notional
+        # branch just above).
+    # Derived from the exact map's own attributed-submitting count when
+    # available, not blindly from every missing id: a MIXED retained set
+    # -- e.g. missing = {A, B} where A never submitted but B genuinely did
+    # -- is neither the "prove all zero" case above nor safe to count as
+    # `len(missing_ids)` (2), which double-counts B as two submissions for
+    # one physical order (Codex review: "Count only attributed submissions
+    # after a partial trim"). Falls back to `len(missing_ids)` only when no
+    # exact map exists at all, matching this function's existing
+    # conservative posture for that case.
+    trimmed["merged_submission_count"] = (
+        _attributed_physical_submission_count if attribution is not None else len(missing_ids)
+    )
+    return trimmed
+
+
 def _merge_whole_share_submission_outcomes(
     existing: Dict[str, Any], new: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -27497,6 +28070,99 @@ def _merge_whole_share_submission_outcomes(
         # "Preserve fresh placement failures when merging recoveries"). The
         # marker rides alongside the status rather than fighting it -- the
         # recovered order really did submit, and today's really did fail.
+        # Per-id provenance for the aggregate-wide markers below: which
+        # SPECIFIC represented id(s) a "failed"/non-deliberately-"blocked"
+        # side stands for, so a LATER trim (_unrepresented_prior_candidate_
+        # part) that refreshes exactly that id can tell the still-missing
+        # sibling's marker apart from one describing a member that got
+        # trimmed away -- rather than reattributing an aggregate-wide flag
+        # to whichever id happens to remain (Codex review: "Attribute
+        # failure markers before trimming aggregate members"). Inherited
+        # from both sides (a side can already be a merged aggregate itself)
+        # before this merge's own new entries are added, same pattern as
+        # `_order_amount_usd_by_id`.
+        _failure_kind_by_id: Dict[str, str] = {}
+        for _side in (existing, new):
+            _inherited_kinds = _side.get("_order_failure_kind_by_id")
+            if isinstance(_inherited_kinds, dict):
+                _failure_kind_by_id.update(
+                    {str(k): str(v) for k, v in _inherited_kinds.items() if isinstance(v, str)}
+                )
+        # Ids contributed by a settlement-ADJUSTMENT leg specifically, not
+        # an ordinary physical order -- inherited the same way as the
+        # failure-kind map. `_submission_count`/`_submitted_orders_in_row`
+        # already treat a settlement-adjustment ROW as zero new
+        # submissions (it corrects an order some earlier run already
+        # counted, never a submission of its own); this is the per-id
+        # equivalent for a MERGED aggregate where only SOME ids are
+        # adjustments. Needed because such an id can still carry a real,
+        # non-ambiguous dollar amount in `_order_amount_usd_by_id` (an
+        # adjustment's own delta is exact, not ambiguous) -- so mere key
+        # presence there is not enough to prove a NEW physical submission
+        # (Codex review: "Keep settlement adjustments out of submission
+        # counts").
+        _adjustment_ids: set[str] = set()
+        for _side in (existing, new):
+            _inherited_adjustment_ids = _side.get("_order_adjustment_ids")
+            if isinstance(_inherited_adjustment_ids, list):
+                _adjustment_ids.update(str(v) for v in _inherited_adjustment_ids)
+        for _side in (existing, new):
+            if _side.get("whole_share_settlement_adjustment"):
+                for _aid in [_side.get("order_id"), *(_side.get("whole_share_order_ids") or [])]:
+                    if _aid is not None and str(_aid).strip():
+                        _adjustment_ids.add(_order_id_key(_aid))
+        # A settlement adjustment deliberately SHARES its order_id with the
+        # physical order it corrects (see this function's own docstring),
+        # so an id can legitimately be both "seen on an adjustment-flagged
+        # side" and a genuine physical submission at once. Marking it
+        # adjustment-only purely from the adjustment side's presence
+        # excluded that shared id from `_attributed_physical_submission_
+        # count` even though it DOES represent a real order, understating
+        # the count the moment a retry refreshes a DIFFERENT sibling id
+        # (Codex review: "Track adjustment-only IDs instead of all
+        # adjusted IDs"). Any id seen on a genuinely physical (non-
+        # adjustment, actually-submitted) side -- in THIS merge or any
+        # earlier one whose own outcome is still available here -- is
+        # excluded from the adjustment-only set regardless of whether it
+        # also appears on an adjustment side.
+        #
+        # `_side` can itself be an already-merged aggregate (a re-merge of
+        # a prior `_order_adjustment_ids`-carrying result with a further
+        # outcome) whose own `whole_share_settlement_adjustment` flag is
+        # NOT set -- a mixed aggregate is not itself a pure adjustment row
+        # -- even though it internally still carries an adjustment-only id
+        # from an earlier merge. Treating every id such a side represents
+        # as physical re-classified that inherited adjustment-only id as
+        # physical the moment it survived one more re-merge, silently
+        # dropping it from `_order_adjustment_ids` and fabricating a
+        # physical order the next time a retry refreshed a sibling id
+        # (Codex review: "Preserve adjustment-only IDs across aggregate
+        # re-merges"). Deriving physical ids from the side's OWN per-id
+        # `_order_adjustment_ids` provenance (when present) rather than
+        # from its aggregate-wide flag alone keeps an inherited
+        # adjustment-only id excluded across any number of further
+        # re-merges.
+        _physical_ids: set[str] = set()
+        for _side in (existing, new):
+            if _side.get("status") != "submitted" or _side.get("whole_share_settlement_adjustment"):
+                continue
+            _side_ids = {
+                _order_id_key(_pid)
+                for _pid in [_side.get("order_id"), *(_side.get("whole_share_order_ids") or [])]
+                if _pid is not None and str(_pid).strip()
+            }
+            _side_own_adjustment_ids_raw = _side.get("_order_adjustment_ids")
+            _side_own_adjustment_ids = (
+                {str(v) for v in _side_own_adjustment_ids_raw}
+                if isinstance(_side_own_adjustment_ids_raw, list)
+                else set()
+            )
+            _physical_ids.update(_side_ids - _side_own_adjustment_ids)
+        _adjustment_only_ids = _adjustment_ids - _physical_ids
+        if _adjustment_only_ids:
+            merged["_order_adjustment_ids"] = sorted(_adjustment_only_ids)
+        else:
+            merged.pop("_order_adjustment_ids", None)
         for side in (existing, new):
             if side.get("status") == "failed":
                 merged["merged_placement_failed"] = True
@@ -27505,6 +28171,9 @@ def _merge_whole_share_submission_outcomes(
                 merged.setdefault(
                     "merged_failure_reason", side.get("skip_reason")
                 )
+                for _fid in [side.get("order_id"), *(side.get("whole_share_order_ids") or [])]:
+                    if _fid is not None and str(_fid).strip():
+                        _failure_kind_by_id[_order_id_key(_fid)] = "failed"
             # A "blocked" side carrying the broker_placement_failed marker is
             # NOT the same event as a "failed" one, and collapsing the two
             # would misreport it: `_apply_no_order_classification` counts a
@@ -27522,6 +28191,9 @@ def _merge_whole_share_submission_outcomes(
                 merged.setdefault(
                     "merged_failure_reason", side.get("skip_reason")
                 )
+                for _fid in [side.get("order_id"), *(side.get("whole_share_order_ids") or [])]:
+                    if _fid is not None and str(_fid).strip():
+                        _failure_kind_by_id[_order_id_key(_fid)] = "blocked"
             # A confirmation-required hold carries broker_placement_failed too
             # -- a real broker call was made -- so the round-28 predicate here
             # ("any non-submitted side with the marker") captured it and
@@ -27546,6 +28218,8 @@ def _merge_whole_share_submission_outcomes(
                 merged.setdefault(
                     "merged_confirmation_reason", side.get("skip_reason")
                 )
+        if _failure_kind_by_id:
+            merged["_order_failure_kind_by_id"] = _failure_kind_by_id
     # A failure outcome can still carry the REQUESTED order notional in
     # submitted_amount_usd for diagnostics even though the broker confirmed
     # no deployment, so only sides that actually submitted (or are
@@ -27568,9 +28242,102 @@ def _merge_whole_share_submission_outcomes(
         ),
         2,
     )
+    # Per-order-id breakdown of the sum just above, so a LATER retry that
+    # only republishes some of this aggregate's ids can trim the carried row
+    # down to its still-unmatched ids' own notional instead of guessing at
+    # a fresh row's amount (see the retry-reinjection block's
+    # ``_unrepresented_prior_candidate_part`` for the P1 double-count/zero-out this fixes:
+    # Codex review, PR #1051: "Preserve notional when trimming a previously
+    # blocked order").
+    # Summed on a colliding key, not overwritten: `existing`/`new` can
+    # deliberately share the SAME order_id -- a settlement adjustment
+    # merged with the physical order it corrects is exactly this shape --
+    # and a plain `{**a, **b}` spread would silently replace `existing`'s
+    # own attributed amount for that id with only `new`'s, understating a
+    # later retry's carried deployment for that order by however much
+    # `existing` contributed (Codex review: "Sum notional when attribution
+    # keys collide").
+    _existing_attribution = _leg_order_amount_attribution(existing)
+    _new_attribution = _leg_order_amount_attribution(new)
+    # `None` (from either side) marks an id as AMBIGUOUS -- a leg that
+    # could not honestly split its own multi-id total (see
+    # _leg_order_amount_attribution's own conservative `None` return for
+    # that shape) -- as opposed to a key simply being ABSENT from one
+    # side's map, which just means that side's leg never touched this id
+    # (routine: the other side is expected to carry it instead). Any
+    # ambiguous id taints the WHOLE combined map: a caller (the retry-
+    # reinjection trim) treats mere key PRESENCE as proof an id was
+    # submitted, so persisting a map that is exact for some ids but
+    # merely guessed for others is no safer than the invented equal split
+    # this whole mechanism replaces (Codex review: "Keep uncertain legacy
+    # aggregate attribution conservative"). Not persisting
+    # `_order_amount_usd_by_id` at all in that case makes the trim's own
+    # `attribution is None` fallback run instead, preserving the
+    # aggregate's full conservative total.
+    _combined_attribution: Dict[str, float] = {}
+    _attribution_has_ambiguous_id = False
+    for key in {*_existing_attribution, *_new_attribution}:
+        # `key in <dict>` first, not just `.get(key) is None`: a key
+        # simply ABSENT from one side's map (that side's leg never
+        # touched this id -- routine, the other side is expected to carry
+        # it) must default to a zero contribution, not be confused with a
+        # key that IS present with an explicit `None` value (this id's
+        # contribution is genuinely unknown/ambiguous).
+        _e_ambiguous = key in _existing_attribution and _existing_attribution[key] is None
+        _n_ambiguous = key in _new_attribution and _new_attribution[key] is None
+        if _e_ambiguous or _n_ambiguous:
+            _attribution_has_ambiguous_id = True
+            break
+        _combined_attribution[key] = round(
+            (_existing_attribution.get(key) or 0.0) + (_new_attribution.get(key) or 0.0), 2
+        )
+    if not _attribution_has_ambiguous_id:
+        merged["_order_amount_usd_by_id"] = _combined_attribution
+    else:
+        # `merged = dict(new)` above already copied `new`'s own exact
+        # `_order_amount_usd_by_id` (if it had one, e.g. `new` is itself
+        # an already-aggregated outcome) straight onto `merged` -- this
+        # merge's own ambiguity (from `existing`'s side) only skips
+        # ASSIGNING a fresh combined map, it does not clear that inherited
+        # one, so it would otherwise survive untouched even though it no
+        # longer describes every id this NEW, larger aggregate represents
+        # (Codex review: "Clear inherited attribution when a leg is
+        # ambiguous"). Explicitly removed so a later trim's own
+        # `attribution is None` check correctly sees "no exact map" rather
+        # than a stale partial one.
+        merged.pop("_order_amount_usd_by_id", None)
     merged["whole_share_quantity"] = (
         (existing.get("whole_share_quantity") or 0) + (new.get("whole_share_quantity") or 0)
     )
+    # Keep the aggregate totals attributable to physical order ids.  A later
+    # same-slot retry can replace only one member of this row; without this
+    # breakdown it cannot know whether that member contributed to the total
+    # (a blocked attempt does not) and subtracting the fresh row's notional
+    # can erase a different, successfully submitted order.
+    def _attributions(side: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        persisted = side.get("whole_share_order_attributions")
+        if isinstance(persisted, list):
+            return [dict(item) for item in persisted if isinstance(item, dict)]
+        side_ids = side.get("whole_share_order_ids") or (
+            [side["order_id"]] if side.get("order_id") else []
+        )
+        # A legacy/pre-aggregated side with several ids cannot be split
+        # reliably.  Do not invent an attribution; retry trimming will then
+        # retain its conservative aggregate total.
+        if len(side_ids) != 1:
+            return []
+        return [{
+            "order_id": side_ids[0],
+            "submitted_amount_usd": (
+                side.get("submitted_amount_usd") or 0.0
+                if side.get("status") == "submitted"
+                else 0.0
+            ),
+            "planned_amount_usd": side.get("planned_amount_usd"),
+            "whole_share_quantity": side.get("whole_share_quantity") or 0,
+        }]
+
+    merged["whole_share_order_attributions"] = _attributions(existing) + _attributions(new)
     # How many real broker SUBMISSIONS this one row now stands for. The
     # aggregate's notional and share count are summed above, but the row is
     # still one dict, and both activity counters count ROWS: two unresolved
@@ -27864,6 +28631,7 @@ def run_once(
                     execution_records=(
                         ctx.run_result.execution_records if ctx.run_result is not None else None
                     ),
+                    dry_run=ctx.config.dry_run,
                     broker=ctx.broker,
                     broker_name=ctx.config.broker.value,
                     expect_no_prior_state=ctx.expect_no_prior_state,
@@ -29136,6 +29904,7 @@ def _write_afternoon_failure_artifacts(
     classification_overrides: Optional[Dict[str, Any]] = None,
     correlation_id: Optional[str] = None,
     execution_records: Optional[Sequence[OrderExecutionRecord]] = None,
+    dry_run: Optional[bool] = None,
     scheduled: bool = True,
     broker: Optional[Any] = None,
     broker_name: Optional[str] = None,
@@ -29147,6 +29916,20 @@ def _write_afternoon_failure_artifacts(
     Preserves any order already placed, never overwrites a run_state the run had
     already written, and completes a partial directory. The artifact proves the
     slot fired; it is never scheduled evidence.
+
+    ``dry_run`` stamps this failure state's own top-level ``dry_run`` field --
+    the same field a successful run's own state carries (see
+    ``run_daily_compact``'s own ``"dry_run": config.dry_run`` sites). Without
+    it, this artifact carried no ``dry_run`` field at all, and a LATER
+    successful retry at the same slot compares its own ``config.dry_run``
+    against this prior state's field with ``_prior_dry_run == config.dry_run``
+    -- an absent field defaults `_prior_dry_run` to `None`, and `None ==
+    False` is `False` even when the retry is running in the exact same
+    (non-dry-run) mode the failed attempt was. That silently failed
+    `_orders_csv_same_run`'s identity check, skipping the ENTIRE reinjection
+    block below it and losing every recovered candidate/broker outcome the
+    failed attempt had already preserved (Codex review: "Stamp dry_run onto
+    afternoon failure artifacts so a same-mode retry is recognized").
 
     ``classification_overrides``/``correlation_id`` let a non-afternoon roster
     slot (``run_dca.run_slot``'s 1030ET/1230ET) stamp its OWN stream/cron_id/
@@ -29914,14 +30697,86 @@ def _write_afternoon_failure_artifacts(
                 _prior_broker_outcomes_malformed = _prior_broker_outcomes_field is not None and not isinstance(
                     _prior_broker_outcomes_field, dict
                 )
-                if (
-                    _loaded.get("trading_day") != trading_day
+                # A readable, same-day/stream/slot/origin prior state can still
+                # belong to the OPPOSITE dry-run mode -- a scheduled slot that
+                # dry-ran earlier today reusing the same directory a LIVE retry
+                # now writes to, or vice versa. Merging a real submitted order
+                # into a state stamped for the other mode would persist it
+                # under a "dry_run" value that disagrees with what actually
+                # happened, and the NEXT live retry's own `_orders_csv_same_run`
+                # check (which DOES compare dry_run) would then reject that
+                # state and silently drop the order's deployment/execution
+                # evidence right back out -- the same hazard the day/stream/
+                # slot checks above already exist to prevent, just on the mode
+                # axis instead of the identity one (Codex review: "Reject
+                # preserved states with a conflicting dry-run mode"). An ABSENT
+                # field does NOT count as a mismatch -- this repo's own test
+                # fixtures, and any pre-upgrade production artifact written
+                # before this function stamped one, routinely hand-build a
+                # prior run_state.json with no "dry_run" key at all, and
+                # treating "unproven" the same as "proven different" would
+                # reject every one of those as foreign, far beyond the specific
+                # opposite-mode hazard this check exists for. Only an EXPLICIT
+                # disagreement rejects.
+                _prior_dry_run_field = _loaded.get("dry_run")
+                _prior_dry_run_value = _prior_dry_run_field if isinstance(_prior_dry_run_field, bool) else None
+                _same_identity_ignoring_mode = (
+                    _loaded.get("trading_day") == trading_day
                     # An absent run_origin predates the field and belongs to the
                     # scheduled path, which is the only one that used to reach here.
-                    or (_prior_run_origin or "scheduled") != _current_run_origin
-                    or _prior_stream != _current_stream
-                    or _prior_scheduled_for_et != _current_scheduled_for_et
-                    or _prior_broker_outcomes_malformed
+                    and (_prior_run_origin or "scheduled") == _current_run_origin
+                    and _prior_stream == _current_stream
+                    and _prior_scheduled_for_et == _current_scheduled_for_et
+                    and not _prior_broker_outcomes_malformed
+                )
+                # A LIVE canonical state that this DRY-RUN invocation's own
+                # mismatch check would otherwise reject is not safe to
+                # replace via full synthesis the way every OTHER rejection
+                # reason here is: full synthesis unconditionally OVERWRITES
+                # state_path, discarding whatever real submitted orders the
+                # live state already recorded, and this dry-run invocation
+                # has no genuine evidence of its own worth that trade
+                # (Codex review: "Preserve live evidence when a dry-run
+                # retry fails"). The opposite direction (a live invocation
+                # rejecting a DRY-RUN prior) is unaffected -- full synthesis
+                # there is correct, since THIS run's real evidence needs
+                # proper recording and the dry-run prior has nothing
+                # genuine to lose. Scoped to an otherwise-matching identity
+                # (day/stream/slot/shape) -- a state foreign on those axes
+                # already falls through to the ordinary full-synthesis path
+                # below, same as before this fix.
+                if (
+                    _same_identity_ignoring_mode
+                    and _prior_dry_run_value is False
+                    and dry_run is True
+                ):
+                    logger.warning(
+                        "not replacing a LIVE run_state.json at %s with this dry-run "
+                        "invocation's own failure state; leaving the live evidence "
+                        "untouched and sidecar-ing this invocation's own outcomes instead",
+                        state_path,
+                    )
+                    if placed:
+                        # Redacted the same way `_persist_cross_account_
+                        # unresolved_evidence` redacts `placed` before
+                        # persisting it: a candidate outcome's own
+                        # diagnostic fields (`skip_reason` in particular)
+                        # routinely interpolate a raw connector exception,
+                        # which can carry account-number/credential shapes
+                        # into this sidecar's arbitrary artifacts directory
+                        # if persisted verbatim (Codex review, PR #1252:
+                        # "Redact outcomes before writing the dry-run
+                        # sidecar").
+                        _persist_undurable_evidence_sidecar(
+                            out,
+                            "dry_run_failure_over_live_state",
+                            now,
+                            {"broker_outcomes": _redact_broker_outcomes_for_sidecar(placed)},
+                        )
+                    return
+                if (
+                    not _same_identity_ignoring_mode
+                    or (_prior_dry_run_value is not None and _prior_dry_run_value != dry_run)
                 ):
                     existing_is_usable = False
                     logger.warning(
@@ -30103,6 +30958,14 @@ def _write_afternoon_failure_artifacts(
                     # slot identity into exception artifacts").
                     "run_id": classification["run_id"],
                     "trading_day": trading_day,
+                    # Without this, a same-mode retry's own
+                    # _orders_csv_same_run identity check always fails
+                    # against this failure state (it reads "dry_run" as
+                    # absent, never "unproven"), and its whole reinjection
+                    # block never runs (Codex review: "Stamp dry_run onto
+                    # afternoon failure artifacts so a same-mode retry is
+                    # recognized").
+                    "dry_run": dry_run,
                     "generated_at": now.astimezone(EASTERN).isoformat(),
                     "broker": broker_name or config_broker_name(),
                     # The SAME non-reversible keyed fingerprint build_run_artifacts
@@ -30275,6 +31138,52 @@ def _write_afternoon_failure_artifacts(
                 )
                 assert _loaded is not None
                 run_state = _loaded
+                # A preserved state written before this function stamped
+                # "dry_run" (or by a hand-built test fixture) has no such
+                # field at all; leaving it absent means the NEXT same-mode
+                # retry's own _orders_csv_same_run identity check reads
+                # "dry_run" as unproven rather than matching, rejects this
+                # state as foreign, and drops its deployment/execution
+                # evidence right back out (Codex review: "Stamp dry_run
+                # onto afternoon failure artifacts so a same-mode retry is
+                # recognized"). Backfilled unconditionally when absent --
+                # not merely when it disagrees -- since the run_state.json
+                # write below always runs regardless of whether any row was
+                # newly merged, so there is no separate "nothing to
+                # persist" case to guard for THAT file. `run_summary.json`
+                # is a SEPARATE file, though, regenerated only when
+                # `state_was_mutated` -- keyed on ROWS changing, not on
+                # this field alone -- so a no-add retry that only just
+                # backfilled dry_run left the on-disk summary permanently
+                # disagreeing with the state it mirrors (`build_run_summary`
+                # copies "dry_run" too), undetected because the validator
+                # only compares their classification blocks (Codex review:
+                # "Regenerate the summary after backfilling dry-run mode").
+                # Tracked here so it can widen `state_was_mutated` below.
+                # Not just an ABSENT field: `existing_is_usable`'s own dry-run
+                # comparison treats any non-boolean value (e.g. a malformed
+                # "dry_run": "false" string) the same as unproven/absent via
+                # its own `isinstance(..., bool)` gate, so a same-slot state
+                # carrying that malformed shape passes through to this merge
+                # branch too -- but checking `is None` here left it
+                # unchanged, still a string, after this write. The NEXT live
+                # retry's own `_prior_execution_mode_matches` check (unlike
+                # this lenient one) compares it literally against `False`,
+                # `"false" != False` is True, and it rejects the very state
+                # this backfill was supposed to make recognizable (Codex
+                # review: "Normalize malformed dry-run fields before
+                # preserving state"). Backfilled whenever the field is not
+                # ALREADY a real bool -- covering both absent and malformed
+                # -- while still requiring a real non-None `dry_run`
+                # argument, so an internal caller that never learned the
+                # mode does not "backfill" None over a malformed value
+                # either (no actual improvement, so it must not falsely
+                # widen state_was_mutated below).
+                _dry_run_backfill_changed = (
+                    not isinstance(run_state.get("dry_run"), bool) and dry_run is not None
+                )
+                if _dry_run_backfill_changed:
+                    run_state["dry_run"] = dry_run
                 # The preserved file can belong to an EARLIER invocation at this slot, so
                 # fold in whatever THIS one placed. Discarding it would hide an accepted
                 # order from the same-day guards and let a later run buy it again (Codex
@@ -31095,8 +32004,21 @@ def _write_afternoon_failure_artifacts(
                     # not itself an unresolved-placement halt, yet the failure stamp
                     # above still just overwrote a preserved SUCCESSFUL status with
                     # "failed" (Codex review, PR #859 round 31: "Regenerate summaries
-                    # after manual failure stamps").
-                    state_was_mutated = added or unresolved_placement_halt or _status_transitioned_to_failed
+                    # after manual failure stamps"). `_dry_run_backfill_changed`
+                    # covers a fourth, narrower gap: a no-add retry whose ONLY
+                    # change to `run_state` was backfilling a previously-absent
+                    # "dry_run" -- neither a row nor the status changed, but
+                    # `build_run_summary` mirrors that field too, so leaving it
+                    # out of this gate left the regenerated state disagreeing
+                    # with an un-regenerated summary on dry_run specifically
+                    # (Codex review: "Regenerate the summary after backfilling
+                    # dry-run mode").
+                    state_was_mutated = (
+                        added
+                        or unresolved_placement_halt
+                        or _status_transitioned_to_failed
+                        or _dry_run_backfill_changed
+                    )
                     _merged_run_state_text = _serialize_run_state(run_state)
                     atomic_write_text(state_path, _merged_run_state_text)
                     _written_run_state_bytes = _merged_run_state_text.encode("utf-8")
@@ -35668,6 +36590,7 @@ def run_daily_compact(
     _prior_trading_day: Optional[str] = None
     _prior_stream: Optional[str] = None
     _prior_scheduled_for_et: Optional[str] = None
+    _prior_dry_run: Optional[bool] = None
     # build_run_artifacts stamps a manual run's run_classification with
     # run_origin="manual" and neither `stream` nor `scheduled_for_et` set,
     # so a manual prior attempt's identity is None/None on both -- which,
@@ -35724,6 +36647,9 @@ def run_daily_compact(
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             _prior_state_payload = None
         if isinstance(_prior_state_payload, dict):
+            candidate_dry_run = _prior_state_payload.get("dry_run")
+            if isinstance(candidate_dry_run, bool):
+                _prior_dry_run = candidate_dry_run
             _candidate_prior_day = _prior_state_payload.get("trading_day")
             if isinstance(_candidate_prior_day, str):
                 _prior_trading_day = _candidate_prior_day
@@ -37205,6 +38131,347 @@ def run_daily_compact(
                 or outcome.get("reconciled_fractional_placement")
             )
         }
+        _prior_buy_candidates = _prior_state_payload.get("buy_candidates")
+        # The unlocked same-slot carry-forward path below predates the later
+        # ownership-verified merge path's full schema guard. It still needs a
+        # minimal compatibility check so a syntactically valid but schema-
+        # invalid prior candidate (wrong-typed buy_multiplier/order_id/
+        # target_price_missing, or missing/empty ticker) is not copied into
+        # this retry's freshly-written state before that later guard runs
+        # (Codex review: "Validate restored candidates before appending").
+        def _prior_candidate_schema_compatible_for_retry_merge(row: Dict[str, Any]) -> bool:
+            ticker = row.get("ticker")
+            if not isinstance(ticker, str) or not ticker:
+                return False
+            buy_multiplier = row.get("buy_multiplier")
+            if not isinstance(buy_multiplier, (int, float)) or isinstance(buy_multiplier, bool):
+                return False
+            planned_amount = row.get("planned_amount_usd")
+            if (
+                not isinstance(planned_amount, (int, float))
+                or isinstance(planned_amount, bool)
+                or planned_amount < 0
+            ):
+                return False
+            order_id = row.get("order_id")
+            if order_id is not None and not isinstance(order_id, str):
+                return False
+            target_price_missing = row.get("target_price_missing")
+            if target_price_missing is not None and not isinstance(target_price_missing, bool):
+                return False
+            return True
+        _prior_candidates = [
+            row for row in (
+                _prior_buy_candidates if isinstance(_prior_buy_candidates, list) else []
+            )
+            if (
+                isinstance(row, dict)
+                and row.get("status") in {"submitted", "filled", "pending"}
+                and _prior_candidate_schema_compatible_for_retry_merge(row)
+            )
+        ]
+        if _prior_recovered_outcomes or _prior_candidates:
+            try:
+                _fresh_state = json.loads((out / "run_state.json").read_bytes())
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                _fresh_state = None
+            if isinstance(_fresh_state, dict):
+                _raw_fresh_candidates = _fresh_state.get("buy_candidates")
+                _fresh_candidates = [
+                    row
+                    for row in (
+                        _raw_fresh_candidates if isinstance(_raw_fresh_candidates, list) else []
+                    )
+                    if isinstance(row, dict)
+                ]
+                _fresh_order_ids = set().union(
+                    *(_represented_order_ids(row) for row in _fresh_candidates)
+                ) if _fresh_candidates else set()
+                # A successful retry can legitimately have no new candidate
+                # for an already-submitted order. Keep the prior deployment
+                # evidence so later cap and kill-switch readers retain it.
+                _added_prior_candidate = False
+                for _candidate in _prior_candidates:
+                    _candidate = _unrepresented_prior_candidate_part(_candidate, _fresh_candidates)
+                    if _candidate is None:
+                        continue
+                    _candidate_order_ids = _represented_order_ids(_candidate)
+                    _fresh_candidates.append(dict(_candidate))
+                    _fresh_order_ids.update(_candidate_order_ids)
+                    _added_prior_candidate = True
+                # Persisted into THIS run's own broker_outcomes too, not just
+                # buy_candidates: a SUBSEQUENT successful retry of the same
+                # slot re-derives _prior_recovered_outcomes from THIS state's
+                # own broker_outcomes (read as _prior_state_payload on that
+                # later call) -- if this block only ever updated
+                # buy_candidates, that later retry would find nothing to
+                # reinject and silently drop the recovered candidate all
+                # over again the moment a second retry happens (Codex
+                # review: "Persist reinjected recoveries for the next
+                # retry").
+                _raw_fresh_broker_outcomes = _fresh_state.get("broker_outcomes")
+                _fresh_broker_outcomes = dict(
+                    _raw_fresh_broker_outcomes
+                    if isinstance(_raw_fresh_broker_outcomes, dict)
+                    else {}
+                )
+                # run_once()'s own SUCCESS-path run_state.json never carries a
+                # top-level "broker_outcomes" field -- only
+                # _write_afternoon_failure_artifacts's own failure-state shape
+                # does -- so the seed above is essentially always empty on a
+                # successful retry. submitted_orders.csv was ALREADY correctly
+                # regenerated moments ago from buy_candidates (see
+                # run_daily_compact's own success-path order_rows
+                # construction), but the rewrite below regenerates it AGAIN
+                # from _fresh_broker_outcomes alone via submitted_order_rows()
+                # -- so every one of THIS run's own real submissions (a fresh
+                # MSFT order, say) silently vanished from the regenerated file
+                # the moment this block reinjected even ONE prior candidate,
+                # even though the run genuinely placed it (Codex review: "Seed
+                # fresh broker outcomes from this run's own candidates before
+                # rewriting submitted_orders.csv"). Seeded here from
+                # `_fresh_candidates` -- this run's own buy_candidates, before
+                # any prior-candidate reinjection below appends to it -- using
+                # the SAME ticker/ticker:order_id collision handling the prior-
+                # candidate loop just below already uses, so a fresh order
+                # survives the regeneration exactly as it would have without
+                # any reinjection at all.
+                # Every fresh candidate is seeded, not just the
+                # submitted/filled/pending ones -- a genuinely FAILED or
+                # non-deliberately BLOCKED fresh candidate is exactly what
+                # _apply_no_order_classification below reads (via its
+                # status/deliberate_skip/placement_breaker_halted/
+                # merged_placement_failed checks) to tell a real trading
+                # failure apart from a healthy no-order run. Omitting those
+                # rows here left a retry that submitted ONE order but lost
+                # ANOTHER to a real placement/connector failure reporting no
+                # failure evidence at all once this block's stale-marker
+                # clear ran, rewriting a partial failure as an ordinary
+                # success (Codex review: "Carry fresh failures into retry
+                # classification"). The whole candidate row is copied
+                # (mirroring the prior-candidate-outcome loop just below),
+                # not a hand-picked field subset, so no marker
+                # _apply_no_order_classification might read is silently
+                # dropped.
+                for _candidate in _fresh_candidates:
+                    _status = _candidate.get("status")
+                    if not _status:
+                        continue
+                    _ticker = _candidate.get("ticker") or "unknown"
+                    _outcome_key = str(_ticker)
+                    if _outcome_key in _fresh_broker_outcomes:
+                        _outcome_key = f"{_ticker}:{_candidate.get('order_id')}"
+                    _fresh_broker_outcomes[_outcome_key] = {
+                        **dict(_candidate),
+                        "ticker": _ticker,
+                        "status": _status,
+                        "submitted_amount_usd": _candidate.get("submitted_amount_usd")
+                        or _candidate.get("planned_amount_usd"),
+                    }
+                # Ordinary carried candidates are submission evidence too.
+                # Classification and submitted_orders.csv are derived solely
+                # from broker_outcomes, so retaining them only in
+                # buy_candidates would incorrectly turn a successful retry
+                # into a completed-no-orders run and omit the prior order.
+                _added_prior_outcome = False
+                for _candidate in _prior_candidates:
+                    _candidate = _unrepresented_prior_candidate_part(
+                        _candidate,
+                        [
+                            outcome
+                            for outcome in _fresh_broker_outcomes.values()
+                            if isinstance(outcome, dict)
+                        ],
+                    )
+                    if _candidate is None:
+                        continue
+                    _candidate_order_ids = _represented_order_ids(_candidate)
+                    if not _candidate_order_ids:
+                        continue
+                    _ticker = _candidate.get("ticker") or "unknown"
+                    _outcome_key = str(_ticker)
+                    if _outcome_key in _fresh_broker_outcomes:
+                        _outcome_key = f"{_ticker}:{_candidate.get('order_id')}"
+                    _fresh_broker_outcomes[_outcome_key] = {
+                        **dict(_candidate),
+                        "ticker": _ticker,
+                        "status": _candidate.get("status"),
+                        "submitted_amount_usd": _candidate.get("submitted_amount_usd")
+                        or _candidate.get("planned_amount_usd"),
+                    }
+                    _added_prior_outcome = True
+                # `_prior_recovered_outcomes` is deliberately NOT reinjected
+                # here. This whole surrounding block runs UNLOCKED -- before
+                # the ownership-verified `cross_process_lock` critical
+                # section below -- so writing these rows here can publish a
+                # foreign or stale directory's contents as this invocation's
+                # own, and races the SAME data the locked block re-reads and
+                # correctly reinjects (via `_outcomes_to_reinject`) under
+                # verified ownership. Reinjecting it twice previously
+                # produced duplicate/miscounted rows when both blocks fired,
+                # and writing it here alone let it survive even when the
+                # later ownership check correctly decided this directory was
+                # no longer this invocation's own to write into (Codex
+                # review: "Move retry reinjection under the ownership
+                # lock"). `_prior_candidates`/`_prior_recovered_outcomes`
+                # themselves stay computed above -- the locked block still
+                # needs `_prior_recovered_outcomes` -- only the unlocked
+                # write of the latter is removed.
+                if _added_prior_candidate or _added_prior_outcome:
+                    _fresh_state["buy_candidates"] = _fresh_candidates
+                    _fresh_state["broker_outcomes"] = _fresh_broker_outcomes
+                    # Grouped via _grouped_submission_rows_by_represented_order
+                    # and summed by _submitted_orders_in_row, not a plain
+                    # union of represented ids: a carried aggregate's own
+                    # merged_submission_count can exceed the number of ids it
+                    # happens to list (e.g. a lone order_id with no
+                    # whole_share_order_ids, whose extra submissions were
+                    # never individually id-tracked), and a union-of-ids count
+                    # silently collapsed that back down to 1 (Codex review:
+                    # "Count every order represented by carried aggregates" --
+                    # same class of bug the locked reinjection block below
+                    # already guards against for its own outcomes).
+                    _fresh_state["orders_submitted_count"] = sum(
+                        _submitted_orders_in_row(row)
+                        for row in _grouped_submission_rows_by_represented_order(
+                            (
+                                row
+                                for row in _fresh_candidates
+                                if row.get("status") in ("submitted", "filled", "pending")
+                            ),
+                            ticker_prefix="ticker:",
+                        )
+                    )
+                    # counts.buy_candidates and the usage-proxy's
+                    # buy_candidates_written/orders_placed_count all derive
+                    # from the SAME buy_candidates/broker_outcomes
+                    # collections that just grew -- leaving them at their
+                    # pre-reinjection values understated the regenerated
+                    # run_summary.json's own copy of these counts too
+                    # (Codex review: "Refresh all derived counts after
+                    # reinjection").
+                    _fresh_state["counts"] = {
+                        **(_fresh_state.get("counts") or {}),
+                        "submitted": _fresh_state["orders_submitted_count"],
+                        "buy_candidates": len(_fresh_candidates),
+                    }
+                    # _submitted_orders_in_row, not a flat 1-per-row count:
+                    # an aggregate outcome seeded above now carries its own
+                    # merged_submission_count (Codex review: "Preserve
+                    # merged submission counts when seeding outcomes"), and
+                    # counting it as a single row here would once again
+                    # contradict the ID-based orders_submitted_count just
+                    # computed above for the same retry.
+                    _fresh_orders_placed_count = sum(
+                        _submitted_orders_in_row(_o)
+                        for _o in _fresh_broker_outcomes.values()
+                        if isinstance(_o, dict)
+                        and _o.get("order_id")
+                        and _o.get("status") in {"submitted", "dry_run"}
+                    )
+                    _fresh_usage = _fresh_state.get("usage_proxy")
+                    if isinstance(_fresh_usage, dict):
+                        _fresh_usage["buy_candidates_written"] = len(_fresh_candidates)
+                        _fresh_usage["orders_placed_count"] = _fresh_orders_placed_count
+                    # A carried prior candidate/outcome is not necessarily a
+                    # NEW submission -- a settlement-adjustment-only
+                    # aggregate reinjected here weighs zero in
+                    # orders_submitted_count above (via
+                    # _submitted_orders_in_row's own adjustment-aware
+                    # count), so unconditionally stamping order_submit_status
+                    # here reported a run that placed nothing as "submitted"
+                    # while orders_submitted_count/counts.submitted/
+                    # usage_proxy.orders_placed_count all stayed zero, and
+                    # _apply_no_order_classification below never clears an
+                    # already-concrete order_submit_status. Gate this on the
+                    # SAME orders_submitted_count just computed above, the
+                    # same way the locked reinjection block further down
+                    # already does for its own outcomes (Codex review, PR
+                    # #1252: "Keep adjustment-only retries in a
+                    # no-submission status").
+                    if _fresh_state["orders_submitted_count"] > 0:
+                        _fresh_state["order_submit_status"] = ORDER_SUBMIT_STATUS_SUBMITTED
+                    # run_once() already stamped a no-order classification
+                    # (run_classification_outcome="completed_no_orders",
+                    # a completion_reason, etc.) onto _fresh_state BEFORE this
+                    # block could learn the retry actually submitted the
+                    # recovered order. _apply_no_order_classification only
+                    # ever ADDS/overwrites these fields for a batch that is
+                    # STILL empty when it runs; it never clears a stale
+                    # no-order marker once orders_submitted_count turns
+                    # positive, so a run can end up simultaneously reported as
+                    # submitted (order_submit_status just above) and
+                    # completed-with-no-orders (Codex review: "Recompute
+                    # classification after reinjecting submissions"). Cleared
+                    # first so the recompute below starts clean -- the
+                    # function re-derives every one of these from the merged
+                    # outcomes, including re-setting is_trading_failure/
+                    # error_class if a genuine failure is still present among
+                    # them.
+                    for _stale_key in (
+                        "run_classification_outcome",
+                        "completion_reason",
+                        "is_trading_failure",
+                        "error_class",
+                        "orders_failed_count",
+                    ):
+                        _fresh_state.pop(_stale_key, None)
+                    _apply_no_order_classification(
+                        _fresh_state, _fresh_broker_outcomes, scheduled=options.scheduled
+                    )
+                    atomic_write_text(out / "run_state.json", _serialize_run_state(_fresh_state))
+                    # run_once() already generated buy_candidates.csv,
+                    # submitted_orders.csv, and run_summary.json from the
+                    # PRE-reinjection state -- rewriting only run_state.json
+                    # above left those three companions contradicting it: a
+                    # risk reader of run_state.json counts the recovered
+                    # order, while a CSV/report reader of the untouched
+                    # companions does not see it at all (Codex review:
+                    # "Rebuild companion artifacts after reinjecting
+                    # recoveries"). Regenerated from the SAME updated state
+                    # so the whole artifact set agrees.
+                    try:  # pragma: no cover - import shim for flat sys.path
+                        from scripts.scheduled_artifacts import (
+                            build_run_summary,
+                            submitted_order_rows,
+                            write_submitted_orders_csv,
+                        )
+                    except ImportError:  # pragma: no cover
+                        from scheduled_artifacts import (  # type: ignore
+                            build_run_summary,
+                            submitted_order_rows,
+                            write_submitted_orders_csv,
+                        )
+                    # A plain _write_csv(rows) derives its header from row[0]
+                    # alone -- fine when every row comes from the same
+                    # builder, but _fresh_candidates mixes run_once()'s own
+                    # _build_buy_candidates rows with a _failure_candidate_row
+                    # shape that does not necessarily carry identical keys.
+                    # csv.DictWriter's default extrasaction="raise" would
+                    # crash on the first field-set mismatch (the same class
+                    # of bug _merge_execution_csv's own extrasaction="ignore"
+                    # already guards against for orders.csv), so build the
+                    # union of every row's keys and ignore the rest.
+                    _candidate_fieldnames: List[str] = []
+                    _seen_candidate_fields: set[str] = set()
+                    for _row in _fresh_candidates:
+                        for _field in _row.keys():
+                            if _field not in _seen_candidate_fields:
+                                _seen_candidate_fields.add(_field)
+                                _candidate_fieldnames.append(_field)
+                    with atomic_open_w(out / "buy_candidates.csv", newline="") as _handle:
+                        _writer = csv.DictWriter(
+                            _handle, fieldnames=_candidate_fieldnames or ["ticker"], extrasaction="ignore"
+                        )
+                        _writer.writeheader()
+                        _writer.writerows(_fresh_candidates)
+                    write_submitted_orders_csv(
+                        out, submitted_order_rows(_fresh_broker_outcomes)
+                    )
+                    atomic_write_text(
+                        out / "run_summary.json",
+                        _serialize_run_state(build_run_summary(_fresh_state)),
+                    )
 
     orders_csv = out / "orders.csv"
     _directory_claimed_by_foreign_run = False
@@ -37739,6 +39006,17 @@ def run_daily_compact(
                         # the same way a missing order_id already
                         # does (Codex review: "Fail closed on
                         # malformed recovered order IDs").
+                        #
+                        # A per-row count (via _submitted_orders_in_row), not
+                        # a union of ids: a reinjected whole-share aggregate's
+                        # merged_submission_count already records how many
+                        # PHYSICAL orders it represents, which can exceed 1
+                        # (multiple submitted legs) even though its own
+                        # order_id/ticker collapses to a single set member
+                        # here -- counting sets alone silently reported an
+                        # aggregate as one submission regardless of how many
+                        # orders it actually merged (Codex review: "Count
+                        # every order represented by carried aggregates").
                         # Includes "potentially_submitted": an ambiguous placement
                         # (OrderPlacementAmbiguousError) genuinely reserved this
                         # candidate too, and excluding it here dropped an
@@ -37746,14 +39024,10 @@ def run_daily_compact(
                         # this reinjection loop ran (Codex review, PR #1300
                         # discussion_r3920765644: "Preserve ambiguous counts in
                         # failure-state merges").
-                        _fresh_state["orders_submitted_count"] = len(
-                            {
-                                row.get("order_id")
-                                if _is_usable_reconciled_order_id(row.get("order_id"))
-                                else f"ticker:{row.get('ticker')}"
-                                for row in _fresh_candidates
-                                if row.get("status") in ("submitted", "filled", "potentially_submitted")
-                            }
+                        _fresh_state["orders_submitted_count"] = sum(
+                            _submitted_orders_in_row(row)
+                            for row in _fresh_candidates
+                            if row.get("status") in ("submitted", "filled", "potentially_submitted")
                         )
                         # counts.buy_candidates and the usage-proxy's
                         # buy_candidates_written/orders_placed_count all derive
@@ -38035,6 +39309,27 @@ def run_daily_compact(
                         _apply_no_order_classification(
                             _fresh_state, _fresh_outcomes_for_classification, scheduled=options.scheduled
                         )
+                        # _apply_no_order_classification recomputes its own
+                        # orders_submitted_count/counts.submitted from
+                        # _fresh_outcomes_for_classification directly --
+                        # UNGROUPED, summing each outcome's own
+                        # _submitted_orders_in_row independently -- which
+                        # reintroduces exactly the double-count this block's
+                        # own _fresh_aggregate_submitted_count computation
+                        # above exists to prevent: two partially overlapping
+                        # aggregates (e.g. {A,B} and {B,C}) plus a standalone
+                        # recovery Z sum to 4 physical orders when grouped,
+                        # but 5 when summed independently (Codex review:
+                        # "Preserve the grouped submission count during
+                        # reclassification"). Restored to the already-
+                        # correct grouped figure right after the call, since
+                        # the classifier's own overwrite is otherwise the
+                        # last word on both fields.
+                        _fresh_state["orders_submitted_count"] = _fresh_aggregate_submitted_count
+                        _fresh_state["counts"] = {
+                            **(_fresh_state.get("counts") or {}),
+                            "submitted": _fresh_aggregate_submitted_count,
+                        }
                         atomic_write_text(out / "run_state.json", _serialize_run_state(_fresh_state))
                         # run_once() already generated buy_candidates.csv,
                         # submitted_orders.csv, and run_summary.json from the
