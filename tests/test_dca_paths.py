@@ -76,13 +76,14 @@ def test_stream_root_joins_multiple_segments(monkeypatch):
 
 
 @pytest.mark.parametrize("module_name,attr,suffix", STREAM_ROOTS)
-def test_every_stream_root_defaults_to_the_repo_relative_path(module_name, attr, suffix):
+def test_every_stream_root_defaults_to_the_repo_relative_path(monkeypatch, module_name, attr, suffix):
     """Pin that every stream constant derives from the shared repo-relative root.
 
     These were 15 separate hardcoded absolute strings before the consolidation;
     this asserts they all derive from DEFAULT_CRON_TRACKING_ROOT, which is now
     the repo-local cron_tracking/ directory rather than the legacy Linux path.
     """
+    monkeypatch.delenv(CRON_TRACKING_ROOT_ENV, raising=False)
     module = importlib.import_module(module_name)
     assert getattr(module, attr) == f"{DEFAULT_CRON_TRACKING_ROOT}/{suffix}"
 
@@ -129,6 +130,26 @@ def test_rebase_rewrites_a_bundled_path(monkeypatch):
         rebase_bundled_root(f"{BUNDLED_CRON_TRACKING_ROOT}/morning_dca/20260728_1030ET/")
         == "/srv/dca/morning_dca/20260728_1030ET/"
     )
+
+
+def test_rebase_bundled_root_bare(monkeypatch):
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/srv/dca")
+    assert rebase_bundled_root(BUNDLED_CRON_TRACKING_ROOT) == "/srv/dca"
+
+
+def test_rebase_bundled_root_trailing_slash(monkeypatch):
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/srv/dca")
+    assert rebase_bundled_root(f"{BUNDLED_CRON_TRACKING_ROOT}/") == "/srv/dca/"
+
+
+def test_rebase_bundled_root_trailing_backslash(monkeypatch):
+    import ntpath
+    monkeypatch.setattr(os, "sep", "\\")
+    monkeypatch.setattr(os.path, "join", ntpath.join)
+    monkeypatch.setattr(os.path, "splitdrive", ntpath.splitdrive)
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "C:\\srv\\dca")
+    assert rebase_bundled_root(f"{BUNDLED_CRON_TRACKING_ROOT}\\") == "C:\\srv\\dca\\"
+
 
 
 def test_rebase_is_a_no_op_when_configured_root_matches_bundled(monkeypatch):
