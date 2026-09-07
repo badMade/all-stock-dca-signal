@@ -47,6 +47,64 @@ def test_build_graded_vs_fixed_uses_per_candidate_dynamic_base():
     assert "$5.00" in report  # fixed: 1 (own base) + 2 (own base) + 2 (fallback), not 2 * 3 = 6
 
 
+def test_build_performance_snapshot_empty_states():
+    report = build_performance_snapshot([])
+    assert "| Run days | 0 |" in report
+    assert "| Buy candidates | 0 |" in report
+    assert "| Orders submitted | 0 |" in report
+    assert "| Planned notional | $0.00 |" in report
+    assert "| Executed notional | $0.00 |" in report
+    assert "| Week notional / cap | $0.00 / $0.00 |" in report
+
+
+def test_build_performance_snapshot_missing_fields():
+    # Test fallback mechanisms when expected budget and counts fields are missing
+    run_states = [
+        {
+            "trading_day": "2026-07-24",
+            # Missing "counts" entirely
+            # Missing "budget" entirely
+            # These will fallback to {}
+            "buy_candidates": [
+                {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 15.0},
+            ]
+        }
+    ]
+    report = build_performance_snapshot(run_states)
+    assert "| Run days | 1 |" in report
+    assert "| Buy candidates | 0 |" in report
+    assert "| Orders submitted | 0 |" in report
+    assert "| Planned notional | $15.00 |" in report
+    # Note: _this_run_submitted_notional fallback parses buy_candidates and extracts planned_amount_usd for executed notional fallback
+    assert "| Executed notional | $15.00 |" in report
+    assert "| Week notional / cap | $0.00 / $0.00 |" in report
+
+
+def test_build_performance_snapshot_renders_happy_path():
+    run_states = [
+        {
+            "trading_day": "2026-07-24",
+            "counts": {"buy_candidates": 2, "submitted": 1},
+            "budget": {
+                "day_notional_usd": 15.0,
+                "week_notional_usd": 15.0,
+                "weekly_cap_usd": 100.0,
+            },
+            "buy_candidates": [
+                {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 15.0},
+                {"ticker": "BBB", "status": "not_submitted", "planned_amount_usd": 10.0}
+            ]
+        }
+    ]
+    report = build_performance_snapshot(run_states)
+    assert "| Run days | 1 |" in report
+    assert "| Buy candidates | 2 |" in report
+    assert "| Orders submitted | 1 |" in report
+    assert "| Planned notional | $25.00 |" in report
+    assert "| Executed notional | $15.00 |" in report
+    assert "| Week notional / cap | $15.00 / $100.00 |" in report
+
+
 def test_build_performance_snapshot_counts_partial_submission_artifact():
     # Codex review, PR #538 discussion_r3837489854 ("Normalize retained
     # partial runs before dashboard aggregation"): morning/midday's
