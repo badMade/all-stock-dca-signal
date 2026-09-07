@@ -176,7 +176,7 @@ def test_emit_daily_artifacts_counts_recovered_forecasts_in_predicted_tickers(tm
     daily_update._emit_daily_artifacts(
         run_dir, fake_harness, fake_config, "2021-06-01", 1, ["2021-06-01"], new_records=[]
     )
-    summary = json.loads((run_dir / "daily" / "2021-06-01_summary.json").read_text(encoding="utf-8"))
+    summary = json.loads((run_dir / "daily" / "2021-06-01_summary.json").read_bytes())
     assert summary["predicted_tickers"] == 1
 
 
@@ -216,7 +216,7 @@ def test_emit_daily_artifacts_excludes_a_dropped_ticker_from_predicted_tickers(t
     daily_update._emit_daily_artifacts(
         run_dir, fake_harness, fake_config, "2021-06-01", 1, ["2021-06-01"], new_records=[]
     )
-    summary = json.loads((run_dir / "daily" / "2021-06-01_summary.json").read_text(encoding="utf-8"))
+    summary = json.loads((run_dir / "daily" / "2021-06-01_summary.json").read_bytes())
     assert summary["predicted_tickers"] == 1
 
 
@@ -270,7 +270,7 @@ class TestDailyCycle:
         processed_date = all_dates[200]
         summary_path = run_dir / "daily" / f"{processed_date}_summary.json"
         assert summary_path.exists()
-        summary = json.loads(summary_path.read_text())
+        summary = json.loads(summary_path.read_bytes())
         assert summary["days_processed"] == [processed_date]
         forecasts_path = run_dir / "daily" / f"{processed_date}_next_day_forecasts.csv"
         assert forecasts_path.exists()
@@ -425,7 +425,7 @@ class TestDailyCycle:
         # Operator skipped three days; one invocation catches up all of them.
         later_now = f"{all_dates[204]}T18:00"
         assert daily_update.main(["--run-dir", str(run_dir), "--history-dir", str(history), "--now", later_now]) == 0
-        summary = json.loads((run_dir / "daily" / f"{all_dates[203]}_summary.json").read_text())
+        summary = json.loads((run_dir / "daily" / f"{all_dates[203]}_summary.json").read_bytes())
         assert summary["days_processed"] == all_dates[200:204]
 
     def test_reads_and_writes_use_explicit_utf8(self, live_setup, capsys, monkeypatch):
@@ -633,7 +633,7 @@ class TestDailyCycle:
         history, run_dir, all_dates = live_setup
         same_now = f"{all_dates[200]}T18:00"  # identical to live_setup's own --now: zero new calendar days
         state_path = run_dir / "checkpoint" / "harness_state.json"
-        state = json.loads(state_path.read_text())
+        state = json.loads(state_path.read_bytes())
         ticker, origin_row = "AAA", 150
         origin_date = all_dates[origin_row]
         band = {c: {"p10": -0.01, "p50": 0.0, "p90": 0.01} for c in ("open", "high", "low", "close")}
@@ -763,7 +763,7 @@ class TestDailyCycle:
 
         history, run_dir, all_dates = live_setup
         state_path = run_dir / "checkpoint" / "harness_state.json"
-        state = json.loads(state_path.read_text())
+        state = json.loads(state_path.read_bytes())
         as_of = pd.Timestamp(f"{all_dates[200]}T18:00")
 
         panel = features.build_panel(history, min_history=60, as_of=as_of)
@@ -790,7 +790,7 @@ class TestDailyCycle:
         # reproduce it.
         history, run_dir, all_dates = live_setup
         state_path = run_dir / "checkpoint" / "harness_state.json"
-        state = json.loads(state_path.read_text())
+        state = json.loads(state_path.read_bytes())
         config_start = state["config"]["start"]
         assert config_start > all_dates[0]  # sanity: pre-start dates genuinely exist in this archive
         state["last_processed_date"] = None
@@ -937,7 +937,7 @@ class TestDailyCycle:
         capsys.readouterr()
 
         state_path = run_dir / "checkpoint" / "harness_state.json"
-        state = json.loads(state_path.read_text())
+        state = json.loads(state_path.read_bytes())
         ticker, origin_row = "AAA", 150
         origin_date = all_dates[origin_row]
         band = {c: {"p10": -0.01, "p50": 0.0, "p90": 0.01} for c in ("open", "high", "low", "close")}
@@ -959,7 +959,7 @@ class TestDailyCycle:
         code = daily_update.main(["--run-dir", str(run_dir), "--history-dir", str(history), "--now", same_now])
         assert code == 0
         assert "NOOP" in capsys.readouterr().out
-        new_state = json.loads(state_path.read_text())
+        new_state = json.loads(state_path.read_bytes())
         assert not any(
             entry.get("ticker") == ticker and entry.get("origin_date") == origin_date
             for entries in new_state["outstanding"].values()
@@ -986,11 +986,11 @@ class TestDailyCycle:
         processed_date = all_dates[199]  # last VISIBLE day under this --now cutoff
         summary_path = run_dir / "daily" / f"{processed_date}_summary.json"
         assert summary_path.exists()
-        before_summary = json.loads(summary_path.read_text())
+        before_summary = json.loads(summary_path.read_bytes())
         assert before_summary["rebound_forecasts"] == 0
 
         state_path = run_dir / "checkpoint" / "harness_state.json"
-        state = json.loads(state_path.read_text())
+        state = json.loads(state_path.read_bytes())
         ticker, origin_row = "AAA", 150
         origin_date = all_dates[origin_row]
         band = {c: {"p10": -0.01, "p50": 0.0, "p90": 0.01} for c in ("open", "high", "low", "close")}
@@ -1012,7 +1012,7 @@ class TestDailyCycle:
         code = daily_update.main(["--run-dir", str(run_dir), "--history-dir", str(history), "--now", same_now])
         assert code == 0
         assert "NOOP" in capsys.readouterr().out
-        after_summary = json.loads(summary_path.read_text())
+        after_summary = json.loads(summary_path.read_bytes())
         assert after_summary["rebound_forecasts"] == 1
 
     def test_daily_update_reuses_the_runs_recorded_history_dir(self, live_setup, capsys):

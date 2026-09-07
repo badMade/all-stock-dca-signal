@@ -375,7 +375,7 @@ def write_metadata(directory: Path, metadata: dict[str, Any]) -> None:
 
 
 def read_metadata(directory: Path) -> dict[str, Any]:
-    return json.loads((directory / METADATA_FILENAME).read_text())
+    return json.loads((directory / METADATA_FILENAME).read_bytes())
 
 
 def save_arrays(directory: Path, arrays: dict[str, np.ndarray]) -> None:

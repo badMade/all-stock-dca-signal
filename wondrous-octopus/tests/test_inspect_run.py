@@ -236,7 +236,7 @@ class TestTomorrow:
             rows = list(csv_module.DictReader(handle))
         assert {row["ticker"] for row in rows} == {"AAA", "BBB", "CCC"}
         # Verify the dollar conversion against the checkpoint's raw entry.
-        state = json.loads((demo_run / "checkpoint" / "harness_state.json").read_text())
+        state = json.loads((demo_run / "checkpoint" / "harness_state.json").read_bytes())
         first = rows[0]
         entry = next(
             e
@@ -296,7 +296,7 @@ class TestSummary:
     def test_summary_prose_contains_report_numbers(self, demo_run, capsys):
         assert inspect_run.main(["--run-dir", str(demo_run), "--summary"]) == 0
         output = capsys.readouterr().out
-        report = json.loads((demo_run / "report" / "report.json").read_text())
+        report = json.loads((demo_run / "report" / "report.json").read_bytes())
         close = report["by_regime"]["all"]["gbm_quantile"]["close"]
         assert f"{100 * close['coverage']:.1f}%" in output
         assert "persistence" in output
@@ -686,7 +686,7 @@ class TestBoundedReads:
         capsys.readouterr()
         shard = next((run_dir / "ledger" / "persistence").glob("score_*.jsonl.gz"))
         relpath = str(shard.relative_to(run_dir / "ledger"))
-        state = json.loads((run_dir / "checkpoint" / "harness_state.json").read_text())
+        state = json.loads((run_dir / "checkpoint" / "harness_state.json").read_bytes())
         expected_size = state["ledger"][relpath]["size"]
         original = shard.read_bytes()
         assert len(original) >= expected_size  # sanity: the checkpoint did fingerprint real bytes
@@ -736,7 +736,7 @@ class TestHtml:
         run_dir = tmp_path / "run_copy"
         shutil.copytree(demo_run, run_dir)
         state_path = run_dir / "checkpoint" / "harness_state.json"
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state = json.loads(state_path.read_bytes())
         unresolved = state["outstanding"][""]
         assert unresolved  # sanity: the demo run has pending forecasts
         # Match the model _view_html() will actually pick (same
@@ -754,7 +754,7 @@ class TestHtml:
         # the current-universe filter (Codex review: "Filter inspection
         # forecasts to the current universe") must not exclude it here.
         meta_path = run_dir / "run_meta.json"
-        run_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        run_meta = json.loads(meta_path.read_bytes())
         run_meta["universe"]["tickers"].append("ZZZLAGGY")
         meta_path.write_text(json.dumps(run_meta), encoding="utf-8")
 

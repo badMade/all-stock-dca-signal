@@ -391,7 +391,7 @@ def write_report(run_dir: Path) -> Path:
         # review: "Refuse reports when no checkpoint fingerprints
         # exist").
         raise Refused(f"no checkpoint under {run_dir}; ledger bytes without a checkpoint are not proven durable")
-    read_fingerprints = json.loads(state_path.read_text(encoding="utf-8"))["ledger"]
+    read_fingerprints = json.loads(state_path.read_bytes())["ledger"]
     ledger = Ledger(run_dir, read_fingerprints=read_fingerprints)
     models = ledger.models()
     if not models:
@@ -399,7 +399,7 @@ def write_report(run_dir: Path) -> Path:
     universe = None
     meta_path = run_dir / "run_meta.json"
     if meta_path.exists():
-        universe = json.loads(meta_path.read_text(encoding="utf-8")).get("universe")
+        universe = json.loads(meta_path.read_bytes()).get("universe")
     def _make_stream(m: str):
         return lambda: ledger.iter_records(model=m, kind="score")
 
@@ -883,7 +883,7 @@ def _verify_resume_universe(run_dir: Path, panel) -> None:
     meta_path = Path(run_dir) / "run_meta.json"
     if not meta_path.exists():
         return
-    recorded = json.loads(meta_path.read_text(encoding="utf-8")).get("universe", {}).get("tickers_sha256")
+    recorded = json.loads(meta_path.read_bytes()).get("universe", {}).get("tickers_sha256")
     if recorded and recorded != _tickers_hash(panel):
         raise Refused(
             "resumed universe differs from the recorded run (ticker set hash mismatch); "
@@ -924,7 +924,7 @@ def _verify_resume_config_hash(run_dir: Path, requested_config: HarnessConfig) -
     state_path = _checkpoint_state_path(run_dir)
     if state_path is None:
         return
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state = json.loads(state_path.read_bytes())
     config_kwargs: dict[str, Any] = dict(state["config"])
     config_kwargs["models"] = tuple(config_kwargs["models"])
     stored_config = HarnessConfig(**config_kwargs)
@@ -959,7 +959,7 @@ def _verify_resume_not_before_cursor(run_dir: Path, panel) -> None:
     state_path = _checkpoint_state_path(run_dir)
     if state_path is None:
         return
-    last_processed = json.loads(state_path.read_text(encoding="utf-8")).get("last_processed_date")
+    last_processed = json.loads(state_path.read_bytes()).get("last_processed_date")
     if not last_processed:
         return
     if len(panel.calendar) == 0 or panel.calendar[-1] < np.datetime64(last_processed):
@@ -974,8 +974,8 @@ def _resume_metadata(run_dir: Path) -> tuple[dict, dict]:
     """Load the frozen CLI metadata and harness config for a resume."""
     meta_path = Path(run_dir) / "run_meta.json"
     state_path = _checkpoint_state_path(run_dir)
-    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
-    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path is not None else {}
+    meta = json.loads(meta_path.read_bytes()) if meta_path.exists() else {}
+    state = json.loads(state_path.read_bytes()) if state_path is not None else {}
     return meta, state.get("config", {})
 
 
@@ -1059,7 +1059,7 @@ def _verify_resume_model_hyper(run_dir: Path, args: argparse.Namespace, knobs: d
     meta_path = Path(run_dir) / "run_meta.json"
     if not meta_path.exists():
         return
-    recorded = json.loads(meta_path.read_text(encoding="utf-8")).get("model_hyper")
+    recorded = json.loads(meta_path.read_bytes()).get("model_hyper")
     if not recorded:
         return  # run predates hyper recording; nothing to validate against
     requested = _model_hyper(args, knobs)
@@ -1151,7 +1151,7 @@ def refresh_run_meta_universe(run_dir: Path, panel) -> None:
     meta_path = Path(run_dir) / "run_meta.json"
     if not meta_path.exists():
         return
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta = json.loads(meta_path.read_bytes())
     universe = meta.get("universe")
     if universe is None:
         return

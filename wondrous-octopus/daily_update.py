@@ -110,7 +110,7 @@ def _daily_artifacts_are_complete(summary_path: Path) -> bool:
     if not summary_path.exists():
         return False
     try:
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary = json.loads(summary_path.read_bytes())
     except (OSError, json.JSONDecodeError):
         return False
     forecasts_csv = summary.get("next_day_forecasts_csv")
@@ -135,7 +135,7 @@ def _load_stored_config(run_dir: Path) -> HarnessConfig:
         state_path = fallback if fallback.exists() else state_path
     if not state_path.exists():
         raise Refused(f"no checkpoint under {run_dir}; run run_walkforward.py first")
-    stored = json.loads(state_path.read_text(encoding="utf-8"))["config"]
+    stored = json.loads(state_path.read_bytes())["config"]
     stored["models"] = tuple(stored["models"])
     config = HarnessConfig(**stored)
     config.end = None  # the live cycle always runs to the newest closed day
@@ -166,7 +166,7 @@ def _load_run_meta(run_dir: Path) -> dict:
             "required to safely continue this run (rerun run_walkforward.py, or restore run_meta.json "
             "from a backup)"
         )
-    return json.loads(meta_path.read_text(encoding="utf-8"))
+    return json.loads(meta_path.read_bytes())
 
 
 def _load_selection(meta: dict) -> dict:

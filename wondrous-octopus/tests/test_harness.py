@@ -780,7 +780,7 @@ class TestResume:
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         harness.run()
         metadata_path = tmp_path / "run" / "checkpoint" / "models" / "persistence" / "metadata.json"
-        payload = json.loads(metadata_path.read_text())
+        payload = json.loads(metadata_path.read_bytes())
         payload["residual_window"] = payload["residual_window"] + 1  # tamper: still valid JSON
         metadata_path.write_text(json.dumps(payload))
         registry = {"persistence": baseline_model.PersistenceModel}
@@ -834,7 +834,7 @@ class TestResume:
         config = _config(panel, n_steps=6)
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         del harness  # only its pre-any-step checkpoint matters below
-        state = json.loads((tmp_path / "run" / "checkpoint" / "harness_state.json").read_text())
+        state = json.loads((tmp_path / "run" / "checkpoint" / "harness_state.json").read_bytes())
         assert state["last_processed_date"] == str(np.datetime_as_string(panel.calendar[150], unit="D"))
 
         start_position = int(np.searchsorted(panel.calendar, np.datetime64(config.start)))
@@ -904,7 +904,7 @@ class TestResume:
         harness = WalkForwardHarness.fresh(panel, {"persistence": model}, tmp_path / "run", config, log=_quiet)
         holder["harness"] = harness
         assert harness.run() == "interrupted"
-        state = json.loads((tmp_path / "run" / "checkpoint" / "harness_state.json").read_text())
+        state = json.loads((tmp_path / "run" / "checkpoint" / "harness_state.json").read_bytes())
         assert state["step_index"] == harness.step_index
 
 
@@ -923,7 +923,7 @@ class TestCircuitBreaker:
         assert any("step_ceiling" in line for line in lines)
         # A checkpoint exists, so the trip is a clean bounded stop.
         state_path = tmp_path / "run" / "checkpoint" / "harness_state.json"
-        assert json.loads(state_path.read_text())["step_index"] == 4
+        assert json.loads(state_path.read_bytes())["step_index"] == 4
 
     def test_wallclock_ceiling_trips_before_the_first_model_fits(self, panel, tmp_path):
         # --max-hours 0 used to be checked from the SECOND model onward

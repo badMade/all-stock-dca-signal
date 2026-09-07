@@ -404,7 +404,7 @@ class TestDemo:
         assert code == 0
         assert (run_dir / "report" / "report.json").exists()
         assert (run_dir / "report" / "report.md").exists()
-        report = json.loads((run_dir / "report" / "report.json").read_text())
+        report = json.loads((run_dir / "report" / "report.json").read_bytes())
         assert set(report["models"]) == {"persistence", "gbm_quantile"}
         # Both models scored a meaningful number of forecasts.
         assert min(report["n_scored"].values()) > 100
@@ -457,7 +457,7 @@ class TestDemo:
         # demo GBM iteration count").
         run_dir = tmp_path / "demo-run"
         assert run_walkforward.main(["--demo", "--run-dir", str(run_dir), "--checkpoint-every", "50"]) == 0
-        metadata = json.loads((run_dir / "checkpoint" / "models" / "gbm_quantile" / "metadata.json").read_text())
+        metadata = json.loads((run_dir / "checkpoint" / "models" / "gbm_quantile" / "metadata.json").read_bytes())
         assert metadata["max_iter"] == 20
 
     def test_demo_records_the_archive_path_as_absolute(self, tmp_path, monkeypatch):
@@ -473,7 +473,7 @@ class TestDemo:
         monkeypatch.chdir(tmp_path)
         relative_run_dir = Path("demo-run")
         assert run_walkforward.main(["--demo", "--run-dir", str(relative_run_dir), "--checkpoint-every", "50"]) == 0
-        recorded = json.loads((relative_run_dir / "run_meta.json").read_text())["history_dir"]
+        recorded = json.loads((relative_run_dir / "run_meta.json").read_bytes())["history_dir"]
         assert Path(recorded).is_absolute()
         assert Path(recorded) == (tmp_path / relative_run_dir / "demo_archive").resolve()
 
@@ -543,7 +543,7 @@ class TestDemo:
         run_dir = tmp_path / "demo-run"
         assert run_walkforward.main(["--demo", "--run-dir", str(run_dir), "--checkpoint-every", "50"]) == 0
         before = run_walkforward.write_report(run_dir)
-        before_report = json.loads(before.read_text())
+        before_report = json.loads(before.read_bytes())
         from ledger import Ledger
 
         shard = next((run_dir / "ledger" / "persistence").glob("score_*.jsonl.gz"))
@@ -552,7 +552,7 @@ class TestDemo:
         with shard.open("ab") as handle:
             handle.write(gzip.compress((json_module.dumps(fake) + "\n").encode(), mtime=0))
         after = run_walkforward.write_report(run_dir)
-        after_report = json.loads(after.read_text())
+        after_report = json.loads(after.read_bytes())
         assert after_report["n_scored"] == before_report["n_scored"]
 
     def test_report_files_are_written_with_explicit_utf8(self, tmp_path, monkeypatch):
@@ -592,7 +592,7 @@ class TestResumeCli:
         assert run_walkforward.main(["--resume", str(run_dir)]) == 0
 
     def test_resume_metadata_reads_use_explicit_utf8(self, synthetic_history_dir, tmp_path, monkeypatch):
-        # json.loads(path.read_text()) without an explicit encoding defers
+        # json.loads(path.read_bytes()) without an explicit encoding defers
         # to the platform's preferred encoding, which is not always UTF-8;
         # a non-ASCII history path stored in run_meta.json could then fail
         # decoding or mojibake under a non-UTF-8 locale, even though
@@ -890,7 +890,7 @@ class TestResumeCli:
         ]
         assert run_walkforward.main(base + ["--end", "2021-11-15", "--run-dir", str(run_dir)]) == 0
         state_path = run_dir / "checkpoint" / "harness_state.json"
-        state = json.loads(state_path.read_text())
+        state = json.loads(state_path.read_bytes())
         state["config"]["seed"] = state["config"]["seed"] + 1  # config_hash now stale
         state_path.write_text(json.dumps(state, sort_keys=True))
         code = run_walkforward.main(base + ["--end", "2021-12-01", "--resume", str(run_dir)])
@@ -910,7 +910,7 @@ class TestResumeCli:
         ]
         assert run_walkforward.main(base + ["--end", "2021-11-15", "--run-dir", str(run_dir)]) == 0
         assert run_walkforward.main(base + ["--end", "2021-12-01", "--resume", str(run_dir)]) == 0
-        report = json.loads((run_dir / "report" / "report.json").read_text())
+        report = json.loads((run_dir / "report" / "report.json").read_bytes())
         assert report["n_scored"]["persistence"] > 0
 
 
@@ -1168,7 +1168,7 @@ class TestHistoryDirAnchoring:
             ]
         )
         assert code == 0
-        recorded = json.loads((run_dir / "run_meta.json").read_text())["history_dir"]
+        recorded = json.loads((run_dir / "run_meta.json").read_bytes())["history_dir"]
         assert Path(recorded).is_absolute()
         assert Path(recorded) == synthetic_history_dir.resolve()
 
@@ -1229,7 +1229,7 @@ class TestRunMetaUniverseRefresh:
             "--checkpoint-every", "50",
         ]
         assert run_walkforward.main(original) == 0
-        original_meta = json.loads((run_dir / "run_meta.json").read_text())
+        original_meta = json.loads((run_dir / "run_meta.json").read_bytes())
         assert "CCC" not in original_meta["universe"]["tickers"]  # too short at this cutoff
 
         later_now = f"{all_dates[200]}T18:00"
@@ -1237,7 +1237,7 @@ class TestRunMetaUniverseRefresh:
             ["--run-dir", str(run_dir), "--history-dir", str(synthetic_history_dir), "--now", later_now]
         )
         assert code == 0
-        refreshed_meta = json.loads((run_dir / "run_meta.json").read_text())
+        refreshed_meta = json.loads((run_dir / "run_meta.json").read_bytes())
         assert "CCC" in refreshed_meta["universe"]["tickers"]
         assert refreshed_meta["universe"]["n_tickers"] > original_meta["universe"]["n_tickers"]
         # The frozen selection RULE itself must stay untouched.

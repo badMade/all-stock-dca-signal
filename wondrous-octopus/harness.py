@@ -655,7 +655,7 @@ class WalkForwardHarness:
                 checkpoint_dir = previous_dir
         if not checkpoint_dir.exists():
             raise HarnessError(f"REFUSED: no checkpoint under {run_dir}")
-        state = json.loads((checkpoint_dir / _STATE_FILENAME).read_text(encoding="utf-8"))
+        state = json.loads((checkpoint_dir / _STATE_FILENAME).read_bytes())
         if state["schema_version"] != SCHEMA_VERSION:
             raise HarnessError(
                 f"REFUSED: checkpoint schema {state['schema_version']} != supported {SCHEMA_VERSION}"

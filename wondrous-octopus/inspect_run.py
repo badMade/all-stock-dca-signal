@@ -68,7 +68,7 @@ def _open_ledger(run_dir: Path) -> Ledger:
         # already refuses this exact case (Codex review: "Refuse inspection
         # when no checkpoint bounds the ledger").
         raise Refused(f"no checkpoint under {run_dir}; ledger bytes without a checkpoint are not proven durable")
-    read_fingerprints = json.loads(state_path.read_text(encoding="utf-8"))["ledger"]
+    read_fingerprints = json.loads(state_path.read_bytes())["ledger"]
     return Ledger(run_dir, read_fingerprints=read_fingerprints)
 
 
@@ -97,13 +97,13 @@ def _load_state(run_dir: Path) -> dict:
     for name in ("checkpoint", "checkpoint.prev"):
         path = run_dir / name / "harness_state.json"
         if path.exists():
-            return json.loads(path.read_text())
+            return json.loads(path.read_bytes())
     raise Refused(f"no checkpoint under {run_dir}")
 
 
 def _load_run_meta(run_dir: Path) -> dict | None:
     meta_path = run_dir / "run_meta.json"
-    return json.loads(meta_path.read_text()) if meta_path.exists() else None
+    return json.loads(meta_path.read_bytes()) if meta_path.exists() else None
 
 
 def _current_universe(run_meta: dict | None) -> set[str] | None:
@@ -494,7 +494,7 @@ def _load_report(run_dir: Path) -> dict:
     # (streamed from the ledger) and idempotent.
     write_report(run_dir)
     path = run_dir / "report" / "report.json"
-    return json.loads(path.read_text())
+    return json.loads(path.read_bytes())
 
 
 def _view_summary(args: argparse.Namespace) -> int:
@@ -504,7 +504,7 @@ def _view_summary(args: argparse.Namespace) -> int:
     run_meta = None
     meta_path = args.run_dir / "run_meta.json"
     if meta_path.exists():
-        run_meta = json.loads(meta_path.read_text())
+        run_meta = json.loads(meta_path.read_bytes())
     text = render_analysis(
         report,
         run_meta=run_meta,
@@ -685,7 +685,7 @@ def _view_html(args: argparse.Namespace) -> int:
     model = _pick_model(ledger.models(), args.model)
     state = _load_state(args.run_dir)
     meta_path = args.run_dir / "run_meta.json"
-    run_meta = json.loads(meta_path.read_text()) if meta_path.exists() else None
+    run_meta = json.loads(meta_path.read_bytes()) if meta_path.exists() else None
     analysis_text = render_analysis(
         report,
         run_meta=run_meta,
