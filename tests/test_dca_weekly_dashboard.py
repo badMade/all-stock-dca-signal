@@ -7980,3 +7980,69 @@ def test_build_execution_quality_empty():
     report = build_execution_quality([])
     assert "## Execution quality" in report
     assert "| **Week avg** | | | **n/a** | | |" in report
+
+
+def test_write_weekly_dashboard_creates_file(tmp_path):
+    import os
+
+    from dca_weekly_dashboard import write_weekly_dashboard
+
+    run_states = [
+        {
+            "trading_day": "2026-07-20",
+            "status": "completed",
+            "buy_candidates": [],
+            "budget": {
+                "base_amount_usd": 3.0,
+                "day_notional_usd": 3.0,
+                "weekly_rollover_reserve_usd": 0.0,
+                "remaining_spend_today_usd": 3.0,
+            },
+        }
+    ]
+
+    # Use tmp_path from pytest
+    result_path = write_weekly_dashboard(run_states=run_states, output_dir=tmp_path, week_label="Week 42")
+
+    assert result_path == str(tmp_path / "weekly_performance_dashboard.md")
+    assert os.path.exists(result_path)
+
+    with open(result_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    assert "Weekly Performance Dashboard — Week 42" in content
+    assert "2026-07-20" in content
+
+
+def test_write_weekly_dashboard_creates_file_and_directories(tmp_path):
+    import os
+
+    from dca_weekly_dashboard import write_weekly_dashboard
+
+    run_states = [
+        {
+            "trading_day": "2026-07-20",
+            "status": "completed",
+            "buy_candidates": [],
+            "budget": {
+                "base_amount_usd": 3.0,
+                "day_notional_usd": 3.0,
+                "weekly_rollover_reserve_usd": 0.0,
+                "remaining_spend_today_usd": 3.0,
+            },
+        }
+    ]
+
+    # Path with non-existent subdirectories
+    output_dir = tmp_path / "deep" / "nested" / "dir"
+
+    result_path = write_weekly_dashboard(run_states=run_states, output_dir=output_dir, week_label="Week 42")
+
+    assert result_path == str(output_dir / "weekly_performance_dashboard.md")
+    assert os.path.exists(result_path)
+
+    with open(result_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    assert "Weekly Performance Dashboard — Week 42" in content
+    assert "2026-07-20" in content
