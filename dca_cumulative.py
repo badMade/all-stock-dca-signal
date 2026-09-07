@@ -998,42 +998,56 @@ class CumulativeCreditLedger:
         symbol = ticker.strip().upper()
         if not symbol:
             raise ValueError("ticker is required to settle a cumulative credit")
+        # Broker adapters are not guaranteed to normalize identifiers. Keep
+        # the canonicalization at the ledger boundary so original-placement
+        # and duplicate-recovery callers cannot persist two spellings of the
+        # same order and bypass the idempotency guard.
+        order_id = _normalized_order_id(order_id)
         day_dir = self.root / trading_day
         state_path = day_dir / "ledger.json"
         lock_path = day_dir / "ledger.lock"
         with cross_process_lock(lock_path):
             state = self._read_state(state_path, trading_day)
-            # The persisted shape is a MAPPING of normalized broker order id ->
-            # what that settlement moved, not a bare list: the metadata is what
-            # makes an ignored duplicate explicable after the fact (which ticker,
-            # how much) without replaying the whole event log. Ids are stripped
-            # before use so a whitespace-padded id from one adapter cannot
-            # settle the same order twice under two spellings.
-            settled_order_ids = state.setdefault("settled_order_ids", {})
-            normalized_order_id = order_id.strip() if order_id is not None else ""
-            if normalized_order_id and normalized_order_id in settled_order_ids:
-                # This exact broker order was already settled -- almost always
-                # the duplicate-recovery path re-settling an order whose
-                # original placement succeeded but whose process died before
-                # publishing. Subtracting again would destroy a real remaining
-                # credit. Recorded rather than silently skipped so the audit
-                # trail shows the recovery happened and was correctly ignored.
-                state["events"].append(
-                    {
-                        "ticker": symbol,
-                        "stream": stream,
-                        "recorded_at": recorded_at,
-                        "final_session": final_session,
-                        "pending_before_usd": float(state["pending_usd_by_ticker"].get(symbol, 0.0)),
-                        "submitted_amount_usd": submitted_amount_usd,
-                        "pending_after_usd": float(state["pending_usd_by_ticker"].get(symbol, 0.0)),
-                        "order_id": order_id,
-                        "decision": "settle_ignored_duplicate_order",
-                    }
-                )
-                day_dir.mkdir(parents=True, exist_ok=True)
-                atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
-                return
+            if order_id:
+                persisted_order_ids = state.setdefault("settled_order_ids", {})
+                settled_order_ids: dict[str, dict[str, Any]] = {}
+                for persisted_order_id, persisted_order_meta in persisted_order_ids.items():
+                    normalized = _normalized_order_id(persisted_order_id)
+                    if normalized is None:
+                        continue
+                    if normalized in settled_order_ids:
+                        continue
+                    settled_order_ids[normalized] = (
+                        persisted_order_meta if isinstance(persisted_order_meta, dict) else {}
+                    )
+                state["settled_order_ids"] = settled_order_ids
+                normalized_order_id = order_id
+                if normalized_order_id in settled_order_ids:
+                    # This exact broker order was already settled -- almost always
+                    # the duplicate-recovery path re-settling an order whose
+                    # original placement succeeded but whose process died before
+                    # publishing. Subtracting again would destroy a real remaining
+                    # credit. Recorded rather than silently skipped so the audit
+                    # trail shows the recovery happened and was correctly ignored.
+                    state["events"].append(
+                        {
+                            "ticker": symbol,
+                            "stream": stream,
+                            "recorded_at": recorded_at,
+                            "final_session": final_session,
+                            "pending_before_usd": float(state["pending_usd_by_ticker"].get(symbol, 0.0)),
+                            "submitted_amount_usd": submitted_amount_usd,
+                            "pending_after_usd": float(state["pending_usd_by_ticker"].get(symbol, 0.0)),
+                            "order_id": order_id,
+                            "decision": "settle_ignored_duplicate_order",
+                        }
+                    )
+                    day_dir.mkdir(parents=True, exist_ok=True)
+                    atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+                    return
+            else:
+                settled_order_ids = state.setdefault("settled_order_ids", {})
+                normalized_order_id = ""
             pending_before = float(state["pending_usd_by_ticker"].get(symbol, 0.0))
             submitted = submitted_amount_usd
             pending_after = round(max(0.0, pending_before - submitted), 2)
@@ -1223,6 +1237,15 @@ def _money(value: float | Decimal | int | str) -> Decimal:
     if not math.isfinite(numeric):
         raise ValueError("credit amounts must be finite")
     return max(Decimal("0"), Decimal(str(numeric))).quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+def _normalized_order_id(value: Any) -> Optional[str]:
+    """Return the canonical form of a usable string or numeric broker order ID."""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    if isinstance(value, (int, float)) and (value == 0 or not math.isfinite(value)):
+        return None
+    return str(value).strip() or None
 
 
 def apply_cumulative_credit(

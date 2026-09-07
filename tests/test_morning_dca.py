@@ -66,6 +66,7 @@ from morning_dca import (
     _RawInputRecorder,
     _same_stream_order_exists,
     _sanitize_budget_ledger_filename,
+    _stable_broker_order_id,
     load_max_consecutive_placement_failures,
     load_max_orders_per_day,
     load_morning_config,
@@ -8591,6 +8592,19 @@ def test_same_stream_order_exists_normalizes_legacy_boolean_adapters(tmp_path):
     # A real order dict passes through unchanged so real order_id/amount survive.
     order = {"id": "O1", "dollar_amount": 7.5}
     assert _same_stream_order_exists(_LegacyBoolBroker(order), "NVDA", trading_day, "morning") == order
+
+
+def test_stable_broker_order_id_rejects_missing_and_blank_ids():
+    assert _stable_broker_order_id(None) is None
+    assert _stable_broker_order_id({}) is None
+    assert _stable_broker_order_id({"id": "   "}) is None
+    assert _stable_broker_order_id({"order_id": " ORDER-1 "}) == "ORDER-1"
+    assert _stable_broker_order_id({"id": "   ", "order_id": " ORDER-1 "}) == "ORDER-1"
+
+
+@pytest.mark.parametrize("invalid_primary", [False, 0, [], {}])
+def test_stable_broker_order_id_uses_fallback_for_malformed_primary_id(invalid_primary):
+    assert _stable_broker_order_id({"id": invalid_primary, "order_id": " ORDER-1 "}) == "ORDER-1"
 
 
 def test_morning_live_same_stream_check_ignores_manual_fill_ref_id(tmp_path):

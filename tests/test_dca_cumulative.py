@@ -394,7 +394,9 @@ def test_settle_with_an_order_id_is_idempotent_against_a_repeat_call(tmp_path):
     ledger = CumulativeCreditLedger(tmp_path)
     ledger.preserve_pending("xyz", "2026-08-03", 2.0, idempotency_key="slot-1")
 
-    ledger.settle("xyz", "2026-08-03", 1.0, stream="morning", order_id="ORDER-1")
+    # The original placement may return surrounding whitespace that duplicate
+    # recovery strips. Both forms must still identify the same broker order.
+    ledger.settle("xyz", "2026-08-03", 1.0, stream="morning", order_id=" ORDER-1 ")
     assert ledger.pending_usd("xyz", "2026-08-03") == 1.0
 
     # A repeat call with the SAME order id must change nothing further.
@@ -402,10 +404,38 @@ def test_settle_with_an_order_id_is_idempotent_against_a_repeat_call(tmp_path):
     assert ledger.pending_usd("xyz", "2026-08-03") == 1.0
     events = ledger.events("2026-08-03")
     assert sum(1 for e in events if e["decision"] == "settled") == 1
+    state = json.loads((tmp_path / "2026-08-03" / "ledger.json").read_text(encoding="utf-8"))
+    assert state["settled_order_ids"] == {
+        "ORDER-1": {"ticker": "XYZ", "submitted_amount_usd": 1.0}
+    }
 
     # A DIFFERENT order id still settles normally.
     ledger.settle("xyz", "2026-08-03", 1.0, stream="morning", order_id="ORDER-2")
     assert ledger.pending_usd("xyz", "2026-08-03") == 0.0
+
+
+def test_settle_normalizes_persisted_order_ids_before_deduplication(tmp_path):
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("xyz", "2026-08-03", 2.0, idempotency_key="slot-1")
+    ledger.settle("xyz", "2026-08-03", 1.0, stream="morning", order_id="ORDER-1")
+
+    state_path = tmp_path / "2026-08-03" / "ledger.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["settled_order_ids"] = {
+        " ORDER-1 ": {"ticker": "XYZ", "submitted_amount_usd": 1.0},
+        " 123 ": {"ticker": "XYZ", "submitted_amount_usd": 1.0},
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    ledger.preserve_pending("xyz", "2026-08-03", 1.0, idempotency_key="slot-2")
+
+    ledger.settle("xyz", "2026-08-03", 1.0, stream="morning", order_id="ORDER-1")
+
+    assert ledger.pending_usd("xyz", "2026-08-03") == 2.0
+    migrated = json.loads(state_path.read_text(encoding="utf-8"))
+    assert migrated["settled_order_ids"] == {
+        "ORDER-1": {"ticker": "XYZ", "submitted_amount_usd": 1.0},
+        "123": {"ticker": "XYZ", "submitted_amount_usd": 1.0},
+    }
 
 
 def test_settle_requires_a_ticker():

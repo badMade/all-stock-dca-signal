@@ -9940,6 +9940,18 @@ def _same_stream_order_exists(
     return result
 
 
+def _stable_broker_order_id(order: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return a non-empty normalized broker order ID, if the match provides one."""
+    for raw_order_id in ((order or {}).get("id"), (order or {}).get("order_id")):
+        if isinstance(raw_order_id, bool) or not isinstance(raw_order_id, (str, int, float)):
+            continue
+        if isinstance(raw_order_id, (int, float)) and (raw_order_id == 0 or not math.isfinite(raw_order_id)):
+            continue
+        if order_id := str(raw_order_id).strip():
+            return order_id
+    return None
+
+
 def _run_state_after_boundary(state: Dict[str, Any], boundary: datetime) -> bool:
     """True when ``state["generated_at"]`` is strictly after ``boundary``.
 
