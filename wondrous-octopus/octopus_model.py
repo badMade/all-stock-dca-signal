@@ -67,8 +67,6 @@ from typing import Any, Callable, Sequence
 import numpy as np
 import pandas as pd
 import torch  # type: ignore[import-not-found,import-untyped]
-from torch import nn  # type: ignore[import-not-found,import-untyped]
-
 from data import COMPONENTS, TrainingPanel
 from market_encoder import MarketDayEncoder
 from model_interface import (
@@ -85,6 +83,7 @@ from model_interface import (
     write_metadata,
 )
 from replay_buffer import ReservoirBuffer
+from torch import nn  # type: ignore[import-not-found,import-untyped]
 
 #: Feature columns holding the day's own bar -- the reconstruction target.
 _BAR_SLICE = slice(0, 4)

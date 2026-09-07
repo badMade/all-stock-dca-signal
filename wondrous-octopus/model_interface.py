@@ -371,7 +371,7 @@ class ConformalCalibrator:
 
 def write_metadata(directory: Path, metadata: dict[str, Any]) -> None:
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / METADATA_FILENAME).write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+    (directory / METADATA_FILENAME).write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def read_metadata(directory: Path) -> dict[str, Any]:

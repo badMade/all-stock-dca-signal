@@ -761,7 +761,7 @@ class TestResumeCli:
             ]
         )
         assert code == 0
-        before = (run_dir / "run_meta.json").read_text()
+        before = (run_dir / "run_meta.json").read_text(encoding="utf-8")
         assert json.loads(before)["model_selection"] == "persistence"
 
         code = run_walkforward.main(
@@ -772,7 +772,7 @@ class TestResumeCli:
             ]
         )
         assert code == 1
-        after = (run_dir / "run_meta.json").read_text()
+        after = (run_dir / "run_meta.json").read_text(encoding="utf-8")
         assert after == before
         assert json.loads(after)["model_selection"] == "persistence"
 
@@ -906,7 +906,7 @@ class TestResumeCli:
         state_path = run_dir / "checkpoint" / "harness_state.json"
         state = json.loads(state_path.read_bytes())
         state["config"]["seed"] = state["config"]["seed"] + 1  # config_hash now stale
-        state_path.write_text(json.dumps(state, sort_keys=True))
+        state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
         code = run_walkforward.main(base + ["--end", "2021-12-01", "--resume", str(run_dir)])
         assert code == 1
         assert "corrupted" in capsys.readouterr().err
@@ -1217,7 +1217,7 @@ class TestRunMetaUniverseRefresh:
         target = tmp_path / "run_meta.json"
         run_walkforward._atomic_write_text(target, "hello")
 
-        assert target.read_text() == "hello"
+        assert target.read_text(encoding="utf-8") == "hello"
         # At least one fsync for the temp file's own contents, plus
         # whatever _fsync_dir()'s own os.fsync(fd) call on the directory
         # adds on top.
@@ -1275,7 +1275,7 @@ class TestRunMetaUniverseRefresh:
             "--checkpoint-every", "50",
         ]
         assert run_walkforward.main(original) == 0
-        before = (run_dir / "run_meta.json").read_text()
+        before = (run_dir / "run_meta.json").read_text(encoding="utf-8")
 
         # _atomic_write_text() no longer uses Path.write_text() (it now
         # fsyncs the handle directly -- Codex review: "Fsync mandatory run
@@ -1319,4 +1319,4 @@ class TestRunMetaUniverseRefresh:
             ["--run-dir", str(run_dir), "--history-dir", str(synthetic_history_dir), "--now", later_now]
         )
         assert code == 2  # runtime failure, per daily_update.main()'s documented contract
-        assert (run_dir / "run_meta.json").read_text() == before  # untouched, not corrupted
+        assert (run_dir / "run_meta.json").read_text(encoding="utf-8") == before  # untouched, not corrupted

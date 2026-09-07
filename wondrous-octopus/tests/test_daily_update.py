@@ -7,13 +7,14 @@ import json
 import math
 from types import SimpleNamespace
 
-import pytest
-import conftest
 import daily_update
 import harness as harness_module
+import pytest
 import run_walkforward
 from harness import UNRESOLVED_KEY
 from ledger import Ledger
+
+import conftest
 
 make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
 write_ticker_csv = conftest.write_ticker_csv
@@ -274,7 +275,7 @@ class TestDailyCycle:
         assert summary["days_processed"] == [processed_date]
         forecasts_path = run_dir / "daily" / f"{processed_date}_next_day_forecasts.csv"
         assert forecasts_path.exists()
-        header = forecasts_path.read_text().splitlines()[0]
+        header = forecasts_path.read_text(encoding="utf-8").splitlines()[0]
         for column in ("ticker", "model", "pred_open", "pred_high", "pred_low", "pred_close", "close_p10", "close_p90"):
             assert column in header
 
@@ -663,8 +664,8 @@ class TestDailyCycle:
                 "adj_ratio": 1.0,
             }
         )
-        state_path.write_text(json.dumps(state))
-        before = state_path.read_text()
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        before = state_path.read_text(encoding="utf-8")
 
         code = daily_update.main(
             ["--run-dir", str(run_dir), "--history-dir", str(history), "--now", same_now, "--dry-run"]
@@ -674,7 +675,7 @@ class TestDailyCycle:
         assert "would rebind and score 1" in output
         assert "would be a NOOP" not in output
         assert not (run_dir / "daily").exists()  # still genuinely non-destructive
-        assert state_path.read_text() == before  # and nothing was mutated
+        assert state_path.read_text(encoding="utf-8") == before  # and nothing was mutated
 
     def test_count_pending_rebinds_matches_despite_an_intraday_stamped_origin_date(self, live_setup, monkeypatch):
         # A read-only mirror of rebind_unresolved()'s own matching logic;
@@ -770,9 +771,8 @@ class TestDailyCycle:
         # rebind_unresolved() ever ran, permanently skipping its only
         # chance at a forecast for that terminal row (Codex review: "Treat
         # newly admitted terminal rows as pending work").
-        import pandas as pd
-
         import features
+        import pandas as pd
 
         history, run_dir, all_dates = live_setup
         state_path = run_dir / "checkpoint" / "harness_state.json"
@@ -967,7 +967,7 @@ class TestDailyCycle:
                 "adj_ratio": 1.0,
             }
         )
-        state_path.write_text(json.dumps(state))
+        state_path.write_text(json.dumps(state), encoding="utf-8")
 
         code = daily_update.main(["--run-dir", str(run_dir), "--history-dir", str(history), "--now", same_now])
         assert code == 0
@@ -1020,7 +1020,7 @@ class TestDailyCycle:
                 "adj_ratio": 1.0,
             }
         )
-        state_path.write_text(json.dumps(state))
+        state_path.write_text(json.dumps(state), encoding="utf-8")
 
         code = daily_update.main(["--run-dir", str(run_dir), "--history-dir", str(history), "--now", same_now])
         assert code == 0

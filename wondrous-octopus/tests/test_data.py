@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import data
 import numpy as np
 import pandas as pd
 import pytest
+
 import conftest
-import data
 
 make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
 write_ticker_csv = conftest.write_ticker_csv

@@ -8207,3 +8207,4 @@ def test_build_coverage_missed_missing_data():
     result = build_coverage_missed(run_states, summaries)
     assert "| ? | 3 | n/a | n/a | n/a | 0 |" in result
     assert "| 2023-10-03 | 0 | n/a | n/a | n/a | 0 |" in result
+

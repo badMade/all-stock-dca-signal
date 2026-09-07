@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import math
 
+import model_interface
 import numpy as np
 import pytest
-
-import model_interface
 from data import COMPONENTS
 
 

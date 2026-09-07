@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
-import pytest
-
 import baseline_model
 import features
 import model_interface
+import numpy as np
+import pandas as pd
+import pytest
 from data import COMPONENTS
 
 build_panel = features.build_panel
@@ -228,7 +227,7 @@ class TestGbmQuantileModel:
         # Simulate an archive correction: perturb one value well inside the
         # fit window (past the rolling-feature warm-up, before the cutoff).
         path = synthetic_history_dir / "AAA.csv"
-        lines = path.read_text().splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
         header = lines[0].split(",")
         close_index = header.index("Close")
         row_cells = lines[110].split(",")
@@ -262,7 +261,7 @@ class TestGbmQuantileModel:
         model.save(tmp_path / "gbm")
 
         path = synthetic_history_dir / "AAA.csv"
-        lines = path.read_text().splitlines()
+        lines = path.read_text(encoding="utf-8").splitlines()
         header = lines[0].split(",")
         close_index = header.index("Close")
         row_cells = lines[110].split(",")

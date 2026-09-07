@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import data
+import features
 import numpy as np
 import pandas as pd
 import pytest
+
 import conftest
-import data
-import features
 
 make_market_returns = conftest.make_market_returns
 make_synthetic_ohlcv = conftest.make_synthetic_ohlcv

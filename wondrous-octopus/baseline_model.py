@@ -35,9 +35,9 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+import features as _features
 import numpy as np
 from data import COMPONENTS, TrainingPanel
-import features as _features
 from model_interface import (
     ForecastRequest,
     OHLCForecast,

@@ -13,11 +13,13 @@ torch = pytest.importorskip("torch")
 
 import features as _features  # noqa: E402
 import model_interface  # noqa: E402
-from conftest import make_synthetic_ohlcv, write_ticker_csv  # noqa: E402 # type: ignore[import-not-found]
 from harness import HarnessConfig, WalkForwardHarness  # noqa: E402
 from ledger import Ledger  # noqa: E402
 from market_encoder import MarketDayEncoder  # noqa: E402
-from octopus_model import OctopusModel as _OctopusModel, _OctopusNet  # noqa: E402
+from octopus_model import OctopusModel as _OctopusModel  # noqa: E402
+from octopus_model import _OctopusNet  # noqa: E402
+
+from conftest import make_synthetic_ohlcv, write_ticker_csv  # noqa: E402 # type: ignore[import-not-found]
 
 features: Any = _features
 OctopusModel: Any = _OctopusModel

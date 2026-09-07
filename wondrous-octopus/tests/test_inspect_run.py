@@ -6,9 +6,8 @@ import json
 import math
 import shutil
 
-import pytest
-
 import inspect_run
+import pytest
 import run_walkforward
 
 
@@ -301,7 +300,7 @@ class TestSummary:
         assert f"{100 * close['coverage']:.1f}%" in output
         assert "persistence" in output
         assert (demo_run / "report" / "analysis.md").exists()
-        assert "nothing is hand-written" in (demo_run / "report" / "analysis.md").read_text()
+        assert "nothing is hand-written" in (demo_run / "report" / "analysis.md").read_text(encoding="utf-8")
 
     def test_analysis_and_html_are_written_with_explicit_utf8(self, demo_run, tmp_path, capsys, monkeypatch):
         # Path.write_text() without an explicit encoding defers to the
@@ -386,9 +385,9 @@ class TestPercentageError:
         # percentage error in price space").
         import math
 
+        import metrics
         from data import COMPONENTS
         from ledger import Ledger
-        import metrics
 
         run_dir = tmp_path / "run"
         ledger = Ledger.create(run_dir)
@@ -434,9 +433,9 @@ class TestPercentageError:
         # exactly the divergent run it would be most useful to look at
         # (Codex review regression: "Bound the latest-view percentage
         # conversion").
+        import metrics
         from data import COMPONENTS
         from ledger import Ledger
-        import metrics
 
         run_dir = tmp_path / "run"
         ledger = Ledger.create(run_dir)
@@ -521,8 +520,8 @@ class TestStreamingViews:
 
     @staticmethod
     def _record(ticker, origin_date, target_date, ref_close=100.0):
-        from data import COMPONENTS
         import metrics
+        from data import COMPONENTS
 
         point = {c: 0.0 for c in COMPONENTS}
         actual = {c: 0.0 for c in COMPONENTS}
@@ -708,7 +707,7 @@ class TestHtml:
     def test_dashboard_is_self_contained_and_complete(self, demo_run, tmp_path, capsys):
         out = tmp_path / "dash.html"
         assert inspect_run.main(["--run-dir", str(demo_run), "--html", str(out)]) == 0
-        page = out.read_text()
+        page = out.read_text(encoding="utf-8")
         assert "<svg" in page and "Tomorrow" in page and "Model analysis" in page
         assert "Regimes" in page
         # Self-contained: no external fetches of any kind.
@@ -723,7 +722,7 @@ class TestHtml:
         # still selects exactly the requested ribbon.
         out = tmp_path / "dash.html"
         assert inspect_run.main(["--run-dir", str(demo_run), "--html", str(out), "--tickers", "BBB"]) == 0
-        page = out.read_text()
+        page = out.read_text(encoding="utf-8")
         assert "Band vs actual" in page
 
     def test_dashboard_marks_a_recovered_tickers_older_origin_date(self, demo_run, tmp_path):
@@ -760,6 +759,6 @@ class TestHtml:
 
         out = tmp_path / "dash.html"
         assert inspect_run.main(["--run-dir", str(run_dir), "--html", str(out)]) == 0
-        page = out.read_text()
+        page = out.read_text(encoding="utf-8")
         assert "ZZZLAGGY" in page
         assert "(from 1999-01-01)" in page

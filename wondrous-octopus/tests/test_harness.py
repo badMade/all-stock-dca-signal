@@ -2270,11 +2270,11 @@ class TestLiveHelpers:
         config = _config(panel, n_steps=6, max_hours_per_run=1.0)
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         harness.run()
-        before = (tmp_path / "run" / "checkpoint" / "harness_state.json").read_text()
+        before = (tmp_path / "run" / "checkpoint" / "harness_state.json").read_text(encoding="utf-8")
         harness.invocation_started_monotonic = -3601.0  # already 1+ hour elapsed
         with pytest.raises(HarnessError, match="budget exhausted during recovery retrain"):
             harness.retrain(panel)
-        assert (tmp_path / "run" / "checkpoint" / "harness_state.json").read_text() == before
+        assert (tmp_path / "run" / "checkpoint" / "harness_state.json").read_text(encoding="utf-8") == before
 
 
 class TestReplayEndBoundary:
