@@ -543,7 +543,7 @@ class CombinedCsvLoader:
                     ticker_idx = header.index("ticker")
                     for row in reader:
                         if len(row) > ticker_idx:
-                            symbol = str(row[ticker_idx] or "").strip().upper()
+                            symbol = row[ticker_idx].strip().upper()
                             if symbol:
                                 seen.add(symbol)
                 except ValueError:
@@ -575,7 +575,7 @@ class CombinedCsvLoader:
                 for row in reader:
                     symbol = ""
                     if t_idx != -1 and len(row) > t_idx:
-                        symbol = str(row[t_idx] or "").strip().upper()
+                        symbol = row[t_idx].strip().upper()
                     if not symbol or (wanted is not None and symbol not in wanted):
                         continue
 
