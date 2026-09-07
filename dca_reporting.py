@@ -957,16 +957,12 @@ def generate_scheduled_reports(
     fills: Sequence[Dict[str, Any]],
     output_dir: str | Path,
     base: Optional[str | Path] = None,
-    model_usage_log_root: Optional[str | Path] = None,
-    model_usage_model_requested: Optional[str] = None,
-    model_usage_model_actual: Optional[str] = None,
-    model_usage_model_routing_mode: Optional[str] = None,
-    model_usage_reason_for_premium_model: Optional[str] = None,
-    *,
+    *args: Any,
     foreground_primary_artifacts: Optional[Iterable[str | Path | Mapping[str, Any]]] = None,
     close_window_summary: Optional[Dict[str, Any]] = None,
     model_usage_config: Optional[ModelUsageConfig] = None,
     blocking_findings: Sequence[str] = (),
+    **kwargs: Any,
 ) -> Dict[str, str]:
     """Task 67aa802b entry point: post-trade reports for the SCHEDULED run only.
 
@@ -988,14 +984,12 @@ def generate_scheduled_reports(
     override the corresponding ``model_usage_config`` field, so old and new
     call sites can both be satisfied.
 
-    The ``model_usage_log_root``/``model_usage_model_*``/
-    ``model_usage_reason_for_premium_model`` parameters are the pre-existing
-    interface documented at ``docs/cost_tracking.md:206-220`` and are kept
-    in their original positional-or-keyword slots (unchanged) for the
-    externally managed 67aa802b scheduler, which still calls this entry
-    point with them -- including positionally. ``model_usage_config`` is
-    the new keyword-only alternative; any of the legacy parameters that is
-    passed (non-``None``) overrides the corresponding ``model_usage_config``
+    The legacy ``model_usage_log_root``/``model_usage_model_*``/
+    ``model_usage_reason_for_premium_model`` parameters are still accepted
+    via ``*args`` and ``**kwargs`` for backward compatibility with the
+    externally managed 67aa802b scheduler. ``model_usage_config`` is
+    the preferred keyword-only alternative; any of the legacy parameters that is
+    passed overrides the corresponding ``model_usage_config``
     field, so old and new call sites can both be satisfied.
 
     ``foreground_primary_artifacts`` opts into the Jul 30 2026 foreground primary
@@ -1045,15 +1039,23 @@ def generate_scheduled_reports(
     # only the new alternative silently got root=None (skipping the audit-log
     # append) and lost every routing override it set (Codex review: "Apply
     # ModelUsageConfig before logging").
+    # Intercept legacy positional-or-keyword arguments for backward compatibility
+    # with the externally managed 67aa802b scheduler.
+    _log_root = kwargs.get("model_usage_log_root", args[0] if len(args) > 0 else None)
+    _req = kwargs.get("model_usage_model_requested", args[1] if len(args) > 1 else None)
+    _act = kwargs.get("model_usage_model_actual", args[2] if len(args) > 2 else None)
+    _mode = kwargs.get("model_usage_model_routing_mode", args[3] if len(args) > 3 else None)
+    _reason = kwargs.get("model_usage_reason_for_premium_model", args[4] if len(args) > 4 else None)
+
     config = model_usage_config or ModelUsageConfig()
-    effective_log_root = model_usage_log_root if model_usage_log_root is not None else config.log_root
+    effective_log_root = _log_root if _log_root is not None else config.log_root
     routing_overrides = {
-        "model_requested": model_usage_model_requested if model_usage_model_requested is not None else config.model_requested,
-        "model_actual": model_usage_model_actual if model_usage_model_actual is not None else config.model_actual,
-        "model_routing_mode": model_usage_model_routing_mode if model_usage_model_routing_mode is not None else config.model_routing_mode,
+        "model_requested": _req if _req is not None else config.model_requested,
+        "model_actual": _act if _act is not None else config.model_actual,
+        "model_routing_mode": _mode if _mode is not None else config.model_routing_mode,
         "reason_for_premium_model": (
-            model_usage_reason_for_premium_model
-            if model_usage_reason_for_premium_model is not None
+            _reason
+            if _reason is not None
             else config.reason_for_premium_model
         ),
     }

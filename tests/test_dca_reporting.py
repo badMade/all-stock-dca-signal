@@ -770,8 +770,9 @@ def test_generate_scheduled_reports_appends_model_usage_log_entry_when_root_conf
     )
     fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
     log_root = base / "model_usage"
+    from dca_reporting import ModelUsageConfig
     report_paths = generate_scheduled_reports(
-        day, fills, base / "reports", base=base, model_usage_log_root=log_root
+        day, fills, base / "reports", base=base, model_usage_config=ModelUsageConfig(log_root=log_root)
     )
 
     from datetime import datetime, timezone
@@ -806,11 +807,14 @@ def test_generate_scheduled_reports_records_premium_routing_metadata_when_suppli
     )
     fills = [{"ticker": "AAPL", "fill_price": 101.0, "filled_qty": 0.03, "order_id": "O1"}]
     log_root = base / "model_usage"
+    from dca_reporting import ModelUsageConfig
     generate_scheduled_reports(
         day, fills, base / "reports", base=base,
-        model_usage_log_root=log_root,
-        model_usage_model_routing_mode="premium",
-        model_usage_reason_for_premium_model="explicit_user_request",
+        model_usage_config=ModelUsageConfig(
+            log_root=log_root,
+            model_routing_mode="premium",
+            reason_for_premium_model="explicit_user_request",
+        ),
     )
     log_path = resolve_log_path(datetime.now(timezone.utc), root=log_root)
     entry = json.loads(log_path.read_bytes().splitlines()[0])
@@ -843,7 +847,7 @@ def test_generate_scheduled_reports_logs_even_when_report_generation_fails(tmp_p
     log_root = base / "model_usage"
     try:
         dca_reporting.generate_scheduled_reports(
-            day, fills, base / "reports", base=base, model_usage_log_root=log_root
+            day, fills, base / "reports", base=base, model_usage_config=dca_reporting.ModelUsageConfig(log_root=log_root)
         )
         raise AssertionError("expected RuntimeError to propagate")
     except RuntimeError as exc:
@@ -1675,13 +1679,14 @@ def test_generate_scheduled_reports_logs_model_usage_when_foreground_report_rais
     monkeypatch.setattr(dca_reporting, "write_foreground_primary_report", raising_write)
 
     with pytest.raises(RuntimeError, match="boom"):
+        from dca_reporting import ModelUsageConfig
         generate_scheduled_reports(
             day,
             [],
             base / "reports",
             base=base,
             foreground_primary_artifacts=[foreground],
-            model_usage_log_root=str(base / "model_usage"),
+            model_usage_config=ModelUsageConfig(log_root=str(base / "model_usage")),
         )
 
     assert len(calls) == 1
