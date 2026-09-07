@@ -17,13 +17,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
+import model as model_module
 import pandas as pd
 import pytest
+import train as train_module
 
 from conftest import make_synthetic_ohlcv, write_ticker_csv
-
-import model as model_module
-import train as train_module
 
 ML_FORECASTER_DIR = Path(__file__).resolve().parent.parent
 
