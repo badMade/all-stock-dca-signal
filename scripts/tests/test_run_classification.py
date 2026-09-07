@@ -1308,6 +1308,45 @@ def test_save_raw_input_persists_before_compute():
         ]
 
 
+def test_list_raw_inputs_saved_excludes_orphaned_temp_files():
+    # atomic_write_text stages every write as a visible <name>.<uuid>.tmp
+    # sibling and removes it on failure, but a process killed mid-write never
+    # runs that cleanup. Listing every regular file published the orphan as a
+    # successfully persisted input -- one no recorder ever finished or read back
+    # (Codex review: "Exclude orphaned temp files from the raw manifest").
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        save_raw_input(TRADING_DAY, quotes_batch_filename(1), {"AAPL": 190.0}, base=base)
+        raw_dir = raw_input_dir(TRADING_DAY, base)
+        # Exactly what a SIGKILL during atomic_write_text leaves behind.
+        (raw_dir / "historicals_batch1.json.0123456789abcdef.tmp").write_text(
+            '{"AAPL": [1, 2', encoding="utf-8"
+        )
+
+        saved = list_raw_inputs_saved(TRADING_DAY, base)
+
+        assert saved == ["quotes_batch1.json"]
+        # And build_raw_persistence_state, which makes the same claim, agrees.
+        assert build_raw_persistence_state(TRADING_DAY, base=base)["raw_inputs_saved"] == saved
+
+
+def test_list_raw_inputs_saved_keeps_a_completed_file_that_does_not_parse():
+    # A file that reached its final name went through os.replace after its
+    # content was fsynced, so it is complete by construction. Dropping it for
+    # failing to parse would hide genuine corruption behind a silently shorter
+    # manifest instead of surfacing it.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        save_raw_input(TRADING_DAY, quotes_batch_filename(1), {"AAPL": 190.0}, base=base)
+        raw_dir = raw_input_dir(TRADING_DAY, base)
+        (raw_dir / "historicals_batch1.json").write_text("not json at all", encoding="utf-8")
+
+        assert list_raw_inputs_saved(TRADING_DAY, base) == [
+            "historicals_batch1.json",
+            "quotes_batch1.json",
+        ]
+
+
 def test_save_raw_input_rejects_non_bare_filename():
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)

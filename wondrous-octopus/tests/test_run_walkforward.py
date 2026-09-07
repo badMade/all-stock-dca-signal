@@ -1046,6 +1046,59 @@ class TestWallClockBudgetBeforeReport:
         assert (run_dir / "report" / "report.json").exists()
 
 
+class TestSignalHandlerRestoration:
+    """main() must hand SIGINT/SIGTERM back to whoever owned them."""
+
+    @staticmethod
+    def _dispositions():
+        import signal
+
+        return (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
+
+    def test_main_restores_original_handlers_after_a_successful_run(self, tmp_path, capsys):
+        # _dispatch() re-points both signals at a temporary _InterruptFlag and
+        # then at the harness; leaving them installed on the way out disarms a
+        # long-lived host process that calls main() twice or embeds this CLI
+        # as a library -- its NEXT Ctrl-C reaches stale state that nothing
+        # reads any more and is effectively ignored (Codex review: "Restore
+        # process signal handlers after walk-forward runs").
+        import signal
+
+        def _sentinel(_signum, _frame):  # pragma: no cover - never invoked
+            raise AssertionError("test sentinel handler must not run")
+
+        previous = [signal.signal(number, _sentinel) for number in (signal.SIGINT, signal.SIGTERM)]
+        try:
+            assert self._dispositions() == (_sentinel, _sentinel)
+            code = run_walkforward.main(["--demo", "--run-dir", str(tmp_path / "run")])
+            capsys.readouterr()
+            assert code == 0
+            assert self._dispositions() == (_sentinel, _sentinel)
+        finally:
+            for number, handler in zip((signal.SIGINT, signal.SIGTERM), previous, strict=True):
+                signal.signal(number, handler)
+
+    def test_main_restores_original_handlers_after_a_refusal(self, tmp_path, capsys):
+        # Restoration happens on EVERY exit path, including the ones main()
+        # turns into an exit code rather than letting propagate.
+        import signal
+
+        def _sentinel(_signum, _frame):  # pragma: no cover - never invoked
+            raise AssertionError("test sentinel handler must not run")
+
+        previous = [signal.signal(number, _sentinel) for number in (signal.SIGINT, signal.SIGTERM)]
+        try:
+            code = run_walkforward.main(
+                ["--run-dir", str(tmp_path / "run"), "--history-dir", str(tmp_path / "nope")]
+            )
+            capsys.readouterr()
+            assert code == 1  # REFUSED
+            assert self._dispositions() == (_sentinel, _sentinel)
+        finally:
+            for number, handler in zip((signal.SIGINT, signal.SIGTERM), previous, strict=True):
+                signal.signal(number, handler)
+
+
 class TestEarlySignalHandling:
     def test_interrupt_flag_handler_sets_requested(self):
         # _InterruptFlag exists precisely because a signal can arrive

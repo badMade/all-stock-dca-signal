@@ -1083,17 +1083,41 @@ def save_raw_input(
     return path
 
 
+#: Every raw input is written by :func:`save_raw_input` as JSON, so this is the
+#: mark of a COMPLETED one. Deliberately a positive test rather than a
+#: ``.tmp`` exclusion: it also skips anything else that finds its way into the
+#: directory.
+_RAW_INPUT_SUFFIX = ".json"
+
+
 def list_raw_inputs_saved(
     trading_day: str,
     base: Optional[Path] = None,
     *,
     raw_dir: Optional[Path] = None,
 ) -> List[str]:
-    """Sorted filenames actually persisted under the run's raw/ directory."""
+    """Sorted filenames actually persisted under the run's raw/ directory.
+
+    Only completed ``.json`` inputs. ``atomic_write_text`` stages every write as
+    a visible ``<name>.<uuid>.tmp`` sibling and removes it on failure, but a
+    process killed mid-write (SIGKILL, power loss) never runs that cleanup, so
+    an orphaned partial file can outlive the attempt that started it. Listing
+    every regular file published that orphan as a successfully persisted input
+    -- one no recorder ever finished or read back -- which is exactly the claim
+    this function exists to make trustworthy (Codex review: "Exclude orphaned
+    temp files from the raw manifest").
+
+    Contents are NOT validated. A file that reached its final name went through
+    ``os.replace`` after its content was fsynced, so it is complete by
+    construction; dropping a ``.json`` that fails to parse would hide genuine
+    corruption behind a silently shorter manifest rather than surfacing it.
+    """
     out_dir = raw_dir if raw_dir is not None else raw_input_dir(trading_day, base)
     if not out_dir.exists():
         return []
-    return sorted(p.name for p in out_dir.iterdir() if p.is_file())
+    return sorted(
+        p.name for p in out_dir.iterdir() if p.is_file() and p.suffix == _RAW_INPUT_SUFFIX
+    )
 
 
 def build_raw_persistence_state(

@@ -1700,6 +1700,39 @@ class WalkForwardHarness:
                 for ticker, row in candidates.items()
                 if ticker not in already_forecast and np.isfinite(self.panel.series[ticker].features[row]).all()
             ]
+            # eligible_on() is keyed on the MARKET-WIDE final calendar date, so
+            # it only ever returns tickers that traded that exact day. A ticker
+            # admitted after the replay had already passed its own last row --
+            # a restored CSV, a --max-tickers ranking swap, a newly warmed-up
+            # series -- whose archive is even ONE session behind the rest of
+            # the market therefore matches nothing here, and with the cursor at
+            # the end there is no later step() to reach it either. Its first
+            # forecast was lost permanently, and once its next actual row
+            # arrives it can never be issued retroactively (Codex review:
+            # "Forecast eligible tickers from their own terminal rows"). Same
+            # eligibility bar as eligible_on() -- past the warm-up window, all
+            # features finite -- applied to each series' OWN terminal row.
+            #
+            # `covered` includes the rows just selected above, not only
+            # already_forecast: a ticker that DID trade on the market-wide
+            # terminal date is already handled there, and its own terminal row
+            # IS that row, so re-adding it would predict a duplicate.
+            covered = already_forecast | {ticker for ticker, _ in newly_eligible}
+            for ticker, series in self.panel.series.items():
+                if ticker in covered or not len(series):
+                    continue
+                own_terminal_row = len(series) - 1
+                if own_terminal_row < self.panel.min_history:
+                    continue
+                # >= rather than == : a series dated ON the market-wide
+                # terminal date was eligible_on()'s to handle (it either
+                # appears above or was excluded there on purpose), and a
+                # date beyond the panel calendar cannot occur.
+                if pd.Timestamp(series.dates[own_terminal_row]) >= terminal_date:
+                    continue
+                if not np.isfinite(series.features[own_terminal_row]).all():
+                    continue
+                newly_eligible.append((ticker, own_terminal_row))
             if newly_eligible:
                 requests = [
                     make_request(self.panel.series[ticker], row, self.config.window_len)

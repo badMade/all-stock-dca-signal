@@ -108,6 +108,105 @@ def test_tomorrow_rows_keeps_each_tickers_current_forecast_despite_mixed_origins
     assert {row["ticker"] for row in rows} == {"AAA", "LAGGY"}
 
 
+def test_tomorrow_rows_mark_nan_components_invalid_instead_of_ref_close():
+    # _bounded_log_return() maps NaN to 0.0 so math.exp() can never raise,
+    # which used to publish a divergent/missing forecast as EXACTLY ref_close
+    # -- a plausible-looking "no change" prediction indistinguishable from a
+    # real one, and one the daily forecast CSV already refuses to write (it
+    # emits daily_update._INVALID_FORECAST_MARKER). The CLI and HTML views
+    # therefore contradicted the scored data they exist to explain (Codex
+    # review: "Mark NaN forecasts as invalid in inspection output").
+    nan = float("nan")
+    band = {c: {"p10": -0.01, "p50": 0.0, "p90": 0.01} for c in ("open", "high", "low", "close")}
+    band["close"] = {"p10": nan, "p50": nan, "p90": nan}
+    point = {c: 0.0 for c in ("open", "high", "low")}
+    point["close"] = nan
+    state = {
+        "outstanding": {
+            "": [
+                {
+                    "ticker": "DIVERGED",
+                    "model": "persistence",
+                    "origin_date": "2021-06-01",
+                    "ref_close": 100.0,
+                    "point": point,
+                    "quantiles": band,
+                }
+            ]
+        }
+    }
+    (row,) = inspect_run._tomorrow_rows(state, "persistence", None)
+    assert row["pred_close"] == inspect_run._INVALID_FORECAST_MARKER
+    assert row["close_p10"] == inspect_run._INVALID_FORECAST_MARKER
+    assert row["close_p90"] == inspect_run._INVALID_FORECAST_MARKER
+    # The finite components are unaffected and still convert to dollars.
+    assert row["pred_open"] == pytest.approx(100.0)
+
+
+def test_svg_ribbon_omits_non_finite_rows_instead_of_plotting_ref_close():
+    # Same contract for the chart: a NaN row must leave a break in the
+    # ribbon, not a fabricated point sitting exactly on ref_close.
+    def _row(target_date, close):
+        return {
+            "target_date": target_date,
+            "ref_close": 100.0,
+            "point": {"close": close},
+            "actual": {"close": close},
+            "quantiles": {"close": {"p10": close, "p50": close, "p90": close}},
+        }
+
+    good = [_row(f"2021-06-0{day}", 0.01) for day in range(1, 4)]
+    bad = _row("2021-06-04", float("nan"))
+    svg = inspect_run._svg_ribbon("AAA", good + [bad])
+    # Four rows in, three plotted: the invalid row gets no actual dot (SVG has
+    # no numeric slot for an "N/A" marker, so the point is dropped from the
+    # series rather than drawn at ref_close), while every valid row keeps one.
+    assert svg.count("<circle") == 3
+    # The x-axis still spans every row -- the header names the full window,
+    # not just the plotted days -- so the missing session reads as a gap at
+    # its own position instead of the survivors being compacted over it.
+    assert "2021-06-01" in svg
+    assert "2021-06-04" in svg
+
+
+def test_svg_ribbon_breaks_the_band_at_an_interior_gap():
+    # Filtering invalid rows out BEFORE assigning x-coordinates compacted the
+    # survivors and drew the band and median straight across the missing
+    # session, so the promised break never appeared and the chart still showed
+    # uninterrupted coverage (Codex review: "Preserve gaps when omitting
+    # invalid forecast rows"). Positions come from the full row list now, and
+    # each contiguous run gets its own polygon/polyline.
+    def _row(target_date, close):
+        return {
+            "target_date": target_date,
+            "ref_close": 100.0,
+            "point": {"close": close},
+            "actual": {"close": close},
+            "quantiles": {"close": {"p10": close, "p50": close, "p90": close}},
+        }
+
+    rows = [
+        _row("2021-06-01", 0.01),
+        _row("2021-06-02", 0.01),
+        _row("2021-06-03", float("nan")),  # interior gap
+        _row("2021-06-04", 0.01),
+        _row("2021-06-05", 0.01),
+    ]
+    svg = inspect_run._svg_ribbon("AAA", rows)
+
+    # Two segments, so two bands and two median lines -- not one spanning the
+    # gap, which is what the old compaction produced.
+    assert svg.count("<polygon") == 2
+    assert svg.count("<polyline") == 2
+    # Every valid row still gets its actual dot; the invalid one does not.
+    assert svg.count("<circle") == 4
+
+    # And with no gap, it stays a single continuous ribbon.
+    contiguous = inspect_run._svg_ribbon("AAA", [_row(f"2021-06-0{d}", 0.01) for d in range(1, 6)])
+    assert contiguous.count("<polygon") == 1
+    assert contiguous.count("<polyline") == 1
+
+
 @pytest.fixture(scope="module")
 def demo_run(tmp_path_factory):
     run_dir = tmp_path_factory.mktemp("demo") / "run"
@@ -367,6 +466,51 @@ class TestPercentageError:
         ledger.append([record])
         _write_bare_checkpoint(run_dir, ledger)
         assert inspect_run.main(["--run-dir", str(run_dir), "--latest"]) == 0
+
+    def test_latest_marks_the_error_percentage_invalid_for_a_nan_forecast(self, tmp_path, capsys):
+        # _bounded_log_return() maps a NaN difference to 0.0, so the err %
+        # column printed exactly 0.00% -- a PERFECT prediction -- on the very
+        # row whose price already read "N/A" (Codex review: "Mark the error
+        # percentage invalid for NaN forecasts"). There is no defensible
+        # number here, so the column carries the marker too.
+        import metrics
+        from data import COMPONENTS
+        from ledger import Ledger
+
+        run_dir = tmp_path / "run"
+        ledger = Ledger.create(run_dir)
+        point = {c: 0.0 for c in COMPONENTS}
+        point["close"] = float("nan")
+        actual = {c: 0.0 for c in COMPONENTS}
+        quantiles = {c: {"p10": -0.05, "p50": 0.0, "p90": 0.05} for c in COMPONENTS}
+        score = metrics.score_forecast(
+            point=point, quantiles=quantiles, quantiles_raw=quantiles, actual=actual, ref_close=100.0
+        )
+        ledger.append([
+            {
+                "schema_version": 1,
+                "record_type": "score",
+                "model": "persistence",
+                "ticker": "ZNAN",
+                "origin_date": "2021-06-01",
+                "target_date": "2021-06-02",
+                "seed": 0,
+                "point": point,
+                "quantiles": quantiles,
+                "quantiles_raw": quantiles,
+                "actual": actual,
+                "ref_close": 100.0,
+                "adj_ratio": 1.0,
+                "score": score,
+            }
+        ])
+        _write_bare_checkpoint(run_dir, ledger)
+        assert inspect_run.main(["--run-dir", str(run_dir), "--latest"]) == 0
+        output = capsys.readouterr().out
+        znan_line = next(line for line in output.splitlines() if line.startswith("ZNAN"))
+        # Neither a fabricated price nor a fabricated 0.00% error.
+        assert "0.00%" not in znan_line
+        assert znan_line.count(inspect_run._INVALID_FORECAST_MARKER) >= 2
 
 
 class TestStreamingViews:

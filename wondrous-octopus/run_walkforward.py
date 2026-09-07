@@ -23,6 +23,7 @@ MPS, then CPU.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -542,6 +543,40 @@ def _install_early_signal_handlers() -> _InterruptFlag:
     return flag
 
 
+@contextlib.contextmanager
+def _restoring_signal_handlers():
+    """Hand SIGINT/SIGTERM back to whoever owned them before this call.
+
+    _install_early_signal_handlers() and _install_signal_handlers() both
+    replace the process-wide disposition of these two signals, and the
+    replacements close over state that only means something for the duration
+    of ONE walk-forward invocation: a temporary _InterruptFlag nobody reads
+    afterwards, then a completed harness whose request_interrupt() sets a
+    field its finished run() loop will never consult again. Leaving them
+    installed on the way out silently disarms the host: a long-lived process
+    that calls main() twice, or embeds this CLI entry point as a library,
+    delivers its NEXT Ctrl-C to that stale state and the signal is swallowed
+    instead of interrupting anything (Codex review: "Restore process signal
+    handlers after walk-forward runs").
+
+    Restores on EVERY exit path (return, refusal, crash, KeyboardInterrupt),
+    which is why it wraps _dispatch() from outside main()'s except clauses
+    rather than living inside one of them.
+    """
+    saved = [(number, signal.getsignal(number)) for number in (signal.SIGINT, signal.SIGTERM)]
+    try:
+        yield
+    finally:
+        for number, handler in saved:
+            # A handler read back as None means the disposition was set from
+            # outside Python (or is otherwise not expressible here); there is
+            # nothing meaningful to restore, so leave that signal alone
+            # rather than raising a TypeError out of a finally block that is
+            # very often already unwinding a real failure.
+            if handler is not None:
+                signal.signal(number, handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
@@ -571,7 +606,8 @@ def main(argv: list[str] | None = None) -> int:
         original_sigint = signal.getsignal(signal.SIGINT)
         original_sigterm = signal.getsignal(signal.SIGTERM)
     try:
-        return _dispatch(args)
+        with _restoring_signal_handlers():
+            return _dispatch(args)
     except (Refused, HarnessError, LedgerError, TrainingDataChanged, ValueError) as error:
         # GbmQuantileModel.fit() and OctopusModel.fit() raise plain
         # ValueError for a "no trainable window at or before cutoff"

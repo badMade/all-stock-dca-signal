@@ -4231,6 +4231,40 @@ def test_batch_pre_pass_reconciles_a_same_day_claim_when_an_order_already_exists
     assert running_deployed_7d == 10.0
 
 
+@pytest.mark.parametrize("blank_cumulative_quantity", [None, "", "   "])
+def test_batch_pre_pass_treats_blank_cumulative_quantity_as_absent(
+    tmp_path, monkeypatch, blank_cumulative_quantity
+):
+    """Blank broker placeholders fall back to the submitted quantity."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    ledger = WholeShareAccumulationLedger()
+    today = date(2026, 8, 16)
+    ledger.record_contribution(
+        "BYDDY", today.isoformat(), 10.0, 10.0, stream="afternoon",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
+
+    class _BlankExecutedSizeBroker(DryRunBroker):
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return True
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {
+                "id": "RH-BLANK-EXECUTED-SIZE-1",
+                "state": "filled",
+                "cumulative_quantity": blank_cumulative_quantity,
+                "quantity": "1",
+            }
+
+    ctx = _ctx(config, _BlankExecutedSizeBroker(cash=500.0, reference_prices={"BYDDY": 10.0}))
+    running_deployed_7d = _reconcile_cross_day_whole_share_claims_for_batch(ctx, running_deployed_7d=0.0)
+
+    assert ledger.shares_purchased_total("BYDDY") == 1
+    assert ledger.unresolved_claim("BYDDY", today.isoformat(), "afternoon-BYDDY") is None
+    assert running_deployed_7d == 10.0
+
+
 def test_batch_pre_pass_does_not_release_a_same_day_stale_claim_with_no_placement_attempt(tmp_path, monkeypatch):
     """Companion to the test above: a same-day claim that is merely STALE,
     with NO placement ever attempted (same_day_strategy_order_exists is

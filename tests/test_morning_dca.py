@@ -71,6 +71,7 @@ from morning_dca import (
     MorningDCAExecutor,
     MorningLedger,
     MorningSignal,
+    RawInputPersistenceError,
     TopUpOutcome,
     _csv_qualifying_notional_total,
     _forbidden_preflight_root_reason,
@@ -98,6 +99,7 @@ from near_close_dca import (
     _nth_weekday_of_month,
     account_pinning_failure,
 )
+from scripts.file_lock import cross_process_lock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -5549,6 +5551,199 @@ def test_morning_top_up_guard_buys_incremental_when_prior_fill_exists(tmp_path):
     assert broker.placed.get("TOPUP") == 2.0, "broker should place $2.00 incremental order"
 
 
+def test_morning_duplicate_recovery_settles_the_preserved_credit(tmp_path):
+    # If the first scheduled top-up attempt reaches the broker but dies before
+    # its settle() call, a retry lands in the duplicate branch and records the
+    # broker order as submitted. That outcome carries status="submitted", so
+    # the post-loop preserve pass skipped it, and it never reaches the settle()
+    # call in the placement path either -- so the credit that ALREADY funded a
+    # real order stayed pending, and the 15:30 aggregate pass could buy it a
+    # second time (Codex review: "Settle preserved credit when recovering a
+    # duplicate").
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
+
+    class _DuplicateBroker(FakeLiveBroker):
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            # The first attempt's order is already sitting at the broker.
+            return {"id": "ORDER-ALREADY-PLACED", "dollar_amount": 1.0}
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):  # pragma: no cover
+            raise AssertionError("a duplicate must never place a second order")
+
+    cfg = MorningConfig(tickers=("AAPL",), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+    # The credit the crashed first attempt left pending after it had already
+    # funded the real broker order.
+    ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.30, stream="morning")
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.30
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.0,
+        previous_close=100.0,
+        drop_pct=1.0,
+        multiplier=1.0,
+        hypothetical_amount_usd=1.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcome = TopUpOutcome(
+        ticker="AAPL",
+        desired_amount=1.30,
+        decision_price=99.0,
+        prior_same_day_amount=1.0,
+        prior_same_day_reference_price=100.0,
+        prior_same_day_run_id="morning_am",
+        prior_same_day_source="morning",
+        incremental_order_amount=1.0,
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        top_up_skipped=False,
+        effective_base_amount_usd=1.0,
+        cumulative_credit_decline_usd=0.30,
+    )
+    broker = _DuplicateBroker()
+    outcomes = ex._place_broker_orders(
+        [signal],
+        trading_day,
+        broker,
+        {"AAPL": outcome},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+
+    assert outcomes["AAPL"]["status"] == "submitted"
+    assert outcomes["AAPL"]["duplicate_preserved"] is True
+    assert outcomes["AAPL"]["order_id"] == "ORDER-ALREADY-PLACED"
+    # The credit is settled against the recovered order, not left pending for
+    # the 15:30 aggregate pass to spend a second time.
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+    assert ex.credit_ledger.events(trading_day.isoformat())[-1]["decision"] == "settled"
+
+    # Repeated recoveries settle EXACTLY ONCE for this order id. Clearing down
+    # to zero is not enough on its own: if another stream adds fresh pending
+    # credit for the ticker in between, a second settlement would consume that
+    # instead, and it never funded this order (Codex review: "Settle a
+    # recovered duplicate only once").
+    ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.45, stream="midday")
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.45
+
+    ex._place_broker_orders(
+        [signal],
+        trading_day,
+        broker,
+        {"AAPL": outcome},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+
+    # The other stream's $0.45 is untouched.
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.45
+
+
+def test_morning_original_settlement_is_keyed_so_the_first_recovery_is_deduped(tmp_path):
+    # The order-scoped guard has to be written by the attempt that PLACED the
+    # order, not only by the recovery that rediscovers it. Writing it from the
+    # recovery branch alone would leave the FIRST recovery after a successful
+    # original settlement undeduplicated: it would find no key, settle again,
+    # and consume whatever fresh credit another stream had added in the
+    # meantime (Codex review: "Key the original settlement with the broker
+    # order ID").
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
+
+    class _PlacingBroker(FakeLiveBroker):
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placed[ticker] = notional_usd
+            return "ORDER-AAPL"
+
+    class _DuplicateBroker(_PlacingBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            # The retry rediscovers the SAME physical order.
+            return {"id": "ORDER-AAPL", "dollar_amount": 1.0}
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):  # pragma: no cover
+            raise AssertionError("a duplicate must never place a second order")
+
+    cfg = MorningConfig(tickers=("AAPL",), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+    ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.30, stream="morning")
+
+    signal = MorningSignal(
+        ticker="AAPL", source="finance", action=Action.BUY, reason="test",
+        current_price=99.0, previous_close=100.0, drop_pct=1.0, multiplier=1.0,
+        hypothetical_amount_usd=1.0, selected_base_amount_usd=1.0,
+    )
+    outcome = TopUpOutcome(
+        ticker="AAPL", desired_amount=1.30, decision_price=99.0,
+        prior_same_day_amount=1.0, prior_same_day_reference_price=100.0,
+        prior_same_day_run_id="morning_am", prior_same_day_source="morning",
+        incremental_order_amount=1.0, top_up_guard_result=TOP_UP_INCREMENTAL,
+        top_up_skipped=False, effective_base_amount_usd=1.0,
+        cumulative_credit_decline_usd=0.30,
+    )
+
+    # The ORIGINAL placement settles successfully, keyed on ORDER-AAPL.
+    ex._place_broker_orders(
+        [signal], trading_day, _PlacingBroker(), {"AAPL": outcome},
+        remaining_daily=180.0, remaining_weekly=900.0,
+    )
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+
+    # Another stream now adds fresh credit for the same ticker.
+    # Sub-threshold so it stays PENDING rather than flushing to an order.
+    ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.45, stream="midday")
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.45
+
+    # The FIRST recovery of that same order must be deduped, not settle again.
+    ex._place_broker_orders(
+        [signal], trading_day, _DuplicateBroker(), {"AAPL": outcome},
+        remaining_daily=180.0, remaining_weekly=900.0,
+    )
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.45
+
+
 def test_morning_place_broker_orders_settles_credit_ledger_after_confirmed_submission(tmp_path):
     # Codex review discussion_r3705349440 ("Route sub-dollar top-ups through
     # the credit policy"): once a credit-derived order is actually confirmed
@@ -9384,6 +9579,235 @@ def test_persisting_broker_adapter_preserves_submitted_order_when_persist_write_
     assert "failed to persist" in recorder.error
 
 
+def test_persisting_provider_archives_the_raw_connector_response_before_parsing(tmp_path):
+    # The persist-before-compute contract is about the CONNECTOR's response,
+    # not the adapter's parsed return value. Archiving only the parsed Bar
+    # would mean a malformed payload -- the case the archive exists for --
+    # left no raw record at all, because the parse raised before anything
+    # reached the recorder (Codex review: "Persist connector payloads before
+    # parsing them"). The injected MCP callables are wrapped so the raw dict
+    # is on disk before the adapter ever sees it.
+    def _exploding_historicals(**kwargs):
+        return {"results": [{"symbol": kwargs["symbols"][0], "historicals": "not-a-list"}]}
+
+    provider = RobinhoodDataProvider(historicals_fn=_exploding_historicals)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+    now = _now_live()
+    try:
+        wrapped.get_intraday_bars(
+            ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=5
+        )
+    except Exception:  # noqa: BLE001 - whether parsing raises is the adapter's business
+        pass
+
+    archived = [name for name in recorder.saved_filenames if name.startswith("historicals_")]
+    assert archived, f"raw connector payload was not archived: {recorder.saved_filenames}"
+    payload = json.loads((tmp_path / "raw" / archived[0]).read_text())
+    assert payload["results"][0]["historicals"] == "not-a-list"
+
+
+def test_each_run_intercepts_its_own_private_view_of_the_provider(tmp_path):
+    # The decorator rebinds a SHALLOW COPY, so the caller's provider is never
+    # mutated and each run's interception is bound to its own recorder. Rebinding
+    # the caller's object could not survive two runs overlapping on one shared
+    # instance: the second wrapper replaced the first, so the first run's later
+    # connector calls archived into the second run's raw/ -- or nowhere at all --
+    # while its recorder stayed error-free and it went on placing orders (Codex
+    # review: "Archive connector responses for every overlapping run").
+    def _historicals(**kwargs):
+        return {"results": [{"symbol": kwargs["symbols"][0], "historicals": []}]}
+
+    def _quotes(**kwargs):
+        return {"results": [{"symbol": kwargs["symbols"][0], "last_trade_price": "1.0"}]}
+
+    provider = RobinhoodDataProvider(historicals_fn=_historicals, quotes_fn=_quotes)
+    first = _RawInputRecorder(tmp_path / "run1" / "raw", "2026-07-08")
+    run_one = _PersistingMarketDataProvider(provider, first)
+    second = _RawInputRecorder(tmp_path / "run2" / "raw", "2026-07-08")
+    run_two = _PersistingMarketDataProvider(provider, second)
+
+    # The caller's provider is untouched by either run, at any point.
+    assert provider._historicals_fn is _historicals
+    assert provider._quotes_fn is _quotes
+    assert run_one._inner is not provider
+    assert run_two._inner is not provider
+    assert run_one._inner is not run_two._inner
+
+    now = _now_live()
+    for run in (run_two, run_one):
+        try:
+            run.get_intraday_bars(
+                ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=5
+            )
+        except Exception:  # noqa: BLE001 - only the archiving side matters here
+            pass
+
+    # Each run archived its OWN call, in its own directory. The first run calling
+    # second -- after the later run was constructed -- is the overlap case.
+    assert any(n.startswith("historicals_") for n in first.saved_filenames), (
+        f"the earlier run stopped archiving once a later one started: {first.saved_filenames}"
+    )
+    assert any(n.startswith("historicals_") for n in second.saved_filenames), (
+        f"the later run captured nothing: {second.saved_filenames}"
+    )
+    # Exactly one connector payload each -- neither run picked up the other's.
+    for recorder in (first, second):
+        connector_files = [n for n in recorder.saved_filenames if n.startswith("historicals_")]
+        assert len(connector_files) == 1, recorder.saved_filenames
+    # Only ONE layer of wrapping, however many runs share the provider.
+    assert run_two._inner._historicals_fn._raw_connector_original is _historicals
+    assert run_two._inner._quotes_fn._raw_connector_original is _quotes
+
+
+def test_the_callers_provider_is_never_mutated_by_a_run(tmp_path):
+    # The completed slot's raw/ directory is closed to later calls because the
+    # caller's provider was never rebound in the first place: manual, watchlist
+    # and preflight calls -- none of which install a recorder, and all of which
+    # the raw-input policy exempts -- reach the untouched original.
+    def _historicals(**kwargs):
+        return {"results": [{"symbol": kwargs["symbols"][0], "historicals": []}]}
+
+    provider = RobinhoodDataProvider(historicals_fn=_historicals)
+    recorder = _RawInputRecorder(tmp_path / "run1" / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+
+    assert wrapped._inner is not provider
+    assert provider._historicals_fn is _historicals
+
+    now = _now_live()
+    try:
+        provider.get_intraday_bars(
+            ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=5
+        )
+    except Exception:  # noqa: BLE001 - only the archiving side matters here
+        pass
+
+    assert recorder.saved_filenames == [], (
+        f"a post-run call contaminated the completed slot's archive: {recorder.saved_filenames}"
+    )
+
+
+def test_an_uncopyable_provider_fails_the_run_closed(tmp_path):
+    # The copy is what keeps concurrent runs apart. Falling back to mutating an
+    # uncopyable provider would reinstate the exact fail-open the copy exists
+    # to prevent -- a second run replacing the callables while the first keeps
+    # placing orders with no persistence error (Codex review: "Fail closed
+    # instead of sharing an uncopyable provider").
+    class _Uncopyable:
+        source = SourceName.ROBINHOOD
+
+        def __init__(self, fn):
+            self._historicals_fn = fn
+
+        def __copy__(self):
+            raise TypeError("not copyable")
+
+    def _historicals(**kwargs):
+        return {"results": []}
+
+    provider = _Uncopyable(_historicals)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+
+    with pytest.raises(RawInputPersistenceError, match="_Uncopyable"):
+        _PersistingMarketDataProvider(provider, recorder)
+
+    # And the caller's provider is left exactly as it arrived.
+    assert provider._historicals_fn is _historicals
+
+
+def test_a_copy_that_returns_the_same_object_is_rejected(tmp_path):
+    # A successful copy is not automatically a PRIVATE one: __copy__ is
+    # caller-defined and may return self (a singleton, a cached connection
+    # wrapper). Rebinding would then land on the shared original and every
+    # overlapping-run hazard is back, this time with no exception to notice it
+    # by (Codex review: "Verify that the provider copy is actually private").
+    class _SelfCopying:
+        source = SourceName.ROBINHOOD
+
+        def __init__(self, fn):
+            self._historicals_fn = fn
+
+        def __copy__(self):
+            return self
+
+    def _historicals(**kwargs):
+        return {"results": []}
+
+    provider = _SelfCopying(_historicals)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+
+    with pytest.raises(RawInputPersistenceError, match="returned the same object"):
+        _PersistingMarketDataProvider(provider, recorder)
+
+    # The shared provider is left exactly as it arrived.
+    assert provider._historicals_fn is _historicals
+
+
+def test_a_copy_sharing_attribute_storage_is_rejected(tmp_path):
+    # A distinct object can still share attribute storage: a __copy__ that
+    # hands its own __dict__ to the new instance passes the identity check
+    # while every rebinding still lands on the caller's provider, silently
+    # restoring the overlapping-run fail-open (Codex review: "Verify copied
+    # providers do not share attribute storage").
+    class _SharedDict:
+        source = SourceName.ROBINHOOD
+
+        def __init__(self, fn):
+            self._historicals_fn = fn
+
+        def __copy__(self):
+            twin = _SharedDict.__new__(_SharedDict)
+            twin.__dict__ = self.__dict__  # distinct object, same storage
+            return twin
+
+    def _historicals(**kwargs):
+        return {"results": []}
+
+    provider = _SharedDict(_historicals)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+
+    with pytest.raises(RawInputPersistenceError, match="shares attribute storage"):
+        _PersistingMarketDataProvider(provider, recorder)
+
+    # The probe used to detect the sharing is fully undone.
+    assert provider._historicals_fn is _historicals
+
+
+def test_a_scheduled_run_blocks_when_the_provider_cannot_be_isolated(tmp_path):
+    # The refusal reaches the caller as a normal blocked run_state -- written
+    # before evaluate(), so nothing was computed and nothing placed -- rather
+    # than as an escaping exception.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+
+    class _UncopyableProvider(DecliningBarsProvider):
+        def __copy__(self):
+            raise TypeError("not copyable")
+
+    data = _UncopyableProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    # The decorator only copies a provider that exposes a connector callable
+    # to intercept (the bars come from the provider itself here; the callable
+    # is never reached), so give it one -- exactly the shape the live
+    # RobinhoodDataProvider has.
+    data._historicals_fn = lambda **kwargs: {"results": []}
+    broker = FakeLiveBroker()
+    res = ex.run(_now_live(), data, broker=broker)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["error_class"] == "missing_or_invalid_raw_inputs"
+    assert "cannot isolate the injected market-data provider" in artifacts["block_reason"]
+    assert artifacts["broker_outcomes"] == {}
+    assert Path(res["paths"]["run_state"]).exists()
+
+
 def test_persisting_adapters_do_not_mutate_caller_owned_broker_or_provider(tmp_path):
     # The wrappers must not leave a recorder-bound connector callable installed on the
     # caller's RobinhoodDataProvider/RobinhoodBroker instance after wrapping: a later
@@ -10590,6 +11014,68 @@ def _live_executor(tmp_path, tickers):
         prior_allocation_roots=(str(tmp_path / "empty_prior"),),
     )
     return MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+
+
+def _lock_is_held(lock_path: Path) -> bool:
+    """True when ``lock_path`` cannot be acquired right now."""
+    if not lock_path.exists():
+        return False
+    try:
+        with cross_process_lock(lock_path, timeout_seconds=0.05):
+            return False
+    except (TimeoutError, OSError):
+        return True
+
+
+class TestScheduledSlotLock:
+    """A scheduled live attempt is serialized against other attempts for its slot.
+
+    Without the lock, an external-scheduler retry that overlaps the original
+    invocation has nothing serializing the two: both can pass the broker's
+    check-then-place duplicate guard before either order becomes visible, and
+    submit the same ticker allocation twice (Codex review: "Restore the
+    scheduled-slot lock around live execution").
+    """
+
+    def test_scheduled_live_run_holds_the_slot_lock_through_placement(self, tmp_path):
+        ex = _live_executor(tmp_path, ("NVDA",))
+        lock_path = ex._slot_lock_path(_now_live())
+        held: list[bool] = []
+
+        # The broker call is the deepest point of the attempt: if the lock is
+        # held there, it covers the calendar gate, raw recording and placement.
+        class _LockObservingBroker(_TopUpBroker):
+            def place_market_buy(self, *args, **kwargs):
+                held.append(_lock_is_held(lock_path))
+                return super().place_market_buy(*args, **kwargs)
+
+        data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+        res = ex.run(_now_live(), data, broker=_LockObservingBroker())
+
+        assert res["artifacts"]["broker_outcomes"]["NVDA"]["status"] == "submitted"
+        assert held == [True], "the slot lock was not held while placing the order"
+        # Released on the way out, so the next scheduled attempt is not blocked.
+        assert not _lock_is_held(lock_path)
+
+    def test_manual_and_watchlist_runs_never_take_the_slot_lock(self, tmp_path):
+        # live_schedule_hardening_2026_07_20's applies_to is scoped to the
+        # scheduled live task, so a manual retry must not be blocked by a
+        # scheduled attempt's lock (nor take one of its own).
+        ex = _live_executor(tmp_path, ("NVDA",))
+        now = _now_live()
+        lock_path = ex._slot_lock_path(now)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+        holder = cross_process_lock(lock_path)
+        holder.__enter__()
+        try:
+            data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+            res = ex.run(now, data, broker=_TopUpBroker(), manual=True)
+        finally:
+            holder.__exit__(None, None, None)
+
+        assert res["artifacts"].get("status") != "blocked"
+        assert res["paths"].get("run_state")
 
 
 def test_morning_live_run_writes_the_complete_root_level_artifact_set(tmp_path):

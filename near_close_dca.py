@@ -8930,7 +8930,21 @@ def _apply_no_order_classification(
         # the possibly-live order StrategyState already reserved (Codex
         # review, PR #1300 discussion_r3920344713: "Classify ambiguous
         # near-close attempts as in-flight").
-        if status in ("submitted", "filled", "pending", "potentially_submitted"):
+        #
+        # And "pending"/"unconfirmed" -- EVERY placed status, via the shared
+        # _PLACED_ORDER_STATUSES set, not an enumerated tuple. Those are orders
+        # that reached the broker (a same-slot retry carries them forward from
+        # the earlier attempt's artifact -- see run_daily_compact's reinjection
+        # loop, which admits them for exactly that reason), so a run holding
+        # one is not a no-order run -- and since this function OVERWRITES
+        # artifacts["orders_submitted_count"] below, a narrower test here
+        # silently reset that count to zero for a batch that really did place
+        # something, and stamped it completed_no_orders beside a regenerated
+        # submitted_orders.csv that lists the order (Codex review: "Count
+        # reinjected in-flight orders in submission metadata"). PR #1147
+        # independently added "pending" to the old enumerated tuple for the
+        # same reason; the shared set already contains it.
+        if status in _PLACED_ORDER_STATUSES:
             # Orders, not rows -- a merged recovery row can stand for several
             # real broker submissions (see _merge_whole_share_submission_
             # outcomes' merged_submission_count).
@@ -10107,6 +10121,25 @@ _TERMINAL_NON_FILL_STATES = _load_terminal_order_states()
 _UNRESOLVED_ORDER_ATTEMPT_STATUSES = frozenset(
     {"submitted", "pending", "unconfirmed", "potentially_submitted"}
 )
+
+# Every status meaning "this order reached the broker (or may have)". The
+# unresolved set above plus "filled" -- a completed order is deployed capital
+# exactly like an in-flight one -- and still without
+# "not_submitted_confirmation_required", which means no order was ever placed.
+# The same line dca_risk.DEPLOYED_CANDIDATE_STATUSES draws for the consumer
+# that reads the result.
+#
+# Used in places that MUST agree, or a run reports itself inconsistently: the
+# same-slot retry reinjection in run_daily_compact (which of an earlier
+# attempt's placed candidates to count once carried forward) and
+# _apply_no_order_classification's own "did this run submit anything?" count.
+# Counting only submitted/filled in the latter meant a carried-forward
+# pending/unconfirmed order appeared in the regenerated submitted_orders.csv
+# while orders_submitted_count, counts.submitted and
+# usage_proxy.orders_placed_count all stayed at zero and the run was stamped
+# completed_no_orders (Codex review: "Count reinjected in-flight orders in
+# submission metadata").
+_PLACED_ORDER_STATUSES = _UNRESOLVED_ORDER_ATTEMPT_STATUSES | {"filled"}
 
 # Submitted-amount aliases, canonical first. `amount_usd` is the broker-native
 # recovery spelling; _orders_csv_fills already reads it. `submitted_amount_usd`
@@ -39519,13 +39552,24 @@ def run_daily_compact(
                     # "Count every order represented by carried aggregates" --
                     # same class of bug the locked reinjection block below
                     # already guards against for its own outcomes).
+                    # Filtered on the shared _PLACED_ORDER_STATUSES set, not an
+                    # enumerated ("submitted", "filled", "pending"): this
+                    # block only CARRIES submitted/filled/pending prior
+                    # candidates (the `_prior_candidates` filter above), but
+                    # `_fresh_candidates` also holds THIS run's own rows, and
+                    # a fresh "unconfirmed"/"potentially_submitted" placement
+                    # counted here as zero contradicted the
+                    # _apply_no_order_classification recount below and the
+                    # locked reinjection block's own figure, both of which
+                    # read the same set (Codex review: "Count reinjected
+                    # in-flight orders in submission metadata").
                     _fresh_state["orders_submitted_count"] = sum(
                         _submitted_orders_in_row(row)
                         for row in _grouped_submission_rows_by_represented_order(
                             (
                                 row
                                 for row in _fresh_candidates
-                                if row.get("status") in ("submitted", "filled", "pending")
+                                if row.get("status") in _PLACED_ORDER_STATUSES
                             ),
                             ticker_prefix="ticker:",
                         )
@@ -39550,12 +39594,26 @@ def run_daily_compact(
                     # counting it as a single row here would once again
                     # contradict the ID-based orders_submitted_count just
                     # computed above for the same retry.
+                    # Every PLACED status plus "dry_run", not a hand-listed
+                    # {"submitted", "dry_run"}: a carried "filled"/"pending"
+                    # outcome (this block admits both) and a fresh
+                    # "unconfirmed" one are counted by orders_submitted_count
+                    # just above, and recognizing only "submitted" here left
+                    # usage_proxy.orders_placed_count -- dca_cost_tracker's
+                    # order-execution usage source -- denying the same
+                    # placements the state's own submitted count reports
+                    # (Codex review: "Count reinjected in-flight orders in
+                    # submission metadata"). Unlike the locked block below,
+                    # there is no separate ambiguous-outcome pass here, so
+                    # "potentially_submitted" is left in the set rather than
+                    # carved out; the order_id gate makes it moot anyway,
+                    # since an ambiguous placement never records one.
                     _fresh_orders_placed_count = sum(
                         _submitted_orders_in_row(_o)
                         for _o in _fresh_broker_outcomes.values()
                         if isinstance(_o, dict)
                         and _o.get("order_id")
-                        and _o.get("status") in {"submitted", "dry_run"}
+                        and _o.get("status") in (_PLACED_ORDER_STATUSES | {"dry_run"})
                     )
                     _fresh_usage = _fresh_state.get("usage_proxy")
                     if isinstance(_fresh_usage, dict):
@@ -40212,10 +40270,17 @@ def run_daily_compact(
                         # this reinjection loop ran (Codex review, PR #1300
                         # discussion_r3920765644: "Preserve ambiguous counts in
                         # failure-state merges").
+                        # Every PLACED status, not just submitted/filled/
+                        # potentially_submitted: the carry-forward above
+                        # admits pending and unconfirmed too, and counting
+                        # them here as zero left the regenerated
+                        # submitted_orders.csv holding an in-flight order the
+                        # metadata denied (Codex review: "Count reinjected
+                        # in-flight orders in submission metadata").
                         _fresh_state["orders_submitted_count"] = sum(
                             _submitted_orders_in_row(row)
                             for row in _fresh_candidates
-                            if row.get("status") in ("submitted", "filled", "potentially_submitted")
+                            if row.get("status") in _PLACED_ORDER_STATUSES
                         )
                         # counts.buy_candidates and the usage-proxy's
                         # buy_candidates_written/orders_placed_count all derive
@@ -40372,13 +40437,16 @@ def run_daily_compact(
                         # an unresolved ambiguous placement is conservatively
                         # counted as a real order until reconciliation proves
                         # otherwise (Codex review, PR #1300 discussion_r3920765644:
-                        # "Preserve ambiguous counts in failure-state merges").
+                        # "Preserve ambiguous counts in failure-state merges") --
+                        # and pending/unconfirmed with them, via the same
+                        # _PLACED_ORDER_STATUSES set `orders_submitted_count`
+                        # reads, so the two figures cannot disagree.
                         _fresh_qualifying_outcomes = [
                             _outcome
                             for _row, _outcome in zip(
                                 _fresh_candidates, _fresh_outcomes_for_classification.values(), strict=True
                             )
-                            if _row.get("status") in ("submitted", "filled", "potentially_submitted")
+                            if _row.get("status") in _PLACED_ORDER_STATUSES
                         ]
                         _fresh_aggregate_submitted_count = sum(
                             _submitted_orders_in_row(_grouped_row)
@@ -40419,12 +40487,31 @@ def run_daily_compact(
                         # "dry_run") is its own distinct set of rows, not a
                         # subset of `_fresh_qualifying_outcomes`, so it needs
                         # its own grouping pass rather than reusing that sum.
+                        # Every PLACED status plus "dry_run", not a hand-listed
+                        # {"submitted", "filled", "dry_run"}: this is the THIRD
+                        # figure the same-slot retry regenerates from the same
+                        # carried-forward rows, and reading it from a narrower
+                        # set than orders_submitted_count/counts.submitted above
+                        # left a carried pending/unconfirmed order counted by
+                        # those two and denied by usage_proxy.orders_placed_count
+                        # -- the exact disagreement the shared
+                        # _PLACED_ORDER_STATUSES set exists to rule out (Codex
+                        # review: "Count reinjected in-flight orders in
+                        # submission metadata"). "potentially_submitted" is
+                        # carved back OUT: it is a member of that set (an
+                        # ambiguous placement is reserved like an in-flight one
+                        # for cap purposes), but it never carries an order_id by
+                        # definition and `_fresh_ambiguous_outcomes` just below
+                        # already counts it on its own, so admitting it here
+                        # would double-count any ambiguous row that did happen
+                        # to record an id.
                         _fresh_placed_outcomes = [
                             _outcome
                             for _row, _outcome in zip(
                                 _fresh_candidates, _fresh_outcomes_for_classification.values(), strict=True
                             )
-                            if _row.get("order_id") and _row.get("status") in {"submitted", "filled", "dry_run"}
+                            if _row.get("order_id")
+                            and _row.get("status") in ((_PLACED_ORDER_STATUSES - {"potentially_submitted"}) | {"dry_run"})
                         ]
                         # "potentially_submitted" checked separately rather than
                         # folded into the order_id-gated filter above: it never

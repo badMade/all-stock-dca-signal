@@ -736,6 +736,389 @@ class DriftDetectionTests(unittest.TestCase):
         self.assertTrue(report.submitted_orders_empty)
         self.assertEqual(report.run_suspected_cause, CAUSE_ORDERS_EMPTY)
 
+    def test_state_only_submission_makes_mixed_empty_orders_reconcile_first(self):
+        # A run-state-confirmed order beside a genuinely missing one: the
+        # report-level cause must not surface CAUSE_ORDERS_EMPTY's "re-run the
+        # live task" guidance, which would duplicate the order run_state
+        # already records (Codex review: "Fix mixed drift retry guidance").
+        self._raw()
+        _write_csv(
+            self.run_dir / "signals.csv",
+            SIGNAL_FIELDS,
+            [_signal("AAPL", incremental=3.0), _signal("MSFT", incremental=4.0)],
+        )
+        _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [])
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps({"broker_outcomes": {"AAPL": {"status": "submitted"}}}),
+            encoding="utf-8",
+        )
+
+        report = detect_drift(self.run_dir)
+
+        causes = {drift.symbol: drift.suspected_cause for drift in report.affected_symbols}
+        self.assertEqual(causes["AAPL"], CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED)
+        self.assertEqual(causes["MSFT"], CAUSE_ORDERS_EMPTY)
+        self.assertEqual(report.run_suspected_cause, CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED)
+        self.assertIn("Reconcile broker order history for every affected symbol", report.recommended_action)
+        self.assertIn("do not re-run the live task first", report.recommended_action)
+
+    def test_every_placed_outcome_status_counts_as_submission_evidence(self):
+        # A strict status == "submitted" test omitted a real filled/pending/
+        # unconfirmed order from the evidence sets, so with an empty canonical
+        # CSV detect_drift() called it genuinely missing and recommended
+        # re-running the live task -- duplicating an order that already exists
+        # or is still in flight (Codex review: "Treat all placed outcomes as
+        # submission evidence").
+        self._raw()
+        for status in ("submitted", "filled", "pending", "unconfirmed"):
+            with self.subTest(status=status):
+                _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
+                _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [])
+                (self.run_dir / "run_state.json").write_text(
+                    json.dumps({"broker_outcomes": {"AAPL": {"status": status}}}), encoding="utf-8"
+                )
+                report = detect_drift(self.run_dir)
+                causes = {d.symbol: d.suspected_cause for d in report.affected_symbols}
+                self.assertEqual(causes.get("AAPL"), CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED)
+                self.assertIn("Do NOT resubmit", report.recommended_action)
+
+        # An order that never reached the broker is still NOT evidence.
+        _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
+        _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [])
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {"broker_outcomes": {"AAPL": {"status": "not_submitted_confirmation_required"}}}
+            ),
+            encoding="utf-8",
+        )
+        report = detect_drift(self.run_dir)
+        causes = {d.symbol: d.suspected_cause for d in report.affected_symbols}
+        self.assertEqual(causes.get("AAPL"), CAUSE_ORDERS_EMPTY)
+
+    def test_a_completely_missing_order_csv_is_reported_for_a_current_artifact(self):
+        # "run_state records a placed order and no order CSV exists at all" is
+        # the most severe form of the artifact disagreement, not an exemption:
+        # every live stream writes submitted_orders.csv today, so a missing one
+        # must never declare the run reconciled (Codex review: "Report a
+        # completely missing canonical order CSV").
+        self._raw()
+        _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
+        # No order CSV written at all.
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {
+                    "stream": "morning",
+                    "raw_input_dir": str(self.run_dir / "raw"),  # the current contract
+                    "broker_outcomes": {"AAPL": {"status": "submitted", "order_id": "O1"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        report = detect_drift(self.run_dir)
+
+        causes = {d.symbol: d.suspected_cause for d in report.affected_symbols}
+        self.assertEqual(causes.get("AAPL"), CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED)
+        self.assertIn("Do NOT resubmit", report.recommended_action)
+
+    def test_a_current_failure_artifact_without_raw_fields_is_still_reported(self):
+        # MorningDCAExecutor's failure writer synthesizes a complete current
+        # run_state -- including broker_outcomes for orders it had ALREADY
+        # placed -- without either raw field, because the run died before raw
+        # persistence was summarized. That artifact (order placed, run failed,
+        # companion CSVs then discarded as stale) is exactly the one whose
+        # state-only submission must surface, raw fields or not (Codex review:
+        # "Recognize current failure artifacts without raw fields").
+        self._raw()
+        _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
+        # No order CSV, and no raw_input_dir/raw_persistence_error -- exactly
+        # what _write_failure_artifacts produces.
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {
+                    "status": "failed",
+                    "run_classification": {
+                        "run_origin": "scheduled",
+                        "stream": "morning",
+                        "run_id": "morning_live_20260629_1030ET",
+                    },
+                    "run_classification_outcome": "failed_after_submission",
+                    "orders_submitted_count": 1,
+                    "placement_evidence_incomplete": True,
+                    "broker_outcomes": {"AAPL": {"status": "submitted", "order_id": "O1"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        report = detect_drift(self.run_dir)
+
+        causes = {d.symbol: d.suspected_cause for d in report.affected_symbols}
+        self.assertEqual(causes.get("AAPL"), CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED)
+        self.assertIn("Do NOT resubmit", report.recommended_action)
+
+    def test_a_state_only_order_is_reported_even_with_no_signal_rows(self):
+        # detect_drift's loop walks `expected`, which is built entirely from
+        # signals.csv -- so a run with NO signal rows never examined the
+        # state-only set at all. _write_failure_artifacts synthesizes exactly
+        # that shape (signal_rows: [] alongside the broker_outcomes for orders
+        # already placed), which defeated the state-only reporting in precisely
+        # the case it exists for (Codex review: "Report state-only orders
+        # without signal rows").
+        self._raw()
+        _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [])  # header only
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {
+                    "status": "failed",
+                    "run_classification": {"run_origin": "scheduled", "stream": "morning"},
+                    "signal_rows": [],
+                    "broker_outcomes": {"AAPL": {"status": "submitted", "order_id": "O1"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        report = detect_drift(self.run_dir)
+
+        self.assertTrue(report.drift_detected)
+        causes = {d.symbol: d.suspected_cause for d in report.affected_symbols}
+        self.assertEqual(causes.get("AAPL"), CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED)
+        self.assertIn("Do NOT resubmit", report.recommended_action)
+
+    def test_a_state_only_order_is_not_reported_twice(self):
+        # When a signal row DOES exist for the symbol, it is reported once
+        # through the expected loop, not again by the signal-independent sweep.
+        self._raw()
+        _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {
+                    "run_classification": {"run_origin": "scheduled", "stream": "morning"},
+                    "broker_outcomes": {"AAPL": {"status": "submitted", "order_id": "O1"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        report = detect_drift(self.run_dir)
+
+        self.assertEqual([d.symbol for d in report.affected_symbols], ["AAPL"])
+
+    def test_a_second_order_for_one_ticker_needs_its_own_canonical_row(self):
+        # A retry can leave TWO distinct physical orders for one ticker in
+        # run_state (near_close_dca keys the second "AAPL:<order-id>" precisely
+        # so both survive the merge). Comparing symbol SETS called the ticker
+        # reconciled as soon as the CSV carried any row for it, so the second
+        # order's missing canonical record went unreported (Codex review:
+        # "Compare state and CSV orders by order ID").
+        self._raw()
+        _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
+        _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [_order("AAPL", order_id="O1")])
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {
+                    "run_classification": {"run_origin": "scheduled", "stream": "morning"},
+                    "broker_outcomes": {
+                        "AAPL": {"ticker": "AAPL", "status": "submitted", "order_id": "O1"},
+                        "AAPL:O2": {"ticker": "AAPL", "status": "filled", "order_id": "O2"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        artifacts = load_run_artifacts(self.run_dir)
+
+        self.assertEqual(artifacts.run_state_only_submitted_symbols, {"AAPL"})
+        # The capital is real either way: the symbol still counts as submitted,
+        # so the guidance is reconcile-and-rebuild, never resubmit.
+        self.assertEqual(artifacts.submitted_symbols, {"AAPL"})
+        report = detect_drift(self.run_dir)
+        causes = {d.symbol: d.suspected_cause for d in report.affected_symbols}
+        self.assertEqual(causes.get("AAPL"), CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED)
+        self.assertIn("Do NOT resubmit", report.recommended_action)
+
+    def test_matching_order_ids_reconcile_and_conflicting_ones_do_not(self):
+        # The per-order comparison must not fire on a healthy artifact set, and
+        # must still catch a CSV row that names a DIFFERENT order than the one
+        # run_state records -- a disagreement equal counts alone would miss.
+        self._raw()
+        _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
+        state = {
+            "run_classification": {"run_origin": "scheduled", "stream": "morning"},
+            "broker_outcomes": {"AAPL": {"ticker": "AAPL", "status": "submitted", "order_id": "O1"}},
+        }
+
+        for csv_order_id, expected in (("O1", set()), ("O9", {"AAPL"})):
+            with self.subTest(csv_order_id=csv_order_id):
+                _write_csv(
+                    self.run_dir / "submitted_orders.csv",
+                    ORDER_FIELDS,
+                    [_order("AAPL", order_id=csv_order_id)],
+                )
+                (self.run_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+                artifacts = load_run_artifacts(self.run_dir)
+                self.assertEqual(artifacts.run_state_only_submitted_symbols, expected)
+
+    def test_a_repeated_order_id_is_not_mistaken_for_a_blank_id_row(self):
+        # Deriving the blank-ID count as total - len(ids) turned a damaged CSV
+        # carrying the same order twice into "one identified row plus one
+        # unidentified row". That phantom spare row then covered a genuinely
+        # missing order: state {O1, O2} against a CSV of {O1, O1} reconciled
+        # while O2's canonical record was absent (Codex review: "Do not count
+        # duplicate IDs as unidentified orders").
+        self._raw()
+        _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
+        _write_csv(
+            self.run_dir / "submitted_orders.csv",
+            ORDER_FIELDS,
+            [_order("AAPL", order_id="O1"), _order("AAPL", order_id="O1")],
+        )
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {
+                    "run_classification": {"run_origin": "scheduled", "stream": "morning"},
+                    "broker_outcomes": {
+                        "AAPL": {"ticker": "AAPL", "status": "submitted", "order_id": "O1"},
+                        "AAPL:O2": {"ticker": "AAPL", "status": "filled", "order_id": "O2"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(load_run_artifacts(self.run_dir).run_state_only_submitted_symbols, {"AAPL"})
+
+    def test_an_order_row_without_an_id_still_accounts_for_a_state_order(self):
+        # The canonical writer copies order_id through, but an id-less row is a
+        # DAMAGED record rather than proof of some other order. Treating the
+        # mismatch as a missing record would report drift for every legacy row,
+        # so a spare id-less row covers one otherwise-unmatched state order --
+        # and stops covering once the state outnumbers the CSV.
+        self._raw()
+        _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
+        _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [_order("AAPL", order_id="")])
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {
+                    "run_classification": {"run_origin": "scheduled", "stream": "morning"},
+                    "broker_outcomes": {"AAPL": {"ticker": "AAPL", "status": "submitted", "order_id": "O1"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(load_run_artifacts(self.run_dir).run_state_only_submitted_symbols, set())
+
+        # A second state order has nothing left to cover it.
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {
+                    "run_classification": {"run_origin": "scheduled", "stream": "morning"},
+                    "broker_outcomes": {
+                        "AAPL": {"ticker": "AAPL", "status": "submitted", "order_id": "O1"},
+                        "AAPL:O2": {"ticker": "AAPL", "status": "filled", "order_id": "O2"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertEqual(load_run_artifacts(self.run_dir).run_state_only_submitted_symbols, {"AAPL"})
+
+    def test_a_placed_candidate_row_does_not_double_count_its_own_outcome(self):
+        # The afternoon stream records one order on BOTH sides of run_state
+        # (buy_candidates and broker_outcomes), and the candidate row need not
+        # repeat the order id. Tallying it as a second, unidentified order
+        # would report a missing canonical record for a CSV that carries the
+        # order exactly once.
+        self._raw()
+        _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
+        _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [_order("AAPL", order_id="O1")])
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {
+                    "run_classification": {"run_origin": "scheduled", "stream": "afternoon"},
+                    "buy_candidates": [{"ticker": "AAPL", "status": "submitted"}],
+                    "broker_outcomes": {"AAPL": {"ticker": "AAPL", "status": "submitted", "order_id": "O1"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(load_run_artifacts(self.run_dir).run_state_only_submitted_symbols, set())
+        self.assertFalse(detect_drift(self.run_dir).drift_detected)
+
+    def test_a_collision_suffixed_outcome_key_resolves_to_its_real_ticker(self):
+        # A retried artifact can key a second order for one ticker as
+        # "AAPL:<order-id>". That key is an identity, not a symbol, so the
+        # evidence set must read the outcome's own ticker (and strip the
+        # suffix when it has none) or the symbol looks unreconciled.
+        _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
+        _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [])
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {
+                    "broker_outcomes": {
+                        "AAPL:ORDER-EARLIER": {"status": "submitted", "order_id": "ORDER-EARLIER"}
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        artifacts = load_run_artifacts(self.run_dir)
+
+        self.assertEqual(artifacts.state_submitted_symbols, {"AAPL"})
+
+    def test_a_lease_recovery_outcome_key_resolves_to_its_real_ticker(self):
+        # near_close_dca keys a recovered inverse-martingale lease
+        # "AAPL#imart-recovery". Today's producer puts the real ticker in the
+        # outcome, so the key is only read for an artifact that omitted it --
+        # where "#" must be stripped exactly as ":" is, or the symbol looks
+        # unreconciled (Antigravity review: "Robust ticker normalization for
+        # lease recovery keys in drift detection").
+        _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
+        _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [])
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {"broker_outcomes": {"AAPL#imart-recovery": {"status": "submitted", "order_id": "O1"}}}
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(load_run_artifacts(self.run_dir).state_submitted_symbols, {"AAPL"})
+
+    def test_a_suffixed_ticker_matches_between_run_state_and_the_order_csv(self):
+        # submitted_order_rows() writes the ticker column with the SAME
+        # "outcome.get('ticker') or key" fallback, so a legacy artifact can
+        # carry the synthetic suffix on both sides. Normalizing only run_state
+        # would turn that matched pair into a false missing-record report; both
+        # sides get the same treatment.
+        self._raw()
+        _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])
+        _write_csv(
+            self.run_dir / "submitted_orders.csv",
+            ORDER_FIELDS,
+            [_order("AAPL#imart-recovery", order_id="O1")],
+        )
+        (self.run_dir / "run_state.json").write_text(
+            json.dumps(
+                {
+                    "run_classification": {"run_origin": "scheduled", "stream": "morning"},
+                    "broker_outcomes": {
+                        "AAPL#imart-recovery": {"status": "submitted", "order_id": "O1"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        artifacts = load_run_artifacts(self.run_dir)
+
+        self.assertEqual(artifacts.csv_submitted_symbols, {"AAPL"})
+        self.assertEqual(artifacts.state_submitted_symbols, {"AAPL"})
+        self.assertEqual(artifacts.run_state_only_submitted_symbols, set())
+
     def test_invalid_utf8_run_state_is_ignored(self):
         self._raw()
         _write_csv(self.run_dir / "signals.csv", SIGNAL_FIELDS, [_signal("AAPL", incremental=3.0)])

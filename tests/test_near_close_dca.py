@@ -8135,6 +8135,31 @@ def test_retry_preserves_a_prior_attempts_placed_candidate(tmp_path, status):
         isinstance(o, dict) and o.get("order_id") == "ORDER-EARLIER"
         for o in run_state["broker_outcomes"].values()
     )
+    # The submission metadata must AGREE with the artifacts. The carried-forward
+    # order appears in the regenerated submitted_orders.csv, so a count that
+    # recognized only "submitted"/"filled" left an in-flight pending/unconfirmed
+    # order present in the CSV but denied by orders_submitted_count,
+    # counts.submitted and usage_proxy.orders_placed_count -- and let
+    # _apply_no_order_classification stamp the run completed_no_orders (Codex
+    # review: "Count reinjected in-flight orders in submission metadata").
+    assert run_state["orders_submitted_count"] >= 1
+    assert run_state["counts"]["submitted"] == run_state["orders_submitted_count"]
+    # `== own + 1`, not `>= 1`: this dry-run retry places its own three
+    # dry_run orders (AAPL/NVDA/MSFT), which alone satisfy a `>= 1` bound and
+    # hid a usage_proxy filter that still recognized only submitted/filled --
+    # so a carried pending/unconfirmed order counted in orders_submitted_count
+    # and counts.submitted above while orders_placed_count silently dropped it.
+    own_dry_run_orders = [
+        c for c in run_state["buy_candidates"]
+        if c.get("status") == "dry_run" and c.get("order_id")
+    ]
+    assert own_dry_run_orders, run_state["buy_candidates"]
+    assert run_state["usage_proxy"]["orders_placed_count"] == len(own_dry_run_orders) + 1, (
+        f"status={status}: orders_placed_count must count the carried-forward order on top of "
+        f"this run's own {len(own_dry_run_orders)} dry_run orders; got "
+        f"{run_state['usage_proxy']['orders_placed_count']}"
+    )
+    assert run_state.get("run_classification_outcome") != "completed_no_orders"
     with open(os.path.join(artifacts_dir, "submitted_orders.csv"), newline="", encoding="utf-8") as handle:
         csv_rows = list(csv.DictReader(handle))
     assert any(row.get("order_id") == "ORDER-EARLIER" for row in csv_rows)

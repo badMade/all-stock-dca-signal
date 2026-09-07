@@ -2501,6 +2501,16 @@ class _RawInputRecorder:
             self.error = detail
 
 
+class RawInputPersistenceError(RuntimeError):
+    """A raw connector input cannot be archived into THIS run's own archive.
+
+    Raised only before ``evaluate()`` -- see
+    :meth:`_PersistingMarketDataProvider._private_copy` -- where failing closed
+    is safe: nothing has been computed and nothing placed, and ``_run_impl``
+    turns it into a blocked run_state naming the provider type.
+    """
+
+
 class _PersistingMarketDataProvider:
     """``MarketDataProvider`` decorator that persists every response it returns.
 
@@ -2510,11 +2520,99 @@ class _PersistingMarketDataProvider:
     wrapped provider unchanged.
     """
 
+    #: The injected MCP/vendor callables whose responses are the run's TRUE raw
+    #: connector payloads, mapped to the raw/ filename ``kind`` each is archived
+    #: under. Shared by :meth:`_wrap_raw_connectors` (what to intercept) and
+    #: :meth:`_private_copy` (which attributes the isolation probe rebinds).
+    _CONNECTOR_ATTRIBUTE_KINDS = (
+        ("_historicals_fn", "historicals"),
+        ("_quotes_fn", "quotes"),
+        ("_bars_fn", "intraday_bars"),
+        ("_previous_close_fn", "prior_close"),
+    )
+
     def __init__(self, inner: Any, recorder: _RawInputRecorder):
         self._inner = inner
         self._recorder = recorder
         self._raw_connector_invocations = 0
         self._raw_connectors_wrapped = self._wrap_raw_connectors()
+
+    @classmethod
+    def _private_copy(cls, inner: Any) -> Any:
+        """A SHALLOW COPY of the provider that only this decorator can see.
+
+        Rebinding the connector callables must touch an object the caller
+        never holds: that is what makes two overlapping scheduled runs on one
+        shared provider instance safe, each intercepting its own view bound to
+        its own recorder. Rebinding the caller's provider directly could not
+        survive that overlap -- the second wrapper replaced the first, so the
+        first run's later connector calls archived into the SECOND run's raw/
+        directory (or nowhere), its recorder never saw an error, and it went
+        on placing orders having silently stopped recording its true payloads:
+        a persist-before-compute violation that fails OPEN (Codex review:
+        "Archive connector responses for every overlapping run").
+
+        A provider that cannot be copied FAILS THE RUN CLOSED. Falling back to
+        mutating the caller's object would reinstate exactly that fail-open,
+        and an escape hatch that silently restores the hazard is worse than no
+        hatch (Codex review: "Fail closed instead of sharing an uncopyable
+        provider"). ``copy.copy`` succeeds for any ordinary object, including
+        the ``RobinhoodDataProvider``/``FinanceDataProvider`` the live streams
+        inject, so refusing here costs nothing on the real path.
+        """
+        try:
+            copied = copy.copy(inner)
+        except Exception as exc:  # noqa: BLE001 - reported as a blocked run by _run_impl
+            raise RawInputPersistenceError(
+                f"cannot isolate the injected market-data provider "
+                f"{type(inner).__name__} for raw-input recording: {exc}"
+            ) from exc
+        # A successful copy is not automatically a PRIVATE one. ``__copy__`` is
+        # caller-defined and may return ``self`` -- a singleton, a cached
+        # connection wrapper -- in which case the rebinding below lands on the
+        # shared original and every overlapping-run hazard above is back, this
+        # time with no exception to notice it by. Identity is the actual
+        # precondition, so it is what gets checked (Codex review: "Verify that
+        # the provider copy is actually private").
+        if copied is inner:
+            raise RawInputPersistenceError(
+                f"cannot isolate the injected market-data provider "
+                f"{type(inner).__name__} for raw-input recording: its __copy__ "
+                f"returned the same object, so recording would mutate the "
+                f"provider shared with other runs"
+            )
+        # Distinct objects can still SHARE attribute storage -- a ``__copy__``
+        # that hands its own ``__dict__`` to the new instance passes the
+        # identity check above while every rebinding still lands on the
+        # caller's provider, silently restoring the overlapping-run fail-open
+        # (Codex review: "Verify copied providers do not share attribute
+        # storage"). Identity of the object is not the property that matters;
+        # independence of its attributes is, so that is what gets tested --
+        # empirically, by writing a sentinel and checking it did not show
+        # through. Guessing at the mechanism (``__dict__ is __dict__``,
+        # ``__slots__``, a proxying ``__setattr__``) would leave whichever
+        # mechanism went unguessed.
+        for attribute, _kind in cls._CONNECTOR_ATTRIBUTE_KINDS:
+            if not hasattr(inner, attribute):
+                continue
+            before = getattr(inner, attribute)
+            probe = object()
+            try:
+                setattr(copied, attribute, probe)
+                leaked = getattr(inner, attribute, None) is probe
+            finally:
+                # Put the copy back as it was either way: on the good path this
+                # undoes the probe before wrapping, and on the bad path the
+                # attribute just written IS the caller's.
+                setattr(copied, attribute, before)
+            if leaked:
+                raise RawInputPersistenceError(
+                    f"cannot isolate the injected market-data provider "
+                    f"{type(inner).__name__} for raw-input recording: its copy "
+                    f"shares attribute storage with the original, so recording "
+                    f"would mutate the provider shared with other runs"
+                )
+        return copied
 
     def _wrap_raw_connectors(self) -> bool:
         """Intercept Robinhood and Finance connector callables before adapter parsing.
@@ -2525,22 +2623,20 @@ class _PersistingMarketDataProvider:
         watchlist run, and a wrapper left bound to this run's (short-lived)
         ``_RawInputRecorder`` would then archive that later run's responses into this
         run's ``raw/`` directory -- or return ``None`` for a perfectly valid response
-        if that directory has since become unwritable.
+        if that directory has since become unwritable. The copy is taken by
+        :meth:`_private_copy`, which refuses (raising
+        :class:`RawInputPersistenceError`) rather than fall back to the shared
+        instance when the provider cannot be isolated.
         """
         wrapped = False
         copied = False
-        for attribute, kind in (
-            ("_historicals_fn", "historicals"),
-            ("_quotes_fn", "quotes"),
-            ("_bars_fn", "intraday_bars"),
-            ("_previous_close_fn", "prior_close"),
-        ):
+        for attribute, kind in self._CONNECTOR_ATTRIBUTE_KINDS:
             connector = getattr(self._inner, attribute, None)
             if not callable(connector) or getattr(connector, "_raw_recorder", None) is self._recorder:
                 continue
             connector = getattr(connector, "_raw_connector_original", connector)
             if not copied:
-                self._inner = copy.copy(self._inner)
+                self._inner = self._private_copy(self._inner)
                 copied = True
                 # copy.copy() is a SHALLOW copy: it duplicates the instance's
                 # __dict__ but the values inside it -- including a populated
@@ -8261,6 +8357,51 @@ class MorningDCAExecutor(DCAExecutor):
             # the conservative potentially_submitted branch, or flagged
             # credit_already_resolved by an earlier same-stream duplicate --
             # not merely one the loop happened not to reach.
+            if isinstance(outcome, dict) and outcome.get("duplicate_preserved"):
+                # A same-stream top-up duplicate on a SCHEDULED retry: the
+                # broker order this outcome describes is REAL -- an earlier
+                # attempt today placed it -- but that attempt can have died
+                # between the broker call and its settle() in
+                # _process_candidate, leaving this ticker's credit still
+                # pending. This branch used to fall through both durable
+                # writes (it is status="submitted", so the preserve pass
+                # skipped it, and it never reaches the placement path's
+                # settle() call), so the credit that already funded a real
+                # order stayed pending and the 15:30 aggregate pass could buy
+                # it a second time (Codex review: "Settle preserved credit
+                # when recovering a duplicate").
+                #
+                # Keyed on the RECOVERED ORDER'S OWN ID so this settles exactly
+                # once for that physical order, however many times a retry
+                # rediscovers it: settle() records every settled order id on
+                # the ledger and ignores a repeat. "Clearing down to zero is
+                # naturally idempotent" only holds while the balance still
+                # belongs to this order -- if the original attempt's settle()
+                # DID succeed and another stream then added fresh pending
+                # credit for the ticker, an unkeyed second settlement here
+                # would consume that new credit instead, and it never funded
+                # this order (Codex review: "Settle a recovered duplicate only
+                # once"). A duplicate with no id (the legacy boolean
+                # duplicate-check contract normalizes to an empty dict) has
+                # nothing stable to key on, so it keeps the at-least-once
+                # behavior -- still the right call for the case this branch
+                # exists for, a first attempt that died before settling.
+                try:
+                    self.credit_ledger.settle(
+                        ticker,
+                        trading_day.isoformat(),
+                        float(outcome.get("submitted_amount_usd") or 0.0),
+                        final_session=False,
+                        stream=self._idempotency_stream(),
+                        order_id=str(outcome.get("order_id") or "") or None,
+                    )
+                except Exception as exc:  # noqa: BLE001 - never mask a real placed order
+                    _log.warning(
+                        "cumulative credit ledger settlement failed for recovered duplicate %s: %s",
+                        ticker,
+                        exc,
+                    )
+                continue
             if isinstance(outcome, dict) and (
                 outcome.get("status") in ("submitted", "dry_run", "potentially_submitted")
                 or outcome.get("credit_already_resolved")
@@ -8929,7 +9070,26 @@ class MorningDCAExecutor(DCAExecutor):
         if is_scheduled_live:
             raw_dir = self.run_state_dir(now) / "raw"
             raw_recorder = _RawInputRecorder(raw_dir, now.astimezone(EASTERN).date().isoformat())
-            data = _PersistingMarketDataProvider(data, raw_recorder)
+            try:
+                data = _PersistingMarketDataProvider(data, raw_recorder)
+            except RawInputPersistenceError as exc:
+                # The provider could not be isolated for recording (see
+                # _PersistingMarketDataProvider._private_copy), so this run
+                # cannot guarantee its connector payloads reach its OWN
+                # archive. Blocked before evaluate(), so nothing has been
+                # computed and nothing placed -- the same fail-closed shape as
+                # a persistence error, and an operator gets a run_state naming
+                # the provider type instead of a silent gap in the audit trail
+                # (Codex review: "Fail closed instead of sharing an uncopyable
+                # provider").
+                return self._blocked_live_result(
+                    now,
+                    str(exc),
+                    [],
+                    data_source or "unknown",
+                    error_class="missing_or_invalid_raw_inputs",
+                    raw_recorder=raw_recorder,
+                )
             if broker is not None:
                 broker = cast(BrokerAdapter, _PersistingBrokerAdapter(broker, raw_recorder))
         signals = self.evaluate(now, data, manual=manual)

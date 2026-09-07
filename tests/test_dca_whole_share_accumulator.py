@@ -1936,6 +1936,69 @@ def test_reconcile_unresolved_whole_share_claim_settles_a_terminal_filled_order(
     assert ledger.pending_usd("BYDDY") == 0.0
 
 
+@pytest.mark.parametrize("blank_cumulative", [None, "", " "])
+def test_reconcile_still_falls_back_when_the_cumulative_field_is_blank(tmp_path, blank_cumulative):
+    """A broker null/blank ``cumulative_quantity`` is an ABSENCE marker, exactly
+    like a missing key (Codex review: "Treat null recovery quantities as
+    absent"): it says nothing about executed size, so the terminal "filled"
+    match falls through to a USABLE submitted ``quantity`` and settles
+    normally rather than being read as a malformed fill.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0,
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+
+    class _NoCumulativeFieldBroker:
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {
+                "id": "RH-NOCUM-1",
+                "state": "filled",
+                "cumulative_quantity": blank_cumulative,
+                "quantity": "1",
+            }
+
+    reconciled = _reconcile_unresolved_whole_share_claim(
+        ledger, _NoCumulativeFieldBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+    )
+
+    assert reconciled == {"order_id": "RH-NOCUM-1", "shares_purchased": 1, "order_notional_usd": 10.0}
+    assert ledger.shares_purchased_total("BYDDY") == 1
+
+
+@pytest.mark.parametrize("blank_quantity", [None, "", " "])
+def test_reconcile_uses_the_claim_size_when_both_size_fields_are_blank(tmp_path, blank_quantity):
+    """The last resort: a terminal "filled" response whose quantity fields are
+    null or blank, just as when they are missing, settles on the claim's own
+    planned size -- the documented answer for a response that said nothing
+    about size at all.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0,
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+
+    class _SizelessBroker:
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {
+                "id": "RH-NOSIZE-1",
+                "state": "filled",
+                "cumulative_quantity": blank_quantity,
+                "quantity": blank_quantity,
+            }
+
+    reconciled = _reconcile_unresolved_whole_share_claim(
+        ledger, _SizelessBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+    )
+
+    assert reconciled == {"order_id": "RH-NOSIZE-1", "shares_purchased": 1, "order_notional_usd": 10.0}
+    assert ledger.shares_purchased_total("BYDDY") == 1
+
+
 def test_reconcile_unresolved_whole_share_claim_settles_a_partial_fill_before_cancellation(tmp_path):
     """Codex review ("Reconcile partial fills before releasing canceled
     claims"): the live-only ref-id lookup excludes a genuinely TERMINAL
