@@ -1145,7 +1145,7 @@ def _run(harness: WalkForwardHarness, run_dir: Path, *, interrupt_flag: _Interru
     # write_report() for a completed run.
     status = harness.run(release_lock=False)
     try:
-        if status in ("interrupted", "budget_tripped"):
+        if status in {"interrupted", "budget_tripped"}:
             # Both are CLEAN bounded stops with a valid checkpoint -- the
             # circuit-breaker trip already printed its banner.
             print(f"{status}: checkpoint saved under {run_dir}. Resume with --resume {run_dir}")
