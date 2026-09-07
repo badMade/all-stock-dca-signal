@@ -23,6 +23,36 @@ def test_resolve_ips():
         assert ipaddress.ip_address("93.184.216.35") in ips
 
 
+
+def test_resolve_ips_empty():
+    with patch("socket.getaddrinfo") as mock_getaddrinfo:
+        mock_getaddrinfo.return_value = []
+        ips = dca_net_utils.resolve_ips("example.com")
+        assert ips == set()
+
+def test_resolve_ips_oserror():
+    with patch("socket.getaddrinfo", side_effect=OSError("resolution failed")):
+        with pytest.raises(OSError, match="resolution failed"):
+            dca_net_utils.resolve_ips("example.com")
+
+def test_resolve_ips_ipv6():
+    with patch("socket.getaddrinfo") as mock_getaddrinfo:
+        mock_getaddrinfo.return_value = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2606:2800:220:1:248:1893:25c8:1946", 80, 0, 0)),
+        ]
+        ips = dca_net_utils.resolve_ips("example.com")
+        assert ipaddress.ip_address("2606:2800:220:1:248:1893:25c8:1946") in ips
+
+def test_resolve_ips_duplicate_ips():
+    with patch("socket.getaddrinfo") as mock_getaddrinfo:
+        mock_getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 80)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 80)),
+        ]
+        ips = dca_net_utils.resolve_ips("example.com")
+        assert len(ips) == 1
+        assert ipaddress.ip_address("93.184.216.34") in ips
+
 def test_proxy_configured_for_missing_host():
     # Line 78: missing host check in proxy_configured_for
     assert dca_net_utils.proxy_configured_for("file:///path/to/something") is False
