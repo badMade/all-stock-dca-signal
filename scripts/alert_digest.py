@@ -3411,7 +3411,7 @@ def _read_calendar_config(name: str) -> Dict[str, Any]:
     this tool exists to surface going unseen.
     """
     try:
-        decoded = json.loads((get_config_dir() / name).read_text(encoding="utf-8"))
+        decoded = json.loads((get_config_dir() / name).read_bytes())
     except (OSError, ValueError):
         return {}
     # Syntactically valid JSON whose top level isn't an object -- an array,
@@ -3683,7 +3683,7 @@ def load_ledger(path: Path) -> Dict[str, Any]:
     if not path.is_file():
         return {"schema_version": LEDGER_SCHEMA_VERSION, "seen": []}
     try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
+        loaded = json.loads(path.read_bytes())
     except (json.JSONDecodeError, OSError, UnicodeError):
         # UnicodeError covers a ledger corrupted with invalid UTF-8, which
         # read_text raises before json ever sees it. Without it the scheduled
@@ -4738,7 +4738,7 @@ def collect_records(
             raise ValueError("stdin was empty; expected a JSON export (use '{}' for no drafts)")
         payloads.append(json.loads(raw))
     if drafts_path is not None:
-        payloads.append(json.loads(drafts_path.read_text(encoding="utf-8")))
+        payloads.append(json.loads(drafts_path.read_bytes()))
 
     draft_records: List[AlertRecord] = []
     for payload in payloads:
@@ -4775,7 +4775,7 @@ def collect_records(
 
     message_records: List[AlertRecord] = []
     if messages_path is not None:
-        sent_payload = json.loads(messages_path.read_text(encoding="utf-8"))
+        sent_payload = json.loads(messages_path.read_bytes())
         if not isinstance(sent_payload, Mapping):
             raise ValueError("message export must be a JSON object with a 'messages' array")
         offered_sent = sent_payload.get("messages") or []

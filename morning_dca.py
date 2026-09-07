@@ -2492,7 +2492,7 @@ class _RawInputRecorder:
                     _raw_json_safe(payload),
                     raw_dir=self.raw_dir,
                 )
-            persisted = json.loads(Path(path).read_text(encoding="utf-8"))
+            persisted = json.loads(Path(path).read_bytes())
             # save_raw_input() may wrap payloads in one or more {"data": ...} envelopes.
             # Unwrap the normalize_connector_payload envelope (normalized true/false) and
             # any nested carrier {"data": {...}} layers so computation sees the archived shape.

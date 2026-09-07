@@ -240,7 +240,7 @@ def _load_legacy_symbol_corrections(repo_root: Path) -> dict[str, str]:
     """
     path = repo_root / "config" / "tickers.json"
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_bytes())
         # Syntactically valid JSON with a non-object top level (null, a
         # bare list, ...) makes .get() raise AttributeError, OUTSIDE this
         # except clause, aborting the whole CLI with a traceback before any
@@ -276,7 +276,7 @@ def _load_current_universe(repo_root: Path) -> tuple[frozenset[str], frozenset[s
     """
     path = repo_root / "config" / "tickers.json"
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_bytes())
         # Same non-object-top-level risk as _load_legacy_symbol_corrections
         # above (Codex review on PR #403: "Validate the ticker-config root
         # before reading mappings") -- raise here so the except clause

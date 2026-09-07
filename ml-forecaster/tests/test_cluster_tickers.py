@@ -245,7 +245,7 @@ def test_cli_reports_a_zero_row_ticker_as_dropped(tmp_path, capsys):
         "--all-tickers-in-archive", "--clusters", "2",
     ])
     assert code == 0
-    document = json.loads(out.read_text(encoding="utf-8"))
+    document = json.loads(out.read_bytes())
     assert "STUB" in document["dropped_tickers"]
     captured = capsys.readouterr()
     assert "dropped (too little history)" in captured.out
@@ -342,7 +342,7 @@ def test_cli_writes_a_grouping_document(two_regime_archive, tmp_path, capsys):
         "--all-tickers-in-archive",
     ])
     assert code == 0
-    document = json.loads(out.read_text(encoding="utf-8"))
+    document = json.loads(out.read_bytes())
     assert document["source"] == "ml-forecaster"
     assert len(document["clusters"]) == 2
     assert "wrote" in capsys.readouterr().out
@@ -466,7 +466,7 @@ def test_cli_normalizes_the_case_of_an_explicit_ticker_list(two_regime_archive, 
         "--tickers", *spelling, "--clusters", "2",
     ])
     assert code == 0
-    document = json.loads(out.read_text(encoding="utf-8"))
+    document = json.loads(out.read_bytes())
     assert set(document["ticker_order"]) == {"CALMA", "CALMB", "WILDA", "WILDB"}
 
 
@@ -492,5 +492,5 @@ def test_cli_honours_an_explicit_ticker_list(two_regime_archive, tmp_path):
         "--tickers", "CALMA", "CALMB", "WILDA", "WILDB", "--clusters", "2",
     ])
     assert code == 0
-    document = json.loads(out.read_text(encoding="utf-8"))
+    document = json.loads(out.read_bytes())
     assert set(document["ticker_order"]) == {"CALMA", "CALMB", "WILDA", "WILDB"}

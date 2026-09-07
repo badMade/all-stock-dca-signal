@@ -427,7 +427,7 @@ def test_calibrated_candidate_fields_match_the_downstream_validator():
     import dca_runner
     from scripts.stream_candidates import _calibration_fields
 
-    sizing = json.loads((REAL_CONFIG_DIR / "per_ticker_sizing.json").read_text(encoding="utf-8"))
+    sizing = json.loads((REAL_CONFIG_DIR / "per_ticker_sizing.json").read_bytes())
     ticker = next(
         t
         for t, model in sizing["tickers"].items()
@@ -456,7 +456,7 @@ def test_calibration_fields_are_withheld_when_the_base_does_not_match():
     publishing none, so the row is treated as uncalibrated instead."""
     from scripts.stream_candidates import _calibration_fields
 
-    sizing = json.loads((REAL_CONFIG_DIR / "per_ticker_sizing.json").read_text(encoding="utf-8"))
+    sizing = json.loads((REAL_CONFIG_DIR / "per_ticker_sizing.json").read_bytes())
     ticker = next(t for t in sizing["tickers"] if t not in sizing.get("fallback_tickers", ()))
     multiplier = float(sizing["tickers"][ticker]["tiers"][0]["multiplier"])
     assert _calibration_fields(ticker, multiplier, 999.0) == {}
@@ -1172,7 +1172,7 @@ def test_cli_rejects_a_half_specified_sizing_ladder(tmp_path):
     """`base amount x ladder multiplier` has two halves. A ladder supplying only
     one takes the other from defaults -- the same wrong-policy sizing reached by
     a partial edit rather than an emptied file."""
-    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_text(encoding="utf-8"))
+    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_bytes())
     real["sizing_ladder"] = {"base_amount_usd": 2.0}
     result = _stream_config_cli_text(tmp_path, json.dumps(real))
     assert result.returncode != 0
@@ -1183,7 +1183,7 @@ def test_cli_rejects_a_budget_ledger_with_no_caps(tmp_path):
     """The exact key this stream's loader reads, derived from the stream name --
     every stream spells its caps `<stream>_daily_cap_usd`, so this needs no
     per-stream table and cannot go stale for a stream it has not learned about."""
-    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_text(encoding="utf-8"))
+    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_bytes())
     real["budget_ledger"] = {"namespace": "midday"}
     result = _stream_config_cli_text(tmp_path, json.dumps(real))
     assert result.returncode != 0
@@ -1200,7 +1200,7 @@ def test_cli_rejects_another_streams_cap_keys(tmp_path):
     `stream` identity check does not cover it: the file still declares "midday"
     (Codex review: "Honor each stream's configured cap keys"; reproduced before
     fixing)."""
-    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_text(encoding="utf-8"))
+    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_bytes())
     real["budget_ledger"] = {
         "namespace": "midday",
         "market_open_daily_cap_usd": 180.0,
@@ -1216,7 +1216,7 @@ def test_cli_rejects_another_streams_cap_keys(tmp_path):
 
 def test_cli_rejects_a_null_cap_value(tmp_path):
     """Present-with-a-null is the same silent fallback as absent."""
-    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_text(encoding="utf-8"))
+    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_bytes())
     real["budget_ledger"]["midday_weekly_cap_usd"] = None
     result = _stream_config_cli_text(tmp_path, json.dumps(real))
     assert result.returncode != 0
@@ -1384,7 +1384,7 @@ def test_cli_rejects_malformed_policy_numbers(tmp_path, path, value, expected):
     published at half size with nothing reporting the substitution (Codex review:
     "Reject boolean values in the stream sizing ladder"; reproduced loading $1.00
     where the checked-in value is $2.00)."""
-    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_text(encoding="utf-8"))
+    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_bytes())
     cursor = real
     for key in path[:-1]:
         cursor = cursor[key]
@@ -1408,7 +1408,7 @@ def test_cli_rejects_malformed_policy_numbers(tmp_path, path, value, expected):
 def test_cli_rejects_a_malformed_ladder_tier(tmp_path, tiers, expected):
     """The tiers decide the multiplier half of `base x multiplier`, so a
     malformed rung substitutes policy exactly like a malformed base does."""
-    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_text(encoding="utf-8"))
+    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_bytes())
     real["sizing_ladder"]["tiers"] = tiers
     result = _stream_config_cli_text(tmp_path, json.dumps(real))
     assert result.returncode != 0
@@ -1419,7 +1419,7 @@ def test_a_zero_minimum_drop_floor_is_still_accepted(tmp_path):
     """The guard against over-tightening: `no_buy_below_pct: 0` is a meaningful
     policy (buy on any drop), unlike a zero base amount, which is an order for
     nothing. Only the latter is refused."""
-    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_text(encoding="utf-8"))
+    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_bytes())
     real["sizing_ladder"]["no_buy_below_pct"] = 0
     result = _stream_config_cli_text(tmp_path, json.dumps(real))
     assert result.returncode == 0, result.stderr
@@ -1441,7 +1441,7 @@ def test_cli_rejects_a_malformed_trend_bar_minimum(tmp_path, value):
     The earlier revision scoped this validator to "the MONEY, not the whole
     schema". That was the wrong line: this field gates placement as directly as
     the ladder does, it just carries no dollar sign."""
-    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_text(encoding="utf-8"))
+    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_bytes())
     if value is ...:
         del real["trend_min_bars"]
     else:
@@ -1453,7 +1453,7 @@ def test_cli_rejects_a_malformed_trend_bar_minimum(tmp_path, value):
 
 def test_the_checked_in_trend_bar_minimum_is_accepted(tmp_path):
     """The control: 6 is a plain positive int and must pass untouched."""
-    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_text(encoding="utf-8"))
+    real = json.loads((REAL_CONFIG_DIR / "midday_dca.json").read_bytes())
     assert real["trend_min_bars"] == 6
     result = _stream_config_cli_text(tmp_path, json.dumps(real))
     assert result.returncode == 0, result.stderr

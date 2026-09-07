@@ -592,12 +592,19 @@ class TestResumeCli:
         assert run_walkforward.main(["--resume", str(run_dir)]) == 0
 
     def test_resume_metadata_reads_use_explicit_utf8(self, synthetic_history_dir, tmp_path, monkeypatch):
-        # json.loads(path.read_bytes()) without an explicit encoding defers
+        # json.loads(path.read_text()) without an explicit encoding defers
         # to the platform's preferred encoding, which is not always UTF-8;
         # a non-ASCII history path stored in run_meta.json could then fail
         # decoding or mojibake under a non-UTF-8 locale, even though
         # _write_run_meta() explicitly wrote it as UTF-8 (Codex review
-        # regression: "Decode persisted run metadata as UTF-8").
+        # regression: "Decode persisted run metadata as UTF-8"). These
+        # reads now go through Path.read_bytes() + json.loads(bytes)
+        # (perf: skip the redundant text decode) -- json.loads decodes
+        # raw bytes per RFC 8259's own UTF-8/16/32 auto-detection, never
+        # the platform locale, so the mojibake risk is gone by
+        # construction rather than by an explicit encoding kwarg. Assert
+        # the spied files go through read_bytes and never a bare,
+        # locale-dependent read_text().
         import pathlib
 
         run_dir = tmp_path / "run"
@@ -608,18 +615,25 @@ class TestResumeCli:
         ]
         assert run_walkforward.main(original) == 3
 
-        seen_encodings = []
+        seen_reads = []
         original_read_text = pathlib.Path.read_text
+        original_read_bytes = pathlib.Path.read_bytes
 
         def spy_read_text(self, *args, **kwargs):
             if self.name in ("run_meta.json", "harness_state.json"):
-                seen_encodings.append(kwargs.get("encoding"))
+                seen_reads.append("read_text")
             return original_read_text(self, *args, **kwargs)
 
+        def spy_read_bytes(self, *args, **kwargs):
+            if self.name in ("run_meta.json", "harness_state.json"):
+                seen_reads.append("read_bytes")
+            return original_read_bytes(self, *args, **kwargs)
+
         monkeypatch.setattr(pathlib.Path, "read_text", spy_read_text)
+        monkeypatch.setattr(pathlib.Path, "read_bytes", spy_read_bytes)
         assert run_walkforward.main(["--resume", str(run_dir)]) == 0
-        assert seen_encodings  # sanity: the spied files were actually read
-        assert all(encoding == "utf-8" for encoding in seen_encodings)
+        assert seen_reads  # sanity: the spied files were actually read
+        assert all(kind == "read_bytes" for kind in seen_reads)
 
     def test_resume_without_run_meta_is_refused(self, synthetic_history_dir, tmp_path, capsys):
         # A resume without run_meta.json has no universe/model-hyper

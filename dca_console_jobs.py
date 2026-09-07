@@ -59,7 +59,7 @@ class JobManager:
             try:
                 if not path.resolve().is_relative_to(self.root.resolve()) or path.stat().st_size > 100_000:
                     continue
-                item = json.loads(path.read_text())
+                item = json.loads(path.read_bytes())
                 if (not isinstance(item, dict) or not isinstance(item.get("id"), str)
                         or re.fullmatch(r"[a-zA-Z0-9-]{1,100}", item["id"]) is None):
                     continue

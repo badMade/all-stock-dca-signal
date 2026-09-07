@@ -1024,7 +1024,7 @@ def test_generate_scheduled_reports_raw_fallback_survives_explicit_unicode_decod
 
     paths = generate_scheduled_reports(day, [], base / "reports", base=base)
 
-    summary = json.loads(Path(paths["latest_run_summary"]).read_text())
+    summary = json.loads(Path(paths["latest_run_summary"]).read_bytes())
     assert summary["coverage"]["fills"] == 0
 
 def test_generate_scheduled_reports_requires_scheduled_state(tmp_path=None):

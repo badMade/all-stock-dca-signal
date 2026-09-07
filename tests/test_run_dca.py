@@ -5668,7 +5668,7 @@ def test_build_frozen_providers_persists_live_corporate_action_evidence(tmp_path
     as_of = date(2026, 8, 18)
     assert cast(Any, finance).get_corporate_action_factor("AAPL", since, as_of) == (2.0, as_of)
 
-    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_text(encoding="utf-8"))
+    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_bytes())
     assert persisted["ticker"] == "AAPL"
     assert persisted["since"] == since.isoformat()
     assert persisted["as_of"] == as_of.isoformat()
@@ -5721,7 +5721,7 @@ def test_build_frozen_providers_serializes_concurrent_action_retries(tmp_path):
     assert not first.is_alive() and not second.is_alive()
     assert calls == ["AAPL"]
     assert results == [(2.0, as_of), (2.0, as_of)]
-    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_text(encoding="utf-8"))
+    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_bytes())
     assert persisted["factor"] == 2.0
 
 
@@ -5816,7 +5816,7 @@ def test_build_frozen_providers_replays_persisted_corporate_action_evidence(tmp_
     assert cast(Any, finance).get_corporate_action_factor("AAPL", other_since, as_of) == (999.0, as_of)
     assert live_calls == [("AAPL", other_since, as_of)]
     assert cast(Any, finance).get_corporate_action_factor.served_from_cache is False
-    original = _json.loads((raw_dir / "corporate_action_AAPL.json").read_text(encoding="utf-8"))
+    original = _json.loads((raw_dir / "corporate_action_AAPL.json").read_bytes())
     assert original["factor"] == 3.0
     distinct_query = _json.loads(
         (raw_dir / f"corporate_action_AAPL_{other_since.isoformat()}_{as_of.isoformat()}.json").read_text(
@@ -5964,7 +5964,7 @@ def test_build_frozen_providers_rejects_a_malformed_fresh_corporate_action(tmp_p
         LiveFinance(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD), raw_dir,
     )
     assert cast(Any, finance).get_corporate_action_factor("AAPL", since, as_of) is None
-    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_text(encoding="utf-8"))
+    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_bytes())
     assert persisted["factor"] is None
     assert persisted["cursor"] is None
 
@@ -6089,7 +6089,7 @@ def test_frozen_provider_snapshots_archive_fallback_over_null_live_evidence(tmp_
         "AAPL", since, as_of, (0.5, as_of)
     )
 
-    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_text(encoding="utf-8"))
+    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_bytes())
     assert persisted["factor"] == pytest.approx(0.5)
     assert persisted["cursor"] == as_of.isoformat()
     assert persisted["source"] == "ticker_history_archive"

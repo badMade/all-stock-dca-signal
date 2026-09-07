@@ -151,7 +151,7 @@ def test_guarded_publish_publishes_when_strictly_better(tmp_path):
     )
 
     assert result["status"] == "published"
-    on_disk = json.loads(config_path.read_text(encoding="utf-8"))
+    on_disk = json.loads(config_path.read_bytes())
     assert on_disk["status"] == "active"
     assert on_disk["model_version"] == "2026-08-08-ridge-v1"
     assert on_disk["generated_at"].startswith("2026-08-08")
@@ -500,7 +500,7 @@ def test_published_output_validates_against_the_repo_schema(tmp_path):
     assert result["status"] == "published"
 
     schema = json.loads((publish.REPO_ROOT / "schemas" / "ml_sizing_adjustment.schema.json").read_bytes())
-    document = json.loads(config_path.read_text(encoding="utf-8"))
+    document = json.loads(config_path.read_bytes())
     jsonschema.validate(document, schema)
 
 
@@ -520,7 +520,7 @@ def test_guarded_publish_persists_the_horizon_used_to_train_the_model(tmp_path):
     )
 
     assert result["status"] == "published"
-    on_disk = json.loads(config_path.read_text(encoding="utf-8"))
+    on_disk = json.loads(config_path.read_bytes())
     assert on_disk["horizon_trading_days"] == 1
 
 
@@ -544,7 +544,7 @@ def test_guarded_publish_does_not_compare_mae_across_different_horizons(tmp_path
     )
 
     assert result["status"] == "published"
-    on_disk = json.loads(config_path.read_text(encoding="utf-8"))
+    on_disk = json.loads(config_path.read_bytes())
     assert on_disk["horizon_trading_days"] == 1
 
 
@@ -600,7 +600,7 @@ def test_guarded_publish_ignores_a_universe_mismatch_as_no_floor(tmp_path):
     )
 
     assert result["status"] == "published"
-    on_disk = json.loads(config_path.read_text(encoding="utf-8"))
+    on_disk = json.loads(config_path.read_bytes())
     assert on_disk["eval_metric"]["universe"] == ["AAPL"]
 
 
@@ -1294,7 +1294,7 @@ def test_guarded_publish_rechecks_incumbent_after_a_better_concurrent_publish(tm
     assert not worse.is_alive()
     assert results["better"]["status"] == "published"
     assert results["worse"]["status"] == "blocked_regression"
-    published = json.loads(config_path.read_text(encoding="utf-8"))
+    published = json.loads(config_path.read_bytes())
     assert published["model_version"] == "better"
     assert published["eval_metric"]["mae"] == pytest.approx(1.0)
 
@@ -1315,7 +1315,7 @@ def test_guarded_publish_persists_the_model_artifact_path(tmp_path):
     )
 
     assert result["status"] == "published"
-    on_disk = json.loads(config_path.read_text(encoding="utf-8"))
+    on_disk = json.loads(config_path.read_bytes())
     assert on_disk["model_artifact_path"] == "/artifacts/models/2026-08-08/model.json"
 
 

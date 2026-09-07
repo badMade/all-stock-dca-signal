@@ -120,7 +120,7 @@ def task(result, task_id, clock=None):
 
 def test_manifest_includes_all_tasks_and_all_intraday_slots(tmp_path):
     result = snapshot(tmp_path)
-    configured = json.loads((CONFIG / "scheduled_tasks.json").read_text())["tasks"]
+    configured = json.loads((CONFIG / "scheduled_tasks.json").read_bytes())["tasks"]
     assert {row["id"] for row in result["schedule"]} == {row["id"] for row in configured}
     assert [row["time"] for row in result["schedule"] if row["id"] == "7be82b97"] == ["11:30", "13:30", "14:30"]
     assert task(result, "claude-tickers-daily-update")["status"] == "not_registered"

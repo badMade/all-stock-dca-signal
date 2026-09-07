@@ -209,7 +209,7 @@ def test_collect_purchase_records_skips_dry_run(tmp_path):
             "ticker,amount_usd,state,average_fill_price,quantity\nAAPL,5.00,filled,200.00,0.025\n"
         ),
     )
-    state = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
+    state = json.loads((run_dir / "run_state.json").read_bytes())
     state["dry_run"] = True
     (run_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
 
@@ -2584,7 +2584,7 @@ def test_write_purchase_history_writes_csv_and_json(tmp_path):
     csv_text = csv_path.read_text(encoding="utf-8")
     assert "MSFT" in csv_text
     assert "order-9" in csv_text
-    rollup_data = json.loads(json_path.read_text(encoding="utf-8"))
+    rollup_data = json.loads(json_path.read_bytes())
     assert rollup_data["MSFT"]["buy_count"] == 1
 
 

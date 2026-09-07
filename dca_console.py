@@ -135,7 +135,7 @@ class ConsoleApp:
             return
         pointer = self.settings.output / "demo" / "octopus-current.json"
         try:
-            value = json.loads(pointer.read_text())
+            value = json.loads(pointer.read_bytes())
             path = Path(value["path"]).resolve()
             if path.is_relative_to((self.settings.output / "demo" / "octopus").resolve()) and path.is_dir():
                 self.octopus_run = path
@@ -288,7 +288,7 @@ class ConsoleApp:
             # A synthetic neural smoke run stops at a fixed historical cursor.
             # The full update is still available for genuine local research runs.
             if self.settings.mode == "demo" and self.octopus_run:
-                meta = json.loads((self.octopus_run / "run_meta.json").read_text())
+                meta = json.loads((self.octopus_run / "run_meta.json").read_bytes())
                 if meta.get("model_selection") == "octopus":
                     argv.extend(["--now", "2019-09-14"])
             results.append(self._command(argv, log, research=True, timeout=1800))

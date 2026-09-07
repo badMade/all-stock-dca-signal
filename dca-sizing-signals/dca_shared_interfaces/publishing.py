@@ -114,7 +114,7 @@ class SuggestionPublisher(ABC):
         if not self._output_path.exists():
             return None
         try:
-            data = json.loads(self._output_path.read_text())
+            data = json.loads(self._output_path.read_bytes())
             return data.get("eval_metric", {}).get("mae")
         except (json.JSONDecodeError, OSError):
             return None  # an unreadable prior file imposes no floor, same as today's publish.py

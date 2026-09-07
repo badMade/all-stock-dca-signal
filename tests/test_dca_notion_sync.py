@@ -132,7 +132,7 @@ def test_write_compact_sync_string_path(tmp_path):
     assert "## Latest Run" in md_path.read_text()
 
     # Verify the JSON payload content
-    payload_data = json.loads(payload_path.read_text())
+    payload_data = json.loads(payload_path.read_bytes())
     assert payload_data["run_id"] == "r-456"
     assert payload_data["trading_day"] == "2023-01-02"
     assert payload_data["metrics"]["coverage"]["buy_candidates"] == 3

@@ -894,7 +894,7 @@ def provider_loader_from_run_dir(
     results: List[Dict[str, Any]] = []
     for path in sorted(raw_dir.glob("historicals_batch*.json")):
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_bytes())
         except (OSError, ValueError):
             continue
         payload = _unwrap_connector_envelope(payload)
@@ -1921,7 +1921,7 @@ def write_market_graph(
 
 def load_groups_file(path: Path | str) -> Dict[str, Any]:
     """Read a grouping export (or flat label mapping) written by another tool."""
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    data = json.loads(Path(path).read_bytes())
     if not isinstance(data, dict):
         raise ValueError(f"grouping file must contain a JSON object: {path}")
     return data
@@ -1967,7 +1967,7 @@ def active_tickers_from_config() -> List[str]:
     from dca_config import get_config_dir
 
     path = Path(get_config_dir()) / "tickers.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(path.read_bytes())
     # Structure is validated, not assumed, and every failure is a ValueError so the
     # CLIs' (OSError, ValueError) boundary actually catches it. Valid JSON is not a
     # valid CONFIG: a bare `[]` makes `.get` an AttributeError and `{"excluded": null}`

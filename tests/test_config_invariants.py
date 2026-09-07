@@ -963,7 +963,7 @@ def test_every_loader_refuses_a_budgets_file_that_omits_the_breaker(tmp_path):
     cfg_dir.mkdir()
     for src in CONFIG_DIR.glob("*.json"):
         shutil.copy(src, cfg_dir / src.name)
-    budgets = json.loads((cfg_dir / "budgets.json").read_text(encoding="utf-8"))
+    budgets = json.loads((cfg_dir / "budgets.json").read_bytes())
     del budgets["circuit_breakers"]["max_consecutive_placement_failures"]
     (cfg_dir / "budgets.json").write_text(json.dumps(budgets), encoding="utf-8")
 

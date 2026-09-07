@@ -499,7 +499,7 @@ def test_reclaim_fences_owner_when_both_attempts_have_the_same_recorded_at(tmp_p
     # Force the lease to appear stale while retaining the same logical time
     # that both scheduled attempts will present.
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state = json.loads(state_path.read_bytes())
     state["recorded_idempotency_keys"]["2026-08-16:slot-1"]["claimed_at"] = "2026-08-16T15:20:00-04:00"
     state_path.write_text(json.dumps(state), encoding="utf-8")
 
@@ -803,7 +803,7 @@ def test_a_pre_upgrade_ledger_entry_still_redispatches(tmp_path):
     )
     # Rewrite the persisted entry into its pre-upgrade shape.
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
     del entry["restored_credit_usd"]
     state_path.write_text(json.dumps(state, indent=2))
@@ -833,7 +833,7 @@ def test_pre_restored_credit_entry_starts_aging_before_later_withdrawals(tmp_pat
         claim_token=first.claim_token,
     )
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:a"]
     del entry["restored_credit_usd"]
     del entry["restored_credit_as_of_withdrawn_usd"]
@@ -842,7 +842,7 @@ def test_pre_restored_credit_entry_starts_aging_before_later_withdrawals(tmp_pat
     ledger.record_contribution(
         "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="b", recorded_at="2026-08-16T15:31:00-04:00"
     )
-    migrated = json.loads(state_path.read_text())["recorded_idempotency_keys"]["2026-08-16:a"]
+    migrated = json.loads(state_path.read_bytes())["recorded_idempotency_keys"]["2026-08-16:a"]
     assert migrated["restored_credit_usd"] == 10.0
     assert migrated["restored_credit_as_of_withdrawn_usd"] == 10.0
 
@@ -883,7 +883,7 @@ def test_a_pre_upgrade_entry_still_may_not_spend_an_unrelated_contribution(tmp_p
 
     # Rewrite the ledger as a build predating restored_credit_usd left it.
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     del state["recorded_idempotency_keys"]["2026-08-16:slot-1"]["restored_credit_usd"]
     state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
 
@@ -912,7 +912,7 @@ def test_a_zero_restored_credit_entry_is_honored_as_a_real_cap(tmp_path):
     """
     ledger = _preserved_fire_with_unrelated_pending(tmp_path)
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     state["recorded_idempotency_keys"]["2026-08-16:slot-1"]["restored_credit_usd"] = 0.0
     state_path.write_text(json.dumps(state, indent=2))
 
@@ -959,7 +959,7 @@ def test_a_zero_share_reclaim_keeps_the_claim_redispatchable(tmp_path):
     assert reclaimed.shares_to_buy == 0
     # The reservation is back in the pool, in full.
     assert ledger.pending_usd("BYDDY") == 10.0
-    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())[
+    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())[
         "recorded_idempotency_keys"
     ]["2026-08-16:slot-1"]
     assert entry["resolved"] is True
@@ -1062,7 +1062,7 @@ def test_a_zero_share_reclaim_writes_off_a_remainder_another_claim_already_spent
     assert reclaimed.shares_to_buy == 0
     assert ledger.pending_usd("XYZ") == 10.0  # only A's own reservation returns
 
-    entry = json.loads((tmp_path / "XYZ" / "ledger.json").read_text())[
+    entry = json.loads((tmp_path / "XYZ" / "ledger.json").read_bytes())[
         "recorded_idempotency_keys"
     ]["2026-08-16:claim-a"]
     assert entry["restored_credit_usd"] == 10.0, (
@@ -1130,7 +1130,7 @@ def test_an_upward_reprice_draw_is_capped_at_the_surviving_claim_remainder(tmp_p
         "C's untouched $2, not left stranded"
     )
 
-    entry = json.loads((tmp_path / "XYZ" / "ledger.json").read_text())[
+    entry = json.loads((tmp_path / "XYZ" / "ledger.json").read_bytes())[
         "recorded_idempotency_keys"
     ]["2026-08-16:claim-a"]
     assert entry["order_notional_usd"] == 0.0, "A's reservation was released, not re-fired"
@@ -1237,7 +1237,7 @@ def test_a_positive_reprice_writes_off_a_remainder_another_claim_already_spent(t
     assert reclaimed.order_notional_usd == 8.0
     assert ledger.pending_usd("XYZ") == 2.0  # only A's own $2 release returns
 
-    entry = json.loads((tmp_path / "XYZ" / "ledger.json").read_text())[
+    entry = json.loads((tmp_path / "XYZ" / "ledger.json").read_bytes())[
         "recorded_idempotency_keys"
     ]["2026-08-16:claim-a"]
     assert entry["claim_credit_remainder_usd"] == 2.0, (
@@ -1354,7 +1354,7 @@ def test_an_upward_reprice_records_its_extra_draw_on_the_pool(tmp_path):
     ledger.record_contribution(
         "BYDDY", "2026-08-16", 0.0, 14.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
     )
-    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())
     assert state["withdrawn_usd_total"] == 14.0, (
         "the $10 original reservation plus the $4 the upward reprice drew"
     )
@@ -2748,7 +2748,7 @@ def test_a_zero_share_reclaim_registers_its_credit_in_the_tie_batch_only_once(tm
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     assert state["credit_tie_batch_width_usd"] == 10.0, (
         "the reclaimed $10 must widen the tie batch by $10 exactly once, "
         "not $20 from being registered under both field names"
@@ -2785,7 +2785,7 @@ def test_repeated_same_price_reclaims_do_not_re_register_an_unchanged_remainder(
 
     assert ledger.pending_usd("BYDDY") == 4.0
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     assert state["credit_tie_batch_width_usd"] == 4.0, (
         "two same-price reclaims of the same unresolved claim must not "
         "widen the tie batch beyond the claim's own unchanged $4 remainder"
@@ -2824,7 +2824,7 @@ def test_preserving_a_fired_claims_remainder_registers_its_credit_in_the_tie_bat
     assert ledger.pending_usd("BYDDY") == 14.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     assert state["credit_tie_batch_width_usd"] == 14.0, (
         "the preserved claim's credit must widen the tie batch by $14 exactly "
         "once, not $18 from the $4 remainder being registered twice"
@@ -3206,7 +3206,7 @@ def test_settle_marks_placed_true_for_a_recovered_positive_fill(tmp_path):
     # leaves it) to reproduce a process that died before the "placed"
     # write landed.
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
     assert entry["placed"] is True
     entry["placed"] = False
@@ -3979,7 +3979,7 @@ def test_a_null_restored_credit_snapshot_is_written_off_not_unaged(tmp_path):
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
     assert entry["restored_credit_usd"] == 10.0
     entry["restored_credit_as_of_withdrawn_usd"] = None
@@ -4039,7 +4039,7 @@ def test_a_zero_share_reprice_records_the_credit_it_released(tmp_path):
     assert reclaim.shares_to_buy == 0
     assert ledger.pending_usd("BYDDY") == 10.0
 
-    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())[
+    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())[
         "recorded_idempotency_keys"
     ]["2026-08-16:A"]
     assert entry["resolved"] is True
@@ -4094,7 +4094,7 @@ def test_a_reclaim_keeps_the_remainder_aged_against_an_intervening_withdrawal(tm
         recorded_at="2026-08-16T15:41:00-04:00",
     )
     assert (reclaim.shares_to_buy, reclaim.order_notional_usd) == (2, 16.0)
-    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())[
+    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())[
         "recorded_idempotency_keys"
     ]["2026-08-16:A"]
     assert entry["claim_credit_remainder_usd"] == 0.0, (
@@ -4113,7 +4113,7 @@ def test_a_reclaim_keeps_the_remainder_aged_against_an_intervening_withdrawal(tm
         recorded_at="2026-08-16T15:43:00-04:00", claim_token=reclaim.claim_token,
     )
     assert ledger.pending_usd("BYDDY") == 20.0
-    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())[
+    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())[
         "recorded_idempotency_keys"
     ]["2026-08-16:A"]
     assert entry["restored_credit_usd"] == 16.0, (
@@ -4159,7 +4159,7 @@ def test_a_non_finite_restored_credit_cannot_redispatch_the_whole_pool(tmp_path)
     assert ledger.pending_usd("BYDDY") == 25.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
     entry["restored_credit_usd"] = "NaN"
     state_path.write_text(json.dumps(state, indent=2))
@@ -4191,7 +4191,7 @@ def test_an_unusable_withdrawal_counter_does_not_abort_the_ticker(tmp_path):
         recorded_at="2026-08-16T15:30:00-04:00",
     )
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     state["withdrawn_usd_total"] = "bad"
     state_path.write_text(json.dumps(state, indent=2))
 
@@ -4205,7 +4205,7 @@ def test_an_unusable_withdrawal_counter_does_not_abort_the_ticker(tmp_path):
 
     # Normalized on the way in, so the counter is a usable number again and
     # this fire's own withdrawal was recorded against it.
-    persisted = json.loads(state_path.read_text())
+    persisted = json.loads(state_path.read_bytes())
     assert isinstance(persisted["withdrawn_usd_total"], (int, float))
     assert persisted["withdrawn_usd_total"] >= 0.0
 
@@ -4224,7 +4224,7 @@ def test_an_absent_withdrawal_counter_does_not_invalidate_legacy_entitlements(tm
     """
     ledger = _preserved_fire_with_unrelated_pending(tmp_path)
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
     assert entry["restored_credit_usd"] == 10.0
     # Simulate a legacy ledger that predates this field entirely.
@@ -4241,7 +4241,7 @@ def test_an_absent_withdrawal_counter_does_not_invalidate_legacy_entitlements(tm
     )
     assert retry.order_notional_usd == 10.0
 
-    persisted = json.loads(state_path.read_text())
+    persisted = json.loads(state_path.read_bytes())
     assert isinstance(persisted["withdrawn_usd_total"], (int, float))
     assert persisted["withdrawn_usd_total"] >= 0.0
 
@@ -4270,7 +4270,7 @@ def test_a_legacy_restored_credit_is_snapshotted_before_future_withdrawals(tmp_p
         recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
     )
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
     assert entry["restored_credit_usd"] == 10.0
     # Simulate a legacy write: restored_credit_usd present, but no snapshot
@@ -4345,7 +4345,7 @@ def test_two_legacy_restored_credits_sharing_a_backfilled_snapshot_are_staggered
     assert ledger.pending_usd("BYDDY") == 30.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     # Simulate A and B (but not C) as legacy writes: restored_credit_usd
     # present, but no snapshot field at all.
@@ -4371,7 +4371,7 @@ def test_two_legacy_restored_credits_sharing_a_backfilled_snapshot_are_staggered
 
     from dca_whole_share_accumulator import _redispatchable_credit_usd
 
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     withdrawn_total = state["withdrawn_usd_total"]
     pool = state["pending_usd"]
@@ -4419,7 +4419,7 @@ def test_legacy_migration_seeds_the_live_tie_batch_so_new_registrations_continue
     assert ledger.pending_usd("BYDDY") == 20.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     # Simulate A and B as legacy writes: restored_credit_usd present, but
     # no snapshot field at all.
@@ -4439,7 +4439,7 @@ def test_legacy_migration_seeds_the_live_tie_batch_so_new_registrations_continue
     )
     assert d_decision.shares_to_buy == 0
 
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     d_offset = entries["2026-08-16:D"]["claim_credit_remainder_tie_offset_usd"]
     assert d_offset == 20.0, (
@@ -4497,7 +4497,7 @@ def test_a_legacy_restored_credit_and_a_legacy_remainder_are_staggered_against_e
     assert ledger.pending_usd(ticker) == 15.0
 
     state_path = tmp_path / ticker / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     x_entry = entries[f"{day}:X"]
     y_entry = entries[f"{day}:Y"]
@@ -4517,7 +4517,7 @@ def test_a_legacy_restored_credit_and_a_legacy_remainder_are_staggered_against_e
         ticker, day, 0.0, 1_000_000.0, idempotency_key="probe", recorded_at="2026-08-16T15:30:30-04:00"
     )
     assert probe.shares_to_buy == 0
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     x_offset = entries[f"{day}:X"]["restored_credit_tie_offset_usd"]
     y_offset = entries[f"{day}:Y"]["claim_credit_remainder_tie_offset_usd"]
@@ -4555,7 +4555,7 @@ def test_a_malformed_idempotency_key_map_fails_the_ledger_closed(tmp_path, malfo
         recorded_at="2026-08-16T15:30:00-04:00",
     )
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     state["recorded_idempotency_keys"] = malformed_shape
     state_path.write_text(json.dumps(state, indent=2))
 
@@ -4603,7 +4603,7 @@ def test_a_corrupted_withdrawal_counter_writes_off_the_entitlements_it_aged(tmp_
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     assert state["withdrawn_usd_total"] > 0.0
     state["withdrawn_usd_total"] = "bad"
     state_path.write_text(json.dumps(state, indent=2))
@@ -4687,7 +4687,7 @@ def test_a_corrupted_tie_offset_larger_than_the_reconstructable_bound_writes_off
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     a_entry = entries["2026-08-16:A"]
     assert a_entry["restored_credit_usd"] == 10.0
@@ -4749,7 +4749,7 @@ def test_a_corrupted_offset_matching_the_claims_own_amount_is_still_caught(tmp_p
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     a_entry = entries["2026-08-16:A"]
     assert a_entry["restored_credit_usd"] == 10.0
@@ -4818,7 +4818,7 @@ def test_a_corrupted_offset_matching_a_later_registered_siblings_amount_is_still
     assert ledger.pending_usd("BYDDY") == 20.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     a_entry = entries[f"{day}:A"]
     assert a_entry["restored_credit_tie_offset_usd"] == 0.0
@@ -4868,7 +4868,7 @@ def test_a_present_but_unreadable_audit_value_fails_the_entitlement_closed(tmp_p
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
     audit_key = f"{day}:A:restored_credit_usd:{_snapshot_key(a_entry['restored_credit_as_of_withdrawn_usd'])}"
     assert audit_key in state["credit_tie_offset_audit"]
@@ -4911,7 +4911,7 @@ def test_writing_off_a_mismatch_retires_the_stale_audit_entry(tmp_path):
     )
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
     as_of = a_entry["restored_credit_as_of_withdrawn_usd"]
     audit_key = f"{day}:A:restored_credit_usd:{_snapshot_key(as_of)}"
@@ -4952,7 +4952,7 @@ def test_a_legacy_initialized_credit_is_not_written_off_by_an_unrelated_same_cou
         "BYDDY", day, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
     )
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
     del a_entry["restored_credit_as_of_withdrawn_usd"]
     del a_entry["restored_credit_tie_offset_usd"]
@@ -5014,7 +5014,7 @@ def test_re_anchoring_after_a_missing_counter_forgets_stale_audits_first(tmp_pat
     )
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     a_entry = entries[f"{day}:A"]
     b_entry = entries[f"{day}:B"]
@@ -5068,7 +5068,7 @@ def test_the_as_of_backfill_migration_forgets_a_stale_audit_at_its_target_key(tm
     )
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
     withdrawn_total = state["withdrawn_usd_total"]
     assert a_entry["restored_credit_as_of_withdrawn_usd"] == withdrawn_total
@@ -5120,7 +5120,7 @@ def test_retiring_an_interval_keeps_the_shifted_siblings_audit_in_sync(tmp_path)
     assert first.order_notional_usd == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
     assert a_entry["claim_credit_remainder_usd"] == 4.0
     assert a_entry["claim_credit_remainder_tie_offset_usd"] == 0.0
@@ -5131,7 +5131,7 @@ def test_retiring_an_interval_keeps_the_shifted_siblings_audit_in_sync(tmp_path)
         "BYDDY", day, 4.0, 100.0, idempotency_key="B", recorded_at="2026-08-16T15:31:00-04:00"
     )
     assert b.shares_to_buy == 0
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     b_entry = state["recorded_idempotency_keys"][f"{day}:B"]
     assert b_entry["claim_credit_remainder_usd"] == 4.0
     assert b_entry["claim_credit_remainder_tie_offset_usd"] == 4.0
@@ -5141,7 +5141,7 @@ def test_retiring_an_interval_keeps_the_shifted_siblings_audit_in_sync(tmp_path)
     ledger.preserve_pending(
         "BYDDY", day, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:32:00-04:00", claim_token=first.claim_token,
     )
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     b_entry = state["recorded_idempotency_keys"][f"{day}:B"]
     assert b_entry["claim_credit_remainder_tie_offset_usd"] == 0.0, "B's live offset must be shifted"
     audit_key = f"{day}:B:claim_credit_remainder_usd:{_snapshot_key(b_entry['claim_credit_remainder_as_of_withdrawn_usd'])}"
@@ -5191,7 +5191,7 @@ def test_a_relabeled_restored_credit_gets_its_own_audit_entry(tmp_path):
     assert repriced.shares_to_buy == 0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
     # The reclaim releases A's WHOLE frozen commitment (its original $10
     # order plus the $4 remainder) back to pending, not just the remainder.
@@ -5268,7 +5268,7 @@ def test_relabeling_a_remainder_with_a_nonzero_offset_forgets_its_own_stale_audi
     assert repriced.shares_to_buy == 0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
     assert a_entry["restored_credit_usd"] == 14.0
     assert a_entry["restored_credit_tie_offset_usd"] > 0.0, (
@@ -5333,7 +5333,7 @@ def test_a_claim_moving_to_a_new_snapshot_does_not_write_off_a_tied_siblings_off
     assert ledger.pending_usd("BYDDY") == 20.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     assert entries[f"{day}:A"]["restored_credit_tie_offset_usd"] == 0.0
     assert entries[f"{day}:B"]["restored_credit_tie_offset_usd"] == 10.0
@@ -5351,7 +5351,7 @@ def test_a_claim_moving_to_a_new_snapshot_does_not_write_off_a_tied_siblings_off
     )
     assert ledger.pending_usd("BYDDY") == 20.0
 
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     a_entry = entries[f"{day}:A"]
     b_entry = entries[f"{day}:B"]
@@ -5422,7 +5422,7 @@ def test_a_shrinking_sibling_credit_does_not_write_off_a_tied_claims_offset(tmp_
     assert ledger.pending_usd("BYDDY") == 20.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     assert entries[f"{day}:A"]["restored_credit_tie_offset_usd"] == 0.0
     assert entries[f"{day}:B"]["restored_credit_tie_offset_usd"] == 10.0
@@ -5437,7 +5437,7 @@ def test_a_shrinking_sibling_credit_does_not_write_off_a_tied_claims_offset(tmp_
     )
     assert a_redispatch.order_notional_usd == 9.0
 
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
     assert "restored_credit_usd" in a_entry and "claim_credit_remainder_usd" in a_entry, (
         "A must carry both a stale restored credit and a fresh remainder at once"
@@ -5493,7 +5493,7 @@ def test_a_corrupted_withdrawal_counter_writes_off_a_legacy_entry_too(tmp_path):
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     # Simulate a legacy write: A's entry predates restored_credit_usd
     # entirely -- no field, not even a null one -- but still carries the
     # positive order_notional_usd its preserve_pending() call recorded.
@@ -5548,7 +5548,7 @@ def test_a_ledger_wide_integer_overflow_does_not_abort_unrelated_reads(tmp_path)
         recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
     )
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     entries["2026-08-16:A"]["restored_credit_usd"] = 10**400
     state_path.write_text(json.dumps(state, indent=2))
@@ -5610,7 +5610,7 @@ def test_a_boolean_withdrawal_counter_writes_off_the_entitlements_it_aged(tmp_pa
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     state["withdrawn_usd_total"] = False
     state_path.write_text(json.dumps(state, indent=2))
 
@@ -5705,7 +5705,7 @@ def test_a_malformed_restored_credit_does_not_inherit_the_legacy_entitlement(tmp
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
     # PRESENT but unreadable, and the entry still carries its order_notional_usd.
     entry["restored_credit_usd"] = "Infinity"
@@ -5755,7 +5755,7 @@ def test_a_null_restored_credit_does_not_inherit_the_legacy_entitlement(tmp_path
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
     # PRESENT as JSON null, and the entry still carries its order_notional_usd.
     entry["restored_credit_usd"] = None
@@ -5800,7 +5800,7 @@ def test_a_non_finite_legacy_order_notional_fails_closed(tmp_path):
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
     # restored_credit_usd genuinely ABSENT (a pre-upgrade entry), but its
     # order_notional_usd is corrupted.
@@ -5897,7 +5897,7 @@ def test_two_restored_credits_at_the_same_snapshot_are_not_both_charged_one_with
     from dca_whole_share_accumulator import _redispatchable_credit_usd
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     withdrawn_total = state["withdrawn_usd_total"]
     pool = state["pending_usd"]
@@ -5922,7 +5922,7 @@ def test_two_restored_credits_at_the_same_snapshot_are_not_both_charged_one_with
     # two $10 withdrawals (C's and D's, $20 total), A and B were each
     # charged for exactly one, never more than the $20 actually drawn from
     # the pool between them.
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     withdrawn_total = state["withdrawn_usd_total"]
     pool = state["pending_usd"]

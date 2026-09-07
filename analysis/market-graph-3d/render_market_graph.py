@@ -399,7 +399,7 @@ def _payload_from_args(args) -> dict:
         # future schema would not fail here, it would draw a plausible and wrong
         # picture. The browser viewer already refuses an unknown schema_version for
         # exactly this reason, and both consumers now share the one check.
-        return mg.validate_payload_document(json.loads(args.payload.read_text(encoding="utf-8")))
+        return mg.validate_payload_document(json.loads(args.payload.read_bytes()))
 
     # Ticker resolution and the archive default come from the shared module, not from
     # a second copy here: the HTML CLI defaults --source archive to the active universe

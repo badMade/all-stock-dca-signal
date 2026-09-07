@@ -3086,7 +3086,7 @@ class InverseMartingaleLedger:
             return
         existing_events: list[dict[str, Any]] = []
         try:
-            existing = json.loads(state_path.read_text(encoding="utf-8"))
+            existing = json.loads(state_path.read_bytes())
             if isinstance(existing, dict) and isinstance(existing.get("events"), list):
                 # _validate_tracker_payload() (see _read_locked) never
                 # validates the shape of individual audit events -- they are
@@ -3268,7 +3268,7 @@ class InverseMartingaleLedger:
     def events(self, ticker: str) -> list[dict[str, Any]]:
         state_path, _ = self._paths(ticker)
         try:
-            data = json.loads(state_path.read_text(encoding="utf-8"))
+            data = json.loads(state_path.read_bytes())
         except (FileNotFoundError, json.JSONDecodeError):
             return []
         events = data.get("events")

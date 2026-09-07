@@ -184,7 +184,7 @@ class TrainedModel:
 
     @classmethod
     def load(cls, path: Path) -> "TrainedModel":
-        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+        return cls.from_dict(json.loads(Path(path).read_bytes()))
 
     def predict_return_pct(self, frame: pd.DataFrame) -> np.ndarray:
         """Predicted forward-return percentage for every row in `frame`."""

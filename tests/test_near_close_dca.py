@@ -21792,7 +21792,7 @@ def test_legacy_historical_recovery_is_accounted_without_republishing(tmp_path):
         ),
     )
 
-    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     own_new_submitted = sum(
         row["planned_amount_usd"]
         for row in run_state["buy_candidates"]
@@ -25230,7 +25230,7 @@ def test_an_unresolved_halt_preserves_accumulated_pre_placement_errors(tmp_path)
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
         near_close_dca._IN_FLIGHT_RUN_EVALUATION.clear()
 
-    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert run_state["orders_failed_count"] == 1
     assert run_state["usage_proxy"]["errors_count"] == 3, (
         "the 2 pre-placement errors must be ADDED to the unresolved "
@@ -25284,7 +25284,7 @@ def test_an_unresolved_retry_outcome_survives_the_failure_artifact_merge(tmp_pat
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    merged = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    merged = json.loads((artifacts_dir / "run_state.json").read_bytes())
     unproven = [
         oc
         for oc in merged["broker_outcomes"].values()
@@ -25330,7 +25330,7 @@ def test_afternoon_failure_counts_a_potentially_submitted_in_flight_order(tmp_pa
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert run_state["orders_submitted_count"] == 1
     assert run_state["buy_candidates"][0]["status"] == "potentially_submitted"
 
@@ -25391,7 +25391,7 @@ def test_a_merged_retry_preserves_a_potentially_submitted_count(tmp_path):
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
 
     assert run_state["orders_submitted_count"] == 1
     [candidate] = run_state["buy_candidates"]
@@ -26463,7 +26463,7 @@ def test_write_afternoon_failure_artifacts_sidecars_placement_on_account_mismatc
 
     sidecar_path = artifacts_dir / "cross_account_unresolved_placements.json"
     assert sidecar_path.exists()
-    sidecar_content = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    sidecar_content = json.loads(sidecar_path.read_bytes())
     assert any(
         entry.get("broker_outcomes", {}).get("AAPL", {}).get("order_id") == "ORD-ACCOUNT-B-REAL"
         for entry in sidecar_content.get("entries", [])
@@ -26538,7 +26538,7 @@ def test_write_afternoon_failure_artifacts_keeps_unavailable_fingerprint_out_of_
     # something else) it carries no entry bound to the sentinel string.
     cross_account_sidecar_path = artifacts_dir / "cross_account_unresolved_placements.json"
     if cross_account_sidecar_path.exists():
-        cross_account_content = json.loads(cross_account_sidecar_path.read_text(encoding="utf-8"))
+        cross_account_content = json.loads(cross_account_sidecar_path.read_bytes())
         assert not any(
             entry.get("account_number") == near_close_dca._ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL
             for entry in cross_account_content.get("entries", [])
@@ -27007,7 +27007,7 @@ def test_retry_reconciles_and_books_prior_ambiguous_placement_before_candidates(
 
     assert state.day_order_count(now.date()) == 1
     assert state.day_notional(now.date()) == 2.0
-    saved = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    saved = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert saved["broker_outcomes"]["AAPL"]["status"] == "submitted"
     assert saved["broker_outcomes"]["AAPL"]["order_id"] == "ORD-RECOVERED"
     assert saved["placement_evidence_incomplete"] is False
@@ -27130,7 +27130,7 @@ def test_reconcile_prior_unproven_fractional_placements_locks_only_its_writes(
 
     assert recovered
     assert broker_call_seen_lock_active is False
-    saved = json.loads(real_read_text(state_path, encoding="utf-8"))
+    saved = json.loads(state_path.read_bytes())
     assert saved["broker_outcomes"]["AAPL"]["status"] == "submitted"
 
 
@@ -27196,7 +27196,7 @@ def test_reconcile_prior_unproven_fractional_placements_fails_closed_on_concurre
 
     # The other retry's evidence must survive untouched -- not overwritten
     # by this invocation's stale snapshot.
-    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    saved = json.loads(state_path.read_bytes())
     assert saved["broker_outcomes"]["AAPL"]["concurrently_published_by"] == "another-retry"
 
 
@@ -28051,7 +28051,7 @@ def test_retry_reconciliation_preserves_conflicts_with_persisted_response_order_
     with pytest.raises(near_close_dca.UnresolvedPlacementError):
         near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
-    persisted = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert persisted["broker_outcomes"]["AAPL"]["order_id"] == "ORD-RESPONSE", (
         "a conflicting history-reconciled id must never overwrite the "
         "persisted response id"
@@ -28263,7 +28263,7 @@ def test_retry_reconciliation_deduplicates_rows_sharing_a_reference(tmp_path):
     assert state.day_notional(now.date()) == 2.0
     assert len(recovered) == 1
     # ...but BOTH rows are still marked resolved in the artifact.
-    saved = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    saved = json.loads((artifacts_dir / "run_state.json").read_bytes())
     for key in ("AAPL", "AAPL:unproven-2"):
         assert saved["broker_outcomes"][key]["status"] == "submitted"
         assert saved["broker_outcomes"][key]["placement_outcome_unproven"] is False
@@ -28324,7 +28324,7 @@ def test_retry_reconciliation_counts_a_merged_whole_share_aggregate_beyond_one(t
     )
     near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
-    saved = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    saved = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert saved["broker_outcomes"]["AAPL"]["status"] == "submitted"
     # 1 for AAPL's own newly-reconciled order + 2 for BYDDY's merged
     # whole-share aggregate -- not 2 (one per unique order_id).
@@ -28564,7 +28564,7 @@ def test_retry_reconciliation_keeps_prior_day_recoveries_in_deployment_accountin
     )
     near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
-    saved = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    saved = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert deployed_usd(saved) == 2.0
 
 
@@ -28914,7 +28914,7 @@ def test_retry_replays_a_durable_booking_pending_marker(tmp_path):
 
     assert near_close_dca._reconcile_prior_unproven_fractional_placements(ctx) == {}
     assert state.day_notional(now.date()) == 5.0
-    persisted = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert "reconciliation_booking_pending" in persisted["broker_outcomes"]["AAPL"]
 
     # A subsequent state_transaction reload observes the durable idempotency
@@ -28925,7 +28925,7 @@ def test_retry_replays_a_durable_booking_pending_marker(tmp_path):
     assert recovered["AAPL#fractional-recovery:afternoon-AAPL-proof"]["order_id"] == "ORD-RECOVERED"
     assert len(run_result.execution_records) == 1
     assert state.day_notional(now.date()) == 5.0
-    persisted = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert "reconciliation_booking_pending" in persisted["broker_outcomes"]["AAPL"]
 
     # If that finalizer is interrupted (or replaces its in-memory result), a
@@ -29336,7 +29336,7 @@ def test_retry_reconciliation_scans_prior_artifact_directories(tmp_path):
     assert state.day_order_count(now.date()) == 1
     assert state.day_notional(now.date()) == 2.0
     assert recovered == {}, "historical recoveries must not be republished in the current slot"
-    prior_state = json.loads((prior_dir / "run_state.json").read_text(encoding="utf-8"))
+    prior_state = json.loads((prior_dir / "run_state.json").read_bytes())
     assert prior_state["broker_outcomes"]["AAPL"]["placement_outcome_unproven"] is False
 
 
@@ -29445,7 +29445,7 @@ def test_retry_reconciliation_excludes_dry_run_historical_artifacts(tmp_path):
     recovered = near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
     assert recovered == {}
 
-    dry_run_state = json.loads((dry_run_dir / "run_state.json").read_text(encoding="utf-8"))
+    dry_run_state = json.loads((dry_run_dir / "run_state.json").read_bytes())
     assert dry_run_state["broker_outcomes"]["AAPL"]["placement_outcome_unproven"] is True
 
 
@@ -29495,7 +29495,7 @@ def test_retry_reconciliation_rejects_every_unreferenced_row_in_prior_artifact(t
     with pytest.raises(near_close_dca.UnresolvedPlacementError, match="MSFT.*incomplete"):
         near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
-    prior_state = json.loads((prior_dir / "run_state.json").read_text(encoding="utf-8"))
+    prior_state = json.loads((prior_dir / "run_state.json").read_bytes())
     assert prior_state["placement_evidence_incomplete"] is True
     assert prior_state["broker_outcomes"]["AAPL"]["placement_outcome_unproven"] is True
 
@@ -29548,7 +29548,7 @@ def test_retry_reconciliation_deduplicates_placement_refs_across_artifacts(tmp_p
     assert state.day_order_count(now.date()) == 1
     assert state.day_notional(now.date()) == 2.0
     for name in ("copy-a", "copy-b"):
-        saved = json.loads((history_root / name / "run_state.json").read_text(encoding="utf-8"))
+        saved = json.loads((history_root / name / "run_state.json").read_bytes())
         assert saved["broker_outcomes"]["AAPL"]["placement_outcome_unproven"] is False
 
     near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
@@ -29768,7 +29768,7 @@ def test_retry_reconciliation_restores_the_attempt_for_a_reconciled_rejection(tm
     assert state.day_order_count(now.date()) == 0
     near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
-    saved = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    saved = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert saved["broker_outcomes"]["AAPL"]["status"] == "failed"
     assert saved["broker_outcomes"]["AAPL"]["placement_outcome_unproven"] is False
     # The attempt is restored even though nothing was bought.
@@ -29936,7 +29936,7 @@ def test_retry_reconciliation_does_not_book_state_when_the_artifact_write_fails(
     # Neither side was updated: the write failed before ctx.state was booked.
     assert state.day_notional(now.date()) == 0.0
     assert state.day_order_count(now.date()) == 0
-    on_disk = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    on_disk = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert on_disk["broker_outcomes"]["AAPL"]["placement_outcome_unproven"] is True
 
 
@@ -30273,7 +30273,7 @@ def test_retry_reconciliation_validates_against_the_latest_grouped_amount(tmp_pa
 
     assert state.day_notional(now.date()) == 3.0
     assert len(recovered) == 1
-    saved = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    saved = json.loads((artifacts_dir / "run_state.json").read_bytes())
     for key in ("AAPL", "AAPL:unproven-2"):
         assert saved["broker_outcomes"][key]["status"] == "submitted"
 
@@ -30336,7 +30336,7 @@ def test_retry_reconciliation_validates_against_an_earlier_grouped_amount(tmp_pa
     assert state.day_notional(now.date()) == 2.0
     assert len(recovered) == 1
     assert next(iter(recovered.values()))["submitted_amount_usd"] == 2.0
-    saved = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    saved = json.loads((artifacts_dir / "run_state.json").read_bytes())
     for key in ("AAPL", "AAPL:unproven-2"):
         assert saved["broker_outcomes"][key]["status"] == "submitted"
         assert saved["broker_outcomes"][key]["order_id"] == "ORD-ORIGINAL"
@@ -30384,7 +30384,7 @@ def test_retry_reconciliation_persists_matched_id_on_unknown_verdict(tmp_path):
     with pytest.raises(near_close_dca.UnresolvedPlacementError, match="unresolved"):
         near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
-    saved = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    saved = json.loads((artifacts_dir / "run_state.json").read_bytes())
     # Still unproven -- the verdict is unchanged -- but the id now on record.
     assert saved["broker_outcomes"]["AAPL"]["placement_outcome_unproven"] is True
     assert saved["broker_outcomes"]["AAPL"]["order_id"] == "ORD-AMBIGUOUS"
@@ -30435,7 +30435,7 @@ def test_retry_reconciliation_persists_earlier_groups_before_a_later_raise(tmp_p
         near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
     # AAPL's resolution reached disk despite MSFT's raise ending the loop.
-    saved = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    saved = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert saved["broker_outcomes"]["AAPL"]["status"] == "submitted"
     assert saved["broker_outcomes"]["AAPL"]["placement_outcome_unproven"] is False
     assert saved["broker_outcomes"]["MSFT"]["placement_outcome_unproven"] is True
@@ -30500,7 +30500,7 @@ def test_retry_reconciliation_updates_the_original_candidate_row(tmp_path):
     )
     near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
-    saved = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    saved = json.loads((artifacts_dir / "run_state.json").read_bytes())
     aapl_rows = [r for r in saved["buy_candidates"] if r["ticker"] == "AAPL"]
     assert len(aapl_rows) == 1, "the original failed row must be replaced, not duplicated"
     assert aapl_rows[0]["status"] == "submitted"
@@ -30558,7 +30558,7 @@ def test_retry_reconciliation_appends_when_the_original_row_is_ambiguous(tmp_pat
     )
     near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
-    saved = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    saved = json.loads((artifacts_dir / "run_state.json").read_bytes())
     aapl_rows = [r for r in saved["buy_candidates"] if r["ticker"] == "AAPL"]
     # The two original ambiguous rows survive untouched, plus the new
     # reconciled row -- three, not a corrupted two.
@@ -30627,7 +30627,7 @@ def test_retry_reconciliation_replaces_each_groups_own_row_by_ref_id(tmp_path):
     )
     recovered = near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
-    saved = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    saved = json.loads((artifacts_dir / "run_state.json").read_bytes())
     aapl_rows = [r for r in saved["buy_candidates"] if r["ticker"] == "AAPL"]
     # Exactly two rows -- one per broker call -- both replaced in place,
     # never four.
@@ -30715,7 +30715,7 @@ def test_retry_reconciliation_collapses_retries_sharing_one_reference(tmp_path):
     )
     near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
-    saved = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    saved = json.loads((artifacts_dir / "run_state.json").read_bytes())
     aapl_rows = [r for r in saved["buy_candidates"] if r["ticker"] == "AAPL"]
     # Exactly ONE row for the one real broker order -- not three (both
     # stale originals plus a new one).
@@ -30787,7 +30787,7 @@ def test_retry_reconciliation_collapses_retries_sharing_one_reference_on_rejecti
     )
     near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
-    saved = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    saved = json.loads((artifacts_dir / "run_state.json").read_bytes())
     aapl_rows = [r for r in saved["buy_candidates"] if r["ticker"] == "AAPL"]
     # Exactly ONE row for the one real (rejected) broker call -- not two
     # stale originals left in place.
@@ -30939,7 +30939,7 @@ def test_retry_merge_survives_a_malformed_nested_order_id(tmp_path):
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    merged = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    merged = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert merged["broker_outcomes"]["AAPL"]["placement_outcome_unproven"] is True
     assert "MSFT" in merged["broker_outcomes"]
 
@@ -30997,7 +30997,7 @@ def test_a_fully_deduped_unresolved_retry_still_stamps_the_failure(tmp_path):
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    merged = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    merged = json.loads((artifacts_dir / "run_state.json").read_bytes())
     # The artifact no longer advertises success.
     assert merged["status"] == "failed"
     assert merged["is_trading_failure"] is True
@@ -31219,7 +31219,7 @@ def test_retry_merge_preserves_a_halted_tail_row(tmp_path):
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    merged = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    merged = json.loads((artifacts_dir / "run_state.json").read_bytes())
     # The prior MSFT submission is still on the record, untouched.
     assert merged["broker_outcomes"]["MSFT"]["order_id"] == "ORD-PRIOR"
     # ...and THIS run's own halted-tail evidence for MSFT survived under
@@ -31293,7 +31293,7 @@ def test_a_fully_deduped_unresolved_retry_regenerates_a_stale_summary(tmp_path):
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    summary = json.loads((artifacts_dir / "run_summary.json").read_text(encoding="utf-8"))
+    summary = json.loads((artifacts_dir / "run_summary.json").read_bytes())
     assert summary["run_classification_outcome"] != "completed_with_orders", (
         "run_summary.json must be regenerated to reflect the new failure "
         "classification, not left advertising the prior successful run"
@@ -31361,9 +31361,9 @@ def test_a_manual_retry_failing_with_no_new_outcomes_regenerates_a_stale_summary
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert run_state["status"] == "failed"
-    summary = json.loads((artifacts_dir / "run_summary.json").read_text(encoding="utf-8"))
+    summary = json.loads((artifacts_dir / "run_summary.json").read_bytes())
     assert summary["run_classification_outcome"] != "completed_with_orders", (
         "run_summary.json must be regenerated to reflect the new failure "
         "classification, not left advertising the prior successful manual run"
@@ -31445,7 +31445,7 @@ def test_unresolved_retry_merge_parses_a_malformed_preserved_counts_field(tmp_pa
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
         near_close_dca._IN_FLIGHT_RUN_EVALUATION.clear()
 
-    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     # The malformed field did not abort the write, and the refreshed
     # evaluated count reflects the current invocation's own scan.
     assert run_state["counts"]["evaluated"] == len(config.tickers)
@@ -31514,7 +31514,7 @@ def test_retry_merge_validates_preserved_counts_before_merging_new_outcomes(tmp_
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     # The malformed field did not abort the write, and the new outcome
     # actually made it into the merged artifact.
     assert run_state["broker_outcomes"]["MSFT"]["order_id"] == "ORD-NEW"
@@ -31582,7 +31582,7 @@ def test_unresolved_retry_merge_weights_usage_proxy_by_submission_multiplicity(t
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert run_state["usage_proxy"]["orders_placed_count"] == 2, (
         "a preserved merged_submission_count=2 aggregate must count as 2 placed orders, not 1"
     )
@@ -31661,7 +31661,7 @@ def test_unresolved_retry_merge_includes_current_evaluation_errors_in_usage_prox
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
         near_close_dca._IN_FLIGHT_RUN_EVALUATION.clear()
 
-    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert run_state["orders_failed_count"] == 1
     assert run_state["usage_proxy"]["errors_count"] == 3, (
         "must add this invocation's own two evaluation errors on top of the "
@@ -31717,7 +31717,7 @@ def test_manual_failure_artifact_preserves_the_configured_broker(tmp_path):
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert run_state["broker"] == "alpaca"
 
 
@@ -33070,7 +33070,7 @@ def test_manual_failure_artifact_redacts_exception_secrets(tmp_path):
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert "123456789" not in run_state["error_detail"]
     assert "abcXYZ789secret" not in run_state["error_detail"]
 
@@ -33149,7 +33149,7 @@ def test_an_unresolved_retry_merge_recomputes_the_failed_placement_count(tmp_pat
     _write()
     _write()
 
-    merged = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    merged = json.loads((artifacts_dir / "run_state.json").read_bytes())
     failed_rows = [
         oc for oc in merged["broker_outcomes"].values()
         if isinstance(oc, dict) and oc.get("status") == "failed"
@@ -33196,7 +33196,7 @@ def test_an_unresolved_retry_merge_survives_a_malformed_preserved_errors_count(t
     _write()
 
     state_path = artifacts_dir / "run_state.json"
-    preserved = json.loads(state_path.read_text(encoding="utf-8"))
+    preserved = json.loads(state_path.read_bytes())
     preserved.setdefault("usage_proxy", {})["errors_count"] = {"nested": "mapping"}
     state_path.write_text(json.dumps(preserved), encoding="utf-8")
 
@@ -33204,7 +33204,7 @@ def test_an_unresolved_retry_merge_survives_a_malformed_preserved_errors_count(t
     # allowed to abort the whole merge.
     _write()
 
-    merged = json.loads(state_path.read_text(encoding="utf-8"))
+    merged = json.loads(state_path.read_bytes())
     assert isinstance(merged["usage_proxy"]["errors_count"], int)
     assert merged["usage_proxy"]["errors_count"] >= merged["orders_failed_count"]
     assert merged["usage_proxy"]["manual_recovery_required"] is True
@@ -33286,7 +33286,7 @@ def test_an_unresolved_retry_merge_refreshes_the_evaluation_context(tmp_path):
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
         near_close_dca._IN_FLIGHT_RUN_EVALUATION.clear()
 
-    merged = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    merged = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert merged["counts"]["evaluated"] == len(decisions)
     assert merged["signal_rows"]
     assert merged["budget"]["daily_cap_usd"] > 0
@@ -33333,7 +33333,7 @@ def test_an_unresolved_retry_merge_refreshes_evaluation_despite_a_prior_submissi
         )
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
-    first = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    first = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert first["orders_submitted_count"] == 1
     assert first["counts"]["evaluated"] == 0
     assert first["signal_rows"] == []
@@ -33369,7 +33369,7 @@ def test_an_unresolved_retry_merge_refreshes_evaluation_despite_a_prior_submissi
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
         near_close_dca._IN_FLIGHT_RUN_EVALUATION.clear()
 
-    merged = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    merged = json.loads((artifacts_dir / "run_state.json").read_bytes())
     # The prior submission is still on the record...
     assert "MSFT" in merged["broker_outcomes"]
     # ...but the evaluation context must still refresh to THIS retry's own,
@@ -33410,7 +33410,7 @@ def test_an_unresolved_retry_merge_is_classified_as_a_placement_failure(tmp_path
     _write({"AAPL": {"status": "failed", "order_id": None, "buy_multiplier": 1.0,
                      "placement_outcome_unproven": True, "submitted_amount_usd": 2.0}})
 
-    merged = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    merged = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert merged["orders_submitted_count"] == 0
     assert merged["run_classification_outcome"] == (
         "failed_after_connector_native_recovery_attempt"
@@ -33542,12 +33542,12 @@ def test_an_unresolved_retry_merge_backfills_the_account_fingerprint(tmp_path):
 
     # First write predates fingerprinting: no broker given at all.
     _write(broker=None)
-    unfingerprinted = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    unfingerprinted = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert unfingerprinted.get("account_number") is None
 
     # A later retry merges into the SAME (still-unfingerprinted) artifact.
     _write(broker=DryRunBroker(cash=500.0))
-    merged = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    merged = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert merged.get("account_number"), "the merge path must backfill a missing fingerprint"
 
 
@@ -33582,12 +33582,12 @@ def test_an_unresolved_retry_merge_never_overwrites_an_existing_fingerprint(tmp_
             near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
     _write(broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER))
-    first = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    first = json.loads((artifacts_dir / "run_state.json").read_bytes())
     original_fingerprint = first["account_number"]
     assert original_fingerprint
 
     _write(broker=DryRunBroker(cash=500.0, account="123456789"))
-    merged = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    merged = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert merged["account_number"] == original_fingerprint
 
     # The SECOND write's own unresolved AAPL outcome must not simply vanish
@@ -33599,7 +33599,7 @@ def test_an_unresolved_retry_merge_never_overwrites_an_existing_fingerprint(tmp_
     # round 45: "Persist cross-account ambiguous placements separately").
     side_path = artifacts_dir / "cross_account_unresolved_placements.json"
     assert side_path.exists()
-    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    side_evidence = json.loads(side_path.read_bytes())
     assert len(side_evidence["entries"]) == 1
     entry = side_evidence["entries"][0]
     assert entry["conflicting_artifact_account_number"] == original_fingerprint
@@ -33659,7 +33659,7 @@ def test_an_unresolved_retry_merge_rejects_a_malformed_preserved_fingerprint(tmp
 
     _write(broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER))
     state_path = artifacts_dir / "run_state.json"
-    first = json.loads(state_path.read_text(encoding="utf-8"))
+    first = json.loads(state_path.read_bytes())
     assert first["account_number"]
 
     # Corrupt the preserved fingerprint into a truthy non-string value.
@@ -33667,7 +33667,7 @@ def test_an_unresolved_retry_merge_rejects_a_malformed_preserved_fingerprint(tmp
     state_path.write_text(json.dumps(first), encoding="utf-8")
 
     _write(broker=DryRunBroker(cash=500.0, account="123456789"))
-    merged = json.loads(state_path.read_text(encoding="utf-8"))
+    merged = json.loads(state_path.read_bytes())
     # The malformed fingerprint is left exactly as it was -- not silently
     # "fixed" by overwriting it with this run's own broker's fingerprint,
     # and not treated as a match either.
@@ -33677,7 +33677,7 @@ def test_an_unresolved_retry_merge_rejects_a_malformed_preserved_fingerprint(tmp
     # instead of merged into the unverifiable primary artifact.
     side_path = artifacts_dir / "cross_account_unresolved_placements.json"
     assert side_path.exists()
-    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    side_evidence = json.loads(side_path.read_bytes())
     assert len(side_evidence["entries"]) == 1
     assert side_evidence["entries"][0]["broker_outcomes"]["AAPL"]["submitted_amount_usd"] == 2.0
     # The primary artifact's own outcome is untouched by the rejected merge.
@@ -33720,7 +33720,7 @@ def test_an_unresolved_retry_merge_rejects_a_falsey_malformed_preserved_fingerpr
 
     _write(broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER))
     state_path = artifacts_dir / "run_state.json"
-    first = json.loads(state_path.read_text(encoding="utf-8"))
+    first = json.loads(state_path.read_bytes())
     assert first["account_number"]
 
     # Corrupt the preserved fingerprint into a FALSEY non-string value.
@@ -33728,7 +33728,7 @@ def test_an_unresolved_retry_merge_rejects_a_falsey_malformed_preserved_fingerpr
     state_path.write_text(json.dumps(first), encoding="utf-8")
 
     _write(broker=DryRunBroker(cash=500.0, account="123456789"))
-    merged = json.loads(state_path.read_text(encoding="utf-8"))
+    merged = json.loads(state_path.read_bytes())
     # The falsey malformed fingerprint is left exactly as it was -- not
     # silently backfilled with this run's own broker's fingerprint.
     assert merged["account_number"] == 0
@@ -33737,7 +33737,7 @@ def test_an_unresolved_retry_merge_rejects_a_falsey_malformed_preserved_fingerpr
     # instead of merged into the unverifiable primary artifact.
     side_path = artifacts_dir / "cross_account_unresolved_placements.json"
     assert side_path.exists()
-    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    side_evidence = json.loads(side_path.read_bytes())
     assert len(side_evidence["entries"]) == 1
     assert side_evidence["entries"][0]["broker_outcomes"]["AAPL"]["submitted_amount_usd"] == 2.0
 
@@ -33828,7 +33828,7 @@ def test_cross_account_mismatch_does_not_stamp_a_contract_failure(tmp_path):
 
     _write(broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER))
     state_path = artifacts_dir / "run_state.json"
-    first = json.loads(state_path.read_text(encoding="utf-8"))
+    first = json.loads(state_path.read_bytes())
 
     # A malformed companion (run_summary.json) is exactly the shape that
     # trips validate_run_artifacts's contract check on the SECOND
@@ -33836,7 +33836,7 @@ def test_cross_account_mismatch_does_not_stamp_a_contract_failure(tmp_path):
     (artifacts_dir / "run_summary.json").write_text("not valid json", encoding="utf-8")
 
     _write(broker=DryRunBroker(cash=500.0, account="123456789"))
-    merged = json.loads(state_path.read_text(encoding="utf-8"))
+    merged = json.loads(state_path.read_bytes())
     # The primary artifact -- still the FIRST account's -- must be exactly
     # as it was: no additional contract-failure marker stamped in from
     # validating a companion set this (mismatched) second run never
@@ -33883,7 +33883,7 @@ def test_cross_account_mismatch_gate_ignores_outcomes_with_no_broker_call(tmp_pa
             "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
         },
     )
-    first = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    first = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert first["account_number"]
 
     # Second (different-account) write's own outcome never reached the
@@ -33936,7 +33936,7 @@ def test_cross_account_mismatch_gate_ignores_dry_run_outcomes(tmp_path):
             "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
         },
     )
-    first = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    first = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert first["account_number"]
 
     # Second (different-account) write is a genuine dry run: a synthetic
@@ -33994,7 +33994,7 @@ def test_cross_account_mismatch_gate_still_skips_merge_with_no_sidecar_evidence(
             "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
         },
     )
-    first = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    first = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert first["account_number"]
     first_outcomes = dict(first.get("broker_outcomes") or {})
 
@@ -34010,7 +34010,7 @@ def test_cross_account_mismatch_gate_still_skips_merge_with_no_sidecar_evidence(
     side_path = artifacts_dir / "cross_account_unresolved_placements.json"
     assert not side_path.exists(), "no sidecar should be created for outcomes that made no broker call"
 
-    second = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    second = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert second["account_number"] == first["account_number"]
     assert dict(second.get("broker_outcomes") or {}) == first_outcomes
 
@@ -34122,7 +34122,7 @@ def test_retry_dedup_validates_current_order_ids_before_deduplication(tmp_path):
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     _tickers_present = {row.get("ticker") for row in (run_state.get("buy_candidates") or [])} | {
         oc.get("ticker") for oc in (run_state.get("broker_outcomes") or {}).values() if isinstance(oc, dict)
     }
@@ -34225,7 +34225,7 @@ def test_cross_account_mismatch_sidecar_persists_execution_only_evidence(tmp_pat
 
     side_path = artifacts_dir / "cross_account_unresolved_placements.json"
     assert side_path.exists()
-    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    side_evidence = json.loads(side_path.read_bytes())
     assert len(side_evidence["entries"]) == 1
     entry = side_evidence["entries"][0]
     recorded_records = entry.get("execution_records") or []
@@ -34274,7 +34274,7 @@ def test_cross_account_mismatch_sidecar_excludes_dry_run_rows_from_mixed_evidenc
 
     side_path = artifacts_dir / "cross_account_unresolved_placements.json"
     assert side_path.exists()
-    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    side_evidence = json.loads(side_path.read_bytes())
     recorded_records = side_evidence["entries"][0].get("execution_records") or []
     recorded_order_ids = {r["order_id"] for r in recorded_records}
     assert recorded_order_ids == {"REAL-EXEC-ORD"}, "the dry-run row must never be persisted as brokerage evidence"
@@ -34338,7 +34338,7 @@ def test_cross_account_mismatch_sidecar_preserves_broker_placement_failed_only_o
         "an outcome carrying only broker_placement_failed=True is still real "
         "broker evidence and must reach the cross-account sidecar"
     )
-    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    side_evidence = json.loads(side_path.read_bytes())
     entry = side_evidence["entries"][0]
     recorded_outcomes = entry.get("broker_outcomes") or {}
     assert "BYDDY" in recorded_outcomes
@@ -34398,7 +34398,7 @@ def test_cross_account_mismatch_sidecar_excludes_a_non_broker_facing_failed_stat
 
     side_path = artifacts_dir / "cross_account_unresolved_placements.json"
     if side_path.exists():
-        side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+        side_evidence = json.loads(side_path.read_bytes())
         recorded_outcomes = side_evidence["entries"][-1].get("broker_outcomes") or {}
         assert "BYDDY" not in recorded_outcomes, (
             "a status=='failed' outcome with no real broker-attempt marker must never "
@@ -34455,7 +34455,7 @@ def test_cross_account_mismatch_sidecar_excludes_a_confirmation_required_hold(tm
 
     side_path = artifacts_dir / "cross_account_unresolved_placements.json"
     if side_path.exists():
-        side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+        side_evidence = json.loads(side_path.read_bytes())
         recorded_outcomes = side_evidence["entries"][-1].get("broker_outcomes") or {}
         assert "BYDDY" not in recorded_outcomes, (
             "a confirmation-required hold documents that no order was ever placed and must "
@@ -34514,7 +34514,7 @@ def test_cross_account_mismatch_sidecar_excludes_a_failed_confirmation_restorati
 
     side_path = artifacts_dir / "cross_account_unresolved_placements.json"
     if side_path.exists():
-        side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+        side_evidence = json.loads(side_path.read_bytes())
         recorded_outcomes = side_evidence["entries"][-1].get("broker_outcomes") or {}
         assert "BYDDY" not in recorded_outcomes, (
             "a failed confirmation restoration documents that no order was ever placed and "
@@ -34569,7 +34569,7 @@ def test_cross_account_mismatch_sidecar_excludes_confirmation_hold_past_malforme
 
     side_path = artifacts_dir / "cross_account_unresolved_placements.json"
     if side_path.exists():
-        side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+        side_evidence = json.loads(side_path.read_bytes())
         recorded_outcomes = side_evidence["entries"][-1].get("broker_outcomes") or {}
         assert "BYDDY" not in recorded_outcomes, (
             "a confirmation-required hold must never reach the cross-account sidecar even "
@@ -34587,7 +34587,7 @@ def _malform_preserved_account_number(artifacts_dir) -> None:
     STRING account" early-return branch (`isinstance(..., str)` is False
     for an int), reaching the later merge/mismatch-recomputation path."""
     state_path = pathlib.Path(artifacts_dir) / "run_state.json"
-    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload = json.loads(state_path.read_bytes())
     payload["account_number"] = 123456789
     state_path.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -34646,7 +34646,7 @@ def test_cross_account_mismatch_sidecar_preserves_broker_failed_outcome_past_mal
         "broker evidence and must reach the cross-account sidecar even past "
         "the later, malformed-fingerprint recomputation path"
     )
-    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    side_evidence = json.loads(side_path.read_bytes())
     entry = side_evidence["entries"][-1]
     recorded_outcomes = entry.get("broker_outcomes") or {}
     assert "BYDDY" in recorded_outcomes
@@ -34709,7 +34709,7 @@ def test_cross_account_mismatch_sidecar_keeps_unavailable_fingerprint_out_of_lat
 
     side_path = artifacts_dir / "cross_account_unresolved_placements.json"
     if side_path.exists():
-        side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+        side_evidence = json.loads(side_path.read_bytes())
         for entry in side_evidence.get("entries") or []:
             assert entry.get("account_number") != near_close_dca._ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL, (
                 "the sentinel must never be bound as a cross-account sidecar entry's "
@@ -34824,11 +34824,11 @@ def test_cross_account_sidecar_quarantines_a_structurally_malformed_prior_file(t
     # The malformed original must survive somewhere on disk, not be lost.
     quarantined = list(artifacts_dir.glob("cross_account_unresolved_placements.json.unreadable.*"))
     assert len(quarantined) == 1
-    quarantined_content = json.loads(quarantined[0].read_text(encoding="utf-8"))
+    quarantined_content = json.loads(quarantined[0].read_bytes())
     assert quarantined_content == {"entries": {"0": {"account_number": "PRIOR"}}}
 
     # The live sidecar now holds only this run's own new entry.
-    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    side_evidence = json.loads(side_path.read_bytes())
     assert len(side_evidence["entries"]) == 1
     assert side_evidence["entries"][0]["account_number"] == "NEW"
 
@@ -34863,7 +34863,7 @@ def test_persist_cross_account_unresolved_evidence_redacts_broker_outcomes(tmp_p
         },
     )
 
-    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    side_evidence = json.loads(side_path.read_bytes())
     outcome = side_evidence["entries"][0]["broker_outcomes"]["AAPL"]
     assert "123456789" not in outcome["skip_reason"]
     assert "sk-abcdef123456" not in outcome["skip_reason"]
@@ -34904,7 +34904,7 @@ def test_persist_cross_account_unresolved_evidence_preserves_numeric_order_ids(t
         },
     )
 
-    side_evidence = json.loads(side_path.read_text(encoding="utf-8"))
+    side_evidence = json.loads(side_path.read_bytes())
     outcome = side_evidence["entries"][0]["broker_outcomes"]["AAPL"]
     assert outcome["order_id"] == "123456789"
     assert outcome["ref_id"] == FIXTURE_ACCOUNT_NUMBER
@@ -35037,7 +35037,7 @@ def test_an_unresolved_retry_merge_recomputes_spread_gate_counts(tmp_path):
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    merged = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    merged = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert merged["candidates_reaching_spread_gate"] == 1
     assert merged["candidates_blocked_missing_spread"] == 0
 
@@ -35148,7 +35148,7 @@ def test_a_manual_unresolved_retry_does_not_replace_the_prior_manual_attempt(tmp
             "skip_reason": "first manual attempt",
         }
     })
-    first = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    first = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert first["run_classification"]["run_origin"] == "manual"
 
     _write({
@@ -35158,7 +35158,7 @@ def test_a_manual_unresolved_retry_does_not_replace_the_prior_manual_attempt(tmp
             "skip_reason": "second manual attempt",
         }
     })
-    second = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    second = json.loads((artifacts_dir / "run_state.json").read_bytes())
 
     # The prior manual attempt is RECOGNIZED as the same run and preserved --
     # both possibly-live orders are still on the record.
@@ -37905,7 +37905,7 @@ def test_fresh_placement_settle_records_the_order_id_for_idempotent_dedup(tmp_pa
     assert order_id
 
     ledger_state_path = tmp_path / trading_day.isoformat() / "ledger.json"
-    persisted = json.loads(ledger_state_path.read_text())
+    persisted = json.loads(ledger_state_path.read_bytes())
     assert order_id in persisted.get("settled_order_ids", [])
 
 
@@ -38764,7 +38764,7 @@ def test_duplicate_recovery_settles_the_aggregate_credit_ledger(tmp_path):
     # settlement idempotent by order ID"). Drop the marker so the ledger state
     # genuinely matches the modelled crash point.
     ledger_state_path = tmp_path / trading_day.isoformat() / "ledger.json"
-    ledger_state = json.loads(ledger_state_path.read_text())
+    ledger_state = json.loads(ledger_state_path.read_bytes())
     ledger_state.pop("settled_order_ids", None)
     ledger_state_path.write_text(json.dumps(ledger_state, indent=2, sort_keys=True) + "\n")
     ledger.record("AAPL", trading_day.isoformat(), 0.30, stream="morning")
@@ -38777,7 +38777,7 @@ def test_duplicate_recovery_settles_the_aggregate_credit_ledger(tmp_path):
     # settled from attempt 1's genuine (non-crashed) settle() above and
     # correctly no-op, which is not what this test is simulating.
     ledger_state_path = tmp_path / trading_day.isoformat() / "ledger.json"
-    ledger_state = json.loads(ledger_state_path.read_text())
+    ledger_state = json.loads(ledger_state_path.read_bytes())
     ledger_state["settled_order_ids"] = {}
     ledger_state_path.write_text(json.dumps(ledger_state, indent=2, sort_keys=True) + "\n")
 
@@ -46026,7 +46026,7 @@ def test_blocked_run_replaces_unreadable_prior_placement_storage(tmp_path, damag
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
-    run_state = json.loads(state_path.read_text(encoding="utf-8"))
+    run_state = json.loads(state_path.read_bytes())
     assert run_state["status"] == "blocked"
     assert run_state["completion_reason"] == "date_or_holiday_gate_blocked"
 
@@ -46158,7 +46158,7 @@ def test_blocked_stub_populates_a_base_amount_for_the_weekly_dashboard(tmp_path)
     artifacts_dir = pathlib.Path(tmp_path) / "runs" / "2026-07-01"
     _write_blocked_run_stub(date(2026, 7, 1), artifacts_dir)
 
-    run_state = json.loads((artifacts_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert run_state["budget"]["base_amount_usd"] == StrategyConfig.base_buy_amount_usd
 
     from dca_weekly_dashboard import build_graded_vs_fixed

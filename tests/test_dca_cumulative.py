@@ -255,7 +255,7 @@ def test_settle_fails_closed_on_a_malformed_settled_order_ids_field(tmp_path):
 
     day_dir = tmp_path / "2026-08-20"
     state_path = day_dir / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     state["settled_order_ids"] = []
     state_path.write_text(json.dumps(state))
 
@@ -280,7 +280,7 @@ def test_settle_fails_closed_on_a_null_settled_order_ids_field(tmp_path):
 
     day_dir = tmp_path / "2026-08-20"
     state_path = day_dir / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     assert isinstance(state["settled_order_ids"], dict) and state["settled_order_ids"]
     state["settled_order_ids"] = None
     state_path.write_text(json.dumps(state))
@@ -572,7 +572,7 @@ def test_settle_with_an_order_id_is_idempotent_against_a_repeat_call(tmp_path):
     assert ledger.pending_usd("xyz", "2026-08-03") == 1.0
     events = ledger.events("2026-08-03")
     assert sum(1 for e in events if e["decision"] == "settled") == 1
-    state = json.loads((tmp_path / "2026-08-03" / "ledger.json").read_text(encoding="utf-8"))
+    state = json.loads((tmp_path / "2026-08-03" / "ledger.json").read_bytes())
     assert state["settled_order_ids"] == {
         "ORDER-1": {"ticker": "XYZ", "submitted_amount_usd": 1.0}
     }
@@ -588,7 +588,7 @@ def test_settle_normalizes_persisted_order_ids_before_deduplication(tmp_path):
     ledger.settle("xyz", "2026-08-03", 1.0, stream="morning", order_id="ORDER-1")
 
     state_path = tmp_path / "2026-08-03" / "ledger.json"
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state = json.loads(state_path.read_bytes())
     state["settled_order_ids"] = {
         " ORDER-1 ": {"ticker": "XYZ", "submitted_amount_usd": 1.0},
         " 123 ": {"ticker": "XYZ", "submitted_amount_usd": 1.0},
@@ -599,7 +599,7 @@ def test_settle_normalizes_persisted_order_ids_before_deduplication(tmp_path):
     ledger.settle("xyz", "2026-08-03", 1.0, stream="morning", order_id="ORDER-1")
 
     assert ledger.pending_usd("xyz", "2026-08-03") == 2.0
-    migrated = json.loads(state_path.read_text(encoding="utf-8"))
+    migrated = json.loads(state_path.read_bytes())
     assert migrated["settled_order_ids"] == {
         "ORDER-1": {"ticker": "XYZ", "submitted_amount_usd": 1.0},
         "123": {"ticker": "XYZ", "submitted_amount_usd": 1.0},
@@ -1429,7 +1429,7 @@ def test_legacy_preserve_without_settlement_accounting_fails_closed(tmp_path):
     ledger = CumulativeCreditLedger(tmp_path)
     ledger.preserve_pending("XYZ", "2026-08-11", 0.20, idempotency_key="slot-1")
     path = tmp_path / "2026-08-11" / "ledger.json"
-    state = json.loads(path.read_text(encoding="utf-8"))
+    state = json.loads(path.read_bytes())
     del state["recorded_idempotency_keys"]["preserve:XYZ:slot-1"]["settled_credit_usd"]
     path.write_text(json.dumps(state), encoding="utf-8")
 
@@ -1446,14 +1446,14 @@ def test_partial_settlement_keeps_legacy_preserve_fail_closed(tmp_path):
     ledger = CumulativeCreditLedger(tmp_path)
     ledger.preserve_pending("XYZ", "2026-08-11", 0.40, idempotency_key="slot-1")
     path = tmp_path / "2026-08-11" / "ledger.json"
-    state = json.loads(path.read_text(encoding="utf-8"))
+    state = json.loads(path.read_bytes())
     entry = state["recorded_idempotency_keys"]["preserve:XYZ:slot-1"]
     del entry["settled_credit_usd"]
     path.write_text(json.dumps(state), encoding="utf-8")
 
     ledger.settle("XYZ", "2026-08-11", 0.10)
 
-    updated = json.loads(path.read_text(encoding="utf-8"))
+    updated = json.loads(path.read_bytes())
     entry = updated["recorded_idempotency_keys"]["preserve:XYZ:slot-1"]
     assert entry["incremental_credit_usd"] == 0.30
     assert "settled_credit_usd" not in entry
@@ -1523,7 +1523,7 @@ def test_cumulative_credit_edge_cases(tmp_path):
     ledger.preserve_pending("MULTI", "2026-08-11", 0.20, idempotency_key="m2")
     # Remove settled_credit_usd from m1 to test branch where key is absent
     m_state_path = tmp_path / "2026-08-11" / "ledger.json"
-    m_state = json.loads(m_state_path.read_text(encoding="utf-8"))
+    m_state = json.loads(m_state_path.read_bytes())
     m_state["recorded_idempotency_keys"]["preserve:MULTI:m1"].pop("settled_credit_usd", None)
     m_state_path.write_text(json.dumps(m_state), encoding="utf-8")
     ledger.settle("MULTI", "2026-08-11", 0.20)

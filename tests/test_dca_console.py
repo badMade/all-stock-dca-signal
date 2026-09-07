@@ -288,5 +288,5 @@ def test_saved_summary_remains_valid_json_with_large_numeric_usage_fields(app):
     }))
     app.snapshot()
     saved = app.settings.output / "summaries/local/2026-09-08.json"
-    restored = json.loads(saved.read_text())
+    restored = json.loads(saved.read_bytes())
     assert restored["daily"]["costs"]["totals"]["total_artifact_bytes"] == 200_000

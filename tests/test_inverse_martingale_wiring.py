@@ -162,7 +162,7 @@ def test_enrolled_ticker_accumulates_without_buying(tmp_path, monkeypatch):
     assert run_state["buy_candidates"] == []
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
     assert tracker_path.exists()
-    tracker = json.loads(tracker_path.read_text())
+    tracker = json.loads(tracker_path.read_bytes())
     assert tracker["status"] == "dipping"
     assert tracker["accumulated_usd"] == 1.0
 
@@ -205,7 +205,7 @@ def test_enrolled_ticker_fires_a_single_order_on_recovery(tmp_path, monkeypatch)
     # Fully resolved, but a retry-idempotency marker is retained rather than
     # deleting the file outright (see test_dca_inverse_martingale.py's
     # test_same_day_retry_after_full_fire_is_a_no_op).
-    tracker = json.loads(tracker_path.read_text())
+    tracker = json.loads(tracker_path.read_bytes())
     assert tracker["status"] == "none"
     assert tracker["last_evaluated_trading_day"] == TEST_DATES[2].isoformat()
 
@@ -275,7 +275,7 @@ def test_kill_switch_caps_a_fire_to_the_unit_base_and_preserves_remainder(tmp_pa
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
     assert tracker_path.exists()  # NOT cleared -- $2.00 remains for a later run
-    tracker = json.loads(tracker_path.read_text())
+    tracker = json.loads(tracker_path.read_bytes())
     assert tracker["status"] == "firing"
     assert tracker["accumulated_usd"] == pytest.approx(2.0, abs=0.01)
 
@@ -312,7 +312,7 @@ def test_kill_switch_capped_rollback_stamps_the_current_stream_not_a_stale_one(t
     assert candidate["planned_amount_usd"] == pytest.approx(1.0, abs=0.01)
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    tracker = json.loads(tracker_path.read_text())
+    tracker = json.loads(tracker_path.read_bytes())
     assert tracker["status"] == "firing"
     assert tracker["accumulated_usd"] == pytest.approx(2.0, abs=0.01)
     assert tracker["fire_attempts"] == 1
@@ -325,7 +325,7 @@ def test_kill_switch_capped_rollback_stamps_the_current_stream_not_a_stale_one(t
     # no-op: no new order, fire_attempts unchanged.
     r3b, s3b, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 98.5, "day3-midday-retry", stream="midday")
     assert s3b["buy_candidates"] == []
-    after_retry = json.loads(tracker_path.read_text())
+    after_retry = json.loads(tracker_path.read_bytes())
     assert after_retry["fire_attempts"] == 1  # unchanged -- not treated as a new continuation
     assert after_retry["accumulated_usd"] == pytest.approx(2.0, abs=0.01)
 
@@ -370,7 +370,7 @@ def test_kill_switch_capped_rollback_stamps_the_settlement_as_a_real_evaluation(
     # _inverse_martingale_advance_age_for_missing_data / the guarded-fire
     # deferral path (near_close_dca.py) would have written.
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    poisoned = json.loads(tracker_path.read_text())
+    poisoned = json.loads(tracker_path.read_bytes())
     poisoned["last_evaluated_trading_day"] = TEST_DATES[2].isoformat()
     poisoned["last_evaluated_is_real"] = False
     tracker_path.write_text(json.dumps(poisoned), encoding="utf-8")
@@ -382,7 +382,7 @@ def test_kill_switch_capped_rollback_stamps_the_settlement_as_a_real_evaluation(
     [candidate] = s3b["buy_candidates"]
     assert candidate["status"] == "submitted"
 
-    settled = json.loads(tracker_path.read_text())
+    settled = json.loads(tracker_path.read_bytes())
     assert settled["status"] == "firing"
     assert settled["accumulated_usd"] == pytest.approx(2.0, abs=0.01)
     assert settled["fire_attempts"] == 1
@@ -398,7 +398,7 @@ def test_kill_switch_capped_rollback_stamps_the_settlement_as_a_real_evaluation(
     # STATUS_FIRING same-stream retry guard here, submitting a second order.
     r3c, s3c, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 98.5, "day3-midday-retry", stream="midday")
     assert s3c["buy_candidates"] == []
-    after_retry = json.loads(tracker_path.read_text())
+    after_retry = json.loads(tracker_path.read_bytes())
     assert after_retry["fire_attempts"] == 1  # unchanged -- not treated as a new continuation
     assert after_retry["accumulated_usd"] == pytest.approx(2.0, abs=0.01)
 
@@ -418,7 +418,7 @@ def test_blocked_placement_preserves_the_balance_and_counts_the_attempt(tmp_path
     _run_day(tmp_path, config, state, TEST_DATES[1], 97.0, "day2")  # +$2 -> $3
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    before = json.loads(tracker_path.read_text())
+    before = json.loads(tracker_path.read_bytes())
     assert before["accumulated_usd"] == pytest.approx(3.0, abs=0.01)
     assert before["status"] == "dipping"
 
@@ -438,7 +438,7 @@ def test_blocked_placement_preserves_the_balance_and_counts_the_attempt(tmp_path
     assert candidate["status"] == "blocked"
     assert candidate["planned_amount_usd"] == pytest.approx(3.0, abs=0.01)
 
-    after = json.loads(tracker_path.read_text())
+    after = json.loads(tracker_path.read_bytes())
     assert after["accumulated_usd"] == pytest.approx(3.0, abs=0.01)  # nothing lost
     assert after["status"] == "firing"  # recovery already committed to firing
     assert after["fire_attempts"] == 1  # this blocked attempt counted
@@ -456,7 +456,7 @@ def test_cross_source_disagreement_defers_the_fire(tmp_path, monkeypatch):
     _run_day(tmp_path, config, state, TEST_DATES[1], 97.0, "day2")  # +$2 -> $3
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    before = json.loads(tracker_path.read_text())
+    before = json.loads(tracker_path.read_bytes())
 
     # Day 3: finance shows a full recovery to 98.5, but Robinhood still
     # reports something close to the original 90.0 reference-day price -- an
@@ -472,7 +472,7 @@ def test_cross_source_disagreement_defers_the_fire(tmp_path, monkeypatch):
     # still ages toward max_cycle_days abandonment instead of the age clock
     # silently freezing while data is unusable (Codex review: "Age cycles
     # across missing-data sessions").
-    after = json.loads(tracker_path.read_text())
+    after = json.loads(tracker_path.read_bytes())
     assert after["accumulated_usd"] == before["accumulated_usd"]
     assert after["crossed_tier_thresholds"] == before["crossed_tier_thresholds"]
     assert after["status"] == before["status"]
@@ -499,7 +499,7 @@ def test_disabling_enrollment_mid_cycle_resets_the_active_tracker(tmp_path, monk
 
     _run_day(tmp_path, enrolled_config, state, TEST_DATES[0], 95.0, "day1")  # -5%, crosses 1/2/4 -> $7
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    before = json.loads(tracker_path.read_text())
+    before = json.loads(tracker_path.read_bytes())
     assert before["status"] == "dipping"
     assert before["accumulated_usd"] == 7.0
 
@@ -513,7 +513,7 @@ def test_disabling_enrollment_mid_cycle_resets_the_active_tracker(tmp_path, monk
     disabled_config = _base_config(inverse_martingale={"MSFT": PCT_ENROLLMENT})
     _run_day(tmp_path, disabled_config, state, TEST_DATES[1], 96.0, "day2")
 
-    after = json.loads(tracker_path.read_text())
+    after = json.loads(tracker_path.read_bytes())
     assert after["status"] == "none"
     assert after["last_evaluated_trading_day"] == TEST_DATES[1].isoformat()
     assert "accumulated_usd" not in after  # resolved_marker() carries no leftover cycle fields
@@ -522,7 +522,7 @@ def test_disabling_enrollment_mid_cycle_resets_the_active_tracker(tmp_path, monk
     # Re-enrolling under the SAME configuration on a later day starts a
     # genuinely fresh cycle -- the old $7 balance is gone, not resumed.
     _run_day(tmp_path, enrolled_config, state, TEST_DATES[2], 99.0, "day3")  # -1% -> crosses only tier 1.0
-    resumed = json.loads(tracker_path.read_text())
+    resumed = json.loads(tracker_path.read_bytes())
     assert resumed["status"] == "dipping"
     assert resumed["accumulated_usd"] == 1.0
 
@@ -545,7 +545,7 @@ def test_removing_a_ticker_from_the_tradable_universe_resets_its_active_cycle(tm
 
     _run_day(tmp_path, enrolled_config, state, TEST_DATES[0], 95.0, "day1")  # -5%, crosses 1/2/4 -> $7
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    before = json.loads(tracker_path.read_text())
+    before = json.loads(tracker_path.read_bytes())
     assert before["status"] == "dipping"
     assert before["accumulated_usd"] == 7.0
 
@@ -557,14 +557,14 @@ def test_removing_a_ticker_from_the_tradable_universe_resets_its_active_cycle(tm
     )
     _run_day(tmp_path, removed_from_universe_config, state, TEST_DATES[1], 96.0, "day2")
 
-    after = json.loads(tracker_path.read_text())
+    after = json.loads(tracker_path.read_bytes())
     assert after["status"] == "none"
     assert "accumulated_usd" not in after  # resolved_marker() carries no leftover cycle fields
 
     # Restoring AAPL to the tradable universe on a later day starts a
     # genuinely fresh cycle -- the old $7 balance is gone, not resumed.
     _run_day(tmp_path, enrolled_config, state, TEST_DATES[2], 99.0, "day3")  # -1% -> crosses only tier 1.0
-    resumed = json.loads(tracker_path.read_text())
+    resumed = json.loads(tracker_path.read_bytes())
     assert resumed["status"] == "dipping"
     assert resumed["accumulated_usd"] == 1.0
 
@@ -586,7 +586,7 @@ def test_disabling_the_entire_mapping_still_resets_active_trackers(tmp_path, mon
 
     _run_day(tmp_path, enrolled_config, state, TEST_DATES[0], 95.0, "day1")  # -5%, crosses 1/2/4 -> $7
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    before = json.loads(tracker_path.read_text())
+    before = json.loads(tracker_path.read_bytes())
     assert before["status"] == "dipping"
     assert before["accumulated_usd"] == 7.0
 
@@ -595,7 +595,7 @@ def test_disabling_the_entire_mapping_still_resets_active_trackers(tmp_path, mon
     disabled_config = _base_config(inverse_martingale={})
     _run_day(tmp_path, disabled_config, state, TEST_DATES[1], 96.0, "day2")
 
-    after = json.loads(tracker_path.read_text())
+    after = json.loads(tracker_path.read_bytes())
     assert after["status"] == "none"
     assert after["last_evaluated_trading_day"] == TEST_DATES[1].isoformat()
     assert "accumulated_usd" not in after
@@ -721,7 +721,7 @@ def test_morning_slot_ticker_gating_does_not_reset_the_cycle(tmp_path, monkeypat
     _run_day(tmp_path, config_full, state, TEST_DATES[0], 99.0, "day1", stream="afternoon")
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    before = json.loads(tracker_path.read_text())
+    before = json.loads(tracker_path.read_bytes())
     assert before["status"] == "dipping"
     assert before["accumulated_usd"] == pytest.approx(1.0)
 
@@ -735,7 +735,7 @@ def test_morning_slot_ticker_gating_does_not_reset_the_cycle(tmp_path, monkeypat
         tmp_path, config_morning_gated, state, TEST_DATES[1], 99.0, "day2-morning", stream="morning",
     )
 
-    after_morning = json.loads(tracker_path.read_text())
+    after_morning = json.loads(tracker_path.read_bytes())
     assert after_morning["status"] == "dipping"  # NOT reset to "none"
     assert after_morning["accumulated_usd"] == pytest.approx(1.0)
 
@@ -744,7 +744,7 @@ def test_morning_slot_ticker_gating_does_not_reset_the_cycle(tmp_path, monkeypat
     # genuinely survived the morning gate-out rather than being silently
     # reset and re-started from zero.
     _run_day(tmp_path, config_full, state, TEST_DATES[1], 97.0, "day2-midday", stream="midday")
-    after_midday = json.loads(tracker_path.read_text())
+    after_midday = json.loads(tracker_path.read_bytes())
     assert after_midday["status"] == "dipping"
     assert after_midday["accumulated_usd"] == pytest.approx(3.0)  # existing $1 + newly-crossed 2% tier ($2)
 
@@ -764,14 +764,14 @@ def test_same_day_retry_after_full_fire_does_not_double_credit(tmp_path, monkeyp
     assert "imart" in (candidate.get("order_id") or "")
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    resolved = json.loads(tracker_path.read_text())
+    resolved = json.loads(tracker_path.read_bytes())
     assert resolved["status"] == "none"
 
     # Retry the SAME slot on the SAME trading day (TEST_DATES[1]), at a price
     # that would look like a fresh 1% dip if the tracker were naively reset.
     r2b, s2b, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 99.0, "day2-retry")
     assert s2b["buy_candidates"] == []  # no new fire, no re-accumulation
-    after_retry = json.loads(tracker_path.read_text())
+    after_retry = json.loads(tracker_path.read_bytes())
     # The audit trail (events) legitimately grows with a no-op entry; every
     # actual state field must stay unchanged by the retry.
     state_fields = {k: v for k, v in after_retry.items() if k != "events"}
@@ -784,7 +784,7 @@ def test_same_day_retry_after_full_fire_does_not_double_credit(tmp_path, monkeyp
     # legitimately still tested and still armed.
     r3, s3, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 99.0, "day3", prev_close=99.0)
     assert s3["buy_candidates"] == []  # accumulates only, no fire yet
-    later = json.loads(tracker_path.read_text())
+    later = json.loads(tracker_path.read_bytes())
     assert later["status"] == "none"
     assert "accumulated_usd" not in later
     assert later["rearm_reference_close"] == pytest.approx(100.0)
@@ -816,7 +816,7 @@ def test_later_slot_the_same_day_still_blocked_by_the_fired_cycles_own_floor(tmp
     assert "imart" in (candidate.get("order_id") or "")
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    resolved = json.loads(tracker_path.read_text())
+    resolved = json.loads(tracker_path.read_bytes())
     assert resolved["status"] == "none"
     assert resolved["last_evaluated_stream"] == "morning"
     assert resolved["fired_floor_drop_metric"] == pytest.approx(5.0)
@@ -826,7 +826,7 @@ def test_later_slot_the_same_day_still_blocked_by_the_fired_cycles_own_floor(tmp
     # covered. Must NOT be treated as a fresh dip: no new cycle, no credit.
     r2b, s2b, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 99.0, "day2-midday-shallow", stream="midday")
     assert s2b["buy_candidates"] == []
-    after_shallow = json.loads(tracker_path.read_text())
+    after_shallow = json.loads(tracker_path.read_bytes())
     assert after_shallow["status"] == "none"
     assert "accumulated_usd" not in after_shallow
 
@@ -834,7 +834,7 @@ def test_later_slot_the_same_day_still_blocked_by_the_fired_cycles_own_floor(tmp
     # still blocked by the SAME floor, not a new/different mechanism.
     r2c, s2c, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 99.0, "day2-midday-retry", stream="midday")
     assert s2c["buy_candidates"] == []
-    after_retry = json.loads(tracker_path.read_text())
+    after_retry = json.loads(tracker_path.read_bytes())
     state_fields = {k: v for k, v in after_retry.items() if k != "events"}
     prior_fields = {k: v for k, v in after_shallow.items() if k != "events"}
     assert state_fields == prior_fields
@@ -845,7 +845,7 @@ def test_later_slot_the_same_day_still_blocked_by_the_fired_cycles_own_floor(tmp
     # same-day observation.
     r3, s3, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 99.0, "day3", prev_close=99.0)
     assert s3["buy_candidates"] == []
-    later = json.loads(tracker_path.read_text())
+    later = json.loads(tracker_path.read_bytes())
     assert later["status"] == "none"
     assert "accumulated_usd" not in later
     assert later["rearm_reference_close"] == pytest.approx(100.0)
@@ -870,7 +870,7 @@ def test_later_slot_deeper_price_remains_latched_until_dip_exit(tmp_path, monkey
     # original descent until price first exits it.
     r2b, s2b, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 94.5, "day2-midday-deep", stream="midday")
     assert s2b["buy_candidates"] == []
-    after_midday = json.loads(tracker_path.read_text())
+    after_midday = json.loads(tracker_path.read_bytes())
     assert after_midday["status"] == "none"
     assert "accumulated_usd" not in after_midday
 
@@ -908,7 +908,7 @@ def test_split_during_an_active_cycle_is_found_after_resolution(tmp_path, monkey
     assert "imart" in (candidate.get("order_id") or "")
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    continuing = json.loads(tracker_path.read_text())
+    continuing = json.loads(tracker_path.read_bytes())
     assert continuing["status"] == "firing"
 
     # Day 3: the continuation settles and only now resolves the cycle. The
@@ -917,7 +917,7 @@ def test_split_during_an_active_cycle_is_found_after_resolution(tmp_path, monkey
     r3, s3, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 49.0, "day3", prev_close=49.0)
     [candidate] = s3["buy_candidates"]
     assert "imart" in (candidate.get("order_id") or "")
-    resolved = json.loads(tracker_path.read_text())
+    resolved = json.loads(tracker_path.read_bytes())
     assert resolved["rearm_reference_close"] == pytest.approx(100.0)
     assert resolved["rearm_last_seen_day"] == (TEST_DATES[0] - timedelta(days=1)).isoformat()
 
@@ -929,7 +929,7 @@ def test_split_during_an_active_cycle_is_found_after_resolution(tmp_path, monkey
     # reference indefinitely.
     r4, s4, _ = _run_day(tmp_path, config, state, TEST_DATES[3], 49.0, "day4", prev_close=49.0)
     assert s4["buy_candidates"] == []
-    after_split = json.loads(tracker_path.read_text())
+    after_split = json.loads(tracker_path.read_bytes())
     assert after_split["rearm_reference_close"] == pytest.approx(50.0)
     # The archive covers the evaluation day, so its cursor proves both the
     # earlier split and the absence of any later action through day 4.
@@ -978,7 +978,7 @@ def test_ambiguous_fire_keeps_the_claim_leased_and_resolved(tmp_path, monkeypatc
     assert candidate["status"] == "potentially_submitted"
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    tracker = json.loads(tracker_path.read_text())
+    tracker = json.loads(tracker_path.read_bytes())
     # Resolved and released, not left frozen or rolled back to "firing".
     assert tracker["status"] == "none"
     assert "settlement_pending" not in tracker
@@ -1130,7 +1130,7 @@ def test_direct_corporate_action_lookup_failure_holds_only_that_tickers_latch(
     _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    before = json.loads(tracker_path.read_text())
+    before = json.loads(tracker_path.read_bytes())
     assert before["rearm_reference_close"] == pytest.approx(100.0)
 
     def _raising_lookup(ticker, since, as_of):
@@ -1156,7 +1156,7 @@ def test_direct_corporate_action_lookup_failure_holds_only_that_tickers_latch(
     # The run completed normally (no exception escaped the per-ticker loop) ...
     assert result["run_state_path"]
     # ... the latch was held, not evaluated against the stale reference ...
-    assert json.loads(tracker_path.read_text()) == before
+    assert json.loads(tracker_path.read_bytes()) == before
     # ... and the raise was surfaced, not swallowed silently.
     assert any(
         "corporate-action lookup failed for AAPL" in record.message for record in caplog.records
@@ -1202,7 +1202,7 @@ def _arm_a_dormant_latch_with_a_confirming_archive(tmp_path, monkeypatch):
     _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1")
     _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    before = json.loads(tracker_path.read_text())
+    before = json.loads(tracker_path.read_bytes())
     assert before["rearm_reference_close"] == pytest.approx(100.0)
     return config, state, tracker_path, before
 
@@ -1249,7 +1249,7 @@ def test_archive_fallback_evidence_is_frozen_through_the_provider_hook_before_us
     assert evidence[1] == TEST_DATES[2]
     # The hook accepted the evidence, so the latch rebased onto the post-split
     # scale exactly as the plain archive-fallback path does.
-    after = json.loads(tracker_path.read_text())
+    after = json.loads(tracker_path.read_bytes())
     assert after["rearm_reference_close"] == pytest.approx(50.0)
     assert after["rearm_last_seen_day"] == TEST_DATES[2].isoformat()
 
@@ -1274,7 +1274,7 @@ def test_archive_fallback_evidence_that_cannot_be_frozen_holds_the_rearm_latch(
 
     assert result["run_state_path"]
     assert len(fin.hook_calls) == 1
-    assert json.loads(tracker_path.read_text()) == before
+    assert json.loads(tracker_path.read_bytes()) == before
 
 
 @pytest.mark.parametrize(
@@ -1304,7 +1304,7 @@ def test_direct_live_corporate_action_lookup_rejects_invalid_results(
     _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    before = json.loads(tracker_path.read_text())
+    before = json.loads(tracker_path.read_bytes())
     trading_day = TEST_DATES[2]
     fin = _LiveCorporateActionData(
         prev_close=99.0,
@@ -1329,7 +1329,7 @@ def test_direct_live_corporate_action_lookup_rejects_invalid_results(
         ),
     )
 
-    assert json.loads(tracker_path.read_text()) == before
+    assert json.loads(tracker_path.read_bytes()) == before
 
 
 def test_falls_back_to_archive_when_the_live_lookup_cannot_confirm(tmp_path, monkeypatch):
@@ -1356,7 +1356,7 @@ def test_falls_back_to_archive_when_the_live_lookup_cannot_confirm(tmp_path, mon
     _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    before = json.loads(tracker_path.read_text())
+    before = json.loads(tracker_path.read_bytes())
     assert before["rearm_reference_close"] == pytest.approx(100.0)
 
     trading_day = TEST_DATES[2]
@@ -1373,7 +1373,7 @@ def test_falls_back_to_archive_when_the_live_lookup_cannot_confirm(tmp_path, mon
             artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon",
         ),
     )
-    after = json.loads(tracker_path.read_text())
+    after = json.loads(tracker_path.read_bytes())
     # The live source could not confirm, but the archive independently could
     # -- the latch still rebases instead of staying stuck on the stale
     # pre-split reference.
@@ -1397,7 +1397,7 @@ def test_unavailable_live_and_archive_evidence_holds_the_rearm_latch(tmp_path, m
     _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    before = json.loads(tracker_path.read_text())
+    before = json.loads(tracker_path.read_bytes())
     assert before["rearm_reference_close"] == pytest.approx(100.0)
 
     trading_day = TEST_DATES[2]
@@ -1422,7 +1422,7 @@ def test_unavailable_live_and_archive_evidence_holds_the_rearm_latch(tmp_path, m
         ),
     )
 
-    assert json.loads(tracker_path.read_text()) == before
+    assert json.loads(tracker_path.read_bytes()) == before
 
 
 def test_archive_ending_before_evaluation_day_holds_the_rearm_latch(tmp_path, monkeypatch):
@@ -1444,7 +1444,7 @@ def test_archive_ending_before_evaluation_day_holds_the_rearm_latch(tmp_path, mo
     _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    before = json.loads(tracker_path.read_text())
+    before = json.loads(tracker_path.read_bytes())
     assert before["rearm_reference_close"] == pytest.approx(100.0)
 
     trading_day = TEST_DATES[2]
@@ -1469,7 +1469,7 @@ def test_archive_ending_before_evaluation_day_holds_the_rearm_latch(tmp_path, mo
         ),
     )
 
-    assert json.loads(tracker_path.read_text()) == before
+    assert json.loads(tracker_path.read_bytes()) == before
 
 
 def test_dry_run_fire_does_not_settle_the_ledger(tmp_path, monkeypatch):
@@ -1488,7 +1488,7 @@ def test_dry_run_fire_does_not_settle_the_ledger(tmp_path, monkeypatch):
     assert "imart" in (candidate.get("order_id") or "")
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    tracker = json.loads(tracker_path.read_text())
+    tracker = json.loads(tracker_path.read_bytes())
     assert tracker["status"] == "firing"  # claimed, but never settled
     assert tracker["accumulated_usd"] == pytest.approx(7.0, abs=0.01)  # nothing debited
 
@@ -1509,7 +1509,7 @@ def test_dry_run_fire_does_not_settle_the_ledger(tmp_path, monkeypatch):
     assert live_candidate["status"] == "submitted"
     assert live_candidate["planned_amount_usd"] == pytest.approx(7.0, abs=0.01)
     assert "7.00" in live_candidate["order_id"]
-    resolved = json.loads(tracker_path.read_text())
+    resolved = json.loads(tracker_path.read_bytes())
     assert resolved["status"] == "none"
     assert "settlement_pending" not in resolved
 
@@ -1540,7 +1540,7 @@ def test_dry_run_fire_attempts_do_not_consume_the_retry_budget(tmp_path, monkeyp
     _run_day(tmp_path, config, state, extended_dates[1], 91.5, "day2")  # -8.5% -> +$14 -> $15 total
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    pre_fire_tracker = json.loads(tracker_path.read_text())
+    pre_fire_tracker = json.loads(tracker_path.read_bytes())
     assert pre_fire_tracker["accumulated_usd"] == pytest.approx(15.0, abs=0.01)
     # Model a recovered cycle that has already spent one genuine production
     # attempt. Dry-run rehearsals must preserve this count rather than consume
@@ -1554,7 +1554,7 @@ def test_dry_run_fire_attempts_do_not_consume_the_retry_budget(tmp_path, monkeyp
     _run_day(tmp_path, config, state, extended_dates[3], 97.0, "day4")  # continuation, dry-run "fires" $5 again
     r5, s5, _ = _run_day(tmp_path, config, state, extended_dates[4], 97.0, "day5")
 
-    tracker = json.loads(tracker_path.read_text())
+    tracker = json.loads(tracker_path.read_bytes())
     assert tracker["status"] == "firing"  # NOT abandoned back to "none"
     assert tracker["accumulated_usd"] == pytest.approx(15.0, abs=0.01)  # nothing lost across 3 dry runs
     assert tracker["fire_attempts"] == 1  # pre-fire production attempt preserved
@@ -1588,7 +1588,7 @@ def test_prior_same_day_allocation_defers_fire_but_still_tracks_the_dip(tmp_path
     )
     assert s1["buy_candidates"] == []
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    tracker = json.loads(tracker_path.read_text())
+    tracker = json.loads(tracker_path.read_bytes())
     assert tracker["status"] == "dipping"
     assert tracker["accumulated_usd"] == pytest.approx(1.0, abs=0.01)
 
@@ -1599,7 +1599,7 @@ def test_prior_same_day_allocation_defers_fire_but_still_tracks_the_dip(tmp_path
         prior_same_day_allocations={"AAPL": prior},
     )
     assert s2["buy_candidates"] == []
-    tracker = json.loads(tracker_path.read_text())
+    tracker = json.loads(tracker_path.read_bytes())
     assert tracker["accumulated_usd"] == pytest.approx(3.0, abs=0.01)
 
 
@@ -1626,7 +1626,7 @@ def test_discarded_sub_threshold_credit_still_tracks_the_dip(tmp_path, monkeypat
     assert credit_ledger.minimum_order_pending_tickers(TEST_DATES[0].isoformat()) == {}
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    tracker = json.loads(tracker_path.read_text())
+    tracker = json.loads(tracker_path.read_bytes())
     assert tracker["status"] == "dipping"
     assert tracker["accumulated_usd"] == pytest.approx(1.0, abs=0.01)
 
@@ -1646,7 +1646,7 @@ def test_prior_same_day_allocation_defers_a_ready_to_fire_recovery(tmp_path, mon
     _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1")  # unguarded: -5%, accum=$7
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    before = json.loads(tracker_path.read_text())
+    before = json.loads(tracker_path.read_bytes())
     assert before["status"] == "dipping"
 
     prior = PriorSameDayAllocation(
@@ -1659,7 +1659,7 @@ def test_prior_same_day_allocation_defers_a_ready_to_fire_recovery(tmp_path, mon
         prior_same_day_allocations={"AAPL": prior},
     )
     assert s2["buy_candidates"] == []  # deferred, not claimed
-    after = json.loads(tracker_path.read_text())
+    after = json.loads(tracker_path.read_bytes())
     # Balance/status/tiers/reference close are untouched -- unclaimed,
     # retried fresh once unguarded -- but the age fields still advanced (and
     # the ledger's own event log, which every claim_fire() write appends to
@@ -1701,7 +1701,7 @@ def test_crash_after_fire_claim_keeps_balance_recoverable(tmp_path, monkeypatch)
         _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    claimed = json.loads(tracker_path.read_text())
+    claimed = json.loads(tracker_path.read_bytes())
     assert claimed["settlement_pending"] is True
     assert claimed["settlement_ref_id"].endswith("-2026-06-30-AAPL")
     # The balance stays on the tracker ITSELF, not in a nested side field: the
@@ -1731,7 +1731,7 @@ def test_next_day_crash_recovery_reconciles_terminal_partial_order(tmp_path, mon
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    claim = json.loads(tracker_path.read_text())
+    claim = json.loads(tracker_path.read_bytes())
 
     class HistoricalBroker(DryRunBroker):
         def __init__(self):
@@ -1753,7 +1753,7 @@ def test_next_day_crash_recovery_reconciles_terminal_partial_order(tmp_path, mon
     _, run_state, _ = _run_day(
         tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker
     )
-    recovered = json.loads(tracker_path.read_text())
+    recovered = json.loads(tracker_path.read_bytes())
     assert broker.queried_days == [TEST_DATES[1]]
     # This lease was claimed YESTERDAY, so its $3 must NOT appear among today's
     # buy candidates: a run_state artifact carries one top-level trading day, so
@@ -1943,7 +1943,7 @@ def _crash_a_fire_claim(tmp_path, monkeypatch, config, state):
     monkeypatch.undo()
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    return tracker_path, json.loads(tracker_path.read_text())
+    return tracker_path, json.loads(tracker_path.read_bytes())
 
 
 class _HistoryBroker(DryRunBroker):
@@ -1982,7 +1982,7 @@ def test_zero_fill_terminal_order_restores_the_whole_claimed_balance(
         {"state": terminal_state, "dollar_amount": "7.00", "cumulative_quantity": "0", "average_price": "0"}
     )
     _, run_state, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
-    recovered = json.loads(tracker_path.read_text())
+    recovered = json.loads(tracker_path.read_bytes())
     assert "settlement_pending" not in recovered
     # No shares were ever bought, so nothing is booked against the claim day's
     # budget for a purchase that never happened...
@@ -2073,7 +2073,7 @@ def test_live_order_keeps_the_lease_until_it_is_terminal(tmp_path, monkeypatch, 
     )
     _, run_state, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
 
-    assert json.loads(tracker_path.read_text()) == claim  # untouched
+    assert json.loads(tracker_path.read_bytes()) == claim  # untouched
     assert [row for row in run_state["buy_candidates"] if row["ticker"] == "AAPL"] == []
 
 
@@ -2109,7 +2109,7 @@ def test_unparseable_broker_notional_keeps_the_lease(tmp_path, monkeypatch, bad_
     broker = _HistoryBroker(order)
     _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
 
-    assert json.loads(tracker_path.read_text()) == claim  # untouched
+    assert json.loads(tracker_path.read_bytes()) == claim  # untouched
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
     assert state.day_notional(TEST_DATES[2]) == pytest.approx(0.0)
 
@@ -2155,7 +2155,7 @@ def test_recovery_against_a_different_broker_account_keeps_the_lease(tmp_path, m
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    claim = json.loads(tracker_path.read_text())
+    claim = json.loads(tracker_path.read_bytes())
     # A non-secret fingerprint, never the account number itself.
     assert claim["settlement_account"] and claiming_account not in json.dumps(claim)
 
@@ -2170,7 +2170,7 @@ def test_recovery_against_a_different_broker_account_keeps_the_lease(tmp_path, m
     # accounts line up, since finding the order proves it exists. What is
     # withheld is the RELEASE: this account's empty history says nothing about
     # an order submitted into the other one.
-    assert json.loads(tracker_path.read_text()) == claim
+    assert json.loads(tracker_path.read_bytes()) == claim
 
 
 def test_executed_notional_values_a_fill_with_no_quantity_or_price(tmp_path, monkeypatch):
@@ -2190,7 +2190,7 @@ def test_executed_notional_values_a_fill_with_no_quantity_or_price(tmp_path, mon
     broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
     _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
 
-    recovered = json.loads(tracker_path.read_text())
+    recovered = json.loads(tracker_path.read_bytes())
     # Recognized as a full fill: the claim settles to its target and the $7 is
     # booked against the claim day, instead of the balance being released as
     # unplaced and bought a second time today.
@@ -2210,7 +2210,7 @@ def test_terminal_fill_with_no_usable_price_keeps_the_lease(tmp_path, monkeypatc
     # A real fill (quantity > 0) with no price and no executed_notional.
     broker = _HistoryBroker({"state": "cancelled", "cumulative_quantity": "0.03"})
     _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
-    assert json.loads(tracker_path.read_text()) == claim
+    assert json.loads(tracker_path.read_bytes()) == claim
 
 
 @pytest.mark.parametrize(
@@ -2241,7 +2241,7 @@ def test_a_filled_order_with_no_positive_valuation_keeps_the_lease(tmp_path, mon
     _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
     # Indeterminate: the lease survives exactly as the crash left it, and no
     # balance is released for a second purchase.
-    assert json.loads(tracker_path.read_text()) == claim
+    assert json.loads(tracker_path.read_bytes()) == claim
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
 
 
@@ -2265,7 +2265,7 @@ def test_live_run_releases_an_expired_dry_run_lease(tmp_path, monkeypatch):
     broker = _HistoryBroker(None)
     _run_day(tmp_path, live, StrategyState(), TEST_DATES[2], 96.5, "day3", broker=broker)
 
-    released = json.loads(tracker_path.read_text())
+    released = json.loads(tracker_path.read_bytes())
     assert "settlement_pending" not in released
     # The balance was never spent, so it survives the release intact.
     assert released.get("accumulated_usd", 0.0) > 0 or released["status"] == STATUS_NONE
@@ -2294,7 +2294,7 @@ def test_same_day_recovery_of_a_removed_ticker_is_still_published(tmp_path, monk
         tmp_path, removed, state, TEST_DATES[1], 96.5, "day2b", broker=broker
     )
 
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     rows = [row for row in run_state["buy_candidates"] if row["ticker"] == "AAPL"]
     assert len(rows) == 1
     assert rows[0]["reason"] == "recovered_inverse_martingale_lease"
@@ -2332,7 +2332,7 @@ def test_live_claim_without_a_fingerprint_is_never_released_on_absence(tmp_path,
     monkeypatch.setattr(ncd, "_broker_account_fingerprint", lambda *a, **k: None)
     broker = _HistoryBroker(None)
     _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
-    assert json.loads(tracker_path.read_text()) == claim  # preserved, not released
+    assert json.loads(tracker_path.read_bytes()) == claim  # preserved, not released
 
 
 def test_mapping_shaped_executed_notional_is_valued(tmp_path, monkeypatch):
@@ -2349,7 +2349,7 @@ def test_mapping_shaped_executed_notional_is_valued(tmp_path, monkeypatch):
     broker = _HistoryBroker({"state": "filled", "executed_notional": {"amount": "7.00"}})
     _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
 
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
 
 
@@ -2378,7 +2378,7 @@ def test_dry_run_lease_expires_without_a_broker_lookup(tmp_path, monkeypatch):
     _run_day(
         tmp_path, live, StrategyState(), TEST_DATES[2], 96.5, "day3", broker=_NoHistoryBroker()
     )
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
 
 
 def test_partial_fill_that_exhausts_the_balance_resolves_the_cycle(tmp_path, monkeypatch):
@@ -2397,7 +2397,7 @@ def test_partial_fill_that_exhausts_the_balance_resolves_the_cycle(tmp_path, mon
     broker = _HistoryBroker({"state": "cancelled", "executed_notional": "7.50"})
     _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
 
-    recovered = json.loads(tracker_path.read_text())
+    recovered = json.loads(tracker_path.read_bytes())
     assert "settlement_pending" not in recovered
     # The paid floor PRICE is persisted alongside the metric, exactly as every
     # ordinary fire-resolution path does. With only the metric, the same-day
@@ -2459,7 +2459,7 @@ def test_filled_order_without_cumulative_quantity_uses_quantity(tmp_path, monkey
     broker = _HistoryBroker({"state": "filled", "quantity": "0.07", "average_price": "100.00"})
     _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
 
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
 
 
@@ -2483,7 +2483,7 @@ def test_filled_order_with_empty_string_cumulative_quantity_falls_back_to_quanti
     )
     _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
 
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
 
 
@@ -2506,7 +2506,7 @@ def test_filled_order_with_whitespace_only_cumulative_quantity_falls_back_to_qua
     )
     _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
 
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
 
 
@@ -2522,7 +2522,7 @@ def test_cancelled_order_never_treats_requested_quantity_as_executed(tmp_path, m
     _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
     # Zero executed -> nothing is booked, and the balance survives intact as a
     # failed fire attempt rather than being written off.
-    recovered = json.loads(tracker_path.read_text())
+    recovered = json.loads(tracker_path.read_bytes())
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
     assert state.day_notional(TEST_DATES[2]) == pytest.approx(0.0)
     assert recovered["accumulated_usd"] == pytest.approx(7.0)
@@ -2636,7 +2636,7 @@ def test_expired_order_is_settled_not_left_indeterminate(tmp_path, monkeypatch):
     broker = _HistoryBroker({"state": "expired", "executed_notional": "3.00"})
     _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
 
-    recovered = json.loads(tracker_path.read_text())
+    recovered = json.loads(tracker_path.read_bytes())
     assert "settlement_pending" not in recovered
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(3.0)
 
@@ -3141,7 +3141,7 @@ def test_a_morning_claim_recovered_by_the_afternoon_stays_out_of_that_stream(tmp
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    claim = json.loads(tracker_path.read_text())
+    claim = json.loads(tracker_path.read_bytes())
     # The lease records where the money came from, so a later stream can tell.
     assert claim["settlement_stream"] == "morning"
 
@@ -3153,7 +3153,7 @@ def test_a_morning_claim_recovered_by_the_afternoon_stays_out_of_that_stream(tmp
         stream="afternoon", deployment_history_root=tmp_path / "runs",
     )
 
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     # The shared daily/weekly budget IS charged -- those caps span the roster.
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
     # But the afternoon-only kill-switch figure is untouched, and no row lands
@@ -3168,7 +3168,7 @@ def test_a_morning_claim_recovered_by_the_afternoon_stays_out_of_that_stream(tmp
     # recovery, the tracker itself must durably record which claim it
     # resolved -- the ledger's own generic step-event log carries no date,
     # stream, order id, or claim ref at all.
-    last_recovery = json.loads(tracker_path.read_text())["last_recovery"]
+    last_recovery = json.loads(tracker_path.read_bytes())["last_recovery"]
     assert last_recovery["claim_trading_day"] == claim["settlement_trading_day"]
     assert last_recovery["claim_stream"] == "morning"
     assert last_recovery["claim_ref"] == claim["settlement_ref_id"]
@@ -3182,7 +3182,7 @@ def test_a_morning_claim_recovered_by_the_afternoon_stays_out_of_that_stream(tmp
     # is reset) -- resolved_marker() carries no such field forward. The
     # SAME attribution must also live in the ledger's own append-only event
     # log, which survives that replacement.
-    events = json.loads(tracker_path.read_text())["events"]
+    events = json.loads(tracker_path.read_bytes())["events"]
     recovery_events = [e for e in events if e.get("recovery_metadata")]
     assert len(recovery_events) == 1
     recovery_event_metadata = recovery_events[0]["recovery_metadata"]
@@ -3215,7 +3215,7 @@ def test_a_same_day_zero_fill_recovery_still_publishes_an_attempt_row(tmp_path, 
         tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover", broker=broker
     )
 
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     recoveries = [
         r for r in run_state["buy_candidates"]
         if r["reason"] == "recovered_inverse_martingale_lease"
@@ -3258,7 +3258,7 @@ def test_a_recovery_already_recorded_on_disk_is_not_republished(tmp_path, monkey
     )
 
     # The lease is still resolved -- reconciliation is the point of the pass...
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     # ...but nothing is re-booked into state...
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
     # ...and no second artifact row carries the already-audited order.
@@ -3287,7 +3287,7 @@ def test_recovery_is_logged_in_the_execution_record(tmp_path, monkeypatch):
     result, run_state, _ = _run_day(
         tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover", broker=broker
     )
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     [recovery] = [
         r for r in run_state["buy_candidates"]
         if r["reason"] == "recovered_inverse_martingale_lease"
@@ -3326,7 +3326,7 @@ def test_recovery_terminal_zero_fill_does_not_fabricate_a_fill(tmp_path, monkeyp
     result, run_state, _ = _run_day(
         tmp_path, config, state, TEST_DATES[1], 96.5, "day2-zero-fill", broker=broker
     )
-    recovered = json.loads(tracker_path.read_text())
+    recovered = json.loads(tracker_path.read_bytes())
     assert "settlement_pending" not in recovered
     # Nothing executed, so nothing is booked...
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
@@ -3528,14 +3528,14 @@ def test_recovered_candidate_reaches_companion_artifacts_across_a_retry(tmp_path
         "submitted_orders.csv must reflect the reinjected recovery"
     )
 
-    summary = json.loads((run_dir / "run_summary.json").read_text(encoding="utf-8"))
+    summary = json.loads((run_dir / "run_summary.json").read_bytes())
     assert summary["orders_submitted_count"] >= 1
 
     # Regression for "Refresh all derived counts after reinjection":
     # counts.buy_candidates and the usage-proxy's buy_candidates_written/
     # orders_placed_count must grow with the reinjected candidate too, not
     # just orders_submitted_count/counts.submitted.
-    run_state = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
+    run_state = json.loads((run_dir / "run_state.json").read_bytes())
     assert run_state["counts"]["buy_candidates"] == len(run_state["buy_candidates"])
     assert run_state["usage_proxy"]["buy_candidates_written"] == len(run_state["buy_candidates"])
     assert run_state["usage_proxy"]["orders_placed_count"] >= 1
@@ -3628,7 +3628,7 @@ def test_a_malformed_prior_broker_outcomes_does_not_abort_a_successful_retry(tmp
     restore_msft_candidate()
 
     run_dir = tmp_path / "runs" / "day2-malformed-prior"
-    prior_state = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
+    prior_state = json.loads((run_dir / "run_state.json").read_bytes())
     prior_state["broker_outcomes"] = ["not", "a", "mapping"]
     # This test isolates the run_daily_compact REINJECTION block's own
     # defensive isinstance check (a downstream concern, unaffected by round
@@ -3712,7 +3712,7 @@ def test_recovery_is_rebooked_when_already_on_disk_in_this_same_directory(tmp_pa
     _, run_state, _ = _run_day(
         tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-here", broker=broker
     )
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     assert any(
         r["reason"] == "recovered_inverse_martingale_lease" and r.get("order_id") == order_id
         for r in run_state["buy_candidates"]
@@ -3861,7 +3861,7 @@ def test_afternoon_failure_replaces_execution_rows_when_the_prior_state_is_forei
     # invocation, not merely have its orders.csv swapped out -- otherwise the
     # artifact still carries the foreign trading_day/stream/run_id while its
     # execution log describes the current failure.
-    written_state = json.loads(state_path.read_text())
+    written_state = json.loads(state_path.read_bytes())
     assert written_state["trading_day"] == "2026-07-01"
     assert written_state["run_classification"]["stream"] == "afternoon"
     assert written_state["run_id"] != "prior-run"
@@ -4516,7 +4516,7 @@ def test_recovery_execution_row_keeps_history_fill_details_without_a_second_look
     result, run_state, _ = _run_day(
         tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover", broker=broker
     )
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     [recovery] = [
         r for r in run_state["buy_candidates"]
         if r["reason"] == "recovered_inverse_martingale_lease"
@@ -4564,7 +4564,7 @@ def test_recovery_prefers_the_terminal_history_quantity_over_a_stale_follow_up(
     result, run_state, _ = _run_day(
         tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-stale", broker=broker
     )
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     [recovery] = [
         r for r in run_state["buy_candidates"]
         if r["reason"] == "recovered_inverse_martingale_lease"
@@ -4623,7 +4623,7 @@ def test_recovery_rejects_stale_partial_timestamps_that_disagree_with_terminal_q
     result, run_state, _ = _run_day(
         tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-stale-ts", broker=broker
     )
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     [recovery] = [
         r for r in run_state["buy_candidates"]
         if r["reason"] == "recovered_inverse_martingale_lease"
@@ -4678,7 +4678,7 @@ def test_recovery_rejects_partial_timestamps_for_a_notional_only_recovery(tmp_pa
     result, run_state, _ = _run_day(
         tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-notional-ts", broker=broker
     )
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     [recovery] = [
         r for r in run_state["buy_candidates"]
         if r["reason"] == "recovered_inverse_martingale_lease"
@@ -4728,7 +4728,7 @@ def test_recovery_logging_survives_a_raising_fill_lookup(tmp_path, monkeypatch):
     result, run_state, _ = _run_day(
         tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-raise", broker=broker
     )
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     [recovery] = [
         r for r in run_state["buy_candidates"]
         if r["reason"] == "recovered_inverse_martingale_lease"
@@ -4773,7 +4773,7 @@ def test_recovery_ignores_a_stale_fill_lookup_when_history_had_no_granular_break
     result, run_state, _ = _run_day(
         tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-notional-only", broker=broker
     )
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     [recovery] = [
         r for r in run_state["buy_candidates"]
         if r["reason"] == "recovered_inverse_martingale_lease"
@@ -4818,7 +4818,7 @@ def test_recovered_execution_row_persists_when_a_later_candidate_raises(tmp_path
             broker=broker,
         )
 
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     orders_csv = tmp_path / "runs" / "day2-recover-fail" / "orders.csv"
     assert orders_csv.exists(), "orders.csv must be written even though the run raised"
     with open(orders_csv, encoding="utf-8") as handle:
@@ -4923,7 +4923,7 @@ def test_recovery_row_survives_alongside_a_same_ticker_candidate(tmp_path, monke
         tmp_path, reopened, state, TEST_DATES[1], 90.0, "day2b", broker=broker
     )
 
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     rows = [r for r in run_state["buy_candidates"] if r["ticker"] == "AAPL"]
     recoveries = [r for r in rows if r["reason"] == "recovered_inverse_martingale_lease"]
     # The recovery is present in its own right, not displaced by the ordinary
@@ -4957,7 +4957,7 @@ def test_another_same_ticker_order_does_not_suppress_recovery_booking(tmp_path, 
         deployment_history_root=tmp_path / "runs",
     )
 
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     # Booked: the ticker-level evidence is about a different order.
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
 
@@ -4999,7 +4999,7 @@ def test_recovery_booking_still_seeds_a_separate_prior_allocation(tmp_path, monk
         prior_same_day_allocations={"AAPL": separate},
     )
 
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     # BOTH orders are accounted for: the recovered $7 and the separate $5.
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(12.0)
     # And both consumed one of the shared max_orders_per_day slots.
@@ -5065,7 +5065,7 @@ def test_account_mismatch_refuses_a_positive_match_too(tmp_path, monkeypatch):
     _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
 
     # Neither settled nor released: nothing about this claim is knowable here.
-    assert json.loads(tracker_path.read_text()) == claim
+    assert json.loads(tracker_path.read_bytes()) == claim
     assert broker.queried == []
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
 
@@ -5088,7 +5088,7 @@ def test_matched_terminal_zero_fill_resolves_on_the_claim_day(tmp_path, monkeypa
     # SAME trading day as the claim -- a later stream on the crash day.
     _run_day(tmp_path, config, state, claim_day, 96.5, "day2b", broker=broker)
 
-    recovered = json.loads(tracker_path.read_text())
+    recovered = json.loads(tracker_path.read_bytes())
     assert "settlement_pending" not in recovered
     assert recovered["accumulated_usd"] == pytest.approx(7.0)
     assert recovered["fire_attempts"] == 1
@@ -5105,7 +5105,7 @@ def test_absent_order_still_waits_for_the_claim_day_to_end(tmp_path, monkeypatch
 
     broker = _HistoryBroker(None, price=96.5)
     _run_day(tmp_path, config, state, claim_day, 96.5, "day2b", broker=broker)
-    assert json.loads(tracker_path.read_text()) == claim  # still leased
+    assert json.loads(tracker_path.read_bytes()) == claim  # still leased
 
 
 def test_lease_recovery_runs_even_after_enrollment_is_disabled(tmp_path, monkeypatch):
@@ -5131,7 +5131,7 @@ def test_lease_recovery_runs_even_after_enrollment_is_disabled(tmp_path, monkeyp
     _run_day(tmp_path, disabled, state, TEST_DATES[2], 96.5, "day3", broker=broker)
 
     assert broker.queried == [("AAPL", TEST_DATES[1], claim["settlement_ref_id"])]
-    recovered = json.loads(tracker_path.read_text())
+    recovered = json.loads(tracker_path.read_bytes())
     assert "settlement_pending" not in recovered
     # The claimed fire landed in full, so the lease settles to its target
     # rather than sitting frozen forever, and the $7 is booked as real spend.
@@ -5171,7 +5171,7 @@ def test_lease_recovery_runs_even_when_the_date_gate_blocks_the_run(tmp_path, mo
     # The lease was still reconciled against the broker despite the run
     # returning immediately after the date gate.
     assert broker.queried == [("AAPL", TEST_DATES[1], claim["settlement_ref_id"])]
-    recovered = json.loads(tracker_path.read_text())
+    recovered = json.loads(tracker_path.read_bytes())
     assert "settlement_pending" not in recovered
     assert recovered["status"] == STATUS_NONE
     # Regression assertion for "Book recovered spend before clearing gated
@@ -5213,7 +5213,7 @@ def test_lease_recovery_books_spend_when_a_market_holiday_blocks_the_run(tmp_pat
     assert result["blocked"] is True
     assert run_state["buy_candidates"] == []
     assert broker.queried == [("AAPL", TEST_DATES[1], claim["settlement_ref_id"])]
-    assert "settlement_pending" not in json.loads(tracker_path.read_text())
+    assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
     assert state.week_notional(TEST_DATES[1]) == pytest.approx(7.0)
 
@@ -5236,7 +5236,7 @@ def test_dry_run_recovery_never_releases_a_live_lease(tmp_path, monkeypatch):
     broker = _HistoryBroker(None)
     _run_day(tmp_path, dry, StrategyState(), TEST_DATES[2], 96.5, "day3", broker=broker)
 
-    preserved = json.loads(tracker_path.read_text())
+    preserved = json.loads(tracker_path.read_bytes())
     assert broker.queried == []  # never even asked -- a dry run cannot answer
     assert preserved == claim  # the lease is left exactly as the crash left it
 
@@ -5260,7 +5260,7 @@ def test_sub_dollar_balance_is_deferred_not_rounded_up_to_the_broker_minimum(tmp
 
     _run_day(tmp_path, config, state, TEST_DATES[0], 99.0, "day1")  # -1%, crosses tier 1 -> $0.30
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    assert json.loads(tracker_path.read_text())["accumulated_usd"] == pytest.approx(0.3, abs=0.01)
+    assert json.loads(tracker_path.read_bytes())["accumulated_usd"] == pytest.approx(0.3, abs=0.01)
 
     _, s2, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 100.0, "day2")  # recovers
     # Nothing is placed: not $0.30 (below the broker minimum) and emphatically
@@ -5268,7 +5268,7 @@ def test_sub_dollar_balance_is_deferred_not_rounded_up_to_the_broker_minimum(tmp
     assert s2["buy_candidates"] == []
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
 
-    tracker = json.loads(tracker_path.read_text())
+    tracker = json.loads(tracker_path.read_bytes())
     # The cycle stays active with its balance intact, so a deeper later dip can
     # still grow it past the minimum; max_cycle_days remains the backstop.
     assert tracker["status"] == STATUS_DIPPING
@@ -5300,7 +5300,7 @@ def test_the_broker_minimum_floor_never_places_past_a_tighter_per_order_cap(tmp_
     _run_day(tmp_path, config, state, TEST_DATES[0], 99.0, "day1")  # +$1
     _run_day(tmp_path, config, state, TEST_DATES[1], 97.0, "day2")  # +$2 -> $3 total
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    assert json.loads(tracker_path.read_text())["accumulated_usd"] == pytest.approx(3.0, abs=0.01)
+    assert json.loads(tracker_path.read_bytes())["accumulated_usd"] == pytest.approx(3.0, abs=0.01)
 
     _, s3, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 100.0, "day3")  # recovers
     [candidate] = s3["buy_candidates"]
@@ -5310,7 +5310,7 @@ def test_the_broker_minimum_floor_never_places_past_a_tighter_per_order_cap(tmp_
     # Nothing was placed, so the rollback must restore the balance in full --
     # the cycle keeps carrying its $3.00 rather than silently losing the
     # claimed slice to a placement that never happened.
-    tracker = json.loads(tracker_path.read_text())
+    tracker = json.loads(tracker_path.read_bytes())
     assert tracker["accumulated_usd"] == pytest.approx(3.0, abs=0.01)
 
 
@@ -5380,7 +5380,7 @@ def test_settlement_skips_rather_than_overwrites_a_concurrently_advanced_ledger(
     assert call_count["n"] == 2  # the injection-site claim, then settlement's own CAS attempt
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    on_disk = json.loads(tracker_path.read_text())
+    on_disk = json.loads(tracker_path.read_bytes())
     # The intruding process's state survives untouched -- settlement's CAS
     # detected the mismatch and skipped writing rather than overwriting it.
     assert on_disk.get("intruder") is True
@@ -5452,7 +5452,7 @@ def test_non_fire_transition_is_also_compare_and_swap_protected(tmp_path, monkey
     assert call_count["n"] == 1  # this run's own single non-fire evaluation
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    on_disk = json.loads(tracker_path.read_text())
+    on_disk = json.loads(tracker_path.read_bytes())
     # The intruding process's state survives -- this run's own non-fire
     # write lost its compare-and-swap (the on-disk state no longer matched
     # expected_prior_state after the intruder's write) and was skipped,
@@ -5568,7 +5568,7 @@ def test_a_settlement_overpay_that_exhausts_the_balance_resolves_cleanly(tmp_pat
     _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2")
 
     tracker_path = tmp_path / "cron_tracking" / "inverse_martingale_dca" / "AAPL" / "tracker.json"
-    resolved = json.loads(tracker_path.read_text())
+    resolved = json.loads(tracker_path.read_bytes())
     # The run completed and the lease is cleared rather than stranded.
     assert "settlement_pending" not in resolved
     assert resolved["status"] == "none"

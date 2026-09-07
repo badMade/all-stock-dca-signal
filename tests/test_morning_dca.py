@@ -3284,7 +3284,7 @@ def test_maybe_block_for_holiday_seeds_prior_spend_in_budget_ledger(tmp_path):
 
     assert res is not None
     assert "budget_ledger" in res["paths"]
-    ledger_data = json.loads(Path(res["paths"]["budget_ledger"]).read_text(encoding="utf-8"))
+    ledger_data = json.loads(Path(res["paths"]["budget_ledger"]).read_bytes())
     assert ledger_data["hypothetical_week_spend_usd"] == 50.0
     assert ledger_data["remaining_weekly_usd"] == 850.0
 
@@ -3327,7 +3327,7 @@ def test_maybe_block_for_holiday_seeds_same_day_pooled_spend(tmp_path):
 
     assert res is not None
     assert "budget_ledger" in res["paths"]
-    ledger_data = json.loads(Path(res["paths"]["budget_ledger"]).read_text(encoding="utf-8"))
+    ledger_data = json.loads(Path(res["paths"]["budget_ledger"]).read_bytes())
     assert ledger_data["hypothetical_day_spend_usd"] == 30.0
     assert ledger_data["remaining_daily_usd"] == 150.0
     assert ledger_data["hypothetical_week_spend_usd"] == 30.0
@@ -4034,7 +4034,7 @@ def test_raw_sequence_numbers_come_from_existing_suffixes_not_a_file_count(tmp_p
     assert recorder.error is None
     assert recorder.saved_filenames == ["quote_CCC_4.json"]
     # The pre-existing _3 file is untouched.
-    assert json.loads((raw_dir / "quote_BBB_3.json").read_text()) == {"original": True}
+    assert json.loads((raw_dir / "quote_BBB_3.json").read_bytes()) == {"original": True}
     assert (raw_dir / "quote_CCC_4.json").exists()
 
 
@@ -5596,7 +5596,7 @@ def test_morning_retry_keeps_partial_preserve_out_of_minimum_order_pool(tmp_path
     )
 
     outcome = ex._compute_top_up(now, [signal])["AAPL"]
-    state = json.loads((tmp_path / "credits" / "2026-07-08" / "ledger.json").read_text())
+    state = json.loads((tmp_path / "credits" / "2026-07-08" / "ledger.json").read_bytes())
 
     assert outcome.cumulative_credit_decline_usd == 0.20
     assert ex.credit_ledger.pending_usd("AAPL", "2026-07-08") == 0.20
@@ -7099,7 +7099,7 @@ def test_run_persists_ambiguous_placement_marker_in_candidate_rows(tmp_path):
 
     row = result["artifacts"]["buy_candidates"][0]
     assert row["ambiguous_placement_exception"] is True
-    persisted = json.loads(Path(result["paths"]["run_state"]).read_text())
+    persisted = json.loads(Path(result["paths"]["run_state"]).read_bytes())
     assert persisted["buy_candidates"][0]["ambiguous_placement_exception"] is True
     assert result["artifacts"]["budget"]["hypothetical_day_spend_usd"] == 3.0
     assert result["artifacts"]["budget"]["hypothetical_week_spend_usd"] == 3.0
@@ -10256,7 +10256,7 @@ def test_raw_input_recorder_namespaces_filenames_across_retry_attempts(tmp_path)
     for name in first_names:
         assert (raw_dir / name).exists()
     first_close_filename = next(n for n in first_names if n.startswith("prior_close"))
-    on_disk_first_close = json.loads((raw_dir / first_close_filename).read_text(encoding="utf-8"))
+    on_disk_first_close = json.loads((raw_dir / first_close_filename).read_bytes())
     assert on_disk_first_close["close"] == 100.0
 
 
@@ -10345,7 +10345,7 @@ def test_raw_input_recorder_normalizes_current_session_context_pointer(tmp_path)
     persisted = recorder.persist("historicals", "AAPL", {"current_session_context": str(context)})
 
     assert persisted == {"results": [{"symbol": "AAPL"}]}
-    archived = json.loads((tmp_path / "raw" / recorder.saved_filenames[0]).read_text(encoding="utf-8"))
+    archived = json.loads((tmp_path / "raw" / recorder.saved_filenames[0]).read_bytes())
     assert archived["current_session_context"] == str(context)
     assert archived["output_path"] == str(context)
     assert archived["normalized"] is True
@@ -10379,7 +10379,7 @@ def test_persisting_finance_provider_archives_connectors_before_parsing(tmp_path
 
     assert len(bars) == 1
     assert previous_close is not None and previous_close.close == 101.25
-    payloads = [json.loads((tmp_path / "raw" / name).read_text(encoding="utf-8")) for name in recorder.saved_filenames]
+    payloads = [json.loads((tmp_path / "raw" / name).read_bytes()) for name in recorder.saved_filenames]
     assert any(payload.get("data") == bars_payload for payload in payloads)
     assert close_payload in payloads
 
@@ -10533,7 +10533,7 @@ def test_persisting_finance_provider_serializes_vendor_scalar_bar_fields(tmp_pat
     assert recorder.error is None
     assert len(bars) == 1
     assert bars[0].volume == 12345
-    archived = json.loads((tmp_path / "raw" / recorder.saved_filenames[0]).read_text(encoding="utf-8"))
+    archived = json.loads((tmp_path / "raw" / recorder.saved_filenames[0]).read_bytes())
     archived_bar = archived["data"][0]
     assert archived_bar["volume"] == 12345
     assert archived_bar["is_regular_session"] is True
@@ -10616,7 +10616,7 @@ def test_persisting_robinhood_adapters_archive_connector_envelopes_before_parsin
     assert _PersistingMarketDataProvider(provider, recorder).get_quote("AAPL", _now_live())[0] == 99.0
     assert _PersistingBrokerAdapter(broker, recorder).available_buying_power() == 137.0
 
-    payloads = [json.loads((tmp_path / "raw" / name).read_text(encoding="utf-8")) for name in recorder.saved_filenames]
+    payloads = [json.loads((tmp_path / "raw" / name).read_bytes()) for name in recorder.saved_filenames]
     assert quote_payload in payloads
     assert buying_power_payload in payloads
 
@@ -10638,7 +10638,7 @@ def test_persisting_broker_adapter_preserves_outer_failure_flag_on_place(tmp_pat
         wrapped.place_market_buy("AAPL", 10.0, "ref-1")
 
     assert recorder.error is None
-    payloads = [json.loads((tmp_path / "raw" / name).read_text(encoding="utf-8")) for name in recorder.saved_filenames]
+    payloads = [json.loads((tmp_path / "raw" / name).read_bytes()) for name in recorder.saved_filenames]
     assert failed_placement in payloads
 
 
@@ -10734,7 +10734,7 @@ def test_persisting_provider_archives_the_raw_connector_response_before_parsing(
 
     archived = [name for name in recorder.saved_filenames if name.startswith("historicals_")]
     assert archived, f"raw connector payload was not archived: {recorder.saved_filenames}"
-    payload = json.loads((tmp_path / "raw" / archived[0]).read_text())
+    payload = json.loads((tmp_path / "raw" / archived[0]).read_bytes())
     assert payload["results"][0]["historicals"] == "not-a-list"
 
 
@@ -11171,7 +11171,7 @@ def test_blocked_live_result_carries_raw_persistence_fields(tmp_path):
     assert artifacts["raw_input_dir"] == str(run_dir / "raw")
     assert artifacts["raw_inputs_saved"] == []
     assert "failed to persist" in artifacts["raw_persistence_error"]
-    on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_bytes())
     assert "raw_persistence_error" in on_disk
 
 
@@ -11228,7 +11228,7 @@ def test_blocked_live_run_preserves_earlier_submission_on_later_raw_failure(tmp_
     assert {c["ticker"] for c in submitted_rows} == {"AAA"}
     trading_day = _now_live().astimezone(EASTERN).date()
     assert ex.ledger.day_planned(trading_day) == artifacts["broker_outcomes"]["AAA"]["submitted_amount_usd"]
-    on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_bytes())
     assert on_disk["broker_outcomes"]["AAA"]["status"] == "submitted"
 
 
@@ -11264,7 +11264,7 @@ def test_blocked_partial_submission_run_denies_scheduled_evidence(tmp_path):
     assert artifacts["is_trading_failure"] is True
     assert artifacts["scheduled_evidence_denied"] is True
     assert derive_valid_scheduled_evidence(artifacts) is False
-    on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_bytes())
     assert on_disk["scheduled_evidence_denied"] is True
     assert derive_valid_scheduled_evidence(on_disk) is False
 
@@ -11317,7 +11317,7 @@ def test_blocked_live_retry_clears_stale_raw_failure_metadata(tmp_path):
     assert "raw_persistence_error" not in second["artifacts"]
     submitted_rows = [c for c in second["artifacts"]["buy_candidates"] if c.get("status") == "submitted"]
     assert {c["ticker"] for c in submitted_rows} == {"AAA"}
-    on_disk = json.loads(run_state_path.read_text(encoding="utf-8"))
+    on_disk = json.loads(run_state_path.read_bytes())
     assert on_disk["error_class"] == ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT
     assert "raw_persistence_error" not in on_disk
     assert on_disk["broker_outcomes"]["AAA"]["status"] == "submitted"
@@ -11368,7 +11368,7 @@ def test_blocked_retry_after_full_earlier_submission_denies_scheduled_evidence(t
     assert artifacts["is_trading_failure"] is True
     assert artifacts["scheduled_evidence_denied"] is True
     assert derive_valid_scheduled_evidence(artifacts) is False
-    on_disk = json.loads(Path(second["paths"]["run_state"]).read_text(encoding="utf-8"))
+    on_disk = json.loads(Path(second["paths"]["run_state"]).read_bytes())
     assert on_disk["scheduled_evidence_denied"] is True
     assert derive_valid_scheduled_evidence(on_disk) is False
 
@@ -11409,7 +11409,7 @@ def test_blocked_retry_preserves_raw_input_references_after_full_submission(tmp_
     assert artifacts["broker_outcomes"]["AAA"]["status"] == "submitted"
     assert artifacts["raw_input_dir"] == original_raw_input_dir
     assert artifacts["raw_inputs_saved"] == original_raw_inputs_saved
-    on_disk = json.loads(Path(second["paths"]["run_state"]).read_text(encoding="utf-8"))
+    on_disk = json.loads(Path(second["paths"]["run_state"]).read_bytes())
     assert on_disk["raw_input_dir"] == original_raw_input_dir
     assert on_disk["raw_inputs_saved"] == original_raw_inputs_saved
 
@@ -11460,7 +11460,7 @@ def test_blocked_retry_merges_raw_filenames_with_preserved_submission(tmp_path):
     assert artifacts["broker_outcomes"]["AAA"]["status"] == "submitted"
     assert artifacts["raw_inputs_saved"][: len(original_raw_inputs_saved)] == original_raw_inputs_saved
     assert new_filename in artifacts["raw_inputs_saved"]
-    on_disk = json.loads(Path(result["paths"]["run_state"]).read_text(encoding="utf-8"))
+    on_disk = json.loads(Path(result["paths"]["run_state"]).read_bytes())
     assert on_disk["raw_inputs_saved"][: len(original_raw_inputs_saved)] == original_raw_inputs_saved
     assert new_filename in on_disk["raw_inputs_saved"]
 
@@ -11645,7 +11645,7 @@ def test_scheduled_live_run_persists_block_when_buying_power_lookup_fails(tmp_pa
     assert artifacts["broker_outcomes"] == {}
     assert heartbeat_results == [False]
     assert Path(res["paths"]["run_state"]).exists()
-    pointer = json.loads((live_root / ex.latest_pointer_name).read_text(encoding="utf-8"))
+    pointer = json.loads((live_root / ex.latest_pointer_name).read_bytes())
     assert pointer["run_state_path"] == res["paths"]["run_state"]
 
 
@@ -11723,7 +11723,7 @@ def test_blocked_buying_power_failure_retains_raw_input_metadata(tmp_path):
     raw_dir = ex.run_state_dir(_now_live()) / "raw"
     assert artifacts["raw_input_dir"] == str(raw_dir)
     assert artifacts["raw_inputs_saved"]
-    on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_bytes())
     assert on_disk["raw_input_dir"] == str(raw_dir)
     assert on_disk["raw_inputs_saved"]
     assert on_disk["scheduled_evidence_denied"] is True
@@ -15044,7 +15044,7 @@ def test_blocked_live_run_preserves_ambiguous_placement_on_later_raw_failure(tmp
     assert artifacts["broker_outcomes"]["AAA"]["status"] == "potentially_submitted"
     assert artifacts["broker_outcomes"]["BBB"]["status"] == "blocked"
     assert "raw input persistence failed" in artifacts["broker_outcomes"]["BBB"]["skip_reason"]
-    on_disk = json.loads(Path(res["paths"]["run_state"]).read_text(encoding="utf-8"))
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_bytes())
     assert on_disk["broker_outcomes"]["AAA"]["status"] == "potentially_submitted"
 
 
@@ -15333,7 +15333,7 @@ def test_persisting_finance_provider_restores_native_datetime_after_raw_round_tr
 
     assert len(bars) == 1
     assert bars[0].timestamp == native_timestamp
-    archived = json.loads((tmp_path / "raw" / recorder.saved_filenames[0]).read_text(encoding="utf-8"))
+    archived = json.loads((tmp_path / "raw" / recorder.saved_filenames[0]).read_bytes())
     assert archived["data"][0]["timestamp"] == {"__datetime__": native_timestamp.isoformat()}
 
 

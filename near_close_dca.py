@@ -14123,7 +14123,7 @@ def _refresh_blocked_run_companions(artifacts_dir: str | Path) -> None:
     out = Path(artifacts_dir)
     state_path = out / "run_state.json"
     try:
-        run_state = json.loads(state_path.read_text(encoding="utf-8"))
+        run_state = json.loads(state_path.read_bytes())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return
     if not isinstance(run_state, dict):
@@ -27021,7 +27021,7 @@ def _reconcile_unproven_fractional_placements_in_artifact(
             f"{_cross_account_side_path}; refusing new placements until it is manually reconciled"
         )
     try:
-        _cross_account_evidence = json.loads(_cross_account_side_path.read_text(encoding="utf-8"))
+        _cross_account_evidence = json.loads(_cross_account_side_path.read_bytes())
     except FileNotFoundError:
         _cross_account_evidence = None
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -31612,7 +31612,7 @@ def _persist_cross_account_unresolved_evidence(
     with cross_process_lock(side_path.with_name(f"{side_path.name}.lock")):
         _quarantine_unreadable_sidecar = False
         try:
-            existing = json.loads(side_path.read_text(encoding="utf-8"))
+            existing = json.loads(side_path.read_bytes())
         except FileNotFoundError:
             existing = None
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):

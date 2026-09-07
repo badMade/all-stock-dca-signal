@@ -1393,7 +1393,7 @@ def test_payload_validates_against_the_published_schema():
     payload = mg.build_payload(
         data, whole_market=True, grouping=mg.seriate_tickers(data), source="synthetic"
     )
-    schema = json.loads((REPO_ROOT / "schemas" / "market_graph_payload.schema.json").read_text())
+    schema = json.loads((REPO_ROOT / "schemas" / "market_graph_payload.schema.json").read_bytes())
     jsonschema.validate(json.loads(mg.build_payload_json(payload)), schema)
 
 
@@ -1583,7 +1583,7 @@ def test_write_market_graph_emits_both_artifacts(tmp_path):
     assert set(paths) == {"viewer_html", "payload_json"}
     for path in paths.values():
         assert Path(path).is_file() and Path(path).stat().st_size > 0
-    reloaded = json.loads(Path(paths["payload_json"]).read_text())
+    reloaded = json.loads(Path(paths["payload_json"]).read_bytes())
     assert reloaded["schema_version"] == mg.PAYLOAD_SCHEMA_VERSION
 
 
@@ -1611,7 +1611,7 @@ def test_active_tickers_from_config_subtracts_excluded():
     """
     from dca_config import get_config_dir
 
-    data = json.loads((Path(get_config_dir()) / "tickers.json").read_text(encoding="utf-8"))
+    data = json.loads((Path(get_config_dir()) / "tickers.json").read_bytes())
     excluded = {str(t).upper() for t in data.get("excluded", [])}
     assert not (set(mg.active_tickers_from_config()) & excluded)
 

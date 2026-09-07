@@ -58,7 +58,7 @@ def test_main_scores_adjustments_from_build_feature_frames_latest_row_not_the_st
     assert exit_code == 0
 
     run_dir = _find_run_dir(models_dir, "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     fitted = model_module.TrainedModel.load(run_dir / "model.json")
 
     feature_frame = train_module.build_feature_frame(history_dir, ["AAA"])
@@ -108,7 +108,7 @@ def test_main_excludes_archive_rows_after_now_for_a_historical_replay(tmp_path):
     assert exit_code == 0
 
     run_dir = _find_run_dir(tmp_path / "models", replay_now.date().isoformat())
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     fitted = model_module.TrainedModel.load(run_dir / "model.json")
 
     # What SHOULD be scored: the row at/before replay_now, from a properly
@@ -240,7 +240,7 @@ def test_main_defaults_to_the_active_ticker_config_not_the_full_archive(tmp_path
     assert exit_code == 0
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert set(report["tickers"]) == {"AAA", "BBB"}
 
     stderr = capsys.readouterr().err
@@ -376,7 +376,7 @@ def test_main_excludes_a_ticker_listed_in_both_active_and_excluded(tmp_path):
     assert exit_code == 0
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert set(report["tickers"]) == {"AAA"}
 
 
@@ -522,7 +522,7 @@ def test_main_all_tickers_in_archive_flag_restores_full_archive_discovery(tmp_pa
     assert exit_code == 0
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert set(report["tickers"]) == {"AAA", "BBB", "CCC", "DDD"}
 
 
@@ -566,7 +566,7 @@ def test_two_same_date_runs_do_not_overwrite_each_others_artifacts(tmp_path):
     )
     assert exit_code_1 == 0
     run_dir_1 = _find_run_dir(models_dir, "2024-06-01")
-    report_1 = json.loads((run_dir_1 / "eval_report.json").read_text(encoding="utf-8"))
+    report_1 = json.loads((run_dir_1 / "eval_report.json").read_bytes())
     model_json_1_before = (run_dir_1 / "model.json").read_text(encoding="utf-8")
 
     exit_code_2 = train_module.main(
@@ -582,9 +582,9 @@ def test_two_same_date_runs_do_not_overwrite_each_others_artifacts(tmp_path):
 
     # The FIRST run's artifacts are untouched by the second run.
     assert (run_dir_1 / "model.json").read_text(encoding="utf-8") == model_json_1_before
-    assert json.loads((run_dir_1 / "eval_report.json").read_text(encoding="utf-8")) == report_1
+    assert json.loads((run_dir_1 / "eval_report.json").read_bytes()) == report_1
     # Each run's model_version is distinct, tying it to its own run directory.
-    report_2 = json.loads((run_dir_2 / "eval_report.json").read_text(encoding="utf-8"))
+    report_2 = json.loads((run_dir_2 / "eval_report.json").read_bytes())
     assert report_1["model_version"] != report_2["model_version"]
 
 
@@ -622,7 +622,7 @@ def test_main_excludes_a_stale_ticker_snapshot_from_adjustments(tmp_path, capsys
     assert exit_code == 0
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert "FRESH" in report["adjustments"]
     assert "STALE" not in report["adjustments"]
 
@@ -656,7 +656,7 @@ def test_main_dry_run_refuses_when_every_snapshot_is_stale(tmp_path, capsys):
     assert exit_code == 0  # --dry-run itself never fails
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert report["status"] == "blocked_no_fresh_snapshot"
     assert report["adjustments"] == {}
 
@@ -691,7 +691,7 @@ def test_main_live_refuses_and_does_not_publish_when_every_snapshot_is_stale(tmp
     assert exit_code == 1
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert report["status"] == "blocked_no_fresh_snapshot"
     assert "publish_result" not in report  # guarded_publish() was never even called
 
@@ -868,7 +868,7 @@ def test_main_live_refuses_to_publish_a_replay_that_drifts_from_the_real_wall_cl
     assert exit_code == 1
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert report["status"] == "blocked_replay_not_current"
 
     stderr = capsys.readouterr().err
@@ -925,7 +925,7 @@ def test_main_live_refuses_a_forward_dated_now_even_within_the_staleness_budget(
     assert exit_code == 1
 
     run_dir = _find_run_dir(tmp_path / "models", future_now.date().isoformat())
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert report["status"] == "blocked_replay_not_current"
 
     stderr = capsys.readouterr().err
@@ -1014,7 +1014,7 @@ def test_main_live_refuses_a_replay_snapshot_stale_relative_to_the_real_publish_
     assert exit_code == 1
 
     run_dir = _find_run_dir(tmp_path / "models", replay_now_dt.date().isoformat())
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert report["status"] == "blocked_no_fresh_snapshot"
     assert "AAA" not in report["adjustments"]
 
@@ -1052,7 +1052,7 @@ def test_main_dry_run_is_unaffected_by_replay_drift(tmp_path):
     assert exit_code == 0
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert report["status"] == "dry_run_not_published"
 
 
@@ -1124,7 +1124,7 @@ def test_main_records_a_non_default_horizon_in_model_and_report(tmp_path):
     assert exit_code == 0
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert report["horizon_trading_days"] == 10
 
     saved_model = model_module.TrainedModel.load(run_dir / "model.json")

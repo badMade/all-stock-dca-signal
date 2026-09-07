@@ -432,22 +432,34 @@ class TestDailyCycle:
         # Path.read_text()/write_text() without an explicit encoding defer
         # to the platform's preferred encoding, which is not always UTF-8
         # (Antigravity review: "Missing Explicit encoding='utf-8' in File
-        # Operations"). Assert every JSON state read/write in the daily
-        # cycle passes it explicitly rather than relying on this test
-        # environment's locale happening to already be UTF-8.
+        # Operations"). JSON state reads now go through
+        # Path.read_bytes() + json.loads(bytes) (perf: skip the redundant
+        # text decode), which sidesteps the platform-locale question
+        # entirely rather than relying on it -- json.loads decodes raw
+        # bytes per RFC 8259's own UTF-8/16/32 auto-detection, never
+        # locale.getpreferredencoding(). Assert those reads go through
+        # read_bytes (never a bare, locale-dependent read_text()) and
+        # that every JSON write in the daily cycle still passes
+        # encoding="utf-8" explicitly.
         import pathlib
 
         history, run_dir, all_dates = live_setup
         next_now = f"{all_dates[201]}T18:00"
-        seen_read: list[object] = []
+        seen_read: list[str] = []
         seen_write: list[object] = []
         original_read_text = pathlib.Path.read_text
+        original_read_bytes = pathlib.Path.read_bytes
         original_write_text = pathlib.Path.write_text
 
         def spy_read_text(self, *args, **kwargs):
             if self.name in ("harness_state.json", "run_meta.json"):
-                seen_read.append(kwargs.get("encoding"))
+                seen_read.append("read_text")
             return original_read_text(self, *args, **kwargs)
+
+        def spy_read_bytes(self, *args, **kwargs):
+            if self.name in ("harness_state.json", "run_meta.json"):
+                seen_read.append("read_bytes")
+            return original_read_bytes(self, *args, **kwargs)
 
         def spy_write_text(self, data, *args, **kwargs):
             if "_summary.json" in self.name:
@@ -455,11 +467,12 @@ class TestDailyCycle:
             return original_write_text(self, data, *args, **kwargs)
 
         monkeypatch.setattr(pathlib.Path, "read_text", spy_read_text)
+        monkeypatch.setattr(pathlib.Path, "read_bytes", spy_read_bytes)
         monkeypatch.setattr(pathlib.Path, "write_text", spy_write_text)
         code = daily_update.main(["--run-dir", str(run_dir), "--history-dir", str(history), "--now", next_now])
         capsys.readouterr()
         assert code == 0
-        assert seen_read and all(encoding == "utf-8" for encoding in seen_read)
+        assert seen_read and all(kind == "read_bytes" for kind in seen_read)
         assert seen_write and all(encoding == "utf-8" for encoding in seen_write)
 
     def test_a_crash_mid_write_never_leaves_a_partial_summary_at_the_real_path(

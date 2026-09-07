@@ -2358,7 +2358,7 @@ def test_write_locked_tolerates_an_unreadable_existing_file_when_preserving_even
     ledger = InverseMartingaleLedger(root=tmp_path)
     state, step = _step({}, decision_price=99.0, previous_close=100.0, trading_day=DAY1)
     ledger.record_step("GME", state, step)  # must not raise
-    written = json.loads((ticker_dir / "tracker.json").read_text(encoding="utf-8"))
+    written = json.loads((ticker_dir / "tracker.json").read_bytes())
     assert written["status"] == STATUS_DIPPING
     assert len(written["events"]) == 1  # prior (unreadable) history discarded, not preserved or crashed on
 
@@ -2397,7 +2397,7 @@ def test_write_locked_discards_non_dict_event_entries_instead_of_raising(tmp_pat
     ledger = InverseMartingaleLedger(root=tmp_path)
     state, step = _step({}, decision_price=99.0, previous_close=100.0, trading_day=DAY1)
     ledger.record_step("GME", state, step)  # must not raise TypeError
-    written = json.loads((ticker_dir / "tracker.json").read_text(encoding="utf-8"))
+    written = json.loads((ticker_dir / "tracker.json").read_bytes())
     # The malformed entries are silently dropped before the cap is ever
     # applied, so the surviving list is bounded and entirely dict events.
     assert len(written["events"]) == _MAX_PERSISTED_EVENTS
@@ -3620,7 +3620,7 @@ def test_ledger_caps_the_persisted_event_history(tmp_path):
         ledger.record_step("AAPL", state, step)
         day = date.fromordinal(day.toordinal() + 1)
 
-    raw = json.loads((tmp_path / "AAPL" / "tracker.json").read_text(encoding="utf-8"))
+    raw = json.loads((tmp_path / "AAPL" / "tracker.json").read_bytes())
     assert len(raw["events"]) == _MAX_PERSISTED_EVENTS
 
 
@@ -3666,7 +3666,7 @@ def test_ledger_retains_a_recovery_event_past_the_ordinary_event_cap(tmp_path):
         ledger.record_step("AAPL", state, step)
         day = date.fromordinal(day.toordinal() + 1)
 
-    raw = json.loads((tmp_path / "AAPL" / "tracker.json").read_text(encoding="utf-8"))
+    raw = json.loads((tmp_path / "AAPL" / "tracker.json").read_bytes())
     recovery_events = [e for e in raw["events"] if "recovery_metadata" in e]
     assert len(recovery_events) == 1
     assert recovery_events[0]["recovery_metadata"]["order_id"] == "order-1"
@@ -3713,7 +3713,7 @@ def test_ledger_caps_the_event_history_even_when_all_events_are_recoveries(tmp_p
     state, step = _step({}, decision_price=99.0, previous_close=100.0, trading_day=day)
     ledger.record_step("AAPL", state, step)  # must not grow the list unbounded
 
-    raw = json.loads((ticker_dir / "tracker.json").read_text(encoding="utf-8"))
+    raw = json.loads((ticker_dir / "tracker.json").read_bytes())
     assert len(raw["events"]) == _MAX_PERSISTED_EVENTS
     # The newest recovery attribution (highest claim_ref index) survives
     # over the oldest -- the same most-recent-wins policy ordinary events get.

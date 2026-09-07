@@ -1015,7 +1015,7 @@ def test_schema_version_2_float_sentinel_is_rejected(tmp_path):
     path = tmp_path / "state.json"
     dca_runner.save_strategy_state(state, path)
 
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw = json.loads(path.read_bytes())
     assert raw["schema_version"] == dca_runner.STATE_SCHEMA_VERSION
     raw["schema_version"] = 2.0
     path.write_text(json.dumps(raw), encoding="utf-8")
@@ -1151,7 +1151,7 @@ def test_zero_proven_attempt_baseline_round_trips(tmp_path):
 def test_save_strategy_state_writes_the_current_schema_version(tmp_path):
     path = tmp_path / "state.json"
     dca_runner.save_strategy_state(StrategyState(), path)
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw = json.loads(path.read_bytes())
     assert raw["schema_version"] == dca_runner.STATE_SCHEMA_VERSION == 3
     assert "recorded_attempt_order_ids" in raw
     assert "seeded_prior_context_proven_attempts_by_ticker_day" in raw
@@ -1294,7 +1294,7 @@ def test_schema_version_2_document_migrates_a_zero_dollar_attempt_as_unapplied(t
 
     # This process's own next save upgrades the file to schema_version=3.
     dca_runner.save_strategy_state(loaded, path)
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw = json.loads(path.read_bytes())
     assert raw["schema_version"] == dca_runner.STATE_SCHEMA_VERSION == 3
     assert "notional_applied_order_ids" in raw
 
@@ -14603,7 +14603,9 @@ def test_idempotency_stream_slot_ids_match_the_runner_roster():
     label_to_stream = {"market-open": "market_open", "final": "afternoon"}
     by_label: dict[str, list[str]] = {}
     for slot_id, spec in dca_runner.SLOTS.items():
-        by_label.setdefault(label_to_stream.get(spec.label, spec.label), []).append(slot_id)
+        assert spec.label is not None
+        stream = label_to_stream.get(spec.label) or spec.label
+        by_label.setdefault(stream, []).append(slot_id)
     assert {k: tuple(sorted(v)) for k, v in by_label.items()} == {
         k: tuple(sorted(v)) for k, v in STREAM_SLOT_IDS.items()
     }

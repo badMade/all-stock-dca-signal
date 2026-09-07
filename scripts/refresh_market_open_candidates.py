@@ -136,8 +136,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--placement-time", required=True, type=datetime.fromisoformat)
     parser.add_argument("--config-dir", type=Path)
     args = parser.parse_args(argv)
-    candidates = json.loads(args.candidates.read_text(encoding="utf-8"))
-    quotes = json.loads(args.quotes.read_text(encoding="utf-8"))
+    candidates = json.loads(args.candidates.read_bytes())
+    quotes = json.loads(args.quotes.read_bytes())
     if not isinstance(candidates, list) or not all(isinstance(candidate, Mapping) for candidate in candidates):
         parser.error("--candidates must contain a JSON list of objects")
     if not isinstance(quotes, Mapping):

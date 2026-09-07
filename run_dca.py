@@ -1003,7 +1003,7 @@ def _build_frozen_providers_from_raw(
                     if not candidate_path.is_file():
                         continue
                     try:
-                        cached = json.loads(candidate_path.read_text(encoding="utf-8"))
+                        cached = json.loads(candidate_path.read_bytes())
                     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                         cached = None
                     if (
