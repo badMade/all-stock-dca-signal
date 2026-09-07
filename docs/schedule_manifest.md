@@ -788,73 +788,13 @@ active. Machine-readable source:
 [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) ->
 `canonical_schedule_reconciliation_2026_07_27`.
 
-Temporary live scheduler override, Aug 17 to Aug 24, 2026:
-
-> **CORRECTED 2026-08-18:** `bb4f6ef1` is the canonical 9:45 AM watchlist
-> scan and required pre-flight writer, not a harmless 9:15 AM readiness task.
-> `MorningDCAExecutor._apply_preflight_gate()` fails closed without its artifact,
-> so removing this task can suppress the 10:30 AM live buy (`42173154`). Treat
-> the 10:30 run as affected and unverified until an operator either restores
-> `bb4f6ef1` immediately or confirms that `42173154` has an alternate pre-flight
-> source. Before Aug 24, the operator must also verify whether a genuinely
-> separate 9:15 task exists under another ID; do not use `bb4f6ef1` for that
-> pause. The one-time task `5cc41080` remains scheduled for Aug 24, but waiting
-> for it is not a safe substitute for restoring the required pre-flight writer.
-> Machine-readable source and complete required action:
-> `config/scheduled_tasks.json` ->
-> `temporary_live_scheduler_overrides.pause_2026_08_17_0915_prevalidation.correction_2026_08_18`.
-
-Temporary live scheduler override, Aug 28, 2026:
-
-> **ADDED 2026-08-28:** The user explicitly authorized Perplexity to run all
-> scheduled buy-only DCA tasks for Friday, Aug 28, 2026, including an immediate
-> one-time 9:35 AM catch-up because the normal 9:35 occurrence had already
-> passed. The override authorizes the existing canonical tasks; parallel
-> Perplexity replacement tasks remain disabled so only one executor owns each
-> slot. Perplexity's scope for this override is scheduled buy-run execution plus
-> required buy-run artifacts and
-> notifications only. Claude handles scheduled reports. Machine-readable source:
-> `config/scheduled_tasks.json` ->
-> `temporary_live_scheduler_overrides.authorize_2026_08_28_all_perplexity_buy_slots_today_only`.
-
-| ET | Live scheduler task | ID | Cadence | Trades | Aug 28 override status |
-|---|---|---|---|---|---|
-| 9:35 AM | Canonical live DCA buy pass | `2ba19526` | Weekdays | **yes** | authorized for 2026-08-28; scheduled occurrence already passed |
-| immediate 9:35 catch-up | Perplexity DCA catch-up buy run | `2c1d3792` | One-time | **yes** | authorized catch-up for 2026-08-28 only |
-| 10:30 AM | Canonical live DCA buy pass | `42173154` | Weekdays | **yes** | authorized for 2026-08-28 |
-| 11:30 AM | Canonical live DCA buy pass | `7be82b97` | Weekdays | **yes** | authorized for 2026-08-28 |
-| 12:30 PM | Canonical live DCA buy pass | `a6239dae` | Weekdays | **yes** | authorized for 2026-08-28 |
-| 1:30 PM | Canonical live DCA buy pass | `7be82b97` | Weekdays | **yes** | authorized for 2026-08-28 |
-| 2:30 PM | Canonical live DCA buy pass | `7be82b97` | Weekdays | **yes** | authorized for 2026-08-28 |
-| 3:30 PM | Canonical live DCA buy pass | `10ce362c` | Weekdays | **yes** | authorized for 2026-08-28 |
-
-The Aug 28 override does not authorize Perplexity to run scheduled reports,
-dashboard refreshes, slippage-only reports, monitor-only reports, or watchdog
-reports. Those scheduled reporting responsibilities remain Claude-only unless
-the user changes the role split.
-
-Temporary live scheduler override, Aug 31, 2026:
-
-> **ADDED 2026-08-31:** The user explicitly authorized Perplexity to run the
-> morning buy-only DCA schedule for Monday, Aug 31, 2026 at 09:35, 10:30, and
-> 11:30 ET. The authorization uses the existing canonical tasks and is
-> date-gated to the America/New_York trading date `2026-08-31`; parallel
-> one-time tasks remain disabled, and the override does not authorize afternoon
-> buys. Perplexity's scope for this override is scheduled buy-run execution plus required buy-run
-> artifacts and notifications only. Claude handles scheduled reports.
-> Machine-readable source: `config/scheduled_tasks.json` ->
-> `temporary_live_scheduler_overrides.authorize_2026_08_31_morning_perplexity_buy_slots_today_only`.
-
-| ET | Live scheduler task | ID | Cadence | Trades | Aug 31 override status |
-|---|---|---|---|---|---|
-| 9:35 AM | Canonical Perplexity-authorized DCA buy pass | `2ba19526` | Weekdays | **yes** | authorized only for 2026-08-31 |
-| 10:30 AM | Canonical Perplexity-authorized DCA buy pass | `42173154` | Weekdays | **yes** | authorized only for 2026-08-31 |
-| 11:30 AM | Canonical Perplexity-authorized DCA buy pass | `7be82b97` | Weekdays | **yes** | authorized only for 2026-08-31 |
-
-The Aug 31 override does not authorize Perplexity to run scheduled reports,
-dashboard refreshes, slippage-only reports, monitor-only reports, watchdog
-reports, or afternoon buy tasks. Those responsibilities remain outside this
-morning-only override unless the user changes the scope.
+**Every dated temporary override recorded against this schedule has expired.**
+None of them grants any authorization today. They are kept, verbatim, under
+[Expired temporary live scheduler overrides](#expired-temporary-live-scheduler-overrides-historical-record)
+below, *after* the canonical table, so the first schedule table a reader meets in
+this section is the authoritative one. Three of those override blocks used to sit
+above it and read in the present tense, which is exactly how an expired
+authorization gets mistaken for a live one.
 
 | ET | Task | ID | Cadence | Cron (UTC) | Trades | Status |
 |---|---|---|---|---|---|---|
@@ -877,6 +817,154 @@ morning-only override unless the user changes the scope.
 **Note on `7be82b97`:** one task fires at three ET slots (11:30 AM, 1:30 PM, and
 2:30 PM). Each run records the slot that actually fired in its own
 `scheduled_for_et`.
+
+### Expired temporary live scheduler overrides (historical record)
+
+These are **not active** and authorize nothing today. Like the retired entries
+below, they are kept as historical records only, and their original text is
+reproduced verbatim; the status line above each one is the only thing added.
+
+Reconciled 2026-09-06 ET against `config/scheduled_tasks.json` ->
+`temporary_live_scheduler_overrides` and its `tasks` array:
+
+| Override | JSON key | Date gate | Self-expiring | Status today |
+|---|---|---|---|---|
+| Aug 17 to Aug 24, 2026 pause | `pause_2026_08_17_0915_prevalidation` | restore due `2026-08-24 09:00 ET` | no explicit window | **superseded**: the condition it demanded is met in the current record |
+| Aug 28, 2026 authorization | `authorize_2026_08_28_all_perplexity_buy_slots_today_only` | trading day `2026-08-28` | `expires_after_trading_day: true` | **expired** |
+| Aug 31, 2026 authorization | `authorize_2026_08_31_morning_perplexity_buy_slots_today_only` | trading day `2026-08-31` | `expires_after_trading_day: true` | **expired** |
+
+Both August authorizations carry
+`authorization_window_et.expires_after_trading_day: true`, so each lapsed by its
+own terms at the end of its named trading day. Neither was ever a change to the
+canonical schedule: both authorized the *existing* canonical task IDs for one day
+and required their task text to end silently on any other date. The canonical
+table above is unchanged by all three.
+
+One asymmetry survives the reconciliation and is worth knowing. Each
+authorization also names `disabled_parallel_task_ids`, the parallel replacement
+tasks that had to stay disabled so two executors could not race for the same
+slot: `4412c3c4`, `e028361e`, `e3590042`, `0c3cde00`, `44b3975d` (Aug 28) and
+`4e8c92af`, `01e4f18b`, `6db8bbf1` (Aug 31). None of those eight has a `tasks`
+entry, so unlike `2c1d3792` their disabled state cannot be confirmed from this
+repo's record at all. That is expected for IDs that were never supposed to run,
+and it is the reason the discoverability rule applies to authorized buy tasks
+rather than to every ID an override mentions. If one of them is ever authorized,
+it needs a `tasks` entry first.
+
+`tests/test_config_invariants.py` holds this reconciliation in place: an override
+whose trading day has passed must be marked expired here, and any one-time task
+an override authorized must be `disabled` in `tasks` once its window closes.
+
+#### Temporary live scheduler override, Aug 17 to Aug 24, 2026 (SUPERSEDED)
+
+> **STATUS (reconciled 2026-09-06 ET):** superseded by the current record, not by a
+> recorded operator sign-off. The correction below required that `bb4f6ef1` be
+> restored or that `42173154` be confirmed to have an alternate pre-flight
+> source. In `config/scheduled_tasks.json` today, `bb4f6ef1` is `status:
+> "active"` with `cron_utc` `45 13 * * 1-5`, matching its 9:45 AM row in the
+> canonical table, so the pre-flight writer the gate depends on is present. The
+> restore task `5cc41080` never received a `tasks` entry and appears nowhere but
+> in this override record. No operator verification is recorded anywhere in the
+> repo, so treat this as a record-state reconciliation: the hazard is closed
+> because the writer is active, not because someone signed it off.
+
+> **CORRECTED 2026-08-18:** `bb4f6ef1` is the canonical 9:45 AM watchlist
+> scan and required pre-flight writer, not a harmless 9:15 AM readiness task.
+> `MorningDCAExecutor._apply_preflight_gate()` fails closed without its artifact,
+> so removing this task can suppress the 10:30 AM live buy (`42173154`). Treat
+> the 10:30 run as affected and unverified until an operator either restores
+> `bb4f6ef1` immediately or confirms that `42173154` has an alternate pre-flight
+> source. Before Aug 24, the operator must also verify whether a genuinely
+> separate 9:15 task exists under another ID; do not use `bb4f6ef1` for that
+> pause. The one-time task `5cc41080` remains scheduled for Aug 24, but waiting
+> for it is not a safe substitute for restoring the required pre-flight writer.
+> Machine-readable source and complete required action:
+> `config/scheduled_tasks.json` ->
+> `temporary_live_scheduler_overrides.pause_2026_08_17_0915_prevalidation.correction_2026_08_18`.
+
+#### Temporary live scheduler override, Aug 28, 2026 (EXPIRED)
+
+> **STATUS (reconciled 2026-09-06 ET):** expired at the end of the America/New_York
+> trading day `2026-08-28`, per its own
+> `authorization_window_et.expires_after_trading_day: true`. It authorizes
+> nothing now.
+
+> **ADDED 2026-08-28:** The user explicitly authorized Perplexity to run all
+> scheduled buy-only DCA tasks for Friday, Aug 28, 2026, including an immediate
+> one-time 9:35 AM catch-up because the normal 9:35 occurrence had already
+> passed. The override authorizes the existing canonical tasks; parallel
+> Perplexity replacement tasks remain disabled so only one executor owns each
+> slot. Perplexity's scope for this override is scheduled buy-run execution plus
+> required buy-run artifacts and
+> notifications only. Claude handles scheduled reports. Machine-readable source:
+> `config/scheduled_tasks.json` ->
+> `temporary_live_scheduler_overrides.authorize_2026_08_28_all_perplexity_buy_slots_today_only`.
+
+The table below is the authorization scope as recorded on 2026-08-28. It is a
+historical record of one expired trading day, **not** an active schedule table.
+
+| ET | Live scheduler task | ID | Cadence | Trades | Aug 28 override status |
+|---|---|---|---|---|---|
+| 9:35 AM | Canonical live DCA buy pass | `2ba19526` | Weekdays | **yes** | authorized for 2026-08-28; scheduled occurrence already passed |
+| immediate 9:35 catch-up | Perplexity DCA catch-up buy run | `2c1d3792` | One-time | **yes** | authorized catch-up for 2026-08-28 only |
+| 10:30 AM | Canonical live DCA buy pass | `42173154` | Weekdays | **yes** | authorized for 2026-08-28 |
+| 11:30 AM | Canonical live DCA buy pass | `7be82b97` | Weekdays | **yes** | authorized for 2026-08-28 |
+| 12:30 PM | Canonical live DCA buy pass | `a6239dae` | Weekdays | **yes** | authorized for 2026-08-28 |
+| 1:30 PM | Canonical live DCA buy pass | `7be82b97` | Weekdays | **yes** | authorized for 2026-08-28 |
+| 2:30 PM | Canonical live DCA buy pass | `7be82b97` | Weekdays | **yes** | authorized for 2026-08-28 |
+| 3:30 PM | Canonical live DCA buy pass | `10ce362c` | Weekdays | **yes** | authorized for 2026-08-28 |
+
+**Current record for the one-time row:** `2c1d3792` is `status: "disabled"` in
+`config/scheduled_tasks.json`'s `tasks` array, with its own note that it was left
+disabled because the 2026-08-28 window has expired. It has a `tasks` entry at all
+only so an override-named buy task is discoverable and validatable the same way a
+canonical task is (codex review `discussion_r3894271690`); it is not, and never
+was, part of the canonical schedule. The seven canonical IDs in the rows above are
+unaffected: they were authorized for that one day and continue on their own
+canonical cadence.
+
+The Aug 28 override does not authorize Perplexity to run scheduled reports,
+dashboard refreshes, slippage-only reports, monitor-only reports, or watchdog
+reports. Those scheduled reporting responsibilities remain Claude-only unless
+the user changes the role split.
+
+#### Temporary live scheduler override, Aug 31, 2026 (EXPIRED)
+
+> **STATUS (reconciled 2026-09-06 ET):** expired at the end of the America/New_York
+> trading day `2026-08-31`, per its own
+> `authorization_window_et.expires_after_trading_day: true`. It authorizes
+> nothing now.
+
+> **ADDED 2026-08-31:** The user explicitly authorized Perplexity to run the
+> morning buy-only DCA schedule for Monday, Aug 31, 2026 at 09:35, 10:30, and
+> 11:30 ET. The authorization uses the existing canonical tasks and is
+> date-gated to the America/New_York trading date `2026-08-31`; parallel
+> one-time tasks remain disabled, and the override does not authorize afternoon
+> buys. Perplexity's scope for this override is scheduled buy-run execution plus required buy-run
+> artifacts and notifications only. Claude handles scheduled reports.
+> Machine-readable source: `config/scheduled_tasks.json` ->
+> `temporary_live_scheduler_overrides.authorize_2026_08_31_morning_perplexity_buy_slots_today_only`.
+
+The table below is the authorization scope as recorded on 2026-08-31. It is a
+historical record of one expired trading day, **not** an active schedule table.
+
+| ET | Live scheduler task | ID | Cadence | Trades | Aug 31 override status |
+|---|---|---|---|---|---|
+| 9:35 AM | Canonical Perplexity-authorized DCA buy pass | `2ba19526` | Weekdays | **yes** | authorized only for 2026-08-31 |
+| 10:30 AM | Canonical Perplexity-authorized DCA buy pass | `42173154` | Weekdays | **yes** | authorized only for 2026-08-31 |
+| 11:30 AM | Canonical Perplexity-authorized DCA buy pass | `7be82b97` | Weekdays | **yes** | authorized only for 2026-08-31 |
+
+**Note on the `7be82b97` row:** the Aug 31 override authorized that shared task
+for its 11:30 ET fire only. Because the same task also fires at 13:30 and 14:30
+ET, its required task text had to fail closed on those two slots
+(`authorized_task_slots_et` pins `7be82b97` to `["11:30"]`). That gate is pinned
+by `test_aug_31_intraday_override_is_gated_to_the_1130_fired_slot`, and it is the
+reason a date guard alone was not sufficient for this override.
+
+The Aug 31 override does not authorize Perplexity to run scheduled reports,
+dashboard refreshes, slippage-only reports, monitor-only reports, watchdog
+reports, or afternoon buy tasks. Those responsibilities remain outside this
+morning-only override unless the user changes the scope.
 
 ### One-time tasks added after the 2026-07-27 canonical verification
 

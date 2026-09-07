@@ -278,9 +278,15 @@ def test_saved_summary_remains_valid_json_with_large_numeric_usage_fields(app):
     app.settings.root.mkdir()
     (app.settings.root / "run_state.json").write_text(json.dumps({
         "trading_day": "2026-09-08", "status": "completed", "dry_run": True,
-        "usage_proxy": {"total_artifact_bytes": 200000},
+        # Digit-grouped on purpose: written without the underscore this is an
+        # unbroken six-digit run, which
+        # test_no_account_shaped_literal_in_tracked_config_source_or_docs reads
+        # as an account-shaped literal and fails the secrets guard on. The
+        # separator keeps the value identical and the guard tight, rather than
+        # growing _NON_ACCOUNT_LITERALS for an incidental byte count.
+        "usage_proxy": {"total_artifact_bytes": 200_000},
     }))
     app.snapshot()
     saved = app.settings.output / "summaries/local/2026-09-08.json"
     restored = json.loads(saved.read_text())
-    assert restored["daily"]["costs"]["totals"]["total_artifact_bytes"] == 200000
+    assert restored["daily"]["costs"]["totals"]["total_artifact_bytes"] == 200_000

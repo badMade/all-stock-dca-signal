@@ -30,7 +30,7 @@ import json
 import re
 import shutil
 import subprocess
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -39,6 +39,7 @@ from conftest import FIXTURE_ACCOUNT_NUMBER
 from near_close_dca import (
     ACTIVE_TICKERS,
     BUDGET_TIERS,
+    EASTERN,
     EXCLUDED_TICKERS,
     TIER_HIGH_MULTIPLIER_SIGNAL_THRESHOLDS,
     TIER_SPEND_THRESHOLDS_USD,
@@ -49,6 +50,7 @@ from near_close_dca import (
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = REPO_ROOT / "config"
 SCHEMAS_DIR = REPO_ROOT / "schemas"
+SCHEDULE_MANIFEST = REPO_ROOT / "docs" / "schedule_manifest.md"
 
 
 def _load(name: str) -> dict:
@@ -95,6 +97,106 @@ def test_aug_28_one_time_catch_up_task_is_registered_in_the_manifest():
         assert one_time_id in task_ids, (
             f"{one_time_id} is authorized as a one-time catch-up buy task but has no tasks[] entry"
         )
+
+
+# --- Dated overrides must not outlive their own authorization window ----------
+#
+# The two August 2026 authorizations each granted a non-Claude executor the
+# right to place real buy orders for exactly one trading day, and each declared
+# its own expiry (`expires_after_trading_day`). Nothing connected that expiry to
+# how docs/schedule_manifest.md presented it, so both stayed written in the
+# present tense, in tables shaped exactly like the canonical schedule table and
+# positioned ABOVE it, for days after they lapsed. A reader scanning the
+# "Active schedule" section top-down met three conflicting schedule tables
+# before the authoritative one. Nothing in the repo was wrong -- the JSON knew
+# the windows had closed and 2c1d3792 was already disabled -- but the document
+# an operator or agent actually reads still said "authorized".
+#
+# These pin the reconciliation. They are deliberately clock-dependent: a
+# self-expiring override that has passed its trading day MUST be marked expired
+# in the manifest, so the day after any future override lapses, the suite says
+# so. A failure here is not a bug to work around; it is the reminder to add the
+# override's `(EXPIRED)` heading and status line, which is a two-line edit.
+
+
+def _expired_authorization_overrides(today: date) -> dict[str, dict]:
+    """Overrides whose own recorded authorization window has already closed.
+
+    Only the self-expiring shape is date-checkable: an override carrying
+    ``authorization_window_et.expires_after_trading_day`` has stated in its own
+    record that it lapses at the end of ``trading_day``. An override without
+    that block (the Aug 17 2026 pre-validation pause) ends by operator action
+    instead, which no clock can decide, so its status stays prose in the
+    manifest rather than an assertion here.
+    """
+    expired: dict[str, dict] = {}
+    overrides = _load("scheduled_tasks.json")["temporary_live_scheduler_overrides"]
+    for key, override in overrides.items():
+        window = override.get("authorization_window_et")
+        if not isinstance(window, dict) or not window.get("expires_after_trading_day"):
+            continue
+        if datetime.strptime(window["trading_day"], "%Y-%m-%d").date() < today:
+            expired[key] = override
+    return expired
+
+
+def _manifest_block_citing(key: str) -> tuple[str, str]:
+    """The one ``####`` heading and body in the manifest that cites ``key``."""
+    blocks = SCHEDULE_MANIFEST.read_text(encoding="utf-8").split("\n#### ")
+    matches = [block for block in blocks[1:] if key in block]
+    assert len(matches) == 1, (
+        f"expected exactly one '#### ' block in docs/schedule_manifest.md citing {key}, "
+        f"found {len(matches)}"
+    )
+    heading, _, body = matches[0].partition("\n")
+    return heading, body
+
+
+def test_an_expired_authorization_override_is_marked_expired_in_the_manifest():
+    """A lapsed same-day trading authorization must read as lapsed."""
+    for key, override in _expired_authorization_overrides(datetime.now(EASTERN).date()).items():
+        trading_day = override["authorization_window_et"]["trading_day"]
+        heading, body = _manifest_block_citing(key)
+        assert heading.rstrip().endswith("(EXPIRED)"), (
+            f"{key} lapsed after {trading_day}, but its docs/schedule_manifest.md heading "
+            f"does not end with '(EXPIRED)': {heading!r}"
+        )
+        assert "expired" in body.lower(), (
+            f"{key} lapsed after {trading_day}, but its manifest block never says so"
+        )
+        assert trading_day in body, (
+            f"{key}'s manifest block must name the trading day {trading_day} it expired after"
+        )
+
+
+def test_a_one_time_buy_task_from_an_expired_override_is_disabled():
+    """``2c1d3792`` exists in ``tasks`` only so an override-named buy task is
+    discoverable (see the test above it). Discoverable also means its status has
+    to stay honest: once the window that authorized it closed, the one thing
+    that entry must never say is ``active``.
+    """
+    tasks = {task["id"]: task for task in _load("scheduled_tasks.json")["tasks"]}
+    for key, override in _expired_authorization_overrides(datetime.now(EASTERN).date()).items():
+        for one_time_id in override.get("one_time_catch_up_task_ids", []):
+            task = tasks.get(one_time_id)
+            assert task is not None, f"{one_time_id} (from {key}) has no tasks[] entry"
+            assert task["status"] == "disabled", (
+                f"{one_time_id} was authorized only for {key}'s expired window but is "
+                f"status={task['status']!r}"
+            )
+
+
+def test_the_canonical_schedule_table_precedes_the_expired_override_records():
+    """Ordering is the whole point of the fix: the authoritative table has to be
+    the first schedule table in the section that calls itself authoritative.
+    """
+    text = SCHEDULE_MANIFEST.read_text(encoding="utf-8")
+    canonical = text.index("| ET | Task | ID | Cadence | Cron (UTC) | Trades | Status |")
+    expired_records = text.index("### Expired temporary live scheduler overrides")
+    assert canonical < expired_records, (
+        "the canonical schedule table must appear before the expired override records, "
+        "or a reader meets an expired authorization table first"
+    )
 
 
 def test_every_config_file_validates_against_its_referenced_schema():

@@ -64,8 +64,19 @@ def test_restored_logs_are_bounded_and_redacted(tmp_path, monkeypatch):
 
 def test_restore_is_newest_first_and_new_job_takes_first_position(tmp_path):
     root = tmp_path / "jobs"
-    for day in (1, 3, 2):
-        saved_job(root, f"2026010{day}T120000-example", started_at=f"2026-01-0{day}T12:00:00+00:00")
+    # Written out per day rather than interpolated: interpolating the day into
+    # the middle of the stamp leaves a truncated seven-digit run in the source
+    # that is not a real date, so the secrets guard
+    # (test_no_account_shaped_literal_in_tracked_config_source_or_docs) reads it
+    # as an account-shaped literal. A whole stamp is exempted as a date; a
+    # truncated one is not. Saved out of order on purpose: the assertion below
+    # is what pins newest-first.
+    for job_id, started_at in (
+        ("20260101T120000-example", "2026-01-01T12:00:00+00:00"),
+        ("20260103T120000-example", "2026-01-03T12:00:00+00:00"),
+        ("20260102T120000-example", "2026-01-02T12:00:00+00:00"),
+    ):
+        saved_job(root, job_id, started_at=started_at)
     manager = JobManager(root)
     try:
         assert [item["id"] for item in manager.snapshot()] == [
