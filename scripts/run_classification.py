@@ -3942,11 +3942,33 @@ def load_same_day_top_up_context(
     """
     result: Dict[str, PriorAllocation] = {}
     seen_order_ids: Set[str] = set()
+    # Fast path: pre-encode the trading day to bytes outside the loop
+    # so we can use a raw substring check to avoid expensive JSON parsing
+    # on artifacts that don't match the trading day.
+    trading_day_bytes = trading_day.encode("utf-8")
     for root in top_up_context_roots(base, stream_roots):
         for path in _iter_run_state_files(root):
             try:
-                state = json.loads(path.read_bytes())
-            except (json.JSONDecodeError, OSError):
+                raw_bytes = path.read_bytes()
+            except OSError:
+                if skip_sink is not None and _mtime_matches_trading_day(path, trading_day):
+                    skip_sink.append(path)
+                continue
+
+            same_day_mtime = None
+            # Skip expensive json.loads if the file doesn't contain the trading day bytes.
+            # Only trust the fast-path if there are no unicode escape sequences (\u),
+            # which could represent the date string differently.
+            if trading_day_bytes not in raw_bytes and b"\\u" not in raw_bytes:
+                same_day_mtime = _mtime_matches_trading_day(path, trading_day)
+                # If mtime is the same day, we must parse to let JSON errors fall through
+                # to the skip_sink logic correctly. Otherwise, we can safely skip.
+                if not same_day_mtime:
+                    continue
+
+            try:
+                state = json.loads(raw_bytes)
+            except json.JSONDecodeError:
                 # An unreadable or mid-write run_state under a manual
                 # top-up-context root is exactly as unverifiable as a
                 # referenced-CSV read failure below -- without recording it,
@@ -3962,7 +3984,8 @@ def load_same_day_top_up_context(
                 # scan_had_failures forever, forcing an unnecessary bounded
                 # reload on every future run (Codex review: "Scope parse
                 # failures to plausible same-day states").
-                if skip_sink is not None and _mtime_matches_trading_day(path, trading_day):
+                same_day_mtime = same_day_mtime if same_day_mtime is not None else _mtime_matches_trading_day(path, trading_day)
+                if skip_sink is not None and same_day_mtime:
                     skip_sink.append(path)
                 continue
             if not isinstance(state, dict) or not is_top_up_context_state(state, trading_day):
