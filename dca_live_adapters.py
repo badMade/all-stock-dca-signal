@@ -6097,7 +6097,7 @@ class RobinhoodBroker:
                     # success path's own marker exists to close (Codex
                     # review, PR #1164: "Preserve sibling-order ambiguity
                     # through reconciliation").
-                    structurally_ambiguous=bool(
+                    structurally_ambiguous=(
                         _order_identity_conflicts or ambiguous_nested_orders or _unresolved_sibling_orders
                     ),
                 )
