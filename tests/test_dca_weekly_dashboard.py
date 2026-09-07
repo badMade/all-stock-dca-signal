@@ -7934,3 +7934,49 @@ def test_build_sector_matrix_empty():
     ]
     report = build_sector_matrix(run_states)
     assert "| _no candidates_ | 0 | $0.00 |" in report
+def test_build_execution_quality():
+    from dca_weekly_dashboard import build_execution_quality
+    summaries = [
+        {
+            "trading_day": "2026-07-20",
+            "execution_quality": {
+                "priced_fills": 5,
+                "target_price_missing": 1,
+                "avg_slippage_pct": 0.15,
+                "max_slippage_pct": 0.42,
+                "worst_ticker": "AAPL"
+            }
+        },
+        {
+            "trading_day": "2026-07-21",
+            "execution_quality": {
+                "priced_fills": 3,
+                "target_price_missing": 0,
+                "avg_slippage_pct": 0.25,
+                "max_slippage_pct": 0.50,
+                "worst_ticker": "TSLA"
+            }
+        },
+        {
+            "trading_day": "2026-07-22",
+        },
+        {
+            "trading_day": "2026-07-23",
+            "execution_quality": {
+                "priced_fills": 2
+            }
+        }
+    ]
+    report = build_execution_quality(summaries)
+    assert "| 2026-07-20 | 5 | 1 | 0.15% | 0.42% | AAPL |" in report
+    assert "| 2026-07-21 | 3 | 0 | 0.25% | 0.5% | TSLA |" in report
+    assert "| 2026-07-22 | 0 | 0 | n/a | n/a | n/a |" in report
+    assert "| 2026-07-23 | 2 | 0 | n/a | n/a | n/a |" in report
+    assert "| **Week avg** | | | **0.2%** | | |" in report
+
+
+def test_build_execution_quality_empty():
+    from dca_weekly_dashboard import build_execution_quality
+    report = build_execution_quality([])
+    assert "## Execution quality" in report
+    assert "| **Week avg** | | | **n/a** | | |" in report
