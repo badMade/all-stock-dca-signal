@@ -260,3 +260,51 @@ def test_ftp_handler_blocked():
 def test_is_disallowed_ip(ip_str, expected):
     ip = ipaddress.ip_address(ip_str)
     assert dca_net_utils.is_disallowed_ip(ip) is expected
+def test_assert_safe_destination_unsupported_scheme():
+    with pytest.raises(dca_net_utils.UnsafeDestinationError, match="unsupported scheme"):
+        dca_net_utils.assert_safe_destination("ftp://example.com")
+
+def test_assert_safe_destination_malformed_port():
+    with pytest.raises(dca_net_utils.UnsafeDestinationError, match="malformed port"):
+        dca_net_utils.assert_safe_destination("https://example.com:notaport/")
+
+def test_assert_safe_destination_literal_disallowed_ip():
+    with pytest.raises(dca_net_utils.UnsafeDestinationError, match="disallowed address"):
+        dca_net_utils.assert_safe_destination("http://127.0.0.1")
+
+def test_assert_safe_destination_literal_allowed_ip():
+    # Should return silently
+    dca_net_utils.assert_safe_destination("http://93.184.216.34")
+
+def test_assert_safe_destination_proxy_fails_resolution_with_proxy():
+    # Hostname fails to resolve locally, but a proxy is configured for it
+    with patch("dca_net_utils.resolve_ips", side_effect=OSError("resolution failed")):
+        with patch("dca_net_utils.proxy_configured_for", return_value=True):
+            dca_net_utils.assert_safe_destination("https://unresolvable-but-proxied.example.com")
+
+def test_assert_safe_destination_proxy_fails_resolution_without_proxy():
+    # Hostname fails to resolve locally, and no proxy is configured
+    with patch("dca_net_utils.resolve_ips", side_effect=OSError("resolution failed")):
+        with patch("dca_net_utils.proxy_configured_for", return_value=False):
+            with pytest.raises(dca_net_utils.UnsafeDestinationError, match="host does not resolve"):
+                dca_net_utils.assert_safe_destination("https://unresolvable.example.com")
+
+def test_assert_safe_destination_resolves_to_disallowed_ip():
+    with patch("dca_net_utils.resolve_ips") as mock_resolve:
+        mock_resolve.return_value = {ipaddress.ip_address("169.254.169.254")}
+        with pytest.raises(dca_net_utils.UnsafeDestinationError, match="host resolves to a disallowed address"):
+            dca_net_utils.assert_safe_destination("https://example.com")
+
+
+def test_assert_safe_destination_resolves_empty_set():
+    with patch("dca_net_utils.resolve_ips") as mock_resolve:
+        mock_resolve.return_value = set()
+        with pytest.raises(dca_net_utils.UnsafeDestinationError, match="host resolves to a disallowed address"):
+            dca_net_utils.assert_safe_destination("https://example.com")
+
+
+def test_assert_safe_destination_resolves_to_allowed_ip():
+    with patch("dca_net_utils.resolve_ips") as mock_resolve:
+        mock_resolve.return_value = {ipaddress.ip_address("93.184.216.34")}
+        # Should return silently
+        dca_net_utils.assert_safe_destination("https://example.com")
