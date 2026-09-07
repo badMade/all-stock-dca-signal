@@ -1021,6 +1021,13 @@ class FinbertSentimentAnalyzer:
     construct its own.
     """
 
+    # Class-level guard for ``_get_inference_lock``'s lazy creation of the
+    # per-instance ``_inference_lock``. Lives on the class (not in
+    # ``__init__``) precisely so it exists on EVERY instance regardless of
+    # how that instance was built -- it is the one thing the lazy path can
+    # rely on when ``__init__`` never ran.
+    _inference_lock_guard = threading.Lock()
+
     def __init__(
         self,
         model_name: str = "ProsusAI/finbert",
@@ -1072,6 +1079,35 @@ class FinbertSentimentAnalyzer:
         self._labels = [self._model.config.id2label[i] for i in range(len(self._model.config.id2label))]
         self._inference_lock = threading.Lock()
 
+    def _get_inference_lock(self) -> threading.Lock:
+        """Return this instance's inference lock, creating it if ``__init__`` never ran.
+
+        ``__init__`` sets ``_inference_lock`` eagerly, but a caller that
+        builds the analyzer via ``__new__`` to skip the multi-GB model
+        download (tests/test_sentiment.py does exactly this to exercise
+        ``score_texts`` model-free) never reaches it: CI on PR #1358 failed
+        test_finbert_score_texts_normalizes_probability_fields_to_builtin_floats
+        with ``AttributeError: 'FinbertSentimentAnalyzer' object has no
+        attribute '_inference_lock'`` for that reason once the lock landed on
+        the branch. Rather than let ``score_texts`` depend on a construction
+        path it cannot see, create the lock on first use -- under the
+        class-level guard, so two threads racing into ``score_texts`` on such
+        an instance still end up sharing ONE lock instead of each minting its
+        own (which would silently void the serialization the lock exists for:
+        PR #644's parallel ``score_candidate`` execution). Instances that ran
+        ``__init__`` keep their eagerly-created lock untouched.
+        """
+        lock = getattr(self, "_inference_lock", None)
+        if lock is None:
+            with type(self)._inference_lock_guard:
+                # Re-check under the guard: another thread may have won the
+                # race between the unguarded read above and acquiring it.
+                lock = getattr(self, "_inference_lock", None)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._inference_lock = lock
+        return lock
+
     def score_texts(self, texts: list[str], *, batch_size: int = 16) -> list[dict[str, object]]:
         """Run FinBERT over ``texts``, chunked by ``batch_size`` to bound peak memory.
 
@@ -1096,7 +1132,10 @@ class FinbertSentimentAnalyzer:
         # pass (Antigravity code review on PR #403).
         for start in range(0, len(texts), batch_size):
             chunk = texts[start : start + batch_size]
-            with self._inference_lock:
+            # Via the accessor, not the attribute: it tolerates an instance
+            # that skipped __init__ (see _get_inference_lock's docstring for
+            # the PR #1358 CI failure) without weakening the serialization.
+            with self._get_inference_lock():
                 inputs = self._tokenizer(chunk, return_tensors="pt", padding=True, truncation=True, max_length=512)
                 with torch.no_grad():
                     logits = self._model(**inputs).logits

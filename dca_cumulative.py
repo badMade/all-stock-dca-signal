@@ -20,7 +20,7 @@ import math
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from dca_fileio import atomic_write_text
 from dca_paths import stream_root
@@ -31,6 +31,22 @@ _log = logging.getLogger(__name__)
 MINIMUM_ORDER_USD = Decimal("1.00")
 ROUND_UP_THRESHOLD_USD = Decimal("0.50")
 CENT = Decimal("0.01")
+
+
+class MinimumOrderDiscard(NamedTuple):
+    """Outcome of one final-session minimum-order discard attempt.
+
+    ``removed_usd`` is what THIS call cleared under its own lock -- 0.0 when
+    the balance was already absent, so nothing of this call's may later be
+    restored. ``refused`` is True when a concurrent update meant the ledger
+    was left untouched entirely. ``revision`` is the ledger's mutation
+    counter as observed by this call, the compare-and-swap token for a later
+    rollback.
+    """
+
+    removed_usd: float
+    revision: int
+    refused: bool
 
 
 @dataclass(frozen=True)
@@ -57,6 +73,14 @@ class CumulativeCreditProvenanceSnapshot:
     pending_usd: float
     preserved_credit_usd: float
     settled_credit_usd: float
+    # Whether the slot's preserve_pending() dedup key exists AT ALL,
+    # regardless of its current outstanding amount -- the same distinction
+    # :meth:`CumulativeCreditLedger.has_preserved_entry_for_slot` draws
+    # (a zeroed-but-existing entry still needs reconciling rather than a
+    # fresh preserve_pending() call that its own dedup would swallow).
+    # Read under the same lock as the three amounts so a retry's
+    # reconcile-vs-skip decision cannot straddle a concurrent write.
+    has_preserved_entry: bool = False
 
 
 _DECISION_FIELDS = (
@@ -332,7 +356,7 @@ class CumulativeCreditLedger:
                 }
             )
             day_dir.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+            self._write_state(state_path, state)
         return decision
 
     def preserve_pending(
@@ -425,7 +449,7 @@ class CumulativeCreditLedger:
                 }
             )
             day_dir.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+            self._write_state(state_path, state)
         return pending_after
 
     def recorded_decision(
@@ -616,7 +640,7 @@ class CumulativeCreditLedger:
             if "settled_credit_usd" not in cached:
                 raise ValueError("cannot safely reconcile a legacy preserved credit")
             current_settled = round(float(cached["settled_credit_usd"]), 2)
-            if current_settled != round(expected_settled_credit_usd, 2):
+            if current_settled != round(float(expected_settled_credit_usd), 2):
                 raise RuntimeError("preserved credit changed during reconciliation")
             # A consumed entry's raw incremental_credit_usd is the OLD,
             # already-paid amount (settle() leaves it unchanged on full
@@ -631,7 +655,7 @@ class CumulativeCreditLedger:
                 if cached.get("consumed_by_settlement")
                 else round(float(cached.get("incremental_credit_usd", 0.0)), 2)
             )
-            if current_outstanding != round(expected_outstanding_credit_usd, 2):
+            if current_outstanding != round(float(expected_outstanding_credit_usd), 2):
                 raise RuntimeError("preserved credit changed during reconciliation")
             if expected_pending_usd is not None:
                 # The caller's order-vs-stays-pending decision was already
@@ -646,7 +670,7 @@ class CumulativeCreditLedger:
                 # reconciliation so the caller recomputes from scratch
                 # rather than acting on a decision based on a stale total.
                 current_pending = round(float(state["pending_usd_by_ticker"].get(symbol, 0.0)), 2)
-                if current_pending != round(expected_pending_usd, 2):
+                if current_pending != round(float(expected_pending_usd), 2):
                     raise RuntimeError("preserved credit changed during reconciliation")
             already_consumed = bool(cached.get("consumed_by_settlement"))
             if already_consumed:
@@ -668,7 +692,7 @@ class CumulativeCreditLedger:
                 # "incremental_credit_usd"] here is the OLD, already-paid
                 # amount, not still-outstanding credit to net against, so
                 # `previous` is reset to 0 below rather than read from it.
-                if round(max(0.0, outstanding_credit_usd), 2) <= 0:
+                if round(max(0.0, float(outstanding_credit_usd)), 2) <= 0:
                     return float(state["pending_usd_by_ticker"].get(symbol, 0.0))
                 cached["consumed_by_settlement"] = False
                 cached["settled_credit_usd"] = 0.0
@@ -683,7 +707,7 @@ class CumulativeCreditLedger:
                 # which stamps a fresh sequence for the same reason.
                 cached["sequence"] = _next_sequence(state)
             previous = 0.0 if already_consumed else float(cached.get("incremental_credit_usd", 0.0))
-            outstanding = round(max(0.0, outstanding_credit_usd), 2)
+            outstanding = round(max(0.0, float(outstanding_credit_usd)), 2)
             pending_before = float(state["pending_usd_by_ticker"].get(symbol, 0.0))
             pending_after = round(max(0.0, pending_before - previous + outstanding), 2)
             cached["incremental_credit_usd"] = outstanding
@@ -712,7 +736,7 @@ class CumulativeCreditLedger:
                 }
             )
             day_dir.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+            self._write_state(state_path, state)
             return pending_after
 
     def settled_credit_for_slot(
@@ -750,10 +774,15 @@ class CumulativeCreditLedger:
         state revision.  Reading them separately permits a concurrent
         settlement to mix a stale pending balance with newer provenance and
         recreate credit that has already been paid.
+
+        ``has_preserved_entry`` rides along from the same read: it is the
+        :meth:`has_preserved_entry_for_slot` answer (True for a zeroed or
+        consumed entry too), so a retry's reconcile-vs-skip decision is made
+        against the same state revision as the amounts it reconciles.
         """
         symbol = ticker.strip().upper()
         if not symbol:
-            return CumulativeCreditProvenanceSnapshot(0.0, 0.0, 0.0)
+            return CumulativeCreditProvenanceSnapshot(0.0, 0.0, 0.0, has_preserved_entry=False)
         day_dir = self.root / trading_day
         with cross_process_lock(day_dir / "ledger.lock"):
             state = self._read_state(day_dir / "ledger.json", trading_day)
@@ -763,7 +792,7 @@ class CumulativeCreditLedger:
                 dedup_key = f"preserve:{symbol}:{idempotency_key}"
                 cached = state.get("recorded_idempotency_keys", {}).get(dedup_key)
             if cached is None:
-                return CumulativeCreditProvenanceSnapshot(pending, 0.0, 0.0)
+                return CumulativeCreditProvenanceSnapshot(pending, 0.0, 0.0, has_preserved_entry=False)
             preserved = 0.0 if cached.get("consumed_by_settlement") else float(
                 cached.get("incremental_credit_usd", 0.0)
             )
@@ -771,6 +800,7 @@ class CumulativeCreditLedger:
                 pending,
                 preserved,
                 float(cached.get("settled_credit_usd", 0.0)),
+                has_preserved_entry=True,
             )
 
     def pending_usd(self, ticker: str, trading_day: str) -> float:
@@ -873,6 +903,70 @@ class CumulativeCreditLedger:
         balance now QUALIFIES FOR AN ORDER (nothing is changed in that case --
         the caller re-evaluates so the now-qualifying order can be placed
         rather than left stranded after the final pass).
+
+        True deliberately covers BOTH "this call removed the balance" and
+        "the balance was already gone" -- for a caller that only needs to
+        know whether anything is left to discard, those are the same answer.
+        A caller that intends to UNDO the discard later (restore the credit
+        if a required post-discard check cannot complete) must not use this
+        bool: it cannot tell "I removed $0.10" apart from "a concurrent retry
+        already settled that $0.10 before my lock", and restoring in the
+        second case resurrects credit a real order already consumed. Use
+        :meth:`discard_minimum_order_pending_amount` for that (Codex review,
+        PR #680 discussion_r3925291346: "Restore only credit this call
+        actually discarded").
+        """
+        return (
+            self.discard_minimum_order_pending_amount(ticker, trading_day, observed_amount_usd)
+            is not None
+        )
+
+    def discard_minimum_order_pending_amount(
+        self, ticker: str, trading_day: str, observed_amount_usd: Optional[float] = None
+    ) -> float | None:
+        """:meth:`discard_minimum_order_pending`, reporting what was removed.
+
+        Same locking, same observed-amount logging and threshold re-check,
+        same ledger write. The return value distinguishes the three outcomes
+        the bool form collapses to two:
+
+        * a positive float -- THIS call cleared exactly that much from the
+          ledger under its own lock (the FRESH amount read under the lock,
+          which is what actually left the pool, not the caller's possibly
+          stale ``observed_amount_usd``);
+        * ``0.0`` -- nothing was left to clear (the balance was already
+          absent, e.g. a concurrent retry settled it first); the ledger was
+          not written;
+        * ``None`` -- refused: a concurrent update raised the balance to
+          order-qualifying; the ledger was left untouched.
+
+        Only the positive case is safe to hand to
+        :meth:`restore_minimum_order_pending` if a required post-discard
+        step later fails -- restoring the caller's stale observed amount on
+        ``0.0`` would re-credit money a concurrent order already spent.
+
+        A caller that will decide whether to UNDO this discard after
+        releasing the lock needs the ledger revision as well, to detect a
+        concurrent mutation landing in between -- use
+        :meth:`discard_minimum_order_pending_tracked`.
+        """
+        _outcome = self.discard_minimum_order_pending_tracked(ticker, trading_day, observed_amount_usd)
+        return None if _outcome.refused else _outcome.removed_usd
+
+    def discard_minimum_order_pending_tracked(
+        self, ticker: str, trading_day: str, observed_amount_usd: Optional[float] = None
+    ) -> MinimumOrderDiscard:
+        """:meth:`discard_minimum_order_pending_amount` plus the ledger revision.
+
+        The revision is read (or written) under this call's OWN lock, so a
+        caller that later reacquires the lock can tell whether any other
+        mutation -- a concurrent ``settle()`` registering the recovered
+        order, a fresh ``record()`` crediting new money -- landed in the
+        gap. That is the compare-and-swap token
+        :meth:`restore_minimum_order_pending` accepts as
+        ``expected_revision`` (Codex review, PR #680
+        discussion_r3925440982: "Make post-discard restoration
+        compare-and-swap").
         """
         symbol = ticker.strip().upper()
         day_dir = self.root / trading_day
@@ -883,30 +977,33 @@ class CumulativeCreditLedger:
             qualifying = state.setdefault("minimum_order_pending_usd_by_ticker", {})
             amount = float(qualifying.get(symbol, 0.0))
             if amount <= 0:
-                return True
-            if observed_amount_usd is not None and round(amount, 2) != round(observed_amount_usd, 2):
+                # Already absent: nothing to discard, and -- critically --
+                # nothing THIS call removed, so nothing it may later restore.
+                return MinimumOrderDiscard(0.0, self._state_revision(state), False)
+            if observed_amount_usd is not None and round(amount, 2) != round(float(observed_amount_usd), 2):
                 # The balance MOVED since the caller's pre-lock scan, but a
-                # move is not by itself a reason to refuse. Returning False
-                # here for any change at all stranded the credit whenever a
-                # concurrent contribution left it still BELOW the threshold
-                # (e.g. $0.10 -> $0.20): both callers read False as "it became
-                # actionable", and neither can route a balance that still has
-                # no order in it -- _select_final_session_credit_flush_tickers
-                # has no decision to route, and the per-candidate path
-                # re-evaluates but declines a second discard -- so nothing in
-                # the final session ever cleared it (Codex review: "Retry
-                # discards when the balance remains sub-threshold"). The
-                # threshold re-check below is the real guard, and it runs
-                # against the FRESH amount read under this lock, so a changed
-                # balance is simply discarded at its current value. Logged
-                # because a concurrent write to a final-session credit is
-                # worth a trace either way.
+                # move is not by itself a reason to refuse. Returning a
+                # refusal here for any change at all stranded the credit
+                # whenever a concurrent contribution left it still BELOW the
+                # threshold (e.g. $0.10 -> $0.20): both callers read False as
+                # "it became actionable", and neither can route a balance
+                # that still has no order in it --
+                # _select_final_session_credit_flush_tickers has no decision
+                # to route, and the per-candidate path re-evaluates but
+                # declines a second discard -- so nothing in the final
+                # session ever cleared it (Codex review: "Retry discards when
+                # the balance remains sub-threshold"). The threshold re-check
+                # below is the real guard, and it runs against the FRESH
+                # amount read under this lock, so a changed balance is simply
+                # discarded at its current value (and THAT fresh amount is
+                # what removed_usd reports). Logged because a concurrent
+                # write to a final-session credit is worth a trace either way.
                 _log.info(
                     "cumulative credit for %s on %s moved from %.2f to %.2f between the "
                     "caller's scan and this final discard; re-evaluating at the current amount",
                     symbol,
                     trading_day,
-                    round(observed_amount_usd, 2),
+                    round(float(observed_amount_usd), 2),
                     amount,
                 )
             if apply_cumulative_credit(amount, 0.0, final_session=True).order_amount_usd > 0:
@@ -915,7 +1012,7 @@ class CumulativeCreditLedger:
                 # scan. Do NOT discard; leave both pools untouched so the
                 # money is not silently lost, even though nothing in this
                 # final session will retry it.
-                return False
+                return MinimumOrderDiscard(0.0, self._state_revision(state), True)
             qualifying.pop(symbol, None)
             pending_before = float(state["pending_usd_by_ticker"].get(symbol, 0.0))
             pending_after = round(max(0.0, pending_before - amount), 2)
@@ -937,7 +1034,71 @@ class CumulativeCreditLedger:
                 }
             )
             day_dir.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+            _revision_after_discard = self._write_state(state_path, state)
+        return MinimumOrderDiscard(round(amount, 2), _revision_after_discard, False)
+
+    def restore_minimum_order_pending(
+        self, ticker: str, trading_day: str, discarded_amount_usd: float, *, expected_revision: Optional[int] = None
+    ) -> bool:
+        """Restore a discard when its required post-discard check cannot finish.
+
+        Returns True when the credit was restored, False when the rollback
+        was refused.
+
+        ``expected_revision`` makes this a COMPARE-AND-SWAP against the
+        revision the discard reported: the rollback is applied only if no
+        other mutation landed in between. Without it, a concurrent retry
+        that settled the recovered broker order after this invocation
+        released the discard lock -- observing zero pending credit and
+        durably recording its ``order_id`` -- would be followed by this
+        unconditional restore, resurrecting spendable credit that the same
+        order can no longer consume, because its settlement is now
+        deduplicated by that very ``order_id`` (Codex review, PR #680
+        discussion_r3925440982: "Make post-discard restoration
+        compare-and-swap"). Callers must pass it whenever they released the
+        lock between discarding and deciding to roll back.
+
+        Restore both the general pending balance and its minimum-order
+        provenance under one lock so a later retry can reconcile the credit.
+        """
+        symbol = ticker.strip().upper()
+        amount = round(float(discarded_amount_usd), 2)
+        if not symbol or amount <= 0:
+            return False
+        day_dir = self.root / trading_day
+        state_path = day_dir / "ledger.json"
+        with cross_process_lock(day_dir / "ledger.lock"):
+            state = self._read_state(state_path, trading_day)
+            if expected_revision is not None and self._state_revision(state) != expected_revision:
+                # Something else mutated the ledger after this caller's own
+                # discard. Whatever it was -- a settlement of the very order
+                # this rollback exists to protect, or fresh credit for the
+                # ticker -- it observed the post-discard state, so re-adding
+                # the discarded dollars now would create credit no longer
+                # backed by an unreconciled order. Fail closed: leave the
+                # ledger as the concurrent writer left it.
+                return False
+            pending = state["pending_usd_by_ticker"]
+            qualifying = state.setdefault("minimum_order_pending_usd_by_ticker", {})
+            pending_before = float(pending.get(symbol, 0.0))
+            pending_after = round(pending_before + amount, 2)
+            pending[symbol] = pending_after
+            qualifying[symbol] = round(float(qualifying.get(symbol, 0.0)) + amount, 2)
+            state["events"].append(
+                {
+                    "ticker": symbol,
+                    "stream": "afternoon",
+                    "recorded_at": None,
+                    "final_session": True,
+                    "pending_before_usd": pending_before,
+                    "incremental_credit_usd": amount,
+                    "order_amount_usd": 0.0,
+                    "pending_after_usd": pending_after,
+                    "decision": "discard_restored",
+                }
+            )
+            day_dir.mkdir(parents=True, exist_ok=True)
+            self._write_state(state_path, state)
         return True
 
     def settle(
@@ -950,8 +1111,17 @@ class CumulativeCreditLedger:
         stream: str = "unknown",
         recorded_at: Optional[str] = None,
         order_id: Optional[str] = None,
+        already_debited_usd: Optional[float] = None,
     ) -> None:
         """Durably confirm a credit-derived order that has actually been placed.
+
+        ``already_debited_usd`` is for the one caller whose dollars were
+        removed from the ledger BEFORE the order was matched to them -- the
+        final-session discard that then discovers a concurrently placed
+        duplicate. Passing it records the settlement as provenance only (order
+        id registered for later dedup, audit event appended) and debits
+        nothing, because the balance was already reduced. See the branch's own
+        note below.
 
         Unlike :meth:`record`, this makes no sizing decision of its own -- the
         decision (whether/how much to order) was already made by the caller
@@ -1008,6 +1178,12 @@ class CumulativeCreditLedger:
         lock_path = day_dir / "ledger.lock"
         with cross_process_lock(lock_path):
             state = self._read_state(state_path, trading_day)
+            # The persisted shape is a MAPPING of normalized broker order id ->
+            # what that settlement moved, not a bare list: the metadata is what
+            # makes an ignored duplicate explicable after the fact (which ticker,
+            # how much) without replaying the whole event log. order_id was
+            # canonicalized above; the persisted keys are re-canonicalized here
+            # too so an id persisted under an older spelling still dedups.
             if order_id:
                 persisted_order_ids = state.setdefault("settled_order_ids", {})
                 settled_order_ids: dict[str, dict[str, Any]] = {}
@@ -1043,11 +1219,54 @@ class CumulativeCreditLedger:
                         }
                     )
                     day_dir.mkdir(parents=True, exist_ok=True)
-                    atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+                    self._write_state(state_path, state)
                     return
             else:
                 settled_order_ids = state.setdefault("settled_order_ids", {})
                 normalized_order_id = ""
+            if already_debited_usd is not None:
+                # The dollars this order consumed were ALREADY removed from
+                # both pools -- by this caller's own successful
+                # discard_minimum_order_pending_*() -- so there is nothing
+                # left to debit. Debiting `submitted` from the CURRENT
+                # balance here would charge whatever credit happens to be
+                # pending NOW: if another stream recorded fresh credit for
+                # the ticker between that discard and this call, the order
+                # would consume money that did not exist when it was
+                # accepted, and `order_id` idempotence cannot prevent the
+                # FIRST wrong application (Codex review, PR #680
+                # discussion_r3925440968: "Keep post-discard settlement from
+                # consuming newer credit").
+                #
+                # Record the settlement as pure provenance instead: register
+                # the order id (in the same mapping shape the ordinary
+                # settlement path below persists, so a later recovery pass
+                # still dedups) and append the audit event naming the
+                # already-removed amount, leaving every balance untouched.
+                _already = round(float(already_debited_usd), 2)
+                if normalized_order_id:
+                    settled_order_ids[normalized_order_id] = {
+                        "ticker": symbol,
+                        "submitted_amount_usd": round(float(submitted_amount_usd), 2),
+                    }
+                state["events"].append(
+                    {
+                        "ticker": symbol,
+                        "stream": stream,
+                        "recorded_at": recorded_at,
+                        "final_session": final_session,
+                        "pending_before_usd": float(state["pending_usd_by_ticker"].get(symbol, 0.0)),
+                        "incremental_credit_usd": 0.0,
+                        "order_amount_usd": round(float(submitted_amount_usd), 2),
+                        "pending_after_usd": float(state["pending_usd_by_ticker"].get(symbol, 0.0)),
+                        "decision": "settled_already_discarded",
+                        "already_discarded_usd": _already,
+                        "order_id": order_id,
+                    }
+                )
+                day_dir.mkdir(parents=True, exist_ok=True)
+                self._write_state(state_path, state)
+                return
             pending_before = float(state["pending_usd_by_ticker"].get(symbol, 0.0))
             submitted = submitted_amount_usd
             pending_after = round(max(0.0, pending_before - submitted), 2)
@@ -1168,12 +1387,41 @@ class CumulativeCreditLedger:
                     "submitted_amount_usd": submitted,
                 }
             day_dir.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+            self._write_state(state_path, state)
 
     def events(self, trading_day: str) -> list[dict[str, Any]]:
         """Return a copy of one day's structured credit-decision history."""
         state = self._read_state(self.root / trading_day / "ledger.json", trading_day)
         return list(state["events"])
+
+    @staticmethod
+    def _state_revision(state: dict[str, Any]) -> int:
+        """This state's mutation counter (0 for a ledger written before it).
+
+        Distinct from ``version``, which is the SCHEMA version and is pinned
+        at 1 by :meth:`_read_state`. ``revision`` instead increments on every
+        durable write, so a caller that released the lock between two
+        operations can tell whether ANY concurrent mutation landed in
+        between -- the compare-and-swap
+        :meth:`restore_minimum_order_pending` needs (Codex review, PR #680
+        discussion_r3925440982: "Make post-discard restoration
+        compare-and-swap").
+        """
+        try:
+            return int(state.get("revision", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _write_state(cls, state_path: Path, state: dict[str, Any]) -> int:
+        """Durably write ``state``, bumping and returning its new revision.
+
+        The single write choke point for this ledger, so no mutation can
+        land without advancing the counter the compare-and-swap depends on.
+        """
+        state["revision"] = cls._state_revision(state) + 1
+        atomic_write_text(state_path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+        return state["revision"]
 
     @staticmethod
     def _read_state(path: Path, trading_day: str) -> dict[str, Any]:

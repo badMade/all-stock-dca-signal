@@ -32,7 +32,7 @@ if str(pathlib.Path(__file__).resolve().parent.parent) not in sys.path:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from conftest import FIXTURE_ACCOUNT_NUMBER
-from dca_cumulative import CumulativeCreditLedger
+from dca_cumulative import CumulativeCreditLedger, MinimumOrderDiscard
 from dca_whole_share_accumulator import WholeShareAccumulationLedger
 from near_close_dca import (
     ACTIVE_TICKERS,
@@ -2896,7 +2896,10 @@ def test_merge_manual_top_up_context_preserves_order_id_provenance():
     }
     merge_manual_top_up_context(prior_same_day_allocations, cast(Any, manual_context))
     merged = prior_same_day_allocations["AAPL"]
-    assert merged.contributing_run_ids == frozenset({"run1"})
+    # The scheduled side's run id survives AND the manual side's own source
+    # joins it -- see test_merge_manual_top_up_context_preserves_existing_
+    # contributor_ids below for why the manual fill is a contributor too.
+    assert merged.contributing_run_ids == frozenset({"run1", "manual_csv"})
     assert merged.contributing_order_ids == frozenset({"order-A"}), (
         "the scheduled side's own order_id provenance must survive the "
         "manual-context merge, not be silently dropped to empty"
@@ -2905,7 +2908,43 @@ def test_merge_manual_top_up_context_preserves_order_id_provenance():
         "the scheduled side's own synthetic uncertain-contributor identity "
         "must survive the manual-context merge too"
     )
-    assert merged.attempt_run_ids == frozenset({"run1"})
+    assert merged.attempt_run_ids == frozenset({"run1", "manual_csv"})
+
+
+def test_merge_manual_top_up_context_preserves_existing_contributor_ids():
+    # Codex review ("Preserve contributor IDs through manual-context merges"):
+    # the merge path's amount_usd still includes existing.amount_usd, so
+    # dropping existing.contributing_run_ids/attempt_run_ids here would make
+    # a caller like morning_dca._compute_top_up's own-slot-already-counted
+    # check see this merged allocation as having no known contributor for
+    # dollars it already counted, double-deducting settled credit. Both sets
+    # must carry the scheduled run's ids forward AND gain the manual side's
+    # sources, since the manual fill also contributed dollars and an attempt.
+    prior_same_day_allocations = {
+        "AAPL": PriorSameDayAllocation(
+            "AAPL",
+            amount_usd=2.0,
+            reference_price=97.0,
+            run_id="run1",
+            source="scheduled",
+            attempt_count=1,
+            contributing_run_ids=frozenset({"run1"}),
+            attempt_run_ids=frozenset({"run1"}),
+        ),
+    }
+    manual_context = {
+        "AAPL": PriorAllocation(
+            ticker="AAPL",
+            prior_usd=5.0,
+            reference_price=99.0,
+            sources=["manual_csv"],
+            attempt_count=1,
+        ),
+    }
+    merge_manual_top_up_context(prior_same_day_allocations, cast(Any, manual_context))
+    merged = prior_same_day_allocations["AAPL"]
+    assert merged.contributing_run_ids == frozenset({"run1", "manual_csv"})
+    assert merged.attempt_run_ids == frozenset({"run1", "manual_csv"})
 
 
 def test_merge_manual_top_up_context_unions_manual_side_order_ids():
@@ -37657,6 +37696,219 @@ def test_cumulative_credit_discards_a_combined_total_still_below_fifty_cents(tmp
     assert events[-1]["decision"] == "discarded"
 
 
+def test_combined_credit_recovers_a_duplicate_instead_of_discarding(tmp_path):
+    # Codex review, PR #656 discussion_r3837462029 ("Check for a placed order
+    # before discarding combined credit"): same setup as the test above (a
+    # combined total that lands back under $0.50 on this retry), but an
+    # earlier same-stream attempt already placed a real broker order for this
+    # ticker today and crashed before settle() ran. Discarding straight away
+    # (as the prior test's ticker correctly does when NO such order exists)
+    # would destroy the only ledger evidence of that real order before the
+    # same-stream duplicate lookup ever runs. The discard must be skipped in
+    # favor of recovering and settling the real order, with the aggregate
+    # audit fields attached.
+    ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 6, 29)
+    ledger.record("AAPL", trading_day.isoformat(), 0.10, stream="morning")
+
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=2.0,
+        suggested_amount_usd=6.0,
+        selected_base_amount_usd=3.0,
+        target_price=98.95,  # a genuine but tiny further decline of $0.05
+    )
+    config = StrategyConfig(dry_run=False)
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.95})
+    ref_id = f"{_graded_dca_ref_id_prefix('afternoon')}-{trading_day.isoformat()}-AAPL"
+    broker._placed_whole_share_orders[ref_id] = {
+        "id": "ORDER-EARLIER-AAPL",
+        "dollar_amount": 1.0,
+    }
+
+    candidate_outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+            credit_ledger=ledger,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert top_up_outcome is not None
+    assert top_up_outcome.discarded_pending_credit_usd == 0.10
+    assert candidate_outcome["status"] == "submitted"
+    assert candidate_outcome["order_id"] == "ORDER-EARLIER-AAPL"
+    assert candidate_outcome["duplicate_preserved"] is True
+    assert candidate_outcome["aggregate_minimum_topup_applied"] is True
+    assert candidate_outcome["aggregate_minimum_topup_remainder_usd"] == 0.10
+    # Codex review, PR #656 follow-up: "Preserve the original aggregate
+    # reason during recovery". cumulative_credit_decline_usd is None here
+    # (this recovery path only has discarded_pending_credit_usd), and the
+    # recovered order's $1.00 notional is exactly at the rounding boundary
+    # -- indistinguishable from a genuinely at/above-minimum combined
+    # total. Asserting "rounded" would be a guess, not a fact.
+    assert candidate_outcome["aggregate_minimum_topup_reason"] == "aggregate_recovered_reason_unknown"
+    # The ledger must be SETTLED against the real recovered order, not
+    # discarded -- discarding here would have erased the only evidence that
+    # a real order already consumed this credit.
+    assert ledger.minimum_order_pending_tickers(trading_day.isoformat()) == {}
+    events = ledger.events(trading_day.isoformat())
+    assert events[-1]["decision"] == "settled"
+
+
+def test_combined_credit_blocks_when_pre_discard_duplicate_check_fails(tmp_path):
+    # Codex review, PR #656 follow-up on discussion_r3837462029 ("Fail
+    # closed when the pre-discard duplicate lookup errors"): same setup as
+    # test_combined_credit_recovers_a_duplicate_instead_of_discarding, but
+    # the pre-discard duplicate lookup itself raises (a transient broker-
+    # history error) instead of returning cleanly. Normalizing that failure
+    # to "no duplicate" would proceed to destructively discard the pending
+    # credit despite being unable to rule out a real order combining it --
+    # this must instead block the candidate and leave the ledger untouched.
+    class _RaisingDupCheckBroker(DryRunBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, prefixes):
+            raise RuntimeError("broker history temporarily unavailable")
+
+    ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 6, 29)
+    ledger.record("AAPL", trading_day.isoformat(), 0.10, stream="morning")
+
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=2.0,
+        suggested_amount_usd=6.0,
+        selected_base_amount_usd=3.0,
+        target_price=98.95,  # a genuine but tiny further decline of $0.05
+    )
+    config = StrategyConfig(dry_run=False)
+    state = StrategyState()
+    broker = _RaisingDupCheckBroker(cash=500.0, reference_prices={"AAPL": 98.95})
+
+    candidate_outcome, top_up_outcome, _, errors_count_inc, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+            credit_ledger=ledger,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert candidate_outcome["status"] == "blocked"
+    assert errors_count_inc == 1
+    # The ledger must be left untouched -- neither discarded nor settled --
+    # so a later retry can still recover the (possibly real) order.
+    assert ledger.minimum_order_pending_tickers(trading_day.isoformat()) == {"AAPL": 0.10}
+    events = ledger.events(trading_day.isoformat())
+    assert events[-1]["decision"] != "discarded"
+
+
+def test_fresh_placement_settle_records_the_order_id_for_idempotent_dedup(tmp_path):
+    # Codex review, PR #656 follow-up: "Deduplicate afternoon recovered-
+    # order settlement". Not just the duplicate-recovery settle() call --
+    # the FRESH-placement settle() call must also pass the real order id,
+    # or a later retry that finds THIS exact order as a same-stream
+    # duplicate has nothing to deduplicate against and can subtract the
+    # same dollars from the shared pending balance a second time.
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=2.0,
+        suggested_amount_usd=6.0,
+        selected_base_amount_usd=3.0,
+        target_price=98.40,
+    )
+    broker = _RefIdTrackingBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    robinhood_data = _FakeDataWithBidAsk(
+        SourceName.ROBINHOOD, 98.40, 100.0, quote=(98.40, now), bid_ask=(98.3, 98.5)
+    )
+    ledger = CumulativeCreditLedger(root=tmp_path)
+    ledger.record("AAPL", trading_day.isoformat(), 0.30, stream="morning")
+
+    candidate_outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=robinhood_data,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+            credit_ledger=ledger,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert candidate_outcome["status"] == "submitted"
+    order_id = candidate_outcome["order_id"]
+    assert order_id
+
+    ledger_state_path = tmp_path / trading_day.isoformat() / "ledger.json"
+    persisted = json.loads(ledger_state_path.read_text())
+    assert order_id in persisted.get("settled_order_ids", [])
+
+
 def test_ordinary_ladder_order_folds_in_a_qualifying_existing_remainder(tmp_path):
     # Codex review discussion on commit 58a536a ("Resolve pending credit on
     # existing buy candidates"): a ticker whose own ladder increment already
@@ -38067,7 +38319,7 @@ def test_final_session_credit_flush_defers_discard_when_a_decline_can_combine_it
                 selected_base_amount_usd=2.0,
             ),
         },
-        discard=discarded.append,
+        discard=lambda ticker, amount: discarded.append(ticker),
     )
 
     # AAPL's own decline this run could still combine with its remainder --
@@ -38092,7 +38344,7 @@ def test_final_session_credit_flush_still_survives_at_or_above_the_minimum():
         {"AAPL": 0.75},
         {},
         {},
-        discard=discarded.append,
+        discard=lambda ticker, amount: discarded.append(ticker),
     )
 
     assert survivors == ["AAPL"]
@@ -38178,8 +38430,8 @@ def test_final_session_flush_discards_a_changed_balance_with_no_decision():
         observed,
         {},  # no decision for ZZZ -- nothing to route it through
         {},
-        discard=lambda ticker: _discard_minimum_order_pending_with_retry(
-            ledger, ticker, "2026-06-29", observed.get(ticker, 0.0)
+        discard=lambda ticker, observed_amount_usd: _discard_minimum_order_pending_with_retry(
+            ledger, ticker, "2026-06-29", observed_amount_usd
         ),
     )
 
@@ -38190,7 +38442,7 @@ def test_final_session_flush_discards_a_changed_balance_with_no_decision():
 def test_final_session_credit_flush_discard_failure_is_logged_not_raised():
     from near_close_dca import _select_final_session_credit_flush_tickers
 
-    def _raising_discard(ticker):
+    def _raising_discard(ticker, amount):
         raise OSError("ledger is locked")
 
     survivors = _select_final_session_credit_flush_tickers(
@@ -38231,7 +38483,7 @@ def test_final_session_credit_flush_routes_a_recoverable_duplicate_to_survivors(
         {"AAPL": 0.30},
         {"AAPL": recovered_decision},
         {},
-        discard=discarded.append,
+        discard=lambda ticker, amount: discarded.append(ticker),
         duplicate_order_exists=lambda ticker: ticker == "AAPL",
     )
 
@@ -38252,7 +38504,7 @@ def test_final_session_credit_flush_leaves_an_unroutable_duplicate_pending():
         {"DELISTED": 0.30},
         {},
         {},
-        discard=discarded.append,
+        discard=lambda ticker, amount: discarded.append(ticker),
         duplicate_order_exists=lambda ticker: True,
     )
 
@@ -38297,7 +38549,7 @@ def test_final_session_credit_flush_discards_a_structurally_combinable_but_unsaf
         {"AAPL": 0.40},
         {"AAPL": unsafe_decision},
         {"AAPL": prior},
-        discard=discarded.append,
+        discard=lambda ticker, amount: discarded.append(ticker),
     )
 
     assert survivors == []
@@ -38333,8 +38585,35 @@ def test_flush_safe_decision_rejects_manual_review_and_no_data():
         assert _is_flush_safe_decision(decision) is True
 
 
+def test_top_up_guard_cannot_flush_pending_credit_from_an_unsafe_decision():
+    """The pure guard retains the confidence gate even if called directly."""
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.MANUAL_REVIEW,
+        reason="finance/robinhood disagreement",
+        finance_signal=None,
+        robinhood_signal=None,
+        target_price=98.0,
+    )
+
+    outcome = evaluate_top_up_guard(
+        decision,
+        None,
+        StrategyConfig(),
+        existing_pending_credit_usd=0.75,
+    )
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.skipped is True
+    assert outcome.manual_review is True
+    assert outcome.cumulative_credit_decline_usd == 0.0
+
+
+@pytest.mark.parametrize(
+    ("stream", "hour", "minute"),
+    (("morning", 10, 30), ("midday", 12, 30)),
+)
 def test_final_session_credit_flush_is_restricted_to_the_afternoon_stream(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, stream, hour, minute
 ):
     # Codex review discussion on commit 8720cec ("Restrict the final credit
     # flush to the afternoon stream"): guard_active alone does not mean
@@ -38350,7 +38629,7 @@ def test_final_session_credit_flush_is_restricted_to_the_afternoon_stream(
     ledger.record("AAPL", trading_day.isoformat(), 0.20, stream="market_open")
     assert ledger.minimum_order_pending_tickers(trading_day.isoformat()) == {"AAPL": 0.20}
 
-    now = datetime(2026, 6, 29, 12, 30, tzinfo=EASTERN)
+    now = datetime(2026, 6, 29, hour, minute, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=True,
         tickers=("AAPL",),
@@ -38365,7 +38644,21 @@ def test_final_session_credit_flush_is_restricted_to_the_afternoon_stream(
     rh = _FakeDataWithBidAsk(
         SourceName.ROBINHOOD, 100.0, 100.0, quote=(100.0, now), bid_ask=(99.99, 100.01)
     )
-    artifacts_dir = os.path.join(tmp_path, "runs", "midday")
+    artifacts_dir = os.path.join(tmp_path, "runs", stream)
+
+    pending_scan_calls = 0
+    original_pending_scan = CumulativeCreditLedger.minimum_order_pending_tickers
+
+    def count_pending_scans(self, trading_date):
+        nonlocal pending_scan_calls
+        pending_scan_calls += 1
+        return original_pending_scan(self, trading_date)
+
+    monkeypatch.setattr(
+        CumulativeCreditLedger,
+        "minimum_order_pending_tickers",
+        count_pending_scans,
+    )
 
     run_daily_compact(
         now,
@@ -38377,11 +38670,15 @@ def test_final_session_credit_flush_is_restricted_to_the_afternoon_stream(
         options=CompactRunOptions(
             artifacts_dir=artifacts_dir,
             scheduled=True,
-            stream="midday",
+            stream=stream,
             prior_same_day_allocations={},
         ),
     )
 
+    # Earlier streams must not even enumerate final-session credit. Keeping
+    # pending_by_ticker empty by construction also prevents planned-spend
+    # tier selection from folding this balance into a 12:30 candidate.
+    assert pending_scan_calls == 0
     # The 12:30 midday run must NOT have touched the ledger -- the $0.20
     # remainder is only for the 3:30 final pass to resolve.
     assert ledger.minimum_order_pending_tickers(trading_day.isoformat()) == {"AAPL": 0.20}
@@ -38471,12 +38768,27 @@ def test_duplicate_recovery_settles_the_aggregate_credit_ledger(tmp_path):
     ledger_state.pop("settled_order_ids", None)
     ledger_state_path.write_text(json.dumps(ledger_state, indent=2, sort_keys=True) + "\n")
     ledger.record("AAPL", trading_day.isoformat(), 0.30, stream="morning")
+    # Also drop the just-recorded order id from settled_order_ids: a real
+    # crash before settle() ran means that id was never durably persisted
+    # in the first place, and settle() is now idempotent per order_id
+    # (Codex review, PR #656 follow-up: "Deduplicate afternoon
+    # recovered-order settlement") -- without this, attempt 2's recovery
+    # settle() call below would see the SAME order id already marked
+    # settled from attempt 1's genuine (non-crashed) settle() above and
+    # correctly no-op, which is not what this test is simulating.
+    ledger_state_path = tmp_path / trading_day.isoformat() / "ledger.json"
+    ledger_state = json.loads(ledger_state_path.read_text())
+    ledger_state["settled_order_ids"] = {}
+    ledger_state_path.write_text(json.dumps(ledger_state, indent=2, sort_keys=True) + "\n")
 
-    # Attempt 2 (the retry): finds the same-stream order and must recover
-    # it, durably settling the ledger this time.
+    # Attempt 2 refreshes to a much smaller decline. Its newly computed
+    # $0.30 remainder + $0.05 decline is below the discard threshold, but
+    # the broker order from attempt 1 must be recovered before that pending
+    # evidence can be discarded.
+    retry_decision = replace(decision, target_price=98.95)
     state2 = StrategyState()
     outcome2, top_up_outcome2, _, _, _ = _process_buy_candidate(
-        decision,
+        retry_decision,
         ctx=ProcessCandidateContext(
             config=config,
             state=state2,
@@ -38493,9 +38805,22 @@ def test_duplicate_recovery_settles_the_aggregate_credit_ledger(tmp_path):
         running_deployed_7d=0.0,
     )
     assert len(broker._orders) == 1, "retry must not place a second broker order"
+    assert top_up_outcome2 is not None
+    assert top_up_outcome2.discarded_pending_credit_usd == 0.30
     assert outcome2["duplicate_preserved"] is True
     assert outcome2["aggregate_minimum_topup_applied"] is True
     assert outcome2["aggregate_minimum_topup_remainder_usd"] == 0.30
+    # attempt 2's own re-evaluation has no fresh decline to report
+    # (cumulative_credit_decline_usd is None -- price recovered instead of
+    # declining further), so the reason falls back to the recovered broker
+    # notional. The recovered order (attempt 1's $1.30) is strictly above
+    # the $1.00 minimum, which a rounded-up-from-sub-dollar order can never
+    # be (rounding only ever produces exactly $1.00) -- so this is NOT the
+    # ambiguous boundary case, and the real historical reason was that the
+    # combined total was genuinely at/above the minimum (Codex review, PR
+    # #656 follow-up: "Preserve the original aggregate reason during
+    # recovery").
+    assert outcome2["aggregate_minimum_topup_reason"] == "aggregate_at_or_above_minimum"
     assert ledger.minimum_order_pending_tickers(trading_day.isoformat()) == {}
 
 
@@ -38622,6 +38947,88 @@ def test_process_buy_candidate_recovers_a_duplicate_with_no_prior_allocation(tmp
     assert outcome["duplicate_preserved"] is True
     assert outcome["order_id"] == "ORDER-EARLIER-AAPL"
     assert len(broker._orders) == 1, "must not place a new order for an unreliable decision"
+    assert ledger.minimum_order_pending_tickers(trading_day.isoformat()) == {}
+
+
+def test_prior_less_duplicate_recovery_sizes_from_the_computed_flush(tmp_path):
+    # Codex review, PR #656 discussion_r3837462030 ("Size prior-less
+    # duplicate recovery from the computed flush"): for a non-BUY survivor
+    # (like the test above), order_amount is initialized to
+    # ctx.config.max_per_order_usd, not this ticker's actual flush size. If
+    # the matched broker order carries an id but no usable dollar_amount/
+    # notional, the fallback must use the already-computed top_up_outcome.
+    # incremental_order_amount (the real $1 flush here) instead of silently
+    # booking and auditing the full per-order ceiling.
+    class _NoAmountDupBroker(_RefIdTrackingBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            for t, rid, _amt, order_id in self._orders:
+                if t == ticker and rid in ref_id_prefixes:
+                    return {"id": order_id}  # no dollar_amount/notional
+            return None
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False, max_per_order_usd=10.0)
+    # NO_ACTION (a recovered/flat price), not MANUAL_REVIEW/NO_DATA: a "safe"
+    # decision per _is_flush_safe_decision, so evaluate_top_up_guard computes
+    # a real incremental_order_amount from the flush instead of zeroing it
+    # for an unreliable signal (that zeroing is covered separately by the
+    # "no recoverable duplicate" tests above/below).
+    recovered_decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.NO_ACTION,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        target_price=101.0,
+    )
+    broker = _NoAmountDupBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    ref_id = f"{_graded_dca_ref_id_prefix('afternoon')}-{trading_day.isoformat()}-AAPL"
+    broker._orders.append(("AAPL", ref_id, 0.0, "ORDER-EARLIER-AAPL"))
+    ledger = CumulativeCreditLedger(root=tmp_path)
+    # A $0.60 balance qualifies for the final-session flush and rounds up to
+    # exactly a $1.00 order -- far below the $10 per-order ceiling.
+    ledger.record("AAPL", trading_day.isoformat(), 0.30, stream="s0")
+    stale_baseline = ledger.pending_usd("AAPL", trading_day.isoformat())
+    ledger.record("AAPL", trading_day.isoformat(), 0.10, stream="s-concurrent")
+    ledger.record(
+        "AAPL",
+        trading_day.isoformat(),
+        0.20,
+        idempotency_key="slot-b",
+        pending_baseline_usd=stale_baseline,
+        stream="s-b",
+    )
+    assert ledger.minimum_order_pending_tickers(trading_day.isoformat()) == {"AAPL": 0.60}
+
+    outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
+        recovered_decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=None,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={},  # no entry for AAPL at all
+            scheduled=True,
+            run_result=None,
+            credit_ledger=ledger,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert top_up_outcome is not None
+    assert top_up_outcome.incremental_order_amount == 1.0
+    assert outcome["status"] == "submitted"
+    assert outcome["duplicate_preserved"] is True
+    assert outcome["order_id"] == "ORDER-EARLIER-AAPL"
+    # Must be sized from the computed $1 flush, never the $10 per-order ceiling.
+    assert outcome["submitted_amount_usd"] == 1.0
+    assert ledger.minimum_order_pending_tickers(trading_day.isoformat()) == {}
 
 
 def test_process_buy_candidate_recovers_a_duplicate_despite_an_unsafe_decision(tmp_path):
@@ -38683,6 +39090,95 @@ def test_process_buy_candidate_recovers_a_duplicate_despite_an_unsafe_decision(t
     assert outcome["duplicate_preserved"] is True
     assert outcome["order_id"] == "ORDER-EARLIER-AAPL"
     assert len(broker._orders) == 1, "must not place a new order for an unreliable decision"
+    assert ledger.minimum_order_pending_tickers(trading_day.isoformat()) == {}
+
+
+def test_unsafe_decision_duplicate_recovery_sizes_from_the_pending_credit(tmp_path):
+    # Codex review, PR #656 follow-up: "Size unsafe duplicate recovery from
+    # the pending credit". Same unsafe-decision recovery scenario as the
+    # test above, but the matched broker order has an id and no usable
+    # dollar_amount/notional. evaluate_top_up_guard's TOP_UP_UNSAFE_DECISION
+    # branch deliberately zeros incremental_order_amount (it must never
+    # AUTHORIZE a new order), so the no-notional fallback must not fall
+    # through to order_amount (max_per_order_usd for this non-BUY survivor)
+    # -- it must recompute the same flush apply_cumulative_credit's own
+    # branch would produce from the pending balance.
+    class _NoAmountDupBroker(_RefIdTrackingBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            for t, rid, _amt, order_id in self._orders:
+                if t == ticker and rid in ref_id_prefixes:
+                    return {"id": order_id}  # no dollar_amount/notional
+            return None
+
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False, max_per_order_usd=10.0)
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    unsafe_decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.MANUAL_REVIEW,
+        reason="finance/robinhood disagreement",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=2.0,
+        suggested_amount_usd=0.0,
+        selected_base_amount_usd=3.0,
+        target_price=98.40,
+    )
+    broker = _NoAmountDupBroker()
+    now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
+    trading_day = date(2026, 6, 29)
+    ref_id = f"{_graded_dca_ref_id_prefix('afternoon')}-{trading_day.isoformat()}-AAPL"
+    broker._orders.append(("AAPL", ref_id, 0.0, "ORDER-EARLIER-AAPL"))
+    ledger = CumulativeCreditLedger(root=tmp_path)
+    # A genuinely PENDING $0.60 balance -- a single record() at/above $0.50
+    # would immediately round up to a $1 order instead of staying pending,
+    # so build it the same netted-baseline-override way
+    # test_prior_less_duplicate_recovery_sizes_from_the_computed_flush does.
+    ledger.record("AAPL", trading_day.isoformat(), 0.30, stream="s0")
+    stale_baseline = ledger.pending_usd("AAPL", trading_day.isoformat())
+    ledger.record("AAPL", trading_day.isoformat(), 0.10, stream="s-concurrent")
+    ledger.record(
+        "AAPL",
+        trading_day.isoformat(),
+        0.20,
+        idempotency_key="slot-b",
+        pending_baseline_usd=stale_baseline,
+        stream="s-b",
+    )
+    assert ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.60
+
+    outcome, _, _, _, _ = _process_buy_candidate(
+        unsafe_decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=None,
+            now=now,
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=True,
+            run_result=None,
+            credit_ledger=ledger,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    assert outcome["duplicate_preserved"] is True
+    # Must be sized from the $0.60 pending credit's own flush (rounds up to
+    # $1.00), never the $10 per-order ceiling.
+    assert outcome["submitted_amount_usd"] == 1.0
+    assert ledger.minimum_order_pending_tickers(trading_day.isoformat()) == {}
 
 
 def test_process_buy_candidate_blocks_an_unsafe_decision_with_no_recoverable_duplicate(tmp_path):
@@ -38805,6 +39301,57 @@ def test_dry_run_never_discards_the_live_credit_ledger(tmp_path):
     assert events[0]["decision"] == "pending"
 
 
+def test_dry_run_never_settles_a_combined_live_credit_order(tmp_path):
+    """A simulated aggregate order must leave its carried live credit intact."""
+    ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 6, 29)
+    ledger.record("AAPL", trading_day.isoformat(), 0.40, stream="morning")
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=5.40,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=2.0,
+        suggested_amount_usd=6.0,
+        selected_base_amount_usd=3.0,
+        target_price=99.80,  # $0.60 fresh decline combines with the $0.40 remainder
+    )
+
+    candidate_outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=StrategyConfig(dry_run=True),
+            state=StrategyState(),
+            broker=DryRunBroker(cash=500.0, reference_prices={"AAPL": 99.80}),
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+            credit_ledger=ledger,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert candidate_outcome["status"] == "dry_run"
+    assert top_up_outcome.cumulative_credit_decline_usd == 0.60
+    assert ledger.minimum_order_pending_tickers(trading_day.isoformat()) == {"AAPL": 0.40}
+    events = ledger.events(trading_day.isoformat())
+    assert len(events) == 1
+    assert events[0]["decision"] == "pending"
+
+
 def test_final_session_credit_flush_routes_a_concurrently_enlarged_balance():
     # Codex review discussion on commit bb3d494 ("Route concurrently
     # enlarged credits into the final pass"): when discard() reports False
@@ -38826,10 +39373,60 @@ def test_final_session_credit_flush_routes_a_concurrently_enlarged_balance():
         {"AAPL": 0.20},
         {"AAPL": decision},
         {},
-        discard=lambda ticker: False,
+        discard=lambda ticker, amount: False,
     )
 
     assert survivors == ["AAPL"]
+
+
+def test_final_session_credit_flush_retries_changed_sub_threshold_without_a_decision():
+    # Codex review, PR #656 discussion_r3838839298 ("Retry changed
+    # sub-threshold discards without a decision"): when discard() returns
+    # False for a ticker with NO entry in decisions_by_ticker (un-enrolled,
+    # excluded, or otherwise absent -- so it cannot be routed to a candidate
+    # evaluation), the changed balance may simply have moved to a different
+    # sub-threshold value (still forgettable), not crossed the discard
+    # threshold. peek_pending lets the selector re-read the fresh balance
+    # and retry the discard directly, instead of leaving it permanently
+    # pending with nothing left this final session to ever revisit it.
+    from near_close_dca import _select_final_session_credit_flush_tickers
+
+    discard_calls = []
+
+    def discard(ticker, amount):
+        discard_calls.append(amount)
+        # The pre-lock scan saw $0.20; a concurrent stream changed it to
+        # $0.30 (still sub-threshold) before the first discard's own lock.
+        return amount == 0.30
+
+    survivors = _select_final_session_credit_flush_tickers(
+        {"AAPL": 0.20},
+        {},  # no decision this run -- AAPL is un-enrolled/excluded
+        {},
+        discard=discard,
+        peek_pending=lambda ticker: 0.30,
+    )
+
+    assert survivors == []
+    # The first attempt (the stale $0.20) fails; the retry re-reads the
+    # fresh $0.30 via peek_pending and succeeds.
+    assert discard_calls == [0.20, 0.30]
+
+
+def test_final_session_credit_flush_gives_up_without_peek_pending():
+    # Same setup as above, but the caller supplied no peek_pending (e.g. a
+    # dry run, or an older caller) -- must preserve the prior log-and-leave-
+    # pending behavior rather than raising.
+    from near_close_dca import _select_final_session_credit_flush_tickers
+
+    survivors = _select_final_session_credit_flush_tickers(
+        {"AAPL": 0.20},
+        {},
+        {},
+        discard=lambda ticker, amount: False,
+    )
+
+    assert survivors == []
 
 
 def test_final_session_credit_flush_checks_the_ladder_delta_before_deferring():
@@ -38868,7 +39465,7 @@ def test_final_session_credit_flush_checks_the_ladder_delta_before_deferring():
         {"AAPL": 0.30},
         {"AAPL": decision},
         {"AAPL": prior},
-        discard=discarded.append,
+        discard=lambda ticker, amount: discarded.append(ticker),
     )
 
     # No combination is structurally possible (desired 1.00 - prior 5.00 is
@@ -39099,6 +39696,543 @@ def test_process_buy_candidate_re_evaluates_a_concurrently_enlarged_discard(tmp_
     # which is exactly what lets the real ledger detect that the locked balance
     # has moved on and refuse the discard.
     assert ledger.discard_calls == [("AAPL", 0.10)]
+
+
+class _DuplicateAppearsAfterEnlargedDiscardBroker(DryRunBroker):
+    """DryRunBroker double whose same-stream duplicate check reports no
+    order on the pre-loop check (the one ``_process_buy_candidate`` runs
+    before the discard-retry loop starts), but a matched broker order on
+    every call after that -- simulating another retry's same-stream order
+    landing while THIS invocation was re-reading a concurrently enlarged
+    pending balance.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.duplicate_checks = 0
+
+    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+        self.duplicate_checks += 1
+        if self.duplicate_checks == 1:
+            return None
+        return {"id": "concurrent-dup-order", "dollar_amount": 1.0}
+
+
+def test_process_buy_candidate_rechecks_duplicates_after_concurrent_discard_refusal(tmp_path):
+    # Codex review, PR #680 discussion_r3910004798 ("Recheck duplicates
+    # after a concurrent discard refusal") and discussion_r3920086271
+    # ("Recover the duplicate after the destructive discard"): the pre-loop
+    # same-stream duplicate check finds nothing, this call's own decline
+    # combines to a sub-threshold discard, but discard_minimum_order_
+    # pending() reports a concurrently enlarged, now-qualifying balance.
+    # Before falling through to a fresh placement, the same-stream duplicate
+    # check must run again against the refreshed state -- and here it now
+    # finds an order another retry already placed, so this invocation must
+    # never place a second one, but it must still route the found order
+    # through the normal recovery/settlement path (not merely block) so the
+    # still-pending credit is durably attributed to it.
+    ledger = _ConcurrentlyEnlargedLedger(initial={"AAPL": 0.10}, enlarged={"AAPL": 0.60})
+    trading_day = date(2026, 6, 29)
+
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=2.0,
+        suggested_amount_usd=6.0,
+        selected_base_amount_usd=3.0,
+        target_price=98.95,  # a genuine but tiny further decline of $0.05
+    )
+    config = StrategyConfig(dry_run=False)
+    state = StrategyState()
+    broker = _DuplicateAppearsAfterEnlargedDiscardBroker(cash=500.0, reference_prices={"AAPL": 98.95})
+
+    candidate_outcome, top_up_outcome, _, errors_count_inc, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+            credit_ledger=cast(Any, ledger),
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert broker.duplicate_checks >= 2
+    # Never placed a second order for the ticker -- the found order is
+    # RECOVERED, not resubmitted -- but the still-pending $0.60 credit is
+    # settled against it rather than left stranded.
+    assert candidate_outcome["status"] == "submitted"
+    assert candidate_outcome["order_id"] == "concurrent-dup-order"
+    assert candidate_outcome["duplicate_preserved"] is True
+    assert ledger.settled == [("AAPL", 1.0)]
+
+
+class _ImmediatelyDiscardedLedger:
+    """CumulativeCreditLedger double where discard_minimum_order_pending()
+    succeeds on the very first call -- simulating a concurrent retry that
+    placed the real broker order and crashed BEFORE it could touch the
+    ledger at all, leaving the balance exactly as this invocation's own
+    discard call expects to find it.
+    """
+
+    def __init__(self, pending):
+        self._pending = dict(pending)
+        self.settled = []
+        self.settled_without_debit = []
+
+    def minimum_order_pending_tickers(self, trading_day):
+        return dict(self._pending)
+
+    def discard_minimum_order_pending(self, ticker, trading_day, observed_amount_usd):
+        return True
+
+    def discard_minimum_order_pending_amount(self, ticker, trading_day, observed_amount_usd):
+        return self.discard_minimum_order_pending_tracked(ticker, trading_day, observed_amount_usd).removed_usd
+
+    def discard_minimum_order_pending_tracked(self, ticker, trading_day, observed_amount_usd):
+        # The real ledger clears exactly the observed balance under its lock
+        # and reports that figure plus the post-write revision; mirror both
+        # so the caller takes the tracked path it takes in production.
+        return MinimumOrderDiscard(round(float(observed_amount_usd), 2), 7, False)
+
+    def settle(
+        self,
+        ticker,
+        trading_day,
+        submitted_amount_usd,
+        *,
+        stream="unknown",
+        recorded_at=None,
+        order_id=None,
+        already_debited_usd=None,
+    ):
+        self.settled.append((ticker, submitted_amount_usd))
+        if already_debited_usd is not None:
+            self.settled_without_debit.append((ticker, round(float(already_debited_usd), 2)))
+
+
+class _DuplicateAppearsAfterSuccessfulDiscardBroker(DryRunBroker):
+    """DryRunBroker double whose same-stream duplicate check reports no
+    order on the pre-loop check (the one ``_process_buy_candidate`` runs
+    before the discard-retry loop starts), but a matched broker order on
+    every call after that -- simulating a concurrent retry's same-stream
+    order landing while THIS invocation's own discard call was in flight.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.duplicate_checks = 0
+
+    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+        self.duplicate_checks += 1
+        if self.duplicate_checks == 1:
+            return None
+        return {"id": "concurrent-dup-order", "dollar_amount": 1.0}
+
+
+def test_process_buy_candidate_rechecks_duplicates_after_successful_discard(tmp_path):
+    # Codex review, PR #680 discussion_r3920000955 ("Retain a duplicate
+    # lookup after successful discard") and discussion_r3920086271 ("Recover
+    # the duplicate after the destructive discard"): the pre-loop same-stream
+    # duplicate check finds nothing, and this call's own discard_minimum_
+    # order_pending() succeeds immediately (True) because the concurrent
+    # retry that actually placed the broker order crashed before it could
+    # touch the ledger at all -- a clean discard success alone cannot
+    # distinguish that race from "no concurrent order exists". The
+    # same-stream duplicate check must run again before trusting the stale
+    # top-up outcome's "skipped" verdict, and here it now finds the order the
+    # concurrent retry placed. The balance discard_minimum_order_pending()
+    # just destructively cleared must be durably settled against that found
+    # order, not merely blocked -- otherwise the credit's provenance is lost
+    # and this run's artifacts omit the order entirely.
+    ledger = _ImmediatelyDiscardedLedger({"AAPL": 0.10})
+    trading_day = date(2026, 6, 29)
+
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=1.0,
+        suggested_amount_usd=3.0,
+        selected_base_amount_usd=3.0,
+        target_price=99.0,  # recovered/flat price -- no further decline
+    )
+    config = StrategyConfig(dry_run=False)
+    state = StrategyState()
+    broker = _DuplicateAppearsAfterSuccessfulDiscardBroker(cash=500.0, reference_prices={"AAPL": 99.0})
+
+    candidate_outcome, top_up_outcome, _, errors_count_inc, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+            credit_ledger=cast(Any, ledger),
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert broker.duplicate_checks >= 2
+    # Never placed a second order for the ticker -- the found order is
+    # RECOVERED, not resubmitted -- but the $0.10 balance the discard call
+    # just destructively cleared is settled against it rather than lost.
+    assert candidate_outcome["status"] == "submitted"
+    assert candidate_outcome["order_id"] == "concurrent-dup-order"
+    assert candidate_outcome["duplicate_preserved"] is True
+    assert ledger.settled == [("AAPL", 1.0)]
+    # Codex review, PR #680 discussion_r3925440968 ("Keep post-discard
+    # settlement from consuming newer credit"): the $0.10 this call's own
+    # discard already removed is settled as PROVENANCE ONLY. Debiting the
+    # current balance instead would charge whatever credit another stream
+    # recorded in the meantime to an order accepted before it existed.
+    assert ledger.settled_without_debit == [("AAPL", 0.10)]
+
+
+def test_process_buy_candidate_restores_discarded_credit_when_the_duplicate_lacks_an_id(tmp_path):
+    # Codex review, PR #680 discussion_r3925440990 ("Restore discarded
+    # credit when the duplicate lacks an ID"): the post-discard recheck
+    # finds a duplicate, but the adapter returns an order with no usable id
+    # (here the legacy boolean contract, normalized to {}). Nothing can
+    # reconcile the already-removed balance against an unidentifiable
+    # order, so returning "blocked" must not leave the discard standing --
+    # the credit has to go back so a later pass can resolve it.
+
+    class _IdlessDuplicateAfterDiscardBroker(DryRunBroker):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.duplicate_checks = 0
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            self.duplicate_checks += 1
+            if self.duplicate_checks == 1:
+                return None
+            return True  # legacy boolean adapter -> {}, no order id
+
+    ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 6, 29)
+    day = trading_day.isoformat()
+    ledger.record("AAPL", day, 0.10, stream="morning")
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=1.0,
+        suggested_amount_usd=3.0,
+        selected_base_amount_usd=3.0,
+        target_price=99.0,
+    )
+    broker = _IdlessDuplicateAfterDiscardBroker(cash=500.0, reference_prices={"AAPL": 99.0})
+
+    candidate_outcome, _, _, errors_count_inc, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=StrategyConfig(dry_run=False),
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+            credit_ledger=ledger,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert candidate_outcome["status"] == "blocked"
+    assert errors_count_inc == 1
+    assert broker.duplicate_checks == 2
+    # The discarded dollars are back, with an auditable rollback event.
+    assert ledger.minimum_order_pending_tickers(day) == {"AAPL": 0.10}
+    assert ledger.events(day)[-1]["decision"] == "discard_restored"
+
+
+def test_process_buy_candidate_restores_credit_when_post_discard_lookup_fails(tmp_path):
+    """A failed safety lookup must roll back the destructive discard."""
+
+    class _PostDiscardLookupFailureBroker(DryRunBroker):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.duplicate_checks = 0
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            self.duplicate_checks += 1
+            if self.duplicate_checks == 1:
+                return None
+            raise RuntimeError("broker history temporarily unavailable")
+
+    ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 6, 29)
+    ledger.record("AAPL", trading_day.isoformat(), 0.10, stream="morning")
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=1.0,
+        suggested_amount_usd=3.0,
+        selected_base_amount_usd=3.0,
+        target_price=99.0,
+    )
+    broker = _PostDiscardLookupFailureBroker(cash=500.0, reference_prices={"AAPL": 99.0})
+
+    candidate_outcome, _, _, errors_count_inc, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=StrategyConfig(dry_run=False),
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+            credit_ledger=ledger,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert candidate_outcome["status"] == "blocked"
+    assert errors_count_inc == 1
+    assert broker.duplicate_checks == 2
+    assert ledger.minimum_order_pending_tickers(trading_day.isoformat()) == {"AAPL": 0.10}
+    assert ledger.events(trading_day.isoformat())[-1]["decision"] == "discard_restored"
+
+
+def test_process_buy_candidate_does_not_restore_credit_a_concurrent_order_already_consumed(tmp_path):
+    # Codex review, PR #680 discussion_r3925291346 ("Restore only credit this
+    # call actually discarded"): this invocation observes a $0.10 balance,
+    # but a concurrent retry's real $1.00 aggregate order wins the ledger
+    # lock first and settles that very balance. The discard then finds the
+    # balance already absent -- the bool form still reports True ("nothing
+    # left to discard"), but THIS call removed nothing. When the post-discard
+    # broker lookup raises, the rollback must therefore restore NOTHING:
+    # putting the stale observed $0.10 back would resurrect credit the
+    # concurrent order already spent and let it fund a second purchase.
+
+    class _PostDiscardLookupFailureBroker(DryRunBroker):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.duplicate_checks = 0
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            self.duplicate_checks += 1
+            if self.duplicate_checks == 1:
+                return None
+            raise RuntimeError("broker history temporarily unavailable")
+
+    class _ConcurrentlySettledBeforeLockLedger(CumulativeCreditLedger):
+        """Real ledger whose discard is beaten to the lock by a concurrent settle."""
+
+        def discard_minimum_order_pending_tracked(self, ticker, trading_day, observed_amount_usd):
+            # Intercepts the TRACKED form, which is what the candidate loop
+            # actually calls (the amount/bool forms delegate to it).
+            self.settle(ticker, trading_day, 1.00, stream="concurrent-retry", order_id="ORD-CONCURRENT")
+            return super().discard_minimum_order_pending_tracked(ticker, trading_day, observed_amount_usd)
+
+    ledger = _ConcurrentlySettledBeforeLockLedger(root=tmp_path)
+    trading_day = date(2026, 6, 29)
+    day = trading_day.isoformat()
+    ledger.record("AAPL", day, 0.10, stream="morning")
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=1.0,
+        suggested_amount_usd=3.0,
+        selected_base_amount_usd=3.0,
+        target_price=99.0,
+    )
+    broker = _PostDiscardLookupFailureBroker(cash=500.0, reference_prices={"AAPL": 99.0})
+
+    candidate_outcome, _, _, errors_count_inc, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=StrategyConfig(dry_run=False),
+            state=StrategyState(),
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+            credit_ledger=ledger,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    assert candidate_outcome["status"] == "blocked"
+    assert errors_count_inc == 1
+    assert broker.duplicate_checks == 2
+    # The concurrent order consumed the balance; it must stay consumed.
+    assert ledger.minimum_order_pending_tickers(day) == {}
+    assert ledger.pending_usd("AAPL", day) == 0.0
+    assert "discard_restored" not in {event["decision"] for event in ledger.events(day)}
+
+
+class _ConcurrentlyChangedSubThresholdLedger:
+    """CumulativeCreditLedger double simulating a concurrent update that
+    moves a balance from one sub-threshold value to another (e.g. $0.20 ->
+    $0.30) between the pending-balance read and the discard call's own
+    lock: discard_minimum_order_pending() refuses (returns False) whenever
+    the observed amount no longer matches the CURRENT balance, and
+    succeeds once the caller retries with the fresh value.
+    """
+
+    def __init__(self, initial, changed):
+        self._initial = initial
+        self._changed = changed
+        self._reads = 0
+        self.discard_calls = []
+        self.settled = []
+
+    def minimum_order_pending_tickers(self, trading_day):
+        self._reads += 1
+        return dict(self._initial if self._reads == 1 else self._changed)
+
+    def discard_minimum_order_pending(self, ticker, trading_day, observed_amount_usd):
+        self.discard_calls.append(observed_amount_usd)
+        current = self._changed.get(ticker, 0.0)
+        return round(current, 2) == round(float(observed_amount_usd), 2)
+
+    def settle(self, ticker, trading_day, submitted_amount_usd, *, stream="unknown", recorded_at=None, order_id=None):
+        self.settled.append((ticker, submitted_amount_usd))
+
+
+def test_process_buy_candidate_retries_discard_for_a_changed_sub_threshold_balance(tmp_path):
+    # PR #533 discussion_r3806549510 ("Re-discard changed balances that
+    # remain sub-threshold"): the first read here sees a $0.20 remainder,
+    # this call's own price shows no further decline, and discard_minimum_
+    # order_pending() refuses because a concurrent stream moved the
+    # ledger's CURRENT balance to a DIFFERENT sub-threshold value ($0.30)
+    # before the observed-amount comparison ran -- not because the balance
+    # crossed the discard threshold. The candidate must retry the discard
+    # against the fresh $0.30 rather than leaving it stranded in the ledger
+    # forever on the mistaken assumption that False always means "now
+    # qualifies for an order".
+    ledger = _ConcurrentlyChangedSubThresholdLedger(
+        initial={"AAPL": 0.20}, changed={"AAPL": 0.30}
+    )
+    trading_day = date(2026, 6, 29)
+
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=6.0,
+        reference_price=99.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=3.0,
+    )
+    decision = ReconciledDecision(
+        ticker="AAPL",
+        action=Action.BUY,
+        reason="test",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=1.0,
+        suggested_amount_usd=3.0,
+        selected_base_amount_usd=3.0,
+        target_price=99.0,  # recovered/flat price -- no further decline
+    )
+    config = StrategyConfig(dry_run=False)
+    state = StrategyState()
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 99.0})
+
+    candidate_outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
+        decision,
+        ctx=ProcessCandidateContext(
+            config=config,
+            state=state,
+            broker=broker,
+            robinhood_data=None,
+            now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
+            trading_day=trading_day,
+            guard_active=True,
+            prior_same_day_allocations={"AAPL": prior},
+            scheduled=False,
+            run_result=None,
+            credit_ledger=ledger,
+        ),
+        running_deployed_7d=0.0,
+    )
+
+    # $0.30 stays below the $0.50 discard threshold -- no order is placed --
+    # but the retry must actually clear it from the ledger using the fresh
+    # amount rather than leaving it un-discarded.
+    assert top_up_outcome.discarded_pending_credit_usd == 0.30
+    assert candidate_outcome["status"] == "skipped"
+    assert ledger.discard_calls == [0.20, 0.30]
+    assert ledger.settled == []
 
 
 class _RaisingSettleLedger:
@@ -49772,5 +50906,3 @@ def test_repeated_failed_calls_with_reused_state_each_consume_a_daily_slot():
     assert state.buys_today("AAPL", day) == 2
     assert state.day_notional(day) == 0.0
     assert state.own_orders_recorded == set()
-
-

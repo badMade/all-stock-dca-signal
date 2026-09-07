@@ -932,8 +932,9 @@ def manual_exclusion_roots(base: Optional[Path] = None) -> List[Path]:
     ``midday_dca/manual_reruns/**`` (incl. ``final_manual_override_*``) — so their
     order IDs are excluded from every scheduled-live metric even though they live
     outside the ce16ba6b task root. A ``MANUAL_EXCLUSION_SUBROOTS`` entry
-    containing ``*`` (e.g. the dated ``perplexity_primary_*/manual_override_*``
-    tree the 2026-08-18 manual cap override introduced) is expanded with
+    containing a glob metacharacter (``*``, ``?`` or ``[`` -- e.g. the dated
+    ``perplexity_primary_*/manual_override_*`` tree the 2026-08-18 manual cap
+    override introduced) is expanded with
     ``Path.glob`` against ``cron_tracking_root(base)`` here, so every matching
     directory that actually exists on disk is scanned -- not just one
     hardcoded date/time.
@@ -941,7 +942,7 @@ def manual_exclusion_roots(base: Optional[Path] = None) -> List[Path]:
     roots = [state_root(base) / "manual_runs"]
     parent = cron_tracking_root(base)
     for sub in MANUAL_EXCLUSION_SUBROOTS:
-        if "*" in sub:
+        if any(character in sub for character in "*?["):
             roots.extend(sorted(parent.glob(sub)))
         else:
             roots.append(parent / sub)

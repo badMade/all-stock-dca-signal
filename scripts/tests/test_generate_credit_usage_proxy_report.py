@@ -33,6 +33,7 @@ from generate_credit_usage_proxy_report import (  # noqa: E402
     _CONSUMER_REQUIRED_OUTPUTS,
     _RENDERED_PER_RUN_FIELDS,
     ALL_STREAMS,
+    NO_RUN_ID,
     RECOVERY_ARTIFACT_TYPES,
     _execution_date_refusal,
     _main,
@@ -698,6 +699,51 @@ def test_canonical_afternoon_manual_runs_root_is_scanned(tmp_path):
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
     recovery_run_ids = {r["run_id"] for r in report["recovery_and_escalation_runs"]}
     assert "final_manual_override_20260727_1536ET" in recovery_run_ids
+
+
+def test_perplexity_manual_override_wildcard_root_is_scanned(tmp_path):
+    # MANUAL_SCAN_SUBROOTS includes the wildcard entry
+    # "perplexity_primary_*/manual_override_*" (copied straight from
+    # MANUAL_EXCLUSION_SUBROOTS). Before _manual_scan_bases() existed, this
+    # report's two scans did a flat `cron_root / subroot` join, which is
+    # never an existing directory for a subroot containing "*" -- so a real
+    # override under perplexity_primary_20260818/manual_override_1555ET was
+    # silently omitted from the recovery rows even though
+    # scripts.run_classification.manual_exclusion_roots() already excludes
+    # its order IDs from scheduled-live metrics elsewhere (Codex review,
+    # PR #680 discussion_r3838729845: "Expand wildcard roots in the
+    # credit-usage scanner").
+    _write_json(
+        tmp_path
+        / "perplexity_primary_20260818"
+        / "manual_override_1555ET"
+        / "run_state.json",
+        {
+            "run_id": "manual_override_1555ET",
+            "trading_day": TRADING_DAY,
+            "run_classification": {
+                "run_origin": "manual",
+                "manual_run": True,
+                "same_day_top_up_context_only": True,
+            },
+        },
+    )
+    report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
+    recovery_run_ids = {r["run_id"] for r in report["recovery_and_escalation_runs"]}
+    assert "manual_override_1555ET" in recovery_run_ids
+
+
+def test_perplexity_manual_override_wildcard_root_orphan_csv_is_scanned(tmp_path):
+    # Same wildcard-expansion gap as the run_state-keyed test above, but for
+    # the second (orphan submitted_orders.csv, no run_state.json) sweep.
+    run_dir = tmp_path / "perplexity_primary_20260818" / "manual_override_20260727_1610ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "submitted_orders.csv").write_text("ticker,order_id\nAAPL,ORDER-1\n")
+    report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
+    recovery_dirs = {
+        r["triggering_issue"] for r in report["recovery_and_escalation_runs"] if r["run_id"] == NO_RUN_ID
+    }
+    assert any(str(run_dir) in issue for issue in recovery_dirs)
 
 
 def test_manual_artifact_top_level_trading_day_is_the_authority(tmp_path):

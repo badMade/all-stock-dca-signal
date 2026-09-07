@@ -38,6 +38,7 @@ try:
     ERROR_CLASS_MISSING_SPREAD_DATA,
     FINAL_MANUAL_OVERRIDE_RUN_TYPE,
     INTRADAY_RECOVERY_SLOTS,
+    MANUAL_EXCLUSION_SUBROOTS,
     ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
     ORDER_SUBMIT_STATUS_ERROR,
     ORDER_SUBMIT_STATUS_NO_ORDERS,
@@ -3166,6 +3167,38 @@ def test_outside_core_loader_reach_is_anchored_at_the_artifact_root():
     assert not _outside_core_loader_reach(Path("/mnt/relocated/final_manual_review/r"), base)
 
 
+def test_top_up_context_reads_orders_csv_under_perplexity_manual_override():
+    """A referenced CSV in the external override tree is not core-loader coverage."""
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = (
+            base.parent / "perplexity_primary_20260818" / "manual_override_1555ET"
+        )
+        run_dir.mkdir(parents=True)
+        orders_path = run_dir / "submitted_orders.csv"
+        orders_path.write_text(
+            "symbol,amount,order_id,status,avg_fill_price,quantity\n"
+            "MRVL,3.0,PPX-CAP-CSV-1,filled,189.36,0.01584284\n"
+        )
+        state = {
+            "trading_day": "2026-08-18",
+            "run_classification": {
+                "run_origin": "manual_user_cap_override",
+                "manual_run": True,
+                "same_day_top_up_context_only": True,
+                "valid_scheduled_evidence": False,
+            },
+            "artifacts": {"orders_csv_path": str(orders_path)},
+        }
+        (run_dir / "run_state.json").write_text(json.dumps(state, indent=2))
+
+        ctx = load_same_day_top_up_context("2026-08-18", base=base)
+        assert ctx["MRVL"].prior_usd == 3.0
+        assert ctx["MRVL"].reference_price == 189.36
+        assert ctx["MRVL"].order_ids == ["PPX-CAP-CSV-1"]
+
+
 def test_top_up_context_buy_candidates_still_skipped_outside_final_manual_review():
     # Companion to the test above: a run WITH buy_candidates under a root the
     # core loader DOES reach (e.g. ce16ba6b/manual_runs, scanned by both
@@ -5379,3 +5412,14 @@ def test_state_root_and_cron_tracking_root_resolve_at_call_time():
     # references) -- which is exactly why state_root() naming it directly
     # was wrong.
     assert lines[2] == str(Path(__file__).resolve().parents[2] / "cron_tracking" / "ce16ba6b"), out.stdout
+
+
+def test_manual_exclusion_subroots_has_no_duplicate_entries():
+    # Codex review, PR #680 discussion_r3914220641 ("Deduplicate the
+    # manual-override scan root"): the perplexity_primary_*/manual_override_*
+    # glob was listed twice in MANUAL_EXCLUSION_SUBROOTS. _scan_recovery_runs
+    # (and generate_credit_usage_proxy_report.py's derived
+    # MANUAL_SCAN_SUBROOTS) walk each tuple entry once and do not dedupe
+    # NO_RUN_ID rows within a single pass, so a repeated entry double-counts
+    # every matching run.
+    assert len(MANUAL_EXCLUSION_SUBROOTS) == len(set(MANUAL_EXCLUSION_SUBROOTS))
