@@ -8054,6 +8054,47 @@ def test_build_execution_quality():
     assert "| **Week avg** | | | **0.2%** | | |" in report
 
 
+# The two tests below come from PR #1332, which was opened in parallel with
+# #1313 (merged first) under the same two test names. They are kept under
+# distinct names because they pin different things: the section and table
+# headers, a settlement-adjustment row counting as an ordinary candidate,
+# and the empty-input case with NO run states at all (#1313 covers a run
+# state whose buy_candidates list is empty).
+def test_build_sector_matrix_renders_header_and_unclassified_rows():
+    run_states = [
+        {
+            "buy_candidates": [
+                {"ticker": "AAPL", "planned_amount_usd": 100.50},
+                {"ticker": "GOOGL", "planned_amount_usd": 200.00},
+                {"ticker": "UNKNOWN", "planned_amount_usd": 50.00},
+                {"ticker": "SETTLE", "planned_amount_usd": 10.00, "description": "Settlement Adjustment (10.00)"},
+            ]
+        },
+        {
+            "buy_candidates": [
+                {"ticker": "AAPL", "planned_amount_usd": 50.00},
+            ]
+        }
+    ]
+    sector_map = {"AAPL": "Technology", "GOOGL": "Technology"}
+
+    result = build_sector_matrix(run_states, sector_map)
+
+    assert "## Sector performance matrix" in result
+    assert "| Sector | Candidates | Planned $ |" in result
+    assert "| Technology | 3 | $350.50 |" in result
+    assert "| Unclassified | 2 | $60.00 |" in result
+
+
+def test_build_sector_matrix_with_no_run_states():
+    run_states = []
+
+    result = build_sector_matrix(run_states)
+
+    assert "## Sector performance matrix" in result
+    assert "| _no candidates_ | 0 | $0.00 |" in result
+
+
 def test_build_execution_quality_empty():
     from dca_weekly_dashboard import build_execution_quality
     report = build_execution_quality([])
