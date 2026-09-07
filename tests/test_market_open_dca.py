@@ -251,8 +251,14 @@ def test_market_open_prior_allocation_roots_are_deliberately_narrow():
 
 def test_market_open_cap_seed_roots_span_every_sibling_stream():
     cap_roots = default_market_open_cap_seed_roots()
-    for sibling in ("market_open_dca", "morning_dca", "midday_dca", "intraday_dca", "ce16ba6b"):
-        assert stream_root(sibling) in cap_roots
+    assert cap_roots == (
+        stream_root("market_open_dca"),
+        stream_root("morning_dca"),
+        stream_root("midday_dca"),
+        stream_root("intraday_dca"),
+        stream_root("ce16ba6b"),
+        stream_root("final_manual_review"),
+    )
 
 
 # --- Artifact-root separation ----------------------------------------------
