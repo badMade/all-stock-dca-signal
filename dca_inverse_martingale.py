@@ -2577,7 +2577,7 @@ def _validate_numeric_fields(
     # ("none") tracker never carries accumulated_usd at all -- resolved_
     # marker() omits the key -- so this check is scoped to the two active
     # statuses only.
-    if status in (STATUS_DIPPING, STATUS_FIRING):
+    if status == STATUS_DIPPING or status == STATUS_FIRING:
         accumulated = data.get("accumulated_usd")
         if accumulated is None or accumulated <= 0:
             raise _corrupted("accumulated_usd", accumulated)
@@ -2664,7 +2664,7 @@ def _validate_cycle_abandonment_fields(
         # newly-accumulated balance almost immediately, defeating the
         # cutoff's entire "give a fresh cycle its full budget" purpose
         # (Codex review: "Reject cycle-age counters on resolved trackers").
-        if status not in (STATUS_DIPPING, STATUS_FIRING) and value is not None and value != 0:
+        if status != STATUS_DIPPING and status != STATUS_FIRING and value is not None and value != 0:
             raise _corrupted(field, value)
 
     # Every legitimate write of trading_days_active happens unconditionally
@@ -2764,7 +2764,7 @@ def _validate_tier_crossing_fields(
     #     the fire-floor metadata on firing trackers"), on top of the
     #     "dipping" recovery-offset danger above.
     # (Codex review: "Require complete snapshots for active trackers").
-    if status in (STATUS_DIPPING, STATUS_FIRING):
+    if status == STATUS_DIPPING or status == STATUS_FIRING:
         if data.get("cycle_reference_close") is None:
             raise _corrupted("cycle_reference_close", None)
         if data.get("lowest_drop_seen") is None:
