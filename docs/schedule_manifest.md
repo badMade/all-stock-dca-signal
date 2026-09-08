@@ -797,6 +797,58 @@ this section is the authoritative one. Three of those override blocks used to si
 above it and read in the present tense, which is exactly how an expired
 authorization gets mistaken for a live one.
 
+Temporary live scheduler override, Aug 28, 2026:
+
+> **ADDED 2026-08-28:** The user explicitly authorized Perplexity to run all
+> scheduled buy-only DCA tasks for Friday, Aug 28, 2026, including an immediate
+> one-time 9:35 AM catch-up because the normal 9:35 occurrence had already
+> passed. The recurring Perplexity buy tasks are date-gated to the current
+> America/New_York trading date `2026-08-28` and must silently no-op after that
+> date unless the user gives a new authorization. Perplexity's scope for this
+> override is scheduled buy-run execution plus required buy-run artifacts and
+> notifications only. Claude handles scheduled reports. Machine-readable source:
+> `config/scheduled_tasks.json` ->
+> `temporary_live_scheduler_overrides.authorize_2026_08_28_all_perplexity_buy_slots_today_only`.
+
+| ET | Live scheduler task | ID | Cadence | Trades | Aug 28 override status |
+|---|---|---|---|---|---|
+| 9:35 AM | Perplexity live DCA buy pass | `4412c3c4` | Weekdays | **yes** | date-gated active only for 2026-08-28 |
+| immediate 9:35 catch-up | Perplexity DCA catch-up buy run | `2c1d3792` | One-time | **yes** | authorized catch-up for 2026-08-28 only |
+| 10:30 AM | Perplexity live DCA buy pass | `e028361e` | Weekdays | **yes** | date-gated active only for 2026-08-28 |
+| 11:30 AM | Perplexity live DCA buy pass | `e3590042` | Weekdays | **yes** | date-gated active only for 2026-08-28 |
+| 12:30 PM | Perplexity live DCA buy pass | `0c3cde00` | Weekdays | **yes** | date-gated active only for 2026-08-28 |
+| 1:30 PM | Perplexity live DCA buy passes | `44b3975d` | Weekdays | **yes** | date-gated active only for 2026-08-28 |
+| 2:30 PM | Perplexity live DCA buy passes | `44b3975d` | Weekdays | **yes** | date-gated active only for 2026-08-28 |
+| 3:30 PM | Perplexity live DCA buy passes | `44b3975d` | Weekdays | **yes** | date-gated active only for 2026-08-28 |
+
+The Aug 28 override does not authorize Perplexity to run scheduled reports,
+dashboard refreshes, slippage-only reports, monitor-only reports, or watchdog
+reports. Those scheduled reporting responsibilities remain Claude-only unless
+the user changes the role split.
+
+Temporary live scheduler override, Aug 31, 2026:
+
+> **ADDED 2026-08-31:** The user explicitly authorized Perplexity to run the
+> morning buy-only DCA schedule for Monday, Aug 31, 2026 at 09:35, 10:30, and
+> 11:30 ET. The authorization uses one-time active buy tasks and is date-gated
+> to the America/New_York trading date `2026-08-31`; it does not reactivate the
+> recurring Aug 28-gated buy slots or authorize afternoon buys. Perplexity's
+> scope for this override is scheduled buy-run execution plus required buy-run
+> artifacts and notifications only. Claude handles scheduled reports.
+> Machine-readable source: `config/scheduled_tasks.json` ->
+> `temporary_live_scheduler_overrides.authorize_2026_08_31_morning_perplexity_buy_slots_today_only`.
+
+| ET | Live scheduler task | ID | Cadence | Trades | Aug 31 override status |
+|---|---|---|---|---|---|
+| 9:35 AM | Today 9:35 AM Perplexity active DCA buy pass | `4e8c92af` | One-time | **yes** | date-gated active only for 2026-08-31 |
+| 10:30 AM | Today 10:30 AM Perplexity active DCA buy pass | `01e4f18b` | One-time | **yes** | date-gated active only for 2026-08-31 |
+| 11:30 AM | Today 11:30 AM Perplexity active DCA buy pass | `6db8bbf1` | One-time | **yes** | date-gated active only for 2026-08-31 |
+
+The Aug 31 override does not authorize Perplexity to run scheduled reports,
+dashboard refreshes, slippage-only reports, monitor-only reports, watchdog
+reports, or afternoon buy tasks. Those responsibilities remain outside this
+morning-only override unless the user changes the scope.
+
 Temporary live scheduler cleanup and delayed morning override, Sep 8-11, 2026:
 
 > **ADDED 2026-09-08:** The user explicitly authorized Perplexity to run only

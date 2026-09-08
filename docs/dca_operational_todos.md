@@ -2,6 +2,16 @@
 
 This file tracks follow-up work from live DCA incidents so the same failure modes are not lost in chat history.
 
+## Handoff - 2026-09-08 delayed morning scheduler cleanup
+
+- Status: User explicitly authorized Perplexity to run only the delayed morning buy-only DCA schedule for Sep 8-11, 2026 so Claude gets first chance to buy first.
+- Active Perplexity buy slots for this week-limited override: 09:45, 10:40, and 11:40 ET.
+- Live scheduler task IDs left active for the override: `4412c3c4` at 09:45, `e028361e` at 10:40, and `e3590042` at 11:40. Expired Aug 28-gated buy tasks `0c3cde00` (12:30) and `44b3975d` (13:30/14:30/15:30) were deleted from the live scheduler.
+- Authorization is date-gated to America/New_York trading days `2026-09-08` through `2026-09-11` only. It does not authorize 12:30 buys, afternoon buys, or any buys outside those delayed morning windows.
+- Role split: Perplexity handles delayed scheduled buy-run execution plus required buy-run artifacts and notifications only. Claude handles scheduled reports and gets first chance to buy.
+- Safety scope remains unchanged: buy-only Robinhood Agentic account <ROBINHOOD_ACCOUNT_NUMBER>, active whitelist only, regular-hours only, no `review_equity_order`, no per-order confirmation, no sells, no cancellations, no options, no crypto, no margin, and no account-setting changes.
+- Repo mirror: `config/scheduled_tasks.json` records this under `temporary_live_scheduler_overrides.authorize_2026_09_08_delayed_morning_perplexity_buy_slots_week_only`; `docs/schedule_manifest.md` mirrors the same dated override.
+
 ## Handoff - 2026-08-31 morning scheduler override
 
 - Status: User explicitly authorized Perplexity to run the morning buy-only DCA schedule for Monday, Aug 31, 2026 at 09:35, 10:30, and 11:30 ET.
