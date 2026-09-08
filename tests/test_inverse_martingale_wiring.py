@@ -56,6 +56,8 @@ class _FixedPriceData:
     trend filter), and a tight bid/ask so the scheduled-run spread gate
     passes."""
 
+    get_corporate_action_factor: Any = None
+
     def __init__(self, prev_close: float, decision_price: float, source=SourceName.FINANCE):
         self._prev = prev_close
         self._price = decision_price
@@ -1088,7 +1090,7 @@ def test_cache_served_corporate_action_lookup_is_not_counted_in_the_usage_proxy(
     def _cache_served_lookup(ticker, since, as_of):
         return 1.0, as_of
 
-    _cache_served_lookup.served_from_cache = True
+    cast(Any, _cache_served_lookup).served_from_cache = True
     fin.get_corporate_action_factor = _cache_served_lookup
 
     rh = _FixedPriceData(prev_close=100.0, decision_price=99.0, source=SourceName.ROBINHOOD)
