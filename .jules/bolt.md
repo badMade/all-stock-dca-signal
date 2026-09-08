@@ -104,3 +104,6 @@
 ## 2026-09-07 - Pre-compute Per-Key Sets, Not Per-Key Tuple Lists
 **Learning:** The first pass at `dca_reporting.build_missing_fills` (PR #1377) hoisted `_normalize_order_id` out of the candidate loop but stored the results as per-ticker `(fill, id)` tuple lists, so the loop still rebuilt a list comprehension per candidate that was only ever tested for truthiness, scanned the tuples linearly for membership, and carried a fill dict it never read. Moving work out of a loop is only half an optimization if the loop still allocates and scans inside.
 **Action:** When a hot loop only needs "does any X exist for this key" and "is Y among this key's Xs", pre-compute exactly those two facts -- a per-key `set` of normalized ids and a `set` of keys that have an unidentified entry -- and keep nothing else in the lookup structure. Before finishing, check that no comprehension inside the loop is used solely as a boolean; that is an allocation for nothing and should become a dict/set lookup.
+## 2026-09-08 - [Avoid json.loads read_text String Allocation in Testing]
+**Learning:** `json.loads(path.read_text())` was discovered in `wondrous-octopus/tests/test_run_walkforward.py` creating test-time string allocation overhead.
+**Action:** Always favor `path.read_bytes()` for `json.loads()` even in secondary modules like tests, matching the primary codebase learning.

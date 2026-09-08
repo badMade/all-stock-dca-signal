@@ -57,6 +57,13 @@ if _REPO_ROOT not in sys.path:
 
 from dca_fileio import atomic_write_text  # noqa: E402 - needs the sys.path setup above
 from dca_net_utils import (  # noqa: E402
+    BlockedFileHandler,
+    BlockedFTPHandler,
+    PinnedHTTPHandler,
+    PinnedHTTPSHandler,
+    SafeRedirectHandler,
+)
+from dca_net_utils import (  # noqa: E402
     UnsafeDestinationError as _UnsafeDestinationError,
 )
 from dca_net_utils import (  # noqa: E402
@@ -1245,7 +1252,14 @@ def send_slack_alert(
 
     payload = json.dumps(build_slack_payload(report)).encode("utf-8")
     request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - operator-supplied webhook
+    opener = urllib.request.build_opener(
+        SafeRedirectHandler,
+        PinnedHTTPHandler,
+        PinnedHTTPSHandler,
+        BlockedFileHandler,
+        BlockedFTPHandler,
+    )
+    with opener.open(request, timeout=timeout) as response:  # noqa: S310 - operator-supplied webhook
         return 200 <= response.status < 300
 
 

@@ -761,7 +761,7 @@ class TestResumeCli:
             ]
         )
         assert code == 0
-        before = (run_dir / "run_meta.json").read_text(encoding="utf-8")
+        before = (run_dir / "run_meta.json").read_bytes()
         assert json.loads(before)["model_selection"] == "persistence"
 
         code = run_walkforward.main(
@@ -772,7 +772,7 @@ class TestResumeCli:
             ]
         )
         assert code == 1
-        after = (run_dir / "run_meta.json").read_text(encoding="utf-8")
+        after = (run_dir / "run_meta.json").read_bytes()
         assert after == before
         assert json.loads(after)["model_selection"] == "persistence"
 
@@ -1275,7 +1275,7 @@ class TestRunMetaUniverseRefresh:
             "--checkpoint-every", "50",
         ]
         assert run_walkforward.main(original) == 0
-        before = (run_dir / "run_meta.json").read_text(encoding="utf-8")
+        before = (run_dir / "run_meta.json").read_bytes()
 
         # _atomic_write_text() no longer uses Path.write_text() (it now
         # fsyncs the handle directly -- Codex review: "Fsync mandatory run
@@ -1319,4 +1319,4 @@ class TestRunMetaUniverseRefresh:
             ["--run-dir", str(run_dir), "--history-dir", str(synthetic_history_dir), "--now", later_now]
         )
         assert code == 2  # runtime failure, per daily_update.main()'s documented contract
-        assert (run_dir / "run_meta.json").read_text(encoding="utf-8") == before  # untouched, not corrupted
+        assert (run_dir / "run_meta.json").read_bytes() == before  # untouched, not corrupted

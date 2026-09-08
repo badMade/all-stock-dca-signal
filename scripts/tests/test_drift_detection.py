@@ -1325,15 +1325,28 @@ class SlackTests(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
-        def fake_urlopen(request, timeout=None):
+        def fake_urlopen(self, request, data=None, timeout=None):
             calls.append(request)
             return _FakeResponse()
 
         with patch.object(
             dca_net_utils, "resolve_ips", lambda hostname: {ipaddress.ip_address("93.184.216.34")}
-        ), patch.object(urllib.request, "urlopen", fake_urlopen):
+        ), patch.object(urllib.request.OpenerDirector, "open", fake_urlopen):
             self.assertTrue(send_slack_alert(report, webhook="https://hooks.example/alert"))
         self.assertEqual(len(calls), 1)
+
+
+    def test_send_slack_blocks_file_scheme(self):
+        report = detect_drift(self.run_dir)
+        with self.assertRaises(urllib.error.URLError) as ctx:
+            send_slack_alert(report, webhook="file:///etc/passwd")
+        self.assertIn("file", str(ctx.exception).lower())
+
+    def test_send_slack_blocks_ftp_scheme(self):
+        report = detect_drift(self.run_dir)
+        with self.assertRaises(urllib.error.URLError) as ctx:
+            send_slack_alert(report, webhook="ftp://example.com/file")
+        self.assertIn("ftp", str(ctx.exception).lower())
 
     def test_safe_redirect_handler_blocks_private_redirect_target(self):
         handler = dca_net_utils.SafeRedirectHandler()
@@ -1387,7 +1400,7 @@ class SlackTests(unittest.TestCase):
             def __exit__(self, *exc):
                 return False
 
-        def fake_urlopen(request, timeout=None):
+        def fake_urlopen(self, request, data=None, timeout=None):
             calls.append(request)
             return _FakeResponse()
 
@@ -1397,7 +1410,7 @@ class SlackTests(unittest.TestCase):
         os.environ["https_proxy"] = "http://proxy.internal:3128"
         self.addCleanup(os.environ.pop, "https_proxy", None)
         with patch.object(dca_net_utils, "resolve_ips", boom), patch.object(
-            urllib.request, "urlopen", fake_urlopen
+            urllib.request.OpenerDirector, "open", fake_urlopen
         ):
             self.assertTrue(send_slack_alert(report, webhook="https://internal-only.example/alert"))
         self.assertEqual(len(calls), 1)
