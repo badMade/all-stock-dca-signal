@@ -3634,6 +3634,7 @@ class MorningDCAExecutor(DCAExecutor):
     def _compute_top_up(
         self, now: datetime, signals: Sequence["MorningSignal"], *, manual: bool = False,
         broker: Optional[BrokerAdapter] = None,
+        same_stream_orders: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, TopUpOutcome]:
         """Return per-ticker prior-allocation/top-up outcomes.
 
@@ -3923,7 +3924,11 @@ class MorningDCAExecutor(DCAExecutor):
                     )
                     if existing_order is None:
                         broker_prior_usd = broker.same_day_ticker_notional_usd(ticker, trading_day)
-                        if not math.isfinite(broker_prior_usd) or broker_prior_usd < 0:
+                        if (
+                            isinstance(broker_prior_usd, bool)
+                            or not math.isfinite(broker_prior_usd)
+                            or broker_prior_usd < 0
+                        ):
                             raise ValueError("invalid same-day broker notional")
                         if broker_prior_usd > ticker_prior.amount_usd:
                             ticker_prior = replace(ticker_prior, amount_usd=broker_prior_usd)
@@ -3931,6 +3936,10 @@ class MorningDCAExecutor(DCAExecutor):
                             # its total already includes previously settled
                             # orders even when their artifacts are missing.
                             broker_prior_reflects_settlement = broker_prior_usd >= settled_credit_for_slot_usd
+                    elif same_stream_orders is not None:
+                        # Retain this evidence for recovery even if a later
+                        # lookup would lose a just-cancelled working order.
+                        same_stream_orders[ticker] = existing_order
                     if getattr(broker, "raw_persistence_error", None):
                         raise RuntimeError("same-day order inputs were not persisted")
                 except Exception as exc:  # noqa: BLE001 - arbitrary broker connector failures
@@ -7221,6 +7230,7 @@ class MorningDCAExecutor(DCAExecutor):
         consecutive_placement_failures: int,
         block_if_raw_persistence_failed: Callable[[str], bool],
         record_breaker_skipped_remainder: Callable[[int, str], List[str]],
+        same_stream_orders: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Tuple[Optional[float], float, float, float, int, bool]:
         """Process one candidate; returns updated batch state plus a halt flag.
 
@@ -7318,9 +7328,12 @@ class MorningDCAExecutor(DCAExecutor):
         dup_order: Optional[Dict[str, Any]] = None
         try:
             if has_prior_allocation:
-                dup_order = _same_stream_order_exists(
-                    broker, ticker, trading_day, self._idempotency_stream()
-                )
+                if same_stream_orders is not None and ticker in same_stream_orders:
+                    dup_order = same_stream_orders[ticker]
+                else:
+                    dup_order = _same_stream_order_exists(
+                        broker, ticker, trading_day, self._idempotency_stream()
+                    )
                 dup = dup_order is not None
                 duplicate_reason = "same-stream broker order exists"
             else:
@@ -8248,6 +8261,7 @@ class MorningDCAExecutor(DCAExecutor):
         data: Any = None,
         now: Optional[datetime] = None,
         raw_recorder: Optional["_RawInputRecorder"] = None,
+        same_stream_orders: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Attempt broker order placement for each EXEC_AUTO_BUY_ELIGIBLE candidate.
 
@@ -8538,6 +8552,7 @@ class MorningDCAExecutor(DCAExecutor):
                 consecutive_placement_failures=consecutive_placement_failures,
                 block_if_raw_persistence_failed=block_if_raw_persistence_failed,
                 record_breaker_skipped_remainder=_record_breaker_skipped_remainder,
+                same_stream_orders=same_stream_orders,
             )
             if halt_batch:
                 break
@@ -9459,7 +9474,10 @@ class MorningDCAExecutor(DCAExecutor):
                     return self._blocked_live_result(now, mismatch, signals, source, raw_recorder=raw_recorder)
                 raise RuntimeError(mismatch)
         trading_day = now.astimezone(EASTERN).date()
-        top_up_outcomes = self._compute_top_up(now, signals, manual=manual, broker=broker)
+        same_stream_orders: Dict[str, Dict[str, Any]] = {}
+        top_up_outcomes = self._compute_top_up(
+            now, signals, manual=manual, broker=broker, same_stream_orders=same_stream_orders
+        )
         # Sort by multiplier DESC, then drop_pct DESC, then ticker ASC so tied
         # multipliers are resolved by the larger-drop ticker first, matching the
         # allocation-priority policy in config/budgets.json.
@@ -9503,6 +9521,7 @@ class MorningDCAExecutor(DCAExecutor):
                     data=data,
                     now=now,
                     raw_recorder=raw_recorder,
+                    same_stream_orders=same_stream_orders,
                 )
                 if raw_recorder is not None and raw_recorder.error:
                     # _place_broker_orders checks after every persisted broker or
