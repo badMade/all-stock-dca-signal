@@ -849,16 +849,17 @@ dashboard refreshes, slippage-only reports, monitor-only reports, watchdog
 reports, or afternoon buy tasks. Those responsibilities remain outside this
 morning-only override unless the user changes the scope.
 
-Temporary live scheduler cleanup and delayed morning override, Sep 8-11, 2026:
+Temporary live scheduler cleanup and delayed buy-slot override, Sep 8-11, 2026:
 
-> **ADDED 2026-09-08:** The user explicitly authorized Perplexity to run only
-> the morning buy-only DCA schedule for Tuesday, Sep 8 through Friday, Sep 11,
-> 2026, delayed 10 minutes so Claude gets first chance to buy. The expired
+> **ADDED 2026-09-08:** The user explicitly authorized Perplexity to run the
+> buy-only DCA schedule for Tuesday, Sep 8 through Friday, Sep 11, 2026,
+> delayed 10 minutes so Claude gets first chance to buy. The expired
 > Aug 28-gated Perplexity buy tasks `0c3cde00` (12:30 PM ET) and `44b3975d`
 > (1:30/2:30/3:30 PM ET) were deleted from the live scheduler so they stop
-> posting stale authorization/no-op messages. Perplexity's scope for this
-> override is delayed morning buy-run execution plus required buy-run artifacts
-> and notifications only. Claude handles scheduled reports. Machine-readable
+> posting stale authorization/no-op messages; replacement delayed tasks now
+> cover those slots. Perplexity's scope for this override is delayed buy-run
+> execution plus required buy-run artifacts and notifications only. Claude
+> handles scheduled reports. Machine-readable
 > source: `config/scheduled_tasks.json` ->
 > `temporary_live_scheduler_overrides.authorize_2026_09_08_delayed_morning_perplexity_buy_slots_week_only`.
 
@@ -867,11 +868,15 @@ Temporary live scheduler cleanup and delayed morning override, Sep 8-11, 2026:
 | 9:45 AM | Perplexity delayed DCA buy pass | `4412c3c4` | Weekdays | **yes** | active Sep 8-11 only; delayed from 9:35 |
 | 10:40 AM | Perplexity delayed DCA buy pass | `e028361e` | Weekdays | **yes** | active Sep 8-11 only; delayed from 10:30 |
 | 11:40 AM | Perplexity delayed DCA buy pass | `e3590042` | Weekdays | **yes** | active Sep 8-11 only; delayed from 11:30 |
+| 12:40 PM | Perplexity delayed DCA buy pass | `062605c6` | Weekdays | **yes** | active Sep 8-11 only; delayed from 12:30 |
+| 1:40 PM | Perplexity delayed DCA buy pass | `54ab24d2` | Weekdays | **yes** | active Sep 8-11 only; delayed from 1:30 |
+| 2:40 PM | Perplexity delayed DCA buy pass | `54ab24d2` | Weekdays | **yes** | active Sep 8-11 only; delayed from 2:30 |
+| 3:40 PM | Perplexity delayed DCA buy pass | `54ab24d2` | Weekdays | **yes** | active Sep 8-11 only; delayed from 3:30 |
 
-The Sep 8-11 override does not authorize Perplexity to run 12:30 PM buys,
-afternoon buys, scheduled reports, dashboard refreshes, slippage-only reports,
-monitor-only reports, or watchdog reports. Those responsibilities remain outside
-this delayed-morning-only override unless the user changes the scope.
+The Sep 8-11 override does not authorize Perplexity to run scheduled reports,
+dashboard refreshes, slippage-only reports, monitor-only reports, or watchdog
+reports. Those responsibilities remain outside this delayed-buy-only override
+unless the user changes the scope.
 
 | ET | Task | ID | Cadence | Cron (UTC) | Trades | Status |
 |---|---|---|---|---|---|---|

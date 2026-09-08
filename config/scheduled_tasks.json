@@ -10,7 +10,7 @@
   "change_note_2026_08_18_manual_cap_override": "Recorded the user-approved manual foreground cap override after the Aug 18 2026 14:30 and 15:30 Perplexity-primary scheduled runs were blocked by the daily cap. The user explicitly instructed Perplexity to ignore the daily cap and buy the combined 14:30 and 15:30 skipped candidates with a $10 per-ticker cap. The manual override run manual_override_20260818_1555ET placed and reconciled 34 Robinhood Agentic buy orders, total requested $207.00, under /home/user/workspace/cron_tracking/perplexity_primary_20260818/manual_override_1555ET/. This artifact is manual_user_cap_override, foreground_primary_surrogate_context=true, valid_scheduled_evidence=false, and valid_primary_executor_evidence=false. It is excluded from scheduled slippage, scheduled fill counts, scheduled reliability, scheduled cost-basis evidence, watchdog scheduled proof, and any claim that the 14:30 or 15:30 scheduled stream succeeded. It may be used only as manual foreground context and same-day or future top-up allocation context where applicable.",
   "change_note_2026_08_28_today_only_perplexity_buy_authorization": "Recorded the user-approved Aug 28 2026 live scheduler override: Perplexity is authorized to run the canonical scheduled buy-only DCA tasks for the current America/New_York trading day, including a one-time immediate 9:35 AM catch-up run because the canonical 9:35 occurrence had already passed. Authorization is date-gated to 2026-08-28 only. Parallel replacement tasks are disabled to preserve one executor per slot. Perplexity scheduled scope is buy-run execution and required buy-run artifacts/notifications only; Claude handles scheduled reports. This documentation change mirrors live scheduler task text and does not place orders by itself.",
   "change_note_2026_08_31_today_only_morning_perplexity_buy_authorization": "Recorded the user-approved Aug 31 2026 live scheduler override: Perplexity is authorized to run the canonical morning buy-only DCA tasks for the current America/New_York trading day at 09:35, 10:30, and 11:30 ET. Authorization is date-gated to 2026-08-31 only and does not reactivate the recurring Aug 28-gated replacement tasks. Parallel one-time tasks are disabled to preserve one executor per slot. Perplexity scheduled scope is buy-run execution and required buy-run artifacts/notifications only; Claude handles scheduled reports. This documentation change mirrors live scheduler task text and does not place orders by itself.",
-  "change_note_2026_09_08_delayed_morning_perplexity_buy_authorization": "Recorded the user-approved Sep 8 2026 live scheduler cleanup and week-limited delayed morning authorization. Expired Aug 28-gated Perplexity buy tasks 0c3cde00 (12:30 PM ET) and 44b3975d (1:30/2:30/3:30 PM ET) were deleted from the live scheduler. The only active Perplexity buy tasks left for Sep 8-11 2026 are delayed morning slots 4412c3c4 at 09:45 ET, e028361e at 10:40 ET, and e3590042 at 11:40 ET, each shifted 10 minutes later than the normal 09:35/10:30/11:30 schedule to give Claude first chance to buy. Perplexity scheduled scope is buy-run execution and required buy-run artifacts/notifications only; Claude handles scheduled reports. This documentation change mirrors live scheduler state and does not place orders by itself.",
+  "change_note_2026_09_08_delayed_morning_perplexity_buy_authorization": "Recorded the user-approved Sep 8 2026 live scheduler cleanup and week-limited delayed buy-slot authorization. Expired Aug 28-gated Perplexity buy tasks 0c3cde00 (12:30 PM ET) and 44b3975d (1:30/2:30/3:30 PM ET) were deleted from the live scheduler and replaced by delayed Sep 8-11 tasks. The active Perplexity buy tasks for Sep 8-11 2026 are delayed slots 4412c3c4 at 09:45 ET, e028361e at 10:40 ET, e3590042 at 11:40 ET, 062605c6 at 12:40 ET, and 54ab24d2 at 13:40/14:40/15:40 ET, each shifted 10 minutes later than the normal buy schedule to give Claude first chance to buy. Perplexity scheduled scope is buy-run execution and required buy-run artifacts/notifications only; Claude handles scheduled reports. This documentation change mirrors live scheduler state and does not place orders by itself.",
   "temporary_live_scheduler_overrides": {
     "pause_2026_08_17_0915_prevalidation": {
       "requested_by_user_on_et": "2026-08-17 09:48",
@@ -168,7 +168,7 @@
     "authorize_2026_09_08_delayed_morning_perplexity_buy_slots_week_only": {
       "requested_by_user_on_et": "2026-09-08 09:20",
       "applied_on_et": "2026-09-08 09:24",
-      "scope": "Live scheduler only. Documentation of week-limited delayed morning trading authorization plus cleanup of expired buy tasks, not a strategy-code change.",
+      "scope": "Live scheduler only. Documentation of week-limited delayed buy-slot trading authorization plus cleanup of expired buy tasks, not a strategy-code change.",
       "authorization_window_et": {
         "start_trading_day": "2026-09-08",
         "end_trading_day": "2026-09-11",
@@ -176,21 +176,27 @@
         "regular_hours_only": true,
         "expires_after_end_trading_day": true
       },
-      "perplexity_role": "Run only the delayed morning scheduled buy-only DCA execution tasks and required buy-run artifacts/notifications.",
+      "perplexity_role": "Run only the delayed scheduled buy-only DCA execution tasks and required buy-run artifacts/notifications.",
       "claude_role": "Get the first chance to buy and handle scheduled reports.",
       "deleted_expired_buy_task_ids": [
         "0c3cde00",
         "44b3975d"
       ],
-      "active_delayed_morning_buy_task_ids": [
+      "active_delayed_buy_task_ids": [
         "4412c3c4",
         "e028361e",
-        "e3590042"
+        "e3590042",
+        "062605c6",
+        "54ab24d2"
       ],
       "authorized_slots_et": [
         "09:45 delayed from 09:35",
         "10:40 delayed from 10:30",
-        "11:40 delayed from 11:30"
+        "11:40 delayed from 11:30",
+        "12:40 delayed from 12:30",
+        "13:40 delayed from 13:30",
+        "14:40 delayed from 14:30",
+        "15:40 delayed from 15:30"
       ],
       "safety_scope": [
         "buy_only",
@@ -209,12 +215,12 @@
       ],
       "task_text_must_include": [
         "AUTHORIZED FOR THIS WEEK ONLY: TUESDAY SEPTEMBER 8 2026 THROUGH FRIDAY SEPTEMBER 11 2026",
-        "delayed version of the normal morning buy run",
+        "delayed version of the normal buy run",
         "shifted 10 minutes later so Claude has a chance to run first",
         "Claude handles scheduled reports",
         "Perplexity task performs only delayed buy-run execution and required buy-run artifacts/notifications"
       ],
-      "notes": "The Sep 8 cleanup leaves only the delayed morning Perplexity buy tasks active for the week. The deleted Aug 28-gated 12:30 and afternoon Perplexity tasks must not keep firing no-op expiration messages."
+      "notes": "The Sep 8 cleanup leaves only the delayed Perplexity buy tasks active for the week. The deleted Aug 28-gated 12:30 and afternoon Perplexity tasks must not keep firing no-op expiration messages; replacement delayed tasks 062605c6 and 54ab24d2 cover 12:40 and 13:40/14:40/15:40 ET through Sep 11."
     }
   },
   "operating_mode": {
