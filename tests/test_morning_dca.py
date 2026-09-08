@@ -8038,6 +8038,64 @@ def test_earlier_weekday_pending_with_unusable_notional_fails_closed(tmp_path, n
     assert ex.ledger.week_planned(now.date()) == 450.0
 
 
+def test_ambiguous_same_ticker_rows_preserve_unknown_notional_marker_and_close_caps(tmp_path):
+    """An amountless sibling keeps an unknown-notional submission ambiguous."""
+    state_root = tmp_path / "live"
+    run_dir = state_root / "20260630_1030ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "ambiguous-aapl-orders",
+                "trading_day": "2026-06-30",
+                "generated_at": "2026-06-30T10:29:00-04:00",
+                "unreconstructable_submitted_tickers": ["AAPL"],
+                "buy_candidates": [
+                    {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 10.0},
+                    {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": None},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",), trading_date=date(2026, 6, 30))
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        morning_run_state_root=str(state_root),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(),
+        morning_daily_cap_usd=90.0,
+        morning_weekly_cap_usd=450.0,
+        approved_test_dates=frozenset({date(2026, 6, 30)}),
+    )
+    now = datetime.combine(date(2026, 6, 30), time(10, 30), tzinfo=EASTERN)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+
+    class _RecordingBroker(FakeLiveBroker):
+        def __init__(self):
+            self.market_buys = []
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.market_buys.append((ticker, notional_usd, ref_id))
+            return super().place_market_buy(ticker, notional_usd, ref_id)
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.08})
+    first_broker = _RecordingBroker()
+    first = ex.run(now, data, broker=first_broker)
+    assert first_broker.market_buys == []
+    assert ex._cap_seed_scan_incomplete is True
+    assert ex.ledger.remaining_daily(now.date()) == 0.0
+    assert ex.ledger.remaining_weekly(now.date()) == 0.0
+    assert first["artifacts"]["unreconstructable_submitted_tickers"] == ["AAPL"]
+
+    retry = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    retry_broker = _RecordingBroker()
+    retry.run(now + timedelta(minutes=1), data, broker=retry_broker)
+    assert retry_broker.market_buys == []
+    assert retry.ledger.remaining_daily(now.date()) == 0.0
+    assert retry.ledger.remaining_weekly(now.date()) == 0.0
+
+
 def test_seed_ledger_from_prior_runs_includes_ambiguous_placement_notional(tmp_path):
     """An ambiguous placement candidate from a prior run must be reserved in the ledger."""
     state_root = tmp_path / "live"

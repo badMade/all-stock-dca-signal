@@ -6955,6 +6955,25 @@ class MorningDCAExecutor(DCAExecutor):
             # here as it does cross-stream.
             _unreconstructable = state.get("unreconstructable_submitted_tickers")
             if isinstance(_unreconstructable, list):
+                # Test ambiguity against every physical order-bearing row,
+                # before the amount validation above filters unusable rows out
+                # of submitted_rows. A known-notional sibling cannot prove
+                # which of two same-ticker orders an ID-less marker describes.
+                _physical_rows_by_ticker: Dict[str, int] = {}
+                for _candidate in _buy_candidates:
+                    if not isinstance(_candidate, dict):
+                        continue
+                    _candidate_ticker = _candidate.get("ticker")
+                    _candidate_status = _candidate.get("status")
+                    if not isinstance(_candidate_ticker, str):
+                        continue
+                    if (
+                        isinstance(_candidate_status, str)
+                        and _candidate_status in _ORDER_BEARING_CANDIDATE_STATUSES
+                    ) or _candidate.get("ambiguous_placement_exception") is True:
+                        _physical_rows_by_ticker[_candidate_ticker] = (
+                            _physical_rows_by_ticker.get(_candidate_ticker, 0) + 1
+                        )
                 # A malformed ticker (a JSON list/object surviving corrupt
                 # input) on an otherwise order-bearing candidate is
                 # unhashable, and an unconditional set comprehension raised
@@ -6971,7 +6990,10 @@ class MorningDCAExecutor(DCAExecutor):
                 for _unrec_ticker in _unreconstructable:
                     if not isinstance(_unrec_ticker, str) or not _unrec_ticker:
                         continue
-                    if _unrec_ticker in _already_represented:
+                    if (
+                        _unrec_ticker in _already_represented
+                        and _physical_rows_by_ticker.get(_unrec_ticker) == 1
+                    ):
                         continue
                     # A broker fill may resolve an order-ID-less durable marker,
                     # but uniqueness is judged across EVERY same-ticker row,
