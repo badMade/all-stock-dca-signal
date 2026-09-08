@@ -910,6 +910,10 @@ class BrokerOrder:
     placed_agent: str | None = None
     state: str = "filled"
     executed_dollar_amount: float | None = None
+    # Client-supplied idempotency key.  Ambiguous placement records retain it
+    # so reconciliation can query and bind the exact broker order before a
+    # reservation is released or the ticker is retried.
+    ref_id: str | None = None
 
     @property
     def counts_toward_budget(self) -> bool:
@@ -4239,11 +4243,13 @@ class ExecutionResult:
     ``placement_enabled`` reports whether both live gates were flipped, so a
     dry run and a real submission are never confused.
 
-    ``attempt_records`` contains zero-notional synthetic broker rows for
-    proven-no-order failures.  Persist these beside the execution artifact and
-    include them with the next broker-history snapshot: unlike a successful
-    order, a no-ID rejection cannot appear in broker history by itself, but it
-    still consumes one ``max_orders_per_day`` slot.
+    ``attempt_records`` contains synthetic broker rows for outcomes that need
+    durable local evidence. Proven-no-order failures carry zero notional.
+    Ambiguous connector failures carry the full requested notional, state
+    ``potentially_submitted``, and the exact client reference used at the
+    broker boundary. Persist these beside the execution artifact and include
+    them with the next broker-history snapshot; the ambiguous reservation must
+    remain until that exact reference is reconciled.
     """
 
     submitted: list[str] = field(default_factory=list)
@@ -6270,6 +6276,19 @@ def execute_plan(
             if response is _PLACE_FN_RAISED or _placement_response_may_hold_a_live_order(
                 response
             ):
+                if response is _PLACE_FN_RAISED:
+                    ambiguous_record = BrokerOrder(
+                        symbol=ticker,
+                        side=order.side,
+                        dollar_amount=order.amount_usd,
+                        created_at=placement_now,
+                        placed_agent="agentic",
+                        state="potentially_submitted",
+                        ref_id=ref_id,
+                    )
+                    result.attempt_records.append(ambiguous_record)
+                    if isinstance(orders, list):
+                        orders.append(ambiguous_record)
                 result.halted_on = ticker
                 unprovable = (
                     "the placement call raised, so whether an order was accepted cannot be "

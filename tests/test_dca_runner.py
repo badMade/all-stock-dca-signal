@@ -9022,10 +9022,12 @@ def _three_ticker_plan(tickers):
     return plan, snapshot, tier, candidates
 
 
-def _execute(plan, broker, snapshot, tier, candidates):
+def _execute(plan, broker, snapshot, tier, candidates, *, orders=None):
+    if orders is None:
+        orders = []
     return dca_runner.execute_plan(
         plan, broker, run_id="test-run-2026-07-28", snapshot=snapshot,
-        trading_day=date(2026, 7, 28), orders=[], tier=tier,
+        trading_day=date(2026, 7, 28), orders=orders, tier=tier,
         buying_power_usd=TEST_BUYING_POWER_USD,
         orders_account_number=TEST_ACCOUNT_NUMBER,
         now=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
@@ -10348,6 +10350,45 @@ def test_a_raised_place_fn_halts_because_nothing_can_be_established():
     assert "cannot be established from here" in result.failure_reason
     # Still named per ticker so Gate 9 reports it.
     assert result.failures[0].reason == "place_fn raised RuntimeError"
+    assert len(result.attempt_records) == 1
+    ambiguous = result.attempt_records[0]
+    assert ambiguous.state == "potentially_submitted"
+    assert ambiguous.dollar_amount == plan.to_place[0].amount_usd
+    assert ambiguous.ref_id == (
+        f"dca-runner-0935-{snapshot.day.isoformat()}-{plan.to_place[0].ticker}"
+    )
+    reserved = dca_runner.budget_snapshot(result.attempt_records, snapshot.day)
+    assert reserved.day_notional_usd == plan.to_place[0].amount_usd
+
+
+def test_an_ambiguous_reference_blocks_retry_until_reconciled():
+    """The exact placement reference remains reserved and cannot be placed twice."""
+    calls = []
+
+    def accepted_then_times_out(**kw):
+        calls.append(kw)
+        raise RuntimeError("connector timeout with secret connector detail")
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=accepted_then_times_out,
+        enable_live_orders=True,
+        dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL"])
+    orders = []
+
+    first = _execute(plan, broker, snapshot, tier, candidates, orders=orders)
+
+    assert len(calls) == 1
+    assert orders[0].ref_id == calls[0]["ref_id"]
+    assert orders[0].state == "potentially_submitted"
+    assert "secret connector detail" not in first.failure_reason
+
+    refreshed_snapshot = dca_runner.budget_snapshot(orders, snapshot.day)
+    with pytest.raises(ValueError, match="orders already present"):
+        _execute(plan, broker, refreshed_snapshot, tier, candidates, orders=orders)
+    assert len(calls) == 1
 
 
 def test_a_broker_refusal_still_isolates_after_the_raise_policy_change():
