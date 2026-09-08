@@ -11,6 +11,7 @@ Runnable with ``pytest`` or ``python test_morning_dca.py``.
 
 import contextlib
 import csv
+import math
 import os
 import re
 import subprocess
@@ -13186,7 +13187,11 @@ def test_terminal_partial_fill_is_booked_before_continuing_batch(tmp_path):
     assert ex.ledger.day_planned(date(2026, 7, 8)) == 6.0
 
 
-@pytest.mark.parametrize("unreadable_quantity", [None, "invalid", "nan", "inf", True, False, 10**400])
+@pytest.mark.parametrize(
+    "unreadable_quantity",
+    [None, "not-a-number", math.nan, math.inf, True, False, 10**4000],
+    ids=["absent", "nonnumeric", "nan", "infinite", "true_boolean", "false_boolean", "oversized"],
+)
 def test_terminal_rejection_with_unreadable_quantity_halts_the_batch(tmp_path, monkeypatch, unreadable_quantity):
     """An unreconcilable terminal fill must halt the batch, never fall through.
 
@@ -13220,9 +13225,8 @@ def test_terminal_rejection_with_unreadable_quantity_halts_the_batch(tmp_path, m
                         # is not a DECLINED state: the order EXISTED before
                         # being killed, so it needs an EXPLICIT zero fill to
                         # be proven a clean non-fill
-                        # (terminal_broker_row_proves_no_order). No
-                        # cumulative_quantity at all is unreadable, not a
-                        # proven zero.
+                        # (terminal_broker_row_proves_no_order). Every
+                        # parameter is unreadable, not a proven zero.
                         "state": "cancelled",
                         "cumulative_quantity": unreadable_quantity,
                     }
@@ -13248,6 +13252,11 @@ def test_terminal_rejection_with_unreadable_quantity_halts_the_batch(tmp_path, m
     assert placement_attempts == ["AAPL"]
     assert outcomes["AAPL"]["status"] == "failed"
     assert outcomes["AAPL"].get("ambiguous_placement_exception") is True
+    assert outcomes["AAPL"]["submitted_amount_usd"] == 10.0
+    assert res["artifacts"]["is_trading_failure"] is True
+    assert res["artifacts"]["scheduled_evidence_denied"] is True
+    assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
+    assert ex.ledger.day_planned(date(2026, 7, 8)) == 10.0
     assert "NVDA" not in outcomes or outcomes["NVDA"]["status"] != "submitted"
     assert res["artifacts"]["is_trading_failure"] is True
     assert res["artifacts"]["scheduled_evidence_denied"] is True
@@ -13255,7 +13264,11 @@ def test_terminal_rejection_with_unreadable_quantity_halts_the_batch(tmp_path, m
     assert heartbeat_results == [False]
 
 
-@pytest.mark.parametrize("unusable_price", [None, "invalid", "nan", "inf", 0, -1, True, 10**400])
+@pytest.mark.parametrize(
+    "unusable_price",
+    [None, "not-a-number", math.nan, math.inf, 0, -1, True, False, 10**4000],
+    ids=["absent", "nonnumeric", "nan", "infinite", "zero", "negative", "true_boolean", "false_boolean", "oversized"],
+)
 def test_terminal_rejection_with_positive_quantity_and_no_usable_price_halts_the_batch(
     tmp_path, monkeypatch, unusable_price
 ):
@@ -13303,6 +13316,10 @@ def test_terminal_rejection_with_positive_quantity_and_no_usable_price_halts_the
     assert placement_attempts == ["AAPL"]
     assert outcomes["AAPL"]["status"] == "failed"
     assert outcomes["AAPL"].get("ambiguous_placement_exception") is True
+    assert res["artifacts"]["is_trading_failure"] is True
+    assert res["artifacts"]["scheduled_evidence_denied"] is True
+    assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
+    assert heartbeat_results == [False]
     assert "NVDA" not in outcomes or outcomes["NVDA"]["status"] != "submitted"
     assert res["artifacts"]["is_trading_failure"] is True
     assert res["artifacts"]["scheduled_evidence_denied"] is True

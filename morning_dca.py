@@ -1065,8 +1065,8 @@ def _finite_float_or_none(value: Any) -> Optional[float]:
 
 
 def _strict_fill_number(value: Any) -> Optional[float]:
-    """Return a finite broker fill number, rejecting boolean lookalikes."""
-    if isinstance(value, bool):
+    """Return a finite broker fill number, rejecting ambiguous scalar types."""
+    if isinstance(value, bool) or value is None:
         return None
     return _finite_float_or_none(value)
 
@@ -8175,9 +8175,12 @@ class MorningDCAExecutor(DCAExecutor):
                 f"placement rejected with unreconcilable fill evidence: {exc}"
             )
             outcomes[ticker]["ambiguous_placement_exception"] = True
-            # The unreadable terminal response may represent a real fill.
-            # Reserve the complete approved notional until reconciliation so
-            # later controls cannot reuse potentially consumed buying power.
+            # The broker order exists but its terminal fill cannot be valued.
+            # Reserve the full approved notional as ambiguous exposure so no
+            # later candidate can reuse buying power that may already have
+            # been consumed.
+            submitted_today += notional
+            submitted_this_week += notional
             reserved_buying_power += notional
             if top_up is not None and top_up.cumulative_credit_decline_usd is not None:
                 try:
