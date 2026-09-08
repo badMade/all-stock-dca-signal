@@ -12937,7 +12937,8 @@ def test_terminal_partial_fill_is_booked_before_continuing_batch(tmp_path):
     assert ex.ledger.day_planned(date(2026, 7, 8)) == 6.0
 
 
-def test_terminal_rejection_with_unreadable_quantity_halts_the_batch(tmp_path):
+@pytest.mark.parametrize("unreadable_quantity", [None, "invalid", "nan", "inf", True, False, 10**400])
+def test_terminal_rejection_with_unreadable_quantity_halts_the_batch(tmp_path, monkeypatch, unreadable_quantity):
     """An unreconcilable terminal fill must halt the batch, never fall through.
 
     A cancelled/rejected order whose ``cumulative_quantity`` is missing (or
@@ -12956,6 +12957,8 @@ def test_terminal_rejection_with_unreadable_quantity_halts_the_batch(tmp_path):
     """
 
     placement_attempts = []
+    heartbeat_results = []
+    monkeypatch.setattr("dca_alerts.send_heartbeat", lambda _stream, *, ok: heartbeat_results.append(ok))
 
     def _place_fn(**kwargs):
         placement_attempts.append(kwargs["symbol"])
@@ -12972,6 +12975,7 @@ def test_terminal_rejection_with_unreadable_quantity_halts_the_batch(tmp_path):
                         # cumulative_quantity at all is unreadable, not a
                         # proven zero.
                         "state": "cancelled",
+                        "cumulative_quantity": unreadable_quantity,
                     }
                 }
             }
@@ -12996,9 +13000,16 @@ def test_terminal_rejection_with_unreadable_quantity_halts_the_batch(tmp_path):
     assert outcomes["AAPL"]["status"] == "failed"
     assert outcomes["AAPL"].get("ambiguous_placement_exception") is True
     assert "NVDA" not in outcomes or outcomes["NVDA"]["status"] != "submitted"
+    assert res["artifacts"]["is_trading_failure"] is True
+    assert res["artifacts"]["scheduled_evidence_denied"] is True
+    assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
+    assert heartbeat_results == [False]
 
 
-def test_terminal_rejection_with_positive_quantity_and_no_usable_price_halts_the_batch(tmp_path):
+@pytest.mark.parametrize("unusable_price", [None, "invalid", "nan", "inf", 0, -1, True, 10**400])
+def test_terminal_rejection_with_positive_quantity_and_no_usable_price_halts_the_batch(
+    tmp_path, monkeypatch, unusable_price
+):
     """A positive fill quantity with no usable average_price is unreconcilable.
 
     Same fall-through bug as the unreadable-quantity case: a positive
@@ -13009,6 +13020,8 @@ def test_terminal_rejection_with_positive_quantity_and_no_usable_price_halts_the
     """
 
     placement_attempts = []
+    heartbeat_results = []
+    monkeypatch.setattr("dca_alerts.send_heartbeat", lambda _stream, *, ok: heartbeat_results.append(ok))
 
     def _place_fn(**kwargs):
         placement_attempts.append(kwargs["symbol"])
@@ -13019,7 +13032,7 @@ def test_terminal_rejection_with_positive_quantity_and_no_usable_price_halts_the
                         "id": "ORD-REJECTED",
                         "state": "rejected",
                         "cumulative_quantity": "0.05",
-                        "average_price": None,
+                        "average_price": unusable_price,
                     }
                 }
             }
@@ -13042,6 +13055,10 @@ def test_terminal_rejection_with_positive_quantity_and_no_usable_price_halts_the
     assert outcomes["AAPL"]["status"] == "failed"
     assert outcomes["AAPL"].get("ambiguous_placement_exception") is True
     assert "NVDA" not in outcomes or outcomes["NVDA"]["status"] != "submitted"
+    assert res["artifacts"]["is_trading_failure"] is True
+    assert res["artifacts"]["scheduled_evidence_denied"] is True
+    assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
+    assert heartbeat_results == [False]
 
 
 def test_terminal_partial_fill_response_is_archived_for_raw_replay(tmp_path):

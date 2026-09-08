@@ -1063,6 +1063,13 @@ def _finite_float_or_none(value: Any) -> Optional[float]:
     return parsed if math.isfinite(parsed) else None
 
 
+def _strict_fill_number(value: Any) -> Optional[float]:
+    """Return a finite broker fill number, rejecting boolean lookalikes."""
+    if isinstance(value, bool):
+        return None
+    return _finite_float_or_none(value)
+
+
 def session_stats(bars: Sequence[Bar]) -> Dict[str, Any]:
     """Aggregate regular-session bars into open/high/low/volume so far.
 
@@ -7943,28 +7950,13 @@ class MorningDCAExecutor(DCAExecutor):
             # "Reconcile terminal partial fills before continuing").
             terminal_order = exc.order
             order_id = str(terminal_order.get("id") or terminal_order.get("order_id") or "") or None
-            raw_filled_quantity = terminal_order.get("cumulative_quantity")
-            try:
-                filled_quantity = float(raw_filled_quantity) if raw_filled_quantity is not None else math.nan
-            except (TypeError, ValueError, OverflowError):
-                # OverflowError too: a broker-supplied huge integer (e.g.
-                # 10**400) raises converting to float rather than becoming
-                # inf, and this is external data that must land in the same
-                # unreadable-quantity path as any other malformed value, not
-                # escape uncaught out of this exception handler (Codex
-                # review, PR #1361 discussion_r3939066629: "Halt when
-                # terminal fill evidence is unreadable").
-                filled_quantity = math.nan
-            average_price = terminal_order.get("average_price")
-            try:
-                fill_price = float(average_price) if average_price is not None else math.nan
-            except (TypeError, ValueError, OverflowError):
-                fill_price = math.nan
+            filled_quantity = _strict_fill_number(terminal_order.get("cumulative_quantity"))
+            fill_price = _strict_fill_number(terminal_order.get("average_price"))
 
             has_reconcilable_fill = (
-                math.isfinite(filled_quantity)
+                filled_quantity is not None
                 and filled_quantity > 0
-                and math.isfinite(fill_price)
+                and fill_price is not None
                 and fill_price > 0
             )
             # The normal (non-exception) placement path archives the raw
@@ -8065,7 +8057,7 @@ class MorningDCAExecutor(DCAExecutor):
             # evidence is unreadable"). Every unreconcilable shape now halts
             # the batch exactly like the generic ambiguous-exception branch
             # below, instead of falling through.
-            if math.isfinite(filled_quantity) and filled_quantity == 0:
+            if filled_quantity == 0:
                 return (
                     batch_buying_power,
                     reserved_buying_power,
@@ -8078,6 +8070,10 @@ class MorningDCAExecutor(DCAExecutor):
                 f"placement rejected with unreconcilable fill evidence: {exc}"
             )
             outcomes[ticker]["ambiguous_placement_exception"] = True
+            # The unreadable terminal response may represent a real fill.
+            # Reserve the complete approved notional until reconciliation so
+            # later controls cannot reuse potentially consumed buying power.
+            reserved_buying_power += notional
             if top_up is not None and top_up.cumulative_credit_decline_usd is not None:
                 try:
                     self.credit_ledger.settle(
@@ -10285,6 +10281,8 @@ def _apply_no_order_classification(
                 if failed or placement_halted or ambiguous_placements
                 else ERROR_CLASS_DEGRADED_MARKET_DATA,
             )
+            if scheduled:
+                artifacts.update(deny_scheduled_evidence(artifacts))
         return
 
     reaching_gate = sum(
@@ -10360,6 +10358,8 @@ def _apply_no_order_classification(
     if concrete is not None:
         fields["order_submit_status"] = concrete
     artifacts.update(fields)
+    if scheduled and artifacts.get("is_trading_failure") is True:
+        artifacts.update(deny_scheduled_evidence(artifacts))
 
 
 def _concrete_order_submit_status(rows: Sequence[Dict[str, Any]]) -> Optional[str]:
