@@ -61,7 +61,6 @@ from dca_net_utils import (  # noqa: E402
     BlockedFTPHandler,
     PinnedHTTPHandler,
     PinnedHTTPSHandler,
-    SafeRedirectHandler,
 )
 from dca_net_utils import (  # noqa: E402
     UnsafeDestinationError as _UnsafeDestinationError,
@@ -1252,13 +1251,12 @@ def send_slack_alert(
 
     payload = json.dumps(build_slack_payload(report)).encode("utf-8")
     request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-    opener = urllib.request.build_opener(
-        SafeRedirectHandler,
-        PinnedHTTPHandler,
-        PinnedHTTPSHandler,
-        BlockedFileHandler,
-        BlockedFTPHandler,
-    )
+
+    class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirectHandler, PinnedHTTPHandler, PinnedHTTPSHandler, BlockedFileHandler, BlockedFTPHandler)
     with opener.open(request, timeout=timeout) as response:  # noqa: S310 - operator-supplied webhook
         return 200 <= response.status < 300
 

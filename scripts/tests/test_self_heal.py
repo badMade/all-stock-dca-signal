@@ -13,7 +13,7 @@ import scripts.self_heal as self_heal
 def test_run_cmd(monkeypatch):
     called = []
 
-    def fake_run(cmd, check=False):
+    def fake_run(cmd, check=False, shell=False):
         called.append(cmd)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
@@ -22,7 +22,7 @@ def test_run_cmd(monkeypatch):
 
 
 def test_run_cmd_file_not_found(monkeypatch):
-    def fake_run(cmd, check=False):
+    def fake_run(cmd, check=False, shell=False):
         raise FileNotFoundError()
 
     monkeypatch.setattr(subprocess, "run", fake_run)

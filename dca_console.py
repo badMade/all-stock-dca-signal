@@ -56,7 +56,7 @@ def python_packages(executable: str) -> dict:
         f"print(json.dumps({{n: importlib.util.find_spec(n) is not None for n in {names!r}}}))"
     )
     try:
-        result = subprocess.run([executable, "-c", code], capture_output=True, text=True, timeout=15)
+        result = subprocess.run([executable, "-c", code], capture_output=True, text=True, timeout=15, shell=False)  # nosec B603 - fixed command, explicit shell=False
         return json.loads(result.stdout) if result.returncode == 0 else {"error": "Python probe failed"}
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return {"error": "Python runtime is unavailable"}

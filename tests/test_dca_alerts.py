@@ -37,14 +37,20 @@ class _FakeResponse(io.BytesIO):
 
 @pytest.fixture
 def captured_requests(monkeypatch):
-    """Capture urllib.request.urlopen calls made by dca_alerts."""
+    """Capture urllib.request.build_opener(...).open(...) calls made by dca_alerts."""
     calls = []
 
     def fake_urlopen(url_or_request, timeout=None):
         calls.append(url_or_request)
         return _FakeResponse()
 
+
+    class FakeOpener:
+        def open(self, request, timeout=None):
+            return fake_urlopen(request, timeout)
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
     return calls
 
 
@@ -123,7 +129,13 @@ def test_send_heartbeat_never_raises_on_network_error(monkeypatch):
     def boom(url, timeout=None):
         raise OSError("network down")
 
+
+    class FakeOpener:
+        def open(self, request, timeout=None):
+            return boom(request, timeout)
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
     monkeypatch.setattr(urllib.request, "urlopen", boom)
+
     assert send_heartbeat("morning") is False
 
 
@@ -134,7 +146,13 @@ def test_send_heartbeat_redacts_url_on_delivery_failure(monkeypatch, caplog):
     def boom(url, timeout=None):
         raise OSError("network down")
 
+
+    class FakeOpener:
+        def open(self, request, timeout=None):
+            return boom(request, timeout)
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
     monkeypatch.setattr(urllib.request, "urlopen", boom)
+
     with caplog.at_level("WARNING"):
         assert send_heartbeat("morning") is False
     assert "super-secret-token" not in caplog.text
@@ -258,7 +276,13 @@ def test_send_heartbeat_does_not_log_raw_exception_text_with_token(monkeypatch, 
 
         raise http.client.InvalidURL("URL can't contain control characters. '/super-secret-token\\x00'")
 
+
+    class FakeOpener:
+        def open(self, request, timeout=None):
+            return boom(request, timeout)
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
     monkeypatch.setattr(urllib.request, "urlopen", boom)
+
     with caplog.at_level("WARNING"):
         assert send_heartbeat("morning") is False
     assert "super-secret-token" not in caplog.text
@@ -274,7 +298,13 @@ def test_alert_failure_does_not_log_raw_exception_text_with_token(monkeypatch, c
 
         raise http.client.InvalidURL("URL can't contain control characters. '/super-secret-token\\x00'")
 
+
+    class FakeOpener:
+        def open(self, request, timeout=None):
+            return boom(request, timeout)
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
     monkeypatch.setattr(urllib.request, "urlopen", boom)
+
     with caplog.at_level("WARNING"):
         assert alert_failure("morning", RuntimeError("boom")) is False
     assert "super-secret-token" not in caplog.text
@@ -557,7 +587,13 @@ def test_alert_failure_never_raises_on_network_error(monkeypatch):
     def boom(request, timeout=None):
         raise OSError("network down")
 
+
+    class FakeOpener:
+        def open(self, request, timeout=None):
+            return boom(request, timeout)
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
     monkeypatch.setattr(urllib.request, "urlopen", boom)
+
     assert alert_failure("morning", RuntimeError("boom")) is False
 
 

@@ -41,6 +41,12 @@ from typing import Any, Callable, Optional, TypeVar
 
 from dca_fileio import atomic_write_text
 from dca_net_utils import (
+    BlockedFileHandler,
+    BlockedFTPHandler,
+    PinnedHTTPHandler,
+    PinnedHTTPSHandler,
+)
+from dca_net_utils import (
     UnsafeDestinationError as _UnsafeDestinationError,
 )
 from dca_net_utils import (
@@ -163,7 +169,11 @@ def send_heartbeat(
     if not ok:
         url = url.rstrip("/") + "/fail"
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310 - operator-supplied URL
+        class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        opener = urllib.request.build_opener(_NoRedirectHandler, PinnedHTTPHandler, PinnedHTTPSHandler, BlockedFileHandler, BlockedFTPHandler)
+        with opener.open(url, timeout=timeout) as response:  # noqa: S310 - operator-supplied URL
             return 200 <= response.status < 300
     except Exception as exc:  # noqa: BLE001 - delivery failure must not raise
         logger.warning(
@@ -286,7 +296,11 @@ def alert_failure(
         url, data=payload, headers={"Content-Type": "application/json"}
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - operator-supplied webhook
+        class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        opener = urllib.request.build_opener(_NoRedirectHandler, PinnedHTTPHandler, PinnedHTTPSHandler, BlockedFileHandler, BlockedFTPHandler)
+        with opener.open(request, timeout=timeout) as response:  # noqa: S310 - operator-supplied webhook
             return 200 <= response.status < 300
     except Exception as delivery_exc:  # noqa: BLE001 - delivery failure must not raise
         logger.warning(

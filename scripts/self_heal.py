@@ -17,7 +17,7 @@ import sys
 
 def run_cmd(cmd):
     try:
-        subprocess.run(cmd, check=False)
+        subprocess.run(cmd, check=False, shell=False)  # nosec B603 - explicit shell=False
     except FileNotFoundError:
         pass
 
@@ -25,7 +25,7 @@ def run_cmd(cmd):
 def check_health():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     healthcheck_script = os.path.join(repo_root, "scripts", "healthcheck.py")
-    result = subprocess.run([sys.executable, healthcheck_script])
+    result = subprocess.run([sys.executable, healthcheck_script], shell=False)  # nosec B603 - explicit shell=False
     return result.returncode == 0
 
 
@@ -34,7 +34,7 @@ def has_diff():
 
 
 def _status():
-    result = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+    result = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True, shell=False)  # nosec B603 - explicit shell=False
     return result.stdout.strip()
 
 
