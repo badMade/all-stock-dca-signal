@@ -8183,6 +8183,76 @@ def test_seed_ledger_from_prior_runs_includes_ambiguous_placement_notional(tmp_p
     assert ex.ledger.week_planned(date(2026, 6, 30)) == 15.0
 
 
+def test_seed_ledger_keeps_unknown_marker_when_same_ticker_rows_are_ambiguous(tmp_path):
+    """A known fill cannot resolve an id-less marker when a sibling row is amountless."""
+    state_root = tmp_path / "live"
+    run_dir = state_root / "20260630_1030ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "ambiguous-physical-rows",
+                "trading_day": "2026-06-30",
+                "unreconstructable_submitted_tickers": ["AAPL"],
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "filled",
+                        "order_id": "distinct-fill",
+                        "planned_amount_usd": 5.0,
+                    },
+                    {
+                        "ticker": "AAPL",
+                        "status": "pending",
+                        "order_id": None,
+                        "planned_amount_usd": None,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        morning_run_state_root=str(state_root),
+        cap_seed_roots=(),
+        morning_daily_cap_usd=90.0,
+        morning_weekly_cap_usd=450.0,
+        approved_test_dates=frozenset({date(2026, 6, 30)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = datetime.combine(date(2026, 6, 30), time(10, 30), tzinfo=EASTERN)
+
+    ex._seed_ledger_from_prior_runs(now)
+
+    assert ex.ledger.remaining_daily(now.date()) == 0.0
+    assert ex.ledger.remaining_weekly(now.date()) == 0.0
+    assert any(
+        row.get("ticker") == "AAPL"
+        and row.get("synthesized_from_unreconstructable_submission") is True
+        for row in ex._prior_same_day_candidate_rows
+    ), "the durable unknown-notional marker must survive fixed-slot carry-forward"
+
+    class _RecordingBroker(FakeLiveBroker):
+        def __init__(self):
+            self.place_calls = []
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.place_calls.append((ticker, notional_usd, ref_id))
+            return super().place_market_buy(ticker, notional_usd, ref_id)
+
+    retry = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _RecordingBroker()
+    result = retry.run(
+        now,
+        DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.03}),
+        broker=broker,
+    )
+
+    assert broker.place_calls == []
+    assert result["artifacts"]["unreconstructable_submitted_tickers"] == ["AAPL"]
+
+
 @pytest.mark.parametrize(
     ("broker_rows", "resolved"),
     [

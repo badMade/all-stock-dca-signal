@@ -6904,6 +6904,7 @@ class MorningDCAExecutor(DCAExecutor):
                 continue
             total = 0.0
             submitted_rows = []
+            physical_row_counts: Dict[str, int] = {}
             _buy_candidates = state.get("buy_candidates") or []
             if not isinstance(_buy_candidates, list):
                 _buy_candidates = []
@@ -6928,6 +6929,15 @@ class MorningDCAExecutor(DCAExecutor):
                     and candidate.get("ambiguous_placement_exception") is not True
                 ):
                     continue
+                candidate_ticker = candidate.get("ticker")
+                if (
+                    isinstance(candidate_ticker, str)
+                    and candidate_ticker
+                    and not candidate.get("whole_share_settlement_adjustment")
+                ):
+                    physical_row_counts[candidate_ticker] = (
+                        physical_row_counts.get(candidate_ticker, 0) + 1
+                    )
                 amount = candidate.get("planned_amount_usd")
                 if amount is None:
                     amount = candidate.get("hypothetical_amount_usd")
