@@ -6318,6 +6318,23 @@ class RobinhoodBroker:
             # A failure envelope that still carries an inner order id (e.g.
             # {"success": false, "data": {"order": {...}}}) must not be read as success.
             logger.error("place_equity_order for %s reported failure: %s", ticker, _artifact_safe_repr(response))
+            # Normalize the complete response before any shape-specific
+            # unwrapping. Connectors may place an accepted order below an
+            # arbitrary failure/context wrapper rather than ``data`` or
+            # ``error``; losing that identity would prevent exact-reference
+            # reconciliation and could exclude real spend from cap accounting.
+            _response_envelopes = list(_placement_response_dicts(response))
+            _response_order_groups = _order_identity_groups(_response_envelopes)
+            _response_has_acceptance = _placement_response_has_acceptance_evidence(response)
+            _response_traversal_incomplete = any(
+                layer.get("_placement_response_incomplete") is True for layer in _response_envelopes
+            )
+            _response_single_order_id = (
+                _response_order_groups[0][0] if len(_response_order_groups) == 1 else None
+            )
+            _response_structurally_ambiguous = (
+                _response_traversal_incomplete or len(_response_order_groups) > 1
+            )
             data = _unwrap_seeking_order_evidence(response)
             # A structured "error" value is real order evidence too, not just a
             # message: `_is_error_response` above already treats a truthy "error"
@@ -6592,6 +6609,13 @@ class RobinhoodBroker:
                 if envelope_order_id and not _order_identity_conflicts and not ambiguous_nested_orders
                 else None
             )
+            if (
+                _carryable_failure_order_id is None
+                and _response_has_acceptance
+                and _response_single_order_id is not None
+                and not _response_structurally_ambiguous
+            ):
+                _carryable_failure_order_id = _response_single_order_id
             if _failure_is_broker_authored(
                 response,
                 order,
@@ -6636,7 +6660,12 @@ class RobinhoodBroker:
                     # possibly-live orders the batch never accounted for
                     # (Codex review, PR #859 round 31: "Honor ambiguity
                     # before proving an ID-bearing failure").
-                    if envelope_order_id and not ambiguous_nested_orders and not _unresolved_sibling_orders:
+                    if (
+                        envelope_order_id
+                        and not ambiguous_nested_orders
+                        and not _unresolved_sibling_orders
+                        and not _response_has_acceptance
+                    ):
                         if terminal_broker_row_proves_no_order(_evidence_order):
                             raise FractionalPlacementRejectedError(
                                 f"live placement for {ticker} was explicitly rejected: {outer_failure}",
@@ -6650,6 +6679,7 @@ class RobinhoodBroker:
                     elif (
                         not ambiguous_nested_orders
                         and not _unresolved_sibling_orders
+                        and not _response_has_acceptance
                         and not _envelope_order_id_unrepresentable
                         and not _reconciled_order_may_have_executed(_evidence_order)
                         and _failure_envelope_state_permits_proven_rejection(_evidence_order)
@@ -6703,10 +6733,19 @@ class RobinhoodBroker:
                     # review, PR #1164: "Preserve sibling-order ambiguity
                     # through reconciliation").
                     structurally_ambiguous=(
-                        _order_identity_conflicts or ambiguous_nested_orders or _unresolved_sibling_orders
+                        _order_identity_conflicts
+                        or ambiguous_nested_orders
+                        or _unresolved_sibling_orders
+                        or _response_structurally_ambiguous
                     ),
                 )
-            if ambiguous_nested_orders or _unresolved_sibling_orders or _order_identity_conflicts:
+            if (
+                ambiguous_nested_orders
+                or _unresolved_sibling_orders
+                or _order_identity_conflicts
+                or _response_has_acceptance
+                or _response_structurally_ambiguous
+            ):
                 # No usable envelope-level id survived above, but the
                 # response still names 2+ conflicting candidate orders --
                 # either through the "orders" collection itself

@@ -1148,9 +1148,27 @@ def test_broker_place_finds_live_order_nested_in_error_container():
             "error": {"order": {"id": "ORD-NESTED", "state": "queued"}},
         },
     )
-    with pytest.raises(RuntimeError, match="failed") as exc_info:
+    with pytest.raises(AmbiguousPlacementResponseError, match="failed") as exc_info:
         broker.place_market_buy("AAPL", 1.0, "ref1")
-    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+    assert exc_info.value.order_id == "ORD-NESTED"
+
+
+def test_broker_place_finds_live_order_nested_in_nonstandard_failure_container():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": False,
+            "connector_failure": {
+                "context": {"order": {"id": "ORD-HIDDEN", "state": "queued"}}
+            },
+        },
+    )
+
+    with pytest.raises(AmbiguousPlacementResponseError, match="failed") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+    assert exc_info.value.order_id == "ORD-HIDDEN"
 
 
 def test_broker_place_handles_cyclic_failure_response_without_looping():

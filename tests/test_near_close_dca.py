@@ -25031,6 +25031,59 @@ def test_a_scheduled_unresolved_placement_halt_records_every_skipped_candidate(t
     assert run_state["usage_proxy"]["order_reviews_attempted"] == 0
 
 
+def test_nested_queued_failure_order_reconciles_before_later_batch_placement(tmp_path):
+    """A hidden accepted order must enter reconciliation and halt the batch."""
+    import near_close_dca
+    from dca_live_adapters import RobinhoodBroker
+
+    events = []
+
+    class _NestedFailureBroker(DryRunBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            events.append(("place", ticker))
+            adapter = RobinhoodBroker(
+                account="test-account",
+                enable_live_orders=True,
+                place_fn=lambda **kwargs: {
+                    "success": False,
+                    "connector_failure": {
+                        "context": {"order": {"id": "ORD-HIDDEN", "state": "queued"}}
+                    },
+                },
+            )
+            return adapter.place_market_buy(ticker, notional_usd, ref_id)
+
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            events.append(("reconcile", ticker))
+            return {"id": "ORD-HIDDEN", "state": "queued", "dollar_amount": 2.0}
+
+    now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
+    config = StrategyConfig(
+        dry_run=False,
+        tickers=config.tickers,
+        approved_test_dates=config.approved_test_dates,
+    )
+    broker = _NestedFailureBroker(cash=500.0, reference_prices={ticker: 98.0 for ticker in config.tickers})
+
+    with pytest.raises(near_close_dca.UnresolvedPlacementError):
+        run_daily_compact(
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
+            options=CompactRunOptions(
+                artifacts_dir=os.path.join(tmp_path, "runs", "nested-failure"),
+                scheduled=True,
+            ),
+        )
+
+    placement_events = [event for event in events if event[0] == "place"]
+    assert len(placement_events) == 1
+    assert ("reconcile", placement_events[0][1]) in events
+
+
 def test_a_manual_unresolved_halt_reports_only_completed_reviews(tmp_path):
     """A manual run's unresolved-placement halt must report the actual number
     of completed review_market_buy calls, not one per reconstructed candidate
