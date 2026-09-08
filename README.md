@@ -189,4 +189,7 @@ python run_dca.py --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir /tmp/
 
 ## More documentation
 
-Start with [`docs/README.md`](docs/README.md) for the strategy documentation index and operational runbooks.
+New contributors should begin with the
+[`docs/newcomer_guide.md`](docs/newcomer_guide.md) architecture and learning
+guide, then use [`docs/README.md`](docs/README.md) for the complete strategy and
+operations index.

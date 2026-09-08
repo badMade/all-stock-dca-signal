@@ -11,6 +11,7 @@ environment (see the repository README).
 
 | File | Contents |
 |---|---|
+| [newcomer_guide.md](newcomer_guide.md) | First-read architecture guide: core components, execution flow, safety boundaries, and a recommended learning path |
 | [repo_map.md](repo_map.md) | Structural map of every runner, report producer, and prediction tool: slot-to-entry-point ownership, which reporting modules are library-only, and which tools can reach live sizing. Read before opening a core module |
 | [local_console.md](local_console.md) | `python3 from.py`: local interface, demo launcher, daily summaries, timing and Octopus predictions |
 | [reliability_spec.md](reliability_spec.md) | Formal run-state, reconciliation, and artifact-contract spec + honest implementation-status matrix |
