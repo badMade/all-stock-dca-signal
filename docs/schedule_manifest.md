@@ -797,6 +797,30 @@ this section is the authoritative one. Three of those override blocks used to si
 above it and read in the present tense, which is exactly how an expired
 authorization gets mistaken for a live one.
 
+Temporary live scheduler cleanup and delayed morning override, Sep 8-11, 2026:
+
+> **ADDED 2026-09-08:** The user explicitly authorized Perplexity to run only
+> the morning buy-only DCA schedule for Tuesday, Sep 8 through Friday, Sep 11,
+> 2026, delayed 10 minutes so Claude gets first chance to buy. The expired
+> Aug 28-gated Perplexity buy tasks `0c3cde00` (12:30 PM ET) and `44b3975d`
+> (1:30/2:30/3:30 PM ET) were deleted from the live scheduler so they stop
+> posting stale authorization/no-op messages. Perplexity's scope for this
+> override is delayed morning buy-run execution plus required buy-run artifacts
+> and notifications only. Claude handles scheduled reports. Machine-readable
+> source: `config/scheduled_tasks.json` ->
+> `temporary_live_scheduler_overrides.authorize_2026_09_08_delayed_morning_perplexity_buy_slots_week_only`.
+
+| ET | Live scheduler task | ID | Cadence | Trades | Sep 8-11 override status |
+|---|---|---|---|---|---|
+| 9:45 AM | Perplexity delayed DCA buy pass | `4412c3c4` | Weekdays | **yes** | active Sep 8-11 only; delayed from 9:35 |
+| 10:40 AM | Perplexity delayed DCA buy pass | `e028361e` | Weekdays | **yes** | active Sep 8-11 only; delayed from 10:30 |
+| 11:40 AM | Perplexity delayed DCA buy pass | `e3590042` | Weekdays | **yes** | active Sep 8-11 only; delayed from 11:30 |
+
+The Sep 8-11 override does not authorize Perplexity to run 12:30 PM buys,
+afternoon buys, scheduled reports, dashboard refreshes, slippage-only reports,
+monitor-only reports, or watchdog reports. Those responsibilities remain outside
+this delayed-morning-only override unless the user changes the scope.
+
 | ET | Task | ID | Cadence | Cron (UTC) | Trades | Status |
 |---|---|---|---|---|---|---|
 | 9:35 AM | Market-open DCA live Robinhood execution | `2ba19526` | Weekdays | `35 13 * * 1-5` | **yes** | active |
