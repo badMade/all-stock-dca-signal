@@ -109,6 +109,7 @@ from near_close_dca import (
     PriorSameDayAllocation,
     StrategyConfig,
     _is_usable_reconciled_order_id,
+    _recovered_broker_notional,
     _ticker_sizing,
     account_pinning_failure,
     completed_bar_anchor,
@@ -6495,7 +6496,9 @@ class MorningDCAExecutor(DCAExecutor):
         )
         return {"artifacts": artifacts, "paths": paths}
 
-    def _seed_ledger_from_prior_runs(self, now: datetime) -> None:
+    def _seed_ledger_from_prior_runs(
+        self, now: datetime, broker: Optional[BrokerAdapter] = None
+    ) -> None:
         """Fold already-submitted same-day/same-week spend into the ledger.
 
         ``MorningLedger`` is in-memory and this executor is normally instantiated
@@ -6969,6 +6972,40 @@ class MorningDCAExecutor(DCAExecutor):
                     if not isinstance(_unrec_ticker, str) or not _unrec_ticker:
                         continue
                     if _unrec_ticker in _already_represented:
+                        continue
+                    # A broker fill may resolve an order-ID-less durable marker,
+                    # but uniqueness is judged across EVERY same-ticker row,
+                    # before discarding rows whose notional cannot be proven.
+                    # Otherwise one priced fill beside one price-only row looks
+                    # uniquely resolvable and silently releases unknown capital.
+                    _resolved_fill = None
+                    if is_scheduled_today and broker is not None:
+                        _orders_reader = getattr(broker, "same_day_ticker_orders", None)
+                        if callable(_orders_reader):
+                            try:
+                                _same_ticker_rows = _orders_reader(_unrec_ticker, trading_day)
+                            except Exception:  # noqa: BLE001 - fail closed below
+                                _same_ticker_rows = None
+                            if isinstance(_same_ticker_rows, list) and len(_same_ticker_rows) == 1:
+                                _row = _same_ticker_rows[0]
+                                if isinstance(_row, dict):
+                                    _proven_notional = _recovered_broker_notional(_row)
+                                    if _proven_notional is not None and _proven_notional > 0:
+                                        _resolved_fill = (_row, _proven_notional)
+                    if _resolved_fill is not None:
+                        _fill_row, _fill_notional = _resolved_fill
+                        total += _fill_notional
+                        submitted_rows.append(
+                            {
+                                "ticker": _unrec_ticker,
+                                "status": "filled",
+                                "order_id": _fill_row.get("id") or _fill_row.get("order_id"),
+                                "buy_multiplier": None,
+                                "planned_amount_usd": _fill_notional,
+                                "reconciled_from_broker_fill": True,
+                            }
+                        )
+                        _already_represented.add(_unrec_ticker)
                         continue
                     # This executor's own configured ceiling, not a flat $10
                     # sentinel -- schemas/budgets.schema.json does not cap
@@ -9499,7 +9536,7 @@ class MorningDCAExecutor(DCAExecutor):
         # already seeded above by _compute_top_up's cap_seed_roots scan, so
         # _seed_ledger_from_prior_runs must not also seed today's amount here
         # or the same on-disk artifact would be double-counted.
-        self._seed_ledger_from_prior_runs(now)
+        self._seed_ledger_from_prior_runs(now, broker=broker)
         # Subtract prior same-day spend (recorded by _compute_top_up) from the
         # pre-run budget so caps account for earlier manual/recovery fills that
         # already consumed part of the daily/weekly cap on other tickers.

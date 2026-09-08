@@ -6162,6 +6162,10 @@ class RobinhoodBroker:
             total += amount
         return total
 
+    def same_day_ticker_orders(self, ticker: str, trading_day: date) -> List[Dict[str, Any]]:
+        """Return every broker row used to reconcile same-day ticker exposure."""
+        return list(self._same_day_orders(ticker, trading_day))
+
     def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
         if self._tradability_fn is None:
             self._refuse_unwired_live_lookup("tradability_fn", f"assume {ticker} is fractional-tradable")

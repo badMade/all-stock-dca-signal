@@ -8073,6 +8073,72 @@ def test_seed_ledger_from_prior_runs_includes_ambiguous_placement_notional(tmp_p
     assert ex.ledger.week_planned(date(2026, 6, 30)) == 15.0
 
 
+@pytest.mark.parametrize(
+    ("broker_rows", "resolved"),
+    [
+        ([{"id": "fill-1", "state": "filled", "cumulative_quantity": "2", "average_price": "6"}], True),
+        (
+            [
+                {"id": "fill-1", "state": "filled", "cumulative_quantity": "2", "average_price": "6"},
+                {"id": "fill-2", "state": "filled", "average_price": "6"},
+            ],
+            False,
+        ),
+    ],
+    ids=("single-proven-fill", "ambiguous-price-only-second-row"),
+)
+def test_no_id_marker_reconciliation_counts_all_same_ticker_broker_rows(
+    tmp_path, broker_rows, resolved
+):
+    """A no-ID marker resolves only from one total row with a proven notional."""
+
+    class Broker(FakeLiveBroker):
+        def same_day_ticker_orders(self, ticker, trading_day):
+            return broker_rows
+
+    now = _now_live()
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        cap_seed_roots=(),
+        approved_test_dates=frozenset({now.date()}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(now)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "unknown-no-id",
+                "trading_day": now.date().isoformat(),
+                "buy_candidates": [],
+                "unreconstructable_submitted_tickers": ["AAPL"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ex._seed_ledger_from_prior_runs(now, broker=Broker())
+
+    if resolved:
+        assert ex._cap_seed_scan_incomplete is False
+        assert ex.ledger.day_planned(now.date()) == pytest.approx(12.0)
+        assert ex._prior_same_day_candidate_rows == [
+            {
+                "ticker": "AAPL",
+                "status": "filled",
+                "order_id": "fill-1",
+                "buy_multiplier": None,
+                "planned_amount_usd": 12.0,
+                "reconciled_from_broker_fill": True,
+            }
+        ]
+    else:
+        assert ex._cap_seed_scan_incomplete is True
+        assert ex.ledger.week_planned(now.date()) == pytest.approx(ex.ledger.weekly_cap_usd)
+        assert ex._prior_same_day_candidate_rows[0]["synthesized_from_unreconstructable_submission"] is True
+
+
 def test_cap_seed_scan_finds_sibling_suffix_fills_under_the_current_stream_root(tmp_path):
     """Codex review ("Seed the weekly cap from every intraday slot"):
     intraday_dca's three slots (11:30/13:30/14:30) all share ONE state root
