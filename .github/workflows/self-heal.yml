@@ -112,7 +112,7 @@ jobs:
           echo "python_version=${PY_VERSION:-3.11}" >> $GITHUB_OUTPUT
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ steps.scope_check.outputs.python_version || '3.11' }}
 
