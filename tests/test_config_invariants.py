@@ -2550,10 +2550,156 @@ def test_midday_live_mirror_counts_complete_afternoon_evidence_by_trading_day():
 def test_market_open_live_mirror_checks_the_union_of_all_repo_probes():
     text = _market_open_live_mirror_text()
     gate_2 = text.split("GATE 2 - REPO REACHABLE", 1)[1].split("GATE 3 - TRADING WINDOW", 1)[0]
-    assert "Run ALL THREE probes" in gate_2
+    assert "Run ALL FOUR probes" in gate_2
     assert "DEDUPLICATED UNION" in gate_2
     assert "require exactly one surviving checkout" in gate_2
     assert "2>/dev/null | head" not in gate_2
+
+
+def test_every_live_mirror_probes_outside_the_cowork_mount_layout():
+    """The 2026-09-08 alert reported "no repo access" for a slot whose shell
+    never ran, but the probes themselves have a narrower gap of their own:
+    they only ever looked under ``/sessions/*/mnt/``. That is the Cowork mount
+    layout, not the only place this checkout lives. ``config/intraday_dca.json``
+    already names ``/home/user/workspace/cron_tracking`` as the live artifact
+    root for the sibling executor on cron 4412c3c4, and a Claude session's own
+    clone can sit at ``/home/user/all-stock-dca`` -- neither is under
+    ``/sessions``, so all three original probes come back empty and Gate 2
+    reports a disconnected folder for a repo that was readable the whole time.
+    Probe 4 closes that, under the same union/exactly-one/config-files rules as
+    the others so it cannot be a back door into an arbitrary tree.
+    """
+    probe_4 = "find /home/user -maxdepth 3 -type d -name all-stock-dca"
+    for filename in _LIVE_MIRROR_FILES:
+        text = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")
+        gate_2 = _gate_section(text, "GATE 2 - REPO REACHABLE")
+        assert probe_4 in gate_2, f"{filename}: Gate 2 never looks outside /sessions/*/mnt/"
+        assert "FOUR probes" in gate_2, (
+            f"{filename}: Gate 2 still tells the executor to run three probes"
+        )
+        # The added probe must not become an exception to the ambiguity rules
+        # the other three are bound by.
+        assert "same deduplicated union" in gate_2, (
+            f"{filename}: probe 4 must fold into the same union as the others"
+        )
+        assert "exactly-one-surviving-checkout" in gate_2, (
+            f"{filename}: probe 4 must count toward the same exactly-one rule"
+        )
+        assert "2>/dev/null | head" not in gate_2, f"{filename}: probe output is truncated"
+
+
+def test_live_mirror_interlock_prefix_names_the_fourth_probe():
+    # The four files carrying the compact interlock are the ones whose Gate 2
+    # body sits past the truncation boundary; a truncated fire there sees only
+    # this line, so a probe missing from it does not exist for that fire.
+    boundary = 5_850
+    filenames = (
+        "1030ET-1030-dca-recurring-buy.txt",
+        "1130ET-1130-mornig-buying-run.txt",
+        "1330ET-130-pm-afternoon-buyiing-run.txt",
+        "1430ET-230-pm-afternoon-buying-run.txt",
+    )
+    for filename in filenames:
+        prefix = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")[:boundary]
+        assert "Run ALL FOUR repo probes" in prefix, f"{filename}: interlock still says three"
+        assert "find /home/user -maxdepth 3 -type d -name all-stock-dca" in prefix, (
+            f"{filename}: the fourth probe falls after the truncation boundary"
+        )
+
+
+def _gate_section(text: str, heading: str) -> str:
+    """The body of one ``GATE N - NAME`` section, up to the next gate heading.
+
+    The seven live mirrors do not agree on which gate follows which -- the
+    1230 mirror folds Gates 0/1/3/4 into one script far above Gate 2, so its
+    Gate 2 is followed by ``GATE 5 - BUY LIST`` rather than the
+    ``GATE 3 - TRADING WINDOW`` every other mirror has next. Slicing to the
+    NEXT line-initial ``GATE `` heading keeps one helper usable for all seven
+    instead of hard-coding a successor per file.
+    """
+    body = text.split(heading, 1)[1]
+    match = re.search(r"^GATE \S", body, re.MULTILINE)
+    return body[: match.start()] if match else body
+
+
+# The 2026-09-08 9:35 fire never reached a gate: the sandboxed shell tool
+# refused to start on four consecutive attempts, each timing out at 120-180
+# seconds, so `ls -d /sessions/*/mnt/all-stock-dca` never ran. The executor had
+# no branch for "the shell itself is dead", so it improvised one -- it retried
+# until roughly a third of the 9:30-10:00 window was gone, then reported the
+# repo-access reason ("executor ran without repo access, no buy list
+# available") whose stated remedy is to reconnect the operator's folder. The
+# folder was never shown to be disconnected; nothing ever looked. It also
+# labelled the abort "GATE 1 - REPO REACHABLE", which is the TIME SANITY
+# bucket in scripts/alert_digest.py's `Failing gate: Gate N` grouping, so the
+# repeat-streak count for this gate can never form. These two tests pin the
+# branch that closes all three, in the truncation-safe prefix and in Gate 2's
+# own body.
+_SHELL_UNAVAILABLE_REASON = "executor shell tool unavailable, repo probes could not run"
+
+
+def test_every_live_mirror_front_loads_the_shell_unavailable_rule():
+    boundary = 5_850
+    for filename in _LIVE_MIRROR_FILES:
+        prefix = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")[:boundary]
+        lowered = prefix.casefold()
+        assert "TRUNCATION-SAFE SHELL-UNAVAILABLE RULE:" in prefix, (
+            f"{filename}: a dead shell aborts before any gate runs, so the rule "
+            "must survive the scheduler truncation boundary"
+        )
+        assert _SHELL_UNAVAILABLE_REASON in prefix, (
+            f"{filename}: the distinct shell-unavailable reason must appear "
+            "before the truncation boundary, not only in Gate 2's body"
+        )
+        assert "abort as GATE 2" in prefix, (
+            f"{filename}: the truncation-safe rule must name the canonical gate "
+            "number, or the alert lands in the wrong alert_digest bucket"
+        )
+        assert "retry at most once" in lowered, (
+            f"{filename}: the retry budget must be bounded before the truncation "
+            "boundary -- an unbounded retry loop is what burned the 9:35 window"
+        )
+        assert "not reconnecting the folder" in lowered, (
+            f"{filename}: the truncation-safe rule must reject the repo-access "
+            "remedy, which sends the operator to fix a mount nothing examined"
+        )
+
+
+def test_every_live_mirror_gate2_separates_a_dead_shell_from_a_missing_repo():
+    for filename in _LIVE_MIRROR_FILES:
+        text = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")
+        gate_2 = _gate_section(text, "GATE 2 - REPO REACHABLE")
+        lowered = gate_2.casefold()
+
+        # The liveness check itself, bounded in both attempts and wall clock.
+        assert "SHELL UNAVAILABLE IS ITS OWN ABORT" in gate_2, f"{filename}: Gate 2 has no dead-shell branch"
+        assert "retry it AT MOST ONCE" in gate_2, f"{filename}: Gate 2 leaves the retry count open-ended"
+        assert "no more than 90 seconds" in gate_2, f"{filename}: Gate 2 leaves the retry deadline open-ended"
+
+        # The distinct reason, and an explicit refusal of the repo-access one.
+        assert _SHELL_UNAVAILABLE_REASON in gate_2, f"{filename}: Gate 2 has no distinct shell-unavailable reason"
+        assert "never the repo-access reason below" in gate_2, (
+            f"{filename}: Gate 2 must forbid reporting a dead shell as missing repo access"
+        )
+        assert "restore the workspace shell tool" in lowered, (
+            f"{filename}: Gate 2 must state the remedy that actually applies"
+        )
+
+        # The alert has to name this gate by its canonical number: the digest
+        # groups on that token and nothing else recovers a mislabelled bucket.
+        assert "Label the failing gate GATE 2" in gate_2, (
+            f"{filename}: Gate 2 must pin its own number in the alert it emits"
+        )
+        assert "scripts/alert_digest.py" in gate_2, (
+            f"{filename}: Gate 2 must say why the gate number matters"
+        )
+
+        # $ROOT resolves through the same shell, so this abort is the
+        # pre-Gate-0 "no artifact is possible" case, not a silent skip.
+        assert "no artifact is possible" in lowered, (
+            f"{filename}: Gate 2 must route a dead-shell abort to the no-artifact case"
+        )
+        assert "all three" in lowered, f"{filename}: Gate 2's dead-shell abort must still alert on every channel"
 
 
 def test_midday_live_mirror_normalizes_broker_notionals_before_orders():

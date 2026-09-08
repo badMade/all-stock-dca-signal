@@ -39,6 +39,34 @@ Characteristics of this generation:
   re-captured, the ACTUAL live 9:35 task still carries the older Gates 5 and 7,
   still cannot produce a buy list, and lacks Gate 7's new placement-boundary
   price safety check. See `docs/market_open_signal_entry.md`.
+* ALL SEVEN copies are AHEAD of live for Gate 2 as of 2026-09-08. The 9:35
+  fire that day never reached a gate: the sandboxed shell tool refused to
+  start on four consecutive attempts, each timing out at 120-180 seconds, so
+  the `ls -d /sessions/*/mnt/all-stock-dca` probe never ran. Gate 2 had no
+  branch for "the shell itself is dead", so the executor improvised one --
+  retried until roughly a third of the window was gone, then reported the
+  repo-access reason whose remedy is "reconnect the folder", which nothing
+  had shown to be disconnected, and labelled the abort "GATE 1 - REPO
+  REACHABLE" (the TIME SANITY bucket in `scripts/alert_digest.py`'s
+  `Failing gate: Gate N` grouping). Every mirror now carries a bounded
+  liveness probe, the distinct reason `executor shell tool unavailable, repo
+  probes could not run`, the shell-restore remedy, and the canonical gate
+  number, both in Gate 2's body and in the truncation-safe prefix. Same
+  caveat as every other bullet here: until a human applies these bodies via
+  `update_scheduled_task` and the mirrors are re-captured, the live tasks
+  still have no dead-shell branch and will improvise again.
+* Gate 2 also gained a FOURTH repo probe,
+  `find /home/user -maxdepth 3 -type d -name all-stock-dca`, in the same
+  change. The original three only ever looked under `/sessions/*/mnt/`, which
+  is the Cowork mount layout and not the only place this checkout lives:
+  `config/intraday_dca.json` names `/home/user/workspace/cron_tracking` as the
+  live artifact root for the sibling executor on cron `4412c3c4`, and a Claude
+  session's own clone can sit at `/home/user/all-stock-dca`. In either
+  environment all three original probes come back empty and Gate 2 reports a
+  disconnected folder for a repo that was readable the whole time. The fourth
+  probe folds into the same deduplicated union, the same
+  exactly-one-surviving-checkout rule, and the same required-config-files
+  check, so it is not a back door into an arbitrary tree.
 * Live placement is authorized for all seven slots as of 2026-09-02, per
   Geoff's explicit direction that order placement be on for all scheduled
   buy runs. The 1230 slot was the one exception up to that point, and its
