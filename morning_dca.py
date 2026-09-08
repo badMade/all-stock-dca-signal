@@ -5950,6 +5950,11 @@ class MorningDCAExecutor(DCAExecutor):
             # (Codex review: "Rebuild carried rows whose notional is
             # unusable"). Only a row with a genuinely usable notional is
             # complete enough to suppress synthesis.
+            physical_rows_by_ticker: Dict[str, List[dict]] = {}
+            for row in submitted_rows:
+                row_ticker = row.get("ticker")
+                if isinstance(row_ticker, str):
+                    physical_rows_by_ticker.setdefault(row_ticker, []).append(row)
             usable_row_tickers = {
                 row.get("ticker")
                 for row in submitted_rows
@@ -5973,7 +5978,16 @@ class MorningDCAExecutor(DCAExecutor):
             # exists for this ticker, which is the evidence a later stream's
             # duplicate check reads.
             synthesized_rows = []
+            prior_unreconstructable = prior_artifacts.get("unreconstructable_submitted_tickers")
             unreconstructable: List[str] = []
+            if isinstance(prior_unreconstructable, list):
+                for marker_ticker in prior_unreconstructable:
+                    if not isinstance(marker_ticker, str) or not marker_ticker:
+                        continue
+                    physical_rows = physical_rows_by_ticker.get(marker_ticker, [])
+                    if len(physical_rows) != 1 or not _usable_planned_amount(physical_rows[0]):
+                        unreconstructable.append(marker_ticker)
+            outcome_unreconstructable: set[str] = set()
             for outcome_ticker, outcome in submitted_outcomes.items():
                 if outcome_ticker in usable_row_tickers:
                     continue
@@ -6021,7 +6035,9 @@ class MorningDCAExecutor(DCAExecutor):
                     # the ticker is named on the artifact and the run is a
                     # trading failure, which is what an unreconstructable
                     # submission actually is.
-                    unreconstructable.append(outcome_ticker)
+                    if outcome_ticker not in unreconstructable:
+                        unreconstructable.append(outcome_ticker)
+                    outcome_unreconstructable.add(outcome_ticker)
                     _log.error(
                         "%s: prior submitted order for %s carries no readable amount; its "
                         "notional cannot be reconstructed for the same-day allocation scan",
@@ -6071,7 +6087,7 @@ class MorningDCAExecutor(DCAExecutor):
             # skipping its unusable amount, which can prematurely exhaust
             # max_orders_per_day (Codex review: "Remove unusable rows when
             # outcomes remain unreconstructable").
-            resolved_tickers = {row["ticker"] for row in synthesized_rows} | set(unreconstructable)
+            resolved_tickers = {row["ticker"] for row in synthesized_rows} | outcome_unreconstructable
             submitted_rows = [
                 row
                 for row in submitted_rows
@@ -6987,9 +7003,25 @@ class MorningDCAExecutor(DCAExecutor):
                     for row in submitted_rows
                     if isinstance(row, dict) and isinstance(row.get("ticker"), str)
                 }
+                _physical_rows_by_ticker: Dict[str, int] = {}
+                for row in _buy_candidates:
+                    if not isinstance(row, dict) or not isinstance(row.get("ticker"), str):
+                        continue
+                    row_status = row.get("status")
+                    if (
+                        isinstance(row_status, str)
+                        and row_status in _ORDER_BEARING_CANDIDATE_STATUSES
+                    ) or row.get("ambiguous_placement_exception") is True:
+                        row_ticker = row["ticker"]
+                        _physical_rows_by_ticker[row_ticker] = _physical_rows_by_ticker.get(row_ticker, 0) + 1
                 for _unrec_ticker in _unreconstructable:
                     if not isinstance(_unrec_ticker, str) or not _unrec_ticker:
                         continue
+                    # A ticker-only marker can be resolved by a notional row
+                    # only when that row identifies the sole physical order.
+                    # Count before filtering unusable notionals: otherwise one
+                    # known row plus one amountless sibling looks uniquely
+                    # resolved and silently reopens the aggregate caps.
                     if (
                         _unrec_ticker in _already_represented
                         and _physical_rows_by_ticker.get(_unrec_ticker) == 1

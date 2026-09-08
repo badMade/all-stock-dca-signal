@@ -4657,6 +4657,58 @@ def test_blocked_retry_validates_outcome_only_order_amount_and_status(
         assert row["synthesized_from_broker_outcome"] is True
 
 
+def test_ambiguous_same_ticker_rows_keep_unknown_notional_marker_across_retries(tmp_path):
+    """An amountless sibling prevents ticker-only evidence from resolving a marker."""
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",))
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    now = _now_live()
+    first_executor = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = first_executor.run_state_dir(now)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state = {
+        "run_id": "ambiguous-aapl",
+        "trading_day": now.date().isoformat(),
+        "buy_candidates": [
+            {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0},
+            {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": None},
+        ],
+        "broker_outcomes": {
+            "AAPL": {"ticker": "AAPL", "status": "filled", "submitted_amount_usd": 3.0}
+        },
+        "unreconstructable_submitted_tickers": ["AAPL"],
+    }
+    (run_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.10})
+    carried = first_executor.run(now, data, broker=None)["artifacts"]
+
+    assert carried["unreconstructable_submitted_tickers"] == ["AAPL"]
+    assert len([row for row in carried["buy_candidates"] if row.get("ticker") == "AAPL"]) == 2
+
+    class RecordingBroker(FakeLiveBroker):
+        def __init__(self):
+            self.placements = []
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placements.append((ticker, notional_usd, ref_id))
+            return super().place_market_buy(ticker, notional_usd, ref_id)
+
+    retry_executor = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = RecordingBroker()
+    retried = retry_executor.run(now + timedelta(minutes=1), data, broker=broker)
+
+    assert retry_executor.ledger.remaining_daily(now.date()) == 0.0
+    assert retry_executor.ledger.remaining_weekly(now.date()) == 0.0
+    assert retried["artifacts"]["unreconstructable_submitted_tickers"] == ["AAPL"]
+    assert broker.placements == []
+
+
 @pytest.mark.parametrize("pre_terminal_status", ["pending", "unconfirmed"])
 def test_blocked_retry_preserves_pending_and_unconfirmed_orders(tmp_path, pre_terminal_status):
     # Codex review ("Preserve pending and unconfirmed orders on blocked
