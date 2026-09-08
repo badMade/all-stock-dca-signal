@@ -55,6 +55,37 @@ Characteristics of this generation:
   caveat as every other bullet here: until a human applies these bodies via
   `update_scheduled_task` and the mirrors are re-captured, the live tasks
   still have no dead-shell branch and will improvise again.
+* Gate 1 was corrected on 2026-09-08 after the 1:30 PM slot was killed by a
+  timezone misread. The run sampled 11:31, reported it as "11:31 AM ET" and
+  aborted as an off-schedule scheduler fault; 11:31 at that instant was
+  UTC-06:00 and New York was 1:31 PM, inside the 1:25-1:55 window. The slot was
+  on time. Six of the seven mirrors said only "Get the current ET time", which
+  a host in another zone answers confidently and wrongly -- the 1230 mirror
+  already derived it correctly as `datetime.now(ZoneInfo('America/New_York'))`
+  and is the precedent the other six now follow. Gate 1 also pins the only two
+  offsets a real ET timestamp carries (-04:00 / -05:00), routes the value
+  through `dca_runner._require_aware()`, and classifies a whole-hour
+  discrepancy as a probable timezone misread rather than a scheduler fault.
+  Fail-closed is unchanged: an out-of-window converted time still aborts.
+* Gate 2 and Gate 7 were corrected again on 2026-09-08 after three more slots
+  failed the same day and two 2026-09-04 alerts surfaced a second failure
+  class. The 10:30 and 11:30 fires lost the shell but kept FILE access, and
+  both read repo files successfully before still reporting repo access as the
+  failure -- which disproved two claims the morning's own fix had made: that a
+  dead shell means the repo is unreachable, and that it means no artifact is
+  possible. Gate 2 now reads `config/trading_window.json` as a fallback probe,
+  reports a readable repo with a distinct reason, and labels the alert by the
+  gate that actually failed (a successful read PASSES Gate 2; the run dies at
+  Gate 1 or Gate 5 instead). When a file write still works it must persist the
+  Gate 9 set, sourcing the path from the stream's own config rather than
+  `dca_paths`, and write the durable alert to the configured destination and
+  not the gitignored `artifacts/` tree the 11:30 fire used. Gate 7 gained a
+  branch for a `place_equity_order` refused by the platform before the broker
+  sees it ("Blocked by classifier", 2026-09-04 1:30 PM): a whole-batch stop,
+  one retry only, no `max_orders_per_day` attempt consumed, and the resolved
+  Gate 6.5 `buy_usd` amounts carried into the alert verbatim so they can be
+  placed by hand. Same caveat as every bullet here: none of it runs until a
+  human applies these bodies and re-captures the mirrors.
 * Gate 2 also gained a FOURTH repo probe,
   `find /home/user -maxdepth 3 -type d -name all-stock-dca`, in the same
   change. The original three only ever looked under `/sessions/*/mnt/`, which

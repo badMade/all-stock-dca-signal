@@ -2588,6 +2588,143 @@ def test_every_live_mirror_probes_outside_the_cowork_mount_layout():
         assert "2>/dev/null | head" not in gate_2, f"{filename}: probe output is truncated"
 
 
+def test_every_live_mirror_forbids_the_account_number_in_alerts():
+    """2026-09-08 12:30: the abort alert carried the live account number in
+    plain text. Nothing in any mirror forbade it -- the only redaction rule any
+    of them carries is the midday prompt's SYMBOL redaction for collision
+    evidence, which is a different thing entirely.
+
+    The repo-side invariant (``test_no_account_number_literals``) greps tracked
+    files, and ``dca_alerts`` redacts what it writes, but these prompts emit
+    alerts by hand through connectors: the text goes to Slack, email and the
+    message center without passing either guard. The live prompt bodies carry
+    the account as a literal (``claude/dca-executor-prompts/README.md``), so the
+    executor sees the real digits and will echo them unless told not to. The
+    rule belongs in the truncation-safe prefix because every abort path emits
+    an alert, including the ones that never reach Gate 9 -- as this one did not.
+    """
+    boundary = 5_850
+    for filename in _LIVE_MIRROR_FILES:
+        prefix = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")[:boundary]
+        assert "TRUNCATION-SAFE SECRET RULE:" in prefix, (
+            f"{filename}: the account-number rule must survive truncation, since an abort "
+            "that never reaches Gate 9 still sends an alert"
+        )
+        assert "NEVER goes into an alert body" in prefix, f"{filename}: the rule states no prohibition"
+        assert "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}" in prefix, (
+            f"{filename}: the rule must name the placeholder to use instead"
+        )
+
+
+# The 1230 mirror derives its clock as datetime.now(ZoneInfo('America/New_York'))
+# in its own Gate 0/1/3/4 script and cannot hit the bug below, so it is
+# deliberately outside this check.
+_ZONE_DERIVING_MIRROR = "1230ET-1230-pm-midday-buying-run.txt"
+_GATE1_PROSE_MIRRORS = [f for f in _LIVE_MIRROR_FILES if f != _ZONE_DERIVING_MIRROR]
+
+
+def test_gate1_derives_et_by_conversion_not_by_reading_the_host_clock():
+    """2026-09-08 1:30 PM: the run sampled 11:31, reported it as "11:31 AM ET",
+    and aborted the slot as an off-schedule scheduler fault. 11:31 at that
+    instant was UTC-06:00; New York was 1:31 PM, inside the 1:25-1:55 window.
+    The slot was on time and the abort threw the day away.
+
+    Six of the seven mirrors said only "Get the current ET time", which a host
+    in another zone answers confidently and wrongly. The 1230 mirror already
+    did it right (``datetime.now(ZoneInfo('America/New_York'))``); this brings
+    the rest into line and makes the offset check explicit.
+
+    Fail-closed is unchanged: an out-of-window CONVERTED time still aborts. What
+    changes is the diagnosis, so a whole-hour discrepancy is reported as a clock
+    problem rather than sending the operator after a scheduler that fired fine.
+    """
+    for filename in _GATE1_PROSE_MIRRORS:
+        text = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")
+        gate_1 = _gate_section(text, "GATE 1 - TIME SANITY")
+
+        assert "datetime.now(ZoneInfo('America/New_York'))" in gate_1, (
+            f"{filename}: Gate 1 must derive ET by conversion, not read the host clock"
+        )
+        assert "Get the current ET time by CONVERSION" in gate_1, (
+            f"{filename}: Gate 1 still tells the executor to just 'get the ET time'"
+        )
+        # The offset check is what actually catches a mislabelled zone.
+        assert "-04:00 (EDT) or -05:00 (EST) and nothing else" in gate_1, (
+            f"{filename}: Gate 1 must pin the only two offsets a real ET timestamp carries"
+        )
+        assert "_require_aware()" in gate_1, (
+            f"{filename}: Gate 1 should route the timestamp through the repo's own aware-check"
+        )
+        # Fail-closed must survive the change.
+        assert "Still ABORT" in gate_1 and "fail-closed does not change here" in gate_1, (
+            f"{filename}: Gate 1 must keep aborting on an out-of-window converted time"
+        )
+        # And the abort must be classified, not blamed on the scheduler by default.
+        assert "PROBABLE TIMEZONE MISREAD" in gate_1, (
+            f"{filename}: a whole-hour discrepancy must not be reported as a scheduler fault"
+        )
+        assert "print the UTC instant and the offset you actually used" in gate_1, (
+            f"{filename}: the alert must carry the evidence needed to fix the clock"
+        )
+
+
+def test_midday_mirror_still_samples_the_zone_aware_clock():
+    """The precedent the other six were brought into line with. If this ever
+    regresses to a bare local clock, the fix above loses its reference point.
+    """
+    text = _midday_live_mirror_text()
+    assert "datetime.now(ZoneInfo('America/New_York'))" in text
+    assert "never the nominal 12:30 schedule time" in text
+
+
+def test_every_live_mirror_gate7_classifies_a_platform_refusal():
+    """2026-09-04: the 1:30 PM run computed a valid buy list (QCOM $1.00, ABBV
+    $2.00, VT $1.00) and every ``place_equity_order`` came back "Blocked by
+    classifier" -- a platform permission denial, not a broker answer. The 3:30
+    PM run the same day aborted at Gate 7 without recording any reason at all.
+
+    Gate 7 had no branch for it, and all three of its existing outcomes are
+    wrong: it is not the ticker-local carve-out (the broker never answered, so
+    nothing is proven about that ticker), it is not a repo safety failure
+    (every gate through 6.7 passed), and it must not consume a
+    ``max_orders_per_day`` slot, which counts attempts the broker actually
+    received. The resolved ``buy_usd`` amounts also exist nowhere but that run,
+    so the alert has to carry them or the operator cannot place by hand.
+    """
+    for filename in _LIVE_MIRROR_FILES:
+        text = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")
+        gate_7 = _gate_section(text, "GATE 7 - PLACE THE ORDERS")
+
+        assert "A PLATFORM REFUSAL IS NOT A BROKER REJECTION AND NOT A GATE FAILURE" in gate_7, (
+            f"{filename}: Gate 7 has no branch for a refusal that never reached the broker"
+        )
+        assert "Blocked by classifier" in gate_7, f"{filename}: Gate 7 never names the observed refusal"
+        # Whole-batch, not the ticker-local carve-out, and bounded to one retry.
+        assert "STOPS THE BATCH" in gate_7, (
+            f"{filename}: a platform refusal must halt the batch, not isolate one ticker"
+        )
+        assert "Retry the FIRST refusal once and no more" in gate_7, (
+            f"{filename}: Gate 7 must bound retries on a permission denial"
+        )
+        # It consumes no attempt against the daily order ceiling.
+        assert "IT CONSUMES NO PLACEMENT ATTEMPT" in gate_7, (
+            f"{filename}: a refused call must not count toward max_orders_per_day"
+        )
+        assert "already_isolated_by_broker_rejection" in gate_7, (
+            f"{filename}: Gate 7 must exclude refusals from the broker-rejection set"
+        )
+        # The alert must carry Gate 6.5's authoritative amounts, unresized.
+        assert "CARRY THE RESOLVED BUY LIST INTO THE ALERT, VERBATIM" in gate_7, (
+            f"{filename}: the resolved buy list exists only in this run; the alert must carry it"
+        )
+        assert "must NOT be resized" in gate_7, (
+            f"{filename}: Gate 6.5's buy_usd is authoritative and must not be re-derived by hand"
+        )
+        assert "`artifacts/` directory" in gate_7, (
+            f"{filename}: Gate 7's alert must avoid the gitignored artifacts/ destination"
+        )
+
+
 def test_live_mirror_interlock_prefix_names_the_fourth_probe():
     # The four files carrying the compact interlock are the ones whose Gate 2
     # body sits past the truncation boundary; a truncated fire there sees only
@@ -2663,6 +2800,15 @@ def test_every_live_mirror_front_loads_the_shell_unavailable_rule():
             f"{filename}: the truncation-safe rule must reject the repo-access "
             "remedy, which sends the operator to fix a mount nothing examined"
         )
+        assert "READ config/trading_window.json" in prefix, (
+            f"{filename}: the truncation-safe rule must try a file read before blaming the repo"
+        )
+        assert "Gate 2 PASSED" in prefix, (
+            f"{filename}: a truncated fire must know a successful read clears Gate 2"
+        )
+        assert "never to the checkout's artifacts/ directory" in prefix, (
+            f"{filename}: the durable alert destination must survive truncation"
+        )
 
 
 def test_every_live_mirror_gate2_separates_a_dead_shell_from_a_missing_repo():
@@ -2685,21 +2831,46 @@ def test_every_live_mirror_gate2_separates_a_dead_shell_from_a_missing_repo():
             f"{filename}: Gate 2 must state the remedy that actually applies"
         )
 
-        # The alert has to name this gate by its canonical number: the digest
-        # groups on that token and nothing else recovers a mislabelled bucket.
-        assert "Label the failing gate GATE 2" in gate_2, (
-            f"{filename}: Gate 2 must pin its own number in the alert it emits"
+        # 2026-09-08 10:30 and 11:30: both fires lost the shell but still had
+        # FILE access, and both read repo files successfully before reporting
+        # repo access as the failure. A read that succeeds means Gate 2 PASSED,
+        # so the alert must be labelled by the gate that actually failed --
+        # scripts/alert_digest.py buckets on `Failing gate: Gate N`, and a
+        # mislabel files the failure under a gate that was fine.
+        assert "READ one known repo file" in gate_2, (
+            f"{filename}: Gate 2 must try a read-only fallback before blaming the repo"
+        )
+        assert "repo readable but its signal entry point cannot be executed" in gate_2, (
+            f"{filename}: Gate 2 needs a distinct reason for a readable repo with no execution"
+        )
+        assert "LABEL THE GATE THAT ACTUALLY FAILED" in gate_2, (
+            f"{filename}: Gate 2 must label by outcome, not always claim itself"
+        )
+        assert "GATE 2 PASSED and must NOT be reported as the failure" in gate_2, (
+            f"{filename}: a successful repo read must clear Gate 2 rather than blame it"
         )
         assert "scripts/alert_digest.py" in gate_2, (
             f"{filename}: Gate 2 must say why the gate number matters"
         )
 
-        # $ROOT resolves through the same shell, so this abort is the
-        # pre-Gate-0 "no artifact is possible" case, not a silent skip.
-        assert "no artifact is possible" in lowered, (
-            f"{filename}: Gate 2 must route a dead-shell abort to the no-artifact case"
+        # A dead shell is not a dead session: file writes can still persist
+        # evidence, and the durable alert must not land in gitignored output.
+        assert "no artifact is possible is narrower than a dead shell" in gate_2, (
+            f"{filename}: Gate 2 must stop treating a dead shell as proof no artifact is possible"
+        )
+        assert "`artifacts/` directory" in gate_2, (
+            f"{filename}: Gate 2 must forbid the gitignored artifacts/ alert destination"
+        )
+        assert "live_run_state_root" in gate_2, (
+            f"{filename}: Gate 2 must source the artifact path from config when dca_paths cannot run"
         )
         assert "all three" in lowered, f"{filename}: Gate 2's dead-shell abort must still alert on every channel"
+
+        # "Workspace still starting" is the 10:30/11:30 signature; treating it
+        # as progress is what bought ~18 and ~30 attempts for nothing.
+        assert "Workspace still starting" in gate_2, (
+            f"{filename}: Gate 2 must count a still-starting workspace against the retry bound"
+        )
 
 
 def test_midday_live_mirror_normalizes_broker_notionals_before_orders():
