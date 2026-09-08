@@ -71,7 +71,7 @@ jobs:
     # burning the full 6-hour runner default.
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 

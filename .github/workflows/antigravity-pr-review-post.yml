@@ -209,7 +209,7 @@ jobs:
       # repository's default branch -- never the PR's code.
       - name: Checkout base branch (never PR head)
         if: steps.check.outputs.reviewed != 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
