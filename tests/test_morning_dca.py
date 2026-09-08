@@ -9305,8 +9305,8 @@ def test_morning_scheduled_duplicate_with_pending_prior_preserves_sent_amount(tm
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
-        base_buy_amount_usd=3.0,
-        max_per_order_usd=15.0,
+        base_buy_amount_usd=2.0,
+        max_per_order_usd=10.0,
         morning_run_state_root=str(live_root),
         preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
@@ -9321,17 +9321,17 @@ def test_morning_scheduled_duplicate_with_pending_prior_preserves_sent_amount(tm
     prior = json.loads(run_state_path.read_bytes())
     row = prior["buy_candidates"][0]
     row["status"] = carried_status
-    sent_amount = 14.0
+    sent_amount = 8.0
     row["planned_amount_usd"] = sent_amount
     row["submitted_amount_usd"] = sent_amount
     prior["broker_outcomes"]["NVDA"]["status"] = carried_status
     prior["broker_outcomes"]["NVDA"]["submitted_amount_usd"] = sent_amount
     run_state_path.write_text(json.dumps(prior), encoding="utf-8")
 
-    # Force the retry's fresh incremental down to $12.00 (15 target minus a new
-    # $3 prior allocation), so a fallback to the recomputed amount would be
+    # Force the retry's fresh incremental down to $4.00 ($10 target minus a new
+    # $6 prior allocation), so a fallback to the recomputed amount would be
     # visibly SMALLER than what was actually sent.
-    _seed_prior(prior_root, "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=2.0)
+    _seed_prior(prior_root, "NVDA", 6.0, reference_price=95.0, selected_base_amount_usd=2.0)
 
     retry = ex.run(_now_live() + timedelta(minutes=1), data, broker=broker)
     nvda_outcome = retry["artifacts"].get("broker_outcomes", {}).get("NVDA", {})
@@ -9339,19 +9339,20 @@ def test_morning_scheduled_duplicate_with_pending_prior_preserves_sent_amount(tm
     retry_row = next(
         row for row in retry["artifacts"].get("buy_candidates", []) if row["ticker"] == "NVDA"
     )
-    # The persisted duplicate carries the $14 that was sent, not the $12 the
+    # The persisted duplicate carries the $8 that was sent, not the $4 the
     # retry recomputed, so the dated-slot artifact never understates spend;
     # the candidate row is rewritten to the same preserved figure.
     assert nvda_outcome.get("submitted_amount_usd") == pytest.approx(sent_amount)
     assert retry_row["planned_amount_usd"] == pytest.approx(sent_amount)
-    assert nvda_outcome.get("submitted_amount_usd") != pytest.approx(12.0)
+    assert nvda_outcome.get("submitted_amount_usd") != pytest.approx(4.0)
     assert nvda_outcome.get("duplicate_preserved") is True
 
 
-def test_morning_scheduled_duplicate_with_pending_prior_without_amount_uses_fresh_amount(tmp_path):
-    # The one case that still falls through to the retry's recomputed amount:
-    # the carried pending row has NO usable amount at all, so there is nothing
-    # sent to preserve. Kept as the boundary for the parametrized test above.
+def test_morning_scheduled_duplicate_with_pending_prior_without_amount_fails_closed(tmp_path):
+    # If both the carried pending row and matching broker order omit notional,
+    # the fresh retry computation is not authoritative evidence of what was
+    # accepted. Reserve the per-order ceiling so cap reconstruction cannot
+    # manufacture headroom by rewriting the order at a smaller amount.
     class _DuplicateWithoutAmountBroker(_RefIdTrackingBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             for t, rid in self._ref_ids:
@@ -9394,7 +9395,9 @@ def test_morning_scheduled_duplicate_with_pending_prior_without_amount_uses_fres
     retry_row = next(
         row for row in retry["artifacts"].get("buy_candidates", []) if row["ticker"] == "NVDA"
     )
-    assert nvda_outcome.get("submitted_amount_usd") == pytest.approx(retry_row["planned_amount_usd"])
+    assert nvda_outcome.get("submitted_amount_usd") == pytest.approx(cfg.max_per_order_usd)
+    assert retry_row["planned_amount_usd"] == pytest.approx(cfg.max_per_order_usd)
+    assert nvda_outcome.get("submitted_amount_usd") != pytest.approx(12.0)
 
 
 def test_morning_scheduled_duplicate_check_preserved_when_cap_fully_consumed(tmp_path):

@@ -7437,18 +7437,22 @@ class MorningDCAExecutor(DCAExecutor):
                 # duplicate-check contract normalize to an empty dup_order
                 # dict with no amount fields, so fall back to this
                 # process's own previously-recorded submission for the
-                # ticker (read into prior_submitted_amounts above) before
-                # finally falling back to the freshly recomputed
-                # `notional`, which can have shrunk since the original
-                # attempt if new prior-allocation context (e.g. an
-                # external fill) appeared in between.
+                # ticker (read into prior_submitted_amounts above). If neither
+                # source has a usable amount, reserve the configured per-order
+                # ceiling rather than a freshly recomputed `notional`, which
+                # can have shrunk since the original attempt and is not
+                # evidence of what the broker already accepted.
                 try:
                     raw_dup_amt = (dup_order or {}).get("dollar_amount") or (dup_order or {}).get("notional")
-                    dup_amount = float(raw_dup_amt) if raw_dup_amt else prior_submitted_amounts.get(ticker, notional)
+                    dup_amount = (
+                        float(raw_dup_amt)
+                        if raw_dup_amt
+                        else prior_submitted_amounts.get(ticker, self.config.max_per_order_usd)
+                    )
                 except (TypeError, ValueError):
-                    dup_amount = prior_submitted_amounts.get(ticker, notional)
+                    dup_amount = prior_submitted_amounts.get(ticker, self.config.max_per_order_usd)
                 if dup_amount is None or not math.isfinite(dup_amount) or dup_amount <= 0:
-                    dup_amount = float(prior_submitted_amounts.get(ticker, notional) or 0.0)
+                    dup_amount = float(prior_submitted_amounts.get(ticker, self.config.max_per_order_usd))
                 outcomes[ticker] = {
                     "status": "submitted",
                     "order_id": (dup_order or {}).get("id") or (dup_order or {}).get("order_id"),
