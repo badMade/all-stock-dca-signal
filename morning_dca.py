@@ -3016,6 +3016,17 @@ class _PersistingBrokerAdapter:
             )
         return value
 
+    def same_day_ticker_notional_usd(self, ticker: str, trading_day: date) -> float:
+        """Return and persist the same-day notional used to size guarded top-ups."""
+        value = self._inner.same_day_ticker_notional_usd(ticker, trading_day)
+        if "_orders_fn" not in self._wrapped_connector_attributes:
+            self._recorder.persist(
+                "orders_since_midnight",
+                ticker,
+                {"ticker": ticker, "trading_day": trading_day.isoformat(), "same_day_notional_usd": value},
+            )
+        return value
+
     def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
         value = self._inner.is_tradable_for_fractional_buy(ticker)
         if "_tradability_fn" not in self._wrapped_connector_attributes:
@@ -3621,7 +3632,8 @@ class MorningDCAExecutor(DCAExecutor):
 
     # -- Top-up guard (same-day prior-allocation offset) ---------------------
     def _compute_top_up(
-        self, now: datetime, signals: Sequence["MorningSignal"], *, manual: bool = False
+        self, now: datetime, signals: Sequence["MorningSignal"], *, manual: bool = False,
+        broker: Optional[BrokerAdapter] = None,
     ) -> Dict[str, TopUpOutcome]:
         """Return per-ticker prior-allocation/top-up outcomes.
 
@@ -3647,6 +3659,9 @@ class MorningDCAExecutor(DCAExecutor):
         Cap seeding is intentionally separate from ``prior_allocation_roots`` so
         cross-stream fills (e.g. afternoon fills scanned for per-ticker top-up
         context) never erroneously reduce this stream's cap.
+        When supplied, ``broker`` must already be account-pinned and enabled for
+        execution. Its same-day notional supplies a floor for prior allocations
+        before evaluating or recording incremental credit.
         """
         self._prior_daily_spend_seeded = 0.0
         self._cap_seed_scan_incomplete = False
@@ -3897,6 +3912,29 @@ class MorningDCAExecutor(DCAExecutor):
             # the pre-existing (safe, never-skip) settled_credit_for_slot_usd
             # deduction instead.
             ticker_prior = prior_allocations.get(ticker)
+            broker_prior_reflects_settlement = False
+            if broker is not None and ticker_prior is not None and ticker_prior.amount_usd > 0:
+                # An existing order from this stream belongs to duplicate
+                # recovery below. Keep its original credit/sizing inputs so
+                # counting that order here cannot turn recovery into a skip.
+                try:
+                    existing_order = _same_stream_order_exists(
+                        broker, ticker, trading_day, self._idempotency_stream()
+                    )
+                    if existing_order is None:
+                        broker_prior_usd = broker.same_day_ticker_notional_usd(ticker, trading_day)
+                        if not math.isfinite(broker_prior_usd) or broker_prior_usd < 0:
+                            raise ValueError("invalid same-day broker notional")
+                        if broker_prior_usd > ticker_prior.amount_usd:
+                            ticker_prior = replace(ticker_prior, amount_usd=broker_prior_usd)
+                            # This broker snapshot follows the credit snapshot;
+                            # its total already includes previously settled
+                            # orders even when their artifacts are missing.
+                            broker_prior_reflects_settlement = broker_prior_usd >= settled_credit_for_slot_usd
+                    if getattr(broker, "raw_persistence_error", None):
+                        raise RuntimeError("same-day order inputs were not persisted")
+                except Exception as exc:  # noqa: BLE001 - arbitrary broker connector failures
+                    raise RuntimeError(f"same-day notional check failed for {ticker}") from exc
             # ticker_prior.run_id names only the MOST RECENT contributor (for
             # reference_price ownership), but amount_usd aggregates every
             # contributing run via contributing_run_ids. A newer same-day
@@ -3909,7 +3947,7 @@ class MorningDCAExecutor(DCAExecutor):
             # contributors for the loaded settlement"). Membership in the
             # full contributor set is the correct positive-identification
             # check.
-            prior_reflects_settlement = (
+            prior_reflects_settlement = broker_prior_reflects_settlement or (
                 not manual
                 and own_scheduled_root_in_prior_context
                 and ticker_prior is not None
@@ -3939,7 +3977,7 @@ class MorningDCAExecutor(DCAExecutor):
                 # remainder (Codex review: "Deduct settled credit from
                 # full-dollar retries too").
                 evaluate_kwargs["preserved_credit_for_slot_usd"] = preserved_credit_for_slot_usd
-            outcome = self._evaluate_top_up(signal, prior_allocations.get(ticker), **evaluate_kwargs)
+            outcome = self._evaluate_top_up(signal, ticker_prior, **evaluate_kwargs)
             preserved_retry_reconciled = False
             # Gated on preserve_entry_exists_for_slot, NOT preserved_credit_
             # for_slot_usd > 0: a slot whose preserve entry a PRIOR retry
@@ -9344,38 +9382,6 @@ class MorningDCAExecutor(DCAExecutor):
                 error_class="missing_or_invalid_raw_inputs",
                 raw_recorder=raw_recorder,
             )
-        trading_day = now.astimezone(EASTERN).date()
-        top_up_outcomes = self._compute_top_up(now, signals, manual=manual)
-        # Sort by multiplier DESC, then drop_pct DESC, then ticker ASC so tied
-        # multipliers are resolved by the larger-drop ticker first, matching the
-        # allocation-priority policy in config/budgets.json.
-        auto_buy_candidates = sorted(
-            (s for s in self._buy_candidates(signals) if s.execution_status != EXEC_MANUAL_REVIEW_CANDIDATE),
-            key=lambda s: (-s.multiplier, -(s.drop_pct or 0.0), s.ticker),
-        )
-        # Fold already-spent same-day capital from an earlier run of this same
-        # stream (retry or manual rerun) into the ledger BEFORE snapshotting
-        # remaining budget, so a fresh-process retry never re-spends the cap.
-        # This only seeds WEEKLY spend from earlier days in the ISO week (plus
-        # today's carry-forward candidate rows) -- today's own-stream spend is
-        # already seeded above by _compute_top_up's cap_seed_roots scan, so
-        # _seed_ledger_from_prior_runs must not also seed today's amount here
-        # or the same on-disk artifact would be double-counted.
-        self._seed_ledger_from_prior_runs(now)
-        # Subtract prior same-day spend (recorded by _compute_top_up) from the
-        # pre-run budget so caps account for earlier manual/recovery fills that
-        # already consumed part of the daily/weekly cap on other tickers.
-        # Restrict to the morning stream: midday has its own independent ledger
-        # namespace and daily/weekly budget, so morning fills must not reduce
-        # the midday cap even when prior_cap_seed_roots is configured.
-        prior_daily_seeded = self._prior_daily_spend_seeded if self.stream == MORNING_STREAM else 0.0
-        pre_run_remaining_daily = max(
-            0.0, self.ledger.remaining_daily(trading_day) - prior_daily_seeded
-        )
-        pre_run_remaining_weekly = max(
-            0.0, self.ledger.remaining_weekly(trading_day) - prior_daily_seeded
-        )
-        broker_outcomes: Optional[Dict[str, Any]] = None
         # Placement switch (MorningConfig.live_execution_enabled). Dropping the
         # broker reference here rather than short-circuiting the whole run routes
         # a disabled stream through the existing no-broker branch below, so it
@@ -9452,6 +9458,39 @@ class MorningDCAExecutor(DCAExecutor):
                     # references into account-mismatch blocks").
                     return self._blocked_live_result(now, mismatch, signals, source, raw_recorder=raw_recorder)
                 raise RuntimeError(mismatch)
+        trading_day = now.astimezone(EASTERN).date()
+        top_up_outcomes = self._compute_top_up(now, signals, manual=manual, broker=broker)
+        # Sort by multiplier DESC, then drop_pct DESC, then ticker ASC so tied
+        # multipliers are resolved by the larger-drop ticker first, matching the
+        # allocation-priority policy in config/budgets.json.
+        auto_buy_candidates = sorted(
+            (s for s in self._buy_candidates(signals) if s.execution_status != EXEC_MANUAL_REVIEW_CANDIDATE),
+            key=lambda s: (-s.multiplier, -(s.drop_pct or 0.0), s.ticker),
+        )
+        # Fold already-spent same-day capital from an earlier run of this same
+        # stream (retry or manual rerun) into the ledger BEFORE snapshotting
+        # remaining budget, so a fresh-process retry never re-spends the cap.
+        # This only seeds WEEKLY spend from earlier days in the ISO week (plus
+        # today's carry-forward candidate rows) -- today's own-stream spend is
+        # already seeded above by _compute_top_up's cap_seed_roots scan, so
+        # _seed_ledger_from_prior_runs must not also seed today's amount here
+        # or the same on-disk artifact would be double-counted.
+        self._seed_ledger_from_prior_runs(now)
+        # Subtract prior same-day spend (recorded by _compute_top_up) from the
+        # pre-run budget so caps account for earlier manual/recovery fills that
+        # already consumed part of the daily/weekly cap on other tickers.
+        # Restrict to the morning stream: midday has its own independent ledger
+        # namespace and daily/weekly budget, so morning fills must not reduce
+        # the midday cap even when prior_cap_seed_roots is configured.
+        prior_daily_seeded = self._prior_daily_spend_seeded if self.stream == MORNING_STREAM else 0.0
+        pre_run_remaining_daily = max(
+            0.0, self.ledger.remaining_daily(trading_day) - prior_daily_seeded
+        )
+        pre_run_remaining_weekly = max(
+            0.0, self.ledger.remaining_weekly(trading_day) - prior_daily_seeded
+        )
+        broker_outcomes: Optional[Dict[str, Any]] = None
+        if broker is not None and self.mode == MORNING_LIVE_MODE:
             try:
                 broker_outcomes = self._place_broker_orders(
                     auto_buy_candidates,

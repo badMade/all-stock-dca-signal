@@ -8964,6 +8964,77 @@ def test_morning_live_applies_prior_manual_offset_incremental(tmp_path):
     assert rows["NVDA"]["top_up_guard_result"] == "incremental_top_up"
 
 
+@pytest.mark.parametrize(
+    ("broker_prior_usd", "expected_increment_usd"),
+    [(2.0, 8.0), (8.0, 2.0)],
+    ids=["artifact_matches_broker", "artifact_understates_broker"],
+)
+def test_morning_live_top_up_accounts_for_broker_spend(
+    tmp_path, monkeypatch, broker_prior_usd, expected_increment_usd
+):
+    """Missing artifact spending must not be purchased again by a later stream."""
+    monkeypatch.setenv("DCA_TICKER_HISTORY_DIR", str(tmp_path / "history"))
+    monkeypatch.setenv("DCA_INTRADAY_ARCHIVE_DIR", str(tmp_path / "intraday"))
+    for name in (
+        "DCA_HEARTBEAT_URL_MORNING", "DCA_HEARTBEAT_URL",
+        "DCA_ALERT_SLACK_WEBHOOK", "DCA_DRIFT_SLACK_WEBHOOK",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    now = _now_live()
+    prior_root = _seed_prior(
+        tmp_path / "prior", "NVDA", 2.0, reference_price=95.0, selected_base_amount_usd=2.0
+    )
+    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(prior_root),),
+        cap_seed_roots=(str(prior_root),),
+        approved_test_dates=frozenset({now.date()}),
+    )
+    prior_order = {
+        "id": "earlier-stream-order",
+        "symbol": "NVDA",
+        "side": "buy",
+        "state": "filled",
+        "dollar_amount": str(broker_prior_usd),
+        "created_at": now.replace(hour=9, minute=35).isoformat(),
+        "ref_id": f"market-open-dca-{now.date().isoformat()}-NVDA",
+    }
+    placed = []
+
+    def place(**kwargs):
+        placed.append((kwargs["symbol"], float(kwargs["dollar_amount"])))
+        return {"order": {"id": "morning-top-up-order", "state": "confirmed"}}
+
+    broker = RobinhoodBroker(
+        account=cfg.target_account_number,
+        enable_live_orders=True,
+        orders_fn=lambda **kwargs: {"orders": [prior_order], "next": None},
+        buying_power_fn=_ample_buying_power,
+        tradability_fn=_all_tradable,
+        review_fn=lambda **kwargs: {"approved": True},
+        place_fn=place,
+    )
+    assert broker.same_day_ticker_notional_usd("NVDA", now.date()) == broker_prior_usd
+    executor = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    result = executor.run(now, data, broker=broker, manual=False)
+
+    # The preserved $2 base and 10% decline produce a $10 ladder target.
+    # Only its remainder after the broker-confirmed prior is still unallocated.
+    assert placed == [("NVDA", expected_increment_usd)]
+    rows = {row["ticker"]: row for row in result["artifacts"]["buy_candidates"]}
+    assert rows["NVDA"]["top_up_guard_result"] == "incremental_top_up"
+    assert rows["NVDA"]["incremental_order_amount"] == expected_increment_usd
+    persisted = json.loads(Path(result["paths"]["run_state"]).read_text(encoding="utf-8"))
+    outcome = persisted["broker_outcomes"]["NVDA"]
+    assert outcome["status"] == "submitted"
+    assert outcome["order_id"] == "morning-top-up-order"
+    assert outcome["submitted_amount_usd"] == expected_increment_usd
+
+
 class _RefIdTrackingBroker(FakeLiveBroker):
     """Broker double that actually remembers placed ref_ids, so the same-stream
     duplicate check (same_day_strategy_order_exists_with_ref_id_prefix) reflects
