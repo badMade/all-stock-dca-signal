@@ -767,6 +767,9 @@ class _TopUpDuplicateBroker:
     def available_buying_power(self):
         return 500.0
 
+    def same_day_ticker_notional_usd(self, ticker, trading_day):
+        return 14.0 if self.duplicate else 2.0
+
     def same_day_strategy_order_exists(self, ticker, trading_day):
         self.broad_duplicate_calls += 1
         return True
@@ -930,7 +933,7 @@ def test_guarded_midday_top_up_ignores_cross_stream_duplicate_for_incremental_or
     res = ex.run(_now_midday(), data, broker=cast(Any, broker))
 
     assert broker.broad_duplicate_calls == 0
-    assert broker.same_stream_calls == 1
+    assert broker.same_stream_calls == 2
     assert broker.placed == [("BIG", 8.0, "midday-dca-topup-2026-07-08-BIG")]
     assert res["artifacts"]["broker_outcomes"]["BIG"]["status"] == "submitted"
 
