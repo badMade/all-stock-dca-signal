@@ -2616,6 +2616,76 @@ def test_every_live_mirror_forbids_the_account_number_in_alerts():
         )
 
 
+def test_standing_perplexity_backup_policy_covers_all_seven_slots():
+    """2026-09-08: the user directed that Perplexity's backup role be
+    standing, not a recurring week-by-week or same-day grant -- "Perplexity
+    shouldn't be disabled anywhere permanently... Perplexity is supposed to
+    back up Claude if it fails, not be disabled" -- after a pattern of four
+    one-off dated overrides (Aug 17, Aug 28, Aug 31, Sep 8-11) each expired
+    or had to explicitly disable the previous batch's leftover task IDs.
+    This pins the permanent replacement: a non-expiring top-level policy
+    naming a backup task for every one of Claude's seven scheduled slots.
+    """
+    data = _load("scheduled_tasks.json")
+    policy = data["standing_perplexity_backup_policy"]
+    assert "expires" not in json.dumps(policy).lower()
+
+    slots = policy["authorized_slots_et"]
+    expected = {
+        "09:35": ("2ba19526", "4412c3c4"),
+        "10:30": ("42173154", "e028361e"),
+        "11:30": ("7be82b97", "e3590042"),
+        "12:30": ("a6239dae", "062605c6"),
+        "13:30": ("7be82b97", "54ab24d2"),
+        "14:30": ("7be82b97", "54ab24d2"),
+        "15:30": ("10ce362c", "54ab24d2"),
+    }
+    assert set(slots) == set(expected)
+    for et, (canonical_id, backup_id) in expected.items():
+        assert slots[et]["canonical_task_id"] == canonical_id, et
+        assert slots[et]["backup_task_id"] == backup_id, et
+
+    # Every backup task ID the policy names must be discoverable in tasks[],
+    # the same discoverability rule test_aug_28_one_time_catch_up_task_is_
+    # registered_in_the_manifest already established for one-time IDs -- an
+    # override-named buy task with no tasks[] entry has no status, fire
+    # window, or safety contract other consumers can validate.
+    task_ids = {task["id"] for task in data["tasks"]}
+    backup_ids = {v["backup_task_id"] for v in slots.values()}
+    for backup_id in backup_ids:
+        assert backup_id in task_ids, f"{backup_id} has no tasks[] entry"
+    for task in data["tasks"]:
+        if task["id"] in backup_ids:
+            assert task["status"] == "active", task["id"]
+            assert task["trades"] is True, task["id"]
+
+    # The now-superseded week-limited override must say so, not silently
+    # lapse on its own end_trading_day with no record of why that is fine.
+    superseded = data["temporary_live_scheduler_overrides"][
+        "authorize_2026_09_08_delayed_morning_perplexity_buy_slots_week_only"
+    ]
+    assert "SUPERSEDED" in superseded["notes"]
+    assert "standing_perplexity_backup_policy" in superseded["notes"]
+
+
+def test_standing_perplexity_backup_policy_is_mirrored_in_docs():
+    """The standing policy must read as current in both operator-facing
+    docs, positioned so a reader meets it before the now-superseded dated
+    overrides, mirroring this file's own established "authoritative table
+    first" convention (test_the_canonical_schedule_table_precedes_the_
+    expired_override_records)."""
+    manifest = SCHEDULE_MANIFEST.read_text(encoding="utf-8")
+    assert "Standing Perplexity backup policy" in manifest
+    assert "PERMANENT, does not expire" in manifest
+    standing_idx = manifest.index("Standing Perplexity backup policy")
+    sep_11_idx = manifest.index("Sep 8-11, 2026 (SUPERSEDED")
+    assert standing_idx < sep_11_idx
+
+    todos = (REPO_ROOT / "docs" / "dca_operational_todos.md").read_text(encoding="utf-8")
+    assert "standing Perplexity backup policy" in todos
+    assert "062605c6" in todos and "54ab24d2" in todos
+
+
 # The 1230 mirror derives its clock as datetime.now(ZoneInfo('America/New_York'))
 # in its own Gate 0/1/3/4 script and cannot hit the bug below, so it is
 # deliberately outside this check.
@@ -4025,21 +4095,34 @@ def test_every_placing_prompt_rejects_late_compatible_exclusions_outright():
 
 
 def test_midday_live_mirror_preserves_gate_sole_executor_semantics():
-    """Fifth Codex review round: midday's actual Gate 4 is
+    """Fifth Codex review round found midday's actual Gate 4 --
     dca_runner.gate_sole_executor, which ignores placed_agent entirely and
-    has no compatible-executor carve-out (docs at line 171) -- unlike the
-    other six prompts' Geoff/compatible/rogue classification. The per-order
-    rescan must keep only the narrow own-batch exemption and treat every
-    other window order as a collision, not import the other prompts' whole
-    classification scheme (Codex review: "Preserve the midday gate's
-    collision semantics")."""
+    had no compatible-executor carve-out -- out of step with the other six
+    prompts' Geoff/compatible/rogue classification, and that round
+    deliberately kept it that way rather than importing the other prompts'
+    whole scheme piecemeal (Codex review: "Preserve the midday gate's
+    collision semantics", the citation string this fix keeps unchanged).
+
+    Fixed 2026-09-08 (standing_perplexity_backup_policy,
+    claude/PERPLEXITY-CLAUDE-COORDINATION.md section 5.5): gate_sole_executor
+    itself still ignores placed_agent, by design, unchanged. What changed is
+    that this prompt now classifies ITS OWN raw collision list the same way
+    the other six slots do in prose -- placed_agent == 'agentic' is
+    compatible and does not stop the batch, anything else does -- because
+    Perplexity's delayed backup task for this slot (062605c6) is now a
+    standing, non-expiring part of the schedule and a genuine fill from it
+    must not read as a rogue second executor.
+    """
     text = _midday_live_mirror_text()
     assert "Preserve the midday gate's collision semantics" in text
-    assert "no Geoff carve-out and no compatible bucket" in text
-    # Regression guard: the borrowed Geoff/compatible/rogue framing this
-    # fix removed must not silently come back into the SECOND-phase rescan.
-    gate_7 = text[text.index("GATE 7 - PLACE THE ORDERS") : text.index("GATE 8 - CONFIRM")]
-    assert "Geoff's-own-activity / compatible-executor / rogue" not in gate_7
+    assert "no Geoff carve-out and no compatible bucket" not in text
+    assert "GATE4_COMPATIBLE_STAND_DOWN" in text
+    assert "already_compatible_covered" in text
+    assert "--already-covered-tickers" in text
+    # The compatible/rogue split must appear at all four points that
+    # classify collisions: Gate 4's own script, the SECOND refresh, and
+    # REVALIDATE's own rescan plus its final pre-placement reclassification.
+    assert text.count("placed_agent == 'agentic'") >= 4
 
 
 def test_every_placing_prompt_preserves_reduced_topups_during_replan():

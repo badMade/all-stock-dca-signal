@@ -343,6 +343,32 @@ slot's window would cause a real abort-and-alert (fail-safe, not a
 duplicate order) rather than a theoretical one -- this follow-up should be
 prioritized ahead of that deployment, not after it.
 
+**Fixed 2026-09-08, prompt-text only, no `dca_runner.py` change.** Two
+corrections to the paragraph above: it said this slot "calls
+`dca_runner.assess()`" -- it does not, and never did. `docs/live_wiring.md`'s
+own "Not yet wired to the live prompts" section documents that none of the
+seven scheduled prompts call `assess()`/`execute_plan()`; the 1230 prompt's
+Gate 4 script calls `r.gate_sole_executor(orders, collision_slot, day)`
+directly, the same low-level function the other six slots restate in prose
+around, not the `assess()` wrapper. It also said closing this gap "is a real
+code change to `dca_runner.py`" -- it is not: `dca_runner.py` already ships a
+compatible-executor classifier (the `sole_executor_grace_period_active`
+kwarg on `assess()`/`execute_plan()`, tested in `tests/test_dca_runner.py`),
+but neither function is reachable from any live prompt, so that mechanism
+was unusable here regardless. The actual fix mirrors what the other six
+slots already do: classify `gate_sole_executor()`'s raw collision list by
+`placed_agent == "agentic"` in the prompt's own Gate 4 script (no external
+grace-period flag or expiry -- this is the standing policy now, not a
+temporary carve-out), abort only on a rogue signal, and on a compatible-only
+window pass the covered tickers to Gate 5 via
+`--already-covered-tickers` (`scripts/stream_candidates.py`'s shared CLI
+flag, already wired through `scripts/generate_midday_candidates.py`, the
+same flag the 0935 prompt already documents using for the identical
+purpose). See the prompt's Gate 4 script, its Gate 5 section, and the two
+per-order revalidation paragraphs (all four now say the same thing about
+compatible collisions instead of three of them contradicting the fourth).
+Context: `config/scheduled_tasks.json` -> `standing_perplexity_backup_policy`.
+
 ## 6. What this supersedes
 
 `docs/safeguards.md`'s "Live execution roster" section and

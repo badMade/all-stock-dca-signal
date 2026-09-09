@@ -2,6 +2,16 @@
 
 This file tracks follow-up work from live DCA incidents so the same failure modes are not lost in chat history.
 
+## Handoff - 2026-09-08 standing Perplexity backup policy
+
+- Status: user direction: "Perplexity shouldn't be disabled anywhere permanently... Perplexity is supposed to back up Claude if it fails, not be disabled." Also: "make sure that if Claude fails on a run that there is a mechanism to run it with perplexity."
+- What this supersedes: the recurring pattern below (Aug 17, Aug 28, Aug 31, Sep 8-11 handoffs) of one-off, date-gated Perplexity buy authorizations that had to be reissued every few days, each disabling the previous batch's leftover task IDs. That churn read as Perplexity repeatedly being disabled; the actual standing intent, recorded in `claude/PERPLEXITY-CLAUDE-COORDINATION.md` since 2026-08-02 ("Long term, Claude is primary and Perplexity is backup"), was never disablement.
+- What changed: `config/scheduled_tasks.json` -> `standing_perplexity_backup_policy` (new top-level key, non-expiring) is now the authoritative record. It covers all seven Claude slots, each backed up by a Perplexity task firing 10 minutes later: 09:35->09:45 (`4412c3c4`), 10:30->10:40 (`e028361e`), 11:30->11:40 (`e3590042`), 12:30->12:40 (`062605c6`), 13:30->13:40, 14:30->14:40, 15:30->15:40 (all three afternoon backups are one task, `54ab24d2`). All five backup task IDs were already live in the scheduler under the Sep 8-11 handoff below; nothing new was deployed to make this current, only the authorization's status changed from temporary to standing.
+- The Sep 8-11 handoff below is marked superseded, not deleted, for audit history. Do not renew or extend it after 2026-09-11 -- the standing policy already covers what renewal would have re-granted.
+- Real gap found and fixed in the same change: the 12:30 PM slot's own Gate 4 (`claude/dca-executor-prompts/live-mirror/1230ET-1230-pm-midday-buying-run.txt`) called `dca_runner.gate_sole_executor` directly, which ignores `placed_agent` entirely and has no compatible-executor branch -- so a genuine `062605c6` backup fill in that window would have aborted the whole midday batch as a rogue collision, the opposite of standing backup. The other six slots (including all three `7be82b97` fires) already recognized a compatible Perplexity order in prose per `claude/PERPLEXITY-CLAUDE-COORDINATION.md` section 3. Fixed by adding the same recognition to the 1230 prompt's Gate 4 script and Gate 5's candidate exclusion, mirroring the existing pattern rather than inventing a new one; see the coordination doc's updated section 5.5.
+- `docs/schedule_manifest.md` carries the same standing table, positioned above the (now superseded) dated override blocks per this repo's own "authoritative table first" convention.
+- Deployment caveat unchanged from every other entry here: this repo's config documents the intended standing policy; it does not and cannot create or remove tasks in Perplexity's own live scheduler. All five backup task IDs are already deployed there as of this handoff.
+
 ## Handoff - 2026-09-08 delayed morning scheduler cleanup
 
 - Status: User explicitly authorized Perplexity to run only the delayed morning buy-only DCA schedule for Sep 8-11, 2026 so Claude gets first chance to buy first.
