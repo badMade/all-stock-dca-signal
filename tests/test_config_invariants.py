@@ -199,6 +199,88 @@ def test_the_canonical_schedule_table_precedes_the_expired_override_records():
     )
 
 
+# --- ...and the ordering fix has to survive the next merge -------------------
+#
+# It did not. The three checks above were satisfied while the manifest carried a
+# SECOND, uncorrected copy of the Aug 28 and Aug 31 blocks sitting ABOVE the
+# canonical table, plus the Sep 8-11 block, all three written in the present
+# tense with no `(EXPIRED)` marker -- the exact shape the section's own preamble
+# says was removed because "that is exactly how an expired authorization gets
+# mistaken for a live one". Two gaps let it back in:
+#
+#   * `_manifest_block_citing` splits on "\n#### " and searches `blocks[1:]`, so
+#     a duplicate introduced by a PARAGRAPH heading ("Temporary live scheduler
+#     override, Aug 28, 2026:") lands in `blocks[0]` and is never counted. Its
+#     "exactly one" assertion stayed green with two copies in the file.
+#   * The ordering test above compares the canonical table against the `###
+#     Expired ...` heading, not against the first schedule table in the section.
+#     Three override tables preceded it and the assertion still passed.
+#
+# This was not cosmetic. The duplicates contradicted the reconciled copies on
+# which task IDs an override authorized: the stale Aug 28 table listed
+# `4412c3c4`, `e028361e`, `e3590042`, `0c3cde00`, `44b3975d` as "date-gated
+# active", while the reconciled block names those same IDs as
+# `disabled_parallel_task_ids` -- IDs that specifically must NOT run, so two
+# executors cannot race for one slot. An operator reading top-down met the
+# wrong answer first, in the document that governs live buy authorization.
+#
+# These two pin the structural property directly, so a future merge that
+# reintroduces a block above the table fails here rather than passing three
+# checks that were written to prevent exactly it.
+
+
+def _active_schedule_preamble() -> str:
+    """Everything in the Active schedule section before its canonical table."""
+    text = SCHEDULE_MANIFEST.read_text(encoding="utf-8")
+    section = text.index("## Active schedule (canonical, verified 2026-07-27)")
+    canonical = text.index("| ET | Task | ID | Cadence | Cron (UTC) | Trades | Status |")
+    assert section < canonical, "the canonical table must live inside the Active schedule section"
+    return text[section:canonical]
+
+
+def test_no_dated_override_is_documented_above_the_canonical_schedule_table():
+    """A dated override cited before the authoritative table is read as live.
+
+    Keyed off ``temporary_live_scheduler_overrides`` rather than off heading
+    text, so an override added later is covered the day it lands: whatever the
+    block calls itself, citing its JSON key above the canonical table fails.
+    The standing backup policy is deliberately not caught -- it is not a dated
+    override, it does not expire, and its own key lives under a different
+    top-level name (``standing_perplexity_backup_policy``).
+    """
+    preamble = _active_schedule_preamble()
+    for key in _load("scheduled_tasks.json")["temporary_live_scheduler_overrides"]:
+        assert key not in preamble, (
+            f"{key} is cited above the canonical schedule table. Every dated override "
+            f"belongs under '### Expired temporary live scheduler overrides', after the "
+            f"table, or a reader meets an expired authorization first"
+        )
+    assert "| ET | Live scheduler task | ID |" not in preamble, (
+        "an override-scope table appears above the canonical schedule table; the "
+        "canonical table must be the first schedule table in this section"
+    )
+
+
+def test_every_override_block_is_introduced_by_a_markdown_heading():
+    """The duplicates used paragraph headings, which is how they hid.
+
+    ``_manifest_block_citing`` can only see blocks introduced by ``#### ``. A
+    block introduced by a bare paragraph line is invisible to it *and* to the
+    ``(EXPIRED)``-suffix check that reads its heading, so it can say anything.
+    Requiring the ``#### `` form keeps every override block inside the reach of
+    the three tests above.
+    """
+    offenders = [
+        line
+        for line in SCHEDULE_MANIFEST.read_text(encoding="utf-8").splitlines()
+        if line.startswith("Temporary live scheduler")
+    ]
+    assert not offenders, (
+        "override blocks must be introduced by a '#### ' heading, not a paragraph, or "
+        f"the expiry and uniqueness checks cannot see them: {offenders}"
+    )
+
+
 def test_every_config_file_validates_against_its_referenced_schema():
     """A schema requirement tightened for the active ladder silently broke a
     DIFFERENT config file that shares the same schema via its own ``$schema``

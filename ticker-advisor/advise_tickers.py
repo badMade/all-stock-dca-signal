@@ -581,7 +581,10 @@ def _signal_has_normalizable_metric(raw_scores: dict[str, dict[str, object]], si
             sum(
                 1
                 for t in tickers
-                if _extract_sentiment_component(cast(dict[str, object] | None, raw_scores[t].get("sentiment"))) is not None
+                if _extract_sentiment_component(
+                    cast(dict[str, object] | None, raw_scores[t].get("sentiment"))
+                )
+                is not None
             )
             >= 2
         )
