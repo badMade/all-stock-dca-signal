@@ -13,8 +13,35 @@ It is the sibling of `docs/market_open_signal_entry.md` (0935ET),
 `docs/midday_signal_entry.md` (1230ET). All four run on the shared core in
 `scripts/stream_candidates.py`; this page covers only what is different about the
 morning slot. Read the market-open page, or the shared module's docstring, for
-the market-data payload contract, the `cands` field contract and the fail-closed
-input rules — they are identical.
+the *mechanics* of the market-data payload contract, the `cands` field contract
+and the fail-closed input rules — those are identical. The **source key** is not:
+see the next section.
+
+### Market data source for this slot
+
+`MORNING_SPEC.source` is `SourceName.ROBINHOOD`, not `SourceName.FINANCE`. This
+slot's `--market-data` payload must carry a populated `sources.robinhood` object;
+that is the key `build_document` requires and scores.
+
+Unlike the Finance-primary slots, **Finance and Alpaca are not accepted keys at
+all here** -- `run_cli()`'s `accepted_sources` is built from `spec.source`
+(robinhood) plus the yfinance fallback key only, so a `sources.finance` or
+`sources.alpaca` object in the payload raises `"unsupported key(s)"`, it does
+not get accepted as validation/context. `sources.yahoo_finance_yfinance` is an
+accepted key but is **not a usable fallback for this slot**: the "missing
+primary can be met by yfinance instead" allowance in `run_cli()` is gated on
+`spec.source is SourceName.FINANCE`, so for this Robinhood-primary spec a
+`robinhood` entry in `source_errors` still aborts even when yfinance data is
+present (`test_cli_does_not_substitute_yfinance_for_a_robinhood_primary_spec`).
+A Robinhood outage at 10:30 has no automatic data-source fallback today.
+
+This is a deliberate, confirmed exception (2026-09-09) to the repo-wide
+Finance-primary policy in `docs/safeguards.md#market-data-source-policy` and
+`config/scheduled_tasks.json:market_data_source_policy`, which both carry a
+`slot_overrides.1030ET` entry recording it. `docs/morning_dca.md`'s "10:30 runner
+self-containment" section and every other slot's Gate 5 doc still describe
+Finance-primary; do not assume this page's payload shape from those without
+checking this section first.
 
 ```bash
 python3 -m scripts.generate_morning_candidates \

@@ -137,14 +137,24 @@ source this slot runs on:
 }
 ```
 
-Fetch the ordinary ticker payload from the Finance connector. Finance bars are
-15-minute and start-stamped: at 09:35 the 09:30 bar is still open, must not be
-included as completed evidence, and the fresh Finance quote supplies the
-decision price. Fetch Robinhood separately into `sources.robinhood` as labeled
-validation/context. GFUZ is the sole policy exception and is scored from its
-Robinhood payload when Finance does not resolve it.
+**Robinhood-primary, confirmed 2026-09-09** (see `docs/safeguards.md`'s
+market-data-source-policy `slot_overrides.0935ET` entry): fetch every ticker's
+payload from Robinhood into `sources.robinhood`. This is the same exception
+1030ET already carries, extended to this slot for the same reason -- live
+executor sessions here have no reliable Finance MCP connector access, and the
+repo's own fail-closed Gate 5 correctly refuses to fabricate `sources.finance`
+from Robinhood data rather than substitute silently. GFUZ is no longer a
+special case: every ticker on this slot, GFUZ included, is scored from
+Robinhood the same way. `sources.yahoo_finance_yfinance` is an accepted key
+but **not a usable fallback** -- as with 1030ET, the "missing primary can be
+met by yfinance instead" allowance in `scripts/stream_candidates.py`'s
+`run_cli()` is gated on `spec.source is SourceName.FINANCE`, which is no
+longer true here, so a `robinhood` entry in `source_errors` still aborts even
+when yfinance data is present. `sources.finance` and `sources.alpaca` are not
+accepted keys at all for this slot -- either raises `"unsupported key(s)"`,
+not a validation/context acceptance.
 
-Mapping for the separately retained Robinhood context/exception payload:
+Mapping for the payload:
 
 | Field here | Robinhood source |
 |---|---|
@@ -167,10 +177,10 @@ for one is valid for the other:
 - A `quote` is honored only when its `as_of` is present, not in the future, and
   within one 5-minute interval of the decision moment; otherwise the completed
   09:30 bar's close is the decision price, exactly as live.
-- `sources.finance` is required and is the policy-selected PRIMARY signal source.
-  `sources.robinhood` is accepted as validation/context evidence, never silently substituted: the executor evaluates one
-  provider, so supplying a second one would look like a dual-source cross-check
-  that never happened.
+- `sources.robinhood` is required and is the policy-selected PRIMARY signal source
+  for this slot (see the market-data source note above). `sources.yahoo_finance_yfinance`
+  is accepted as a key but never substitutes for a missing/errored `robinhood`
+  entry on this slot; `sources.finance` and `sources.alpaca` are rejected outright.
 - Listing `"robinhood"` in `source_errors` **aborts**. This slot has one source, so
   a failed fetch leaves nothing to score, and a zero-candidate document would be
   indistinguishable from a genuinely quiet tape that Gate 5 ends silently on.
@@ -189,7 +199,7 @@ filter (`config/scheduled_tasks.json:2ba19526.trend_validation_exemption`).
 {
   "slot": "0935ET", "runner_slot_id": "0935", "stream": "market_open",
   "cron_id": "2ba19526", "trading_day": "2026-08-26", "decision_time_et": "09:35",
-  "source": "finance", "trend_validation_exempt": true,
+  "source": "robinhood", "trend_validation_exempt": true,
   "live_execution_enabled": false,
   "evaluated_count": 58, "buy_count": 2,
   "manual_review_count": 0, "manual_review_tickers": [],

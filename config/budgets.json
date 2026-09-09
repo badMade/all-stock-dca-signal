@@ -92,6 +92,16 @@
     "fallback_source": "yahoo_finance_yfinance",
     "summary": "The Finance connector is the PRIMARY market-data source. Alpaca and Robinhood provide validation / context. Yahoo Finance through yfinance is a FALLBACK ONLY, used when the Finance connector data is unavailable, stale, incomplete, or unresolved. Fallback data must be labeled as fallback and must NOT weaken confidence, spread, trend, top-up, budget, whitelist, buy-only, regular-hours-only, or any safety rule. Robinhood remains the only execution broker.",
     "gfuz_exception": "GFUZ may use Robinhood as its PRIMARY source when the Finance connector cannot resolve it (see config/tickers.json:special_handling.GFUZ).",
+    "slot_overrides": {
+      "1030ET": {
+        "primary_source": "robinhood",
+        "reason": "See config/scheduled_tasks.json:market_data_source_policy.slot_overrides.1030ET and docs/morning_signal_entry.md."
+      },
+      "0935ET": {
+        "primary_source": "robinhood",
+        "reason": "See config/scheduled_tasks.json:market_data_source_policy.slot_overrides.0935ET and docs/market_open_signal_entry.md."
+      }
+    },
     "authoritative_source": "config/scheduled_tasks.json:market_data_source_policy",
     "doc": "docs/safeguards.md"
   },

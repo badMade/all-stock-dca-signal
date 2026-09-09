@@ -298,10 +298,16 @@ all required raw inputs: portfolio / buying power, quotes, prior regular-session
 close, tradability, `orders_since_midnight` (for same-day top-up context), and the
 historical / trend bars needed for the 60-minute trend check. If a runner requires
 a `RUN_DATE_ET` argument, pass the current America/New_York date as `YYYYMMDD`. Do
-**not** reuse stale files. Inputs come from the Finance connector primary, Alpaca
-and Robinhood validation / context, and `yfinance` fallback **only** when connector
-data is unavailable, stale, incomplete, or unresolved (see
-[safeguards.md](safeguards.md#market-data-source-policy)). If raw input generation
+**not** reuse stale files. **This slot's Gate 5 signal generation
+(`scripts/generate_morning_candidates.py`, `MORNING_SPEC.source`) is
+Robinhood-primary**, not Finance-primary like the rest of the roster, and it has
+**no automatic data-source fallback**: Finance and Alpaca are not accepted
+`--market-data` keys for this slot at all (an unsupported-key error, not
+validation/context), and `yfinance`, while an accepted key, cannot substitute
+for a Robinhood outage the way it can for the Finance-primary slots -- a
+`robinhood` entry in `source_errors` still aborts Gate 5 (see
+[safeguards.md](safeguards.md#market-data-source-policy)'s 1030ET slot
+exception and `docs/morning_signal_entry.md`). If raw input generation
 fails once, perform **one** bounded recovery attempt on the alternate approved
 data source path, then stop.
 
