@@ -13251,6 +13251,7 @@ def test_terminal_rejection_with_unreadable_quantity_halts_the_batch(tmp_path, m
     # terminal rejection instead of falling through to place it.
     assert placement_attempts == ["AAPL"]
     assert outcomes["AAPL"]["status"] == "failed"
+    assert outcomes["AAPL"]["order_id"] == "ORD-CANCELLED"
     assert outcomes["AAPL"].get("ambiguous_placement_exception") is True
     assert outcomes["AAPL"]["submitted_amount_usd"] == 10.0
     assert res["artifacts"]["is_trading_failure"] is True
@@ -13262,6 +13263,50 @@ def test_terminal_rejection_with_unreadable_quantity_halts_the_batch(tmp_path, m
     assert res["artifacts"]["scheduled_evidence_denied"] is True
     assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
     assert heartbeat_results == [False]
+
+
+def test_terminal_rejection_with_zero_quantity_and_nonzero_price_halts_the_batch(tmp_path, monkeypatch):
+    """Contradictory terminal fill evidence (0 qty, non-zero price) is ambiguous."""
+
+    placement_attempts = []
+    heartbeat_results = []
+    monkeypatch.setattr("dca_alerts.send_heartbeat", lambda _stream, *, ok: heartbeat_results.append(ok))
+
+    def _place_fn(**kwargs):
+        placement_attempts.append(kwargs["symbol"])
+        if kwargs["symbol"] == "AAPL":
+            return {
+                "data": {
+                    "order": {
+                        "id": "ORD-CANCELLED",
+                        "state": "cancelled",
+                        "cumulative_quantity": "0",
+                        "average_price": "100.00",
+                    }
+                }
+            }
+        return {"data": {"order": {"id": "ORD-NVDA", "state": "confirmed"}}}
+
+    ex = _live_executor(tmp_path, ("AAPL", "NVDA"))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.10, "NVDA": 0.10})
+    broker = RobinhoodBroker(
+        place_fn=_place_fn,
+        buying_power_fn=lambda **_kwargs: {"buying_power": "1000"},
+        orders_fn=_no_orders_today,
+        tradability_fn=_all_tradable,
+        enable_live_orders=True,
+    )
+
+    res = ex.run(_now_live(), data, broker=broker)
+    outcomes = res["artifacts"]["broker_outcomes"]
+    assert placement_attempts == ["AAPL"]
+    assert outcomes["AAPL"]["status"] == "failed"
+    assert outcomes["AAPL"].get("ambiguous_placement_exception") is True
+    assert res["artifacts"]["is_trading_failure"] is True
+    assert res["artifacts"]["scheduled_evidence_denied"] is True
+    assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
+    assert heartbeat_results == [False]
+    assert "NVDA" not in outcomes or outcomes["NVDA"]["status"] != "submitted"
 
 
 @pytest.mark.parametrize(

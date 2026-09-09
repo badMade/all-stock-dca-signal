@@ -1295,6 +1295,22 @@ def test_broker_place_terminal_state_positive_fill_with_zero_cumulative_quantity
     assert not isinstance(exc_info.value, OrderPlacementRejectedError)
 
 
+def test_broker_place_terminal_state_zero_quantity_with_nonzero_price_is_ambiguous():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "data": {"order": {
+                "id": "ORD-7", "state": "cancelled",
+                "cumulative_quantity": "0", "average_price": "100.00",
+            }}
+        },
+    )
+    with pytest.raises(RuntimeError, match="terminal state") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
 def test_broker_place_terminal_state_requires_zero_for_each_order():
     broker = RobinhoodBroker(
         account="999000111",

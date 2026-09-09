@@ -59,6 +59,7 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Sequence, Set, Tuple, cast
 
@@ -1064,11 +1065,47 @@ def _finite_float_or_none(value: Any) -> Optional[float]:
     return parsed if math.isfinite(parsed) else None
 
 
-def _strict_fill_number(value: Any) -> Optional[float]:
-    """Return a finite broker fill number, rejecting ambiguous scalar types."""
-    if isinstance(value, bool) or value is None:
+class _TerminalFillKind(Enum):
+    ZERO = "zero"
+    RECONCILED = "reconciled"
+    AMBIGUOUS = "ambiguous"
+
+
+@dataclass(frozen=True)
+class _TerminalFill:
+    kind: _TerminalFillKind
+    quantity: Optional[float] = None
+    price: Optional[float] = None
+
+
+def _strict_finite_float(value: Any) -> Optional[float]:
+    """Parse an external numeric scalar without accepting booleans or non-finite values."""
+    if isinstance(value, bool):
         return None
-    return _finite_float_or_none(value)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _parse_terminal_fill(order: Dict[str, Any]) -> _TerminalFill:
+    """Classify terminal broker fill evidence as zero, reconciled, or ambiguous."""
+    quantity = _strict_finite_float(order.get("cumulative_quantity"))
+    if quantity == 0:
+        # A zero quantity proves no fill only when price evidence is either absent
+        # or exactly zero as well. A non-zero terminal average_price conflicts with
+        # the zero-quantity claim, so fail closed as ambiguous.
+        zero_price = _strict_finite_float(order.get("average_price"))
+        if zero_price is not None and zero_price != 0:
+            return _TerminalFill(_TerminalFillKind.AMBIGUOUS, quantity=quantity, price=zero_price)
+        return _TerminalFill(_TerminalFillKind.ZERO, quantity=quantity)
+    if quantity is None or quantity < 0:
+        return _TerminalFill(_TerminalFillKind.AMBIGUOUS)
+    price = _strict_finite_float(order.get("average_price"))
+    if price is None or price <= 0:
+        return _TerminalFill(_TerminalFillKind.AMBIGUOUS, quantity=quantity)
+    return _TerminalFill(_TerminalFillKind.RECONCILED, quantity=quantity, price=price)
 
 
 def session_stats(bars: Sequence[Bar]) -> Dict[str, Any]:
@@ -8055,15 +8092,7 @@ class MorningDCAExecutor(DCAExecutor):
             # "Reconcile terminal partial fills before continuing").
             terminal_order = exc.order
             order_id = str(terminal_order.get("id") or terminal_order.get("order_id") or "") or None
-            filled_quantity = _strict_fill_number(terminal_order.get("cumulative_quantity"))
-            fill_price = _strict_fill_number(terminal_order.get("average_price"))
-
-            has_reconcilable_fill = (
-                filled_quantity is not None
-                and filled_quantity > 0
-                and fill_price is not None
-                and fill_price > 0
-            )
+            terminal_fill = _parse_terminal_fill(terminal_order)
             # The normal (non-exception) placement path archives the raw
             # broker response into broker._raw_placement_responses (see
             # dca_live_adapters.RobinhoodBroker.place_market_buy's own
@@ -8083,14 +8112,15 @@ class MorningDCAExecutor(DCAExecutor):
                     "order_id": str(order_id) if order_id else "",
                     **terminal_order,
                 })
-            if has_reconcilable_fill:
+            if terminal_fill.kind is _TerminalFillKind.RECONCILED:
                 # A terminal state proves only that no LIVE remainder is
                 # left. It does not prove that no capital executed before
                 # cancellation/failure. Book the broker's authoritative
                 # cumulative fill so later candidates see the real cap and
                 # buying-power consumption (Codex review, PR #688:
                 # "Reconcile terminal partial fills before continuing").
-                filled_notional = round(filled_quantity * fill_price, 2)
+                assert terminal_fill.quantity is not None and terminal_fill.price is not None
+                filled_notional = round(terminal_fill.quantity * terminal_fill.price, 2)
                 outcomes[ticker] = {
                     "status": "submitted",
                     "order_id": order_id,
@@ -8103,7 +8133,7 @@ class MorningDCAExecutor(DCAExecutor):
                 _log.warning(
                     "Placement for %s partially filled %.8g share(s) for $%.2f before terminating, order_id=%s",
                     ticker,
-                    filled_quantity,
+                    terminal_fill.quantity,
                     filled_notional,
                     order_id,
                 )
@@ -8162,7 +8192,7 @@ class MorningDCAExecutor(DCAExecutor):
             # evidence is unreadable"). Every unreconcilable shape now halts
             # the batch exactly like the generic ambiguous-exception branch
             # below, instead of falling through.
-            if filled_quantity == 0:
+            if terminal_fill.kind is _TerminalFillKind.ZERO:
                 return (
                     batch_buying_power,
                     reserved_buying_power,

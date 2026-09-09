@@ -25616,6 +25616,18 @@ def terminal_broker_row_proves_no_order(order: Mapping) -> bool:
         return False
     if _reconciled_order_may_have_executed(order):
         return False
+    # A non-zero average price conflicts with a "no execution happened" claim.
+    # Keep malformed/non-finite prices on the historical path's existing
+    # behavior (they are ignored when quantity is explicitly zero), but fail
+    # closed on an explicit finite non-zero price value.
+    _raw_avg_price = _unwrap_fill_alias_value(order.get("average_price"))
+    if not isinstance(_raw_avg_price, bool) and not _is_blank_broker_field(_raw_avg_price):
+        try:
+            _avg_price = float(_raw_avg_price)
+        except (TypeError, ValueError, OverflowError):
+            _avg_price = None
+        if _avg_price is not None and math.isfinite(_avg_price) and _avg_price != 0:
+            return False
     if state in _DECLINED_BROKER_ORDER_STATES:
         return True
     # Scanned across the SAME alias set `_reconciled_order_may_have_executed`
