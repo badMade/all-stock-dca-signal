@@ -959,12 +959,18 @@ def test_broker_place_wraps_connector_failure_as_ambiguous():
     # broker response was observed, place_market_buy must re-raise as
     # OrderPlacementAmbiguousError -- distinct from every RuntimeError below,
     # which reacts to a DEFINITIVE response the broker DID return.
+    accepted_requests = []
+
     def _raising_place_fn(**kwargs):
+        accepted_requests.append(kwargs.copy())
         raise TimeoutError("connection reset")
 
     broker = RobinhoodBroker(account="999000111", enable_live_orders=True, place_fn=_raising_place_fn)
     with pytest.raises(OrderPlacementAmbiguousError, match="no broker response"):
         broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert len(accepted_requests) == 1
+    assert accepted_requests[0]["ref_id"] == "ref1"
+    assert accepted_requests[0]["dollar_amount"] == "1.00"
 
 
 def test_broker_place_raises_on_outer_failure_envelope():

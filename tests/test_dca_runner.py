@@ -10351,14 +10351,15 @@ def test_a_raised_place_fn_halts_because_nothing_can_be_established():
     # Still named per ticker so Gate 9 reports it.
     assert result.failures[0].reason == "place_fn raised RuntimeError"
     assert len(result.attempt_records) == 1
-    ambiguous = result.attempt_records[0]
-    assert ambiguous.state == "potentially_submitted"
-    assert ambiguous.dollar_amount == plan.to_place[0].amount_usd
-    assert ambiguous.ref_id == (
-        f"dca-runner-0935-{snapshot.day.isoformat()}-{plan.to_place[0].ticker}"
-    )
+    reservation = result.attempt_records[0]
+    assert reservation.symbol == plan.to_place[0].ticker
+    assert reservation.dollar_amount == plan.to_place[0].amount_usd
+    assert reservation.state == "potentially_submitted"
+    assert reservation.client_order_id == "dca-runner-0935-2026-07-28-AAPL"
+    assert reservation.ref_id == "dca-runner-0935-2026-07-28-AAPL"
     reserved = dca_runner.budget_snapshot(result.attempt_records, snapshot.day)
     assert reserved.day_notional_usd == plan.to_place[0].amount_usd
+    assert reserved.day_order_count == 1
 
 
 def test_an_ambiguous_reference_blocks_retry_until_reconciled():

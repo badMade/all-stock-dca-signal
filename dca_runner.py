@@ -910,6 +910,10 @@ class BrokerOrder:
     placed_agent: str | None = None
     state: str = "filled"
     executed_dollar_amount: float | None = None
+    # Deterministic client reference used to reconcile an id-less placement
+    # after the connector lost its response. Broker history adapters may map
+    # this to ref_id/client_order_uuid as appropriate.
+    client_order_id: str | None = None
     # Client-supplied idempotency key.  Ambiguous placement records retain it
     # so reconciliation can query and bind the exact broker order before a
     # reservation is released or the ticker is retried.
@@ -4243,13 +4247,13 @@ class ExecutionResult:
     ``placement_enabled`` reports whether both live gates were flipped, so a
     dry run and a real submission are never confused.
 
-    ``attempt_records`` contains synthetic broker rows for outcomes that need
-    durable local evidence. Proven-no-order failures carry zero notional.
-    Ambiguous connector failures carry the full requested notional, state
+    ``attempt_records`` contains synthetic broker rows for outcomes that do not
+    otherwise produce a submitted row. Proven-no-order failures reserve only
+    an attempt. Ambiguous placements carry the full requested notional, state
     ``potentially_submitted``, and the exact client reference used at the
-    broker boundary. Persist these beside the execution artifact and include
-    them with the next broker-history snapshot; the ambiguous reservation must
-    remain until that exact reference is reconciled.
+    broker boundary under both ``ref_id`` and ``client_order_id`` so later
+    reconciliation can bind an id-less broker row while cap checks remain
+    conservative until that exact reference is reconciled.
     """
 
     submitted: list[str] = field(default_factory=list)
@@ -6276,19 +6280,24 @@ def execute_plan(
             if response is _PLACE_FN_RAISED or _placement_response_may_hold_a_live_order(
                 response
             ):
-                if response is _PLACE_FN_RAISED:
-                    ambiguous_record = BrokerOrder(
-                        symbol=ticker,
-                        side=order.side,
-                        dollar_amount=order.amount_usd,
-                        created_at=placement_now,
-                        placed_agent="agentic",
-                        state="potentially_submitted",
-                        ref_id=ref_id,
-                    )
-                    result.attempt_records.append(ambiguous_record)
-                    if isinstance(orders, list):
-                        orders.append(ambiguous_record)
+                # The placement call either raised or returned an ambiguous payload. Either way,
+                # we cannot prove whether the request reached the broker or was accepted, so book
+                # the worst-case exposure immediately before returning the halted result. Without
+                # this reservation, durable state says zero and a later invocation can spend the
+                # same daily dollars and attempt slot again while reconciliation is unavailable.
+                reservation = BrokerOrder(
+                    symbol=ticker,
+                    side=order.side,
+                    dollar_amount=order.amount_usd,
+                    created_at=placement_now,
+                    placed_agent="agentic",
+                    state="potentially_submitted",
+                    client_order_id=ref_id,
+                    ref_id=ref_id,
+                )
+                result.attempt_records.append(reservation)
+                if isinstance(orders, list):
+                    orders.append(reservation)
                 result.halted_on = ticker
                 unprovable = (
                     "the placement call raised, so whether an order was accepted cannot be "
