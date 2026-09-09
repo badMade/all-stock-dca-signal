@@ -417,6 +417,19 @@ from assess").
 
 ## Safety gates (both must be flipped to place real orders)
 
+Every live placement also requires a fresh clock reading inside that day's
+regular NYSE session (09:30 inclusive to 16:00 exclusive, or 13:00 on a
+configured early close). Compact execution and the executor classes sample
+the system clock immediately before calling the broker; whole-share orders
+sample it inside the ledger's claim lock. The live runner applies the same
+session check to its injected `now_fn` reading. All three reuse the validated
+market calendar and fail closed when the clock/calendar cannot be verified or
+the clock's ET date differs from the scan's trading day.
+
+Manual runs may execute within the regular session outside a scheduled slot's
+narrower window, after the existing review checks. Historical dry runs retain
+their supplied scan timestamps and do not consult the live placement clock.
+
 1. **`StrategyConfig.dry_run`** — True by default. While True, `run_once` never calls
    `place_market_buy` on a live broker; it records a simulated `DRY-RUN-SIM-…` order id.
 2. **`RobinhoodBroker.enable_live_orders`** — False by default. Even with `dry_run=False`,

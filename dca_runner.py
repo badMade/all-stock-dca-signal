@@ -744,15 +744,10 @@ class MarketDayStatus:
         A closed exchange or an early-close afternoon is a normal calendar fact,
         not a fault worth waking anyone for.
 
-        Known deferred gap (Codex review: "End the midday window before an
-        early market close"): this checks only ``slot.nominal_et``, not
-        whether ``slot.window_end_et`` could reach the 1:00 PM early close --
-        the 12:30 slot's window ends exactly at 13:00. Not exploitable today
-        (``config/trading_window.json`` ends 2026-10-30, before every
-        currently-listed early-close date), so gate_time_sanity's contract
-        was not changed to thread market status through it; revisit before
-        extending the trading window into a year with an early close on/after
-        a pre-13:00 slot's nominal time.
+        This start-of-run decision checks the nominal slot time. The fresh
+        placement-clock check also validates the regular exchange session,
+        independently of the slot's acceptance window, so a delayed order
+        cannot cross the 1:00 PM early close.
         """
         if self.is_closed:
             return True
@@ -4910,6 +4905,13 @@ def _now_fn_clock_failure(
             f"{slot.window_end_et[0]:02d}:{slot.window_end_et[1]:02d} ET acceptance "
             "window has closed before this order could be placed"
         )
+    # Slot acceptance and the exchange session are independent: a
+    # configured early close can truncate an otherwise valid slot.
+    from near_close_dca import _regular_session_failure
+
+    session_failure = _regular_session_failure(fresh_now, trading_day)
+    if session_failure:
+        return None, session_failure
     if orders_fetched_at is not None:
         orders_age_seconds = (fresh_now - orders_fetched_at).total_seconds()
         if orders_age_seconds < 0 or orders_age_seconds > MAX_ORDERS_FETCH_AGE_SECONDS:

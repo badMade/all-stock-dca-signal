@@ -75,10 +75,17 @@ jobs:
           # triple-dot fails with "no merge base", so fail closed only on
           # truly broken git state and fall back to two-dot for artifact
           # generation (review remains pinned to BASE_SHA either way).
-          if git merge-base "${BASE_SHA}" HEAD >/dev/null 2>&1; then
-            git diff "${BASE_SHA}...HEAD" > review_input/diff.patch
+          # HEAD may be GitHub's synthetic merge commit; metadata describes
+          # HEAD_SHA, so this diagnostic diff must describe that same commit.
+          # The privileged consumer independently computes its review input.
+          if git merge-base "${BASE_SHA}" "${HEAD_SHA}" >/dev/null; then
+            git diff --no-ext-diff --no-textconv --no-color "${BASE_SHA}...${HEAD_SHA}" > review_input/diff.patch
           else
-            git diff "${BASE_SHA}..HEAD" > review_input/diff.patch
+            status=$?
+            if [ "$status" -ne 1 ]; then
+              exit "$status"
+            fi
+            git diff --no-ext-diff --no-textconv --no-color "${BASE_SHA}..${HEAD_SHA}" > review_input/diff.patch
           fi
           # Metadata is written by a script, not interpolated into a shell
           # heredoc, so a PR number/SHA/ref value can never be treated as

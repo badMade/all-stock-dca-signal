@@ -2770,6 +2770,135 @@ def test_broker_order_fill_swallows_lookup_failure():
     assert RobinhoodBroker(order_fill_fn=boom).get_order_fill("ORD-1") is None
 
 
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        pytest.param(lambda row: {"success": False, "orders": [row]}, id="failed_outer"),
+        pytest.param(lambda row: {"data": {"ok": False, "orders": [row]}}, id="failed_inner"),
+        pytest.param(lambda row: {"success": True, "data": {"success": False, "orders": [row]}}, id="contradictory_health"),
+        pytest.param(lambda row: {"isError": True, "orders": [row]}, id="bridge_failure"),
+        pytest.param(lambda row: {"orders": [None]}, id="null_row"),
+        pytest.param(lambda row: {"orders": [None, row]}, id="malformed_then_valid"),
+        pytest.param(lambda row: {"orders": row}, id="object_collection"),
+        pytest.param(lambda row: {"orders": "invalid"}, id="string_collection"),
+        pytest.param(lambda row: {"order": {**row, "order_id": "other-order"}}, id="conflicting_ids"),
+        pytest.param(lambda row: {"order": {**row, "state": "filled", "status": "queued"}}, id="conflicting_lifecycle"),
+        pytest.param(lambda row: {"order": {**row, "filled_quantity": "2"}}, id="conflicting_quantity"),
+        pytest.param(lambda row: {"order": {**row, "executed_notional": "20"}}, id="conflicting_execution"),
+        pytest.param(lambda row: {"order": {**row, "average_price": None, "price": "10"}}, id="limit_price_is_not_fill"),
+        pytest.param(lambda row: {"orders": [row, {**row, "average_price": "20"}]}, id="conflicting_duplicate_rows"),
+        pytest.param(lambda row: {"order": row, "orders": [{**row, "cumulative_quantity": "2"}]}, id="conflicting_representations"),
+    ],
+)
+def test_order_fill_rejects_failed_malformed_or_conflicting_evidence(wrap):
+    """M1: unavailable fill evidence must preserve the accepted order without inventing a fill."""
+    row = {"id": "fill-fixture", "cumulative_quantity": "1", "average_price": "10"}
+    broker = RobinhoodBroker(order_fill_fn=lambda **kwargs: wrap(row))
+
+    assert broker.get_order_fill("fill-fixture") is None
+
+
+@pytest.mark.parametrize("quantity_key", ["cumulative_quantity", "executed_quantity", "filled_quantity", "quantity_filled"])
+def test_order_fill_accepts_consistent_execution_aliases(quantity_key):
+    row = {"id": "fill-fixture", "status": "partially_filled", quantity_key: "0.5", "average_price": "10"}
+    broker = RobinhoodBroker(order_fill_fn=lambda **kwargs: {"orders": [row, dict(row)]})
+
+    fill = broker.get_order_fill("fill-fixture")
+    assert fill is not None
+    assert fill.quantity_filled == pytest.approx(0.5)
+    assert fill.avg_fill_price == pytest.approx(10)
+
+
+@pytest.mark.parametrize("quantity_key", ["cumulative_quantity", "quantity"])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize(
+    "outer_fields",
+    [
+        pytest.param({"executed_notional": "0"}, id="zero_dollars"),
+        pytest.param({"executed_notional": "11"}, id="different_dollars"),
+        pytest.param({"executed_dollar_amount": "11"}, id="different_dollar_alias"),
+        pytest.param({"filled_notional": "11"}, id="different_filled_notional"),
+        pytest.param({"cumulative_quantity": "2"}, id="different_quantity"),
+        pytest.param({"executed_quantity": "0"}, id="zero_quantity"),
+        pytest.param({"filled_quantity": "2"}, id="different_filled_quantity"),
+        pytest.param({"quantity_filled": {"amount": "2"}}, id="wrapped_quantity"),
+        pytest.param({"average_price": "11"}, id="different_average"),
+        pytest.param({"average_price": "NaN"}, id="unreadable_average"),
+        pytest.param({"executed_notional": {"amount": None}}, id="unreadable_dollars"),
+        pytest.param({"executed_quantity": "NaN"}, id="unreadable_quantity"),
+    ],
+)
+def test_order_fill_rejects_conflicting_envelope_execution(quantity_key, nested, outer_fields):
+    """M1: matching outer identity does not excuse contradictory execution evidence."""
+    row = {"id": "fill-fixture", "state": "filled", quantity_key: "1", "average_price": "10"}
+    envelope = {"id": "fill-fixture", "state": "filled", **outer_fields}
+    response = {"data": {**envelope, "order": row}} if nested else {**envelope, "data": {"orders": [row]}}
+    broker = RobinhoodBroker(order_fill_fn=lambda **kwargs: response)
+
+    assert broker.get_order_fill("fill-fixture") is None
+
+
+@pytest.mark.parametrize("quantity_key", ["cumulative_quantity", "quantity"])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize(
+    "outer_fields",
+    [
+        pytest.param({}, id="identity_only"),
+        pytest.param({"updated_at": "2026-07-08T14:00:00Z"}, id="metadata_only"),
+        pytest.param({"executed_notional": "10.00"}, id="complementary_dollars"),
+        pytest.param({"executed_notional": "10.0005"}, id="reconstructed_dollar_rounding"),
+        pytest.param({"filled_notional": {"amount": "10.0"}}, id="wrapped_dollars"),
+        pytest.param({"cumulative_quantity": "1.00"}, id="equivalent_quantity"),
+        pytest.param({"quantity_filled": {"amount": "1.0"}}, id="equivalent_wrapped_quantity"),
+        pytest.param({"average_price": {"amount": "10.00"}}, id="equivalent_wrapped_average"),
+        pytest.param({"executed_notional": None, "average_price": " ", "filled_quantity": {"amount": " "}}, id="blanks"),
+    ],
+)
+def test_order_fill_preserves_consistent_envelope_execution(quantity_key, nested, outer_fields):
+    row = {"id": "fill-fixture", "state": "filled", quantity_key: "1", "average_price": "10"}
+    envelope = {"id": "fill-fixture", "state": "filled", **outer_fields}
+    response = {"data": {**envelope, "order": row}} if nested else {**envelope, "data": {"orders": [row, dict(row)]}}
+    broker = RobinhoodBroker(order_fill_fn=lambda **kwargs: response)
+
+    fill = broker.get_order_fill("fill-fixture")
+    assert fill is not None
+    assert fill.quantity_filled == pytest.approx(1)
+    assert fill.avg_fill_price == pytest.approx(10)
+
+
+@pytest.mark.parametrize("inner_key", ["executed_notional", "filled_notional"])
+@pytest.mark.parametrize("outer_dollars,inner_dollars", [("10", "11"), ("11", "10"), ("10.0005", "9.9995")])
+def test_order_fill_checks_execution_at_every_identified_envelope_layer(outer_dollars, inner_dollars, inner_key):
+    row = {"id": "fill-fixture", "cumulative_quantity": "1", "average_price": "10"}
+    response = {
+        "id": "fill-fixture", "executed_notional": outer_dollars,
+        "data": {"id": "fill-fixture", inner_key: inner_dollars, "order": row},
+    }
+    assert RobinhoodBroker(order_fill_fn=lambda **kwargs: response).get_order_fill("fill-fixture") is None
+
+
+@pytest.mark.parametrize("inner_fields", [{"executed_notional": "10.0005"}, {"filled_notional": "10.0005"}, {}])
+def test_order_fill_preserves_agreement_between_envelope_layers(inner_fields):
+    row = {"id": "fill-fixture", "cumulative_quantity": "1", "average_price": "10"}
+    response = {
+        "id": "fill-fixture", "executed_notional": "10.0005",
+        "data": {"id": "fill-fixture", **inner_fields, "order": row},
+    }
+    fill = RobinhoodBroker(order_fill_fn=lambda **kwargs: response).get_order_fill("fill-fixture")
+    assert fill is not None
+    assert fill.quantity_filled == pytest.approx(1)
+    assert fill.avg_fill_price == pytest.approx(10)
+
+
+@pytest.mark.parametrize("row_fields", [{"cumulative_quantity": "0", "average_price": "10"}, {"cumulative_quantity": "1"}])
+def test_order_fill_does_not_complete_missing_execution_from_outer_metadata(row_fields):
+    response = {
+        "id": "fill-fixture", "cumulative_quantity": "1", "average_price": "10",
+        "data": {"order": {"id": "fill-fixture", **row_fields}},
+    }
+    assert RobinhoodBroker(order_fill_fn=lambda **kwargs: response).get_order_fill("fill-fixture") is None
+
+
 def test_broker_buying_power_keyword_call_and_failure():
     assert RobinhoodBroker(simulated_buying_power_usd=250.0).available_buying_power() == 250.0
 
@@ -7483,6 +7612,92 @@ def test_same_day_ticker_notional_fails_closed_on_a_non_finite_amount():
         broker.same_day_ticker_notional_usd("AAPL", date(2026, 9, 8))
 
 
+@pytest.mark.parametrize(
+    ("state", "fill_fields", "expected_total"),
+    [
+        pytest.param("cancelled", {"executed_notional": "6.00"}, 8.0, id="cancelled_executed_notional"),
+        pytest.param("canceled", {"executed_notional": "6.00"}, 8.0, id="canceled_executed_notional"),
+        pytest.param("expired", {"executed_notional": "6.00"}, 8.0, id="expired_executed_notional"),
+        pytest.param("cancelled", {"cumulative_quantity": "0.06", "average_price": "100.00"}, 8.0, id="cancelled_fill_price"),
+        pytest.param("canceled", {"cumulative_quantity": "0.06", "average_price": "100.00"}, 8.0, id="canceled_fill_price"),
+        pytest.param("expired", {"cumulative_quantity": "0.06", "average_price": "100.00"}, 8.0, id="expired_fill_price"),
+        pytest.param("cancelled", {"cumulative_quantity": "0"}, 2.0, id="cancelled_zero_fill"),
+        pytest.param("expired", {"cumulative_quantity": "0"}, 2.0, id="expired_zero_fill"),
+        pytest.param(
+            "cancelled", {"cumulative_quantity": "0.06", "executed_quantity": "0.060", "average_price": "100"},
+            8.0, id="equivalent_terminal_quantities",
+        ),
+        pytest.param(
+            "expired", {"cumulative_quantity": "0.06", "filled_quantity": {"amount": "0.060"}, "average_price": "100"},
+            8.0, id="wrapped_terminal_quantity",
+        ),
+        pytest.param(
+            "cancelled", {"cumulative_quantity": "0", "executed_quantity": "0.00"},
+            2.0, id="equivalent_terminal_zero_quantities",
+        ),
+        pytest.param(
+            "cancelled", {"executed_notional": "6.00", "filled_notional": "6.0005"},
+            8.0, id="terminal_dollar_rounding_tolerance",
+        ),
+        pytest.param("partially_filled", {"executed_notional": "6.00"}, 12.0, id="working_order_keeps_full_commitment"),
+    ],
+)
+def test_same_day_ticker_notional_preserves_terminal_fills(state, fill_fields, expected_total):
+    """H2: termination releases the unfilled remainder, never dollars already spent."""
+    orders = [
+        {
+            "id": "filled-prior", "symbol": "AAPL", "side": "buy", "state": "filled",
+            "dollar_amount": "2.00", "executed_notional": "2.00",
+            "created_at": "2026-07-08T13:35:00Z",
+        },
+        {
+            "id": "partial-prior", "symbol": "AAPL", "side": "buy", "state": state,
+            "dollar_amount": "10.00", "quantity": "0.10",
+            "created_at": "2026-07-08T14:00:00Z", **fill_fields,
+        },
+    ]
+    broker = RobinhoodBroker(orders_fn=lambda **kwargs: {"orders": orders, "next": None})
+
+    # Terminal: $2 + executed $6 (or explicit $0). Working: $2 + the entire $10 commitment.
+    assert broker.same_day_ticker_notional_usd("AAPL", date(2026, 7, 8)) == pytest.approx(expected_total)
+
+
+@pytest.mark.parametrize("state", ["cancelled", "expired"])
+@pytest.mark.parametrize(
+    "fill_fields",
+    [
+        pytest.param({"cumulative_quantity": "0.06", "price": "100.00"}, id="missing_average_fill_price"),
+        pytest.param({"executed_notional": "NaN"}, id="nonfinite_execution"),
+    ],
+)
+def test_same_day_ticker_notional_blocks_unvalued_terminal_fills(state, fill_fields):
+    """Unproven execution value must not become zero or use the requested/limit price."""
+    order = {
+        "id": "unvalued-terminal", "symbol": "AAPL", "side": "buy", "state": state,
+        "dollar_amount": "10.00", "created_at": "2026-07-08T14:00:00Z", **fill_fields,
+    }
+    broker = RobinhoodBroker(orders_fn=lambda **kwargs: {"orders": [order], "next": None})
+
+    with pytest.raises(RuntimeError):
+        broker.same_day_ticker_notional_usd("AAPL", date(2026, 7, 8))
+
+
+@pytest.mark.parametrize("state", ["cancelled", "canceled", "expired"])
+@pytest.mark.parametrize("quantity_key", ["executed_quantity", "filled_quantity", "quantity_filled"])
+@pytest.mark.parametrize("quantity", ["0.07", "0", {"amount": "0.07"}, "NaN"])
+def test_same_day_ticker_notional_blocks_conflicting_terminal_quantities(state, quantity_key, quantity):
+    """H2: every supplied execution quantity must support the settled dollar total."""
+    order = {
+        "id": "terminal-quantity-fixture", "symbol": "AAPL", "side": "buy", "state": state,
+        "created_at": "2026-07-08T14:00:00Z", "dollar_amount": "10.00",
+        "cumulative_quantity": "0.06", "average_price": "100.00", quantity_key: quantity,
+    }
+    broker = RobinhoodBroker(orders_fn=lambda **kwargs: {"orders": [order], "next": None})
+
+    with pytest.raises(RuntimeError, match="unproven executed notional"):
+        broker.same_day_ticker_notional_usd("AAPL", date(2026, 7, 8))
+
+
 # --- Copilot review of PR #1394 ------------------------------------------------
 _SYNTHETIC_ACCOUNT = "123456789"  # synthetic, allow-listed account-shaped value
 
@@ -7638,3 +7853,44 @@ def test_a_live_broker_refuses_an_unrecognizable_order_page_instead_of_reading_i
 
     dry = RobinhoodBroker(account="999000111", enable_live_orders=False, orders_fn=unrecognized)
     assert list(dry._iter_same_day_orders("AAPL", date(2026, 9, 4))) == []
+@pytest.mark.parametrize("lookup", ["buying_power", "fill"])
+def test_failed_broker_lookup_redacts_log_message_and_exception_chain(lookup, caplog):
+    import logging
+
+    def failed(**kwargs):
+        try:
+            raise RuntimeError("Authorization: Bearer synthetic-inner-token")
+        except RuntimeError as exc:
+            raise OSError("password=synthetic-outer-secret") from exc
+
+    broker = RobinhoodBroker(buying_power_fn=failed, order_fill_fn=failed)
+    if lookup == "buying_power":
+        assert broker.available_buying_power() == 0.0
+    else:
+        assert broker.get_order_fill("token=synthetic-order-secret") is None
+    records = [record for record in caplog.records if record.name == "near_close_dca.live_adapters"]
+    assert len(records) == 1
+    formatted = logging.Formatter().format(records[0])
+    for value in ("synthetic-inner-token", "synthetic-outer-secret", "synthetic-order-secret"):
+        assert value not in formatted
+    assert "[REDACTED]" in formatted
+    assert "OSError" in formatted
+    assert records[0].exc_info is None and not records[0].exc_text
+
+
+@pytest.mark.parametrize("lookup", ["buying_power", "fill"])
+def test_broker_lookup_keeps_safe_fallback_when_exception_stringification_raises(lookup, caplog):
+    class BrokenMessageError(Exception):
+        def __str__(self):
+            raise TypeError("unusable connector error message")
+
+    def failed(**kwargs):
+        raise BrokenMessageError()
+
+    broker = RobinhoodBroker(buying_power_fn=failed, order_fill_fn=failed)
+    if lookup == "buying_power":
+        assert broker.available_buying_power() == 0.0
+    else:
+        assert broker.get_order_fill("synthetic-order") is None
+    assert "BrokenMessageError" in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)

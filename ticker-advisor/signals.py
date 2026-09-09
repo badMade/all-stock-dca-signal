@@ -403,9 +403,11 @@ SEC_MAX_REQUESTS_PER_SECOND = 8.0
 # extract a bounded, tag-stripped snippet from it -- capped well short of
 # a full 10-K (often hundreds of KB) since only a representative excerpt is
 # needed for FinBERT sentiment, not the complete filing.
-_HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 _WHITESPACE_RUN_PATTERN = re.compile(r"\s+")
 _MAX_FILING_SNIPPET_CHARS = 4000
+_MAX_FILING_DOCUMENT_BYTES = 2 * 1024 * 1024
+_MAX_FILING_DOCUMENT_CHARS = 2 * 1024 * 1024
+_FILING_DOWNLOAD_CHUNK_BYTES = 64 * 1024
 # Modern filings are inline-XBRL: a <head> full of CSS/metadata and an
 # <ix:header> block of hidden tagged facts routinely precede the visible
 # narrative, and a naive strip-tags-then-truncate can consume the entire
@@ -413,14 +415,14 @@ _MAX_FILING_SNIPPET_CHARS = 4000
 # actual prose -- FinBERT would then score filing metadata, not filing
 # CONTENT, the same "score CONTENT, not metadata" line this module already
 # draws elsewhere (Codex review on PR #429: "Extract visible filing prose
-# before truncating"). DOTALL so ".*?" spans the (frequently multi-line)
-# block content; non-greedy so a document with more than one such block
-# doesn't collapse everything between the first open tag and the last close
-# tag of the same name into one match.
-_HTML_HIDDEN_BLOCK_PATTERN = re.compile(
-    r"<(script|style|head|ix:header)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL
+# before truncating"). Separate opening/closing scans avoid retrying a
+# whole-document wildcard at every unclosed tag, which is quadratic.
+_HTML_HIDDEN_TAG_PATTERNS = tuple(
+    (re.compile(rf"<{tag}\b", re.IGNORECASE), re.compile(rf"</{tag}\s*>", re.IGNORECASE))
+    for tag in ("script", "style", "head", "ix:header")
 )
-_HTML_BODY_PATTERN = re.compile(r"<body\b[^>]*>(.*)</body\s*>", re.IGNORECASE | re.DOTALL)
+_HTML_BODY_OPEN_PATTERN = re.compile(r"<body\b", re.IGNORECASE)
+_HTML_BODY_CLOSE_PATTERN = re.compile(r"</body\s*>", re.IGNORECASE)
 
 
 class _SecRateLimiter:
@@ -499,33 +501,90 @@ def _sec_filing_document_url(hit: dict, source: dict) -> str | None:
     return f"https://www.sec.gov/Archives/edgar/data/{cik_number}/{accession_no_nodash}/{filename}"
 
 
+def _remove_hidden_filing_blocks(document: str) -> str:
+    """Remove complete hidden blocks in a fixed number of forward-only passes."""
+    for opening, closing in _HTML_HIDDEN_TAG_PATTERNS:
+        parts = []
+        cursor = 0
+        while match := opening.search(document, cursor):
+            tag_end = document.find(">", match.end())
+            if tag_end < 0:
+                break
+            end = closing.search(document, tag_end + 1)
+            if end is None:
+                # No later opener of this kind can have a closing tag either.
+                break
+            parts.extend((document[cursor:match.start()], " "))
+            cursor = end.end()
+        if cursor:
+            parts.append(document[cursor:])
+            document = "".join(parts)
+    return document
+
+
+def _strip_filing_tags(document: str) -> str:
+    """Strip the same <...> spans without rescanning every unmatched '<'."""
+    parts = []
+    cursor = 0
+    search_from = 0
+    while (start := document.find("<", search_from)) >= 0:
+        end = document.find(">", start + 1)
+        if end < 0:
+            break
+        search_from = end + 1
+        if end == start + 1:
+            continue  # The previous <[^>]+> pattern also preserved empty <>.
+        parts.extend((document[cursor:start], " "))
+        cursor = end + 1
+    parts.append(document[cursor:])
+    return "".join(parts)
+
+
+def _reject_filing_redirect(response, **_kwargs) -> None:
+    """Stop redirect bodies before Requests eagerly consumes them internally."""
+    if 300 <= response.status_code < 400:
+        response.close()
+        raise ValueError("SEC filing document redirect refused")
+
+
 def _extract_filing_snippet(raw_document: str) -> str | None:
     """Reduce a fetched filing document to a bounded, sentiment-scorable text snippet.
 
     Filing documents are HTML (occasionally plain text) and can run to
     hundreds of KB for a 10-K -- far more than FinBERT's tokenizer needs or
     a sentiment excerpt should require. Strips markup, collapses
-    whitespace, and caps the result well short of the full document.
+    whitespace, and caps the result well short of the full document. Refuses
+    oversized raw text before preprocessing, including injected documents.
     Returns None for a document that reduces to nothing usable (a blank
     document, or one that was entirely markup with no text content).
     """
     if not isinstance(raw_document, str):
         return None
+    if len(raw_document) > _MAX_FILING_DOCUMENT_CHARS:
+        raise ValueError(f"SEC filing document exceeds {_MAX_FILING_DOCUMENT_CHARS} character limit")
     # Drop <script>/<style>/<head>/<ix:header> blocks (content included, not
     # just the tags) before anything else -- otherwise their content would
     # still be present as plain text after generic tag-stripping below, and
     # could consume the truncation budget before any visible prose is
-    # reached (see the module-level comment on _HTML_HIDDEN_BLOCK_PATTERN).
-    without_hidden_blocks = _HTML_HIDDEN_BLOCK_PATTERN.sub(" ", raw_document)
+    # reached (see the module-level comment on _HTML_HIDDEN_TAG_PATTERNS).
+    without_hidden_blocks = _remove_hidden_filing_blocks(raw_document)
     # Prefer the <body> content specifically when present -- narrows to the
     # visible document even when boilerplate outside <body> (a <head> this
     # particular document didn't close properly, XML/DOCTYPE preamble)
     # wasn't already caught above. Falls back to the whole (already-
     # cleaned) document for a plain-text filing or a fragment with no
     # <body> tag at all.
-    body_match = _HTML_BODY_PATTERN.search(without_hidden_blocks)
-    visible_html = body_match.group(1) if body_match else without_hidden_blocks
-    without_tags = _HTML_TAG_PATTERN.sub(" ", visible_html)
+    visible_html = without_hidden_blocks
+    body_start = _HTML_BODY_OPEN_PATTERN.search(without_hidden_blocks)
+    if body_start is not None:
+        tag_end = without_hidden_blocks.find(">", body_start.end())
+        if tag_end >= 0:
+            body_end = None
+            for closing in _HTML_BODY_CLOSE_PATTERN.finditer(without_hidden_blocks, tag_end + 1):
+                body_end = closing.start()
+            if body_end is not None:
+                visible_html = without_hidden_blocks[tag_end + 1:body_end]
+    without_tags = _strip_filing_tags(visible_html)
     collapsed = _WHITESPACE_RUN_PATTERN.sub(" ", without_tags).strip()
     if not collapsed:
         return None
@@ -585,7 +644,7 @@ def fetch_sec_filings(
     starving the SEC-only sentiment fallback for users without a NewsAPI
     key (Codex review on PR #429: "Fetch SEC filing content before
     requiring _text"). A per-hit document fetch failure (403, timeout,
-    unparseable response) excludes just that hit -- matching this
+    unparseable or oversized response) excludes just that hit -- matching this
     function's existing "degrade, don't raise" contract -- rather than
     aborting the whole candidate's SEC signal.
     """
@@ -623,9 +682,30 @@ def fetch_sec_filings(
 
             headers = {"User-Agent": os.environ.get("SEC_EDGAR_USER_AGENT", _DEFAULT_SEC_EDGAR_USER_AGENT)}
             _sec_rate_limiter.acquire()
-            response = requests.get(url, headers=headers, timeout=timeout)
-            response.raise_for_status()
-            return response.text
+            # Requests consumes redirect bodies even when preparing _next for
+            # allow_redirects=False. Its response hook runs before that read.
+            with requests.get(
+                url, headers=headers, timeout=timeout, stream=True, allow_redirects=False,
+                hooks={"response": _reject_filing_redirect},
+            ) as response:
+                response.raise_for_status()
+                try:
+                    declared_size = int(response.headers.get("Content-Length", ""))
+                except (TypeError, ValueError):
+                    declared_size = 0
+                if declared_size > _MAX_FILING_DOCUMENT_BYTES:
+                    raise ValueError(f"SEC filing document exceeds {_MAX_FILING_DOCUMENT_BYTES} byte limit")
+                payload = bytearray()
+                for chunk in response.iter_content(chunk_size=_FILING_DOWNLOAD_CHUNK_BYTES):
+                    # iter_content yields decompressed bytes, so a missing or
+                    # misleading Content-Length cannot bypass this bound.
+                    if len(chunk) > _MAX_FILING_DOCUMENT_BYTES - len(payload):
+                        raise ValueError(f"SEC filing document exceeds {_MAX_FILING_DOCUMENT_BYTES} byte limit")
+                    payload.extend(chunk)
+                try:
+                    return payload.decode(response.encoding or "utf-8", errors="replace")
+                except LookupError:
+                    return payload.decode("utf-8", errors="replace")
 
     try:
         payload = fetcher()
@@ -778,14 +858,13 @@ def fetch_sec_filings(
             if document_url is not None:
                 try:
                     raw_document = document_fetcher(document_url)
+                    if raw_document is not None:
+                        snippet = _extract_filing_snippet(raw_document)
                 except Exception as exc:  # noqa: BLE001 -- one hit's document fetch must not abort the batch
                     if errors is not None:
                         errors.append(
                             f"SEC filing document fetch failed for {ticker}: {_sanitize_fetch_error(exc)}"
                         )
-                    raw_document = None
-                if raw_document is not None:
-                    snippet = _extract_filing_snippet(raw_document)
         if snippet:
             filings.append({"ticker": ticker, "text": snippet, "form": form_type})
     return filings

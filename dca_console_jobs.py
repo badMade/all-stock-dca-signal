@@ -100,11 +100,13 @@ class JobManager:
                 "started_at": datetime.now(timezone.utc).isoformat(),
                 "finished_at": None, "returncode": None, "log": "",
             }
-            self.jobs.append(item)
-            self.jobs = self.jobs[-30:]
+            worker = threading.Thread(target=self._work, args=(item, work), daemon=True)
             self._persist(item)
-            self.worker = threading.Thread(target=self._work, args=(item, work), daemon=True)
-            self.worker.start()
+            worker.start()
+            # _work takes this lock before running. Publish only after startup
+            # succeeds, so a failure preserves the prior worker and job history.
+            self.jobs = (self.jobs + [item])[-30:]
+            self.worker = worker
             return dict(item)
 
     def _persist(self, item: dict) -> None:
@@ -141,13 +143,24 @@ class JobManager:
         log("\nRunning: " + " ".join(command.argv) + "\n")
         with subprocess.Popen(
             command.argv, cwd=command.cwd, env=command.env, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, start_new_session=os.name == "posix",
+            stderr=subprocess.STDOUT, start_new_session=os.name == "posix", bufsize=0,
         ) as process:
+            assert process.stdout is not None
+            if os.name == "posix":
+                os.set_blocking(process.stdout.fileno(), False)
+            stop_reading = threading.Event()
+
             def pump() -> None:
                 assert process.stdout is not None
                 # Buffer partial lines so a secret cannot be split across redaction calls.
                 pending = ""
-                while chunk := process.stdout.read1(4096):
+                while not stop_reading.is_set():
+                    chunk = process.stdout.read(4096)
+                    if chunk is None:
+                        stop_reading.wait(0.05)
+                        continue
+                    if not chunk or stop_reading.is_set():
+                        break
                     pending += chunk.decode("utf-8", errors="replace")
                     while "\n" in pending:
                         line, pending = pending.split("\n", 1)
@@ -161,7 +174,7 @@ class JobManager:
             reader.start()
             deadline = time.monotonic() + command.timeout
             interrupted = False
-            while process.poll() is None:
+            while process.poll() is None or reader.is_alive():
                 if self.stop.wait(0.2) or time.monotonic() >= deadline:
                     interrupted = True
                     log("\nJob stopping: console shutdown or execution time limit reached.\n")
@@ -172,9 +185,10 @@ class JobManager:
                             process.terminate()
                     except ProcessLookupError:
                         pass
-                    try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
+                    grace_deadline = time.monotonic() + 10
+                    while (process.poll() is None or reader.is_alive()) and time.monotonic() < grace_deadline:
+                        time.sleep(0.05)
+                    if process.poll() is None or reader.is_alive():
                         try:
                             if os.name == "posix":
                                 os.killpg(process.pid, signal.SIGKILL)
@@ -185,6 +199,11 @@ class JobManager:
                     break
             code = process.wait()
             reader.join(timeout=2)
+            # A descendant may have escaped the group while retaining stdout.
+            # Stop the POSIX reader even without EOF; unbuffered close never waits
+            # behind a reader's buffered-I/O lock on the other platforms.
+            stop_reading.set()
+            reader.join(timeout=0.2)
             return 3 if interrupted else code
 
     def close(self) -> None:

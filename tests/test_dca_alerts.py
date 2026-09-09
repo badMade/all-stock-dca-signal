@@ -4,6 +4,7 @@ import http.client
 import io
 import ipaddress
 import json
+import logging
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timezone
@@ -23,6 +24,74 @@ import near_close_dca  # noqa: F401
 from dca_alerts import GuardedRunConfig, alert_failure, guarded_run, heartbeat_url, send_heartbeat
 
 _PUBLIC_IP = ipaddress.ip_address("93.184.216.34")
+
+
+def _assert_redacted_log_records(caplog, expected_count):
+    records = [
+        record for record in caplog.records
+        if record.name == dca_alerts.logger.name and record.levelno == logging.ERROR
+    ]
+    assert len(records) == expected_count
+    formatted = "\n".join(logging.Formatter().format(record) for record in records)
+    assert "synthetic-log-token" not in formatted
+    assert "[REDACTED]" in formatted
+    assert all(record.exc_info is None and not record.exc_text for record in records)
+
+
+def test_guarded_run_redacts_all_chained_failure_logs(monkeypatch, caplog):
+    original = RuntimeError("Authorization: Bearer synthetic-log-token")
+    callbacks = []
+
+    def fail_run():
+        raise original
+
+    def failed_callback(name):
+        def fail(*args, **kwargs):
+            callbacks.append(name)
+            raise OSError("secondary callback failed")
+        return fail
+
+    for name in ("alert_failure", "send_heartbeat", "write_failed_start_marker"):
+        monkeypatch.setattr(dca_alerts, name, failed_callback(name))
+    with pytest.raises(RuntimeError) as raised:
+        guarded_run("morning", fail_run, GuardedRunConfig(run_artifact_written=failed_callback("probe")))
+    assert raised.value is original
+    assert callbacks == ["alert_failure", "send_heartbeat", "probe", "write_failed_start_marker"]
+    _assert_redacted_log_records(caplog, 5)
+
+
+def test_failed_marker_redacts_nested_history_and_write_errors(monkeypatch, tmp_path, caplog):
+    def failed_write(*args, **kwargs):
+        raise OSError("secondary storage failure")
+
+    monkeypatch.setattr(Path, "open", failed_write)
+    monkeypatch.setattr(dca_alerts, "atomic_write_text", failed_write)
+    try:
+        raise RuntimeError("Authorization: Bearer synthetic-log-token")
+    except RuntimeError as exc:
+        assert dca_alerts.write_failed_start_marker("morning", exc, root=str(tmp_path)) is None
+    _assert_redacted_log_records(caplog, 2)
+
+
+@pytest.mark.parametrize("callback", ["result_ok", "send_heartbeat"])
+def test_guarded_result_redacts_callback_logs_without_changing_result(monkeypatch, caplog, callback):
+    result = object()
+    heartbeat_results = []
+
+    def failed(*args, **kwargs):
+        raise RuntimeError("Authorization: Bearer synthetic-log-token")
+
+    monkeypatch.setattr(dca_alerts, "write_alert_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr(dca_alerts, "send_heartbeat", lambda stream, ok: heartbeat_results.append(ok))
+    config = GuardedRunConfig()
+    if callback == "result_ok":
+        config = GuardedRunConfig(result_ok=failed)
+    else:
+        monkeypatch.setattr(dca_alerts, "send_heartbeat", failed)
+    assert guarded_run("morning", lambda: result, config) is result
+    if callback == "result_ok":
+        assert heartbeat_results == [False]
+    _assert_redacted_log_records(caplog, 1)
 
 
 class _FakeResponse(io.BytesIO):

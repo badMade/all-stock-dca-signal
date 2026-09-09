@@ -109,6 +109,7 @@ from near_close_dca import (
     PriorSameDayAllocation,
     StrategyConfig,
     _is_usable_reconciled_order_id,
+    _live_session_failure,
     _ticker_sizing,
     account_pinning_failure,
     completed_bar_anchor,
@@ -7804,6 +7805,20 @@ class MorningDCAExecutor(DCAExecutor):
         # max_orders_per_day semantics (a cancelled/rejected/failed buy
         # still consumes one of the shared slots), and is what
         # _compute_top_up's cross-stream seeding above counts too.
+        # Manual review and scheduled broker lookups can finish after the
+        # close. Recheck the actual regular session for BOTH run origins,
+        # before charging an attempt or calling the placement adapter.
+        session_failure = _live_session_failure(trading_day)
+        if session_failure:
+            outcomes[ticker] = {"status": "blocked", "skip_reason": session_failure, "deliberate_skip": True}
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
         self.ledger.record_attempt(trading_day)
         try:
             order_id = broker.place_market_buy(ticker, notional, ref_id=ref_id)

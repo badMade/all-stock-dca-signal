@@ -61,6 +61,9 @@ from near_close_dca import (  # noqa: E402
     graded_buy_multiplier,
 )
 
+# Live simulations use their supplied historical clock; session/calendar gates stay enabled.
+pytestmark = pytest.mark.usefixtures("historical_live_clock")
+
 
 def _now_midday():
     """Decision timestamp for the 12:30 PM ET live execution."""
@@ -247,25 +250,23 @@ def test_midday_default_prior_allocation_roots_include_market_open_and_intraday(
     # against morning_dca's IMPORT-TIME constants. conftest's autouse
     # _isolate_cron_tracking_root sets that variable per test, so drop it here
     # to compare the unset default against the unset default.
-    monkeypatch.delenv("DCA_CRON_TRACKING_ROOT", raising=False)
     # Codex review ("Feed market-open fills into later top-up guards"; "Include
     # the 11:30 intraday run in midday context"): the midday guard's own
     # hardcoded default prior_allocation_roots must scan the 9:35 market-open
     # and 11:30/13:30/14:30 intraday roots in addition to morning/afternoon,
     # so those earlier same-day fills offset the 12:30 desired amount instead
     # of being re-bought as first allocations.
-    from morning_dca import (
-        DEFAULT_AFTERNOON_TASK_ROOT,
-        DEFAULT_INTRADAY_TASK_ROOT,
-        DEFAULT_MARKET_OPEN_TASK_ROOT,
-        DEFAULT_MORNING_LIVE_STATE_ROOT,
-    )
-
-    roots = MiddayConfig().prior_allocation_roots
-    assert DEFAULT_MARKET_OPEN_TASK_ROOT in roots
-    assert DEFAULT_MORNING_LIVE_STATE_ROOT in roots
-    assert DEFAULT_INTRADAY_TASK_ROOT in roots
-    assert DEFAULT_AFTERNOON_TASK_ROOT in roots
+    # Constants must be imported after removing the ambient override; deleting
+    # it in this already-imported test process cannot change those constants.
+    probe = """
+from dca_paths import DEFAULT_CRON_TRACKING_ROOT
+from midday_dca import MiddayConfig
+roots = MiddayConfig().prior_allocation_roots
+for stream in ('market_open_dca', 'morning_dca', 'intraday_dca', 'ce16ba6b'):
+    assert f'{DEFAULT_CRON_TRACKING_ROOT}/{stream}' in roots
+"""
+    env = {k: v for k, v in os.environ.items() if k not in (CRON_TRACKING_ROOT_ENV, "DCA_CONFIG_DIR")}
+    subprocess.run([sys.executable, "-c", probe], cwd=Path(__file__).resolve().parent.parent, env=env, check=True)
 
 
 def test_midday_default_prior_allocation_roots_resolve_at_construction_time():
@@ -1420,17 +1421,23 @@ def test_midday_executor_default_init_loads_shipped_config(monkeypatch):
     # Same reason as the prior-allocation-roots test above: this asserts the
     # loaded state_root against an import-time constant, so the autouse
     # $DCA_CRON_TRACKING_ROOT isolation must be dropped for the comparison.
-    monkeypatch.delenv("DCA_CRON_TRACKING_ROOT", raising=False)
-    ex = MiddayDCAExecutor()
-    assert ex.config.base_buy_amount_usd == 2.0
+    probe = """
+from datetime import date
+from midday_dca import MiddayDCAExecutor, DEFAULT_MIDDAY_LIVE_STATE_ROOT
+from near_close_dca import StrategyConfig
+ex = MiddayDCAExecutor()
+assert ex.config.base_buy_amount_usd == 2.0
     # Shared Normal-tier ceiling (near_close_dca.BUDGET_TIERS[0]), not the old
     # isolated 90.0 per-stream half-share -- see midday_dca.py's
     # DEFAULT_MIDDAY_DAILY_CAP_USD comment (pooling fix, 2026-08-02).
-    assert ex.config.morning_daily_cap_usd == 180.0
-    assert date(2026, 7, 2) in ex.config.approved_test_dates
-    assert date(2026, 8, 28) in ex.config.approved_test_dates
-    assert ex.state_root == DEFAULT_MIDDAY_LIVE_STATE_ROOT
-    assert ex.config.sizing_tiers == StrategyConfig().sizing_tiers
+assert ex.config.morning_daily_cap_usd == 180.0
+assert date(2026, 7, 2) in ex.config.approved_test_dates
+assert date(2026, 8, 28) in ex.config.approved_test_dates
+assert ex.state_root == DEFAULT_MIDDAY_LIVE_STATE_ROOT
+assert ex.config.sizing_tiers == StrategyConfig().sizing_tiers
+"""
+    env = {k: v for k, v in os.environ.items() if k not in (CRON_TRACKING_ROOT_ENV, "DCA_CONFIG_DIR")}
+    subprocess.run([sys.executable, "-c", probe], cwd=Path(__file__).resolve().parent.parent, env=env, check=True)
 
 
 def test_midday_ledger_namespace_isolated_from_morning_and_afternoon(tmp_path):

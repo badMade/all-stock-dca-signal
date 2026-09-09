@@ -164,6 +164,16 @@ review surface), mapped onto this system:
   shard is truncated back (un-checkpointed steps re-run deterministically); a mismatched one
   REFUSES. Per-(day, purpose) seeds derive from the master seed, so resumed and uninterrupted
   runs are byte-identical — enforced by the flagship harness test.
+- **Ledger filesystem boundary**: create, append, resume, and checkpoint verification require
+  descriptor-relative, no-follow filesystem operations (supported on Linux and macOS).
+  They refuse symlinks below the selected run directory, nonregular shard files, hard-linked
+  shards, and malformed checkpoint paths. Recovery hashes and truncates the same open file;
+  cleanup uses a pinned parent directory. Ordinary interrupted runs still recover their
+  uncheckpointed tails. Windows currently REFUSES these operations because Python does not
+  provide the required primitives there; read-only report/inspection readers remain available.
+  Use a local copy with ordinary directories and single-linked shard files on a supported
+  platform. The run directory selected by the operator may itself be a filesystem alias.
+  See [the filesystem boundary decision](adr-octopus-ledger-filesystem-boundary.md).
 - **Live re-anchoring**: the cursor is stored as a date, so a grown archive (new days, new
   IPOs) re-anchors correctly; new tickers get embedding rows initialized from the
   unknown-ticker embedding at bind time (deterministic vocabulary expansion).

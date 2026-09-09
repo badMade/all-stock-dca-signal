@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import math
 import shutil
@@ -704,6 +705,65 @@ class TestBoundedReads:
 
 
 class TestHtml:
+    @staticmethod
+    def _dashboard_with_labels(
+        tmp_path, *, model="persistence", ticker="AAA", latest="2021-06-04", lag="2021-06-01", targets=None
+    ):
+        from ledger import Ledger
+
+        run_dir = tmp_path / "run"
+        ledger = Ledger.create(run_dir)
+        targets = targets or ["2021-06-02", "2021-06-03"]
+        rows = [
+            dict(TestStreamingViews._record(ticker, f"2021-06-0{index + 1}", target), model=model)
+            for index, target in enumerate(targets)
+        ]
+        ledger.append(rows)
+        _write_bare_checkpoint(run_dir, ledger)
+        checkpoint = run_dir / "checkpoint/harness_state.json"
+        state = json.loads(checkpoint.read_bytes())
+        state["outstanding"] = {"": [
+            dict(rows[0], ticker=ticker, origin_date=latest),
+            dict(rows[0], ticker="LAGGY", origin_date=lag),
+        ]}
+        checkpoint.write_text(json.dumps(state), encoding="utf-8")
+        (run_dir / "run_meta.json").write_text(
+            json.dumps({"universe": {"tickers": [ticker, "LAGGY"], "n_tickers": 2}}), encoding="utf-8"
+        )
+        output = tmp_path / "dashboard.html"
+        assert inspect_run.main(["--run-dir", str(run_dir), "--html", str(output)]) == 0
+        return output.read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("field", ["latest", "lag"])
+    @pytest.mark.parametrize("suffix", ["<mark data-probe='date'>label</mark>", "&lt;mark&gt; & \"quoted\""])
+    def test_dashboard_escapes_pending_dates_as_text(self, tmp_path, field, suffix):
+        label = ("2099-01-01" if field == "latest" else "1999-01-01") + suffix
+        page = self._dashboard_with_labels(tmp_path, **{field: label})
+        assert label not in page
+        assert html.escape(label) in page
+        assert "<mark" not in page
+        assert "100.00" in page  # Normal forecast values still render.
+
+    def test_dashboard_escapes_model_and_ticker_names(self, tmp_path):
+        # Model names are directory names: use an entity-shaped label that
+        # also exercises escaping on filesystems that disallow angle brackets.
+        model = "custom&copy;"
+        ticker = "AAA<mark data-probe='ticker'>"
+        page = self._dashboard_with_labels(tmp_path, model=model, ticker=ticker)
+        assert model not in page and ticker not in page
+        assert html.escape(model) in page and html.escape(ticker) in page
+        assert "<mark" not in page
+        assert "(from 2021-06-01)" in page
+
+    def test_dashboard_escapes_both_ribbon_date_labels(self, tmp_path):
+        targets = ["2021-06-02<mark data-probe='first'>", "2021-06-03<mark data-probe='last'>"]
+        page = self._dashboard_with_labels(tmp_path, targets=targets)
+        assert "Band vs actual" in page and "<circle" in page
+        for label in targets:
+            assert label not in page
+            assert html.escape(label) in page
+        assert "<mark" not in page
+
     def test_dashboard_is_self_contained_and_complete(self, demo_run, tmp_path, capsys):
         out = tmp_path / "dash.html"
         assert inspect_run.main(["--run-dir", str(demo_run), "--html", str(out)]) == 0

@@ -39,6 +39,7 @@ import logging
 import os
 import os as _os
 import smtplib
+import ssl
 import sys
 import traceback
 from datetime import date, datetime, timedelta
@@ -1249,7 +1250,7 @@ class EmailNotifier:
         )
         with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
             server.ehlo()
-            server.starttls()
+            server.starttls(context=ssl.create_default_context())
             server.ehlo()
             server.login(smtp_user, smtp_pass)
             server.sendmail(smtp_user, [recipient], msg.as_string())

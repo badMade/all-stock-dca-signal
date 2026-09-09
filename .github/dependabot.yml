@@ -15,6 +15,18 @@ updates:
     labels:
       - dependencies
 
+  # uv.lock also records the optional research graph. Keep those exact
+  # transitive versions current independently of the pinned pip dev tools.
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    labels:
+      - dependencies
+
   # Workflow actions are currently pinned by tag, which is mutable. These PRs
   # keep them current; converting the pins to commit SHAs is the stronger
   # posture and dependabot maintains those too.
@@ -28,8 +40,6 @@ updates:
       - dependencies
       - ci
 
-# trading-strategies/requirements.txt is intentionally NOT tracked here. It is
-# fully unpinned research tooling (torch, transformers, vectorbt) that never
-# runs in CI and has no tests; dependabot cannot meaningfully update
-# requirements that specify no versions. Pinning that file is the prerequisite,
-# and is tracked separately.
+# Floating research manifests do not supply versions for update PRs. Their
+# corresponding strategies extra and locked transitive versions are maintained
+# by the uv job above; CI also resolves and audits each manifest separately.

@@ -3712,11 +3712,11 @@ class BrokerAdapter(Protocol):
         ...
 
     def same_day_ticker_notional_usd(self, ticker: str, trading_day: date) -> float:
-        """Return the total dollar notional of every live same-day order for ticker.
+        """Return same-day commitments plus terminal executed dollars for ticker.
 
         Unlike the two methods above (existence checks scoped to this
-        strategy's own ref-id conventions), this sums EVERY live-state broker
-        order for the ticker/day regardless of ref id or which stream/executor
+        strategy's own ref-id conventions), this includes EVERY live-state
+        commitment and terminal fill regardless of ref id or which stream/executor
         placed it -- the real, ground-truth figure a guarded top-up's
         incremental delta must never under-count relative to (see
         ``evaluate_top_up_guard``'s KNOWN GAP note).
@@ -14255,6 +14255,53 @@ def _check_account_pinning(config: StrategyConfig, broker: BrokerAdapter) -> Non
         )
 
 
+def _live_placement_now() -> datetime:
+    """Read the actual clock for one placement; never reuse the scan timestamp."""
+    return datetime.now(EASTERN)
+
+
+def _regular_session_failure(now: datetime, trading_day: date) -> Optional[str]:
+    """Fail closed unless this reading belongs to the run's open NYSE session.
+
+    Manual runs may use the full regular session, independently of scheduled
+    slot windows. Reuse the runner's validated calendar, including its coverage
+    refusal and early closes; a guessed weekday calendar is insufficient here.
+    """
+    # dca_runner imports this strategy module, so defer the reverse dependency
+    # until placement, after both modules can finish initializing.
+    from dca_runner import market_day_status
+
+    try:
+        if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+            return "live session: clock must return a timezone-aware datetime"
+        local = now.astimezone(EASTERN)
+        if local.date() != trading_day:
+            return "live session: clock date differs from the run's ET trading day"
+        status = market_day_status(trading_day)
+        if status.is_closed:
+            return "live session: market is closed for this trading day"
+        close = time(13) if status.is_early_close else time(16)
+        if not time(9, 30) <= local.time() < close:
+            return "live session: outside regular market hours"
+    except Exception as exc:  # a failed calendar/clock check must never reach placement
+        # Calendar or clock adapters may embed secrets in their error messages.
+        return f"live session: verification failed ({type(exc).__name__})"
+    return None
+
+
+def _live_session_failure(trading_day: date) -> Optional[str]:
+    """Sample a fresh placement clock and return a safe blocking reason."""
+    try:
+        now = _live_placement_now()
+    except Exception as exc:
+        return f"live session: clock failed ({type(exc).__name__})"
+    return _regular_session_failure(now, trading_day)
+
+
+class _LiveSessionBlockedError(RuntimeError):
+    """Known no-submission refusal inside the whole-share claim lock."""
+
+
 def _check_execution_gates(
     trading_day: date,
     config: StrategyConfig,
@@ -19883,13 +19930,21 @@ def _process_whole_share_candidate(
         )
         return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
+    def place_in_regular_session() -> str:
+        # The claim lock can block after every earlier check passed. Sample
+        # INSIDE its callback so a wait across the close cannot submit later.
+        session_failure = _live_session_failure(ctx.trading_day)
+        if session_failure:
+            raise _LiveSessionBlockedError(session_failure)
+        return ctx.broker.place_whole_share_buy(ticker, quantity, ref_id)
+
     try:
         owns_claim, placement = ledger.execute_claimed(
             ticker,
             trading_day_iso,
             idempotency_key,
             ctx.now.isoformat(),
-            lambda: ctx.broker.place_whole_share_buy(ticker, quantity, ref_id),
+            place_in_regular_session,
             # Token-aware ownership check, not just the timestamp -- a
             # fenced-out caller sharing the same recorded_at as a later
             # reclaim must not slip past execute_claimed()'s own check (see
@@ -19913,6 +19968,12 @@ def _process_whole_share_candidate(
         # whole-share acceptances"). Marked at the placement site rather than
         # on any return path, so no future branch can forget to.
         _mark_whole_share_acceptance(ticker, order_id, order_notional)
+    except _LiveSessionBlockedError as exc:
+        candidate_outcome = _preserve_and_block(
+            MISSING_FILL_BROKER_BLOCKED,
+            {"status": "blocked", "skip_reason": str(exc), "deliberate_skip": True, **spread_fields},
+        )
+        return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
     except WholeShareClaimPersistenceError as exc:
         # operation() (the broker call) already SUCCEEDED -- exc.result is a
         # real, live order id -- but ledger.execute_claimed() could not
@@ -23199,6 +23260,16 @@ def _process_buy_candidate(
             **spread_fields,
         }
     else:
+        # Review, connector lookups, or an earlier ticker can outlast the
+        # session. A historical scan timestamp cannot authorize a live order.
+        session_failure = _live_session_failure(ctx.trading_day)
+        if session_failure:
+            candidate_outcome = {
+                "status": "blocked", "skip_reason": session_failure,
+                "deliberate_skip": True, "reviewed_order": reviewed_order, **spread_fields,
+            }
+            _record_block_reason(ctx, ticker, MISSING_FILL_BROKER_BLOCKED, session_failure)
+            return candidate_outcome, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
         try:
             order_id = ctx.broker.place_market_buy(ticker, order_amount, ref_id=ref_id)
         except OrderConfirmationRequiredError:

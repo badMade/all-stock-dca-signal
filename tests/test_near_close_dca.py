@@ -130,6 +130,10 @@ LADDER_BOUNDARY_CASES = [
 ]
 
 
+# Live simulations use their supplied historical clock; session/calendar gates stay enabled.
+pytestmark = pytest.mark.usefixtures("historical_live_clock")
+
+
 def test_ladder_boundaries():
     config = StrategyConfig()
     for drop_pct, expected in LADDER_BOUNDARY_CASES:
