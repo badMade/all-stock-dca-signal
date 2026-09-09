@@ -5855,6 +5855,9 @@ def test_morning_scheduled_duplicate_recovery_settles_preserved_credit(tmp_path)
         def available_buying_power(self):
             return 500.0
 
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
         def same_day_strategy_order_exists_with_ref_id_prefix(
             self, ticker, trading_day, ref_id_prefixes
         ):
@@ -6371,6 +6374,9 @@ def test_morning_scheduled_duplicate_recovery_settlement_is_idempotent(tmp_path)
         def available_buying_power(self):
             return 500.0
 
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
         def same_day_strategy_order_exists_with_ref_id_prefix(
             self, ticker, trading_day, ref_id_prefixes
         ):
@@ -6736,7 +6742,9 @@ def test_morning_original_settlement_is_keyed_so_the_first_recovery_is_deduped(t
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return False
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ) -> Optional[dict[str, Any]]:
             return None
 
         def is_tradable_for_fractional_buy(self, ticker):
@@ -7076,7 +7084,7 @@ def test_credit_ledger_read_failure_aborts_top_up_computation(tmp_path):
         prior_allocation_roots=(str(tmp_path / "prior"),),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    ex.credit_ledger = _UnreadableLedger()
+    ex.credit_ledger = cast(Any, _UnreadableLedger())
 
     with pytest.raises(RuntimeError, match="ledger idempotency read failed"):
         ex._compute_top_up(_now_live(), [_isolation_signal("AAPL")])
@@ -9255,6 +9263,7 @@ def test_morning_live_top_up_accounts_for_broker_spend(
         placed.append((kwargs["symbol"], float(kwargs["dollar_amount"])))
         return {"order": {"id": "morning-top-up-order", "state": "confirmed"}}
 
+    assert cfg.target_account_number is not None
     broker = RobinhoodBroker(
         account=cfg.target_account_number,
         enable_live_orders=True,
@@ -10436,6 +10445,7 @@ def test_same_stream_order_exists_normalizes_legacy_boolean_adapters(tmp_path):
     assert result.get("id") == "legacy-bool-dup:morning:2026-07-08:NVDA"
     assert result.get("dollar_amount") is None
     again = _same_stream_order_exists(cast(Any, _LegacyBoolBroker(True)), "NVDA", trading_day, "morning")
+    assert again is not None
     assert again.get("id") == result.get("id")
     # A real order dict passes through unchanged so real order_id/amount survive.
     order = {"id": "O1", "dollar_amount": 7.5}
@@ -11240,6 +11250,8 @@ def test_a_scheduled_run_blocks_when_the_provider_cannot_be_isolated(tmp_path):
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
 
     class _UncopyableProvider(DecliningBarsProvider):
+        _historicals_fn: Any = None
+
         def __copy__(self):
             raise TypeError("not copyable")
 
@@ -11875,7 +11887,7 @@ class _BadTradabilityBroker(FakeLiveBroker):
     def __init__(self):
         self.place_calls = []
 
-    def is_tradable_for_fractional_buy(self, ticker):
+    def is_tradable_for_fractional_buy(self, ticker) -> Any:
         return _Unserializable()
 
     def place_market_buy(self, ticker, notional_usd, ref_id):
@@ -11901,7 +11913,7 @@ def test_raw_persistence_failure_during_this_candidate_blocks_this_candidate(tmp
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
     broker = _BadTradabilityBroker()
-    res = ex.run(_now_live(), data, broker=broker)
+    res = ex.run(_now_live(), data, broker=cast(Any, broker))
     artifacts = res["artifacts"]
 
     outcome = artifacts.get("broker_outcomes", {}).get("SMALL")
@@ -13259,9 +13271,6 @@ def test_terminal_rejection_with_unreadable_quantity_halts_the_batch(tmp_path, m
     assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
     assert ex.ledger.day_planned(date(2026, 7, 8)) == 10.0
     assert "NVDA" not in outcomes or outcomes["NVDA"]["status"] != "submitted"
-    assert res["artifacts"]["is_trading_failure"] is True
-    assert res["artifacts"]["scheduled_evidence_denied"] is True
-    assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
     assert heartbeat_results == [False]
 
 
@@ -13364,11 +13373,7 @@ def test_terminal_rejection_with_positive_quantity_and_no_usable_price_halts_the
     assert res["artifacts"]["is_trading_failure"] is True
     assert res["artifacts"]["scheduled_evidence_denied"] is True
     assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
-    assert heartbeat_results == [False]
     assert "NVDA" not in outcomes or outcomes["NVDA"]["status"] != "submitted"
-    assert res["artifacts"]["is_trading_failure"] is True
-    assert res["artifacts"]["scheduled_evidence_denied"] is True
-    assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
     assert heartbeat_results == [False]
 
 
@@ -15780,6 +15785,9 @@ def test_place_broker_orders_settles_ambiguous_credit_exactly_once(tmp_path):
         def available_buying_power(self):
             return 1000.0
 
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None
 
@@ -15968,7 +15976,7 @@ def test_same_stream_order_exists_asks_for_every_entry_points_family(tmp_path):
             asked.append(tuple(ref_id_prefixes))
             return {"id": "ORD-1", "ref_id": "graded-dca-morning-2026-07-08-AAPL"}
 
-    found = _same_stream_order_exists(_Recorder(), "AAPL", date(2026, 7, 8), "morning")
+    found = _same_stream_order_exists(cast(Any, _Recorder()), "AAPL", date(2026, 7, 8), "morning")
     assert found == {"id": "ORD-1", "ref_id": "graded-dca-morning-2026-07-08-AAPL"}
     assert asked == [same_stream_ref_id_prefixes("morning", date(2026, 7, 8), "AAPL")]
     assert "graded-dca-morning-2026-07-08-AAPL" in asked[0]

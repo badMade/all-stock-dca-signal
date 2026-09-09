@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-from typing import cast
-
+import evaluate as evaluate_module
+import model as model_module
 import numpy as np
 import pandas as pd
 import pytest
-
-import evaluate as evaluate_module
-import model as model_module
 from evaluate import DEFAULT_N_SPLITS, evaluate_walk_forward, score_incumbent_on_folds, walk_forward_splits
 from features import TARGET_COLUMN
 
@@ -337,4 +334,4 @@ def test_row_fingerprint_changes_when_scored_values_change():
     # Genuinely identical content still hashes identically, and row ORDER is
     # still irrelevant -- the digest stays a set comparison, not a sequence one.
     assert _row_fingerprint(base.copy()) == original
-    assert _row_fingerprint(cast(pd.DataFrame, base.iloc[::-1].reset_index(drop=True))) == original
+    assert _row_fingerprint(base.iloc[::-1].reset_index(drop=True)) == original

@@ -21776,7 +21776,7 @@ def test_legacy_historical_recovery_is_accounted_without_republishing(tmp_path):
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-LEGACY", "state": "queued", "dollar_amount": "50.00"}
 
     run_daily_compact(
@@ -28950,7 +28950,7 @@ def test_retry_replays_a_durable_booking_pending_marker(tmp_path):
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             raise AssertionError("booking replay must not query broker history")
 
     run_result = near_close_dca.RunResult(trading_day=now.date(), decisions=[])
@@ -29369,8 +29369,8 @@ def test_retry_reconciliation_scans_prior_artifact_directories(tmp_path):
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
-            assert tuple(refs) == ("afternoon-AAPL-prior-slot",)
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            assert tuple(ref_id_prefixes) == ("afternoon-AAPL-prior-slot",)
             return {"id": "ORD-PRIOR-SLOT", "state": "queued", "dollar_amount": "2.00"}
 
     ctx = near_close_dca.RunContext(
@@ -29423,7 +29423,7 @@ def test_retry_reconciliation_persists_execution_to_historical_artifact_log(tmp_
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-PRIOR-SLOT", "state": "queued", "dollar_amount": "2.00"}
 
     run_result = near_close_dca.RunResult(trading_day=now.date(), decisions=[])
@@ -29479,7 +29479,7 @@ def test_retry_reconciliation_excludes_dry_run_historical_artifacts(tmp_path):
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             raise AssertionError("a dry-run historical artifact must never reach live broker reconciliation")
 
     ctx = near_close_dca.RunContext(
@@ -29531,7 +29531,7 @@ def test_retry_reconciliation_rejects_every_unreferenced_row_in_prior_artifact(t
     }), encoding="utf-8")
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             raise AssertionError("all rows must be validated before broker reconciliation")
 
     ctx = near_close_dca.RunContext(
@@ -29576,8 +29576,8 @@ def test_retry_reconciliation_deduplicates_placement_refs_across_artifacts(tmp_p
     lookup_calls = []
 
     class Broker(DryRunBroker):
-        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, refs):
-            lookup_calls.append((ticker, tuple(refs)))
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            lookup_calls.append((ticker, tuple(ref_id_prefixes)))
             return {"id": "ORD-SHARED", "state": "queued", "dollar_amount": "2.00"}
 
     ctx = near_close_dca.RunContext(
@@ -37842,7 +37842,7 @@ def test_combined_credit_blocks_when_pre_discard_duplicate_check_fails(tmp_path)
     # credit despite being unable to rule out a real order combining it --
     # this must instead block the candidate and leave the ledger untouched.
     class _RaisingDupCheckBroker(DryRunBroker):
-        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, prefixes):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             raise RuntimeError("broker history temporarily unavailable")
 
     ledger = CumulativeCreditLedger(root=tmp_path)
@@ -39398,6 +39398,7 @@ def test_dry_run_never_settles_a_combined_live_credit_order(tmp_path):
     )
 
     assert candidate_outcome["status"] == "dry_run"
+    assert top_up_outcome is not None
     assert top_up_outcome.cumulative_credit_decline_usd == 0.60
     assert ledger.minimum_order_pending_tickers(trading_day.isoformat()) == {"AAPL": 0.40}
     events = ledger.events(trading_day.isoformat())
@@ -39990,7 +39991,9 @@ def test_process_buy_candidate_restores_discarded_credit_when_the_duplicate_lack
             super().__init__(*args, **kwargs)
             self.duplicate_checks = 0
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ) -> Any:
             self.duplicate_checks += 1
             if self.duplicate_checks == 1:
                 return None
@@ -40026,7 +40029,7 @@ def test_process_buy_candidate_restores_discarded_credit_when_the_duplicate_lack
         ctx=ProcessCandidateContext(
             config=StrategyConfig(dry_run=False),
             state=StrategyState(),
-            broker=broker,
+            broker=cast(Any, broker),
             robinhood_data=None,
             now=datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN),
             trading_day=trading_day,
@@ -40135,7 +40138,7 @@ def test_process_buy_candidate_does_not_restore_credit_a_concurrent_order_alread
     class _ConcurrentlySettledBeforeLockLedger(CumulativeCreditLedger):
         """Real ledger whose discard is beaten to the lock by a concurrent settle."""
 
-        def discard_minimum_order_pending_tracked(self, ticker, trading_day, observed_amount_usd):
+        def discard_minimum_order_pending_tracked(self, ticker, trading_day, observed_amount_usd=None):
             # Intercepts the TRACKED form, which is what the candidate loop
             # actually calls (the amount/bool forms delegate to it).
             self.settle(ticker, trading_day, 1.00, stream="concurrent-retry", order_id="ORD-CONCURRENT")
@@ -40274,7 +40277,7 @@ def test_process_buy_candidate_retries_discard_for_a_changed_sub_threshold_balan
             prior_same_day_allocations={"AAPL": prior},
             scheduled=False,
             run_result=None,
-            credit_ledger=ledger,
+            credit_ledger=cast(Any, ledger),
         ),
         running_deployed_7d=0.0,
     )
@@ -40282,6 +40285,7 @@ def test_process_buy_candidate_retries_discard_for_a_changed_sub_threshold_balan
     # $0.30 stays below the $0.50 discard threshold -- no order is placed --
     # but the retry must actually clear it from the ledger using the fresh
     # amount rather than leaving it un-discarded.
+    assert top_up_outcome is not None
     assert top_up_outcome.discarded_pending_credit_usd == 0.30
     assert candidate_outcome["status"] == "skipped"
     assert ledger.discard_calls == [0.20, 0.30]
@@ -48438,7 +48442,7 @@ def test_retry_trimming_preserves_notional_for_a_previously_blocked_sibling():
     # whole_share_order_attributions breakdown (a prior revision of this
     # merge's own per-order record) gets EXACT attribution from it instead
     # of the conservative fallback.
-    legacy_with_attributions = dict(legacy_aggregate)
+    legacy_with_attributions: dict[str, Any] = dict(legacy_aggregate)
     legacy_with_attributions["whole_share_order_attributions"] = [
         {"order_id": "A", "submitted_amount_usd": 0.0, "planned_amount_usd": None, "whole_share_quantity": 0},
         {"order_id": "B", "submitted_amount_usd": 23.0, "planned_amount_usd": 23.0, "whole_share_quantity": 1},
@@ -48486,7 +48490,7 @@ def test_retry_trimming_preserves_quantity_for_a_previously_blocked_sibling():
     assert trimmed["whole_share_quantity"] == 1
 
     # With an exact whole_share_order_attributions breakdown, use it.
-    with_attributions = dict(prior_aggregate)
+    with_attributions: dict[str, Any] = dict(prior_aggregate)
     with_attributions["whole_share_order_attributions"] = [
         {"order_id": "A", "submitted_amount_usd": 0.0, "planned_amount_usd": None, "whole_share_quantity": 0},
         {"order_id": "B", "submitted_amount_usd": 23.0, "planned_amount_usd": 23.0, "whole_share_quantity": 1},
@@ -50400,11 +50404,10 @@ def test_an_unapproved_execution_is_logged_like_any_accepted_order(monkeypatch, 
     )
 
     class _Broker(DryRunBroker):
-        def place_market_buy(self, ticker, amount_usd, ref_id=None):
+        def place_market_buy(self, ticker, notional_usd, ref_id=None):
             raise RuntimeError("connector died carrying an acceptance back")
 
-        @staticmethod
-        def same_day_order_with_ref_id_prefix_any_state(ticker, day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-BIG", "state": "filled", "executed_notional": 100.0}
 
     logged = []
@@ -50416,7 +50419,7 @@ def test_an_unapproved_execution_is_logged_like_any_accepted_order(monkeypatch, 
         config, StrategyState(), _Broker(cash=500.0, reference_prices={"AAPL": 98.0}),
         now, trading_day,
     )
-    ctx = replace(ctx, run_result=object())
+    ctx = replace(ctx, run_result=cast(Any, object()))
     ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
     monkeypatch.setattr(ncd, "quote_spread_pct", lambda *a, **k: 0.05)
     monkeypatch.setattr(ncd, "_log_execution", _capture)
@@ -50441,8 +50444,7 @@ def test_an_unapproved_execution_is_logged_like_any_accepted_order(monkeypatch, 
     # executed nothing must never be forced to "filled" — that would fabricate
     # a broker confirmation.
     class _LiveBroker(_Broker):
-        @staticmethod
-        def same_day_order_with_ref_id_prefix_any_state(ticker, day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-LIVE", "state": "queued", "dollar_amount": 100.0}
 
     logged.clear()
@@ -50452,7 +50454,7 @@ def test_an_unapproved_execution_is_logged_like_any_accepted_order(monkeypatch, 
             config, StrategyState(),
             _LiveBroker(cash=500.0, reference_prices={"AAPL": 98.0}), now, trading_day,
         ),
-        run_result=object(),
+        run_result=cast(Any, object()),
     )
     monkeypatch.setattr(ncd, "_log_execution", _capture)
     caplog.clear()
@@ -50481,7 +50483,7 @@ def test_an_unapproved_execution_is_logged_like_any_accepted_order(monkeypatch, 
         config, StrategyState(), _Broker(cash=500.0, reference_prices={"AAPL": 98.0}),
         now, trading_day,
     )
-    ctx2 = replace(ctx2, run_result=object())
+    ctx2 = replace(ctx2, run_result=cast(Any, object()))
     outcome, _t, _d, _e, _r = ncd._process_buy_candidate(
         decision=_isolation_buy_decision("AAPL"), ctx=ctx2, running_deployed_7d=0.0
     )
@@ -50510,16 +50512,18 @@ def test_an_unapproved_execution_settles_the_carried_top_up_credit(monkeypatch):
     )
 
     class _Broker(DryRunBroker):
-        def place_market_buy(self, ticker, amount_usd, ref_id=None):
+        def place_market_buy(self, ticker, notional_usd, ref_id=None):
             raise RuntimeError("connector died carrying an acceptance back")
 
-        @staticmethod
-        def same_day_order_with_ref_id_prefix_any_state(ticker, day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORD-BIG", "state": "filled", "executed_notional": 100.0}
 
     settled = []
 
     class _Ledger(ncd.CumulativeCreditLedger):
+        def __init__(self):
+            pass
+
         def minimum_order_pending_tickers(self, day_iso):
             return {"AAPL": 0.6}
 

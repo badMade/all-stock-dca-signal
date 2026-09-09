@@ -5696,7 +5696,7 @@ class RobinhoodBroker:
         order today", and the executors' sole duplicate gate re-placed every
         order on a retry.
         """
-        require_provable_history = require_provable_history or bool(self.enable_live_orders)
+        require_provable_history = require_provable_history or self.enable_live_orders
         if self._orders_fn is None:
             if require_provable_history:
                 raise RuntimeError(

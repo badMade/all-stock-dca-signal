@@ -525,11 +525,17 @@ def _signal_has_usable_metric(raw: dict[str, object], signal: str) -> bool:
     weighted metric usability, not container presence").
     """
     if signal == "health":
-        return any(_extract_health_component(raw.get("health"), c) is not None for c in _HEALTH_COMPONENTS)
+        return any(
+            _extract_health_component(cast(dict[str, float] | None, raw.get("health")), c) is not None
+            for c in _HEALTH_COMPONENTS
+        )
     if signal == "backtest":
-        return any(_extract_backtest_component(raw.get("backtest"), s) is not None for s in _BACKTEST_STRATEGIES)
+        return any(
+            _extract_backtest_component(cast(dict[str, dict[str, float]] | None, raw.get("backtest")), s) is not None
+            for s in _BACKTEST_STRATEGIES
+        )
     if signal == "sentiment":
-        return _extract_sentiment_component(raw.get("sentiment")) is not None
+        return _extract_sentiment_component(cast(dict[str, object] | None, raw.get("sentiment"))) is not None
     return False
 
 
@@ -549,17 +555,35 @@ def _signal_has_normalizable_metric(raw_scores: dict[str, dict[str, object]], si
     tickers = list(raw_scores)
     if signal == "health":
         return any(
-            sum(1 for t in tickers if _extract_health_component(raw_scores[t].get("health"), c) is not None) >= 2
+            sum(
+                1
+                for t in tickers
+                if _extract_health_component(cast(dict[str, float] | None, raw_scores[t].get("health")), c) is not None
+            )
+            >= 2
             for c in _HEALTH_COMPONENTS
         )
     if signal == "backtest":
         return any(
-            sum(1 for t in tickers if _extract_backtest_component(raw_scores[t].get("backtest"), s) is not None) >= 2
+            sum(
+                1
+                for t in tickers
+                if _extract_backtest_component(
+                    cast(dict[str, dict[str, float]] | None, raw_scores[t].get("backtest")), s
+                )
+                is not None
+            )
+            >= 2
             for s in _BACKTEST_STRATEGIES
         )
     if signal == "sentiment":
         return (
-            sum(1 for t in tickers if _extract_sentiment_component(raw_scores[t].get("sentiment")) is not None) >= 2
+            sum(
+                1
+                for t in tickers
+                if _extract_sentiment_component(cast(dict[str, object] | None, raw_scores[t].get("sentiment"))) is not None
+            )
+            >= 2
         )
     return False
 
@@ -726,7 +750,7 @@ def _normalize_datetime_frame(frame: pd.DataFrame) -> pd.DataFrame:
     # duplicate (Codex review, PR #654 follow-up: "Keep duplicate
     # timestamps stable while sorting").
     frame = frame.set_axis(_coerce_datetime_index(frame.index))
-    frame = cast(pd.DataFrame, frame.loc[frame.index.notna()])
+    frame = frame.loc[frame.index.notna()]
     frame = frame.sort_index(kind="stable")
     assert isinstance(frame.index, pd.DatetimeIndex)
     normalized = frame.index
@@ -735,7 +759,7 @@ def _normalize_datetime_frame(frame: pd.DataFrame) -> pd.DataFrame:
     frame = frame.set_axis(cast(Any, normalized).normalize())
     assert isinstance(frame.index, pd.DatetimeIndex)
     dup_mask = np.asarray(frame.index.duplicated(keep="last"))
-    return cast(pd.DataFrame, frame.loc[~dup_mask])
+    return cast(pd.DataFrame, frame[~dup_mask])
 
 
 def score_candidate(
@@ -751,11 +775,11 @@ def score_candidate(
     benchmark_calendar: pd.DatetimeIndex | None = None,
     benchmark_calendar_unavailable_reason: str | None = None,
     run_as_of: datetime | None = None,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """Every signal is best-effort: one signal's failure doesn't drop the candidate,
     it just leaves that signal None with the error recorded in ``errors``."""
-    raw: dict[str, object] = {"health": None, "backtest": None, "sentiment": None, "errors": []}
-    errors: list[str] = raw["errors"]  # type: ignore[assignment]
+    raw: dict[str, Any] = {"health": None, "backtest": None, "sentiment": None, "errors": []}
+    errors: list[str] = raw["errors"]
 
     # Price history feeds health/backtest only -- sentiment is independent
     # of it (news/SEC text, not price data), so a price-history failure must
@@ -982,7 +1006,9 @@ def score_candidate(
             # "Preserve SEC request failures in the report").
             sentiment_result = raw["sentiment"]
             if isinstance(sentiment_result, dict) and sentiment_result.get("errors"):
-                errors.extend(sentiment_result["errors"])
+                sent_errors = sentiment_result["errors"]
+                if isinstance(sent_errors, (list, tuple)):
+                    errors.extend(str(e) for e in sent_errors)
     elif not skip_sentiment and analyzer is None and sentiment_unavailable_reason:
         # Distinguishes "sentiment ran and genuinely found nothing" (also
         # raw["sentiment"] is None, but no error) from "sentiment never ran
@@ -1620,13 +1646,18 @@ def main(argv: list[str] | None = None) -> int:
     # render_proposed_diff Output Fields Are Always Empty"). Legacy
     # symbols have no matching bucket here (they're neither invalid-shape
     # nor active/excluded) and stay recorded only in run_metadata.
-    diff["skipped_invalid_symbol_shape"] = list(diff["skipped_invalid_symbol_shape"]) + invalid_shaped
-    diff["skipped_already_active"] = list(diff["skipped_already_active"]) + [
-        t for t in ineligible_universe_symbols if t in active_tickers
-    ]
-    diff["skipped_explicitly_excluded"] = list(diff["skipped_explicitly_excluded"]) + [
-        t for t in ineligible_universe_symbols if t in excluded_tickers
-    ]
+    skipped_invalid = diff.get("skipped_invalid_symbol_shape")
+    diff["skipped_invalid_symbol_shape"] = (
+        list(skipped_invalid) if isinstance(skipped_invalid, (list, tuple)) else []
+    ) + invalid_shaped
+    skipped_active = diff.get("skipped_already_active")
+    diff["skipped_already_active"] = (
+        list(skipped_active) if isinstance(skipped_active, (list, tuple)) else []
+    ) + [t for t in ineligible_universe_symbols if t in active_tickers]
+    skipped_excluded = diff.get("skipped_explicitly_excluded")
+    diff["skipped_explicitly_excluded"] = (
+        list(skipped_excluded) if isinstance(skipped_excluded, (list, tuple)) else []
+    ) + [t for t in ineligible_universe_symbols if t in excluded_tickers]
     diff["run_metadata"] = run_metadata
 
     # Every artifact's content is rendered BEFORE any of them is written --
