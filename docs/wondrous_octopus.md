@@ -17,6 +17,7 @@ and does not share code with it — sibling trees deliberately do not import eac
 | Backward in time | Causal attention over each ticker's trailing window → forward head (point + p10/p50/p90 per component) | **Yes — the only path forecasts use** |
 | Both directions in time | Training-only masked-day reconstruction (BERT-style): reconstruct a day's bar from context on both sides | Training + diagnostics only |
 | Sideways across the market | A Perceiver-style per-day market encoder: learned latent tokens cross-attend to every ticker's day-*t* features; every window position consumes its day's market embedding | Yes — leakage-free by construction (all inputs are day ≤ *t*) |
+| Sideways across a peer group | Correlation-based style clustering: the universe is re-clustered periodically from a trailing window of returns, giving each ticker a peer group without any sector or fundamental input. The group's median return and the ticker's rank inside it become features; the cluster label itself is embedded by the octopus and split on by the GBM | Yes — each refit reads only bars at or before its own refit date, and labels are aligned across refits so a persisting group keeps its id |
 
 The reconstruction head doubles as the live **"predict yesterday" health diagnostic**: at each
 step it reconstructs the most recent closed day with that position masked, in two modes —

@@ -105,6 +105,27 @@ def resolve_device(requested: str) -> str:
     return "cpu"
 
 
+#: Embedding-table size for the style cluster. Sized once at construction
+#: and checkpointed with the weights, so it is a ceiling rather than the
+#: panel's actual k -- a panel clustered more finely clamps into it instead
+#: of failing a resume on a shape mismatch.
+_MAX_CLUSTERS = 16
+
+
+def _panel_cluster_count(panel: TrainingPanel) -> int:
+    """Distinct assigned style clusters in a panel (label 0 is 'unassigned').
+
+    Drives whether the net gets a cluster embedding at all, so it is
+    recorded in the checkpoint rather than re-derived on load: a resumed run
+    must rebuild the same architecture even if a later panel happens to
+    cluster differently.
+    """
+    labels: set[int] = set()
+    for series in panel.series.values():
+        labels.update(int(label) for label in np.unique(series.cluster_id) if label > 0)
+    return len(labels)
+
+
 class _OctopusNet(nn.Module):
     def __init__(
         self,
@@ -119,6 +140,7 @@ class _OctopusNet(nn.Module):
         vocab_size: int,
         n_latents: int,
         market_summary_dim: int,
+        n_clusters: int = _MAX_CLUSTERS,
     ) -> None:
         super().__init__()
         self.window_len = window_len
@@ -147,6 +169,23 @@ class _OctopusNet(nn.Module):
             n_heads=n_heads,
             ticker_embedding=self.ticker_embedding,
         )
+        # Constructed LAST on purpose. Every nn.Module above draws its
+        # initial weights from the same torch RNG stream, so inserting a new
+        # parameter earlier would shift every later tensor's initialization
+        # and silently change the trajectory of runs that are otherwise
+        # unaffected by this feature -- which showed up as the mask-ticker
+        # reconstruction diagnostic regressing on a fixed seed. Appending
+        # leaves every pre-existing parameter initialized exactly as before.
+        # +1 because index 0 is the reserved "not assigned yet" label a
+        # ticker wears until the correlation window has filled.
+        # Built only when the universe actually splits into styles. With a
+        # single cluster the label is constant, so the embedding could only
+        # ever act as one more additive bias, redundant with the biases
+        # already in the trunk -- parameters that cannot carry information
+        # but still consume optimizer steps. +1 on the size because index 0
+        # is the reserved "not assigned yet" label a ticker wears until the
+        # correlation window has filled.
+        self.cluster_embedding = nn.Embedding(n_clusters + 1, d_model) if n_clusters > 1 else None
         causal = torch.triu(torch.ones(window_len, window_len, dtype=torch.bool), diagonal=1)
         self.register_buffer("causal_mask", causal)
 
@@ -156,6 +195,7 @@ class _OctopusNet(nn.Module):
         market: torch.Tensor,  # (B, L, d)
         ticker_ids: torch.Tensor,  # (B,)
         day_of_week: torch.Tensor,  # (B, L)
+        cluster_id: torch.Tensor | None = None,  # (B, L)
         mask_positions: torch.Tensor | None = None,  # (B, L) bool
         mask_mode: str | None = None,
     ) -> torch.Tensor:
@@ -170,6 +210,15 @@ class _OctopusNet(nn.Module):
             + self.ticker_embedding(ticker_ids.long()).unsqueeze(1)
             + self.dow_embedding(day_of_week.long())
         )
+        if cluster_id is not None and self.cluster_embedding is not None:
+            # cluster_id is stored compactly as int8 in panel and request
+            # artifacts, and nn.Embedding needs Long/Int indices -- the same
+            # normalization ticker_ids and day_of_week already get here.
+            # Clamped because the table is sized for the configured k and a
+            # panel built with a larger one must degrade to a valid index
+            # rather than index out of bounds mid-forecast.
+            clusters = cluster_id.to(dtype=torch.long).clamp(0, self.cluster_embedding.num_embeddings - 1)
+            base = base + self.cluster_embedding(clusters)
         f = self.feat_proj(windows)
         m = self.market_proj(market)
         tok = base + f + m
@@ -255,6 +304,7 @@ class OctopusModel:
         self._seed = 0
         self._market_cache: dict[int, torch.Tensor] = {}
         self._update_rounds = 0
+        self._n_clusters = 0
 
     # ------------------------------------------------------------------
     # Protocol: fit / predict / update / diagnostic / save / load
@@ -266,6 +316,7 @@ class OctopusModel:
         self._normalization = dict(panel.normalization)
         self._vocab = list(panel.tickers)
         self._vocab_index = {ticker: index + 1 for index, ticker in enumerate(self._vocab)}
+        self._n_clusters = _panel_cluster_count(panel)
         torch.manual_seed(_derive(seed, "init"))
         self._net = _OctopusNet(
             n_features=len(panel.feature_names),
@@ -278,6 +329,7 @@ class OctopusModel:
             vocab_size=len(self._vocab),
             n_latents=self.hyper["n_latents"],
             market_summary_dim=panel.market_summary.shape[1],
+            n_clusters=self._n_clusters,
         ).to(self.device)
         self._optimizer = torch.optim.AdamW(self._net.parameters(), lr=self.hyper["lr_fit"])
         self._replay = ReservoirBuffer(self.hyper["replay_capacity"], _derive(seed, "replay"))
@@ -338,7 +390,11 @@ class OctopusModel:
                 tensors = self._tensors_from_requests(chunk)
                 market = self._market_tensor(tensors["cal_pos"], in_graph_final=False)
                 tok = self._net.tokens(
-                    tensors["windows"], market, tensors["ticker_ids"], tensors["day_of_week"]
+                    tensors["windows"],
+                    market,
+                    tensors["ticker_ids"],
+                    tensors["day_of_week"],
+                    tensors["cluster_id"],
                 )
                 raw = self._net.causal_forward(tok, tensors["padding"])
                 raw = raw.view(len(chunk), len(COMPONENTS), 1 + len(QUANTILES)).cpu().numpy()
@@ -418,6 +474,7 @@ class OctopusModel:
                     market,
                     tensors["ticker_ids"],
                     tensors["day_of_week"],
+                    tensors["cluster_id"],
                     mask_positions=final_only,
                     mask_mode=mode,
                 )
@@ -487,6 +544,7 @@ class OctopusModel:
                 "device": self.device,
                 "seed": self._seed,
                 "vocab": self._vocab,
+                "n_clusters": self._n_clusters,
                 "normalization": self._normalization,
                 "param_groups": optimizer_state["param_groups"],
                 "optim_param_ids": sorted(int(key) for key in optimizer_state["state"]),
@@ -528,6 +586,7 @@ class OctopusModel:
         model = cls(device=effective_device, **metadata["hyper"])
         model._seed = metadata["seed"]
         model._vocab = list(metadata["vocab"])
+        model._n_clusters = int(metadata.get("n_clusters", 0))
         model._vocab_index = {ticker: index + 1 for index, ticker in enumerate(model._vocab)}
         model._normalization = metadata["normalization"]
         panel = panel_provider()
@@ -544,6 +603,14 @@ class OctopusModel:
             vocab_size=len(model._vocab),
             n_latents=model.hyper["n_latents"],
             market_summary_dim=panel.market_summary.shape[1],
+            # From the checkpoint, never re-derived from the panel handed to
+            # load(): whether the net HAS a cluster embedding decides its
+            # state_dict layout, so a panel that happens to cluster
+            # differently on resume must not change the architecture the
+            # saved weights are about to be loaded into. Checkpoints written
+            # before this feature carry no entry and rebuild without one,
+            # exactly as they were saved.
+            n_clusters=model._n_clusters,
         ).to(model.device)
         state = {
             key[len("net.") :]: torch.from_numpy(np.array(value))
@@ -653,12 +720,16 @@ class OctopusModel:
         windows = np.stack([self._normalize(request.features_window) for request in requests])
         masks = np.stack([request.window_mask for request in requests])
         dows = np.stack([np.clip(request.day_of_week, 0, 6) for request in requests]).astype(np.int64)
+        clusters = np.stack(
+            [np.clip(request.cluster_id, 0, _MAX_CLUSTERS) for request in requests]
+        ).astype(np.int64)
         ids = np.array([self._ticker_id(request.ticker) for request in requests], dtype=np.int64)
         cal_pos = np.stack([self._calendar_positions(request.window_dates) for request in requests])
         return {
             "windows": torch.from_numpy(windows).to(self.device),
             "padding": torch.from_numpy(~masks).to(self.device),
             "day_of_week": torch.from_numpy(dows).long().to(self.device),
+            "cluster_id": torch.from_numpy(clusters).long().to(self.device),
             "ticker_ids": torch.from_numpy(ids).to(self.device),
             "cal_pos": torch.from_numpy(cal_pos).to(self.device),
         }
@@ -789,7 +860,11 @@ class OctopusModel:
 
         # -- forward (causal) loss ------------------------------------------
         tok = self._net.tokens(
-            tensors["windows"], market, tensors["ticker_ids"], tensors["day_of_week"]
+            tensors["windows"],
+            market,
+            tensors["ticker_ids"],
+            tensors["day_of_week"],
+            tensors["cluster_id"],
         )
         raw = self._net.causal_forward(tok, tensors["padding"]).view(batch, len(COMPONENTS), 1 + len(QUANTILES))
         targets = tensors["targets"]
@@ -815,6 +890,7 @@ class OctopusModel:
                 market.detach(),
                 tensors["ticker_ids"],
                 tensors["day_of_week"],
+                tensors["cluster_id"],
                 mask_positions=mask_positions,
                 mask_mode=mode,
             )

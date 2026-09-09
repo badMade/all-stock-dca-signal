@@ -72,6 +72,7 @@ class ForecastRequest:
     features_window: np.ndarray  # (window_len, n_features) float32
     window_mask: np.ndarray  # (window_len,) bool
     day_of_week: np.ndarray  # (window_len,) int8
+    cluster_id: np.ndarray  # (window_len,) int8 style cluster; 0 = unassigned
     window_dates: np.ndarray  # (window_len,) datetime64[ns]; NaT on padded rows
     ref_close: float  # adjusted close at day t
     adj_ratio: float  # day t's Adj Close / Close ratio (for dollar conversion)
@@ -100,6 +101,7 @@ class RevealedDay:
     features_window: np.ndarray  # the window as of origin_date (for update batches)
     window_mask: np.ndarray
     day_of_week: np.ndarray
+    cluster_id: np.ndarray
     window_dates: np.ndarray
     ref_close: float
 
@@ -404,17 +406,22 @@ def batch_last_rows(requests: Iterable[ForecastRequest]) -> np.ndarray:
 
 def _window_slices(
     series: TickerSeries, row_index: int, window_len: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Front-padded (features, mask, day_of_week, dates) window ending at row_index."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Front-padded (features, mask, day_of_week, cluster_id, dates) window."""
     start = max(0, row_index + 1 - window_len)
     rows = series.features[start : row_index + 1]
     day_of_week = series.day_of_week[start : row_index + 1]
+    cluster_id = series.cluster_id[start : row_index + 1]
     dates = series.dates[start : row_index + 1]
     pad = window_len - len(rows)
     mask = np.ones(len(rows), dtype=bool)
     if pad:
         rows = np.concatenate([np.zeros((pad, rows.shape[1]), dtype=rows.dtype), rows])
         day_of_week = np.concatenate([np.zeros(pad, dtype=day_of_week.dtype), day_of_week])
+        # 0 is already the "not assigned yet" label, so a padded row and a
+        # genuinely pre-refit row read alike to the model instead of the pad
+        # pointing at some real cluster.
+        cluster_id = np.concatenate([np.zeros(pad, dtype=cluster_id.dtype), cluster_id])
         # Explicit unit on the NaT fill value: numpy deprecates the generic-
         # unit-to-`dates.dtype` conversion `np.datetime64("NaT")` would
         # otherwise need here, and the padded window (common at the archive
@@ -425,12 +432,12 @@ def _window_slices(
         nat = np.datetime64("NaT", unit)
         dates = np.concatenate([np.full(pad, nat, dtype=dates.dtype), dates])
         mask = np.concatenate([np.zeros(pad, dtype=bool), mask])
-    return rows, mask, day_of_week, dates
+    return rows, mask, day_of_week, cluster_id, dates
 
 
 def make_request(series: TickerSeries, row_index: int, window_len: int) -> ForecastRequest:
     """A ForecastRequest for predicting the row AFTER ``row_index``."""
-    rows, mask, day_of_week, dates = _window_slices(series, row_index, window_len)
+    rows, mask, day_of_week, cluster_id, dates = _window_slices(series, row_index, window_len)
     return ForecastRequest(
         ticker=series.ticker,
         ticker_id=series.ticker_id,
@@ -438,6 +445,7 @@ def make_request(series: TickerSeries, row_index: int, window_len: int) -> Forec
         features_window=rows,
         window_mask=mask,
         day_of_week=day_of_week,
+        cluster_id=cluster_id,
         window_dates=dates,
         ref_close=float(series.ref_close[row_index]),
         adj_ratio=float(series.adj_ratio[row_index]),
@@ -446,7 +454,7 @@ def make_request(series: TickerSeries, row_index: int, window_len: int) -> Forec
 
 def make_revealed(series: TickerSeries, row_index: int, window_len: int) -> RevealedDay:
     """The RevealedDay for row ``row_index``'s (now knowable) target."""
-    rows, mask, day_of_week, dates = _window_slices(series, row_index, window_len)
+    rows, mask, day_of_week, cluster_id, dates = _window_slices(series, row_index, window_len)
     return RevealedDay(
         ticker=series.ticker,
         ticker_id=series.ticker_id,
@@ -456,6 +464,7 @@ def make_revealed(series: TickerSeries, row_index: int, window_len: int) -> Reve
         features_window=rows,
         window_mask=mask,
         day_of_week=day_of_week,
+        cluster_id=cluster_id,
         window_dates=dates,
         ref_close=float(series.ref_close[row_index]),
     )

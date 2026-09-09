@@ -479,11 +479,20 @@ class GbmQuantileModel:
     @staticmethod
     def _design(requests: Sequence[ForecastRequest]) -> np.ndarray:
         last_rows = batch_last_rows(requests)
+        last_real = [np.flatnonzero(request.window_mask)[-1] for request in requests]
         day_of_week = np.array(
-            [request.day_of_week[np.flatnonzero(request.window_mask)[-1]] for request in requests],
+            [request.day_of_week[position] for request, position in zip(requests, last_real, strict=True)],
             dtype=np.float32,
         )
-        return np.column_stack([last_rows, day_of_week])
+        # The style cluster rides along as its own column. Trees split on a
+        # categorical code perfectly well, and without this the label would
+        # be computed, checkpointed and then never seen by the model that is
+        # supposed to use it. Column order must match _training_matrix below.
+        cluster_id = np.array(
+            [request.cluster_id[position] for request, position in zip(requests, last_real, strict=True)],
+            dtype=np.float32,
+        )
+        return np.column_stack([last_rows, day_of_week, cluster_id])
 
     def _usable_mask(self, series, cutoff64: np.datetime64 | None) -> np.ndarray:
         usable = np.isfinite(series.features).all(axis=1) & np.isfinite(series.targets).all(axis=1)
@@ -525,7 +534,13 @@ class GbmQuantileModel:
                 series = self._panel.series[ticker]
                 rows = np.flatnonzero(self._usable_mask(series, cutoff64))
                 blocks_x.append(
-                    np.column_stack([series.features[rows], series.day_of_week[rows].astype(np.float32)])
+                    np.column_stack(
+                        [
+                            series.features[rows],
+                            series.day_of_week[rows].astype(np.float32),
+                            series.cluster_id[rows].astype(np.float32),
+                        ]
+                    )
                 )
                 blocks_y.append(series.targets[rows])
             return np.concatenate(blocks_x), np.concatenate(blocks_y)
@@ -539,7 +554,10 @@ class GbmQuantileModel:
         rng = np.random.default_rng(self._seed)
         chosen = np.sort(rng.choice(total_n, size=self.row_cap, replace=False))
         sample_series = self._panel.series[counts[0][0]]
-        design = np.empty((self.row_cap, sample_series.features.shape[1] + 1), dtype=np.float32)
+        # +2: day_of_week and cluster_id, the two categoricals _design()
+        # appends at predict time. A mismatch here trains the model on a
+        # different column layout than it scores with.
+        design = np.empty((self.row_cap, sample_series.features.shape[1] + 2), dtype=np.float32)
         targets = np.empty((self.row_cap, sample_series.targets.shape[1]), dtype=np.float32)
         write_at = 0
         offset = 0
@@ -553,7 +571,11 @@ class GbmQuantileModel:
                 rows = np.flatnonzero(self._usable_mask(series, cutoff64))[local_rows]
                 k = len(rows)
                 design[write_at : write_at + k] = np.column_stack(
-                    [series.features[rows], series.day_of_week[rows].astype(np.float32)]
+                    [
+                        series.features[rows],
+                        series.day_of_week[rows].astype(np.float32),
+                        series.cluster_id[rows].astype(np.float32),
+                    ]
                 )
                 targets[write_at : write_at + k] = series.targets[rows]
                 write_at += k

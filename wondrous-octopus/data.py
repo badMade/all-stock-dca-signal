@@ -284,6 +284,14 @@ class TickerSeries:
     dates: np.ndarray  # datetime64[ns], sorted ascending, unique
     features: np.ndarray  # (n, F) float32
     day_of_week: np.ndarray  # (n,) int8, Monday=0 -- embedded/encoded per model
+    #: (n,) int8 style-cluster label, 0 = not assigned yet (the correlation
+    #: window has not filled). Kept OUT of ``features`` for the same reason
+    #: day_of_week is: it is a categorical, and a float column where 3 sits
+    #: between 2 and 4 would invent an ordering the labels do not have. Both
+    #: models consume it as a category -- embedded by the octopus, appended
+    #: as a column the GBM can split on -- so it travels with every request
+    #: window rather than living only on the panel.
+    cluster_id: np.ndarray
     targets: np.ndarray  # (n, 4) float32 -- next-row log-returns vs this row's close
     label_end_dates: np.ndarray  # (n,) datetime64[ns], NaT on the last row
     ref_close: np.ndarray  # (n,) float64, ADJUSTED close (log-return <-> price pivot)

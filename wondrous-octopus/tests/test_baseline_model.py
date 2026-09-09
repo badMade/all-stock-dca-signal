@@ -116,6 +116,7 @@ class TestPersistenceModel:
                 features_window=window,
                 window_mask=mask,
                 day_of_week=np.zeros(4, dtype=np.int8),
+                cluster_id=np.zeros(4, dtype=np.int8),
                 window_dates=dates,
                 ref_close=100.0,
             )
@@ -319,7 +320,15 @@ class TestGbmQuantileModel:
             if not len(rows):
                 continue
             blocks_x.append(
-                np.column_stack([series.features[rows], series.day_of_week[rows].astype(np.float32)])
+                np.column_stack(
+                    [
+                        series.features[rows],
+                        series.day_of_week[rows].astype(np.float32),
+                        # Mirrors _training_matrix's column order: the style
+                        # cluster is appended after day_of_week.
+                        series.cluster_id[rows].astype(np.float32),
+                    ]
+                )
             )
             blocks_y.append(series.targets[rows])
         ref_design = np.concatenate(blocks_x)
@@ -348,7 +357,15 @@ class TestGbmQuantileModel:
             if not len(rows):
                 continue
             blocks_x.append(
-                np.column_stack([series.features[rows], series.day_of_week[rows].astype(np.float32)])
+                np.column_stack(
+                    [
+                        series.features[rows],
+                        series.day_of_week[rows].astype(np.float32),
+                        # Mirrors _training_matrix's column order: the style
+                        # cluster is appended after day_of_week.
+                        series.cluster_id[rows].astype(np.float32),
+                    ]
+                )
             )
             blocks_y.append(series.targets[rows])
         expected_design = np.concatenate(blocks_x)
@@ -393,3 +410,39 @@ def test_attach_target_dates_matches_despite_an_intraday_stamped_origin_date(pan
 
     filled = baseline_model.attach_target_dates(forecasts, panel)
     assert filled[0].target_date == expected
+
+
+class TestClusterReachesTheDesignMatrix:
+    """The GBM must actually see the style cluster, not just the panel.
+
+    _design() appends day_of_week to the last real feature row and nothing
+    else, so a cluster label stored on TickerSeries would never enter a
+    single split (Copilot review: "GBM design matrices append only
+    day_of_week ... an implementation can pass this suite while ignoring the
+    promised categorical entirely").
+    """
+
+    @staticmethod
+    def _request(cluster_value):
+        window = np.zeros((4, len(FEATURE_NAMES)), dtype=np.float32)
+        return model_interface.ForecastRequest(
+            ticker="AAA",
+            ticker_id=1,
+            origin_date="2021-06-01",
+            features_window=window,
+            window_mask=np.array([False, False, False, True]),
+            day_of_week=np.zeros(4, dtype=np.int8),
+            cluster_id=np.full(4, cluster_value, dtype=np.int8),
+            window_dates=np.full(4, np.datetime64("NaT"), dtype="datetime64[ns]"),
+            ref_close=100.0,
+            adj_ratio=1.0,
+        )
+
+    def test_design_matrix_gains_a_cluster_column(self):
+        design = baseline_model.GbmQuantileModel._design([self._request(1)])
+        # last feature row + day_of_week + cluster_id
+        assert design.shape[1] == len(FEATURE_NAMES) + 2
+
+    def test_two_rows_differing_only_by_cluster_are_not_identical(self):
+        design = baseline_model.GbmQuantileModel._design([self._request(1), self._request(2)])
+        assert not np.array_equal(design[0], design[1])

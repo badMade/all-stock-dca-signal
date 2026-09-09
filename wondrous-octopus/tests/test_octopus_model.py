@@ -138,13 +138,27 @@ class TestMarketEncoder:
         probe = features.build_panel(history, min_history=60)
         cutoff = pd.Timestamp(probe.calendar[200])
         panel = features.build_panel(history, min_history=60, initial_train_end=cutoff)
+        # Capacity scaled to the input width, NOT a loosened threshold. The
+        # feature vector went from 20 columns to 36, and at TINY's d_model=16
+        # / 10 epochs the recon head simply underfits the wider input: the
+        # skill ratio below drifts from ~0.74 to ~0.94 across seeds purely
+        # from the extra columns (verified by rebuilding this same fixture
+        # with the legacy 20-name tuple, which reproduces 0.74 exactly on
+        # this code). The first stabilization pass widened d_model but left
+        # the transformer's feed-forward path at TINY's 32 hidden units,
+        # which was still enough of a bottleneck that CI's torch build could
+        # land around 0.90 on the fixed seed. Keep the original 0.85 bar and
+        # give the wider feature set matching hidden capacity instead.
         kwargs: Any = {
             **TINY,
             "alpha": 0.0,
             "beta": 1.0,
             "gamma": 0.1,
-            "fit_epochs": 10,
-            "fit_sample_cap": 800,
+            "d_model": 48,
+            "ffn": 128,
+            "n_latents": 8,
+            "fit_epochs": 25,
+            "fit_sample_cap": 2000,
             "lr_fit": 3e-3,
         }
         model = OctopusModel(**kwargs)
@@ -428,3 +442,83 @@ class TestSaveLoadAndResume:
             straight_records = list(Ledger(tmp_path / "straight").iter_records(model="octopus", kind=kind))
             resumed_records = list(Ledger(tmp_path / "resumed").iter_records(model="octopus", kind=kind))
             assert straight_records == resumed_records
+
+
+class TestClusterReachesTheOctopusTokens:
+    """The octopus must embed the style cluster, not just receive it.
+
+    tokens() sums a position embedding, a ticker embedding and a day-of-week
+    embedding; a cluster label that never becomes a fourth embedding is
+    invisible to the trunk no matter how well it was computed (Copilot
+    review: "Octopus tokens embed only ticker/day-of-week").
+    """
+
+    @staticmethod
+    def _net(window_len=8, d_model=16, n_clusters=4):
+        return _OctopusNet(
+            n_features=4,
+            d_model=d_model,
+            n_heads=2,
+            num_layers=1,
+            ffn=32,
+            dropout=0.0,
+            window_len=window_len,
+            vocab_size=3,
+            n_latents=4,
+            market_summary_dim=3,
+            n_clusters=n_clusters,
+        )
+
+    def test_net_exposes_a_cluster_embedding_sized_for_the_unassigned_label(self):
+        # Index 0 is "not assigned yet", the same reserved-zero convention
+        # ticker_embedding already uses for the unknown ticker, so the table
+        # needs n_clusters + 1 rows.
+        net = self._net(n_clusters=4)
+        assert net.cluster_embedding.num_embeddings == 5
+
+    def test_a_single_style_universe_gets_no_cluster_embedding(self):
+        # With one cluster the label is constant, so the embedding could
+        # only act as another additive bias -- redundant, and measurably
+        # harmful to the mask-ticker reconstruction diagnostic on a small
+        # model. It is not created at all.
+        assert self._net(n_clusters=1).cluster_embedding is None
+        assert self._net(n_clusters=0).cluster_embedding is None
+
+    def test_changing_only_the_cluster_changes_the_tokens(self):
+        torch.manual_seed(0)
+        net = self._net()
+        net.eval()
+        windows = torch.randn(1, 8, 4)
+        market = torch.randn(1, 8, 16)
+        ticker_ids = torch.ones(1, dtype=torch.long)
+        dow = torch.zeros(1, 8, dtype=torch.long)
+        with torch.no_grad():
+            first = net.tokens(windows, market, ticker_ids, dow, torch.ones(1, 8, dtype=torch.long))
+            second = net.tokens(windows, market, ticker_ids, dow, torch.full((1, 8), 2, dtype=torch.long))
+        assert not torch.allclose(first, second, atol=1e-6)
+
+    def test_an_int8_cluster_window_is_accepted_at_the_call_edge(self):
+        # cluster_id is stored compactly as int8 in panel and request
+        # artifacts, but nn.Embedding requires Long/Int indices -- the same
+        # normalization ticker_ids and day_of_week already get.
+        torch.manual_seed(0)
+        net = self._net()
+        net.eval()
+        clusters = torch.from_numpy(np.ones((1, 8), dtype=np.int8))
+        with torch.no_grad():
+            tokens = net.tokens(
+                torch.randn(1, 8, 4),
+                torch.randn(1, 8, 16),
+                torch.ones(1, dtype=torch.long),
+                torch.zeros(1, 8, dtype=torch.long),
+                clusters,
+            )
+        assert tokens.shape == (1, 8, 16)
+
+    def test_a_fitted_model_round_trips_cluster_ids_through_predict(self, panel, fitted):
+        # End to end: the panel's clusters must survive into a real forecast
+        # call, which is what proves the wiring rather than the tensor shape.
+        requests = _requests(panel, "AAA", [200])
+        assert requests[0].cluster_id.shape == requests[0].day_of_week.shape
+        forecast = fitted.predict(requests)[0]
+        assert set(forecast.point) == {"open", "high", "low", "close"}
