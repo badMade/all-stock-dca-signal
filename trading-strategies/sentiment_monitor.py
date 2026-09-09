@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import smtplib
+import ssl
 import sys
 import traceback
 import urllib.error
@@ -920,7 +921,7 @@ class EmailBriefing:
         try:
             with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30) as server:
                 server.ehlo()
-                server.starttls()
+                server.starttls(context=ssl.create_default_context())
                 server.login(self.smtp_user, self.smtp_password)
                 server.sendmail(self.smtp_user, [self.recipient], msg.as_string())
             logger.info("Email sent to %s via %s:%d", self.recipient, self.smtp_host, self.smtp_port)

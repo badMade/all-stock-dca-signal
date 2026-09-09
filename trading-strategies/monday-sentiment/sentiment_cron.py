@@ -27,6 +27,7 @@ import logging
 import os
 import shutil
 import smtplib
+import ssl
 import sys
 import traceback
 import urllib.error
@@ -1010,7 +1011,7 @@ def send_email(
     try:
         with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
             server.ehlo()
-            server.starttls()
+            server.starttls(context=ssl.create_default_context())
             server.ehlo()
             server.login(smtp_user, smtp_password)
             server.sendmail(smtp_user, recipient, msg.as_string())

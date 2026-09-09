@@ -67,10 +67,9 @@ def _load_diff() -> "str | None":
 
       * set -- reads a precomputed diff file. This is the privileged
         workflow_run job's path: that job's checkout never touches PR code
-        (see antigravity-pr-review-post.yml's header), so there is no local
-        git history to diff against. The diff arrives as TEXT, computed
-        earlier by the unprivileged analyzer job and downloaded as an
-        artifact.
+        (see antigravity-pr-review-post.yml's header). Trusted consumer code
+        computes this file from the validated immutable base/head commits;
+        the analyzer's downloaded diff is diagnostic data only.
       * unset -- runs `git diff` against a live checkout, exactly as this
         script did before the two-workflow split. Kept for local/manual runs
         against a real PR checkout; nothing in the shipped workflows relies on

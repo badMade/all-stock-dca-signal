@@ -109,6 +109,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # lookup whose callable is unwired (simulated buying power, "tradable", "no
 # order today" are dry-run defaults only), so fixtures that exercise placement
 # wire the three lookups explicitly with permissive stubs.
+# Live simulations use their supplied historical clock; session/calendar gates stay enabled.
+pytestmark = pytest.mark.usefixtures("historical_live_clock")
+
+
 def _no_orders_today(**_kwargs):
     # An explicit, provable empty page (an ``orders`` list), not a bare
     # ``results`` page: a live broker now refuses a page shape it cannot
@@ -8762,21 +8766,21 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.03})
 
-    # Step 1: manual run at 9:00 AM — buys TICK ($4.50), writes artifact to manual_runs/.
+    # Step 1: manual run at 9:35 AM — buys TICK ($4.50), writes artifact to manual_runs/.
     # Use an earlier timestamp so the artifact's generated_at is before the 10:30 AM
     # boundary used by the scheduled run's cap-seeding scan (boundary check is strict <).
-    _now_manual = datetime.combine(date(2026, 7, 8), time(9, 0), tzinfo=EASTERN)
+    _now_manual = datetime.combine(date(2026, 7, 8), time(9, 35), tzinfo=EASTERN)
     broker = _SimpleBroker()
     ex.run(_now_manual, data, broker=broker, manual=True)
     manual_amount = broker.placed.get("TICK", 0.0)
     assert manual_amount == 4.5
 
     # Step 2: an external fill of $4 appears in manual_runs/ (simulates another executor/session)
-    ext_dir1 = manual_root / "20260708_0901ET"
+    ext_dir1 = manual_root / "20260708_0936ET"
     ext_dir1.mkdir(parents=True, exist_ok=True)
     (ext_dir1 / "run_state.json").write_text(
         _json.dumps({
-            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:01:00-04:00",
+            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:36:00-04:00",
             "run_classification": {"run_origin": "manual", "manual_run": True},
             "buy_candidates": [{"ticker": "EXT1", "status": "submitted",
                                 "planned_amount_usd": 4.0, "decision_price": 55.0}],
@@ -8793,11 +8797,11 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     )
 
     # Step 4: another external $4 fill appears in manual_runs/
-    ext_dir2 = manual_root / "20260708_0902ET"
+    ext_dir2 = manual_root / "20260708_0937ET"
     ext_dir2.mkdir(parents=True, exist_ok=True)
     (ext_dir2 / "run_state.json").write_text(
         _json.dumps({
-            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:02:00-04:00",
+            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:37:00-04:00",
             "run_classification": {"run_origin": "manual", "manual_run": True},
             "buy_candidates": [{"ticker": "EXT2", "status": "submitted",
                                 "planned_amount_usd": 4.0, "decision_price": 55.0}],
@@ -9367,7 +9371,7 @@ def test_morning_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id(tm
 
     # Step 1: manual run, 3% drop -> 1.5x * $3 = $4.50 placed with the
     # ORDINARY ref_id (top-up computation is disabled for manual+MORNING).
-    manual_now = datetime.combine(date(2026, 7, 8), time(9, 0), tzinfo=EASTERN)
+    manual_now = datetime.combine(date(2026, 7, 8), time(9, 35), tzinfo=EASTERN)
     manual_data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.03})
     manual_res = ex.run(manual_now, manual_data, broker=broker, manual=True)
     assert broker.placed.get("NVDA") == pytest.approx(4.5)
@@ -10171,17 +10175,17 @@ def test_morning_cap_seeding_own_amount_scoped_to_cap_roots(tmp_path):
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.03})
 
     # Step 1: manual run buys TICK ($4.50) → _own_recorded[day]=4.50
-    _now_manual = datetime.combine(date(2026, 7, 8), time(9, 0), tzinfo=EASTERN)
+    _now_manual = datetime.combine(date(2026, 7, 8), time(9, 35), tzinfo=EASTERN)
     broker = _SimpleBroker()
     ex.run(_now_manual, data, broker=broker, manual=True)
     assert broker.placed.get("TICK") == 4.5
 
     # Step 2: an external $4 fill appears in external_cap_root (NOT under manual_runs)
-    ext_dir = external_cap_root / "20260708_0901ET"
+    ext_dir = external_cap_root / "20260708_0936ET"
     ext_dir.mkdir(parents=True, exist_ok=True)
     (ext_dir / "run_state.json").write_text(
         _json.dumps({
-            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:01:00-04:00",
+            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:36:00-04:00",
             "run_classification": {"run_origin": "manual", "manual_run": True},
             "buy_candidates": [{"ticker": "EXT", "status": "submitted",
                                 "planned_amount_usd": 4.0, "decision_price": 55.0}],

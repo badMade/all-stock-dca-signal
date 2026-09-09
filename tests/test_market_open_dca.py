@@ -44,6 +44,10 @@ from near_close_dca import EASTERN, Action, SourceName, StrategyConfig, load_pri
 TRADING_DAY = date(2026, 7, 8)
 
 
+# Live simulations use their supplied historical clock; session/calendar gates stay enabled.
+pytestmark = pytest.mark.usefixtures("historical_live_clock")
+
+
 def _now_market_open():
     """Decision timestamp for the 9:35 AM ET live execution."""
     return datetime.combine(TRADING_DAY, time(9, 35), tzinfo=EASTERN)

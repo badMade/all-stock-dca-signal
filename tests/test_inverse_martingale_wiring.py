@@ -50,6 +50,10 @@ PCT_ENROLLMENT = {
 TEST_DATES = (date(2026, 6, 29), date(2026, 6, 30), date(2026, 7, 1), date(2026, 7, 2))
 
 
+# Live simulations use their supplied historical clock; session/calendar gates stay enabled.
+pytestmark = pytest.mark.usefixtures("historical_live_clock")
+
+
 class _FixedPriceData:
     """Minimal provider: a constant prior close, a caller-supplied decision
     price, a declining 60-minute trend (required by evaluate_source_signal's

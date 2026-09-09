@@ -485,6 +485,7 @@ def test_append_observations_refuses_to_create_the_archive_root_when_missing(tmp
     # available when it never was.
     missing_root = tmp_path / "ticker_data_not_mounted"
     monkeypatch.setenv("DCA_TICKER_HISTORY_DIR", str(missing_root))
+    monkeypatch.delenv("DCA_INTRADAY_ARCHIVE_DIR", raising=False)
 
     result = archive_observations_safely([_observation()])
 

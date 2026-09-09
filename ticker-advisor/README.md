@@ -48,6 +48,20 @@ supply one; set `SEC_EDGAR_USER_AGENT` to your own `"Org Name contact@domain"` f
 access to the SEC-filing half of the sentiment signal (see
 [sec.gov/os/webmaster-faq#developers](https://www.sec.gov/os/webmaster-faq#developers)).
 
+Filing-document downloads retain at most **2 MiB of decompressed bytes**, read in 64 KiB
+chunks; an oversized declared `Content-Length` is refused before reading. Missing or
+incorrect length headers do not bypass the streamed byte limit. Redirects are refused
+before Requests can buffer their intermediate bodies, and responses close on success or
+failure. The existing SEC request throttle and request timeout still apply.
+
+Excerpt preprocessing accepts at most **2 Mi characters** of raw document text, including
+injected/offline document fetchers, and uses forward scans to remove markup and hidden
+head/script/style/inline-XBRL content before selecting the usual 4,000-character excerpt.
+These input limits allow over 500 times the excerpt budget for filing markup. Oversized
+documents and redirects exclude only that filing; the advisory report records the fetch
+failure while other filings and news remain usable. HTTP-declared text encodings are
+respected, with UTF-8 as the fallback when no usable encoding is supplied.
+
 Output lands in `analysis/<today>-ticker-advisory/<HHMMSS>/` (override with `--output-dir`) --
 the time-of-day component keeps multiple same-day runs (different candidate batches, retried
 with different `--weights`, etc.) from silently overwriting each other:

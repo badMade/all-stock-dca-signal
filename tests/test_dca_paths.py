@@ -13,7 +13,6 @@ configured tree at load time.
 
 from __future__ import annotations
 
-import importlib
 import ntpath
 import os
 import subprocess
@@ -75,6 +74,19 @@ def test_stream_root_joins_multiple_segments(monkeypatch):
     assert stream_root("morning_dca", "20260728_1030ET") == "/srv/dca/morning_dca/20260728_1030ET"
 
 
+def test_operational_history_paths_are_isolated_from_ambient_environment(tmp_path):
+    """Test execution must never inherit the operator's history or publication target."""
+    from dca_intraday_archive import configured_intraday_archive_dir
+    from dca_ticker_paths import configured_ticker_history_dir
+
+    history = configured_ticker_history_dir()
+    archive = configured_intraday_archive_dir()
+    assert history.is_relative_to(tmp_path)
+    assert archive.is_relative_to(tmp_path)
+    # A missing managed history must remain missing until a test creates it.
+    assert not history.exists()
+
+
 @pytest.mark.parametrize("module_name,attr,suffix", STREAM_ROOTS)
 def test_every_stream_root_defaults_to_the_repo_relative_path(monkeypatch, module_name, attr, suffix):
     """Pin that every stream constant derives from the shared repo-relative root.
@@ -87,9 +99,16 @@ def test_every_stream_root_defaults_to_the_repo_relative_path(monkeypatch, modul
     autouse monkeypatch of DCA_CRON_TRACKING_ROOT (which breaks local imports)
     without using the dangerous importlib.reload() anti-pattern.
     """
-    monkeypatch.delenv(CRON_TRACKING_ROOT_ENV, raising=False)
-    module = importlib.import_module(module_name)
-    assert getattr(module, attr) == f"{DEFAULT_CRON_TRACKING_ROOT}/{suffix}"
+    env = {key: value for key, value in os.environ.items() if key != CRON_TRACKING_ROOT_ENV}
+    probe = (
+        "import importlib\n"
+        f"print(getattr(importlib.import_module({module_name!r}), {attr!r}))\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], cwd=REPO_ROOT, env=env,
+        capture_output=True, text=True, check=True,
+    )
+    assert out.stdout.strip() == f"{DEFAULT_CRON_TRACKING_ROOT}/{suffix}"
 
 
 def test_every_stream_root_follows_the_override():

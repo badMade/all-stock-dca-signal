@@ -13,7 +13,7 @@ import json
 import os
 from dataclasses import replace
 from datetime import date, datetime, time, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -6090,6 +6090,33 @@ def test_gitignored_path_write_claim_survives_a_file_extension_period():
     body = "artifacts/alerts/x.txt was written"
     codes = {c for c, _ in detect_channel_warnings(body, source="alert_file")}
     assert "GITIGNORED_ALERT_PATH" in codes
+
+
+@pytest.mark.parametrize("path_form", ["posix", "windows", "unc"])
+@pytest.mark.parametrize("relative_path", ["artifacts/alerts/x.txt", "cron_tracking/morning_dca/alerts/x.txt"])
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("template, written", [
+    ("Durable alert written to {path}", True),
+    ("{path} was written", True),
+    ("Wrote {path}. This path was not used.", True),
+    ("Did not write {path}.", False),
+    ("{path} is gitignored. Wrote a durable copy elsewhere.", False),
+])
+def test_gitignored_dotted_parent_paths_preserve_claim_scope(
+    tmp_path, monkeypatch, path_form, relative_path, external, template, written,
+):
+    if path_form == "posix":
+        checkout = (tmp_path / "checkout.with.dots").resolve()
+    elif path_form == "windows":
+        checkout = PureWindowsPath("C:/workspace.with.dots/checkout")
+    else:
+        checkout = PureWindowsPath("//server/share.with.dots/checkout")
+    monkeypatch.setattr("scripts.alert_digest._REPO_ROOT", Path(str(checkout)))
+    location = checkout.with_name("external.with.dots") if external else checkout
+    alert_path = location.joinpath(*relative_path.split("/"))
+    body = template.format(path=alert_path)
+    codes = {code for code, _ in detect_channel_warnings(body, source="alert_file")}
+    assert ("GITIGNORED_ALERT_PATH" in codes) == (written and not external)
 
 
 def test_gitignored_path_extension_period_masking_does_not_affect_other_sentences():
