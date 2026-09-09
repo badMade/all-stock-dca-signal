@@ -329,6 +329,14 @@ class GbmQuantileModel:
         # off: its internal validation split is randomized and would break
         # the refit-on-load exactness this model's checkpointing depends on.
         self._hist_params = {"max_iter": max_iter, "learning_rate": 0.1, "early_stopping": False}
+        # The design matrix is [features..., day_of_week, cluster_id]; the
+        # trailing column is a style-cluster LABEL, and an unmarked integer
+        # column gets threshold-split as an ordered quantity, which would
+        # invent an ordering between arbitrary cluster ids. Declaring it
+        # categorical makes the estimator split on set membership instead.
+        # day_of_week is deliberately left as it was -- pre-existing
+        # behaviour, and changing it is not this change's business.
+        self._categorical_design_columns = (-1,)
         self._estimators: dict[str, dict[str, Any]] = {}
         self._panel: TrainingPanel | None = None
         self._seed = 0
@@ -476,6 +484,13 @@ class GbmQuantileModel:
         hasher.update(np.ascontiguousarray(targets).tobytes())
         return hasher.hexdigest()
 
+    def _categorical_mask(self, n_columns: int) -> np.ndarray:
+        """Boolean mask marking the design matrix's categorical columns."""
+        mask = np.zeros(n_columns, dtype=bool)
+        for column in self._categorical_design_columns:
+            mask[column] = True
+        return mask
+
     @staticmethod
     def _design(requests: Sequence[ForecastRequest]) -> np.ndarray:
         last_rows = batch_last_rows(requests)
@@ -484,10 +499,14 @@ class GbmQuantileModel:
             [request.day_of_week[position] for request, position in zip(requests, last_real, strict=True)],
             dtype=np.float32,
         )
-        # The style cluster rides along as its own column. Trees split on a
-        # categorical code perfectly well, and without this the label would
-        # be computed, checkpointed and then never seen by the model that is
-        # supposed to use it. Column order must match _training_matrix below.
+        # The style cluster rides along as its own column; without it the
+        # label would be computed, checkpointed and then never seen by the
+        # model meant to use it. It is declared categorical at fit time (see
+        # _CATEGORICAL_DESIGN_COLUMNS) -- appending the raw integer alone
+        # would let the estimator threshold-split it as an ordered float,
+        # inventing exactly the ordering between arbitrary cluster ids that
+        # keeping the label out of the float feature vector was meant to
+        # avoid (Copilot review). Column order must match _training_matrix.
         cluster_id = np.array(
             [request.cluster_id[position] for request, position in zip(requests, last_real, strict=True)],
             dtype=np.float32,
@@ -596,12 +615,20 @@ class GbmQuantileModel:
         for position, component in enumerate(COMPONENTS):
             y = targets[:, position].astype(np.float64)
             fits: dict[str, Any] = {}
+            categorical = self._categorical_mask(design.shape[1])
             fits["point"] = HistGradientBoostingRegressor(
-                loss="absolute_error", random_state=self._seed, **self._hist_params
+                loss="absolute_error",
+                random_state=self._seed,
+                categorical_features=categorical,
+                **self._hist_params,
             ).fit(design, y)
             for key, quantile in (("p10", 0.1), ("p50", 0.5), ("p90", 0.9)):
                 fits[key] = HistGradientBoostingRegressor(
-                    loss="quantile", quantile=quantile, random_state=self._seed, **self._hist_params
+                    loss="quantile",
+                    quantile=quantile,
+                    random_state=self._seed,
+                    categorical_features=categorical,
+                    **self._hist_params,
                 ).fit(design, y)
             self._estimators[component] = fits
         return len(design)

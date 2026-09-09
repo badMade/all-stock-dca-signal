@@ -112,20 +112,6 @@ def resolve_device(requested: str) -> str:
 _MAX_CLUSTERS = 16
 
 
-def _panel_cluster_count(panel: TrainingPanel) -> int:
-    """Distinct assigned style clusters in a panel (label 0 is 'unassigned').
-
-    Drives whether the net gets a cluster embedding at all, so it is
-    recorded in the checkpoint rather than re-derived on load: a resumed run
-    must rebuild the same architecture even if a later panel happens to
-    cluster differently.
-    """
-    labels: set[int] = set()
-    for series in panel.series.values():
-        labels.update(int(label) for label in np.unique(series.cluster_id) if label > 0)
-    return len(labels)
-
-
 class _OctopusNet(nn.Module):
     def __init__(
         self,
@@ -178,14 +164,17 @@ class _OctopusNet(nn.Module):
         # leaves every pre-existing parameter initialized exactly as before.
         # +1 because index 0 is the reserved "not assigned yet" label a
         # ticker wears until the correlation window has filled.
-        # Built only when the universe actually splits into styles. With a
-        # single cluster the label is constant, so the embedding could only
-        # ever act as one more additive bias, redundant with the biases
-        # already in the trunk -- parameters that cannot carry information
-        # but still consume optimizer steps. +1 on the size because index 0
-        # is the reserved "not assigned yet" label a ticker wears until the
+        # Sized to a FIXED capacity, not to the panel that happened to fit
+        # this model. bind_panel() swaps panels during a live cycle and
+        # expands only the ticker embedding, so a table sized from the
+        # initial panel would either clamp genuinely new styles together or,
+        # for a model first fit on a single-cluster universe, drop them
+        # entirely -- silently, in forecasts and online updates alike
+        # (Copilot review). A constant capacity is also what makes the
+        # state_dict layout stable across a resume. +1 because index 0 is
+        # the reserved "not assigned yet" label a ticker wears until the
         # correlation window has filled.
-        self.cluster_embedding = nn.Embedding(n_clusters + 1, d_model) if n_clusters > 1 else None
+        self.cluster_embedding = nn.Embedding(n_clusters + 1, d_model)
         causal = torch.triu(torch.ones(window_len, window_len, dtype=torch.bool), diagonal=1)
         self.register_buffer("causal_mask", causal)
 
@@ -210,7 +199,7 @@ class _OctopusNet(nn.Module):
             + self.ticker_embedding(ticker_ids.long()).unsqueeze(1)
             + self.dow_embedding(day_of_week.long())
         )
-        if cluster_id is not None and self.cluster_embedding is not None:
+        if cluster_id is not None:
             # cluster_id is stored compactly as int8 in panel and request
             # artifacts, and nn.Embedding needs Long/Int indices -- the same
             # normalization ticker_ids and day_of_week already get here.
@@ -304,7 +293,6 @@ class OctopusModel:
         self._seed = 0
         self._market_cache: dict[int, torch.Tensor] = {}
         self._update_rounds = 0
-        self._n_clusters = 0
 
     # ------------------------------------------------------------------
     # Protocol: fit / predict / update / diagnostic / save / load
@@ -316,7 +304,6 @@ class OctopusModel:
         self._normalization = dict(panel.normalization)
         self._vocab = list(panel.tickers)
         self._vocab_index = {ticker: index + 1 for index, ticker in enumerate(self._vocab)}
-        self._n_clusters = _panel_cluster_count(panel)
         torch.manual_seed(_derive(seed, "init"))
         self._net = _OctopusNet(
             n_features=len(panel.feature_names),
@@ -329,7 +316,7 @@ class OctopusModel:
             vocab_size=len(self._vocab),
             n_latents=self.hyper["n_latents"],
             market_summary_dim=panel.market_summary.shape[1],
-            n_clusters=self._n_clusters,
+            n_clusters=_MAX_CLUSTERS,
         ).to(self.device)
         self._optimizer = torch.optim.AdamW(self._net.parameters(), lr=self.hyper["lr_fit"])
         self._replay = ReservoirBuffer(self.hyper["replay_capacity"], _derive(seed, "replay"))
@@ -544,7 +531,6 @@ class OctopusModel:
                 "device": self.device,
                 "seed": self._seed,
                 "vocab": self._vocab,
-                "n_clusters": self._n_clusters,
                 "normalization": self._normalization,
                 "param_groups": optimizer_state["param_groups"],
                 "optim_param_ids": sorted(int(key) for key in optimizer_state["state"]),
@@ -586,7 +572,6 @@ class OctopusModel:
         model = cls(device=effective_device, **metadata["hyper"])
         model._seed = metadata["seed"]
         model._vocab = list(metadata["vocab"])
-        model._n_clusters = int(metadata.get("n_clusters", 0))
         model._vocab_index = {ticker: index + 1 for index, ticker in enumerate(model._vocab)}
         model._normalization = metadata["normalization"]
         panel = panel_provider()
@@ -603,14 +588,7 @@ class OctopusModel:
             vocab_size=len(model._vocab),
             n_latents=model.hyper["n_latents"],
             market_summary_dim=panel.market_summary.shape[1],
-            # From the checkpoint, never re-derived from the panel handed to
-            # load(): whether the net HAS a cluster embedding decides its
-            # state_dict layout, so a panel that happens to cluster
-            # differently on resume must not change the architecture the
-            # saved weights are about to be loaded into. Checkpoints written
-            # before this feature carry no entry and rebuild without one,
-            # exactly as they were saved.
-            n_clusters=model._n_clusters,
+            n_clusters=_MAX_CLUSTERS,
         ).to(model.device)
         state = {
             key[len("net.") :]: torch.from_numpy(np.array(value))

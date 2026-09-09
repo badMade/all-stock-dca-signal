@@ -95,18 +95,21 @@ _AMIHUD_SCALE = 1e9
 #: coarse: each refit builds an n_tickers x n_tickers distance matrix, which
 #: on the full-universe archive is the most expensive thing in this module.
 _DEFAULT_N_CLUSTERS = 8
-#: Matched to build_panel's default min_history on purpose. The two
-#: cluster-derived features are NaN until the first refit, and the harness
-#: needs every feature finite before a ticker is eligible, so a window longer
-#: than the existing warm-up would push the whole replay's start date out by
-#: the difference -- a clustering knob silently deciding when trading begins.
-_DEFAULT_CLUSTER_WINDOW = 60
 _DEFAULT_CLUSTER_REFRESH = 60
 
 #: Minimum share of the correlation window a ticker must actually have traded
 #: through before it can be clustered -- a name with six overlapping days
 #: correlates with anything.
 _CLUSTER_MIN_COVERAGE = 0.5
+
+#: Where the refit schedule is anchored. It is a CONSTANT, not a function of
+#: the archive's length, and that is the whole point: an anchor derived from
+#: len(calendar) makes a past label depend on how much FUTURE data happens to
+#: be loaded, so rebuilding after one more day arrives would silently
+#: renumber history (Copilot review). Refit positions are now
+#: min(cluster_window, this) - 1 and every cluster_refresh after, which
+#: appending rows can only extend, never move.
+_CLUSTER_ANCHOR_ROWS = 20
 
 #: Calendar-day gap clip: anything beyond two weeks of silence carries no
 #: extra signal over "long halt" and would otherwise dominate normalization.
@@ -587,7 +590,7 @@ def _cluster_once(window: pd.DataFrame, n_clusters: int) -> dict[str, int]:
     # never moved through the window has an undefined correlation with
     # everything, but excluding it would leave it permanently unassigned,
     # and the two cluster-derived features would then be NaN on every one
-    # of its rows -- costing it all 35 features, since the harness's
+    # of its rows -- costing it all 36 features, since the harness's
     # eligibility check needs the whole vector finite. It is admitted here
     # and the undefined correlations become the uncorrelated distance below.
     usable = [ticker for ticker in window.columns if window[ticker].count() >= minimum]
@@ -598,7 +601,13 @@ def _cluster_once(window: pd.DataFrame, n_clusters: int) -> dict[str, int]:
         # One group: no distance matrix needed, and sklearn will not fit a
         # single cluster over a single sample anyway.
         return dict.fromkeys(usable, 1)
-    correlation = window[usable].corr()
+    # min_periods applies the same floor PAIRWISE. The per-ticker coverage
+    # check above admits two names that each traded half the window; without
+    # this they could still share only a couple of days and produce a
+    # spurious +/-1 correlation from that overlap alone (Copilot review).
+    # Under-overlapped pairs come back NaN and take the uncorrelated
+    # distance below.
+    correlation = window[usable].corr(min_periods=minimum)
     # 1 - corr is the standard correlation distance. A pair with no
     # overlapping days has no correlation to speak of, and 1.0 (the
     # uncorrelated distance) is the honest filler.
@@ -637,13 +646,11 @@ def _assign_clusters(
     labels = pd.DataFrame(np.nan, index=index, columns=returns_wide.columns, dtype=float)
     previous: dict[str, int] = {}
     effective_cap = max(1, min(n_clusters, len(returns_wide.columns) // 2 or 1))
-    # An archive shorter than the requested window still gets clustered, from
-    # whatever history it has. Skipping the refit entirely would leave every
-    # row unassigned, both cluster features NaN throughout, and therefore no
-    # fully-finite row anywhere -- which makes build_panel refuse a short
-    # archive it used to handle. The window below is a tail(), so it simply
-    # comes back shorter.
-    first_refit = min(cluster_window, len(index)) - 1
+    # Anchored to a constant, never to len(index): the window below is a
+    # tail(), so an archive shorter than cluster_window simply clusters from
+    # less history instead of not at all, and appending rows can only add
+    # later refits -- it can never move or unassign an earlier one.
+    first_refit = min(cluster_window, _CLUSTER_ANCHOR_ROWS) - 1
     for position in range(first_refit, len(index), cluster_refresh):
         refit_date = index[position]
         window = returns_wide.loc[:refit_date].tail(cluster_window)
@@ -651,6 +658,12 @@ def _assign_clusters(
         if not assignment:
             continue
         assignment = _align_cluster_labels(assignment, previous, effective_cap)
+        # Every ticker is reset to unassigned FIRST, then the successful
+        # assignments overlay it. Writing only the assignments would let
+        # ffill carry a stale label forward for a ticker that dropped out of
+        # this refit (coverage fell away), and its rows would then be ranked
+        # inside a peer group it is no longer part of (Copilot review).
+        labels.loc[refit_date, :] = 0.0
         for ticker, label in assignment.items():
             labels.loc[refit_date, ticker] = label
         previous = assignment
@@ -669,7 +682,7 @@ def build_panel(
     initial_train_end: pd.Timestamp | None = None,
     min_history: int = 60,
     n_clusters: int = _DEFAULT_N_CLUSTERS,
-    cluster_window: int = _DEFAULT_CLUSTER_WINDOW,
+    cluster_window: int | None = None,
     cluster_refresh: int = _DEFAULT_CLUSTER_REFRESH,
 ) -> TrainingPanel:
     """Assemble the full in-memory panel from the per-ticker CSV archive.
@@ -793,11 +806,17 @@ def build_panel(
     returns_wide = long_frame.pivot_table(index="Date", columns="ticker", values="ret_close")
     calendar_index = np.array(sorted(market.index.to_numpy()), dtype="datetime64[ns]")
     returns_wide = returns_wide.reindex(pd.DatetimeIndex(calendar_index))
+    # Derived from min_history rather than fixed, so --min-history stays the
+    # one knob that decides how much warm-up a ticker needs; a hard-coded
+    # window silently overrode it (Copilot review).
+    effective_window = cluster_window if cluster_window is not None else max(
+        _CLUSTER_ANCHOR_ROWS, min_history
+    )
     cluster_labels = _assign_clusters(
         returns_wide,
         calendar_index,
         n_clusters=n_clusters,
-        cluster_window=cluster_window,
+        cluster_window=effective_window,
         cluster_refresh=cluster_refresh,
     )
     stacked = cluster_labels.stack()
