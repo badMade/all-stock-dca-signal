@@ -304,6 +304,40 @@ class Ledger:
             self._sizes[relpath] = self._sizes.get(relpath, 0) + len(member)
 
     # -- reading -----------------------------------------------------------
+    def available_years(self, *, model: str, kind: str) -> list[str]:
+        """Ascending list of origin-date years this model has shards for.
+
+        Lives here rather than in the caller because this module owns the
+        shard-naming convention (_shard_relpath): a reader that globbed and
+        parsed those filenames itself would be a second copy of that format,
+        free to drift from this one. Lets a streaming reader pull one year
+        at a time through iter_records(..., year=...) instead of holding a
+        whole run in memory.
+        """
+        model_dir = self.root / model
+        if not model_dir.is_dir():
+            return []
+        years = set()
+        for path in model_dir.glob(f"{kind}_*.jsonl.gz"):
+            if self._read_fingerprints is not None:
+                # Same checkpoint-bounded view iter_records() reads through:
+                # a shard created entirely after the last checkpoint is not
+                # durable and is skipped there. Reporting its year here
+                # instead let a caller's "no records for this model" guard
+                # pass on a shard that then yields nothing -- silence where
+                # a refusal was owed (Copilot review: "available_years()
+                # does not apply this Ledger's checkpoint fingerprints").
+                if path.relative_to(self.root).as_posix() not in self._read_fingerprints:
+                    continue
+            year = path.name[len(kind) + 1 : -len(".jsonl.gz")]
+            # Exactly four digits, matching _shard_parts()'s own
+            # [0-9]{4} rule rather than a looser isdigit(): a name this
+            # module would refuse to write or resume must not be reported
+            # as a readable year either.
+            if len(year) == 4 and year.isdigit():
+                years.add(year)
+        return sorted(years)
+
     def iter_records(
         self, *, model: str, kind: str, year: str | None = None
     ) -> Iterator[dict[str, Any]]:
