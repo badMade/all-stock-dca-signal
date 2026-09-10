@@ -111,3 +111,7 @@
 ## 2026-09-09 - Avoid raw json.loads read_bytes when it breaks concurrency models
 **Learning:** The Python standard library `json` module does not have a C-level fast path for bytes. Instead, it internally calls `.decode()` to convert the bytes back into a string before parsing. Therefore, replacing `json.loads(path.read_text())` with `json.loads(path.read_bytes())` provides zero actual performance benefit and breaks pessimistic concurrency locks if the raw string values are directly used in cross-process checks.
 **Action:** Do not blindly replace `read_text()` with `read_bytes()` for standard library `json.loads()` when the resulting string or bytes is required for further operations without manually `.decode()`ing, as it can cause regressions or concurrency failures.
+
+## 2026-10-10 - Avoid text decode when filtering local JSON files via substring check
+**Learning:** When filtering JSON files on a loop using a substring check before `json.loads`, loading the file as bytes (`path.read_bytes()`) and checking against a pre-encoded bytes needle (`needle.encode("utf-8")`) avoids decoding the entire file into a Python string. Although `json.loads` will eventually decode it back to string internally, skipping the explicit text decode provides measurable performance improvements since skipped files avoid text allocation altogether.
+**Action:** When performing substring filtering on local JSON files before parsing, prefer `read_bytes()` with a loop-invariant bytes needle over `read_text(encoding="utf-8")` with a string needle.

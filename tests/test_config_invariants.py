@@ -1452,6 +1452,8 @@ _NON_ACCOUNT_LITERALS = frozenset(
         "109417000000",
         "000020",
         "0000000000",
+        # Microsoft VSCode link ID in launch.json.
+        "830387",
     }
 )
 

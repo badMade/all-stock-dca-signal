@@ -203,22 +203,23 @@ def collect_month_run_states(
     that DID real work is kept; see :func:`_is_empty_blocked_stub`.
     """
     prefix = _month_prefix(year, month)
+    prefix_bytes = prefix.encode("utf-8")
     run_states: List[Dict[str, Any]] = []
     for path in find_run_state_files(root):
         try:
-            raw_text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
+            raw_bytes = path.read_bytes()
+        except OSError as exc:
             logger.warning("skipping unreadable run-state artifact %s: %s", path, exc)
             continue
 
         # ⚡ Bolt Optimization: Fast JSON filtering via substring check.
         # Skip the expensive JSON parse if the file doesn't match the month prefix.
-        if prefix not in raw_text:
+        if prefix_bytes not in raw_bytes:
             continue
 
         try:
-            data = json.loads(raw_text)
-        except json.JSONDecodeError as exc:
+            data = json.loads(raw_bytes)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             logger.warning("skipping unparseable run-state artifact %s: %s", path, exc)
             continue
 
