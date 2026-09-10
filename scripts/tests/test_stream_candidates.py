@@ -72,7 +72,7 @@ def test_require_parseable_stream_config_validations(tmp_path):
         _require_parseable_stream_config(cfg_file, "morning")
 
     # 4. Stream mismatch
-    valid_base = {
+    valid_base: dict[str, Any] = {
         "stream": "midday",
         "live_task": "task",
         "sizing_ladder": {"base_amount_usd": 1.0, "tiers": [{"min_drop_pct": 1.0, "multiplier": 1.0}]},

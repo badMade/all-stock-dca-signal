@@ -11,6 +11,7 @@ import math
 import re
 import statistics
 from dataclasses import dataclass, field
+from typing import TypeGuard
 
 # Exactly config/tickers.json's `active`/`excluded` schema pattern
 # (schemas/tickers.schema.json). Shared between advise_tickers.py (filters
@@ -64,7 +65,7 @@ class TickerScore:
     rationale: list[str] = field(default_factory=list)
 
 
-def _is_usable(value: object) -> bool:
+def _is_usable(value: object) -> TypeGuard[float | int]:
     # math.isfinite rejects NaN AND +/-inf -- a zero-variance/zero-drawdown
     # edge case can produce an infinite Sharpe/Calmar, and an infinite value
     # reaching statistics.pstdev() would corrupt or crash normalization for
@@ -73,7 +74,7 @@ def _is_usable(value: object) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(value)
 
 
-def _extract_health_component(health: dict[str, float] | None, component: str) -> float | None:
+def _extract_health_component(health: object, component: str) -> float | None:
     # A truthy non-mapping (a list or string surviving corrupt/malformed
     # producer output) must degrade this ONE component to "unavailable",
     # not raise AttributeError out of .get() and abort combine_scores() for
@@ -85,7 +86,7 @@ def _extract_health_component(health: dict[str, float] | None, component: str) -
     return float(value) if _is_usable(value) else None
 
 
-def _extract_backtest_component(backtest: dict[str, dict[str, float]] | None, strategy_name: str) -> float | None:
+def _extract_backtest_component(backtest: object, strategy_name: str) -> float | None:
     if not isinstance(backtest, dict):
         return None
     # The nested per-strategy value can ALSO be a truthy non-mapping (e.g. a
@@ -98,7 +99,7 @@ def _extract_backtest_component(backtest: dict[str, dict[str, float]] | None, st
     return float(value) if _is_usable(value) else None
 
 
-def _extract_sentiment_component(sentiment: dict[str, object] | None) -> float | None:
+def _extract_sentiment_component(sentiment: object) -> float | None:
     if not isinstance(sentiment, dict):
         return None
     value = sentiment.get("score")

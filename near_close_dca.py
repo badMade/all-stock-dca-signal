@@ -2081,6 +2081,9 @@ class StrategyState:
     pending_durable_commit_callbacks: List[Callable[[], None]] = field(
         default_factory=list, repr=False, compare=False
     )
+    _durable_commit: Optional[Callable[[], None]] = field(
+        default=None, repr=False, compare=False
+    )
 
     def buys_today(self, ticker: str, trading_day: date) -> int:
         return self.buys_by_ticker_by_day.get(ticker, {}).get(trading_day, 0)

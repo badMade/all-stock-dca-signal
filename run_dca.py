@@ -908,7 +908,7 @@ def _build_frozen_providers_from_raw(
             validated = _validated_corporate_action_result(result, as_of)
             if validated is None:
                 return False
-            symbol = str(ticker).strip().upper()
+            symbol = ticker.strip().upper()
             payload = {
                 "ticker": symbol,
                 "since": since.isoformat(),
@@ -4418,7 +4418,7 @@ def _run_pipeline_impl(
                     _report_run_state_bytes: Optional[bytes] = _report_lock_path_obj.read_bytes()
                 except OSError:
                     _report_run_state_bytes = None
-            if _report_run_state_bytes != _known_run_state_bytes:
+            if _report_run_state_bytes is None or _report_run_state_bytes != _known_run_state_bytes:
                 result["directory_ownership_verified"] = False
                 logger.warning(
                     "run_state at %s changed concurrently immediately before "
