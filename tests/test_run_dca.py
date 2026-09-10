@@ -4575,6 +4575,12 @@ def test_cli_refuses_without_demo(tmp_path):
     assert rc == 2
 
 
+def test_cli_bare_defaults_to_demo(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["run_dca.py"])
+    rc = main(None)
+    assert rc == 0
+
+
 def test_cli_demo_does_not_touch_the_real_cron_tracking_root(tmp_path, monkeypatch):
     """Regression test for "Keep CLI demos out of the live accumulator".
 

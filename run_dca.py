@@ -32,6 +32,7 @@ import logging
 import math
 import os
 import shutil
+import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -4679,6 +4680,8 @@ def _demo_runtime(
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    if argv is None and len(sys.argv) == 1:
+        argv = ["--demo"]
     parser = argparse.ArgumentParser(
         description="Near-close graded DCA orchestrator (dry-run CLI)."
     )
