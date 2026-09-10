@@ -3930,6 +3930,9 @@ class DryRunBroker:
     def get_order_fill(self, order_id: str) -> Optional[OrderFill]:
         return self._fills.get(order_id)
 
+    def get_order_fills(self, order_ids: list[str]) -> dict[str, Optional[OrderFill]]:
+        return {order_id: self.get_order_fill(order_id) for order_id in order_ids}
+
     def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
         return []
 
@@ -4396,6 +4399,9 @@ class AlpacaBroker:
         except Exception:  # noqa: BLE001 - a fill-lookup outage or malformed response must not abort the run
             logger.exception("order-fill lookup failed for %s; recording as unfilled", order_id)
             return None
+
+    def get_order_fills(self, order_ids: list[str]) -> dict[str, Optional[OrderFill]]:
+        return {order_id: self.get_order_fill(order_id) for order_id in order_ids}
 
     def _resolve_alpaca_order_fill(self, order_id: str) -> Optional[OrderFill]:
         """Resolve ``order_id`` to a fill, following any ``replaced_by`` chain.
