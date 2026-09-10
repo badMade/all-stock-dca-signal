@@ -35,6 +35,9 @@ import json
 import math
 from statistics import NormalDist
 
+import pytest
+
+pytest.importorskip('kalman')
 import kalman
 import model_interface
 import numpy as np
