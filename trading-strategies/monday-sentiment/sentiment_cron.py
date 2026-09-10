@@ -711,7 +711,7 @@ def build_email_html(
     def ticker_card_html(info: dict) -> str:
         raw_ticker = str(info["ticker"])
         ticker   = html.escape(raw_ticker)
-        company  = html.escape(str(COMPANY_NAMES.get(raw_ticker, raw_ticker)))
+        company  = html.escape(COMPANY_NAMES.get(raw_ticker, raw_ticker))
         zscore   = info.get("zscore", 0.0)
         score    = info.get("score", 0.0)
         mu       = info.get("history_mean", 0.0)
@@ -810,7 +810,7 @@ def build_email_html(
     def summary_row_html(info: dict) -> str:
         raw_ticker = str(info["ticker"])
         ticker   = html.escape(raw_ticker)
-        company  = html.escape(str(COMPANY_NAMES.get(raw_ticker, raw_ticker)))
+        company  = html.escape(COMPANY_NAMES.get(raw_ticker, raw_ticker))
         score    = info.get("score", 0.0)
         zscore   = info.get("zscore")
         status   = info.get("status", "normal")
@@ -831,7 +831,7 @@ def build_email_html(
             st_str  = "✅ Normal"
             st_bg   = "#ffffff"
 
-        company = html.escape(str(COMPANY_NAMES.get(raw_ticker, raw_ticker)))
+        company = html.escape(COMPANY_NAMES.get(raw_ticker, raw_ticker))
         return f"""
           <tr style="background:{st_bg};">
             <td style="padding:8px 12px;font-weight:bold;font-family:Arial,sans-serif;font-size:13px;">{ticker}</td>

@@ -108,12 +108,12 @@ def test_require_parseable_stream_config_validations(tmp_path):
     with pytest.raises(ValueError, match="'sizing_ladder.tiers' must be a list"):
         _require_parseable_stream_config(cfg_file, "morning")
 
-    valid_base["sizing_ladder"]["tiers"] = ["not_a_dict"]
+    valid_base["sizing_ladder"] = {"base_amount_usd": 1.0, "tiers": ["not_a_dict"]}
     cfg_file.write_text(json.dumps(valid_base), encoding="utf-8")
     with pytest.raises(ValueError, match="'sizing_ladder.tiers\\[0\\]' must be an object"):
         _require_parseable_stream_config(cfg_file, "morning")
 
-    valid_base["sizing_ladder"]["tiers"] = [{"min_drop_pct": 1.0}]
+    valid_base["sizing_ladder"] = {"base_amount_usd": 1.0, "tiers": [{"min_drop_pct": 1.0}]}
     cfg_file.write_text(json.dumps(valid_base), encoding="utf-8")
     with pytest.raises(ValueError, match="has no 'multiplier'"):
         _require_parseable_stream_config(cfg_file, "morning")
@@ -123,7 +123,7 @@ def test_require_parseable_stream_config_validations(tmp_path):
     # hardcoded default behind it, so an absent key silently validates the
     # 60-minute downtrend on the fallback bar count rather than the checked-in
     # one (PR #898, "Require explicit trend bar minimum").
-    valid_base["sizing_ladder"]["tiers"] = [{"min_drop_pct": 1.0, "multiplier": 1.0}]
+    valid_base["sizing_ladder"] = {"base_amount_usd": 1.0, "tiers": [{"min_drop_pct": 1.0, "multiplier": 1.0}]}
     trend_min_bars_message = "'trend_min_bars' must be present and be an integer of at least 1"
     valid_base["trend_min_bars"] = True
     cfg_file.write_text(json.dumps(valid_base), encoding="utf-8")

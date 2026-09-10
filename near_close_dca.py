@@ -18410,17 +18410,19 @@ def _persist_gated_whole_share_recovery(
             # identity"). _net_submitted_amount's own order_id branch is
             # checked FIRST and returns immediately, so a row that DOES
             # match by id never double-counts by also matching this map.
-            for entry in candidate.get("whole_share_claim_breakdown") or ():
-                if isinstance(entry, dict) and entry.get("trading_day") and isinstance(candidate.get("ticker"), str):
-                    key = (str(candidate.get("ticker")), str(entry["trading_day"]))
-                    adjustment_totals_by_ticker_day[key] = (
-                        adjustment_totals_by_ticker_day.get(key, 0.0) + adj_amount
-                    )
-                    attempt_id = entry.get("claim_attempt_id")
-                    if attempt_id:
-                        adjustment_totals_by_attempt_id[attempt_id] = (
-                            adjustment_totals_by_attempt_id.get(attempt_id, 0.0) + adj_amount
+            _cand_ticker = candidate.get("ticker")
+            if isinstance(_cand_ticker, str):
+                for entry in candidate.get("whole_share_claim_breakdown") or ():
+                    if isinstance(entry, dict) and entry.get("trading_day"):
+                        key = (_cand_ticker, str(entry["trading_day"]))
+                        adjustment_totals_by_ticker_day[key] = (
+                            adjustment_totals_by_ticker_day.get(key, 0.0) + adj_amount
                         )
+                        attempt_id = entry.get("claim_attempt_id")
+                        if attempt_id:
+                            adjustment_totals_by_attempt_id[attempt_id] = (
+                                adjustment_totals_by_attempt_id.get(attempt_id, 0.0) + adj_amount
+                            )
 
         # The ticker/trading-day fallback above is safe ONLY when exactly
         # ONE physical (non-adjustment) row shares that (ticker, day) --
@@ -18434,9 +18436,11 @@ def _persist_gated_whole_share_recovery(
         # (Codex review: "Avoid applying corrections to sibling orders").
         _ticker_day_row_counts: Dict[tuple[str, str], int] = {}
         for _row in submitted_rows:
-            if not isinstance(_row, dict) or not isinstance(_row.get("ticker"), str):
+            if not isinstance(_row, dict):
                 continue
-            _ticker_str = str(_row.get("ticker"))
+            _ticker_str = _row.get("ticker")
+            if not isinstance(_ticker_str, str):
+                continue
             _row_keys = {
                 (_ticker_str, str(entry["trading_day"]))
                 for entry in (_row.get("whole_share_claim_breakdown") or ())
@@ -23580,10 +23584,9 @@ def _process_buy_candidate(
                 # sums on the NEXT run. Booking the approved $2 for a $100 fill
                 # is how the excess went missing in the first place.
                 if isinstance(reconciled_executed_usd, (tuple, list)):
-                    executed_usd, exposure_basis = reconciled_executed_usd[0], str(reconciled_executed_usd[1])
+                    executed_usd, exposure_basis = float(reconciled_executed_usd[0]), reconciled_executed_usd[1]
                 else:
-                    executed_usd, exposure_basis = float(reconciled_executed_usd or 0.0), "executed"
-                executed_usd = float(executed_usd)
+                    executed_usd, exposure_basis = (reconciled_executed_usd or 0.0), "executed"
                 exposure_is_executed = exposure_basis.startswith("executed")
                 ctx.state.record_buy(ticker, ctx.trading_day, executed_usd)
                 # Same idiom as the success path, for the same reason: a REAL
@@ -27895,7 +27898,7 @@ def _reconcile_unproven_fractional_placements_in_artifact(
             amount: float = (
                 float(accepted_amount)
                 if verdict == _PLACEMENT_ACCEPTED and isinstance(accepted_amount, (int, float))
-                else float(candidate_amounts[-1])
+                else candidate_amounts[-1]
             )
         except Exception as exc:  # noqa: BLE001 - unreadable history stays blocked
             for key in keys:
