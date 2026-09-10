@@ -32,7 +32,6 @@ from datetime import date
 from unittest.mock import patch
 
 import pytest
-
 from market_data_ingest.edgar_fundamentals import (
     PointInTimeFact,
     build_headers,

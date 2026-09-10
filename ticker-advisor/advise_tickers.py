@@ -510,7 +510,7 @@ def _price_returns(frame: pd.DataFrame) -> pd.Series:
     # too, so this replaces dropna() entirely rather than needing both
     # (Antigravity review on PR #403: "Unfiltered Non-Finite Returns
     # (inf / -inf) in _price_returns").
-    return returns[np.isfinite(returns)]
+    return cast(pd.Series, returns[np.isfinite(returns)])
 
 
 def _signal_has_usable_metric(raw: dict[str, object], signal: str) -> bool:
@@ -761,8 +761,9 @@ def _normalize_datetime_frame(frame: pd.DataFrame) -> pd.DataFrame:
         normalized = normalized.tz_localize(None)
     frame = frame.set_axis(cast(Any, normalized).normalize())
     assert isinstance(frame.index, pd.DatetimeIndex)
-    dup_mask = np.asarray(frame.index.duplicated(keep="last"))
-    return cast(pd.DataFrame, frame[~dup_mask])
+    dup_mask: list[bool] = [not bool(d) for d in frame.index.duplicated(keep="last")]
+    frame = frame.loc[dup_mask]
+    return frame
 
 
 def score_candidate(

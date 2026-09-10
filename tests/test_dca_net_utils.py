@@ -4,6 +4,7 @@ import ipaddress
 import socket
 import urllib.error
 import urllib.request
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -109,9 +110,9 @@ def test_pinned_https_connection_wraps_the_pinned_socket_with_host_sni():
     wrapped_sock = MagicMock(name="wrapped_sock")
     context = MagicMock()
     context.wrap_socket.return_value = wrapped_sock
-    conn._context = context
+    cast(Any, conn)._context = context
     conn.sock = raw_sock
-    conn._tunnel_host = None
+    cast(Any, conn)._tunnel_host = None
 
     with patch("dca_net_utils.connect_pinned") as mock_connect:
         conn.connect()
@@ -132,9 +133,9 @@ def test_pinned_https_connection_uses_the_tunnel_host_for_sni():
     wrapped_sock = MagicMock(name="wrapped_sock")
     context = MagicMock()
     context.wrap_socket.return_value = wrapped_sock
-    conn._context = context
+    cast(Any, conn)._context = context
     conn.sock = raw_sock
-    conn._tunnel_host = "tunnel.example.com"
+    cast(Any, conn)._tunnel_host = "tunnel.example.com"
 
     with patch("dca_net_utils.connect_pinned") as mock_connect:
         conn.connect()
@@ -216,7 +217,7 @@ def test_redirect_request_missing_argument_is_a_type_error():
     handler = dca_net_utils.SafeRedirectHandler()
     req = urllib.request.Request("https://hc.example/start")
     with pytest.raises(TypeError):
-        handler.redirect_request(req, None, 302, "Found", {})
+        cast(Any, handler).redirect_request(req, None, 302, "Found", {})
 
 
 def test_redact_url_with_port():

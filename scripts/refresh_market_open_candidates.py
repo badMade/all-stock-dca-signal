@@ -50,7 +50,7 @@ def refresh_market_open_candidates(
             continue
         price = quote.get("price")
         as_of_raw = quote.get("as_of")
-        if isinstance(price, bool):
+        if price is None or isinstance(price, bool):
             dropped.append({"ticker": ticker, "reason": "invalid_refresh_quote"})
             continue
         try:

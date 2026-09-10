@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time
+from typing import Any, cast
 
 import pytest
 
@@ -540,7 +541,9 @@ def test_finance_provider_folds_a_dividend_into_the_factor():
         bars_fn=lambda *a: [{"date": "2026-08-18", "Stock Splits": 0.0, "Dividends": 2.0, "Close": 98.0}],
         previous_close_fn=lambda *a: 100.0,
     )
-    factor, cursor = prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18))
+    res = prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18))
+    assert res is not None
+    factor, cursor = res
     assert factor == pytest.approx(100.0 / 98.0)
     assert cursor == date(2026, 8, 18)
 
@@ -579,9 +582,11 @@ def test_finance_provider_combines_a_split_and_dividend_on_the_same_ex_date():
         previous_close_fn=lambda *a: 100.0,
     )
 
-    factor, cursor = prov.get_corporate_action_factor(
+    res = prov.get_corporate_action_factor(
         "AAPL", date(2026, 8, 17), date(2026, 8, 18)
     )
+    assert res is not None
+    factor, cursor = res
 
     assert factor == pytest.approx(2.0 * (100.0 / 98.0))
     assert cursor == date(2026, 8, 18)
@@ -808,7 +813,9 @@ def test_finance_provider_accepts_close_price_and_c_aliases_for_dividends():
             ],
             previous_close_fn=lambda *a: 100.0,
         )
-        factor, cursor = prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18))
+        res = prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18))
+        assert res is not None, key
+        factor, cursor = res
         assert factor == pytest.approx(100.0 / 98.0), key
         assert cursor == date(2026, 8, 18), key
 
@@ -824,7 +831,9 @@ def test_finance_provider_get_quote_accepts_a_mapping():
         previous_close_fn=lambda *a: 100.0,
         quote_fn=lambda *a: {"price": 95.5, "as_of": "2026-07-02T15:44:00-04:00"},
     )
-    price, as_of = prov.get_quote("AAPL", _decision_dt())
+    quote = prov.get_quote("AAPL", _decision_dt())
+    assert quote is not None
+    price, as_of = quote
     assert price == pytest.approx(95.5)
     assert as_of == datetime(2026, 7, 2, 15, 44, tzinfo=EASTERN)
 
@@ -833,7 +842,9 @@ def test_finance_provider_get_quote_accepts_a_bare_scalar():
     prov = FinanceDataProvider(
         bars_fn=lambda *a: [], previous_close_fn=lambda *a: 100.0, quote_fn=lambda *a: 95.5
     )
-    price, as_of = prov.get_quote("AAPL", _decision_dt())
+    quote = prov.get_quote("AAPL", _decision_dt())
+    assert quote is not None
+    price, as_of = quote
     assert price == pytest.approx(95.5)
     assert as_of == _decision_dt()
 
@@ -889,7 +900,7 @@ def test_finance_provider_third_positional_argument_still_sets_supports_corporat
 
 def test_finance_provider_quote_fn_is_keyword_only():
     with pytest.raises(TypeError):
-        FinanceDataProvider(lambda *a: [], lambda *a: 100.0, True, lambda *a: 95.5)
+        cast(Any, FinanceDataProvider)(lambda *a: [], lambda *a: 100.0, True, lambda *a: 95.5)
 
 
 def test_finance_provider_accepts_capitalized_date_alias():
@@ -1178,7 +1189,7 @@ def test_broker_place_finds_live_order_nested_in_nonstandard_failure_container()
 
 
 def test_broker_place_handles_cyclic_failure_response_without_looping():
-    response = {"success": False, "message": "timeout"}
+    response: dict[str, Any] = {"success": False, "message": "timeout"}
     response["error"] = response
     broker = RobinhoodBroker(
         account="999000111", enable_live_orders=True, place_fn=lambda **k: response
@@ -3146,7 +3157,7 @@ def test_robinhood_broker_pagination_follows_a_nested_continuation_pointer():
     even misread the outer bare "cursor" as an echo of itself, ending
     pagination before page 3 -- where the actually-requested order sits --
     was ever reached."""
-    pages = [
+    pages: list[dict[str, Any]] = [
         {
             "cursor": "P2",
             "data": {
@@ -3179,7 +3190,7 @@ def test_robinhood_broker_pagination_carries_an_intervening_continuation_pointer
     between them. Checking only the row-bearing layer and the outer
     settled layer (as an earlier, narrower fix did) skips that
     intervening layer and loses the real continuation pointer entirely."""
-    pages = [
+    pages: list[dict[str, Any]] = [
         {
             "orders": [],
             "data": {
@@ -3331,7 +3342,7 @@ def test_robinhood_broker_pagination_preserves_cursors_traversed_while_resolving
     the outer settled layer whenever the effective orders collection ended
     up empty lost that intermediate P3 pointer entirely, concluding
     history ended at P2 while a live order still sat on P3."""
-    pages = [
+    pages: list[dict[str, Any]] = [
         {"data": {"orders": [{"state": "filled", "ref_id": "other"}], "next_cursor": "P2"}},
         {"data": {"cursor": "P2", "data": {"next_cursor": "P3", "data": {"orders": []}}}},
         {"data": {"orders": [{"state": "filled", "ref_id": "crashed-fire"}]}},

@@ -1189,6 +1189,7 @@ def test_load_midday_config_appends_dated_manual_override_to_configured_cap_seed
 
     cfg = load_midday_config(str(cfg_dir))
 
+    assert cfg.cap_seed_roots is not None
     assert configured_root in cfg.cap_seed_roots
     assert str(override_dir) in cfg.cap_seed_roots
 

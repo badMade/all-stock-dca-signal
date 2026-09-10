@@ -2150,6 +2150,7 @@ def test_load_morning_config_appends_dated_manual_override_to_configured_cap_see
 
     cfg = load_morning_config(str(cfg_dir))
 
+    assert cfg.cap_seed_roots is not None
     assert configured_root in cfg.cap_seed_roots
     assert str(override_dir) in cfg.cap_seed_roots
 
@@ -5849,7 +5850,7 @@ def test_morning_scheduled_duplicate_recovery_settles_preserved_credit(tmp_path)
     from dca_cumulative import CumulativeCreditLedger
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
 
-    class _DuplicateBroker:
+    class _DuplicateBroker(FakeLiveBroker):
         def __init__(self):
             self.placed = {}
 
@@ -6368,7 +6369,7 @@ def test_morning_scheduled_duplicate_recovery_settlement_is_idempotent(tmp_path)
     from dca_cumulative import CumulativeCreditLedger
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
 
-    class _DuplicateBroker:
+    class _DuplicateBroker(FakeLiveBroker):
         def __init__(self):
             self.placed = {}
 
@@ -9922,7 +9923,9 @@ def test_default_cap_seed_roots_include_dated_manual_overrides(monkeypatch):
         lambda: (override_root,),
     )
 
-    assert override_root in MorningConfig().cap_seed_roots
+    roots = MorningConfig().cap_seed_roots
+    assert roots is not None
+    assert override_root in roots
 
 
 def test_morning_live_scheduled_artifact_not_prior_context_on_retry(tmp_path):
@@ -15782,7 +15785,7 @@ def test_place_broker_orders_settles_ambiguous_credit_exactly_once(tmp_path):
     from dca_cumulative import CumulativeCreditLedger
     from near_close_dca import TOP_UP_INCREMENTAL, OrderPlacementAmbiguousError
 
-    class _AmbiguousBroker:
+    class _AmbiguousBroker(FakeLiveBroker):
         def account_number(self):
             return "999000111"
 

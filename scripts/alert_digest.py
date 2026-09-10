@@ -1540,7 +1540,7 @@ def states_email_failure(body: str) -> bool:
                     clause_has_unnegated_failure = True
                     failure_match_end = send_failed_match.end()
                     break
-                if clause_has_unnegated_failure:
+                if clause_has_unnegated_failure and failure_match_end is not None:
                     # The match's OWN end position, not the whole clause's:
                     # a colon (not a _CLAUSE_SPLIT boundary) can join a
                     # failed attempt and its successful retry into one
@@ -3721,7 +3721,7 @@ def save_ledger(path: Path, keys: Iterable[str], *, now: Optional[datetime] = No
 
 
 def _classify_coverage_day(
-    day: date, silent: Set[date], calendar: Set[date], incomplete: Set[date] = frozenset()
+    day: date, silent: Set[date], calendar: Set[date], incomplete: Set[date] | frozenset[date] = frozenset()
 ) -> str:
     """One of ``"roster_silent"``, ``"incomplete_roster_day"``,
     ``"outside_approved_trading_window"``, ``"not_a_trading_day"``, or
@@ -4089,7 +4089,9 @@ def _file_event_utc(record: AlertRecord) -> datetime:
             record.date_evidence != "filename" or abs((mtime.astimezone(ET).date() - record.et_date).days) <= 1
         ):
             return mtime
-    return _slot_scheduled_utc(record.et_date, record.slot)
+    if record.slot is not None:
+        return _slot_scheduled_utc(record.et_date, record.slot)
+    return record.timestamp_utc
 
 
 # The reason an executor gives for stopping, as Gate 9 requires it to be stated:

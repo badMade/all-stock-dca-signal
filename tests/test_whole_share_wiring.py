@@ -98,6 +98,9 @@ class _TightSpreadData:
     def get_previous_close_bar(self, ticker, as_of):
         return None
 
+    def get_intraday_bars(self, ticker, start, end, interval_minutes):
+        return []
+
 
 _UNSET = object()
 
@@ -3855,7 +3858,7 @@ def test_reconcile_unresolved_whole_share_claim_does_not_book_a_zero_fill_attemp
 
     ledger.preserve_pending_if_claimed = _raising_preserve_pending
 
-    class _ZeroFillBroker:
+    class _ZeroFillBroker(DryRunBroker):
         def account_number(self) -> str:
             return "test-account"
 
@@ -4023,9 +4026,10 @@ def test_reconcile_falls_back_to_submitted_quantity_when_cumulative_quantity_is_
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY")
+    assert unresolved is not None
     assert unresolved["shares_to_buy"] == 2
 
-    class _UnparseableCumulativeQuantityBroker:
+    class _UnparseableCumulativeQuantityBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "RH-CLAMPED-1",
@@ -4066,9 +4070,10 @@ def test_reconcile_rejects_a_negative_fractional_fill_from_the_live_match_branch
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY")
+    assert unresolved is not None
     assert unresolved["shares_to_buy"] == 2
 
-    class _NegativeFractionalLiveMatchBroker:
+    class _NegativeFractionalLiveMatchBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "RH-NEG-FRAC-LIVE-1",
@@ -4104,9 +4109,10 @@ def test_reconcile_rejects_a_positive_fractional_fill_from_the_live_match_branch
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY")
+    assert unresolved is not None
     assert unresolved["shares_to_buy"] == 2
 
-    class _PositiveFractionalLiveMatchBroker:
+    class _PositiveFractionalLiveMatchBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "RH-POS-FRAC-LIVE-1",
@@ -4149,9 +4155,10 @@ def test_reconcile_rejects_a_fractional_submitted_quantity_fallback(
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY")
+    assert unresolved is not None
     assert unresolved["shares_to_buy"] == 2
 
-    class _FractionalSubmittedQuantityBroker:
+    class _FractionalSubmittedQuantityBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "RH-FRAC-SUBMITTED-1",
@@ -4188,7 +4195,7 @@ def test_reconcile_does_not_release_claim_for_negative_fractional_live_fill_with
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY")
     assert unresolved is not None
 
-    class _NegativeFractionalLiveMatchBroker:
+    class _NegativeFractionalLiveMatchBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "RH-NEG-FRAC-LIVE-NO-SUBMITTED-QUANTITY",
@@ -4375,7 +4382,7 @@ def test_publish_or_merge_whole_share_outcome_merges_a_prior_zero_fill_recovery(
     merged = _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]["BYDDY"]
     assert merged["status"] == "submitted"
     # The zero-fill order's id survives the merge, not just the new one's.
-    assert set(merged["whole_share_order_ids"]) == {"RH-ZERO-FILL-1", "RH-SUBMITTED-1"}
+    assert set(cast(list[str], merged["whole_share_order_ids"])) == {"RH-ZERO-FILL-1", "RH-SUBMITTED-1"}
 
 
 def test_batch_keeps_submission_published_during_candidate_processing(monkeypatch):
@@ -5498,6 +5505,7 @@ def test_whole_share_gated_recovery_keeps_claim_when_evidence_write_fails(tmp_pa
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     claim = ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY")
+    assert claim is not None
     ledger_before = (ledger.root / "BYDDY" / "ledger.json").read_bytes()
 
     class _FilledBroker(DryRunBroker):
@@ -5541,7 +5549,9 @@ def test_settle_evidence_hook_fires_only_for_the_claim_winner(tmp_path, monkeypa
         "BYDDY", claim_day.isoformat(), 10.0, 10.0, stream="afternoon",
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
-    claim_token = ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY")["claim_token"]
+    unresolved = ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY")
+    assert unresolved is not None
+    claim_token = unresolved["claim_token"]
     fired = []
 
     def _settle_once():
@@ -5576,7 +5586,9 @@ def test_settle_evidence_hook_failure_leaves_the_claim_unresolved(tmp_path, monk
         "BYDDY", claim_day.isoformat(), 10.0, 10.0, stream="afternoon",
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
-    claim_token = ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY")["claim_token"]
+    unresolved = ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY")
+    assert unresolved is not None
+    claim_token = unresolved["claim_token"]
 
     with pytest.raises(OSError, match="disk full"):
         ledger.settle(
@@ -7255,6 +7267,7 @@ def test_whole_share_zero_fill_release_hook_fires_before_ledger_commit(tmp_path,
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     claim = ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY")
+    assert claim is not None
 
     class _ZeroFillBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
@@ -7295,6 +7308,7 @@ def test_whole_share_zero_fill_release_hook_failure_leaves_claim_unresolved(tmp_
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     claim = ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY")
+    assert claim is not None
     ledger_before = (ledger.root / "BYDDY" / "ledger.json").read_bytes()
 
     class _ZeroFillBroker(DryRunBroker):

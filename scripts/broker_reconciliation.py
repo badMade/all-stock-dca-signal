@@ -404,7 +404,7 @@ def _dedupe_orders_by_id(orders: Iterable[BrokerOrder]) -> List[BrokerOrder]:
     return list(by_id.values())
 
 
-def _clean_order_ids(order_ids: Iterable[str]) -> List[str]:
+def _clean_order_ids(order_ids: Iterable[Any]) -> List[str]:
     if isinstance(order_ids, str):
         # A bare string is iterable char-by-char; a single id passed as a string
         # would otherwise be split into individual characters. Treat it as one id.

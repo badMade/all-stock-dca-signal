@@ -50528,11 +50528,22 @@ def test_an_unapproved_execution_settles_the_carried_top_up_credit(monkeypatch):
         def __init__(self):
             pass
 
-        def minimum_order_pending_tickers(self, day_iso):
+        def minimum_order_pending_tickers(self, trading_day):
             return {"AAPL": 0.6}
 
-        def settle(self, ticker, day_iso, amount_usd, stream=None, order_id=None):
-            settled.append((ticker, day_iso, amount_usd, stream, order_id))
+        def settle(
+            self,
+            ticker: str,
+            trading_day: str,
+            submitted_amount_usd: float,
+            *,
+            final_session: bool = True,
+            stream: str = "unknown",
+            recorded_at: str | None = None,
+            order_id: str | None = None,
+            already_debited_usd: float | None = None,
+        ) -> None:
+            settled.append((ticker, trading_day, submitted_amount_usd, stream, order_id))
 
     ctx = _isolation_context(
         config, StrategyState(), _Broker(cash=500.0, reference_prices={"AAPL": 98.0}),
@@ -50851,11 +50862,12 @@ def test_an_oversized_recovered_fill_is_booked_and_not_lost(monkeypatch):
     state = StrategyState()
 
     class _Broker(DryRunBroker):
-        def place_market_buy(self, ticker, amount_usd, ref_id=None):
+        def place_market_buy(self, ticker, notional_usd, ref_id=None):
             raise RuntimeError("connector died carrying an acceptance back")
 
-        @staticmethod
-        def same_day_order_with_ref_id_prefix_any_state(ticker, day, refs):
+        def same_day_order_with_ref_id_prefix_any_state(
+            self, ticker: str, trading_day: date, ref_id_prefixes: tuple[str, ...]
+        ) -> dict[str, Any] | None:
             # The adapter's NORMAL fill shape: quantity and price, no
             # executed_notional at all.
             return {

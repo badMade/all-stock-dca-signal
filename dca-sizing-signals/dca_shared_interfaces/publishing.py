@@ -28,7 +28,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from .forecasting import SizingSuggestion
+from dca_shared_interfaces.forecasting import SizingSuggestion
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,7 +50,7 @@ def _acquire_lock(lock_path: Path, timeout_s: float = 30.0, poll_s: float = 0.05
                 break
             except FileExistsError:
                 if time.monotonic() > deadline:
-                    raise TimeoutError(f"could not acquire {lock_path} within {timeout_s}s")
+                    raise TimeoutError(f"could not acquire {lock_path} within {timeout_s}s") from None
                 time.sleep(poll_s)
         yield
     finally:
