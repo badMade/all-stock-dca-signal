@@ -332,119 +332,57 @@ def _infer_trading_day_from_path(path: Path) -> Optional[str]:
     return None
 
 
-def collect_purchase_records(
-    root: Optional[Path | str] = None,
-    *,
-    additional_roots: Sequence[Path | str] = (),
-) -> tuple[List[PurchaseRecord], List[str]]:
-    """Scan every run directory under ``root`` (default: the configured
-    cron-tracking root) plus every root in ``additional_roots``, and return
-    ``(records, warnings)``.
+class _PurchaseCollector:
+    def __init__(self, root: Optional[Path | str] = None, additional_roots: Sequence[Path | str] = ()):
+        from dca_live_adapters import _LIVE_ORDER_STATES
+        try:
+            from scripts.drift_detection import _NOT_ACTUALLY_SUBMITTED_STATUSES
+        except ImportError:  # pragma: no cover - exercised via the flat-sys.path invocation
+            from drift_detection import _NOT_ACTUALLY_SUBMITTED_STATUSES  # type: ignore
+        from near_close_dca import (
+            _EXECUTED_QUANTITY_COLS,
+            _TERMINAL_NON_FILL_STATES,
+            _UNRESOLVED_ORDER_ATTEMPT_STATUSES,
+            _executed_quantity_is_explicit_zero,
+            _orders_csv_fills,
+            _recovery_root_for,
+            _resolve_recorded_orders_csv,
+        )
 
-    A deployment can relocate a stream's live artifact root outside the
-    cron-tracking tree entirely (``morning``/``midday`` via
-    ``artifact_paths.live_run_state_root``, ``intraday``/``market-open`` via
-    ``DCA_INTRADAY_LIVE_STATE_ROOT`` / ``DCA_MARKET_OPEN_LIVE_STATE_ROOT`` --
-    see ``run_dca._resolve_cross_stream_prior_allocation_roots``, which
-    resolves the same set for the afternoon top-up guard). A single scan root
-    then silently omits that stream's whole history (Codex review: "Include
-    configured stream roots outside the cron tree"). ``additional_roots`` is a
-    generic escape hatch for a caller who knows their deployment's actual
-    roots -- this module deliberately does not import ``run_dca``'s
-    config-loading/trust-rule machinery (built for a narrower afternoon-root-
-    relative purpose) to auto-discover them, keeping this reporting tool's
-    only in-repo dependency the fill parser it already reuses.
+        self._LIVE_ORDER_STATES = _LIVE_ORDER_STATES
+        self._NOT_ACTUALLY_SUBMITTED_STATUSES = _NOT_ACTUALLY_SUBMITTED_STATUSES
+        self._EXECUTED_QUANTITY_COLS = _EXECUTED_QUANTITY_COLS
+        self._TERMINAL_NON_FILL_STATES = _TERMINAL_NON_FILL_STATES
+        self._UNRESOLVED_ORDER_ATTEMPT_STATUSES = _UNRESOLVED_ORDER_ATTEMPT_STATUSES
+        self._executed_quantity_is_explicit_zero = _executed_quantity_is_explicit_zero
+        self._orders_csv_fills = _orders_csv_fills
+        self._recovery_root_for = _recovery_root_for
+        self._resolve_recorded_orders_csv = _resolve_recorded_orders_csv
 
-    Deduplicates by ``order_id``: when the same order_id is seen from more than
-    one directory, the occurrence from the more authoritative run wins (see
-    :func:`_dedup_rank`), and every other occurrence is recorded as a warning
-    rather than a second row -- a real fill has exactly one broker order_id no
-    matter how many run directories reference it. This dedup applies across
-    ``root`` and every ``additional_roots`` entry alike, so overlapping roots
-    are merged rather than double-counted.
-    """
-    # Deferred: near_close_dca is a ~450k-line module; importing it only when
-    # this function actually runs (not at module import time) keeps `--help`
-    # and other lightweight invocations of this script cheap, matching the
-    # deferred-import pattern scripts/generate_buy_candidates.py already uses
-    # for dca_runner.
-    from dca_live_adapters import _LIVE_ORDER_STATES
+        self._NON_TERMINAL_LIVE_STATES = frozenset(
+            _UNRESOLVED_ORDER_ATTEMPT_STATUSES | _LIVE_ORDER_STATES
+        ) - {"filled", "partially_filled"}
 
-    try:
-        from scripts.drift_detection import _NOT_ACTUALLY_SUBMITTED_STATUSES
-    except ImportError:  # pragma: no cover - exercised via the flat-sys.path invocation
-        from drift_detection import _NOT_ACTUALLY_SUBMITTED_STATUSES  # type: ignore
+        import dca_paths
+        resolved_root = Path(root) if root is not None else Path(dca_paths.cron_tracking_root())
 
-    from near_close_dca import (
-        _EXECUTED_QUANTITY_COLS,
-        _TERMINAL_NON_FILL_STATES,
-        _UNRESOLVED_ORDER_ATTEMPT_STATUSES,
-        _executed_quantity_is_explicit_zero,
-        _orders_csv_fills,
-        _recovery_root_for,
-        _resolve_recorded_orders_csv,
-    )
+        scan_roots_list = []
+        seen_scan_roots = set()
+        for candidate in (resolved_root, *(Path(r) for r in additional_roots)):
+            normalized = candidate.resolve()
+            if normalized in seen_scan_roots:
+                continue
+            seen_scan_roots.add(normalized)
+            scan_roots_list.append(normalized)
 
-    # The full non-terminal, non-filled broker state vocabulary this
-    # collector can encounter in a submission-side CSV: near_close_dca's own
-    # _UNRESOLVED_ORDER_ATTEMPT_STATUSES ("submitted"/"pending"/
-    # "unconfirmed") covers what a canonical submitted_orders.csv writer
-    # emits, but dca_live_adapters._LIVE_ORDER_STATES is the broker-native
-    # vocabulary actually observed on the wire and additionally includes
-    # "new"/"queued"/"confirmed"/"partially_filled" -- any of which can carry
-    # a positive REQUESTED ``quantity`` with no quantity_filled/
-    # cumulative_quantity column and be misread as a confirmed partial fill
-    # the same way "submitted" is (Codex review: "Cover every live broker
-    # state before accepting quantity"). "filled" is excluded -- that state
-    # is a real, confirmed execution the shared parser already trusts
-    # correctly. "partially_filled" is ALSO excluded from this set (handled
-    # as its own case below) -- unlike every other member here, it means
-    # SOME quantity genuinely executed, so it shares the terminal branch's
-    # legitimate recovery-shape exception rather than this branch's
-    # filename-independent one.
-    _NON_TERMINAL_LIVE_STATES = (
-        frozenset(_UNRESOLVED_ORDER_ATTEMPT_STATUSES | _LIVE_ORDER_STATES) - {"filled", "partially_filled"}
-    )
+        self.scan_roots = tuple(scan_roots_list)
+        self.records = []
+        self.warnings = []
+        self.seen = {}
+        self.covered_dirs = set()
+        self.covered_files = set()
 
-    resolved_root = Path(root) if root is not None else Path(dca_paths.cron_tracking_root())
-    # Resolved (absolute, no symlinks, no ".." segments) and deduplicated: the
-    # same physical directory reachable through two different path spellings
-    # (a relative --cron-tracking-root that happens to coincide with an
-    # absolute or symlinked --additional-root) would otherwise be walked
-    # TWICE. order_id-bearing rows happen to still dedup (their key doesn't
-    # depend on the scan root's own spelling), but a legacy no-order-id
-    # row's key is scoped by the lexical fill_source_dir string, so two
-    # aliases of the same root produced two distinct keys and doubled
-    # quantity/dollars/buy_count for it (Codex review: "Normalize scan roots
-    # before deduplicating artifacts").
-    scan_roots_list: List[Path] = []
-    seen_scan_roots: set = set()
-    for candidate in (resolved_root, *(Path(r) for r in additional_roots)):
-        normalized = candidate.resolve()
-        if normalized in seen_scan_roots:
-            continue
-        seen_scan_roots.add(normalized)
-        scan_roots_list.append(normalized)
-    scan_roots: tuple[Path, ...] = tuple(scan_roots_list)
-    records: List[PurchaseRecord] = []
-    warnings: List[str] = []
-    seen: Dict[str, Dict[str, Any]] = {}
-    # Every directory a run_state*.json under it was actually parsed for,
-    # successfully -- including a dry-run directory that was then
-    # deliberately skipped, and a recovery root whose fills were pulled in
-    # (or already read once via run_dir) below. The orphan sweep at the end
-    # of this function treats anything NOT in this set as undiscovered
-    # evidence; a dry-run/recovery directory being "covered" here is what
-    # stops that sweep from re-surfacing a simulated fill, or double-counting
-    # a recovery-root fill already folded in above, as if it were new.
-    covered_dirs: set = set()
-    # Specific FILES already consumed by an externally-referenced
-    # artifacts.orders_csv_path (see below) -- narrower than covered_dirs,
-    # since a full-report output directory can legitimately hold more than
-    # one run's evidence.
-    covered_files: set = set()
-
-    def _authoritative_no_fill_rows(csv_path: Path) -> tuple[bool, set, set]:
+    def _authoritative_no_fill_rows(self, csv_path: Path) -> tuple[bool, set, set]:
         """Analyze ``csv_path`` for explicit terminal no-fill outcomes.
 
         Returns ``(all_authoritative, rejected_order_ids, rejected_no_id_tickers)``:
@@ -453,7 +391,7 @@ def collect_purchase_records(
           explicit terminal non-fill outcome: ``state='rejected'`` (no
           execution is possible by definition), or any OTHER state in the
           broker's canonical terminal set (``cancelled``/``canceled``/
-          ``failed``/``voided``/``expired`` -- ``_TERMINAL_NON_FILL_STATES``,
+          ``failed``/``voided``/``expired`` -- ``self._TERMINAL_NON_FILL_STATES``,
           not just the American "canceled" spelling (Codex review:
           "Recognize every terminal no-fill state before falling back"))
           with an EXPLICIT numeric zero in an executed-quantity column.
@@ -562,7 +500,7 @@ def collect_purchase_records(
             checks below -- both need the identical "was this ``quantity``
             actually reported as executed, or just requested" test.
             """
-            for col in _EXECUTED_QUANTITY_COLS:
+            for col in self._EXECUTED_QUANTITY_COLS:
                 value = row.get(col)
                 if value not in (None, "", "-"):
                     return False
@@ -603,12 +541,12 @@ def collect_purchase_records(
             if not row_state:
                 row_state = (row.get("status") or "").strip().lower() if "status" in row else ""
             execution_unconfirmed = False
-            if row_state == "rejected" or row_state in _NOT_ACTUALLY_SUBMITTED_STATUSES:
+            if row_state == "rejected" or row_state in self._NOT_ACTUALLY_SUBMITTED_STATUSES:
                 # "not_submitted_confirmation_required"
                 # (near_close_dca.OrderConfirmationRequiredError /
                 # scripts.run_classification's confirmation-required status,
                 # sourced from scripts.drift_detection's own
-                # _NOT_ACTUALLY_SUBMITTED_STATUSES) means the order was
+                # self._NOT_ACTUALLY_SUBMITTED_STATUSES) means the order was
                 # blocked pending a separate pre-authorization step and
                 # NEVER reached the broker at all -- stronger than
                 # 'rejected' (which at least means the broker saw and
@@ -617,8 +555,8 @@ def collect_purchase_records(
                 # whatever its ``quantity`` column happens to hold (Codex
                 # review: "Exclude confirmation-blocked attempt rows").
                 is_explicit_no_fill = True
-            elif row_state in _TERMINAL_NON_FILL_STATES:
-                is_explicit_no_fill = _executed_quantity_is_explicit_zero(row)
+            elif row_state in self._TERMINAL_NON_FILL_STATES:
+                is_explicit_no_fill = self._executed_quantity_is_explicit_zero(row)
                 # A terminal (canceled/failed/voided/expired) row with no
                 # genuine executed-quantity column at all still reads as a
                 # confirmed PARTIAL FILL from the shared parser: its own
@@ -687,12 +625,12 @@ def collect_purchase_records(
                 # deferring to its judgment here instead of re-litigating it
                 # a third time.
                 is_explicit_no_fill = False
-            elif row_state in _NON_TERMINAL_LIVE_STATES:
+            elif row_state in self._NON_TERMINAL_LIVE_STATES:
                 # An in-flight order (submitted/pending/unconfirmed/new/
                 # queued/confirmed -- covers both
-                # near_close_dca._UNRESOLVED_ORDER_ATTEMPT_STATUSES, the
+                # near_close_dca.self._UNRESOLVED_ORDER_ATTEMPT_STATUSES, the
                 # canonical submitted_orders.csv writer's vocabulary, and
-                # dca_live_adapters._LIVE_ORDER_STATES, the broker-native
+                # dca_live_adapters.self._LIVE_ORDER_STATES, the broker-native
                 # vocabulary actually observed on the wire; never terminal,
                 # may still fill later, and -- unlike 'partially_filled' --
                 # confirms NOTHING has executed yet) with no genuine
@@ -737,7 +675,7 @@ def collect_purchase_records(
                 all_authoritative = False
         return all_authoritative, rejected_order_ids, rejected_no_id_tickers
 
-    def _fills_with_sibling_fallback(
+    def _fills_with_sibling_fallback(self,
         directory: Path,
         orders_csv_file: Optional[Path],
         *,
@@ -774,14 +712,14 @@ def collect_purchase_records(
             )
         )
         try:
-            fills = _orders_csv_fills(
+            fills = self._orders_csv_fills(
                 directory,
                 orders_csv_file=orders_csv_file,
                 skip_sink=fill_skip_sink,
                 preserve_order_rows=True,
             )
         except Exception as exc:  # pragma: no cover - defensive; _orders_csv_fills already fails soft
-            warnings.append(f"failed to read fills under {directory}: {exc}")
+            self.warnings.append(f"failed to read fills under {directory}: {exc}")
             return {}, resolved_orders_csv_file
 
         def _row_is_rejected(fill: Dict[str, Any], order_ids: set, no_id_tickers: set) -> bool:
@@ -837,7 +775,7 @@ def collect_purchase_records(
         # straight through the early return below untouched while the exact
         # same row under a canonical filename gets filtered (Codex review:
         # "Analyze custom CSV outcomes before returning").
-        all_authoritative, rejected_order_ids, rejected_no_id_tickers = _authoritative_no_fill_rows(
+        all_authoritative, rejected_order_ids, rejected_no_id_tickers = self._authoritative_no_fill_rows(
             resolved_orders_csv_file
         )
         if rejected_order_ids or rejected_no_id_tickers:
@@ -900,14 +838,14 @@ def collect_purchase_records(
             if not sibling_csv.exists() or already_tried_sibling:
                 continue
             try:
-                sibling_fills = _orders_csv_fills(
+                sibling_fills = self._orders_csv_fills(
                     sibling_dir,
                     orders_csv_file=sibling_csv,
                     skip_sink=fill_skip_sink,
                     preserve_order_rows=True,
                 )
             except Exception as exc:  # pragma: no cover - defensive; _orders_csv_fills already fails soft
-                warnings.append(f"failed to read fallback {sibling_name} fills under {sibling_dir}: {exc}")
+                self.warnings.append(f"failed to read fallback {sibling_name} fills under {sibling_dir}: {exc}")
                 continue
             if rejected_order_ids or rejected_no_id_tickers:
                 sibling_fills = {
@@ -934,7 +872,7 @@ def collect_purchase_records(
             # filtering for this sibling's other, complete rows (Codex
             # review: "Filter trusted rows despite a truncated tail").
             sibling_all_authoritative, sibling_rejected_ids, sibling_rejected_tickers = (
-                _authoritative_no_fill_rows(sibling_csv)
+                self._authoritative_no_fill_rows(sibling_csv)
             )
             if sibling_rejected_ids or sibling_rejected_tickers:
                 sibling_fills = {
@@ -943,7 +881,7 @@ def collect_purchase_records(
                     if not _row_is_rejected(fill, sibling_rejected_ids, sibling_rejected_tickers)
                 }
             if sibling_fills:
-                warnings.append(
+                self.warnings.append(
                     f"{resolved_orders_csv_file.name} under {sibling_dir} yielded no usable fill evidence; "
                     f"falling back to sibling {sibling_name} confirmed rows"
                 )
@@ -967,7 +905,7 @@ def collect_purchase_records(
             rejected_no_id_tickers |= sibling_rejected_tickers
         return fills, resolved_orders_csv_file
 
-    def _record_fills(
+    def _record_fills(self,
         fill_sources: Iterable[tuple[Path, str, Dict[str, Any]]],
         *,
         run_dir: Path,
@@ -977,7 +915,7 @@ def collect_purchase_records(
         run_id: Optional[str],
         broker: Optional[str],
     ) -> None:
-        """Resolve and dedup one run's fills into ``records``/``seen``.
+        """Resolve and dedup one run's fills into ``self.records``/``self.seen``.
 
         Shared by the main run_state-keyed scan below and the orphan-CSV
         sweep at the end of this function, so a fill discovered either way
@@ -1048,11 +986,11 @@ def collect_purchase_records(
                 # only the unreliable dollar figure is nulled.
                 amount = None
             if price is None and quantity is None and amount is None:
-                warnings.append(f"confirmed fill for {ticker!r} under {fill_source_dir} has no usable price/quantity/amount; skipped")
+                self.warnings.append(f"confirmed fill for {ticker!r} under {fill_source_dir} has no usable price/quantity/amount; skipped")
                 continue
 
             # A fill with no order_id (a documented shape: some manual/recovery
-            # filled_orders.csv records predate that column, e.g. the Jul 27
+            # filled_orders.csv self.records predate that column, e.g. the Jul 27
             # 2026 12:30 recovery pass) cannot be deduplicated against another
             # directory by identity, so it is kept rather than silently
             # dropped -- the alternative (requiring order_id) would erase real,
@@ -1164,10 +1102,10 @@ def collect_purchase_records(
                 "amount_usd": amount,
                 "order_id": str(order_id) if order_id else None,
             }
-            incumbent = seen.get(dedup_key)
+            incumbent = self.seen.get(dedup_key)
             if incumbent is None:
-                seen[dedup_key] = {"index": len(records), "attribution": attribution, "values": values}
-                records.append(
+                self.seen[dedup_key] = {"index": len(self.records), "attribution": attribution, "values": values}
+                self.records.append(
                     PurchaseRecord(
                         trading_day=attribution["trading_day"],
                         ticker=ticker,
@@ -1243,13 +1181,13 @@ def collect_purchase_records(
             # this scan visiting the same evidence twice. Only warn when the
             # two occurrences actually came from different directories.
             if incumbent["attribution"]["run_dir"] != run_dir:
-                warnings.append(
-                    f"duplicate order_id {order_id!r} for {ticker!r} also seen under "
+                self.warnings.append(
+                    f"duplicate order_id {order_id!r} for {ticker!r} also self.seen under "
                     f"{incumbent['attribution']['run_dir']}; attributed to {best_attribution['run_dir']}, "
                     f"fill data from {best_values['run_dir']}"
                 )
-            seen[dedup_key] = {"index": incumbent["index"], "attribution": best_attribution, "values": best_values}
-            records[incumbent["index"]] = PurchaseRecord(
+            self.seen[dedup_key] = {"index": incumbent["index"], "attribution": best_attribution, "values": best_values}
+            self.records[incumbent["index"]] = PurchaseRecord(
                 trading_day=best_attribution["trading_day"],
                 ticker=ticker,
                 quantity=best_values["quantity"],
@@ -1263,7 +1201,7 @@ def collect_purchase_records(
                 source_run_dir=best_attribution["source_run_dir"],
             )
 
-    def _order_fill_items(fills: Dict[str, Dict[str, Any]]) -> Iterator[tuple[str, Dict[str, Any]]]:
+    def _order_fill_items(self, fills: Dict[str, Dict[str, Any]]) -> Iterator[tuple[str, Dict[str, Any]]]:
         """Yield the real ticker with every order-level fill returned by the parser.
 
         ``preserve_order_rows=True`` (passed to every ``_orders_csv_fills``
@@ -1278,342 +1216,15 @@ def collect_purchase_records(
         for key, fill in fills.items():
             yield str(fill.get("_ticker") or key), {**fill, "_row_key": key}
 
-    for state_path in chain.from_iterable(_iter_run_state_paths(r) for r in scan_roots):
-        run_dir = state_path.parent
-        state = _load_json(state_path)
-        if state is None:
-            warnings.append(f"unreadable or malformed {state_path.name} under {run_dir}")
-            continue
-        covered_dirs.add(run_dir)
-        # A full-report or compact demo dry run (DryRunBroker) writes simulated
-        # fill rows with status="filled" and no real capital deployed, the same
-        # shape as a genuine confirmed fill. The historical-allocation scanner
-        # already excludes these (near_close_dca.py's own dry_run check); this
-        # ledger must too, or it records purchases that never happened (Codex
-        # review: "Skip simulated dry-run fills").
-        if state.get("dry_run"):
-            continue
-        trading_day = state.get("trading_day")
-        classification = state.get("run_classification")
-        stream = classification.get("stream") if isinstance(classification, dict) else None
-        run_origin = classification.get("run_origin") if isinstance(classification, dict) else None
-        # run_classification.run_id is the origin-scoped identifier reporting
-        # elsewhere in this repo treats as authoritative; the top-level run_id
-        # is only the artifact's own build id and can differ from it. Falling
-        # back to the top-level value only when the classification is silent
-        # keeps older/legacy states (with no run_classification block at all)
-        # working (Codex review: "Report the authoritative classification run
-        # ID").
-        run_id = (classification.get("run_id") if isinstance(classification, dict) else None) or state.get("run_id")
-        # near_close_dca.write_run_state's full-report shape has NO
-        # run_classification block and no top-level run_id at all -- only
-        # top-level "scheduled" (bool) and "run_label". Leaving run_origin/
-        # run_id null for every one of those runs threw away the only
-        # provenance available for them (Codex review: "Read full-report
-        # provenance from top-level fields"). Used only as a fallback so a
-        # run WITH a real run_classification block is never overridden by it.
-        if run_origin is None and "scheduled" in state:
-            run_origin = "scheduled" if state.get("scheduled") else "manual"
-        if run_id is None:
-            run_id = state.get("run_label")
-        # Multi-broker support is real (near_close_dca.AlpacaBroker/AlpacaConfig
-        # alongside RobinhoodBroker, both selectable via config.broker), and a
-        # broker's own order_id is only guaranteed unique WITHIN that broker --
-        # nothing prevents two different brokers from generating the same
-        # order_id string independently. Deduplicating purely by order_id could
-        # then collapse two genuinely distinct fills from two different brokers
-        # into one row (Codex review: "Scope deduplication to the execution
-        # broker"). A non-string/missing value (older states predate this
-        # field, or record it as an empty stub) falls back to None rather than
-        # a fabricated broker name, so legacy states with no real broker
-        # identity still dedup against each other exactly as before this
-        # field existed.
-        raw_broker = state.get("broker")
-        if not (isinstance(raw_broker, str) and raw_broker.strip()):
-            # MorningDCAExecutor and midday run states store the definitive
-            # broker as run_classification.execution_broker and never add a
-            # top-level "broker" field at all (see morning_dca.py's own
-            # classification-stamping code). Without this fallback, one of
-            # those runs gaining a confirmed reconciliation or manual
-            # filled_orders.csv is recorded with broker=None -- its order IDs
-            # land in the "unknown" namespace despite the classification
-            # block already knowing it's Robinhood, which also weakens the
-            # cross-copy dedup broker-scoping above depends on (Codex
-            # review: "Read the broker from run classification").
-            raw_broker = classification.get("execution_broker") if isinstance(classification, dict) else None
-        broker = raw_broker.strip() if isinstance(raw_broker, str) and raw_broker.strip() else None
-
-        # Follow the same order-artifact resolution every other reader of this
-        # tree uses: a full-report run records a custom-named CSV under
-        # artifacts.orders_csv_path (run_and_report's dca_<label>_..._orders.csv),
-        # and the market-open/intraday streams -- which have no in-repo Python
-        # entry point -- write only a bare sibling submitted_orders.csv, never
-        # an artifacts block. Checking only filled_orders.csv/orders.csv (the
-        # default _orders_csv_fills sibling search) silently missed both shapes
-        # (Codex review: "Follow every run state's actual order artifact").
-        skip_sink: List[Path] = []
-        orders_csv_file = _resolve_recorded_orders_csv(state, state_path, skip_sink=skip_sink)
-        if orders_csv_file is not None and not orders_csv_file.exists():
-            # The recorded path can go stale (artifacts relocated/archived
-            # after the state was written): following it verbatim made
-            # _orders_csv_fills return an empty mapping -- indistinguishable
-            # from a genuine zero-fill run -- even when a real sibling CSV
-            # exists right next to it (Codex review: "Fall back when the
-            # recorded order path is stale").
-            warnings.append(
-                f"recorded order artifact {orders_csv_file} under {run_dir} no longer exists; "
-                "falling back to sibling order files"
-            )
-            # An archived full-report run can keep its custom-named CSV
-            # sitting right beside its (also archived) run_state.json, with
-            # the recorded path -- written before the archive move -- still
-            # naming the OLD location. Discarding the basename entirely and
-            # falling through to only the three canonical sibling names
-            # below missed it, and the orphan sweep can never recover it
-            # afterward since this directory is already marked covered
-            # (Codex review: "Fall back to the recorded basename for stale
-            # report paths"). _orders_csv_fills fails soft on a still-
-            # missing path, so trying this unconditionally is safe.
-            stale_basename_candidate = run_dir / orders_csv_file.name
-            orders_csv_file = stale_basename_candidate if stale_basename_candidate.exists() else None
-        if (
-            orders_csv_file is None
-            and not (run_dir / "filled_orders.csv").exists()
-            and not (run_dir / "orders.csv").exists()
-        ):
-            # Only fall back to the bare market-open/intraday-only name when
-            # NEITHER canonical sibling exists. Falling back unconditionally
-            # forced this exact file on _orders_csv_fills even when a
-            # confirmed filled_orders.csv sat right beside it, which bypassed
-            # that function's own preference for the confirmed file over a
-            # merely-submitted one -- losing the confirmed price/quantity, or
-            # seeing no fill at all for a row still reading status=submitted
-            # (Codex review: "Prefer confirmed sibling fills before submitted
-            # orders"). Leaving orders_csv_file as None here lets
-            # _orders_csv_fills apply its own filled_orders.csv-over-orders.csv
-            # default resolution untouched.
-            bare_submitted = run_dir / "submitted_orders.csv"
-            if bare_submitted.exists():
-                orders_csv_file = bare_submitted
-
-        # Remembered so BOTH the originally preferred file and whatever the
-        # fallback actually used end up in covered_files below -- the
-        # preferred file can be an externally recorded path (a full-report
-        # state's artifacts.orders_csv_path can point at a directory other
-        # than run_dir), and if the fallback swaps in a sibling without this
-        # directory otherwise being covered, the orphan sweep later
-        # rediscovers the ORIGINAL preferred file, reruns the same fallback,
-        # and records its no-order-id rows a second time under a different
-        # source identity (Codex review: "Mark the preferred external CSV
-        # covered after fallback").
-        preferred_orders_csv_file = orders_csv_file
-        fills, orders_csv_file = _fills_with_sibling_fallback(
-            run_dir,
-            orders_csv_file,
-            fill_skip_sink=skip_sink,
-        )
-        # _resolve_recorded_orders_csv explicitly permits a non-recovery
-        # full-report state to reference an order CSV in a DIFFERENT
-        # directory than run_dir (the full-report writer's own directory
-        # layout doesn't guarantee co-location). Labeling every fill from it
-        # with run_dir let the orphan sweep read that same external file a
-        # second time: a legacy no-order-id row's dedup key is scoped per
-        # source directory and can't tell "same file, seen under two
-        # different labels" from "two distinct files" (Codex review: "Mark
-        # externally recorded CSVs as covered"). Track the CSV's real parent
-        # as the fill source. ``.resolve()`` matters: _resolve_recorded_orders_csv
-        # builds the path via simple concatenation (``run_state_path.parent /
-        # orders_csv_path``), never normalizing a ``../`` segment, so its
-        # ``.parent`` can be a DIFFERENT Path object (unresolved) than the
-        # same real directory the orphan sweep's own ``rglob`` walk yields.
-        # The FILE itself, not just its parent directory: a full-report
-        # output directory is explicitly shared across runs, so two DIFFERENT
-        # run_states can each reference a distinct custom-named CSV in that
-        # SAME shared directory. Using only the parent directory as the
-        # no-order-id key's source identity let two unrelated files' row #0
-        # for the same ticker collide (fill_source_dir was identical and
-        # row_key independently restarts at "{ticker}#0" in each file),
-        # silently merging two real purchases into one (Codex review:
-        # "Include source files in brokerless dedup keys").
-        # _fills_with_sibling_fallback always returns a CONCRETE resolved
-        # file now, even when its own input was None (it resolves the same
-        # implicit filled_orders.csv-over-orders.csv default internally) --
-        # so two run_state*.json variants in one directory that land on the
-        # SAME physical default file (one explicitly recording
-        # "filled_orders.csv" in artifacts.orders_csv_path, the other
-        # omitting artifacts entirely and relying on the implicit default)
-        # always produce the IDENTICAL fill_source_dir, rather than a
-        # no-order-id row from that one file getting two different dedup
-        # keys and being recorded twice (Codex review: "Normalize implicit
-        # CSVs to their resolved file identity").
-        resolved_fill_source_dir = orders_csv_file.resolve()
-        # Mark only the SPECIFIC resolved file as covered here, not its
-        # whole parent directory: a full-report output directory is
-        # EXPLICITLY shared across runs (each gets its own uniquely
-        # timestamped filename), so a DIFFERENT, genuinely orphaned
-        # dca_*_orders.csv can legitimately sit beside this externally-
-        # referenced one in that same directory. Covering the whole
-        # directory made the full-report orphan pass below skip that
-        # second, unrelated file too (Codex review: "Track covered order
-        # files instead of whole directories"). orders_csv_file is always
-        # concrete now (see _fills_with_sibling_fallback), so the resolved
-        # file is covered unconditionally; preferred_orders_csv_file (the
-        # ORIGINAL, pre-fallback input) is only added when it was itself a
-        # real recorded path, distinct from run_dir's own implicit default.
-        covered_files.add(orders_csv_file.resolve())
-        if preferred_orders_csv_file is not None:
-            covered_files.add(preferred_orders_csv_file.resolve())
-        # A recovery run can write artifacts/run_state.json beneath a
-        # recovery directory while its confirmed filled_orders.csv sits at
-        # that ENCLOSING directory's own root, with no artifacts.orders_csv_path
-        # recorded to point at it. Checking only run_dir (the directory
-        # containing run_state.json) missed it entirely (Codex review:
-        # "Search the enclosing recovery root for fill artifacts"). _recovery_root_for
-        # is a pure directory-name-pattern check, safe to call unconditionally:
-        # it returns run_dir unchanged for any non-recovery layout.
-        #
-        # Deliberately NOT merged via near_close_dca._merge_fill: that helper
-        # is built for the allocation guard's ticker-keyed aggregate, and
-        # combines two DISTINCT orders for the same ticker into one blended
-        # entry with order_id=None -- exactly wrong for a per-order ledger,
-        # since it would silently collapse two real purchases into one row
-        # and clear the order_id dedup key needed to catch a later duplicate
-        # of either original order (Codex review: "Preserve distinct recovery
-        # orders as separate ledger rows"). Instead, recovery-root fills are
-        # fed through the SAME per-order loop below as run_dir's own fills:
-        # a genuine cross-directory duplicate (same order_id) is reconciled
-        # by this function's own order_id dedup further down; two distinct
-        # orders for one ticker are kept as two separate rows.
-        recovery_root = _recovery_root_for(run_dir)
-        # Covered regardless of whether recovery_fills ends up populated below:
-        # either its fills were just folded in via recovery_fills, or the
-        # already_covered check found they were the SAME physical file run_dir
-        # itself already read. Either way the orphan sweep below must not
-        # treat this directory as undiscovered.
-        covered_dirs.add(recovery_root)
-        recovery_fills: Dict[str, Dict[str, Any]] = {}
-        resolved_recovery_csv_file: Optional[Path] = None
-        if recovery_root != run_dir:
-            # A recorded artifacts.orders_csv_path like "../filled_orders.csv"
-            # already resolves INTO recovery_root, and recovery_root's own
-            # default sibling search (below) would then find that SAME
-            # physical file a second time -- double-reading one CSV double-
-            # counts every legacy no-order-id row in it (order_id-bearing
-            # rows are merely deduped-with-warnings, not double-counted, but
-            # a no-order-id row's dedup key is scoped per source directory
-            # and can't tell "same file, two directories" from "two distinct
-            # files") (Codex review: "Avoid reading a recorded recovery CSV
-            # twice"). ``orders_csv_file`` is what run_dir's own read
-            # ACTUALLY used -- always a concrete resolved path now (see
-            # _fills_with_sibling_fallback) -- so no separate default-guess
-            # is needed here.
-            #
-            # A supported market-open/intraday recovery can store confirmed
-            # evidence at the recovery root ONLY as submitted_orders.csv
-            # (with a broker-native state=filled row) -- the same bare-sibling
-            # shape run_dir's own read above already falls back to. Without
-            # applying the same fallback HERE, this read silently returns no
-            # fills even though real evidence sits right there, and the
-            # orphan sweep can't rescue it either since recovery_root is
-            # already marked covered above regardless of outcome (Codex
-            # review: "Read submitted-only files from enclosing recovery
-            # roots").
-            recovery_orders_csv_file = None
-            if not (recovery_root / "filled_orders.csv").exists() and not (recovery_root / "orders.csv").exists():
-                recovery_bare_submitted = recovery_root / "submitted_orders.csv"
-                if recovery_bare_submitted.exists():
-                    recovery_orders_csv_file = recovery_bare_submitted
-            # ALWAYS run the recovery-root reader (rather than trying to
-            # predict beforehand whether it would land on the same file
-            # run_dir already read) and compare the two REAL resolved
-            # outcomes afterward -- a static prediction has to duplicate
-            # _fills_with_sibling_fallback's own default-vs-sibling
-            # resolution logic, and every previous attempt at that guess
-            # missed a case: matching only the exact preferred name missed a
-            # post-fallback swap to the sibling (Codex review: "Skip
-            # recovery-root reread after sibling fallback"), and then
-            # broadening the guess to "either canonical name in
-            # recovery_root" wrongly skipped recovery_root's OWN distinct
-            # filled_orders.csv when only its sibling orders.csv had been
-            # explicitly recorded (Codex review: "Read the other recovery
-            # CSV before marking the root covered"). Comparing real resolved
-            # outcomes is correct regardless of which file either side
-            # actually landed on.
-            recovery_fills, resolved_recovery_csv_file = _fills_with_sibling_fallback(
-                recovery_root,
-                recovery_orders_csv_file,
-                fill_skip_sink=skip_sink,
-            )
-            if resolved_recovery_csv_file.resolve() == orders_csv_file.resolve():
-                # Same physical file run_dir's own read already consumed --
-                # discard rather than fold in as new evidence, or every
-                # no-order-id row in it is double-counted.
-                recovery_fills = {}
-        # _orders_csv_fills fails soft: an unreadable/malformed/truncated CSV
-        # returns an empty mapping rather than raising, which is indistinguishable
-        # from a legitimate zero-fill day unless the caller passes skip_sink and
-        # reports what landed in it (Codex review: "Report order-file parse
-        # failures in ledger warnings").
-        for bad_path in skip_sink:
-            warnings.append(f"failed to parse order artifact {bad_path} under {run_dir}; its fills may be missing from this ledger")
-
-        # The recovery fill source must be the RESOLVED file, not the bare
-        # recovery_root directory: two run_state*.json variants in the same
-        # recovery directory can each explicitly reference a DIFFERENT
-        # canonical file (one "../orders.csv", another "../filled_orders.csv"),
-        # and keying both by recovery_root alone collided their no-order-id
-        # rows into one entry even though they came from two distinct
-        # physical files (Codex review: "Key recovery fills by the resolved
-        # CSV file") -- the same identity-granularity fix already applied to
-        # the primary reader's resolved_fill_source_dir above.
-        fill_sources = chain(
-            ((resolved_fill_source_dir, ticker, fill) for ticker, fill in _order_fill_items(fills)),
-            (
-                (resolved_recovery_csv_file, ticker, fill)
-                for ticker, fill in _order_fill_items(recovery_fills)
-                if resolved_recovery_csv_file is not None
-            ),
-        )
-        _record_fills(
-            fill_sources,
-            run_dir=run_dir,
-            trading_day=trading_day,
-            stream=stream,
-            run_origin=run_origin,
-            run_id=run_id,
-            broker=broker,
-        )
-
-    # recovery_artifact_types_rule's equivalent here: a run_state-keyed scan
-    # only visits a directory that HAS a run_state*.json. An order-artifact
-    # persisted with no run_state at all -- a repair/reconciliation pass, or
-    # a run interrupted after writing its CSV but before its own state file --
-    # is invisible to every branch above (Codex review: "Include orphan
-    # confirmed-fill artifacts"). Mirrors the orphan sweep
-    # scripts/generate_credit_usage_proxy_report.py already runs over
-    # MANUAL_SCAN_SUBROOTS, generalized across every scan root (not just the
-    # cron-tracking root's known manual subroots) since --additional-root can
-    # point at an arbitrary relocated stream layout this module has no
-    # subroot list for.
-    order_csv_names = ("filled_orders.csv", "orders.csv", "submitted_orders.csv")
-    # run_and_report (the full-report/3:30pm-shape writer) records its
-    # confirmed-fill CSV under a custom name -- dca_<label>_<day>_<stamp>_orders.csv
-    # -- via generate_slippage_report, which runs strictly BEFORE
-    # write_run_state persists run_state.json. An interruption between those
-    # two steps leaves exactly this file on disk with no run_state.json at
-    # all, and the fixed three-name whitelist above never discovers it
-    # (Codex review: "Discover orphan full-report order CSVs").
-    _FULL_REPORT_ORPHAN_GLOB = "dca_*_orders.csv"
-
-    def _process_orphan(run_dir: Path, orders_csv_file: Optional[Path], date_source: Path) -> None:
+    def _process_orphan(self, run_dir: Path, orders_csv_file: Optional[Path], date_source: Path) -> None:
         # skip_sink: without it, an unreadable/empty/truncated orphan CSV
         # fails soft to an empty mapping and the scan publishes with no
         # warning at all -- the run-state and recovery readers above
-        # already report into warnings this way; this reader must too
+        # already report into self.warnings this way; this reader must too
         # (Codex review: "Report parse failures from orphan order
         # artifacts").
         orphan_skip_sink: List[Path] = []
-        fills, resolved_orders_csv_file = _fills_with_sibling_fallback(
+        fills, resolved_orders_csv_file = self._fills_with_sibling_fallback(
             run_dir,
             orders_csv_file,
             fill_skip_sink=orphan_skip_sink,
@@ -1633,12 +1244,12 @@ def collect_purchase_records(
         # the covered-file check and as the fill source identity below, not
         # the stale originally-discovered path.
         resolved_path = resolved_orders_csv_file.resolve()
-        if resolved_path in covered_files:
+        if resolved_path in self.covered_files:
             return
-        covered_files.add(resolved_path)
+        self.covered_files.add(resolved_path)
         date_source = resolved_orders_csv_file
         for bad_path in orphan_skip_sink:
-            warnings.append(
+            self.warnings.append(
                 f"failed to parse orphan order artifact {bad_path} under {run_dir}; its fills may be "
                 "missing from this ledger"
             )
@@ -1666,11 +1277,11 @@ def collect_purchase_records(
         # any successfully parsed run_state's attribution via _dedup_rank)
         # rather than guessing a stream or run_origin this ledger cannot
         # actually verify.
-        warnings.append(
+        self.warnings.append(
             f"orphan order artifact(s) under {run_dir} with no run_state*.json; included with unknown "
             "provenance (stream/run_origin/run_id/broker could not be determined)"
         )
-        _record_fills(
+        self._record_fills(
             # date_source (the specific discovered CSV path), not run_dir, as
             # the fill source: the full-report orphan pass deliberately lets
             # more than one dca_*_orders.csv share a single directory, and a
@@ -1682,7 +1293,7 @@ def collect_purchase_records(
             # review: "Scope no-ID orphan fills to their source file"). For
             # the canonical pass (always exactly one artifact per directory)
             # this is the same identity run_dir would have given anyway.
-            ((date_source, ticker, fill) for ticker, fill in _order_fill_items(fills)),
+            ((date_source, ticker, fill) for ticker, fill in self._order_fill_items(fills)),
             run_dir=run_dir,
             # The definitive date can live in the CSV's own FILENAME (the
             # full-report shape always stamps one in) even when its
@@ -1698,160 +1309,532 @@ def collect_purchase_records(
             broker=None,
         )
 
-    orphan_dirs_seen: set = set()
-    orphan_full_report_seen: set = set()
-    for scan_root in scan_roots:
-        if not scan_root.is_dir():
-            continue
 
-        # Canonical per-directory artifacts: exactly one confirmed-fill
-        # record per run directory by convention, so directory-level dedup
-        # (orphan_dirs_seen) is correct here.
-        canonical_paths = sorted({p for name in order_csv_names for p in scan_root.rglob(name)})
-        for csv_path in canonical_paths:
-            run_dir = csv_path.parent
-            if run_dir in covered_dirs or run_dir in orphan_dirs_seen or csv_path.resolve() in covered_files:
+    def collect(self) -> tuple[List[PurchaseRecord], List[str]]:
+
+
+
+
+
+        for state_path in chain.from_iterable(_iter_run_state_paths(r) for r in self.scan_roots):
+            run_dir = state_path.parent
+            state = _load_json(state_path)
+            if state is None:
+                self.warnings.append(f"unreadable or malformed {state_path.name} under {run_dir}")
                 continue
-            orphan_dirs_seen.add(run_dir)
-            # _orders_csv_fills's own default sibling search only tries
-            # filled_orders.csv then orders.csv -- never submitted_orders.csv,
-            # which it has no way to guess. Matches the main scan's own
-            # bare_submitted fallback above.
-            orphan_orders_csv_file = None
-            if not (run_dir / "filled_orders.csv").exists() and not (run_dir / "orders.csv").exists():
+            self.covered_dirs.add(run_dir)
+            # A full-report or compact demo dry run (DryRunBroker) writes simulated
+            # fill rows with status="filled" and no real capital deployed, the same
+            # shape as a genuine confirmed fill. The historical-allocation scanner
+            # already excludes these (near_close_dca.py's own dry_run check); this
+            # ledger must too, or it self.records purchases that never happened (Codex
+            # review: "Skip simulated dry-run fills").
+            if state.get("dry_run"):
+                continue
+            trading_day = state.get("trading_day")
+            classification = state.get("run_classification")
+            stream = classification.get("stream") if isinstance(classification, dict) else None
+            run_origin = classification.get("run_origin") if isinstance(classification, dict) else None
+            # run_classification.run_id is the origin-scoped identifier reporting
+            # elsewhere in this repo treats as authoritative; the top-level run_id
+            # is only the artifact's own build id and can differ from it. Falling
+            # back to the top-level value only when the classification is silent
+            # keeps older/legacy states (with no run_classification block at all)
+            # working (Codex review: "Report the authoritative classification run
+            # ID").
+            run_id = (classification.get("run_id") if isinstance(classification, dict) else None) or state.get("run_id")
+            # near_close_dca.write_run_state's full-report shape has NO
+            # run_classification block and no top-level run_id at all -- only
+            # top-level "scheduled" (bool) and "run_label". Leaving run_origin/
+            # run_id null for every one of those runs threw away the only
+            # provenance available for them (Codex review: "Read full-report
+            # provenance from top-level fields"). Used only as a fallback so a
+            # run WITH a real run_classification block is never overridden by it.
+            if run_origin is None and "scheduled" in state:
+                run_origin = "scheduled" if state.get("scheduled") else "manual"
+            if run_id is None:
+                run_id = state.get("run_label")
+            # Multi-broker support is real (near_close_dca.AlpacaBroker/AlpacaConfig
+            # alongside RobinhoodBroker, both selectable via config.broker), and a
+            # broker's own order_id is only guaranteed unique WITHIN that broker --
+            # nothing prevents two different brokers from generating the same
+            # order_id string independently. Deduplicating purely by order_id could
+            # then collapse two genuinely distinct fills from two different brokers
+            # into one row (Codex review: "Scope deduplication to the execution
+            # broker"). A non-string/missing value (older states predate this
+            # field, or record it as an empty stub) falls back to None rather than
+            # a fabricated broker name, so legacy states with no real broker
+            # identity still dedup against each other exactly as before this
+            # field existed.
+            raw_broker = state.get("broker")
+            if not (isinstance(raw_broker, str) and raw_broker.strip()):
+                # MorningDCAExecutor and midday run states store the definitive
+                # broker as run_classification.execution_broker and never add a
+                # top-level "broker" field at all (see morning_dca.py's own
+                # classification-stamping code). Without this fallback, one of
+                # those runs gaining a confirmed reconciliation or manual
+                # filled_orders.csv is recorded with broker=None -- its order IDs
+                # land in the "unknown" namespace despite the classification
+                # block already knowing it's Robinhood, which also weakens the
+                # cross-copy dedup broker-scoping above depends on (Codex
+                # review: "Read the broker from run classification").
+                raw_broker = classification.get("execution_broker") if isinstance(classification, dict) else None
+            broker = raw_broker.strip() if isinstance(raw_broker, str) and raw_broker.strip() else None
+
+            # Follow the same order-artifact resolution every other reader of this
+            # tree uses: a full-report run self.records a custom-named CSV under
+            # artifacts.orders_csv_path (run_and_report's dca_<label>_..._orders.csv),
+            # and the market-open/intraday streams -- which have no in-repo Python
+            # entry point -- write only a bare sibling submitted_orders.csv, never
+            # an artifacts block. Checking only filled_orders.csv/orders.csv (the
+            # default _orders_csv_fills sibling search) silently missed both shapes
+            # (Codex review: "Follow every run state's actual order artifact").
+            skip_sink: List[Path] = []
+            orders_csv_file = self._resolve_recorded_orders_csv(state, state_path, skip_sink=skip_sink)
+            if orders_csv_file is not None and not orders_csv_file.exists():
+                # The recorded path can go stale (artifacts relocated/archived
+                # after the state was written): following it verbatim made
+                # _orders_csv_fills return an empty mapping -- indistinguishable
+                # from a genuine zero-fill run -- even when a real sibling CSV
+                # exists right next to it (Codex review: "Fall back when the
+                # recorded order path is stale").
+                self.warnings.append(
+                    f"recorded order artifact {orders_csv_file} under {run_dir} no longer exists; "
+                    "falling back to sibling order files"
+                )
+                # An archived full-report run can keep its custom-named CSV
+                # sitting right beside its (also archived) run_state.json, with
+                # the recorded path -- written before the archive move -- still
+                # naming the OLD location. Discarding the basename entirely and
+                # falling through to only the three canonical sibling names
+                # below missed it, and the orphan sweep can never recover it
+                # afterward since this directory is already marked covered
+                # (Codex review: "Fall back to the recorded basename for stale
+                # report paths"). _orders_csv_fills fails soft on a still-
+                # missing path, so trying this unconditionally is safe.
+                stale_basename_candidate = run_dir / orders_csv_file.name
+                orders_csv_file = stale_basename_candidate if stale_basename_candidate.exists() else None
+            if (
+                orders_csv_file is None
+                and not (run_dir / "filled_orders.csv").exists()
+                and not (run_dir / "orders.csv").exists()
+            ):
+                # Only fall back to the bare market-open/intraday-only name when
+                # NEITHER canonical sibling exists. Falling back unconditionally
+                # forced this exact file on _orders_csv_fills even when a
+                # confirmed filled_orders.csv sat right beside it, which bypassed
+                # that function's own preference for the confirmed file over a
+                # merely-submitted one -- losing the confirmed price/quantity, or
+                # seeing no fill at all for a row still reading status=submitted
+                # (Codex review: "Prefer confirmed sibling fills before submitted
+                # orders"). Leaving orders_csv_file as None here lets
+                # _orders_csv_fills apply its own filled_orders.csv-over-orders.csv
+                # default resolution untouched.
                 bare_submitted = run_dir / "submitted_orders.csv"
                 if bare_submitted.exists():
-                    orphan_orders_csv_file = bare_submitted
-            _process_orphan(run_dir, orphan_orders_csv_file, csv_path)
+                    orders_csv_file = bare_submitted
 
-        # Full-report artifacts (dca_<label>_<day>_<stamp>_orders.csv):
-        # unlike the three canonical names above, run_and_report
-        # deliberately gives EACH run a unique timestamped filename while
-        # accepting output_dir and state_path independently -- more than one
-        # run's evidence can legitimately coexist in a single directory,
-        # including a directory that ALSO holds a DIFFERENT, successfully-
-        # parsed run_state*.json for an unrelated completed run. Collapsing
-        # discovery to "one per directory" the way the canonical pass above
-        # does for canonical names silently dropped every run but the
-        # lexicographically first one (Codex review: "Process every orphan
-        # report in a shared directory"); skipping the whole directory
-        # whenever ANY run_state parsed there is the same mistake in a
-        # different guise (Codex review: "Scan custom reports beside covered
-        # runs"), and so is skipping it whenever a canonical orphan artifact
-        # (filled_orders.csv etc.) was found there -- orphan_dirs_seen marks
-        # directory-level coverage for the canonical pass's OWN one-artifact-
-        # per-directory assumption, which says nothing about a full-report
-        # CSV, an entirely different filename set, also present (Codex
-        # review: "Do not suppress custom reports beside canonical
-        # orphans"). Discovered and processed per FILE instead: the two
-        # filename sets never overlap, so the only real duplicate-read risk
-        # is re-processing the exact same file twice, which
-        # orphan_full_report_seen and covered_files (the specific file an
-        # externally-referenced run_state already consumed) already prevent.
-        for csv_path in sorted(scan_root.rglob(_FULL_REPORT_ORPHAN_GLOB)):
-            if csv_path in orphan_full_report_seen:
-                continue
-            orphan_full_report_seen.add(csv_path)
-            run_dir = csv_path.parent
-            if csv_path.resolve() in covered_files:
-                continue
-            _process_orphan(run_dir, csv_path, csv_path)
-
-    # Reconcile every "unknown-broker" order_id against a UNIQUE known-broker
-    # occurrence of the same order_id, in one final pass independent of scan
-    # order -- the dedup_key construction above deliberately does NOT
-    # attempt this inline, since a legacy/full-report run_state that omits
-    # `broker` entirely (near_close_dca.write_run_state's shape, not only an
-    # orphan) can be scanned either BEFORE or after a later occurrence that
-    # does carry a real broker name, and an inline lookback only catches one
-    # of the two orderings (Codex review: "Reconcile a brokerless copy when
-    # the brokered copy arrives later").
-    by_order_id: Dict[str, Dict[str, str]] = {}
-    for key in seen:
-        if key.endswith("::no-order-id"):
-            continue
-        order_id_part, _, broker_part = key.rpartition("::")
-        by_order_id.setdefault(order_id_part, {})[broker_part] = key
-    indices_to_drop: set = set()
-    for order_id, broker_map in by_order_id.items():
-        unknown_key = broker_map.get("unknown-broker")
-        if unknown_key is None:
-            continue
-        known_matches = {b: k for b, k in broker_map.items() if b != "unknown-broker"}
-        if len(known_matches) != 1:
-            if len(known_matches) > 1:
-                warnings.append(
-                    f"order_id {order_id!r} matches known broker orders under more than one broker "
-                    f"({sorted(known_matches)}); kept as a separate, unattributed row rather than "
-                    "guessing which one it belongs to"
+            # Remembered so BOTH the originally preferred file and whatever the
+            # fallback actually used end up in self.covered_files below -- the
+            # preferred file can be an externally recorded path (a full-report
+            # state's artifacts.orders_csv_path can point at a directory other
+            # than run_dir), and if the fallback swaps in a sibling without this
+            # directory otherwise being covered, the orphan sweep later
+            # rediscovers the ORIGINAL preferred file, reruns the same fallback,
+            # and self.records its no-order-id rows a second time under a different
+            # source identity (Codex review: "Mark the preferred external CSV
+            # covered after fallback").
+            preferred_orders_csv_file = orders_csv_file
+            fills, orders_csv_file = self._fills_with_sibling_fallback(
+                run_dir,
+                orders_csv_file,
+                fill_skip_sink=skip_sink,
+            )
+            # _resolve_recorded_orders_csv explicitly permits a non-recovery
+            # full-report state to reference an order CSV in a DIFFERENT
+            # directory than run_dir (the full-report writer's own directory
+            # layout doesn't guarantee co-location). Labeling every fill from it
+            # with run_dir let the orphan sweep read that same external file a
+            # second time: a legacy no-order-id row's dedup key is scoped per
+            # source directory and can't tell "same file, self.seen under two
+            # different labels" from "two distinct files" (Codex review: "Mark
+            # externally recorded CSVs as covered"). Track the CSV's real parent
+            # as the fill source. ``.resolve()`` matters: _resolve_recorded_orders_csv
+            # builds the path via simple concatenation (``run_state_path.parent /
+            # orders_csv_path``), never normalizing a ``../`` segment, so its
+            # ``.parent`` can be a DIFFERENT Path object (unresolved) than the
+            # same real directory the orphan sweep's own ``rglob`` walk yields.
+            # The FILE itself, not just its parent directory: a full-report
+            # output directory is explicitly shared across runs, so two DIFFERENT
+            # run_states can each reference a distinct custom-named CSV in that
+            # SAME shared directory. Using only the parent directory as the
+            # no-order-id key's source identity let two unrelated files' row #0
+            # for the same ticker collide (fill_source_dir was identical and
+            # row_key independently restarts at "{ticker}#0" in each file),
+            # silently merging two real purchases into one (Codex review:
+            # "Include source files in brokerless dedup keys").
+            # _fills_with_sibling_fallback always returns a CONCRETE resolved
+            # file now, even when its own input was None (it resolves the same
+            # implicit filled_orders.csv-over-orders.csv default internally) --
+            # so two run_state*.json variants in one directory that land on the
+            # SAME physical default file (one explicitly recording
+            # "filled_orders.csv" in artifacts.orders_csv_path, the other
+            # omitting artifacts entirely and relying on the implicit default)
+            # always produce the IDENTICAL fill_source_dir, rather than a
+            # no-order-id row from that one file getting two different dedup
+            # keys and being recorded twice (Codex review: "Normalize implicit
+            # CSVs to their resolved file identity").
+            resolved_fill_source_dir = orders_csv_file.resolve()
+            # Mark only the SPECIFIC resolved file as covered here, not its
+            # whole parent directory: a full-report output directory is
+            # EXPLICITLY shared across runs (each gets its own uniquely
+            # timestamped filename), so a DIFFERENT, genuinely orphaned
+            # dca_*_orders.csv can legitimately sit beside this externally-
+            # referenced one in that same directory. Covering the whole
+            # directory made the full-report orphan pass below skip that
+            # second, unrelated file too (Codex review: "Track covered order
+            # files instead of whole directories"). orders_csv_file is always
+            # concrete now (see _fills_with_sibling_fallback), so the resolved
+            # file is covered unconditionally; preferred_orders_csv_file (the
+            # ORIGINAL, pre-fallback input) is only added when it was itself a
+            # real recorded path, distinct from run_dir's own implicit default.
+            self.covered_files.add(orders_csv_file.resolve())
+            if preferred_orders_csv_file is not None:
+                self.covered_files.add(preferred_orders_csv_file.resolve())
+            # A recovery run can write artifacts/run_state.json beneath a
+            # recovery directory while its confirmed filled_orders.csv sits at
+            # that ENCLOSING directory's own root, with no artifacts.orders_csv_path
+            # recorded to point at it. Checking only run_dir (the directory
+            # containing run_state.json) missed it entirely (Codex review:
+            # "Search the enclosing recovery root for fill artifacts"). _recovery_root_for
+            # is a pure directory-name-pattern check, safe to call unconditionally:
+            # it returns run_dir unchanged for any non-recovery layout.
+            #
+            # Deliberately NOT merged via near_close_dca._merge_fill: that helper
+            # is built for the allocation guard's ticker-keyed aggregate, and
+            # combines two DISTINCT orders for the same ticker into one blended
+            # entry with order_id=None -- exactly wrong for a per-order ledger,
+            # since it would silently collapse two real purchases into one row
+            # and clear the order_id dedup key needed to catch a later duplicate
+            # of either original order (Codex review: "Preserve distinct recovery
+            # orders as separate ledger rows"). Instead, recovery-root fills are
+            # fed through the SAME per-order loop below as run_dir's own fills:
+            # a genuine cross-directory duplicate (same order_id) is reconciled
+            # by this function's own order_id dedup further down; two distinct
+            # orders for one ticker are kept as two separate rows.
+            recovery_root = self._recovery_root_for(run_dir)
+            # Covered regardless of whether recovery_fills ends up populated below:
+            # either its fills were just folded in via recovery_fills, or the
+            # already_covered check found they were the SAME physical file run_dir
+            # itself already read. Either way the orphan sweep below must not
+            # treat this directory as undiscovered.
+            self.covered_dirs.add(recovery_root)
+            recovery_fills: Dict[str, Dict[str, Any]] = {}
+            resolved_recovery_csv_file: Optional[Path] = None
+            if recovery_root != run_dir:
+                # A recorded artifacts.orders_csv_path like "../filled_orders.csv"
+                # already resolves INTO recovery_root, and recovery_root's own
+                # default sibling search (below) would then find that SAME
+                # physical file a second time -- double-reading one CSV double-
+                # counts every legacy no-order-id row in it (order_id-bearing
+                # rows are merely deduped-with-self.warnings, not double-counted, but
+                # a no-order-id row's dedup key is scoped per source directory
+                # and can't tell "same file, two directories" from "two distinct
+                # files") (Codex review: "Avoid reading a recorded recovery CSV
+                # twice"). ``orders_csv_file`` is what run_dir's own read
+                # ACTUALLY used -- always a concrete resolved path now (see
+                # _fills_with_sibling_fallback) -- so no separate default-guess
+                # is needed here.
+                #
+                # A supported market-open/intraday recovery can store confirmed
+                # evidence at the recovery root ONLY as submitted_orders.csv
+                # (with a broker-native state=filled row) -- the same bare-sibling
+                # shape run_dir's own read above already falls back to. Without
+                # applying the same fallback HERE, this read silently returns no
+                # fills even though real evidence sits right there, and the
+                # orphan sweep can't rescue it either since recovery_root is
+                # already marked covered above regardless of outcome (Codex
+                # review: "Read submitted-only files from enclosing recovery
+                # roots").
+                recovery_orders_csv_file = None
+                if not (recovery_root / "filled_orders.csv").exists() and not (recovery_root / "orders.csv").exists():
+                    recovery_bare_submitted = recovery_root / "submitted_orders.csv"
+                    if recovery_bare_submitted.exists():
+                        recovery_orders_csv_file = recovery_bare_submitted
+                # ALWAYS run the recovery-root reader (rather than trying to
+                # predict beforehand whether it would land on the same file
+                # run_dir already read) and compare the two REAL resolved
+                # outcomes afterward -- a static prediction has to duplicate
+                # _fills_with_sibling_fallback's own default-vs-sibling
+                # resolution logic, and every previous attempt at that guess
+                # missed a case: matching only the exact preferred name missed a
+                # post-fallback swap to the sibling (Codex review: "Skip
+                # recovery-root reread after sibling fallback"), and then
+                # broadening the guess to "either canonical name in
+                # recovery_root" wrongly skipped recovery_root's OWN distinct
+                # filled_orders.csv when only its sibling orders.csv had been
+                # explicitly recorded (Codex review: "Read the other recovery
+                # CSV before marking the root covered"). Comparing real resolved
+                # outcomes is correct regardless of which file either side
+                # actually landed on.
+                recovery_fills, resolved_recovery_csv_file = self._fills_with_sibling_fallback(
+                    recovery_root,
+                    recovery_orders_csv_file,
+                    fill_skip_sink=skip_sink,
                 )
-            continue
-        target_broker, target_key = next(iter(known_matches.items()))
-        unknown_entry = seen.pop(unknown_key)
-        target_entry = seen[target_key]
-        target_rank = target_entry["attribution"]["rank"]
-        unknown_rank = unknown_entry["attribution"]["rank"]
-        if unknown_rank < target_rank:
-            best_attribution = unknown_entry["attribution"]
-        elif target_rank < unknown_rank:
-            best_attribution = target_entry["attribution"]
-        elif target_entry["attribution"]["run_dir"] == unknown_entry["attribution"]["run_dir"]:
-            # Ranks tie AND both occurrences share a run_dir -- the same
-            # same-directory merge condition the main dedup loop above
-            # applies, extended to this later broker-reconciliation pass.
-            # Two same-directory run_state*.json variants can split across
-            # broker namespaces here too: one supplies stream/run_id while
-            # lacking a broker (landing in "unknown-broker"), the other
-            # supplies the broker while lacking those fields -- picking the
-            # brokered attribution wholesale on a tie published stream=None/
-            # run_id=None even though the other SAME-directory variant had
-            # them (Codex review: "Merge same-run provenance during broker
-            # reconciliation"). Broker itself is deliberately excluded from
-            # this merge: the record's final broker always comes from
-            # target_broker below, never from best_attribution.
-            best_attribution = dict(target_entry["attribution"])
-            for field in ("trading_day", "stream", "run_origin", "run_id"):
-                if not best_attribution[field] and unknown_entry["attribution"][field]:
-                    best_attribution[field] = unknown_entry["attribution"][field]
-        else:
-            best_attribution = target_entry["attribution"]
-        best_values = (
-            unknown_entry["values"]
-            if _values_sort_key(unknown_entry["values"]) > _values_sort_key(target_entry["values"])
-            else target_entry["values"]
-        )
-        target_entry["attribution"] = best_attribution
-        target_entry["values"] = best_values
-        ticker = records[target_entry["index"]].ticker
-        records[target_entry["index"]] = PurchaseRecord(
-            trading_day=best_attribution["trading_day"],
-            ticker=ticker,
-            quantity=best_values["quantity"],
-            avg_fill_price=best_values["avg_fill_price"],
-            amount_usd=best_values["amount_usd"],
-            order_id=best_values["order_id"],
-            stream=best_attribution["stream"],
-            run_origin=best_attribution["run_origin"],
-            run_id=best_attribution["run_id"],
-            # The KNOWN broker, not best_attribution["broker"]: the winning
-            # attribution is chosen purely by _dedup_rank (which run's
-            # identity metadata to credit), and the brokerless occurrence
-            # can legitimately win that comparison (e.g. a "scheduled"
-            # full-report row beats a "scheduled_recovery" one) while still
-            # carrying broker=None -- using it here would silently discard
-            # the one known broker this merge exists specifically because it
-            # uniquely proved (Codex review: "Preserve the known broker when
-            # merging brokerless attribution").
-            broker=target_broker,
-            source_run_dir=best_attribution["source_run_dir"],
-        )
-        indices_to_drop.add(unknown_entry["index"])
-    if indices_to_drop:
-        records = [record for index, record in enumerate(records) if index not in indices_to_drop]
+                if resolved_recovery_csv_file.resolve() == orders_csv_file.resolve():
+                    # Same physical file run_dir's own read already consumed --
+                    # discard rather than fold in as new evidence, or every
+                    # no-order-id row in it is double-counted.
+                    recovery_fills = {}
+            # _orders_csv_fills fails soft: an unreadable/malformed/truncated CSV
+            # returns an empty mapping rather than raising, which is indistinguishable
+            # from a legitimate zero-fill day unless the caller passes skip_sink and
+            # reports what landed in it (Codex review: "Report order-file parse
+            # failures in ledger self.warnings").
+            for bad_path in skip_sink:
+                self.warnings.append(f"failed to parse order artifact {bad_path} under {run_dir}; its fills may be missing from this ledger")
 
-    records.sort(key=lambda r: (r.trading_day, r.ticker, r.order_id or ""))
-    return records, warnings
+            # The recovery fill source must be the RESOLVED file, not the bare
+            # recovery_root directory: two run_state*.json variants in the same
+            # recovery directory can each explicitly reference a DIFFERENT
+            # canonical file (one "../orders.csv", another "../filled_orders.csv"),
+            # and keying both by recovery_root alone collided their no-order-id
+            # rows into one entry even though they came from two distinct
+            # physical files (Codex review: "Key recovery fills by the resolved
+            # CSV file") -- the same identity-granularity fix already applied to
+            # the primary reader's resolved_fill_source_dir above.
+            fill_sources = chain(
+                ((resolved_fill_source_dir, ticker, fill) for ticker, fill in self._order_fill_items(fills)),
+                (
+                    (resolved_recovery_csv_file, ticker, fill)
+                    for ticker, fill in self._order_fill_items(recovery_fills)
+                    if resolved_recovery_csv_file is not None
+                ),
+            )
+            self._record_fills(
+                fill_sources,
+                run_dir=run_dir,
+                trading_day=trading_day,
+                stream=stream,
+                run_origin=run_origin,
+                run_id=run_id,
+                broker=broker,
+            )
 
+        # recovery_artifact_types_rule's equivalent here: a run_state-keyed scan
+        # only visits a directory that HAS a run_state*.json. An order-artifact
+        # persisted with no run_state at all -- a repair/reconciliation pass, or
+        # a run interrupted after writing its CSV but before its own state file --
+        # is invisible to every branch above (Codex review: "Include orphan
+        # confirmed-fill artifacts"). Mirrors the orphan sweep
+        # scripts/generate_credit_usage_proxy_report.py already runs over
+        # MANUAL_SCAN_SUBROOTS, generalized across every scan root (not just the
+        # cron-tracking root's known manual subroots) since --additional-root can
+        # point at an arbitrary relocated stream layout this module has no
+        # subroot list for.
+        order_csv_names = ("filled_orders.csv", "orders.csv", "submitted_orders.csv")
+        # run_and_report (the full-report/3:30pm-shape writer) self.records its
+        # confirmed-fill CSV under a custom name -- dca_<label>_<day>_<stamp>_orders.csv
+        # -- via generate_slippage_report, which runs strictly BEFORE
+        # write_run_state persists run_state.json. An interruption between those
+        # two steps leaves exactly this file on disk with no run_state.json at
+        # all, and the fixed three-name whitelist above never discovers it
+        # (Codex review: "Discover orphan full-report order CSVs").
+        _FULL_REPORT_ORPHAN_GLOB = "dca_*_orders.csv"
+
+
+        orphan_dirs_seen: set = set()
+        orphan_full_report_seen: set = set()
+        for scan_root in self.scan_roots:
+            if not scan_root.is_dir():
+                continue
+
+            # Canonical per-directory artifacts: exactly one confirmed-fill
+            # record per run directory by convention, so directory-level dedup
+            # (orphan_dirs_seen) is correct here.
+            canonical_paths = sorted({p for name in order_csv_names for p in scan_root.rglob(name)})
+            for csv_path in canonical_paths:
+                run_dir = csv_path.parent
+                if run_dir in self.covered_dirs or run_dir in orphan_dirs_seen or csv_path.resolve() in self.covered_files:
+                    continue
+                orphan_dirs_seen.add(run_dir)
+                # _orders_csv_fills's own default sibling search only tries
+                # filled_orders.csv then orders.csv -- never submitted_orders.csv,
+                # which it has no way to guess. Matches the main scan's own
+                # bare_submitted fallback above.
+                orphan_orders_csv_file = None
+                if not (run_dir / "filled_orders.csv").exists() and not (run_dir / "orders.csv").exists():
+                    bare_submitted = run_dir / "submitted_orders.csv"
+                    if bare_submitted.exists():
+                        orphan_orders_csv_file = bare_submitted
+                self._process_orphan(run_dir, orphan_orders_csv_file, csv_path)
+
+            # Full-report artifacts (dca_<label>_<day>_<stamp>_orders.csv):
+            # unlike the three canonical names above, run_and_report
+            # deliberately gives EACH run a unique timestamped filename while
+            # accepting output_dir and state_path independently -- more than one
+            # run's evidence can legitimately coexist in a single directory,
+            # including a directory that ALSO holds a DIFFERENT, successfully-
+            # parsed run_state*.json for an unrelated completed run. Collapsing
+            # discovery to "one per directory" the way the canonical pass above
+            # does for canonical names silently dropped every run but the
+            # lexicographically first one (Codex review: "Process every orphan
+            # report in a shared directory"); skipping the whole directory
+            # whenever ANY run_state parsed there is the same mistake in a
+            # different guise (Codex review: "Scan custom reports beside covered
+            # runs"), and so is skipping it whenever a canonical orphan artifact
+            # (filled_orders.csv etc.) was found there -- orphan_dirs_seen marks
+            # directory-level coverage for the canonical pass's OWN one-artifact-
+            # per-directory assumption, which says nothing about a full-report
+            # CSV, an entirely different filename set, also present (Codex
+            # review: "Do not suppress custom reports beside canonical
+            # orphans"). Discovered and processed per FILE instead: the two
+            # filename sets never overlap, so the only real duplicate-read risk
+            # is re-processing the exact same file twice, which
+            # orphan_full_report_seen and self.covered_files (the specific file an
+            # externally-referenced run_state already consumed) already prevent.
+            for csv_path in sorted(scan_root.rglob(_FULL_REPORT_ORPHAN_GLOB)):
+                if csv_path in orphan_full_report_seen:
+                    continue
+                orphan_full_report_seen.add(csv_path)
+                run_dir = csv_path.parent
+                if csv_path.resolve() in self.covered_files:
+                    continue
+                self._process_orphan(run_dir, csv_path, csv_path)
+
+        # Reconcile every "unknown-broker" order_id against a UNIQUE known-broker
+        # occurrence of the same order_id, in one final pass independent of scan
+        # order -- the dedup_key construction above deliberately does NOT
+        # attempt this inline, since a legacy/full-report run_state that omits
+        # `broker` entirely (near_close_dca.write_run_state's shape, not only an
+        # orphan) can be scanned either BEFORE or after a later occurrence that
+        # does carry a real broker name, and an inline lookback only catches one
+        # of the two orderings (Codex review: "Reconcile a brokerless copy when
+        # the brokered copy arrives later").
+        by_order_id: Dict[str, Dict[str, str]] = {}
+        for key in self.seen:
+            if key.endswith("::no-order-id"):
+                continue
+            order_id_part, _, broker_part = key.rpartition("::")
+            by_order_id.setdefault(order_id_part, {})[broker_part] = key
+        indices_to_drop: set = set()
+        for order_id, broker_map in by_order_id.items():
+            unknown_key = broker_map.get("unknown-broker")
+            if unknown_key is None:
+                continue
+            known_matches = {b: k for b, k in broker_map.items() if b != "unknown-broker"}
+            if len(known_matches) != 1:
+                if len(known_matches) > 1:
+                    self.warnings.append(
+                        f"order_id {order_id!r} matches known broker orders under more than one broker "
+                        f"({sorted(known_matches)}); kept as a separate, unattributed row rather than "
+                        "guessing which one it belongs to"
+                    )
+                continue
+            target_broker, target_key = next(iter(known_matches.items()))
+            unknown_entry = self.seen.pop(unknown_key)
+            target_entry = self.seen[target_key]
+            target_rank = target_entry["attribution"]["rank"]
+            unknown_rank = unknown_entry["attribution"]["rank"]
+            if unknown_rank < target_rank:
+                best_attribution = unknown_entry["attribution"]
+            elif target_rank < unknown_rank:
+                best_attribution = target_entry["attribution"]
+            elif target_entry["attribution"]["run_dir"] == unknown_entry["attribution"]["run_dir"]:
+                # Ranks tie AND both occurrences share a run_dir -- the same
+                # same-directory merge condition the main dedup loop above
+                # applies, extended to this later broker-reconciliation pass.
+                # Two same-directory run_state*.json variants can split across
+                # broker namespaces here too: one supplies stream/run_id while
+                # lacking a broker (landing in "unknown-broker"), the other
+                # supplies the broker while lacking those fields -- picking the
+                # brokered attribution wholesale on a tie published stream=None/
+                # run_id=None even though the other SAME-directory variant had
+                # them (Codex review: "Merge same-run provenance during broker
+                # reconciliation"). Broker itself is deliberately excluded from
+                # this merge: the record's final broker always comes from
+                # target_broker below, never from best_attribution.
+                best_attribution = dict(target_entry["attribution"])
+                for field in ("trading_day", "stream", "run_origin", "run_id"):
+                    if not best_attribution[field] and unknown_entry["attribution"][field]:
+                        best_attribution[field] = unknown_entry["attribution"][field]
+            else:
+                best_attribution = target_entry["attribution"]
+            best_values = (
+                unknown_entry["values"]
+                if _values_sort_key(unknown_entry["values"]) > _values_sort_key(target_entry["values"])
+                else target_entry["values"]
+            )
+            target_entry["attribution"] = best_attribution
+            target_entry["values"] = best_values
+            ticker = self.records[target_entry["index"]].ticker
+            self.records[target_entry["index"]] = PurchaseRecord(
+                trading_day=best_attribution["trading_day"],
+                ticker=ticker,
+                quantity=best_values["quantity"],
+                avg_fill_price=best_values["avg_fill_price"],
+                amount_usd=best_values["amount_usd"],
+                order_id=best_values["order_id"],
+                stream=best_attribution["stream"],
+                run_origin=best_attribution["run_origin"],
+                run_id=best_attribution["run_id"],
+                # The KNOWN broker, not best_attribution["broker"]: the winning
+                # attribution is chosen purely by _dedup_rank (which run's
+                # identity metadata to credit), and the brokerless occurrence
+                # can legitimately win that comparison (e.g. a "scheduled"
+                # full-report row beats a "scheduled_recovery" one) while still
+                # carrying broker=None -- using it here would silently discard
+                # the one known broker this merge exists specifically because it
+                # uniquely proved (Codex review: "Preserve the known broker when
+                # merging brokerless attribution").
+                broker=target_broker,
+                source_run_dir=best_attribution["source_run_dir"],
+            )
+            indices_to_drop.add(unknown_entry["index"])
+        if indices_to_drop:
+            self.records = [record for index, record in enumerate(self.records) if index not in indices_to_drop]
+
+        self.records.sort(key=lambda r: (r.trading_day, r.ticker, r.order_id or ""))
+        return self.records, self.warnings
+
+
+
+
+def collect_purchase_records(
+    root: Optional[Path | str] = None,
+    *,
+    additional_roots: Sequence[Path | str] = (),
+) -> tuple[List[PurchaseRecord], List[str]]:
+    """Scan every run directory under ``root`` (default: the configured
+    cron-tracking root) plus every root in ``additional_roots``, and return
+    ``(records, warnings)``.
+
+    A deployment can relocate a stream's live artifact root outside the
+    cron-tracking tree entirely (``morning``/``midday`` via
+    ``artifact_paths.live_run_state_root``, ``intraday``/``market-open`` via
+    ``DCA_INTRADAY_LIVE_STATE_ROOT`` / ``DCA_MARKET_OPEN_LIVE_STATE_ROOT`` --
+    see ``run_dca._resolve_cross_stream_prior_allocation_roots``, which
+    resolves the same set for the afternoon top-up guard). A single scan root
+    then silently omits that stream's whole history (Codex review: "Include
+    configured stream roots outside the cron tree"). ``additional_roots`` is a
+    generic escape hatch for a caller who knows their deployment's actual
+    roots -- this module deliberately does not import ``run_dca``'s
+    config-loading/trust-rule machinery (built for a narrower afternoon-root-
+    relative purpose) to auto-discover them, keeping this reporting tool's
+    only in-repo dependency the fill parser it already reuses.
+
+    Deduplicates by ``order_id``: when the same order_id is seen from more than
+    one directory, the occurrence from the more authoritative run wins (see
+    :func:`_dedup_rank`), and every other occurrence is recorded as a warning
+    rather than a second row -- a real fill has exactly one broker order_id no
+    matter how many run directories reference it. This dedup applies across
+    ``root`` and every ``additional_roots`` entry alike, so overlapping roots
+    are merged rather than double-counted.
+    """
+
+    collector = _PurchaseCollector(root, additional_roots=additional_roots)
+    return collector.collect()
 
 def build_ticker_rollup(records: List[PurchaseRecord]) -> Dict[str, Dict[str, Any]]:
     """Per-ticker summary: total shares bought, total invested, average cost
