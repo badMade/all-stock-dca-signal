@@ -33,7 +33,7 @@ import math
 import numpy as np
 import pandas as pd
 import pytest
-pytest.importorskip('volatility')
+volatility = pytest.importorskip('volatility')
 from data import COMPONENTS
 from features import build_panel
 

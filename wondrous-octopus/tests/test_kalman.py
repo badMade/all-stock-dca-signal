@@ -36,7 +36,7 @@ import math
 from statistics import NormalDist
 
 import pytest
-pytest.importorskip('kalman')
+kalman = pytest.importorskip('kalman')
 import model_interface
 import numpy as np
 import pandas as pd
