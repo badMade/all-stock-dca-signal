@@ -107,3 +107,7 @@
 ## 2026-09-08 - [Avoid json.loads read_text String Allocation in Testing]
 **Learning:** `json.loads(path.read_text())` was discovered in `wondrous-octopus/tests/test_run_walkforward.py` creating test-time string allocation overhead.
 **Action:** Always favor `path.read_bytes()` for `json.loads()` even in secondary modules like tests, matching the primary codebase learning.
+
+## 2026-09-09 - Avoid raw json.loads read_bytes when it breaks concurrency models
+**Learning:** The Python standard library `json` module does not have a C-level fast path for bytes. Instead, it internally calls `.decode()` to convert the bytes back into a string before parsing. Therefore, replacing `json.loads(path.read_text())` with `json.loads(path.read_bytes())` provides zero actual performance benefit and breaks pessimistic concurrency locks if the raw string values are directly used in cross-process checks.
+**Action:** Do not blindly replace `read_text()` with `read_bytes()` for standard library `json.loads()` when the resulting string or bytes is required for further operations without manually `.decode()`ing, as it can cause regressions or concurrency failures.

@@ -655,7 +655,17 @@ def trailing_daily_returns(
     path = Path(root) / f"{symbol}.csv"
     try:
         with path.open(newline="", encoding="utf-8") as handle:
-            rows = list(csv.DictReader(handle))
+            reader = csv.reader(handle)
+            header = next(reader, None)
+            if not header:
+                return []
+            column_indices = {name: index for index, name in enumerate(header)}
+            date_idx = column_indices.get("Date", -1)
+            adj_idx = column_indices.get("Adj Close", -1)
+            close_idx = column_indices.get("Close", -1)
+            if date_idx < 0:
+                return []
+            rows = list(reader)
     except (FileNotFoundError, OSError, UnicodeDecodeError, csv.Error):
         return []
     # Keyed by date, not a plain list: a duplicate Date in the archive (a
@@ -672,7 +682,7 @@ def trailing_daily_returns(
     raw_by_date: dict[date, Optional[float]] = {}
     latest_eligible_row_date: Optional[date] = None
     for row in rows:
-        row_date_raw = row.get("Date")
+        row_date_raw = row[date_idx] if date_idx >= 0 and date_idx < len(row) else None
         if not row_date_raw:
             continue
         try:
@@ -681,8 +691,8 @@ def trailing_daily_returns(
             continue
         if row_date >= as_of:
             continue
-        adjusted = _parse_positive_finite(row.get("Adj Close"))
-        raw = _parse_positive_finite(row.get("Close"))
+        adjusted = _parse_positive_finite(row[adj_idx] if adj_idx >= 0 and adj_idx < len(row) else None)
+        raw = _parse_positive_finite(row[close_idx] if close_idx >= 0 and close_idx < len(row) else None)
         adjusted_by_date[row_date] = adjusted
         raw_by_date[row_date] = raw
         # Freshness must be judged against a row that can actually
@@ -853,12 +863,17 @@ def archived_split_factor(
     path = Path(root) / f"{symbol}.csv"
     try:
         with path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
+            reader = csv.reader(handle)
+            header = next(reader, None)
             # A missing column reads back as None for every row, identically
             # to a genuine "0.0"/absent cell -- indistinguishable from "no
             # corporate action" without checking the header itself first.
-            if reader.fieldnames is None or not {"Stock Splits", "Dividends"} <= set(reader.fieldnames):
+            if header is None or not {"Stock Splits", "Dividends"} <= set(header):
                 return None
+            date_idx = header.index("Date") if "Date" in header else -1
+            splits_idx = header.index("Stock Splits") if "Stock Splits" in header else -1
+            div_idx = header.index("Dividends") if "Dividends" in header else -1
+            close_idx = header.index("Close") if "Close" in header else -1
             rows = list(reader)
     except (FileNotFoundError, OSError, UnicodeDecodeError, csv.Error):
         return None
@@ -866,7 +881,7 @@ def archived_split_factor(
     latest_row_date: Optional[date] = None
     saw_usable_row = False
     for row in rows:
-        row_date_raw = row.get("Date")
+        row_date_raw = row[date_idx] if date_idx >= 0 and date_idx < len(row) else None
         if not row_date_raw:
             # A blank Date is ordinary trailing-row noise UNLESS the row also
             # carries a genuine nonzero Stock Splits or Dividends value --
@@ -895,8 +910,8 @@ def archived_split_factor(
             # split lookup over the archive until that row is removed (Codex
             # review: "Keep blank undated rows inert"). Only a NONBLANK cell
             # that still fails to parse counts as malformed.
-            raw_undated_split = row.get("Stock Splits")
-            raw_undated_dividend = row.get("Dividends")
+            raw_undated_split = (row[splits_idx] if splits_idx >= 0 and splits_idx < len(row) else None)
+            raw_undated_dividend = (row[div_idx] if div_idx >= 0 and div_idx < len(row) else None)
             undated_split_ok, undated_split = _parse_corporate_action_cell(raw_undated_split)
             undated_dividend_ok, undated_dividend = _parse_corporate_action_cell(raw_undated_dividend)
             undated_split_malformed = raw_undated_split not in (None, "") and not undated_split_ok
@@ -931,7 +946,7 @@ def archived_split_factor(
             latest_row_date = row_date
         if row_date <= since:
             continue
-        split_ok, ratio = _parse_corporate_action_cell(row.get("Stock Splits"))
+        split_ok, ratio = _parse_corporate_action_cell((row[splits_idx] if splits_idx >= 0 and splits_idx < len(row) else None))
         if not split_ok:
             # Unparseable text, NaN, or a negative value reads back through
             # plain float-and-check as indistinguishable from the ordinary
@@ -945,7 +960,7 @@ def archived_split_factor(
         # on a row is a no-op split and multiplies harmlessly.
         if ratio is not None:
             factor *= ratio
-        dividend_ok, dividend = _parse_corporate_action_cell(row.get("Dividends"))
+        dividend_ok, dividend = _parse_corporate_action_cell((row[div_idx] if div_idx >= 0 and div_idx < len(row) else None))
         if not dividend_ok:
             # Same malformed-vs-ordinary ambiguity as the Stock Splits cell
             # above: unparseable text, NaN, or a negative payout must not be
@@ -963,7 +978,7 @@ def archived_split_factor(
             # ``rearm_reference_close`` by it (exactly like a split) scales
             # the reference DOWN by the same proportion the real price just
             # dropped.
-            close = _parse_positive_finite(row.get("Close"))
+            close = _parse_positive_finite((row[close_idx] if close_idx >= 0 and close_idx < len(row) else None))
             if close is None:
                 # Cannot value this distribution -- returning a factor that
                 # silently omits it, while still reporting this row's date
