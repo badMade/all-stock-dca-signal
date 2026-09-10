@@ -14633,6 +14633,7 @@ def _valid_future_artifact_claim(
                 entry_day = date.fromisoformat(entry["trading_day"][:10])
             except ValueError:
                 continue
+            amount = entry.get("amount_usd")
             if amount is not None and not isinstance(amount, bool):
                 try:
                     amount_val = float(amount)
@@ -18475,16 +18476,18 @@ def _persist_gated_whole_share_recovery(
                     attempt_id = entry.get("claim_attempt_id")
                     if attempt_id and attempt_id in adjustment_totals_by_attempt_id:
                         return round(base_amount + adjustment_totals_by_attempt_id[attempt_id], 2)
-                    key = (candidate.get("ticker"), entry["trading_day"])
-                    # Only unambiguous when exactly ONE physical row shares
-                    # this (ticker, day) -- otherwise this candidate cannot
-                    # be told apart from a SIBLING order for the same
-                    # ticker/day that also missed the direct id lookup, and
-                    # applying the correction here risks handing it to the
-                    # wrong physical order (Codex review: "Avoid applying
-                    # corrections to sibling orders").
-                    if key in adjustment_totals_by_ticker_day and _ticker_day_row_counts.get(key, 0) <= 1:
-                        return round(base_amount + adjustment_totals_by_ticker_day[key], 2)
+                    _t = candidate.get("ticker")
+                    if isinstance(_t, str):
+                        key = (_t, str(entry["trading_day"]))
+                        # Only unambiguous when exactly ONE physical row shares
+                        # this (ticker, day) -- otherwise this candidate cannot
+                        # be told apart from a SIBLING order for the same
+                        # ticker/day that also missed the direct id lookup, and
+                        # applying the correction here risks handing it to the
+                        # wrong physical order (Codex review: "Avoid applying
+                        # corrections to sibling orders").
+                        if key in adjustment_totals_by_ticker_day and _ticker_day_row_counts.get(key, 0) <= 1:
+                            return round(base_amount + adjustment_totals_by_ticker_day[key], 2)
             return round(base_amount, 2)
 
         write_submitted_orders_csv(
@@ -27762,7 +27765,7 @@ def _reconcile_unproven_fractional_placements_in_artifact(
         raw = outcomes[key]
         ticker = str(raw.get("ticker") or str(key).split(":", 1)[0]).strip().upper()
         ref_id = raw.get("placement_ref_id")
-        amount = _finite_nonnegative_float(raw.get("submitted_amount_usd"))
+        _raw_amount = _finite_nonnegative_float(raw.get("submitted_amount_usd"))
         # STRICTLY positive, not merely readable-and-nonnegative: the
         # placement path never submits a non-positive order, so a
         # persisted $0 approved amount is not a legitimate small placement
@@ -27774,10 +27777,11 @@ def _reconcile_unproven_fractional_placements_in_artifact(
         # permanently omitting its exposure from daily/weekly deployment
         # and letting later orders past the caps (Codex review, PR #911
         # round 29: "Reject zero-dollar unresolved placement evidence").
-        if not ticker or not isinstance(ref_id, str) or not ref_id.strip() or amount is None or amount <= 0:
+        if not ticker or not isinstance(ref_id, str) or not ref_id.strip() or _raw_amount is None or _raw_amount <= 0:
             raise UnresolvedPlacementError(
                 f"prior placement evidence for {ticker or 'unknown ticker'} is incomplete"
             )
+        amount = _raw_amount
         ref_id = ref_id.strip()
         # Carried alongside ticker/amount so the reconciliation call below
         # can supply it to `_reconcile_ambiguous_fractional_placement`
@@ -27888,10 +27892,10 @@ def _reconcile_unproven_fractional_placements_in_artifact(
             # recorded: booking `candidate_amounts[-1]` unconditionally on
             # ACCEPTED would overstate an accepted $10 order as $12 whenever
             # the LATEST row is the one that did NOT match.
-            amount = (
-                accepted_amount
-                if verdict == _PLACEMENT_ACCEPTED and accepted_amount is not None
-                else candidate_amounts[-1]
+            amount: float = (
+                float(accepted_amount)
+                if verdict == _PLACEMENT_ACCEPTED and isinstance(accepted_amount, (int, float))
+                else float(candidate_amounts[-1])
             )
         except Exception as exc:  # noqa: BLE001 - unreadable history stays blocked
             for key in keys:
