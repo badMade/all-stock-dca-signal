@@ -207,7 +207,7 @@ def test_specresult_is_frozen():
     )
 
     with pytest.raises(dataclasses.FrozenInstanceError):
-        setattr(result, "what_it_does", "changed")
+        result.what_it_does = "changed"
 
 
 def test_load_from_second_writer_instance_same_db(tmp_path):
