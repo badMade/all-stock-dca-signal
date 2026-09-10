@@ -14633,22 +14633,19 @@ def _valid_future_artifact_claim(
                 entry_day = date.fromisoformat(entry["trading_day"][:10])
             except ValueError:
                 continue
-            amount = entry.get("amount_usd")
-            try:
-                # float() on an oversized-but-valid JSON integer can raise
-                # OverflowError, not just TypeError/ValueError -- treat that
-                # the same as any other unusable amount rather than letting it
-                # propagate and abort the caller (Codex review: "Handle
-                # oversized future claim amounts without conversion failure").
-                amount_val = None if isinstance(amount, bool) else float(amount)
-            except (TypeError, ValueError, OverflowError):
+            if amount is not None and not isinstance(amount, bool):
+                try:
+                    amount_val = float(amount)
+                except (TypeError, ValueError, OverflowError):
+                    amount_val = None
+            else:
                 amount_val = None
             entry_unusable = (
                 amount_val is None or not math.isfinite(amount_val) or amount_val < 0
             )
             if entry_day == claim_day and entry_unusable:
                 return True
-            if not entry_unusable:
+            if not entry_unusable and amount_val is not None:
                 accounted_usd += amount_val
                 valid_entry_days.append(entry_day)
         row_amount = float(candidate["planned_amount_usd"])
@@ -18091,12 +18088,12 @@ def _persist_gated_whole_share_recovery(
     if zero_fill:
         amount = 0.0
     else:
-        amount = float(
+        raw_amount = (
             reconciled.get("planned_notional_usd")
             if reconciled.get("live_order_found")
             else reconciled.get("order_notional_usd")
-            or 0.0
         )
+        amount = float(raw_amount or 0.0)
         if amount <= 0:
             return 0.0
     state_path = Path(artifacts_dir) / "run_state.json"
@@ -18413,8 +18410,8 @@ def _persist_gated_whole_share_recovery(
             # checked FIRST and returns immediately, so a row that DOES
             # match by id never double-counts by also matching this map.
             for entry in candidate.get("whole_share_claim_breakdown") or ():
-                if isinstance(entry, dict) and entry.get("trading_day"):
-                    key = (candidate.get("ticker"), entry["trading_day"])
+                if isinstance(entry, dict) and entry.get("trading_day") and isinstance(candidate.get("ticker"), str):
+                    key = (str(candidate.get("ticker")), str(entry["trading_day"]))
                     adjustment_totals_by_ticker_day[key] = (
                         adjustment_totals_by_ticker_day.get(key, 0.0) + adj_amount
                     )
@@ -18436,10 +18433,11 @@ def _persist_gated_whole_share_recovery(
         # (Codex review: "Avoid applying corrections to sibling orders").
         _ticker_day_row_counts: Dict[tuple[str, str], int] = {}
         for _row in submitted_rows:
-            if not isinstance(_row, dict):
+            if not isinstance(_row, dict) or not isinstance(_row.get("ticker"), str):
                 continue
+            _ticker_str = str(_row.get("ticker"))
             _row_keys = {
-                (_row.get("ticker"), entry["trading_day"])
+                (_ticker_str, str(entry["trading_day"]))
                 for entry in (_row.get("whole_share_claim_breakdown") or ())
                 if isinstance(entry, dict) and entry.get("trading_day")
             }
@@ -21623,6 +21621,7 @@ def _process_buy_candidate(
         else ctx.config.max_per_order_usd
     )
     prior = ctx.prior_same_day_allocations.get(ticker) if ctx.guard_active else None
+    effective_prior = prior
     ticker_guarded = ctx.guard_active and prior is not None
     top_up_outcome = None
     errors_count_inc = 0
@@ -21671,15 +21670,16 @@ def _process_buy_candidate(
             outcome = tracked_fn(ticker, day, observed_amount_usd)
             if getattr(outcome, "refused", False):
                 return False, 0.0, None
-            return True, max(0.0, float(outcome.removed_usd)), outcome.revision
+            removed_usd = float(getattr(outcome, "removed_usd", 0.0))
+            return True, max(0.0, removed_usd), getattr(outcome, "revision", None)
         amount_fn = getattr(ctx.credit_ledger, "discard_minimum_order_pending_amount", None)
         if callable(amount_fn):
             removed = amount_fn(ticker, day, observed_amount_usd)
             if removed is None:
                 return False, 0.0, None
-            return True, max(0.0, float(removed)), None
+            return True, max(0.0, float(cast(Any, removed))), None
         return (
-            bool(ctx.credit_ledger.discard_minimum_order_pending(ticker, day, observed_amount_usd)),
+            ctx.credit_ledger.discard_minimum_order_pending(ticker, day, observed_amount_usd),
             0.0,
             None,
         )
@@ -21705,13 +21705,11 @@ def _process_buy_candidate(
             return False
         day = ctx.trading_day.isoformat()
         try:
-            return bool(
-                ctx.credit_ledger.restore_minimum_order_pending(
-                    ticker, day, amount_usd, expected_revision=revision
-                )
+            return ctx.credit_ledger.restore_minimum_order_pending(
+                ticker, day, amount_usd, expected_revision=revision
             )
         except TypeError:
-            return bool(ctx.credit_ledger.restore_minimum_order_pending(ticker, day, amount_usd))
+            return ctx.credit_ledger.restore_minimum_order_pending(ticker, day, amount_usd)
 
     def _recover_duplicate_order(
         dup_order: Dict[str, Any],
@@ -22330,6 +22328,10 @@ def _process_buy_candidate(
         # (see the audit-fields comment above for why). Never from a dry
         # run, which must not mutate the live-root ledger (see the matching
         # guard on the fresh-placement settle below).
+        recovered_order_id = candidate_outcome.get("order_id")
+        recovered_order_id_str: Optional[str] = (
+            str(recovered_order_id) if recovered_order_id is not None else None
+        )
         if (
             not ctx.config.dry_run
             and top_up_outcome is not None
@@ -22339,6 +22341,11 @@ def _process_buy_candidate(
             )
         ):
             try:
+                extra_settle_kwargs: Dict[str, Any] = (
+                    {"already_debited_usd": already_discarded_usd}
+                    if already_discarded_usd > 0
+                    else {}
+                )
                 ctx.credit_ledger.settle(
                     ticker,
                     ctx.trading_day.isoformat(),
@@ -22357,7 +22364,7 @@ def _process_buy_candidate(
                     # later credit for this ticker (Codex review, PR #656
                     # follow-up: "Deduplicate afternoon recovered-order
                     # settlement").
-                    order_id=candidate_outcome.get("order_id"),
+                    order_id=recovered_order_id_str,
                     # When this caller's own discard already removed the
                     # dollars, settle() must record provenance only: the
                     # current balance may hold unrelated newer credit by
@@ -22365,11 +22372,7 @@ def _process_buy_candidate(
                     # order accepted before it existed (Codex review, PR
                     # #680 discussion_r3925440968: "Keep post-discard
                     # settlement from consuming newer credit").
-                    **(
-                        {"already_debited_usd": already_discarded_usd}
-                        if already_discarded_usd > 0
-                        else {}
-                    ),
+                    **extra_settle_kwargs,
                 )
             except TypeError:
                 # Ledger too old for already_debited_usd. Settling anyway
@@ -22422,7 +22425,7 @@ def _process_buy_candidate(
             _log_execution(
                 ctx.run_result,
                 decision,
-                candidate_outcome.get("order_id"),
+                recovered_order_id_str,
                 ctx.broker,
                 notional_usd=dup_amount,
             )
@@ -22598,13 +22601,13 @@ def _process_buy_candidate(
         # two flush-only branches' pre-existing no-ledger-write behavior
         # (Codex review discussion on commit 0af4768: "Clear combined
         # credits that remain below fifty cents").
-        if top_up_outcome.discarded_pending_credit_usd is not None and ctx.config.dry_run:
+        if top_up_outcome is not None and top_up_outcome.discarded_pending_credit_usd is not None and ctx.config.dry_run:
             discarded = True  # simulate success; never mutate the live-root
             # ledger from a dry run -- see the matching guard and comment on
             # _select_final_session_credit_flush_tickers's discard callback
             # in _run_once_impl (Codex review discussion on commit e385a54:
             # "Keep dry runs from discarding the live credit ledger").
-        elif top_up_outcome.discarded_pending_credit_usd is not None:
+        elif top_up_outcome is not None and top_up_outcome.discarded_pending_credit_usd is not None:
             # discard_minimum_order_pending() returning False is ambiguous on
             # its own: a concurrent update may have raised the balance to or
             # above the discard threshold (it now qualifies for an order), OR
@@ -23411,6 +23414,7 @@ def _process_buy_candidate(
                     if _is_usable_reconciled_order_id(_rejected_id)
                     else None
                 )
+                reconciled_executed_usd = None
                 history_readable = True
             else:
                 try:
@@ -23439,6 +23443,7 @@ def _process_buy_candidate(
                         type(reconcile_exc).__name__,
                     )
                     verdict, reconciled_order_id = _PLACEMENT_UNKNOWN, None
+                    reconciled_executed_usd = None
                     history_readable = False
             if isinstance(exc, AmbiguousPlacementResponseError):
                 _response_order_id = getattr(exc, "order_id", None)
@@ -23571,7 +23576,10 @@ def _process_buy_candidate(
                 # `planned_amount_usd`, which is what `dca_risk.deployed_usd()`
                 # sums on the NEXT run. Booking the approved $2 for a $100 fill
                 # is how the excess went missing in the first place.
-                executed_usd, exposure_basis = reconciled_executed_usd
+                if isinstance(reconciled_executed_usd, (tuple, list)):
+                    executed_usd, exposure_basis = reconciled_executed_usd[0], str(reconciled_executed_usd[1])
+                else:
+                    executed_usd, exposure_basis = float(reconciled_executed_usd or 0.0), "executed"
                 executed_usd = float(executed_usd)
                 exposure_is_executed = exposure_basis.startswith("executed")
                 ctx.state.record_buy(ticker, ctx.trading_day, executed_usd)
@@ -24630,7 +24638,7 @@ def _process_buy_candidates_batch(
             # two, understating usage/cost and incident telemetry exactly
             # as round 28's pre-batch gap did (Codex review, PR #859 round
             # 39: "Carry candidate-stage errors into halt telemetry").
-            if errors_count_inc:
+            if errors_count_inc > 0:
                 _IN_FLIGHT_RUN_EVALUATION["errors_count"] = _coerce_nonnegative_int(
                     _IN_FLIGHT_RUN_EVALUATION.get("errors_count")
                 ) + errors_count_inc
@@ -26066,10 +26074,11 @@ def _recovered_execution_evidence(order: dict, state: str = "") -> tuple[Optiona
         return known, True
     if reconstructed is None:
         return known, unreadable
+    reconstructed_val = float(cast(Any, reconstructed))
     if known is None or known <= 0:
         # Nothing authoritative to weigh it against -- an absent dollar figure,
         # or an explicit zero that the quantity pair contradicts.
-        return max(known or 0.0, reconstructed), unreadable
+        return max(known or 0.0, reconstructed_val), unreadable
     # Both are readable and positive, so the question is whether they DISAGREE
     # or merely round differently. quantity * price is a reconstruction from
     # two separately-rounded fields and lands a fraction off even for a genuine
@@ -26078,8 +26087,8 @@ def _recovered_execution_evidence(order: dict, state: str = "") -> tuple[Optiona
     # batch. The dollar figure therefore stays authoritative unless the
     # reconstruction exceeds it by more than rounding can explain: a cent, or
     # one percent of the reported figure, whichever is larger.
-    if reconstructed - known > max(0.01, 0.01 * known):
-        return reconstructed, unreadable
+    if reconstructed_val - known > max(0.01, 0.01 * known):
+        return reconstructed_val, unreadable
     return known, unreadable
 
 
@@ -26305,12 +26314,16 @@ def _response_evidence_conflicts_with_matched_row(
     the response's own proof of execution outranks a row this call cannot
     show describes the same spend.
     """
-    response_notionals = (
-        response_notional_usd
-        if isinstance(response_notional_usd, (list, tuple))
-        else (response_notional_usd,)
+    if isinstance(response_notional_usd, (list, tuple)) or (
+        isinstance(response_notional_usd, Sequence)
+        and not isinstance(response_notional_usd, (str, bytes))
+    ):
+        raw_response_notionals = list(response_notional_usd)
+    else:
+        raw_response_notionals = [response_notional_usd]
+    response_notionals: tuple[float, ...] = tuple(
+        float(value) for value in raw_response_notionals if value is not None
     )
-    response_notionals = tuple(value for value in response_notionals if value is not None)
     if not response_notionals:
         # A response with execution-shaped evidence but no recoverable dollar
         # value cannot be corroborated safely by a later history row.
@@ -26347,7 +26360,7 @@ def _reconcile_ambiguous_fractional_placement(
     matched_order_out: Optional[Dict[str, Any]] = None,
     response_notional_usd: Optional[float] | Sequence[Optional[float]] = None,
     response_may_have_executed: bool = False,
-) -> Tuple[str, Optional[str], Optional[float]]:
+) -> Tuple[str, Optional[str], Optional[Union[float, Tuple[float, str]]]]:
     """What the day's order history says about a placement that raised.
 
     Returns ``(verdict, order_id, accepted_amount_usd)`` where ``verdict`` is
@@ -26884,10 +26897,7 @@ def _reconcile_ambiguous_fractional_placement(
         for _candidate in _candidates:
             if _candidate is None:
                 continue
-            try:
-                _approved_candidate = float(_candidate)
-            except (TypeError, ValueError, OverflowError):
-                continue
+            _approved_candidate = _candidate
             if not math.isfinite(_approved_candidate):
                 continue
             if (
@@ -27910,7 +27920,7 @@ def _reconcile_unproven_fractional_placements_in_artifact(
         # fail-closed reading a genuine history ambiguity already gets.
         if order_id and any(
             _is_usable_reconciled_order_id(outcomes[_key].get("order_id"))
-            and str(outcomes[_key]["order_id"]).strip() != str(order_id).strip()
+            and str(outcomes[_key]["order_id"]).strip() != order_id.strip()
             for _key in keys
         ):
             verdict = _PLACEMENT_UNKNOWN
@@ -29774,7 +29784,7 @@ def _unrepresented_prior_candidate_part(
                 continue
             _values = [_item.get(field) for _item in _matched_legacy]
             if all(isinstance(_v, (int, float)) for _v in _values):
-                trimmed[field] = round(sum(float(_v) for _v in _values), 2)
+                trimmed[field] = round(sum(float(_v) for _v in _values if isinstance(_v, (int, float))), 2)
         # Restricted to just the still-represented ids, not the prior
         # aggregate's full list (inherited unchanged via `dict(prior)`
         # above): a later `_merge_whole_share_submission_outcomes` call on
@@ -29937,7 +29947,7 @@ def _unrepresented_prior_candidate_part(
         if _legacy_fully_matched:
             _qty_values = [_item.get("whole_share_quantity") for _item in _matched_legacy]
             if all(isinstance(_v, (int, float)) for _v in _qty_values):
-                trimmed["whole_share_quantity"] = sum(float(_v) for _v in _qty_values)
+                trimmed["whole_share_quantity"] = sum(float(_v) for _v in _qty_values if isinstance(_v, (int, float)))
         # else: no exact per-order quantity available -- preserve the
         # prior's full quantity (already in `trimmed` via `dict(prior)`)
         # rather than subtract a fresh sibling's own quantity from a total
@@ -30033,7 +30043,7 @@ def _merge_whole_share_submission_outcomes(
             _inherited_kinds = _side.get("_order_failure_kind_by_id")
             if isinstance(_inherited_kinds, dict):
                 _failure_kind_by_id.update(
-                    {str(k): str(v) for k, v in _inherited_kinds.items() if isinstance(v, str)}
+                    {str(k): v for k, v in _inherited_kinds.items() if isinstance(v, str)}
                 )
         # Ids contributed by a settlement-ADJUSTMENT leg specifically, not
         # an ordinary physical order -- inherited the same way as the
@@ -41125,7 +41135,7 @@ def run_daily_compact(
                             # a lease recovery (which also carries its own ticker).
                             _outcome = {
                                 **_outcome,
-                                "ticker": _outcome.get("ticker") or str(_key).split("#", 1)[0],
+                                "ticker": _outcome.get("ticker") or _key.split("#", 1)[0],
                             }
                         # Keep the FINAL, collision-resolved mapping key as
                         # explicit provenance when this outcome has to move under a
@@ -41135,7 +41145,7 @@ def run_daily_compact(
                         # earlier retry remains authoritative.
                         _outcome = {
                             **_outcome,
-                            "carry_forward_ref": _outcome.get("carry_forward_ref") or str(_outcome_key),
+                            "carry_forward_ref": _outcome.get("carry_forward_ref") or _outcome_key,
                         }
                         _fresh_broker_outcomes[_outcome_key] = _outcome
                         if _order_id_usable:
