@@ -1089,8 +1089,9 @@ class SheetsWriter:
             logger.error("SheetsWriter: blocked unsafe Sheets API URL %s", url)
             return False
 
-        from dca_net_utils import assert_safe_destination as _assert_safe_destination
         try:
+            from dca_net_utils import assert_safe_destination as _assert_safe_destination
+
             _assert_safe_destination(url)
         except Exception as exc:
             logger.error("SheetsWriter: blocked unsafe Sheets API URL %s (%s)", url, exc)
