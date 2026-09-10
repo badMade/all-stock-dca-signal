@@ -38,7 +38,7 @@ from datetime import date, datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Third-party imports
@@ -458,12 +458,14 @@ class SentimentAnalyzer:
             return []
 
         # Batch inference — HuggingFace pipeline handles batching internally
-        raw_results = self._pipeline(texts)
+        raw_results: Any = self._pipeline(texts)
 
         output = []
         for text, label_scores in zip(texts, raw_results):
             # label_scores is a list of {'label': str, 'score': float}
-            score_map = {item["label"].lower(): item["score"] for item in label_scores}
+            score_map: dict[str, float] = {
+                str(item["label"]).lower(): float(item["score"]) for item in label_scores
+            }
             pos = score_map.get("positive", 0.0)
             neg = score_map.get("negative", 0.0)
             neu = score_map.get("neutral", 0.0)
