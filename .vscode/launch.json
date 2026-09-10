@@ -10,6 +10,14 @@
             "request": "launch",
             "program": "${file}",
             "console": "integratedTerminal"
+        },
+        {
+            "name": "Run DCA: Demo Dry-Run",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/run_dca.py",
+            "args": ["--demo", "--report", "--artifacts-dir", "/tmp/dca-demo"],
+            "console": "integratedTerminal"
         }
     ]
 }

@@ -23584,7 +23584,7 @@ def _process_buy_candidate(
                 # sums on the NEXT run. Booking the approved $2 for a $100 fill
                 # is how the excess went missing in the first place.
                 if isinstance(reconciled_executed_usd, (tuple, list)):
-                    executed_usd, exposure_basis = float(reconciled_executed_usd[0]), reconciled_executed_usd[1]
+                    executed_usd, exposure_basis = reconciled_executed_usd[0], reconciled_executed_usd[1]
                 else:
                     executed_usd, exposure_basis = (reconciled_executed_usd or 0.0), "executed"
                 exposure_is_executed = exposure_basis.startswith("executed")
