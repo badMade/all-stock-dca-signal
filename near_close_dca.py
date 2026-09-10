@@ -4562,6 +4562,9 @@ class AlpacaBroker:
     def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
         return []
 
+    def get_order_fills(self, order_ids: list[str]) -> dict[str, Optional[OrderFill]]:
+        return {order_id: self.get_order_fill(order_id) for order_id in order_ids}
+
 
 def account_pinning_failure(
     target_account_number: Optional[str],
