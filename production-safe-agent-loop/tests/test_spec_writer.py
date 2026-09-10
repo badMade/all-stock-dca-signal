@@ -14,7 +14,6 @@ import sqlite3
 import uuid
 
 import pytest
-
 from spec_writer import SpecResult, SpecWriter
 
 Q1 = "What does this do?"
@@ -207,7 +206,7 @@ def test_specresult_is_frozen():
     )
 
     with pytest.raises(dataclasses.FrozenInstanceError):
-        setattr(result, "what_it_does", "changed")
+        result.what_it_does = "changed"  # noqa: B010
 
 
 def test_load_from_second_writer_instance_same_db(tmp_path):
