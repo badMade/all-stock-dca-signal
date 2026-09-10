@@ -33,9 +33,11 @@ import math
 import numpy as np
 import pandas as pd
 import pytest
-volatility = pytest.importorskip('volatility')
 from data import COMPONENTS
 from features import build_panel
+
+kalman = pytest.importorskip('kalman')
+volatility = pytest.importorskip('volatility')
 
 
 def _simulate_garch(*, omega: float, alpha: float, beta: float, n: int, seed: int) -> np.ndarray:

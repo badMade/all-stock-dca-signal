@@ -20,12 +20,11 @@ from datetime import date, timedelta
 
 import numpy as np
 import pytest
+import stacking
 from data import COMPONENTS
 from ledger import Ledger
 from metrics import score_forecast
 from model_interface import QUANTILE_KEYS
-
-import stacking
 
 ComponentWeights = stacking.ComponentWeights
 blend = stacking.blend

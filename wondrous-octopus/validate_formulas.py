@@ -12,11 +12,10 @@ from __future__ import annotations
 import math
 import sys
 
-import numpy as np
-import pandas as pd
-
 import data
 import features
+import numpy as np
+import pandas as pd
 import stacking
 
 FAILURES: list[str] = []
