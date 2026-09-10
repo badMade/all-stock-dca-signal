@@ -192,8 +192,8 @@ def generate_ma_crossover_signals(
     close: pd.Series, fast_window: int = 50, slow_window: int = 200
 ) -> tuple[pd.Series, pd.Series]:
     """Golden/death-cross entries and exits, boolean series aligned to ``close``."""
-    fast: pd.Series = close.rolling(fast_window).mean()
-    slow: pd.Series = close.rolling(slow_window).mean()
+    fast: pd.Series = cast(Any, close.rolling(fast_window).mean())
+    slow: pd.Series = cast(Any, close.rolling(slow_window).mean())
     entries: pd.Series = (fast > slow) & (fast.shift(1) <= slow.shift(1))
     exits: pd.Series = (fast < slow) & (fast.shift(1) >= slow.shift(1))
     return entries.fillna(False), exits.fillna(False)
@@ -203,9 +203,7 @@ def _wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     """Standard Wilder RSI, hand-rolled to avoid a pandas_ta dependency.
 
     (pandas_ta's current PyPI releases require Python >=3.12, an
-    unnecessary version constraint to take on for a ~10-line, well-known
-    formula that trading-strategies/backtest.py otherwise pulls the whole
-    library in for.)
+    unnecessary floor when the RSI formula is ~10 lines of pandas math.)
     """
     delta = close.diff()
     gain = delta.clip(lower=0.0)
@@ -235,7 +233,7 @@ def _wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     avg_loss_s = pd.Series(avg_loss.tolist(), index=close.index)
 
     relative_strength = avg_gain_s / avg_loss_s
-    rsi: pd.Series = 100.0 - (100.0 / (1.0 + relative_strength))
+    rsi: pd.Series = cast(Any, 100.0 - (100.0 / (1.0 + relative_strength)))
     rsi = rsi.where(avg_loss_s != 0, 100.0)
     # A fully flat window (no gains AND no losses) has no relative strength
     # at all -- 100.0 above is only correct for "gains with zero losses"
