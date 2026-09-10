@@ -659,10 +659,10 @@ def trailing_daily_returns(
             header = next(reader, None)
             if not header:
                 return []
-column_indices = {name: index for index, name in enumerate(header)}
-date_idx = column_indices.get("Date", -1)
-adj_idx = column_indices.get("Adj Close", -1)
-close_idx = column_indices.get("Close", -1)
+            column_indices = {name: index for index, name in enumerate(header)}
+            date_idx = column_indices.get("Date", -1)
+            adj_idx = column_indices.get("Adj Close", -1)
+            close_idx = column_indices.get("Close", -1)
             if date_idx < 0:
                 return []
             rows = list(reader)
