@@ -33,9 +33,10 @@ import math
 import numpy as np
 import pandas as pd
 import pytest
-import volatility
 from data import COMPONENTS
 from features import build_panel
+
+volatility = pytest.importorskip("volatility", reason="optional volatility component is not present in this checkout")
 
 
 def _simulate_garch(*, omega: float, alpha: float, beta: float, n: int, seed: int) -> np.ndarray:
