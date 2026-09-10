@@ -192,11 +192,11 @@ def generate_ma_crossover_signals(
     close: pd.Series, fast_window: int = 50, slow_window: int = 200
 ) -> tuple[pd.Series, pd.Series]:
     """Golden/death-cross entries and exits, boolean series aligned to ``close``."""
-    fast = cast(pd.Series, close.rolling(fast_window).mean())
-    slow = cast(pd.Series, close.rolling(slow_window).mean())
-    entries = (fast > slow) & (cast(pd.Series, fast.shift(1)) <= cast(pd.Series, slow.shift(1)))
-    exits = (fast < slow) & (cast(pd.Series, fast.shift(1)) >= cast(pd.Series, slow.shift(1)))
-    return cast(pd.Series, entries.fillna(False)), cast(pd.Series, exits.fillna(False))
+    fast: pd.Series = close.rolling(fast_window).mean()
+    slow: pd.Series = close.rolling(slow_window).mean()
+    entries: pd.Series = (fast > slow) & (fast.shift(1) <= slow.shift(1))
+    exits: pd.Series = (fast < slow) & (fast.shift(1) >= slow.shift(1))
+    return entries.fillna(False), exits.fillna(False)
 
 
 def _wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -231,19 +231,19 @@ def _wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
         for i in range(period + 1, len(close)):
             avg_gain[i] = (avg_gain[i - 1] * (period - 1) + gain_values[i]) / period
             avg_loss[i] = (avg_loss[i - 1] * (period - 1) + loss_values[i]) / period
-    avg_gain_s = pd.Series(avg_gain, index=close.index, dtype=float)
-    avg_loss_s = pd.Series(avg_loss, index=close.index, dtype=float)
+    avg_gain_s = pd.Series(avg_gain.tolist(), index=close.index)
+    avg_loss_s = pd.Series(avg_loss.tolist(), index=close.index)
 
     relative_strength = avg_gain_s / avg_loss_s
-    rsi: pd.Series = cast(pd.Series, 100.0 - (100.0 / (1.0 + relative_strength)))
-    rsi = cast(pd.Series, rsi.where(avg_loss_s != 0, 100.0))
+    rsi: pd.Series = 100.0 - (100.0 / (1.0 + relative_strength))
+    rsi = rsi.where(avg_loss_s != 0, 100.0)
     # A fully flat window (no gains AND no losses) has no relative strength
     # at all -- 100.0 above is only correct for "gains with zero losses"
     # (strictly rising), not "nothing moved." Treat a flat window as neutral
     # rather than falsely overbought, or generate_rsi_reversion_signals would
     # fire spurious exit signals on a static price (Antigravity code review
     # on PR #403).
-    return cast(pd.Series, rsi.where((avg_gain_s != 0) | (avg_loss_s != 0), 50.0))
+    return rsi.where((avg_gain_s != 0) | (avg_loss_s != 0), 50.0)
 
 
 def generate_rsi_reversion_signals(
