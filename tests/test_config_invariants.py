@@ -1397,6 +1397,8 @@ _NON_ACCOUNT_LITERALS = frozenset(
         "42173154",
         # HHMMSS clock values and a unix timestamp in tests.
         "152001",
+        # VS Code launch.json link.
+        "830387",
         "110000",
         "154500",
         "152000",
