@@ -659,9 +659,10 @@ def trailing_daily_returns(
             header = next(reader, None)
             if not header:
                 return []
-            date_idx = header.index("Date") if "Date" in header else -1
-            adj_idx = header.index("Adj Close") if "Adj Close" in header else -1
-            close_idx = header.index("Close") if "Close" in header else -1
+column_indices = {name: index for index, name in enumerate(header)}
+date_idx = column_indices.get("Date", -1)
+adj_idx = column_indices.get("Adj Close", -1)
+close_idx = column_indices.get("Close", -1)
             if date_idx < 0:
                 return []
             rows = list(reader)
