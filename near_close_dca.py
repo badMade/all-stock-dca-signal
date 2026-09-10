@@ -3776,10 +3776,14 @@ class BrokerAdapter(Protocol):
         return an order id. Quantity-based counterpart to :meth:`place_market_buy`.
         """
         ...
-
     def get_order_fill(self, order_id: str) -> Optional[OrderFill]:
         """Return fill details for a placed order, or None if not yet filled."""
         ...
+
+    def get_order_fills(self, order_ids: list[str]) -> dict[str, Optional[OrderFill]]:
+        """Return fill details for multiple orders at once."""
+        ...
+
 
     @property
     def supports_concurrent_fill_lookup(self) -> bool:
