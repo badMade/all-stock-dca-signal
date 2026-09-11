@@ -5403,13 +5403,13 @@ class FinanceDataProvider:
                     continue
                 raw_ratio = row[split_key]
                 raw_dividend = row[dividend_key]
+                if raw_ratio is None or raw_dividend is None:
+                    return None
                 # Providers sometimes serialize unavailable numeric metadata as
                 # whitespace rather than an empty string. Keep that on the
                 # same fail-closed path: it is not evidence of a zero action.
-                split_blank = raw_ratio is None or (isinstance(raw_ratio, str) and not raw_ratio.strip())
-                dividend_blank = raw_dividend is None or (
-                    isinstance(raw_dividend, str) and not raw_dividend.strip()
-                )
+                split_blank = isinstance(raw_ratio, str) and not raw_ratio.strip()
+                dividend_blank = isinstance(raw_dividend, str) and not raw_dividend.strip()
                 if split_blank or dividend_blank:
                     return None
                 # bool is a subclass of int in Python, so float(True)/
