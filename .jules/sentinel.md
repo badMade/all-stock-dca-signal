@@ -50,3 +50,7 @@
 **Vulnerability:** `urllib.request.urlopen` lacked SSRF mitigations for user-supplied webhook URLs in `scripts/drift_detection.py`.
 **Learning:** Validation methods like `_assert_safe_destination` that pre-filter `http`/`https` schemes do not prevent TOCTOU redirection bugs if the underlying `urllib.request` handles redirects unsafe out-of-the-box.
 **Prevention:** `urllib.request.build_opener(..., BlockedFileHandler, BlockedFTPHandler)` must be used comprehensively anytime external network calls are performed by built-in Python standard libraries.
+## 2026-09-08 - SSRF in strategy_monitor.py SheetsWriter
+**Vulnerability:** `urllib.request.urlopen` lacked SSRF mitigations for operator-supplied Sheets API URLs in `trading-strategies/strategy_monitor.py`, potentially enabling local file inclusion or internal network requests.
+**Learning:** Checking the `scheme` and `netloc` components of a URL via `urlparse` is insufficient to prevent SSRF if the URL resolves to an internal or restricted IP address, or if DNS rebinding occurs. We must validate the resolved IP addresses against a denylist of private/local subnets.
+**Prevention:** Rely on the centralized `dca_net_utils.assert_safe_destination` utility to validate all operator-supplied URLs before making outbound requests, ensuring both scheme/host checks and IP-level verification are performed.
