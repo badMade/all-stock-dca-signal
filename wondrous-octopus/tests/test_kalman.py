@@ -35,13 +35,15 @@ import json
 import math
 from statistics import NormalDist
 
-import kalman
 import model_interface
 import numpy as np
 import pandas as pd
 import pytest
 from data import COMPONENTS
 from features import build_panel
+
+kalman = pytest.importorskip('kalman')
+volatility = pytest.importorskip('volatility')
 
 #: Phi^-1(0.9), derived from the standard library rather than copied from
 #: the module under test -- the band half-width constant is exactly the kind
