@@ -1401,20 +1401,36 @@ def _refresh_fills_from_broker(
     if not queries:
         return refreshed
 
-    def _fetch(query_tuple):
-        oid, tkr, row_status = query_tuple
+    if hasattr(broker, "get_order_fills"):
+        order_ids = [q[0] for q in queries]
         try:
-            return oid, tkr, row_status, broker.get_order_fill(oid)
-        except Exception:  # noqa: BLE001 - a fill re-query must never crash reporting
-            logger.exception("fill refresh failed for %s", oid)
-            return oid, tkr, row_status, None
+            fills_map = broker.get_order_fills(order_ids)
+        except Exception:  # noqa: BLE001
+            logger.exception("batch fill refresh failed")
+            fills_map = {}
 
-    if getattr(broker, "supports_concurrent_fill_lookup", False):
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            # Use map to preserve the order of elements from queries
-            results = list(executor.map(_fetch, queries))
+        results = []
+        for oid, tkr, row_status in queries:
+            try:
+                # Need to handle potential KeyError if the batch result was partial or empty map was returned
+                results.append((oid, tkr, row_status, fills_map.get(oid)))
+            except Exception: # noqa: BLE001
+                results.append((oid, tkr, row_status, None))
     else:
-        results = [_fetch(query) for query in queries]
+        def _fetch(query_tuple):
+            oid, tkr, row_status = query_tuple
+            try:
+                return oid, tkr, row_status, broker.get_order_fill(oid)
+            except Exception:  # noqa: BLE001 - a fill re-query must never crash reporting
+                logger.exception("fill refresh failed for %s", oid)
+                return oid, tkr, row_status, None
+
+        if getattr(broker, "supports_concurrent_fill_lookup", False):
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                # Use map to preserve the order of elements from queries
+                results = list(executor.map(_fetch, queries))
+        else:
+            results = [_fetch(query) for query in queries]
 
     for order_id, ticker, row_status, fill in results:
         if fill is not None and fill.quantity_filled > 0 and fill.avg_fill_price > 0:

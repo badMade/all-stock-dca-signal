@@ -1425,6 +1425,8 @@ _NON_ACCOUNT_LITERALS = frozenset(
         "5151032",
         # Google support-article id inside a documentation URL.
         "185833",
+        # VS Code's stock launch.json help-link id in .vscode/launch.json.
+        "830387",
         # Fictional SEC EDGAR accession-number/CIK fixture pieces in
         # ticker-advisor/signals.py's _sec_filing_document_url() docstring
         # example and ticker-advisor/tests/test_signals.py's fetch_sec_filings

@@ -3776,10 +3776,14 @@ class BrokerAdapter(Protocol):
         return an order id. Quantity-based counterpart to :meth:`place_market_buy`.
         """
         ...
-
     def get_order_fill(self, order_id: str) -> Optional[OrderFill]:
         """Return fill details for a placed order, or None if not yet filled."""
         ...
+
+    def get_order_fills(self, order_ids: list[str]) -> dict[str, Optional[OrderFill]]:
+        """Return fill details for multiple orders at once."""
+        ...
+
 
     @property
     def supports_concurrent_fill_lookup(self) -> bool:
@@ -3925,6 +3929,9 @@ class DryRunBroker:
 
     def get_order_fill(self, order_id: str) -> Optional[OrderFill]:
         return self._fills.get(order_id)
+
+    def get_order_fills(self, order_ids: list[str]) -> dict[str, Optional[OrderFill]]:
+        return {order_id: self.get_order_fill(order_id) for order_id in order_ids}
 
     def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
         return []
@@ -4393,6 +4400,9 @@ class AlpacaBroker:
             logger.exception("order-fill lookup failed for %s; recording as unfilled", order_id)
             return None
 
+    def get_order_fills(self, order_ids: list[str]) -> dict[str, Optional[OrderFill]]:
+        return {order_id: self.get_order_fill(order_id) for order_id in order_ids}
+
     def _resolve_alpaca_order_fill(self, order_id: str) -> Optional[OrderFill]:
         """Resolve ``order_id`` to a fill, following any ``replaced_by`` chain.
 
@@ -4551,6 +4561,9 @@ class AlpacaBroker:
 
     def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
         return []
+
+    def get_order_fills(self, order_ids: list[str]) -> dict[str, Optional[OrderFill]]:
+        return {order_id: self.get_order_fill(order_id) for order_id in order_ids}
 
 
 def account_pinning_failure(

@@ -111,3 +111,9 @@
 ## 2026-09-09 - Avoid raw json.loads read_bytes when it breaks concurrency models
 **Learning:** The Python standard library `json` module does not have a C-level fast path for bytes. Instead, it internally calls `.decode()` to convert the bytes back into a string before parsing. Therefore, replacing `json.loads(path.read_text())` with `json.loads(path.read_bytes())` provides zero actual performance benefit and breaks pessimistic concurrency locks if the raw string values are directly used in cross-process checks.
 **Action:** Do not blindly replace `read_text()` with `read_bytes()` for standard library `json.loads()` when the resulting string or bytes is required for further operations without manually `.decode()`ing, as it can cause regressions or concurrency failures.
+## 2024-06-25 - [Batch query methods]
+**Learning:**
+I learned that replacing N sequential network lookups with 1 batch lookup and falling back to asynchronous execution when a batch isn't supported avoids the N+1 API lookup problem.
+
+**Action:**
+Added `get_order_fills` to `BrokerAdapter` protocol and Robinhood live adapter, and modified `run_dca.py` to use `broker.get_order_fills` if available, and fallback to `ThreadPoolExecutor` async loop, or fallback to sequential loop otherwise.

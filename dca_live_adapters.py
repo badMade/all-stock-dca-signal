@@ -7901,6 +7901,9 @@ class RobinhoodBroker:
             )
         return None
 
+    def get_order_fills(self, order_ids: list[str]) -> dict[str, Optional[OrderFill]]:
+        return {order_id: self.get_order_fill(order_id) for order_id in order_ids}
+
 
 # -- module helpers --------------------------------------------------------------
 

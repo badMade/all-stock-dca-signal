@@ -36,8 +36,7 @@ import pytest
 from data import COMPONENTS
 from features import build_panel
 
-kalman = pytest.importorskip('kalman')
-volatility = pytest.importorskip('volatility')
+volatility = pytest.importorskip("volatility", reason="optional volatility component is not present in this checkout")
 
 
 def _simulate_garch(*, omega: float, alpha: float, beta: float, n: int, seed: int) -> np.ndarray:
