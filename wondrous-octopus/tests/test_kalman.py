@@ -38,13 +38,12 @@ from statistics import NormalDist
 import pytest
 
 pytest.importorskip('kalman')
-import kalman
-import model_interface
-import numpy as np
-import pandas as pd
-import pytest
-from data import COMPONENTS
-from features import build_panel
+import kalman  # noqa: E402
+import model_interface  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+from data import COMPONENTS  # noqa: E402
+from features import build_panel  # noqa: E402
 
 #: Phi^-1(0.9), derived from the standard library rather than copied from
 #: the module under test -- the band half-width constant is exactly the kind
