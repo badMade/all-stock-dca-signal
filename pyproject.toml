@@ -319,4 +319,14 @@ extraPaths = [
 ]
 typeCheckingMode = "basic"
 reportGeneralTypeIssues = false
+executionEnvironments = [
+    { root = "wondrous-octopus", extraPaths = ["wondrous-octopus", "."] },
+    { root = "ml-forecaster", extraPaths = ["ml-forecaster", "."] },
+    { root = "ticker-advisor", extraPaths = ["ticker-advisor", "."] },
+    { root = "production-safe-agent-loop", extraPaths = ["production-safe-agent-loop", "."] },
+    { root = "dca-sizing-signals", extraPaths = ["dca-sizing-signals", "."] },
+    { root = ".", extraPaths = ["tests", "scripts"] },
+]
+
+
 

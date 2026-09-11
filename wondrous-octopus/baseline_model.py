@@ -51,7 +51,8 @@ from model_interface import (
     write_metadata,
 )
 
-FEATURE_NAMES: Any = _features.FEATURE_NAMES
+_features_module: Any = _features
+FEATURE_NAMES: Any = _features_module.FEATURE_NAMES
 
 #: Feature-column indices used to express "tomorrow = today" in target space:
 #: ln(O_t / C_t) = ret_open - ret_close, etc. (both returns share the
