@@ -1451,12 +1451,15 @@ def _live_circuit_breaker_overrides(config_dir_path, mode) -> dict:
     # `None` for TWO different situations -- no `budgets.json` at all, and a
     # readable one that deliberately omits the optional
     # `circuit_breakers.max_orders_per_day` -- and an unconditional fallback
-    # capped the second at the shipped 8. That contradicts
+    # capped the second at the shipped default. That contradicts
     # `dca_config.load_strategy_config`, which leaves the SAME present file
     # uncapped, so one live path enforced an order-count ceiling the
     # deployment never configured while another did not, and the 10:30
-    # executor skipped valid candidates after eight attempts (Codex review,
-    # PR #786: "Keep an omitted morning order cap uncapped").
+    # executor skipped valid candidates once it hit that default (Codex
+    # review, PR #786: "Keep an omitted morning order cap uncapped"). The
+    # default itself (`DEFAULT_MAX_ORDERS_PER_DAY`) was 8 when this was
+    # written; see config/budgets.json's own `max_orders_per_day_note` for
+    # why it changed.
     #
     # This is round 50's own lesson, applied to `dca_config` in that round
     # and not to the loader I was fixing IN it: the fallback belongs to an
@@ -1502,12 +1505,15 @@ def resolved_count_breakers(config_dir_path: Path) -> dict:
     # `load_max_orders_per_day` returns `None` for TWO different situations --
     # no `budgets.json` at all, and a readable one that deliberately omits the
     # optional `circuit_breakers.max_orders_per_day` -- and an unconditional
-    # fallback capped the second at the shipped 8. That contradicts
+    # fallback capped the second at the shipped default. That contradicts
     # `dca_config.load_strategy_config`, which leaves the SAME present file
     # uncapped, so one live path enforced an order-count ceiling the
     # deployment never configured while another did not, and the 10:30
-    # executor skipped valid candidates after eight attempts (Codex review,
-    # PR #786: "Keep an omitted morning order cap uncapped").
+    # executor skipped valid candidates once it hit that default (Codex
+    # review, PR #786: "Keep an omitted morning order cap uncapped"). The
+    # default itself (`DEFAULT_MAX_ORDERS_PER_DAY`) was 8 when this was
+    # written; see config/budgets.json's own `max_orders_per_day_note` for
+    # why it changed.
     budgets_absent = not (config_dir_path / "budgets.json").exists()
     max_orders = load_max_orders_per_day(config_dir_path)
     if max_orders is not None:
