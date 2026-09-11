@@ -1,11 +1,15 @@
-"""Kalman forecaster used by the wondrous-octopus walk-forward harness."""
+"""A lightweight Kalman forecaster for the wondrous-octopus test suite.
+
+This module keeps the same small, no-pickle surface as the other forecasters:
+plain JSON metadata plus numeric ``weights.npz`` arrays, causal fit/update
+semantics, and one independent filter per (ticker, OHLC component).
+"""
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from pathlib import Path
 from statistics import NormalDist
+from pathlib import Path
 from typing import Any, Callable, Sequence
 
 import numpy as np
@@ -23,13 +27,16 @@ from model_interface import (
 )
 
 DEFAULT_Q_RATIO = 0.01
+_MIN_VARIANCE = 1e-8
 _Z90 = NormalDist().inv_cdf(0.9)
-_COMPONENT_TO_INDEX = {name: idx for idx, name in enumerate(COMPONENTS)}
 
 
 def steady_state_variance(q: float, r: float) -> float:
-    if q < 0.0 or r <= 0.0:
-        raise ValueError("q must be >= 0 and r must be > 0")
+    """The positive scalar Riccati root for process variance ``q`` and noise ``r``."""
+    if q < 0.0:
+        raise ValueError("q must be non-negative")
+    if r <= 0.0:
+        raise ValueError("r must be strictly positive")
     return float((q + math.sqrt(q * q + 4.0 * q * r)) / 2.0)
 
 
@@ -38,143 +45,186 @@ def steady_state_gain(q: float, r: float) -> float:
     return float(variance / (variance + r))
 
 
-@dataclass
 class ScalarFilter:
-    r: float
-    q_ratio: float = DEFAULT_Q_RATIO
-    trend: bool = False
-    prior_variance: float = 1.0
-    prior_level: float = 0.0
-    prior_slope: float = 0.0
-
-    def __post_init__(self) -> None:
-        if self.r <= 0.0:
-            raise ValueError("r must be > 0")
-        if self.q_ratio < 0.0:
-            raise ValueError("q_ratio must be >= 0")
-        if self.prior_variance <= 0.0:
-            raise ValueError("prior_variance must be > 0")
-        self.level = float(self.prior_level)
-        self.slope = float(self.prior_slope)
-        self.observations = 0
-        if self.trend:
-            self.covariance = np.eye(2, dtype=np.float64) * float(self.prior_variance)
-        else:
-            self.covariance = np.array([[float(self.prior_variance)]], dtype=np.float64)
-
-    def project(self) -> tuple[float, float]:
-        predicted_state, predicted_covariance = self._predict()
-        mean = float(predicted_state[0])
-        variance = float(predicted_covariance[0, 0] + self.r)
-        return mean, variance
-
-    def absorb(self, observation: float) -> float:
-        predicted_state, predicted_covariance = self._predict()
-        innovation = float(observation - predicted_state[0])
-        innovation_variance = float(predicted_covariance[0, 0] + self.r)
-        kalman_gain = predicted_covariance[:, 0] / innovation_variance
-        updated_state = predicted_state + kalman_gain * innovation
-        updated_covariance = predicted_covariance - np.outer(kalman_gain, predicted_covariance[0, :])
-        self.level = float(updated_state[0])
-        self.slope = float(updated_state[1]) if self.trend else 0.0
-        self.covariance = updated_covariance
-        self.observations += 1
-        return innovation
-
-    def _predict(self) -> tuple[np.ndarray, np.ndarray]:
-        process = self.q_ratio * self.r
-        if self.trend:
-            state = np.array([self.level, self.slope], dtype=np.float64)
-            transition = np.array([[1.0, 1.0], [0.0, 1.0]], dtype=np.float64)
-            noise = process * np.array([[0.25, 0.5], [0.5, 1.0]], dtype=np.float64)
-            predicted_state = transition @ state
-            predicted_covariance = transition @ self.covariance @ transition.T + noise
-            return predicted_state, predicted_covariance
-        predicted_covariance = self.covariance + np.array([[process]], dtype=np.float64)
-        return np.array([self.level], dtype=np.float64), predicted_covariance
-
-
-class KalmanForecaster:
-    name = "kalman"
+    """A scalar local-level or local-trend Kalman filter."""
 
     def __init__(
         self,
         *,
-        trend: bool = False,
+        r: float,
         q_ratio: float = DEFAULT_Q_RATIO,
-        default_r: float = 1e-4,
-        prior_variance: float = 1.0,
+        trend: bool = False,
+        prior_variance: float | None = None,
+        prior_level: float = 0.0,
+        prior_slope: float = 0.0,
+        observations: int = 0,
+        covariance: np.ndarray | None = None,
     ) -> None:
-        self.trend = trend
-        self.q_ratio = q_ratio
-        self.default_r = default_r
-        self.prior_variance = prior_variance
+        if r <= 0.0:
+            raise ValueError("r must be strictly positive")
+        if q_ratio < 0.0:
+            raise ValueError("q_ratio must be non-negative")
+        self.r = float(r)
+        self.q_ratio = float(q_ratio)
+        self.trend = bool(trend)
+        self.observations = int(observations)
+        variance = float(prior_variance if prior_variance is not None else r)
+        if variance <= 0.0:
+            raise ValueError("prior_variance must be strictly positive")
+        if self.trend:
+            self._state = np.array([prior_level, prior_slope], dtype=np.float64)
+            self.covariance = (
+                np.array(covariance, dtype=np.float64, copy=True)
+                if covariance is not None
+                else np.diag([variance, variance]).astype(np.float64)
+            )
+        else:
+            self._state = np.array([prior_level], dtype=np.float64)
+            self.covariance = (
+                np.array(covariance, dtype=np.float64, copy=True)
+                if covariance is not None
+                else np.array([[variance]], dtype=np.float64)
+            )
+
+    @property
+    def level(self) -> float:
+        return float(self._state[0])
+
+    @property
+    def slope(self) -> float:
+        return float(self._state[1]) if self.trend else 0.0
+
+    def _predict(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        if self.trend:
+            transition = np.array([[1.0, 1.0], [0.0, 1.0]], dtype=np.float64)
+            process = self.q_ratio * self.r * np.eye(2, dtype=np.float64)
+            state = transition @ self._state
+            covariance = transition @ self.covariance @ transition.T + process
+            observation = np.array([1.0, 0.0], dtype=np.float64)
+        else:
+            transition = np.array([[1.0]], dtype=np.float64)
+            process = np.array([[self.q_ratio * self.r]], dtype=np.float64)
+            state = transition @ self._state
+            covariance = transition @ self.covariance @ transition.T + process
+            observation = np.array([1.0], dtype=np.float64)
+        variance = float(observation @ covariance @ observation + self.r)
+        return state, covariance, observation, variance
+
+    def project(self) -> tuple[float, float]:
+        state, _, observation, variance = self._predict()
+        return float(observation @ state), variance
+
+    def absorb(self, value: float) -> float:
+        state, covariance, observation, variance = self._predict()
+        mean = float(observation @ state)
+        innovation = float(value) - mean
+        gain = (covariance @ observation) / variance
+        self._state = state + gain * innovation
+        identity = np.eye(covariance.shape[0], dtype=np.float64)
+        update = identity - np.outer(gain, observation)
+        self.covariance = update @ covariance
+        self.observations += 1
+        return innovation
+
+    def to_state(self) -> dict[str, Any]:
+        return {
+            "r": self.r,
+            "q_ratio": self.q_ratio,
+            "trend": self.trend,
+            "observations": self.observations,
+            "state": self._state.tolist(),
+            "covariance": self.covariance.tolist(),
+        }
+
+    @classmethod
+    def from_state(cls, state: dict[str, Any]) -> "ScalarFilter":
+        values = [float(value) for value in state["state"]]
+        return cls(
+            r=float(state["r"]),
+            q_ratio=float(state["q_ratio"]),
+            trend=bool(state["trend"]),
+            prior_variance=1.0,
+            prior_level=values[0],
+            prior_slope=values[1] if len(values) > 1 else 0.0,
+            observations=int(state["observations"]),
+            covariance=np.array(state["covariance"], dtype=np.float64),
+        )
+
+
+class KalmanForecaster:
+    """One independent Kalman filter per ticker and OHLC component."""
+
+    name = "kalman"
+
+    def __init__(self, *, q_ratio: float = DEFAULT_Q_RATIO, trend: bool = False) -> None:
+        self.q_ratio = float(q_ratio)
+        self.trend = bool(trend)
         self._filters: dict[str, dict[str, ScalarFilter]] = {}
-        self._pooled_prior = {component: (0.0, default_r) for component in COMPONENTS}
+        self._pooled_level = {component: 0.0 for component in COMPONENTS}
+        self._pooled_r = {component: 0.01 for component in COMPONENTS}
         self.last_repairs = RepairCounts()
 
     def fit(self, panel: TrainingPanel, *, seed: int, step_index: int = 0) -> dict[str, Any]:
         del seed, step_index
         self._filters = {}
-        self._pooled_prior = {component: (0.0, self.default_r) for component in COMPONENTS}
-        absorbed = 0
-        pooled_values: dict[str, list[float]] = {component: [] for component in COMPONENTS}
-        cutoff_raw = panel.normalization.get("window_end")
-        cutoff = np.datetime64(str(cutoff_raw)) if cutoff_raw else None
+        cutoff = panel.normalization.get("window_end")
+        cutoff_value = np.datetime64(str(cutoff)) if cutoff else None
+        pooled: dict[str, list[float]] = {component: [] for component in COMPONENTS}
+        trainable: dict[str, np.ndarray] = {}
         for ticker, series in panel.series.items():
             usable = np.isfinite(series.features).all(axis=1) & np.isfinite(series.targets).all(axis=1)
-            if cutoff is not None:
-                usable &= series.label_end_dates <= cutoff
+            if cutoff_value is not None:
+                usable &= series.label_end_dates <= cutoff_value
             rows = np.flatnonzero(usable)
+            trainable[ticker] = rows
             if not len(rows):
                 continue
-            ticker_filters: dict[str, ScalarFilter] = {}
-            for component in COMPONENTS:
-                values = series.targets[rows, _COMPONENT_TO_INDEX[component]].astype(np.float64)
-                pooled_values[component].extend(float(value) for value in values)
-                variance = float(np.mean(values**2)) if len(values) else self.default_r
-                variance = max(self.default_r, variance)
+            for index, component in enumerate(COMPONENTS):
+                pooled[component].extend(float(value) for value in series.targets[rows, index])
+        for component in COMPONENTS:
+            values = np.asarray(pooled[component], dtype=np.float64)
+            if values.size:
+                self._pooled_level[component] = float(np.mean(values))
+                self._pooled_r[component] = max(float(np.var(values)), _MIN_VARIANCE)
+            else:
+                self._pooled_level[component] = 0.0
+                self._pooled_r[component] = 0.01
+        absorbed = 0
+        for ticker, series in panel.series.items():
+            rows = trainable[ticker]
+            if not len(rows):
+                continue
+            filters = {}
+            for index, component in enumerate(COMPONENTS):
+                own = np.asarray(series.targets[rows, index], dtype=np.float64)
+                r = max(float(np.var(own)), self._pooled_r[component], _MIN_VARIANCE)
                 filt = ScalarFilter(
-                    r=variance,
+                    r=r,
                     q_ratio=self.q_ratio,
                     trend=self.trend,
-                    prior_variance=self.prior_variance,
+                    prior_variance=r,
+                    prior_level=self._pooled_level[component],
                 )
-                for value in values:
+                for value in own:
                     filt.absorb(float(value))
-                ticker_filters[component] = filt
-            self._filters[ticker] = ticker_filters
+                filters[component] = filt
+            self._filters[ticker] = filters
             absorbed += int(len(rows))
-        for component in COMPONENTS:
-            values = pooled_values[component]
-            if values:
-                arr = np.asarray(values, dtype=np.float64)
-                mean = float(np.mean(arr))
-                variance = float(np.mean((arr - mean) ** 2))
-                self._pooled_prior[component] = (mean, max(self.default_r, variance))
         return {"absorbed": absorbed}
 
     def predict(self, requests: Sequence[ForecastRequest]) -> list[OHLCForecast]:
         repairs = RepairCounts()
-        forecasts: list[OHLCForecast] = []
+        forecasts = []
         for request in requests:
+            filters = self._filters.get(request.ticker)
             point: dict[str, float] = {}
             quantiles: dict[str, dict[str, float]] = {}
             for component in COMPONENTS:
-                filt = self._filters.get(request.ticker, {}).get(component)
-                if filt is None:
-                    mean, variance = self._pooled_prior[component]
-                    filt = ScalarFilter(
-                        r=variance,
-                        q_ratio=self.q_ratio,
-                        trend=self.trend,
-                        prior_variance=self.prior_variance,
-                        prior_level=mean,
-                    )
+                filt = filters[component] if filters is not None else self._pooled_filter(component)
                 mean, variance = filt.project()
-                half = _Z90 * math.sqrt(variance)
+                half_width = _Z90 * math.sqrt(max(variance, _MIN_VARIANCE))
                 point[component] = mean
-                quantiles[component] = {"p10": mean - half, "p50": mean, "p90": mean + half}
+                quantiles[component] = {"p10": mean - half_width, "p50": mean, "p90": mean + half_width}
             forecasts.append(
                 finalize_forecast(
                     ticker=request.ticker,
@@ -193,20 +243,12 @@ class KalmanForecaster:
     def update(self, revealed: Sequence[RevealedDay], *, step_index: int) -> dict[str, Any]:
         del step_index
         for day in revealed:
-            ticker_filters = self._filters.setdefault(day.ticker, {})
+            filters = self._filters.setdefault(
+                day.ticker,
+                {component: self._pooled_filter(component) for component in COMPONENTS},
+            )
             for component in COMPONENTS:
-                filt = ticker_filters.get(component)
-                if filt is None:
-                    mean, variance = self._pooled_prior[component]
-                    filt = ScalarFilter(
-                        r=variance,
-                        q_ratio=self.q_ratio,
-                        trend=self.trend,
-                        prior_variance=self.prior_variance,
-                        prior_level=mean,
-                    )
-                    ticker_filters[component] = filt
-                filt.absorb(float(day.actual[component]))
+                filters[component].absorb(day.actual[component])
         return {"absorbed": len(revealed)}
 
     def reconstruction_diagnostic(self, requests: Sequence[ForecastRequest]) -> None:
@@ -214,45 +256,27 @@ class KalmanForecaster:
         return None
 
     def save(self, directory: Path) -> None:
-        filter_rows: list[tuple[str, str]] = []
-        levels: list[float] = []
-        slopes: list[float] = []
-        observations: list[int] = []
-        rs: list[float] = []
-        covariance: list[np.ndarray] = []
-        for ticker in sorted(self._filters):
-            for component in COMPONENTS:
-                filt = self._filters[ticker][component]
-                filter_rows.append((ticker, component))
-                levels.append(filt.level)
-                slopes.append(filt.slope)
-                observations.append(filt.observations)
-                rs.append(filt.r)
-                cov = np.zeros((2, 2), dtype=np.float64)
-                if filt.trend:
-                    cov[:, :] = filt.covariance
-                else:
-                    cov[0, 0] = float(filt.covariance[0, 0])
-                covariance.append(cov)
-        arrays = {
-            "levels": np.asarray(levels, dtype=np.float64),
-            "slopes": np.asarray(slopes, dtype=np.float64),
-            "observations": np.asarray(observations, dtype=np.int64),
-            "r": np.asarray(rs, dtype=np.float64),
-            "covariance": np.asarray(covariance, dtype=np.float64),
-            "pooled_mean": np.asarray([self._pooled_prior[component][0] for component in COMPONENTS], dtype=np.float64),
-            "pooled_r": np.asarray([self._pooled_prior[component][1] for component in COMPONENTS], dtype=np.float64),
-        }
+        arrays: dict[str, np.ndarray] = {}
+        for ticker, filters in self._filters.items():
+            arrays[f"state_{ticker}"] = np.stack(
+                [filters[component]._state for component in COMPONENTS]
+            ).astype(np.float64)
+            arrays[f"r_{ticker}"] = np.array([filters[component].r for component in COMPONENTS], dtype=np.float64)
+            arrays[f"cov_{ticker}"] = np.stack(
+                [filters[component].covariance for component in COMPONENTS]
+            ).astype(np.float64)
+            arrays[f"obs_{ticker}"] = np.array(
+                [filters[component].observations for component in COMPONENTS], dtype=np.int64
+            )
         save_arrays(directory, arrays)
         write_metadata(
             directory,
             {
                 "name": self.name,
-                "trend": self.trend,
                 "q_ratio": self.q_ratio,
-                "default_r": self.default_r,
-                "prior_variance": self.prior_variance,
-                "filters": [{"ticker": ticker, "component": component} for ticker, component in filter_rows],
+                "trend": self.trend,
+                "pooled_level": {component: float(self._pooled_level[component]) for component in COMPONENTS},
+                "pooled_r": {component: float(self._pooled_r[component]) for component in COMPONENTS},
             },
         )
 
@@ -267,35 +291,39 @@ class KalmanForecaster:
     ) -> "KalmanForecaster":
         del panel_provider, strict, device
         metadata = read_metadata(directory)
+        model = cls(q_ratio=float(metadata["q_ratio"]), trend=bool(metadata["trend"]))
+        model._pooled_level = {component: float(value) for component, value in metadata["pooled_level"].items()}
+        model._pooled_r = {component: float(value) for component, value in metadata["pooled_r"].items()}
         arrays = load_arrays(directory)
-        model = cls(
-            trend=bool(metadata.get("trend", False)),
-            q_ratio=float(metadata.get("q_ratio", DEFAULT_Q_RATIO)),
-            default_r=float(metadata.get("default_r", 1e-4)),
-            prior_variance=float(metadata.get("prior_variance", 1.0)),
-        )
-        pooled_mean = arrays.get("pooled_mean")
-        pooled_r = arrays.get("pooled_r")
-        if pooled_mean is not None and pooled_r is not None and len(pooled_mean) == len(COMPONENTS):
-            model._pooled_prior = {
-                component: (float(pooled_mean[idx]), float(pooled_r[idx])) for idx, component in enumerate(COMPONENTS)
-            }
-        for idx, row in enumerate(metadata.get("filters", [])):
-            ticker = str(row["ticker"])
-            component = str(row["component"])
-            filt = ScalarFilter(
-                r=float(arrays["r"][idx]),
-                q_ratio=model.q_ratio,
-                trend=model.trend,
-                prior_variance=model.prior_variance,
-                prior_level=float(arrays["levels"][idx]),
-                prior_slope=float(arrays["slopes"][idx]),
-            )
-            filt.observations = int(arrays["observations"][idx])
-            saved_covariance = arrays["covariance"][idx]
-            if model.trend:
-                filt.covariance = saved_covariance.astype(np.float64, copy=True)
-            else:
-                filt.covariance = np.array([[float(saved_covariance[0, 0])]], dtype=np.float64)
-            model._filters.setdefault(ticker, {})[component] = filt
+        for name, state in arrays.items():
+            if not name.startswith("state_"):
+                continue
+            ticker = name[len("state_") :]
+            measurement = arrays[f"r_{ticker}"]
+            covariance = arrays[f"cov_{ticker}"]
+            observations = arrays[f"obs_{ticker}"]
+            filters = {}
+            for index, component in enumerate(COMPONENTS):
+                values = np.asarray(state[index], dtype=np.float64)
+                filters[component] = ScalarFilter(
+                    r=float(measurement[index]),
+                    q_ratio=model.q_ratio,
+                    trend=model.trend,
+                    prior_variance=1.0,
+                    prior_level=float(values[0]),
+                    prior_slope=float(values[1]) if model.trend else 0.0,
+                    observations=int(observations[index]),
+                    covariance=np.asarray(covariance[index], dtype=np.float64),
+                )
+            model._filters[ticker] = filters
         return model
+
+    def _pooled_filter(self, component: str) -> ScalarFilter:
+        r = self._pooled_r[component]
+        return ScalarFilter(
+            r=r,
+            q_ratio=self.q_ratio,
+            trend=self.trend,
+            prior_variance=r,
+            prior_level=self._pooled_level[component],
+        )

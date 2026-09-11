@@ -14,7 +14,6 @@ import sqlite3
 import uuid
 
 import pytest
-
 from spec_writer import SpecResult, SpecWriter
 
 Q1 = "What does this do?"
