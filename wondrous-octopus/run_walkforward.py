@@ -340,7 +340,7 @@ def _build_panel(
             max_tickers=knobs["max_tickers"],
             as_of=pd.Timestamp(_parse_now(args.now)) if args.now else None,
             end=pd.Timestamp(config.end) if config.end else None,
-            initial_train_end=pd.Timestamp(config.initial_train_end),
+            initial_train_end=pd.Timestamp(config.initial_train_end) if config.initial_train_end else None,
             min_history=config.min_history,
         )
     except ValueError as error:
