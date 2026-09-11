@@ -119,6 +119,7 @@ __all__ = [
     "gate_trading_window",
     "gate_sole_executor",
     "budget_snapshot",
+    "count_compatible_executor_attempts",
     "plan_orders",
     "build_runner_broker",
     "execute_plan",
@@ -1069,6 +1070,71 @@ def gate_sole_executor(orders, slot: SlotSpec, day: date) -> list[BrokerOrder]:
     """
     start, end = slot.window_bounds_utc(day)
     return [o for o in orders if start <= _require_aware(o.created_at).astimezone(timezone.utc) <= end]
+
+
+def count_compatible_executor_attempts(
+    orders,
+    trading_day: date,
+    *,
+    self_client_ref_prefix: str,
+    compatible_agent_value: str = "agentic",
+) -> int:
+    """Count ``trading_day``'s buy ATTEMPTS attributable to the recognized
+    compatible executor (Perplexity's standing backup task -- see
+    ``claude/PERPLEXITY-CLAUDE-COORDINATION.md``), for a caller to fold into
+    a SEPARATE engine's own local ``max_orders_per_day`` seeding.
+
+    Built for the one live path whose own order-count seeding is NOT already
+    account-wide: near_close_dca.py's 3:30 PM canonical stream seeds
+    ``day_order_count`` purely from this repo's own local run artifacts (see
+    ``_seed_prior_allocations``), with no visibility into orders a second,
+    cooperating executor places directly against the same broker account.
+    The other six live-mirror prompts already route through ``plan_orders()``
+    fed by freshly fetched broker history, which -- per ``budget_snapshot()``'s
+    own "count every order regardless of ``placed_agent``" policy -- is
+    already account-wide provided that fetch is complete and fresh; this
+    function is additive to a caller's own local seeding, never a
+    replacement for it, and must never be used to seed a count for THIS
+    engine's own attempts (those are already counted locally).
+
+    An order counts when ALL of:
+
+    * ``order.is_buy_attempt`` -- mirrors ``budget_snapshot()``'s own
+      "REJECTED and CANCELLED attempts still consume one" contract.
+      Over-counting is the safe direction for a count ceiling.
+    * its ``created_at`` falls on ``trading_day`` in America/New_York, the
+      same ``_require_aware(...).astimezone(ET).date() == trading_day``
+      convention ``budget_snapshot()`` already uses.
+    * ``order.placed_agent`` equals ``compatible_agent_value`` EXACTLY
+      (fail-safe: ``None``, ``"user"``, ``"recurring"``, ``"drip"``, or any
+      other value is never compatible -- mirrors Gate 4's own
+      classification).
+    * its ``client_order_id`` does NOT start with ``self_client_ref_prefix``.
+      Required, not optional, and given no default: a bare
+      ``placed_agent == "agentic"`` is not sufficient to attribute an order
+      to the compatible executor specifically, because THIS engine's own
+      live orders carry the identical generic tag
+      (``claude/PERPLEXITY-CLAUDE-COORDINATION.md`` Sec 4: "A bare
+      placed_agent of 'agentic' alone is NOT sufficient"). Without excluding
+      this engine's own client-reference prefix
+      (``dca-runner-<slot>-<trading_day>-<TICKER>``, per that same doc),
+      this function would double-count THIS engine's own attempts --
+      already reflected in its caller's local seeding -- as the compatible
+      executor's.
+    """
+    count = 0
+    for order in orders:
+        if not order.is_buy_attempt:
+            continue
+        if order.placed_agent != compatible_agent_value:
+            continue
+        client_ref = order.client_order_id or ""
+        if client_ref.startswith(self_client_ref_prefix):
+            continue
+        if _require_aware(order.created_at).astimezone(ET).date() != trading_day:
+            continue
+        count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------

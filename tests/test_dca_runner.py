@@ -12277,6 +12277,140 @@ def test_the_dollar_caps_still_bind_independently_of_the_count_cap(monkeypatch):
     assert dca_runner.SKIPPED_DAILY_CAP in {reason for _, reason in plan.skipped}
 
 
+# ---------------------------------------------------------------------------
+# PROPOSED, NOT YET IMPLEMENTED: dca_runner.count_compatible_executor_attempts
+#
+# TDD spec only -- dca_runner.py does not define this function yet. These
+# tests are expected to fail RED (AttributeError) until it is written; this
+# is the "write the test, present it, wait for approval" step, not the
+# implementation. Presented 2026-09-11 alongside the max_orders_per_day cap
+# fix, for the still-open gap that fix's own config note flags: the 3:30 PM
+# canonical path (near_close_dca.py's _seed_prior_allocations) seeds
+# day_order_count purely from this repo's own local run artifacts, with no
+# visibility into orders the standing Perplexity backup executor places
+# directly against the same broker account (see
+# claude/PERPLEXITY-CLAUDE-COORDINATION.md). The other six live-mirror
+# prompts already route through dca_runner.plan_orders() fed by freshly
+# fetched broker history, which -- per budget_snapshot()'s own "count every
+# order regardless of placed_agent" policy -- is already account-wide
+# PROVIDED the fetch is complete and fresh; this function is meant for the
+# one path that is not: a caller (run_dca.py, or whatever fetches broker
+# data ahead of the 3:30 PM run) would call this once per run and fold the
+# result into near_close_dca's own local seed as an additional attempt
+# count, additive to (never a replacement for) that local seeding.
+#
+# Spec:
+#   count_compatible_executor_attempts(
+#       orders: Sequence[BrokerOrder],
+#       trading_day: date,
+#       *,
+#       self_client_ref_prefix: str,          # required, no default
+#       compatible_agent_value: str = "agentic",
+#   ) -> int
+#
+# An order counts toward the result when ALL of:
+#   - order.is_buy_attempt (mirrors budget_snapshot()'s own "REJECTED and
+#     CANCELLED attempts still consume one" contract -- over-counting is the
+#     safe direction for a count ceiling)
+#   - its created_at falls on trading_day in America/New_York (same
+#     _require_aware(...).astimezone(ET).date() == trading_day convention
+#     budget_snapshot() already uses)
+#   - order.placed_agent == compatible_agent_value EXACTLY (fail-safe:
+#     anything else -- None, "user", "recurring", "drip", or any other
+#     value -- is never compatible, mirroring Gate 4's own classification)
+#   - its client_order_id does NOT start with self_client_ref_prefix.
+#     REQUIRED, not optional: claude/PERPLEXITY-CLAUDE-COORDINATION.md's own
+#     Sec 4 documents that a bare placed_agent of "agentic" is not
+#     sufficient to attribute an order to Perplexity specifically, because
+#     Claude's own live orders carry the identical "agentic" tag -- without
+#     excluding this engine's own client-reference prefix
+#     (dca-runner-<slot>-<trading_day>-<TICKER>, per that same doc), this
+#     function would double-count THIS engine's own attempts (already
+#     reflected in its local seeding) as if they belonged to the compatible
+#     executor.
+# ---------------------------------------------------------------------------
+
+
+_SELF_PREFIX = "dca-runner-1530-2026-09-11-"
+
+
+def _compat_order(symbol, *, hour=10, minute=0, day=date(2026, 9, 11),
+                   placed_agent="agentic", side="buy", state="filled",
+                   client_order_id=None):
+    return dca_runner.BrokerOrder(
+        symbol=symbol,
+        side=side,
+        dollar_amount=2.0,
+        created_at=datetime(day.year, day.month, day.day, hour, minute, tzinfo=dca_runner.ET).astimezone(
+            timezone.utc
+        ),
+        placed_agent=placed_agent,
+        state=state,
+        client_order_id=client_order_id,
+    )
+
+
+def test_compatible_executor_attempts_counts_agentic_orders_not_self():
+    """A Perplexity-attributable order (agentic, no self-prefix) counts; this
+    engine's own order (agentic, self-prefix) does not -- it is already
+    reflected in this engine's own local seeding."""
+    orders = [
+        _compat_order("AAPL", client_order_id="some-other-client-ref-AAPL"),
+        _compat_order("MSFT", client_order_id=f"{_SELF_PREFIX}MSFT"),
+    ]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 1
+
+
+def test_compatible_executor_attempts_excludes_manual_and_unrecognized_agents():
+    """Fail-safe: only an exact compatible_agent_value match counts. Manual,
+    recurring, drip, and unrecognized/None provenance are never compatible,
+    mirroring Gate 4's own classification."""
+    orders = [
+        _compat_order("AAPL", placed_agent="user", client_order_id="ref-1"),
+        _compat_order("MSFT", placed_agent="recurring", client_order_id="ref-2"),
+        _compat_order("GOOG", placed_agent=None, client_order_id="ref-3"),
+        _compat_order("TSLA", placed_agent="some_other_bot", client_order_id="ref-4"),
+    ]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 0
+
+
+def test_compatible_executor_attempts_excludes_other_days():
+    """Matching on the same _require_aware(...).astimezone(ET).date() ==
+    trading_day convention budget_snapshot() already uses."""
+    orders = [
+        _compat_order("AAPL", day=date(2026, 9, 10), client_order_id="ref-1"),
+        _compat_order("MSFT", day=date(2026, 9, 12), client_order_id="ref-2"),
+    ]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 0
+
+
+def test_compatible_executor_attempts_counts_cancelled_and_rejected():
+    """is_buy_attempt semantics: a cancelled or rejected compatible attempt
+    still consumed one of the shared daily slots -- over-counting is the
+    safe direction for a count ceiling (config/budgets.json's own
+    max_orders_per_day_note)."""
+    orders = [
+        _compat_order("AAPL", state="cancelled", client_order_id="ref-1"),
+        _compat_order("MSFT", state="rejected", client_order_id="ref-2"),
+    ]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 2
+
+
+def test_compatible_executor_attempts_excludes_sells():
+    orders = [_compat_order("AAPL", side="sell", client_order_id="ref-1")]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 0
+
+
 def test_budget_snapshot_counts_todays_buy_attempts_including_dead_ones():
     """A cancelled or rejected buy still consumed one of the day's orders."""
     day = date(2026, 8, 4)
