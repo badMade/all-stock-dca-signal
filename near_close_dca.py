@@ -31860,6 +31860,1167 @@ def _persist_cross_account_unresolved_evidence(
     )
 
 
+
+def _synthesize_afternoon_failure_artifacts(
+    artifacts_dir: str | Path,
+    now: datetime,
+    exc: BaseException,
+    broker: Optional[Any],
+    broker_name: Optional[str],
+    classification_overrides: Optional[Dict[str, Any]],
+    correlation_id: Optional[str],
+    dry_run: Optional[bool],
+    placed: Dict[str, Any],
+    scheduled: bool,
+    state_path: Path,
+    trading_day: str,
+    submitted: int,
+    unresolved_placement_halt: bool,
+    _placement_failure_class: str,
+    _evaluated: Dict[str, Any],
+    _evaluated_decisions: List[Dict[str, Any]],
+    _evaluated_budget: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], bytes]:
+    """Synthesize a completely new run_state.json for an afternoon failure."""
+    try:  # pragma: no cover - import shim for flat sys.path
+        from scripts.run_classification import (
+            build_manual_classification,
+            build_scheduled_classification,
+        )
+    except ImportError:  # pragma: no cover
+        from run_classification import (  # type: ignore
+            build_manual_classification,
+            build_scheduled_classification,
+        )
+    classification = dict(
+        build_scheduled_classification(trading_day, **(classification_overrides or {}))
+        if scheduled
+        else build_manual_classification(
+            now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
+    )
+    classification["valid_scheduled_evidence"] = False
+    _failure_candidate_rows = [
+        _failure_candidate_row(ticker, outcome) for ticker, outcome in placed.items()
+    ]
+    _failure_signal_rows = (
+        _build_signal_rows(_evaluated_decisions, placed) if _evaluated_decisions else []
+    )
+    # The same backfill the normal artifact path applies right after it
+    # builds its rows -- without it a failure report reads each provider's
+    # raw suggested amount as money that went missing.
+    _backfill_reconciled_signal_amounts(_failure_signal_rows, _failure_candidate_rows)
+    run_state: Dict[str, Any] = {
+        # Unlike the deliberately runless calendar-gate stub, a failure state
+        # IS a run: it carries the scheduled run id the schema requires and
+        # build_run_summary reads (Codex review). Derived from the (possibly
+        # slot-overridden) classification rather than always the afternoon
+        # scheduled_run_id, so a 10:30/12:30 run's failure artifact carries
+        # its own run_id instead of the afternoon one (Codex review: "Forward
+        # slot identity into exception artifacts").
+        "run_id": classification["run_id"],
+        "trading_day": trading_day,
+        # Without this, a same-mode retry's own
+        # _orders_csv_same_run identity check always fails
+        # against this failure state (it reads "dry_run" as
+        # absent, never "unproven"), and its whole reinjection
+        # block never runs (Codex review: "Stamp dry_run onto
+        # afternoon failure artifacts so a same-mode retry is
+        # recognized").
+        "dry_run": dry_run,
+        "generated_at": now.astimezone(EASTERN).isoformat(),
+        "broker": broker_name or config_broker_name(),
+        # The SAME non-reversible keyed fingerprint build_run_artifacts
+        # stamps on a successful write, computed the same way (same
+        # key_dir convention: beside, not inside, the artifacts tree).
+        # This writer runs precisely when a placement halted ambiguous
+        # -- i.e. exactly the artifact _reconcile_prior_unproven_
+        # fractional_placements later reads back to verify account
+        # provenance -- so leaving it null here (the previous state)
+        # defeated that check for every FIRST-halt artifact: the one
+        # this whole feature exists to protect (Codex review, PR #911
+        # round 4: "Stamp fingerprints on ambiguous failure artifacts").
+        "account_number": _account_number_for_unresolved_evidence(
+            broker, Path(artifacts_dir).parent
+        ),
+        "status": "failed",
+        "run_classification": classification,
+        "run_classification_outcome": (
+            RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
+            if submitted
+            else _placement_failure_class
+            if unresolved_placement_halt
+            else RUN_CLASSIFICATION_STARTUP_FAILED
+        ),
+        "order_submit_status": (
+            ORDER_SUBMIT_STATUS_SUBMITTED
+            if submitted
+            else ORDER_SUBMIT_STATUS_ERROR
+        ),
+        "error_class": (
+            ERROR_CLASS_POST_SUBMISSION_FAILURE
+            if submitted
+            else _placement_failure_class
+            if unresolved_placement_halt
+            else ERROR_CLASS_STARTUP_FAILURE
+        ),
+        "error_detail": _redacted_exception_detail(exc),
+        "is_trading_failure": True,
+        "scheduled_evidence_denied": True,
+        "orders_submitted_count": submitted,
+        # DERIVED from the published outcomes, not hard-coded zero. An
+        # unresolved placement's own candidate necessarily PASSED the
+        # spread gate before it could reach place_market_buy, so a run
+        # summary reporting "nothing reached the gate" contradicts its own
+        # candidate rows and hides how far evaluation got (Codex review,
+        # PR #859: "Preserve spread-gate counts in unresolved artifacts").
+        # Same two aggregates _apply_no_order_classification computes from
+        # the same per-row verdicts.
+        "candidates_reaching_spread_gate": sum(
+            1
+            for oc in placed.values()
+            if oc.get("spread_status")
+            and oc.get("spread_status") != SPREAD_STATUS_NOT_EVALUATED
+        ),
+        "candidates_blocked_missing_spread": sum(
+            1 for oc in placed.values() if oc.get("blocked_by") == BLOCKED_BY_SPREAD_GATE
+        ),
+        "budget": _evaluated_budget
+        or {
+            "budget_tier": "normal",
+            "daily_cap_usd": 0,
+            "weekly_cap_usd": 0,
+        },
+        "counts": {
+            "evaluated": len(_evaluated_decisions),
+            "buy_candidates": len(placed),
+            "submitted": submitted,
+        },
+        "signal_rows": _failure_signal_rows,
+        "buy_candidates": _failure_candidate_rows,
+        "broker_outcomes": placed,
+    }
+    if unresolved_placement_halt:
+        # The count an operator reads to know how many orders to chase.
+        # `classify_no_order_run` does not carry it either -- the
+        # zero-order path stamps it separately, from the same row
+        # statuses -- so the halt path stamps it here for the same reason.
+        run_state["orders_failed_count"] = _failed_placement_count(placed)
+        # AND THE FLAG THAT SUMMONS THE OPERATOR. The raise unwinds past
+        # the batch's `errors_count_inc` accounting, and this writer
+        # synthesized no usage_proxy at all, so the one artifact left by a
+        # run that may have a LIVE order at the broker carried no
+        # `manual_recovery_required` anywhere -- the exact signal the
+        # normal path derives from the placement error count, missing from
+        # the exact case that needs it most (Codex review, PR #859: "Mark
+        # unresolved halts as requiring manual recovery"). Built through
+        # build_usage_proxy rather than hand-rolled so every
+        # USAGE_PROXY_FIELDS key is present and a consumer reading this
+        # block does not have to special-case the failure artifact.
+        run_state["usage_proxy"] = build_usage_proxy(
+            decisions=_evaluated_decisions,
+            signal_rows=_failure_signal_rows,
+            buy_candidates=_failure_candidate_rows,
+            candidate_outcomes=placed,
+            # Left unset (build_usage_proxy defaults to len(buy_candidates))
+            # reported reviews that never happened: _process_buy_candidate
+            # only ever calls review_market_buy when `not ctx.scheduled`,
+            # so a SCHEDULED halt -- the common case, and the only one an
+            # unresolved fractional placement can occur on -- attempted
+            # zero reviews, not one per reconstructed candidate row (most
+            # of which are the unattempted tail after the halt, never
+            # reviewed at all). A manual run's actual count is reconstructed
+            # from the published outcomes: order_reviews_attempted_inc is
+            # bumped immediately before every review_market_buy call, and
+            # every candidate that reached one is published either with
+            # `reviewed_order` set (review passed) or a "review blocked:"
+            # skip_reason (review ran and refused) -- the two outcomes a
+            # completed review call can leave behind (Codex review,
+            # PR #859: "Report only broker reviews that actually ran").
+            order_reviews_attempted=(
+                0
+                if scheduled
+                else sum(
+                    1
+                    for oc in placed.values()
+                    if isinstance(oc, dict)
+                    and (
+                        oc.get("reviewed_order") is not None
+                        or (
+                            isinstance(oc.get("skip_reason"), str)
+                            and oc["skip_reason"].startswith("review blocked:")
+                        )
+                    )
+                )
+            ),
+            # At least one: the unresolved placement itself. An outcome
+            # count of zero would silently clear the flag on the one path
+            # that must always raise it. PLUS whatever this same run
+            # already accumulated BEFORE the halt -- signal-evaluation
+            # provider errors, pre-roll whole-share reconciliation
+            # errors -- published into _IN_FLIGHT_RUN_EVALUATION the
+            # moment evaluation completed. Starting over from just the
+            # placement error discarded that count entirely: one
+            # provider error followed by one unresolved placement
+            # reported as a single error instead of two, understating
+            # usage/cost and incident telemetry (Codex review, PR #859
+            # round 28: "Preserve evaluation errors in halt telemetry").
+            errors_count=(
+                _coerce_nonnegative_int(_evaluated.get("errors_count"))
+                + max(1, run_state["orders_failed_count"])
+            ),
+        )
+    if placed or unresolved_placement_halt:
+        # `placed` alone misses the STARTUP reconciliation halt: when
+        # `_reconcile_prior_unproven_fractional_placements` raises
+        # `UnresolvedPlacementError` because the PRIOR artifact's own
+        # `broker_outcomes` was malformed (a list/null) alongside its
+        # own `placement_evidence_incomplete=True`, that raise happens
+        # BEFORE any candidate in this run is ever processed -- `placed`
+        # is still empty, so the flag was never set on the freshly
+        # synthesized state that overwrites the malformed one. The next
+        # invocation's own reconciliation pass then reads a clean, valid,
+        # EMPTY `broker_outcomes` with no flag set at all, sees nothing
+        # to fail closed on, and may place a fresh order over a
+        # placement neither confirmed nor denied (Codex review, PR #911
+        # round 39: "Preserve malformed unresolved storage after
+        # raising"). `unresolved_placement_halt` is exactly this run's
+        # own signal that placement evidence is incomplete regardless of
+        # whether any candidate got as far as publishing an outcome.
+        run_state["placement_evidence_incomplete"] = True
+    if correlation_id is not None:
+        run_state["correlation_id"] = correlation_id
+    _synthesized_run_state_text = _serialize_run_state(run_state)
+    atomic_write_text(state_path, _synthesized_run_state_text)
+    _written_run_state_bytes = _synthesized_run_state_text.encode("utf-8")
+    return run_state, _written_run_state_bytes
+
+
+
+def _merge_afternoon_failure_artifacts(
+    artifacts_dir: str | Path,
+    now: datetime,
+    exc: BaseException,
+    broker: Optional[Any],
+    dry_run: Optional[bool],
+    execution_records: Optional[Sequence[OrderExecutionRecord]],
+    placed: Dict[str, Any],
+    state_path: Path,
+    submitted: int,
+    unresolved_placement_halt: bool,
+    _placement_failure_class: str,
+    _evaluated: Dict[str, Any],
+    _evaluated_decisions: List[Dict[str, Any]],
+    _evaluated_budget: Optional[Dict[str, Any]],
+    _loaded: Dict[str, Any],
+) -> Tuple[Dict[str, Any], bool, bool, bool, Optional[bytes]]:
+    """Merge an afternoon failure into an existing, usable run_state.json."""
+    _rewrite_merged_signals_csv = False
+    state_was_mutated = False
+    added = False
+    _written_run_state_bytes = None
+    _written_run_state_bytes = None
+    state_was_mutated = False
+    added = False
+    logger.warning(
+        "afternoon run failed after run_state.json was written; preserving it "
+        "and completing any missing companion artifacts"
+    )
+    assert _loaded is not None
+    run_state = _loaded
+    # A preserved state written before this function stamped
+    # "dry_run" (or by a hand-built test fixture) has no such
+    # field at all; leaving it absent means the NEXT same-mode
+    # retry's own _orders_csv_same_run identity check reads
+    # "dry_run" as unproven rather than matching, rejects this
+    # state as foreign, and drops its deployment/execution
+    # evidence right back out (Codex review: "Stamp dry_run
+    # onto afternoon failure artifacts so a same-mode retry is
+    # recognized"). Backfilled unconditionally when absent --
+    # not merely when it disagrees -- since the run_state.json
+    # write below always runs regardless of whether any row was
+    # newly merged, so there is no separate "nothing to
+    # persist" case to guard for THAT file. `run_summary.json`
+    # is a SEPARATE file, though, regenerated only when
+    # `state_was_mutated` -- keyed on ROWS changing, not on
+    # this field alone -- so a no-add retry that only just
+    # backfilled dry_run left the on-disk summary permanently
+    # disagreeing with the state it mirrors (`build_run_summary`
+    # copies "dry_run" too), undetected because the validator
+    # only compares their classification blocks (Codex review:
+    # "Regenerate the summary after backfilling dry-run mode").
+    # Tracked here so it can widen `state_was_mutated` below.
+    # Not just an ABSENT field: `existing_is_usable`'s own dry-run
+    # comparison treats any non-boolean value (e.g. a malformed
+    # "dry_run": "false" string) the same as unproven/absent via
+    # its own `isinstance(..., bool)` gate, so a same-slot state
+    # carrying that malformed shape passes through to this merge
+    # branch too -- but checking `is None` here left it
+    # unchanged, still a string, after this write. The NEXT live
+    # retry's own `_prior_execution_mode_matches` check (unlike
+    # this lenient one) compares it literally against `False`,
+    # `"false" != False` is True, and it rejects the very state
+    # this backfill was supposed to make recognizable (Codex
+    # review: "Normalize malformed dry-run fields before
+    # preserving state"). Backfilled whenever the field is not
+    # ALREADY a real bool -- covering both absent and malformed
+    # -- while still requiring a real non-None `dry_run`
+    # argument, so an internal caller that never learned the
+    # mode does not "backfill" None over a malformed value
+    # either (no actual improvement, so it must not falsely
+    # widen state_was_mutated below).
+    _dry_run_backfill_changed = (
+        not isinstance(run_state.get("dry_run"), bool) and dry_run is not None
+    )
+    if _dry_run_backfill_changed:
+        run_state["dry_run"] = dry_run
+    # The preserved file can belong to an EARLIER invocation at this slot, so
+    # fold in whatever THIS one placed. Discarding it would hide an accepted
+    # order from the same-day guards and let a later run buy it again (Codex
+    # review). The ROWS are folded in only when there is something to add;
+    # the failure stamp below always runs.
+    merged = dict(run_state)
+    # Backfilled, not stamped unconditionally: this preserved artifact
+    # may predate account fingerprinting (round 4 stamped it only on the
+    # fresh-synthesis branch above), and `_reconcile_prior_unproven_
+    # fractional_placements` treats a missing/null persisted fingerprint
+    # as "nothing to verify" and skips its account check entirely. A
+    # retry that merges new unresolved evidence into such an artifact
+    # left it permanently unfingerprinted -- unlike the fresh-synthesis
+    # branch's own artifact, which is always stamped from its very first
+    # write -- so a later invocation under a MISWIRED broker for a
+    # different account could satisfy this same deterministic reference
+    # and have that account's history trusted (Codex review, PR #911
+    # round 8: "Stamp fingerprints when merging ambiguous failure
+    # evidence"). Never overwrites an existing non-empty fingerprint:
+    # this run's own broker is not necessarily the one that first wrote
+    # this artifact, and a fingerprint already present is that first
+    # writer's authoritative identity, not this retry's.
+    existing_account_fingerprint = merged.get("account_number")
+    current_account_fingerprint = (
+        _account_number_for_unresolved_evidence(broker, Path(artifacts_dir).parent)
+        if broker is not None
+        else None
+    )
+    # Gated on `placed` OR `execution_records`, not `placed` alone:
+    # `run_once` can fail with a nonempty `execution_records` (a
+    # recovery row appended before the raise) while `placed` -- the
+    # in-flight candidate outcomes -- is still empty, an execution-
+    # only path independent of `_IN_FLIGHT_CANDIDATE_OUTCOMES`. Gating
+    # on `placed` alone let that shape slip past this mismatch check
+    # entirely, so the `orders.csv` merge/backfill block further down
+    # (guarded by `not _cross_account_mismatch`) went on to merge
+    # account B's execution into account A's preserved log and
+    # backfill A's state from it (Codex review, PR #1164/#1169:
+    # "Include execution-only failures in the account mismatch gate").
+    #
+    # `placed` itself is filtered to outcomes that reflect an ACTUAL
+    # broker call -- an `order_id`, `broker_call_attempted`/
+    # `broker_placement_attempted`, or `placement_outcome_unproven` --
+    # not just truthy-dict-valued. A batch containing only skipped/
+    # internally-blocked candidate rows (no broker call ever made) was
+    # still `placed`-truthy, so a later exception in this same run
+    # created a `cross_account_unresolved_placements.json` sidecar for
+    # evidence that was never actually ambiguous, and the NEXT run for
+    # this account treats any matching sidecar entry as unresolved and
+    # raises in `_reconcile_prior_unproven_fractional_placements`,
+    # blocking all placements until manual cleanup (Codex review, PR
+    # #1168: "Do not sidecar outcomes that made no broker call").
+    # `execution_records` DOES need an equivalent filter: a dry run
+    # that logs a simulated order still calls `_log_execution` from
+    # both the normal and whole-share buy paths (see "Log successful
+    # whole-share dry-run executions"), appending a record to
+    # `execution_records` even though no broker call ever happened.
+    # Every dry-run order id -- `DryRunBroker.place_market_buy`/
+    # `place_whole_share_buy`'s own `"DRY-RUN-<ticker>-..."`/
+    # `"DRY-RUN-WHOLESHARE-<ticker>-..."`, and the synthetic
+    # `"DRY-RUN-SIM-..."`/`"DRY-RUN-SIM-WHOLESHARE-..."` ids used when
+    # `ctx.broker` is not a `DryRunBroker` -- starts with the same
+    # `"DRY-RUN-"` prefix, so treating a nonempty `execution_records`
+    # as real broker evidence created a cross-account unresolved
+    # sidecar for a call that was never sent, and the next REAL run
+    # for this account sees the matching sidecar and refuses all
+    # placements until manual cleanup (Codex review, PR #1169:
+    # "Exclude dry-run execution rows from mismatch evidence").
+    _execution_records_with_broker_call = [
+        record
+        for record in (execution_records or [])
+        if not (isinstance(record.order_id, str) and record.order_id.startswith("DRY-RUN-"))
+    ]
+    #
+    # Excludes `status == "dry_run"` outcomes unconditionally, even
+    # though every scheduled dry run stamps a synthetic
+    # `DRY-RUN-SIM-*` `order_id` (see the whole-share/fractional
+    # placement paths a few thousand lines below) -- that id predicate
+    # alone still classified a dry run as an actual broker call, so a
+    # dry run landing in a directory containing another account's
+    # preserved artifact wrote a cross-account sidecar for a call that
+    # was never sent, blocking every later real placement for this
+    # account until manual cleanup (Codex review, PR #1168: "Exclude
+    # dry-run IDs from cross-account evidence").
+    _placed_with_broker_call = {
+        ticker: outcome
+        for ticker, outcome in placed.items()
+        if outcome.get("status") != "dry_run"
+        and (
+            outcome.get("order_id")
+            or outcome.get("broker_call_attempted")
+            or outcome.get("broker_placement_attempted")
+            or outcome.get("placement_outcome_unproven")
+            # Several whole-share failure branches record a real,
+            # broker-facing call solely via
+            # `broker_placement_failed=True`, with none of the
+            # four markers above set (see
+            # `_outcome_records_a_broker_attempt`'s own docstring
+            # for the two shapes that do this). This LATER
+            # recomputation of `_placed_with_broker_call` -- used
+            # when a same-slot `run_state.json` has a malformed
+            # non-string account fingerprint, so execution
+            # reaches here instead of the earlier ownership
+            # shortcut -- had the identical gap the earlier
+            # occurrence of this same filter was already fixed
+            # for: an outcome shaped that way was silently
+            # dropped here too, so a possibly-unresolved
+            # broker-facing failure never reached the sidecar
+            # (Codex review, PR #1251: "Preserve broker-failed
+            # outcomes in the later mismatch filter").
+            #
+            # The explicit `broker_placement_failed` marker,
+            # NOT the broader
+            # `_outcome_records_a_broker_attempt` predicate,
+            # for the identical reason the earlier occurrence
+            # of this same filter was narrowed (Codex review,
+            # PR #1251: "Limit sidecar eligibility to actual
+            # broker-call markers"): that helper also matches
+            # bare `status == "failed"`, which the last-resort
+            # "candidate processing raised" handler publishes
+            # for an exception that struck before any broker
+            # call was made at all. And EXCLUDING a
+            # confirmation-required hold -- keyed off the
+            # explicit `confirmation_required_no_submission`
+            # marker, not a `status` string, for the same
+            # reason the earlier occurrence was widened past a
+            # string comparison too (Codex review, PR #1251:
+            # "Exclude confirmation holds from unresolved
+            # sidecars" / "Exclude failed confirmation
+            # restorations from sidecars"): a status check
+            # alone missed the sibling outcome where the
+            # pending-credit restoration also failed (spelled
+            # "blocked", not "not_submitted_confirmation_
+            # required"), which still carries no submission
+            # either.
+            or (
+                outcome.get("broker_placement_failed")
+                and not outcome.get("confirmation_required_no_submission")
+            )
+        )
+    }
+    # Fingerprint disagreement alone, with NO evidence-presence gating --
+    # this is the fact that the preserved artifact belongs to a
+    # different account than this run's own, independent of whether
+    # this run happened to produce any placement/execution evidence
+    # worth sidecaring. Every downstream guard that exists to avoid
+    # mutating/merging into the OTHER account's artifact (skipping the
+    # run_state stamp, the orders.csv merge, the pointer/contract
+    # validation) must key off THIS, not off evidence eligibility: a
+    # run whose own placements were all filtered out of
+    # `_placed_with_broker_call`/`_execution_records_with_broker_call`
+    # (e.g. every outcome was a dry run, or nothing was placed at all)
+    # still must not have its `placed`/`execution_records` merged into
+    # a differently-fingerprinted preserved artifact just because there
+    # was nothing worth sidecaring (Codex review, PR #1168: "Separate
+    # account mismatch from sidecar eligibility").
+    # A present, NON-STRING preserved fingerprint (an int or
+    # list from damaged or externally-produced storage) used to
+    # fall through this check entirely -- the `isinstance(...,
+    # str)` guard made the whole `and` chain False, reporting
+    # no mismatch, and the falsey-only backfill a few lines
+    # below (`if not merged.get("account_number")`) also leaves
+    # an already-truthy malformed value untouched. This run's
+    # own possibly-live outcomes and execution rows were then
+    # merged into an artifact whose account ownership could
+    # never actually be verified -- exactly the risk the
+    # string-mismatch check exists to catch -- and the NEXT
+    # reconciliation, which explicitly rejects a malformed
+    # binding, then blocked recovery over evidence merged in
+    # under false pretenses (Codex review, PR #1169: "Reject
+    # malformed preserved account fingerprints"). Treated as an
+    # unconditional mismatch -- fail closed -- so it is routed
+    # through the SAME cross-account sidecar/no-merge path a
+    # genuine cross-account mismatch already uses, rather than
+    # silently binding this run's evidence to an unverifiable
+    # fingerprint.
+    #
+    # Deliberately NOT gated on truthiness (no ``bool(...)``
+    # guard): a FALSEY non-string binding -- ``account_number=
+    # 0``, ``[]``, ``{}`` -- is exactly as malformed as a
+    # truthy one; only ``None`` (never persisted at all) is the
+    # genuine "nothing recorded" shape a legacy artifact can
+    # carry. Gating on truthiness let a falsey malformed value
+    # report no mismatch AND then be silently overwritten by
+    # the falsey-only backfill below, binding this run's
+    # evidence to the same unverifiable fingerprint the
+    # truthy case was already fixed to reject (Codex review,
+    # PR #1169: "Reject falsey malformed preserved account
+    # fingerprints").
+    _existing_account_fingerprint_malformed = (
+        existing_account_fingerprint is not None and not isinstance(existing_account_fingerprint, str)
+    )
+    _account_fingerprint_mismatch = _existing_account_fingerprint_malformed or (
+        isinstance(existing_account_fingerprint, str)
+        and existing_account_fingerprint
+        and current_account_fingerprint is not None
+        and existing_account_fingerprint != current_account_fingerprint
+    )
+    # Sidecar-persist eligibility additionally requires real evidence:
+    # persisting a `cross_account_unresolved_placements.json` sidecar
+    # for a run that made no broker call at all would create a
+    # phantom "unresolved" entry the NEXT run for this account then
+    # refuses to place around, for evidence that was never actually
+    # ambiguous (see the "Do not sidecar outcomes that made no broker
+    # call" / "Exclude dry-run execution rows from mismatch evidence"
+    # comments above this block).
+    _cross_account_mismatch = _account_fingerprint_mismatch and (
+        _placed_with_broker_call or _execution_records_with_broker_call
+    )
+    if _cross_account_mismatch:
+        # One artifact-level fingerprint cannot safely bind unresolved
+        # outcomes from two accounts -- that reasoning is unchanged.
+        # What changed is what happens to THIS run's own evidence: it
+        # used to be discarded outright by raising here, aborting the
+        # whole write before this call's outcomes were persisted
+        # anywhere at all. Persisted separately instead (never merged
+        # into `merged`, which keeps the ORIGINAL fingerprint's own
+        # evidence intact below), so a possibly-live order this
+        # invocation just placed is not lost to reconciliation and cap
+        # accounting on either account (Codex review, PR #859/#911
+        # round 45: "Persist cross-account ambiguous placements
+        # separately").
+        # Filtered the SAME way the mismatch decision above already is
+        # -- `_placed_with_broker_call`/`_execution_records_with_
+        # broker_call`, not the raw `placed`/`execution_records` --
+        # not just when it is the ONLY evidence gating eligibility. A
+        # mismatched run mixing real broker-backed evidence with
+        # dry-run/skipped rows still persisted the unfiltered
+        # collections, recording synthetic DRY-RUN-* executions and
+        # no-broker-call outcomes as though they were unresolved
+        # brokerage evidence in the account-scoped audit sidecar
+        # (Codex review, PR #1169: "Persist only broker-backed rows in
+        # mismatch sidecars").
+        #
+        # `current_account_fingerprint` can itself be `None` (the
+        # lookup failed) or the SENTINEL string (the lookup
+        # explicitly could not verify an account, e.g. a missing
+        # HMAC key) while `_account_fingerprint_mismatch` is still
+        # True -- the malformed-existing-fingerprint branch above
+        # trips unconditionally, independent of whether THIS run's
+        # own fingerprint could be computed at all. Binding a
+        # cross-account sidecar entry to the sentinel would make
+        # the reconciliation scan treat it as unresolved evidence
+        # for EVERY current account whose own fingerprint happens
+        # to be unavailable too, persistently blocking unrelated
+        # accounts' placements until manual cleanup -- the same
+        # risk the earlier same-identity-different-account branch
+        # above was already fixed to exclude (Codex review: "Keep
+        # unavailable fingerprints out of account sidecars"). This
+        # later path reused the SAME fingerprint-mismatch/sidecar-
+        # eligibility computation but not that exclusion (Codex
+        # review, PR #1251: "Keep unavailable fingerprints out of
+        # the later sidecar path"); routed through the same
+        # generic undurable-evidence sidecar the earlier branch
+        # falls back to in this case, rather than the cross-
+        # account one, which requires a real fingerprint string on
+        # both sides.
+        if (
+            current_account_fingerprint is not None
+            and current_account_fingerprint != _ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL
+        ):
+            _persist_cross_account_unresolved_evidence(
+                artifacts_dir,
+                now,
+                current_account_fingerprint,
+                existing_account_fingerprint,
+                _placed_with_broker_call,
+                _execution_records_with_broker_call,
+            )
+        else:
+            _persist_undurable_evidence_sidecar(
+                artifacts_dir,
+                "unwritten_failure_artifact_placement",
+                now,
+                {
+                    # Redacted via `_redact_broker_outcomes_for_
+                    # sidecar` rather than persisted verbatim: an
+                    # outcome's own diagnostic fields (`skip_
+                    # reason` in particular) can interpolate a raw
+                    # connector exception carrying the same
+                    # account-number/credential shapes this
+                    # module's per-field redaction already
+                    # strips for the ordinary cross-account
+                    # sidecar (Codex review, PR #1251: "Redact
+                    # outcomes before writing the unbound
+                    # sidecar").
+                    "broker_outcomes": _redact_broker_outcomes_for_sidecar(
+                        _placed_with_broker_call
+                    ),
+                    # `execution_records`, not just `placed`: this
+                    # branch's own `current_account_fingerprint`
+                    # is unavailable, the SAME reason the
+                    # `_persist_cross_account_unresolved_evidence`
+                    # call above it carries execution records
+                    # alongside outcomes -- omitting them here
+                    # silently dropped a known fill the instant
+                    # the current-account fingerprint could not
+                    # be verified (Codex review, PR #1251:
+                    # "Preserve execution records in the unbound
+                    # fallback").
+                    "execution_records": [
+                        {
+                            field_name: _iso(getattr(record, field_name))
+                            for field_name in _CSV_FIELDS
+                        }
+                        for record in _execution_records_with_broker_call
+                    ],
+                    "account_fingerprint": None,
+                },
+            )
+    # Everything in this block mutates and persists the PRIMARY
+    # run_state.json artifact -- skipped entirely on a cross-account
+    # mismatch, since that artifact's own outcomes/counts/fingerprint
+    # belong to a DIFFERENT account than the one that just raised.
+    # This run's own evidence is already durably recorded in the
+    # cross-account sidecar above; rewriting the primary artifact's
+    # status/classification/companion reports (signals.csv,
+    # run_summary.json) with THIS run's exception would corrupt
+    # account-scoped audit data -- the artifact would retain the
+    # OTHER account's fingerprint, outcomes, and counts while
+    # claiming THIS account's failure (Codex review, PR #1164/#1165:
+    # "Avoid stamping the prior account's artifact after sidecar
+    # fallback"). Leaving `run_state`/`merged` as the untouched
+    # preserved artifact and skipping the write keeps the primary
+    # artifact exactly as it was for its own account.
+    if _account_fingerprint_mismatch:
+        logger.warning(
+            "skipping run_state.json stamp/write at %s: preserved artifact belongs to "
+            "a different account than this run's own evidence%s",
+            state_path,
+            ", already persisted separately" if _cross_account_mismatch else "",
+        )
+        run_state = merged
+        # Nothing was merged into the (untouched) primary artifact, and
+        # its status is unchanged -- matching the values every reader
+        # below this skipped block expects when nothing happened here.
+        added = False
+    else:
+        if not merged.get("account_number") and broker is not None:
+            # Sentinel-on-failure, not a bare None: see
+            # _account_number_for_unresolved_evidence's own docstring
+            # (Codex review, PR #911 round 10: "Fail closed when evidence
+            # fingerprinting fails").
+            merged["account_number"] = current_account_fingerprint
+        added = False
+        # Counts a failed outcome dropped by the order-id dedup below (line
+        # ~18755's `continue`) -- a row this run genuinely halted on, sharing
+        # an order_id with an EARLIER preserved outcome, is discarded as "the
+        # same order restated" rather than added to broker_outcomes.
+        # _failed_placement_count only ever scans broker_outcomes, so without
+        # this a same-slot unresolved retry that happened to collide with an
+        # already-submitted order_id vanished from orders_failed_count
+        # entirely -- reporting zero orders to chase on a run stamped failed
+        # and flagged manual_recovery_required (Codex review, PR #859:
+        # "Count deduplicated unresolved orders as failed").
+        deduped_failed_count = 0
+        if placed and not _account_fingerprint_mismatch:
+            existing_outcomes = dict(merged.get("broker_outcomes") or {})
+            rows = [
+                row
+                for row in (merged.get("buy_candidates") or [])
+                if isinstance(row, dict)
+            ]
+            # Keyed by ORDER ID, not ticker. A retry can place a distinct
+            # incremental order for a ticker the earlier attempt already bought,
+            # and a ticker-keyed setdefault would silently keep only the old one
+            # while the count and the CSV are derived from these outcomes (Codex
+            # review).
+            # Both sources are read defensively against a MALFORMED nested
+            # order_id, not just a missing one: a readable artifact whose
+            # order_id happens to be a truthy non-scalar (e.g. `["BAD"]`,
+            # from external or hand-edited damage) is unhashable, and an
+            # unguarded set comprehension over it raises `TypeError`
+            # before this run's own current, possibly-live outcome is
+            # ever merged in or `run_state.json` is rewritten -- the
+            # unresolved retry this whole branch exists to preserve is
+            # lost to an uncaught crash instead (Codex review, PR #859
+            # round 38: "Validate preserved order IDs before building the
+            # dedup set"). Scalar strings are the only shape a real order
+            # id ever takes elsewhere in this module; anything else is
+            # excluded from the dedup set the same way a missing id
+            # already is, rather than aborting the whole merge over it.
+            seen_orders = {
+                oc.get("order_id")
+                for oc in existing_outcomes.values()
+                if isinstance(oc, dict) and isinstance(oc.get("order_id"), str) and oc.get("order_id")
+            }
+            seen_orders.update(
+                row.get("order_id")
+                for row in rows
+                if isinstance(row.get("order_id"), str) and row.get("order_id")
+            )
+            for ticker, outcome in placed.items():
+                order_id = outcome.get("order_id")
+                # Validated the SAME way `seen_orders` itself was built
+                # just above: a truthy non-scalar current order_id (a
+                # list/mapping, from a malformed broker adapter) is
+                # unhashable, and an unguarded `order_id in seen_orders`
+                # raised `TypeError` here -- the surrounding `run_once`
+                # handler only logs that the failure-artifact write
+                # itself failed and re-raises the ORIGINAL error, so
+                # this run's own current, possibly-live outcome was
+                # never merged or persisted at all (Codex review, PR
+                # #1169: "Validate current order IDs before retry
+                # deduplication"). Treated as ID-less evidence instead,
+                # the same as a genuinely missing order_id, so it falls
+                # through to the ID-less handling just below rather
+                # than aborting the whole write.
+                if not isinstance(order_id, str):
+                    order_id = None
+                if order_id and order_id in seen_orders:
+                    if outcome.get("status") == "failed":
+                        deduped_failed_count += 1
+                    continue
+                if (
+                    not order_id
+                    and ticker in existing_outcomes
+                    and not outcome.get("placement_outcome_unproven")
+                    and not outcome.get("unresolved_placement_halted")
+                ):
+                    # An ID-less outcome for a ticker the artifact already
+                    # covers is ordinarily the same non-order restated, and
+                    # dropping it keeps the record clean. An UNPROVEN placement
+                    # is the one ID-less outcome that is never a restatement:
+                    # it reports a call that may have created a live order the
+                    # broker has not indexed yet. Skipping it left the artifact
+                    # showing only the earlier attempt's row, with no evidence
+                    # anywhere that a second, possibly-live order exists --
+                    # exactly what this halt is supposed to preserve (Codex
+                    # review, PR #859: "Preserve ID-less outcomes from
+                    # unresolved retries").
+                    #
+                    # A HALTED TAIL row is the other ID-less shape that is
+                    # never a restatement either: a candidate AFTER the
+                    # ticker this batch actually halted on, deliberately
+                    # marked unresolved_placement_halted=True because it
+                    # never got a chance to place at all -- a fundamentally
+                    # different kind of evidence than "the same order
+                    # restated". Dropping it left the merged artifact
+                    # showing only the PRIOR invocation's outcome for that
+                    # ticker, losing this run's own halt reason, and let a
+                    # later evaluation refresh leave auto_buy_signal enabled
+                    # instead of recognizing the deliberate skip (Codex
+                    # review, PR #859 round 35: "Preserve halted tail rows
+                    # during retry merges").
+                    continue
+                if order_id:
+                    seen_orders.add(order_id)
+                # A second order for the same ticker needs its own key so it is
+                # not lost to the collision this fixes. The real ticker is
+                # carried INSIDE the outcome, because submitted_order_rows()
+                # would otherwise write the synthetic key into the canonical
+                # order row as the symbol (Codex review).
+                key = (
+                    ticker
+                    if ticker not in existing_outcomes
+                    # An unproven retry has no order id to distinguish it, so
+                    # it is keyed by ATTEMPT instead -- `AAPL:unproven-2` --
+                    # rather than by `f"{ticker}:None"`, which would collide
+                    # with the next unproven retry for the same ticker and
+                    # lose it the same way the ticker key did.
+                    else f"{ticker}:{order_id}"
+                    if order_id
+                    else _unproven_retry_key(ticker, existing_outcomes)
+                )
+                if key != ticker:
+                    outcome = {**outcome, "ticker": ticker}
+                existing_outcomes[key] = outcome
+                rows.append(_failure_candidate_row(ticker, outcome))
+                added = True
+
+            # ROWS are merged only when there is something new to merge; the
+            # FAILURE STAMP below is not conditional on that. Gating both on
+            # `added` meant a retry whose every outcome deduped away -- the
+            # broker returning the same idempotent order id for a retried
+            # deterministic ref_id, say -- left the preserved state exactly as
+            # it was, classification included. When that preserved state
+            # recorded an earlier SUCCESS, the artifact went on advertising a
+            # successful run while this invocation had just halted for an
+            # order that needs reconciliation (Codex review, PR #859:
+            # "Preserve failure state for unresolved retries with known IDs").
+            # This writer only ever runs because this invocation raised, so
+            # that fact must reach the state whether or not any row is new.
+            if added:
+                merged["broker_outcomes"] = existing_outcomes
+                merged["buy_candidates"] = rows
+                # Read the SAME defensive way `seen_orders` above now is: a
+                # truthy but NON-SCALAR order_id (e.g. `["BAD"]`, from
+                # external or hand-edited damage) is unhashable, and the
+                # bare `or` here never engages for it (the list is already
+                # truthy), so it reached this set literal unguarded and
+                # raised `TypeError` -- after `existing_outcomes`/`rows`
+                # were already reassigned onto `merged` a few lines above,
+                # but before `run_state.json` was ever rewritten with them
+                # (Codex review, PR #859 round 38: "Validate preserved
+                # order IDs before building the dedup set"). Falls back to
+                # the same ticker-keyed synthetic id a missing order_id
+                # already uses.
+                # ONE representative row per distinct identity (order_id, or
+                # the same ticker-keyed synthetic fallback the set-union
+                # version of this used), summed via `_submitted_orders_in_row`
+                # rather than just counted as a flat `len(...)` of distinct
+                # identities: a preserved whole-share AGGREGATE row can carry
+                # `merged_submission_count=2`, standing for TWO physical
+                # broker orders behind one identity, while a
+                # `whole_share_settlement_adjustment` row stands for ZERO new
+                # orders despite having its own "submitted" status -- both
+                # already correctly weighted by `_submitted_orders_in_row`
+                # everywhere else this module recomputes this same figure
+                # (see the `_submitted_order_groups` loop a few hundred lines
+                # above). The flat count-of-distinct-identities this replaced
+                # treated every row as exactly one order regardless, so a
+                # retry merge left `orders_submitted_count`/`counts.submitted`
+                # UNDER-counting a preserved aggregate's true order count, or
+                # OVER-counting a settlement adjustment that added none
+                # (Codex review, PR #1164: "Preserve merged order multiplicity
+                # in retry counts").
+                # Includes "potentially_submitted": an ambiguous placement
+                # (OrderPlacementAmbiguousError) genuinely reserved this
+                # candidate too, and excluding it here dropped an ambiguous
+                # placement's count contribution right back to 0 whenever
+                # this merge branch runs -- the exact regression a readable
+                # existing run_state.json triggers (Codex review, PR #1300
+                # discussion_r3920765644: "Preserve ambiguous counts in
+                # failure-state merges").
+                _submitted_identity_rows: Dict[str, Dict[str, Any]] = {}
+                for _key, _oc in existing_outcomes.items():
+                    if isinstance(_oc, dict) and _oc.get("status") in (
+                        "submitted",
+                        "potentially_submitted",
+                    ):
+                        _identity = (
+                            _oc.get("order_id") if isinstance(_oc.get("order_id"), str) else None
+                        ) or f"ticker:{_key}"
+                        _submitted_identity_rows.setdefault(_identity, _oc)
+                for _row in rows:
+                    if _row.get("status") in ("submitted", "filled", "potentially_submitted"):
+                        _identity = (
+                            _row.get("order_id") if isinstance(_row.get("order_id"), str) else None
+                        ) or f"ticker:{_row.get('ticker')}"
+                        _submitted_identity_rows.setdefault(_identity, _row)
+                merged["orders_submitted_count"] = sum(
+                    _submitted_orders_in_row(_row) for _row in _submitted_identity_rows.values()
+                )
+                # A malformed preserved `counts` (a string or list, from
+                # damaged or externally produced storage) is truthy, so
+                # `or {}` never engages and `**value` raised BEFORE
+                # run_state.json could be rewritten -- abandoning the
+                # newly-added, possibly-live outcome this whole `added`
+                # branch exists to persist. The LATER `_merged_counts`
+                # conversion a few hundred lines down already guards this
+                # exact shape for the fully-deduplicated-retry evaluation
+                # refresh (Codex review, PR #859 round 31: "Parse
+                # preserved counts before refreshing retry state"); this
+                # merge runs FIRST and needed the identical guard (Codex
+                # review, PR #859 round 35: "Validate preserved counts
+                # before merging new outcomes").
+                _preserved_counts_for_merge = merged.get("counts")
+                merged["counts"] = {
+                    **(_preserved_counts_for_merge if isinstance(_preserved_counts_for_merge, dict) else {}),
+                    "submitted": merged["orders_submitted_count"],
+                    "buy_candidates": len(rows),
+                }
+                # RECOMPUTED from the MERGED outcomes (old rows plus this
+                # retry's own), never left at whatever the preserved state
+                # happened to carry. The preserved artifact's own
+                # candidates_reaching_spread_gate/candidates_blocked_missing_
+                # spread describe only the EARLIER attempt's rows; a
+                # newly-merged unresolved placement necessarily passed the
+                # spread gate before it could reach place_market_buy, so
+                # leaving these two aggregates unrefreshed let the summary
+                # claim no candidate reached the gate even though the merged
+                # failed outcome proves one did (Codex review, PR #859:
+                # "Recompute spread counts during retry merges"). Same
+                # formula the fresh-synthesis branch above uses, applied to
+                # the full merged outcome set instead of just `placed`.
+                merged["candidates_reaching_spread_gate"] = sum(
+                    1
+                    for oc in existing_outcomes.values()
+                    if isinstance(oc, dict)
+                    and oc.get("spread_status")
+                    and oc.get("spread_status") != SPREAD_STATUS_NOT_EVALUATED
+                )
+                merged["candidates_blocked_missing_spread"] = sum(
+                    1
+                    for oc in existing_outcomes.values()
+                    if isinstance(oc, dict) and oc.get("blocked_by") == BLOCKED_BY_SPREAD_GATE
+                )
+                # counts.buy_candidates above already reflects the newly
+                # appended recovery row(s); usage_proxy predates this merge
+                # entirely (it was computed by whatever wrote the preserved
+                # run_state.json) and so still carries the PRIOR attempt's
+                # candidate/placement counts unless refreshed here too --
+                # the same staleness the successful-retry reinjection path in
+                # run_daily_compact() already guards against (Codex review:
+                # "Refresh failure-state counts for seeded recoveries").
+                merged_usage = merged.get("usage_proxy")
+                if isinstance(merged_usage, dict):
+                    merged_usage["buy_candidates_written"] = len(rows)
+                    # ONE representative row per distinct order_id,
+                    # summed via `_submitted_orders_in_row` rather than
+                    # counted as a flat `1` per row: the same
+                    # merged_submission_count/whole_share_settlement_
+                    # adjustment weighting `orders_submitted_count` above
+                    # already applies (Codex review, PR #1169: "Weight
+                    # failure-merge usage by submission multiplicity") --
+                    # a preserved whole-share aggregate carrying
+                    # `merged_submission_count=2` stands for TWO physical
+                    # broker orders behind one identity, so the flat
+                    # count-of-rows this replaced under/over-counted the
+                    # same way `orders_submitted_count` used to.
+                    _placed_identity_rows: Dict[str, Dict[str, Any]] = {}
+                    for _oc in existing_outcomes.values():
+                        if (
+                            isinstance(_oc, dict)
+                            and _oc.get("order_id")
+                            and _oc.get("status") in {"submitted", "dry_run"}
+                        ):
+                            _raw_oid = _oc.get("order_id")
+                            _placed_identity = (
+                                _raw_oid if isinstance(_raw_oid, str) else str(_raw_oid)
+                            )
+                            _placed_identity_rows.setdefault(_placed_identity, _oc)
+                    # "potentially_submitted" checked separately rather than
+                    # folded into the order_id-and-status test above: it
+                    # never carries an order_id by definition (Codex review,
+                    # PR #1300 discussion_r3921082064: "Count ambiguous
+                    # placement attempts in usage totals").
+                    _ambiguous_identity_rows: Dict[str, Dict[str, Any]] = {
+                        _key: _oc
+                        for _key, _oc in existing_outcomes.items()
+                        if isinstance(_oc, dict) and _oc.get("status") == "potentially_submitted"
+                    }
+                    merged_usage["orders_placed_count"] = sum(
+                        _submitted_orders_in_row(_row) for _row in _placed_identity_rows.values()
+                    ) + sum(
+                        _submitted_orders_in_row(_row) for _row in _ambiguous_identity_rows.values()
+                    )
+        # THIS invocation raised, so the merged state is a failure. The
+        # label is gated on the merged submitted COUNT, not on merely
+        # having an outcome to merge: a retry whose only outcomes were
+        # blocked or failed placed nothing, and calling that a
+        # post-submission failure would claim an order landed when none
+        # did (Codex review). Shared with morning_dca so the two cannot
+        # drift. Runs OUTSIDE the `if added:` block above -- see its
+        # comment for why a fully-deduped retry must still be stamped.
+        merged.setdefault(
+            "orders_submitted_count", run_state.get("orders_submitted_count", 0) or 0
+        )
+        # Captured before the stamp below, which unconditionally overwrites
+        # "status" (to "failed") on EVERY invocation of this merge branch --
+        # a second same-slot invocation (manual retries in particular,
+        # since round 27's "Preserve prior manual unresolved attempts on
+        # retry" widened this handler to merge into a prior MANUAL artifact
+        # too) that fails before publishing any new outcome (`added` stays
+        # False) and is not itself an unresolved-placement halt genuinely
+        # transitions a preserved SUCCESSFUL state to a failed one here,
+        # even though neither of state_was_mutated's other two inputs
+        # fires. Leaving that transition out of state_was_mutated left an
+        # existing run_summary.json unregenerated, so summary consumers
+        # kept reporting the prior successful run while run_state.json
+        # itself now says the slot failed (Codex review, PR #859 round 31:
+        # "Regenerate summaries after manual failure stamps"). Compared
+        # against "status" specifically, not the finer-grained
+        # classification/error_class fields the stamp also always
+        # rewrites: a retry of an ALREADY-failed slot re-confirming the
+        # same failure is not a meaningful transition worth regenerating
+        # over, matching state_was_mutated's own documented "rows changed"
+        # standard for what counts as mutation.
+        _pre_stamp_status = merged.get("status")
+        run_state = stamp_failure_classification(
+            merged,
+            submitted=merged["orders_submitted_count"],
+            error_detail=_redacted_exception_detail(exc),
+        )
+        _status_transitioned_to_failed = _pre_stamp_status != run_state.get("status")
+        if unresolved_placement_halt:
+            # Recomputed from the MERGED outcomes, never left at the
+            # earlier attempt's figure: the attempt-specific key now
+            # retains every unresolved call for a ticker, so two
+            # halted AAPL attempts leave two rows an operator must
+            # reconcile while the stale count still said one (Codex
+            # review, PR #859: "Recompute failed-placement counts
+            # after retaining retries").
+            # Plus any genuinely-failed outcome the order-id dedup above
+            # dropped before it ever reached broker_outcomes -- otherwise a
+            # same-slot unresolved retry that collided with an
+            # already-submitted order_id vanished from this count entirely,
+            # reporting zero orders to chase on a run stamped failed (Codex
+            # review, PR #859: "Count deduplicated unresolved orders as
+            # failed").
+            run_state["orders_failed_count"] = (
+                _failed_placement_count(run_state.get("broker_outcomes") or {})
+                + deduped_failed_count
+            )
+            _merged_usage = run_state.get("usage_proxy")
+            if not isinstance(_merged_usage, dict):
+                _merged_usage = {}
+            # The preserved state may predate this run entirely, and
+            # its usage_proxy said nothing about the order this
+            # invocation may have left live. The comparison also omitted
+            # THIS invocation's own accumulated evaluation errors --
+            # provider errors, pre-roll whole-share reconciliation errors,
+            # published into _IN_FLIGHT_RUN_EVALUATION the moment
+            # evaluation completed -- unlike the synthesized branch above
+            # (`errors_count=_evaluated.get("errors_count") + max(1,
+            # orders_failed_count)`), which already adds them. A retry
+            # that logged two evaluation errors before one unresolved
+            # placement could merge into a preserved zero-error artifact
+            # and still report `errors_count=1`, discarding the two
+            # evaluation errors entirely (Codex review, PR #859 round 32:
+            # "Add current evaluation errors during retry merges").
+            run_state["usage_proxy"] = {
+                **_merged_usage,
+                "errors_count": max(
+                    _coerce_nonnegative_int(_merged_usage.get("errors_count")),
+                    _coerce_nonnegative_int(_evaluated.get("errors_count"))
+                    + max(1, run_state["orders_failed_count"]),
+                ),
+                "manual_recovery_required": True,
+            }
+        if unresolved_placement_halt:
+            if not merged["orders_submitted_count"]:
+                # stamp_failure_classification labels every zero-submission
+                # merge `failed_scheduled_run_startup`, which is exactly the
+                # misdiagnosis the synthesized branch above already refuses:
+                # this retry DID reach the broker placement boundary. The
+                # two branches are alternatives for the same failure, so
+                # they must not disagree about what kind of failure it was
+                # (Codex review, PR #859: "Classify unresolved retry merges
+                # as placement failures"). Only reachable at all because
+                # the unproven retry outcome is now retained rather than
+                # dropped. Scoped to a zero-submission merge specifically --
+                # unlike the evaluation-context refresh just below, this
+                # correction exists only for the misclassification a
+                # zero-submission merge produces; a merge that already has
+                # a submitted order was never mislabeled this way.
+                run_state["run_classification_outcome"] = _placement_failure_class
+                run_state["error_class"] = _placement_failure_class
+            # ...and the EVALUATION the retry completed, not the
+            # preserved attempt's. A same-slot state written by an
+            # earlier startup failure carries `counts.evaluated=0`,
+            # empty signal_rows and zero caps, and correcting only the
+            # classification left the final artifact claiming a
+            # placement failure that evaluated no symbols -- the same
+            # contradiction the synthesized branch already refuses
+            # (Codex review, PR #859: "Refresh evaluation context on
+            # unresolved retry merges"). Only when this invocation
+            # actually has an evaluation to offer; otherwise the
+            # preserved values stay, since they are then the better
+            # record. Deliberately NOT gated on orders_submitted_count
+            # (unlike the classification fix above): an existing same-
+            # slot artifact that already contains a submitted order,
+            # merged with a NEW unresolved candidate, previously kept
+            # the earlier invocation's signal_rows/evaluated count/
+            # budget verbatim and never rewrote signals.csv, leaving
+            # drift-detection and reporting consumers unable to see the
+            # signals or cap context that produced the newly recorded
+            # failure (Codex review, PR #859 round 27: "Refresh retry
+            # evaluation after prior submissions").
+            if _evaluated_decisions:
+                _merged_candidates = [
+                    row
+                    for row in (run_state.get("buy_candidates") or [])
+                    if isinstance(row, dict)
+                ]
+                _merged_signal_rows = _build_signal_rows(
+                    _evaluated_decisions, run_state.get("broker_outcomes") or {}
+                )
+                _backfill_reconciled_signal_amounts(
+                    _merged_signal_rows, _merged_candidates
+                )
+                run_state["signal_rows"] = _merged_signal_rows
+                # A malformed but readable `counts` value on the preserved
+                # same-slot artifact (a string or list, from damaged or
+                # externally produced storage) is not a shape `dict(...)`
+                # can convert -- it raised, and because the failure-state
+                # write happens LATER in this same function, the exception
+                # abandoned this halt's refreshed classification, failure
+                # count, and recovery telemetry entirely, along with
+                # everything downstream (Codex review, PR #859 round 31:
+                # "Parse preserved counts before refreshing retry state").
+                # Treated the same as an absent field: a malformed value is
+                # not evidence of anything worth preserving over a fresh
+                # `evaluated` count.
+                _preserved_counts = run_state.get("counts")
+                _merged_counts = dict(_preserved_counts) if isinstance(_preserved_counts, dict) else {}
+                _merged_counts["evaluated"] = len(_evaluated_decisions)
+                run_state["counts"] = _merged_counts
+                if _evaluated_budget is not None:
+                    run_state["budget"] = _evaluated_budget
+                # signals.csv is regenerated from run_state below only
+                # when the state is synthesized; a merged state keeps
+                # its companion, which now disagrees with the rows just
+                # written. Rewritten here so the two match.
+                _rewrite_merged_signals_csv = True
+        # `state_was_mutated` means ROWS changed, which is what the
+        # run_summary.json regeneration gate below is keyed on -- NOT merely
+        # that the state file was rewritten. The failure stamp above rewrites
+        # it on every raise, and setting this flag for that alone would
+        # regenerate a summary for a preserved state whose stale companion the
+        # artifact-contract check exists to catch. But an UNRESOLVED halt is
+        # never "nothing changed" even when every current outcome's order id
+        # was already present and deduplicated away (added stays False): the
+        # classification correction and evaluation/count refresh above (see
+        # "unresolved_placement_halt" a few lines up) still rewrote
+        # run_classification_outcome/error_class/orders_failed_count/
+        # usage_proxy regardless of whether any ROW was newly merged. Gating
+        # regeneration on `added` alone left a stale run_summary.json --
+        # possibly still describing an earlier SUCCESSFUL run at this slot --
+        # standing after run_state.json itself was rewritten to say a
+        # possibly-live order needs reconciliation, exactly the artifact-
+        # contract mismatch this gate exists to prevent (Codex review, PR
+        # #859 round 28: "Regenerate the summary for fully deduplicated
+        # halts"). `_status_transitioned_to_failed` covers the remaining
+        # gap: neither `added` nor `unresolved_placement_halt` fires for a
+        # same-slot retry that fails before publishing any outcome AND is
+        # not itself an unresolved-placement halt, yet the failure stamp
+        # above still just overwrote a preserved SUCCESSFUL status with
+        # "failed" (Codex review, PR #859 round 31: "Regenerate summaries
+        # after manual failure stamps"). `_dry_run_backfill_changed`
+        # covers a fourth, narrower gap: a no-add retry whose ONLY
+        # change to `run_state` was backfilling a previously-absent
+        # "dry_run" -- neither a row nor the status changed, but
+        # `build_run_summary` mirrors that field too, so leaving it
+        # out of this gate left the regenerated state disagreeing
+        # with an un-regenerated summary on dry_run specifically
+        # (Codex review: "Regenerate the summary after backfilling
+        # dry-run mode").
+        state_was_mutated = (
+            added
+            or unresolved_placement_halt
+            or _status_transitioned_to_failed
+            or _dry_run_backfill_changed
+        )
+        _merged_run_state_text = _serialize_run_state(run_state)
+        atomic_write_text(state_path, _merged_run_state_text)
+        _written_run_state_bytes = _merged_run_state_text.encode("utf-8")
+    return (
+        run_state,
+        added,
+        _rewrite_merged_signals_csv,
+        state_was_mutated,
+        _written_run_state_bytes,
+    )
+
+
 def _write_afternoon_failure_artifacts(
     artifacts_dir: str | Path,
     now: datetime,
@@ -32232,6 +33393,7 @@ def _write_afternoon_failure_artifacts(
     # rows with this invocation's own, so the companion CSV is rewritten to
     # match rather than left describing the earlier attempt.
     _rewrite_merged_signals_csv = False
+    _written_run_state_bytes = None
     # Initialized here too, for the identical reason `state_was_mutated`
     # is: the shared orders.csv/usage-backfill block much further down in
     # this function reads it unconditionally to decide whether writing
@@ -32894,1098 +34056,50 @@ def _write_afternoon_failure_artifacts(
                         return
 
             if not existing_is_usable:
-                classification = dict(
-                    build_scheduled_classification(trading_day, **(classification_overrides or {}))
-                    if scheduled
-                    else build_manual_classification(
-                        now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                    )
+                run_state, _written_run_state_bytes = _synthesize_afternoon_failure_artifacts(
+                    artifacts_dir=artifacts_dir,
+                    now=now,
+                    exc=exc,
+                    broker=broker,
+                    broker_name=broker_name,
+                    classification_overrides=classification_overrides,
+                    correlation_id=correlation_id,
+                    dry_run=dry_run,
+                    placed=placed,
+                    scheduled=scheduled,
+                    state_path=state_path,
+                    trading_day=trading_day,
+                    submitted=submitted,
+                    unresolved_placement_halt=unresolved_placement_halt,
+                    _placement_failure_class=_placement_failure_class,
+                    _evaluated=_evaluated,
+                    _evaluated_decisions=_evaluated_decisions,
+                    _evaluated_budget=_evaluated_budget,
                 )
-                classification["valid_scheduled_evidence"] = False
-                _failure_candidate_rows = [
-                    _failure_candidate_row(ticker, outcome) for ticker, outcome in placed.items()
-                ]
-                _failure_signal_rows = (
-                    _build_signal_rows(_evaluated_decisions, placed) if _evaluated_decisions else []
-                )
-                # The same backfill the normal artifact path applies right after it
-                # builds its rows -- without it a failure report reads each provider's
-                # raw suggested amount as money that went missing.
-                _backfill_reconciled_signal_amounts(_failure_signal_rows, _failure_candidate_rows)
-                run_state: Dict[str, Any] = {
-                    # Unlike the deliberately runless calendar-gate stub, a failure state
-                    # IS a run: it carries the scheduled run id the schema requires and
-                    # build_run_summary reads (Codex review). Derived from the (possibly
-                    # slot-overridden) classification rather than always the afternoon
-                    # scheduled_run_id, so a 10:30/12:30 run's failure artifact carries
-                    # its own run_id instead of the afternoon one (Codex review: "Forward
-                    # slot identity into exception artifacts").
-                    "run_id": classification["run_id"],
-                    "trading_day": trading_day,
-                    # Without this, a same-mode retry's own
-                    # _orders_csv_same_run identity check always fails
-                    # against this failure state (it reads "dry_run" as
-                    # absent, never "unproven"), and its whole reinjection
-                    # block never runs (Codex review: "Stamp dry_run onto
-                    # afternoon failure artifacts so a same-mode retry is
-                    # recognized").
-                    "dry_run": dry_run,
-                    "generated_at": now.astimezone(EASTERN).isoformat(),
-                    "broker": broker_name or config_broker_name(),
-                    # The SAME non-reversible keyed fingerprint build_run_artifacts
-                    # stamps on a successful write, computed the same way (same
-                    # key_dir convention: beside, not inside, the artifacts tree).
-                    # This writer runs precisely when a placement halted ambiguous
-                    # -- i.e. exactly the artifact _reconcile_prior_unproven_
-                    # fractional_placements later reads back to verify account
-                    # provenance -- so leaving it null here (the previous state)
-                    # defeated that check for every FIRST-halt artifact: the one
-                    # this whole feature exists to protect (Codex review, PR #911
-                    # round 4: "Stamp fingerprints on ambiguous failure artifacts").
-                    "account_number": _account_number_for_unresolved_evidence(
-                        broker, Path(artifacts_dir).parent
-                    ),
-                    "status": "failed",
-                    "run_classification": classification,
-                    "run_classification_outcome": (
-                        RUN_CLASSIFICATION_FAILED_AFTER_SUBMISSION
-                        if submitted
-                        else _placement_failure_class
-                        if unresolved_placement_halt
-                        else RUN_CLASSIFICATION_STARTUP_FAILED
-                    ),
-                    "order_submit_status": (
-                        ORDER_SUBMIT_STATUS_SUBMITTED
-                        if submitted
-                        else ORDER_SUBMIT_STATUS_ERROR
-                    ),
-                    "error_class": (
-                        ERROR_CLASS_POST_SUBMISSION_FAILURE
-                        if submitted
-                        else _placement_failure_class
-                        if unresolved_placement_halt
-                        else ERROR_CLASS_STARTUP_FAILURE
-                    ),
-                    "error_detail": _redacted_exception_detail(exc),
-                    "is_trading_failure": True,
-                    "scheduled_evidence_denied": True,
-                    "orders_submitted_count": submitted,
-                    # DERIVED from the published outcomes, not hard-coded zero. An
-                    # unresolved placement's own candidate necessarily PASSED the
-                    # spread gate before it could reach place_market_buy, so a run
-                    # summary reporting "nothing reached the gate" contradicts its own
-                    # candidate rows and hides how far evaluation got (Codex review,
-                    # PR #859: "Preserve spread-gate counts in unresolved artifacts").
-                    # Same two aggregates _apply_no_order_classification computes from
-                    # the same per-row verdicts.
-                    "candidates_reaching_spread_gate": sum(
-                        1
-                        for oc in placed.values()
-                        if oc.get("spread_status")
-                        and oc.get("spread_status") != SPREAD_STATUS_NOT_EVALUATED
-                    ),
-                    "candidates_blocked_missing_spread": sum(
-                        1 for oc in placed.values() if oc.get("blocked_by") == BLOCKED_BY_SPREAD_GATE
-                    ),
-                    "budget": _evaluated_budget
-                    or {
-                        "budget_tier": "normal",
-                        "daily_cap_usd": 0,
-                        "weekly_cap_usd": 0,
-                    },
-                    "counts": {
-                        "evaluated": len(_evaluated_decisions),
-                        "buy_candidates": len(placed),
-                        "submitted": submitted,
-                    },
-                    "signal_rows": _failure_signal_rows,
-                    "buy_candidates": _failure_candidate_rows,
-                    "broker_outcomes": placed,
-                }
-                if unresolved_placement_halt:
-                    # The count an operator reads to know how many orders to chase.
-                    # `classify_no_order_run` does not carry it either -- the
-                    # zero-order path stamps it separately, from the same row
-                    # statuses -- so the halt path stamps it here for the same reason.
-                    run_state["orders_failed_count"] = _failed_placement_count(placed)
-                    # AND THE FLAG THAT SUMMONS THE OPERATOR. The raise unwinds past
-                    # the batch's `errors_count_inc` accounting, and this writer
-                    # synthesized no usage_proxy at all, so the one artifact left by a
-                    # run that may have a LIVE order at the broker carried no
-                    # `manual_recovery_required` anywhere -- the exact signal the
-                    # normal path derives from the placement error count, missing from
-                    # the exact case that needs it most (Codex review, PR #859: "Mark
-                    # unresolved halts as requiring manual recovery"). Built through
-                    # build_usage_proxy rather than hand-rolled so every
-                    # USAGE_PROXY_FIELDS key is present and a consumer reading this
-                    # block does not have to special-case the failure artifact.
-                    run_state["usage_proxy"] = build_usage_proxy(
-                        decisions=_evaluated_decisions,
-                        signal_rows=_failure_signal_rows,
-                        buy_candidates=_failure_candidate_rows,
-                        candidate_outcomes=placed,
-                        # Left unset (build_usage_proxy defaults to len(buy_candidates))
-                        # reported reviews that never happened: _process_buy_candidate
-                        # only ever calls review_market_buy when `not ctx.scheduled`,
-                        # so a SCHEDULED halt -- the common case, and the only one an
-                        # unresolved fractional placement can occur on -- attempted
-                        # zero reviews, not one per reconstructed candidate row (most
-                        # of which are the unattempted tail after the halt, never
-                        # reviewed at all). A manual run's actual count is reconstructed
-                        # from the published outcomes: order_reviews_attempted_inc is
-                        # bumped immediately before every review_market_buy call, and
-                        # every candidate that reached one is published either with
-                        # `reviewed_order` set (review passed) or a "review blocked:"
-                        # skip_reason (review ran and refused) -- the two outcomes a
-                        # completed review call can leave behind (Codex review,
-                        # PR #859: "Report only broker reviews that actually ran").
-                        order_reviews_attempted=(
-                            0
-                            if scheduled
-                            else sum(
-                                1
-                                for oc in placed.values()
-                                if isinstance(oc, dict)
-                                and (
-                                    oc.get("reviewed_order") is not None
-                                    or (
-                                        isinstance(oc.get("skip_reason"), str)
-                                        and oc["skip_reason"].startswith("review blocked:")
-                                    )
-                                )
-                            )
-                        ),
-                        # At least one: the unresolved placement itself. An outcome
-                        # count of zero would silently clear the flag on the one path
-                        # that must always raise it. PLUS whatever this same run
-                        # already accumulated BEFORE the halt -- signal-evaluation
-                        # provider errors, pre-roll whole-share reconciliation
-                        # errors -- published into _IN_FLIGHT_RUN_EVALUATION the
-                        # moment evaluation completed. Starting over from just the
-                        # placement error discarded that count entirely: one
-                        # provider error followed by one unresolved placement
-                        # reported as a single error instead of two, understating
-                        # usage/cost and incident telemetry (Codex review, PR #859
-                        # round 28: "Preserve evaluation errors in halt telemetry").
-                        errors_count=(
-                            _coerce_nonnegative_int(_evaluated.get("errors_count"))
-                            + max(1, run_state["orders_failed_count"])
-                        ),
-                    )
-                if placed or unresolved_placement_halt:
-                    # `placed` alone misses the STARTUP reconciliation halt: when
-                    # `_reconcile_prior_unproven_fractional_placements` raises
-                    # `UnresolvedPlacementError` because the PRIOR artifact's own
-                    # `broker_outcomes` was malformed (a list/null) alongside its
-                    # own `placement_evidence_incomplete=True`, that raise happens
-                    # BEFORE any candidate in this run is ever processed -- `placed`
-                    # is still empty, so the flag was never set on the freshly
-                    # synthesized state that overwrites the malformed one. The next
-                    # invocation's own reconciliation pass then reads a clean, valid,
-                    # EMPTY `broker_outcomes` with no flag set at all, sees nothing
-                    # to fail closed on, and may place a fresh order over a
-                    # placement neither confirmed nor denied (Codex review, PR #911
-                    # round 39: "Preserve malformed unresolved storage after
-                    # raising"). `unresolved_placement_halt` is exactly this run's
-                    # own signal that placement evidence is incomplete regardless of
-                    # whether any candidate got as far as publishing an outcome.
-                    run_state["placement_evidence_incomplete"] = True
-                if correlation_id is not None:
-                    run_state["correlation_id"] = correlation_id
-                _synthesized_run_state_text = _serialize_run_state(run_state)
-                atomic_write_text(state_path, _synthesized_run_state_text)
-                _written_run_state_bytes = _synthesized_run_state_text.encode("utf-8")
             else:
-                logger.warning(
-                    "afternoon run failed after run_state.json was written; preserving it "
-                    "and completing any missing companion artifacts"
+                (
+                    run_state,
+                    added,
+                    _rewrite_merged_signals_csv,
+                    state_was_mutated,
+                    _written_run_state_bytes,
+                ) = _merge_afternoon_failure_artifacts(
+                    artifacts_dir=artifacts_dir,
+                    now=now,
+                    exc=exc,
+                    broker=broker,
+                    dry_run=dry_run,
+                    execution_records=execution_records,
+                    placed=placed,
+                    state_path=state_path,
+                    submitted=submitted,
+                    unresolved_placement_halt=unresolved_placement_halt,
+                    _placement_failure_class=_placement_failure_class,
+                    _evaluated=_evaluated,
+                    _evaluated_decisions=_evaluated_decisions,
+                    _evaluated_budget=_evaluated_budget,
+                    _loaded=_loaded,
                 )
-                assert _loaded is not None
-                run_state = _loaded
-                # A preserved state written before this function stamped
-                # "dry_run" (or by a hand-built test fixture) has no such
-                # field at all; leaving it absent means the NEXT same-mode
-                # retry's own _orders_csv_same_run identity check reads
-                # "dry_run" as unproven rather than matching, rejects this
-                # state as foreign, and drops its deployment/execution
-                # evidence right back out (Codex review: "Stamp dry_run
-                # onto afternoon failure artifacts so a same-mode retry is
-                # recognized"). Backfilled unconditionally when absent --
-                # not merely when it disagrees -- since the run_state.json
-                # write below always runs regardless of whether any row was
-                # newly merged, so there is no separate "nothing to
-                # persist" case to guard for THAT file. `run_summary.json`
-                # is a SEPARATE file, though, regenerated only when
-                # `state_was_mutated` -- keyed on ROWS changing, not on
-                # this field alone -- so a no-add retry that only just
-                # backfilled dry_run left the on-disk summary permanently
-                # disagreeing with the state it mirrors (`build_run_summary`
-                # copies "dry_run" too), undetected because the validator
-                # only compares their classification blocks (Codex review:
-                # "Regenerate the summary after backfilling dry-run mode").
-                # Tracked here so it can widen `state_was_mutated` below.
-                # Not just an ABSENT field: `existing_is_usable`'s own dry-run
-                # comparison treats any non-boolean value (e.g. a malformed
-                # "dry_run": "false" string) the same as unproven/absent via
-                # its own `isinstance(..., bool)` gate, so a same-slot state
-                # carrying that malformed shape passes through to this merge
-                # branch too -- but checking `is None` here left it
-                # unchanged, still a string, after this write. The NEXT live
-                # retry's own `_prior_execution_mode_matches` check (unlike
-                # this lenient one) compares it literally against `False`,
-                # `"false" != False` is True, and it rejects the very state
-                # this backfill was supposed to make recognizable (Codex
-                # review: "Normalize malformed dry-run fields before
-                # preserving state"). Backfilled whenever the field is not
-                # ALREADY a real bool -- covering both absent and malformed
-                # -- while still requiring a real non-None `dry_run`
-                # argument, so an internal caller that never learned the
-                # mode does not "backfill" None over a malformed value
-                # either (no actual improvement, so it must not falsely
-                # widen state_was_mutated below).
-                _dry_run_backfill_changed = (
-                    not isinstance(run_state.get("dry_run"), bool) and dry_run is not None
-                )
-                if _dry_run_backfill_changed:
-                    run_state["dry_run"] = dry_run
-                # The preserved file can belong to an EARLIER invocation at this slot, so
-                # fold in whatever THIS one placed. Discarding it would hide an accepted
-                # order from the same-day guards and let a later run buy it again (Codex
-                # review). The ROWS are folded in only when there is something to add;
-                # the failure stamp below always runs.
-                merged = dict(run_state)
-                # Backfilled, not stamped unconditionally: this preserved artifact
-                # may predate account fingerprinting (round 4 stamped it only on the
-                # fresh-synthesis branch above), and `_reconcile_prior_unproven_
-                # fractional_placements` treats a missing/null persisted fingerprint
-                # as "nothing to verify" and skips its account check entirely. A
-                # retry that merges new unresolved evidence into such an artifact
-                # left it permanently unfingerprinted -- unlike the fresh-synthesis
-                # branch's own artifact, which is always stamped from its very first
-                # write -- so a later invocation under a MISWIRED broker for a
-                # different account could satisfy this same deterministic reference
-                # and have that account's history trusted (Codex review, PR #911
-                # round 8: "Stamp fingerprints when merging ambiguous failure
-                # evidence"). Never overwrites an existing non-empty fingerprint:
-                # this run's own broker is not necessarily the one that first wrote
-                # this artifact, and a fingerprint already present is that first
-                # writer's authoritative identity, not this retry's.
-                existing_account_fingerprint = merged.get("account_number")
-                current_account_fingerprint = (
-                    _account_number_for_unresolved_evidence(broker, Path(artifacts_dir).parent)
-                    if broker is not None
-                    else None
-                )
-                # Gated on `placed` OR `execution_records`, not `placed` alone:
-                # `run_once` can fail with a nonempty `execution_records` (a
-                # recovery row appended before the raise) while `placed` -- the
-                # in-flight candidate outcomes -- is still empty, an execution-
-                # only path independent of `_IN_FLIGHT_CANDIDATE_OUTCOMES`. Gating
-                # on `placed` alone let that shape slip past this mismatch check
-                # entirely, so the `orders.csv` merge/backfill block further down
-                # (guarded by `not _cross_account_mismatch`) went on to merge
-                # account B's execution into account A's preserved log and
-                # backfill A's state from it (Codex review, PR #1164/#1169:
-                # "Include execution-only failures in the account mismatch gate").
-                #
-                # `placed` itself is filtered to outcomes that reflect an ACTUAL
-                # broker call -- an `order_id`, `broker_call_attempted`/
-                # `broker_placement_attempted`, or `placement_outcome_unproven` --
-                # not just truthy-dict-valued. A batch containing only skipped/
-                # internally-blocked candidate rows (no broker call ever made) was
-                # still `placed`-truthy, so a later exception in this same run
-                # created a `cross_account_unresolved_placements.json` sidecar for
-                # evidence that was never actually ambiguous, and the NEXT run for
-                # this account treats any matching sidecar entry as unresolved and
-                # raises in `_reconcile_prior_unproven_fractional_placements`,
-                # blocking all placements until manual cleanup (Codex review, PR
-                # #1168: "Do not sidecar outcomes that made no broker call").
-                # `execution_records` DOES need an equivalent filter: a dry run
-                # that logs a simulated order still calls `_log_execution` from
-                # both the normal and whole-share buy paths (see "Log successful
-                # whole-share dry-run executions"), appending a record to
-                # `execution_records` even though no broker call ever happened.
-                # Every dry-run order id -- `DryRunBroker.place_market_buy`/
-                # `place_whole_share_buy`'s own `"DRY-RUN-<ticker>-..."`/
-                # `"DRY-RUN-WHOLESHARE-<ticker>-..."`, and the synthetic
-                # `"DRY-RUN-SIM-..."`/`"DRY-RUN-SIM-WHOLESHARE-..."` ids used when
-                # `ctx.broker` is not a `DryRunBroker` -- starts with the same
-                # `"DRY-RUN-"` prefix, so treating a nonempty `execution_records`
-                # as real broker evidence created a cross-account unresolved
-                # sidecar for a call that was never sent, and the next REAL run
-                # for this account sees the matching sidecar and refuses all
-                # placements until manual cleanup (Codex review, PR #1169:
-                # "Exclude dry-run execution rows from mismatch evidence").
-                _execution_records_with_broker_call = [
-                    record
-                    for record in (execution_records or [])
-                    if not (isinstance(record.order_id, str) and record.order_id.startswith("DRY-RUN-"))
-                ]
-                #
-                # Excludes `status == "dry_run"` outcomes unconditionally, even
-                # though every scheduled dry run stamps a synthetic
-                # `DRY-RUN-SIM-*` `order_id` (see the whole-share/fractional
-                # placement paths a few thousand lines below) -- that id predicate
-                # alone still classified a dry run as an actual broker call, so a
-                # dry run landing in a directory containing another account's
-                # preserved artifact wrote a cross-account sidecar for a call that
-                # was never sent, blocking every later real placement for this
-                # account until manual cleanup (Codex review, PR #1168: "Exclude
-                # dry-run IDs from cross-account evidence").
-                _placed_with_broker_call = {
-                    ticker: outcome
-                    for ticker, outcome in placed.items()
-                    if outcome.get("status") != "dry_run"
-                    and (
-                        outcome.get("order_id")
-                        or outcome.get("broker_call_attempted")
-                        or outcome.get("broker_placement_attempted")
-                        or outcome.get("placement_outcome_unproven")
-                        # Several whole-share failure branches record a real,
-                        # broker-facing call solely via
-                        # `broker_placement_failed=True`, with none of the
-                        # four markers above set (see
-                        # `_outcome_records_a_broker_attempt`'s own docstring
-                        # for the two shapes that do this). This LATER
-                        # recomputation of `_placed_with_broker_call` -- used
-                        # when a same-slot `run_state.json` has a malformed
-                        # non-string account fingerprint, so execution
-                        # reaches here instead of the earlier ownership
-                        # shortcut -- had the identical gap the earlier
-                        # occurrence of this same filter was already fixed
-                        # for: an outcome shaped that way was silently
-                        # dropped here too, so a possibly-unresolved
-                        # broker-facing failure never reached the sidecar
-                        # (Codex review, PR #1251: "Preserve broker-failed
-                        # outcomes in the later mismatch filter").
-                        #
-                        # The explicit `broker_placement_failed` marker,
-                        # NOT the broader
-                        # `_outcome_records_a_broker_attempt` predicate,
-                        # for the identical reason the earlier occurrence
-                        # of this same filter was narrowed (Codex review,
-                        # PR #1251: "Limit sidecar eligibility to actual
-                        # broker-call markers"): that helper also matches
-                        # bare `status == "failed"`, which the last-resort
-                        # "candidate processing raised" handler publishes
-                        # for an exception that struck before any broker
-                        # call was made at all. And EXCLUDING a
-                        # confirmation-required hold -- keyed off the
-                        # explicit `confirmation_required_no_submission`
-                        # marker, not a `status` string, for the same
-                        # reason the earlier occurrence was widened past a
-                        # string comparison too (Codex review, PR #1251:
-                        # "Exclude confirmation holds from unresolved
-                        # sidecars" / "Exclude failed confirmation
-                        # restorations from sidecars"): a status check
-                        # alone missed the sibling outcome where the
-                        # pending-credit restoration also failed (spelled
-                        # "blocked", not "not_submitted_confirmation_
-                        # required"), which still carries no submission
-                        # either.
-                        or (
-                            outcome.get("broker_placement_failed")
-                            and not outcome.get("confirmation_required_no_submission")
-                        )
-                    )
-                }
-                # Fingerprint disagreement alone, with NO evidence-presence gating --
-                # this is the fact that the preserved artifact belongs to a
-                # different account than this run's own, independent of whether
-                # this run happened to produce any placement/execution evidence
-                # worth sidecaring. Every downstream guard that exists to avoid
-                # mutating/merging into the OTHER account's artifact (skipping the
-                # run_state stamp, the orders.csv merge, the pointer/contract
-                # validation) must key off THIS, not off evidence eligibility: a
-                # run whose own placements were all filtered out of
-                # `_placed_with_broker_call`/`_execution_records_with_broker_call`
-                # (e.g. every outcome was a dry run, or nothing was placed at all)
-                # still must not have its `placed`/`execution_records` merged into
-                # a differently-fingerprinted preserved artifact just because there
-                # was nothing worth sidecaring (Codex review, PR #1168: "Separate
-                # account mismatch from sidecar eligibility").
-                # A present, NON-STRING preserved fingerprint (an int or
-                # list from damaged or externally-produced storage) used to
-                # fall through this check entirely -- the `isinstance(...,
-                # str)` guard made the whole `and` chain False, reporting
-                # no mismatch, and the falsey-only backfill a few lines
-                # below (`if not merged.get("account_number")`) also leaves
-                # an already-truthy malformed value untouched. This run's
-                # own possibly-live outcomes and execution rows were then
-                # merged into an artifact whose account ownership could
-                # never actually be verified -- exactly the risk the
-                # string-mismatch check exists to catch -- and the NEXT
-                # reconciliation, which explicitly rejects a malformed
-                # binding, then blocked recovery over evidence merged in
-                # under false pretenses (Codex review, PR #1169: "Reject
-                # malformed preserved account fingerprints"). Treated as an
-                # unconditional mismatch -- fail closed -- so it is routed
-                # through the SAME cross-account sidecar/no-merge path a
-                # genuine cross-account mismatch already uses, rather than
-                # silently binding this run's evidence to an unverifiable
-                # fingerprint.
-                #
-                # Deliberately NOT gated on truthiness (no ``bool(...)``
-                # guard): a FALSEY non-string binding -- ``account_number=
-                # 0``, ``[]``, ``{}`` -- is exactly as malformed as a
-                # truthy one; only ``None`` (never persisted at all) is the
-                # genuine "nothing recorded" shape a legacy artifact can
-                # carry. Gating on truthiness let a falsey malformed value
-                # report no mismatch AND then be silently overwritten by
-                # the falsey-only backfill below, binding this run's
-                # evidence to the same unverifiable fingerprint the
-                # truthy case was already fixed to reject (Codex review,
-                # PR #1169: "Reject falsey malformed preserved account
-                # fingerprints").
-                _existing_account_fingerprint_malformed = (
-                    existing_account_fingerprint is not None and not isinstance(existing_account_fingerprint, str)
-                )
-                _account_fingerprint_mismatch = _existing_account_fingerprint_malformed or (
-                    isinstance(existing_account_fingerprint, str)
-                    and existing_account_fingerprint
-                    and current_account_fingerprint is not None
-                    and existing_account_fingerprint != current_account_fingerprint
-                )
-                # Sidecar-persist eligibility additionally requires real evidence:
-                # persisting a `cross_account_unresolved_placements.json` sidecar
-                # for a run that made no broker call at all would create a
-                # phantom "unresolved" entry the NEXT run for this account then
-                # refuses to place around, for evidence that was never actually
-                # ambiguous (see the "Do not sidecar outcomes that made no broker
-                # call" / "Exclude dry-run execution rows from mismatch evidence"
-                # comments above this block).
-                _cross_account_mismatch = _account_fingerprint_mismatch and (
-                    _placed_with_broker_call or _execution_records_with_broker_call
-                )
-                if _cross_account_mismatch:
-                    # One artifact-level fingerprint cannot safely bind unresolved
-                    # outcomes from two accounts -- that reasoning is unchanged.
-                    # What changed is what happens to THIS run's own evidence: it
-                    # used to be discarded outright by raising here, aborting the
-                    # whole write before this call's outcomes were persisted
-                    # anywhere at all. Persisted separately instead (never merged
-                    # into `merged`, which keeps the ORIGINAL fingerprint's own
-                    # evidence intact below), so a possibly-live order this
-                    # invocation just placed is not lost to reconciliation and cap
-                    # accounting on either account (Codex review, PR #859/#911
-                    # round 45: "Persist cross-account ambiguous placements
-                    # separately").
-                    # Filtered the SAME way the mismatch decision above already is
-                    # -- `_placed_with_broker_call`/`_execution_records_with_
-                    # broker_call`, not the raw `placed`/`execution_records` --
-                    # not just when it is the ONLY evidence gating eligibility. A
-                    # mismatched run mixing real broker-backed evidence with
-                    # dry-run/skipped rows still persisted the unfiltered
-                    # collections, recording synthetic DRY-RUN-* executions and
-                    # no-broker-call outcomes as though they were unresolved
-                    # brokerage evidence in the account-scoped audit sidecar
-                    # (Codex review, PR #1169: "Persist only broker-backed rows in
-                    # mismatch sidecars").
-                    #
-                    # `current_account_fingerprint` can itself be `None` (the
-                    # lookup failed) or the SENTINEL string (the lookup
-                    # explicitly could not verify an account, e.g. a missing
-                    # HMAC key) while `_account_fingerprint_mismatch` is still
-                    # True -- the malformed-existing-fingerprint branch above
-                    # trips unconditionally, independent of whether THIS run's
-                    # own fingerprint could be computed at all. Binding a
-                    # cross-account sidecar entry to the sentinel would make
-                    # the reconciliation scan treat it as unresolved evidence
-                    # for EVERY current account whose own fingerprint happens
-                    # to be unavailable too, persistently blocking unrelated
-                    # accounts' placements until manual cleanup -- the same
-                    # risk the earlier same-identity-different-account branch
-                    # above was already fixed to exclude (Codex review: "Keep
-                    # unavailable fingerprints out of account sidecars"). This
-                    # later path reused the SAME fingerprint-mismatch/sidecar-
-                    # eligibility computation but not that exclusion (Codex
-                    # review, PR #1251: "Keep unavailable fingerprints out of
-                    # the later sidecar path"); routed through the same
-                    # generic undurable-evidence sidecar the earlier branch
-                    # falls back to in this case, rather than the cross-
-                    # account one, which requires a real fingerprint string on
-                    # both sides.
-                    if (
-                        current_account_fingerprint is not None
-                        and current_account_fingerprint != _ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL
-                    ):
-                        _persist_cross_account_unresolved_evidence(
-                            artifacts_dir,
-                            now,
-                            current_account_fingerprint,
-                            existing_account_fingerprint,
-                            _placed_with_broker_call,
-                            _execution_records_with_broker_call,
-                        )
-                    else:
-                        _persist_undurable_evidence_sidecar(
-                            artifacts_dir,
-                            "unwritten_failure_artifact_placement",
-                            now,
-                            {
-                                # Redacted via `_redact_broker_outcomes_for_
-                                # sidecar` rather than persisted verbatim: an
-                                # outcome's own diagnostic fields (`skip_
-                                # reason` in particular) can interpolate a raw
-                                # connector exception carrying the same
-                                # account-number/credential shapes this
-                                # module's per-field redaction already
-                                # strips for the ordinary cross-account
-                                # sidecar (Codex review, PR #1251: "Redact
-                                # outcomes before writing the unbound
-                                # sidecar").
-                                "broker_outcomes": _redact_broker_outcomes_for_sidecar(
-                                    _placed_with_broker_call
-                                ),
-                                # `execution_records`, not just `placed`: this
-                                # branch's own `current_account_fingerprint`
-                                # is unavailable, the SAME reason the
-                                # `_persist_cross_account_unresolved_evidence`
-                                # call above it carries execution records
-                                # alongside outcomes -- omitting them here
-                                # silently dropped a known fill the instant
-                                # the current-account fingerprint could not
-                                # be verified (Codex review, PR #1251:
-                                # "Preserve execution records in the unbound
-                                # fallback").
-                                "execution_records": [
-                                    {
-                                        field_name: _iso(getattr(record, field_name))
-                                        for field_name in _CSV_FIELDS
-                                    }
-                                    for record in _execution_records_with_broker_call
-                                ],
-                                "account_fingerprint": None,
-                            },
-                        )
-                # Everything in this block mutates and persists the PRIMARY
-                # run_state.json artifact -- skipped entirely on a cross-account
-                # mismatch, since that artifact's own outcomes/counts/fingerprint
-                # belong to a DIFFERENT account than the one that just raised.
-                # This run's own evidence is already durably recorded in the
-                # cross-account sidecar above; rewriting the primary artifact's
-                # status/classification/companion reports (signals.csv,
-                # run_summary.json) with THIS run's exception would corrupt
-                # account-scoped audit data -- the artifact would retain the
-                # OTHER account's fingerprint, outcomes, and counts while
-                # claiming THIS account's failure (Codex review, PR #1164/#1165:
-                # "Avoid stamping the prior account's artifact after sidecar
-                # fallback"). Leaving `run_state`/`merged` as the untouched
-                # preserved artifact and skipping the write keeps the primary
-                # artifact exactly as it was for its own account.
-                if _account_fingerprint_mismatch:
-                    logger.warning(
-                        "skipping run_state.json stamp/write at %s: preserved artifact belongs to "
-                        "a different account than this run's own evidence%s",
-                        state_path,
-                        ", already persisted separately" if _cross_account_mismatch else "",
-                    )
-                    run_state = merged
-                    # Nothing was merged into the (untouched) primary artifact, and
-                    # its status is unchanged -- matching the values every reader
-                    # below this skipped block expects when nothing happened here.
-                    added = False
-                else:
-                    if not merged.get("account_number") and broker is not None:
-                        # Sentinel-on-failure, not a bare None: see
-                        # _account_number_for_unresolved_evidence's own docstring
-                        # (Codex review, PR #911 round 10: "Fail closed when evidence
-                        # fingerprinting fails").
-                        merged["account_number"] = current_account_fingerprint
-                    added = False
-                    # Counts a failed outcome dropped by the order-id dedup below (line
-                    # ~18755's `continue`) -- a row this run genuinely halted on, sharing
-                    # an order_id with an EARLIER preserved outcome, is discarded as "the
-                    # same order restated" rather than added to broker_outcomes.
-                    # _failed_placement_count only ever scans broker_outcomes, so without
-                    # this a same-slot unresolved retry that happened to collide with an
-                    # already-submitted order_id vanished from orders_failed_count
-                    # entirely -- reporting zero orders to chase on a run stamped failed
-                    # and flagged manual_recovery_required (Codex review, PR #859:
-                    # "Count deduplicated unresolved orders as failed").
-                    deduped_failed_count = 0
-                    if placed and not _account_fingerprint_mismatch:
-                        existing_outcomes = dict(merged.get("broker_outcomes") or {})
-                        rows = [
-                            row
-                            for row in (merged.get("buy_candidates") or [])
-                            if isinstance(row, dict)
-                        ]
-                        # Keyed by ORDER ID, not ticker. A retry can place a distinct
-                        # incremental order for a ticker the earlier attempt already bought,
-                        # and a ticker-keyed setdefault would silently keep only the old one
-                        # while the count and the CSV are derived from these outcomes (Codex
-                        # review).
-                        # Both sources are read defensively against a MALFORMED nested
-                        # order_id, not just a missing one: a readable artifact whose
-                        # order_id happens to be a truthy non-scalar (e.g. `["BAD"]`,
-                        # from external or hand-edited damage) is unhashable, and an
-                        # unguarded set comprehension over it raises `TypeError`
-                        # before this run's own current, possibly-live outcome is
-                        # ever merged in or `run_state.json` is rewritten -- the
-                        # unresolved retry this whole branch exists to preserve is
-                        # lost to an uncaught crash instead (Codex review, PR #859
-                        # round 38: "Validate preserved order IDs before building the
-                        # dedup set"). Scalar strings are the only shape a real order
-                        # id ever takes elsewhere in this module; anything else is
-                        # excluded from the dedup set the same way a missing id
-                        # already is, rather than aborting the whole merge over it.
-                        seen_orders = {
-                            oc.get("order_id")
-                            for oc in existing_outcomes.values()
-                            if isinstance(oc, dict) and isinstance(oc.get("order_id"), str) and oc.get("order_id")
-                        }
-                        seen_orders.update(
-                            row.get("order_id")
-                            for row in rows
-                            if isinstance(row.get("order_id"), str) and row.get("order_id")
-                        )
-                        for ticker, outcome in placed.items():
-                            order_id = outcome.get("order_id")
-                            # Validated the SAME way `seen_orders` itself was built
-                            # just above: a truthy non-scalar current order_id (a
-                            # list/mapping, from a malformed broker adapter) is
-                            # unhashable, and an unguarded `order_id in seen_orders`
-                            # raised `TypeError` here -- the surrounding `run_once`
-                            # handler only logs that the failure-artifact write
-                            # itself failed and re-raises the ORIGINAL error, so
-                            # this run's own current, possibly-live outcome was
-                            # never merged or persisted at all (Codex review, PR
-                            # #1169: "Validate current order IDs before retry
-                            # deduplication"). Treated as ID-less evidence instead,
-                            # the same as a genuinely missing order_id, so it falls
-                            # through to the ID-less handling just below rather
-                            # than aborting the whole write.
-                            if not isinstance(order_id, str):
-                                order_id = None
-                            if order_id and order_id in seen_orders:
-                                if outcome.get("status") == "failed":
-                                    deduped_failed_count += 1
-                                continue
-                            if (
-                                not order_id
-                                and ticker in existing_outcomes
-                                and not outcome.get("placement_outcome_unproven")
-                                and not outcome.get("unresolved_placement_halted")
-                            ):
-                                # An ID-less outcome for a ticker the artifact already
-                                # covers is ordinarily the same non-order restated, and
-                                # dropping it keeps the record clean. An UNPROVEN placement
-                                # is the one ID-less outcome that is never a restatement:
-                                # it reports a call that may have created a live order the
-                                # broker has not indexed yet. Skipping it left the artifact
-                                # showing only the earlier attempt's row, with no evidence
-                                # anywhere that a second, possibly-live order exists --
-                                # exactly what this halt is supposed to preserve (Codex
-                                # review, PR #859: "Preserve ID-less outcomes from
-                                # unresolved retries").
-                                #
-                                # A HALTED TAIL row is the other ID-less shape that is
-                                # never a restatement either: a candidate AFTER the
-                                # ticker this batch actually halted on, deliberately
-                                # marked unresolved_placement_halted=True because it
-                                # never got a chance to place at all -- a fundamentally
-                                # different kind of evidence than "the same order
-                                # restated". Dropping it left the merged artifact
-                                # showing only the PRIOR invocation's outcome for that
-                                # ticker, losing this run's own halt reason, and let a
-                                # later evaluation refresh leave auto_buy_signal enabled
-                                # instead of recognizing the deliberate skip (Codex
-                                # review, PR #859 round 35: "Preserve halted tail rows
-                                # during retry merges").
-                                continue
-                            if order_id:
-                                seen_orders.add(order_id)
-                            # A second order for the same ticker needs its own key so it is
-                            # not lost to the collision this fixes. The real ticker is
-                            # carried INSIDE the outcome, because submitted_order_rows()
-                            # would otherwise write the synthetic key into the canonical
-                            # order row as the symbol (Codex review).
-                            key = (
-                                ticker
-                                if ticker not in existing_outcomes
-                                # An unproven retry has no order id to distinguish it, so
-                                # it is keyed by ATTEMPT instead -- `AAPL:unproven-2` --
-                                # rather than by `f"{ticker}:None"`, which would collide
-                                # with the next unproven retry for the same ticker and
-                                # lose it the same way the ticker key did.
-                                else f"{ticker}:{order_id}"
-                                if order_id
-                                else _unproven_retry_key(ticker, existing_outcomes)
-                            )
-                            if key != ticker:
-                                outcome = {**outcome, "ticker": ticker}
-                            existing_outcomes[key] = outcome
-                            rows.append(_failure_candidate_row(ticker, outcome))
-                            added = True
-
-                        # ROWS are merged only when there is something new to merge; the
-                        # FAILURE STAMP below is not conditional on that. Gating both on
-                        # `added` meant a retry whose every outcome deduped away -- the
-                        # broker returning the same idempotent order id for a retried
-                        # deterministic ref_id, say -- left the preserved state exactly as
-                        # it was, classification included. When that preserved state
-                        # recorded an earlier SUCCESS, the artifact went on advertising a
-                        # successful run while this invocation had just halted for an
-                        # order that needs reconciliation (Codex review, PR #859:
-                        # "Preserve failure state for unresolved retries with known IDs").
-                        # This writer only ever runs because this invocation raised, so
-                        # that fact must reach the state whether or not any row is new.
-                        if added:
-                            merged["broker_outcomes"] = existing_outcomes
-                            merged["buy_candidates"] = rows
-                            # Read the SAME defensive way `seen_orders` above now is: a
-                            # truthy but NON-SCALAR order_id (e.g. `["BAD"]`, from
-                            # external or hand-edited damage) is unhashable, and the
-                            # bare `or` here never engages for it (the list is already
-                            # truthy), so it reached this set literal unguarded and
-                            # raised `TypeError` -- after `existing_outcomes`/`rows`
-                            # were already reassigned onto `merged` a few lines above,
-                            # but before `run_state.json` was ever rewritten with them
-                            # (Codex review, PR #859 round 38: "Validate preserved
-                            # order IDs before building the dedup set"). Falls back to
-                            # the same ticker-keyed synthetic id a missing order_id
-                            # already uses.
-                            # ONE representative row per distinct identity (order_id, or
-                            # the same ticker-keyed synthetic fallback the set-union
-                            # version of this used), summed via `_submitted_orders_in_row`
-                            # rather than just counted as a flat `len(...)` of distinct
-                            # identities: a preserved whole-share AGGREGATE row can carry
-                            # `merged_submission_count=2`, standing for TWO physical
-                            # broker orders behind one identity, while a
-                            # `whole_share_settlement_adjustment` row stands for ZERO new
-                            # orders despite having its own "submitted" status -- both
-                            # already correctly weighted by `_submitted_orders_in_row`
-                            # everywhere else this module recomputes this same figure
-                            # (see the `_submitted_order_groups` loop a few hundred lines
-                            # above). The flat count-of-distinct-identities this replaced
-                            # treated every row as exactly one order regardless, so a
-                            # retry merge left `orders_submitted_count`/`counts.submitted`
-                            # UNDER-counting a preserved aggregate's true order count, or
-                            # OVER-counting a settlement adjustment that added none
-                            # (Codex review, PR #1164: "Preserve merged order multiplicity
-                            # in retry counts").
-                            # Includes "potentially_submitted": an ambiguous placement
-                            # (OrderPlacementAmbiguousError) genuinely reserved this
-                            # candidate too, and excluding it here dropped an ambiguous
-                            # placement's count contribution right back to 0 whenever
-                            # this merge branch runs -- the exact regression a readable
-                            # existing run_state.json triggers (Codex review, PR #1300
-                            # discussion_r3920765644: "Preserve ambiguous counts in
-                            # failure-state merges").
-                            _submitted_identity_rows: Dict[str, Dict[str, Any]] = {}
-                            for _key, _oc in existing_outcomes.items():
-                                if isinstance(_oc, dict) and _oc.get("status") in (
-                                    "submitted",
-                                    "potentially_submitted",
-                                ):
-                                    _identity = (
-                                        _oc.get("order_id") if isinstance(_oc.get("order_id"), str) else None
-                                    ) or f"ticker:{_key}"
-                                    _submitted_identity_rows.setdefault(_identity, _oc)
-                            for _row in rows:
-                                if _row.get("status") in ("submitted", "filled", "potentially_submitted"):
-                                    _identity = (
-                                        _row.get("order_id") if isinstance(_row.get("order_id"), str) else None
-                                    ) or f"ticker:{_row.get('ticker')}"
-                                    _submitted_identity_rows.setdefault(_identity, _row)
-                            merged["orders_submitted_count"] = sum(
-                                _submitted_orders_in_row(_row) for _row in _submitted_identity_rows.values()
-                            )
-                            # A malformed preserved `counts` (a string or list, from
-                            # damaged or externally produced storage) is truthy, so
-                            # `or {}` never engages and `**value` raised BEFORE
-                            # run_state.json could be rewritten -- abandoning the
-                            # newly-added, possibly-live outcome this whole `added`
-                            # branch exists to persist. The LATER `_merged_counts`
-                            # conversion a few hundred lines down already guards this
-                            # exact shape for the fully-deduplicated-retry evaluation
-                            # refresh (Codex review, PR #859 round 31: "Parse
-                            # preserved counts before refreshing retry state"); this
-                            # merge runs FIRST and needed the identical guard (Codex
-                            # review, PR #859 round 35: "Validate preserved counts
-                            # before merging new outcomes").
-                            _preserved_counts_for_merge = merged.get("counts")
-                            merged["counts"] = {
-                                **(_preserved_counts_for_merge if isinstance(_preserved_counts_for_merge, dict) else {}),
-                                "submitted": merged["orders_submitted_count"],
-                                "buy_candidates": len(rows),
-                            }
-                            # RECOMPUTED from the MERGED outcomes (old rows plus this
-                            # retry's own), never left at whatever the preserved state
-                            # happened to carry. The preserved artifact's own
-                            # candidates_reaching_spread_gate/candidates_blocked_missing_
-                            # spread describe only the EARLIER attempt's rows; a
-                            # newly-merged unresolved placement necessarily passed the
-                            # spread gate before it could reach place_market_buy, so
-                            # leaving these two aggregates unrefreshed let the summary
-                            # claim no candidate reached the gate even though the merged
-                            # failed outcome proves one did (Codex review, PR #859:
-                            # "Recompute spread counts during retry merges"). Same
-                            # formula the fresh-synthesis branch above uses, applied to
-                            # the full merged outcome set instead of just `placed`.
-                            merged["candidates_reaching_spread_gate"] = sum(
-                                1
-                                for oc in existing_outcomes.values()
-                                if isinstance(oc, dict)
-                                and oc.get("spread_status")
-                                and oc.get("spread_status") != SPREAD_STATUS_NOT_EVALUATED
-                            )
-                            merged["candidates_blocked_missing_spread"] = sum(
-                                1
-                                for oc in existing_outcomes.values()
-                                if isinstance(oc, dict) and oc.get("blocked_by") == BLOCKED_BY_SPREAD_GATE
-                            )
-                            # counts.buy_candidates above already reflects the newly
-                            # appended recovery row(s); usage_proxy predates this merge
-                            # entirely (it was computed by whatever wrote the preserved
-                            # run_state.json) and so still carries the PRIOR attempt's
-                            # candidate/placement counts unless refreshed here too --
-                            # the same staleness the successful-retry reinjection path in
-                            # run_daily_compact() already guards against (Codex review:
-                            # "Refresh failure-state counts for seeded recoveries").
-                            merged_usage = merged.get("usage_proxy")
-                            if isinstance(merged_usage, dict):
-                                merged_usage["buy_candidates_written"] = len(rows)
-                                # ONE representative row per distinct order_id,
-                                # summed via `_submitted_orders_in_row` rather than
-                                # counted as a flat `1` per row: the same
-                                # merged_submission_count/whole_share_settlement_
-                                # adjustment weighting `orders_submitted_count` above
-                                # already applies (Codex review, PR #1169: "Weight
-                                # failure-merge usage by submission multiplicity") --
-                                # a preserved whole-share aggregate carrying
-                                # `merged_submission_count=2` stands for TWO physical
-                                # broker orders behind one identity, so the flat
-                                # count-of-rows this replaced under/over-counted the
-                                # same way `orders_submitted_count` used to.
-                                _placed_identity_rows: Dict[str, Dict[str, Any]] = {}
-                                for _oc in existing_outcomes.values():
-                                    if (
-                                        isinstance(_oc, dict)
-                                        and _oc.get("order_id")
-                                        and _oc.get("status") in {"submitted", "dry_run"}
-                                    ):
-                                        _raw_oid = _oc.get("order_id")
-                                        _placed_identity = (
-                                            _raw_oid if isinstance(_raw_oid, str) else str(_raw_oid)
-                                        )
-                                        _placed_identity_rows.setdefault(_placed_identity, _oc)
-                                # "potentially_submitted" checked separately rather than
-                                # folded into the order_id-and-status test above: it
-                                # never carries an order_id by definition (Codex review,
-                                # PR #1300 discussion_r3921082064: "Count ambiguous
-                                # placement attempts in usage totals").
-                                _ambiguous_identity_rows: Dict[str, Dict[str, Any]] = {
-                                    _key: _oc
-                                    for _key, _oc in existing_outcomes.items()
-                                    if isinstance(_oc, dict) and _oc.get("status") == "potentially_submitted"
-                                }
-                                merged_usage["orders_placed_count"] = sum(
-                                    _submitted_orders_in_row(_row) for _row in _placed_identity_rows.values()
-                                ) + sum(
-                                    _submitted_orders_in_row(_row) for _row in _ambiguous_identity_rows.values()
-                                )
-                    # THIS invocation raised, so the merged state is a failure. The
-                    # label is gated on the merged submitted COUNT, not on merely
-                    # having an outcome to merge: a retry whose only outcomes were
-                    # blocked or failed placed nothing, and calling that a
-                    # post-submission failure would claim an order landed when none
-                    # did (Codex review). Shared with morning_dca so the two cannot
-                    # drift. Runs OUTSIDE the `if added:` block above -- see its
-                    # comment for why a fully-deduped retry must still be stamped.
-                    merged.setdefault(
-                        "orders_submitted_count", run_state.get("orders_submitted_count", 0) or 0
-                    )
-                    # Captured before the stamp below, which unconditionally overwrites
-                    # "status" (to "failed") on EVERY invocation of this merge branch --
-                    # a second same-slot invocation (manual retries in particular,
-                    # since round 27's "Preserve prior manual unresolved attempts on
-                    # retry" widened this handler to merge into a prior MANUAL artifact
-                    # too) that fails before publishing any new outcome (`added` stays
-                    # False) and is not itself an unresolved-placement halt genuinely
-                    # transitions a preserved SUCCESSFUL state to a failed one here,
-                    # even though neither of state_was_mutated's other two inputs
-                    # fires. Leaving that transition out of state_was_mutated left an
-                    # existing run_summary.json unregenerated, so summary consumers
-                    # kept reporting the prior successful run while run_state.json
-                    # itself now says the slot failed (Codex review, PR #859 round 31:
-                    # "Regenerate summaries after manual failure stamps"). Compared
-                    # against "status" specifically, not the finer-grained
-                    # classification/error_class fields the stamp also always
-                    # rewrites: a retry of an ALREADY-failed slot re-confirming the
-                    # same failure is not a meaningful transition worth regenerating
-                    # over, matching state_was_mutated's own documented "rows changed"
-                    # standard for what counts as mutation.
-                    _pre_stamp_status = merged.get("status")
-                    run_state = stamp_failure_classification(
-                        merged,
-                        submitted=merged["orders_submitted_count"],
-                        error_detail=_redacted_exception_detail(exc),
-                    )
-                    _status_transitioned_to_failed = _pre_stamp_status != run_state.get("status")
-                    if unresolved_placement_halt:
-                        # Recomputed from the MERGED outcomes, never left at the
-                        # earlier attempt's figure: the attempt-specific key now
-                        # retains every unresolved call for a ticker, so two
-                        # halted AAPL attempts leave two rows an operator must
-                        # reconcile while the stale count still said one (Codex
-                        # review, PR #859: "Recompute failed-placement counts
-                        # after retaining retries").
-                        # Plus any genuinely-failed outcome the order-id dedup above
-                        # dropped before it ever reached broker_outcomes -- otherwise a
-                        # same-slot unresolved retry that collided with an
-                        # already-submitted order_id vanished from this count entirely,
-                        # reporting zero orders to chase on a run stamped failed (Codex
-                        # review, PR #859: "Count deduplicated unresolved orders as
-                        # failed").
-                        run_state["orders_failed_count"] = (
-                            _failed_placement_count(run_state.get("broker_outcomes") or {})
-                            + deduped_failed_count
-                        )
-                        _merged_usage = run_state.get("usage_proxy")
-                        if not isinstance(_merged_usage, dict):
-                            _merged_usage = {}
-                        # The preserved state may predate this run entirely, and
-                        # its usage_proxy said nothing about the order this
-                        # invocation may have left live. The comparison also omitted
-                        # THIS invocation's own accumulated evaluation errors --
-                        # provider errors, pre-roll whole-share reconciliation errors,
-                        # published into _IN_FLIGHT_RUN_EVALUATION the moment
-                        # evaluation completed -- unlike the synthesized branch above
-                        # (`errors_count=_evaluated.get("errors_count") + max(1,
-                        # orders_failed_count)`), which already adds them. A retry
-                        # that logged two evaluation errors before one unresolved
-                        # placement could merge into a preserved zero-error artifact
-                        # and still report `errors_count=1`, discarding the two
-                        # evaluation errors entirely (Codex review, PR #859 round 32:
-                        # "Add current evaluation errors during retry merges").
-                        run_state["usage_proxy"] = {
-                            **_merged_usage,
-                            "errors_count": max(
-                                _coerce_nonnegative_int(_merged_usage.get("errors_count")),
-                                _coerce_nonnegative_int(_evaluated.get("errors_count"))
-                                + max(1, run_state["orders_failed_count"]),
-                            ),
-                            "manual_recovery_required": True,
-                        }
-                    if unresolved_placement_halt:
-                        if not merged["orders_submitted_count"]:
-                            # stamp_failure_classification labels every zero-submission
-                            # merge `failed_scheduled_run_startup`, which is exactly the
-                            # misdiagnosis the synthesized branch above already refuses:
-                            # this retry DID reach the broker placement boundary. The
-                            # two branches are alternatives for the same failure, so
-                            # they must not disagree about what kind of failure it was
-                            # (Codex review, PR #859: "Classify unresolved retry merges
-                            # as placement failures"). Only reachable at all because
-                            # the unproven retry outcome is now retained rather than
-                            # dropped. Scoped to a zero-submission merge specifically --
-                            # unlike the evaluation-context refresh just below, this
-                            # correction exists only for the misclassification a
-                            # zero-submission merge produces; a merge that already has
-                            # a submitted order was never mislabeled this way.
-                            run_state["run_classification_outcome"] = _placement_failure_class
-                            run_state["error_class"] = _placement_failure_class
-                        # ...and the EVALUATION the retry completed, not the
-                        # preserved attempt's. A same-slot state written by an
-                        # earlier startup failure carries `counts.evaluated=0`,
-                        # empty signal_rows and zero caps, and correcting only the
-                        # classification left the final artifact claiming a
-                        # placement failure that evaluated no symbols -- the same
-                        # contradiction the synthesized branch already refuses
-                        # (Codex review, PR #859: "Refresh evaluation context on
-                        # unresolved retry merges"). Only when this invocation
-                        # actually has an evaluation to offer; otherwise the
-                        # preserved values stay, since they are then the better
-                        # record. Deliberately NOT gated on orders_submitted_count
-                        # (unlike the classification fix above): an existing same-
-                        # slot artifact that already contains a submitted order,
-                        # merged with a NEW unresolved candidate, previously kept
-                        # the earlier invocation's signal_rows/evaluated count/
-                        # budget verbatim and never rewrote signals.csv, leaving
-                        # drift-detection and reporting consumers unable to see the
-                        # signals or cap context that produced the newly recorded
-                        # failure (Codex review, PR #859 round 27: "Refresh retry
-                        # evaluation after prior submissions").
-                        if _evaluated_decisions:
-                            _merged_candidates = [
-                                row
-                                for row in (run_state.get("buy_candidates") or [])
-                                if isinstance(row, dict)
-                            ]
-                            _merged_signal_rows = _build_signal_rows(
-                                _evaluated_decisions, run_state.get("broker_outcomes") or {}
-                            )
-                            _backfill_reconciled_signal_amounts(
-                                _merged_signal_rows, _merged_candidates
-                            )
-                            run_state["signal_rows"] = _merged_signal_rows
-                            # A malformed but readable `counts` value on the preserved
-                            # same-slot artifact (a string or list, from damaged or
-                            # externally produced storage) is not a shape `dict(...)`
-                            # can convert -- it raised, and because the failure-state
-                            # write happens LATER in this same function, the exception
-                            # abandoned this halt's refreshed classification, failure
-                            # count, and recovery telemetry entirely, along with
-                            # everything downstream (Codex review, PR #859 round 31:
-                            # "Parse preserved counts before refreshing retry state").
-                            # Treated the same as an absent field: a malformed value is
-                            # not evidence of anything worth preserving over a fresh
-                            # `evaluated` count.
-                            _preserved_counts = run_state.get("counts")
-                            _merged_counts = dict(_preserved_counts) if isinstance(_preserved_counts, dict) else {}
-                            _merged_counts["evaluated"] = len(_evaluated_decisions)
-                            run_state["counts"] = _merged_counts
-                            if _evaluated_budget is not None:
-                                run_state["budget"] = _evaluated_budget
-                            # signals.csv is regenerated from run_state below only
-                            # when the state is synthesized; a merged state keeps
-                            # its companion, which now disagrees with the rows just
-                            # written. Rewritten here so the two match.
-                            _rewrite_merged_signals_csv = True
-                    # `state_was_mutated` means ROWS changed, which is what the
-                    # run_summary.json regeneration gate below is keyed on -- NOT merely
-                    # that the state file was rewritten. The failure stamp above rewrites
-                    # it on every raise, and setting this flag for that alone would
-                    # regenerate a summary for a preserved state whose stale companion the
-                    # artifact-contract check exists to catch. But an UNRESOLVED halt is
-                    # never "nothing changed" even when every current outcome's order id
-                    # was already present and deduplicated away (added stays False): the
-                    # classification correction and evaluation/count refresh above (see
-                    # "unresolved_placement_halt" a few lines up) still rewrote
-                    # run_classification_outcome/error_class/orders_failed_count/
-                    # usage_proxy regardless of whether any ROW was newly merged. Gating
-                    # regeneration on `added` alone left a stale run_summary.json --
-                    # possibly still describing an earlier SUCCESSFUL run at this slot --
-                    # standing after run_state.json itself was rewritten to say a
-                    # possibly-live order needs reconciliation, exactly the artifact-
-                    # contract mismatch this gate exists to prevent (Codex review, PR
-                    # #859 round 28: "Regenerate the summary for fully deduplicated
-                    # halts"). `_status_transitioned_to_failed` covers the remaining
-                    # gap: neither `added` nor `unresolved_placement_halt` fires for a
-                    # same-slot retry that fails before publishing any outcome AND is
-                    # not itself an unresolved-placement halt, yet the failure stamp
-                    # above still just overwrote a preserved SUCCESSFUL status with
-                    # "failed" (Codex review, PR #859 round 31: "Regenerate summaries
-                    # after manual failure stamps"). `_dry_run_backfill_changed`
-                    # covers a fourth, narrower gap: a no-add retry whose ONLY
-                    # change to `run_state` was backfilling a previously-absent
-                    # "dry_run" -- neither a row nor the status changed, but
-                    # `build_run_summary` mirrors that field too, so leaving it
-                    # out of this gate left the regenerated state disagreeing
-                    # with an un-regenerated summary on dry_run specifically
-                    # (Codex review: "Regenerate the summary after backfilling
-                    # dry-run mode").
-                    state_was_mutated = (
-                        added
-                        or unresolved_placement_halt
-                        or _status_transitioned_to_failed
-                        or _dry_run_backfill_changed
-                    )
-                    _merged_run_state_text = _serialize_run_state(run_state)
-                    atomic_write_text(state_path, _merged_run_state_text)
-                    _written_run_state_bytes = _merged_run_state_text.encode("utf-8")
     except (TimeoutError, OSError) as _lock_exc:
         # This handler already fired because the run raised; failing to
         # acquire the sidecar lock -- whether a timeout, or a plain OSError
