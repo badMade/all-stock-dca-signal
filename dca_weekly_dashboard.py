@@ -952,15 +952,32 @@ def _merge_authoritative_amount_into_keeper(
     # -- they absorb the claim-attribution delta instead of the full dollar
     # delta, so a metadata-only reattribution (equal amount, different claim
     # week) still moves them correctly.
-    for _budget_key in ("day_notional_usd", "hypothetical_day_spend_usd"):
-        _existing_value = _finite_float(_keeper_budget.get(_budget_key))
-        if _existing_value is not None:
-            _keeper_budget[_budget_key] = _existing_value + _delta
+    # Optimization: Unrolled loops and avoided passing None to _finite_float
+    # to eliminate iteration overhead and exception handling cost.
+    _val = _keeper_budget.get("day_notional_usd")
+    if _val is not None:
+        _existing = _finite_float(_val)
+        if _existing is not None:
+            _keeper_budget["day_notional_usd"] = _existing + _delta
+
+    _val = _keeper_budget.get("hypothetical_day_spend_usd")
+    if _val is not None:
+        _existing = _finite_float(_val)
+        if _existing is not None:
+            _keeper_budget["hypothetical_day_spend_usd"] = _existing + _delta
+
     if _week_delta:
-        for _budget_key in ("week_notional_usd", "hypothetical_week_spend_usd"):
-            _existing_value = _finite_float(_keeper_budget.get(_budget_key))
-            if _existing_value is not None:
-                _keeper_budget[_budget_key] = _existing_value + _week_delta
+        _val = _keeper_budget.get("week_notional_usd")
+        if _val is not None:
+            _existing = _finite_float(_val)
+            if _existing is not None:
+                _keeper_budget["week_notional_usd"] = _existing + _week_delta
+
+        _val = _keeper_budget.get("hypothetical_week_spend_usd")
+        if _val is not None:
+            _existing = _finite_float(_val)
+            if _existing is not None:
+                _keeper_budget["hypothetical_week_spend_usd"] = _existing + _week_delta
 
 
 def _order_constituent_ids(order_id: Any, source: Optional[Dict[str, Any]]) -> frozenset:

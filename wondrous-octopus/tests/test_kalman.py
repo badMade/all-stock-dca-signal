@@ -34,7 +34,6 @@ import dataclasses
 import json
 import math
 from statistics import NormalDist
-
 import model_interface
 import numpy as np
 import pandas as pd
