@@ -1918,7 +1918,7 @@ def write_purchase_history(
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / PURCHASE_HISTORY_CSV_FILENAME
     with dca_fileio.atomic_open_w(csv_path, newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=PURCHASE_HISTORY_FIELDS)
+        writer: csv.DictWriter[str] = csv.DictWriter(handle, fieldnames=list(PURCHASE_HISTORY_FIELDS))
         writer.writeheader()
         for record in records:
             writer.writerow(asdict(record))
@@ -1932,7 +1932,9 @@ def write_purchase_history(
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    doc_lines = (__doc__ or "").splitlines()
+    description = doc_lines[0] if doc_lines else None
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--cron-tracking-root",
         type=Path,
