@@ -166,6 +166,31 @@ def test_write_rows_rejects_untrusted_host(monkeypatch):
     mock_build_opener.assert_not_called()
     mock_urlopen.assert_not_called()
 
+def test_write_rows_rejects_disallowed_ip(monkeypatch):
+    monkeypatch.setattr(
+        strategy_monitor.SheetsWriter,
+        "_API_BASE",
+        "https://api.pipedream.com/v1/accounts/google_sheets__pipedream/actions",
+    )
+    writer = strategy_monitor.SheetsWriter(CONFIG)
+
+    with (
+        patch("urllib.request.build_opener") as mock_build_opener,
+        patch("urllib.request.urlopen") as mock_urlopen,
+        patch(
+            "dca_net_utils.assert_safe_destination",
+            side_effect=Exception("disallowed ip"),
+        ) as mock_assert_safe_destination,
+    ):
+        result = writer.write_rows({}, {}, "2026-08-10")
+
+    assert result is False
+    mock_assert_safe_destination.assert_called_once_with(
+        "https://api.pipedream.com/v1/accounts/google_sheets__pipedream/actions/add-rows"
+    )
+    mock_build_opener.assert_not_called()
+    mock_urlopen.assert_not_called()
+
 
 def test_write_rows_rejects_file_scheme(monkeypatch):
     monkeypatch.setattr(strategy_monitor.SheetsWriter, "_API_BASE", "file:///etc/passwd")
