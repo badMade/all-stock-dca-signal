@@ -37,12 +37,12 @@ def steady_state_variance(q: float, r: float) -> float:
         raise ValueError("q must be non-negative")
     if r <= 0.0:
         raise ValueError("r must be strictly positive")
-    return float((q + math.sqrt(q * q + 4.0 * q * r)) / 2.0)
+    return (q + math.sqrt(q * q + 4.0 * q * r)) / 2.0
 
 
 def steady_state_gain(q: float, r: float) -> float:
     variance = steady_state_variance(q, r)
-    return float(variance / (variance + r))
+    return variance / (variance + r)
 
 
 class ScalarFilter:
@@ -64,11 +64,11 @@ class ScalarFilter:
             raise ValueError("r must be strictly positive")
         if q_ratio < 0.0:
             raise ValueError("q_ratio must be non-negative")
-        self.r = float(r)
-        self.q_ratio = float(q_ratio)
-        self.trend = bool(trend)
-        self.observations = int(observations)
-        variance = float(prior_variance if prior_variance is not None else r)
+        self.r = r
+        self.q_ratio = q_ratio
+        self.trend = trend
+        self.observations = observations
+        variance = prior_variance if prior_variance is not None else r
         if variance <= 0.0:
             raise ValueError("prior_variance must be strictly positive")
         if self.trend:
@@ -117,7 +117,7 @@ class ScalarFilter:
     def absorb(self, value: float) -> float:
         state, covariance, observation, variance = self._predict()
         mean = float(observation @ state)
-        innovation = float(value) - mean
+        innovation = value - mean
         gain = (covariance @ observation) / variance
         self._state = state + gain * innovation
         identity = np.eye(covariance.shape[0], dtype=np.float64)
@@ -157,8 +157,8 @@ class KalmanForecaster:
     name = "kalman"
 
     def __init__(self, *, q_ratio: float = DEFAULT_Q_RATIO, trend: bool = False) -> None:
-        self.q_ratio = float(q_ratio)
-        self.trend = bool(trend)
+        self.q_ratio = q_ratio
+        self.trend = trend
         self._filters: dict[str, dict[str, ScalarFilter]] = {}
         self._pooled_level = {component: 0.0 for component in COMPONENTS}
         self._pooled_r = {component: 0.01 for component in COMPONENTS}
@@ -209,7 +209,7 @@ class KalmanForecaster:
                     filt.absorb(float(value))
                 filters[component] = filt
             self._filters[ticker] = filters
-            absorbed += int(len(rows))
+            absorbed += len(rows)
         return {"absorbed": absorbed}
 
     def predict(self, requests: Sequence[ForecastRequest]) -> list[OHLCForecast]:
@@ -275,8 +275,8 @@ class KalmanForecaster:
                 "name": self.name,
                 "q_ratio": self.q_ratio,
                 "trend": self.trend,
-                "pooled_level": {component: float(self._pooled_level[component]) for component in COMPONENTS},
-                "pooled_r": {component: float(self._pooled_r[component]) for component in COMPONENTS},
+                "pooled_level": {component: self._pooled_level[component] for component in COMPONENTS},
+                "pooled_r": {component: self._pooled_r[component] for component in COMPONENTS},
             },
         )
 
