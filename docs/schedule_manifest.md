@@ -797,9 +797,9 @@ this section is the authoritative one. Three of those override blocks used to si
 above it and read in the present tense, which is exactly how an expired
 authorization gets mistaken for a live one.
 
-Standing Perplexity backup policy, added Sep 8, 2026 -- PERMANENT, does not expire:
+Standing Perplexity backup policy, added Sep 8 and updated Sep 11, 2026 -- PERMANENT, does not expire:
 
-> **ADDED 2026-09-08:** The user directed that Perplexity's backup role be
+> **ADDED 2026-09-08; UPDATED 2026-09-11:** The user directed that Perplexity's backup role be
 > standing rather than a recurring week-by-week or same-day grant: "Perplexity
 > shouldn't be disabled anywhere permanently... Perplexity is supposed to back
 > up Claude if it fails, not be disabled." The three dated override blocks
@@ -809,26 +809,26 @@ Standing Perplexity backup policy, added Sep 8, 2026 -- PERMANENT, does not expi
 > days and had to explicitly disable the previous batch's leftover task IDs,
 > which reads as Perplexity repeatedly being shut off when the actual design,
 > recorded in `claude/PERPLEXITY-CLAUDE-COORDINATION.md` since 2026-08-02, has
-> always been standing coexistence. This entry replaces that pattern. All five
-> backup task IDs below were already live under the Sep 8-11 override; nothing
-> new was deployed to make this table current, only the authorization's status
-> changed from temporary to standing. Machine-readable source:
+> always been standing coexistence. The Sep 11 update retimed the backup slots
+> to the requested 20-minute offset and added a separate 3:45 PM final backup
+> task so the last buy still has time before close. Machine-readable source:
 > `config/scheduled_tasks.json` -> `standing_perplexity_backup_policy`.
 
 | Canonical ET | Canonical task | Backup ET | Backup task | Trades | Status |
 |---|---|---|---|---|---|
-| 9:35 AM | `2ba19526` | 9:45 AM | `4412c3c4` | **yes** | standing |
-| 10:30 AM | `42173154` | 10:40 AM | `e028361e` | **yes** | standing |
-| 11:30 AM | `7be82b97` (11:30 fire) | 11:40 AM | `e3590042` | **yes** | standing |
-| 12:30 PM | `a6239dae` | 12:40 PM | `062605c6` | **yes** | standing |
-| 1:30 PM | `7be82b97` (1:30 fire) | 1:40 PM | `54ab24d2` | **yes** | standing |
-| 2:30 PM | `7be82b97` (2:30 fire) | 2:40 PM | `54ab24d2` | **yes** | standing |
-| 3:30 PM | `10ce362c` | 3:40 PM | `54ab24d2` | **yes** | standing |
+| 9:35 AM | `2ba19526` | 9:55 AM | `4412c3c4` | **backup only** | standing |
+| 10:30 AM | `42173154` | 10:50 AM | `e028361e` | **backup only** | standing |
+| 11:30 AM | `7be82b97` (11:30 fire) | 11:50 AM | `e3590042` | **backup only** | standing |
+| 12:30 PM | `a6239dae` | 12:50 PM | `062605c6` | **backup only** | standing |
+| 1:30 PM | `7be82b97` (1:30 fire) | 1:50 PM | `54ab24d2` | **backup only** | standing |
+| 2:30 PM | `7be82b97` (2:30 fire) | 2:50 PM | `54ab24d2` | **backup only** | standing |
+| 3:30 PM | `10ce362c` | 3:45 PM | `f83b8d62` | **backup only** | standing |
 
-Each backup fires 10 minutes after its canonical counterpart so Claude gets
-first chance to buy; if Claude's slot fails, aborts, or never reaches
-placement, Perplexity's own per-slot check (see the coordination doc's
-section 4) finds no qualifying order in the window and proceeds. The 12:30 PM
+Each backup fires 20 minutes after its canonical counterpart except the final
+slot, which fires at 3:45 PM so the backup still has time before close. Claude
+gets first chance to buy; if Claude's slot fails, aborts, or never reaches
+placement, Perplexity's own per-slot check (see the coordination doc's section
+4) finds no qualifying order in the window and proceeds. The 12:30 PM
 slot's own Gate 4 could not recognize a compatible Perplexity order until a
 2026-09-08 fix to `claude/dca-executor-prompts/live-mirror/1230ET-1230-pm-midday-buying-run.txt`
 (see `config/scheduled_tasks.json` -> `standing_perplexity_backup_policy.midday_gate4_dependency`
