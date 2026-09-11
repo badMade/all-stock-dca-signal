@@ -1503,7 +1503,6 @@ _ALLOWED = {
     "dca-sizing-signals-package 2.tar.gz",
     # Generated package lockfile full of hashes and sizes that match account shapes.
     "uv.lock",
-    ".vscode/launch.json",
 }
 
 # The scan is an EXCLUDE list, not an include list. It used to allowlist text
