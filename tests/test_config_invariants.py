@@ -2716,25 +2716,28 @@ def test_standing_perplexity_backup_policy_covers_all_seven_slots():
 
     slots = policy["authorized_slots_et"]
     expected = {
-        "09:35": ("2ba19526", "4412c3c4"),
-        "10:30": ("42173154", "e028361e"),
-        "11:30": ("7be82b97", "e3590042"),
-        "12:30": ("a6239dae", "062605c6"),
-        "13:30": ("7be82b97", "54ab24d2"),
-        "14:30": ("7be82b97", "54ab24d2"),
-        "15:30": ("10ce362c", "54ab24d2"),
+        "09:35": ("2ba19526", "4412c3c4", "09:55"),
+        "10:30": ("42173154", "e028361e", "10:50"),
+        "11:30": ("7be82b97", "e3590042", "11:50"),
+        "12:30": ("a6239dae", "062605c6", "12:50"),
+        "13:30": ("7be82b97", "54ab24d2", "13:50"),
+        "14:30": ("7be82b97", "54ab24d2", "14:50"),
+        "15:30": ("10ce362c", "f83b8d62", "15:45"),
     }
     assert set(slots) == set(expected)
-    for et, (canonical_id, backup_id) in expected.items():
+    task_by_id = {task["id"]: task for task in data["tasks"]}
+    for et, (canonical_id, backup_id, backup_fire_time) in expected.items():
         assert slots[et]["canonical_task_id"] == canonical_id, et
         assert slots[et]["backup_task_id"] == backup_id, et
+        assert slots[et]["backup_fires_at_et"] == backup_fire_time, et
+        assert backup_fire_time in task_by_id[backup_id]["trigger_window"], et
 
     # Every backup task ID the policy names must be discoverable in tasks[],
     # the same discoverability rule test_aug_28_one_time_catch_up_task_is_
     # registered_in_the_manifest already established for one-time IDs -- an
     # override-named buy task with no tasks[] entry has no status, fire
     # window, or safety contract other consumers can validate.
-    task_ids = {task["id"] for task in data["tasks"]}
+    task_ids = set(task_by_id)
     backup_ids = {v["backup_task_id"] for v in slots.values()}
     for backup_id in backup_ids:
         assert backup_id in task_ids, f"{backup_id} has no tasks[] entry"
