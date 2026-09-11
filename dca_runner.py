@@ -1109,8 +1109,11 @@ def count_compatible_executor_attempts(
       (fail-safe: ``None``, ``"user"``, ``"recurring"``, ``"drip"``, or any
       other value is never compatible -- mirrors Gate 4's own
       classification).
-    * its ``client_order_id`` does NOT start with ``self_client_ref_prefix``.
-      Required, not optional, and given no default: a bare
+    * its ``client_order_id`` is present AND does NOT start with
+      ``self_client_ref_prefix``. ``self_client_ref_prefix`` is required, not
+      optional, and given no default, and must be a nonempty string (an
+      empty prefix would make ``str.startswith("")`` True for every order,
+      silently zeroing this function's entire count): a bare
       ``placed_agent == "agentic"`` is not sufficient to attribute an order
       to the compatible executor specifically, because THIS engine's own
       live orders carry the identical generic tag
@@ -1120,15 +1123,30 @@ def count_compatible_executor_attempts(
       (``dca-runner-<slot>-<trading_day>-<TICKER>``, per that same doc),
       this function would double-count THIS engine's own attempts --
       already reflected in its caller's local seeding -- as the compatible
-      executor's.
+      executor's. A MISSING ``client_order_id`` fails closed (does not
+      count) rather than being treated as "not self": the 1530ET
+      live-mirror prompt's own Gate 7 documents that a refreshed broker
+      fetch can return ``client_order_id`` as null even for an order THIS
+      engine itself placed, so a missing reference cannot prove the order
+      is NOT self and must never be counted as the compatible executor's on
+      that gap alone (PR review: "fail closed when the identifier is
+      absent instead").
     """
+    if not isinstance(self_client_ref_prefix, str) or not self_client_ref_prefix:
+        raise ValueError(
+            "count_compatible_executor_attempts requires a nonempty "
+            f"self_client_ref_prefix to exclude this engine's own orders; "
+            f"got {self_client_ref_prefix!r}"
+        )
     count = 0
     for order in orders:
         if not order.is_buy_attempt:
             continue
         if order.placed_agent != compatible_agent_value:
             continue
-        client_ref = order.client_order_id or ""
+        client_ref = order.client_order_id
+        if not client_ref:
+            continue
         if client_ref.startswith(self_client_ref_prefix):
             continue
         if _require_aware(order.created_at).astimezone(ET).date() != trading_day:

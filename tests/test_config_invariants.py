@@ -2367,7 +2367,7 @@ def test_market_open_live_mirror_fail_closes_reviewed_placement_boundaries():
     assert "BrokerOrder.is_buy_attempt" in gate_7
     assert "canceled/cancelled and rejected attempts consume the shared limit" in gate_7
     assert "submit no remaining orders once the fresh count has reached it" in gate_7
-    assert "skip the rest rather than submitting a ninth attempt" in gate_7
+    assert "skip the rest rather than submitting an attempt beyond the configured limit" in gate_7
     assert "ISO week's Monday at 00:00 ET" in gate_7
     assert "fully paginate it before EACH placement" in gate_7
     assert "fetch a NEW current bid/ask" in gate_7

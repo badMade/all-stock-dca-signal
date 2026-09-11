@@ -12278,13 +12278,11 @@ def test_the_dollar_caps_still_bind_independently_of_the_count_cap(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# PROPOSED, NOT YET IMPLEMENTED: dca_runner.count_compatible_executor_attempts
+# dca_runner.count_compatible_executor_attempts
 #
-# TDD spec only -- dca_runner.py does not define this function yet. These
-# tests are expected to fail RED (AttributeError) until it is written; this
-# is the "write the test, present it, wait for approval" step, not the
-# implementation. Presented 2026-09-11 alongside the max_orders_per_day cap
-# fix, for the still-open gap that fix's own config note flags: the 3:30 PM
+# Implemented (dca_runner.py:1075), but NOT YET WIRED into any live path --
+# no caller invokes it yet. Written 2026-09-11 alongside the max_orders_per_day
+# cap fix, for the still-open gap that fix's own config note flags: the 3:30 PM
 # canonical path (near_close_dca.py's _seed_prior_allocations) seeds
 # day_order_count purely from this repo's own local run artifacts, with no
 # visibility into orders the standing Perplexity backup executor places
@@ -12318,16 +12316,22 @@ def test_the_dollar_caps_still_bind_independently_of_the_count_cap(monkeypatch):
 #   - order.placed_agent == compatible_agent_value EXACTLY (fail-safe:
 #     anything else -- None, "user", "recurring", "drip", or any other
 #     value -- is never compatible, mirroring Gate 4's own classification)
-#   - its client_order_id does NOT start with self_client_ref_prefix.
-#     REQUIRED, not optional: claude/PERPLEXITY-CLAUDE-COORDINATION.md's own
-#     Sec 4 documents that a bare placed_agent of "agentic" is not
-#     sufficient to attribute an order to Perplexity specifically, because
-#     Claude's own live orders carry the identical "agentic" tag -- without
-#     excluding this engine's own client-reference prefix
+#   - its client_order_id is PRESENT and does NOT start with
+#     self_client_ref_prefix. self_client_ref_prefix is REQUIRED (must be a
+#     nonempty string, or the function raises ValueError -- an empty prefix
+#     would make str.startswith("") true for every order, silently zeroing
+#     the count): claude/PERPLEXITY-CLAUDE-COORDINATION.md's own Sec 4
+#     documents that a bare placed_agent of "agentic" is not sufficient to
+#     attribute an order to Perplexity specifically, because Claude's own
+#     live orders carry the identical "agentic" tag -- without excluding
+#     this engine's own client-reference prefix
 #     (dca-runner-<slot>-<trading_day>-<TICKER>, per that same doc), this
 #     function would double-count THIS engine's own attempts (already
 #     reflected in its local seeding) as if they belonged to the compatible
-#     executor.
+#     executor. A MISSING client_order_id fails closed (does not count):
+#     the 1530ET live-mirror prompt documents that a refreshed broker fetch
+#     can return client_order_id as null even for an order THIS engine
+#     placed, so a missing reference cannot prove the order is not self.
 # ---------------------------------------------------------------------------
 
 
@@ -12409,6 +12413,29 @@ def test_compatible_executor_attempts_excludes_sells():
     assert dca_runner.count_compatible_executor_attempts(
         orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
     ) == 0
+
+
+def test_compatible_executor_attempts_fails_closed_on_missing_client_order_id():
+    """A missing client_order_id cannot prove an agentic order is NOT this
+    engine's own -- the 1530ET live-mirror prompt documents that a
+    refreshed broker fetch can return client_order_id as null even for an
+    order THIS engine placed. Must not count it (PR review: "fail closed
+    when the identifier is absent instead")."""
+    orders = [_compat_order("AAPL", client_order_id=None)]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 0
+
+
+def test_compatible_executor_attempts_rejects_empty_self_prefix():
+    """An empty self_client_ref_prefix would make str.startswith("") true
+    for every order, silently zeroing the count instead of raising -- must
+    fail loudly instead."""
+    orders = [_compat_order("AAPL", client_order_id="ref-1")]
+    with pytest.raises(ValueError):
+        dca_runner.count_compatible_executor_attempts(
+            orders, date(2026, 9, 11), self_client_ref_prefix=""
+        )
 
 
 def test_budget_snapshot_counts_todays_buy_attempts_including_dead_ones():

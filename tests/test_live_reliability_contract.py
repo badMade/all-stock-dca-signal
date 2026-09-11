@@ -520,8 +520,14 @@ def test_a_plan_is_refused_once_the_days_order_count_is_exhausted():
     empty_day = dca_runner.budget_snapshot([], TRADING_DAY)
     plan = dca_runner.plan_orders(cands, empty_day, NORMAL_TIER)
 
+    # $1.00 per row (not the ordinary $2.00 base): at MAX_ORDERS_PER_DAY (120)
+    # rows, $2.00 each would total $240, past the $180 Normal daily cap, so a
+    # ValueError here would no longer isolate the COUNT cap from the separate
+    # notional cap already tested above (PR review: "keep the history's
+    # notional at or below the daily cap ... assert the count-specific
+    # refusal"). $1.00 * 120 = $120, comfortably under $180.
     full_day = [
-        _broker_order(t, 2.0) for t in _tickers_with_repeats(dca_runner.MAX_ORDERS_PER_DAY, skip=20)
+        _broker_order(t, 1.0) for t in _tickers_with_repeats(dca_runner.MAX_ORDERS_PER_DAY, skip=20)
     ]
     with pytest.raises(ValueError):
         _execute(plan, _live_broker(place_fn), candidates=cands, orders=full_day, snapshot=empty_day)
