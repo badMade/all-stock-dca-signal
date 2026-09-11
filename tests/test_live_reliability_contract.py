@@ -35,6 +35,7 @@ implementation detail of the clause and the clause is what must not regress.
 
 from __future__ import annotations
 
+import itertools
 import re
 import socket
 import urllib.request
@@ -149,6 +150,26 @@ def _tickers(n, *, skip=0):
 
 def _cands(n, *, amount=2.0, multiplier=1.0, skip=0):
     return [dca_runner.Candidate(t, amount, multiplier) for t in _tickers(n, skip=skip)]
+
+
+def _tickers_with_repeats(n, *, skip=0):
+    """Like ``_tickers``, but cycles the real whitelist instead of raising
+    when ``n`` exceeds its 59-ticker size (true since MAX_ORDERS_PER_DAY
+    became 120 -- see config/budgets.json's own max_orders_per_day_note).
+
+    Only for BROKER ORDER HISTORY rows (already-placed same-day orders):
+    ``budget_snapshot``/``day_order_count`` count every row, with no
+    per-ticker dedup (a real account can top up the same ticker more than
+    once a day), so a repeated symbol here is realistic. This is NOT a
+    substitute for ``_tickers``/``_cands`` when building a NEW candidate
+    batch: ``plan_orders`` dedups candidates by ticker within one batch, so
+    a candidate list still needs ``n`` genuinely distinct tickers.
+    """
+    pool = sorted(dca_runner.ACTIVE_TICKERS)
+    if not pool:
+        raise AssertionError("the active whitelist is empty")
+    rotated = pool[skip % len(pool):] + pool[: skip % len(pool)]
+    return list(itertools.islice(itertools.cycle(rotated), n))
 
 
 def _broker_order(symbol, amount, *, hour_et=9, minute_et=40, state="filled", side="buy"):
@@ -500,7 +521,7 @@ def test_a_plan_is_refused_once_the_days_order_count_is_exhausted():
     plan = dca_runner.plan_orders(cands, empty_day, NORMAL_TIER)
 
     full_day = [
-        _broker_order(t, 2.0) for t in _tickers(dca_runner.MAX_ORDERS_PER_DAY, skip=20)
+        _broker_order(t, 2.0) for t in _tickers_with_repeats(dca_runner.MAX_ORDERS_PER_DAY, skip=20)
     ]
     with pytest.raises(ValueError):
         _execute(plan, _live_broker(place_fn), candidates=cands, orders=full_day, snapshot=empty_day)
@@ -546,7 +567,7 @@ def test_assess_stops_a_batch_at_the_days_shared_order_count():
     why."""
     earlier = [
         _broker_order(t, 2.0, hour_et=9, minute_et=40)
-        for t in _tickers(dca_runner.MAX_ORDERS_PER_DAY, skip=20)
+        for t in _tickers_with_repeats(dca_runner.MAX_ORDERS_PER_DAY, skip=20)
     ]
     result = _assess(
         slot_id="1030",
@@ -566,7 +587,7 @@ def test_a_cancelled_attempt_still_consumes_one_of_the_days_orders():
     direction for a count ceiling, and a cancelled order did occupy a slot."""
     earlier = [
         _broker_order(t, 2.0, hour_et=9, minute_et=40, state="cancelled")
-        for t in _tickers(dca_runner.MAX_ORDERS_PER_DAY, skip=20)
+        for t in _tickers_with_repeats(dca_runner.MAX_ORDERS_PER_DAY, skip=20)
     ]
     snapshot = dca_runner.budget_snapshot(earlier, TRADING_DAY)
     assert snapshot.day_order_count == dca_runner.MAX_ORDERS_PER_DAY
