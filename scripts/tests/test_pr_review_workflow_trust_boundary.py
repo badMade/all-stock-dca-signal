@@ -457,6 +457,19 @@ def test_validate_provenance_also_outputs_a_base_sha():
     assert 'core.setOutput("base_sha"' in script
 
 
+def test_validate_provenance_uses_workflow_run_head_sha_not_live_pr_head():
+    """workflow_run.head_sha is immutable for the triggering run; PR-head
+    fields can drift if a new commit lands before the privileged workflow runs."""
+    job = _job(POST, "validate-provenance")
+    script = ""
+    for step in job.get("steps") or []:
+        with_block = step.get("with") or {}
+        if "script" in with_block:
+            script += with_block["script"]
+    assert "run.head_sha" in script
+    assert 'core.setOutput("head_sha", run.head_sha);' in script
+
+
 def test_the_dedup_check_also_compares_the_current_base_sha():
     script = _check_step()["with"]["script"]
     assert "pr.data.base.sha" in script and "baseSha" in script, (

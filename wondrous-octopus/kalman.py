@@ -8,8 +8,8 @@ semantics, and one independent filter per (ticker, OHLC component).
 from __future__ import annotations
 
 import math
-from statistics import NormalDist
 from pathlib import Path
+from statistics import NormalDist
 from typing import Any, Callable, Sequence
 
 import numpy as np

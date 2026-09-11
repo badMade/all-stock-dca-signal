@@ -96,6 +96,9 @@ jobs:
             if (prs.length === 0) {
               failures.push("no associated pull_requests on the triggering run");
             }
+            if (!run.head_sha) {
+              failures.push("triggering run does not expose an immutable head_sha");
+            }
 
             if (failures.length > 0) {
               for (const f of failures) core.error(f);
@@ -106,10 +109,10 @@ jobs:
             const pr = prs[0];
             core.info(
               `provenance OK: workflow="${run.name}" event=${run.event} ` +
-              `repo=${actualRepo} pr=#${pr.number} head=${pr.head.sha} base=${pr.base.sha}`
+              `repo=${actualRepo} pr=#${pr.number} head=${run.head_sha} base=${pr.base.sha}`
             );
             core.setOutput("pr_number", String(pr.number));
-            core.setOutput("head_sha", pr.head.sha);
+            core.setOutput("head_sha", run.head_sha);
             core.setOutput("base_sha", pr.base.sha);
 
   review:
