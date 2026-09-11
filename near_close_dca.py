@@ -4562,7 +4562,6 @@ class AlpacaBroker:
     def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
         return []
 
-
 def account_pinning_failure(
     target_account_number: Optional[str],
     broker: "BrokerName | str | None" = None,
