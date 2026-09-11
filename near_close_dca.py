@@ -293,10 +293,12 @@ ACTIVE_TICKERS = [
     # for any of the six (this session has no broker access) -- tradability,
     # fractional tradability, and prior-close availability are unverified,
     # and the run-time preflight and data-confidence gates admit or gate
-    # each out fail-closed if it does not resolve. None are in tickers.txt,
-    # so all six calibrate on the global fallback ladder until history is
-    # fetched and scripts/generate_per_ticker_sizing.py is re-run. See
-    # config/tickers.json's notes.
+    # each out fail-closed if it does not resolve. All six ARE already in
+    # tickers.txt (the history-fetch symbol list), but none has been
+    # through scripts/generate_per_ticker_sizing.py's calibration yet, so
+    # all six use the global fallback ladder (config/per_ticker_sizing.json's
+    # fallback_tickers) until that script is re-run against their archived
+    # history. See config/tickers.json's notes.
     "VIAV",
     "CIEN",
     "ANET",

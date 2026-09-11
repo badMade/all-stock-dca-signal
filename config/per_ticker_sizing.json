@@ -1,5 +1,5 @@
 {
-  "version": "2026-08-16",
+  "version": "2026-09-11",
   "status": "active",
   "description": "Per-stock DCA: all positive first orders start at $1.00; later amounts are precise historical-drop tiers.",
   "method": "25th/50th/75th/90th/97.5th percentile adjusted prior-close-to-low drops map to 1x/1.5x/2.5x/4x/5x.",
