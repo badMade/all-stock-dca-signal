@@ -828,9 +828,11 @@ Standing Perplexity backup policy, added Sep 8 and updated Sep 11, 2026 -- PERMA
 
 Each backup fires 20 minutes after its canonical counterpart except the final
 slot, which fires at 3:45 PM so the backup still has time before close. Claude
-gets first chance to buy; if Claude's slot fails, aborts, or never reaches
-placement, Perplexity's own per-slot check (see the coordination doc's section
-4) finds no qualifying order in the window and proceeds. The 12:30 PM
+gets first chance to buy; per `config/scheduled_tasks.json` ->
+`standing_perplexity_backup_policy.mechanism`, Perplexity proceeds only when a
+complete, current per-slot check proves Claude placed no qualifying submitted
+or filled buy for the corresponding original slot, and otherwise stands down
+without placing orders. The 12:30 PM
 slot's own Gate 4 could not recognize a compatible Perplexity order until a
 2026-09-08 fix to `claude/dca-executor-prompts/live-mirror/1230ET-1230-pm-midday-buying-run.txt`
 (see `config/scheduled_tasks.json` -> `standing_perplexity_backup_policy.midday_gate4_dependency`
