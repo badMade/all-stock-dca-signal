@@ -21604,6 +21604,816 @@ def _process_whole_share_candidate(
     return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
 
+
+def _discard_pending_credit(ctx: ProcessCandidateContext, ticker: str, observed_amount_usd: float) -> tuple[bool, float, Optional[int]]:
+    """Run the ledger's final-session discard; report what THIS call removed.
+
+    Returns ``(discarded, removed_usd, revision)``. ``revision`` is the
+    ledger's mutation counter as of this discard, or None when the ledger
+    cannot report one -- the compare-and-swap token
+    restore_minimum_order_pending() needs so a rollback issued after the
+    lock was released cannot overwrite a concurrent settlement (Codex
+    review, PR #680 discussion_r3925440982: "Make post-discard
+    restoration compare-and-swap"). ``discarded`` keeps the ledger's
+    bool contract the retry loop below already keys on: True when nothing
+    is left to discard (whether because this call cleared it or because
+    it was already gone), False when a concurrent update raised the
+    balance to order-qualifying and the ledger was left untouched.
+    ``removed_usd`` is the amount this call itself cleared under the
+    ledger lock, 0.0 otherwise -- and it is the ONLY figure the
+    post-discard failure path may ever hand back to
+    restore_minimum_order_pending(). A bare True cannot tell "I removed
+    $0.10" apart from "a concurrent retry already settled that $0.10
+    before my lock", and restoring the stale observed amount in the
+    second case resurrects credit a real order already consumed, letting
+    it fund a second purchase (Codex review, PR #680
+    discussion_r3925291346: "Restore only credit this call actually
+    discarded"). A ledger exposing only the legacy bool API (test
+    doubles) therefore reports removed_usd=0.0 -- failing closed toward
+    "never restore" rather than guessing.
+    """
+    day = ctx.trading_day.isoformat()
+    # Preferred: the tracked form, which also reports the ledger revision
+    # so a later rollback can be a compare-and-swap.
+    tracked_fn = getattr(ctx.credit_ledger, "discard_minimum_order_pending_tracked", None)
+    if callable(tracked_fn):
+        outcome = tracked_fn(ticker, day, observed_amount_usd)
+        if getattr(outcome, "refused", False):
+            return False, 0.0, None
+        removed_usd = float(getattr(outcome, "removed_usd", 0.0))
+        return True, max(0.0, removed_usd), getattr(outcome, "revision", None)
+    amount_fn = getattr(ctx.credit_ledger, "discard_minimum_order_pending_amount", None)
+    if callable(amount_fn):
+        removed = amount_fn(ticker, day, observed_amount_usd)
+        if removed is None:
+            return False, 0.0, None
+        return True, max(0.0, float(cast(Any, removed))), None
+    return (
+        ctx.credit_ledger.discard_minimum_order_pending(ticker, day, observed_amount_usd),
+        0.0,
+        None,
+    )
+
+def _restore_discarded_credit(ctx: ProcessCandidateContext, ticker: str, amount_usd: float, revision: Optional[int]) -> bool:
+    """Roll back a discard this call made, as a compare-and-swap.
+
+    ``revision`` is the ledger revision the discard reported. Passing it
+    makes the ledger refuse the rollback if ANY other mutation landed
+    after the discard released its lock -- in particular a concurrent
+    retry settling the very order this rollback exists to protect, which
+    observed zero pending credit and durably recorded its ``order_id``.
+    Restoring on top of that would resurrect spendable credit the same
+    order can never consume again, because its settlement is now
+    deduplicated by that id (Codex review, PR #680
+    discussion_r3925440982: "Make post-discard restoration
+    compare-and-swap").
+
+    A ledger too old to support the keyword still gets the unconditional
+    restore it always did -- strictly better than erasing the credit.
+    """
+    if amount_usd <= 0:
+        return False
+    day = ctx.trading_day.isoformat()
+    try:
+        return ctx.credit_ledger.restore_minimum_order_pending(
+            ticker, day, amount_usd, expected_revision=revision
+        )
+    except TypeError:
+        return ctx.credit_ledger.restore_minimum_order_pending(ticker, day, amount_usd)
+
+def _recover_duplicate_order(
+    ctx: ProcessCandidateContext,
+    ticker: str,
+    decision: ReconciledDecision,
+    order_amount: float,
+    dup_order: Dict[str, Any],
+    existing_pending_credit_usd: float,
+    top_up_outcome: Optional[TopUpGuardOutcome],
+    running_deployed_7d: float,
+    errors_count_inc: int,
+    order_reviews_attempted_inc: int,
+    ticker_guarded: bool,
+    *,
+    already_discarded_usd: float = 0.0,
+    discarded_revision: Optional[int] = None,
+) -> tuple:
+    """Recover a same-stream duplicate broker order: book it, settle its
+    pending credit against the ledger and return the tuple this call's
+    caller should return immediately.
+
+    Shared by the initial pre-discard duplicate check and both
+    discard-retry-loop rechecks (Codex review, PR #680
+    discussion_r3920086271: "Recover the duplicate after the destructive
+    discard" -- a duplicate found AFTER discard_minimum_order_pending()
+    already destructively cleared the pending balance must still be
+    routed through this same recovery/settlement path, not merely
+    blocked, or the credit's provenance is lost for good).
+
+    ``already_discarded_usd`` names dollars a caller's own successful
+    discard ALREADY removed from both ledger pools before this order was
+    matched to them. It changes two things: the settlement is recorded
+    without debiting the current balance (which may by now hold unrelated
+    newer credit -- Codex review, PR #680 discussion_r3925440968: "Keep
+    post-discard settlement from consuming newer credit"), and a refusal
+    path that returns without settling must first put those dollars back
+    under ``discarded_revision`` as a compare-and-swap, or the credit is
+    erased with the order left unreconciled (Codex review, PR #680
+    discussion_r3925440990: "Restore discarded credit when the duplicate
+    lacks an ID").
+
+    The booking itself (fill-based sizing of an amount-less match, the
+    fail-closed per-order-ceiling fallback with its week poisoning, the
+    fractional-recovery own-order dedup, and the order-id-aware
+    deployment-history check) is the same code that used to live inline
+    under the ``if dup_order is not None:`` branch -- only hoisted into
+    this closure so the post-discard rechecks can reuse it verbatim.
+    """
+    order_id = _first_usable_order_id_alias(dup_order)
+    if not order_id:
+        # Nothing here can reconcile the removed credit against an order
+        # with no identity, so preserve it as pending rather than let the
+        # discard stand (discussion_r3925440990).
+        if already_discarded_usd > 0:
+            if not _restore_discarded_credit(ctx, ticker, already_discarded_usd, discarded_revision):
+                logger.warning(
+                    "cumulative credit ledger rollback refused for %s after an "
+                    "unidentifiable post-discard duplicate; $%.2f stays discarded "
+                    "pending out-of-band reconciliation",
+                    ticker,
+                    already_discarded_usd,
+                )
+        # A legacy boolean-style adapter (True, normalized to {} by
+        # _same_stream_order_exists) or a matched order dict missing
+        # both id fields carries no traceable identity: recording
+        # status="submitted" with a null order_id would land an
+        # unidentifiable row in submitted_orders.csv that
+        # reconciliation can never match to a broker fill, while
+        # _log_execution can't query a fill for it either. Classify
+        # it as incomplete and let a human/recovery pass resolve the
+        # real order id rather than publish an untraceable
+        # submission (Codex review, PR #231: "Require an order ID
+        # before marking legacy duplicates submitted").
+        errors_count_inc += 1
+        candidate_outcome = {
+            "status": "blocked",
+            "skip_reason": "same-stream broker order exists but adapter returned no order id",
+        }
+        _record_block_reason(ctx, ticker,
+            MISSING_FILL_DATA_ERROR,
+            f"{ticker}: same-stream duplicate found but broker returned no order id; skipping",
+        )
+        return (
+            candidate_outcome,
+            top_up_outcome,
+            running_deployed_7d,
+            errors_count_inc,
+            order_reviews_attempted_inc,
+        )
+    # Set True only when dup_amount is booked at THIS retry's current
+    # max_per_order_usd because the originating order's true size
+    # could not be recovered from anything the broker returned --
+    # not a bound proven safe for all time, since config can be
+    # lowered before a LATER run reads this same persisted figure
+    # back as historical evidence. Carried onto the row (see
+    # candidate_outcome/candidate_row below) so dca_risk.py's
+    # evidence gate treats it as unusable there too, not just via
+    # this run's in-memory force_week_notional_to_worst_case_ceiling
+    # call, which stops mattering the moment this run ends (Codex
+    # review: "Poison durable deployment instead of only the
+    # current week").
+    dup_amount_notional_uncertain = False
+    try:
+        dup_amount = float(
+            dup_order.get("dollar_amount") or dup_order.get("notional") or 0
+        )
+    except (TypeError, ValueError):
+        dup_amount = 0.0
+    # A matched order missing both amount fields carries no real
+    # dollar figure -- fall back to this run's own freshly
+    # recomputed order_amount (pre-kill-switch, pre-top-up-cap at
+    # this point) rather than record a nonsensical $0 buy against
+    # the ticker's daily cap. The real production broker adapter
+    # always reports dollar_amount for a matched order, so this
+    # fallback is not reachable there.
+    if not math.isfinite(dup_amount) or dup_amount <= 0:
+        # Prefer the matched order's OWN fill, exactly as the immediate
+        # -recovery path does (see "Book the actual fill notional after
+        # immediate recovery"): it is the real deployment, not an
+        # estimate of it.
+        #
+        # Exact only for a SETTLED order. The same-day lookup that
+        # produced this match admits `partially_filled` (see
+        # dca_live_adapters._LIVE_ORDER_STATES), and a partial fill's
+        # executed amount is a floor on what the order will finally
+        # take, not the total -- the unfilled remainder is still live
+        # and can execute at any moment. Booking the executed slice
+        # alone understates daily/weekly deployment and the rolling
+        # kill-switch total, and hands later candidates budget the
+        # outstanding order may still consume (Codex review: "Keep
+        # partially filled duplicates booked at the requested
+        # notional"). _SETTLED_BROKER_ORDER_STATES draws exactly this
+        # line -- see its own comment. A missing or unrecognized state
+        # counts as non-terminal, the same conservative reading.
+        #
+        # For a SETTLED, non-filled row (canceled/expired after
+        # executing some shares), cumulative_quantity is the ONLY field
+        # that means "executed": `quantity` on such a row is what was
+        # REQUESTED, not executed, so substituting it books a partially
+        # filled cancellation at its full requested size and overstates
+        # daily/weekly deployment, suppressing later candidates that
+        # should still fit (Codex review discussion_r3868141054:
+        # "Avoid treating requested quantity as a terminal partial
+        # fill"). Only a FILLED row's plain `quantity` equals its
+        # executed amount too -- the same scoping
+        # _recovered_broker_notional() applies to the same fallback.
+        dup_state = str(dup_order.get("state", "")).strip().lower()
+        if dup_state not in _SETTLED_BROKER_ORDER_STATES:
+            dup_shares = _usable_positive_float(
+                dup_order.get("cumulative_quantity") or dup_order.get("quantity")
+            )
+        else:
+            dup_shares = _usable_positive_float(
+                dup_order.get("cumulative_quantity")
+                or (dup_order.get("quantity") if dup_state == "filled" else None)
+            )
+        dup_price = _usable_positive_float(dup_order.get("average_price"))
+        if dup_shares is not None and dup_price is not None:
+            dup_amount = round(dup_shares * dup_price, 2)
+            if dup_state not in _SETTLED_BROKER_ORDER_STATES:
+                # A non-terminal (e.g. partially_filled) order's executed
+                # slice is a FLOOR on the original request, not the
+                # total -- but order_amount is not a reliable ceiling for
+                # it either: it is this retry's own freshly recomputed
+                # figure (an incremental top-up can be far smaller than
+                # the original full-size order that is still partially
+                # live), so a $20 original with $5 executed and a $10
+                # retry still under-records at max($5, $10) == $10 while
+                # the live remainder can still consume the full $20
+                # (Codex review: "Preserve the original notional for
+                # live partial duplicates"). Nothing durable available at
+                # this point identifies the true original size -- the
+                # broker returned no dollar_amount/notional for this
+                # match, and a same-stream duplicate bypasses the
+                # cross-stream prior-allocation scan by design (see
+                # _same_stream_order_exists's own docstring). The only
+                # figure guaranteed to be at least as large as ANY order
+                # this system could ever place is the configured
+                # absolute per-order ceiling (config/budgets.json's
+                # max_per_order_note) -- book that instead of a smaller
+                # recomputed or partially-filled figure, so an
+                # unrecoverable original notional caps later candidates
+                # too tightly rather than too loosely, the same
+                # direction every other branch here already fails
+                # closed in.
+                dup_amount = max(dup_amount, order_amount, ctx.config.max_per_order_usd)
+                # ctx.config.max_per_order_usd is still only THIS
+                # retry's own current ceiling, not proof about
+                # whatever ceiling governed the order actually
+                # placed -- config can be lowered between the
+                # original submission and this recovery retry, so a
+                # $50 original order booked here at a since-lowered
+                # $10 ceiling would leave $40 of false daily/weekly
+                # headroom for later candidates (Codex review:
+                # "Bound duplicates by the originating order
+                # ceiling"). There is no way to recover the true
+                # originating ceiling from anything the broker
+                # returned, so rather than risk under-counting real
+                # deployed capital, force the shared weekly bucket to
+                # the worst-case tier ceiling -- the same fail-closed
+                # response every other unrecoverable-historical-
+                # ceiling case in this run applies.
+                ctx.state.force_week_notional_to_worst_case_ceiling(ctx.trading_day)
+                dup_amount_notional_uncertain = True
+        elif (
+            top_up_outcome is not None
+            and existing_pending_credit_usd > 0
+            and not ticker_guarded
+            and top_up_outcome.incremental_order_amount > 0
+        ):
+            # No fill detail, but this is a PRIOR-LESS credit-flush
+            # survivor: ticker_guarded is False, so `order_amount` was
+            # initialized to ctx.config.max_per_order_usd rather than
+            # anything this ticker actually ordered, and the ONLY order
+            # this stream could have placed for it is the final-session
+            # flush of the very pending balance that is still pending
+            # (the crash landed before settle()). That flush is a pure,
+            # deterministic function of the balance, so the guard's own
+            # freshly computed top_up_outcome.incremental_order_amount IS
+            # the originating order's size -- not the "retry delta"
+            # guesswork the ceiling fallback below exists to avoid.
+            # Booking and auditing the full per-order ceiling here instead
+            # would misprice a $1 flush as $10 in the aggregate audit
+            # fields and settle $10 against a sub-dollar balance (Codex
+            # review, PR #656 discussion_r3837462030: "Size prior-less
+            # duplicate recovery from the computed flush").
+            dup_amount = top_up_outcome.incremental_order_amount
+        elif (
+            top_up_outcome is not None
+            and top_up_outcome.cumulative_credit_decline_usd == 0.0
+            and top_up_outcome.incremental_order_amount <= 0
+            and existing_pending_credit_usd > 0
+            and apply_cumulative_credit(
+                existing_pending_credit_usd, 0.0, final_session=True
+            ).order_amount_usd
+            > 0
+        ):
+            # The unsafe-decision path (evaluate_top_up_guard's
+            # TOP_UP_UNSAFE_DECISION branch, for a MANUAL_REVIEW/
+            # NO_DATA retry decision) deliberately zeroes
+            # incremental_order_amount so it can never AUTHORIZE a
+            # new order, while still marking
+            # cumulative_credit_decline_usd=0.0 as the signal for
+            # THIS recovery block to settle the already-pending
+            # balance. Falling through to the raw order_amount
+            # ceiling here would misprice a real, much smaller
+            # recovered order as the full per-order maximum (Codex
+            # review, PR #656 follow-up: "Size unsafe duplicate
+            # recovery from the pending credit"). Recompute the
+            # same flush apply_cumulative_credit's own branch would
+            # have produced from this exact pending balance.
+            dup_amount = apply_cumulative_credit(
+                existing_pending_credit_usd, 0.0, final_session=True
+            ).order_amount_usd
+            # Unlike the prior-less case above, an unsafe decision
+            # proves nothing about what the EARLIER attempt's own
+            # (possibly BUY) decision folded into this order beyond the
+            # flush, so the booked figure is a floor, not a fact. Fail
+            # closed the same way the ceiling branches do: poison the
+            # shared weekly bucket and flag the persisted row as
+            # unusable deployment evidence (Codex review: "Bound
+            # duplicates by the originating order ceiling" / "Poison
+            # durable deployment instead of only the current week").
+            ctx.state.force_week_notional_to_worst_case_ceiling(ctx.trading_day)
+            dup_amount_notional_uncertain = True
+        else:
+            # No fill detail either, so this duplicate genuinely cannot
+            # be priced from anything the broker returned. Book the
+            # retry's own order_amount and nothing smaller.
+            #
+            # The retry's freshly recomputed incremental top-up is NOT a
+            # safer figure here, in either direction. When it is zero
+            # (the top-up is now skipped entirely) min()-ing it in
+            # booked the already-placed order as a $0 buy -- the very
+            # "nonsensical $0 buy" the comment above exists to prevent
+            # (Codex review: "Preserve recovered notional when the retry
+            # delta is zero"). When it is positive but SMALLER than
+            # order_amount -- e.g. additional prior-allocation context
+            # appeared between the attempts -- min()-ing it in books the
+            # historical order at today's delta, understating
+            # StrategyState deployment, the rolling kill-switch total
+            # and the persisted candidate notional, and leaving later
+            # candidates budget the duplicate order already consumed
+            # (Codex review: "Avoid shrinking amountless duplicates to
+            # the retry delta"). Over-recording caps later candidates
+            # too tightly, which is the safe direction for an order this
+            # path cannot verify.
+            #
+            # order_amount alone is still only THIS retry's own
+            # recomputed figure, not a bound on the original order's
+            # true size -- the same gap the terminal-fill branch above
+            # closes with the configured per-order ceiling. A still-
+            # live duplicate this path cannot price at all (no
+            # dollar_amount, no cumulative_quantity/average_price
+            # either) can therefore still consume up to that ceiling
+            # even though order_amount alone under-recorded it (Codex
+            # review: "Use the order ceiling when fill detail is
+            # absent").
+            dup_amount = max(order_amount, ctx.config.max_per_order_usd)
+            # Same gap as the terminal-fill branch above (Codex
+            # review: "Bound duplicates by the originating order
+            # ceiling"): ctx.config.max_per_order_usd is only THIS
+            # retry's current ceiling, not proof about whatever
+            # ceiling governed the order actually placed. Force the
+            # shared weekly bucket closed the same way.
+            ctx.state.force_week_notional_to_worst_case_ceiling(ctx.trading_day)
+            dup_amount_notional_uncertain = True
+    order_key = (ticker, ctx.trading_day)
+    # A fractional-placement recovery earlier THIS SAME invocation
+    # (book_reconciled_attempt_notional) already called record_buy
+    # for this exact ticker/day, but marks it under a RECOVERY-
+    # SPECIFIC key -- (f"{ticker}#fractional-recovery", trading_day)
+    # -- deliberately never the bare order_key, so
+    # _seed_prior_allocations still folds in OTHER streams'
+    # cross-stream context for it (see that method's own docstring).
+    # This duplicate-broker-order lookup queries the broker directly,
+    # so it finds that SAME now-real order and, seeing the bare key
+    # absent, called record_buy a second time for it -- doubling
+    # daily/weekly notional, the attempt count, and deployment-
+    # history accounting for the one broker order (Codex review,
+    # PR #911 round 9: "Deduplicate fractional recoveries before
+    # duplicate booking").
+    recovery_key = (f"{ticker}#fractional-recovery", ctx.trading_day)
+    # A recovery_key MATCH alone does not prove this broker row IS
+    # the recovered order -- own_orders_recorded only ever tracked
+    # ticker+day, so a genuinely DIFFERENT order for the same
+    # ticker/day (a distinct top-up reference, or an afternoon
+    # order after reconciling a morning claim) looked identical and
+    # its own record_buy call was wrongly skipped, omitting its
+    # notional/attempt from the daily/weekly breakers and
+    # potentially authorizing an excess broker call (Codex review,
+    # PR #911 round 18: "Compare order IDs before suppressing
+    # duplicate booking"). own_recovered_order_ids resolves the
+    # ambiguity: suppress only when the recovered order's own id
+    # matches ONE OF THIS ticker/day's tracked ids -- there can be
+    # more than one when two distinct unresolved reference groups
+    # for the same ticker/day were both recovered this same run
+    # (a plain placement and a later "-topup-" retry), each its
+    # own broker order. Checking against only the LAST id tracked
+    # let this duplicate lookup rediscover an EARLIER recovered
+    # order, find its id absent from that single scalar, and read
+    # it as "a genuinely different order" -- booking an
+    # already-recovered order a second time (Codex review, PR
+    # #911 round 25: "Track every recovered order ID per ticker
+    # and day"). A recovery with no tracked id at all (an
+    # older/legacy call site, or one that genuinely had none)
+    # falls back to the prior, more conservative ticker+day-only
+    # reading -- there is nothing here to prove they differ, so
+    # treating them as the same order remains the safe default.
+    #
+    # `order_id` here is whatever the broker's own dup_order.get(
+    # "id"/"order_id") returned -- a supported broker can report a
+    # bare numeric id, not just a string -- while
+    # own_recovered_order_ids stores ids the SAME way
+    # _reconcile_ambiguous_fractional_placement does: `str(...).
+    # strip()`. Comparing the raw value directly against that set
+    # made a numeric 12345 read as absent from a set holding the
+    # string "12345", so this lookup rediscovered the ALREADY-
+    # recovered order, found no exact membership match, and
+    # concluded it was a different order -- booking it a second
+    # time and inflating attempt, notional, and kill-switch
+    # accounting for one physical order (Codex review, PR #911
+    # round 36: "Normalize recovered IDs before duplicate
+    # comparison").
+    _recovered_order_ids = ctx.state.own_recovered_order_ids.get(order_key)
+    _dup_order_id_normalized = str(order_id).strip() if order_id is not None else None
+    _is_recovery_own_order = recovery_key in ctx.state.own_orders_recorded and (
+        not _recovered_order_ids or _dup_order_id_normalized in _recovered_order_ids
+    )
+    if order_key not in ctx.state.own_orders_recorded and not _is_recovery_own_order:
+        ctx.state.record_buy(ticker, ctx.trading_day, dup_amount, order_id=_dup_order_id_normalized)
+        ctx.state.own_orders_recorded.add(order_key)
+    # else: this exact StrategyState instance already booked THIS
+    # STREAM's own order for this ticker/day earlier in the SAME run
+    # (e.g. an in-process retry that reuses its StrategyState rather
+    # than starting a fresh one) -- recording it again here would
+    # inflate today's/this week's spend and buy count, incorrectly
+    # capping later candidates and overstating the persisted budget
+    # audit (Codex review, PR #231: "Avoid rebooking duplicates in
+    # reused strategy state"). Checked via own_orders_recorded, NOT
+    # buys_today: _seed_prior_allocations also calls record_buy to
+    # seed CROSS-stream (morning/midday) prior context into this
+    # ticker's day/week spend, which bumps buys_today to a nonzero
+    # value even on a freshly restarted process whose OWN afternoon
+    # order was never booked into this state instance -- checking
+    # buys_today alone would then wrongly skip recording a genuinely
+    # new-to-this-state recovered order, omitting it from day/week
+    # spend and letting later candidates exceed the corrected cap
+    # (Codex review, PR #231: "Record the recovered buy separately
+    # from seeded prior context").
+    #
+    # Whether this order is already counted toward the trailing-7-day
+    # kill-switch figure depends on whether THIS ticker's submitted
+    # order is recorded in an on-disk scheduled-afternoon artifact for
+    # today: _apply_deployment_history sums deployment from disk once
+    # before this batch starts, so a written artifact already reflects
+    # it (adding it again here would double-count against the
+    # kill-switch threshold -- Codex review, PR #231: "Do not add a
+    # preserved duplicate to deployment again"). But when the prior
+    # attempt was interrupted after the broker accepted the order yet
+    # before it could write ITS OWN artifact for this ticker, nothing
+    # on disk has ever counted this capital, and the recovered order
+    # must be added so later candidates in this retry's batch (and the
+    # kill-switch audit) see the real deployed total. Checked per
+    # ticker, not merely "does any artifact exist for today's date":
+    # a same-day artifact that doesn't itself contain THIS ticker's
+    # submitted order (e.g. a zero-order artifact from an earlier,
+    # unrelated invocation) must not be mistaken for proof that this
+    # order was already counted (Codex review, PR #231: "Verify the
+    # recovered order is actually in deployment history"). Matched
+    # on THIS row's own order_id first, not merely ticker+day: a
+    # ticker-only check treats ANY already-written submitted row for
+    # this ticker/day as proof this specific order was counted, so
+    # once an earlier recovery for a DIFFERENT order (order A) on
+    # this same ticker/day was already on disk, a later invocation
+    # recognizing a genuinely distinct broker order (order B, per
+    # the order-ID-aware _is_recovery_own_order check above) would
+    # still see the ticker/day match and skip adding B's own
+    # notional here, even though B's capital was never counted on
+    # disk -- under-counting the trailing-7-day kill-switch total
+    # by exactly the amount that let it bypass the cap (Codex
+    # review, PR #911 round 24: "Count the second recovered order
+    # in deployment history"). But an order-id-only check cannot
+    # match a LEGACY on-disk row recorded before order-id tracking
+    # existed (no order_id field at all) -- reading that as "never
+    # counted" double-counts the very order round 10's own ticker-
+    # only check already existed to dedupe, so
+    # _same_day_ticker_deployment_recorded_without_order_id keeps
+    # that legacy fallback alive for exactly (and only) an id-less
+    # row; a row that DOES carry a different order_id is real proof
+    # of a distinct order, not something this fallback papers over.
+    # And not when THIS broker order is the exact fractional
+    # recovery `_is_recovery_own_order` above already proved it is:
+    # `_run_once_impl` folds every recovered outcome's own
+    # `submitted_amount_usd` into `running_deployed_7d`'s STARTING
+    # baseline (`_recovered_fractional_notional`) before this batch
+    # ever runs, using the identical disk-lookup this branch
+    # repeats. When that recovery is absent from deployment_history_
+    # root (the same reason this branch's own disk checks fail),
+    # both sites add the SAME order's dollars: once into the
+    # baseline, and again here for the ordinary duplicate-broker-
+    # order path -- inflating running_deployed_7d for every LATER
+    # candidate in this batch and risking a premature kill-switch
+    # trip (Codex review, PR #911 round 30: "Avoid double-counting
+    # a recovered duplicate in the kill switch").
+    if (
+        ctx.deployment_history_root is not None
+        and not _is_recovery_own_order
+        and not (
+            _same_day_order_id_already_recorded(
+                order_id, ticker, ctx.trading_day, ctx.deployment_history_root
+            )
+            or _same_day_ticker_deployment_recorded_without_order_id(
+                ticker, ctx.trading_day, ctx.deployment_history_root, dup_amount
+            )
+        )
+    ):
+        running_deployed_7d += dup_amount
+    # This row's real order was authorized by the spread gate on the
+    # EARLIER attempt that actually placed it, and that original
+    # evidence isn't available here without threading the prior
+    # artifact's path through this call (out of scope for this
+    # change). Taking a fresh retry-time quote_spread_pct and
+    # recording it as an ordinary spread_ok/spread_not_ok/
+    # spread_unavailable verdict would be worse than recording
+    # nothing: the spread can move between the original placement and
+    # this retry, and a fresh unfavorable reading would relabel an
+    # already-authorized, genuinely submitted order as having failed
+    # or never reached the safety gate, corrupting the historical
+    # evidence config/scheduled_tasks.json's audit consumers rely on
+    # (Codex review, PR #231: "Retain the original spread verdict for
+    # recovered orders"). A prior attempt at this used a bespoke
+    # "duplicate_recovered" status, but config/scheduled_tasks.json's
+    # row_level_statuses contract enumerates exactly spread_ok,
+    # spread_unavailable, spread_not_ok, and not_evaluated -- emitting
+    # anything outside that declared enum breaks contract consumers
+    # (Codex review, PR #231: "Keep recovered spread evidence within
+    # the declared contract"). SPREAD_STATUS_NOT_EVALUATED is the
+    # nearest compliant value: like this row, it commits to no
+    # pass/fail verdict and per the contract's own note is "never
+    # recorded as spread_ok=true" -- spread_ok/spread_pct stay None
+    # rather than a fabricated True/False. duplicate_preserved=True
+    # on the outcome remains the signal that this status reflects
+    # missing RETRY evidence, not a row that skipped the gate outright.
+    spread_fields = {
+        "spread_ok": None,
+        "spread_pct": None,
+        "spread_status": SPREAD_STATUS_NOT_EVALUATED,
+    }
+    # This SAME broker order may be the one a fractional-placement
+    # recovery earlier THIS invocation already booked and published
+    # under its own synthetic ref_id-qualified key -- see the
+    # recovery_key comment above. Publishing this row as another
+    # "submitted" row too would give dca_risk.deployed_usd() (which
+    # sums every "submitted" buy_candidates row without
+    # deduplicating by order_id) two rows for the one order,
+    # inflating a later run's trailing-seven-day kill-switch scan
+    # (Codex review, PR #911 round 9: "Deduplicate fractional
+    # recoveries before duplicate booking"). "skipped" is a
+    # schema-valid status that keeps every other field (order_id,
+    # submitted_amount_usd, duplicate_preserved) for audit purposes
+    # without counting a second time. Reuses the SAME order-id-aware
+    # `_is_recovery_own_order` computed above the booking gate --
+    # nothing between there and here can change whether this broker
+    # row is the recovered order, so recomputing it here added
+    # nothing but a second (and, before this fix, less precise)
+    # copy of the same check.
+    candidate_outcome = {
+        "status": "skipped" if _is_recovery_own_order else "submitted",
+        "order_id": order_id,
+        "skip_reason": (
+            "already recorded this run by fractional-placement recovery"
+            if _is_recovery_own_order
+            else "same-stream broker order exists"
+        ),
+        "submitted_amount_usd": dup_amount,
+        # True only when dup_amount above is a fail-closed ceiling
+        # estimate, not the broker's own real figure -- see its
+        # own comment. Copied onto the persisted row by
+        # _build_buy_candidates so dca_risk.py's evidence gate
+        # keeps treating this figure as unusable evidence even
+        # after this run's own in-memory
+        # force_week_notional_to_worst_case_ceiling stops applying
+        # (Codex review: "Poison durable deployment instead of
+        # only the current week").
+        "deployed_notional_uncertain": dup_amount_notional_uncertain,
+        # Carried on the outcome so a failure handler synthesizing a
+        # buy_candidates row from this outcome alone (see
+        # _publish_in_flight_outcome / _failure_candidate_row) can
+        # still record the real multiplier, matching the fresh-
+        # placement branch below.
+        "buy_multiplier": decision.buy_multiplier,
+        # Preserves the real broker order rather than a fresh placement,
+        # so a caller booking this candidate into a persistent ledger
+        # must not double-count it against an earlier attempt's record,
+        # and so _build_buy_candidates keeps this amount instead of
+        # clamping it against THIS retry's freshly recomputed
+        # incremental_order_amount (Codex review, PR #231: "Keep the
+        # broker notional when rebuilding duplicate artifacts").
+        "duplicate_preserved": True,
+        # Same aggregate-topup audit contract as the fresh-placement
+        # branch below: if THIS retry's own evaluate_top_up_guard
+        # call (above, before the duplicate check) shows the
+        # aggregate rule applied, the recovered real order deserves
+        # the same audit fields a fresh placement would carry --
+        # otherwise a crash-recovered aggregate order silently
+        # serializes aggregate_minimum_topup_applied=false forever
+        # (Codex review discussion on commit 8720cec: "Reconcile
+        # aggregate credits on duplicate recovery").
+        # Also fires when THIS retry's own re-evaluation landed on
+        # discarded_pending_credit_usd rather than cumulative_credit_
+        # decline_usd (i.e. a combined total that crossed the
+        # threshold on the EARLIER attempt that placed this real
+        # order, but recomputes below $0.50 now, e.g. a partial price
+        # recovery since then): the recovered order still consumed
+        # that pending credit and must be labeled/settled, not left
+        # silently un-audited just because this retry's own fresh
+        # math no longer combines the same way (Codex review, PR
+        # #656 discussion_r3837462029: "Check for a placed order
+        # before discarding combined credit"). cumulative_credit_
+        # decline_usd is None in that case (no fresh decline exists
+        # to report), so the "at/above vs rounded-up-to-$1" reason
+        # falls back to reading the real broker notional instead of
+        # a recomputed combined total this retry no longer has.
+        **(
+            {
+                "aggregate_minimum_topup_applied": True,
+                "aggregate_minimum_topup_remainder_usd": existing_pending_credit_usd,
+                "aggregate_minimum_topup_order_usd": dup_amount,
+                "aggregate_minimum_topup_reason": (
+                    "aggregate_at_or_above_minimum"
+                    if (
+                        top_up_outcome.cumulative_credit_decline_usd is not None
+                        and round(
+                            existing_pending_credit_usd
+                            + top_up_outcome.cumulative_credit_decline_usd,
+                            2,
+                        )
+                        >= 1.0
+                    )
+                    or (
+                        top_up_outcome.cumulative_credit_decline_usd is None
+                        and dup_amount > 1.0
+                    )
+                    # No fresh-decline total to compare against $1.00
+                    # here (cumulative_credit_decline_usd is None --
+                    # this fallback has only the recovered broker
+                    # notional), and dup_amount itself is <= $1.00 --
+                    # a real order is never below the broker's $1.00
+                    # minimum, so this is exactly the ambiguous
+                    # boundary: a combined total genuinely AT $1.00
+                    # and a sub-dollar total ROUNDED UP to $1.00
+                    # produce the identical notional, and the
+                    # notional alone cannot tell them apart. Asserting
+                    # "rounded" here was a guess, not a fact (Codex
+                    # review, PR #656 follow-up: "Preserve the
+                    # original aggregate reason during recovery").
+                    else (
+                        "aggregate_rounded_up_to_minimum"
+                        if top_up_outcome.cumulative_credit_decline_usd is not None
+                        else "aggregate_recovered_reason_unknown"
+                    )
+                ),
+            }
+            if top_up_outcome is not None
+            and (
+                top_up_outcome.cumulative_credit_decline_usd is not None
+                or top_up_outcome.discarded_pending_credit_usd is not None
+            )
+            and existing_pending_credit_usd > 0
+            else {}
+        ),
+        **spread_fields,
+    }
+    # Settle the credit ledger for the SAME reason the fresh-
+    # placement branch below does: the earlier attempt that actually
+    # placed this order crashed before it could settle its own
+    # credit-ledger write, so this recovery is the only chance to
+    # durably clear it -- otherwise the remainder is left stranded
+    # even though the real order it was rolled into already exists
+    # at the broker. Also fires for discarded_pending_credit_usd
+    # (see the audit-fields comment above for why). Never from a dry
+    # run, which must not mutate the live-root ledger (see the matching
+    # guard on the fresh-placement settle below).
+    recovered_order_id = candidate_outcome.get("order_id")
+    recovered_order_id_str: Optional[str] = (
+        str(recovered_order_id) if recovered_order_id is not None else None
+    )
+    if (
+        not ctx.config.dry_run
+        and top_up_outcome is not None
+        and (
+            top_up_outcome.cumulative_credit_decline_usd is not None
+            or top_up_outcome.discarded_pending_credit_usd is not None
+        )
+    ):
+        try:
+            extra_settle_kwargs: Dict[str, Any] = (
+                {"already_debited_usd": already_discarded_usd}
+                if already_discarded_usd > 0
+                else {}
+            )
+            ctx.credit_ledger.settle(
+                ticker,
+                ctx.trading_day.isoformat(),
+                dup_amount,
+                stream=ctx.stream,
+                # THE case settle()'s order-id dedup exists for: the
+                # earlier attempt may have settled this very order
+                # before dying, and settling it again would subtract
+                # its notional from the pending balance a second time.
+                # Without the real order id, settle()'s own dedup never
+                # engages for this recovery path at all: if the original
+                # attempt already settled before crashing, or this exact
+                # recovery is retried after a clamped order left credit
+                # pending, the same broker order would subtract from the
+                # shared pending balance again and consume unrelated
+                # later credit for this ticker (Codex review, PR #656
+                # follow-up: "Deduplicate afternoon recovered-order
+                # settlement").
+                order_id=recovered_order_id_str,
+                # When this caller's own discard already removed the
+                # dollars, settle() must record provenance only: the
+                # current balance may hold unrelated newer credit by
+                # now, and debiting it would charge that money to an
+                # order accepted before it existed (Codex review, PR
+                # #680 discussion_r3925440968: "Keep post-discard
+                # settlement from consuming newer credit").
+                **extra_settle_kwargs,
+            )
+        except TypeError:
+            # Ledger too old for already_debited_usd. Settling anyway
+            # would debit dollars this order never owned, so leave the
+            # credit discarded for out-of-band reconciliation instead.
+            if already_discarded_usd > 0:
+                logger.warning(
+                    "cumulative credit ledger does not support already_debited_usd; "
+                    "leaving $%.2f discarded for %s rather than debiting newer credit",
+                    already_discarded_usd,
+                    ticker,
+                )
+            else:
+                raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "cumulative credit ledger settlement failed for %s: %s", ticker, exc
+            )
+    _publish_in_flight_outcome(ticker, candidate_outcome)
+    logger.info(
+        "%s: same-stream broker order already exists; not re-submitting (order_id=%s)",
+        ticker,
+        candidate_outcome.get("order_id"),
+    )
+    if ctx.run_result is not None and not any(
+        r.order_id == candidate_outcome.get("order_id")
+        for r in ctx.run_result.execution_records
+    ):
+        # Log this the same way as a fresh placement (not via _block):
+        # this ticker's order was actually submitted, so it must appear
+        # in execution_records for the slippage/coverage report, and
+        # any missing-fill classification must come from the real fill
+        # status (_log_execution only classifies MISSING_FILL_EXECUTION_GAP
+        # when the order truly has no fill) rather than a hardcoded
+        # "budget capped" reason that would misreport a submitted order.
+        #
+        # Skipped entirely when this order_id is ALREADY in
+        # execution_records: the crash-lease recovery-publish loop
+        # (near_close_dca._run_once_impl, earlier in the same run)
+        # can have already appended an execution record for this
+        # exact order when its ticker also remains a current buy
+        # candidate that this same-stream-duplicate check then
+        # recognizes as the SAME broker order. Logging it again here
+        # left two execution records with the same order_id --
+        # _merge_execution_csv does not deduplicate within its own
+        # incoming batch -- double-counting one execution in
+        # orders.csv, filled-order counts, and filled notional
+        # (Codex review: "Deduplicate recovered execution records by
+        # order ID").
+        _log_execution(
+            ctx.run_result,
+            decision,
+            recovered_order_id_str,
+            ctx.broker,
+            notional_usd=dup_amount,
+        )
+    return (
+        candidate_outcome,
+        top_up_outcome,
+        running_deployed_7d,
+        errors_count_inc,
+        order_reviews_attempted_inc,
+    )
+
+
 def _process_buy_candidate(
     decision: ReconciledDecision,
     ctx: ProcessCandidateContext,
@@ -21652,807 +22462,6 @@ def _process_buy_candidate(
     # survivors").
     existing_pending_credit_usd = 0.0
 
-    def _discard_pending_credit(observed_amount_usd: float) -> tuple[bool, float, Optional[int]]:
-        """Run the ledger's final-session discard; report what THIS call removed.
-
-        Returns ``(discarded, removed_usd, revision)``. ``revision`` is the
-        ledger's mutation counter as of this discard, or None when the ledger
-        cannot report one -- the compare-and-swap token
-        restore_minimum_order_pending() needs so a rollback issued after the
-        lock was released cannot overwrite a concurrent settlement (Codex
-        review, PR #680 discussion_r3925440982: "Make post-discard
-        restoration compare-and-swap"). ``discarded`` keeps the ledger's
-        bool contract the retry loop below already keys on: True when nothing
-        is left to discard (whether because this call cleared it or because
-        it was already gone), False when a concurrent update raised the
-        balance to order-qualifying and the ledger was left untouched.
-        ``removed_usd`` is the amount this call itself cleared under the
-        ledger lock, 0.0 otherwise -- and it is the ONLY figure the
-        post-discard failure path may ever hand back to
-        restore_minimum_order_pending(). A bare True cannot tell "I removed
-        $0.10" apart from "a concurrent retry already settled that $0.10
-        before my lock", and restoring the stale observed amount in the
-        second case resurrects credit a real order already consumed, letting
-        it fund a second purchase (Codex review, PR #680
-        discussion_r3925291346: "Restore only credit this call actually
-        discarded"). A ledger exposing only the legacy bool API (test
-        doubles) therefore reports removed_usd=0.0 -- failing closed toward
-        "never restore" rather than guessing.
-        """
-        day = ctx.trading_day.isoformat()
-        # Preferred: the tracked form, which also reports the ledger revision
-        # so a later rollback can be a compare-and-swap.
-        tracked_fn = getattr(ctx.credit_ledger, "discard_minimum_order_pending_tracked", None)
-        if callable(tracked_fn):
-            outcome = tracked_fn(ticker, day, observed_amount_usd)
-            if getattr(outcome, "refused", False):
-                return False, 0.0, None
-            removed_usd = float(getattr(outcome, "removed_usd", 0.0))
-            return True, max(0.0, removed_usd), getattr(outcome, "revision", None)
-        amount_fn = getattr(ctx.credit_ledger, "discard_minimum_order_pending_amount", None)
-        if callable(amount_fn):
-            removed = amount_fn(ticker, day, observed_amount_usd)
-            if removed is None:
-                return False, 0.0, None
-            return True, max(0.0, float(cast(Any, removed))), None
-        return (
-            ctx.credit_ledger.discard_minimum_order_pending(ticker, day, observed_amount_usd),
-            0.0,
-            None,
-        )
-
-    def _restore_discarded_credit(amount_usd: float, revision: Optional[int]) -> bool:
-        """Roll back a discard this call made, as a compare-and-swap.
-
-        ``revision`` is the ledger revision the discard reported. Passing it
-        makes the ledger refuse the rollback if ANY other mutation landed
-        after the discard released its lock -- in particular a concurrent
-        retry settling the very order this rollback exists to protect, which
-        observed zero pending credit and durably recorded its ``order_id``.
-        Restoring on top of that would resurrect spendable credit the same
-        order can never consume again, because its settlement is now
-        deduplicated by that id (Codex review, PR #680
-        discussion_r3925440982: "Make post-discard restoration
-        compare-and-swap").
-
-        A ledger too old to support the keyword still gets the unconditional
-        restore it always did -- strictly better than erasing the credit.
-        """
-        if amount_usd <= 0:
-            return False
-        day = ctx.trading_day.isoformat()
-        try:
-            return ctx.credit_ledger.restore_minimum_order_pending(
-                ticker, day, amount_usd, expected_revision=revision
-            )
-        except TypeError:
-            return ctx.credit_ledger.restore_minimum_order_pending(ticker, day, amount_usd)
-
-    def _recover_duplicate_order(
-        dup_order: Dict[str, Any],
-        existing_pending_credit_usd: float,
-        top_up_outcome: Optional[TopUpGuardOutcome],
-        running_deployed_7d: float,
-        errors_count_inc: int,
-        *,
-        already_discarded_usd: float = 0.0,
-        discarded_revision: Optional[int] = None,
-    ) -> tuple:
-        """Recover a same-stream duplicate broker order: book it, settle its
-        pending credit against the ledger and return the tuple this call's
-        caller should return immediately.
-
-        Shared by the initial pre-discard duplicate check and both
-        discard-retry-loop rechecks (Codex review, PR #680
-        discussion_r3920086271: "Recover the duplicate after the destructive
-        discard" -- a duplicate found AFTER discard_minimum_order_pending()
-        already destructively cleared the pending balance must still be
-        routed through this same recovery/settlement path, not merely
-        blocked, or the credit's provenance is lost for good).
-
-        ``already_discarded_usd`` names dollars a caller's own successful
-        discard ALREADY removed from both ledger pools before this order was
-        matched to them. It changes two things: the settlement is recorded
-        without debiting the current balance (which may by now hold unrelated
-        newer credit -- Codex review, PR #680 discussion_r3925440968: "Keep
-        post-discard settlement from consuming newer credit"), and a refusal
-        path that returns without settling must first put those dollars back
-        under ``discarded_revision`` as a compare-and-swap, or the credit is
-        erased with the order left unreconciled (Codex review, PR #680
-        discussion_r3925440990: "Restore discarded credit when the duplicate
-        lacks an ID").
-
-        The booking itself (fill-based sizing of an amount-less match, the
-        fail-closed per-order-ceiling fallback with its week poisoning, the
-        fractional-recovery own-order dedup, and the order-id-aware
-        deployment-history check) is the same code that used to live inline
-        under the ``if dup_order is not None:`` branch -- only hoisted into
-        this closure so the post-discard rechecks can reuse it verbatim.
-        """
-        order_id = _first_usable_order_id_alias(dup_order)
-        if not order_id:
-            # Nothing here can reconcile the removed credit against an order
-            # with no identity, so preserve it as pending rather than let the
-            # discard stand (discussion_r3925440990).
-            if already_discarded_usd > 0:
-                if not _restore_discarded_credit(already_discarded_usd, discarded_revision):
-                    logger.warning(
-                        "cumulative credit ledger rollback refused for %s after an "
-                        "unidentifiable post-discard duplicate; $%.2f stays discarded "
-                        "pending out-of-band reconciliation",
-                        ticker,
-                        already_discarded_usd,
-                    )
-            # A legacy boolean-style adapter (True, normalized to {} by
-            # _same_stream_order_exists) or a matched order dict missing
-            # both id fields carries no traceable identity: recording
-            # status="submitted" with a null order_id would land an
-            # unidentifiable row in submitted_orders.csv that
-            # reconciliation can never match to a broker fill, while
-            # _log_execution can't query a fill for it either. Classify
-            # it as incomplete and let a human/recovery pass resolve the
-            # real order id rather than publish an untraceable
-            # submission (Codex review, PR #231: "Require an order ID
-            # before marking legacy duplicates submitted").
-            errors_count_inc += 1
-            candidate_outcome = {
-                "status": "blocked",
-                "skip_reason": "same-stream broker order exists but adapter returned no order id",
-            }
-            _record_block_reason(ctx, ticker,
-                MISSING_FILL_DATA_ERROR,
-                f"{ticker}: same-stream duplicate found but broker returned no order id; skipping",
-            )
-            return (
-                candidate_outcome,
-                top_up_outcome,
-                running_deployed_7d,
-                errors_count_inc,
-                order_reviews_attempted_inc,
-            )
-        # Set True only when dup_amount is booked at THIS retry's current
-        # max_per_order_usd because the originating order's true size
-        # could not be recovered from anything the broker returned --
-        # not a bound proven safe for all time, since config can be
-        # lowered before a LATER run reads this same persisted figure
-        # back as historical evidence. Carried onto the row (see
-        # candidate_outcome/candidate_row below) so dca_risk.py's
-        # evidence gate treats it as unusable there too, not just via
-        # this run's in-memory force_week_notional_to_worst_case_ceiling
-        # call, which stops mattering the moment this run ends (Codex
-        # review: "Poison durable deployment instead of only the
-        # current week").
-        dup_amount_notional_uncertain = False
-        try:
-            dup_amount = float(
-                dup_order.get("dollar_amount") or dup_order.get("notional") or 0
-            )
-        except (TypeError, ValueError):
-            dup_amount = 0.0
-        # A matched order missing both amount fields carries no real
-        # dollar figure -- fall back to this run's own freshly
-        # recomputed order_amount (pre-kill-switch, pre-top-up-cap at
-        # this point) rather than record a nonsensical $0 buy against
-        # the ticker's daily cap. The real production broker adapter
-        # always reports dollar_amount for a matched order, so this
-        # fallback is not reachable there.
-        if not math.isfinite(dup_amount) or dup_amount <= 0:
-            # Prefer the matched order's OWN fill, exactly as the immediate
-            # -recovery path does (see "Book the actual fill notional after
-            # immediate recovery"): it is the real deployment, not an
-            # estimate of it.
-            #
-            # Exact only for a SETTLED order. The same-day lookup that
-            # produced this match admits `partially_filled` (see
-            # dca_live_adapters._LIVE_ORDER_STATES), and a partial fill's
-            # executed amount is a floor on what the order will finally
-            # take, not the total -- the unfilled remainder is still live
-            # and can execute at any moment. Booking the executed slice
-            # alone understates daily/weekly deployment and the rolling
-            # kill-switch total, and hands later candidates budget the
-            # outstanding order may still consume (Codex review: "Keep
-            # partially filled duplicates booked at the requested
-            # notional"). _SETTLED_BROKER_ORDER_STATES draws exactly this
-            # line -- see its own comment. A missing or unrecognized state
-            # counts as non-terminal, the same conservative reading.
-            #
-            # For a SETTLED, non-filled row (canceled/expired after
-            # executing some shares), cumulative_quantity is the ONLY field
-            # that means "executed": `quantity` on such a row is what was
-            # REQUESTED, not executed, so substituting it books a partially
-            # filled cancellation at its full requested size and overstates
-            # daily/weekly deployment, suppressing later candidates that
-            # should still fit (Codex review discussion_r3868141054:
-            # "Avoid treating requested quantity as a terminal partial
-            # fill"). Only a FILLED row's plain `quantity` equals its
-            # executed amount too -- the same scoping
-            # _recovered_broker_notional() applies to the same fallback.
-            dup_state = str(dup_order.get("state", "")).strip().lower()
-            if dup_state not in _SETTLED_BROKER_ORDER_STATES:
-                dup_shares = _usable_positive_float(
-                    dup_order.get("cumulative_quantity") or dup_order.get("quantity")
-                )
-            else:
-                dup_shares = _usable_positive_float(
-                    dup_order.get("cumulative_quantity")
-                    or (dup_order.get("quantity") if dup_state == "filled" else None)
-                )
-            dup_price = _usable_positive_float(dup_order.get("average_price"))
-            if dup_shares is not None and dup_price is not None:
-                dup_amount = round(dup_shares * dup_price, 2)
-                if dup_state not in _SETTLED_BROKER_ORDER_STATES:
-                    # A non-terminal (e.g. partially_filled) order's executed
-                    # slice is a FLOOR on the original request, not the
-                    # total -- but order_amount is not a reliable ceiling for
-                    # it either: it is this retry's own freshly recomputed
-                    # figure (an incremental top-up can be far smaller than
-                    # the original full-size order that is still partially
-                    # live), so a $20 original with $5 executed and a $10
-                    # retry still under-records at max($5, $10) == $10 while
-                    # the live remainder can still consume the full $20
-                    # (Codex review: "Preserve the original notional for
-                    # live partial duplicates"). Nothing durable available at
-                    # this point identifies the true original size -- the
-                    # broker returned no dollar_amount/notional for this
-                    # match, and a same-stream duplicate bypasses the
-                    # cross-stream prior-allocation scan by design (see
-                    # _same_stream_order_exists's own docstring). The only
-                    # figure guaranteed to be at least as large as ANY order
-                    # this system could ever place is the configured
-                    # absolute per-order ceiling (config/budgets.json's
-                    # max_per_order_note) -- book that instead of a smaller
-                    # recomputed or partially-filled figure, so an
-                    # unrecoverable original notional caps later candidates
-                    # too tightly rather than too loosely, the same
-                    # direction every other branch here already fails
-                    # closed in.
-                    dup_amount = max(dup_amount, order_amount, ctx.config.max_per_order_usd)
-                    # ctx.config.max_per_order_usd is still only THIS
-                    # retry's own current ceiling, not proof about
-                    # whatever ceiling governed the order actually
-                    # placed -- config can be lowered between the
-                    # original submission and this recovery retry, so a
-                    # $50 original order booked here at a since-lowered
-                    # $10 ceiling would leave $40 of false daily/weekly
-                    # headroom for later candidates (Codex review:
-                    # "Bound duplicates by the originating order
-                    # ceiling"). There is no way to recover the true
-                    # originating ceiling from anything the broker
-                    # returned, so rather than risk under-counting real
-                    # deployed capital, force the shared weekly bucket to
-                    # the worst-case tier ceiling -- the same fail-closed
-                    # response every other unrecoverable-historical-
-                    # ceiling case in this run applies.
-                    ctx.state.force_week_notional_to_worst_case_ceiling(ctx.trading_day)
-                    dup_amount_notional_uncertain = True
-            elif (
-                top_up_outcome is not None
-                and existing_pending_credit_usd > 0
-                and not ticker_guarded
-                and top_up_outcome.incremental_order_amount > 0
-            ):
-                # No fill detail, but this is a PRIOR-LESS credit-flush
-                # survivor: ticker_guarded is False, so `order_amount` was
-                # initialized to ctx.config.max_per_order_usd rather than
-                # anything this ticker actually ordered, and the ONLY order
-                # this stream could have placed for it is the final-session
-                # flush of the very pending balance that is still pending
-                # (the crash landed before settle()). That flush is a pure,
-                # deterministic function of the balance, so the guard's own
-                # freshly computed top_up_outcome.incremental_order_amount IS
-                # the originating order's size -- not the "retry delta"
-                # guesswork the ceiling fallback below exists to avoid.
-                # Booking and auditing the full per-order ceiling here instead
-                # would misprice a $1 flush as $10 in the aggregate audit
-                # fields and settle $10 against a sub-dollar balance (Codex
-                # review, PR #656 discussion_r3837462030: "Size prior-less
-                # duplicate recovery from the computed flush").
-                dup_amount = top_up_outcome.incremental_order_amount
-            elif (
-                top_up_outcome is not None
-                and top_up_outcome.cumulative_credit_decline_usd == 0.0
-                and top_up_outcome.incremental_order_amount <= 0
-                and existing_pending_credit_usd > 0
-                and apply_cumulative_credit(
-                    existing_pending_credit_usd, 0.0, final_session=True
-                ).order_amount_usd
-                > 0
-            ):
-                # The unsafe-decision path (evaluate_top_up_guard's
-                # TOP_UP_UNSAFE_DECISION branch, for a MANUAL_REVIEW/
-                # NO_DATA retry decision) deliberately zeroes
-                # incremental_order_amount so it can never AUTHORIZE a
-                # new order, while still marking
-                # cumulative_credit_decline_usd=0.0 as the signal for
-                # THIS recovery block to settle the already-pending
-                # balance. Falling through to the raw order_amount
-                # ceiling here would misprice a real, much smaller
-                # recovered order as the full per-order maximum (Codex
-                # review, PR #656 follow-up: "Size unsafe duplicate
-                # recovery from the pending credit"). Recompute the
-                # same flush apply_cumulative_credit's own branch would
-                # have produced from this exact pending balance.
-                dup_amount = apply_cumulative_credit(
-                    existing_pending_credit_usd, 0.0, final_session=True
-                ).order_amount_usd
-                # Unlike the prior-less case above, an unsafe decision
-                # proves nothing about what the EARLIER attempt's own
-                # (possibly BUY) decision folded into this order beyond the
-                # flush, so the booked figure is a floor, not a fact. Fail
-                # closed the same way the ceiling branches do: poison the
-                # shared weekly bucket and flag the persisted row as
-                # unusable deployment evidence (Codex review: "Bound
-                # duplicates by the originating order ceiling" / "Poison
-                # durable deployment instead of only the current week").
-                ctx.state.force_week_notional_to_worst_case_ceiling(ctx.trading_day)
-                dup_amount_notional_uncertain = True
-            else:
-                # No fill detail either, so this duplicate genuinely cannot
-                # be priced from anything the broker returned. Book the
-                # retry's own order_amount and nothing smaller.
-                #
-                # The retry's freshly recomputed incremental top-up is NOT a
-                # safer figure here, in either direction. When it is zero
-                # (the top-up is now skipped entirely) min()-ing it in
-                # booked the already-placed order as a $0 buy -- the very
-                # "nonsensical $0 buy" the comment above exists to prevent
-                # (Codex review: "Preserve recovered notional when the retry
-                # delta is zero"). When it is positive but SMALLER than
-                # order_amount -- e.g. additional prior-allocation context
-                # appeared between the attempts -- min()-ing it in books the
-                # historical order at today's delta, understating
-                # StrategyState deployment, the rolling kill-switch total
-                # and the persisted candidate notional, and leaving later
-                # candidates budget the duplicate order already consumed
-                # (Codex review: "Avoid shrinking amountless duplicates to
-                # the retry delta"). Over-recording caps later candidates
-                # too tightly, which is the safe direction for an order this
-                # path cannot verify.
-                #
-                # order_amount alone is still only THIS retry's own
-                # recomputed figure, not a bound on the original order's
-                # true size -- the same gap the terminal-fill branch above
-                # closes with the configured per-order ceiling. A still-
-                # live duplicate this path cannot price at all (no
-                # dollar_amount, no cumulative_quantity/average_price
-                # either) can therefore still consume up to that ceiling
-                # even though order_amount alone under-recorded it (Codex
-                # review: "Use the order ceiling when fill detail is
-                # absent").
-                dup_amount = max(order_amount, ctx.config.max_per_order_usd)
-                # Same gap as the terminal-fill branch above (Codex
-                # review: "Bound duplicates by the originating order
-                # ceiling"): ctx.config.max_per_order_usd is only THIS
-                # retry's current ceiling, not proof about whatever
-                # ceiling governed the order actually placed. Force the
-                # shared weekly bucket closed the same way.
-                ctx.state.force_week_notional_to_worst_case_ceiling(ctx.trading_day)
-                dup_amount_notional_uncertain = True
-        order_key = (ticker, ctx.trading_day)
-        # A fractional-placement recovery earlier THIS SAME invocation
-        # (book_reconciled_attempt_notional) already called record_buy
-        # for this exact ticker/day, but marks it under a RECOVERY-
-        # SPECIFIC key -- (f"{ticker}#fractional-recovery", trading_day)
-        # -- deliberately never the bare order_key, so
-        # _seed_prior_allocations still folds in OTHER streams'
-        # cross-stream context for it (see that method's own docstring).
-        # This duplicate-broker-order lookup queries the broker directly,
-        # so it finds that SAME now-real order and, seeing the bare key
-        # absent, called record_buy a second time for it -- doubling
-        # daily/weekly notional, the attempt count, and deployment-
-        # history accounting for the one broker order (Codex review,
-        # PR #911 round 9: "Deduplicate fractional recoveries before
-        # duplicate booking").
-        recovery_key = (f"{ticker}#fractional-recovery", ctx.trading_day)
-        # A recovery_key MATCH alone does not prove this broker row IS
-        # the recovered order -- own_orders_recorded only ever tracked
-        # ticker+day, so a genuinely DIFFERENT order for the same
-        # ticker/day (a distinct top-up reference, or an afternoon
-        # order after reconciling a morning claim) looked identical and
-        # its own record_buy call was wrongly skipped, omitting its
-        # notional/attempt from the daily/weekly breakers and
-        # potentially authorizing an excess broker call (Codex review,
-        # PR #911 round 18: "Compare order IDs before suppressing
-        # duplicate booking"). own_recovered_order_ids resolves the
-        # ambiguity: suppress only when the recovered order's own id
-        # matches ONE OF THIS ticker/day's tracked ids -- there can be
-        # more than one when two distinct unresolved reference groups
-        # for the same ticker/day were both recovered this same run
-        # (a plain placement and a later "-topup-" retry), each its
-        # own broker order. Checking against only the LAST id tracked
-        # let this duplicate lookup rediscover an EARLIER recovered
-        # order, find its id absent from that single scalar, and read
-        # it as "a genuinely different order" -- booking an
-        # already-recovered order a second time (Codex review, PR
-        # #911 round 25: "Track every recovered order ID per ticker
-        # and day"). A recovery with no tracked id at all (an
-        # older/legacy call site, or one that genuinely had none)
-        # falls back to the prior, more conservative ticker+day-only
-        # reading -- there is nothing here to prove they differ, so
-        # treating them as the same order remains the safe default.
-        #
-        # `order_id` here is whatever the broker's own dup_order.get(
-        # "id"/"order_id") returned -- a supported broker can report a
-        # bare numeric id, not just a string -- while
-        # own_recovered_order_ids stores ids the SAME way
-        # _reconcile_ambiguous_fractional_placement does: `str(...).
-        # strip()`. Comparing the raw value directly against that set
-        # made a numeric 12345 read as absent from a set holding the
-        # string "12345", so this lookup rediscovered the ALREADY-
-        # recovered order, found no exact membership match, and
-        # concluded it was a different order -- booking it a second
-        # time and inflating attempt, notional, and kill-switch
-        # accounting for one physical order (Codex review, PR #911
-        # round 36: "Normalize recovered IDs before duplicate
-        # comparison").
-        _recovered_order_ids = ctx.state.own_recovered_order_ids.get(order_key)
-        _dup_order_id_normalized = str(order_id).strip() if order_id is not None else None
-        _is_recovery_own_order = recovery_key in ctx.state.own_orders_recorded and (
-            not _recovered_order_ids or _dup_order_id_normalized in _recovered_order_ids
-        )
-        if order_key not in ctx.state.own_orders_recorded and not _is_recovery_own_order:
-            ctx.state.record_buy(ticker, ctx.trading_day, dup_amount, order_id=_dup_order_id_normalized)
-            ctx.state.own_orders_recorded.add(order_key)
-        # else: this exact StrategyState instance already booked THIS
-        # STREAM's own order for this ticker/day earlier in the SAME run
-        # (e.g. an in-process retry that reuses its StrategyState rather
-        # than starting a fresh one) -- recording it again here would
-        # inflate today's/this week's spend and buy count, incorrectly
-        # capping later candidates and overstating the persisted budget
-        # audit (Codex review, PR #231: "Avoid rebooking duplicates in
-        # reused strategy state"). Checked via own_orders_recorded, NOT
-        # buys_today: _seed_prior_allocations also calls record_buy to
-        # seed CROSS-stream (morning/midday) prior context into this
-        # ticker's day/week spend, which bumps buys_today to a nonzero
-        # value even on a freshly restarted process whose OWN afternoon
-        # order was never booked into this state instance -- checking
-        # buys_today alone would then wrongly skip recording a genuinely
-        # new-to-this-state recovered order, omitting it from day/week
-        # spend and letting later candidates exceed the corrected cap
-        # (Codex review, PR #231: "Record the recovered buy separately
-        # from seeded prior context").
-        #
-        # Whether this order is already counted toward the trailing-7-day
-        # kill-switch figure depends on whether THIS ticker's submitted
-        # order is recorded in an on-disk scheduled-afternoon artifact for
-        # today: _apply_deployment_history sums deployment from disk once
-        # before this batch starts, so a written artifact already reflects
-        # it (adding it again here would double-count against the
-        # kill-switch threshold -- Codex review, PR #231: "Do not add a
-        # preserved duplicate to deployment again"). But when the prior
-        # attempt was interrupted after the broker accepted the order yet
-        # before it could write ITS OWN artifact for this ticker, nothing
-        # on disk has ever counted this capital, and the recovered order
-        # must be added so later candidates in this retry's batch (and the
-        # kill-switch audit) see the real deployed total. Checked per
-        # ticker, not merely "does any artifact exist for today's date":
-        # a same-day artifact that doesn't itself contain THIS ticker's
-        # submitted order (e.g. a zero-order artifact from an earlier,
-        # unrelated invocation) must not be mistaken for proof that this
-        # order was already counted (Codex review, PR #231: "Verify the
-        # recovered order is actually in deployment history"). Matched
-        # on THIS row's own order_id first, not merely ticker+day: a
-        # ticker-only check treats ANY already-written submitted row for
-        # this ticker/day as proof this specific order was counted, so
-        # once an earlier recovery for a DIFFERENT order (order A) on
-        # this same ticker/day was already on disk, a later invocation
-        # recognizing a genuinely distinct broker order (order B, per
-        # the order-ID-aware _is_recovery_own_order check above) would
-        # still see the ticker/day match and skip adding B's own
-        # notional here, even though B's capital was never counted on
-        # disk -- under-counting the trailing-7-day kill-switch total
-        # by exactly the amount that let it bypass the cap (Codex
-        # review, PR #911 round 24: "Count the second recovered order
-        # in deployment history"). But an order-id-only check cannot
-        # match a LEGACY on-disk row recorded before order-id tracking
-        # existed (no order_id field at all) -- reading that as "never
-        # counted" double-counts the very order round 10's own ticker-
-        # only check already existed to dedupe, so
-        # _same_day_ticker_deployment_recorded_without_order_id keeps
-        # that legacy fallback alive for exactly (and only) an id-less
-        # row; a row that DOES carry a different order_id is real proof
-        # of a distinct order, not something this fallback papers over.
-        # And not when THIS broker order is the exact fractional
-        # recovery `_is_recovery_own_order` above already proved it is:
-        # `_run_once_impl` folds every recovered outcome's own
-        # `submitted_amount_usd` into `running_deployed_7d`'s STARTING
-        # baseline (`_recovered_fractional_notional`) before this batch
-        # ever runs, using the identical disk-lookup this branch
-        # repeats. When that recovery is absent from deployment_history_
-        # root (the same reason this branch's own disk checks fail),
-        # both sites add the SAME order's dollars: once into the
-        # baseline, and again here for the ordinary duplicate-broker-
-        # order path -- inflating running_deployed_7d for every LATER
-        # candidate in this batch and risking a premature kill-switch
-        # trip (Codex review, PR #911 round 30: "Avoid double-counting
-        # a recovered duplicate in the kill switch").
-        if (
-            ctx.deployment_history_root is not None
-            and not _is_recovery_own_order
-            and not (
-                _same_day_order_id_already_recorded(
-                    order_id, ticker, ctx.trading_day, ctx.deployment_history_root
-                )
-                or _same_day_ticker_deployment_recorded_without_order_id(
-                    ticker, ctx.trading_day, ctx.deployment_history_root, dup_amount
-                )
-            )
-        ):
-            running_deployed_7d += dup_amount
-        # This row's real order was authorized by the spread gate on the
-        # EARLIER attempt that actually placed it, and that original
-        # evidence isn't available here without threading the prior
-        # artifact's path through this call (out of scope for this
-        # change). Taking a fresh retry-time quote_spread_pct and
-        # recording it as an ordinary spread_ok/spread_not_ok/
-        # spread_unavailable verdict would be worse than recording
-        # nothing: the spread can move between the original placement and
-        # this retry, and a fresh unfavorable reading would relabel an
-        # already-authorized, genuinely submitted order as having failed
-        # or never reached the safety gate, corrupting the historical
-        # evidence config/scheduled_tasks.json's audit consumers rely on
-        # (Codex review, PR #231: "Retain the original spread verdict for
-        # recovered orders"). A prior attempt at this used a bespoke
-        # "duplicate_recovered" status, but config/scheduled_tasks.json's
-        # row_level_statuses contract enumerates exactly spread_ok,
-        # spread_unavailable, spread_not_ok, and not_evaluated -- emitting
-        # anything outside that declared enum breaks contract consumers
-        # (Codex review, PR #231: "Keep recovered spread evidence within
-        # the declared contract"). SPREAD_STATUS_NOT_EVALUATED is the
-        # nearest compliant value: like this row, it commits to no
-        # pass/fail verdict and per the contract's own note is "never
-        # recorded as spread_ok=true" -- spread_ok/spread_pct stay None
-        # rather than a fabricated True/False. duplicate_preserved=True
-        # on the outcome remains the signal that this status reflects
-        # missing RETRY evidence, not a row that skipped the gate outright.
-        spread_fields = {
-            "spread_ok": None,
-            "spread_pct": None,
-            "spread_status": SPREAD_STATUS_NOT_EVALUATED,
-        }
-        # This SAME broker order may be the one a fractional-placement
-        # recovery earlier THIS invocation already booked and published
-        # under its own synthetic ref_id-qualified key -- see the
-        # recovery_key comment above. Publishing this row as another
-        # "submitted" row too would give dca_risk.deployed_usd() (which
-        # sums every "submitted" buy_candidates row without
-        # deduplicating by order_id) two rows for the one order,
-        # inflating a later run's trailing-seven-day kill-switch scan
-        # (Codex review, PR #911 round 9: "Deduplicate fractional
-        # recoveries before duplicate booking"). "skipped" is a
-        # schema-valid status that keeps every other field (order_id,
-        # submitted_amount_usd, duplicate_preserved) for audit purposes
-        # without counting a second time. Reuses the SAME order-id-aware
-        # `_is_recovery_own_order` computed above the booking gate --
-        # nothing between there and here can change whether this broker
-        # row is the recovered order, so recomputing it here added
-        # nothing but a second (and, before this fix, less precise)
-        # copy of the same check.
-        candidate_outcome = {
-            "status": "skipped" if _is_recovery_own_order else "submitted",
-            "order_id": order_id,
-            "skip_reason": (
-                "already recorded this run by fractional-placement recovery"
-                if _is_recovery_own_order
-                else "same-stream broker order exists"
-            ),
-            "submitted_amount_usd": dup_amount,
-            # True only when dup_amount above is a fail-closed ceiling
-            # estimate, not the broker's own real figure -- see its
-            # own comment. Copied onto the persisted row by
-            # _build_buy_candidates so dca_risk.py's evidence gate
-            # keeps treating this figure as unusable evidence even
-            # after this run's own in-memory
-            # force_week_notional_to_worst_case_ceiling stops applying
-            # (Codex review: "Poison durable deployment instead of
-            # only the current week").
-            "deployed_notional_uncertain": dup_amount_notional_uncertain,
-            # Carried on the outcome so a failure handler synthesizing a
-            # buy_candidates row from this outcome alone (see
-            # _publish_in_flight_outcome / _failure_candidate_row) can
-            # still record the real multiplier, matching the fresh-
-            # placement branch below.
-            "buy_multiplier": decision.buy_multiplier,
-            # Preserves the real broker order rather than a fresh placement,
-            # so a caller booking this candidate into a persistent ledger
-            # must not double-count it against an earlier attempt's record,
-            # and so _build_buy_candidates keeps this amount instead of
-            # clamping it against THIS retry's freshly recomputed
-            # incremental_order_amount (Codex review, PR #231: "Keep the
-            # broker notional when rebuilding duplicate artifacts").
-            "duplicate_preserved": True,
-            # Same aggregate-topup audit contract as the fresh-placement
-            # branch below: if THIS retry's own evaluate_top_up_guard
-            # call (above, before the duplicate check) shows the
-            # aggregate rule applied, the recovered real order deserves
-            # the same audit fields a fresh placement would carry --
-            # otherwise a crash-recovered aggregate order silently
-            # serializes aggregate_minimum_topup_applied=false forever
-            # (Codex review discussion on commit 8720cec: "Reconcile
-            # aggregate credits on duplicate recovery").
-            # Also fires when THIS retry's own re-evaluation landed on
-            # discarded_pending_credit_usd rather than cumulative_credit_
-            # decline_usd (i.e. a combined total that crossed the
-            # threshold on the EARLIER attempt that placed this real
-            # order, but recomputes below $0.50 now, e.g. a partial price
-            # recovery since then): the recovered order still consumed
-            # that pending credit and must be labeled/settled, not left
-            # silently un-audited just because this retry's own fresh
-            # math no longer combines the same way (Codex review, PR
-            # #656 discussion_r3837462029: "Check for a placed order
-            # before discarding combined credit"). cumulative_credit_
-            # decline_usd is None in that case (no fresh decline exists
-            # to report), so the "at/above vs rounded-up-to-$1" reason
-            # falls back to reading the real broker notional instead of
-            # a recomputed combined total this retry no longer has.
-            **(
-                {
-                    "aggregate_minimum_topup_applied": True,
-                    "aggregate_minimum_topup_remainder_usd": existing_pending_credit_usd,
-                    "aggregate_minimum_topup_order_usd": dup_amount,
-                    "aggregate_minimum_topup_reason": (
-                        "aggregate_at_or_above_minimum"
-                        if (
-                            top_up_outcome.cumulative_credit_decline_usd is not None
-                            and round(
-                                existing_pending_credit_usd
-                                + top_up_outcome.cumulative_credit_decline_usd,
-                                2,
-                            )
-                            >= 1.0
-                        )
-                        or (
-                            top_up_outcome.cumulative_credit_decline_usd is None
-                            and dup_amount > 1.0
-                        )
-                        # No fresh-decline total to compare against $1.00
-                        # here (cumulative_credit_decline_usd is None --
-                        # this fallback has only the recovered broker
-                        # notional), and dup_amount itself is <= $1.00 --
-                        # a real order is never below the broker's $1.00
-                        # minimum, so this is exactly the ambiguous
-                        # boundary: a combined total genuinely AT $1.00
-                        # and a sub-dollar total ROUNDED UP to $1.00
-                        # produce the identical notional, and the
-                        # notional alone cannot tell them apart. Asserting
-                        # "rounded" here was a guess, not a fact (Codex
-                        # review, PR #656 follow-up: "Preserve the
-                        # original aggregate reason during recovery").
-                        else (
-                            "aggregate_rounded_up_to_minimum"
-                            if top_up_outcome.cumulative_credit_decline_usd is not None
-                            else "aggregate_recovered_reason_unknown"
-                        )
-                    ),
-                }
-                if top_up_outcome is not None
-                and (
-                    top_up_outcome.cumulative_credit_decline_usd is not None
-                    or top_up_outcome.discarded_pending_credit_usd is not None
-                )
-                and existing_pending_credit_usd > 0
-                else {}
-            ),
-            **spread_fields,
-        }
-        # Settle the credit ledger for the SAME reason the fresh-
-        # placement branch below does: the earlier attempt that actually
-        # placed this order crashed before it could settle its own
-        # credit-ledger write, so this recovery is the only chance to
-        # durably clear it -- otherwise the remainder is left stranded
-        # even though the real order it was rolled into already exists
-        # at the broker. Also fires for discarded_pending_credit_usd
-        # (see the audit-fields comment above for why). Never from a dry
-        # run, which must not mutate the live-root ledger (see the matching
-        # guard on the fresh-placement settle below).
-        recovered_order_id = candidate_outcome.get("order_id")
-        recovered_order_id_str: Optional[str] = (
-            str(recovered_order_id) if recovered_order_id is not None else None
-        )
-        if (
-            not ctx.config.dry_run
-            and top_up_outcome is not None
-            and (
-                top_up_outcome.cumulative_credit_decline_usd is not None
-                or top_up_outcome.discarded_pending_credit_usd is not None
-            )
-        ):
-            try:
-                extra_settle_kwargs: Dict[str, Any] = (
-                    {"already_debited_usd": already_discarded_usd}
-                    if already_discarded_usd > 0
-                    else {}
-                )
-                ctx.credit_ledger.settle(
-                    ticker,
-                    ctx.trading_day.isoformat(),
-                    dup_amount,
-                    stream=ctx.stream,
-                    # THE case settle()'s order-id dedup exists for: the
-                    # earlier attempt may have settled this very order
-                    # before dying, and settling it again would subtract
-                    # its notional from the pending balance a second time.
-                    # Without the real order id, settle()'s own dedup never
-                    # engages for this recovery path at all: if the original
-                    # attempt already settled before crashing, or this exact
-                    # recovery is retried after a clamped order left credit
-                    # pending, the same broker order would subtract from the
-                    # shared pending balance again and consume unrelated
-                    # later credit for this ticker (Codex review, PR #656
-                    # follow-up: "Deduplicate afternoon recovered-order
-                    # settlement").
-                    order_id=recovered_order_id_str,
-                    # When this caller's own discard already removed the
-                    # dollars, settle() must record provenance only: the
-                    # current balance may hold unrelated newer credit by
-                    # now, and debiting it would charge that money to an
-                    # order accepted before it existed (Codex review, PR
-                    # #680 discussion_r3925440968: "Keep post-discard
-                    # settlement from consuming newer credit").
-                    **extra_settle_kwargs,
-                )
-            except TypeError:
-                # Ledger too old for already_debited_usd. Settling anyway
-                # would debit dollars this order never owned, so leave the
-                # credit discarded for out-of-band reconciliation instead.
-                if already_discarded_usd > 0:
-                    logger.warning(
-                        "cumulative credit ledger does not support already_debited_usd; "
-                        "leaving $%.2f discarded for %s rather than debiting newer credit",
-                        already_discarded_usd,
-                        ticker,
-                    )
-                else:
-                    raise
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "cumulative credit ledger settlement failed for %s: %s", ticker, exc
-                )
-        _publish_in_flight_outcome(ticker, candidate_outcome)
-        logger.info(
-            "%s: same-stream broker order already exists; not re-submitting (order_id=%s)",
-            ticker,
-            candidate_outcome.get("order_id"),
-        )
-        if ctx.run_result is not None and not any(
-            r.order_id == candidate_outcome.get("order_id")
-            for r in ctx.run_result.execution_records
-        ):
-            # Log this the same way as a fresh placement (not via _block):
-            # this ticker's order was actually submitted, so it must appear
-            # in execution_records for the slippage/coverage report, and
-            # any missing-fill classification must come from the real fill
-            # status (_log_execution only classifies MISSING_FILL_EXECUTION_GAP
-            # when the order truly has no fill) rather than a hardcoded
-            # "budget capped" reason that would misreport a submitted order.
-            #
-            # Skipped entirely when this order_id is ALREADY in
-            # execution_records: the crash-lease recovery-publish loop
-            # (near_close_dca._run_once_impl, earlier in the same run)
-            # can have already appended an execution record for this
-            # exact order when its ticker also remains a current buy
-            # candidate that this same-stream-duplicate check then
-            # recognizes as the SAME broker order. Logging it again here
-            # left two execution records with the same order_id --
-            # _merge_execution_csv does not deduplicate within its own
-            # incoming batch -- double-counting one execution in
-            # orders.csv, filled-order counts, and filled notional
-            # (Codex review: "Deduplicate recovered execution records by
-            # order ID").
-            _log_execution(
-                ctx.run_result,
-                decision,
-                recovered_order_id_str,
-                ctx.broker,
-                notional_usd=dup_amount,
-            )
-        return (
-            candidate_outcome,
-            top_up_outcome,
-            running_deployed_7d,
-            errors_count_inc,
-            order_reviews_attempted_inc,
-        )
 
     # Computed here (before any early-return gate below) purely for context --
     # its incremental_order_amount still caps order_amount further down, but
@@ -22600,7 +22609,7 @@ def _process_buy_candidate(
             )
         if dup_order is not None:
             return _recover_duplicate_order(
-                dup_order, existing_pending_credit_usd, top_up_outcome, running_deployed_7d, errors_count_inc
+                ctx, ticker, decision, order_amount, dup_order, existing_pending_credit_usd, top_up_outcome, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc, ticker_guarded
             )
 
     # Only discard after same-stream duplicate recovery has had a chance to preserve
@@ -22647,7 +22656,7 @@ def _process_buy_candidate(
             discarded_revision: Optional[int] = None
             try:
                 discarded, discarded_amount_usd, discarded_revision = _discard_pending_credit(
-                    existing_pending_credit_usd
+                    ctx, ticker, existing_pending_credit_usd
                 )
             except Exception as exc:  # noqa: BLE001
                 discarded = True  # do not retry on a ledger I/O failure
@@ -22694,7 +22703,7 @@ def _process_buy_candidate(
                         # this call actually discarded").
                         if discarded_amount_usd > 0:
                             try:
-                                _restore_discarded_credit(discarded_amount_usd, discarded_revision)
+                                _restore_discarded_credit(ctx, ticker, discarded_amount_usd, discarded_revision)
                             except Exception as restore_exc:  # noqa: BLE001
                                 logger.error(
                                     "cumulative credit ledger restore failed for %s after "
@@ -22732,11 +22741,17 @@ def _process_buy_candidate(
                         # discussion_r3920086271: "Recover the duplicate
                         # after the destructive discard").
                         return _recover_duplicate_order(
+                            ctx,
+                            ticker,
+                            decision,
+                            order_amount,
                             refreshed_dup_order,
                             existing_pending_credit_usd,
                             top_up_outcome,
                             running_deployed_7d,
                             errors_count_inc,
+                            order_reviews_attempted_inc,
+                            ticker_guarded,
                             already_discarded_usd=discarded_amount_usd,
                             discarded_revision=discarded_revision,
                         )
@@ -22816,19 +22831,23 @@ def _process_buy_candidate(
                             # discussion_r3920086271: "Recover the duplicate
                             # after the destructive discard").
                             return _recover_duplicate_order(
-                                refreshed_dup_order,
-                                existing_pending_credit_usd,
-                                top_up_outcome,
-                                running_deployed_7d,
-                                errors_count_inc,
-                                already_discarded_usd=discarded_amount_usd,
-                                discarded_revision=discarded_revision,
-                            )
+                                    ctx,
+                                    ticker,
+                                    decision,
+                                    order_amount,
+                                    refreshed_dup_order,
+                                    existing_pending_credit_usd,
+                                    top_up_outcome,
+                                    running_deployed_7d,
+                                    errors_count_inc,
+                                    order_reviews_attempted_inc,
+                                    ticker_guarded,
+                                    already_discarded_usd=discarded_amount_usd,
+                                    discarded_revision=discarded_revision,
+                                )
                     break
                 try:
-                    discarded, discarded_amount_usd, discarded_revision = _discard_pending_credit(
-                        existing_pending_credit_usd
-                    )
+                    discarded, discarded_amount_usd, discarded_revision = _discard_pending_credit(ctx, ticker, existing_pending_credit_usd)
                 except Exception as exc:  # noqa: BLE001
                     discarded = True  # do not retry on a ledger I/O failure
                     discarded_amount_usd = 0.0  # nothing provably removed -> never restore
