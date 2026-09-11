@@ -31906,7 +31906,7 @@ def _synthesize_afternoon_failure_artifacts(
     unresolved_placement_halt: bool,
     _placement_failure_class: str,
     _evaluated: Dict[str, Any],
-    _evaluated_decisions: List[Dict[str, Any]],
+    _evaluated_decisions: Sequence[ReconciledDecision],
     _evaluated_budget: Optional[Dict[str, Any]],
 ) -> Tuple[Dict[str, Any], bytes]:
     """Synthesize a completely new run_state.json for an afternoon failure."""
@@ -32138,9 +32138,9 @@ def _merge_afternoon_failure_artifacts(
     unresolved_placement_halt: bool,
     _placement_failure_class: str,
     _evaluated: Dict[str, Any],
-    _evaluated_decisions: List[Dict[str, Any]],
+    _evaluated_decisions: Sequence[ReconciledDecision],
     _evaluated_budget: Optional[Dict[str, Any]],
-    _loaded: Dict[str, Any],
+    _loaded: Optional[Dict[str, Any]],
 ) -> Tuple[Dict[str, Any], bool, bool, bool, Optional[bytes]]:
     """Merge an afternoon failure into an existing, usable run_state.json."""
     _rewrite_merged_signals_csv = False
@@ -33385,7 +33385,7 @@ def _write_afternoon_failure_artifacts(
     _evaluated: Dict[str, Any] = {}
     if unresolved_placement_halt:
         _evaluated = dict(_IN_FLIGHT_RUN_EVALUATION)
-    _evaluated_decisions = list(_evaluated.get("decisions") or [])
+    _evaluated_decisions: Sequence[ReconciledDecision] = list(_evaluated.get("decisions") or [])
     _evaluated_budget: Optional[Dict[str, Any]] = None
     if _evaluated.get("config") is not None and _evaluated.get("state") is not None:
         _eval_state = _evaluated["state"]
