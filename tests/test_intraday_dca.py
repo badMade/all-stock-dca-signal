@@ -47,6 +47,10 @@ TRADING_DAY = date(2026, 7, 8)
 SLOT_TIMES = {"1130": time(11, 30), "1330": time(13, 30), "1430": time(14, 30)}
 
 
+# Live simulations use their supplied historical clock; session/calendar gates stay enabled.
+pytestmark = pytest.mark.usefixtures("historical_live_clock")
+
+
 def _now_slot(slot):
     return datetime.combine(TRADING_DAY, SLOT_TIMES[slot], tzinfo=EASTERN)
 

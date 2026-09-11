@@ -37,7 +37,7 @@ python inspect_run.py --run-dir /tmp/octopus-demo --summary    # the short whole
 | Module | Responsibility |
 |---|---|
 | `data.py` | Archive discovery/loading, full-bar split/dividend adjustment, as-of truncation, panel containers |
-| `features.py` | Causal per-ticker features, next-day OHLC log-return targets, cross-sectional market features, correlation-based style clustering, panel assembly |
+| `features.py` | Causal per-ticker features, next-day OHLC log-return targets, cross-sectional market features, correlation-based style clustering, panel assembly, the opt-in `calculus` feature block |
 | `model_interface.py` | The `OHLCForecaster` protocol, shared quantile/bar repairs, adaptive conformal calibration, no-pickle artifact helpers |
 | `baseline_model.py` | `persistence` (with honest residual bands) and `gbm_quantile` (16 histogram-GBM fits, scheduled refits) |
 | `market_encoder.py` | The per-day cross-ticker latent bottleneck ("the brain") |
@@ -46,6 +46,7 @@ python inspect_run.py --run-dir /tmp/octopus-demo --summary    # the short whole
 | `ledger.py` | Append-only gzip-member JSONL shards with the truncate-or-refuse resume contract |
 | `harness.py` | The engine: reveal → score → diagnose → update → predict, checkpoint/resume, deterministic seeding |
 | `metrics.py` | Scoring payloads, regime × model × component reports, encoder-health verdicts |
+| `stacking.py` | The regime-weighted ensemble over the models' already-ledgered scores (library-only; see `docs/wondrous_octopus.md`) |
 | `run_walkforward.py` | CLI: the historical replay (`--demo`, `--preset`, `--resume`, `--retrain`, `--report-only`) |
 | `daily_update.py` | CLI: the live one-day cycle; writes the next-day forecast CSV + daily summary |
 | `analysis.py` / `inspect_run.py` | The observability layer: `--tomorrow`, `--latest`, `--ticker`, `--summary`, `--html` |

@@ -66,13 +66,20 @@ ruff check --isolated --select=E,F,B --line-length=120 ticker-market-breadth
 ```
 
 CI (`.github/workflows/ci.yml`) runs lint + coverage-gated tests on Python 3.11 and 3.12, the
-demo smoke test, `pip-audit` on `requirements-dev.txt`, and the `production-safe-agent-loop`,
+demo smoke test, `pip-audit` on pinned dev tooling and the resolved transitive dependencies
+from `uv.lock` plus each independent research manifest, and the `production-safe-agent-loop`,
 `ticker-advisor`, `ml-forecaster` (the sizing-adjustment ML retrain pipeline, see
 `docs/ticker_advisory.md`'s "Implemented: the ml-forecaster sibling tool" section),
 `wondrous-octopus` (walk-forward OHLC forecasting, see `docs/wondrous_octopus.md`), and
 `ticker-market-breadth` (yfinance `^TICK` NYSE breadth-index archive fetch, data only --
 see `ticker-market-breadth/README.md`) suites each in their own job. Dev tool versions are
 **pinned** in `requirements-dev.txt` on purpose — bump deliberately.
+The `dev` extra uses the same exact pins. It also installs `pip-audit`, `uv`, and
+Pyright; Pyright uses the existing `[tool.pyright]` configuration but is not a CI
+gate while its existing diagnostics remain unresolved. Audit lock exports and
+manifest resolutions are temporary CI artifacts, not research package installs.
+The research audit has a separate job name and runs on both CI Python versions;
+research-only failures stay outside self-heal's documented core-only scope.
 
 ## Architecture
 

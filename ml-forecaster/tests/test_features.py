@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import cast
-
 import numpy as np
 import pandas as pd
 import pytest
@@ -167,7 +165,7 @@ def test_compute_features_no_lookahead():
     full_features = compute_features(frame, "AAA")
     day_t_from_full = full_features.iloc[cutoff]
 
-    truncated = cast(pd.DataFrame, frame.iloc[: cutoff + 1].copy())
+    truncated = frame.iloc[: cutoff + 1].copy()
     truncated_features = compute_features(truncated, "AAA")
     day_t_from_truncated = truncated_features.iloc[cutoff]
 
@@ -272,7 +270,7 @@ def test_build_dataset_and_build_feature_frame_drop_rows_with_infinite_ratios(tm
     # (day of the extreme close) and at the very next row's day-over-day
     # feature -- otherwise the assertions below would trivially pass without
     # exercising the overflow path at all.
-    close_series = pd.Series(close)
+    close_series = pd.Series(close.tolist())
     target = ((close_series.shift(-FORWARD_RETURN_HORIZON_DAYS) - close_series) / close_series) * 100.0
     assert not np.isfinite(target.iloc[extreme_idx])
     drop_pct = ((close_series.shift(1) - close_series) / close_series.shift(1)) * 100.0

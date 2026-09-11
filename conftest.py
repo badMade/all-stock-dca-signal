@@ -36,6 +36,94 @@ os.environ["ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"] = FIXTURE_ACCOUNT_NUMBER
 
 
 @pytest.fixture(autouse=True)
+def _isolate_ticker_history_and_intraday_archive(monkeypatch, tmp_path):
+    """Keep signal inputs and publication out of the operator's managed archive.
+
+    Do not create the history directory: missing-history behavior must stay
+    distinguishable from an available archive. Individual tests may override
+    either location explicitly after this fixture, as with the cron roots.
+    """
+    monkeypatch.setenv("DCA_TICKER_HISTORY_DIR", str(tmp_path / "ticker_history"))
+    monkeypatch.setenv("DCA_INTRADAY_ARCHIVE_DIR", str(tmp_path / "intraday_archive"))
+
+
+@pytest.fixture
+def historical_live_clock(monkeypatch, request):
+    """Opt-in clock for historical tests that simulate live broker placement.
+
+    Freeze ONLY the clock source at each entry point's explicit scan/context
+    timestamp. The real execution path, placement checks, and NYSE calendar
+    still run. The dedicated session-boundary regressions do not use this
+    fixture: they drive their own clocks, including changes during placement.
+    ContextVar scopes nested and concurrent calls without sharing a scan's
+    timestamp with another thread or leaving it set after an exception.
+    """
+    import inspect
+    from contextvars import ContextVar
+    from datetime import datetime, time
+    from functools import wraps
+
+    import morning_dca
+    import near_close_dca
+
+    # Some recovery tests undo their own temporary failure injection mid-test.
+    # Keep this fixture's lifecycle independent of that monkeypatch stack.
+    test_patches = monkeypatch
+    monkeypatch = pytest.MonkeyPatch()
+
+    def restore():
+        # A test may have patched one of our wrappers. Restore its snapshot
+        # first, then ours, so fixture wrappers cannot leak into the next test.
+        test_patches.undo()
+        monkeypatch.undo()
+
+    request.addfinalizer(restore)
+    clock: ContextVar[datetime | None] = ContextVar("historical_live_clock", default=None)
+    real_clock = near_close_dca._live_placement_now
+    monkeypatch.setattr(near_close_dca, "_live_placement_now", lambda: clock.get() or real_clock())
+
+    def freeze_call(function):
+        signature = inspect.signature(function)
+
+        @wraps(function)
+        def invoke(*args, **kwargs):
+            bound = signature.bind(*args, **kwargs)
+            now = bound.arguments.get("now")
+            ctx = bound.arguments.get("ctx")
+            if ctx is not None:
+                now = ctx.now
+            # Direct executor placement tests supply a trading_day without
+            # running a scan. Their synthetic session is noon on that day.
+            if now is None and "trading_day" in bound.arguments:
+                now = datetime.combine(bound.arguments["trading_day"], time(12), tzinfo=near_close_dca.EASTERN)
+            if clock.get() is not None or not isinstance(now, datetime):
+                return function(*args, **kwargs)
+            token = clock.set(now)
+            try:
+                return function(*args, **kwargs)
+            finally:
+                clock.reset(token)
+
+        return invoke
+
+    for owner, name in (
+        (near_close_dca, "_run_once_impl"),
+        (near_close_dca, "_process_buy_candidate"),
+        (near_close_dca, "_process_whole_share_candidate"),
+        (morning_dca.MorningDCAExecutor, "_run_impl"),
+        (morning_dca.MorningDCAExecutor, "_place_broker_orders"),
+    ):
+        original = getattr(owner, name)
+        wrapped = freeze_call(original)
+        monkeypatch.setattr(owner, name, wrapped)
+        # Tests importing a function directly keep that binding even after
+        # the module attribute changes; freeze the same call in either form.
+        for alias, value in vars(request.module).copy().items():
+            if value is original:
+                monkeypatch.setattr(request.module, alias, wrapped)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_attempt_log_root(monkeypatch, tmp_path):
     """Force every test's dca_alerts.write_failed_start_marker calls into a
     throwaway directory instead of the real cron_tracking tree.

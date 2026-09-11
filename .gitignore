@@ -26,6 +26,7 @@ dist/
 
 # Local run output
 artifacts/
+artifacts_tmp*
 .coverage
 
 # scripts/file_lock.py sidecar lock files (e.g. config/ml_sizing_adjustment.json.lock

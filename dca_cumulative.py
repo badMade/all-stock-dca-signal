@@ -256,7 +256,7 @@ class CumulativeCreditLedger:
             elif pending_baseline_usd is not None:
                 # No idempotency_key to rebase against: the caller-supplied
                 # baseline is used verbatim, exactly as documented.
-                pending = float(pending_baseline_usd)
+                pending = pending_baseline_usd
             else:
                 pending = state["pending_usd_by_ticker"].get(symbol, 0.0)
             decision = apply_cumulative_credit(
@@ -640,7 +640,7 @@ class CumulativeCreditLedger:
             if "settled_credit_usd" not in cached:
                 raise ValueError("cannot safely reconcile a legacy preserved credit")
             current_settled = round(float(cached["settled_credit_usd"]), 2)
-            if current_settled != round(float(expected_settled_credit_usd), 2):
+            if current_settled != round(expected_settled_credit_usd, 2):
                 raise RuntimeError("preserved credit changed during reconciliation")
             # A consumed entry's raw incremental_credit_usd is the OLD,
             # already-paid amount (settle() leaves it unchanged on full
@@ -655,7 +655,7 @@ class CumulativeCreditLedger:
                 if cached.get("consumed_by_settlement")
                 else round(float(cached.get("incremental_credit_usd", 0.0)), 2)
             )
-            if current_outstanding != round(float(expected_outstanding_credit_usd), 2):
+            if current_outstanding != round(expected_outstanding_credit_usd, 2):
                 raise RuntimeError("preserved credit changed during reconciliation")
             if expected_pending_usd is not None:
                 # The caller's order-vs-stays-pending decision was already
@@ -670,7 +670,7 @@ class CumulativeCreditLedger:
                 # reconciliation so the caller recomputes from scratch
                 # rather than acting on a decision based on a stale total.
                 current_pending = round(float(state["pending_usd_by_ticker"].get(symbol, 0.0)), 2)
-                if current_pending != round(float(expected_pending_usd), 2):
+                if current_pending != round(expected_pending_usd, 2):
                     raise RuntimeError("preserved credit changed during reconciliation")
             already_consumed = bool(cached.get("consumed_by_settlement"))
             if already_consumed:
@@ -692,7 +692,7 @@ class CumulativeCreditLedger:
                 # "incremental_credit_usd"] here is the OLD, already-paid
                 # amount, not still-outstanding credit to net against, so
                 # `previous` is reset to 0 below rather than read from it.
-                if round(max(0.0, float(outstanding_credit_usd)), 2) <= 0:
+                if round(max(0.0, outstanding_credit_usd), 2) <= 0:
                     return float(state["pending_usd_by_ticker"].get(symbol, 0.0))
                 cached["consumed_by_settlement"] = False
                 cached["settled_credit_usd"] = 0.0
@@ -707,7 +707,7 @@ class CumulativeCreditLedger:
                 # which stamps a fresh sequence for the same reason.
                 cached["sequence"] = _next_sequence(state)
             previous = 0.0 if already_consumed else float(cached.get("incremental_credit_usd", 0.0))
-            outstanding = round(max(0.0, float(outstanding_credit_usd)), 2)
+            outstanding = round(max(0.0, outstanding_credit_usd), 2)
             pending_before = float(state["pending_usd_by_ticker"].get(symbol, 0.0))
             pending_after = round(max(0.0, pending_before - previous + outstanding), 2)
             cached["incremental_credit_usd"] = outstanding
@@ -980,7 +980,7 @@ class CumulativeCreditLedger:
                 # Already absent: nothing to discard, and -- critically --
                 # nothing THIS call removed, so nothing it may later restore.
                 return MinimumOrderDiscard(0.0, self._state_revision(state), False)
-            if observed_amount_usd is not None and round(amount, 2) != round(float(observed_amount_usd), 2):
+            if observed_amount_usd is not None and round(amount, 2) != round(observed_amount_usd, 2):
                 # The balance MOVED since the caller's pre-lock scan, but a
                 # move is not by itself a reason to refuse. Returning a
                 # refusal here for any change at all stranded the credit
@@ -1003,7 +1003,7 @@ class CumulativeCreditLedger:
                     "caller's scan and this final discard; re-evaluating at the current amount",
                     symbol,
                     trading_day,
-                    round(float(observed_amount_usd), 2),
+                    round(observed_amount_usd, 2),
                     amount,
                 )
             if apply_cumulative_credit(amount, 0.0, final_session=True).order_amount_usd > 0:
@@ -1062,7 +1062,7 @@ class CumulativeCreditLedger:
         provenance under one lock so a later retry can reconcile the credit.
         """
         symbol = ticker.strip().upper()
-        amount = round(float(discarded_amount_usd), 2)
+        amount = round(discarded_amount_usd, 2)
         if not symbol or amount <= 0:
             return False
         day_dir = self.root / trading_day
@@ -1243,11 +1243,11 @@ class CumulativeCreditLedger:
                 # settlement path below persists, so a later recovery pass
                 # still dedups) and append the audit event naming the
                 # already-removed amount, leaving every balance untouched.
-                _already = round(float(already_debited_usd), 2)
+                _already = round(already_debited_usd, 2)
                 if normalized_order_id:
                     settled_order_ids[normalized_order_id] = {
                         "ticker": symbol,
-                        "submitted_amount_usd": round(float(submitted_amount_usd), 2),
+                        "submitted_amount_usd": round(submitted_amount_usd, 2),
                     }
                 state["events"].append(
                     {
@@ -1257,7 +1257,7 @@ class CumulativeCreditLedger:
                         "final_session": final_session,
                         "pending_before_usd": float(state["pending_usd_by_ticker"].get(symbol, 0.0)),
                         "incremental_credit_usd": 0.0,
-                        "order_amount_usd": round(float(submitted_amount_usd), 2),
+                        "order_amount_usd": round(submitted_amount_usd, 2),
                         "pending_after_usd": float(state["pending_usd_by_ticker"].get(symbol, 0.0)),
                         "decision": "settled_already_discarded",
                         "already_discarded_usd": _already,

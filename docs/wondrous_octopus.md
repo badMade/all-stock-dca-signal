@@ -64,6 +64,41 @@ scaled by each row's `Adj Close / Close`); every record carries the applied rati
 conversion stays auditable (day-*t*'s ratio is wrong only across an overnight split — rare and
 visible, never silent). The dead Polygon stub `historical_stock_data.csv` is not used.
 
+### Optional feature blocks
+
+The default feature layout is 36 columns (23 per-ticker, 6 cross-sectional, 7 market) and is
+what every existing checkpoint, frozen normalization vector and octopus `feat_proj` weight
+matrix was built against. `features.build_panel(..., extra_features=("calculus",))` appends an
+opt-in **calculus block** of 5 more per-ticker columns:
+
+| Column | What it adds | Warm-up |
+|---|---|---|
+| `ret_accel` | The literal discrete second derivative of log price (`ret_close.diff()`). The base set carries level and velocity but no curvature | 2 rows |
+| `vol20_roc` | Which way `realized_vol_20` is *moving*, not just where it sits: a log-ratio against its own reading 5 rows back, neutral-and-finite when either endpoint is zero, clipped at ±3.0 | 25 rows |
+| `sg_slope`, `sg_curvature` | Savitzky-Golay local derivatives: a degree-2 polynomial fitted to the trailing 11 log prices, differentiated at the window's right edge. Noise-robust without a moving average's lag | 10 rows |
+| `frac_diff_close` | Fractionally differenced log close (López de Prado, *AFML* ch. 5) at `d = 0.4`: sheds the trend while keeping the long memory integer differencing destroys | 54 rows |
+
+Three properties are load-bearing and enforced by `tests/test_features.py`:
+
+- **Off by default, appended at the tail.** Indices 0..35 keep meaning what they meant, because
+  `harness._BAR_FEATURE_SLICE` and `baseline_model`'s `FEATURE_NAMES.index(...)` constants are
+  positional and resolved at import against the default tuple.
+- **Causal, hand-rolled Savitzky-Golay.** `scipy.signal.savgol_filter` is *centered*: it reads
+  future rows and would break the no-lookahead invariant (and scipy is only a transitive
+  dependency here). The kernels are fixed FIR taps derived from a Vandermonde pseudo-inverse.
+- **The fractional-differencing kernel is anchored and width-capped.** Truncated binomial
+  weights do not sum to zero (`sum(w) = +0.136` at `d = 0.4`), so a raw application leaks the
+  price *level*: a ticker priced 100x higher with an identical return shape lands +0.63 away on
+  a column whose own signal std is 0.033, and the panel fits one global mean/std per column.
+  Each window is anchored on its own oldest observation, which removes that exactly. `tau` is
+  `1e-3` so the kernel truncates at 55 taps rather than the 282 a `1e-4` threshold would need:
+  the harness only forecasts rows where every feature is finite, so a kernel wider than
+  `min_history` would delay every ticker's first forecast and drop short-history tickers.
+
+No CLI reaches this yet, by design. Wiring `--features` through `HarnessConfig` (which puts the
+layout into the config hash, so a resume against a differently-shaped checkpoint refuses cleanly
+instead of failing inside `load_state_dict`) is a separate change.
+
 ## Running it on your own machine
 
 No model server, no Ollama — `python run_walkforward.py …` is the whole deployment.
@@ -131,6 +166,58 @@ python inspect_run.py --run-dir <dir> --html dash.html             # self-contai
 The replay logs one line per simulated day (`tail -f` friendly), and `--report-only <run_dir>`
 re-renders `report/report.json` + `report.md` from the ledger at any time, even mid-run.
 
+## The ensemble (`stacking.py`)
+
+A regime-weighted blend of the models a run already scored. It needs nothing new: a ledgered
+`score` record carries the forecast, the realized truth *and* the per-quantile pinball loss, so
+the ensemble is a second pass over records already on disk. No re-run, no new training pipeline.
+
+```python
+from stacking import replay
+for record in replay(run_dir, ("persistence", "gbm_quantile", "octopus")):
+    ...   # a score record under model name "ensemble"
+```
+
+- **Weights** are an exponentially-weighted inverse mean-pinball per *(model, component)*, so a
+  model can win the `close` blend and lose the `high` one. Non-negative by construction, with a
+  floor under every model: today's worst is the next regime's best, and a model at weight zero
+  never generates the evidence that would win its weight back. Default half-life 60 revealed
+  days, floor 0.02.
+- **Blending is vincentized** (the quantile *functions* are averaged level by level). A
+  component's p10/p50/p90 all share that component's weights, and a convex combination of sorted
+  vectors stays sorted, so the ensemble can never emit a **crossed band**.
+  **Bar validity is not guaranteed**, and this is the one place the convexity argument does not
+  reach: `max` being convex would preserve `high >= max(open, close)` only under *one* weight
+  vector shared by every component, and weights here are deliberately per-component. So `open`
+  can follow model A while `high` follows model B, and two individually valid bars can blend into
+  an impossible one. Measured: models at *(open 0.00, high 0.001)* and *(open 0.10, high 0.101)*,
+  with `open` following the second and `high` the first, blend to a high of 0.001 below an open of
+  0.100. `finalize_forecast()` repairs it, so what leaves is always a possible bar, but the repair
+  is real work rather than defense in depth: its counts ride out on every record `replay()` emits,
+  per the repo's repairs-are-counted-never-silent contract.
+- **Causality** is structural: `replay()` reads the weights once per target day *before* blending
+  any of that day's records, and folds that day's losses in only afterwards. The regression test
+  perturbs every score after a cutoff and asserts nothing at or before it moves, the same shape
+  as the feature layer's no-lookahead test.
+- **Decay is once per revealed day**, not once per record. A full-universe day matures thousands
+  of scores; per-record decay would collapse a 60-day half-life into about a day of replay and
+  make the weights depend on universe size. Same rule `ConformalCalibrator.observe_batch()`
+  follows. A model absent from a day is left untouched rather than decayed, since decaying it
+  would read as improvement in an inverse-loss scheme.
+- **Honest sample**: only *(ticker, origin day)* pairs every requested model forecast are
+  emitted, matching the intersect-to-shared-pairs rule the multi-model reports already use.
+- **Memory is bounded by one year, not by the run.** The ledger already shards by the origin
+  date's year, so `replay()` walks those shards in order (`Ledger.available_years`) and holds
+  only the year being processed. A forecast matures on its ticker's next trading row, so one
+  originating in year *Y* matures in *Y* or, across the new-year boundary, in *Y+1* and no
+  later; every pair maturing in *Y* is therefore complete once shard *Y* is loaded, and the
+  handful that cross carry forward. Records are projected down to the fields the blend actually
+  reads as they are loaded. A full-universe multi-decade run is millions of records.
+
+Records come out under the model name `ensemble` in the same shape `harness._score_one()` writes,
+so `metrics.py`'s regime × model × component tables aggregate it beside its components unchanged.
+Library-only for now: no CLI reaches it, and it is not wired into the harness's live predict loop.
+
 ## Metrics and reports
 
 Per model × regime (dot-com bust, GFC, COVID, 2022 rate shock, other, all) × component:
@@ -165,6 +252,16 @@ review surface), mapped onto this system:
   shard is truncated back (un-checkpointed steps re-run deterministically); a mismatched one
   REFUSES. Per-(day, purpose) seeds derive from the master seed, so resumed and uninterrupted
   runs are byte-identical — enforced by the flagship harness test.
+- **Ledger filesystem boundary**: create, append, resume, and checkpoint verification require
+  descriptor-relative, no-follow filesystem operations (supported on Linux and macOS).
+  They refuse symlinks below the selected run directory, nonregular shard files, hard-linked
+  shards, and malformed checkpoint paths. Recovery hashes and truncates the same open file;
+  cleanup uses a pinned parent directory. Ordinary interrupted runs still recover their
+  uncheckpointed tails. Windows currently REFUSES these operations because Python does not
+  provide the required primitives there; read-only report/inspection readers remain available.
+  Use a local copy with ordinary directories and single-linked shard files on a supported
+  platform. The run directory selected by the operator may itself be a filesystem alias.
+  See [the filesystem boundary decision](adr-octopus-ledger-filesystem-boundary.md).
 - **Live re-anchoring**: the cursor is stored as a date, so a grown archive (new days, new
   IPOs) re-anchors correctly; new tickers get embedding rows initialized from the
   unknown-ticker embedding at bind time (deterministic vocabulary expansion).

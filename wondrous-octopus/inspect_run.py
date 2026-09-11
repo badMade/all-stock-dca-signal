@@ -666,7 +666,7 @@ def _svg_ribbon(ticker: str, rows: list[dict], *, width: int = 720, height: int 
         f'<svg viewBox="0 0 {width} {height}" role="img" style="max-width:100%">'
         f'<text x="{pad}" y="10" font-size="12" fill="#333">{html_module.escape(ticker)} '
         "— predicted band vs actual close "
-        f"({rows[0]['target_date']} → {rows[-1]['target_date']})</text>"
+        f"({html_module.escape(rows[0]['target_date'])} → {html_module.escape(rows[-1]['target_date'])})</text>"
         f"{band_polygons}{mid_polylines}{dots}</svg>"
     )
 
@@ -733,7 +733,11 @@ def _view_html(args: argparse.Namespace) -> int:
         # (Codex review: "Preserve per-ticker origin dates in the HTML
         # forecast table").
         latest_origin = max(row["origin_date"] for row in tomorrow)
-        sections.append(f"<h2>Tomorrow ({model}, as of {latest_origin}, adjusted $)</h2>")
+        # Checkpoints and ledger labels are artifact data, including dates
+        # and model names. Render them as text just like ticker labels.
+        sections.append(
+            f"<h2>Tomorrow ({html_module.escape(model)}, as of {html_module.escape(latest_origin)}, adjusted $)</h2>"
+        )
         header = (
             "<tr><th>ticker</th><th>open</th><th>high</th><th>low</th><th>close</th>"
             "<th>close p10</th><th>close p90</th></tr>"
@@ -741,7 +745,7 @@ def _view_html(args: argparse.Namespace) -> int:
         body = "".join(
             f"<tr><td>{html_module.escape(row['ticker'])}"
             + (
-                f" <small>(from {row['origin_date']})</small>"
+                f" <small>(from {html_module.escape(row['origin_date'])})</small>"
                 if row["origin_date"] != latest_origin
                 else ""
             )

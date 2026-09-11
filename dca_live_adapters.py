@@ -27,6 +27,7 @@ from __future__ import annotations
 import decimal
 import logging
 import math
+import traceback
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -5402,13 +5403,13 @@ class FinanceDataProvider:
                     continue
                 raw_ratio = row[split_key]
                 raw_dividend = row[dividend_key]
+                if raw_ratio is None or raw_dividend is None:
+                    return None
                 # Providers sometimes serialize unavailable numeric metadata as
                 # whitespace rather than an empty string. Keep that on the
                 # same fail-closed path: it is not evidence of a zero action.
-                split_blank = raw_ratio is None or (isinstance(raw_ratio, str) and not raw_ratio.strip())
-                dividend_blank = raw_dividend is None or (
-                    isinstance(raw_dividend, str) and not raw_dividend.strip()
-                )
+                split_blank = isinstance(raw_ratio, str) and not raw_ratio.strip()
+                dividend_blank = isinstance(raw_dividend, str) and not raw_dividend.strip()
                 if split_blank or dividend_blank:
                     return None
                 # bool is a subclass of int in Python, so float(True)/
@@ -5588,8 +5589,11 @@ class RobinhoodBroker:
             return self._simulated_buying_power_usd
         try:
             result = self._buying_power_fn(account_number=self._account)
-        except Exception:  # noqa: BLE001 - never let buying-power lookup crash a scan
-            logger.exception("buying-power lookup failed; treating as 0")
+        except Exception as exc:  # noqa: BLE001 - never let buying-power lookup crash a scan
+            logger.error(
+                "buying-power lookup failed; treating as 0: %s",
+                _redacted_diagnostic_text("".join(traceback.format_exception_only(exc)).strip()),
+            )
             return 0.0
         # Accept either a scalar or a raw MCP dict (per the module-level callable contract).
         if isinstance(result, dict):
@@ -5696,7 +5700,7 @@ class RobinhoodBroker:
         order today", and the executors' sole duplicate gate re-placed every
         order on a retry.
         """
-        require_provable_history = require_provable_history or bool(self.enable_live_orders)
+        require_provable_history = require_provable_history or self.enable_live_orders
         if self._orders_fn is None:
             if require_provable_history:
                 raise RuntimeError(
@@ -6130,11 +6134,11 @@ class RobinhoodBroker:
         return None
 
     def same_day_ticker_notional_usd(self, ticker: str, trading_day: date) -> float:
-        """Sum the dollar notional of every live same-day order for ``ticker``.
+        """Sum same-day commitments and terminal executed dollars for ``ticker``.
 
         Unlike the two methods above, this is NOT scoped to any particular
-        ref-id convention -- it sums every live-state order the broker itself
-        reports for this ticker/day, regardless of which stream or executor
+        ref-id convention -- it includes every live-state order and any fills
+        from terminal orders, regardless of which stream or executor
         (this roster, a legacy morning_dca.py/midday_dca.py run, or a manual
         fill) placed it. Ground truth for a guarded top-up's incremental
         delta, which must never trust an artifact-derived prior allocation
@@ -6143,7 +6147,27 @@ class RobinhoodBroker:
         """
         total = 0.0
         for order in self._same_day_orders(ticker, trading_day):
-            if str(order.get("state", "")).lower() not in _LIVE_ORDER_STATES:
+            if _order_lifecycle_aliases_conflict(order):
+                raise RuntimeError(f"same-day order for {ticker} reports conflicting lifecycle states")
+            state = _normalize_broker_lifecycle_alias(order.get("state")) or _normalize_broker_lifecycle_alias(
+                order.get("status")
+            )
+            if state in _TERMINAL_BROKER_ORDER_STATES:
+                # Compare all executed-share aliases without changing the
+                # settled-value parser's separate dollar-rounding tolerance.
+                execution_quantities = {key: order[key] for key in _FILL_EVIDENCE_QUANTITY_ALIASES if key in order}
+                if _order_rows_contradict(execution_quantities, execution_quantities):
+                    raise RuntimeError(f"same-day terminal order for {ticker} has unproven executed notional")
+                # Cancellation releases only the unfilled remainder. The
+                # requested notional/quantity is not the terminal execution;
+                # reuse the existing settled-value parser instead. A zero
+                # also needs proof: missing fill evidence is not no spending.
+                executed = _recovered_broker_notional(order)
+                if executed is None or (executed == 0 and not terminal_broker_row_proves_no_order(order)):
+                    raise RuntimeError(f"same-day terminal order for {ticker} has unproven executed notional")
+                total += executed
+                continue
+            if state not in _LIVE_ORDER_STATES:
                 continue
             raw = order.get("dollar_amount") or order.get("notional") or 0
             amount = _to_float(raw, default=math.nan)
@@ -7769,25 +7793,57 @@ class RobinhoodBroker:
         if not order_id or self._order_fill_fn is None:
             return None
         try:
-            data = _unwrap(self._order_fill_fn(account_number=self._account, order_id=order_id))
-        except Exception:  # noqa: BLE001 - a fill-lookup outage must not abort the run
+            response = self._order_fill_fn(account_number=self._account, order_id=order_id)
+        except Exception as exc:  # noqa: BLE001 - a fill-lookup outage must not abort the run
             # The order is already placed by the time we look up its fill; a transient
             # get_equity_orders failure should leave it recorded as submitted/unfilled,
             # not crash run_once before the durable artifacts are written.
-            logger.exception("order-fill lookup failed for %s; recording as unfilled", order_id)
+            logger.error(
+                "order-fill lookup failed for %s; recording as unfilled: %s",
+                _artifact_safe_repr(order_id),
+                _redacted_diagnostic_text("".join(traceback.format_exception_only(exc)).strip()),
+            )
             return None
+        # Fill lookup follows an accepted placement. Failed or contradictory
+        # evidence must leave that order submitted/unfilled, never fabricate a
+        # fill or raise before the caller can persist the accepted order.
+        layers, truncated = _all_data_layers(response)
+        if truncated or _response_failure(response) or any(_is_error_response(layer) for layer in layers):
+            return None
+        data = _unwrap(response)
         # Accept list mode ({"orders": [...]}), a single-order envelope ({"order": {...}},
         # the same nesting place_market_buy accepts), or a bare top-level order object.
         single = data.get("order") if isinstance(data.get("order"), dict) else None
         if single is None and (data.get("id") or data.get("order_id")):
             single = data
-        orders = data.get("orders") or ([single] if single else [])
+        orders = data.get("orders")
+        if orders is None:
+            orders = []
+        if not isinstance(orders, list) or any(not isinstance(order, dict) for order in orders):
+            return None
+        orders = [*orders, *([single] if single is not None else [])]
+        matched = []
         for order in orders:
             # place_market_buy accepts either "id" or "order_id"; match on both here so a
             # history wrapper that keys fills by "order_id" is not misread as an unfilled gap.
-            oid = order.get("id") or order.get("order_id")
-            if str(oid) != order_id:
+            oid = _first_usable_order_id_alias(order)
+            if _normalized_order_identifier(oid) != _normalized_order_identifier(order_id):
                 continue
+            if (
+                _is_error_response(order)
+                or _order_identifier_aliases_conflict(order)
+                or _order_rows_contradict(order, order)
+                or _envelope_layers_conflict_with_order(order, response, *layers)
+                or (matched and _order_rows_contradict(matched[0], order))
+            ):
+                return None
+            # Keep one agreed representation, so repeated same-ID rows do not
+            # turn a single-order lookup into pairwise comparisons.
+            if matched:
+                matched[0] = _merge_envelope_layers_prefer_innermost_nonblank(matched[0], order)
+            else:
+                matched.append(order)
+        for order in matched:
             # Plain "quantity" is the REQUESTED amount, not what executed --
             # scoped to state == "filled" for the same reason
             # near_close_dca._recovered_broker_notional's own quantity_field
@@ -7797,17 +7853,46 @@ class RobinhoodBroker:
             # for an order that moved nothing, marking a correctly-$0
             # recovery as "filled" in build_execution_record() (Codex
             # review: "Do not turn confirmed zero-fill orders into fills").
-            order_state = str(order.get("state", "")).strip().lower()
-            if not _is_blank_broker_field(order.get("cumulative_quantity")):
-                quantity_source = order.get("cumulative_quantity")
+            order_state = _normalize_broker_lifecycle_alias(order.get("state")) or _normalize_broker_lifecycle_alias(
+                order.get("status")
+            )
+            quantities = [
+                _unwrap_fill_alias_value(order.get(key)) for key in _FILL_EVIDENCE_QUANTITY_ALIASES
+                if not _is_blank_broker_field(_unwrap_fill_alias_value(order.get(key)))
+            ]
+            if quantities:
+                quantity_source = quantities[0]
             elif order_state == "filled":
                 quantity_source = order.get("quantity")
             else:
                 quantity_source = None
             filled_qty = _to_float(quantity_source) if quantity_source is not None else 0.0
-            avg_price = _to_float(order.get("average_price") or order.get("price"))
+            # A requested limit price is not an average execution price.
+            avg_price = _to_float(_unwrap_fill_alias_value(order.get("average_price")))
             if filled_qty <= 0 or avg_price <= 0:
                 return None
+            # Compare explicitly identified envelopes against the selected
+            # execution, including the filled-only requested-quantity fallback.
+            # Overlay supplied fields for comparison only: sparse metadata must
+            # neither contradict a fill by omission nor supply a missing fill.
+            fill_evidence = {key: order[key] for key in _FILL_EVIDENCE_ALIASES if key in order}
+            fill_evidence.update(cumulative_quantity=filled_qty, average_price=avg_price)
+            envelope_evidence = fill_evidence
+            for layer in (response, *layers):
+                if not isinstance(layer, dict) or _normalized_order_identifier(
+                    _first_usable_order_id_alias(layer)
+                ) != _normalized_order_identifier(order_id):
+                    continue
+                layer_fill = {
+                    key: layer[key] for key in (*_FILL_EVIDENCE_ALIASES, "average_price")
+                    if key in layer and not _is_blank_broker_field(_unwrap_fill_alias_value(layer[key]))
+                }
+                layer_evidence = {**envelope_evidence, **layer_fill}
+                if _order_rows_contradict(fill_evidence, layer_evidence) or _order_rows_contradict(
+                    envelope_evidence, layer_evidence
+                ):
+                    return None
+                envelope_evidence = layer_evidence
             return OrderFill(
                 avg_fill_price=avg_price,
                 quantity_filled=filled_qty,
@@ -7815,6 +7900,9 @@ class RobinhoodBroker:
                 order_filled_at=_parse_rfc3339(order.get("last_transaction_at") or order.get("updated_at")),
             )
         return None
+
+    def get_order_fills(self, order_ids: list[str]) -> dict[str, Optional[OrderFill]]:
+        return {order_id: self.get_order_fill(order_id) for order_id in order_ids}
 
 
 # -- module helpers --------------------------------------------------------------

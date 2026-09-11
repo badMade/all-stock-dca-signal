@@ -478,6 +478,7 @@ def test_restore_after_amount_discard_round_trips_exactly(tmp_path):
     ledger.record("XYZ", "2026-08-18", 0.20, stream="morning")
 
     removed = ledger.discard_minimum_order_pending_amount("XYZ", "2026-08-18", 0.20)
+    assert removed is not None
     ledger.restore_minimum_order_pending("XYZ", "2026-08-18", removed)
 
     assert ledger.minimum_order_pending_tickers("2026-08-18") == {"XYZ": 0.20}

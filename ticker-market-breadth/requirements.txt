@@ -1,0 +1,4 @@
+# Independent breadth archive tooling; never imported by the stdlib-only core.
+pandas
+yfinance
+pytest>=8.0.0

@@ -21,20 +21,23 @@ dependencies = []
 # silent pass, and without pytest-cov the documented coverage command cannot run
 # at all (Codex review, PR #219).
 dev = [
-    "pytest>=7.4",
-    "ruff>=0.5",
-    "jsonschema>=4.25",
-    "referencing>=0.36",
-    "pytest-cov>=7.0",
+    "pytest==9.1.1",
+    "ruff==0.16.2",
+    "jsonschema==4.26.0",
+    "referencing==0.37.0",
+    "pytest-cov==7.1.0",
     # scripts/workflow_policy.py imports yaml; without it here, `pip install
     # -e '.[dev]'` collects fine on an environment where jsonschema/referencing
     # happen to pull PyYAML in transitively and fails collection everywhere
     # else, since it isn't a documented dependency of either (Codex review,
     # PR #219: "Include PyYAML in the dev extra").
-    "pyyaml>=6.0",
-    "types-requests>=2.32",
-    "types-PyYAML>=6.0",
-    "types-beautifulsoup4>=4.12",
+    "pyyaml==6.0.3",
+    "types-requests==2.33.0.20260712",
+    "types-PyYAML==6.0.12.20240917",
+    "types-beautifulsoup4==4.12.0.20250516",
+    "pip-audit==2.10.1",
+    "pyright==1.1.411",
+    "uv==0.12.10",
 ]
 # Heavy, undeclared-elsewhere deps used only by the trading-strategies/ research
 # tools (backtester, sentiment monitor). Not needed to run the DCA strategy.
@@ -223,7 +226,7 @@ python_files = ["test_*.py"]
 # of import resolve regardless of whether the suite is invoked as `pytest` or
 # `python -m pytest` (the latter already adds the cwd to sys.path via `-m`,
 # but CI's `pytest --cov=. ...` does not).
-pythonpath = [".", "tests"]
+pythonpath = [".", "tests", "dca-sizing-signals"]
 # production-safe-agent-loop/ and ticker-advisor/ are self-contained tools
 # with their own deps (production-safe-agent-loop: anthropic, requests,
 # beautifulsoup4; ticker-advisor: pandas, vectorbt, transformers/torch, ...)
@@ -306,12 +309,24 @@ ignore = ["E501"]
 
 [tool.pyright]
 extraPaths = [
+    "tests",
     "scripts",
     "ml-forecaster",
     "ticker-advisor",
     "production-safe-agent-loop",
     "wondrous-octopus",
+    "dca-sizing-signals",
 ]
 typeCheckingMode = "basic"
 reportGeneralTypeIssues = false
+executionEnvironments = [
+    { root = "wondrous-octopus", extraPaths = ["wondrous-octopus", "."] },
+    { root = "ml-forecaster", extraPaths = ["ml-forecaster", "."] },
+    { root = "ticker-advisor", extraPaths = ["ticker-advisor", "."] },
+    { root = "production-safe-agent-loop", extraPaths = ["production-safe-agent-loop", "."] },
+    { root = "dca-sizing-signals", extraPaths = ["dca-sizing-signals", "."] },
+    { root = ".", extraPaths = ["tests", "scripts"] },
+]
+
+
 

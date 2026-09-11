@@ -44,6 +44,10 @@ from near_close_dca import EASTERN, Action, SourceName, StrategyConfig, load_pri
 TRADING_DAY = date(2026, 7, 8)
 
 
+# Live simulations use their supplied historical clock; session/calendar gates stay enabled.
+pytestmark = pytest.mark.usefixtures("historical_live_clock")
+
+
 def _now_market_open():
     """Decision timestamp for the 9:35 AM ET live execution."""
     return datetime.combine(TRADING_DAY, time(9, 35), tzinfo=EASTERN)
@@ -68,21 +72,35 @@ class _Broker:
     def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes) -> Optional[dict]:
         return None
 
+    def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes) -> Optional[dict]:
+        return None
+
     def strategy_order_with_ref_id(self, ticker, trading_day, ref_id) -> Optional[dict]:
         return None
 
     def same_day_ticker_notional_usd(self, ticker, trading_day) -> float:
         return 0.0
 
+    supports_concurrent_fill_lookup: bool = False
+
     def is_tradable_for_fractional_buy(self, ticker) -> bool:
+        return True
+
+    def is_tradable_for_whole_share_buy(self, ticker) -> bool:
         return True
 
     def review_market_buy(self, ticker, notional_usd) -> tuple[bool, str]:
         return True, "ok"
 
+    def review_whole_share_buy(self, ticker, quantity) -> tuple[bool, str]:
+        return True, "ok"
+
     def place_market_buy(self, ticker, notional_usd, ref_id) -> str:
         self.placed[ticker] = notional_usd
         return f"ORDER-{ticker}"
+
+    def place_whole_share_buy(self, ticker, quantity, ref_id) -> str:
+        return f"ORDER-WS-{ticker}"
 
     def get_order_fill(self, order_id) -> Any:
         return None

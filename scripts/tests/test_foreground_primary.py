@@ -318,7 +318,7 @@ def test_missing_scheduled_evidence_with_foreground_primary_active_does_not_esca
     alert = evaluate_scheduled_evidence_alert(
         scheduled_evidence_ok=False,
         scheduled_evidence_reasons=["no scheduled run_state at .../run_state.json"],
-        foreground=foreground,
+        foreground=cast(Any, foreground),
     )
     assert alert.escalate is False
     assert alert.foreground_primary_mode_active is True
@@ -331,7 +331,7 @@ def test_missing_scheduled_evidence_without_foreground_primary_active_escalates(
     alert = evaluate_scheduled_evidence_alert(
         scheduled_evidence_ok=False,
         scheduled_evidence_reasons=["run_state is not a valid scheduled run"],
-        foreground=foreground,
+        foreground=cast(Any, foreground),
     )
     assert alert.escalate is True
     assert alert.foreground_primary_mode_active is False
@@ -353,7 +353,7 @@ def test_real_failures_still_escalate_under_foreground_primary_mode():
     alert = evaluate_scheduled_evidence_alert(
         scheduled_evidence_ok=False,
         scheduled_evidence_reasons=["no scheduled run_state"],
-        foreground=foreground,
+        foreground=cast(Any, foreground),
         blocking_findings=[FINDING_SAFETY_FAILURE, FINDING_BROKER_MISMATCH],
     )
     assert alert.escalate is True

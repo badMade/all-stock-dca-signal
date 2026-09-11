@@ -109,6 +109,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # lookup whose callable is unwired (simulated buying power, "tradable", "no
 # order today" are dry-run defaults only), so fixtures that exercise placement
 # wire the three lookups explicitly with permissive stubs.
+# Live simulations use their supplied historical clock; session/calendar gates stay enabled.
+pytestmark = pytest.mark.usefixtures("historical_live_clock")
+
+
 def _no_orders_today(**_kwargs):
     # An explicit, provable empty page (an ``orders`` list), not a bare
     # ``results`` page: a live broker now refuses a page shape it cannot
@@ -2146,6 +2150,7 @@ def test_load_morning_config_appends_dated_manual_override_to_configured_cap_see
 
     cfg = load_morning_config(str(cfg_dir))
 
+    assert cfg.cap_seed_roots is not None
     assert configured_root in cfg.cap_seed_roots
     assert str(override_dir) in cfg.cap_seed_roots
 
@@ -5845,7 +5850,7 @@ def test_morning_scheduled_duplicate_recovery_settles_preserved_credit(tmp_path)
     from dca_cumulative import CumulativeCreditLedger
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
 
-    class _DuplicateBroker:
+    class _DuplicateBroker(FakeLiveBroker):
         def __init__(self):
             self.placed = {}
 
@@ -5854,6 +5859,9 @@ def test_morning_scheduled_duplicate_recovery_settles_preserved_credit(tmp_path)
 
         def available_buying_power(self):
             return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
 
         def same_day_strategy_order_exists_with_ref_id_prefix(
             self, ticker, trading_day, ref_id_prefixes
@@ -6361,7 +6369,7 @@ def test_morning_scheduled_duplicate_recovery_settlement_is_idempotent(tmp_path)
     from dca_cumulative import CumulativeCreditLedger
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
 
-    class _DuplicateBroker:
+    class _DuplicateBroker(FakeLiveBroker):
         def __init__(self):
             self.placed = {}
 
@@ -6370,6 +6378,9 @@ def test_morning_scheduled_duplicate_recovery_settlement_is_idempotent(tmp_path)
 
         def available_buying_power(self):
             return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
 
         def same_day_strategy_order_exists_with_ref_id_prefix(
             self, ticker, trading_day, ref_id_prefixes
@@ -6736,7 +6747,9 @@ def test_morning_original_settlement_is_keyed_so_the_first_recovery_is_deduped(t
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return False
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ) -> Optional[dict[str, Any]]:
             return None
 
         def is_tradable_for_fractional_buy(self, ticker):
@@ -7076,7 +7089,7 @@ def test_credit_ledger_read_failure_aborts_top_up_computation(tmp_path):
         prior_allocation_roots=(str(tmp_path / "prior"),),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    ex.credit_ledger = _UnreadableLedger()
+    ex.credit_ledger = cast(Any, _UnreadableLedger())
 
     with pytest.raises(RuntimeError, match="ledger idempotency read failed"):
         ex._compute_top_up(_now_live(), [_isolation_signal("AAPL")])
@@ -8754,21 +8767,21 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.03})
 
-    # Step 1: manual run at 9:00 AM — buys TICK ($4.50), writes artifact to manual_runs/.
+    # Step 1: manual run at 9:35 AM — buys TICK ($4.50), writes artifact to manual_runs/.
     # Use an earlier timestamp so the artifact's generated_at is before the 10:30 AM
     # boundary used by the scheduled run's cap-seeding scan (boundary check is strict <).
-    _now_manual = datetime.combine(date(2026, 7, 8), time(9, 0), tzinfo=EASTERN)
+    _now_manual = datetime.combine(date(2026, 7, 8), time(9, 35), tzinfo=EASTERN)
     broker = _SimpleBroker()
     ex.run(_now_manual, data, broker=broker, manual=True)
     manual_amount = broker.placed.get("TICK", 0.0)
     assert manual_amount == 4.5
 
     # Step 2: an external fill of $4 appears in manual_runs/ (simulates another executor/session)
-    ext_dir1 = manual_root / "20260708_0901ET"
+    ext_dir1 = manual_root / "20260708_0936ET"
     ext_dir1.mkdir(parents=True, exist_ok=True)
     (ext_dir1 / "run_state.json").write_text(
         _json.dumps({
-            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:01:00-04:00",
+            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:36:00-04:00",
             "run_classification": {"run_origin": "manual", "manual_run": True},
             "buy_candidates": [{"ticker": "EXT1", "status": "submitted",
                                 "planned_amount_usd": 4.0, "decision_price": 55.0}],
@@ -8785,11 +8798,11 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     )
 
     # Step 4: another external $4 fill appears in manual_runs/
-    ext_dir2 = manual_root / "20260708_0902ET"
+    ext_dir2 = manual_root / "20260708_0937ET"
     ext_dir2.mkdir(parents=True, exist_ok=True)
     (ext_dir2 / "run_state.json").write_text(
         _json.dumps({
-            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:02:00-04:00",
+            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:37:00-04:00",
             "run_classification": {"run_origin": "manual", "manual_run": True},
             "buy_candidates": [{"ticker": "EXT2", "status": "submitted",
                                 "planned_amount_usd": 4.0, "decision_price": 55.0}],
@@ -9255,6 +9268,7 @@ def test_morning_live_top_up_accounts_for_broker_spend(
         placed.append((kwargs["symbol"], float(kwargs["dollar_amount"])))
         return {"order": {"id": "morning-top-up-order", "state": "confirmed"}}
 
+    assert cfg.target_account_number is not None
     broker = RobinhoodBroker(
         account=cfg.target_account_number,
         enable_live_orders=True,
@@ -9358,7 +9372,7 @@ def test_morning_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id(tm
 
     # Step 1: manual run, 3% drop -> 1.5x * $3 = $4.50 placed with the
     # ORDINARY ref_id (top-up computation is disabled for manual+MORNING).
-    manual_now = datetime.combine(date(2026, 7, 8), time(9, 0), tzinfo=EASTERN)
+    manual_now = datetime.combine(date(2026, 7, 8), time(9, 35), tzinfo=EASTERN)
     manual_data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.03})
     manual_res = ex.run(manual_now, manual_data, broker=broker, manual=True)
     assert broker.placed.get("NVDA") == pytest.approx(4.5)
@@ -9909,7 +9923,9 @@ def test_default_cap_seed_roots_include_dated_manual_overrides(monkeypatch):
         lambda: (override_root,),
     )
 
-    assert override_root in MorningConfig().cap_seed_roots
+    roots = MorningConfig().cap_seed_roots
+    assert roots is not None
+    assert override_root in roots
 
 
 def test_morning_live_scheduled_artifact_not_prior_context_on_retry(tmp_path):
@@ -10162,17 +10178,17 @@ def test_morning_cap_seeding_own_amount_scoped_to_cap_roots(tmp_path):
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.03})
 
     # Step 1: manual run buys TICK ($4.50) → _own_recorded[day]=4.50
-    _now_manual = datetime.combine(date(2026, 7, 8), time(9, 0), tzinfo=EASTERN)
+    _now_manual = datetime.combine(date(2026, 7, 8), time(9, 35), tzinfo=EASTERN)
     broker = _SimpleBroker()
     ex.run(_now_manual, data, broker=broker, manual=True)
     assert broker.placed.get("TICK") == 4.5
 
     # Step 2: an external $4 fill appears in external_cap_root (NOT under manual_runs)
-    ext_dir = external_cap_root / "20260708_0901ET"
+    ext_dir = external_cap_root / "20260708_0936ET"
     ext_dir.mkdir(parents=True, exist_ok=True)
     (ext_dir / "run_state.json").write_text(
         _json.dumps({
-            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:01:00-04:00",
+            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:36:00-04:00",
             "run_classification": {"run_origin": "manual", "manual_run": True},
             "buy_candidates": [{"ticker": "EXT", "status": "submitted",
                                 "planned_amount_usd": 4.0, "decision_price": 55.0}],
@@ -10436,6 +10452,7 @@ def test_same_stream_order_exists_normalizes_legacy_boolean_adapters(tmp_path):
     assert result.get("id") == "legacy-bool-dup:morning:2026-07-08:NVDA"
     assert result.get("dollar_amount") is None
     again = _same_stream_order_exists(cast(Any, _LegacyBoolBroker(True)), "NVDA", trading_day, "morning")
+    assert again is not None
     assert again.get("id") == result.get("id")
     # A real order dict passes through unchanged so real order_id/amount survive.
     order = {"id": "O1", "dollar_amount": 7.5}
@@ -11240,6 +11257,8 @@ def test_a_scheduled_run_blocks_when_the_provider_cannot_be_isolated(tmp_path):
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
 
     class _UncopyableProvider(DecliningBarsProvider):
+        _historicals_fn: Any = None
+
         def __copy__(self):
             raise TypeError("not copyable")
 
@@ -11875,7 +11894,7 @@ class _BadTradabilityBroker(FakeLiveBroker):
     def __init__(self):
         self.place_calls = []
 
-    def is_tradable_for_fractional_buy(self, ticker):
+    def is_tradable_for_fractional_buy(self, ticker) -> Any:
         return _Unserializable()
 
     def place_market_buy(self, ticker, notional_usd, ref_id):
@@ -11901,7 +11920,7 @@ def test_raw_persistence_failure_during_this_candidate_blocks_this_candidate(tmp
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
     broker = _BadTradabilityBroker()
-    res = ex.run(_now_live(), data, broker=broker)
+    res = ex.run(_now_live(), data, broker=cast(Any, broker))
     artifacts = res["artifacts"]
 
     outcome = artifacts.get("broker_outcomes", {}).get("SMALL")
@@ -13259,9 +13278,6 @@ def test_terminal_rejection_with_unreadable_quantity_halts_the_batch(tmp_path, m
     assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
     assert ex.ledger.day_planned(date(2026, 7, 8)) == 10.0
     assert "NVDA" not in outcomes or outcomes["NVDA"]["status"] != "submitted"
-    assert res["artifacts"]["is_trading_failure"] is True
-    assert res["artifacts"]["scheduled_evidence_denied"] is True
-    assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
     assert heartbeat_results == [False]
 
 
@@ -13364,11 +13380,7 @@ def test_terminal_rejection_with_positive_quantity_and_no_usable_price_halts_the
     assert res["artifacts"]["is_trading_failure"] is True
     assert res["artifacts"]["scheduled_evidence_denied"] is True
     assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
-    assert heartbeat_results == [False]
     assert "NVDA" not in outcomes or outcomes["NVDA"]["status"] != "submitted"
-    assert res["artifacts"]["is_trading_failure"] is True
-    assert res["artifacts"]["scheduled_evidence_denied"] is True
-    assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
     assert heartbeat_results == [False]
 
 
@@ -15773,12 +15785,15 @@ def test_place_broker_orders_settles_ambiguous_credit_exactly_once(tmp_path):
     from dca_cumulative import CumulativeCreditLedger
     from near_close_dca import TOP_UP_INCREMENTAL, OrderPlacementAmbiguousError
 
-    class _AmbiguousBroker:
+    class _AmbiguousBroker(FakeLiveBroker):
         def account_number(self):
             return "999000111"
 
         def available_buying_power(self):
             return 1000.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None
@@ -15968,7 +15983,7 @@ def test_same_stream_order_exists_asks_for_every_entry_points_family(tmp_path):
             asked.append(tuple(ref_id_prefixes))
             return {"id": "ORD-1", "ref_id": "graded-dca-morning-2026-07-08-AAPL"}
 
-    found = _same_stream_order_exists(_Recorder(), "AAPL", date(2026, 7, 8), "morning")
+    found = _same_stream_order_exists(cast(Any, _Recorder()), "AAPL", date(2026, 7, 8), "morning")
     assert found == {"id": "ORD-1", "ref_id": "graded-dca-morning-2026-07-08-AAPL"}
     assert asked == [same_stream_ref_id_prefixes("morning", date(2026, 7, 8), "AAPL")]
     assert "graded-dca-morning-2026-07-08-AAPL" in asked[0]

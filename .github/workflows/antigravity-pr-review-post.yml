@@ -18,8 +18,8 @@ name: Antigravity PR Review (Post)
 #      `review` job's checkout step below intentionally has no `ref:` --
 #      omitting it means "check out github.sha", which for a workflow_run
 #      event IS the default branch, not the branch that triggered it. The PR
-#      still reaches this job, but only as DATA (the diff text, downloaded as
-#      an artifact), never as CODE that gets executed.
+#      still reaches this job, but only as DATA (commit objects used to
+#      compute the diff), never as CODE that gets executed.
 #      scripts/tests/test_pr_review_workflow_trust_boundary.py fails CI if any
 #      checkout step here ever gains a `ref:` at all.
 #
@@ -33,7 +33,9 @@ name: Antigravity PR Review (Post)
 # Downloading another workflow run's artifact by run ID is itself a place
 # confusion could creep in (an attacker-influenced run ID, or two runs racing
 # on the same PR), so the downloaded metadata.json is cross-checked against
-# the validated PR number and head SHA before anything in it is trusted.
+# the validated PR number and commit pair. Artifact contents cannot prove
+# which code was reviewed: the consumer computes its own diff from those
+# immutable commits and treats the downloaded diff as diagnostic data only.
 
 on:
   workflow_run:
@@ -94,6 +96,9 @@ jobs:
             if (prs.length === 0) {
               failures.push("no associated pull_requests on the triggering run");
             }
+            if (!run.head_sha) {
+              failures.push("triggering run does not expose an immutable head_sha");
+            }
 
             if (failures.length > 0) {
               for (const f of failures) core.error(f);
@@ -104,10 +109,10 @@ jobs:
             const pr = prs[0];
             core.info(
               `provenance OK: workflow="${run.name}" event=${run.event} ` +
-              `repo=${actualRepo} pr=#${pr.number} head=${pr.head.sha} base=${pr.base.sha}`
+              `repo=${actualRepo} pr=#${pr.number} head=${run.head_sha} base=${pr.base.sha}`
             );
             core.setOutput("pr_number", String(pr.number));
-            core.setOutput("head_sha", pr.head.sha);
+            core.setOutput("head_sha", run.head_sha);
             core.setOutput("base_sha", pr.base.sha);
 
   review:
@@ -211,6 +216,9 @@ jobs:
         if: steps.check.outputs.reviewed != 'true'
         uses: actions/checkout@v7
         with:
+          # Fetch same-repository branch history while checkout's ephemeral
+          # authentication is available; only the default branch is checked out.
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Verify reviewer script is present
@@ -242,10 +250,8 @@ jobs:
           # Defends against artifact/run confusion: the artifact just
           # downloaded by run ID must describe the exact PR, head SHA, and
           # base SHA the provenance job already validated, not merely SOME
-          # PR -- the base check also confirms the diff this artifact carries
-          # was actually computed against the pinned base_sha, not a moving
-          # branch tip (Codex review, PR #219: "Pin and recheck the reviewed
-          # base SHA").
+          # PR. Metadata is a provenance cross-check, not evidence that the
+          # untrusted analyzer actually computed the accompanying diff.
           python3 - <<'PYEOF'
           import json
           import os
@@ -271,6 +277,35 @@ jobs:
           )
           PYEOF
 
+      - name: Compute trusted review diff
+        if: steps.check.outputs.reviewed != 'true'
+        env:
+          EXPECTED_HEAD_SHA: ${{ needs.validate-provenance.outputs.head_sha }}
+          EXPECTED_BASE_SHA: ${{ needs.validate-provenance.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          # The analyzer workflow and its artifact are PR-controlled. Compute
+          # authoritative review text here without checking out any PR code.
+          for sha in "$EXPECTED_BASE_SHA" "$EXPECTED_HEAD_SHA"; do
+            if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]] || [[ "$(git cat-file -t "$sha")" != commit ]]; then
+              echo "::error::review provenance must identify available immutable commits"
+              exit 1
+            fi
+          done
+          if git merge-base "$EXPECTED_BASE_SHA" "$EXPECTED_HEAD_SHA" >/dev/null; then
+            comparison="${EXPECTED_BASE_SHA}...${EXPECTED_HEAD_SHA}"
+          else
+            status=$?
+            # Exit 1 means valid but disconnected histories. Other failures
+            # indicate broken git state and must not produce a review.
+            if [ "$status" -ne 1 ]; then
+              exit "$status"
+            fi
+            comparison="${EXPECTED_BASE_SHA}..${EXPECTED_HEAD_SHA}"
+          fi
+          mkdir -p trusted_review_input
+          git diff --no-ext-diff --no-textconv --no-color "$comparison" > trusted_review_input/diff.patch
+
       - name: Set up Python
         if: steps.check.outputs.reviewed != 'true'
         uses: actions/setup-python@v7
@@ -287,14 +322,14 @@ jobs:
         # (Codex review, PR #219).
         run: |
           python -m pip install --upgrade pip
-          pip install google-antigravity==0.1.8
+          pip install -r requirements-pr-review.txt
 
       - name: Generate PR Review
         id: run_review
         if: steps.check.outputs.reviewed != 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          DIFF_FILE: review_input/diff.patch
+          DIFF_FILE: trusted_review_input/diff.patch
         run: |
           python .github/scripts/pr_review.py > review_output.md
 

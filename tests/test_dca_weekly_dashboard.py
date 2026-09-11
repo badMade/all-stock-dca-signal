@@ -8208,3 +8208,55 @@ def test_build_coverage_missed_missing_data():
     assert "| ? | 3 | n/a | n/a | n/a | 0 |" in result
     assert "| 2023-10-03 | 0 | n/a | n/a | n/a | 0 |" in result
 
+
+def test_build_coverage_missed_edge_cases():
+    # Empty lists
+    result_empty = build_coverage_missed([], [])
+    assert "## Coverage and missed opportunities" in result_empty
+    # No rows should be added beyond the header (4 lines total, including empty ones)
+    assert len(result_empty.strip().split("\n")) == 4
+
+    # Explicit zeros to ensure they don't render as "n/a"
+    run_states = [
+        {
+            "trading_day": "2023-11-01",
+            "counts": {"buy_candidates": 0},
+            "manual_review_tickers": [],
+        }
+    ]
+    summaries = [
+        {
+            "trading_day": "2023-11-01",
+            "coverage": {
+                "buy_candidates": 0,
+                "fills": 0,
+                "coverage_pct": 0.0,
+                "missing_fills": 0,
+            }
+        }
+    ]
+    result_zeros = build_coverage_missed(run_states, summaries)
+    assert "| 2023-11-01 | 0 | 0 | 0.0% | 0 | 0 |" in result_zeros
+
+    # Only run_states, no matching summary for the day
+    run_states_no_summary = [
+        {
+            "trading_day": "2023-11-02",
+            "counts": {"buy_candidates": 10},
+        }
+    ]
+    result_no_summary = build_coverage_missed(run_states_no_summary, [])
+    assert "| 2023-11-02 | 10 | n/a | n/a | n/a | 0 |" in result_no_summary
+
+    # Coverage has buy_candidates but missing counts in run_states
+    run_states_no_counts = [
+        {"trading_day": "2023-11-03"}
+    ]
+    summaries_with_cov = [
+        {
+            "trading_day": "2023-11-03",
+            "coverage": {"buy_candidates": 5}
+        }
+    ]
+    result_cov_candidates = build_coverage_missed(run_states_no_counts, summaries_with_cov)
+    assert "| 2023-11-03 | 5 | n/a | n/a | n/a | 0 |" in result_cov_candidates

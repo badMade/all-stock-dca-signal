@@ -110,6 +110,7 @@ from near_close_dca import (
     PriorSameDayAllocation,
     StrategyConfig,
     _is_usable_reconciled_order_id,
+    _live_session_failure,
     _recovered_broker_notional,
     _ticker_sizing,
     account_pinning_failure,
@@ -697,7 +698,7 @@ class MorningConfig:
     # checks that consume this) -- e.g. for an isolated replay/staging config.
     # Override via artifact_paths.cap_seed_roots in morning_dca.json/
     # midday_dca.json.
-    cap_seed_roots: Tuple[str, ...] = field(default_factory=default_pooled_cap_seed_roots)
+    cap_seed_roots: Optional[Tuple[str, ...]] = field(default_factory=default_pooled_cap_seed_roots)
     # Minimum number of completed intraday bars over the trend window required to
     # validate the intraday trend in live mode. When fewer are available a
     # qualifying candidate is flagged manual_review_candidate rather than bought.
@@ -1652,7 +1653,7 @@ def load_morning_config(
     # production tree. No-op when the variable is unset.
     raw = rebase_bundled_roots_in(raw)
 
-    kwargs = dict(approved_date_overrides)
+    kwargs: dict[str, Any] = dict(approved_date_overrides)
 
     sizing = raw.get("sizing_ladder", {})
     if "base_amount_usd" in sizing:
@@ -3102,13 +3103,14 @@ class _PersistingBrokerAdapter:
     ) -> None:
         getter = getattr(self._inner, "get_raw_placement_responses", None)
         try:
-            responses = getter() if callable(getter) else []
+            responses_raw = getter() if callable(getter) else []
         except Exception as exc:  # noqa: BLE001
             # Placement may already have succeeded.  Surface the missing raw
             # evidence to the run, but never replace a known broker order id
             # with a synthetic placement failure.
             self._recorder.record_error(f"failed to drain placement responses: {exc}")
             return
+        responses: list[Any] = list(responses_raw) if isinstance(responses_raw, (list, tuple)) else []
         if responses:
             self._placement_responses.extend(response for response in responses if isinstance(response, dict))
             for response in responses:
@@ -3243,9 +3245,9 @@ def _forbidden_preflight_root_reason(
         resolved = Path(root)
     for forbidden in forbidden_roots:
         try:
-            normalized = Path(_strip_template_segments(str(forbidden))).resolve()
+            normalized = Path(_strip_template_segments(forbidden)).resolve()
         except (OSError, RuntimeError):
-            normalized = Path(_strip_template_segments(str(forbidden)))
+            normalized = Path(_strip_template_segments(forbidden))
         if resolved == normalized or normalized in resolved.parents:
             return (
                 f"preflight_run_state_root {root!r} resolves under a forbidden "
@@ -4586,9 +4588,9 @@ class MorningDCAExecutor(DCAExecutor):
             )
         self._sizing_config = replace(
             self._sizing_config,
-            deployed_last_7d_usd=float(deployed_last_7d_usd),
-            monthly_cash_allocation_usd=float(monthly_cash_allocation_usd),
-            kill_switch_7d_deploy_fraction=float(kill_switch_7d_deploy_fraction),
+            deployed_last_7d_usd=deployed_last_7d_usd,
+            monthly_cash_allocation_usd=monthly_cash_allocation_usd,
+            kill_switch_7d_deploy_fraction=kill_switch_7d_deploy_fraction,
         )
         return kill_switch_engaged(self._sizing_config)
 
@@ -4755,11 +4757,12 @@ class MorningDCAExecutor(DCAExecutor):
         not auto-bought. The watchlist scan places no orders.
         """
         source_for_ticker = getattr(data, "source_for_ticker", None)
-        source = (
+        raw_source = (
             source_for_ticker(ticker)
             if callable(source_for_ticker)
             else getattr(getattr(data, "source", None), "value", "unknown")
         )
+        source = str(raw_source) if raw_source is not None else "unknown"
         now_et = now.astimezone(EASTERN)
         trading_day = now_et.date()
         decision_dt = datetime.combine(trading_day, self.decision_time, tzinfo=EASTERN)
@@ -7553,7 +7556,7 @@ class MorningDCAExecutor(DCAExecutor):
                 except (TypeError, ValueError):
                     dup_amount = prior_submitted_amounts.get(ticker, self.config.max_per_order_usd)
                 if dup_amount is None or not math.isfinite(dup_amount) or dup_amount <= 0:
-                    dup_amount = float(prior_submitted_amounts.get(ticker, self.config.max_per_order_usd))
+                    dup_amount = prior_submitted_amounts.get(ticker, self.config.max_per_order_usd)
                 outcomes[ticker] = {
                     "status": "submitted",
                     "order_id": (dup_order or {}).get("id") or (dup_order or {}).get("order_id"),
@@ -7953,6 +7956,20 @@ class MorningDCAExecutor(DCAExecutor):
         # max_orders_per_day semantics (a cancelled/rejected/failed buy
         # still consumes one of the shared slots), and is what
         # _compute_top_up's cross-stream seeding above counts too.
+        # Manual review and scheduled broker lookups can finish after the
+        # close. Recheck the actual regular session for BOTH run origins,
+        # before charging an attempt or calling the placement adapter.
+        session_failure = _live_session_failure(trading_day)
+        if session_failure:
+            outcomes[ticker] = {"status": "blocked", "skip_reason": session_failure, "deliberate_skip": True}
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
         self.ledger.record_attempt(trading_day)
         try:
             order_id = broker.place_market_buy(ticker, notional, ref_id=ref_id)
@@ -8109,7 +8126,7 @@ class MorningDCAExecutor(DCAExecutor):
             if isinstance(_terminal_raw_responses, list):
                 _terminal_raw_responses.append({
                     "ticker": ticker,
-                    "order_id": str(order_id) if order_id else "",
+                    "order_id": order_id or "",
                     **terminal_order,
                 })
             if terminal_fill.kind is _TerminalFillKind.RECONCILED:

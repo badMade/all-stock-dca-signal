@@ -49,6 +49,9 @@ from near_close_dca import (
     run_once,
 )
 
+# Live simulations use their supplied historical clock; session/calendar gates stay enabled.
+pytestmark = pytest.mark.usefixtures("historical_live_clock")
+
 
 class _FakeSignalData:
     """Minimal MarketDataProvider double producing a controlled small drop
@@ -95,18 +98,23 @@ class _TightSpreadData:
     def get_previous_close_bar(self, ticker, as_of):
         return None
 
+    def get_intraday_bars(self, ticker, start, end, interval_minutes):
+        return []
+
 
 _UNSET = object()
 
 
+# Shared live placement date is Monday 2026-08-17; the former Sunday
+# date could only succeed while the placement session check was missing.
 def _ctx(config, broker, *, scheduled=True, run_result=None, robinhood_data: Any = _UNSET):
     return ProcessCandidateContext(
         config=config,
         state=StrategyState(),
         broker=broker,
         robinhood_data=_TightSpreadData() if robinhood_data is _UNSET else robinhood_data,
-        now=datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN),
-        trading_day=date(2026, 8, 16),
+        now=datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN),
+        trading_day=date(2026, 8, 17),
         guard_active=False,
         prior_same_day_allocations={},
         scheduled=scheduled,
@@ -211,7 +219,7 @@ def test_whole_share_ledger_settles_only_the_confirmed_fill(tmp_path, monkeypatc
 
     class PartialFillBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-17-BYDDY",):
                 return {"id": "RH-PARTIAL-FILL-1", "state": "filled", "cumulative_quantity": "1", "average_price": "10"}
             return None
 
@@ -257,7 +265,7 @@ def test_ordinary_success_path_defers_settlement_for_a_still_live_order(
 
     class _StillLiveAfterPlacementBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-17-BYDDY",):
                 return {
                     "id": "RH-STILL-LIVE-1",
                     "state": working_state,
@@ -268,7 +276,7 @@ def test_ordinary_success_path_defers_settlement_for_a_still_live_order(
             return None
 
     broker = _StillLiveAfterPlacementBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
-    run_result = RunResult(trading_day=date(2026, 8, 16), decisions=[])
+    run_result = RunResult(trading_day=date(2026, 8, 17), decisions=[])
 
     outcome, top_up, running_deployed_7d, errors, _ = _process_buy_candidate(
         _decision(suggested_amount_usd=10.0, target_price=10.0),
@@ -294,7 +302,7 @@ def test_ordinary_success_path_defers_settlement_for_a_still_live_order(
     # actually terminates.
     assert ledger.pending_usd("BYDDY") == 0.0
     assert ledger.shares_purchased_total("BYDDY") == 0
-    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
+    assert ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY") is not None
 
 
 def test_ordinary_success_path_defers_settlement_when_order_not_yet_visible(tmp_path, monkeypatch):
@@ -332,7 +340,7 @@ def test_ordinary_success_path_defers_settlement_when_order_not_yet_visible(tmp_
     ledger = WholeShareAccumulationLedger()
     assert ledger.pending_usd("BYDDY") == 0.0
     assert ledger.shares_purchased_total("BYDDY") == 0
-    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
+    assert ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY") is not None
 
 
 def test_ordinary_success_path_books_the_accepted_order_when_state_verification_raises(
@@ -381,7 +389,7 @@ def test_ordinary_success_path_books_the_accepted_order_when_state_verification_
     ledger = WholeShareAccumulationLedger()
     # The ledger claim is genuinely left unresolved for a later
     # reconciliation attempt -- its true state was never confirmed.
-    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
+    assert ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY") is not None
 
 
 def test_ordinary_success_path_books_the_verified_fill_price(tmp_path, monkeypatch):
@@ -398,7 +406,7 @@ def test_ordinary_success_path_books_the_verified_fill_price(tmp_path, monkeypat
 
     class _VerifiedFillAboveEstimateBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-17-BYDDY",):
                 return {"id": "RH-VERIFIED-FILL-1", "state": "filled", "cumulative_quantity": "1", "average_price": "10.35"}
             return None
 
@@ -433,7 +441,7 @@ def test_an_explicit_zero_fill_is_not_replaced_by_the_requested_quantity(tmp_pat
 
     class _ExplicitZeroFillBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-17-BYDDY",):
                 return {
                     "id": "RH-ZERO-FILL-1", "state": "filled",
                     "cumulative_quantity": 0, "quantity": 1, "average_price": "10.00",
@@ -471,7 +479,7 @@ def test_a_negative_cumulative_quantity_is_rejected_not_booked(tmp_path, monkeyp
 
     class _NegativeFillBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-17-BYDDY",):
                 return {
                     "id": "RH-NEGATIVE-FILL-1", "state": "filled",
                     "cumulative_quantity": -1, "quantity": 1, "average_price": "10.00",
@@ -498,7 +506,7 @@ def test_a_negative_cumulative_quantity_is_rejected_not_booked(tmp_path, monkeyp
     assert outcome["whole_share_settlement_reconciliation_needed"] is True
     ledger = WholeShareAccumulationLedger()
     assert ledger.shares_purchased_total("BYDDY") == 0
-    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY")
     assert unresolved is not None and unresolved["resolved"] is False
 
 
@@ -520,7 +528,7 @@ def test_an_unreadable_filled_quantity_leaves_the_claim_unresolved(tmp_path, mon
 
     class _UnreadableFillBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-17-BYDDY",):
                 return {
                     "id": "RH-UNREADABLE-FILL-1", "state": "filled",
                     "cumulative_quantity": "unknown", "average_price": "10.00",
@@ -539,7 +547,7 @@ def test_an_unreadable_filled_quantity_leaves_the_claim_unresolved(tmp_path, mon
     assert outcome["whole_share_settlement_reconciliation_needed"] is True
     ledger = WholeShareAccumulationLedger()
     assert ledger.shares_purchased_total("BYDDY") == 0
-    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY")
     assert unresolved is not None and unresolved["resolved"] is False
 
 
@@ -561,7 +569,7 @@ def test_an_explicit_null_filled_quantity_leaves_the_claim_unresolved(tmp_path, 
 
     class _NullFillBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-17-BYDDY",):
                 return {
                     "id": "RH-NULL-FILL-1", "state": "filled",
                     "cumulative_quantity": None, "average_price": "10.00",
@@ -580,7 +588,7 @@ def test_an_explicit_null_filled_quantity_leaves_the_claim_unresolved(tmp_path, 
     assert outcome["whole_share_settlement_reconciliation_needed"] is True
     ledger = WholeShareAccumulationLedger()
     assert ledger.shares_purchased_total("BYDDY") == 0
-    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY")
     assert unresolved is not None and unresolved["resolved"] is False
 
 
@@ -594,7 +602,7 @@ def test_an_absent_filled_quantity_still_settles_normally(tmp_path, monkeypatch)
 
     class _SilentFillBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-17-BYDDY",):
                 return {"id": "RH-SILENT-FILL-1", "state": "filled", "average_price": "10.00"}
             return None
 
@@ -616,7 +624,7 @@ def test_execution_record_is_logged_on_success(tmp_path, monkeypatch):
 
     config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
-    run_result = RunResult(trading_day=date(2026, 8, 16), decisions=[])
+    run_result = RunResult(trading_day=date(2026, 8, 17), decisions=[])
 
     outcome, _, _, _, _ = _process_buy_candidate(
         _decision(suggested_amount_usd=10.0, target_price=10.0),
@@ -657,7 +665,7 @@ def test_execution_record_uses_the_known_fill_not_a_broker_requery(tmp_path, mon
             return OrderFill(avg_fill_price=1.0, quantity_filled=999.0)
 
     broker = _StaleRequeryBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
-    run_result = RunResult(trading_day=date(2026, 8, 16), decisions=[])
+    run_result = RunResult(trading_day=date(2026, 8, 17), decisions=[])
 
     outcome, _, _, _, _ = _process_buy_candidate(
         _decision(suggested_amount_usd=10.0, target_price=10.0),
@@ -1414,7 +1422,7 @@ def test_placement_failure_restores_credit_only_after_both_order_history_checks(
         running_deployed_7d=0.0,
     )
 
-    ref_id = "graded-dca-wholeshare-2026-08-16-BYDDY"
+    ref_id = "graded-dca-wholeshare-2026-08-17-BYDDY"
     assert calls == [
         ("place", ref_id),
         ("live", (ref_id,)),
@@ -1485,13 +1493,13 @@ def test_ambiguous_whole_share_placement_books_the_reserved_notional(tmp_path, m
     config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
     broker = _AmbiguousConnectorBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
     state = StrategyState()
-    trading_day = date(2026, 8, 16)
+    trading_day = date(2026, 8, 17)
     ctx = ProcessCandidateContext(
         config=config,
         state=state,
         broker=broker,
         robinhood_data=_TightSpreadData(),
-        now=datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN),
+        now=datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN),
         trading_day=trading_day,
         guard_active=False,
         prior_same_day_allocations={},
@@ -1533,7 +1541,7 @@ def test_ambiguous_placement_failure_reconciles_via_ref_id_instead_of_restoring_
             raise RuntimeError("response timeout")
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-            assert ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",)
+            assert ref_id_prefixes == ("graded-dca-wholeshare-2026-08-17-BYDDY",)
             return {"id": "RH-ALREADY-ACCEPTED-123", "state": "filled", "quantity": "1"}
 
     broker = _AmbiguousFailureBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
@@ -1759,7 +1767,7 @@ def test_reconciliation_settlement_forwards_the_claim_ownership_token():
     """
     claim_token = "claim-owner-token"
     claim = {
-        "claimed_at": "2026-08-16T15:45:00-04:00",
+        "claimed_at": "2026-08-17T15:45:00-04:00",
         "claim_token": claim_token,
         "current_share_price_usd": 10.0,
     }
@@ -1774,7 +1782,7 @@ def test_reconciliation_settlement_forwards_the_claim_ownership_token():
         _RecordingLedger(),
         "BYDDY",
         claim,
-        "2026-08-16",
+        "2026-08-17",
         1,
         "afternoon",
         "afternoon-BYDDY",
@@ -1836,14 +1844,14 @@ def test_the_second_predisplacement_duplicate_check_leaves_a_reclaimed_claim_res
     # and this candidate cannot rule out that it's its own reclaimed fire.
     assert ledger.pending_usd("BYDDY") == 0.0
     assert ledger.shares_purchased_total("BYDDY") == 0
-    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
+    assert ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY") is not None
 
 
 def test_a_later_trading_day_reconciles_an_unresolved_claim_from_an_earlier_day(tmp_path, monkeypatch):
     """Codex review ("Reconcile unresolved claims across trading days"): an
     ambiguous placement failure whose ref-id reconciliation lookup ALSO
     failed can remain unresolved past midnight. A LATER trading day's run
-    (this test's `_ctx()` fixture is fixed at 2026-08-16) must still be
+    (this test's `_ctx()` fixture is fixed at 2026-08-17) must still be
     able to discover and reconcile a claim left unresolved on an EARLIER
     day (2026-08-15) against its ORIGINAL trading day/ref_id -- not just
     today's.
@@ -1875,7 +1883,7 @@ def test_a_later_trading_day_reconciles_an_unresolved_claim_from_an_earlier_day(
             return None
 
     broker = _CrossDayConfirmingBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
-    run_result = RunResult(trading_day=date(2026, 8, 16), decisions=[])
+    run_result = RunResult(trading_day=date(2026, 8, 17), decisions=[])
     ctx = _ctx(config, broker, run_result=run_result)
 
     # TODAY's own candidate is a fresh, below-threshold accumulation --
@@ -1914,7 +1922,7 @@ def test_a_reconciled_order_outside_the_7day_window_is_not_booked_as_current_dep
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     ledger = WholeShareAccumulationLedger()
-    old_trading_day = "2026-07-20"  # well over 7 calendar days before 2026-08-16
+    old_trading_day = "2026-07-20"  # well over 7 calendar days before 2026-08-17
     ledger.record_contribution(
         "BYDDY",
         old_trading_day,
@@ -2012,10 +2020,10 @@ def test_a_stale_confirmed_rejected_claim_is_released(tmp_path, monkeypatch):
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     ledger = WholeShareAccumulationLedger()
     # Claimed well over UNRESOLVED_CLAIM_STALE_SECONDS (5 minutes) before
-    # this test's fixed `now` (2026-08-16T15:45 ET, from _ctx()).
+    # this test's fixed `now` (2026-08-17T15:45 ET, from _ctx()).
     ledger.record_contribution(
-        "BYDDY", "2026-08-16", 10.0, 10.0, stream="afternoon", idempotency_key="afternoon-BYDDY",
-        recorded_at="2026-08-16T15:00:00-04:00",
+        "BYDDY", "2026-08-17", 10.0, 10.0, stream="afternoon", idempotency_key="afternoon-BYDDY",
+        recorded_at="2026-08-17T15:00:00-04:00",
     )
     assert ledger.pending_usd("BYDDY") == 0.0  # deducted
 
@@ -2040,7 +2048,7 @@ def test_a_stale_confirmed_rejected_claim_is_released(tmp_path, monkeypatch):
     # The stale, confirmed-rejected claim's $10 was released back to
     # pending_usd rather than staying permanently deducted.
     assert ledger2.pending_usd("BYDDY") == 10.0
-    assert ledger2.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is None
+    assert ledger2.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY") is None
 
 
 @pytest.mark.parametrize("order_state", ["new", "confirmed", "partially_filled"])
@@ -2102,7 +2110,7 @@ def test_a_nonterminal_ambiguous_match_leaves_the_claim_reserved(tmp_path, monke
     # exactly as record_contribution left it.
     assert ledger.shares_purchased_total("BYDDY") == 0
     assert ledger.pending_usd("BYDDY") == 0.0
-    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
+    assert ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY") is not None
 
 
 def test_immediate_placement_failure_settles_a_partial_fill_found_via_terminal_lookup(tmp_path, monkeypatch):
@@ -2168,7 +2176,7 @@ def test_immediate_placement_failure_settles_a_partial_fill_found_via_terminal_l
     # claim price.  The filled share's $4 credit remains consumed even
     # though its actual execution notional ($4.25) is used for reporting.
     assert ledger.pending_usd("BYDDY") == 12.0
-    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is None
+    assert ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY") is None
     assert running_deployed_7d == 4.25
     # Ownership enforcement is only meaningful when this terminal-inclusive
     # recovery passes the actionable decision's rotated claim token.
@@ -2268,7 +2276,7 @@ def test_terminal_placement_error_logs_execution_from_its_own_payload_without_re
             return None
 
     broker = _TerminalErrorFillQueryMissesBroker(cash=500.0, reference_prices={"BYDDY": 4.0})
-    run_result = RunResult(trading_day=date(2026, 8, 16), decisions=[])
+    run_result = RunResult(trading_day=date(2026, 8, 17), decisions=[])
 
     outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
         _decision(suggested_amount_usd=16.0, target_price=4.0),
@@ -2341,7 +2349,7 @@ def test_immediate_placement_failure_books_a_still_live_order_found_via_terminal
     # Still deducted (a real order was placed) but NOT settled -- the claim
     # stays unresolved for a later reconciliation attempt.
     assert ledger.shares_purchased_total("BYDDY") == 0
-    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
+    assert ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY") is not None
 
 
 def test_live_order_carried_by_placement_failure_envelope_is_booked_without_history_lookup(
@@ -2391,11 +2399,11 @@ def test_live_order_carried_by_placement_failure_envelope_is_booked_without_hist
     assert outcome["whole_share_settlement_reconciliation_needed"] is True
     assert running_deployed_7d == pytest.approx(8.0)
     assert errors == 1
-    assert ctx.state.day_order_count(date(2026, 8, 16)) == 1
-    assert ctx.state.day_notional(date(2026, 8, 16)) == pytest.approx(8.0)
+    assert ctx.state.day_order_count(date(2026, 8, 17)) == 1
+    assert ctx.state.day_notional(date(2026, 8, 17)) == pytest.approx(8.0)
     ledger = WholeShareAccumulationLedger()
     assert ledger.shares_purchased_total("BYDDY") == 0
-    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
+    assert ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY") is not None
 
 
 def test_immediate_placement_failure_normalizes_a_boolean_primary_id_from_terminal_lookup(tmp_path, monkeypatch):
@@ -2564,7 +2572,7 @@ def test_immediate_placement_failure_books_a_still_live_order_found_via_live_onl
     assert running_deployed_7d == pytest.approx(8.0)
     ledger = WholeShareAccumulationLedger()
     assert ledger.shares_purchased_total("BYDDY") == 0
-    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
+    assert ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY") is not None
 
 
 @pytest.mark.parametrize("terminal_quantity", [None, "not-a-number"])
@@ -2611,7 +2619,7 @@ def test_immediate_placement_failure_leaves_the_claim_reserved_when_terminal_qua
     ledger = WholeShareAccumulationLedger()
     assert ledger.shares_purchased_total("BYDDY") == 0
     # NOT restored -- left reserved for later reconciliation.
-    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
+    assert ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY") is not None
 
 
 def test_immediate_placement_failure_marks_broker_placement_failed_for_a_confirmed_zero_fill(
@@ -2660,7 +2668,7 @@ def test_immediate_placement_failure_marks_broker_placement_failed_for_a_confirm
     assert running_deployed_7d == 0.0
     ledger = WholeShareAccumulationLedger()
     assert ledger.shares_purchased_total("BYDDY") == 0
-    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is None
+    assert ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY") is None
 
 
 def test_a_confirmed_zero_fill_consumes_exactly_one_attempt_through_the_batch_funnel(
@@ -2718,11 +2726,11 @@ def test_a_confirmed_zero_fill_consumes_exactly_one_attempt_through_the_batch_fu
     # The confirmed attempt is counted exactly ONCE, even though nothing was
     # spent -- not twice, which is what the internal record_buy call plus
     # the funnel's own charge produced before the fix.
-    assert ctx.state.day_order_count(date(2026, 8, 16)) == 1
-    assert ctx.state.day_notional(date(2026, 8, 16)) == 0.0
+    assert ctx.state.day_order_count(date(2026, 8, 17)) == 1
+    assert ctx.state.day_notional(date(2026, 8, 17)) == 0.0
     ledger = WholeShareAccumulationLedger()
     assert ledger.shares_purchased_total("BYDDY") == 0
-    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is None
+    assert ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY") is None
 
 
 def test_a_confirmation_hold_merged_with_a_recovered_fill_does_not_consume_an_attempt(
@@ -2772,7 +2780,7 @@ def test_a_confirmation_hold_merged_with_a_recovered_fill_does_not_consume_an_at
     assert outcome["merged_confirmation_required"] is True
     # Today's confirmation hold made no placement attempt of its own, so it
     # must not consume a max_orders_per_day slot.
-    assert ctx.state.day_order_count(date(2026, 8, 16)) == 0
+    assert ctx.state.day_order_count(date(2026, 8, 17)) == 0
 
 
 def test_immediate_placement_failure_does_not_count_a_zero_fill_attempt_when_release_fails(
@@ -2820,7 +2828,7 @@ def test_immediate_placement_failure_does_not_count_a_zero_fill_attempt_when_rel
     assert outcome["order_id"] == "RH-ZERO-FILL-RELEASE-FAILS"
     # The release failed, so nothing is counted -- a LATER reconciliation
     # attempt, once release succeeds, is the one that should book it.
-    assert ctx.state.day_order_count(date(2026, 8, 16)) == 0
+    assert ctx.state.day_order_count(date(2026, 8, 17)) == 0
 
 
 def test_pre_roll_zero_fill_recovery_counts_toward_the_attempt_cap(tmp_path, monkeypatch):
@@ -2967,8 +2975,8 @@ def test_a_swallowed_same_day_existence_lookup_reaches_the_error_sink(tmp_path, 
     ledger = WholeShareAccumulationLedger()
     # TODAY's own claim: what reaches the same-day branch at all.
     ledger.record_contribution(
-        "BYDDY", "2026-08-16", 10.0, 10.0, stream="afternoon",
-        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-16T15:30:00-04:00",
+        "BYDDY", "2026-08-17", 10.0, 10.0, stream="afternoon",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-17T15:30:00-04:00",
     )
 
     class _ExistenceCheckDown(DryRunBroker):
@@ -3003,8 +3011,8 @@ def test_a_swallowed_same_day_terminal_lookup_reaches_the_error_sink(tmp_path, m
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     ledger = WholeShareAccumulationLedger()
     ledger.record_contribution(
-        "BYDDY", "2026-08-16", 10.0, 10.0, stream="afternoon",
-        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-16T15:30:00-04:00",
+        "BYDDY", "2026-08-17", 10.0, 10.0, stream="afternoon",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-17T15:30:00-04:00",
     )
 
     class _TerminalHistoryDown(DryRunBroker):
@@ -3147,8 +3155,8 @@ def test_pre_roll_live_order_recovery_queues_a_post_commit_state_booked_marker(
         state=state,
         broker=_StillLiveBroker(cash=500.0, reference_prices={"BYDDY": 10.0}),
         robinhood_data=None,
-        now=datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN),
-        trading_day=date(2026, 8, 16),
+        now=datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN),
+        trading_day=date(2026, 8, 17),
         guard_active=False,
         prior_same_day_allocations={},
         scheduled=True,
@@ -3327,13 +3335,13 @@ def test_a_still_live_recovered_order_already_recorded_on_a_later_day_is_not_reb
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
 
-    # Simulates the FIRST recovery run (2026-08-16): it found the same
+    # Simulates the FIRST recovery run (2026-08-17): it found the same
     # still-live order and published a "submitted" outcome under ITS OWN
     # trading_day, not the claim's original 2026-08-15.
     history_root = str(tmp_path / "runs")
     _write_scheduled_afternoon_artifact(
         history_root,
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         [{"ticker": "BYDDY", "status": "submitted", "order_id": "RH-STILL-LIVE-1", "planned_amount_usd": 10.0}],
     )
 
@@ -3347,8 +3355,8 @@ def test_a_still_live_recovered_order_already_recorded_on_a_later_day_is_not_reb
         state=StrategyState(),
         broker=_StillLiveBroker(cash=500.0, reference_prices={"BYDDY": 10.0}),
         robinhood_data=None,
-        now=datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN),
-        trading_day=date(2026, 8, 17),
+        now=datetime(2026, 8, 18, 15, 45, tzinfo=EASTERN),
+        trading_day=date(2026, 8, 18),
         guard_active=False,
         prior_same_day_allocations={},
         scheduled=True,
@@ -3385,10 +3393,10 @@ def test_find_same_day_recorded_order_recognizes_filled_status(tmp_path):
     from test_near_close_dca import _write_scheduled_afternoon_artifact
 
     history_root = str(tmp_path / "runs")
-    trading_day = date(2026, 8, 17)
+    trading_day = date(2026, 8, 18)
     _write_scheduled_afternoon_artifact(
         history_root,
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         [{"ticker": "BYDDY", "status": "filled", "order_id": "RH-FILLED-GATED-1", "planned_amount_usd": 10.0}],
     )
 
@@ -3413,17 +3421,17 @@ def test_find_same_day_recorded_order_falls_back_to_claim_attempt_id(tmp_path):
     from test_near_close_dca import _write_scheduled_afternoon_artifact
 
     history_root = str(tmp_path / "runs")
-    trading_day = date(2026, 8, 17)
+    trading_day = date(2026, 8, 18)
     _write_scheduled_afternoon_artifact(
         history_root,
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         [{
             "ticker": "BYDDY",
             "status": "submitted",
             "order_id": None,
             "planned_amount_usd": 10.0,
             "whole_share_claim_breakdown": [
-                {"trading_day": "2026-08-16", "claim_attempt_id": "attempt-1", "amount_usd": 10.0}
+                {"trading_day": "2026-08-17", "claim_attempt_id": "attempt-1", "amount_usd": 10.0}
             ],
         }],
     )
@@ -3465,7 +3473,7 @@ def test_a_terminally_filled_recovery_is_not_rebooked_after_an_earlier_live_prov
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
 
-    # Simulates the FIRST recovery run (2026-08-16): found the order still
+    # Simulates the FIRST recovery run (2026-08-17): found the order still
     # live and provisionally booked it under ITS OWN trading_day, with the
     # SAME shape real production outcomes publish -- the top-level dollar
     # field is persisted as "planned_amount_usd" (not "submitted_amount_usd",
@@ -3475,7 +3483,7 @@ def test_a_terminally_filled_recovery_is_not_rebooked_after_an_earlier_live_prov
     history_root = str(tmp_path / "runs")
     _write_scheduled_afternoon_artifact(
         history_root,
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         [{
             "ticker": "BYDDY", "status": "submitted", "order_id": "RH-NOW-FILLED-1",
             "planned_amount_usd": 10.0,
@@ -3493,8 +3501,8 @@ def test_a_terminally_filled_recovery_is_not_rebooked_after_an_earlier_live_prov
         state=StrategyState(),
         broker=_NowFilledBroker(cash=500.0, reference_prices={"BYDDY": 10.0}),
         robinhood_data=None,
-        now=datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN),
-        trading_day=date(2026, 8, 17),
+        now=datetime(2026, 8, 18, 15, 45, tzinfo=EASTERN),
+        trading_day=date(2026, 8, 18),
         guard_active=False,
         prior_same_day_allocations={},
         scheduled=True,
@@ -3547,7 +3555,7 @@ def test_a_terminally_filled_recovery_publishes_the_delta_from_an_earlier_provis
     history_root = str(tmp_path / "runs")
     _write_scheduled_afternoon_artifact(
         history_root,
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         [{
             "ticker": "BYDDY", "status": "submitted", "order_id": "RH-DELTA-FILL-1",
             # One persisted row can aggregate multiple broker orders.  Both
@@ -3576,8 +3584,8 @@ def test_a_terminally_filled_recovery_publishes_the_delta_from_an_earlier_provis
         state=StrategyState(),
         broker=_FilledAboveCachedPriceBroker(cash=500.0, reference_prices={"BYDDY": 10.0}),
         robinhood_data=None,
-        now=datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN),
-        trading_day=date(2026, 8, 17),
+        now=datetime(2026, 8, 18, 15, 45, tzinfo=EASTERN),
+        trading_day=date(2026, 8, 18),
         guard_active=False,
         prior_same_day_allocations={},
         scheduled=True,
@@ -3635,7 +3643,7 @@ def test_an_ambiguous_legacy_breakdown_skips_the_reconciliation_delta_instead_of
     history_root = str(tmp_path / "runs")
     _write_scheduled_afternoon_artifact(
         history_root,
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         [{
             "ticker": "BYDDY", "status": "submitted", "order_id": "RH-DELTA-FILL-1",
             "planned_amount_usd": 30.0,
@@ -3659,8 +3667,8 @@ def test_an_ambiguous_legacy_breakdown_skips_the_reconciliation_delta_instead_of
         state=StrategyState(),
         broker=_FilledAboveCachedPriceBroker(cash=500.0, reference_prices={"BYDDY": 10.0}),
         robinhood_data=None,
-        now=datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN),
-        trading_day=date(2026, 8, 17),
+        now=datetime(2026, 8, 18, 15, 45, tzinfo=EASTERN),
+        trading_day=date(2026, 8, 18),
         guard_active=False,
         prior_same_day_allocations={},
         scheduled=True,
@@ -3705,7 +3713,7 @@ def test_a_terminally_filled_recovery_below_the_provisional_amount_is_not_republ
     history_root = str(tmp_path / "runs")
     _write_scheduled_afternoon_artifact(
         history_root,
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         [{
             "ticker": "BYDDY", "status": "submitted", "order_id": "RH-DELTA-BELOW-1",
             "planned_amount_usd": 10.0,
@@ -3724,8 +3732,8 @@ def test_a_terminally_filled_recovery_below_the_provisional_amount_is_not_republ
         state=StrategyState(),
         broker=_FilledBelowCachedPriceBroker(cash=500.0, reference_prices={"BYDDY": 10.0}),
         robinhood_data=None,
-        now=datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN),
-        trading_day=date(2026, 8, 17),
+        now=datetime(2026, 8, 18, 15, 45, tzinfo=EASTERN),
+        trading_day=date(2026, 8, 18),
         guard_active=False,
         prior_same_day_allocations={},
         scheduled=True,
@@ -3775,7 +3783,7 @@ def test_a_terminally_filled_recovery_uses_its_own_breakdown_entry_not_the_aggre
     history_root = str(tmp_path / "runs")
     _write_scheduled_afternoon_artifact(
         history_root,
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         [{
             "ticker": "BYDDY", "status": "submitted",
             "order_id": "RH-CLAIM-15",
@@ -3804,8 +3812,8 @@ def test_a_terminally_filled_recovery_uses_its_own_breakdown_entry_not_the_aggre
         state=StrategyState(),
         broker=_OnlyOneNowFilledBroker(cash=500.0, reference_prices={"BYDDY": 10.0}),
         robinhood_data=None,
-        now=datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN),
-        trading_day=date(2026, 8, 17),
+        now=datetime(2026, 8, 18, 15, 45, tzinfo=EASTERN),
+        trading_day=date(2026, 8, 18),
         guard_active=False,
         prior_same_day_allocations={},
         scheduled=True,
@@ -3850,7 +3858,7 @@ def test_reconcile_unresolved_whole_share_claim_does_not_book_a_zero_fill_attemp
 
     ledger.preserve_pending_if_claimed = _raising_preserve_pending
 
-    class _ZeroFillBroker:
+    class _ZeroFillBroker(DryRunBroker):
         def account_number(self) -> str:
             return "test-account"
 
@@ -4018,9 +4026,10 @@ def test_reconcile_falls_back_to_submitted_quantity_when_cumulative_quantity_is_
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY")
+    assert unresolved is not None
     assert unresolved["shares_to_buy"] == 2
 
-    class _UnparseableCumulativeQuantityBroker:
+    class _UnparseableCumulativeQuantityBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "RH-CLAMPED-1",
@@ -4061,9 +4070,10 @@ def test_reconcile_rejects_a_negative_fractional_fill_from_the_live_match_branch
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY")
+    assert unresolved is not None
     assert unresolved["shares_to_buy"] == 2
 
-    class _NegativeFractionalLiveMatchBroker:
+    class _NegativeFractionalLiveMatchBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "RH-NEG-FRAC-LIVE-1",
@@ -4099,9 +4109,10 @@ def test_reconcile_rejects_a_positive_fractional_fill_from_the_live_match_branch
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY")
+    assert unresolved is not None
     assert unresolved["shares_to_buy"] == 2
 
-    class _PositiveFractionalLiveMatchBroker:
+    class _PositiveFractionalLiveMatchBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "RH-POS-FRAC-LIVE-1",
@@ -4144,9 +4155,10 @@ def test_reconcile_rejects_a_fractional_submitted_quantity_fallback(
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY")
+    assert unresolved is not None
     assert unresolved["shares_to_buy"] == 2
 
-    class _FractionalSubmittedQuantityBroker:
+    class _FractionalSubmittedQuantityBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "RH-FRAC-SUBMITTED-1",
@@ -4183,7 +4195,7 @@ def test_reconcile_does_not_release_claim_for_negative_fractional_live_fill_with
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-15", "afternoon-BYDDY")
     assert unresolved is not None
 
-    class _NegativeFractionalLiveMatchBroker:
+    class _NegativeFractionalLiveMatchBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "RH-NEG-FRAC-LIVE-NO-SUBMITTED-QUANTITY",
@@ -4362,7 +4374,7 @@ def test_publish_or_merge_whole_share_outcome_merges_a_prior_zero_fill_recovery(
             "submitted_amount_usd": 10.0,
             "whole_share_quantity": 1,
             "whole_share_claim_breakdown": [
-                {"trading_day": "2026-08-16", "order_id": "RH-SUBMITTED-1", "amount_usd": 10.0}
+                {"trading_day": "2026-08-17", "order_id": "RH-SUBMITTED-1", "amount_usd": 10.0}
             ],
         },
     )
@@ -4370,7 +4382,7 @@ def test_publish_or_merge_whole_share_outcome_merges_a_prior_zero_fill_recovery(
     merged = _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]["BYDDY"]
     assert merged["status"] == "submitted"
     # The zero-fill order's id survives the merge, not just the new one's.
-    assert set(merged["whole_share_order_ids"]) == {"RH-ZERO-FILL-1", "RH-SUBMITTED-1"}
+    assert set(cast(list[str], merged["whole_share_order_ids"])) == {"RH-ZERO-FILL-1", "RH-SUBMITTED-1"}
 
 
 def test_batch_keeps_submission_published_during_candidate_processing(monkeypatch):
@@ -4667,7 +4679,7 @@ def test_batch_pre_pass_logs_execution_against_the_reconciled_price_not_zero(tmp
             return None
 
     broker = _CrossDayConfirmingBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
-    run_result = RunResult(trading_day=date(2026, 8, 16), decisions=[])
+    run_result = RunResult(trading_day=date(2026, 8, 17), decisions=[])
     ctx = _ctx(config, broker, run_result=run_result)
 
     # No decisions_by_ticker entry for BYDDY -- forces the synthetic decision.
@@ -4698,10 +4710,10 @@ def test_batch_pre_pass_reconciles_a_same_day_claim_when_an_order_already_exists
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     ledger = WholeShareAccumulationLedger()
-    today = date(2026, 8, 16)
+    today = date(2026, 8, 17)
     ledger.record_contribution(
         "BYDDY", today.isoformat(), 10.0, 10.0, stream="afternoon",
-        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-16T15:30:00-04:00",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-17T15:30:00-04:00",
     )
 
     config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
@@ -4711,7 +4723,7 @@ def test_batch_pre_pass_reconciles_a_same_day_claim_when_an_order_already_exists
             return True  # an order already exists today -- an ambiguous retry's own
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-17-BYDDY",):
                 return {"id": "RH-SAME-DAY-1", "state": "filled", "quantity": "1"}
             return None
 
@@ -4733,10 +4745,10 @@ def test_batch_pre_pass_treats_blank_cumulative_quantity_as_absent(
     """Blank broker placeholders fall back to the submitted quantity."""
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     ledger = WholeShareAccumulationLedger()
-    today = date(2026, 8, 16)
+    today = date(2026, 8, 17)
     ledger.record_contribution(
         "BYDDY", today.isoformat(), 10.0, 10.0, stream="afternoon",
-        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-16T15:30:00-04:00",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-17T15:30:00-04:00",
     )
     config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
 
@@ -4771,10 +4783,10 @@ def test_batch_pre_pass_does_not_release_a_same_day_stale_claim_with_no_placemen
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     ledger = WholeShareAccumulationLedger()
-    today = date(2026, 8, 16)
+    today = date(2026, 8, 17)
     ledger.record_contribution(
         "BYDDY", today.isoformat(), 10.0, 10.0, stream="afternoon",
-        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-16T15:00:00-04:00",  # stale by _ctx()'s now
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-17T15:00:00-04:00",  # stale by _ctx()'s now
     )
     assert ledger.pending_usd("BYDDY") == 0.0  # deducted
 
@@ -4791,7 +4803,7 @@ def test_batch_pre_pass_does_not_release_a_same_day_stale_claim_with_no_placemen
 
     # Left completely untouched -- not released via preserve_pending.
     assert ledger.pending_usd("BYDDY") == 0.0
-    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
+    assert ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY") is not None
 
 
 def test_batch_pre_pass_reconciles_a_same_day_terminal_partial_fill_before_reclaim(tmp_path, monkeypatch):
@@ -4808,10 +4820,10 @@ def test_batch_pre_pass_reconciles_a_same_day_terminal_partial_fill_before_recla
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     ledger = WholeShareAccumulationLedger()
-    today = date(2026, 8, 16)
+    today = date(2026, 8, 17)
     ledger.record_contribution(
         "BYDDY", today.isoformat(), 20.0, 10.0, stream="afternoon",
-        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-16T15:30:00-04:00",
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-17T15:30:00-04:00",
     )
 
     config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
@@ -4824,7 +4836,7 @@ def test_batch_pre_pass_reconciles_a_same_day_terminal_partial_fill_before_recla
             return None  # terminal orders are excluded from the live-only lookup
 
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
-            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-16-BYDDY",):
+            if ref_id_prefixes == ("graded-dca-wholeshare-2026-08-17-BYDDY",):
                 return {"id": "RH-SAME-DAY-TERMINAL-1", "state": "cancelled", "cumulative_quantity": "1"}
             return None
 
@@ -4836,7 +4848,7 @@ def test_batch_pre_pass_reconciles_a_same_day_terminal_partial_fill_before_recla
     # The 1 filled share is settled for real -- not left for a stale reclaim
     # to resubmit the full 2-share planned quantity.
     assert ledger.shares_purchased_total("BYDDY") == 1
-    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is None
+    assert ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY") is None
     assert running_deployed_7d == 10.0
 
 
@@ -5139,12 +5151,12 @@ def test_pre_roll_recovered_spend_is_carried_into_the_candidate_batch(tmp_path, 
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
 
@@ -5202,10 +5214,10 @@ def test_whole_share_claim_is_reconciled_even_when_the_date_gate_blocks_the_run(
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
 
-    # The trading window closed before a retry ever ran -- 2026-08-16 is not
+    # The trading window closed before a retry ever ran -- 2026-08-17 is not
     # in this config's approved_test_dates, so _check_execution_gates blocks
     # the whole run.
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
@@ -5307,7 +5319,7 @@ def test_gated_reconciliation_refuses_a_mismatched_broker_account(tmp_path, monk
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
@@ -5378,7 +5390,7 @@ def test_whole_share_claim_is_reconciled_on_the_gated_path_for_a_ticker_removed_
 
     # Reconciliation evidence belongs to the older afternoon claim even when
     # this blocked retry happens before the ordinary 14:30 ET evidence floor.
-    now = datetime(2026, 8, 16, 10, 0, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 10, 0, tzinfo=EASTERN)
     # BYDDY is no longer enrolled in whole_share_tickers at all -- an
     # operator removed it after the claim was recorded.
     config = StrategyConfig(
@@ -5454,7 +5466,7 @@ def test_whole_share_claim_is_reconciled_on_the_gated_path_for_a_ticker_removed_
         }
     ]
     later_config = _near_close_dca._apply_deployment_history(
-        config, date(2026, 8, 17), tmp_path
+        config, date(2026, 8, 18), tmp_path
     )
     assert later_config.deployed_last_7d_usd == pytest.approx(10.0)
 
@@ -5473,7 +5485,7 @@ def test_whole_share_claim_is_reconciled_on_the_gated_path_for_a_ticker_removed_
         "BYDDY",
         claim_trading_day.isoformat(),
         {"order_id": "RH-ORPHANED-GATED-1", "shares_purchased": 1, "order_notional_usd": 12.0},
-        date(2026, 8, 17),
+        date(2026, 8, 18),
         tmp_path,
     )
     adjustment = _near_close_dca.json.loads(
@@ -5493,6 +5505,7 @@ def test_whole_share_gated_recovery_keeps_claim_when_evidence_write_fails(tmp_pa
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     claim = ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY")
+    assert claim is not None
     ledger_before = (ledger.root / "BYDDY" / "ledger.json").read_bytes()
 
     class _FilledBroker(DryRunBroker):
@@ -5536,7 +5549,9 @@ def test_settle_evidence_hook_fires_only_for_the_claim_winner(tmp_path, monkeypa
         "BYDDY", claim_day.isoformat(), 10.0, 10.0, stream="afternoon",
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
-    claim_token = ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY")["claim_token"]
+    unresolved = ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY")
+    assert unresolved is not None
+    claim_token = unresolved["claim_token"]
     fired = []
 
     def _settle_once():
@@ -5571,7 +5586,9 @@ def test_settle_evidence_hook_failure_leaves_the_claim_unresolved(tmp_path, monk
         "BYDDY", claim_day.isoformat(), 10.0, 10.0, stream="afternoon",
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
-    claim_token = ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY")["claim_token"]
+    unresolved = ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY")
+    assert unresolved is not None
+    claim_token = unresolved["claim_token"]
 
     with pytest.raises(OSError, match="disk full"):
         ledger.settle(
@@ -5601,7 +5618,7 @@ def test_gated_recovery_reverses_provisional_evidence_for_a_zero_fill_terminal(t
         "BYDDY", claim_trading_day.isoformat(), 10.0, 10.0, stream="afternoon",
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
-    now = datetime(2026, 8, 16, 10, 0, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 10, 0, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
@@ -5634,14 +5651,14 @@ def test_gated_recovery_reverses_provisional_evidence_for_a_zero_fill_terminal(t
     second_dir.mkdir()
     _near_close_dca.atomic_write_text(
         second_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-18", triggered_at_utc="2026-08-18T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         second_dir,
         "BYDDY",
         "2026-08-15",
         {"zero_fill_attempt": True, "order_id": "RH-ZF-1"},
-        date(2026, 8, 17),
+        date(2026, 8, 18),
         tmp_path,
     )
     second_state = _near_close_dca.json.loads((second_dir / "run_state.json").read_bytes())
@@ -5661,14 +5678,14 @@ def test_gated_recovery_reverses_provisional_evidence_for_a_zero_fill_terminal(t
     third_dir.mkdir()
     _near_close_dca.atomic_write_text(
         third_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-18", triggered_at_utc="2026-08-18T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         third_dir,
         "GOOG",
         "2026-08-15",
         {"zero_fill_attempt": True, "order_id": "RH-ZF-NEVER-RECORDED"},
-        date(2026, 8, 17),
+        date(2026, 8, 18),
         tmp_path,
     )
     third_state = _near_close_dca.json.loads((third_dir / "run_state.json").read_bytes())
@@ -5702,21 +5719,21 @@ def test_persist_gated_whole_share_recovery_corrects_id_less_terminal_result(
     first_dir.mkdir()
     _near_close_dca.atomic_write_text(
         first_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         first_dir, "BYDDY", "2026-08-15",
         {"live_order_found": True, "order_id": None, "planned_notional_usd": 10.0},
-        date(2026, 8, 16), tmp_path,
+        date(2026, 8, 17), tmp_path,
     )
     second_dir = tmp_path / "second"
     second_dir.mkdir()
     _near_close_dca.atomic_write_text(
         second_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-18", triggered_at_utc="2026-08-18T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
-        second_dir, "BYDDY", "2026-08-15", terminal_result, date(2026, 8, 17), tmp_path,
+        second_dir, "BYDDY", "2026-08-15", terminal_result, date(2026, 8, 18), tmp_path,
     )
     second_state = _near_close_dca.json.loads((second_dir / "run_state.json").read_bytes())
     correction = second_state["buy_candidates"][0]
@@ -5788,14 +5805,14 @@ def test_persist_gated_whole_share_recovery_does_not_dedupe_absent_order_ids(tmp
     artifacts_dir.mkdir()
     _near_close_dca.atomic_write_text(
         artifacts_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         artifacts_dir,
         "BYDDY",
         "2026-08-15",
         {"order_id": None, "shares_purchased": 1, "order_notional_usd": 10.0},
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         tmp_path,
     )
     _near_close_dca._persist_gated_whole_share_recovery(
@@ -5803,7 +5820,7 @@ def test_persist_gated_whole_share_recovery_does_not_dedupe_absent_order_ids(tmp
         "BYDDY",
         "2026-08-14",  # a genuinely DIFFERENT claim day, same ticker
         {"order_id": None, "shares_purchased": 1, "order_notional_usd": 5.0},
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         tmp_path,
     )
     run_state = _near_close_dca.json.loads((artifacts_dir / "run_state.json").read_bytes())
@@ -5820,7 +5837,7 @@ def test_id_less_gated_recoveries_on_same_claim_day_use_the_claim_attempt_id(tmp
     artifacts_dir.mkdir()
     _near_close_dca.atomic_write_text(
         artifacts_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     first = {
         "order_id": None,
@@ -5836,16 +5853,16 @@ def test_id_less_gated_recoveries_on_same_claim_day_use_the_claim_attempt_id(tmp
     }
 
     _near_close_dca._persist_gated_whole_share_recovery(
-        artifacts_dir, "BYDDY", "2026-08-15", first, date(2026, 8, 16), tmp_path,
+        artifacts_dir, "BYDDY", "2026-08-15", first, date(2026, 8, 17), tmp_path,
     )
     _near_close_dca._mark_gated_whole_share_recovery_state_booked(
-        artifacts_dir, "BYDDY", "2026-08-15", None, date(2026, 8, 16), "attempt-1",
+        artifacts_dir, "BYDDY", "2026-08-15", None, date(2026, 8, 17), "attempt-1",
     )
     assert not _near_close_dca._gated_whole_share_recovery_already_recorded(
-        "BYDDY", "2026-08-15", second, date(2026, 8, 16), tmp_path, artifacts_dir,
+        "BYDDY", "2026-08-15", second, date(2026, 8, 17), tmp_path, artifacts_dir,
     )
     _near_close_dca._persist_gated_whole_share_recovery(
-        artifacts_dir, "BYDDY", "2026-08-15", second, date(2026, 8, 16), tmp_path,
+        artifacts_dir, "BYDDY", "2026-08-15", second, date(2026, 8, 17), tmp_path,
     )
 
     rows = _near_close_dca.json.loads((artifacts_dir / "run_state.json").read_bytes())["buy_candidates"]
@@ -5869,29 +5886,29 @@ def test_gated_recovery_already_recorded_detects_id_less_live_claims_across_arti
     first_dir.mkdir()
     _near_close_dca.atomic_write_text(
         first_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         first_dir, "BYDDY", "2026-08-15",
         {"live_order_found": True, "order_id": None, "planned_notional_usd": 10.0},
-        date(2026, 8, 16), tmp_path,
+        date(2026, 8, 17), tmp_path,
     )
     # Simulate the booking step that normally follows persist -- already_
     # recorded depends on state_booked, not merely on evidence existing
     # (Codex review: "Track state booking separately from artifact
     # deduplication").
     _near_close_dca._mark_gated_whole_share_recovery_state_booked(
-        first_dir, "BYDDY", "2026-08-15", None, date(2026, 8, 16),
+        first_dir, "BYDDY", "2026-08-15", None, date(2026, 8, 17),
     )
     reconciled = {"live_order_found": True, "order_id": None, "planned_notional_usd": 10.0}
     already_recorded = _near_close_dca._gated_whole_share_recovery_already_recorded(
-        "BYDDY", "2026-08-15", reconciled, date(2026, 8, 17), tmp_path,
+        "BYDDY", "2026-08-15", reconciled, date(2026, 8, 18), tmp_path,
     )
     assert already_recorded is True
 
     # A ticker with NO prior recording at all is correctly NOT flagged.
     fresh = _near_close_dca._gated_whole_share_recovery_already_recorded(
-        "GOOG", "2026-08-15", reconciled, date(2026, 8, 17), tmp_path,
+        "GOOG", "2026-08-15", reconciled, date(2026, 8, 18), tmp_path,
     )
     assert fresh is False
 
@@ -5908,19 +5925,19 @@ def test_gated_recovery_already_recorded_detects_id_less_terminal_claims(tmp_pat
     first_dir.mkdir()
     _near_close_dca.atomic_write_text(
         first_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         first_dir, "BYDDY", "2026-08-15",
         {"live_order_found": True, "order_id": None, "planned_notional_usd": 10.0},
-        date(2026, 8, 16), tmp_path,
+        date(2026, 8, 17), tmp_path,
     )
     _near_close_dca._mark_gated_whole_share_recovery_state_booked(
-        first_dir, "BYDDY", "2026-08-15", None, date(2026, 8, 16),
+        first_dir, "BYDDY", "2026-08-15", None, date(2026, 8, 17),
     )
     terminal_reconciled = {"order_id": None, "shares_purchased": 1, "order_notional_usd": 10.0}
     already_recorded = _near_close_dca._gated_whole_share_recovery_already_recorded(
-        "BYDDY", "2026-08-15", terminal_reconciled, date(2026, 8, 17), tmp_path,
+        "BYDDY", "2026-08-15", terminal_reconciled, date(2026, 8, 18), tmp_path,
     )
     assert already_recorded is True
 
@@ -5942,7 +5959,7 @@ def test_total_recorded_whole_share_claim_amount_nets_across_id_availability_cha
         }
     ]
     total, found, _, _, _ = _near_close_dca._total_recorded_whole_share_claim_amount(
-        "RH-LATER-ID", "BYDDY", "2026-08-15", date(2026, 8, 17), None, no_id_row,
+        "RH-LATER-ID", "BYDDY", "2026-08-15", date(2026, 8, 18), None, no_id_row,
     )
     assert found is True
     assert total == pytest.approx(10.0)
@@ -5957,14 +5974,14 @@ def test_total_recorded_whole_share_claim_amount_nets_across_id_availability_cha
         }
     ]
     total2, found2, _, _, _ = _near_close_dca._total_recorded_whole_share_claim_amount(
-        None, "BYDDY", "2026-08-15", date(2026, 8, 17), None, with_id_row,
+        None, "BYDDY", "2026-08-15", date(2026, 8, 18), None, with_id_row,
     )
     assert found2 is True
     assert total2 == pytest.approx(10.0)
 
     # Two DIFFERENT stable ids never match, even for the same ticker/day.
     total3, found3, _, _, _ = _near_close_dca._total_recorded_whole_share_claim_amount(
-        "RH-UNRELATED", "BYDDY", "2026-08-15", date(2026, 8, 17), None, with_id_row,
+        "RH-UNRELATED", "BYDDY", "2026-08-15", date(2026, 8, 18), None, with_id_row,
     )
     assert found3 is False
     assert total3 == pytest.approx(0.0)
@@ -5987,7 +6004,7 @@ def test_persist_gated_whole_share_recovery_takes_an_artifact_level_lock(tmp_pat
     artifacts_dir.mkdir()
     _near_close_dca.atomic_write_text(
         artifacts_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
 
     real_cross_process_lock = file_lock_module.cross_process_lock
@@ -6004,12 +6021,12 @@ def test_persist_gated_whole_share_recovery_takes_an_artifact_level_lock(tmp_pat
     _near_close_dca._persist_gated_whole_share_recovery(
         artifacts_dir, "BYDDY", "2026-08-15",
         {"order_id": "RH-LOCK-1", "shares_purchased": 1, "order_notional_usd": 10.0},
-        date(2026, 8, 16), tmp_path,
+        date(2026, 8, 17), tmp_path,
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         artifacts_dir, "GOOG", "2026-08-15",
         {"order_id": "RH-LOCK-2", "shares_purchased": 1, "order_notional_usd": 5.0},
-        date(2026, 8, 16), tmp_path,
+        date(2026, 8, 17), tmp_path,
     )
 
     assert len(calls) == 2
@@ -6044,7 +6061,7 @@ def test_persist_gated_whole_share_recovery_rejects_a_foreign_stream_stub(tmp_pa
         _near_close_dca._persist_gated_whole_share_recovery(
             artifacts_dir, "BYDDY", "2026-08-15",
             {"live_order_found": True, "order_id": "RH-FOREIGN-1", "planned_notional_usd": 10.0},
-            date(2026, 8, 16), tmp_path,
+            date(2026, 8, 17), tmp_path,
         )
     # Nothing was written -- the artifact is untouched.
     run_state = _near_close_dca.json.loads((artifacts_dir / "run_state.json").read_bytes())
@@ -6062,38 +6079,38 @@ def test_gated_recovery_survives_a_crash_between_evidence_and_state_booking(tmp_
     artifacts_dir.mkdir()
     _near_close_dca.atomic_write_text(
         artifacts_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     reconciled = {"live_order_found": True, "order_id": "RH-CRASH-1", "planned_notional_usd": 10.0}
 
     # Step 1 (evidence persisted) happened; step 2 (state booked) did not --
     # simulating the process being killed in between.
     _near_close_dca._persist_gated_whole_share_recovery(
-        artifacts_dir, "BYDDY", "2026-08-15", reconciled, date(2026, 8, 16), tmp_path,
+        artifacts_dir, "BYDDY", "2026-08-15", reconciled, date(2026, 8, 17), tmp_path,
     )
 
     # A retry's dedup decision must come back False -- state was NOT booked,
     # even though evidence was.
     already_recorded = _near_close_dca._gated_whole_share_recovery_already_recorded(
-        "BYDDY", "2026-08-15", reconciled, date(2026, 8, 16), tmp_path,
+        "BYDDY", "2026-08-15", reconciled, date(2026, 8, 17), tmp_path,
     )
     assert already_recorded is False
 
     # The retry books state and marks it.
     state = StrategyState()
     _near_close_dca._book_reconciled_whole_share_order_durably(
-        state, "BYDDY", "2026-08-15", reconciled, date(2026, 8, 16), tmp_path,
+        state, "BYDDY", "2026-08-15", reconciled, date(2026, 8, 17), tmp_path,
         already_recorded=already_recorded,
     )
     assert state.day_notional(date(2026, 8, 15)) == pytest.approx(10.0)
     _near_close_dca._mark_gated_whole_share_recovery_state_booked(
-        artifacts_dir, "BYDDY", "2026-08-15", "RH-CRASH-1", date(2026, 8, 16),
+        artifacts_dir, "BYDDY", "2026-08-15", "RH-CRASH-1", date(2026, 8, 17),
     )
 
     # A THIRD attempt now correctly sees it as fully recorded and does not
     # re-book.
     final_check = _near_close_dca._gated_whole_share_recovery_already_recorded(
-        "BYDDY", "2026-08-15", reconciled, date(2026, 8, 16), tmp_path,
+        "BYDDY", "2026-08-15", reconciled, date(2026, 8, 17), tmp_path,
     )
     assert final_check is True
 
@@ -6120,7 +6137,7 @@ def test_write_blocked_run_stub_locks_against_recovery_updates(tmp_path, monkeyp
     monkeypatch.setattr(file_lock_module, "cross_process_lock", _tracking_lock)
 
     artifacts_dir = tmp_path / "artifacts"
-    _near_close_dca._write_blocked_run_stub(date(2026, 8, 16), artifacts_dir)
+    _near_close_dca._write_blocked_run_stub(date(2026, 8, 17), artifacts_dir)
 
     assert len(calls) == 1
     expected_lock_path = _near_close_dca._gated_recovery_lock_path(artifacts_dir / "run_state.json")
@@ -6176,7 +6193,7 @@ def test_write_blocked_run_stub_keeps_companion_writes_inside_the_recovery_lock(
     )
 
     artifacts_dir = tmp_path / "artifacts"
-    _near_close_dca._write_blocked_run_stub(date(2026, 8, 16), artifacts_dir)
+    _near_close_dca._write_blocked_run_stub(date(2026, 8, 17), artifacts_dir)
 
     assert observed_lock_held_during_companion_write == [True]
 
@@ -6195,12 +6212,12 @@ def test_persist_gated_whole_share_recovery_dedupes_id_less_live_recoveries_acro
     first_dir.mkdir()
     _near_close_dca.atomic_write_text(
         first_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         first_dir, "BYDDY", "2026-08-15",
         {"live_order_found": True, "order_id": None, "planned_notional_usd": 10.0},
-        date(2026, 8, 16), tmp_path,
+        date(2026, 8, 17), tmp_path,
     )
     first_state = _near_close_dca.json.loads((first_dir / "run_state.json").read_bytes())
     assert len(first_state["buy_candidates"]) == 1
@@ -6210,7 +6227,7 @@ def test_persist_gated_whole_share_recovery_dedupes_id_less_live_recoveries_acro
     # (Codex review: "Track state booking separately from artifact
     # deduplication").
     _near_close_dca._mark_gated_whole_share_recovery_state_booked(
-        first_dir, "BYDDY", "2026-08-15", None, date(2026, 8, 16),
+        first_dir, "BYDDY", "2026-08-15", None, date(2026, 8, 17),
     )
 
     # A LATER gated run, still live, still no id, writing into a DIFFERENT
@@ -6219,12 +6236,12 @@ def test_persist_gated_whole_share_recovery_dedupes_id_less_live_recoveries_acro
     second_dir.mkdir()
     _near_close_dca.atomic_write_text(
         second_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-18", triggered_at_utc="2026-08-18T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         second_dir, "BYDDY", "2026-08-15",
         {"live_order_found": True, "order_id": None, "planned_notional_usd": 10.0},
-        date(2026, 8, 17), tmp_path,
+        date(2026, 8, 18), tmp_path,
     )
     second_state = _near_close_dca.json.loads((second_dir / "run_state.json").read_bytes())
     assert second_state["buy_candidates"] == []
@@ -6234,12 +6251,12 @@ def test_persist_gated_whole_share_recovery_dedupes_id_less_live_recoveries_acro
     third_dir.mkdir()
     _near_close_dca.atomic_write_text(
         third_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-18", triggered_at_utc="2026-08-18T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-19", triggered_at_utc="2026-08-19T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         third_dir, "BYDDY", "2026-08-14",
         {"live_order_found": True, "order_id": None, "planned_notional_usd": 7.0},
-        date(2026, 8, 18), tmp_path,
+        date(2026, 8, 19), tmp_path,
     )
     third_state = _near_close_dca.json.loads((third_dir / "run_state.json").read_bytes())
     assert len(third_state["buy_candidates"]) == 1
@@ -6267,7 +6284,7 @@ def test_total_recorded_whole_share_claim_amount_matches_aggregated_order_ids(tm
         }
     ]
     total, found, _, _, _ = _near_close_dca._total_recorded_whole_share_claim_amount(
-        "RH-OLDEST", "BYDDY", "2026-08-15", date(2026, 8, 16), None, extra_candidates,
+        "RH-OLDEST", "BYDDY", "2026-08-15", date(2026, 8, 17), None, extra_candidates,
     )
     assert found is True
     assert total == pytest.approx(10.0)
@@ -6296,7 +6313,7 @@ def test_total_recorded_whole_share_claim_amount_nets_only_the_matching_orders_e
         }
     ]
     total, found, _, _, _ = _near_close_dca._total_recorded_whole_share_claim_amount(
-        "RH-ORDER-A", "BYDDY", "2026-08-15", date(2026, 8, 16), None, extra_candidates,
+        "RH-ORDER-A", "BYDDY", "2026-08-15", date(2026, 8, 17), None, extra_candidates,
     )
     assert found is True
     assert total == pytest.approx(10.0)
@@ -6327,7 +6344,7 @@ def test_total_recorded_whole_share_claim_amount_rejects_ambiguous_id_less_aggre
         }
     ]
     total, found, _, _, ambiguous = _near_close_dca._total_recorded_whole_share_claim_amount(
-        None, "BYDDY", "2026-08-15", date(2026, 8, 16), None, extra_candidates,
+        None, "BYDDY", "2026-08-15", date(2026, 8, 17), None, extra_candidates,
     )
     assert ambiguous is True
     assert found is False
@@ -6360,7 +6377,7 @@ def test_total_recorded_whole_share_claim_amount_skips_ambiguous_id_less_legacy_
         }
     ]
     total, found, _, _, _ = _near_close_dca._total_recorded_whole_share_claim_amount(
-        "RH-ORDER-A", "BYDDY", "2026-08-15", date(2026, 8, 16), None, extra_candidates,
+        "RH-ORDER-A", "BYDDY", "2026-08-15", date(2026, 8, 17), None, extra_candidates,
     )
     assert found is False
     assert total == pytest.approx(0.0)
@@ -6386,14 +6403,14 @@ def test_persist_gated_whole_share_recovery_marks_a_confirmed_fill_as_filled(tmp
     artifacts_dir.mkdir()
     _near_close_dca.atomic_write_text(
         artifacts_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         artifacts_dir,
         "BYDDY",
         "2026-08-15",
         {"order_id": "RH-CONFIRMED-FILL-1", "shares_purchased": 1, "order_notional_usd": 10.0},
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         tmp_path,
     )
     run_state = _near_close_dca.json.loads((artifacts_dir / "run_state.json").read_bytes())
@@ -6409,14 +6426,14 @@ def test_persist_gated_whole_share_recovery_marks_a_confirmed_fill_as_filled(tmp
     live_artifacts_dir.mkdir()
     _near_close_dca.atomic_write_text(
         live_artifacts_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         live_artifacts_dir,
         "BYDDY",
         "2026-08-15",
         {"live_order_found": True, "order_id": "RH-STILL-LIVE-1", "planned_notional_usd": 10.0},
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         tmp_path,
     )
     live_run_state = _near_close_dca.json.loads((live_artifacts_dir / "run_state.json").read_bytes())
@@ -6439,14 +6456,14 @@ def test_persist_gated_whole_share_recovery_corrects_terminal_result_in_same_stu
     artifacts_dir.mkdir()
     _near_close_dca.atomic_write_text(
         artifacts_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         artifacts_dir,
         "BYDDY",
         "2026-08-15",
         {"live_order_found": True, "order_id": "RH-SAME-STUB-1", "planned_notional_usd": 10.0},
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         tmp_path,
     )
     # The SAME retry (same artifacts_dir) later discovers the order is now
@@ -6456,7 +6473,7 @@ def test_persist_gated_whole_share_recovery_corrects_terminal_result_in_same_stu
         "BYDDY",
         "2026-08-15",
         {"order_id": "RH-SAME-STUB-1", "shares_purchased": 1, "order_notional_usd": 12.0},
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         tmp_path,
     )
     run_state = _near_close_dca.json.loads((artifacts_dir / "run_state.json").read_bytes())
@@ -6503,14 +6520,14 @@ def test_persist_gated_whole_share_recovery_csv_nets_across_an_order_id_availabi
     artifacts_dir.mkdir()
     _near_close_dca.atomic_write_text(
         artifacts_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         artifacts_dir,
         "BYDDY",
         "2026-08-15",
         {"order_id": "RH-ID-BASE-1", "shares_purchased": 1, "order_notional_usd": 10.0},
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         tmp_path,
     )
     # The terminal settlement's own reconciled result is id-less this time.
@@ -6519,7 +6536,7 @@ def test_persist_gated_whole_share_recovery_csv_nets_across_an_order_id_availabi
         "BYDDY",
         "2026-08-15",
         {"shares_purchased": 1, "order_notional_usd": 12.0},
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         tmp_path,
     )
     run_state = _near_close_dca.json.loads((artifacts_dir / "run_state.json").read_bytes())
@@ -6551,14 +6568,14 @@ def test_persist_gated_whole_share_recovery_csv_does_not_apply_corrections_to_si
     artifacts_dir.mkdir()
     _near_close_dca.atomic_write_text(
         artifacts_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         artifacts_dir,
         "BYDDY",
         "2026-08-15",
         {"order_id": "RH-ORDER-A", "shares_purchased": 1, "order_notional_usd": 10.0},
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         tmp_path,
     )
     _near_close_dca._persist_gated_whole_share_recovery(
@@ -6566,7 +6583,7 @@ def test_persist_gated_whole_share_recovery_csv_does_not_apply_corrections_to_si
         "BYDDY",
         "2026-08-15",
         {"order_id": "RH-ORDER-B", "shares_purchased": 1, "order_notional_usd": 20.0},
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         tmp_path,
     )
     # A's own terminal settlement corrects it upward by $2.
@@ -6575,7 +6592,7 @@ def test_persist_gated_whole_share_recovery_csv_does_not_apply_corrections_to_si
         "BYDDY",
         "2026-08-15",
         {"order_id": "RH-ORDER-A", "shares_purchased": 1, "order_notional_usd": 12.0},
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         tmp_path,
     )
 
@@ -6601,7 +6618,7 @@ def test_persist_gated_whole_share_recovery_csv_nets_when_the_adjustment_gains_a
     artifacts_dir.mkdir()
     _near_close_dca.atomic_write_text(
         artifacts_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     # The provisional live recovery is id-less.
     _near_close_dca._persist_gated_whole_share_recovery(
@@ -6609,7 +6626,7 @@ def test_persist_gated_whole_share_recovery_csv_nets_when_the_adjustment_gains_a
         "BYDDY",
         "2026-08-15",
         {"live_order_found": True, "order_id": None, "planned_notional_usd": 10.0},
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         tmp_path,
     )
     # The terminal settlement's own reconciled result gains an order id.
@@ -6618,7 +6635,7 @@ def test_persist_gated_whole_share_recovery_csv_nets_when_the_adjustment_gains_a
         "BYDDY",
         "2026-08-15",
         {"order_id": "RH-GAINED-ID-1", "shares_purchased": 1, "order_notional_usd": 12.0},
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         tmp_path,
     )
     run_state = _near_close_dca.json.loads((artifacts_dir / "run_state.json").read_bytes())
@@ -6701,7 +6718,7 @@ def test_persist_gated_whole_share_recovery_refuses_ambiguous_legacy_matches(tmp
     """
     artifacts_dir = tmp_path / "artifacts"
     artifacts_dir.mkdir()
-    stub = _blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")
+    stub = _blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")
     stub["buy_candidates"] = [
         {
             "ticker": "BYDDY",
@@ -6722,7 +6739,7 @@ def test_persist_gated_whole_share_recovery_refuses_ambiguous_legacy_matches(tmp
             "BYDDY",
             "2026-08-15",
             {"order_id": "RH-ORDER-A", "shares_purchased": 1, "order_notional_usd": 12.0},
-            date(2026, 8, 16),
+            date(2026, 8, 17),
             None,
         )
     # The pre-existing (un-netted) rows must be left completely untouched.
@@ -6743,7 +6760,7 @@ def test_persist_gated_whole_share_recovery_does_not_reverse_unchanged_fill_in_s
     artifacts_dir.mkdir()
     _near_close_dca.atomic_write_text(
         artifacts_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     recovery = {
         "live_order_found": True,
@@ -6751,7 +6768,7 @@ def test_persist_gated_whole_share_recovery_does_not_reverse_unchanged_fill_in_s
         "planned_notional_usd": 10.0,
     }
     _near_close_dca._persist_gated_whole_share_recovery(
-        artifacts_dir, "BYDDY", "2026-08-15", recovery, date(2026, 8, 16), tmp_path,
+        artifacts_dir, "BYDDY", "2026-08-15", recovery, date(2026, 8, 17), tmp_path,
     )
 
     _near_close_dca._persist_gated_whole_share_recovery(
@@ -6759,7 +6776,7 @@ def test_persist_gated_whole_share_recovery_does_not_reverse_unchanged_fill_in_s
         "BYDDY",
         "2026-08-15",
         {"order_id": recovery["order_id"], "shares_purchased": 1, "order_notional_usd": 10.0},
-        date(2026, 8, 16),
+        date(2026, 8, 17),
         tmp_path,
     )
 
@@ -6785,12 +6802,12 @@ def test_persist_gated_whole_share_recovery_nets_adjustments_across_retries(tmp_
     first_dir.mkdir()
     _near_close_dca.atomic_write_text(
         first_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         first_dir, "BYDDY", "2026-08-15",
         {"live_order_found": True, "order_id": order_id, "planned_notional_usd": 10.0},
-        date(2026, 8, 16), tmp_path,
+        date(2026, 8, 17), tmp_path,
     )
     # Simulate the base row's own booking step completing too -- fully_
     # committed is an AND across every matching row (not just the latest),
@@ -6798,19 +6815,19 @@ def test_persist_gated_whole_share_recovery_nets_adjustments_across_retries(tmp_
     # claim, base included, is marked (Codex review: "Keep unbooked
     # settlement adjustments visible").
     _near_close_dca._mark_gated_whole_share_recovery_state_booked(
-        first_dir, "BYDDY", "2026-08-15", order_id, date(2026, 8, 16),
+        first_dir, "BYDDY", "2026-08-15", order_id, date(2026, 8, 17),
     )
     # First retry: terminal fill at $12 -- persists a +$2 adjustment.
     second_dir = tmp_path / "second"
     second_dir.mkdir()
     _near_close_dca.atomic_write_text(
         second_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-18", triggered_at_utc="2026-08-18T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         second_dir, "BYDDY", "2026-08-15",
         {"order_id": order_id, "shares_purchased": 1, "order_notional_usd": 12.0},
-        date(2026, 8, 17), tmp_path,
+        date(2026, 8, 18), tmp_path,
     )
     second_state = _near_close_dca.json.loads((second_dir / "run_state.json").read_bytes())
     assert second_state["buy_candidates"][0]["planned_amount_usd"] == pytest.approx(2.0)
@@ -6820,7 +6837,7 @@ def test_persist_gated_whole_share_recovery_nets_adjustments_across_retries(tmp_
     # no-op (Codex review: "Track state booking separately from artifact
     # deduplication").
     _near_close_dca._mark_gated_whole_share_recovery_state_booked(
-        second_dir, "BYDDY", "2026-08-15", order_id, date(2026, 8, 17),
+        second_dir, "BYDDY", "2026-08-15", order_id, date(2026, 8, 18),
     )
 
     # A LATER retry recomputes the SAME $12 terminal correction (e.g. the
@@ -6831,12 +6848,12 @@ def test_persist_gated_whole_share_recovery_nets_adjustments_across_retries(tmp_
     third_dir.mkdir()
     _near_close_dca.atomic_write_text(
         third_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-18", triggered_at_utc="2026-08-18T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-19", triggered_at_utc="2026-08-19T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         third_dir, "BYDDY", "2026-08-15",
         {"order_id": order_id, "shares_purchased": 1, "order_notional_usd": 12.0},
-        date(2026, 8, 18), tmp_path,
+        date(2026, 8, 19), tmp_path,
     )
     third_state = _near_close_dca.json.loads((third_dir / "run_state.json").read_bytes())
     assert third_state["buy_candidates"] == []
@@ -6857,12 +6874,12 @@ def test_persist_gated_whole_share_recovery_zeros_the_unchanged_marker_amount(tm
     first_dir.mkdir()
     _near_close_dca.atomic_write_text(
         first_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         first_dir, "BYDDY", "2026-08-15",
         {"order_id": order_id, "shares_purchased": 1, "order_notional_usd": 10.0},
-        date(2026, 8, 16), tmp_path,
+        date(2026, 8, 17), tmp_path,
     )
     # NOT marked state_booked -- simulates a crash between persisting
     # evidence and durably booking StrategyState.
@@ -6875,12 +6892,12 @@ def test_persist_gated_whole_share_recovery_zeros_the_unchanged_marker_amount(tm
     second_dir.mkdir()
     _near_close_dca.atomic_write_text(
         second_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-18", triggered_at_utc="2026-08-18T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         second_dir, "BYDDY", "2026-08-15",
         {"order_id": order_id, "shares_purchased": 1, "order_notional_usd": 10.0},
-        date(2026, 8, 17), tmp_path,
+        date(2026, 8, 18), tmp_path,
     )
     second_state = _near_close_dca.json.loads((second_dir / "run_state.json").read_bytes())
     marker_row = second_state["buy_candidates"][0]
@@ -6899,7 +6916,7 @@ def test_persist_gated_whole_share_recovery_scopes_terminal_rewrite_to_the_attem
     """
     stub_dir = tmp_path / "stub"
     stub_dir.mkdir()
-    stub = _blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")
+    stub = _blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")
     stub["buy_candidates"] = [{
         "ticker": "BYDDY",
         "order_id": None,
@@ -6918,7 +6935,7 @@ def test_persist_gated_whole_share_recovery_scopes_terminal_rewrite_to_the_attem
         "claim_attempt_id": "attempt-2",
     }
     _near_close_dca._persist_gated_whole_share_recovery(
-        stub_dir, "BYDDY", "2026-08-15", reconciled, date(2026, 8, 16), None,
+        stub_dir, "BYDDY", "2026-08-15", reconciled, date(2026, 8, 17), None,
     )
     written = _near_close_dca.json.loads((stub_dir / "run_state.json").read_bytes())
     candidates = written["buy_candidates"]
@@ -6962,16 +6979,16 @@ def test_persist_gated_whole_share_recovery_keeps_a_booked_base_from_masking_an_
     first_dir.mkdir()
     _near_close_dca.atomic_write_text(
         first_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         first_dir, "BYDDY", "2026-08-15",
         {"live_order_found": True, "order_id": order_id, "planned_notional_usd": 10.0},
-        date(2026, 8, 16), tmp_path,
+        date(2026, 8, 17), tmp_path,
     )
     # The BASE row IS booked...
     _near_close_dca._mark_gated_whole_share_recovery_state_booked(
-        first_dir, "BYDDY", "2026-08-15", order_id, date(2026, 8, 16),
+        first_dir, "BYDDY", "2026-08-15", order_id, date(2026, 8, 17),
     )
 
     # ...but the settlement correction to $15 is persisted and then a
@@ -6980,17 +6997,17 @@ def test_persist_gated_whole_share_recovery_keeps_a_booked_base_from_masking_an_
     second_dir.mkdir()
     _near_close_dca.atomic_write_text(
         second_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-18", triggered_at_utc="2026-08-18T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         second_dir, "BYDDY", "2026-08-15",
         {"order_id": order_id, "shares_purchased": 1, "order_notional_usd": 15.0},
-        date(2026, 8, 17), tmp_path,
+        date(2026, 8, 18), tmp_path,
     )
     # NOT marked -- simulates the crash. The claim-wide OR would (wrongly)
     # already report state_booked=True here because of the base row alone.
     _, _, state_booked_or, fully_committed, _ = _near_close_dca._total_recorded_whole_share_claim_amount(
-        order_id, "BYDDY", "2026-08-15", date(2026, 8, 18), tmp_path, [],
+        order_id, "BYDDY", "2026-08-15", date(2026, 8, 19), tmp_path, [],
     )
     assert state_booked_or is True
     assert fully_committed is False
@@ -7002,12 +7019,12 @@ def test_persist_gated_whole_share_recovery_keeps_a_booked_base_from_masking_an_
     third_dir.mkdir()
     _near_close_dca.atomic_write_text(
         third_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-18", triggered_at_utc="2026-08-18T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-19", triggered_at_utc="2026-08-19T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         third_dir, "BYDDY", "2026-08-15",
         {"order_id": order_id, "shares_purchased": 1, "order_notional_usd": 15.0},
-        date(2026, 8, 18), tmp_path,
+        date(2026, 8, 19), tmp_path,
     )
     third_state = _near_close_dca.json.loads((third_dir / "run_state.json").read_bytes())
     assert len(third_state["buy_candidates"]) == 1
@@ -7056,12 +7073,12 @@ def test_stale_no_match_release_reverses_provisional_evidence(tmp_path, monkeypa
     artifacts_dir.mkdir()
     _near_close_dca.atomic_write_text(
         artifacts_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         artifacts_dir, "BYDDY", "2026-08-15",
         {"live_order_found": True, "order_id": "RH-STALE-1", "planned_notional_usd": 10.0},
-        date(2026, 8, 16), tmp_path,
+        date(2026, 8, 17), tmp_path,
     )
 
     class _NoMatchBroker(DryRunBroker):
@@ -7199,12 +7216,12 @@ def test_persist_gated_whole_share_recovery_rows_are_schema_valid(tmp_path):
     first_dir.mkdir()
     _near_close_dca.atomic_write_text(
         first_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         first_dir, "BYDDY", "2026-08-15",
         {"live_order_found": True, "order_id": "RH-SCHEMA-1", "planned_notional_usd": 10.0, "planned_quantity": 1},
-        date(2026, 8, 16), tmp_path,
+        date(2026, 8, 17), tmp_path,
     )
     fresh_row = _near_close_dca.json.loads((first_dir / "run_state.json").read_bytes())["buy_candidates"][0]
     jsonschema.validate(fresh_row, candidate_schema)
@@ -7213,12 +7230,12 @@ def test_persist_gated_whole_share_recovery_rows_are_schema_valid(tmp_path):
     second_dir.mkdir()
     _near_close_dca.atomic_write_text(
         second_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-18", triggered_at_utc="2026-08-18T19:35:00Z")),
     )
     _near_close_dca._persist_gated_whole_share_recovery(
         second_dir, "BYDDY", "2026-08-15",
         {"zero_fill_attempt": True, "order_id": "RH-SCHEMA-1"},
-        date(2026, 8, 17), tmp_path,
+        date(2026, 8, 18), tmp_path,
     )
     reversal_row = _near_close_dca.json.loads((second_dir / "run_state.json").read_bytes())["buy_candidates"][0]
     assert reversal_row["planned_amount_usd"] < 0
@@ -7250,6 +7267,7 @@ def test_whole_share_zero_fill_release_hook_fires_before_ledger_commit(tmp_path,
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     claim = ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY")
+    assert claim is not None
 
     class _ZeroFillBroker(DryRunBroker):
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
@@ -7290,6 +7308,7 @@ def test_whole_share_zero_fill_release_hook_failure_leaves_claim_unresolved(tmp_
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
     claim = ledger.unresolved_claim("BYDDY", claim_day.isoformat(), "afternoon-BYDDY")
+    assert claim is not None
     ledger_before = (ledger.root / "BYDDY" / "ledger.json").read_bytes()
 
     class _ZeroFillBroker(DryRunBroker):
@@ -7337,7 +7356,7 @@ def test_gated_recovery_persists_live_evidence_before_booking_durable_state(tmp_
         "BYDDY", claim_trading_day.isoformat(), 10.0, 10.0, stream="afternoon",
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
-    now = datetime(2026, 8, 16, 10, 0, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 10, 0, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
@@ -7412,7 +7431,7 @@ def test_gated_live_recovery_locks_the_tickers_own_ledger_lock(tmp_path, monkeyp
         "BYDDY", claim_trading_day.isoformat(), 10.0, 10.0, stream="afternoon",
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
-    now = datetime(2026, 8, 16, 10, 0, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 10, 0, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
@@ -7465,7 +7484,7 @@ def test_book_reconciled_whole_share_order_durably_corrects_already_booked_notio
     """
     order_id = "RH-NOTIONAL-CORRECT-1"
     claim_day = date(2026, 8, 15)
-    trading_day = date(2026, 8, 16)
+    trading_day = date(2026, 8, 17)
 
     # First gated run: books the claim as live_order_found at its full $10
     # planned notional, and the marker gets committed (simulating the
@@ -7474,7 +7493,7 @@ def test_book_reconciled_whole_share_order_durably_corrects_already_booked_notio
     first_dir.mkdir()
     _near_close_dca.atomic_write_text(
         first_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
     )
     state = StrategyState()
     live_result = {"live_order_found": True, "order_id": order_id, "planned_notional_usd": 10.0}
@@ -7497,7 +7516,7 @@ def test_book_reconciled_whole_share_order_durably_corrects_already_booked_notio
     second_dir.mkdir()
     _near_close_dca.atomic_write_text(
         second_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-18", triggered_at_utc="2026-08-18T19:35:00Z")),
     )
     terminal_result = {"order_id": order_id, "shares_purchased": 1, "order_notional_usd": 4.0}
     already_recorded = _near_close_dca._gated_whole_share_recovery_already_recorded(
@@ -7529,13 +7548,13 @@ def test_gated_recovery_notional_correction_clears_a_stale_earlier_week_reserve(
     """
     order_id = "RH-RESERVE-INVALIDATE-1"
     claim_day = date(2026, 8, 10)  # an earlier ISO week than trading_day below
-    trading_day = date(2026, 8, 17)  # a later ISO week
+    trading_day = date(2026, 8, 18)  # a later ISO week
 
     first_dir = tmp_path / "first"
     first_dir.mkdir()
     _near_close_dca.atomic_write_text(
         first_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-18", triggered_at_utc="2026-08-18T19:35:00Z")),
     )
     state = StrategyState()
     live_result = {"live_order_found": True, "order_id": order_id, "planned_notional_usd": 10.0}
@@ -7562,7 +7581,7 @@ def test_gated_recovery_notional_correction_clears_a_stale_earlier_week_reserve(
     second_dir.mkdir()
     _near_close_dca.atomic_write_text(
         second_dir / "run_state.json",
-        _near_close_dca.json.dumps(_blocked_stub("2026-08-18", triggered_at_utc="2026-08-18T19:35:00Z")),
+        _near_close_dca.json.dumps(_blocked_stub("2026-08-19", triggered_at_utc="2026-08-19T19:35:00Z")),
     )
     terminal_result = {"order_id": order_id, "shares_purchased": 1, "order_notional_usd": 15.0}
     already_recorded = _near_close_dca._gated_whole_share_recovery_already_recorded(
@@ -7642,7 +7661,7 @@ def test_ordinary_live_order_row_is_not_trusted_as_state_booked(tmp_path):
         # ordinary live_order_found publish writes.
     }
     _, found, state_booked, _, _ = _near_close_dca._total_recorded_whole_share_claim_amount(
-        "RH-ORDINARY-LIVE-1", "BYDDY", "2026-08-15", date(2026, 8, 16), None, [live_ordinary_row],
+        "RH-ORDINARY-LIVE-1", "BYDDY", "2026-08-15", date(2026, 8, 17), None, [live_ordinary_row],
     )
     assert found is True
     assert state_booked is False
@@ -7657,7 +7676,7 @@ def test_ordinary_live_order_row_is_not_trusted_as_state_booked(tmp_path):
         "whole_share_claim_breakdown": [{"trading_day": "2026-08-15", "amount_usd": 10.0}],
     }
     _, _, terminal_state_booked, _, _ = _near_close_dca._total_recorded_whole_share_claim_amount(
-        "RH-ORDINARY-TERMINAL-1", "BYDDY", "2026-08-15", date(2026, 8, 16), None, [terminal_ordinary_row],
+        "RH-ORDINARY-TERMINAL-1", "BYDDY", "2026-08-15", date(2026, 8, 17), None, [terminal_ordinary_row],
     )
     assert terminal_state_booked is True
 
@@ -7675,7 +7694,7 @@ def test_gated_dedup_finds_current_stub_evidence_without_a_history_root(tmp_path
     order_id = "RH-CURRENT-STUB-DEDUP-1"
     artifacts_dir = tmp_path / "artifacts"
     artifacts_dir.mkdir()
-    stub = _blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")
+    stub = _blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")
     stub["buy_candidates"] = [
         {
             "ticker": "BYDDY",
@@ -7690,14 +7709,14 @@ def test_gated_dedup_finds_current_stub_evidence_without_a_history_root(tmp_path
 
     reconciled = {"order_id": order_id, "shares_purchased": 1, "order_notional_usd": 10.0}
     already_recorded = _near_close_dca._gated_whole_share_recovery_already_recorded(
-        "BYDDY", "2026-08-15", reconciled, date(2026, 8, 16), None, artifacts_dir,
+        "BYDDY", "2026-08-15", reconciled, date(2026, 8, 17), None, artifacts_dir,
     )
     assert already_recorded is True
 
     # Without the current-stub fallback (no artifacts_dir passed), the
     # lookup has nothing to scan at all with deployment_history_root=None.
     still_missing = _near_close_dca._gated_whole_share_recovery_already_recorded(
-        "BYDDY", "2026-08-15", reconciled, date(2026, 8, 16), None,
+        "BYDDY", "2026-08-15", reconciled, date(2026, 8, 17), None,
     )
     assert still_missing is False
 
@@ -7712,7 +7731,7 @@ def test_gated_dedup_does_not_double_count_the_current_stub(tmp_path):
     order_id = "RH-NO-DOUBLE-COUNT-1"
     artifacts_dir = tmp_path / "artifacts"
     artifacts_dir.mkdir()
-    stub = _blocked_stub("2026-08-16", triggered_at_utc="2026-08-16T19:35:00Z")
+    stub = _blocked_stub("2026-08-17", triggered_at_utc="2026-08-17T19:35:00Z")
     stub["buy_candidates"] = [
         {
             "ticker": "BYDDY",
@@ -7726,7 +7745,7 @@ def test_gated_dedup_does_not_double_count_the_current_stub(tmp_path):
     _near_close_dca.atomic_write_text(artifacts_dir / "run_state.json", _near_close_dca.json.dumps(stub))
 
     total, found, state_booked, _, _ = _near_close_dca._total_recorded_whole_share_claim_amount(
-        order_id, "BYDDY", "2026-08-15", date(2026, 8, 16), tmp_path,
+        order_id, "BYDDY", "2026-08-15", date(2026, 8, 17), tmp_path,
         _near_close_dca._current_gated_stub_candidates(artifacts_dir),
         exclude_path=artifacts_dir / "run_state.json",
     )
@@ -7747,7 +7766,7 @@ def test_gated_live_recovery_fails_closed_with_no_artifacts_dir(tmp_path):
         _near_close_dca._persist_gated_whole_share_recovery(
             None, "BYDDY", "2026-08-15",
             {"order_id": "RH-NO-DIR-1", "shares_purchased": 1, "order_notional_usd": 10.0},
-            date(2026, 8, 16), tmp_path,
+            date(2026, 8, 17), tmp_path,
         )
 
 
@@ -7796,7 +7815,7 @@ def test_gated_recovery_marker_is_queued_not_written_immediately(tmp_path, monke
         "BYDDY", claim_trading_day.isoformat(), 10.0, 10.0, stream="afternoon",
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
-    now = datetime(2026, 8, 16, 10, 0, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 10, 0, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
@@ -7837,7 +7856,7 @@ def test_gated_recovery_marker_is_queued_not_written_immediately(tmp_path, monke
     # queued-but-never-fired marker must not have leaked onto disk.
     reconciled = {"order_id": "RH-QUEUED-MARKER-1", "order_notional_usd": 10.0, "shares_purchased": 1}
     still_unbooked = _near_close_dca._gated_whole_share_recovery_already_recorded(
-        "BYDDY", claim_trading_day.isoformat(), reconciled, date(2026, 8, 16), tmp_path,
+        "BYDDY", claim_trading_day.isoformat(), reconciled, date(2026, 8, 17), tmp_path,
     )
     assert still_unbooked is False
 
@@ -7952,7 +7971,7 @@ def test_gated_marker_write_failure_raises_instead_of_silently_swallowing(tmp_pa
 
     with pytest.raises(RuntimeError, match="could not mark gated whole-share recovery state-booked"):
         _near_close_dca._mark_gated_whole_share_recovery_state_booked(
-            artifacts_dir, "BYDDY", "2026-08-15", "RH-1", date(2026, 8, 16),
+            artifacts_dir, "BYDDY", "2026-08-15", "RH-1", date(2026, 8, 17),
         )
 
 
@@ -7977,7 +7996,7 @@ def test_ordinary_recovery_rows_are_treated_as_already_state_booked(tmp_path):
         # exactly what the ordinary (non-gated) publish path writes.
     }
     total, found, state_booked, _, _ = _near_close_dca._total_recorded_whole_share_claim_amount(
-        "RH-ORDINARY-1", "BYDDY", "2026-08-15", date(2026, 8, 16), None, [ordinary_row],
+        "RH-ORDINARY-1", "BYDDY", "2026-08-15", date(2026, 8, 17), None, [ordinary_row],
     )
     assert found is True
     assert state_booked is True
@@ -7994,7 +8013,7 @@ def test_ordinary_recovery_rows_are_treated_as_already_state_booked(tmp_path):
         "state_booked": False,
     }
     _, _, gated_state_booked, _, _ = _near_close_dca._total_recorded_whole_share_claim_amount(
-        "RH-GATED-1", "BYDDY", "2026-08-15", date(2026, 8, 16), None, [gated_row],
+        "RH-GATED-1", "BYDDY", "2026-08-15", date(2026, 8, 17), None, [gated_row],
     )
     assert gated_state_booked is False
 
@@ -8022,12 +8041,12 @@ def test_pre_roll_recovered_fill_is_persisted_into_buy_candidates(tmp_path, monk
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-15T15:30:00-04:00",
     )
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
 
@@ -8121,10 +8140,10 @@ def test_batch_aggregates_a_recovered_fill_with_todays_own_submission(tmp_path, 
     # newer of the two) -- not a synthetic joined string no exact-ID
     # consumer could ever match (Codex review: "Preserve each broker order
     # ID when aggregating outcomes"). Both distinct ids are still recorded.
-    assert outcome["order_id"] == "DRY-RUN-WHOLESHARE-BYDDY-1-graded-dca-wholeshare-2026-08-16-BYDDY"
+    assert outcome["order_id"] == "DRY-RUN-WHOLESHARE-BYDDY-1-graded-dca-wholeshare-2026-08-17-BYDDY"
     assert outcome["whole_share_order_ids"] == [
         "RH-RECOVERED-1",
-        "DRY-RUN-WHOLESHARE-BYDDY-1-graded-dca-wholeshare-2026-08-16-BYDDY",
+        "DRY-RUN-WHOLESHARE-BYDDY-1-graded-dca-wholeshare-2026-08-17-BYDDY",
     ]
 
 
@@ -8177,7 +8196,7 @@ def test_out_of_window_reconciliation_is_published_with_its_true_claim_date(tmp_
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     ledger = WholeShareAccumulationLedger()
-    claim_trading_day = date(2026, 8, 1)  # well outside the 7-day window ending 2026-08-16
+    claim_trading_day = date(2026, 8, 1)  # well outside the 7-day window ending 2026-08-17
     ledger.record_contribution(
         "BYDDY", claim_trading_day.isoformat(), 10.0, 10.0, stream="afternoon",
         idempotency_key="afternoon-BYDDY", recorded_at="2026-08-01T15:30:00-04:00",
@@ -8195,7 +8214,7 @@ def test_out_of_window_reconciliation_is_published_with_its_true_claim_date(tmp_
             return None
 
     broker = _OutOfWindowConfirmingBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
-    ctx = _ctx(config, broker)  # trading_day is 2026-08-16
+    ctx = _ctx(config, broker)  # trading_day is 2026-08-17
     _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
 
     running_deployed_7d = _reconcile_cross_day_whole_share_claims_for_batch(ctx, running_deployed_7d=0.0)
@@ -8203,7 +8222,7 @@ def test_out_of_window_reconciliation_is_published_with_its_true_claim_date(tmp_
     assert ledger.shares_purchased_total("BYDDY") == 1
     assert ledger.unresolved_claim("BYDDY", "2026-08-01", "afternoon-BYDDY") is None
     # Excluded from the in-memory kill-switch total -- outside the trailing
-    # 7-day window ending on THIS run's own trading_day (2026-08-16).
+    # 7-day window ending on THIS run's own trading_day (2026-08-17).
     assert running_deployed_7d == 0.0
 
     outcome = _near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]["BYDDY"]
@@ -8246,7 +8265,7 @@ def test_reconciling_a_prior_week_claim_before_rolling_reserve_reduces_the_rollo
             return None
 
     broker = _PriorWeekConfirmingBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
-    trading_day = date(2026, 8, 17)  # the following Monday -- a new ISO week
+    trading_day = date(2026, 8, 18)  # the following Monday -- a new ISO week
     state = StrategyState()
     state.finalized_budget_days.add(claim_trading_day)  # last week saw activity
     ctx = ProcessCandidateContext(
@@ -8254,7 +8273,7 @@ def test_reconciling_a_prior_week_claim_before_rolling_reserve_reduces_the_rollo
         state=state,
         broker=broker,
         robinhood_data=None,
-        now=datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN),
+        now=datetime(2026, 8, 18, 15, 45, tzinfo=EASTERN),
         trading_day=trading_day,
         guard_active=False,
         prior_same_day_allocations={},
@@ -8304,14 +8323,14 @@ def test_pre_roll_reconciliation_runs_before_tier_planning_kill_switch_preview(t
     # threshold, but a kill-switch-CAPPED preview (ceiling clamped to
     # today's $2.00 selected_base_amount_usd, far below the $10 share
     # price) contributes $0.
-    ledger.preserve_pending("BYDDY", "2026-08-16", 140.0, stream="afternoon", recorded_at="2026-08-16T15:45:00-04:00")
+    ledger.preserve_pending("BYDDY", "2026-08-17", 140.0, stream="afternoon", recorded_at="2026-08-17T15:45:00-04:00")
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
         monthly_cash_allocation_usd=20.0,
         kill_switch_7d_deploy_fraction=0.4,
         max_per_order_usd=150.0,
@@ -8405,8 +8424,8 @@ def test_a_reconciled_claim_already_recorded_on_disk_is_not_rebooked(tmp_path, m
         state=StrategyState(),
         broker=broker,
         robinhood_data=None,
-        now=datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN),
-        trading_day=date(2026, 8, 16),
+        now=datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN),
+        trading_day=date(2026, 8, 17),
         guard_active=False,
         prior_same_day_allocations={},
         scheduled=True,
@@ -8582,7 +8601,7 @@ def test_ambiguous_placement_recovery_leaves_an_unreadable_fill_unresolved(tmp_p
     assert outcome["whole_share_settlement_reconciliation_needed"] is True
     ledger = WholeShareAccumulationLedger()
     assert ledger.shares_purchased_total("BYDDY") == 0
-    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY")
     assert unresolved is not None and unresolved["resolved"] is False
 
 
@@ -8622,7 +8641,7 @@ def test_ambiguous_placement_recovery_leaves_an_explicit_null_fill_unresolved(tm
     assert outcome["whole_share_settlement_reconciliation_needed"] is True
     ledger = WholeShareAccumulationLedger()
     assert ledger.shares_purchased_total("BYDDY") == 0
-    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-17", "afternoon-BYDDY")
     assert unresolved is not None and unresolved["resolved"] is False
 
 
@@ -8721,7 +8740,7 @@ def test_immediate_recovery_does_not_rebook_after_losing_claim_ownership(tmp_pat
     assert errors == 0
     # Nothing was double-booked into THIS run's own state/deployment total.
     assert running_deployed_7d == 0.0
-    assert ("BYDDY", date(2026, 8, 16)) not in ctx.state.own_orders_recorded
+    assert ("BYDDY", date(2026, 8, 17)) not in ctx.state.own_orders_recorded
 
 
 def test_terminal_partial_fill_does_not_rebook_after_losing_claim_ownership(tmp_path, monkeypatch):
@@ -8778,8 +8797,8 @@ def test_terminal_partial_fill_does_not_rebook_after_losing_claim_ownership(tmp_
     assert outcome["order_id"] == "RH-WON-BY-SOMEONE-ELSE-2"
     assert errors == 0
     assert running_deployed_7d == 0.0
-    assert ctx.state.day_notional(date(2026, 8, 16)) == 0.0
-    assert ("BYDDY", date(2026, 8, 16)) not in ctx.state.own_orders_recorded
+    assert ctx.state.day_notional(date(2026, 8, 17)) == 0.0
+    assert ("BYDDY", date(2026, 8, 17)) not in ctx.state.own_orders_recorded
     assert settle_calls, "the terminal-partial-fill branch never called settle()"
     assert settle_calls[-1].get("require_claim_ownership") is True
 
@@ -8829,7 +8848,7 @@ def test_confirmation_required_redispatch_outcome_retains_a_whole_share_marker(t
     # Seeded at a deliberately huge price so the seed call itself buys 0
     # shares, leaving the full $10 pending (rather than immediately firing).
     ledger.record_contribution(
-        "BYDDY", "2026-08-16", 10.0, 1_000_000.0, stream="seed", idempotency_key="seed"
+        "BYDDY", "2026-08-17", 10.0, 1_000_000.0, stream="seed", idempotency_key="seed"
     )
     assert ledger.pending_usd("BYDDY") == 10.0
 
@@ -9126,14 +9145,14 @@ def test_a_reclaimed_fire_is_not_placed_by_the_fenced_out_caller(tmp_path, monke
         def review_whole_share_buy(self, ticker, quantity):
             WholeShareAccumulationLedger().record_contribution(
                 ticker,
-                "2026-08-16",
+                "2026-08-17",
                 10.0,
                 10.0,
                 stream="afternoon",
                 idempotency_key="afternoon-BYDDY",
                 # Far enough past the original call's recorded_at to read
                 # as an abandoned, reclaimable claim.
-                recorded_at="2026-08-16T16:00:00-04:00",
+                recorded_at="2026-08-17T16:00:00-04:00",
             )
             return True, "reclaimed by another attempt"
 
@@ -9237,7 +9256,7 @@ def test_accepted_order_is_published_before_a_fallible_fill_lookup(tmp_path, mon
 
     config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
     broker = _RaisingFillBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
-    run_result = _n.RunResult(trading_day=date(2026, 8, 16), decisions=[])
+    run_result = _n.RunResult(trading_day=date(2026, 8, 17), decisions=[])
 
     _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
     try:
@@ -9379,12 +9398,12 @@ def test_planned_spend_previews_the_accumulated_order_not_the_days_contribution(
     )
     assert ledger.pending_usd("BYDDY") == 8.00
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 9.90})
@@ -9438,12 +9457,12 @@ def test_planned_spend_preview_is_clamped_to_the_max_per_order_ceiling(tmp_path,
     )
     assert ledger.pending_usd("BYDDY") == 50.00
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 4.00})
@@ -9496,12 +9515,12 @@ def test_planned_spend_preview_clamps_with_the_ledger_rounded_price(tmp_path, mo
     )
     assert ledger.pending_usd("BYDDY") == 8.00
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 3.334})
@@ -9563,18 +9582,18 @@ def test_planned_spend_preview_does_not_double_count_an_already_recorded_slot(tm
     )
     assert ledger.pending_usd("BYDDY") == 7.00
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     # Records TODAY's own $2 contribution under the exact key run_daily_compact's
     # tier-planning loop and _process_whole_share_candidate will both use --
     # simulating an earlier attempt this same day already ran and left the
     # slot recorded (resolved, since 0 shares qualify).
     ledger.record_contribution(
         "BYDDY",
-        "2026-08-16",
+        "2026-08-17",
         2.00,
         10.0,
         stream="afternoon",
-        recorded_at="2026-08-16T15:30:00-04:00",
+        recorded_at="2026-08-17T15:30:00-04:00",
         idempotency_key="afternoon-BYDDY",
     )
     assert ledger.pending_usd("BYDDY") == 9.00
@@ -9583,7 +9602,7 @@ def test_planned_spend_preview_does_not_double_count_an_already_recorded_slot(tm
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
@@ -9631,31 +9650,31 @@ def test_planned_spend_preview_does_not_recompute_a_preserved_already_recorded_s
     # will use, already resolved by the time tier planning previews it.
     decision = ledger.record_contribution(
         "BYDDY",
-        "2026-08-16",
+        "2026-08-17",
         10.00,
         10.0,
         stream="afternoon",
-        recorded_at="2026-08-16T15:30:00-04:00",
+        recorded_at="2026-08-17T15:30:00-04:00",
         idempotency_key="afternoon-BYDDY",
     )
     ledger.preserve_pending(
         "BYDDY",
-        "2026-08-16",
+        "2026-08-17",
         10.00,
         stream="afternoon",
-        recorded_at="2026-08-16T15:30:00-04:00",
+        recorded_at="2026-08-17T15:30:00-04:00",
         idempotency_key="afternoon-BYDDY",
         claim_token=decision.claim_token,
     )
     # The restored balance alone now covers (and exceeds) a full share.
     assert ledger.pending_usd("BYDDY") == 10.00
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 10.0})
@@ -9699,21 +9718,21 @@ def test_planned_spend_preview_reflects_an_actionable_stale_claim(tmp_path, monk
     # under the SAME slot _process_whole_share_candidate will use.
     ledger.record_contribution(
         "BYDDY",
-        "2026-08-16",
+        "2026-08-17",
         10.00,
         10.0,
         stream="afternoon",
-        recorded_at="2026-08-16T15:30:00-04:00",
+        recorded_at="2026-08-17T15:30:00-04:00",
         idempotency_key="afternoon-BYDDY",
     )
     assert ledger.pending_usd("BYDDY") == 0.0  # deducted at record time
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)  # 15 min later -> stale
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)  # 15 min later -> stale
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
     # Reference price matches the CURRENT $9.90 quote, not the original
@@ -9767,11 +9786,11 @@ def test_dry_run_preview_honors_an_already_recorded_slot(tmp_path, monkeypatch):
     ledger = WholeShareAccumulationLedger()
     ledger.record_contribution(
         "BYDDY",
-        "2026-08-16",
+        "2026-08-17",
         9.00,
         10.0,
         stream="afternoon",
-        recorded_at="2026-08-16T15:30:00-04:00",
+        recorded_at="2026-08-17T15:30:00-04:00",
         idempotency_key="afternoon-BYDDY",
     )
     assert ledger.pending_usd("BYDDY") == 9.00
@@ -9895,12 +9914,12 @@ def test_a_corrupt_whole_share_ledger_does_not_abort_planning_for_other_tickers(
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     ledger_path.write_text("not valid json{{{")
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=("AAA",),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"AAA": 9.90, "BYDDY": 9.90})
@@ -9934,19 +9953,19 @@ def test_whole_share_evaluated_tickers_are_in_the_coverage_universe(tmp_path, mo
     active_universe includes it too, not just the normal tradable universe.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=True,
         tickers=("AAA",),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"AAA": 9.90, "BYDDY": 9.90})
     data = _FakeSignalData(SourceName.FINANCE, close_price=9.90, prev_close=10.00)
     rh_data = _FakeSignalData(SourceName.ROBINHOOD, close_price=9.90, prev_close=10.00)
 
-    run_result = RunResult(trading_day=date(2026, 8, 16), decisions=[])
+    run_result = RunResult(trading_day=date(2026, 8, 17), decisions=[])
     ctx = RunContext(
         now=now,
         config=config,
@@ -9968,15 +9987,15 @@ def test_whole_share_evaluated_tickers_are_in_the_coverage_universe(tmp_path, mo
 def test_whole_share_tickers_are_not_evaluated_outside_afternoon(stream, tmp_path, monkeypatch):
     """Morning and midday slots must not contribute to the once-daily ledger."""
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
         target_account_number="999000111",
     )
-    run_result = RunResult(trading_day=date(2026, 8, 16), decisions=[])
+    run_result = RunResult(trading_day=date(2026, 8, 17), decisions=[])
     ctx = RunContext(
         now=now,
         config=config,
@@ -10009,12 +10028,12 @@ def test_accumulator_only_run_is_not_misclassified_as_budget_exhausted(tmp_path,
     is_trading_failure=False; this test locks that behavior in.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
         target_account_number="999000111",
     )
     state = StrategyState()
@@ -10251,7 +10270,7 @@ def test_preserve_pending_failure_outcome_retains_a_whole_share_marker_for_redis
     # Seeded at a deliberately huge price so the seed call itself buys 0
     # shares, leaving the full $50 pending (rather than immediately firing).
     ledger.record_contribution(
-        "BYDDY", "2026-08-16", 60.0, 1_000_000.0, stream="seed", idempotency_key="seed"
+        "BYDDY", "2026-08-17", 60.0, 1_000_000.0, stream="seed", idempotency_key="seed"
     )
     assert ledger.pending_usd("BYDDY") == 60.0
 
@@ -10393,12 +10412,12 @@ def test_a_preserved_fire_is_redispatched_without_a_fresh_buy_signal(tmp_path, m
     )
     assert ledger.pending_usd("BYDDY") == 15.00
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 9.90})
@@ -10459,12 +10478,12 @@ def test_a_preserved_fire_is_not_redispatched_on_a_manual_review_decision(tmp_pa
     )
     assert ledger.pending_usd("BYDDY") == 15.00
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 9.90})
@@ -10521,12 +10540,12 @@ def test_redispatch_eligibility_uses_cent_rounded_comparison(tmp_path, monkeypat
     )
     assert ledger.pending_usd("BYDDY") == 10.00
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 10.004})
@@ -10572,12 +10591,12 @@ def test_redispatch_ledger_read_failure_dispatches_for_proper_error_classificati
     ledger_dir.mkdir(parents=True)
     (ledger_dir / "ledger.json").write_text("{not valid json")
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 9.90})
@@ -10627,12 +10646,12 @@ def test_blocked_redispatch_outcome_is_persisted_in_buy_candidates(tmp_path, mon
     )
     assert ledger.pending_usd("BYDDY") == 15.00
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
     # Cash well below the $9.90 share price -> insufficient buying power block.
@@ -10691,12 +10710,12 @@ def test_redispatch_outcome_with_no_whole_share_marker_is_still_persisted(tmp_pa
     )
     assert ledger.pending_usd("BYDDY") == 15.00
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
 
@@ -10753,12 +10772,12 @@ def test_redispatch_abstains_when_sources_disagree_on_price(tmp_path, monkeypatc
     )
     assert ledger.pending_usd("BYDDY") == 10.00
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 9.50})
@@ -11032,12 +11051,12 @@ def test_redispatch_caps_the_executable_fire_to_the_kill_switch_base(tmp_path, m
     )
     assert ledger.pending_usd("BYDDY") == 15.00
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
         # Saturates the rolling 7-day deployment threshold so
         # kill_switch_engaged() is True for this run.
         deployed_last_7d_usd=1_000_000.0,
@@ -11229,12 +11248,12 @@ def test_planned_spend_preview_applies_the_kill_switch_ceiling(tmp_path, monkeyp
 
     monkeypatch.setattr("near_close_dca.select_budget_tier", _spy_select_budget_tier)
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
         deployed_last_7d_usd=1_000_000.0,  # saturates kill_switch_engaged()
     )
     state = StrategyState()
@@ -11253,7 +11272,7 @@ def test_planned_spend_preview_applies_the_kill_switch_ceiling(tmp_path, monkeyp
     # default (None) skips that re-derivation entirely, keeping this test's
     # config authoritative -- exactly like
     # test_whole_share_evaluated_tickers_are_in_the_coverage_universe above.
-    run_result = RunResult(trading_day=date(2026, 8, 16), decisions=[])
+    run_result = RunResult(trading_day=date(2026, 8, 17), decisions=[])
     ctx = RunContext(
         now=now,
         config=config,
@@ -11334,17 +11353,17 @@ def test_tier_planning_reconciles_the_price_for_a_fresh_whole_share_buy(tmp_path
 
     monkeypatch.setattr("near_close_dca.select_budget_tier", _spy_select_budget_tier)
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig(
         dry_run=False,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 9.90})
 
-    run_result = RunResult(trading_day=date(2026, 8, 16), decisions=[])
+    run_result = RunResult(trading_day=date(2026, 8, 17), decisions=[])
     ctx = RunContext(
         now=now,
         config=config,
@@ -11394,7 +11413,7 @@ def test_whole_share_tickers_are_evaluated_in_a_stable_sorted_order(tmp_path, mo
 
     monkeypatch.setattr("near_close_dca._evaluate_all_signals", _capture)
 
-    now = datetime(2026, 8, 16, 15, 45, tzinfo=EASTERN)
+    now = datetime(2026, 8, 17, 15, 45, tzinfo=EASTERN)
     # Deliberately NOT in sorted order in the literal, and with one excluded,
     # so the assertion cannot pass by accident.
     config = StrategyConfig(
@@ -11402,7 +11421,7 @@ def test_whole_share_tickers_are_evaluated_in_a_stable_sorted_order(tmp_path, mo
         tickers=(),
         whole_share_tickers=frozenset({"RVII", "BYDDY", "ZZZZ"}),
         excluded_tickers=frozenset({"ZZZZ"}),
-        approved_test_dates=frozenset({date(2026, 8, 16)}),
+        approved_test_dates=frozenset({date(2026, 8, 17)}),
     )
     ctx = RunContext(
         now=now,
@@ -11412,7 +11431,7 @@ def test_whole_share_tickers_are_evaluated_in_a_stable_sorted_order(tmp_path, mo
         robinhood_data=_FakeSignalData(SourceName.ROBINHOOD, close_price=10.09, prev_close=10.00),
         broker=DryRunBroker(cash=500.0, reference_prices={"BYDDY": 9.90, "RVII": 23.36}),
         artifacts_dir=str(tmp_path / "artifacts"),
-        run_result=RunResult(trading_day=date(2026, 8, 16), decisions=[]),
+        run_result=RunResult(trading_day=date(2026, 8, 17), decisions=[]),
         stream="afternoon",
     )
     run_once(ctx)

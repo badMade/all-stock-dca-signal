@@ -2,6 +2,7 @@
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -142,4 +143,109 @@ def test_secrets_split_across_child_output_reads_are_redacted_before_persistence
         assert "[redacted]" in result["log"]
         assert private_value not in (manager.root / f"{result['id']}.json").read_text()
     finally:
+        manager.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Process-group cleanup requires POSIX signals")
+@pytest.mark.parametrize("stop_kind", ["timeout", "shutdown"])
+@pytest.mark.parametrize("ignore_term", [False, True])
+def test_deadline_and_shutdown_reap_descendants_that_retain_stdout(tmp_path, monkeypatch, stop_kind, ignore_term):
+    original_popen, original_killpg = subprocess.Popen, os.killpg
+    processes, sent_signals = [], []
+    launched = threading.Event()
+
+    def capture_process(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        launched.set()
+        return process
+
+    def capture_signal(group, signum):
+        sent_signals.append(signum)
+        original_killpg(group, signum)
+
+    monkeypatch.setattr(dca_console_jobs.subprocess, "Popen", capture_process)
+    monkeypatch.setattr(dca_console_jobs.os, "killpg", capture_signal)
+    child = (
+        "import pathlib,signal,sys,time; "
+        + ("signal.signal(signal.SIGTERM,signal.SIG_IGN); " if ignore_term else "")
+        + "pathlib.Path(sys.argv[1]).touch(); time.sleep(30)"
+    )
+    parent = (
+        "import pathlib,subprocess,sys,time; "
+        "subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2]]); "
+        "ready=pathlib.Path(sys.argv[2]); "
+        "\nwhile not ready.exists(): time.sleep(0.01)"
+    )
+    manager = JobManager(tmp_path / "jobs")
+    command = Command(
+        (sys.executable, "-c", parent, child, str(tmp_path / "ready")), tmp_path, dict(os.environ),
+        timeout=0.5 if stop_kind == "timeout" else 30,
+    )
+    try:
+        manager.submit("demo-dca", "Descendant cleanup", lambda job_id, log: manager.run_command(command, log))
+        assert launched.wait(2)
+        # The pipe remains open after the process that run_command owns exits.
+        assert processes[0].wait(timeout=2) == 0
+        if stop_kind == "shutdown":
+            manager.close()
+        assert manager.worker is not None
+        manager.worker.join(timeout=13)
+        assert not manager.worker.is_alive()
+        result = manager.snapshot()[0]
+        assert result["status"] == "interrupted"
+        assert result["returncode"] == 3
+        assert signal.SIGTERM in sent_signals
+        if ignore_term:
+            assert signal.SIGKILL in sent_signals
+    finally:
+        # Only signal the group created by this test, including if its leader exited.
+        for process in processes:
+            try:
+                original_killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=2)
+        manager.close()
+
+
+@pytest.mark.parametrize("failure", ["persist", "construct", "start"])
+@pytest.mark.parametrize("prior_work", [False, True])
+def test_submit_startup_failure_preserves_history_and_allows_retry(tmp_path, monkeypatch, failure, prior_work):
+    root = tmp_path / "jobs"
+    for index in range(30):
+        saved_job(root, f"prior-{index:02}")
+    manager = JobManager(root)
+    ran = threading.Event()
+    error_type = OSError if failure == "persist" else RuntimeError
+
+    def fail(*args, **kwargs):
+        raise error_type("Injected startup failure")
+
+    try:
+        if prior_work:
+            manager.submit("demo-dca", "Prior work", lambda job_id, log: 0)
+            join_job(manager)
+        before, previous_worker = manager.snapshot(), manager.worker
+        with monkeypatch.context() as startup:
+            if failure == "persist":
+                startup.setattr(manager, "_persist", fail)
+            elif failure == "construct":
+                startup.setattr(dca_console_jobs.threading, "Thread", fail)
+            else:
+                startup.setattr(threading.Thread, "start", fail)
+            with pytest.raises(error_type, match="Injected startup failure"):
+                manager.submit("demo-dca", "Failed startup", lambda job_id, log: ran.set() or 0)
+        assert not ran.is_set()
+        assert manager.snapshot() == before
+        assert manager.worker is previous_worker
+        manager.submit("demo-dca", "Retry", lambda job_id, log: 0)
+        result = join_job(manager)
+        assert result["status"] == "completed"
+        assert len(manager.snapshot()) == 30
+        manager.close()
+    finally:
+        # Preserve cleanup even when exercising the original unstarted-thread bug.
+        if manager.worker is not None and manager.worker.ident is None:
+            manager.worker = None
         manager.close()

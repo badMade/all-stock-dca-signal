@@ -918,6 +918,24 @@
       "labeling": "Fallback data must be labeled as fallback and must NOT weaken confidence, spread, trend, top-up, budget, whitelist, buy-only, regular-hours-only, or any safety rule."
     },
     "gfuz_exception": "GFUZ may use Robinhood as its PRIMARY source when the Finance connector cannot resolve it (see config/tickers.json:special_handling.GFUZ and config/morning_dca.json:gfuz_special_handling).",
+    "slot_overrides": {
+      "1030ET": {
+        "primary_source": "robinhood",
+        "since": "2026-09-09",
+        "reason": "scripts/generate_morning_candidates.py's MORNING_SPEC (cron 42173154) has scored this slot's Gate 5 candidates from Robinhood as its sole required source since the entry point was first committed. Confirmed 2026-09-09 as the deliberate policy for this slot rather than reverting it to match the Finance-primary default -- see docs/morning_signal_entry.md.",
+        "accepted_sources": ["robinhood", "yahoo_finance_yfinance"],
+        "validation_context_sources": [],
+        "yfinance_note": "yahoo_finance_yfinance is an accepted --market-data key but is NOT a usable fallback for this slot: scripts/stream_candidates.py's run_cli() only permits yfinance to substitute for a missing/errored primary source when spec.source is FINANCE. For this Robinhood-primary spec a robinhood source_errors entry aborts even when yfinance data is present (scripts/tests/test_generate_market_open_candidates.py::test_cli_does_not_substitute_yfinance_for_a_robinhood_primary_spec). Finance and Alpaca are not accepted keys at all for this slot -- supplying either raises 'unsupported key(s)'."
+      },
+      "0935ET": {
+        "primary_source": "robinhood",
+        "since": "2026-09-09",
+        "reason": "scripts/generate_market_open_candidates.py's MARKET_OPEN_SPEC (cron 2ba19526) was Finance-primary until 2026-09-09, when two live executor sessions aborted the same day because no Finance MCP connector was available. Confirmed 2026-09-09 as the deliberate policy for this slot, the same exception 1030ET already carries -- see docs/market_open_signal_entry.md. GFUZ's ticker_source_overrides carve-out was removed as part of this change: every ticker on this slot, GFUZ included, is now scored from Robinhood the same way.",
+        "accepted_sources": ["robinhood", "yahoo_finance_yfinance"],
+        "validation_context_sources": [],
+        "yfinance_note": "Same no-fallback contract as 1030ET above: yahoo_finance_yfinance is an accepted key but does not substitute for a missing/errored robinhood entry, and finance/alpaca are rejected outright as unsupported keys."
+      }
+    },
     "execution_broker": "Robinhood is the ONLY execution broker; Alpaca/Finance/Yahoo remain read-only validation/context and never place orders.",
     "doc": "docs/safeguards.md"
   },

@@ -46,6 +46,32 @@ that deployment happens, not one that is live today -- extending §3's
 carve-out to `dca_runner.py` should be in place before that deployment,
 not treated as a lower-priority follow-up after it.
 
+**Update 2026-09-10 -- 09:35 collision, widened offsets, placement-time
+recheck (§4).** The 09:35 canonical run (cron `2ba19526`) fired at
+approximately 09:43 ET (scheduler jitter) and was still sequentially
+placing its 45-order batch when the then-configured 09:45 fire time for
+standing backup task `4412c3c4` arrived. §4's reconciliation check below
+ran once, against a same-window order history that did not yet contain
+most of the canonical batch, so it excluded only the handful of tickers
+already filled by 09:45 -- not the roughly 26 more the canonical run placed
+afterward, nor as a batch. Result: approximately 29 extra
+`placed_agent='agentic'` orders, duplicating roughly 26 tickers and adding
+3 the canonical run did not intend (RGTI, QBTS, and GOOG, which the
+canonical run had deliberately excluded via its own GOOG/GOOGL dedup). No
+budget cap was breached, and nothing here was a rogue or unrecognized
+executor -- the backup did exactly what §4 told it to do, off a stale
+snapshot. Two fixes, both recorded in `config/scheduled_tasks.json`'s
+`standing_perplexity_backup_policy`: the canonical-to-backup offset is
+widened per slot, sized to jitter history plus realistic batch-placement
+time rather than a flat delay (see `backup_fires_at_et_basis`); and §4's
+check below must now re-run immediately before Perplexity places its own
+orders, not only once at the offset fire time (see
+`placement_time_revalidation_required`) -- this is the part that actually
+closes the gap, since no fixed offset can guarantee a still-running batch
+has finished. The paste-ready text in §4 below is updated accordingly; per
+this document's own standing caveat, Perplexity cannot read this repo, so a
+human still needs to apply the updated text to Perplexity's live prompts.
+
 ## 1. What "first come, first serve" actually means here
 
 There is still no medium both engines can read and write (see
@@ -282,6 +308,27 @@ into Perplexity's five task prompts, the same way the top-up guard was.
 > special case to escalate or report loudly; a slot Claude already handled,
 > in whole or in part, is the expected, designed outcome of running both
 > executors side by side, not a fault.
+>
+> IMMEDIATELY BEFORE PLACING -- REVALIDATE, DO NOT PLACE OFF THE EARLIER
+> SNAPSHOT. Added 2026-09-10 after a 09:35 collision where this check ran
+> once while Claude's own canonical run was still mid-batch, so the window
+> it inspected did not yet contain most of Claude's orders and excluded only
+> the few already filled. The check above can go stale for exactly that
+> reason: Claude's run may still be placing when this task's own offset
+> timer fires. Immediately before placing your FIRST order for this slot --
+> after sizing is complete but before submitting anything -- repeat the SAME
+> check above from scratch: call `get_equity_orders` again, follow every
+> pagination cursor to completion, and reclassify every order now in the
+> window. If this fresh check finds a Claude-attributable order for a ticker
+> still on your candidate list, drop that ticker before placing anything,
+> exactly as the original check would have excluded it had the order existed
+> the first time. If this fresh check finds a new UNRECOGNIZED order that
+> was not present the first time, treat it the same as any unrecognized
+> order under this task's existing safety rules -- escalate/alert, do not
+> silently stand down. Do not place any order for this slot without having
+> performed this immediately-pre-placement recheck; one check performed
+> minutes earlier is not sufficient when Claude's own batch can still be
+> running.
 
 This is the Perplexity-side mirror of §3's Gate 4 addition: whichever engine's
 qualifying order shows up first in the window wins that ticker, and the other

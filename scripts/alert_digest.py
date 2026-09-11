@@ -195,6 +195,8 @@ _UNC_PATH = re.compile(r"^\\\\\S")
 
 def _matched_path_is_external(path_text: str) -> bool:
     """Whether the absolute path text ``path_text`` sits OUTSIDE this checkout."""
+    # Sentence scanning masks periods, but containment needs the actual path.
+    path_text = path_text.replace(_PATH_EXTENSION_PERIOD_MASK, ".")
     if _WINDOWS_DRIVE_PATH.match(path_text) or _UNC_PATH.match(path_text):
         # Compared with Windows path semantics, not assumed external
         # outright: if THIS process also happens to run on Windows,
@@ -289,7 +291,7 @@ _PATH_EXTENSION_PERIOD_MASK = ""
 
 
 def _mask_path_extension_periods(text: str, pattern: str) -> str:
-    """Replace every "." INSIDE a ``pattern`` match with a placeholder, else return ``text`` unchanged.
+    """Mask internal path periods while preserving genuine sentence boundaries.
 
     _SENTENCE_SPLIT treats every "." as a sentence boundary -- including one
     that is merely part of a file extension inside the matched path itself,
@@ -301,6 +303,10 @@ def _mask_path_extension_periods(text: str, pattern: str) -> str:
     defeating the write-claim requirement above for exactly the ordinary
     case where the write verb follows the path (Codex review: "Keep
     filename extensions with their write claims").
+
+    Absolute paths also need their parent-directory periods masked: splitting
+    at a dotted checkout name separates a preceding write verb from the ignored
+    root and can strip an external path of the prefix that proves it external.
 
     Masking only the periods actually INSIDE a path match -- never a genuine
     sentence-ending period elsewhere, such as the one that correctly isolates
@@ -318,10 +324,12 @@ def _mask_path_extension_periods(text: str, pattern: str) -> str:
     genuine next sentence into the same fragment, letting its "not" reach
     back and wrongly negate the match (Codex review: "Preserve sentence
     boundaries after path extensions"). Every OTHER period inside the
-    match -- a real extension separator -- is still masked normally.
+    match -- a directory or extension separator -- is still masked normally.
     """
     chars = list(text)
-    for match in re.finditer(pattern, text, re.IGNORECASE):
+    matches = list(re.finditer(pattern, text, re.IGNORECASE))
+    matches.extend(_BODY_ARTIFACTS_PATH.finditer(text))
+    for match in matches:
         last_index = match.end() - 1
         for i in range(match.start(), match.end()):
             if chars[i] == "." and i != last_index:
@@ -1532,7 +1540,7 @@ def states_email_failure(body: str) -> bool:
                     clause_has_unnegated_failure = True
                     failure_match_end = send_failed_match.end()
                     break
-                if clause_has_unnegated_failure:
+                if clause_has_unnegated_failure and failure_match_end is not None:
                     # The match's OWN end position, not the whole clause's:
                     # a colon (not a _CLAUSE_SPLIT boundary) can join a
                     # failed attempt and its successful retry into one
@@ -3713,7 +3721,7 @@ def save_ledger(path: Path, keys: Iterable[str], *, now: Optional[datetime] = No
 
 
 def _classify_coverage_day(
-    day: date, silent: Set[date], calendar: Set[date], incomplete: Set[date] = frozenset()
+    day: date, silent: Set[date], calendar: Set[date], incomplete: Set[date] | frozenset[date] = frozenset()
 ) -> str:
     """One of ``"roster_silent"``, ``"incomplete_roster_day"``,
     ``"outside_approved_trading_window"``, ``"not_a_trading_day"``, or
@@ -4081,7 +4089,9 @@ def _file_event_utc(record: AlertRecord) -> datetime:
             record.date_evidence != "filename" or abs((mtime.astimezone(ET).date() - record.et_date).days) <= 1
         ):
             return mtime
-    return _slot_scheduled_utc(record.et_date, record.slot)
+    if record.slot is not None:
+        return _slot_scheduled_utc(record.et_date, record.slot)
+    return record.timestamp_utc
 
 
 # The reason an executor gives for stopping, as Gate 9 requires it to be stated:

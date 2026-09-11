@@ -39,6 +39,15 @@ aligned across refits by membership overlap so a group that persists keeps
 its id. The label itself is carried as ``TickerSeries.cluster_id``, an int8
 kept OUT of the float vector for the same reason day_of_week is.
 
+An OPTIONAL "calculus" block (``extra_features=("calculus",)``) appends 5
+more per-ticker columns: a literal second derivative of log price, the
+direction realized volatility is moving, causal Savitzky-Golay slope and
+curvature, and a fractionally differenced close. It is OFF by default and
+appended at the TAIL of the layout, so every existing index keeps meaning
+what it meant -- harness.py's ``_BAR_FEATURE_SLICE`` and baseline_model's
+module-level ``FEATURE_NAMES.index(...)`` constants are positional and
+resolved at import against the default tuple.
+
 The market features feed the GBM baseline directly and are ALSO inputs to
 the octopus market encoder -- both model families see the same raw market
 information, one through statistics, one through learned attention, which
@@ -50,7 +59,7 @@ categorical is a float feature.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -95,18 +104,21 @@ _AMIHUD_SCALE = 1e9
 #: coarse: each refit builds an n_tickers x n_tickers distance matrix, which
 #: on the full-universe archive is the most expensive thing in this module.
 _DEFAULT_N_CLUSTERS = 8
-#: Matched to build_panel's default min_history on purpose. The two
-#: cluster-derived features are NaN until the first refit, and the harness
-#: needs every feature finite before a ticker is eligible, so a window longer
-#: than the existing warm-up would push the whole replay's start date out by
-#: the difference -- a clustering knob silently deciding when trading begins.
-_DEFAULT_CLUSTER_WINDOW = 60
 _DEFAULT_CLUSTER_REFRESH = 60
 
 #: Minimum share of the correlation window a ticker must actually have traded
 #: through before it can be clustered -- a name with six overlapping days
 #: correlates with anything.
 _CLUSTER_MIN_COVERAGE = 0.5
+
+#: Where the refit schedule is anchored. It is a CONSTANT, not a function of
+#: the archive's length, and that is the whole point: an anchor derived from
+#: len(calendar) makes a past label depend on how much FUTURE data happens to
+#: be loaded, so rebuilding after one more day arrives would silently
+#: renumber history (Copilot review). Refit positions are now
+#: min(cluster_window, this) - 1 and every cluster_refresh after, which
+#: appending rows can only extend, never move.
+_CLUSTER_ANCHOR_ROWS = 20
 
 #: Calendar-day gap clip: anything beyond two weeks of silence carries no
 #: extra signal over "long halt" and would otherwise dominate normalization.
@@ -185,6 +197,209 @@ MARKET_SUMMARY_NAMES: tuple[str, ...] = ("mkt_median_ret", "mkt_frac_down2", "mk
 #: Floor for normalization standard deviations -- a constant feature (e.g.
 #: volume_missing in an all-volume archive) must normalize to 0, not inf.
 _STD_FLOOR = 1e-8
+
+
+#: --- The optional "calculus" block (off by default) -------------------
+#: Trailing rows between the two realized_vol_20 readings vol20_roc
+#: compares. A week: short enough to register a regime change quickly,
+#: long enough that the 20-row windows being compared barely overlap.
+_VOL_ROC_LAG = 5
+
+#: Bound on vol20_roc. A log-ratio of realized vols is unbounded, and one
+#: degenerate reading (a ticker emerging from a flat, zero-vol stretch)
+#: would otherwise dominate this column's SINGLE global normalization
+#: mean/std for the whole universe. +-3.0 is a 20x change in realized vol.
+VOL_ROC_CLIP = 3.0
+
+#: Savitzky-Golay: fit a degree-2 polynomial to the trailing SG_WINDOW log
+#: prices and read its 1st/2nd derivative AT THE WINDOW'S RIGHT EDGE.
+#: Deliberately NOT scipy.signal.savgol_filter -- that one is CENTERED, so
+#: it reads future rows and would break this module's no-lookahead
+#: invariant (and scipy is only a transitive dependency here anyway).
+SG_WINDOW = 11
+SG_DEGREE = 2
+
+#: Fractional differentiation (Lopez de Prado, Advances in Financial
+#: Machine Learning ch. 5): difference by a FRACTIONAL order instead of
+#: integer order 1, so the series sheds most of its trend while keeping the
+#: long memory that ret_close throws away. d and tau are chosen by warm-up
+#: budget, not by a stationarity test: at d=0.4 a tau of 1e-3 truncates the
+#: kernel at 55 taps, where 1e-4 would need 282. The harness only forecasts
+#: rows where EVERY feature is finite, so a kernel wider than min_history
+#: would delay every ticker's first forecast and drop short-history tickers
+#: outright -- silently contradicting "missing stocks are never blockers".
+#: (Choosing d by an ADF test, as the book does, would also mean taking a
+#: statsmodels dependency this subproject does not have.)
+FRAC_DIFF_D = 0.4
+FRAC_DIFF_TAU = 1e-3
+FRAC_DIFF_MAX_WIDTH = 60
+
+
+def _frac_diff_weights(d: float, tau: float, max_width: int) -> np.ndarray:
+    """Truncated binomial weights w_k = -w_{k-1} (d - k + 1) / k, w_0 = 1."""
+    weights = [1.0]
+    while len(weights) < max_width:
+        following = -weights[-1] * (d - len(weights) + 1) / len(weights)
+        if abs(following) < tau:
+            break
+        weights.append(following)
+    return np.array(weights, dtype=np.float64)
+
+
+def _savgol_kernels(width: int, degree: int) -> tuple[np.ndarray, np.ndarray]:
+    """Fixed FIR kernels for the 1st/2nd derivative at a trailing window's edge.
+
+    Positions run 0, -1, ... -(width - 1) to match the newest-first window
+    ordering in _trailing_kernel(), so the polynomial's derivatives at
+    position 0 ARE the derivatives at day t. Both kernels sum to zero (the
+    derivative of a constant is zero), which is what makes them comparable
+    across a $5 and a $500 ticker without any anchoring.
+    """
+    positions = np.arange(0, -width, -1.0)
+    inverse = np.linalg.pinv(np.vander(positions, degree + 1, increasing=True))
+    return inverse[1], 2.0 * inverse[2]
+
+
+FRAC_DIFF_WEIGHTS: np.ndarray = _frac_diff_weights(FRAC_DIFF_D, FRAC_DIFF_TAU, FRAC_DIFF_MAX_WIDTH)
+SG_SLOPE_KERNEL, SG_CURVATURE_KERNEL = _savgol_kernels(SG_WINDOW, SG_DEGREE)
+
+CALCULUS_FEATURES: tuple[str, ...] = (
+    "ret_accel",
+    "vol20_roc",
+    "sg_slope",
+    "sg_curvature",
+    "frac_diff_close",
+)
+
+#: Optional feature blocks, appended at the TAIL of FEATURE_NAMES in the
+#: order requested. Tail-appending is load-bearing, not cosmetic: see the
+#: module docstring.
+FEATURE_BLOCKS: dict[str, tuple[str, ...]] = {"calculus": CALCULUS_FEATURES}
+
+
+def resolve_feature_names(extra_features: Sequence[str] | None = ()) -> tuple[str, ...]:
+    """The feature layout for a given set of optional blocks.
+
+    Refuses an unknown block name rather than falling back to the default
+    layout: a typo in a run's config must not leave that run quietly
+    missing the features it claims to have.
+
+    Typed as a Sequence so a caller passing a list type-checks (Antigravity
+    review: "Type hint flexibility for extra_features"), which opens one
+    hole worth closing explicitly: a bare ``str`` IS a Sequence[str], so
+    ``extra_features="calculus"`` would type-check and then iterate
+    CHARACTERS, refusing on 'c'. Caught by name here instead.
+    """
+    # None means "no optional blocks", the same way build_panel()'s
+    # tickers=None means "every ticker": callers threading an optional
+    # argument through a wrapper layer default it to None, and a bare
+    # TypeError out of dict.fromkeys() would be a poor way to say this
+    # (Antigravity review: "Graceful None handling in
+    # resolve_feature_names").
+    if extra_features is None:
+        extra_features = ()
+    if isinstance(extra_features, str):
+        raise ValueError(
+            f"REFUSED: extra_features must be a sequence of block names, not the bare string "
+            f"{extra_features!r}; pass ({extra_features!r},)"
+        )
+    names = FEATURE_NAMES
+    # dict.fromkeys: de-duplicate while preserving order, so a block named
+    # twice in a config does not append its columns twice.
+    for block in dict.fromkeys(extra_features):
+        if block not in FEATURE_BLOCKS:
+            raise ValueError(
+                f"REFUSED: unknown feature block {block!r}; known blocks: {sorted(FEATURE_BLOCKS)}"
+            )
+        names = names + FEATURE_BLOCKS[block]
+    return names
+
+
+def _trailing_kernel(values: np.ndarray, kernel: np.ndarray, *, anchored: bool = False) -> np.ndarray:
+    """Apply a fixed FIR ``kernel`` to each row's TRAILING window.
+
+    ``out[t] = kernel @ [values[t], values[t-1], ...]``, NaN until the
+    window fills -- causal by construction, which is the only reason these
+    columns can exist in this module at all.
+
+    ``anchored`` subtracts each window's OLDEST observation before the dot
+    product. The fractional-differencing kernel is truncated, so its weights
+    do not sum to zero (sum(w) = +0.136 at d=0.4) and a raw application to
+    log price would leak the price LEVEL: a ticker priced 100x higher with
+    an identical return shape lands +0.63 away on a column whose own signal
+    std is 0.033, and the panel fits ONE global mean/std per column, so
+    nothing downstream would wash it out. Anchoring removes the level term
+    exactly. The Savitzky-Golay kernels already sum to zero and need none.
+
+    Vectorized over the whole series (sliding_window_view + one matmul)
+    rather than looped per row: this runs once per ticker over a 26-year
+    archive, where a Python-level loop is a real cost.
+    """
+    width = kernel.size
+    out = np.full(values.shape[0], np.nan, dtype=np.float64)
+    if values.shape[0] < width:
+        return out
+    # Oldest-first windows, reversed to newest-first so index 0 is day t.
+    ordered = np.lib.stride_tricks.sliding_window_view(values, width)[:, ::-1]
+    if anchored:
+        ordered = ordered - ordered[:, -1:]
+    out[width - 1 :] = ordered @ kernel
+    return out
+
+
+def _add_calculus_features(out: pd.DataFrame, close: pd.Series) -> None:
+    """Append the optional calculus block to a computed feature frame."""
+    # Acceleration: the discrete second derivative of log price. ret_close
+    # is already "vs this ticker's own previous trading row", so its diff
+    # stays on the ticker's own clock across halts and gaps -- the same
+    # convention the targets use.
+    out["ret_accel"] = out["ret_close"].diff()
+
+    # Vol-of-vol DIRECTION, not level: realized_vol_20 says how volatile
+    # things are, this says which way that is moving.
+    realized = out["realized_vol_20"]
+    now = realized.to_numpy()
+    lagged = realized.shift(_VOL_ROC_LAG).to_numpy()
+    # A halted or thinly-traded ticker prints the same close for weeks and
+    # realized_vol_20 goes to EXACTLY 0, where a naive log-ratio is +-inf or
+    # NaN. Same graceful-degradation contract as close_position's 0.5 on a
+    # doji and volume_z's 0.0 on a missing row: neutral 0.0, never a
+    # non-finite value that would drop the ticker from the harness's
+    # all-features-finite eligibility filter for a month of valid days.
+    usable = np.isfinite(now) & np.isfinite(lagged) & (now > 0) & (lagged > 0)
+    warmed = np.isfinite(now) & np.isfinite(lagged)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ratio = np.where(usable, np.log(np.where(usable, now, 1.0) / np.where(usable, lagged, 1.0)), 0.0)
+    out["vol20_roc"] = np.where(warmed, np.clip(ratio, -VOL_ROC_CLIP, VOL_ROC_CLIP), np.nan)
+
+    # errstate: a corrupt non-positive close makes np.log emit a
+    # RuntimeWarning per bad row. The value it produces is already handled
+    # -- log(0) is -inf, which the Savitzky-Golay columns carry through as
+    # -inf and the ANCHORED frac-diff turns into NaN (-inf minus -inf);
+    # either way the row is non-finite, so it fails the harness's
+    # all-features-finite eligibility check, which is the correct outcome.
+    # The warning is therefore pure log noise on a full-universe run
+    # (Antigravity review: "Suppress RuntimeWarning on np.log for
+    # non-positive prices").
+    with np.errstate(invalid="ignore", divide="ignore"):
+        log_price = np.log(close.to_numpy(dtype=np.float64))
+    out["sg_slope"] = _trailing_kernel(log_price, SG_SLOPE_KERNEL)
+    out["sg_curvature"] = _trailing_kernel(log_price, SG_CURVATURE_KERNEL)
+    out["frac_diff_close"] = _trailing_kernel(log_price, FRAC_DIFF_WEIGHTS, anchored=True)
+
+
+#: Which function computes each optional block. Kept beside FEATURE_BLOCKS
+#: and checked against it at import: a block added to one registry and not
+#: the other used to mean the columns were NAMED in the layout but never
+#: COMPUTED, which surfaces only as a wholly-NaN feature much later
+#: (Antigravity review: "Modular feature block dispatching").
+_BLOCK_BUILDERS: dict[str, Any] = {"calculus": _add_calculus_features}
+
+if set(_BLOCK_BUILDERS) != set(FEATURE_BLOCKS):
+    raise RuntimeError(
+        "REFUSED: feature block registries disagree; "
+        f"FEATURE_BLOCKS={sorted(FEATURE_BLOCKS)} builders={sorted(_BLOCK_BUILDERS)}"
+    )
 
 
 def _wilder_smooth(values: np.ndarray, period: int, *, start: int = 0) -> np.ndarray:
@@ -301,8 +516,11 @@ def _signed_streak(close: pd.Series) -> np.ndarray:
     return np.clip(streak.to_numpy(dtype=float), -_STREAK_CLIP, _STREAK_CLIP)
 
 
-def compute_ticker_features(frame: pd.DataFrame) -> pd.DataFrame:
+def compute_ticker_features(frame: pd.DataFrame, *, extra_features: Sequence[str] = ()) -> pd.DataFrame:
     """Per-ticker causal features + targets for one adjusted, Date-sorted frame.
+
+    ``extra_features`` names optional blocks to append (see
+    :func:`resolve_feature_names`); the default is the base layout alone.
 
     Returns a frame with Date, the PER_TICKER_FEATURES columns, day_of_week,
     the four target columns (``target_open`` .. ``target_close``),
@@ -429,6 +647,13 @@ def compute_ticker_features(frame: pd.DataFrame) -> pd.DataFrame:
     gap = date_col.diff().dt.days.astype(float)
     out["gap_days"] = gap.clip(upper=_GAP_CLIP_DAYS)
     out["day_of_week"] = date_col.dt.dayofweek.astype(np.int8)
+    # Optional blocks read the base columns computed above, so they are
+    # appended here rather than interleaved. resolve_feature_names() is the
+    # single place that validates block names, so a typo refuses here too
+    # rather than silently returning the base layout.
+    resolve_feature_names(extra_features)
+    for block in dict.fromkeys(extra_features or ()):
+        _BLOCK_BUILDERS[block](out, close)
     # Targets: the NEXT row's bar as log-returns vs THIS row's close. A
     # ticker's "t+1" is its own next trading row, whatever the calendar gap
     # -- ragged histories are handled by eligibility, never by forward-fill.
@@ -587,7 +812,7 @@ def _cluster_once(window: pd.DataFrame, n_clusters: int) -> dict[str, int]:
     # never moved through the window has an undefined correlation with
     # everything, but excluding it would leave it permanently unassigned,
     # and the two cluster-derived features would then be NaN on every one
-    # of its rows -- costing it all 35 features, since the harness's
+    # of its rows -- costing it all 36 features, since the harness's
     # eligibility check needs the whole vector finite. It is admitted here
     # and the undefined correlations become the uncorrelated distance below.
     usable = [ticker for ticker in window.columns if window[ticker].count() >= minimum]
@@ -598,7 +823,13 @@ def _cluster_once(window: pd.DataFrame, n_clusters: int) -> dict[str, int]:
         # One group: no distance matrix needed, and sklearn will not fit a
         # single cluster over a single sample anyway.
         return dict.fromkeys(usable, 1)
-    correlation = window[usable].corr()
+    # min_periods applies the same floor PAIRWISE. The per-ticker coverage
+    # check above admits two names that each traded half the window; without
+    # this they could still share only a couple of days and produce a
+    # spurious +/-1 correlation from that overlap alone (Copilot review).
+    # Under-overlapped pairs come back NaN and take the uncorrelated
+    # distance below.
+    correlation = window[usable].corr(min_periods=minimum)
     # 1 - corr is the standard correlation distance. A pair with no
     # overlapping days has no correlation to speak of, and 1.0 (the
     # uncorrelated distance) is the honest filler.
@@ -637,13 +868,11 @@ def _assign_clusters(
     labels = pd.DataFrame(np.nan, index=index, columns=returns_wide.columns, dtype=float)
     previous: dict[str, int] = {}
     effective_cap = max(1, min(n_clusters, len(returns_wide.columns) // 2 or 1))
-    # An archive shorter than the requested window still gets clustered, from
-    # whatever history it has. Skipping the refit entirely would leave every
-    # row unassigned, both cluster features NaN throughout, and therefore no
-    # fully-finite row anywhere -- which makes build_panel refuse a short
-    # archive it used to handle. The window below is a tail(), so it simply
-    # comes back shorter.
-    first_refit = min(cluster_window, len(index)) - 1
+    # Anchored to a constant, never to len(index): the window below is a
+    # tail(), so an archive shorter than cluster_window simply clusters from
+    # less history instead of not at all, and appending rows can only add
+    # later refits -- it can never move or unassign an earlier one.
+    first_refit = min(cluster_window, _CLUSTER_ANCHOR_ROWS) - 1
     for position in range(first_refit, len(index), cluster_refresh):
         refit_date = index[position]
         window = returns_wide.loc[:refit_date].tail(cluster_window)
@@ -651,6 +880,12 @@ def _assign_clusters(
         if not assignment:
             continue
         assignment = _align_cluster_labels(assignment, previous, effective_cap)
+        # Every ticker is reset to unassigned FIRST, then the successful
+        # assignments overlay it. Writing only the assignments would let
+        # ffill carry a stale label forward for a ticker that dropped out of
+        # this refit (coverage fell away), and its rows would then be ranked
+        # inside a peer group it is no longer part of (Copilot review).
+        labels.loc[refit_date, :] = 0.0
         for ticker, label in assignment.items():
             labels.loc[refit_date, ticker] = label
         previous = assignment
@@ -669,8 +904,9 @@ def build_panel(
     initial_train_end: pd.Timestamp | None = None,
     min_history: int = 60,
     n_clusters: int = _DEFAULT_N_CLUSTERS,
-    cluster_window: int = _DEFAULT_CLUSTER_WINDOW,
+    cluster_window: int | None = None,
     cluster_refresh: int = _DEFAULT_CLUSTER_REFRESH,
+    extra_features: Sequence[str] = (),
 ) -> TrainingPanel:
     """Assemble the full in-memory panel from the per-ticker CSV archive.
 
@@ -683,6 +919,11 @@ def build_panel(
     that give the models the most to learn from. NOTE: there is deliberately
     no ``start`` truncation here -- prediction start is the harness's
     concern; training reaches as far back as each archive goes.
+
+    ``extra_features`` names optional feature blocks to append to the
+    layout (see :func:`resolve_feature_names`). The default is the base
+    layout, byte-for-byte what every existing checkpoint and frozen
+    normalization vector was built against.
 
     Normalization statistics (per-feature mean/std) are computed over rows
     whose date is at or before ``initial_train_end`` (all rows when None)
@@ -769,7 +1010,11 @@ def build_panel(
             f"{history_dir} (skipped: {dict(sorted(skipped.items())[:10])}{'...' if len(skipped) > 10 else ''})"
         )
 
-    per_ticker = {ticker: compute_ticker_features(frame) for ticker, frame in frames.items()}
+    feature_names = resolve_feature_names(extra_features)
+    per_ticker = {
+        ticker: compute_ticker_features(frame, extra_features=extra_features)
+        for ticker, frame in frames.items()
+    }
 
     # --- Cross-sectional pass: pooled long frame of each day's returns. ---
     # trailing_ret_20 / realized_vol_20 ride along so the universe can be
@@ -793,11 +1038,17 @@ def build_panel(
     returns_wide = long_frame.pivot_table(index="Date", columns="ticker", values="ret_close")
     calendar_index = np.array(sorted(market.index.to_numpy()), dtype="datetime64[ns]")
     returns_wide = returns_wide.reindex(pd.DatetimeIndex(calendar_index))
+    # Derived from min_history rather than fixed, so --min-history stays the
+    # one knob that decides how much warm-up a ticker needs; a hard-coded
+    # window silently overrode it (Copilot review).
+    effective_window = cluster_window if cluster_window is not None else max(
+        _CLUSTER_ANCHOR_ROWS, min_history
+    )
     cluster_labels = _assign_clusters(
         returns_wide,
         calendar_index,
         n_clusters=n_clusters,
-        cluster_window=cluster_window,
+        cluster_window=effective_window,
         cluster_refresh=cluster_refresh,
     )
     stacked = cluster_labels.stack()
@@ -875,7 +1126,7 @@ def build_panel(
         cluster_column = (
             cluster_labels[ticker].reindex(computed["Date"]).fillna(0).to_numpy(dtype=np.int8)
         )
-        feature_matrix = joined[list(FEATURE_NAMES)].to_numpy(dtype=np.float32)
+        feature_matrix = joined[list(feature_names)].to_numpy(dtype=np.float32)
         target_matrix = computed[["target_open", "target_high", "target_low", "target_close"]].to_numpy(
             dtype=np.float32
         )
@@ -894,13 +1145,13 @@ def build_panel(
         for row_index, date in enumerate(dates):
             date_index.setdefault(pd.Timestamp(date), []).append((ticker, row_index))
 
-    normalization = _fit_normalization(series, initial_train_end)
+    normalization = _fit_normalization(series, initial_train_end, feature_names)
     return TrainingPanel(
         series=series,
         tickers=tickers_sorted,
         calendar=calendar,
         date_index=date_index,
-        feature_names=FEATURE_NAMES,
+        feature_names=feature_names,
         normalization=normalization,
         min_history=min_history,
         market_summary=market_summary,
@@ -919,10 +1170,16 @@ def refreeze_normalization(panel: TrainingPanel, initial_train_end: pd.Timestamp
     cursor"). Ordinary online updates never call this -- the freeze rule
     stands; a retrain is the one sanctioned re-freeze.
     """
-    panel.normalization = _fit_normalization(panel.series, initial_train_end)
+    # panel.feature_names, not FEATURE_NAMES: a panel built with optional
+    # blocks must refit over ITS layout, not the default one.
+    panel.normalization = _fit_normalization(panel.series, initial_train_end, panel.feature_names)
 
 
-def _fit_normalization(series: dict[str, TickerSeries], initial_train_end: pd.Timestamp | None) -> dict:
+def _fit_normalization(
+    series: dict[str, TickerSeries],
+    initial_train_end: pd.Timestamp | None,
+    feature_names: tuple[str, ...] = FEATURE_NAMES,
+) -> dict:
     """Per-feature mean/std over finite rows inside the initial-fit window.
 
     Falls back to the full history if the window holds no fully finite row
@@ -951,7 +1208,7 @@ def _fit_normalization(series: dict[str, TickerSeries], initial_train_end: pd.Ti
         rows"). Matches np.nanmean/np.nanstd(ddof=0)'s per-column,
         NaN-skipping semantics exactly.
         """
-        n_features = len(FEATURE_NAMES)
+        n_features = len(feature_names)
         count = np.zeros(n_features, dtype=np.float64)
         total = np.zeros(n_features, dtype=np.float64)
         total_sq = np.zeros(n_features, dtype=np.float64)

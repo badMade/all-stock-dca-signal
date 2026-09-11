@@ -201,6 +201,12 @@ def _redacted(text: str) -> str:
     return _redacted_diagnostic_text(text)
 
 
+def _log_redacted_exception(message: str, *args: object) -> None:
+    """Redact the entire exception chain before handing text to log handlers."""
+    diagnostic = message % args if args else message
+    logger.error("%s\n%s", _redacted(diagnostic), _redacted(traceback.format_exc()))
+
+
 def _trading_day_et(now: Optional[datetime] = None) -> str:
     from zoneinfo import ZoneInfo
 
@@ -398,12 +404,12 @@ def write_failed_start_marker(
             with (day_dir / f"{stream}{ATTEMPT_LOG_HISTORY_SUFFIX}").open("a", encoding="utf-8") as handle:
                 handle.write(serialized + "\n")
         except OSError:
-            logger.exception("failed-start attempt-history append failed for %s", stream)
+            _log_redacted_exception("failed-start attempt-history append failed for %s", stream)
         path = day_dir / f"{stream}.json"
         atomic_write_text(path, serialized, encoding="utf-8")
         return path
     except Exception:  # noqa: BLE001 - see alert_failure/send_heartbeat above
-        logger.exception("failed-start marker write raised for %s", stream)
+        _log_redacted_exception("failed-start marker write raised for %s", stream)
         return None
 
 
@@ -524,15 +530,15 @@ def guarded_run(
     try:
         result = fn()
     except Exception as exc:
-        logger.exception("live %s run failed", stream)
+        _log_redacted_exception("live %s run failed", stream)
         try:
             alert_failure(stream, exc, context=config.context)
         except Exception:  # noqa: BLE001 - alerting errors must not mask the run failure
-            logger.exception("alert_failure raised while handling a %s run failure", stream)
+            _log_redacted_exception("alert_failure raised while handling a %s run failure", stream)
         try:
             send_heartbeat(stream, ok=False)
         except Exception:  # noqa: BLE001 - alerting errors must not mask the run failure
-            logger.exception("send_heartbeat raised while handling a %s run failure", stream)
+            _log_redacted_exception("send_heartbeat raised while handling a %s run failure", stream)
         try:
             # Probe whether the run already persisted its own artifact, so
             # the marker records the failure PHASE rather than unconditionally
@@ -545,19 +551,19 @@ def guarded_run(
                 try:
                     artifact_written = config.run_artifact_written()
                 except Exception:  # noqa: BLE001 - a broken probe must not lose the marker
-                    logger.exception("run_artifact_written probe raised for %s; recording a failed start", stream)
+                    _log_redacted_exception("run_artifact_written probe raised for %s; recording a failed start", stream)
             write_failed_start_marker(
                 stream, exc, root=config.attempt_log_root, run_artifact_written=artifact_written
             )
         except Exception:  # noqa: BLE001 - alerting errors must not mask the run failure
-            logger.exception("write_failed_start_marker raised while handling a %s run failure", stream)
+            _log_redacted_exception("write_failed_start_marker raised while handling a %s run failure", stream)
         raise
     ok = True
     if config.result_ok is not None:
         try:
             ok = config.result_ok(result)
         except Exception:  # noqa: BLE001 - fail closed: a broken predicate must not report healthy
-            logger.exception("result_ok predicate raised for %s; pinging failed heartbeat", stream)
+            _log_redacted_exception("result_ok predicate raised for %s; pinging failed heartbeat", stream)
             ok = False
     if not ok:
         # The one channel that needs no configuration: Slack and heartbeats
@@ -578,5 +584,5 @@ def guarded_run(
             )
         send_heartbeat(stream, ok=ok)
     except Exception:  # noqa: BLE001 - see above
-        logger.exception("heartbeat raised for %s", stream)
+        _log_redacted_exception("heartbeat raised for %s", stream)
     return result

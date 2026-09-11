@@ -1,6 +1,7 @@
 """Tests for the opt-in whole-share accumulation module (see docs/whole_share_accumulation.md)."""
 
 import json
+from typing import Any, cast
 
 import pytest
 
@@ -1812,7 +1813,7 @@ def test_reconcile_unresolved_whole_share_claim_uses_the_original_claim_timestam
             return {"id": "RH-1", "state": "filled", "quantity": "1"}
 
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _MatchingBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _MatchingBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     assert reconciled == {"order_id": "RH-1", "shares_purchased": 1, "order_notional_usd": 10.0}
@@ -1844,7 +1845,7 @@ def test_reconcile_unresolved_whole_share_claim_requires_an_exact_ref_id_match(t
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _NoExactMatchBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _NoExactMatchBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     assert reconciled is None
@@ -1889,7 +1890,7 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_order(tmp_pa
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _StillWorkingBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _StillWorkingBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     # Codex review ("Book live orders discovered during claim recovery"):
@@ -1928,7 +1929,7 @@ def test_reconcile_unresolved_whole_share_claim_settles_a_terminal_filled_order(
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _FilledBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _FilledBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     assert reconciled == {"order_id": "RH-FILLED-1", "shares_purchased": 1, "order_notional_usd": 10.0}
@@ -1960,8 +1961,9 @@ def test_reconcile_still_falls_back_when_the_cumulative_field_is_blank(tmp_path,
                 "quantity": "1",
             }
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _NoCumulativeFieldBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _NoCumulativeFieldBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     assert reconciled == {"order_id": "RH-NOCUM-1", "shares_purchased": 1, "order_notional_usd": 10.0}
@@ -1991,8 +1993,9 @@ def test_reconcile_uses_the_claim_size_when_both_size_fields_are_blank(tmp_path,
                 "quantity": blank_quantity,
             }
 
+    assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _SizelessBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _SizelessBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     assert reconciled == {"order_id": "RH-NOSIZE-1", "shares_purchased": 1, "order_notional_usd": 10.0}
@@ -2039,7 +2042,7 @@ def test_reconcile_unresolved_whole_share_claim_settles_a_partial_fill_before_ca
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _PartialFillThenCanceledBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _PartialFillThenCanceledBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     assert reconciled is not None
@@ -2102,7 +2105,7 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_any_state_fa
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _RaceConditionStillLiveBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _RaceConditionStillLiveBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     assert reconciled is None
@@ -2144,7 +2147,7 @@ def test_reconcile_unresolved_whole_share_claim_falls_back_to_quantity_for_a_fil
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _FilledViaAnyStateNoCumulativeQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY",
+        ledger, cast(Any, _FilledViaAnyStateNoCumulativeQuantityBroker()), "BYDDY", "afternoon", "afternoon-BYDDY",
         "2026-08-16", unresolved,
     )
 
@@ -2197,7 +2200,7 @@ def test_reconcile_falls_back_to_quantity_for_a_filled_any_state_match_with_a_bl
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _FilledViaAnyStateBlankCumulativeBroker(), "BYDDY", "afternoon", "afternoon-BYDDY",
+        ledger, cast(Any, _FilledViaAnyStateBlankCumulativeBroker()), "BYDDY", "afternoon", "afternoon-BYDDY",
         "2026-08-16", unresolved,
     )
 
@@ -2237,7 +2240,7 @@ def test_reconcile_unresolved_whole_share_claim_does_not_fall_back_to_quantity_f
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _CanceledViaAnyStateNoCumulativeQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY",
+        ledger, cast(Any, _CanceledViaAnyStateNoCumulativeQuantityBroker()), "BYDDY", "afternoon", "afternoon-BYDDY",
         "2026-08-16", unresolved,
     )
 
@@ -2291,7 +2294,7 @@ def test_reconcile_unresolved_whole_share_claim_does_not_treat_requested_quantit
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _RejectedNoCumulativeQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16",
+        ledger, cast(Any, _RejectedNoCumulativeQuantityBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16",
         unresolved,
     )
 
@@ -2361,7 +2364,7 @@ def test_reconcile_unresolved_whole_share_claim_releases_a_confirmed_zero_fill_c
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _ZeroFillRejectedBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
+        ledger, cast(Any, _ZeroFillRejectedBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
         now_iso="2026-08-16T15:45:00-04:00",  # 1 second after claimed_at -- not stale
     )
 
@@ -2409,7 +2412,7 @@ def test_reconcile_unresolved_whole_share_claim_leaves_the_claim_reserved_when_t
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _TerminalNoQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
+        ledger, cast(Any, _TerminalNoQuantityBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
         now_iso="2026-08-16T15:45:00-04:00",  # 1 second after claimed_at -- not stale
     )
 
@@ -2458,7 +2461,7 @@ def test_reconcile_unresolved_whole_share_claim_leaves_the_claim_untouched_when_
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _TerminalLookupRaisesBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
+        ledger, cast(Any, _TerminalLookupRaisesBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
         now_iso="2026-08-16T15:45:00-04:00",  # well past staleness
     )
 
@@ -2700,6 +2703,7 @@ def test_a_claim_repriced_to_zero_shares_is_resolved_and_cannot_re_spend_consume
     preview = ledger.cached_fire_decision(
         "BYDDY", "2026-08-16", "slot-1", "2026-08-16T16:04:00-04:00", 10.0
     )
+    assert preview is not None
     assert preview.shares_to_buy == 0
     assert preview.order_notional_usd == 0.0
     resolved_retry = ledger.record_contribution(

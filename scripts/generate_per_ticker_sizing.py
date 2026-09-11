@@ -142,7 +142,13 @@ def adjusted_low_drops(history_path: Path, start_date: str) -> list[float]:
                     ac_val = row[ac_idx] if ac_idx != -1 and len(row) > ac_idx else None
                     l_val = row[l_idx] if l_idx != -1 and len(row) > l_idx else None
 
-                    if d_val is not None and d_val >= start_date:
+                    if (
+                        d_val is not None
+                        and c_val is not None
+                        and ac_val is not None
+                        and l_val is not None
+                        and d_val >= start_date
+                    ):
                         prices.append((float(c_val), float(ac_val), float(l_val)))
                 except (ValueError, TypeError):
                     continue

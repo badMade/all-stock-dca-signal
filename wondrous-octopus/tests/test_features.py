@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import data
 import features
 import numpy as np
@@ -16,12 +18,50 @@ write_ticker_csv = conftest.write_ticker_csv
 compute_ticker_features = features.compute_ticker_features
 build_panel = features.build_panel
 FEATURE_NAMES = features.FEATURE_NAMES
+resolve_feature_names = features.resolve_feature_names
+CALCULUS_FEATURES = features.CALCULUS_FEATURES
+FRAC_DIFF_WEIGHTS = features.FRAC_DIFF_WEIGHTS
 MARKET_SUMMARY_NAMES = features.MARKET_SUMMARY_NAMES
 
 
 def _adjusted(frame):
     adjusted, _ = data.adjusted_ohlc(frame)
     return adjusted
+
+
+def _log_return_frame(log_returns, *, start_price=50.0, start=conftest.DEFAULT_START):
+    """An adjusted frame whose close path follows ``log_returns`` EXACTLY.
+
+    Every bar is a doji (Open == High == Low == Close), which is a
+    degenerate-but-legal bar the data layer already handles (see
+    test_doji_bar_close_position_is_neutral) and which makes ret_close[t]
+    exactly ``log_returns[t - 1]``. The calculus features are all functions
+    of the close path alone, so pinning that path exactly is what lets the
+    tests below assert hand-computed values instead of plausible ranges.
+    """
+    prices = start_price * np.exp(np.cumsum(np.concatenate([[0.0], np.asarray(log_returns, dtype=float)])))
+    frame = pd.DataFrame(
+        {
+            "Date": pd.bdate_range(start=start, periods=len(prices)),
+            "Open": prices,
+            "High": prices,
+            "Low": prices,
+            "Close": prices,
+            "Adj Close": prices,
+            "Dividends": 0.0,
+            "Stock Splits": 0.0,
+            "Volume": 1_000_000,
+        }
+    )
+    return _adjusted(frame)
+
+
+def _autocorrelation(values, lag):
+    """Lag-``lag`` autocorrelation over the finite rows of ``values``."""
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    centered = finite - finite.mean()
+    return float((centered[lag:] @ centered[:-lag]) / (centered @ centered))
 
 
 class TestComputeTickerFeatures:
@@ -109,6 +149,267 @@ class TestComputeTickerFeatures:
         assert np.isfinite(computed.loc[25, "trailing_ret_20"])
 
 
+class TestCalculusFeatures:
+    """The OPT-IN calculus block: acceleration, vol-of-vol, causal
+    Savitzky-Golay derivatives, and fractional differencing.
+
+    Every column here is a function of the close path alone, so these tests
+    drive a hand-built path through _log_return_frame() and assert exact
+    values rather than "looks plausible" ranges.
+    """
+
+    def test_calculus_columns_are_absent_by_default(self, synthetic_history_dir):
+        # The block is opt-in on purpose: the DEFAULT layout has to stay
+        # byte-for-byte what every existing checkpoint, frozen normalization
+        # vector and octopus feat_proj weight matrix was built against.
+        assert not set(CALCULUS_FEATURES) & set(FEATURE_NAMES)
+        frame = _adjusted(make_synthetic_ohlcv(n=80, seed=30))
+        assert not set(CALCULUS_FEATURES) & set(compute_ticker_features(frame).columns)
+        panel = build_panel(synthetic_history_dir, min_history=60)
+        assert panel.feature_names == FEATURE_NAMES
+
+    def test_calculus_columns_append_after_the_existing_layout(self):
+        # Appended at the TAIL, never inside the per-ticker block: the
+        # harness's _BAR_FEATURE_SLICE = slice(0, 4) and baseline_model's
+        # module-level FEATURE_NAMES.index("ret_open"/...) constants are
+        # POSITIONAL and resolved at import against the default tuple.
+        # Tail-appending keeps every existing index valid in both layouts,
+        # which is what makes the flag purely additive.
+        extended = resolve_feature_names(("calculus",))
+        assert extended[: len(FEATURE_NAMES)] == FEATURE_NAMES
+        assert extended[len(FEATURE_NAMES) :] == CALCULUS_FEATURES
+        assert extended[:4] == ("ret_open", "ret_high", "ret_low", "ret_close")
+
+    def test_unknown_feature_block_is_refused(self):
+        # Fail closed, the house rule everywhere else in this module: a
+        # typo'd block name must refuse, not silently build the default
+        # layout and leave a run quietly missing the features its own
+        # config claims it has.
+        with pytest.raises(ValueError, match="REFUSED"):
+            resolve_feature_names(("calcuslus",))
+
+    def test_a_bare_string_block_name_is_refused(self):
+        # A bare str IS a Sequence[str], so extra_features="calculus"
+        # type-checks and then iterates CHARACTERS -- refusing on 'c' with
+        # a message that points at the wrong thing. Caught by name instead
+        # (Antigravity review: "Type hint flexibility for extra_features").
+        with pytest.raises(ValueError, match="REFUSED: extra_features must be a sequence"):
+            resolve_feature_names("calculus")
+
+    def test_a_list_of_block_names_resolves_like_a_tuple(self):
+        assert resolve_feature_names(["calculus"]) == resolve_feature_names(("calculus",))
+
+    def test_none_means_no_optional_blocks(self):
+        # The same idiom build_panel()'s tickers=None already uses. A
+        # caller threading an optional argument through a wrapper layer
+        # defaults it to None, and a bare TypeError out of dict.fromkeys()
+        # would be a poor way to say "no blocks" (Antigravity review
+        # regression: "Graceful None handling").
+        assert resolve_feature_names(None) == FEATURE_NAMES
+        frame = _adjusted(make_synthetic_ohlcv(n=40, seed=38))
+        assert not set(CALCULUS_FEATURES) & set(compute_ticker_features(frame, extra_features=None).columns)
+
+    def test_every_named_block_has_a_builder(self):
+        # A block added to the layout registry but not the compute one
+        # would be NAMED in feature_names and never COMPUTED, surfacing
+        # only as a wholly-NaN column much later. features.py cross-checks
+        # the two registries at import; this pins that they stay in step
+        # (Antigravity review: "Modular feature block dispatching").
+        assert set(features._BLOCK_BUILDERS) == set(features.FEATURE_BLOCKS)
+        for block, columns in features.FEATURE_BLOCKS.items():
+            computed = compute_ticker_features(
+                _adjusted(make_synthetic_ohlcv(n=120, seed=39)), extra_features=(block,)
+            )
+            for column in columns:
+                assert column in computed.columns, (block, column)
+                assert np.isfinite(computed[column].to_numpy()[-1]), (block, column)
+
+    def test_acceleration_is_the_difference_of_consecutive_close_returns(self):
+        # The literal discrete second derivative of log price. The feature
+        # set already carries level and velocity (the ret_* columns); this
+        # is the curvature term, and it is one .diff() to compute.
+        frame = _adjusted(make_synthetic_ohlcv(n=60, seed=31))
+        computed = compute_ticker_features(frame, extra_features=("calculus",))
+        row = 30
+        expected = computed.loc[row, "ret_close"] - computed.loc[row - 1, "ret_close"]
+        assert computed.loc[row, "ret_accel"] == pytest.approx(expected, rel=1e-12)
+
+    def test_vol_roc_tracks_the_direction_of_a_volatility_regime_change(self):
+        # This is the whole point of the column: realized_vol_20 says how
+        # volatile things ARE, vol20_roc says which way that is moving --
+        # a derivative of a derivative, direction rather than level.
+        rng = np.random.default_rng(21)
+        calm_storm_calm = np.concatenate(
+            [rng.normal(0.0, 0.004, 120), rng.normal(0.0, 0.020, 120), rng.normal(0.0, 0.004, 120)]
+        )
+        computed = compute_ticker_features(_log_return_frame(calm_storm_calm), extra_features=("calculus",))
+        roc = computed["vol20_roc"].to_numpy()
+        assert np.nanmean(roc[122:146]) > 0.1  # measured +0.32 entering the storm
+        assert np.nanmean(roc[242:266]) < -0.1  # measured -0.41 leaving it
+        assert abs(np.nanmean(roc[60:111])) < 0.1  # measured +0.03 inside a calm stretch
+
+    def test_vol_roc_is_neutral_and_finite_across_a_zero_volatility_stretch(self):
+        # A halted or thinly-traded ticker prints the same close for weeks:
+        # realized_vol_20 goes to EXACTLY 0 and a naive log-ratio would be
+        # -inf, +inf or NaN. Same graceful-degradation contract as
+        # close_position's 0.5 on a doji and volume_z's 0.0 on a missing
+        # row -- neutral 0.0, never a non-finite value that would drop the
+        # ticker from the harness's all-features-finite eligibility filter
+        # for a month of otherwise-valid days.
+        rng = np.random.default_rng(32)
+        with_flat_stretch = np.concatenate(
+            [rng.normal(0.0, 0.015, 80), np.zeros(60), rng.normal(0.0, 0.015, 80)]
+        )
+        computed = compute_ticker_features(_log_return_frame(with_flat_stretch), extra_features=("calculus",))
+        roc = computed["vol20_roc"].to_numpy()
+        assert (roc[125:141] == 0.0).all()  # both endpoints of the ratio are exactly zero
+        assert np.isfinite(roc[141:150]).all()  # and the edge, where only the LAGGED endpoint is zero
+        assert np.isfinite(roc[25:]).all()
+        # Clipped, so one degenerate ratio cannot dominate the panel's single
+        # global mean/std for this column.
+        assert np.nanmax(np.abs(roc)) <= features.VOL_ROC_CLIP
+
+    def test_savgol_kernels_are_level_invariant(self):
+        # Both kernels must sum to zero -- the derivative of a constant is
+        # zero, so a $5 and a $500 ticker with the same shape have to give
+        # the same slope and curvature. (This is exactly the property
+        # frac_diff's TRUNCATED kernel does not have; hence the anchoring
+        # in test_frac_diff_is_invariant_to_the_price_level.)
+        assert float(np.sum(features.SG_SLOPE_KERNEL)) == pytest.approx(0.0, abs=1e-12)
+        assert float(np.sum(features.SG_CURVATURE_KERNEL)) == pytest.approx(0.0, abs=1e-12)
+
+    def test_savgol_slope_and_curvature_are_exact_on_a_quadratic_log_price(self):
+        # The strongest correctness statement available for these two: a
+        # degree-2 causal fit must reproduce the TRUE first and second
+        # derivative of an exactly quadratic log-price path, evaluated at
+        # the window's right edge. Measured error: under 2e-15 absolute.
+        positions = np.arange(200.0)
+        intercept, slope, curve = np.log(50.0), 0.001, -5e-6
+        log_price = intercept + slope * positions + curve * positions**2
+        frame = _log_return_frame(np.diff(log_price), start_price=float(np.exp(log_price[0])))
+        computed = compute_ticker_features(frame, extra_features=("calculus",))
+        for row in (50, 120, 199):
+            assert computed.loc[row, "sg_slope"] == pytest.approx(slope + 2 * curve * row, abs=1e-12)
+            assert computed.loc[row, "sg_curvature"] == pytest.approx(2 * curve, abs=1e-12)
+
+    def test_savgol_slope_is_less_noisy_than_the_raw_first_difference(self):
+        # Why the column exists at all: a smoothed local derivative without
+        # the lag a trailing moving average introduces. Measured on this
+        # path: sg_slope std 0.0105 against ret_close std 0.0166.
+        rng = np.random.default_rng(34)
+        computed = compute_ticker_features(
+            _log_return_frame(rng.normal(0.0003, 0.018, 299)), extra_features=("calculus",)
+        )
+        assert np.nanstd(computed["sg_slope"]) < 0.9 * np.nanstd(computed["ret_close"])
+
+    def test_calculus_features_read_only_past_rows(self):
+        # THE invariant of this module, asserted at the source rather than
+        # only through the archive path. It matters most for the
+        # Savitzky-Golay pair: scipy.signal.savgol_filter is CENTERED (it
+        # reads future rows), so anyone "simplifying" these columns into
+        # that call would silently break no-lookahead -- and scipy is not
+        # even a declared dependency here, only a transitive one.
+        base = make_synthetic_ohlcv(n=120, seed=33)
+        mutated = base.copy()
+        for column in ("Open", "High", "Low", "Close", "Adj Close"):
+            mutated.loc[60:, column] = mutated.loc[60:, column] * 1.5
+        clean = compute_ticker_features(_adjusted(base), extra_features=("calculus",))
+        perturbed = compute_ticker_features(_adjusted(mutated), extra_features=("calculus",))
+        for column in CALCULUS_FEATURES:
+            np.testing.assert_array_equal(
+                clean.loc[:59, column].to_numpy(), perturbed.loc[:59, column].to_numpy()
+            )
+
+    def test_frac_diff_matches_the_binomial_weight_recursion(self):
+        # Recompute Lopez de Prado's w_k = -w_{k-1} (d - k + 1) / k here,
+        # independently of the module's own kernel, and dot it against the
+        # anchored trailing window.
+        weights = [1.0]
+        while len(weights) < len(FRAC_DIFF_WEIGHTS):
+            weights.append(-weights[-1] * (features.FRAC_DIFF_D - len(weights) + 1) / len(weights))
+        np.testing.assert_allclose(FRAC_DIFF_WEIGHTS, weights, rtol=1e-12)
+
+        rng = np.random.default_rng(35)
+        frame = _log_return_frame(rng.normal(0.0003, 0.018, 200))
+        computed = compute_ticker_features(frame, extra_features=("calculus",))
+        row, width = 150, len(FRAC_DIFF_WEIGHTS)
+        window = np.log(frame["Close"].to_numpy())[row - width + 1 : row + 1][::-1]
+        expected = float(np.asarray(weights) @ (window - window[-1]))
+        assert computed.loc[row, "frac_diff_close"] == pytest.approx(expected, rel=1e-10)
+
+    def test_frac_diff_is_invariant_to_the_price_level(self):
+        # The truncated kernel does NOT sum to zero (measured sum(w) =
+        # +0.1359 at d = 0.4), so a raw FFD of log price leaks the price
+        # LEVEL: a ticker priced 100x higher with an identical return shape
+        # would sit +0.63 away on a feature whose own signal std is 0.033 --
+        # a 19x artifact. The panel fits ONE global mean/std per column, so
+        # nothing downstream would wash it out. Anchoring each window on its
+        # own oldest observation removes it exactly (measured residual
+        # 1.6e-15).
+        rng = np.random.default_rng(36)
+        path = rng.normal(0.0003, 0.018, 200)
+        cheap = compute_ticker_features(_log_return_frame(path, start_price=50.0), extra_features=("calculus",))
+        pricey = compute_ticker_features(
+            _log_return_frame(path, start_price=5000.0), extra_features=("calculus",)
+        )
+        np.testing.assert_allclose(
+            cheap["frac_diff_close"].to_numpy(),
+            pricey["frac_diff_close"].to_numpy(),
+            atol=1e-12,
+            equal_nan=True,
+        )
+
+    def test_frac_diff_retains_memory_that_first_differencing_destroys(self):
+        # The entire reason for the column. On an i.i.d. return path
+        # ret_close has essentially no autocorrelation by construction,
+        # while the fractionally differenced series stays strongly
+        # autocorrelated at lag 1 AND still at lag 20: long memory kept,
+        # which integer differencing throws away. Measured on this seed:
+        # ac(1) = 0.86 and ac(20) = 0.48 for frac_diff against ac(1) = 0.07
+        # for ret_close.
+        rng = np.random.default_rng(6)
+        computed = compute_ticker_features(
+            _log_return_frame(rng.normal(0.0003, 0.018, 400)), extra_features=("calculus",)
+        )
+        warm = len(FRAC_DIFF_WEIGHTS) - 1
+        frac_diff = computed["frac_diff_close"].to_numpy()[warm:]
+        returns = computed["ret_close"].to_numpy()[warm:]
+        assert _autocorrelation(frac_diff, 1) > 0.5
+        assert _autocorrelation(frac_diff, 20) > 0.2
+        assert abs(_autocorrelation(returns, 1)) < 0.25
+
+    def test_frac_diff_warmup_fits_inside_the_warmup_the_panel_already_pays(self):
+        # The harness only forecasts rows where EVERY feature is finite, so
+        # a kernel wider than min_history would delay every ticker's first
+        # forecast and drop short-history tickers outright -- silently
+        # contradicting "missing stocks are never blockers". Measured widths
+        # at d = 0.4: tau = 1e-3 gives 55 rows, tau = 1e-4 gives 282. That is
+        # why tau is 1e-3 and the width is hard-capped, rather than d being
+        # chosen by a stationarity test (which would also mean taking a
+        # statsmodels dependency this subproject does not have).
+        default_min_history = inspect.signature(build_panel).parameters["min_history"].default
+        assert len(FRAC_DIFF_WEIGHTS) <= default_min_history
+
+    def test_calculus_warmup_rows_are_nan_not_garbage(self):
+        # Parallel to test_warmup_rows_carry_nan_not_garbage: a warm-up row
+        # must be NaN, so eligibility filters it out, rather than a
+        # plausible-looking 0.0 that would train the models on fiction.
+        computed = compute_ticker_features(
+            _adjusted(make_synthetic_ohlcv(n=120, seed=37)), extra_features=("calculus",)
+        )
+        first_finite = {
+            column: int(np.flatnonzero(np.isfinite(computed[column].to_numpy()))[0])
+            for column in CALCULUS_FEATURES
+        }
+        assert first_finite == {
+            "ret_accel": 2,  # ret_close is NaN at row 0, so its diff is real from row 2
+            "vol20_roc": 25,  # realized_vol_20 (20) plus the 5-row comparison lag
+            "sg_slope": 10,  # the 11-row polynomial window
+            "sg_curvature": 10,
+            "frac_diff_close": 54,  # the 55-tap truncated binomial kernel
+        }
+
+
 class TestNoLookahead:
     """Perturb everything after day D; nothing at or before D may move."""
 
@@ -135,10 +436,14 @@ class TestNoLookahead:
             write_ticker_csv(perturbed_dir, ticker, mutated)
         return clean_dir, perturbed_dir, cutoff
 
-    def test_features_before_cutoff_are_bit_identical(self, tmp_path):
+    # Parametrized over the opt-in block so the calculus columns get the
+    # same bit-for-bit perturbation guarantee the base layout has, without
+    # a near-duplicate copy of this test.
+    @pytest.mark.parametrize("extra_features", [(), ("calculus",)])
+    def test_features_before_cutoff_are_bit_identical(self, tmp_path, extra_features):
         clean_dir, perturbed_dir, cutoff = self._build_archives(tmp_path)
-        clean = build_panel(clean_dir, initial_train_end=cutoff)
-        perturbed = build_panel(perturbed_dir, initial_train_end=cutoff)
+        clean = build_panel(clean_dir, initial_train_end=cutoff, extra_features=extra_features)
+        perturbed = build_panel(perturbed_dir, initial_train_end=cutoff, extra_features=extra_features)
         for ticker in clean.tickers:
             clean_series = clean.series[ticker]
             perturbed_series = perturbed.series[ticker]
@@ -1293,3 +1598,42 @@ class TestStyleClustering:
             cluster = int(panel.series[ticker].cluster_id[row])
             sizes[cluster] = sizes.get(cluster, 0) + 1
         assert max(sizes.values()) > 1, f"clamp produced singleton clusters only: {sizes}"
+
+
+class TestCalculusPanelLayout:
+    """Panel-level consequences of turning the block on."""
+
+    def test_enabling_calculus_leaves_the_shared_columns_bit_identical(self, synthetic_history_dir):
+        # The flag has to be purely ADDITIVE, or the A/B question it exists
+        # to answer ("does the calculus block earn its place?") would be
+        # comparing two different base feature sets.
+        base = build_panel(synthetic_history_dir, min_history=60)
+        extended = build_panel(synthetic_history_dir, min_history=60, extra_features=("calculus",))
+        assert extended.feature_names == FEATURE_NAMES + CALCULUS_FEATURES
+        for ticker in base.tickers:
+            np.testing.assert_array_equal(
+                base.series[ticker].features,
+                extended.series[ticker].features[:, : len(FEATURE_NAMES)],
+            )
+
+    def test_normalization_covers_the_calculus_columns(self, synthetic_history_dir):
+        # _fit_normalization()'s moments() sizes its accumulators from the
+        # feature layout; the hard-coded len(FEATURE_NAMES) it uses today
+        # would either crash or leave the new columns unnormalized once the
+        # block is on.
+        panel = build_panel(synthetic_history_dir, min_history=60, extra_features=("calculus",))
+        width = len(FEATURE_NAMES) + len(CALCULUS_FEATURES)
+        assert len(panel.normalization["mean"]) == width
+        assert len(panel.normalization["std"]) == width
+        assert np.isfinite(panel.normalization["mean"]).all()
+        assert (np.asarray(panel.normalization["std"]) > 0).all()
+
+    def test_short_history_tickers_still_join_with_calculus_on(self, synthetic_history_dir):
+        # CCC is the late-IPO fixture ticker (156 rows). With a 55-row
+        # frac-diff kernel it must still reach fully finite feature rows --
+        # that is the whole point of capping the kernel at min_history
+        # rather than at a stationarity threshold.
+        panel = build_panel(synthetic_history_dir, min_history=60, extra_features=("calculus",))
+        assert "CCC" not in panel.skipped
+        finite_rows = int(np.isfinite(panel.series["CCC"].features).all(axis=1).sum())
+        assert finite_rows > 0

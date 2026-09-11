@@ -6,6 +6,7 @@ import math
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any, cast
 
 import advise_tickers
 import pandas as pd
@@ -855,7 +856,7 @@ def test_score_candidate_still_attempts_sentiment_after_price_history_failure(mo
         lookback_years=3,
         skip_sentiment=False,
         news_api_key=None,
-        analyzer=_FakeAnalyzer(),
+        analyzer=cast(Any, _FakeAnalyzer()),
         history_dir=None,
     )
 
