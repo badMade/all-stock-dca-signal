@@ -286,6 +286,23 @@ ACTIVE_TICKERS = [
     # does not resolve. See config/tickers.json's notes.
     "LLY",
     "TSLA",
+    # SEP 11 2026 (user-requested): VIAV (Viavi Solutions Inc.), CIEN (Ciena
+    # Corporation), ANET (Arista Networks, Inc.), CSCO (Cisco Systems, Inc.),
+    # FFIV (F5, Inc.), and COHR (Coherent Corp.). As with VT/QBUT/RVII/RVI/
+    # VCX/TRLV/LLY/TSLA above, no Robinhood instrument search was run in-repo
+    # for any of the six (this session has no broker access) -- tradability,
+    # fractional tradability, and prior-close availability are unverified,
+    # and the run-time preflight and data-confidence gates admit or gate
+    # each out fail-closed if it does not resolve. None are in tickers.txt,
+    # so all six calibrate on the global fallback ladder until history is
+    # fetched and scripts/generate_per_ticker_sizing.py is re-run. See
+    # config/tickers.json's notes.
+    "VIAV",
+    "CIEN",
+    "ANET",
+    "CSCO",
+    "FFIV",
+    "COHR",
 ]
 
 # No ticker is categorically excluded (no mechanism to buy it at all) today.
