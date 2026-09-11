@@ -34,10 +34,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-pytest.importorskip('volatility')
-import volatility
-from data import COMPONENTS
-from features import build_panel
+pytest.importorskip("volatility")
+import volatility  # noqa: E402
+from data import COMPONENTS  # noqa: E402
+from features import build_panel  # noqa: E402
 
 
 def _simulate_garch(*, omega: float, alpha: float, beta: float, n: int, seed: int) -> np.ndarray:
