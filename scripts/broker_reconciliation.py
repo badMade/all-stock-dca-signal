@@ -491,8 +491,10 @@ def paginate_same_day_orders(
         try:
             response = orders_fn(**kwargs)
         except Exception as exc:  # noqa: BLE001 - a paging outage must fail closed, not crash
-            logger.warning("same-day order paging failed on page %d: %s", pages + 1, exc)
-            reasons.append(f"page_fetch_exception: {exc}")
+            # Transport exception messages can contain account credentials.
+            detail = type(exc).__name__
+            logger.warning("same-day order paging failed on page %d: %s", pages + 1, detail)
+            reasons.append(f"page_fetch_exception: {detail}")
             break
         pages += 1
         if isinstance(response, dict):
@@ -641,7 +643,7 @@ def same_day_order_snapshot(
         try:
             response = fetch_by_id(account_number=account_number, order_id=oid)
         except Exception as exc:  # noqa: BLE001 - fallback outage fails closed for that id
-            logger.warning("order-id fallback lookup failed for %s: %s", oid, exc)
+            logger.warning("order-id fallback lookup failed for %s: %s", oid, type(exc).__name__)
             unresolved.append(oid)
             reasons.append(f"fallback_exception:{oid}")
             continue

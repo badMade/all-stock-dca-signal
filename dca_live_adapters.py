@@ -45,6 +45,7 @@ from near_close_dca import (
     OrderPlacementAmbiguousError,
     SourceName,
     WholeSharePlacementTerminalError,
+    _DiagnosticRedactionFilter,
     _is_blank_broker_field,
     _normalize_broker_lifecycle_alias,
     _normalized_order_id,
@@ -57,6 +58,8 @@ from near_close_dca import (
 )
 
 logger = logging.getLogger("near_close_dca.live_adapters")
+# Parent logger filters do not run for propagated child records.
+logger.addFilter(_DiagnosticRedactionFilter())
 
 
 def _log_safe_repr(value: Any) -> str:

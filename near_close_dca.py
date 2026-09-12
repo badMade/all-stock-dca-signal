@@ -61,6 +61,7 @@ import os
 import re
 import secrets
 import statistics
+import traceback
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -24751,7 +24752,7 @@ def _process_buy_candidates_batch(
                 # exactly like skip_reason, so it is subject to the same
                 # secrets policy (Codex review, PR #786: "Redact unexpected
                 # exception text before persisting it"). logger.exception
-                # above already gave the operator the full traceback.
+                # above already gave the operator a redacted traceback.
                 published["candidate_processing_error"] = (
                     f"candidate processing raised {type(exc).__name__}"
                 )
@@ -24849,8 +24850,8 @@ def _process_buy_candidates_batch(
                 # dca_runner's own "place_fn raised {type}" treatment of
                 # connector exceptions (Codex review, PR #786: "Redact
                 # unexpected exception text before persisting it"). The
-                # full message still reaches the operator through
-                # logger.exception above, which is not a repo artifact.
+                # redacted message still reaches the operator through
+                # logger.exception above.
                 "skip_reason": f"candidate processing raised {type(exc).__name__}",
                 # schemas/run_state.schema.json REQUIRES planned_amount_usd to
                 # be a number, and _failure_candidate_row maps it straight from
@@ -31566,6 +31567,27 @@ def _redacted_diagnostic_text(message: str) -> str:
     message = _ACCOUNT_LABELED_DIGITS.sub(lambda m: f"{m.group(1)}[REDACTED]", message)
     message = _ACCOUNT_SHAPED_LITERAL.sub("[REDACTED]", message)
     return message
+
+
+class _DiagnosticRedactionFilter(logging.Filter):
+    """Remove secrets before handlers can format messages or exception chains."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            record.msg = _redacted_diagnostic_text(record.getMessage())
+            exception = "".join(traceback.format_exception(*record.exc_info)) if record.exc_info else record.exc_text
+            record.exc_text = _redacted_diagnostic_text(exception) if exception else None
+            record.stack_info = _redacted_diagnostic_text(record.stack_info) if record.stack_info else None
+        except Exception:  # Malformed diagnostics must not leak through logging.handleError.
+            record.msg = "Diagnostic unavailable: could not safely format log record"
+            record.exc_text = record.stack_info = None
+        record.args, record.exc_info = (), None
+        record.message = record.msg
+        return True
+
+
+# Logger filters run before all handlers; a handler-only filter misses other outputs.
+logger.addFilter(_DiagnosticRedactionFilter())
 
 
 def _persist_undurable_evidence_sidecar(
