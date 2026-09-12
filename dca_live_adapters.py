@@ -7801,8 +7801,10 @@ class RobinhoodBroker:
             # The order is already placed by the time we look up its fill; a transient
             # get_equity_orders failure should leave it recorded as submitted/unfilled,
             # not crash run_once before the durable artifacts are written.
+            # A separate line keeps a labeled order ID from swallowing the error
+            # type when the complete diagnostic is redacted again by the logger.
             logger.error(
-                "order-fill lookup failed for %s; recording as unfilled: %s",
+                "order-fill lookup failed for %s; recording as unfilled:\n%s",
                 _artifact_safe_repr(order_id),
                 _redacted_diagnostic_text("".join(traceback.format_exception_only(exc)).strip()),
             )
