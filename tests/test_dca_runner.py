@@ -12178,8 +12178,10 @@ def test_assess_dedupe_keeps_the_allocation_priority_winner_for_tier_selection()
 
 # ---------------------------------------------------------------------------
 # Daily order-count cap (config/budgets.json circuit_breakers.max_orders_per_day)
-# Added 2026-07-31 at Geoff's direction: at most 8 orders a day across all seven
-# slots and manual buying, changeable by editing that one config number.
+# Added 2026-07-31 at Geoff's direction: at most dca_runner.MAX_ORDERS_PER_DAY
+# orders a day across all seven slots and manual buying, changeable by editing
+# that one config number (120 as of 2026-09-11; see config/budgets.json's own
+# max_orders_per_day_note for why it moved from the original 8).
 # ---------------------------------------------------------------------------
 
 
@@ -12187,10 +12189,30 @@ def _count_cap_tier():
     return dca_runner.select_budget_tier(0.0, 0)
 
 
-def _count_cap_cands(n):
-    """n whitelisted 1x candidates at the $2 base, so nothing is refused for
-    sizing reasons and only the count cap can stop the batch."""
-    return [dca_runner.Candidate(t, 2.0, 1.0) for t in sorted(dca_runner.ACTIVE_TICKERS)[:n]]
+#: plan_orders() refuses any ticker outside dca_runner.ACTIVE_TICKERS (the
+#: real roster has 59 entries), so a test exercising "more candidates than
+#: the cap allows" now that MAX_ORDERS_PER_DAY is 120 needs a wider
+#: whitelist than the real roster provides. Synthetic, test-only tickers,
+#: swapped in per-test via _patch_wide_whitelist() rather than sliced from
+#: the real roster.
+_WIDE_TEST_WHITELIST = frozenset(f"CAND{i:04d}" for i in range(200))
+
+
+def _patch_wide_whitelist(monkeypatch):
+    monkeypatch.setattr(dca_runner, "ACTIVE_TICKERS", _WIDE_TEST_WHITELIST)
+
+
+def _count_cap_cands(n, amount_usd=1.0):
+    """n 1x candidates, so nothing is refused for sizing reasons. Defaults to
+    the $1 reduced base: now that MAX_ORDERS_PER_DAY (120) is well above what
+    the $2 base would clear before the $180 daily dollar cap does (90
+    orders), tests isolating the COUNT cap need the cheaper base so the
+    dollar cap stays out of the way; test_the_dollar_caps_still_bind... below
+    passes amount_usd=2.0 explicitly since it exercises the dollar cap
+    instead. Callers must first patch in _WIDE_TEST_WHITELIST via
+    _patch_wide_whitelist() when n can exceed the real ACTIVE_TICKERS
+    roster's 59 entries."""
+    return [dca_runner.Candidate(t, amount_usd, 1.0) for t in sorted(_WIDE_TEST_WHITELIST)[:n]]
 
 
 def _count_cap_snapshot(day_order_count, *, day_notional_usd=0.0):
@@ -12202,31 +12224,40 @@ def _count_cap_snapshot(day_order_count, *, day_notional_usd=0.0):
     )
 
 
-def test_the_daily_order_count_cap_stops_the_batch_at_the_configured_limit():
-    """Twelve placeable candidates, cap of 8, dollar headroom to spare: exactly
-    8 are planned and the rest are skipped for the count, not the notional."""
-    plan = dca_runner.plan_orders(_count_cap_cands(12), _count_cap_snapshot(0), _count_cap_tier())
-    assert len(plan.to_place) == dca_runner.MAX_ORDERS_PER_DAY == 8
+def test_the_daily_order_count_cap_stops_the_batch_at_the_configured_limit(monkeypatch):
+    """Four more placeable candidates than the configured cap, dollar headroom
+    to spare: exactly the cap's worth are planned and the rest are skipped for
+    the count, not the notional."""
+    _patch_wide_whitelist(monkeypatch)
+    cap = dca_runner.MAX_ORDERS_PER_DAY
+    plan = dca_runner.plan_orders(_count_cap_cands(cap + 4), _count_cap_snapshot(0), _count_cap_tier())
+    assert len(plan.to_place) == cap
     assert len(plan.skipped) == 4
     assert {reason for _, reason in plan.skipped} == {dca_runner.SKIPPED_DAILY_ORDER_COUNT_CAP}
 
 
-def test_the_daily_order_count_cap_counts_orders_already_placed_today():
-    """The cap is shared across the whole day, not per run: six orders already
-    submitted leaves room for two, whoever placed them."""
-    plan = dca_runner.plan_orders(_count_cap_cands(5), _count_cap_snapshot(6), _count_cap_tier())
+def test_the_daily_order_count_cap_counts_orders_already_placed_today(monkeypatch):
+    """The cap is shared across the whole day, not per run: a day already two
+    short of the cap leaves room for exactly two, whoever placed them."""
+    _patch_wide_whitelist(monkeypatch)
+    cap = dca_runner.MAX_ORDERS_PER_DAY
+    plan = dca_runner.plan_orders(_count_cap_cands(5), _count_cap_snapshot(cap - 2), _count_cap_tier())
     assert len(plan.to_place) == 2
     assert {reason for _, reason in plan.skipped} == {dca_runner.SKIPPED_DAILY_ORDER_COUNT_CAP}
 
 
-def test_the_daily_order_count_cap_places_nothing_once_the_day_is_full():
-    plan = dca_runner.plan_orders(_count_cap_cands(3), _count_cap_snapshot(8), _count_cap_tier())
+def test_the_daily_order_count_cap_places_nothing_once_the_day_is_full(monkeypatch):
+    _patch_wide_whitelist(monkeypatch)
+    plan = dca_runner.plan_orders(
+        _count_cap_cands(3), _count_cap_snapshot(dca_runner.MAX_ORDERS_PER_DAY), _count_cap_tier()
+    )
     assert plan.to_place == []
     assert len(plan.skipped) == 3
 
 
 def test_the_daily_order_count_cap_is_changeable(monkeypatch):
     """The limit is a config number, not a constant baked into the planner."""
+    _patch_wide_whitelist(monkeypatch)
     monkeypatch.setattr(dca_runner, "MAX_ORDERS_PER_DAY", 3)
     assert len(dca_runner.plan_orders(
         _count_cap_cands(9), _count_cap_snapshot(0), _count_cap_tier()).to_place) == 3
@@ -12235,13 +12266,176 @@ def test_the_daily_order_count_cap_is_changeable(monkeypatch):
         _count_cap_cands(9), _count_cap_snapshot(0), _count_cap_tier()).to_place) == 9
 
 
-def test_the_dollar_caps_still_bind_independently_of_the_count_cap():
+def test_the_dollar_caps_still_bind_independently_of_the_count_cap(monkeypatch):
     """The count cap is additional to the daily notional cap, not a replacement:
-    a day under 8 orders but at its dollar ceiling still stops."""
+    a day nowhere near the order-count cap but at its dollar ceiling still
+    stops."""
+    _patch_wide_whitelist(monkeypatch)
     snapshot = _count_cap_snapshot(0, day_notional_usd=179.0)
-    plan = dca_runner.plan_orders(_count_cap_cands(3), snapshot, _count_cap_tier())
+    plan = dca_runner.plan_orders(_count_cap_cands(3, amount_usd=2.0), snapshot, _count_cap_tier())
     assert plan.to_place == []
     assert dca_runner.SKIPPED_DAILY_CAP in {reason for _, reason in plan.skipped}
+
+
+# ---------------------------------------------------------------------------
+# dca_runner.count_compatible_executor_attempts
+#
+# Implemented (dca_runner.py:1075), but NOT YET WIRED into any live path --
+# no caller invokes it yet. Written 2026-09-11 alongside the max_orders_per_day
+# cap fix, for the still-open gap that fix's own config note flags: the 3:30 PM
+# canonical path (near_close_dca.py's _seed_prior_allocations) seeds
+# day_order_count purely from this repo's own local run artifacts, with no
+# visibility into orders the standing Perplexity backup executor places
+# directly against the same broker account (see
+# claude/PERPLEXITY-CLAUDE-COORDINATION.md). The other six live-mirror
+# prompts already route through dca_runner.plan_orders() fed by freshly
+# fetched broker history, which -- per budget_snapshot()'s own "count every
+# order regardless of placed_agent" policy -- is already account-wide
+# PROVIDED the fetch is complete and fresh; this function is meant for the
+# one path that is not: a caller (run_dca.py, or whatever fetches broker
+# data ahead of the 3:30 PM run) would call this once per run and fold the
+# result into near_close_dca's own local seed as an additional attempt
+# count, additive to (never a replacement for) that local seeding.
+#
+# Spec:
+#   count_compatible_executor_attempts(
+#       orders: Sequence[BrokerOrder],
+#       trading_day: date,
+#       *,
+#       self_client_ref_prefix: str,          # required, no default
+#       compatible_agent_value: str = "agentic",
+#   ) -> int
+#
+# An order counts toward the result when ALL of:
+#   - order.is_buy_attempt (mirrors budget_snapshot()'s own "REJECTED and
+#     CANCELLED attempts still consume one" contract -- over-counting is the
+#     safe direction for a count ceiling)
+#   - its created_at falls on trading_day in America/New_York (same
+#     _require_aware(...).astimezone(ET).date() == trading_day convention
+#     budget_snapshot() already uses)
+#   - order.placed_agent == compatible_agent_value EXACTLY (fail-safe:
+#     anything else -- None, "user", "recurring", "drip", or any other
+#     value -- is never compatible, mirroring Gate 4's own classification)
+#   - its client_order_id is PRESENT and does NOT start with
+#     self_client_ref_prefix. self_client_ref_prefix is REQUIRED (must be a
+#     nonempty string, or the function raises ValueError -- an empty prefix
+#     would make str.startswith("") true for every order, silently zeroing
+#     the count): claude/PERPLEXITY-CLAUDE-COORDINATION.md's own Sec 4
+#     documents that a bare placed_agent of "agentic" is not sufficient to
+#     attribute an order to Perplexity specifically, because Claude's own
+#     live orders carry the identical "agentic" tag -- without excluding
+#     this engine's own client-reference prefix
+#     (dca-runner-<slot>-<trading_day>-<TICKER>, per that same doc), this
+#     function would double-count THIS engine's own attempts (already
+#     reflected in its local seeding) as if they belonged to the compatible
+#     executor. A MISSING client_order_id fails closed (does not count):
+#     the 1530ET live-mirror prompt documents that a refreshed broker fetch
+#     can return client_order_id as null even for an order THIS engine
+#     placed, so a missing reference cannot prove the order is not self.
+# ---------------------------------------------------------------------------
+
+
+_SELF_PREFIX = "dca-runner-1530-2026-09-11-"
+
+
+def _compat_order(symbol, *, hour=10, minute=0, day=date(2026, 9, 11),
+                   placed_agent="agentic", side="buy", state="filled",
+                   client_order_id=None):
+    return dca_runner.BrokerOrder(
+        symbol=symbol,
+        side=side,
+        dollar_amount=2.0,
+        created_at=datetime(day.year, day.month, day.day, hour, minute, tzinfo=dca_runner.ET).astimezone(
+            timezone.utc
+        ),
+        placed_agent=placed_agent,
+        state=state,
+        client_order_id=client_order_id,
+    )
+
+
+def test_compatible_executor_attempts_counts_agentic_orders_not_self():
+    """A Perplexity-attributable order (agentic, no self-prefix) counts; this
+    engine's own order (agentic, self-prefix) does not -- it is already
+    reflected in this engine's own local seeding."""
+    orders = [
+        _compat_order("AAPL", client_order_id="some-other-client-ref-AAPL"),
+        _compat_order("MSFT", client_order_id=f"{_SELF_PREFIX}MSFT"),
+    ]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 1
+
+
+def test_compatible_executor_attempts_excludes_manual_and_unrecognized_agents():
+    """Fail-safe: only an exact compatible_agent_value match counts. Manual,
+    recurring, drip, and unrecognized/None provenance are never compatible,
+    mirroring Gate 4's own classification."""
+    orders = [
+        _compat_order("AAPL", placed_agent="user", client_order_id="ref-1"),
+        _compat_order("MSFT", placed_agent="recurring", client_order_id="ref-2"),
+        _compat_order("GOOG", placed_agent=None, client_order_id="ref-3"),
+        _compat_order("TSLA", placed_agent="some_other_bot", client_order_id="ref-4"),
+    ]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 0
+
+
+def test_compatible_executor_attempts_excludes_other_days():
+    """Matching on the same _require_aware(...).astimezone(ET).date() ==
+    trading_day convention budget_snapshot() already uses."""
+    orders = [
+        _compat_order("AAPL", day=date(2026, 9, 10), client_order_id="ref-1"),
+        _compat_order("MSFT", day=date(2026, 9, 12), client_order_id="ref-2"),
+    ]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 0
+
+
+def test_compatible_executor_attempts_counts_cancelled_and_rejected():
+    """is_buy_attempt semantics: a cancelled or rejected compatible attempt
+    still consumed one of the shared daily slots -- over-counting is the
+    safe direction for a count ceiling (config/budgets.json's own
+    max_orders_per_day_note)."""
+    orders = [
+        _compat_order("AAPL", state="cancelled", client_order_id="ref-1"),
+        _compat_order("MSFT", state="rejected", client_order_id="ref-2"),
+    ]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 2
+
+
+def test_compatible_executor_attempts_excludes_sells():
+    orders = [_compat_order("AAPL", side="sell", client_order_id="ref-1")]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 0
+
+
+def test_compatible_executor_attempts_fails_closed_on_missing_client_order_id():
+    """A missing client_order_id cannot prove an agentic order is NOT this
+    engine's own -- the 1530ET live-mirror prompt documents that a
+    refreshed broker fetch can return client_order_id as null even for an
+    order THIS engine placed. Must not count it (PR review: "fail closed
+    when the identifier is absent instead")."""
+    orders = [_compat_order("AAPL", client_order_id=None)]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 0
+
+
+def test_compatible_executor_attempts_rejects_empty_self_prefix():
+    """An empty self_client_ref_prefix would make str.startswith("") true
+    for every order, silently zeroing the count instead of raising -- must
+    fail loudly instead."""
+    orders = [_compat_order("AAPL", client_order_id="ref-1")]
+    with pytest.raises(ValueError):
+        dca_runner.count_compatible_executor_attempts(
+            orders, date(2026, 9, 11), self_client_ref_prefix=""
+        )
 
 
 def test_budget_snapshot_counts_todays_buy_attempts_including_dead_ones():

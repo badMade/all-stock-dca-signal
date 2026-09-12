@@ -345,7 +345,7 @@ def _config_float(raw: object, *, field: str) -> float:
 #: which is what stops these from becoming a second, quietly-diverging set of
 #: limits -- the failure mode this PR has hit repeatedly.
 DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES = 3
-DEFAULT_MAX_ORDERS_PER_DAY = 8
+DEFAULT_MAX_ORDERS_PER_DAY = 120
 
 #: Emitted by :func:`load_budgets` when there is no ``budgets.json`` AT ALL,
 #: and resolved (and popped) by :func:`load_strategy_config`. Distinguishes
