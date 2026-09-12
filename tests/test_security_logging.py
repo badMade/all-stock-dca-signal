@@ -11,9 +11,25 @@ from typing import Iterator
 import pytest
 
 import dca_live_adapters
+import intraday_dca
+import market_open_dca
+import midday_dca
+import morning_dca
 import near_close_dca
+import run_dca
 from dca_live_adapters import FinanceDataProvider, RobinhoodDataProvider
 from near_close_dca import EASTERN, Action, AlpacaBroker, StrategyConfig, _evaluate_all_signals
+
+_STREAM_LOGGERS = [
+    pytest.param(near_close_dca.logger, id="core"),
+    pytest.param(dca_live_adapters.logger, id="adapter"),
+    pytest.param(run_dca.logger, id="run"),
+    pytest.param(morning_dca.logger, id="morning"),
+    pytest.param(midday_dca._log, id="midday"),
+    pytest.param(market_open_dca._log, id="market-open"),
+    pytest.param(intraday_dca._log, id="intraday"),
+    pytest.param(logging.getLogger("morning_dca.drift"), id="morning-drift"),
+]
 
 
 @contextmanager
@@ -104,7 +120,39 @@ def test_adapter_quote_warning_redacts_untrusted_state_field():
     assert secret not in text
 
 
-@pytest.mark.parametrize("logger", [near_close_dca.logger, dca_live_adapters.logger], ids=["core", "adapter"])
+@pytest.mark.parametrize("batch", [False, True], ids=["individual", "batch"])
+def test_report_fill_refresh_redacts_failed_broker_lookup(tmp_path, batch):
+    bearer = "synthetic-report-fill-bearer-value"
+    calls = []
+    orders = tmp_path / "orders.csv"
+    orders.write_text("ticker,status,order_id\nAAPL,submitted,synthetic-order\n", encoding="utf-8")
+
+    def failed_lookup(order_ids):
+        calls.append(order_ids)
+        try:
+            raise ValueError(f"Authorization: Bearer {bearer}")
+        except ValueError as cause:
+            raise RuntimeError("synthetic reporting transport failure") from cause
+
+    class FailedBroker:
+        get_order_fill = staticmethod(failed_lookup)
+
+    broker = FailedBroker()
+    if batch:
+        broker.get_order_fills = failed_lookup
+    with _logged_output(run_dca.logger) as output:
+        assert run_dca._refresh_fills_from_broker(orders, broker, []) == []
+
+    expected_calls = [["synthetic-order"]] if batch else ["synthetic-order"]
+    assert calls == expected_calls
+    text = output.getvalue()
+    assert "fill refresh failed" in text
+    assert "ValueError" in text and "RuntimeError" in text
+    assert "[REDACTED]" in text
+    assert bearer not in text
+
+
+@pytest.mark.parametrize("logger", _STREAM_LOGGERS)
 def test_benign_numeric_log_arguments_keep_their_formatting(logger):
     with _logged_output(logger) as output:
         logger.info("AAPL: count=%d price=%.2f", 3, 12.5)
@@ -112,7 +160,7 @@ def test_benign_numeric_log_arguments_keep_their_formatting(logger):
     assert output.getvalue() == "INFO AAPL: count=3 price=12.50\n"
 
 
-@pytest.mark.parametrize("logger", [near_close_dca.logger, dca_live_adapters.logger], ids=["core", "adapter"])
+@pytest.mark.parametrize("logger", _STREAM_LOGGERS)
 def test_cached_traceback_stack_and_message_are_sanitized(logger):
     exception_secret = "synthetic-cached-api-value"
     stack_secret = "synthetic-stack-bearer-value"
@@ -135,7 +183,7 @@ def test_cached_traceback_stack_and_message_are_sanitized(logger):
     assert record.exc_info is None
 
 
-@pytest.mark.parametrize("logger", [near_close_dca.logger, dca_live_adapters.logger], ids=["core", "adapter"])
+@pytest.mark.parametrize("logger", _STREAM_LOGGERS)
 @pytest.mark.parametrize("broken_object", [False, True], ids=["bad-format", "bad-str"])
 def test_unformattable_diagnostics_fail_closed(logger, broken_object, capsys):
     secret = "synthetic-unformattable-password-value"

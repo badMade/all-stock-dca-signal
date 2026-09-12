@@ -109,6 +109,7 @@ from near_close_dca import (
     OrderPlacementRejectedError,
     PriorSameDayAllocation,
     StrategyConfig,
+    _DiagnosticRedactionFilter,
     _is_usable_reconciled_order_id,
     _live_session_failure,
     _recovered_broker_notional,
@@ -180,6 +181,8 @@ from scripts.scheduled_artifacts import (
 )
 
 _log = logging.getLogger(__name__)
+_log.addFilter(_DiagnosticRedactionFilter())
+logging.getLogger("morning_dca.drift").addFilter(_DiagnosticRedactionFilter())
 
 # Placed-or-in-flight statuses whose evidence a blocked retry must preserve
 # rather than overwrite -- ORDER_ATTEMPT_STATUSES minus

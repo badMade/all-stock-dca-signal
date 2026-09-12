@@ -22,12 +22,14 @@ def redact(text: str) -> str:
     """Remove credential-shaped values before persisting or showing job output."""
     from near_close_dca import _redacted_diagnostic_text
 
+    # Preserve multiline credential delimiters until the shared sanitizer sees them.
+    text = _redacted_diagnostic_text(text).replace("[REDACTED]", "[redacted]")
     for name, value in os.environ.items():
         if value and len(value) >= 6 and any(key in name.upper() for key in ("SECRET", "TOKEN", "PASSWORD", "API_KEY", "ACCOUNT_NUMBER")):
             text = text.replace(value, "[redacted]")
     text = re.sub(r'(?i)((?:account(?:_number)?|token|api_key|password|secret)[\s\"\x27:=]+)[^\s,}\"\x27]+', r'\1[redacted]', text)
     text = re.sub(r"\b\d{6,12}\b", "[redacted-number]", text)
-    return _redacted_diagnostic_text(text).replace("[REDACTED]", "[redacted]")
+    return text
 
 
 @dataclass(frozen=True)
@@ -158,10 +160,13 @@ class JobManager:
             stop_reading = threading.Event()
 
             def pump() -> None:
+                from near_close_dca import _find_armor_spans
+
                 assert process.stdout is not None
                 # Buffer partial lines so a secret cannot be split across redaction calls.
                 pending = ""
                 discarding = False
+                omit_remainder = False
                 while not stop_reading.is_set():
                     chunk = process.stdout.read(4096)
                     if chunk is None:
@@ -169,6 +174,8 @@ class JobManager:
                         continue
                     if not chunk or stop_reading.is_set():
                         break
+                    if omit_remainder:
+                        continue
                     decoded = chunk.decode("utf-8", errors="replace")
                     if discarding:
                         if "\n" not in decoded:
@@ -177,10 +184,19 @@ class JobManager:
                         discarding = False
                     pending += decoded
                     while "\n" in pending:
-                        line, pending = pending.split("\n", 1)
-                        log(line + "\n")
+                        boundary = pending.index("\n") + 1
+                        spans = _find_armor_spans(pending)
+                        if any(private and not closed for _, _, private, closed in spans):
+                            break
+                        # Keep each private-key block intact until redaction, including nested armor.
+                        for start, end, private, _ in spans:
+                            if private and start < boundary:
+                                boundary = max(boundary, end)
+                        log(pending[:boundary])
+                        pending = pending[boundary:]
                     if len(pending) > 32_000:
                         # Never expose a suffix after dropping the context that identifies a secret.
+                        omit_remainder = any(private and not closed for _, _, private, closed in _find_armor_spans(pending))
                         log("[long output line omitted]\n")
                         pending, discarding = "", True
                 if pending:

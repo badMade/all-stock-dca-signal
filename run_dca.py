@@ -74,6 +74,7 @@ from near_close_dca import (
     SourceName,
     StrategyConfig,
     StrategyState,
+    _DiagnosticRedactionFilter,
     _earlier_selected_base,
     _existing_csv_artifacts,
     _redacted_diagnostic_text,
@@ -113,6 +114,7 @@ from scripts.scheduled_artifacts import (
 )
 
 logger = logging.getLogger("near_close_dca.run")
+logger.addFilter(_DiagnosticRedactionFilter())
 
 # Root for ad hoc intraday scheduled-recovery streams (e.g. the Jul 24 2026
 # 2:30 PM ET intraday_1430 recovery -- see config/scheduled_tasks.json

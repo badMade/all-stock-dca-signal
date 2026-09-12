@@ -32,6 +32,66 @@ def test_console_redaction_preserves_ordinary_diagnostics():
     assert redact(message) == message
 
 
+@pytest.mark.parametrize("label", ["secret=", "token:", "password=", "client_secret="])
+def test_console_redacts_complete_labeled_private_key_before_rewriting_header(label):
+    body = "U1lOVEhFVElDX0xPQ0FMX0tFWV9CT0RZ"
+    message = (
+        f"Operation failed: {label}-----BEGIN PRIVATE KEY-----\n"
+        f"{body}\n-----END PRIVATE KEY-----\nNext output retained."
+    )
+    rendered = redact(message)
+    assert body not in rendered
+    assert "[redacted]" in rendered.lower()
+    assert rendered.endswith("Next output retained.")
+
+
+@pytest.mark.parametrize("armor", ["closed", "nested", "mismatched", "incomplete", "overlong"])
+def test_private_key_child_output_stays_redacted_across_lines_and_chunks(tmp_path, armor):
+    # These bodies encode synthetic test labels; they are not actual key material.
+    body = "U1lOVEhFVElDX0xPQ0FMX0tFWV9CT0RZ"
+    inner_body = "U1lOVEhFVElDX0lOTkVSX0tFWV9CT0RZ"
+    tail_body = "U1lOVEhFVElDX1RBSUxfS0VZX0JPRFk="
+    header = "-----BEGIN PRIVATE KEY-----\n"
+    footer = "-----END PRIVATE KEY-----\n"
+    parts = [header, body + "\n"]
+    if armor == "closed":
+        parts += [footer, "Next output retained.\n"]
+    elif armor == "nested":
+        parts += [header, inner_body + "\n", footer, tail_body + "\n", footer, "Next output retained.\n"]
+    elif armor == "mismatched":
+        parts += ["-----END CERTIFICATE-----\n", tail_body]
+    elif armor == "incomplete":
+        parts += [tail_body]
+    else:
+        parts += ["x" * 32_768 + "\n", tail_body + "\n"]
+    env = dict(os.environ)
+    # Use a neutral variable name so literal environment-secret matching cannot
+    # hide a failure to recognize streamed private-key armor.
+    env["DCA_TEST_OUTPUT_PARTS"] = json.dumps(parts)
+    code = (
+        "import json,os,time; "
+        "parts=json.loads(os.environ['DCA_TEST_OUTPUT_PARTS']); "
+        "[(os.write(1,part.encode()),time.sleep(0.1)) for part in parts]"
+    )
+    command = Command((sys.executable, "-c", code), tmp_path, env, timeout=5)
+    manager = JobManager(tmp_path / "jobs")
+    try:
+        manager.submit("demo-dca", "Private output", lambda job_id, log: manager.run_command(command, log))
+        assert manager.worker is not None
+        manager.worker.join(timeout=8)
+        assert not manager.worker.is_alive()
+        result = manager.snapshot()[0]
+        assert result["status"] == "completed"
+        persisted = (manager.root / f"{result['id']}.json").read_text(encoding="utf-8")
+        for rendered in (result["log"], persisted):
+            assert all(value not in rendered for value in (body, inner_body, tail_body))
+        assert len(result["log"]) <= 24_000
+        if armor in {"closed", "nested"}:
+            assert result["log"].endswith("Next output retained.\n")
+    finally:
+        manager.close()
+
+
 @pytest.mark.parametrize("field", ["log", "label"])
 def test_restored_fields_redact_complete_secrets_before_truncation(tmp_path, monkeypatch, field):
     private_value = "opaque-restored-credential-value"
