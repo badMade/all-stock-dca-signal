@@ -14399,9 +14399,9 @@ def _load_deployment_history_states(
     # DOES match still passes through the full parse and deployed_by_day
     # stream/afternoon-evidence filters, so a match is never counted unvalidated.
     # Skipped entirely when ``unbounded`` -- see that parameter's own docstring.
-    window_days = (
+    window_days_bytes = (
         {
-            (trading_day - timedelta(days=offset)).isoformat()
+            (trading_day - timedelta(days=offset)).isoformat().encode("utf-8")
             for offset in range(KILL_SWITCH_WINDOW_DAYS)
         }
         if not unbounded
@@ -14414,7 +14414,7 @@ def _load_deployment_history_states(
         if resolved_exclude_path is not None and path.resolve() == resolved_exclude_path:
             continue
         try:
-            raw_text = path.read_text(encoding="utf-8")
+            raw_bytes = path.read_bytes()
         except (ValueError, OSError):
             continue
 
@@ -14425,15 +14425,15 @@ def _load_deployment_history_states(
         # Escaped files fall through to a full parse so a same-window artifact is
         # never silently dropped.
         if (
-            window_days is not None
-            and "\\u" not in raw_text
-            and not any(day in raw_text for day in window_days)
+            window_days_bytes is not None
+            and b"\\u" not in raw_bytes
+            and not any(day in raw_bytes for day in window_days_bytes)
         ):
             continue
 
         try:
-            data = json.loads(raw_text)
-        except ValueError:
+            data = json.loads(raw_bytes)
+        except (ValueError, UnicodeDecodeError):
             continue
         # Exclude date-gate blocked stubs from deployment accounting, but KEEP a
         # contract-rejected state (artifact_contract_failure marker): it is invalid
