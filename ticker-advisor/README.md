@@ -84,7 +84,7 @@ with different `--weights`, etc.) from silently overwriting each other:
 ## The three signals
 
 | Signal | Module | Dependency | What it measures |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Strategy health | `signals.strategy_health_score` | pandas/numpy/scipy | Sharpe, Sortino, max drawdown, CAGR, Calmar, beta, alpha on the candidate's own price series |
 | Backtested returns | `signals.backtest_score` | vectorbt | MA-crossover and RSI-reversion backtest performance |
 | Sentiment | `signals.sentiment_score` | transformers/torch | FinBERT score over recent NewsAPI headlines (if `NEWS_API_KEY` is set) + SEC EDGAR filings (always available, no key needed) |
