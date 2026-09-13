@@ -206,21 +206,21 @@ def test_compute_cadence_dormant_when_empty(monkeypatch):
 def test_compute_cadence_high_velocity(monkeypatch):
     monkeypatch.setattr(compute_schedule, "run_cmd", lambda cmd: "\n".join(["2026-09-01T12:00:00Z"] * 55))
     schedule, rationale = compute_schedule.compute_cadence()
-    assert schedule == "0 3 * * *"
+    assert schedule == "0 0 * * *"
     assert ">50 commits/mo" in rationale
 
 
 def test_compute_cadence_active_velocity(monkeypatch):
     monkeypatch.setattr(compute_schedule, "run_cmd", lambda cmd: "\n".join(["2026-09-01T12:00:00Z"] * 25))
     schedule, rationale = compute_schedule.compute_cadence()
-    assert schedule == "0 3 * * 1,4"
+    assert schedule == "0 0 * * 1,4"
     assert "Active velocity" in rationale
 
 
 def test_compute_cadence_standard_velocity(monkeypatch):
     monkeypatch.setattr(compute_schedule, "run_cmd", lambda cmd: "\n".join(["2026-09-01T12:00:00Z"] * 5))
     schedule, rationale = compute_schedule.compute_cadence()
-    assert schedule == "0 3 * * 1"
+    assert schedule == "0 0 * * 1"
     assert "Standard velocity" in rationale
 
 
