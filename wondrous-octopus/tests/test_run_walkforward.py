@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import daily_update
+import dca_paths
 import features as _features
 import numpy as np
 import pytest
@@ -976,6 +977,51 @@ def test_preset_knobs_resolve_with_explicit_flag_override():
     assert knobs["window_len"] == 96  # explicit flag wins
     assert knobs["update_every"] == 5  # preset value stands
     assert knobs["max_tickers"] == 500
+
+
+class TestDefaultRunRootIsolation:
+    """Regression guard for the run-directory leak fixed on 2026-09-13.
+
+    Without ``conftest._isolate_cron_tracking_root`` the fit-refusal test
+    below (``test_zero_trainable_windows_fit_refusal_exits_1_not_2``) wrote a
+    ``run_meta.json`` skeleton into the checkout's real
+    ``cron_tracking/wondrous_octopus/runs/`` on every suite run. Both tests
+    here use the same ``main()`` invocation shape -- no ``--run-dir`` -- so
+    they exercise the exact path that leaked.
+    """
+
+    # The real, unconfigured root the leak landed in. Read from dca_paths
+    # rather than spelled out so a relocation of the default keeps this
+    # test honest (CLAUDE.md: no hard-coded absolute paths).
+    REAL_RUNS_ROOT = Path(dca_paths.DEFAULT_CRON_TRACKING_ROOT) / "wondrous_octopus" / "runs"
+
+    def test_default_run_dir_resolves_under_the_isolated_tmp_root(self, tmp_path):
+        run_dir = run_walkforward._default_run_dir("c0d80b1dffffffff", None)
+        assert run_dir.is_relative_to(tmp_path), run_dir
+        assert not run_dir.is_relative_to(Path(dca_paths.DEFAULT_CRON_TRACKING_ROOT)), run_dir
+
+    def test_fresh_run_without_run_dir_never_touches_the_real_runs_root(self, synthetic_history_dir, capsys):
+        before = set(self.REAL_RUNS_ROOT.iterdir()) if self.REAL_RUNS_ROOT.is_dir() else set()
+        # Same refusal recipe as the leaking test: fresh() creates the run
+        # directory and run_meta.json, THEN the fit refuses. A code of 1
+        # proves we got past directory creation rather than failing early
+        # on argument validation, which would make the assertion vacuous.
+        probe = _features.build_panel(synthetic_history_dir, min_history=60)
+        impossible_cutoff = str(np.datetime_as_string(probe.calendar[0], unit="D"))
+        code = run_walkforward.main(
+            [
+                "--history-dir", str(synthetic_history_dir), "--all-tickers-in-archive",
+                "--model", "gbm", "--start", "2021-11-01",
+                "--initial-train-end", impossible_cutoff,
+            ]
+        )
+        assert code == 1
+        assert "REFUSED" in capsys.readouterr().err
+        after = set(self.REAL_RUNS_ROOT.iterdir()) if self.REAL_RUNS_ROOT.is_dir() else set()
+        assert after == before, sorted(p.name for p in after - before)
+        # And the skeleton DID get written -- just under the isolated root.
+        leaked_here = list((Path(os.environ["DCA_CRON_TRACKING_ROOT"]) / "wondrous_octopus" / "runs").iterdir())
+        assert len(leaked_here) == 1 and (leaked_here[0] / "run_meta.json").is_file()
 
 
 def test_initial_training_cutoff_must_precede_prediction_start(capsys):

@@ -126,6 +126,37 @@ def write_ticker_csv(history_dir: Path, ticker: str, frame: pd.DataFrame) -> Pat
     return path
 
 
+@pytest.fixture(autouse=True)
+def _isolate_cron_tracking_root(monkeypatch, tmp_path: Path) -> None:
+    """Point ``dca_paths.stream_root()`` at a throwaway tree for every test.
+
+    ``run_walkforward._default_run_dir()`` resolves the run root AT CALL TIME
+    through ``dca_paths.stream_root("wondrous_octopus")``, which falls back to
+    the checkout's own gitignored ``cron_tracking/`` whenever
+    ``$DCA_CRON_TRACKING_ROOT`` is unset. Any test that drives ``main()``
+    without an explicit ``--run-dir`` therefore lands a real run directory in
+    the working copy. ``test_zero_trainable_windows_fit_refusal_exits_1_not_2``
+    is the documented case: ``fresh()`` has already created the run directory
+    and written ``run_meta.json`` (recording the pytest ``tmp_path`` archive
+    and the five-ticker fixture universe) before the fit refusal fires, so
+    every suite run left one more ``<stamp>-c0d80b1d`` skeleton under
+    ``cron_tracking/wondrous_octopus/runs/``. Ten of them had piled up by
+    2026-09-13, and because they carry ``run_meta.json`` they look enough like
+    genuine runs that the local console's ``--octopus-run`` discovery, and an
+    operator picking "the newest run", could be pointed at one that has no
+    checkpoint and an archive path that no longer exists.
+
+    The root suite's ``conftest.py`` already has this exact fixture, but this
+    sibling subproject is run with ``cd wondrous-octopus && pytest tests/``
+    (CLAUDE.md), so the root conftest is never loaded here and the isolation
+    has to be mirrored. Autouse and ``tmp_path``-derived so it is per-test and
+    nobody has to remember it; a test that needs a specific root can still
+    ``setenv`` afterward. ``tests/test_run_walkforward.py``'s
+    ``TestDefaultRunRootIsolation`` is the regression guard.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+
+
 @pytest.fixture
 def market_factor() -> np.ndarray:
     return make_market_returns()
