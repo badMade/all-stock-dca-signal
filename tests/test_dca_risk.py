@@ -30,6 +30,7 @@ from dca_risk import (
     main,
     rolling_cash_burn,
     seven_day_deployed,
+    unusable_deployed_notional_dates,
 )
 from near_close_dca import StrategyConfig, graded_buy_multiplier, kill_switch_engaged
 from scripts.run_classification import build_manual_classification, build_scheduled_classification
@@ -870,6 +871,32 @@ def test_deployed_usd_by_claim_date_ignores_non_finite_breakdown_amounts():
     assert deployed_usd_by_claim_date(state) == {date(2026, 7, 6): 10.0}
 
 
+def test_unusable_notional_keeps_artifact_day_for_unclaimed_remainder():
+    """An uncertain row's claim-date remainder is uncertain on its artifact day."""
+    state = {
+        "trading_day": "2026-07-10",
+        "buy_candidates": [
+            {
+                "status": "submitted",
+                "planned_amount_usd": 20.0,
+                "deployed_notional_uncertain": True,
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-06-30", "amount_usd": 10.0},
+                ],
+            }
+        ],
+    }
+
+    assert deployed_usd_by_claim_date(state) == {
+        date(2026, 6, 30): 10.0,
+        date(2026, 7, 10): 10.0,
+    }
+    assert unusable_deployed_notional_dates(state) == {
+        date(2026, 6, 30),
+        date(2026, 7, 10),
+    }
+
+
 def test_deployed_usd_by_claim_date_ignores_an_unhashable_candidate_status():
     # The identical expression in deployed_usd_by_claim_date() needs the same
     # guard -- it is reached by the per-claim-date rollup, not by deployed_usd.
@@ -1567,6 +1594,323 @@ def test_overfilled_breakdown_with_an_undated_claim_retains_artifact_uncertainty
     assert unusable_deployed_notional_dates(state) == {date(2026, 8, 10), date(2026, 8, 26)}
 
 
+def test_a_malformed_sibling_entry_does_not_discard_a_valid_claim_date():
+    """Codex review ("Preserve valid claim dates when a sibling entry is
+    malformed"): the row_unusable early exit used to discard claim_dates
+    accumulated from OTHER, valid breakdown entries, keeping only the
+    artifact-day fallback the malformed sibling itself added. During a
+    historical replay where that artifact day is outside the trailing
+    evidence window (e.g. a reconciliation artifact written after the
+    fact), the known historical claim contributed neither deployment nor
+    uncertainty and could incorrectly leave the live cap open.
+    """
+    from dca_risk import unusable_deployed_notional_dates
+
+    state = {
+        "trading_day": "2026-08-26",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "NaN",  # unusable top-level notional
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-08-10", "amount_usd": 8.0},  # valid
+                    {"amount_usd": "NaN"},  # malformed sibling: unusable amount
+                ],
+            }
+        ],
+    }
+
+    dates = unusable_deployed_notional_dates(state)
+    assert date(2026, 8, 10) in dates, (
+        "the valid historical claim date must survive a malformed sibling "
+        "entry elsewhere in the same breakdown"
+    )
+    assert date(2026, 8, 26) in dates
+
+
+def test_malformed_sibling_entry_does_not_discard_a_valid_siblings_claim_date():
+    # Codex review: "Preserve valid claim dates when a sibling entry is
+    # malformed". An unusable top-level notional with a valid, dated
+    # breakdown entry AND a malformed (non-dict) sibling entry must retain
+    # the valid entry's own claim date, not just the malformed sibling's
+    # artifact-day fallback -- otherwise a known historical claim
+    # contributes neither deployment nor uncertainty for its own day and
+    # the live cap can stay open when it should be reserving that capital.
+    from dca_risk import unusable_deployed_notional_dates
+
+    state = {
+        "trading_day": "2026-08-26",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "unknown",
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-08-10", "amount_usd": 5.0},
+                    "not-a-dict",
+                ],
+            }
+        ],
+    }
+
+    assert unusable_deployed_notional_dates(state) == {date(2026, 8, 10), date(2026, 8, 26)}
+
+
+def test_unparseable_row_total_keeps_artifact_day_uncertain():
+    """A row whose top-level notional cannot be parsed as a number at all
+    (not merely negative/non-finite) has no total to compare accounted_usd
+    against, so completeness of a fully-dated breakdown can never be
+    established -- the artifact day must stay uncertain rather than being
+    cleared just because every breakdown entry happened to be well-formed
+    (Codex review: "Preserve uncertainty for an unaccounted breakdown
+    remainder")."""
+    from dca_risk import unusable_deployed_notional_dates
+
+    state = {
+        "trading_day": "2026-08-31",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "NaN",
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-08-28", "amount_usd": 50.0},
+                ],
+            }
+        ],
+    }
+
+    assert unusable_deployed_notional_dates(state) == {date(2026, 8, 28), date(2026, 8, 31)}
+    # deployed_usd_by_claim_date() agrees this row is entirely unreadable --
+    # it drops the whole thing, including the $50 breakdown entry -- so both
+    # dates genuinely need to stay flagged as uncertain evidence.
+    assert deployed_usd_by_claim_date(state) == {}
+
+
+def test_row_total_that_exactly_matches_a_readable_breakdown_clears_artifact_day():
+    """Regression guard: when the top-level total IS a readable, non-negative
+    number (so ``planned`` is not None) and a fully-dated breakdown accounts
+    for every dollar of it, the artifact day must NOT be marked uncertain --
+    only a genuinely un-parseable total (the test above) or a real
+    unaccounted remainder should keep it in the set. Uses
+    ``deployed_notional_uncertain`` to make the row unusable without an
+    unparseable amount, so ``planned`` stays a real, comparable number."""
+    from dca_risk import unusable_deployed_notional_dates
+
+    state = {
+        "trading_day": "2026-08-31",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 50.0,
+                "deployed_notional_uncertain": True,
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-08-28", "amount_usd": 50.0},
+                ],
+            }
+        ],
+    }
+
+    assert unusable_deployed_notional_dates(state) == {date(2026, 8, 28)}
+
+
+def test_malformed_breakdown_sibling_does_not_drop_a_valid_claim_date():
+    """A malformed or unusable SIBLING entry in the same breakdown must not
+    erase an already-parsed valid claim date collected earlier in the same
+    loop -- deployed_usd_by_claim_date() drops the WHOLE row the moment any
+    part of it is unreadable, so the valid claim date is one of the
+    surviving pieces of evidence that day's deployment is uncertain (Codex
+    review: "Retain valid claim dates when a sibling entry is malformed").
+    The artifact day is ALSO uncertain here: row_unusable means at least one
+    entry's own amount could not be read, so accounted_usd is necessarily
+    incomplete and completeness can never be established (Codex review:
+    "Preserve artifact-day uncertainty in malformed breakdowns")."""
+    from dca_risk import unusable_deployed_notional_dates
+
+    state = {
+        "trading_day": "2026-08-31",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "NaN",
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-08-29", "amount_usd": 50.0},
+                    {"trading_day": "2026-09-15", "amount_usd": "garbage"},
+                ],
+            }
+        ],
+    }
+
+    assert unusable_deployed_notional_dates(state) == {
+        date(2026, 8, 29),
+        date(2026, 9, 15),
+        date(2026, 8, 31),
+    }
+    assert deployed_usd_by_claim_date(state) == {}
+
+
+def test_unreadable_breakdown_with_no_other_entries_still_flags_artifact_day():
+    """A row whose top-level total is unparseable and whose ONLY breakdown
+    entry is also malformed must not lose artifact-day uncertainty just
+    because there happens to be no other, valid sibling to fall back on --
+    deployed_usd_by_claim_date() still drops the whole row, and a fresh,
+    entirely unaccounted remainder could belong to the artifact day (Codex
+    review: "Preserve artifact-day uncertainty in malformed breakdowns")."""
+    from dca_risk import unusable_deployed_notional_dates
+
+    state = {
+        "trading_day": "2026-08-31",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "NaN",
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-01-01", "amount_usd": "garbage"},
+                ],
+            }
+        ],
+    }
+
+    assert unusable_deployed_notional_dates(state) == {date(2026, 1, 1), date(2026, 8, 31)}
+    assert deployed_usd_by_claim_date(state) == {}
+
+
+def test_zero_dollar_breakdown_entry_is_not_propagated_as_uncertain():
+    """A breakdown entry with a genuine, VERIFIED $0.00 amount is real
+    evidence of no deployment on that date -- near_close_dca.py emits these
+    for recovered zero-fill attempts. Sweeping its date into the
+    row_notional_unusable propagation alongside a genuinely malformed
+    sibling would flag a date whose evidence was never actually missing
+    (Codex review: "Exclude zero-dollar claims from sibling
+    propagation")."""
+    from dca_risk import unusable_deployed_notional_dates
+
+    state = {
+        "trading_day": "2026-08-31",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "NaN",
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-08-29", "amount_usd": 0.0},
+                    {"trading_day": "2026-01-01", "amount_usd": "garbage"},
+                ],
+            }
+        ],
+    }
+
+    assert unusable_deployed_notional_dates(state) == {date(2026, 1, 1), date(2026, 8, 31)}
+    assert date(2026, 8, 29) not in unusable_deployed_notional_dates(state)
+
+
+def test_overfilled_row_stays_uncertain_even_with_a_malformed_sibling():
+    """A row whose top-level total IS readable but whose GOOD breakdown
+    entries alone already exceed it is overfilled -- deployed_usd_by_claim_date()
+    caps that entry's attribution at the row's own total, so the current
+    attribution is only an artifact of which entries happened to be
+    readable, not a verified fact. The overfill check must still run even
+    when a DIFFERENT sibling entry is separately malformed -- accounted_usd
+    only ever sums independently-readable entries, so the overfill is real
+    regardless -- rather than short-circuiting on row_unusable and leaving
+    only the malformed entry's own date flagged (Codex review: "Retain
+    dates for overfilled readable rows")."""
+    from dca_risk import unusable_deployed_notional_dates
+
+    state = {
+        "trading_day": "2026-08-31",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 10.0,
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-08-31", "amount_usd": 20.0},
+                    {"trading_day": "2026-01-01", "amount_usd": "garbage"},
+                ],
+            }
+        ],
+    }
+
+    assert unusable_deployed_notional_dates(state) == {date(2026, 1, 1), date(2026, 8, 31)}
+    # deployed_usd_by_claim_date() caps the $20 claim at the row's own $10
+    # total and books it all to the artifact day -- an attribution the
+    # overfill logic above correctly refuses to trust on its own.
+    assert deployed_usd_by_claim_date(state) == {date(2026, 8, 31): 10.0}
+
+
+def test_overfill_reconstruction_excludes_a_zero_dollar_dated_sibling():
+    """The overfill branch rebuilds claim_dates from scratch to distrust
+    individual per-entry attribution, but a dated entry with a genuine,
+    verified $0.00 amount contributes nothing to either accounted_usd or
+    deployed_usd_by_claim_date() -- it must not be swept into that
+    reconstruction just because its date happens to be readable (Codex
+    review: "Filter zero claims in the newly reachable overfill path")."""
+    from dca_risk import unusable_deployed_notional_dates
+
+    state = {
+        "trading_day": "2026-08-31",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 10.0,
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-08-31", "amount_usd": 20.0},
+                    {"trading_day": "2026-01-01", "amount_usd": "garbage"},
+                    {"trading_day": "2026-08-30", "amount_usd": 0.0},
+                ],
+            }
+        ],
+    }
+
+    assert unusable_deployed_notional_dates(state) == {date(2026, 1, 1), date(2026, 8, 31)}
+    assert date(2026, 8, 30) not in unusable_deployed_notional_dates(state)
+    assert deployed_usd_by_claim_date(state) == {date(2026, 8, 31): 10.0}
+
+
+def test_valid_row_total_does_not_propagate_sibling_dates_on_a_bad_entry():
+    """Regression guard for the fix above: sibling-date propagation on
+    row_unusable must be scoped to row_notional_unusable. When the row's OWN
+    top-level total IS a usable number, deployed_usd_by_claim_date() does
+    NOT drop the whole row just because one breakdown entry is malformed --
+    it still books every valid entry under its own date and the remainder
+    under the artifact day. Propagating every sibling claim date here in
+    that case would flag a date whose evidence was never actually lost, only
+    the malformed entry's own date (already added directly, independent of
+    claim_dates) is genuinely uncertain (Codex review: "Restrict sibling
+    claim propagation to unusable row totals")."""
+    from dca_risk import unusable_deployed_notional_dates
+
+    state = {
+        "trading_day": "2026-08-31",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": 100.0,
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-08-29", "amount_usd": 50.0},
+                    {"trading_day": "2026-06-01", "amount_usd": "garbage"},
+                ],
+            }
+        ],
+    }
+
+    assert unusable_deployed_notional_dates(state) == {date(2026, 6, 1)}
+    # deployed_usd_by_claim_date() agrees the valid entry and the remainder
+    # are both fully accounted for -- nothing was silently dropped for
+    # 2026-08-29 or the artifact day, so neither belongs in the result above.
+    assert deployed_usd_by_claim_date(state) == {
+        date(2026, 8, 29): 50.0,
+        date(2026, 8, 31): 50.0,
+    }
+
+
 def test_deployed_notional_reader_rejects_an_oversized_json_integer():
     """A syntactically valid JSON integer can still overflow float()."""
     from dca_risk import has_unusable_deployed_notional
@@ -1579,3 +1923,32 @@ def test_deployed_notional_reader_rejects_an_oversized_json_integer():
     }
 
     assert has_unusable_deployed_notional(state) is True
+
+
+def test_nonnumeric_row_total_retains_artifact_day_even_with_a_fully_dated_breakdown():
+    # Codex review: "Retain artifact-day uncertainty when the row total is
+    # unknown". A whole_share_claim_breakdown is allowed to cover only part
+    # of a row -- any remainder belongs to the artifact day. When the row's
+    # own planned_amount_usd is nonnumeric (not merely uncertain-but-numeric),
+    # there is no known total to compare the breakdown sum against, so we can
+    # never prove the breakdown is exhaustive. Every claim-date entry here is
+    # validly dated (no has_unusable_claim_date), which previously caused the
+    # artifact day to be dropped entirely -- silently hiding an unbounded
+    # omitted remainder from the trailing evidence window.
+    from dca_risk import unusable_deployed_notional_dates
+
+    state = {
+        "trading_day": "2026-08-26",
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "planned_amount_usd": "unknown",
+                "whole_share_claim_breakdown": [
+                    {"trading_day": "2026-08-10", "amount_usd": 5.0},
+                ],
+            }
+        ],
+    }
+
+    assert unusable_deployed_notional_dates(state) == {date(2026, 8, 10), date(2026, 8, 26)}

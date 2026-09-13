@@ -48,10 +48,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
-import pandas as pd
-
 import evaluate as evaluate_module
 import model as model_module
+import pandas as pd
 import publish as publish_module
 from features import (
     _TICKER_SYMBOL_PATTERN,

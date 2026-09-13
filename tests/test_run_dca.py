@@ -1410,6 +1410,12 @@ def test_run_pipeline_bounded_reload_resolves_unresolved_same_day_context(tmp_pa
 
     calls: list = []
 
+    # **_kwargs absorbs the real _compute_auto_derived_prior_allocations()'s
+    # keyword-only max_per_order_usd/unreconstructable_sink parameters (the
+    # "fail same-day unknown submission amounts closed globally" fix) that
+    # this and every other bounded-reload fake in this module were written
+    # before -- the reload behavior under test here is orthogonal to those
+    # two, so the fakes only need to keep accepting the call, not use them.
     def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
         calls.append((now, trading_day, artifacts_dir, config_dir))
         if len(calls) == 1:
@@ -1602,6 +1608,64 @@ def test_compute_auto_derived_prior_allocations_deduplicates_a_mirrored_run_acro
     # The SAME $5.00 order, mirrored under two roots, must count once.
     assert allocations["AAPL"].amount_usd == pytest.approx(5.0)
     assert allocations["AAPL"].attempt_count == 1
+
+
+def test_compute_auto_derived_prior_allocations_full_duplicate_merge_unions_order_ids(
+    tmp_path,
+):
+    """Codex review: "Preserve uncertain order IDs across duplicate-root
+    merges". Same mirrored-run scenario as the dollar-dedup test above
+    (the afternoon root and a cross-stream sibling share a run_id, so the
+    final merge treats it as a full duplicate and keeps `existing`'s
+    dollars/run_ids), but the sibling root's copy of that run also exposes
+    a SECOND, uncertain order (A) for the same ticker that the afternoon
+    root's copy never saw. The full-duplicate branch must still union
+    contributing_order_ids -- discarding A's identity there would let a
+    later reload whose order-id set happens to match `existing`'s alone
+    look, by set equality, like proof A was resolved."""
+    import json
+
+    from run_dca import _compute_auto_derived_prior_allocations
+
+    trading_day = _now().date()
+    root = tmp_path / "cron_tracking"
+    same_run_id = "mirrored_override_0900"
+    afternoon_state = {
+        "trading_day": trading_day.isoformat(),
+        "generated_at": f"{trading_day.isoformat()}T09:00:00-04:00",
+        "run_classification": {"run_origin": "manual", "run_id": same_run_id},
+        "buy_candidates": [
+            {"ticker": "AAPL", "order_id": "order-B", "status": "filled", "planned_amount_usd": 5.0},
+        ],
+    }
+    sibling_state = {
+        "trading_day": trading_day.isoformat(),
+        "generated_at": f"{trading_day.isoformat()}T09:00:00-04:00",
+        "run_classification": {"run_origin": "manual", "run_id": same_run_id},
+        "buy_candidates": [
+            {"ticker": "AAPL", "order_id": "order-B", "status": "filled", "planned_amount_usd": 5.0},
+            {"ticker": "AAPL", "order_id": "order-A", "status": "filled", "planned_amount_usd": -1.0},
+        ],
+    }
+
+    afternoon_task_root = root / "ce16ba6b"
+    afternoon_dir = afternoon_task_root / "manual_runs" / "0900"
+    afternoon_dir.mkdir(parents=True)
+    (afternoon_dir / "run_state.json").write_text(json.dumps(afternoon_state), encoding="utf-8")
+
+    morning_dir = root / "morning_dca" / "manual_runs" / "0900"
+    morning_dir.mkdir(parents=True)
+    (morning_dir / "run_state.json").write_text(json.dumps(sibling_state), encoding="utf-8")
+
+    scheduled_dir = afternoon_task_root / "scheduled_runs" / "20260706_1520ET"
+    allocations, scan_had_failures = _compute_auto_derived_prior_allocations(
+        _now(), trading_day, scheduled_dir, None
+    )
+
+    assert scan_had_failures is False
+    assert allocations["AAPL"].amount_usd == pytest.approx(5.0)
+    assert "order-A" in allocations["AAPL"].contributing_order_ids
+    assert "order-B" in allocations["AAPL"].contributing_order_ids
 
 
 def test_compute_auto_derived_prior_allocations_deduplicates_a_mirrored_zero_notional_attempt(
@@ -2228,18 +2292,26 @@ def test_run_pipeline_does_not_poison_a_resolved_allocation_with_no_fill_price(
                     "AAPL": PriorSameDayAllocation(
                         "AAPL", amount_usd=3.0, reference_price=None, selected_base_amount_usd=2.0,
                         notional_uncertain=True,
+                        contributing_order_ids=frozenset({"order-1"}),
                     )
                 },
                 False,
             )
-        # Clean, complete reload: a genuine, larger reconstructed amount --
-        # still no fill price (a live "submitted" order), but NOT the
-        # unreconstructable sentinel.
+        # Clean, complete reload: the SAME order (order-1), now fully
+        # reconstructed with a genuine, larger dollar total -- still no
+        # fill price (a live "submitted" order), but NOT the
+        # unreconstructable sentinel. The matching order_ids are the
+        # provenance proof this branch's uncertainty-clearing guard
+        # requires (Codex review: "Preserve uncertainty when the reload
+        # amount increases") -- an unrelated order growing the total
+        # without proving it still accounts for order-1 must NOT clear
+        # the flag, but this is the SAME order, so it legitimately may.
         return (
             {
                 "AAPL": PriorSameDayAllocation(
                     "AAPL", amount_usd=8.0, reference_price=None, selected_base_amount_usd=2.0,
                     notional_uncertain=False,
+                    contributing_order_ids=frozenset({"order-1"}),
                 )
             },
             False,
@@ -2263,6 +2335,379 @@ def test_run_pipeline_does_not_poison_a_resolved_allocation_with_no_fill_price(
         "a resolved allocation with a genuine reconstructed amount must not "
         "poison the shared weekly bucket just because it still has no "
         "known fill price"
+    )
+
+
+def test_run_pipeline_clean_equal_reload_clears_notional_uncertainty(tmp_path, monkeypatch):
+    """An equal, clean reconstructed amount from the SAME order supersedes
+    a sentinel estimate."""
+    import run_dca
+    from near_close_dca import BUDGET_TIERS, PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(*_args, unreconstructable_sink=None, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            if unreconstructable_sink is not None:
+                unreconstructable_sink.append("AAPL")
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", 3.0, None, notional_uncertain=True,
+                        contributing_run_ids=frozenset({"same_run"}),
+                        contributing_order_ids=frozenset({"order-1"}),
+                    )
+                },
+                False,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", 3.0, None, notional_uncertain=False,
+                    contributing_run_ids=frozenset({"same_run"}),
+                    contributing_order_ids=frozenset({"order-1"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    trading_day = _now().astimezone(EASTERN).date()
+    state = StrategyState()
+
+    run_dca.run_pipeline(
+        _now(), _demo_config(), state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(_demo_config()), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert state.week_notional(trading_day) < max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+
+
+def test_run_pipeline_equal_reload_from_a_different_contributor_keeps_uncertainty(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Preserve uncertainty unless reload provenance matches"):
+    an equal dollar total across two scans is not proof the SAME order was
+    reconstructed. An uncertain $3 submission can disappear between scans
+    while an unrelated $3 fill for the same ticker appears -- the true
+    deployment could be $6, not $3, and clearing the uncertainty just
+    because the numbers happened to match would drop the worst-case cap
+    poisoning for a submission that is still genuinely unresolved.
+    """
+    import run_dca
+    from near_close_dca import BUDGET_TIERS, PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(*_args, unreconstructable_sink=None, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            if unreconstructable_sink is not None:
+                unreconstructable_sink.append("AAPL")
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", 3.0, None, notional_uncertain=True,
+                        contributing_run_ids=frozenset({"first_run"}),
+                        contributing_order_ids=frozenset({"order-1"}),
+                    )
+                },
+                False,
+            )
+        # A DIFFERENT run now accounts for the same $3 -- not proof the
+        # first pass's uncertain submission was ever actually resolved.
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", 3.0, None, notional_uncertain=False,
+                    contributing_run_ids=frozenset({"second_run"}),
+                    contributing_order_ids=frozenset({"order-2"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    trading_day = _now().astimezone(EASTERN).date()
+    state = StrategyState()
+
+    run_dca.run_pipeline(
+        _now(), _demo_config(), state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(_demo_config()), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+    assert state.week_notional(trading_day) == worst_case_cap, (
+        "an equal amount from a DIFFERENT contributor must not clear the "
+        "first pass's uncertainty -- the worst-case poisoning must stand"
+    )
+
+
+def test_run_pipeline_same_run_id_but_different_order_keeps_uncertainty(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Match order-level provenance before clearing
+    uncertainty"): equal contributing_run_ids does not prove the SAME order
+    was reconstructed -- a single mutable run_state.json can expose
+    MULTIPLE distinct same-ticker orders under one run_id across two scans.
+    An uncertain $3 submission can disappear from a run while a DIFFERENT
+    confirmed $3 order from that SAME run appears -- clearing uncertainty
+    on run_id equality alone would understate deployment even though the
+    run identity matches exactly.
+    """
+    import run_dca
+    from near_close_dca import BUDGET_TIERS, PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(*_args, unreconstructable_sink=None, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            if unreconstructable_sink is not None:
+                unreconstructable_sink.append("AAPL")
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", 3.0, None, notional_uncertain=True,
+                        contributing_run_ids=frozenset({"same_run"}),
+                        contributing_order_ids=frozenset({"order-A"}),
+                    )
+                },
+                False,
+            )
+        # The SAME run_id, but a genuinely DIFFERENT order under it.
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", 3.0, None, notional_uncertain=False,
+                    contributing_run_ids=frozenset({"same_run"}),
+                    contributing_order_ids=frozenset({"order-B"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    trading_day = _now().astimezone(EASTERN).date()
+    state = StrategyState()
+
+    run_dca.run_pipeline(
+        _now(), _demo_config(), state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(_demo_config()), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+    assert state.week_notional(trading_day) == worst_case_cap, (
+        "an equal run_id with a DIFFERENT order_id must not clear the "
+        "first pass's uncertainty -- run-level identity alone is not proof"
+    )
+
+
+def test_run_pipeline_a_lost_uncertain_contributor_keeps_uncertainty(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Require provenance for the uncertain contributor
+    itself"): contributing_order_ids used to only be populated at the
+    dollar-CONFIRMED site, so an uncertain/sentinel row's own order
+    identity was never tracked. Pass one sees an uncertain order A (order
+    id "order-A") plus a known $2 order B ("order-B") -- contributing_
+    order_ids only contained {"order-B"}, silently omitting A. A clean
+    reload that loses A entirely while correcting B to $5 (an entirely
+    plausible independent reconciliation) would then show the SAME
+    {"order-B"} set on both passes and clear the uncertainty, even though
+    A may still represent live, unaccounted spend. With the fix,
+    contributing_order_ids on pass one includes BOTH "order-A" and
+    "order-B", so pass two's {"order-B"}-only set no longer matches and
+    the uncertainty correctly survives.
+    """
+    import run_dca
+    from near_close_dca import BUDGET_TIERS, PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(*_args, unreconstructable_sink=None, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            if unreconstructable_sink is not None:
+                unreconstructable_sink.append("AAPL")
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", 5.0, None, notional_uncertain=True,
+                        contributing_run_ids=frozenset({"same_run"}),
+                        # Both the uncertain order A and the known order B
+                        # contributed to this pass's identity set -- the
+                        # exact fix this test guards.
+                        contributing_order_ids=frozenset({"order-A", "order-B"}),
+                    )
+                },
+                False,
+            )
+        # A lost entirely; B alone now accounts for the same $5 total.
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", 5.0, None, notional_uncertain=False,
+                    contributing_run_ids=frozenset({"same_run"}),
+                    contributing_order_ids=frozenset({"order-B"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    trading_day = _now().astimezone(EASTERN).date()
+    state = StrategyState()
+
+    run_dca.run_pipeline(
+        _now(), _demo_config(), state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(_demo_config()), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+    assert state.week_notional(trading_day) == worst_case_cap, (
+        "losing the uncertain contributor A while another known order B "
+        "coincidentally accounts for the same total must not clear the "
+        "first pass's uncertainty"
+    )
+
+
+def test_run_pipeline_a_larger_reload_amount_keeps_uncertainty_without_provenance(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Preserve uncertainty when the reload amount
+    increases"): the order-level provenance guard only protected the
+    EQUAL-amount branch of the cross-stream merge. When the reload's
+    amount is strictly LARGER, the merge used to replace the entry
+    wholesale (`prior_same_day_allocations[ticker] = alloc`), always
+    carrying alloc's own notional_uncertain regardless of provenance.
+    Pass one sees an uncertain $10 order A; pass two loses A entirely
+    while discovering an unrelated, larger $12 order B. $12 > $10 looks
+    "more complete", but B's total does not include A's $10 at all --
+    the real aggregate could still be $22, not $12 -- so the merge must
+    not silently clear the uncertainty just because the reload's number
+    got bigger.
+    """
+    import run_dca
+    from near_close_dca import BUDGET_TIERS, PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(*_args, unreconstructable_sink=None, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            if unreconstructable_sink is not None:
+                unreconstructable_sink.append("AAPL")
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", 10.0, None, notional_uncertain=True,
+                        contributing_run_ids=frozenset({"first_run"}),
+                        contributing_order_ids=frozenset({"order-A"}),
+                    )
+                },
+                False,
+            )
+        # A lost entirely; a DIFFERENT, larger order B now accounts for a
+        # bigger total that never actually included A's dollars.
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", 12.0, None, notional_uncertain=False,
+                    contributing_run_ids=frozenset({"second_run"}),
+                    contributing_order_ids=frozenset({"order-B"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    trading_day = _now().astimezone(EASTERN).date()
+    state = StrategyState()
+
+    run_dca.run_pipeline(
+        _now(), _demo_config(), state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(_demo_config()), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+    assert state.week_notional(trading_day) == worst_case_cap, (
+        "a LARGER reload amount from an unrelated order must not clear the "
+        "first pass's uncertainty without proving A's dollars are accounted for"
+    )
+
+
+def test_run_pipeline_a_new_reference_price_does_not_smuggle_away_uncertainty(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Preserve uncertainty through reload metadata
+    replacement"): the provenance check only guards the FIRST branch's own
+    explicit notional_uncertain clearing. When the reload has disjoint
+    provenance (so that check correctly declines to clear) but ALSO
+    supplies a new, different reference price, the separate reference-
+    price-replacement branch used to overwrite the whole entry with the
+    reload's own alloc -- whose notional_uncertain is False -- silently
+    smuggling away the uncertainty this exact ticker was just proven NOT to
+    have resolved.
+    """
+    import run_dca
+    from near_close_dca import BUDGET_TIERS, PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(*_args, unreconstructable_sink=None, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            if unreconstructable_sink is not None:
+                unreconstructable_sink.append("AAPL")
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL", 3.0, None, notional_uncertain=True,
+                        contributing_run_ids=frozenset({"first_run"}),
+                    )
+                },
+                False,
+            )
+        # A DIFFERENT run accounts for the same $3, but ALSO happens to
+        # carry a known reference price this ticker never had before.
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL", 3.0, 99.0, notional_uncertain=False,
+                    contributing_run_ids=frozenset({"second_run"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+    trading_day = _now().astimezone(EASTERN).date()
+    state = StrategyState()
+
+    run_dca.run_pipeline(
+        _now(), _demo_config(), state,
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(_demo_config()), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    worst_case_cap = max(tier.weekly_cap_usd for tier in BUDGET_TIERS)
+    assert state.week_notional(trading_day) == worst_case_cap, (
+        "a new reference price from a DIFFERENT contributor must not clear "
+        "the first pass's uncertainty through the metadata-replacement "
+        "branch -- the worst-case poisoning must stand"
     )
 
 
@@ -2773,6 +3218,257 @@ def test_run_pipeline_bounded_reload_keeps_newly_recovered_ticker_uncertain(
     assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_price"
     assert by_ticker["AAPL"]["top_up_manual_review"] is True
     assert by_ticker["AAPL"]["prior_same_day_amount"] == 6.0
+
+
+def test_run_pipeline_bounded_reload_keeps_uncertainty_when_reload_omits_id_less_contributor(
+    tmp_path, monkeypatch
+):
+    # Codex review, PR badMade/all-stock-dca#1168 discussion r3900047294:
+    # "Track identity for id-less uncertain contributors, not just a
+    # known-ID subset check". The first scan combines a KNOWN $3 order
+    # ("order-X") with an id-less $2 uncertain candidate (no order_id at
+    # all, so it never enters contributing_order_ids -- only
+    # uncertain_contributor_ids) -- amount_usd=5.0, notional_uncertain=True.
+    # A clean reload swaps in a DIFFERENT known $3 order ("order-Y") while
+    # never re-observing the id-less candidate -- amount_usd=6.0 (order-X +
+    # order-Y), notional_uncertain=False, contributing_order_ids={"order-X",
+    # "order-Y"}. existing.contributing_order_ids={"order-X"} IS a subset of
+    # that, so the OLD known-ID-only subset check would wrongly treat this
+    # as proof the first pass's uncertainty was fully resolved -- silently
+    # dropping the id-less candidate's possibly-still-live $2 from
+    # deployment/cap accounting. uncertain_contributor_ids must block that:
+    # existing's is nonempty and the reload's own uncertain_contributor_ids
+    # is empty, so the subset proof fails and the merge must keep the
+    # ticker unresolved, poisoned to the larger $6.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL",
+                        amount_usd=5.0,
+                        reference_price=None,
+                        selected_base_amount_usd=2.0,
+                        notional_uncertain=True,
+                        contributing_order_ids=frozenset({"order-X"}),
+                        uncertain_contributor_ids=frozenset({"uncertain-1"}),
+                    )
+                },
+                True,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL",
+                    amount_usd=6.0,
+                    reference_price=98.0,
+                    run_id="am",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                    notional_uncertain=False,
+                    contributing_order_ids=frozenset({"order-X", "order-Y"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must stay unresolved despite the known-order subset matching -- the
+    # id-less uncertain contributor was never re-observed. notional_uncertain
+    # staying True routes through evaluate_top_up_guard's own dedicated
+    # branch for it (TOP_UP_MISSING_PRIOR_BASE), distinct from the
+    # reference-price-poisoning branches (TOP_UP_MISSING_PRIOR_PRICE) the
+    # OTHER bounded-reload tests in this file exercise.
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_base"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 6.0
+
+
+def test_run_pipeline_bounded_reload_keeps_uncertainty_on_equal_total_when_id_less_contributor_vanishes(
+    tmp_path, monkeypatch
+):
+    # Same gap as the "omits id-less contributor" test above, but for the
+    # EQUAL-amount branch's exact-set-equality check instead of the
+    # larger-amount branch's subset check (the task's "equal-amount
+    # equality check nearby has the same completeness problem"). First
+    # scan: a known $3 order ("order-X") plus an id-less $2 uncertain
+    # candidate -- amount_usd=5.0, notional_uncertain=True. Clean reload:
+    # a coincidentally equal $5.0 total built from order-X ($3) plus a
+    # DIFFERENT known order ("order-Y", $2) -- contributing_order_ids=
+    # {"order-X","order-Y"} != existing's {"order-X"}, so the
+    # contributing_order_ids equality check alone already blocks this.
+    # This test isolates the case where contributing_order_ids themselves
+    # happen to match exactly (order-X's set is literally reused) while the
+    # id-less uncertain candidate is simply dropped from the total this
+    # pass and replaced by a resolved, equal-dollar in-place correction --
+    # uncertain_contributor_ids must still block clearing since the id-less
+    # candidate itself was never re-observed.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL",
+                        amount_usd=5.0,
+                        reference_price=None,
+                        selected_base_amount_usd=2.0,
+                        notional_uncertain=True,
+                        contributing_order_ids=frozenset({"order-X"}),
+                        uncertain_contributor_ids=frozenset({"uncertain-1"}),
+                    )
+                },
+                True,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL",
+                    amount_usd=5.0,
+                    reference_price=98.0,
+                    run_id="am",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                    notional_uncertain=False,
+                    contributing_order_ids=frozenset({"order-X"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must stay unresolved despite contributing_order_ids matching exactly
+    # -- the id-less uncertain contributor was never re-observed.
+    # notional_uncertain staying True routes through evaluate_top_up_guard's
+    # own dedicated branch for it (TOP_UP_MISSING_PRIOR_BASE).
+    assert by_ticker["AAPL"]["top_up_guard_result"] == "missing_prior_base"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is True
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 5.0
+
+
+def test_run_pipeline_bounded_reload_resolves_an_id_less_contributor_that_becomes_reconstructable(
+    tmp_path, monkeypatch
+):
+    # Codex review, PR badMade/all-stock-dca#1171 discussion: "Retain
+    # identity after resolving an anonymous row" -- a P1 caught in review
+    # on an EARLIER version of the fix above. That version assigned an
+    # id-less row's synthetic uncertain_contributor_ids identity ONLY on
+    # the uncertain/sentinel path, so a row that later became fully
+    # reconstructable (e.g. its transient NaN amount replaced by a usable
+    # one on a clean reload) necessarily produced an EMPTY set on the
+    # resolved pass -- the subset/equality proof could then never succeed
+    # for that contributor, permanently forcing notional_uncertain=True
+    # and the worst-case shared-cap ceiling even after a clean, complete
+    # re-observation. This is the positive case the fix must still allow:
+    # AAPL's first pass has ONLY an id-less uncertain candidate (no known
+    # order at all) contributing a $2 sentinel; a clean reload reads the
+    # SAME row now resolved to a real $4 -- the synthetic identity must be
+    # recorded on BOTH passes so the merge can tell this is the same
+    # contributor, re-observed and resolved, not a different one replacing
+    # it, and let the ticker clear to a normal (non-manual-review) outcome.
+    import run_dca
+    from near_close_dca import PriorSameDayAllocation
+
+    calls: list = []
+
+    def _fake_compute(now, trading_day, artifacts_dir, config_dir, **_kwargs):
+        calls.append((now, trading_day, artifacts_dir, config_dir))
+        if len(calls) == 1:
+            return (
+                {
+                    "AAPL": PriorSameDayAllocation(
+                        "AAPL",
+                        amount_usd=2.0,
+                        reference_price=None,
+                        selected_base_amount_usd=2.0,
+                        notional_uncertain=True,
+                        uncertain_contributor_ids=frozenset({"uncertain:AAPL:run-1:row0"}),
+                    )
+                },
+                True,
+            )
+        return (
+            {
+                "AAPL": PriorSameDayAllocation(
+                    "AAPL",
+                    amount_usd=4.0,
+                    reference_price=98.0,
+                    run_id="am",
+                    source="manual",
+                    selected_base_amount_usd=2.0,
+                    notional_uncertain=False,
+                    # Same row, same synthetic identity, now on the
+                    # resolved/confirmed side -- the exact carry-forward
+                    # the fix must produce.
+                    uncertain_contributor_ids=frozenset({"uncertain:AAPL:run-1:row0"}),
+                )
+            },
+            False,
+        )
+
+    monkeypatch.setattr(run_dca, "_compute_auto_derived_prior_allocations", _fake_compute)
+
+    config = _demo_config()
+    result = run_dca.run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        build_broker(config), artifacts_dir=tmp_path,
+    )
+
+    assert len(calls) == 2
+    assert result["blocked"] is False
+    import json
+
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = json.load(handle)
+    by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
+    # Must NOT be stuck at the manual-review missing_prior_base outcome --
+    # the same contributor was cleanly re-observed and resolved, so the
+    # guard must evaluate normally against the resolved $4/$98 context.
+    assert by_ticker["AAPL"]["top_up_guard_result"] != "missing_prior_base"
+    assert by_ticker["AAPL"]["top_up_manual_review"] is not True
+    assert by_ticker["AAPL"]["prior_same_day_amount"] == 4.0
 
 
 def test_run_pipeline_bounded_reload_poisons_resolved_ticker_on_reverse_swap(
@@ -5369,6 +6065,144 @@ def test_run_pipeline_manifest_refresh_skips_a_concurrently_modified_run_state(
     assert "skipping raw-input manifest refresh" in caplog.text
 
 
+def test_run_pipeline_skips_post_processing_when_ownership_not_verified(
+    tmp_path, monkeypatch, caplog
+):
+    """Codex review ("Propagate foreign ownership to the outer pipeline"):
+    run_daily_compact() can determine the shared artifacts directory
+    belongs to a DIFFERENT invocation or account and correctly leave it
+    untouched -- but this caller used to still trust
+    result["run_state_path"] as its own output regardless, letting the
+    raw-input manifest refresh and preflight_gate persistence rewrite that
+    foreign artifact. When result["directory_ownership_verified"] is False,
+    the pipeline must skip all of that post-processing and return
+    immediately, the foreign state left byte-for-byte untouched."""
+    import json as _json
+
+    import run_dca
+
+    config = load_strategy_config(approved_test_dates=frozenset({_now().date()}), dry_run=False)
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
+    scheduled_dir.mkdir(parents=True)
+    broker = DryRunBroker(account=config.target_account_number)
+
+    foreign_state = {
+        "run_id": "foreign-owner-2026-07-06-1530ET",
+        "trading_day": "2026-07-06",
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "raw_inputs_saved": [],
+    }
+    run_state_path = scheduled_dir / "run_state.json"
+    run_state_path.write_text(_json.dumps(foreign_state), encoding="utf-8")
+
+    def foreign_owner_compact(*_args, **_kwargs):
+        # Stands in for run_daily_compact() having already refused to touch
+        # this directory -- the minimal result shape _run_pipeline_impl
+        # reads before reaching the new ownership check.
+        return {
+            "blocked": False,
+            "run_state_path": str(run_state_path),
+            "directory_ownership_verified": False,
+        }
+
+    monkeypatch.setattr(run_dca, "run_daily_compact", foreign_owner_compact)
+
+    good_inputs = {
+        "quotes_batch1.json": {"results": [{"quote": {"symbol": "AAPL"}}]},
+        "historicals_batch1.json": {"results": [{"symbol": "AAPL", "interval": 5, "items": []}]},
+        "finance_bars_batch1.json": {"results": [{"ticker": "AAPL", "interval_minutes": 5, "bars": []}]},
+        "finance_close_batch1.json": {"results": [{"ticker": "AAPL", "previous_close": 149.0}]},
+    }
+
+    with caplog.at_level("WARNING"):
+        result = run_pipeline(
+            _now(), config, StrategyState(),
+            DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+            cast(Any, broker), artifacts_dir=scheduled_dir,
+            raw_connector_inputs=good_inputs,
+        )
+    assert result.get("directory_ownership_verified") is False
+    assert "could not verify ownership" in caplog.text
+
+    # The foreign state must survive completely untouched -- no manifest
+    # refresh, no preflight_gate rewrite.
+    persisted = _json.loads(run_state_path.read_bytes())
+    assert persisted == foreign_state
+
+
+def test_run_pipeline_pings_a_failed_heartbeat_when_ownership_not_verified(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Fail the heartbeat on directory ownership
+    conflicts"): the sibling test above confirms the pipeline skips
+    post-processing when directory_ownership_verified is False, but
+    guarded_run's own result_ok predicate never checked that flag --
+    it only recognized raw_persistence_error and
+    ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT. A scheduled LIVE run whose
+    artifact publication was rejected due to an ownership conflict
+    still returned a result result_ok read as healthy, clearing the
+    success heartbeat and sending no failure alert even though its
+    live placements may exist only in a manual-reconciliation
+    sidecar."""
+    import json as _json
+
+    import dca_alerts
+    import run_dca
+
+    config = load_strategy_config(approved_test_dates=frozenset({_now().date()}), dry_run=False)
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
+    scheduled_dir.mkdir(parents=True)
+    broker = DryRunBroker(account=config.target_account_number)
+
+    foreign_state = {
+        "run_id": "foreign-owner-2026-07-06-1530ET",
+        "trading_day": "2026-07-06",
+        "run_classification": {
+            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        },
+        "raw_inputs_saved": [],
+    }
+    run_state_path = scheduled_dir / "run_state.json"
+    run_state_path.write_text(_json.dumps(foreign_state), encoding="utf-8")
+
+    def foreign_owner_compact(*_args, **_kwargs):
+        return {
+            "blocked": False,
+            "run_state_path": str(run_state_path),
+            "directory_ownership_verified": False,
+        }
+
+    monkeypatch.setattr(run_dca, "run_daily_compact", foreign_owner_compact)
+
+    heartbeat_calls = []
+    monkeypatch.setattr(
+        dca_alerts, "send_heartbeat",
+        lambda stream, ok: heartbeat_calls.append((stream, ok)),
+    )
+    monkeypatch.setattr(dca_alerts, "alert_failure", lambda *a, **k: None)
+
+    good_inputs = {
+        "quotes_batch1.json": {"results": [{"quote": {"symbol": "AAPL"}}]},
+        "historicals_batch1.json": {"results": [{"symbol": "AAPL", "interval": 5, "items": []}]},
+        "finance_bars_batch1.json": {"results": [{"ticker": "AAPL", "interval_minutes": 5, "bars": []}]},
+        "finance_close_batch1.json": {"results": [{"ticker": "AAPL", "previous_close": 149.0}]},
+    }
+
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        cast(Any, broker), artifacts_dir=scheduled_dir,
+        raw_connector_inputs=good_inputs,
+    )
+    assert result.get("directory_ownership_verified") is False
+
+    assert len(heartbeat_calls) == 1
+    _stream, ok = heartbeat_calls[0]
+    assert ok is False
+
+
 def test_build_frozen_providers_hides_corporate_action_lookup_for_legacy_providers(tmp_path):
     """A legacy/test finance provider without get_corporate_action_factor must
     not gain the capability just because it's backed by a real
@@ -6440,6 +7274,535 @@ def test_run_slot_1030et_still_runs_account_pinning_with_no_preflight_artifact(
     assert run_state["error_class"] == "scheduled_run_startup_failure"
     assert "Refusing to trade account" in run_state["error_detail"]
     assert run_state["run_classification_outcome"] == "failed_scheduled_run_startup"
+
+
+def test_run_slot_1030et_skips_preflight_gate_rewrite_on_concurrent_state_change(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Reverify ownership before rewriting post-run state"):
+    the preflight_gate persistence read-modify-write used to have neither a
+    lock nor a byte comparison. Two overlapping live invocations of the
+    same slot can both pass the earlier ownership check; without
+    serializing this rewrite, invocation A reads run_state.json here,
+    invocation B publishes its own newer state in the meantime, and A's
+    write would overwrite B's state built from A's stale read -- dropping
+    B's own submitted candidates from the canonical state. This test
+    injects B's overwrite into the gap between A's initial read and A's
+    final compare-before-write (via _existing_csv_artifacts, the one call
+    made between those two reads whenever usage_proxy is present), and
+    asserts A's write is skipped rather than clobbering B's state."""
+    import json
+
+    import run_dca
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    run_state_path = tmp_path / "artifacts" / "run_state.json"
+
+    # A SEPARATE invocation of the same slot's own genuinely different,
+    # already-published state -- standing in for invocation B.
+    peer_state = {
+        "run_id": "peer-b-1030et",
+        "trading_day": "peer",
+        "buy_candidates": [{"ticker": "MSFT", "status": "submitted", "order_id": "PEER-B-ORDER"}],
+        "usage_proxy": {},
+    }
+
+    real_existing_csv_artifacts = run_dca._existing_csv_artifacts
+    _calls = {"count": 0}
+
+    def existing_csv_artifacts_then_peer_overwrites(run_dir):
+        # Only the preflight_gate rewrite's OWN call reaches here in this
+        # scenario (no raw_persistence_state is passed, so the sibling
+        # manifest-refresh block above it never runs its own identical
+        # call) -- landing exactly between A's initial read and A's final
+        # compare-before-write, still inside A's own lock.
+        _calls["count"] += 1
+        if _calls["count"] == 1:
+            run_state_path.write_text(json.dumps(peer_state), encoding="utf-8")
+        return real_existing_csv_artifacts(run_dir)
+
+    monkeypatch.setattr(run_dca, "_existing_csv_artifacts", existing_csv_artifacts_then_peer_overwrites)
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        preflight_gate={"preflight_found": False, "warning": "test"},
+    )
+    # The in-memory return value still carries it (documented behavior)...
+    assert result["preflight_gate"]["preflight_found"] is False
+    # ...but B's on-disk state must survive completely untouched -- A's
+    # stale-read rewrite must never have been written.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
+
+
+def test_run_pipeline_rechecks_identity_when_a_peer_claims_the_directory_after_ownership_verified(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Recheck artifact identity inside each post-run
+    lock"): the sibling test above (`..._skips_preflight_gate_rewrite_on_
+    concurrent_state_change`) proves the byte comparison catches a peer
+    that overwrites BETWEEN this rewrite's own initial read and its final
+    compare-before-write, still inside the SAME lock. It does not cover
+    the narrower, earlier gap this fix closes: a peer that publishes
+    AFTER run_daily_compact() returned with directory_ownership_verified=
+    True but BEFORE this rewrite's own lock is even acquired. The
+    rewrite's own first read (taken only once the lock is held) is
+    already that peer's payload in that case, so comparing the final
+    read against IT (the old behavior) trivially matches. The fix binds
+    the comparison to a snapshot captured immediately when ownership was
+    last confirmed, before either rewrite does any further work of its
+    own."""
+    import json
+    import sys
+
+    import run_dca
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    run_state_path = tmp_path / "artifacts" / "run_state.json"
+
+    # A SEPARATE invocation of the same slot's own genuinely different,
+    # already-published state -- standing in for invocation B, publishing
+    # in the gap BEFORE either rewrite's own lock is acquired at all.
+    peer_state = {
+        "run_id": "peer-b-1030et-pre-lock",
+        "trading_day": "peer",
+        "buy_candidates": [{"ticker": "MSFT", "status": "submitted", "order_id": "PEER-B-PRE-LOCK-ORDER"}],
+        "usage_proxy": {},
+    }
+
+    real_read_bytes = Path.read_bytes
+    _fired = {"value": False}
+
+    def read_bytes_then_peer_claims_directory(self, *args, **kwargs):
+        result = real_read_bytes(self, *args, **kwargs)
+        # Fires exactly once, right after `_run_pipeline_impl`'s OWN
+        # `_known_run_state_bytes` capture -- the pipeline-level snapshot
+        # taken immediately after run_daily_compact() returned with
+        # ownership verified, before the preflight_gate rewrite's own
+        # lock is ever acquired.
+        if (
+            not _fired["value"]
+            and self.name == "run_state.json"
+            and sys._getframe(1).f_code.co_name == "_run_pipeline_impl"
+        ):
+            _fired["value"] = True
+            run_state_path.write_text(json.dumps(peer_state), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes_then_peer_claims_directory)
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        preflight_gate={"preflight_found": False, "warning": "test"},
+    )
+    assert _fired["value"] is True
+    # The in-memory return value still carries it (documented behavior)...
+    assert result["preflight_gate"]["preflight_found"] is False
+    # ...but B's on-disk state must survive completely untouched -- A's
+    # rewrite must never have landed in B's file just because A's own
+    # in-lock self-comparison trivially matched.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
+
+
+def test_run_pipeline_binds_post_run_snapshot_to_run_daily_compacts_own_lock(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Bind the post-run snapshot to the ownership check"):
+    a follow-up on the sibling test above
+    (`..._rechecks_identity_when_a_peer_claims_the_directory_after_
+    ownership_verified`), which only injects the peer AFTER `_run_pipeline_
+    impl`'s own `_known_run_state_bytes` read -- proving the byte-compare
+    inside each rewrite's lock works, but not closing the window one level
+    earlier: a peer replacing run_state.json AFTER `run_daily_compact()`
+    releases its own ownership lock but BEFORE `_known_run_state_bytes` is
+    even captured. An unconditional re-read there would silently adopt the
+    PEER's payload as "this invocation's last verified state" -- passing
+    every later in-lock comparison trivially, since they all compare
+    against that same now-wrong snapshot, and letting the downstream
+    rewrites mutate the peer's artifact. The fix threads the exact bytes
+    out of `run_daily_compact()`'s own lock instead of ever re-reading the
+    shared path here, so this window must be closed even when the
+    injection happens as early as immediately after `run_daily_compact()`
+    itself returns."""
+    import json
+
+    import run_dca
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    run_state_path = tmp_path / "artifacts" / "run_state.json"
+
+    # A SEPARATE invocation's own genuinely different, already-published
+    # state -- standing in for invocation B, publishing in the gap
+    # immediately after run_daily_compact() released its own ownership
+    # lock but before this invocation's post-run snapshot is captured.
+    peer_state = {
+        "run_id": "peer-b-1030et-post-return",
+        "trading_day": "peer",
+        "buy_candidates": [
+            {"ticker": "MSFT", "status": "submitted", "order_id": "PEER-B-POST-RETURN-ORDER"}
+        ],
+        "usage_proxy": {},
+    }
+
+    real_run_daily_compact = run_dca.run_daily_compact
+    _fired = {"value": False}
+
+    def run_daily_compact_then_peer_claims_directory(*args, **kwargs):
+        result = real_run_daily_compact(*args, **kwargs)
+        # Fires exactly once, immediately after run_daily_compact() itself
+        # returns -- BEFORE `_run_pipeline_impl` captures its own
+        # `_known_run_state_bytes` snapshot at all. The old, unconditional
+        # re-read there would adopt this peer's bytes as "known"; the fix
+        # must use the bytes `run_daily_compact()` itself returns instead.
+        if not _fired["value"] and result.get("directory_ownership_verified") is True:
+            _fired["value"] = True
+            run_state_path.write_text(json.dumps(peer_state), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(run_dca, "run_daily_compact", run_daily_compact_then_peer_claims_directory)
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        preflight_gate={"preflight_found": False, "warning": "test"},
+    )
+    assert _fired["value"] is True
+    # The in-memory return value still carries it (documented behavior)...
+    assert result["preflight_gate"]["preflight_found"] is False
+    # ...but B's on-disk state must survive completely untouched -- neither
+    # the raw-input-manifest refresh nor the preflight_gate rewrite may
+    # bind their own "known" snapshot to the peer's bytes just because this
+    # invocation re-read the shared path after the peer published.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
+
+
+def test_run_pipeline_rechecks_ownership_immediately_before_raw_response_merge(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Recheck ownership immediately before downstream
+    writes"): `_ownership_lost_mid_pipeline` was previously only ever set by
+    the raw-manifest-refresh and preflight_gate rewrites above -- and each
+    only performs its own in-lock ownership comparison when it actually has
+    something to rewrite (`raw_persistence_state`/`preflight_gate` set).
+    With NEITHER present (the scenario here), nothing at all rechecked
+    ownership between `run_daily_compact()` confirming it and the raw-
+    placement-response merge / full-report generation that follow -- so a
+    peer publishing in that exact window went completely undetected, and
+    both would have run against a directory this invocation no longer
+    owned. Companion to the two rewrite-specific tests above -- this proves
+    the recheck this fix adds is not merely redundant with them."""
+    import json
+
+    import run_dca
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    run_state_path = tmp_path / "artifacts" / "run_state.json"
+
+    # A SEPARATE invocation's own genuinely different, already-published
+    # state -- standing in for invocation B, publishing immediately after
+    # run_daily_compact() returns and before either rewrite (both skipped
+    # here) or this fix's own recheck runs.
+    peer_state = {
+        "run_id": "peer-b-1030et-no-rewrites",
+        "trading_day": "peer",
+        "buy_candidates": [
+            {"ticker": "MSFT", "status": "submitted", "order_id": "PEER-B-NO-REWRITES-ORDER"}
+        ],
+        "usage_proxy": {},
+    }
+
+    real_run_daily_compact = run_dca.run_daily_compact
+    _fired = {"value": False}
+
+    def run_daily_compact_then_peer_claims_directory(*args, **kwargs):
+        result = real_run_daily_compact(*args, **kwargs)
+        if not _fired["value"] and result.get("directory_ownership_verified") is True:
+            _fired["value"] = True
+            run_state_path.write_text(json.dumps(peer_state), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(run_dca, "run_daily_compact", run_daily_compact_then_peer_claims_directory)
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        generate_full_reports=True,
+        # Neither `raw_persistence_state` nor `preflight_gate` is passed --
+        # both existing rewrites are skipped entirely, so only this fix's
+        # own recheck stands between run_daily_compact() and the merge/
+        # report section below.
+    )
+    assert _fired["value"] is True
+    assert result.get("directory_ownership_verified") is False
+    # Full-report generation never ran against the peer's directory.
+    assert "reports" not in result
+    # B's on-disk state must survive completely untouched.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
+
+
+def test_run_pipeline_fails_closed_when_the_ownership_recheck_cannot_be_verified(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Fail closed when the ownership lock cannot be
+    checked"): the pre-merge ownership recheck's own `except (TimeoutError,
+    OSError):` handler used to only log a warning, leaving
+    `_ownership_lost_mid_pipeline` False -- an UNVERIFIABLE check was
+    treated the same as a VERIFIED one, even though a lock timeout can
+    happen exactly because a peer is actively publishing right now, the
+    precise scenario this recheck exists to catch. This proves a lock
+    failure AT THAT FIRST RECHECK SPECIFICALLY fails closed -- isolated
+    from the later report-generation lock (which has its own, separate
+    fail-closed handling: see
+    `test_run_pipeline_reverifies_ownership_at_the_report_generation_
+    write_site`) by only failing the FIRST `run_state.json.lock`
+    acquisition and letting every later one succeed normally, so this test
+    cannot pass merely because some OTHER lock site also fails closed."""
+    import run_dca
+    import scripts.file_lock as file_lock_mod
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    real_cross_process_lock = file_lock_mod.cross_process_lock
+    _run_state_lock_calls = {"count": 0}
+
+    def timeout_on_first_run_state_lock_only(path, *args, **kwargs):
+        if Path(path).name == "run_state.json.lock":
+            _run_state_lock_calls["count"] += 1
+            if _run_state_lock_calls["count"] == 1:
+                raise TimeoutError("simulated: lock contended by an actively-publishing peer")
+        return real_cross_process_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(file_lock_mod, "cross_process_lock", timeout_on_first_run_state_lock_only)
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        generate_full_reports=True,
+    )
+    # Proves the injected failure landed at the FIRST run_state.json.lock
+    # acquisition (the pre-merge recheck) and nothing else -- if the pipeline
+    # never even reached that lock, this test would prove nothing about the
+    # recheck's own except-clause.
+    assert _run_state_lock_calls["count"] >= 1
+    # Fail closed: an unverifiable check is treated as ownership lost, not
+    # as ownership confirmed.
+    assert result.get("directory_ownership_verified") is False
+    # Full-report generation never ran -- the unverifiable check stopped
+    # execution at the same early-return guard a confirmed loss uses.
+    assert "reports" not in result
+
+
+def test_run_pipeline_reverifies_ownership_at_the_report_generation_write_site(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Keep ownership through the downstream
+    artifact writes"): the standalone pre-merge recheck acquires the lock,
+    compares, and RELEASES it -- report generation (which reads
+    run_state.json and then writes derived report/notion-sync files into
+    the same directory) runs afterward, completely unprotected by that
+    released lock. A peer publishing in the gap between the recheck's own
+    lock release and report generation's read of run_state.json went
+    completely undetected by the standalone recheck (which already
+    confirmed ownership BEFORE the peer published).
+
+    This proves the fix closes that specific gap: report generation's own
+    read of run_state.json is now itself wrapped in a fresh lock+compare,
+    immediately preceding use -- not a second standalone check released
+    before the read, but the SAME lock scope as the read that feeds report
+    generation. A peer publishing between the standalone recheck's release
+    and this locked read is caught here, where the standalone recheck alone
+    could not have caught it."""
+    import json
+
+    import run_dca
+    import scripts.file_lock as file_lock_mod
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    run_state_path = tmp_path / "artifacts" / "run_state.json"
+
+    # A separate invocation's own genuinely different, already-published
+    # state -- standing in for a peer publishing in the gap between the
+    # standalone recheck's lock release and report generation's own locked
+    # read.
+    peer_state = {
+        "run_id": "peer-b-1030et-after-standalone-recheck",
+        "trading_day": "peer",
+        "buy_candidates": [
+            {
+                "ticker": "MSFT",
+                "status": "submitted",
+                "order_id": "PEER-B-AFTER-STANDALONE-RECHECK-ORDER",
+            }
+        ],
+        "usage_proxy": {},
+    }
+
+    real_cross_process_lock = file_lock_mod.cross_process_lock
+    _run_state_lock_calls = {"count": 0}
+
+    def claim_directory_before_second_run_state_lock(path, *args, **kwargs):
+        if Path(path).name == "run_state.json.lock":
+            _run_state_lock_calls["count"] += 1
+            # The FIRST run_state.json.lock acquisition is the standalone
+            # pre-merge recheck -- let it pass normally, confirming
+            # ownership fine (this invocation still owns the directory at
+            # that point). The SECOND is report generation's own locked
+            # read -- inject the peer's publish immediately before it is
+            # acquired, simulating the peer winning the race in the exact
+            # gap between the two.
+            if _run_state_lock_calls["count"] == 2:
+                run_state_path.write_text(json.dumps(peer_state), encoding="utf-8")
+        return real_cross_process_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        file_lock_mod, "cross_process_lock", claim_directory_before_second_run_state_lock
+    )
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        generate_full_reports=True,
+    )
+    # Proves the injection actually landed at the intended point.
+    assert _run_state_lock_calls["count"] >= 2
+    # The standalone recheck alone would have seen ownership as fine (the
+    # peer had not published yet) -- only the SECOND, report-generation-
+    # site lock catches this.
+    assert result.get("directory_ownership_verified") is False
+    assert "reports" not in result
+    # B's on-disk state must survive completely untouched -- report
+    # generation never read it, let alone wrote derived files describing
+    # it.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
+
+
+def test_run_pipeline_binds_post_run_snapshot_for_owned_blocked_runs(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Return a bound snapshot for owned blocked runs"): a
+    calendar-blocked run whose ownership check returns True used to leave
+    `run_daily_compact()`'s own result without a `_run_state_bytes_under_
+    lock` key at all -- the ONLY normal-path branch that didn't populate
+    it -- so this pipeline's `_known_run_state_bytes` fell back to its own
+    unlocked read of the shared path before the raw-manifest and
+    preflight_gate rewrites (both of which run even on a blocked result;
+    see the `if result.get("blocked"): return` a few lines further down).
+    A same-identity peer replacing the state between the blocked ownership
+    check inside `run_daily_compact()` and this unlocked fallback read
+    would become the accepted baseline, letting this invocation's own
+    preflight_gate rewrite land in the peer's artifact."""
+    import json
+
+    import run_dca
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    # This config approves NO trading day at all -- every call blocks on the
+    # calendar gate.
+    config = load_strategy_config(approved_test_dates=frozenset())
+
+    run_state_path = tmp_path / "artifacts" / "run_state.json"
+
+    peer_state = {
+        "run_id": "peer-b-1030et-post-blocked-return",
+        "trading_day": "peer",
+        "buy_candidates": [
+            {"ticker": "MSFT", "status": "submitted", "order_id": "PEER-B-BLOCKED-ORDER"}
+        ],
+        "usage_proxy": {},
+    }
+
+    real_run_daily_compact = run_dca.run_daily_compact
+    _fired = {"value": False}
+
+    def run_daily_compact_then_peer_claims_directory(*args, **kwargs):
+        result = real_run_daily_compact(*args, **kwargs)
+        # Fires exactly once, immediately after run_daily_compact() itself
+        # returns from the calendar-blocked-but-owned branch -- BEFORE
+        # `_run_pipeline_impl` captures its own `_known_run_state_bytes`
+        # snapshot at all.
+        if (
+            not _fired["value"]
+            and result.get("blocked") is True
+            and result.get("directory_ownership_verified") is True
+        ):
+            _fired["value"] = True
+            run_state_path.write_text(json.dumps(peer_state), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(run_dca, "run_daily_compact", run_daily_compact_then_peer_claims_directory)
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        preflight_gate={"preflight_found": False, "warning": "test"},
+    )
+    assert _fired["value"] is True
+    assert result["blocked"] is True
+    # B's on-disk state must survive completely untouched -- the preflight_
+    # gate rewrite (which still runs on a blocked result) must never bind
+    # its own "known" snapshot to the peer's bytes just because this
+    # invocation had nothing lock-bound to compare against.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
 
 
 def test_run_slot_1230et_and_1530et_are_unaffected_by_a_missing_preflight_artifact(tmp_path, monkeypatch):

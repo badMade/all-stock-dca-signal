@@ -111,11 +111,8 @@ Deployment is accounted **per stream** and never mixed
     `run_state.json` artifacts is for audit only until per-slot readers exist
     (Codex review, PR #232: "Write scheduled evidence where consumers scan").
     Not exploitable today: Gate 5 is a hard abort (verdict `GATE5_DISABLED`)
-    in every LIVE executor prompt (`PRODUCTION_READINESS.md`), so none of these
-    slots place real orders yet. As of 2026-08-26 all seven slots have a
-    committed Gate 5 entry point in this repo, but the live prompt text lives
-    outside it and is not applied yet, so the abort still holds every fire —
-    see `docs/safeguards.md#live-execution-roster`.
+    in every executor prompt (`PRODUCTION_READINESS.md`), so none of these
+    slots place real orders yet.
 - **Manual** runs (`run_origin='manual'` / `manual_run=true`) are tracked
   separately and **never** counted toward scheduled-live deployment.
 - Monitor/analytics/morning runs place no trades and are classified as `other`.

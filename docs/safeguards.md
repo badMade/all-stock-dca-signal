@@ -63,7 +63,8 @@ first-come-first-serve per slot via the one thing they actually share — the
 Robinhood account's own order history — rather than being handed off in one
 flip of a switch once Gate 5 ships. Long-term intent is Claude-primary,
 Perplexity-backup; today Perplexity wins every slot by construction, since
-Claude cannot complete Gate 5 for any of them. See
+none of the seven Claude prompts has yet been deployed to invoke its
+committed Gate 5 producer (see below). See
 `claude/PERPLEXITY-CLAUDE-COORDINATION.md` for the full design, the Gate 4
 addition needed to recognize Perplexity as an expected, compatible executor
 instead of alerting on it as an anomaly, and the one empirical fact (what
@@ -71,52 +72,23 @@ value Perplexity's own orders actually carry in `placed_agent`) that must be
 confirmed against real order history before that addition is more than a
 placeholder. That document also carries the paste-ready Perplexity-side
 mirror of the same check. Gate 5 itself (see `PRODUCTION_READINESS.md`) is
-untouched by this.
-
-**Gate 5 entry-point status (updated 2026-08-26).** All seven slots now have a
-callable signal-generation entry point:
-
-| Slot | Gate 5 entry point |
-|---|---|
-| 0935ET market-open | `scripts/generate_market_open_candidates.py` — constructs the real `MarketOpenDCAExecutor` and calls its own `evaluate()`. Trend-exempt. See `docs/market_open_signal_entry.md`. |
-| 1030ET morning | `scripts/generate_morning_candidates.py` — drives `MorningDCAExecutor` itself in live mode, so the 9:45 pre-flight gate runs (non-blocking; the verdict rides along in the document's `preflight_gate` field). See `docs/morning_signal_entry.md`. |
-| 1130 / 1330 / 1430ET intraday | `scripts/generate_intraday_candidates.py --slot {1130,1330,1430}` — one module for all three fires, because they are one cron, one executor class and one config. `--slot` is required and has no default. See `docs/intraday_signal_entry.md`. |
-| 1230ET midday | `scripts/generate_midday_candidates.py` — same shape, on `MiddayDCAExecutor`; trend validation applies and the 7-day kill switch is required of the producer. See `docs/midday_signal_entry.md`. |
-| 1530ET final | `scripts/generate_buy_candidates.py` — calls `near_close_dca.evaluate_source_signal`, that stream's own engine. |
-
-The first four share one core (`scripts/stream_candidates.py`), so an eighth slot
-would be a `StreamSpec` plus a thin CLI module rather than a fresh build. 1530ET
-stays separate on purpose: it runs on a different signal engine
-(`near_close_dca.evaluate_source_signal`), not on `MorningDCAExecutor.evaluate()`.
-
-1030ET is the one slot whose command reads the artifact tree — the inherited 9:45
-pre-flight gate — and therefore the one whose output is not purely a function of
-its arguments. That gate is deliberately non-blocking (Geoff, 2026-08-02): a
-missing, invalid or empty pre-flight degrades to the full universe with a
-warning, never a hard block.
-
-Having an entry point is necessary but not sufficient for a slot to trade: the
-live task's own prompt text must also invoke it. That text lives in Cowork, not
-in this repo, so a committed `live-mirror/` copy naming the command changes
-nothing until a human applies it through `update_scheduled_task` and re-captures
-the mirror (see `claude/dca-executor-prompts/README.md`). **This is now the only
-thing standing between the roster and a real buy list on every slot:** as of
-2026-08-26 all seven `live-mirror/` Gate 5 sections name a committed command, and
-until each is applied every slot keeps producing no buy list even though the code
-it needs is committed.
-
-As of 2026-07-30 the `GATE5_DISABLED` verdict alerts on
-every fire (a blocked entry point read as indistinguishable from an
-evaluated, empty universe when four of seven slots fired silently the same
-day, and a silent executor is worse than an aborting one). It is no longer the
-correct verdict for any slot **once that slot's live prompt has been applied**:
-every slot now has an entry point, so a Gate 5 failure on an applied prompt is an
-ordinary abort-and-alert, the same as every other gate, and should be
-investigated rather than expected. Until a slot's prompt is applied its live text
-still carries the old stand-down and will keep firing it. (1230ET's own prompt
-never used the `GATE5_DISABLED` label — it aborted with "no signal-generation
-entry point exists for this slot; nothing to buy" — and that abort is likewise no
-longer expected once applied.) The seven Claude
+untouched by this in a different sense than it used to be: all seven slots
+now have a real, tested signal-generation entry point committed in this repo
+(`scripts/generate_market_open_candidates.py`, `generate_morning_candidates.py`,
+`generate_intraday_candidates.py`, `generate_midday_candidates.py`, and
+`generate_buy_candidates.py` — see `PRODUCTION_READINESS.md`'s "Gate 5 half of
+this gap is closed" status), but a producer existing is not the same as a slot
+trading. A slot does not start placing orders merely because its entry point
+exists — the *live task's prompt* must name the command, and that prompt text
+lives outside this repo, so none of the seven Claude prompts can place a
+single order today regardless of what Gate 4 decides until each one is
+deployed to name its committed producer. As of 2026-07-30 the `GATE5_DISABLED`
+verdict alerts on every fire (a blocked entry point read as indistinguishable
+from an evaluated, empty universe when four of seven slots fired silently the
+same day, and a silent executor is worse than an aborting one) -- that verdict
+still applies to any slot whose deployed prompt has not yet been updated to
+invoke its producer, even though the producer itself is no longer missing.
+The seven Claude
 prompts run, if created, **alongside** the five Perplexity-era tasks above,
 not instead of them (see `claude/dca-executor-prompts/0-setup-card.md`) —
 and, per the standing design above, are meant to keep running alongside them
@@ -272,16 +244,17 @@ See the `execution_authorization_policy` and `circuit_breakers` blocks in
 
 ## Budget caps
 
-Base amount is **$2**. Daily and weekly caps are selected per run by tier, based
-on the day's planned spend and the count of 3x-or-greater signals (multiplier
->= 3.0). Pick the highest tier triggered by **either** dimension.
+Base amount is **$2**. Daily and weekly caps are selected per run by tier,
+keyed **solely** on the count of 3x-or-greater signals (multiplier >= 3.0) in
+the Gate 7 candidate list -- a value fixed before sizing runs, not an output
+of the sizing decision. Tier selection never keys on planned spend.
 
 | Tier | Select when | Daily cap | Weekly cap |
 |---|---|---|---|
-| Normal | planned spend <= $129 **and** 3x+ signals <= 5 | $180 | $900 |
-| Elevated | planned spend > $129 **or** 3x+ signals 6-10 | $240 | $1,200 |
-| High-volatility | planned spend > $213 **or** 3x+ signals 11-17 | $300 | $1,500 |
-| Stress | planned spend > $272 **or** 3x+ signals > 17 | $360 | $1,800 |
+| Normal | 3x+ signals <= 5 | $180 | $900 |
+| Elevated | 3x+ signals 6-10 | $240 | $1,200 |
+| High-volatility | 3x+ signals 11-17 | $300 | $1,500 |
+| Stress | 3x+ signals > 17 | $360 | $1,800 |
 
 - The selected daily and weekly caps are absolute ceilings.
 - **Stress** tier capacity is usable only to the extent prior unused weekly
@@ -382,11 +355,8 @@ on the day's planned spend and the count of 3x-or-greater signals (multiplier
   scheduled trading task (see [Live execution roster](#live-execution-roster)
   — today, the five Perplexity-era tasks, since the seven Claude tasks still
   end every fire at the `GATE5_DISABLED` verdict and place no orders (this
-  verdict alerts as of 2026-07-30, but still never reaches a trade; every slot
-  now HAS a committed Gate 5 entry point as of 2026-08-26, but the live prompts
-  that must invoke them live outside this repo and are not applied yet — see
-  the roster note above); this extends to those seven too once each prompt is
-  applied and Gate 5 is enabled)
+  verdict alerts as of 2026-07-30, but still never reaches a trade); this
+  extends to those seven too once Gate 5 is wired and enabled)
   treats a mid-run failure caused by **internal persistence, parsing, wrapper-normalization,
   transient connector throttling, or raw-file write** problems **after data was
   fetched** as a **recovery trigger, not a terminal stop**. The task reruns the

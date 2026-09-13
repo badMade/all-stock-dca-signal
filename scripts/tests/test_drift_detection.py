@@ -27,26 +27,49 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import drift_detection  # noqa: E402
-from drift_detection import (  # noqa: E402
-    CAUSE_BROKER_PLACEMENT_AMBIGUOUS,
-    CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED,
-    CAUSE_ORDERS_EMPTY,
-    CAUSE_RAW_MISSING,
-    CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION,
-    CAUSE_ROW_BLOCK,
-    DEFAULT_SLACK_WEBHOOK_ENV,
-    build_slack_payload,
-    detect_drift,
-    load_run_artifacts,
-    main,
-    parse_amount,
-    parse_bool,
-    resolve_webhook,
-    send_slack_alert,
-)
+try:
+    import scripts.drift_detection as drift_detection  # noqa: E402
+except ModuleNotFoundError as _import_exc:  # pragma: no cover - fallback when running directly in scripts/
+    # Only a failure to resolve the "scripts" package itself -- e.g. running
+    # this file directly as `python scripts/tests/test_drift_detection.py`
+    # without the repo root on sys.path -- means package-style import
+    # doesn't apply here and the flat, run-from-scripts/ import style is
+    # needed instead. A ModuleNotFoundError for anything else (a real
+    # missing dependency inside drift_detection.py's OWN imports) must not
+    # be silently reinterpreted as "package layout doesn't resolve" and
+    # retried through a duplicate module instance under a different import
+    # path, which would obscure the real failure and could test against a
+    # second, separately-initialized copy of the module (Codex review:
+    # "Narrow the direct-execution import fallback"; AGENTS.md: "Do not
+    # wrap imports in broad try/except blocks").
+    if _import_exc.name not in ("scripts", "scripts.drift_detection"):
+        raise
+    import drift_detection  # type: ignore # noqa: E402
 
-import dca_net_utils
+import dca_net_utils  # noqa: E402
+
+# Pulled as attributes off the already-resolved module (rather than a
+# second `from <module> import (...)` statement duplicated per branch
+# above) so there is only ONE place that can raise on a genuinely missing
+# symbol, and it raises a plain, honest AttributeError instead of being
+# eligible for the same broad-except reinterpretation this fix removes.
+CAUSE_BROKER_PLACEMENT_AMBIGUOUS = drift_detection.CAUSE_BROKER_PLACEMENT_AMBIGUOUS
+CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED = (
+    drift_detection.CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED
+)
+CAUSE_ORDERS_EMPTY = drift_detection.CAUSE_ORDERS_EMPTY
+CAUSE_RAW_MISSING = drift_detection.CAUSE_RAW_MISSING
+CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION = drift_detection.CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION
+CAUSE_ROW_BLOCK = drift_detection.CAUSE_ROW_BLOCK
+DEFAULT_SLACK_WEBHOOK_ENV = drift_detection.DEFAULT_SLACK_WEBHOOK_ENV
+build_slack_payload = drift_detection.build_slack_payload
+detect_drift = drift_detection.detect_drift
+load_run_artifacts = drift_detection.load_run_artifacts
+main = drift_detection.main
+parse_amount = drift_detection.parse_amount
+parse_bool = drift_detection.parse_bool
+resolve_webhook = drift_detection.resolve_webhook
+send_slack_alert = drift_detection.send_slack_alert
 
 SIGNAL_FIELDS = [
     "ticker",

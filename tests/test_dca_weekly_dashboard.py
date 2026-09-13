@@ -131,6 +131,53 @@ def test_load_json_files_preserves_unplaced_candidates_for_coverage(tmp_path):
     assert row.split("|")[3].strip() == "$3.50"  # Graded $: A only, not B's $10
 
 
+def test_load_json_files_skips_a_malformed_file_and_keeps_the_rest(tmp_path, capsys):
+    # Codex review ("Isolate malformed run states during loading"): a
+    # truncated or unreadable run_state.json (an interrupted write, a
+    # crash) previously aborted the WHOLE weekly dashboard via an
+    # all-or-nothing list comprehension -- every other, healthy day's real
+    # order/notional evidence discarded along with the one damaged file.
+    # The malformed file must be skipped (with a stderr warning), not
+    # fatal to the rest of the week.
+    healthy = tmp_path / "healthy.json"
+    healthy.write_text(
+        json.dumps({"status": "ok", "trading_day": "2026-07-24", "buy_candidates": []}),
+        encoding="utf-8",
+    )
+    truncated = tmp_path / "truncated.json"
+    truncated.write_text('{"status": "ok", "trading_day": "2026-07-2', encoding="utf-8")
+
+    loaded = load_json_files([healthy, truncated])
+
+    assert len(loaded) == 1
+    assert loaded[0]["trading_day"] == "2026-07-24"
+    assert "truncated.json" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("root", ["null", "[]", '"just a string"', "42"])
+def test_load_json_files_skips_a_non_object_json_root(tmp_path, capsys, root):
+    # Codex review ("Validate decoded run states before retaining them"):
+    # syntactically valid JSON with a non-object root (null, a bare list,
+    # a string, a number) decodes without error, but every consumer --
+    # starting with this same function's own status/manual-run filter --
+    # assumes a dict and raises AttributeError on .get(). That escaped the
+    # per-path guard meant to isolate exactly this kind of malformed
+    # artifact, aborting the whole weekly dashboard again.
+    healthy = tmp_path / "healthy.json"
+    healthy.write_text(
+        json.dumps({"status": "ok", "trading_day": "2026-07-24", "buy_candidates": []}),
+        encoding="utf-8",
+    )
+    bad_root = tmp_path / "bad_root.json"
+    bad_root.write_text(root, encoding="utf-8")
+
+    loaded = load_json_files([healthy, bad_root])
+
+    assert len(loaded) == 1
+    assert loaded[0]["trading_day"] == "2026-07-24"
+    assert "bad_root.json" in capsys.readouterr().err
+
+
 def test_load_json_files_deduplicates_outcome_only_submission_by_order_id(tmp_path):
     # Codex review, PR #654 ("Deduplicate outcome-only submissions by order
     # ID"): the same physical order (order_id "B") appears in
@@ -2697,29 +2744,39 @@ def test_load_scheduled_run_states_valid_files(tmp_path: Path):
     assert [r["id"] for r in results] == [1, 2, 3]
 
 
-def test_load_scheduled_run_states_corrupt_json(tmp_path: Path):
-    """Test that a corrupt JSON file raises an exception."""
+def test_load_scheduled_run_states_corrupt_json(tmp_path: Path, capsys):
+    # Codex review ("Isolate malformed run states during loading"): a
+    # single truncated/unreadable run_state.json previously aborted the
+    # WHOLE weekly dashboard via load_json_files()'s all-or-nothing list
+    # comprehension. It must now be skipped (with a stderr warning) so the
+    # rest of the historical tree still produces a report -- not raised.
     scheduled_dir = tmp_path / "scheduled_runs"
     scheduled_dir.mkdir()
     (scheduled_dir / "run_state_corrupt.json").write_text("{invalid json")
 
-    with pytest.raises(json.JSONDecodeError):
-        load_scheduled_run_states(tmp_path)
+    results = load_scheduled_run_states(tmp_path)
+
+    assert results == []
+    assert "run_state_corrupt.json" in capsys.readouterr().err
 
 
-def test_load_scheduled_run_states_unreadable_file(tmp_path: Path):
-    """Test that an unreadable file raises an OSError.
-
-    A directory is created where a file is expected: unlike os.chmod(path, 0),
+def test_load_scheduled_run_states_unreadable_file(tmp_path: Path, capsys):
+    """A directory is created where a file is expected: unlike os.chmod(path, 0),
     this deterministically raises OSError on read regardless of platform or
     whether the test runs as root (both make chmod-based denial a no-op).
+
+    Codex review ("Isolate malformed run states during loading"): this must
+    be skipped like any other unreadable artifact, not abort the whole
+    weekly dashboard build.
     """
     scheduled_dir = tmp_path / "scheduled_runs"
     scheduled_dir.mkdir()
     (scheduled_dir / "run_state_unreadable.json").mkdir()
 
-    with pytest.raises(OSError):
-        load_scheduled_run_states(tmp_path)
+    results = load_scheduled_run_states(tmp_path)
+
+    assert results == []
+    assert "run_state_unreadable.json" in capsys.readouterr().err
 
 
 def test_load_json_files_rejects_boolean_claim_breakdown_entry_amount(tmp_path):

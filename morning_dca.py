@@ -104,6 +104,7 @@ from near_close_dca import (
     OrderPlacementRejectedError,
     PriorSameDayAllocation,
     StrategyConfig,
+    _is_usable_reconciled_order_id,
     _ticker_sizing,
     account_pinning_failure,
     completed_bar_anchor,
@@ -637,13 +638,12 @@ class MorningConfig:
     # an explicit [] is preserved as () to honour the opt-out intent.
     prior_allocation_roots: Optional[Tuple[str, ...]] = None
     # Roots seeded into the shared daily/weekly cap ledger with prior same-day/
-    # week spend (2026-08-02 pooling fix: every sibling live stream's root, not
-    # just this one -- see default_pooled_cap_seed_roots). OMITTING this kwarg
+    # week spend (every sibling live stream's root, not just this one -- see
+    # default_pooled_cap_seed_roots). OMITTING this kwarg
     # gets the default_factory (every known stream root) so a config that
     # fails to load, or a caller that constructs MorningConfig/MiddayConfig
     # directly, still gets cross-stream cap visibility instead of an isolated
-    # full ceiling with zero seeding (Codex review: "Seed cross-stream roots
-    # for default pooled-cap configs"). Explicitly passing () or None fully
+    # full ceiling with zero seeding. Explicitly passing () or None fully
     # disables cap seeding either way (both falsy to the `if cap_seed_roots:`
     # checks that consume this) -- e.g. for an isolated replay/staging config.
     # Override via artifact_paths.cap_seed_roots in morning_dca.json/
@@ -654,7 +654,14 @@ class MorningConfig:
     # qualifying candidate is flagged manual_review_candidate rather than bought.
     trend_min_bars: int = 6
     # Broker account number that must match the supplied BrokerAdapter before
-    # any live orders are placed.
+    # any live orders are placed. Optional, not str: load_morning_config(...,
+    # allow_unpinned_account=True) and the stream loader both deliberately
+    # construct this class with target_account_number=None when account
+    # resolution fails (see _load_morning_config's own comment), so a
+    # narrower `str` annotation makes this public dataclass's contract false
+    # for a supported fail-closed path and lets typed consumers perform
+    # string operations against an actual None (Codex review: "Keep the
+    # account field optional").
     target_account_number: Optional[str] = ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
     # Weekday dates on which live (non-manual) execution is permitted. Empty
     # frozenset means the date gate is disabled (no restriction beyond weekends
@@ -1523,7 +1530,7 @@ def load_morning_config(
             **_live_circuit_breaker_overrides(config_dir_path, mode),
         )
 
-    approved_date_overrides: Dict[str, Any] = {
+    approved_date_overrides = {
         "approved_test_dates": _load_approved_dates_fail_closed(config_dir_path),
         # stream_root() at LOAD time, not the import-time constant:
         # $DCA_CRON_TRACKING_ROOT set between import and config load
@@ -1553,7 +1560,7 @@ def load_morning_config(
     # production tree. No-op when the variable is unset.
     raw = rebase_bundled_roots_in(raw)
 
-    kwargs: Dict[str, Any] = dict(approved_date_overrides)
+    kwargs = dict(approved_date_overrides)
 
     sizing = raw.get("sizing_ladder", {})
     if "base_amount_usd" in sizing:
@@ -2171,7 +2178,7 @@ class _RawInputRecorder:
         try:
             with cross_process_lock(self.raw_dir / ".sequence.lock"):
                 self._seq = max(self._seq, self._highest_persisted_sequence()) + 1
-                safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in key)
+                safe_key = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in str(key))
                 filename = f"{kind}_{safe_key}_{self._seq}.json"
                 save_raw_input(
                     self.trading_day_iso,
@@ -2240,10 +2247,16 @@ class _PersistingBrokerAdapter:
     ``is_tradable_for_fractional_buy``/``same_day_strategy_order_exists`` --
     the broker-side inputs a live run consults before placing an order -- so
     portfolio/buying-power/tradability/same-day-order-existence responses are
-    captured under ``raw/``. ``review_market_buy``/``place_market_buy``/
-    ``get_order_fill``/``get_raw_placement_responses`` pass straight through:
-    those are order actions and fill evidence, not inputs the persist-before-
-    compute contract covers.
+    captured under ``raw/``. ``review_market_buy`` and ``place_market_buy``
+    are ALSO persisted (``order_review``/``order_response``) -- the broker's
+    real-money placement response is exactly the evidence a disk/
+    serialization failure at this boundary must be able to set
+    ``raw_persistence_error`` for, so a run can never report itself complete
+    with persisted inputs while its own order-placement response is absent
+    from the audit trail (Codex review: "Persist broker placement
+    responses"). Only ``get_order_fill``/``get_raw_placement_responses``
+    pass straight through: those are fill evidence read back LATER from
+    already-persisted responses, not inputs to this call.
     """
 
     def __init__(self, inner: BrokerAdapter, recorder: _RawInputRecorder):
@@ -2413,9 +2426,9 @@ def _forbidden_preflight_root_reason(
         resolved = Path(root)
     for forbidden in forbidden_roots:
         try:
-            normalized = Path(_strip_template_segments(forbidden)).resolve()
+            normalized = Path(_strip_template_segments(str(forbidden))).resolve()
         except (OSError, RuntimeError):
-            normalized = Path(_strip_template_segments(forbidden))
+            normalized = Path(_strip_template_segments(str(forbidden)))
         if resolved == normalized or normalized in resolved.parents:
             return (
                 f"preflight_run_state_root {root!r} resolves under a forbidden "
@@ -3438,9 +3451,9 @@ class MorningDCAExecutor(DCAExecutor):
             )
         self._sizing_config = replace(
             self._sizing_config,
-            deployed_last_7d_usd=deployed_last_7d_usd,
-            monthly_cash_allocation_usd=monthly_cash_allocation_usd,
-            kill_switch_7d_deploy_fraction=kill_switch_7d_deploy_fraction,
+            deployed_last_7d_usd=float(deployed_last_7d_usd),
+            monthly_cash_allocation_usd=float(monthly_cash_allocation_usd),
+            kill_switch_7d_deploy_fraction=float(kill_switch_7d_deploy_fraction),
         )
         return kill_switch_engaged(self._sizing_config)
 
@@ -4326,7 +4339,7 @@ class MorningDCAExecutor(DCAExecutor):
             run_id=str(artifacts.get("run_id") or ""),
             run_state_path=str(run_state_path),
             stream=artifacts.get("stream", self.stream),
-            trading_day=str(artifacts.get("trading_day") or ""),
+            trading_day=artifacts.get("trading_day"),
             valid_scheduled_evidence=valid_scheduled_evidence,
             pointer_status=pointer_status,
         )
@@ -4702,6 +4715,13 @@ class MorningDCAExecutor(DCAExecutor):
                     return False
                 return math.isfinite(amount) and amount > 0
 
+            def _carried_outcome_status(outcome: dict) -> str:
+                """Return an order-bearing status, failing closed for ambiguity."""
+                status = outcome.get("status")
+                if isinstance(status, str) and status in _ORDER_BEARING_CANDIDATE_STATUSES:
+                    return status
+                return "failed"
+
             # _existing_submitted_run_state() admits the prior artifact on
             # status alone, so a malformed ticker (a JSON list/object
             # surviving corrupt input) can reach here even though the
@@ -4810,12 +4830,7 @@ class MorningDCAExecutor(DCAExecutor):
                         # The outcome's OWN status: flattening a "filled" order
                         # to "submitted" would discard a distinct, schema-valid
                         # fact that downstream readers separate.
-                        "status": (
-                            outcome["status"]
-                            if isinstance(outcome.get("status"), str)
-                            and outcome["status"] in _ORDER_BEARING_CANDIDATE_STATUSES
-                            else "failed"
-                        ),
+                        "status": _carried_outcome_status(outcome),
                         "buy_multiplier": outcome.get("buy_multiplier"),
                         "order_id": outcome.get("order_id"),
                         "planned_amount_usd": planned_amount,
@@ -5412,6 +5427,72 @@ class MorningDCAExecutor(DCAExecutor):
             # no-op for every other stream, whose roots have no
             # scheduled_runs/ subdirectory.
             all_cap_roots = [Path(r) for r in _cap_seed_roots]
+            # Leaf manual-override roots (Codex review, PR #631: "Seed run
+            # states from leaf override roots"): _dated_manual_override_cap_
+            # seed_roots() globs perplexity_primary_*/manual_override_*
+            # directly, so each entry it appends to cap_seed_roots IS ALREADY
+            # the leaf directory holding run_state.json -- not a parent with
+            # dated child directories beneath it the day_str glob below can
+            # match. Without this, an override's spend from an earlier
+            # weekday in the current ISO week never enters candidate_paths at
+            # all, silently omitting it from planned_by_week and potentially
+            # letting a later scheduled slot spend past the shared weekly
+            # cap. Read the leaf's own recorded trading_day and only consume
+            # it here when that day is STRICTLY before today: a same-day
+            # override is already covered by _compute_top_up's own
+            # cap_seed_roots scan (see _today_seeded_by_cap_roots above), and
+            # admitting it again here would double-count the same fill.
+            for cap_root in all_cap_roots:
+                leaf_state_path = cap_root / "run_state.json"
+                if leaf_state_path in _earlier_weekday_sibling_paths:
+                    continue
+                if not leaf_state_path.is_file():
+                    continue
+                # A truncated, malformed, or otherwise unreadable leaf
+                # run_state.json is not evidence the leaf is out of scope --
+                # it is the ONE path capable of finding this leaf at all
+                # (unlike the same-day loader, which can fall back to mtime
+                # ordering for a historical parse failure). Silently
+                # `continue`-ing here let a scheduled run treat the weekly
+                # scan as complete with $0 credited from an override whose
+                # spend it could not actually verify, potentially spending
+                # past headroom the override had already consumed (Codex
+                # review, PR #631: "Fail closed on unreadable leaf override
+                # states"). Fail closed the same way the per-path validation
+                # loop below already does for _earlier_weekday_sibling_paths
+                # members, rather than trying to re-derive its in-scope-ness
+                # from content this can't parse.
+                try:
+                    leaf_state = json.loads(leaf_state_path.read_bytes())
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    self._cap_seed_scan_incomplete = True
+                    self._cap_seed_scan_incomplete_paths.append(str(leaf_state_path))
+                    continue
+                if not isinstance(leaf_state, dict):
+                    self._cap_seed_scan_incomplete = True
+                    self._cap_seed_scan_incomplete_paths.append(str(leaf_state_path))
+                    continue
+                leaf_trading_day_str = leaf_state.get("trading_day")
+                try:
+                    leaf_trading_day = (
+                        date.fromisoformat(leaf_trading_day_str) if leaf_trading_day_str else None
+                    )
+                except (TypeError, ValueError):
+                    leaf_trading_day = None
+                if leaf_trading_day is None:
+                    # Missing/unparseable trading_day on an otherwise-valid
+                    # JSON object is invalid required metadata, not a
+                    # legitimate out-of-scope artifact -- same fail-closed
+                    # reasoning as the per-path loop below.
+                    self._cap_seed_scan_incomplete = True
+                    self._cap_seed_scan_incomplete_paths.append(str(leaf_state_path))
+                    continue
+                if not (week_start <= leaf_trading_day < trading_day):
+                    # A VALID trading_day that is simply out of this scan's
+                    # week/day scope is an ordinary skip, not a failure.
+                    continue
+                candidate_paths.append((leaf_state_path, False))
+                _earlier_weekday_sibling_paths.add(leaf_state_path)
             earlier_day = week_start
             while earlier_day < trading_day:
                 day_str = earlier_day.strftime("%Y%m%d")
@@ -5901,6 +5982,883 @@ class MorningDCAExecutor(DCAExecutor):
                                 0.0, self.ledger.day_planned(trading_day) - poisoned_day
                             )
 
+    def _process_candidate(
+        self,
+        signal: Any,
+        trading_day: Any,
+        broker: Any,
+        top_up: Any,
+        remaining_daily: float,
+        remaining_weekly: float,
+        manual: bool,
+        data: Any,
+        now: Optional[datetime],
+        prior_submitted_amounts: Dict[str, float],
+        outcomes: Dict[str, Any],
+        spread_by_ticker: Dict[str, Dict[str, Any]],
+        batch_buying_power: Optional[float],
+        reserved_buying_power: float,
+        submitted_today: float,
+        submitted_this_week: float,
+        consecutive_placement_failures: int,
+        block_if_raw_persistence_failed: Callable[[str], bool],
+        record_breaker_skipped_remainder: Callable[[int, str], List[str]],
+    ) -> Tuple[Optional[float], float, float, float, int, bool]:
+        """Process one candidate; returns updated batch state plus a halt flag.
+
+        The final two return values are ``consecutive_placement_failures``
+        (the running streak, reset on any real submission) and
+        ``halt_batch`` (True when the caller's loop must ``break`` rather
+        than continue to the next candidate -- either the consecutive-
+        failure circuit breaker tripped, or an ambiguous placement
+        exception left a real order's fate unproven and every remaining
+        candidate must stop rather than risk over-submitting).
+        """
+        ticker = signal.ticker
+        # Re-checked BEFORE every candidate, not just once before the loop.
+        # The broker adapter is wrapped by _PersistingBrokerAdapter, so a
+        # disk or serialization failure can begin partway through the batch
+        # -- during a buying-power lookup, an order review, or while
+        # recording the response of an order that was ALREADY submitted.
+        # The pre-loop gate upstream cannot see that, and the post-run
+        # handler only surfaced `raw_persistence_error` on an otherwise
+        # normal artifact, so later candidates kept submitting from inputs
+        # nothing had durably recorded (Codex review: "Stop placement when
+        # broker raw persistence fails"). Checking at the top of every
+        # candidate (rather than batch-filling the tail of ``candidates``
+        # once and breaking) means every candidate still gets its own turn
+        # through this same check, so every one still ends up with a
+        # recorded outcome once persistence has failed.
+        if block_if_raw_persistence_failed(ticker):
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+
+        # Determine the real order notional from the top-up outcome if active.
+        if top_up is not None:
+            if top_up.top_up_skipped or top_up.incremental_order_amount <= 0:
+                outcomes[ticker] = {
+                    "status": "skipped",
+                    "skip_reason": f"top-up guard: {top_up.top_up_guard_result}",
+                }
+                return (
+                    batch_buying_power,
+                    reserved_buying_power,
+                    submitted_today,
+                    submitted_this_week,
+                    consecutive_placement_failures,
+                    False,
+                )
+            notional = round(top_up.incremental_order_amount, 2)
+        else:
+            notional = signal.hypothetical_amount_usd
+
+        # Hard per-order ceiling from config/budgets.json circuit_breakers.max_per_order_usd.
+        # A pure local computation (no broker round-trip), so it stays ahead
+        # of the duplicate check below -- an over-ceiling candidate must
+        # never even reach the broker (Codex review #25 on PR #22).
+        _max_order_usd = self.config.max_per_order_usd
+        if notional > _max_order_usd:
+            outcomes[ticker] = {
+                "status": "blocked",
+                "skip_reason": f"exceeds ${_max_order_usd:.0f} per-order ceiling",
+                "deliberate_skip": True,
+            }
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+
+        # Bypass the broad same-day duplicate check only when there is an actual
+        # cross-stream prior allocation (top-up guard result is not 'no_prior_run').
+        # Even then, keep a same-stream ref-id check so retrying this stream after
+        # it already submitted the ticker remains idempotent.
+        #
+        # This duplicate check runs BEFORE the daily/weekly cap checks
+        # below: a duplicate places no new order, so it must never be
+        # gated by checks that exist to decide whether a NEW placement
+        # should proceed. Once cap-seeding has recovered an earlier
+        # scheduled order that exactly consumes (or slightly exceeds, via
+        # a freshly recomputed but stale notional) the remaining cap,
+        # running the cap check first would record cap_exceeded and
+        # overwrite the dated-slot artifact's real "submitted" row for
+        # this ticker, erasing evidence a fresh executor's cap-seeding
+        # scan depends on (Codex review, PR #88: "Preserve submitted
+        # evidence when a cap-seeded retry is full").
+        has_prior_allocation = (
+            top_up is not None and top_up.top_up_guard_result != TOP_UP_NO_PRIOR_RUN
+        )
+        dup_order: Optional[Dict[str, Any]] = None
+        try:
+            if has_prior_allocation:
+                dup_order = _same_stream_order_exists(
+                    broker, ticker, trading_day, self._idempotency_stream()
+                )
+                dup = dup_order is not None
+                duplicate_reason = "same-stream broker order exists"
+            else:
+                dup = broker.same_day_strategy_order_exists(ticker, trading_day)
+                duplicate_reason = "same-day broker order exists"
+        except Exception as exc:  # noqa: BLE001
+            outcomes[ticker] = {
+                "status": "blocked",
+                "skip_reason": f"duplicate-check failed: {exc}",
+            }
+            _log.warning("Duplicate-check error for %s: %s", ticker, exc)
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+        # The persisting adapter records the returned lookup value after
+        # the broker call. Recheck here so a serialization/disk failure
+        # caused by THIS candidate cannot slip past the top-of-candidate
+        # check and reach placement.
+        if block_if_raw_persistence_failed(ticker):
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+        if dup:
+            if has_prior_allocation and not manual:
+                # A same-stream top-up duplicate on a SCHEDULED retry means
+                # this stream already submitted/reserved the incremental
+                # order on an earlier attempt today, and a scheduled rerun
+                # overwrites the same date-keyed run_state.json path (see
+                # run_state_dir()), so there is no separate artifact for
+                # load_prior_same_day_allocations() to double-sum against.
+                # Persist the real broker order's id and amount so rewriting
+                # run_state on retry does not fabricate phantom values that
+                # downstream fill-lookup or reconciliation would reject or
+                # misread. Prefer the broker's own dollar_amount for this
+                # matched order (most authoritative -- straight from the
+                # broker); adapters that only support the legacy boolean
+                # duplicate-check contract normalize to an empty dup_order
+                # dict with no amount fields, so fall back to this
+                # process's own previously-recorded submission for the
+                # ticker (read into prior_submitted_amounts above) before
+                # finally falling back to the freshly recomputed
+                # `notional`, which can have shrunk since the original
+                # attempt if new prior-allocation context (e.g. an
+                # external fill) appeared in between.
+                try:
+                    dup_amount = float(
+                        (dup_order or {}).get("dollar_amount")
+                        or (dup_order or {}).get("notional")
+                        or 0
+                    ) or prior_submitted_amounts.get(ticker, notional)
+                except (TypeError, ValueError):
+                    dup_amount = prior_submitted_amounts.get(ticker, notional)
+                if not math.isfinite(dup_amount) or dup_amount <= 0:
+                    dup_amount = prior_submitted_amounts.get(ticker, notional)
+                outcomes[ticker] = {
+                    "status": "submitted",
+                    "order_id": (dup_order or {}).get("id") or (dup_order or {}).get("order_id"),
+                    "skip_reason": duplicate_reason,
+                    "submitted_amount_usd": dup_amount,
+                    # This amount is a DUPLICATE of an already-submitted
+                    # order, not a fresh placement -- it's already
+                    # reflected in the cap-seeding scan of this same
+                    # dated-slot artifact (_compute_top_up), so run()'s
+                    # submitted_candidates filter must exclude it from
+                    # record_buy_candidates()'s ledger booking, or the
+                    # amount gets double-counted every retry (Codex
+                    # review, PR #88: "Avoid booking same-stream top-up
+                    # retries a second time").
+                    "duplicate_preserved": True,
+                }
+                submitted_today += dup_amount
+                submitted_this_week += dup_amount
+                # Do NOT add to reserved_buying_power: available_buying_power()
+                # is a fresh broker snapshot fetched (lazily, below) AFTER the
+                # earlier order already consumed it, so crediting dup_amount
+                # again here would double-subtract it and could incorrectly
+                # block a later candidate in this retry batch even when real
+                # buying power is sufficient (Codex review, PR #51: "Do not
+                # reserve buying power for existing duplicates").
+            elif has_prior_allocation and manual:
+                # A MANUAL/recovery retry always writes to its own fresh,
+                # uuid-suffixed artifact directory (see run_id()) and never
+                # overwrites the original submission's run_state.json. If
+                # this were also recorded as "submitted" with a fresh
+                # notional, load_prior_same_day_allocations() would find
+                # both files and double-count the same broker order as two
+                # separate same-day allocations, understating what an
+                # afternoon/final top-up is still owed. The original
+                # submission's own artifact already carries the real
+                # notional, so this retry contributes nothing further.
+                outcomes[ticker] = {
+                    "status": "skipped",
+                    "skip_reason": f"{duplicate_reason} (duplicate top-up retry; already recorded by the original run)",
+                    # The original (non-duplicate) attempt already settled
+                    # this ticker's credit via _place_broker_orders'
+                    # confirmed-submission path, so the post-loop credit
+                    # preservation pass below must not treat this as an
+                    # unresolved block and record the decline a second time.
+                    "credit_already_resolved": True,
+                }
+            else:
+                outcomes[ticker] = {"status": "skipped", "skip_reason": duplicate_reason}
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+
+        # Shared daily order-ATTEMPT ceiling (config/budgets.json
+        # circuit_breakers.max_orders_per_day, seeded cross-stream in
+        # _compute_top_up above) -- a pure local check, ahead of the
+        # broker round-trip, mirroring the per-order ceiling above (Codex
+        # review: "Enforce the shared daily order-count cap in new
+        # executors"). Runs AFTER the duplicate-recovery check above, not
+        # before: a preserved duplicate creates no new attempt (it was
+        # already counted when the earlier attempt actually placed the
+        # order), so enforcing this cap first could wrongly block the
+        # recovery path and overwrite the dated-slot artifact's real
+        # "submitted" row with a fabricated "blocked" one on a retry that
+        # itself brought the shared attempt count to the cap (Codex
+        # review: "Check for preserved duplicates before enforcing the
+        # attempt cap").
+        _max_orders_per_day = self.config.max_orders_per_day
+        if _max_orders_per_day is not None and self.ledger.day_attempts(trading_day) >= _max_orders_per_day:
+            outcomes[ticker] = {
+                "status": "blocked",
+                "skip_reason": f"exceeds {_max_orders_per_day} order daily attempt cap",
+                "deliberate_skip": True,
+                "budget_blocked": True,
+            }
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+
+        # Enforce daily/weekly caps against pre-run remaining budget.
+        if submitted_today + notional > remaining_daily:
+            outcomes[ticker] = {"status": "cap_exceeded", "skip_reason": "daily cap would be exceeded"}
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+        if submitted_this_week + notional > remaining_weekly:
+            outcomes[ticker] = {"status": "cap_exceeded", "skip_reason": "weekly cap would be exceeded"}
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+
+        # This ticker qualified on the ladder and top-up rules, so it reaches
+        # the spread gate. Every row that gets this far records its own spread
+        # outcome, and only rows that get this far can be counted as blocked
+        # for want of a spread (config/scheduled_tasks.json:
+        # spread_data_availability_policy.evaluation_order).
+        max_spread = self.config.max_bid_ask_spread_pct
+        if data is not None and now is not None:
+            try:
+                spread_pct = quote_spread_pct(data, ticker, now)
+            except Exception as exc:  # noqa: BLE001
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": f"spread quote error: {exc}",
+                    **spread_gate_fields(spread_pct=None, max_spread_pct=max_spread),
+                }
+                _log.warning("Spread quote error for %s: %s", ticker, exc)
+                return (
+                    batch_buying_power,
+                    reserved_buying_power,
+                    submitted_today,
+                    submitted_this_week,
+                    consecutive_placement_failures,
+                    False,
+                )
+            spread_fields = spread_gate_fields(
+                spread_pct=spread_pct, max_spread_pct=max_spread
+            )
+            if spread_pct is None and not manual:
+                # A scheduled run is pre-authorized to place without review, so
+                # the spread breaker is the only thing standing between an
+                # unproven quote and a live order: fail this row closed rather
+                # than placing on an unproven spread. Only THIS row fails; every
+                # other ticker keeps being evaluated. Manual runs still go
+                # through review_market_buy as a human-reviewed safety net, so
+                # they are not blocked on a missing spread alone (mirrors
+                # near_close_dca's scheduled spread gate).
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": (
+                        "bid/ask spread unavailable; scheduled runs require spread_ok"
+                    ),
+                    "deliberate_skip": True,
+                    # The spread gate is what stopped this row. Recorded
+                    # explicitly rather than inferred from spread_status,
+                    # which a manual run can carry on a row the gate let
+                    # through (Codex review).
+                    "blocked_by": BLOCKED_BY_SPREAD_GATE,
+                    **spread_fields,
+                }
+                return (
+                    batch_buying_power,
+                    reserved_buying_power,
+                    submitted_today,
+                    submitted_this_week,
+                    consecutive_placement_failures,
+                    False,
+                )
+            if spread_pct is not None and spread_pct > max_spread:
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": (
+                        f"bid/ask spread {spread_pct:.2f}% exceeds {max_spread:.2f}% limit"
+                    ),
+                    "deliberate_skip": True,
+                    **spread_fields,
+                }
+                return (
+                    batch_buying_power,
+                    reserved_buying_power,
+                    submitted_today,
+                    submitted_this_week,
+                    consecutive_placement_failures,
+                    False,
+                )
+            spread_by_ticker[ticker] = spread_fields
+        else:
+            spread_by_ticker[ticker] = spread_gate_fields(
+                spread_pct=None, max_spread_pct=max_spread, evaluated=False
+            )
+        try:
+            tradable = broker.is_tradable_for_fractional_buy(ticker)
+        except Exception as exc:  # noqa: BLE001
+            outcomes[ticker] = {
+                "status": "blocked",
+                "skip_reason": f"tradability lookup failed: {exc}",
+            }
+            _log.warning("Tradability lookup error for %s: %s", ticker, exc)
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+        if block_if_raw_persistence_failed(ticker):
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+        if not tradable:
+            outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy", "deliberate_skip": True}
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+        if batch_buying_power is None:
+            batch_buying_power = broker.available_buying_power()
+        if block_if_raw_persistence_failed(ticker):
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+        if batch_buying_power - reserved_buying_power < notional:
+            outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power", "deliberate_skip": True}
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+        # Scheduled runs are pre-authorized to call place_equity_order directly
+        # (config/budgets.json execution_authorization_policy: calls_review_equity_order=false).
+        # Manual runs still call review_market_buy before placement.
+        if manual:
+            try:
+                review_ok, review_reason = broker.review_market_buy(ticker, notional)
+            except Exception as exc:  # noqa: BLE001
+                outcomes[ticker] = {
+                    "status": "blocked",
+                    "skip_reason": f"review failed: {exc}",
+                }
+                _log.warning("Review error for %s: %s", ticker, exc)
+                return (
+                    batch_buying_power,
+                    reserved_buying_power,
+                    submitted_today,
+                    submitted_this_week,
+                    consecutive_placement_failures,
+                    False,
+                )
+            if block_if_raw_persistence_failed(ticker):
+                return (
+                    batch_buying_power,
+                    reserved_buying_power,
+                    submitted_today,
+                    submitted_this_week,
+                    consecutive_placement_failures,
+                    False,
+                )
+            if not review_ok:
+                outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}", "deliberate_skip": True}
+                return (
+                    batch_buying_power,
+                    reserved_buying_power,
+                    submitted_today,
+                    submitted_this_week,
+                    consecutive_placement_failures,
+                    False,
+                )
+        # Stable across retries so the broker's idempotency key can collapse
+        # duplicate submissions; guarded top-ups use a distinct suffix to
+        # avoid colliding with the earlier same-day run's ref_id for the
+        # ticker. A manual run without a prior allocation (e.g. a MORNING
+        # manual recovery run, which disables per-ticker top-up computation
+        # in _compute_top_up) gets its own "-manual-" ref_id segment too:
+        # without it, a manual fill's ref_id is indistinguishable from a
+        # plain scheduled order's ref_id, so a LATER scheduled run that
+        # finds this manual fill as a prior allocation and computes a
+        # guarded top-up would have its _same_stream_order_exists ordinary-
+        # prefix check match the manual fill and wrongly treat the fresh
+        # incremental top-up as an already-submitted retry -- recording it
+        # as "submitted" without ever calling place_market_buy (Codex
+        # review, PR #42).
+        idempotency_stream = self._idempotency_stream()
+        if has_prior_allocation:
+            ref_id = f"{idempotency_stream}-dca-topup-{trading_day.isoformat()}-{ticker}"
+        elif manual:
+            ref_id = f"{idempotency_stream}-dca-manual-{trading_day.isoformat()}-{ticker}"
+        else:
+            ref_id = f"{idempotency_stream}-dca-{trading_day.isoformat()}-{ticker}"
+        # Asked again, right here, because none of the checks above can see
+        # a failure that begins partway through THIS candidate. Everything
+        # between the earlier checks and here goes through
+        # _PersistingBrokerAdapter -- the duplicate lookup, the tradability
+        # call, the buying-power snapshot, the order review -- so any of
+        # them can set raw_recorder.error after an earlier check already
+        # passed. Checking only earlier blocked the NEXT candidate while
+        # still submitting THIS one from an input nothing had durably
+        # recorded, defeating the fail-closed contract (Codex review:
+        # "Recheck persistence before submitting the current candidate").
+        # Placed above record_attempt so a candidate stopped here never
+        # consumes one of the day's shared order slots either.
+        if block_if_raw_persistence_failed(ticker):
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+        # Counted as a buy ATTEMPT the moment the broker call is actually
+        # made, regardless of outcome -- mirrors near_close_dca's own
+        # max_orders_per_day semantics (a cancelled/rejected/failed buy
+        # still consumes one of the shared slots), and is what
+        # _compute_top_up's cross-stream seeding above counts too.
+        self.ledger.record_attempt(trading_day)
+        try:
+            order_id = broker.place_market_buy(ticker, notional, ref_id=ref_id)
+        except OrderConfirmationRequiredError:
+            outcomes[ticker] = {
+                "status": "not_submitted_confirmation_required",
+                "order_id": None,
+                "skip_reason": "broker requires post-review confirmation before submission",
+                "submitted_amount_usd": notional,
+            }
+            # A REAL broker placement call that produced no order, so it
+            # counts toward the streak exactly like a raised placement:
+            # a broker refusing every direct submission is precisely the
+            # systemic condition the breaker exists to stop, and only a
+            # SUCCESS resets the streak (Codex review, PR #786: "Count
+            # confirmation-required placement failures").
+            consecutive_placement_failures += 1
+            if (
+                self.config.max_consecutive_placement_failures is not None
+                and consecutive_placement_failures
+                >= self.config.max_consecutive_placement_failures
+            ):
+                breaker_skipped = record_breaker_skipped_remainder(
+                    consecutive_placement_failures, ticker
+                )
+                _log.error(
+                    "Halting the batch after %d consecutive placement failures "
+                    "(circuit_breakers.max_consecutive_placement_failures); "
+                    "%d candidate(s) never attempted: %s",
+                    consecutive_placement_failures,
+                    len(breaker_skipped),
+                    ", ".join(breaker_skipped) or "none",
+                )
+                return (
+                    batch_buying_power,
+                    reserved_buying_power,
+                    submitted_today,
+                    submitted_this_week,
+                    consecutive_placement_failures,
+                    True,
+                )
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+        except OrderPlacementRejectedError as exc:
+            # The literal public name, not `type(exc).__name__`:
+            # `near_close_dca.OrderPlacementRejectedError` is a plain
+            # alias for `FractionalPlacementRejectedError` (`Order
+            # PlacementRejectedError = FractionalPlacementRejectedError`),
+            # not a subclass, so every instance's own class -- and
+            # therefore `type(exc).__name__` -- always reads
+            # "FractionalPlacementRejectedError" regardless of which
+            # name caught it. This `except` clause already proves the
+            # exception IS this case, so deriving the name at runtime
+            # silently renamed the persisted skip_reason string the
+            # morning strategy and adapter consumers still depend on
+            # (Codex review, PR #859/#911 round 45: "Preserve the
+            # public rejection class name").
+            #
+            # `exc.order_id` is copied through (validated the same way
+            # `_is_usable_reconciled_order_id` guards every other
+            # broker-supplied id this module persists) rather than
+            # hard-coded to `None`: an ID-bearing terminal rejection --
+            # a real broker record `OrderPlacementRejectedError` was
+            # extended to carry -- otherwise had no durable link to the
+            # rejected order in this artifact for auditing or operator
+            # lookup, unlike the afternoon path's own persisted id
+            # (Codex review, PR #1164: "Preserve rejected broker IDs
+            # in morning outcomes").
+            _rejected_order_id = getattr(exc, "order_id", None)
+            if _is_usable_reconciled_order_id(_rejected_order_id):
+                # Stringified, not persisted in whatever type the
+                # broker returned it as: a numeric id passes
+                # `_is_usable_reconciled_order_id` (it accepts
+                # `str`/`int`/`float`) unchanged, but
+                # `schemas/run_state.schema.json` permits only a
+                # string or null for `order_id` -- an otherwise valid
+                # rejection artifact then failed schema-based
+                # reporting and validation. The afternoon rejection
+                # path already stringifies every accepted id the same
+                # way (Codex review, PR #1164: "Normalize rejected
+                # order IDs before persisting them").
+                _rejected_order_id = str(_rejected_order_id).strip()
+            else:
+                _rejected_order_id = None
+            outcomes[ticker] = {
+                "status": "failed",
+                "order_id": _rejected_order_id,
+                "skip_reason": "broker rejected placement: OrderPlacementRejectedError",
+                "submitted_amount_usd": notional,
+            }
+            _log.error("Broker rejected placement for %s: %s", ticker, exc)
+            consecutive_placement_failures += 1
+            if (
+                self.config.max_consecutive_placement_failures is not None
+                and consecutive_placement_failures
+                >= self.config.max_consecutive_placement_failures
+            ):
+                breaker_skipped = record_breaker_skipped_remainder(
+                    consecutive_placement_failures, ticker
+                )
+                _log.error(
+                    "Halting the batch after %d consecutive placement failures; "
+                    "%d candidate(s) never attempted: %s",
+                    consecutive_placement_failures,
+                    len(breaker_skipped),
+                    ", ".join(breaker_skipped) or "none",
+                )
+                return (
+                    batch_buying_power,
+                    reserved_buying_power,
+                    submitted_today,
+                    submitted_this_week,
+                    consecutive_placement_failures,
+                    True,
+                )
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            outcomes[ticker] = {
+                "status": "failed",
+                "order_id": None,
+                "skip_reason": f"ambiguous placement exception: {type(exc).__name__}",
+                "submitted_amount_usd": notional,
+                "ambiguous_placement_exception": True,
+            }
+            _log.error("Ambiguous placement exception for %s: %s", ticker, exc)
+            if top_up is not None and top_up.cumulative_credit_decline_usd is not None:
+                try:
+                    self.credit_ledger.settle(
+                        ticker,
+                        trading_day.isoformat(),
+                        notional,
+                        final_session=False,
+                        stream=self._idempotency_stream(),
+                        order_id=None,
+                    )
+                    outcomes[ticker]["credit_already_resolved"] = True
+                except Exception as credit_exc:  # noqa: BLE001
+                    _log.warning("ambiguous credit quarantine failed for %s: %s", ticker, credit_exc)
+            breaker_skipped = record_breaker_skipped_remainder(1, ticker)
+            for skipped_ticker in breaker_skipped:
+                outcomes[skipped_ticker]["skip_reason"] = (
+                    f"not attempted: {ticker}'s placement exception may have left an accepted order"
+                )
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                True,
+            )
+        # DryRunBroker returns a DRY-RUN-... order id; record as dry_run so
+        # load_prior_same_day_allocations never treats it as real capital.
+        if order_id.startswith("DRY-RUN"):
+            outcomes[ticker] = {
+                "status": "dry_run",
+                "order_id": order_id,
+                "skip_reason": "dry_run: order not placed",
+                "submitted_amount_usd": notional,
+            }
+            return (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                False,
+            )
+        outcomes[ticker] = {
+            "status": "submitted",
+            "order_id": order_id,
+            "submitted_amount_usd": notional,
+        }
+        submitted_today += notional
+        submitted_this_week += notional
+        reserved_buying_power += notional
+        # Reset only on an actual submission: the breaker is about an
+        # unbroken RUN of failures, and a submitted order is proof the
+        # broker leg is still working.
+        consecutive_placement_failures = 0
+        _log.info("Placed morning buy for %s: $%.2f, order_id=%s", ticker, notional, order_id)
+        # Durably settle the cumulative sub-dollar credit ledger ONLY now
+        # that the order is actually confirmed submitted -- not during
+        # _evaluate_top_up's earlier, pre-placement computation, which
+        # runs before the cap/spread/buying-power/duplicate gates above
+        # could still block this candidate (Codex review: "Defer ledger
+        # updates until the submitted amount is known", the same fix
+        # already applied to near_close_dca.evaluate_top_up_guard).
+        # Records the ACTUAL submitted notional, not the originally
+        # computed credit amount. A corrupt/locked/unwritable ledger must
+        # never mask this real, already-placed and already-published
+        # order -- log and continue rather than raise.
+        if top_up is not None and top_up.cumulative_credit_decline_usd is not None:
+            try:
+                self.credit_ledger.settle(
+                    ticker,
+                    trading_day.isoformat(),
+                    notional,
+                    final_session=False,
+                    stream=self._idempotency_stream(),
+                    order_id=order_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _log.warning(
+                    "cumulative credit ledger settlement failed for %s: %s", ticker, exc
+                )
+        return (
+            batch_buying_power,
+            reserved_buying_power,
+            submitted_today,
+            submitted_this_week,
+            consecutive_placement_failures,
+            False,
+        )
+
+    def _check_for_duplicate_order(
+        self,
+        broker: BrokerAdapter,
+        ticker: str,
+        trading_day: Any,
+        notional: float,
+        top_up: Optional[Any],
+        manual: bool,
+        prior_submitted_amounts: Dict[str, float],
+    ) -> Optional[Tuple[Dict[str, Any], float]]:
+        """Evaluate whether an order for this ticker is a duplicate of a prior submission.
+
+        Returns a tuple of (outcome_dict, duplicate_amount) if it's a duplicate,
+        or None if no duplicate exists and placement should proceed.
+
+        Bypass the broad same-day duplicate check only when there is an actual
+        cross-stream prior allocation (top-up guard result is not 'no_prior_run').
+        Even then, keep a same-stream ref-id check so retrying this stream after
+        it already submitted the ticker remains idempotent.
+
+        This duplicate check runs BEFORE the daily/weekly cap checks
+        below: a duplicate places no new order, so it must never be
+        gated by checks that exist to decide whether a NEW placement
+        should proceed. Once cap-seeding has recovered an earlier
+        scheduled order that exactly consumes (or slightly exceeds, via
+        a freshly recomputed but stale notional) the remaining cap,
+        running the cap check first would record cap_exceeded and
+        overwrite the dated-slot artifact's real "submitted" row for
+        this ticker, erasing evidence a fresh executor's cap-seeding
+        scan depends on (Codex review, PR #88: "Preserve submitted
+        evidence when a cap-seeded retry is full").
+        """
+        has_prior_allocation = (
+            top_up is not None and top_up.top_up_guard_result != TOP_UP_NO_PRIOR_RUN
+        )
+        dup_order: Optional[Dict[str, Any]] = None
+        try:
+            if has_prior_allocation:
+                dup_order = _same_stream_order_exists(
+                    broker, ticker, trading_day, self._idempotency_stream()
+                )
+                dup = dup_order is not None
+                duplicate_reason = "same-stream broker order exists"
+            else:
+                dup = broker.same_day_strategy_order_exists(ticker, trading_day)
+                duplicate_reason = "same-day broker order exists"
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("Duplicate-check error for %s: %s", ticker, exc)
+            return ({"status": "blocked", "skip_reason": f"duplicate-check failed: {exc}"}, 0.0)
+
+        if dup:
+            if has_prior_allocation and not manual:
+                # A same-stream top-up duplicate on a SCHEDULED retry means
+                # this stream already submitted/reserved the incremental
+                # order on an earlier attempt today, and a scheduled rerun
+                # overwrites the same date-keyed run_state.json path (see
+                # run_state_dir()), so there is no separate artifact for
+                # load_prior_same_day_allocations() to double-sum against.
+                # Persist the real broker order's id and amount so rewriting
+                # run_state on retry does not fabricate phantom values that
+                # downstream fill-lookup or reconciliation would reject or
+                # misread. Prefer the broker's own dollar_amount for this
+                # matched order (most authoritative -- straight from the
+                # broker); adapters that only support the legacy boolean
+                # duplicate-check contract normalize to an empty dup_order
+                # dict with no amount fields, so fall back to this
+                # process's own previously-recorded submission for the
+                # ticker (read into prior_submitted_amounts above) before
+                # finally falling back to the freshly recomputed
+                # `notional`, which can have shrunk since the original
+                # attempt if new prior-allocation context (e.g. an
+                # external fill) appeared in between.
+                try:
+                    dup_amount = float(
+                        (dup_order or {}).get("dollar_amount")
+                        or (dup_order or {}).get("notional")
+                        or 0
+                    ) or prior_submitted_amounts.get(ticker, notional)
+                except (TypeError, ValueError):
+                    dup_amount = prior_submitted_amounts.get(ticker, notional)
+                if not math.isfinite(dup_amount) or dup_amount <= 0:
+                    dup_amount = prior_submitted_amounts.get(ticker, notional)
+                outcome = {
+                    "status": "submitted",
+                    "order_id": (dup_order or {}).get("id") or (dup_order or {}).get("order_id"),
+                    "skip_reason": duplicate_reason,
+                    "submitted_amount_usd": dup_amount,
+                    # This amount is a DUPLICATE of an already-submitted
+                    # order, not a fresh placement -- it's already
+                    # reflected in the cap-seeding scan of this same
+                    # dated-slot artifact (_compute_top_up), so run()'s
+                    # submitted_candidates filter must exclude it from
+                    # record_buy_candidates()'s ledger booking, or the
+                    # amount gets double-counted every retry (Codex
+                    # review, PR #88: "Avoid booking same-stream top-up
+                    # retries a second time").
+                    "duplicate_preserved": True,
+                }
+                # Do NOT add to reserved_buying_power in caller: available_buying_power()
+                # is a fresh broker snapshot fetched AFTER the
+                # earlier order already consumed it, so crediting dup_amount
+                # again here would double-subtract it and could incorrectly
+                # block a later candidate in this retry batch even when real
+                # buying power is sufficient (Codex review, PR #51: "Do not
+                # reserve buying power for existing duplicates").
+                return (outcome, dup_amount)
+            elif has_prior_allocation and manual:
+                # A MANUAL/recovery retry always writes to its own fresh,
+                # uuid-suffixed artifact directory (see run_id()) and never
+                # overwrites the original submission's run_state.json. If
+                # this were also recorded as "submitted" with a fresh
+                # notional, load_prior_same_day_allocations() would find
+                # both files and double-count the same broker order as two
+                # separate same-day allocations, understating what an
+                # afternoon/final top-up is still owed. The original
+                # submission's own artifact already carries the real
+                # notional, so this retry contributes nothing further.
+                outcome = {
+                    "status": "skipped",
+                    "skip_reason": f"{duplicate_reason} (duplicate top-up retry; already recorded by the original run)",
+                    # The original (non-duplicate) attempt already settled
+                    # this ticker's credit via _place_broker_orders'
+                    # confirmed-submission path, so the post-loop credit
+                    # preservation pass below must not treat this as an
+                    # unresolved block and record the decline a second time.
+                    "credit_already_resolved": True,
+                }
+                return (outcome, 0.0)
+            else:
+                outcome = {"status": "skipped", "skip_reason": duplicate_reason}
+                return (outcome, 0.0)
+        return None
+
     def _place_broker_orders(
         self,
         candidates: List[MorningSignal],
@@ -6106,483 +7064,38 @@ class MorningDCAExecutor(DCAExecutor):
 
         for signal in candidates:
             ticker = signal.ticker
-            # Re-checked BEFORE every candidate, not just once before the loop.
-            # The broker adapter is wrapped by _PersistingBrokerAdapter, so a
-            # disk or serialization failure can begin partway through the batch
-            # -- during a buying-power lookup, an order review, or while
-            # recording the response of an order that was ALREADY submitted.
-            # The pre-loop gate upstream cannot see that, and the post-run
-            # handler only surfaced `raw_persistence_error` on an otherwise
-            # normal artifact, so later candidates kept submitting from inputs
-            # nothing had durably recorded (Codex review: "Stop placement when
-            # broker raw persistence fails"). Stop here instead: candidates
-            # already submitted keep their real outcomes, every remaining one
-            # is explicitly blocked, and _run_once_impl classifies the run as a
-            # partial failure rather than a success with a footnote. Checking at
-            # the top of every iteration (rather than batch-filling the tail of
-            # ``candidates`` once and breaking) means every candidate still gets
-            # its own turn through this same check, so every one still ends up
-            # with a recorded outcome once persistence has failed.
             if block_if_raw_persistence_failed(ticker):
                 continue
-            top_up = (top_up_outcomes or {}).get(ticker)
-
-            # Determine the real order notional from the top-up outcome if active.
-            if top_up is not None:
-                if top_up.top_up_skipped or top_up.incremental_order_amount <= 0:
-                    outcomes[ticker] = {
-                        "status": "skipped",
-                        "skip_reason": f"top-up guard: {top_up.top_up_guard_result}",
-                    }
-                    continue
-                notional = round(top_up.incremental_order_amount, 2)
-            else:
-                notional = signal.hypothetical_amount_usd
-
-            # Hard per-order ceiling from config/budgets.json circuit_breakers.max_per_order_usd.
-            # A pure local computation (no broker round-trip), so it stays ahead
-            # of the duplicate check below -- an over-ceiling candidate must
-            # never even reach the broker (Codex review #25 on PR #22).
-            _max_order_usd = self.config.max_per_order_usd
-            if notional > _max_order_usd:
-                outcomes[ticker] = {
-                    "status": "blocked",
-                    "skip_reason": f"exceeds ${_max_order_usd:.0f} per-order ceiling",
-                    "deliberate_skip": True,
-                }
-                continue
-
-            # Bypass the broad same-day duplicate check only when there is an actual
-            # cross-stream prior allocation (top-up guard result is not 'no_prior_run').
-            # Even then, keep a same-stream ref-id check so retrying this stream after
-            # it already submitted the ticker remains idempotent.
-            #
-            # This duplicate check runs BEFORE the daily/weekly cap checks
-            # below: a duplicate places no new order, so it must never be
-            # gated by checks that exist to decide whether a NEW placement
-            # should proceed. Once cap-seeding has recovered an earlier
-            # scheduled order that exactly consumes (or slightly exceeds, via
-            # a freshly recomputed but stale notional) the remaining cap,
-            # running the cap check first would record cap_exceeded and
-            # overwrite the dated-slot artifact's real "submitted" row for
-            # this ticker, erasing evidence a fresh executor's cap-seeding
-            # scan depends on (Codex review, PR #88: "Preserve submitted
-            # evidence when a cap-seeded retry is full").
-            has_prior_allocation = (
-                top_up is not None and top_up.top_up_guard_result != TOP_UP_NO_PRIOR_RUN
+            (
+                batch_buying_power,
+                reserved_buying_power,
+                submitted_today,
+                submitted_this_week,
+                consecutive_placement_failures,
+                halt_batch,
+            ) = self._process_candidate(
+                signal=signal,
+                trading_day=trading_day,
+                broker=broker,
+                top_up=(top_up_outcomes or {}).get(signal.ticker),
+                remaining_daily=remaining_daily,
+                remaining_weekly=remaining_weekly,
+                manual=manual,
+                data=data,
+                now=now,
+                prior_submitted_amounts=prior_submitted_amounts,
+                outcomes=outcomes,
+                spread_by_ticker=spread_by_ticker,
+                batch_buying_power=batch_buying_power,
+                reserved_buying_power=reserved_buying_power,
+                submitted_today=submitted_today,
+                submitted_this_week=submitted_this_week,
+                consecutive_placement_failures=consecutive_placement_failures,
+                block_if_raw_persistence_failed=block_if_raw_persistence_failed,
+                record_breaker_skipped_remainder=_record_breaker_skipped_remainder,
             )
-            dup_order: Optional[Dict[str, Any]] = None
-            try:
-                if has_prior_allocation:
-                    dup_order = _same_stream_order_exists(
-                        broker, ticker, trading_day, self._idempotency_stream()
-                    )
-                    dup = dup_order is not None
-                    duplicate_reason = "same-stream broker order exists"
-                else:
-                    dup = broker.same_day_strategy_order_exists(ticker, trading_day)
-                    duplicate_reason = "same-day broker order exists"
-            except Exception as exc:  # noqa: BLE001
-                outcomes[ticker] = {
-                    "status": "blocked",
-                    "skip_reason": f"duplicate-check failed: {exc}",
-                }
-                _log.warning("Duplicate-check error for %s: %s", ticker, exc)
-                continue
-            # The persisting adapter records the returned lookup value after
-            # the broker call. Recheck here so a serialization/disk failure
-            # caused by THIS candidate cannot slip past the top-of-loop check
-            # and reach placement.
-            if block_if_raw_persistence_failed(ticker):
-                continue
-            if dup:
-                if has_prior_allocation and not manual:
-                    # A same-stream top-up duplicate on a SCHEDULED retry means
-                    # this stream already submitted/reserved the incremental
-                    # order on an earlier attempt today, and a scheduled rerun
-                    # overwrites the same date-keyed run_state.json path (see
-                    # run_state_dir()), so there is no separate artifact for
-                    # load_prior_same_day_allocations() to double-sum against.
-                    # Persist the real broker order's id and amount so rewriting
-                    # run_state on retry does not fabricate phantom values that
-                    # downstream fill-lookup or reconciliation would reject or
-                    # misread. Prefer the broker's own dollar_amount for this
-                    # matched order (most authoritative -- straight from the
-                    # broker); adapters that only support the legacy boolean
-                    # duplicate-check contract normalize to an empty dup_order
-                    # dict with no amount fields, so fall back to this
-                    # process's own previously-recorded submission for the
-                    # ticker (read into prior_submitted_amounts above) before
-                    # finally falling back to the freshly recomputed
-                    # `notional`, which can have shrunk since the original
-                    # attempt if new prior-allocation context (e.g. an
-                    # external fill) appeared in between.
-                    try:
-                        dup_amount = float(
-                            (dup_order or {}).get("dollar_amount")
-                            or (dup_order or {}).get("notional")
-                            or 0
-                        ) or prior_submitted_amounts.get(ticker, notional)
-                    except (TypeError, ValueError):
-                        dup_amount = prior_submitted_amounts.get(ticker, notional)
-                    if not math.isfinite(dup_amount) or dup_amount <= 0:
-                        dup_amount = prior_submitted_amounts.get(ticker, notional)
-                    outcomes[ticker] = {
-                        "status": "submitted",
-                        "order_id": (dup_order or {}).get("id") or (dup_order or {}).get("order_id"),
-                        "skip_reason": duplicate_reason,
-                        "submitted_amount_usd": dup_amount,
-                        # This amount is a DUPLICATE of an already-submitted
-                        # order, not a fresh placement -- it's already
-                        # reflected in the cap-seeding scan of this same
-                        # dated-slot artifact (_compute_top_up), so run()'s
-                        # submitted_candidates filter must exclude it from
-                        # record_buy_candidates()'s ledger booking, or the
-                        # amount gets double-counted every retry (Codex
-                        # review, PR #88: "Avoid booking same-stream top-up
-                        # retries a second time").
-                        "duplicate_preserved": True,
-                    }
-                    submitted_today += dup_amount
-                    submitted_this_week += dup_amount
-                    # Do NOT add to reserved_buying_power: available_buying_power()
-                    # is a fresh broker snapshot fetched (lazily, below) AFTER the
-                    # earlier order already consumed it, so crediting dup_amount
-                    # again here would double-subtract it and could incorrectly
-                    # block a later candidate in this retry batch even when real
-                    # buying power is sufficient (Codex review, PR #51: "Do not
-                    # reserve buying power for existing duplicates").
-                elif has_prior_allocation and manual:
-                    # A MANUAL/recovery retry always writes to its own fresh,
-                    # uuid-suffixed artifact directory (see run_id()) and never
-                    # overwrites the original submission's run_state.json. If
-                    # this were also recorded as "submitted" with a fresh
-                    # notional, load_prior_same_day_allocations() would find
-                    # both files and double-count the same broker order as two
-                    # separate same-day allocations, understating what an
-                    # afternoon/final top-up is still owed. The original
-                    # submission's own artifact already carries the real
-                    # notional, so this retry contributes nothing further.
-                    outcomes[ticker] = {
-                        "status": "skipped",
-                        "skip_reason": f"{duplicate_reason} (duplicate top-up retry; already recorded by the original run)",
-                        # The original (non-duplicate) attempt already settled
-                        # this ticker's credit via _place_broker_orders'
-                        # confirmed-submission path, so the post-loop credit
-                        # preservation pass below must not treat this as an
-                        # unresolved block and record the decline a second time.
-                        "credit_already_resolved": True,
-                    }
-                else:
-                    outcomes[ticker] = {"status": "skipped", "skip_reason": duplicate_reason}
-                continue
-
-            # Shared daily order-ATTEMPT ceiling (config/budgets.json
-            # circuit_breakers.max_orders_per_day, seeded cross-stream in
-            # _compute_top_up above) -- a pure local check, ahead of the
-            # broker round-trip, mirroring the per-order ceiling above (Codex
-            # review: "Enforce the shared daily order-count cap in new
-            # executors"). Runs AFTER the duplicate-recovery check above, not
-            # before: a preserved duplicate creates no new attempt (it was
-            # already counted when the earlier attempt actually placed the
-            # order), so enforcing this cap first could wrongly block the
-            # recovery path and overwrite the dated-slot artifact's real
-            # "submitted" row with a fabricated "blocked" one on a retry that
-            # itself brought the shared attempt count to the cap (Codex
-            # review: "Check for preserved duplicates before enforcing the
-            # attempt cap").
-            _max_orders_per_day = self.config.max_orders_per_day
-            if _max_orders_per_day is not None and self.ledger.day_attempts(trading_day) >= _max_orders_per_day:
-                outcomes[ticker] = {
-                    "status": "blocked",
-                    "skip_reason": f"exceeds {_max_orders_per_day} order daily attempt cap",
-                    "deliberate_skip": True,
-                    "budget_blocked": True,
-                }
-                continue
-
-            # Enforce daily/weekly caps against pre-run remaining budget.
-            if submitted_today + notional > remaining_daily:
-                outcomes[ticker] = {"status": "cap_exceeded", "skip_reason": "daily cap would be exceeded"}
-                continue
-            if submitted_this_week + notional > remaining_weekly:
-                outcomes[ticker] = {"status": "cap_exceeded", "skip_reason": "weekly cap would be exceeded"}
-                continue
-
-            # This ticker qualified on the ladder and top-up rules, so it reaches
-            # the spread gate. Every row that gets this far records its own spread
-            # outcome, and only rows that get this far can be counted as blocked
-            # for want of a spread (config/scheduled_tasks.json:
-            # spread_data_availability_policy.evaluation_order).
-            max_spread = self.config.max_bid_ask_spread_pct
-            if data is not None and now is not None:
-                try:
-                    spread_pct = quote_spread_pct(data, ticker, now)
-                except Exception as exc:  # noqa: BLE001
-                    outcomes[ticker] = {
-                        "status": "blocked",
-                        "skip_reason": f"spread quote error: {exc}",
-                        **spread_gate_fields(spread_pct=None, max_spread_pct=max_spread),
-                    }
-                    _log.warning("Spread quote error for %s: %s", ticker, exc)
-                    continue
-                spread_fields = spread_gate_fields(
-                    spread_pct=spread_pct, max_spread_pct=max_spread
-                )
-                if spread_pct is None and not manual:
-                    # A scheduled run is pre-authorized to place without review, so
-                    # the spread breaker is the only thing standing between an
-                    # unproven quote and a live order: fail this row closed rather
-                    # than placing on an unproven spread. Only THIS row fails; every
-                    # other ticker keeps being evaluated. Manual runs still go
-                    # through review_market_buy as a human-reviewed safety net, so
-                    # they are not blocked on a missing spread alone (mirrors
-                    # near_close_dca's scheduled spread gate).
-                    outcomes[ticker] = {
-                        "status": "blocked",
-                        "skip_reason": (
-                            "bid/ask spread unavailable; scheduled runs require spread_ok"
-                        ),
-                        "deliberate_skip": True,
-                        # The spread gate is what stopped this row. Recorded
-                        # explicitly rather than inferred from spread_status,
-                        # which a manual run can carry on a row the gate let
-                        # through (Codex review).
-                        "blocked_by": BLOCKED_BY_SPREAD_GATE,
-                        **spread_fields,
-                    }
-                    continue
-                if spread_pct is not None and spread_pct > max_spread:
-                    outcomes[ticker] = {
-                        "status": "blocked",
-                        "skip_reason": (
-                            f"bid/ask spread {spread_pct:.2f}% exceeds {max_spread:.2f}% limit"
-                        ),
-                        "deliberate_skip": True,
-                        **spread_fields,
-                    }
-                    continue
-                spread_by_ticker[ticker] = spread_fields
-            else:
-                spread_by_ticker[ticker] = spread_gate_fields(
-                    spread_pct=None, max_spread_pct=max_spread, evaluated=False
-                )
-            try:
-                tradable = broker.is_tradable_for_fractional_buy(ticker)
-            except Exception as exc:  # noqa: BLE001
-                outcomes[ticker] = {
-                    "status": "blocked",
-                    "skip_reason": f"tradability lookup failed: {exc}",
-                }
-                _log.warning("Tradability lookup error for %s: %s", ticker, exc)
-                continue
-            if block_if_raw_persistence_failed(ticker):
-                continue
-            if not tradable:
-                outcomes[ticker] = {"status": "blocked", "skip_reason": "not tradable for fractional buy", "deliberate_skip": True}
-                continue
-            if batch_buying_power is None:
-                batch_buying_power = broker.available_buying_power()
-            if block_if_raw_persistence_failed(ticker):
-                continue
-            if batch_buying_power - reserved_buying_power < notional:
-                outcomes[ticker] = {"status": "blocked", "skip_reason": "insufficient buying power", "deliberate_skip": True}
-                continue
-            # Scheduled runs are pre-authorized to call place_equity_order directly
-            # (config/budgets.json execution_authorization_policy: calls_review_equity_order=false).
-            # Manual runs still call review_market_buy before placement.
-            if manual:
-                try:
-                    review_ok, review_reason = broker.review_market_buy(ticker, notional)
-                except Exception as exc:  # noqa: BLE001
-                    outcomes[ticker] = {
-                        "status": "blocked",
-                        "skip_reason": f"review failed: {exc}",
-                    }
-                    _log.warning("Review error for %s: %s", ticker, exc)
-                    continue
-                if block_if_raw_persistence_failed(ticker):
-                    continue
-                if not review_ok:
-                    outcomes[ticker] = {"status": "blocked", "skip_reason": f"review blocked: {review_reason}", "deliberate_skip": True}
-                    continue
-            # Stable across retries so the broker's idempotency key can collapse
-            # duplicate submissions; guarded top-ups use a distinct suffix to
-            # avoid colliding with the earlier same-day run's ref_id for the
-            # ticker. A manual run without a prior allocation (e.g. a MORNING
-            # manual recovery run, which disables per-ticker top-up computation
-            # in _compute_top_up) gets its own "-manual-" ref_id segment too:
-            # without it, a manual fill's ref_id is indistinguishable from a
-            # plain scheduled order's ref_id, so a LATER scheduled run that
-            # finds this manual fill as a prior allocation and computes a
-            # guarded top-up would have its _same_stream_order_exists ordinary-
-            # prefix check match the manual fill and wrongly treat the fresh
-            # incremental top-up as an already-submitted retry -- recording it
-            # as "submitted" without ever calling place_market_buy (Codex
-            # review, PR #42).
-            idempotency_stream = self._idempotency_stream()
-            if has_prior_allocation:
-                ref_id = f"{idempotency_stream}-dca-topup-{trading_day.isoformat()}-{ticker}"
-            elif manual:
-                ref_id = f"{idempotency_stream}-dca-manual-{trading_day.isoformat()}-{ticker}"
-            else:
-                ref_id = f"{idempotency_stream}-dca-{trading_day.isoformat()}-{ticker}"
-            # Asked a SECOND time, right here, because the top-of-loop check
-            # cannot see a failure that begins partway through THIS candidate.
-            # Everything between the two checks goes through
-            # _PersistingBrokerAdapter -- the duplicate lookup, the tradability
-            # call, the buying-power snapshot, the order review -- so any of
-            # them can set raw_recorder.error after the top-of-loop gate has
-            # already passed. Checking only at the top blocked the NEXT
-            # candidate while still submitting this one from an input nothing
-            # had durably recorded, defeating the fail-closed contract (Codex
-            # review: "Recheck persistence before submitting the current
-            # candidate"). Placed above record_attempt so a candidate stopped
-            # here never consumes one of the day's shared order slots either.
-            if block_if_raw_persistence_failed(ticker):
-                continue
-            # Counted as a buy ATTEMPT the moment the broker call is actually
-            # made, regardless of outcome -- mirrors near_close_dca's own
-            # max_orders_per_day semantics (a cancelled/rejected/failed buy
-            # still consumes one of the shared slots), and is what
-            # _compute_top_up's cross-stream seeding above counts too.
-            self.ledger.record_attempt(trading_day)
-            try:
-                order_id = broker.place_market_buy(ticker, notional, ref_id=ref_id)
-            except OrderConfirmationRequiredError:
-                outcomes[ticker] = {
-                    "status": "not_submitted_confirmation_required",
-                    "order_id": None,
-                    "skip_reason": "broker requires post-review confirmation before submission",
-                    "submitted_amount_usd": notional,
-                }
-                # A REAL broker placement call that produced no order, so it
-                # counts toward the streak exactly like a raised placement:
-                # a broker refusing every direct submission is precisely the
-                # systemic condition the breaker exists to stop, and only a
-                # SUCCESS resets the streak (Codex review, PR #786: "Count
-                # confirmation-required placement failures").
-                consecutive_placement_failures += 1
-                if (
-                    self.config.max_consecutive_placement_failures is not None
-                    and consecutive_placement_failures
-                    >= self.config.max_consecutive_placement_failures
-                ):
-                    breaker_skipped = _record_breaker_skipped_remainder(
-                        consecutive_placement_failures, ticker
-                    )
-                    _log.error(
-                        "Halting the batch after %d consecutive placement failures "
-                        "(circuit_breakers.max_consecutive_placement_failures); "
-                        "%d candidate(s) never attempted: %s",
-                        consecutive_placement_failures,
-                        len(breaker_skipped),
-                        ", ".join(breaker_skipped) or "none",
-                    )
-                    break
-                continue
-            except OrderPlacementRejectedError as exc:
-                outcomes[ticker] = {
-                    "status": "failed",
-                    "order_id": None,
-                    "skip_reason": f"broker rejected placement: {type(exc).__name__}",
-                    "submitted_amount_usd": notional,
-                }
-                _log.error("Broker rejected placement for %s: %s", ticker, exc)
-                consecutive_placement_failures += 1
-                if (
-                    self.config.max_consecutive_placement_failures is not None
-                    and consecutive_placement_failures
-                    >= self.config.max_consecutive_placement_failures
-                ):
-                    breaker_skipped = _record_breaker_skipped_remainder(
-                        consecutive_placement_failures, ticker
-                    )
-                    _log.error(
-                        "Halting the batch after %d consecutive placement failures; "
-                        "%d candidate(s) never attempted: %s",
-                        consecutive_placement_failures,
-                        len(breaker_skipped),
-                        ", ".join(breaker_skipped) or "none",
-                    )
-                    break
-                continue
-            except Exception as exc:  # noqa: BLE001
-                outcomes[ticker] = {
-                    "status": "failed",
-                    "order_id": None,
-                    "skip_reason": f"ambiguous placement exception: {type(exc).__name__}",
-                    "submitted_amount_usd": notional,
-                    "ambiguous_placement_exception": True,
-                }
-                _log.error("Ambiguous placement exception for %s: %s", ticker, exc)
-                if top_up is not None and top_up.cumulative_credit_decline_usd is not None:
-                    try:
-                        self.credit_ledger.settle(
-                            ticker,
-                            trading_day.isoformat(),
-                            notional,
-                            final_session=False,
-                            stream=self._idempotency_stream(),
-                            order_id=None,
-                        )
-                        outcomes[ticker]["credit_already_resolved"] = True
-                    except Exception as credit_exc:  # noqa: BLE001
-                        _log.warning("ambiguous credit quarantine failed for %s: %s", ticker, credit_exc)
-                breaker_skipped = _record_breaker_skipped_remainder(1, ticker)
-                for skipped_ticker in breaker_skipped:
-                    outcomes[skipped_ticker]["skip_reason"] = (
-                        f"not attempted: {ticker}'s placement exception may have left an accepted order"
-                    )
+            if halt_batch:
                 break
-            # DryRunBroker returns a DRY-RUN-... order id; record as dry_run so
-            # load_prior_same_day_allocations never treats it as real capital.
-            if order_id.startswith("DRY-RUN"):
-                outcomes[ticker] = {
-                    "status": "dry_run",
-                    "order_id": order_id,
-                    "skip_reason": "dry_run: order not placed",
-                    "submitted_amount_usd": notional,
-                }
-                continue
-            outcomes[ticker] = {
-                "status": "submitted",
-                "order_id": order_id,
-                "submitted_amount_usd": notional,
-            }
-            submitted_today += notional
-            submitted_this_week += notional
-            reserved_buying_power += notional
-            # Reset only on an actual submission: the breaker is about an
-            # unbroken RUN of failures, and a submitted order is proof the
-            # broker leg is still working.
-            consecutive_placement_failures = 0
-            _log.info("Placed morning buy for %s: $%.2f, order_id=%s", ticker, notional, order_id)
-            # Durably settle the cumulative sub-dollar credit ledger ONLY now
-            # that the order is actually confirmed submitted -- not during
-            # _evaluate_top_up's earlier, pre-placement computation, which
-            # runs before the cap/spread/buying-power/duplicate gates above
-            # could still block this candidate (Codex review: "Defer ledger
-            # updates until the submitted amount is known", the same fix
-            # already applied to near_close_dca.evaluate_top_up_guard).
-            # Records the ACTUAL submitted notional, not the originally
-            # computed credit amount. A corrupt/locked/unwritable ledger must
-            # never mask this real, already-placed and already-published
-            # order -- log and continue rather than raise.
-            if top_up is not None and top_up.cumulative_credit_decline_usd is not None:
-                try:
-                    self.credit_ledger.settle(
-                        ticker,
-                        trading_day.isoformat(),
-                        notional,
-                        final_session=False,
-                        stream=self._idempotency_stream(),
-                        order_id=order_id,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    _log.warning(
-                        "cumulative credit ledger settlement failed for %s: %s", ticker, exc
-                    )
         # Preserve threshold-crossing credits that a LATER gate blocked before
         # placement. _evaluate_top_up's cumulative_credit_decline_usd is only
         # durably recorded above in two places: _compute_top_up (when the
@@ -7658,9 +8171,39 @@ def _merge_placements_into_state(
     added = False
     outcomes = dict(merged.get("broker_outcomes") or {})
     for ticker, outcome in placed.items():
-        if ticker not in outcomes:
+        existing_outcome = outcomes.get(ticker)
+        if existing_outcome is None:
             outcomes[ticker] = outcome
             added = True
+            continue
+        # The preserved state can already hold a blocked/failed outcome for
+        # this exact ticker from an EARLIER attempt at this same slot (no
+        # order ever reached the broker for it) -- the plain `ticker not in
+        # outcomes` check above treated that stale, order-less entry as
+        # already-covering this ticker and silently discarded THIS attempt's
+        # real submitted outcome, leaving broker_outcomes saying no order
+        # exists for a ticker that was actually just bought (Codex review:
+        # "Preserve same-ticker placements by order identity"). An entry
+        # with no real order evidence is safe to replace outright: nothing
+        # is lost, since it never represented an accepted order in the
+        # first place.
+        existing_has_real_order = (
+            isinstance(existing_outcome, dict)
+            and (
+                existing_outcome.get("order_id")
+                or _is_deployed_candidate_status(existing_outcome.get("status"))
+            )
+        )
+        if not existing_has_real_order:
+            outcomes[ticker] = outcome
+            added = True
+            continue
+        # Both the preserved entry and this attempt's outcome claim a real
+        # order for the same ticker -- the one-order-per-ticker-per-slot
+        # invariant means this should never happen, but failing closed here
+        # (keeping the earlier, already-durable order and not overwriting
+        # it with an unverified in-memory one) is safer than silently
+        # picking either.
     merged["broker_outcomes"] = outcomes
 
     existing_rows = list(merged.get("buy_candidates") or [])

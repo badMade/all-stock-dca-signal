@@ -193,7 +193,6 @@ class CumulativeCreditLedger:
                 # preserve_pending() contribution against the ledger's raw
                 # balance (Codex review: "Rebase retries even without an
                 # explicit pending_baseline_usd").
-                rebased = True
                 preserve_key = f"preserve:{symbol}:{idempotency_key}"
                 cached_preserve = recorded_keys.get(preserve_key)
                 own_contribution = (
@@ -201,6 +200,22 @@ class CumulativeCreditLedger:
                     if cached_preserve is None or cached_preserve.get("consumed_by_settlement")
                     else float(cached_preserve.get("incremental_credit_usd", 0.0))
                 )
+                # `rebased` (which later suppresses this call from ever
+                # returning an order below) must track whether this call
+                # actually had something to rebase against -- either a
+                # preserved contribution that was netted out above, or an
+                # explicit `pending_baseline_usd` from a caller that is
+                # documented to never inspect the return value (see the
+                # docstring) -- not merely whether an idempotency_key was
+                # supplied. A plain record() retry with an idempotency_key
+                # but no matching preserve_pending() entry AND no explicit
+                # baseline has nothing to rebase against, so treating it as
+                # rebased would wrongly convert every threshold-crossing
+                # decision into pending credit and starve this call of the
+                # order the policy actually earned (Codex review: "Limit
+                # rebase suppression to preserved retries" /
+                # "Rebase only when a matching preserved credit exists").
+                rebased = own_contribution > 0.0 or pending_baseline_usd is not None
                 pending = max(
                     0.0,
                     round(state["pending_usd_by_ticker"].get(symbol, 0.0) - own_contribution, 2),
@@ -208,7 +223,7 @@ class CumulativeCreditLedger:
             elif pending_baseline_usd is not None:
                 # No idempotency_key to rebase against: the caller-supplied
                 # baseline is used verbatim, exactly as documented.
-                pending = pending_baseline_usd
+                pending = float(pending_baseline_usd)
             else:
                 pending = state["pending_usd_by_ticker"].get(symbol, 0.0)
             decision = apply_cumulative_credit(

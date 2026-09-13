@@ -839,6 +839,27 @@ def test_load_strategy_config_whole_share_default_honors_an_explicit_override_ex
     assert config.whole_share_tickers == frozenset(WHOLE_SHARE_TICKERS) - {"BYDDY"}
 
 
+def test_load_strategy_config_explicit_empty_override_clears_a_config_file_exclusion(tmp_path):
+    """Codex review, PR #631 discussion_r3914702406 ("Honor an explicit
+    empty exclusion override"): the whole-share default's precedence chain
+    used to pick a layer by TRUTHINESS (`overrides.get(...) or merged.get(...)
+    or base.excluded_tickers or frozenset()`), so a caller explicitly passing
+    `excluded_tickers=frozenset()` -- "no exclusions, clear whatever the
+    config file said" -- was indistinguishable from not passing the override
+    at all: an empty frozenset is falsy, so the chain fell through to the
+    tickers.json-level "excluded": ["BYDDY"] underneath it, and BYDDY stayed
+    missing from the resolved whole_share_tickers/buying universe despite the
+    caller's explicit instruction to clear it.
+    """
+    _write(tmp_path, "tickers.json", {"active": ["AAPL"], "excluded": ["BYDDY"]})
+
+    config = load_strategy_config(tmp_path, excluded_tickers=frozenset())
+
+    assert "BYDDY" not in config.excluded_tickers
+    assert "BYDDY" in config.whole_share_tickers
+    assert config.whole_share_tickers == frozenset(WHOLE_SHARE_TICKERS)
+
+
 def test_load_strategy_config_an_explicit_base_is_not_overridden(tmp_path):
     """A caller passing an explicit `base` (e.g. a test isolating a small ad
     hoc universe) must be unaffected by the missing-config-dir fallback
@@ -1250,11 +1271,12 @@ def test_budgets_maps_surviving_fields_only(tmp_path):
         "base_amount_below_close_usd": 1.0,
         "weekly_rollover_reserve_cap_usd": 900.0,
         "budget_tiers": [{"name": "normal", "daily_cap_usd": 180.0}],
-        # max_consecutive_placement_failures is required by
-        # schemas/budgets.schema.json, and load_budgets now refuses an existing
-        # file that omits it rather than leaving the breaker disabled (Codex
-        # review, PR #786: "Reject an omitted breaker in the strategy loader"),
-        # so every fixture here carries it to stay schema-valid.
+        # max_consecutive_placement_failures is REQUIRED whenever budgets.json
+        # exists (Codex review, PR #786: "Reject an omitted breaker in the
+        # strategy loader") -- an existing file omitting it is refused rather
+        # than silently disabling the breaker, so every synthetic budgets.json
+        # fixture in this module supplies it even when the test itself is
+        # about a different field entirely.
         "circuit_breakers": {"max_per_order_usd": 10.0, "max_consecutive_placement_failures": 3},
     })
     out = load_budgets(tmp_path)
@@ -1264,14 +1286,12 @@ def test_budgets_maps_surviving_fields_only(tmp_path):
         "weekly_rollover_reserve_cap_usd": 900.0,
         "max_per_order_usd": 10.0,
         "max_consecutive_placement_failures": 3,
-        # A MARKER, not a number. A budgets.json that never opted into the
-        # whole-share allowance must not inherit StrategyConfig's $50 default
-        # (Codex review, PR #786: "Require an explicit whole-share ceiling in
-        # existing budgets") -- but the value it collapses to is the EFFECTIVE
-        # ordinary ceiling, which depends on the caller's own `base` and
-        # overrides and so cannot be resolved here (Codex review, PR #786:
-        # "Preserve explicit-base whole-share limits without budgets").
-        # load_strategy_config resolves it and drops this key.
+        # This fixture's circuit_breakers never sets whole_share_max_per_order_usd,
+        # so load_budgets stamps the "not opted in" marker load_strategy_config
+        # later pops and resolves against the effective ordinary ceiling (Codex
+        # review, PR #786: "Require an explicit whole-share ceiling in existing
+        # budgets") -- load_budgets's own raw output, read directly here rather
+        # than through load_strategy_config, still carries it.
         "_whole_share_ceiling_not_opted_in": True,
     }
     # ... and the collapse itself still holds, asserted where it now happens.
@@ -1288,12 +1308,12 @@ def test_budgets_overlays_max_orders_per_day(tmp_path):
         "circuit_breakers": {"max_orders_per_day": 8, "max_consecutive_placement_failures": 3},
     })
     out = load_budgets(tmp_path)
-    # The non-opt-in MARKER; load_strategy_config resolves it against the
-    # effective ordinary ceiling, which this fixture leaves at StrategyConfig's
-    # own default.
     assert out == {
         "max_orders_per_day": 8,
         "max_consecutive_placement_failures": 3,
+        # See test_budgets_maps_surviving_fields_only's own comment: this
+        # fixture doesn't opt into whole_share_max_per_order_usd either, so
+        # load_budgets's raw output still carries the marker.
         "_whole_share_ceiling_not_opted_in": True,
     }
     config = load_strategy_config(tmp_path)
@@ -1314,11 +1334,9 @@ def test_max_orders_per_day_defaults_to_uncapped_when_absent(tmp_path):
     """A config directory with no circuit_breakers.max_orders_per_day key must
     leave StrategyConfig's own None (uncapped) default untouched, matching
     every other optional overlay in this module."""
-    _write(
-        tmp_path,
-        "budgets.json",
-        {"circuit_breakers": {"max_per_order_usd": 10.0, "max_consecutive_placement_failures": 3}},
-    )
+    _write(tmp_path, "budgets.json", {
+        "circuit_breakers": {"max_per_order_usd": 10.0, "max_consecutive_placement_failures": 3},
+    })
     out = load_budgets(tmp_path)
     assert "max_orders_per_day" not in out
     config = load_strategy_config(tmp_path)
@@ -1601,7 +1619,6 @@ def test_malformed_accounts_are_rejected_at_load(monkeypatch, bad):
             "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", source="test broker_account"
         )
 
-
 def test_surrounding_whitespace_is_stripped_not_rejected(monkeypatch):
     """An account exported with a stray newline is unambiguous; failing on it
     would be a needless outage."""
@@ -1821,9 +1838,10 @@ def test_shipped_budgets_json_clears_the_whole_share_universe_share_prices():
 
 def test_shipped_tickers_json_enrolls_byddy_as_whole_share():
     """The checked-in config/tickers.json's "whole_share" array enrolls
-    BYDDY -- the ticker this category was built for -- plus RVII (moved out of
-    "active" 2026-08-24 for the same fractional-tradability reason), and
-    "excluded" is empty (no ticker has NO buying mechanism today)."""
+    BYDDY -- the ticker this category was built for -- and, per the AUG 24
+    2026 update recorded in that file's own "notes", RVII too (not tradable
+    for fractional/notional buys either). "excluded" is empty (no ticker has
+    NO buying mechanism today)."""
     loaded = load_tickers(get_config_dir())
     assert loaded["whole_share_tickers"] == frozenset({"BYDDY", "RVII"})
     assert loaded["excluded_tickers"] == frozenset()
@@ -2223,4 +2241,3 @@ def test_keyword_overrides_cannot_bypass_the_budget_field_validation():
             ).kill_switch_7d_deploy_fraction
             == _ok
         )
-

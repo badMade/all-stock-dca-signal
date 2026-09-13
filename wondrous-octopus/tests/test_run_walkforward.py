@@ -328,8 +328,7 @@ class TestParseIsoDate:
         # bare ValueError as a refusal, so this reported exit 2 "RUNTIME
         # FAILURE" -- after fresh() had already created the run directory
         # and ledger -- instead of the documented exit 1 "REFUSED" for a
-        # data/config problem (Codex review regression: "Route empty-fit
-        # refusals through the refusal exit path").
+        # data/config problem.
         probe = features.build_panel(synthetic_history_dir, min_history=60)
         # calendar[0] exactly: normalization still succeeds (row 0's
         # close_position doesn't need a previous close, so the relaxed
@@ -1039,7 +1038,6 @@ class TestEarlySignalHandling:
         # must be honored on run()'s very first iteration rather than lost
         # (Codex review regression: "Install signal handlers before
         # initial fitting").
-        import numpy as np
         import baseline_model
         from harness import HarnessConfig, WalkForwardHarness
 
@@ -1138,8 +1136,7 @@ class TestRunMetaUniverseRefresh:
         # threshold); run_meta.json's universe snapshot must reflect that
         # instead of the ORIGINAL fit-time ticker list forever, and
         # inspect_run.py's ribbon-ticker fallback reads this file
-        # directly (Codex review regression: "Keep report universe
-        # metadata current as tickers join").
+        # directly.
         probe = features.build_panel(synthetic_history_dir, min_history=60)
         all_dates = [str(np.datetime_as_string(date, unit="D")) for date in probe.calendar]
         run_dir = tmp_path / "run"
@@ -1171,8 +1168,7 @@ class TestRunMetaUniverseRefresh:
         # frozen ticker selection, archive path, and model hyperparameters
         # those verify against, plus bare-resume argument reconstruction),
         # so subsequent commands would fail before they could even reach
-        # the otherwise-valid checkpoint's recovery path (Codex review
-        # regression: "Replace refreshed run metadata atomically").
+        # the otherwise-valid checkpoint's recovery path.
         probe = features.build_panel(synthetic_history_dir, min_history=60)
         all_dates = [str(np.datetime_as_string(date, unit="D")) for date in probe.calendar]
         run_dir = tmp_path / "run"

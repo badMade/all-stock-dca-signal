@@ -3535,6 +3535,64 @@ def test_outside_window_retry_refreshes_pointer_to_preserved_submitted_evidence(
         assert pointer["run_state_path"] == str(run_state_path)
 
 
+def test_outside_window_retry_preserves_pending_and_unconfirmed_evidence(tmp_path):
+    # PR #631 review discussion_r3914248608: _existing_submitted_run_state()
+    # (the helper the is_outside_window/is_outside_time_window gate above
+    # calls) must admit an artifact on ANY order-bearing status -- not just
+    # the literal "submitted" a fresh order starts at -- because a broker
+    # refresh between the original attempt and this date/time-gated retry can
+    # advance the row to "filled", or leave it at the still-live "pending"/
+    # "unconfirmed" acceptance a not-yet-terminal order carries. Restricting
+    # the gate to "submitted" exactly would fall through to the "no existing
+    # evidence" branch below and overwrite the fixed slot's real order with a
+    # zero-order blocked stub, erasing it from every later same-day
+    # cap/top-up scan (dca_risk.DEPLOYED_CANDIDATE_STATUSES is the canonical
+    # set this helper's own _ORDER_BEARING_CANDIDATE_STATUSES mirrors).
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    live_root = tmp_path / "live"
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),  # in window
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    first = ex.run(_now_live(), data, broker=FakeLiveBroker())
+    assert first["artifacts"]["buy_candidates"][0]["status"] == "submitted"
+    run_state_path = Path(first["paths"]["run_state"])
+
+    # Simulate a broker refresh reconciling the order to "pending" (still
+    # live at the venue, not yet a terminal fill) between the original
+    # attempt and the retry below.
+    on_disk_first = json.loads(run_state_path.read_bytes())
+    on_disk_first["buy_candidates"][0]["status"] = "pending"
+    on_disk_first["broker_outcomes"][on_disk_first["buy_candidates"][0]["ticker"]]["status"] = "pending"
+    run_state_path.write_text(json.dumps(on_disk_first, indent=2, sort_keys=True))
+
+    # Retry at the same slot with a config that now excludes today -> hits the
+    # is_outside_window gate. Must preserve the "pending" evidence rather
+    # than overwriting it with a fresh zero-order blocked stub.
+    retry_cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 7)}),  # no longer approved
+    )
+    retry_ex = MorningDCAExecutor(retry_cfg, mode=MORNING_LIVE_MODE)
+    second = retry_ex.run(_now_live() + timedelta(minutes=1), data, broker=FakeLiveBroker())
+
+    assert second["artifacts"]["buy_candidates"][0]["status"] == "pending"
+    on_disk = json.loads(run_state_path.read_bytes())
+    assert on_disk["buy_candidates"][0]["status"] == "pending"
+    for name in ("latest_morning_run.json", "latest_morning_live.json"):
+        pointer = json.loads((live_root / name).read_bytes())
+        assert pointer["trading_day"] == "2026-07-08"
+        assert pointer["valid_scheduled_evidence"] is True
+        assert pointer["run_state_path"] == str(run_state_path)
+
+
 def test_live_gate_permits_when_in_approved_window(tmp_path):
     # A scheduled live run on a day inside approved_test_dates is not date-gated.
     pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
@@ -4407,6 +4465,7 @@ def test_blocked_retry_synthesizes_a_row_for_outcome_only_evidence(tmp_path):
         ({"status": "submitted", "submitted_amount_usd": True}, True),
         ({"ambiguous_placement_exception": True, "submitted_amount_usd": 2.0}, False),
     ],
+    ids=("boolean-amount", "ambiguous-missing-status"),
 )
 def test_blocked_retry_validates_outcome_only_order_amount_and_status(
     tmp_path, outcome, expects_unreconstructable
@@ -4433,10 +4492,15 @@ def test_blocked_retry_validates_outcome_only_order_amount_and_status(
 
     if expects_unreconstructable:
         assert artifacts["unreconstructable_submitted_tickers"] == [ticker]
+        assert not any(
+            row["ticker"] == ticker and row.get("planned_amount_usd") == 1.0
+            for row in artifacts["buy_candidates"]
+        )
     else:
         row = next(row for row in artifacts["buy_candidates"] if row["ticker"] == ticker)
         assert row["status"] == "failed"
         assert row["ambiguous_placement_exception"] is True
+        assert row["synthesized_from_broker_outcome"] is True
 
 
 @pytest.mark.parametrize("pre_terminal_status", ["pending", "unconfirmed"])
@@ -6364,8 +6428,9 @@ def test_own_stream_earlier_weekday_run_state_failure_fails_closed(tmp_path):
     assert ex.ledger.week_planned(date(2026, 6, 30)) == 450.0
 
 
-def test_earlier_weekday_pending_with_malformed_notional_fails_closed(tmp_path):
-    """An in-flight order with an unknown notional cannot be treated as zero spend."""
+@pytest.mark.parametrize("notional", ["nan", 0, -5.0])
+def test_earlier_weekday_pending_with_unusable_notional_fails_closed(tmp_path, notional):
+    """An in-flight order with an unusable notional cannot be treated as zero spend."""
     state_root = tmp_path / "live"
     monday_dir = state_root / "20260629_1030ET"
     monday_dir.mkdir(parents=True)
@@ -6374,7 +6439,7 @@ def test_earlier_weekday_pending_with_malformed_notional_fails_closed(tmp_path):
             "trading_day": "2026-06-29",
             "run_id": "pending-with-unknown-notional",
             "buy_candidates": [
-                {"ticker": "AAPL", "status": "pending", "planned_amount_usd": "nan"},
+                {"ticker": "AAPL", "status": "pending", "planned_amount_usd": notional},
             ],
         }),
         encoding="utf-8",
@@ -6485,6 +6550,132 @@ def test_cap_seed_scan_finds_sibling_suffix_fills_under_the_current_stream_root(
     ex._seed_ledger_from_prior_runs(now)
 
     assert ex.ledger.week_planned(date(2026, 7, 8)) == 25.0
+
+
+def test_cap_seed_scan_reads_a_leaf_override_roots_own_run_state(tmp_path):
+    """Codex review, PR #631 (issue comment "Seed run states from
+    leaf override roots"): _dated_manual_override_cap_seed_roots() globs
+    perplexity_primary_*/manual_override_* directly, so each cap_seed_roots
+    entry it contributes IS ALREADY the leaf directory holding run_state.json
+    -- not a parent with dated child directories beneath it the earlier-
+    weekday day_str glob can match. Without reading the leaf's run_state.json
+    directly, an override's spend from an earlier weekday in the current ISO
+    week never enters candidate_paths, silently omitting it from
+    planned_by_week.
+    """
+    live_root = tmp_path / "live"
+    override_root = tmp_path / "perplexity_primary_20260706" / "manual_override_1015ET"
+    override_root.mkdir(parents=True)
+    (override_root / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-07-06",  # Monday, same ISO week as _now_live()'s Wednesday
+            "run_id": "manual_override_20260706_1015ET",
+            "buy_candidates": [
+                {"ticker": "CCC", "status": "submitted", "planned_amount_usd": 12.0}
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("CCC",))
+    cfg = MorningConfig(
+        tickers=("CCC",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(str(override_root),),
+        morning_daily_cap_usd=100.0,
+        morning_weekly_cap_usd=100.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = _now_live()
+
+    ex._compute_top_up(now, ())
+    ex._seed_ledger_from_prior_runs(now)
+
+    assert ex.ledger.week_planned(date(2026, 7, 8)) == 12.0
+
+
+def test_cap_seed_scan_fails_closed_on_an_unreadable_leaf_override_state(tmp_path):
+    """Codex review, PR #631 ("Fail closed on unreadable leaf override
+    states"): the leaf-override direct read above used to silently
+    `continue` on a truncated/malformed run_state.json -- but that leaf is
+    the ONLY path capable of finding this override at all (unlike the
+    same-day loader, which can fall back to mtime ordering), so a silent
+    skip let the weekly scan report complete with $0 credited from spend it
+    could not actually verify. Must fail closed instead, poisoning the week
+    to the configured cap ceiling, the same as every other unreadable
+    earlier-weekday candidate in this function.
+    """
+    live_root = tmp_path / "live"
+    override_root = tmp_path / "perplexity_primary_20260706" / "manual_override_1015ET"
+    override_root.mkdir(parents=True)
+    # Malformed JSON -- caught mid-write.
+    (override_root / "run_state.json").write_text("{not valid json", encoding="utf-8")
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("CCC",))
+    cfg = MorningConfig(
+        tickers=("CCC",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(str(override_root),),
+        morning_daily_cap_usd=100.0,
+        morning_weekly_cap_usd=100.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = _now_live()
+
+    ex._compute_top_up(now, ())
+    ex._seed_ledger_from_prior_runs(now)
+
+    assert ex._cap_seed_scan_incomplete is True
+    assert ex.ledger.week_planned(date(2026, 7, 8)) == 100.0
+
+
+def test_cap_seed_scan_ignores_a_same_day_leaf_override_root(tmp_path):
+    """The leaf-override direct read above must stay scoped to STRICTLY earlier
+    weekdays: a same-day override is already folded in by _compute_top_up's own
+    cap_seed_roots scan (guarded by _today_seeded_by_cap_roots), so admitting it
+    again here would double-count the same fill.
+    """
+    live_root = tmp_path / "live"
+    override_root = tmp_path / "perplexity_primary_20260708" / "manual_override_0900ET"
+    override_root.mkdir(parents=True)
+    (override_root / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": "2026-07-08",  # same day as _now_live()
+            "run_id": "manual_override_20260708_0900ET",
+            "buy_candidates": [
+                {"ticker": "CCC", "status": "submitted", "planned_amount_usd": 12.0}
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("CCC",))
+    cfg = MorningConfig(
+        tickers=("CCC",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(str(override_root),),
+        morning_daily_cap_usd=100.0,
+        morning_weekly_cap_usd=100.0,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = _now_live()
+
+    ex._compute_top_up(now, ())
+    ex._seed_ledger_from_prior_runs(now)
+
+    # The leaf-override direct read must not itself add the $12 for TODAY;
+    # any credit for it (if e.g. _compute_top_up's own scan also finds it) is
+    # that mechanism's responsibility, not this one's.
+    assert ex.ledger.week_planned(date(2026, 7, 8)) < 24.0
 
 
 def test_earlier_weekday_cap_seed_poison_clears_on_a_recovered_rescan(tmp_path):
@@ -6679,8 +6870,6 @@ def test_morning_cap_seeding_does_not_double_count_own_manual_submission(tmp_pat
 
     # Step 2: scheduled run — TICK already in shared_broker.placed → dup-blocked.
     # The cap seeding scan will find manual_runs/ artifact with $7.50.
-    # Without the fix: prev_total=0, incremental=7.50 → ledger becomes $15, cap blocks.
-    # With the fix: _own_recorded[day]=7.50, prev_total=7.50, incremental=0 → ledger stays at $7.50.
     ex.run(_now_live(), data, broker=shared_broker)
     assert ex.ledger.day_planned(date(2026, 7, 8)) == manual_amount, (
         "cap-seeding must not re-count the manual run's own submission; "
@@ -6689,10 +6878,10 @@ def test_morning_cap_seeding_does_not_double_count_own_manual_submission(tmp_pat
 
 
 def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
-    # Codex review on 955cbd5: if _cap_seeded_amounts stored new_total (instead of
-    # new_total - own_amount), a scheduled-run record_buy_candidates call would grow
-    # _own_recorded beyond the filesystem scan's new_total, making prev_total > new_total
-    # on the next scan and suppressing pickup of newly-written external fills.
+    # _cap_seeded_amounts must store new_total - own_amount. If it stored new_total,
+    # a scheduled-run record_buy_candidates call would grow _own_recorded beyond
+    # the filesystem scan's new_total, making prev_total > new_total on the next scan
+    # and suppressing pickup of newly-written external fills.
     #
     # Scenario:
     #   1. Manual run buys $4.50 → _own_recorded[day]=4.50, artifact in manual_runs/
@@ -6700,8 +6889,8 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     #   3. Scheduled run 1: seeds $4 (incremental), writes $4.50 to ledger via record_buy_candidates
     #      (but NOT to _own_recorded since manual=False)
     #   4. Another external $4 fill appears in manual_runs/
-    #   5. Scheduled run 2: should seed another $4 — without the watermark fix it would
-    #      compute prev_total = old_watermark + _own_recorded and get a negative incremental.
+    #   5. Scheduled run 2: should seed another $4 — computing prev_total = old_watermark + _own_recorded
+    #      correctly avoids a negative incremental.
     import json as _json
 
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
@@ -6782,10 +6971,6 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     )
 
     # Step 5: another scheduled run — must pick up the second external $4 fill.
-    # Without the watermark fix: _cap_seeded_amounts stored new_total=$8.50, so
-    # prev_total = 8.50 + _own_recorded(4.50) = 13.0 > new_total($12.50) → no increment.
-    # With the fix: _cap_seeded_amounts stored new_total - own = $4.0, so
-    # prev_total = 4.0 + 4.50 = 8.50, incremental = 12.50 - 8.50 = 4.0 → seeds $4.
     ex.run(_now_live(), data, broker=broker)
     ledger_after_sched2 = ex.ledger.day_planned(date(2026, 7, 8))
     assert ledger_after_sched2 == manual_amount + 8.0, (
@@ -7912,9 +8097,7 @@ def test_morning_cap_seeding_runs_even_when_per_ticker_guard_disabled(tmp_path):
 def test_morning_cap_seeding_own_amount_scoped_to_cap_roots(tmp_path):
     # Codex review (PR #42 line 960): when cap_seed_roots does NOT cover
     # state_root/manual_runs/, own_amount must not be subtracted from prev_total
-    # because own fills are absent from new_total. Without the fix an in-memory
-    # $4.50 own fill reduces prev_total below new_total and the external $4 is
-    # never seeded, giving $4 too much daily headroom.
+    # because own fills are absent from new_total.
     import json as _json
 
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
@@ -8363,6 +8546,20 @@ def test_persisting_broker_adapter_records_buying_power_and_tradability(tmp_path
         wrapped.same_day_strategy_order_exists_with_ref_id_prefix("AAPL", date(2026, 7, 8), [])
         is None
     )
+
+
+def test_persisting_broker_adapter_records_placement_response(tmp_path):
+    # Codex review ("Persist broker placement responses"): a real-money
+    # order response is exactly the evidence a disk/serialization failure
+    # at this boundary must be able to set raw_persistence_error for -- so
+    # the wrapper must persist it under raw/, not merely pass it through.
+    broker = FakeLiveBroker()
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(cast(Any, broker), recorder)
+    order_id = wrapped.place_market_buy("AAPL", 2.0, "ref-1")
+    assert order_id
+    assert recorder.error is None
+    assert any(name.startswith("order_response_AAPL_") for name in recorder.saved_filenames)
 
 
 def test_scheduled_live_run_persists_raw_inputs_on_success(tmp_path):
@@ -9828,6 +10025,33 @@ def test_a_retry_that_raises_merges_its_order_into_the_preserved_state(tmp_path)
     assert {r["order_id"] for r in merged["buy_candidates"]} == {"o-earlier", "o-retry"}
     assert merged["orders_submitted_count"] == 2
     assert merged["placement_evidence_incomplete"] is True
+
+
+def test_a_retry_merge_preserves_a_new_order_over_a_stale_ticker_only_block(tmp_path):
+    # Codex review ("Preserve same-ticker placements by order identity"): the
+    # preserved state can already hold a blocked/failed outcome for this
+    # exact ticker from an EARLIER attempt at this same slot -- no order
+    # ever reached the broker for it. The old `ticker not in outcomes` check
+    # treated that stale, order-less entry as already covering the ticker
+    # and silently dropped THIS attempt's real submitted outcome, leaving
+    # broker_outcomes saying no order exists for a ticker that was actually
+    # just bought.
+    import morning_dca as _m
+
+    earlier = {
+        "run_id": "earlier",
+        "trading_day": "2026-07-08",
+        "broker_outcomes": {"AAA": {"status": "blocked", "skip_reason": "spread_not_ok"}},
+        "buy_candidates": [{"ticker": "AAA", "status": "blocked"}],
+        "orders_submitted_count": 0,
+    }
+    placed = {"AAA": {"status": "submitted", "order_id": "o-retry", "submitted_amount_usd": 2.0}}
+    rows = [{"ticker": "AAA", "status": "submitted", "order_id": "o-retry", "planned_amount_usd": 2.0}]
+
+    merged = _m._merge_placements_into_state(earlier, placed, rows)
+
+    assert merged["broker_outcomes"]["AAA"]["status"] == "submitted"
+    assert merged["broker_outcomes"]["AAA"]["order_id"] == "o-retry"
 
 
 def test_a_placement_failure_outranks_a_confirmation_required_row(tmp_path):

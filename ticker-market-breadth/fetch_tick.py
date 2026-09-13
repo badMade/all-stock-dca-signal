@@ -242,7 +242,16 @@ def _merge_with_existing(frame, existing_path: Path):
             + (", and no existing archive to fall back to" if existing is None else "")
         )
     if existing is None:
-        return frame
+        # The initial-write path needs the SAME keep-last-date dedup/sort the
+        # refresh path below applies -- Yahoo's own response can carry
+        # duplicate dates on its own (not just across a merge with an
+        # existing archive), and returning `frame` here unmodified let a
+        # first-ever write create an archive with multiple rows for the same
+        # Date (Codex review, PR #631 discussion_r3914702431: "Deduplicate
+        # the initial refresh the same as later ones"). keep="last" matches
+        # the refresh branch's own convention: the later row in Yahoo's
+        # response order wins for a repeated date.
+        return frame[~frame.index.duplicated(keep="last")].sort_index()
     merged = pd.concat([existing, frame])
     # keep="last": `frame` (the fresh download, now filtered to usable rows
     # only) is concatenated second, so a date present in both wins with the

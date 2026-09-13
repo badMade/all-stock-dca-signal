@@ -8,6 +8,7 @@ from dca_whole_share_accumulator import (
     WholeShareAccumulationLedger,
     WholeShareClaimPersistenceError,
     _claim_credit_remainder_usd,
+    _snapshot_key,
     apply_contribution,
     compute_virtual_contribution_usd,
 )
@@ -1359,6 +1360,72 @@ def test_an_upward_reprice_records_its_extra_draw_on_the_pool(tmp_path):
     )
 
 
+def test_a_zero_share_reclaim_does_not_double_register_its_own_tie_offset(tmp_path):
+    """Codex review ("Avoid registering the reclaimed credit twice"): when a
+    stale fire reprices to zero shares, its remainder was already allocated
+    a slice of the shared tie batch when _CLAIM_REMAINDER_TIE_OFFSET_FIELD
+    was written. Allocating the SAME reclaimed_remainder again for
+    _RESTORED_CREDIT_TIE_OFFSET_FIELD just below treats the same dollars as
+    two distinct claims on the batch, inflating the restored credit's own
+    offset by its own amount -- protecting it from aging it should not be
+    exempt from. After a later withdrawal fully drains the claim's own
+    reclaimed money and a completely unrelated contribution replenishes the
+    pool to the same balance, the stale claim must not still redispatch
+    against that unrelated money.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    day = "2026-08-16"
+    ticker = "BYDDY"
+
+    # slot-1 fires $10 of a fresh $14 contribution at $10/share, leaving a
+    # $4 remainder still outstanding as an unresolved fire (not yet
+    # reclaimed/settled/preserved).
+    first = ledger.record_contribution(
+        ticker, day, 14.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    assert first.shares_to_buy == 1
+    assert first.order_notional_usd == 10.0
+    assert ledger.pending_usd(ticker) == 4.0
+
+    # Reclaimed at a price so high the whole $14 basis no longer buys even
+    # one share -- reprices to ZERO shares, releasing the whole $14 back to
+    # the pool and folding it into restored_credit_usd (the "resolved"
+    # branch this finding is about).
+    reclaimed = ledger.record_contribution(
+        ticker, day, 0.0, 1000.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:31:00-04:00"
+    )
+    assert reclaimed.shares_to_buy == 0
+    assert ledger.pending_usd(ticker) == 14.0
+
+    # An unrelated fresh claim drains the WHOLE $14 pool -- a real
+    # withdrawal that fully consumes slot-1's just-reclaimed $14.
+    drain = ledger.record_contribution(
+        ticker, day, 0.0, 14.0, idempotency_key="drain", recorded_at="2026-08-16T15:32:00-04:00"
+    )
+    assert drain.shares_to_buy == 1
+    assert ledger.pending_usd(ticker) == 0.0
+
+    # A completely unrelated claim then replenishes the pool back to $14 --
+    # coincidentally the SAME balance, but none of it is slot-1's money.
+    replenish = ledger.record_contribution(
+        ticker, day, 14.0, 1000.0, idempotency_key="replenish", recorded_at="2026-08-16T15:33:00-04:00"
+    )
+    assert replenish.shares_to_buy == 0
+    assert ledger.pending_usd(ticker) == 14.0
+
+    # slot-1's own reclaimed $14 was already fully consumed by the drain --
+    # its zero-contribution retry must not fire using the replenishing
+    # claim's money.
+    retry = ledger.record_contribution(
+        ticker, day, 0.0, 14.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:34:00-04:00"
+    )
+    assert retry.shares_to_buy == 0, (
+        "slot-1's own credit was already fully consumed by the drain -- it "
+        "must not fire using the replenishing claim's money"
+    )
+    assert ledger.pending_usd(ticker) == 14.0
+
+
 def _capped_redispatch_in_a_padded_pool(tmp_path):
     """A $20-restored claim holding an unresolved capped redispatch, in a pool
     an unrelated $5 contribution has padded to $25."""
@@ -2472,6 +2539,125 @@ def test_a_claim_repriced_to_zero_shares_is_resolved_and_cannot_re_spend_consume
     )
     assert second_reclaim.shares_to_buy == 0
     assert ledger.pending_usd("BYDDY") == 0.0
+
+
+def test_a_zero_share_reclaim_registers_its_credit_in_the_tie_batch_only_once(tmp_path):
+    """Codex review ("Avoid registering the reclaimed credit twice"): a
+    stale reclaim that reprices to 0 shares writes the SAME dollar figure
+    into both claim_credit_remainder_usd (immediately zeroed after) and
+    restored_credit_usd (the entitlement's final resting place) -- ONE
+    claim's entitlement, not two. Calling _allocate_credit_tie_offset()
+    once for each write double-counted it into credit_tie_batch_width_usd,
+    inflating this claim's own offset with its own amount and letting a
+    later, unrelated pool replenishment be redispatched against it. After
+    the fix, a $10 reclaim-to-zero-shares must widen the tie batch by
+    exactly $10, not $20.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 0.0  # 1 share bought, no remainder
+
+    # Reclaim slot-1 stale, 10+ minutes later, at a doubled price -- 0
+    # shares fit the frozen $10 total now, so it reprices to zero shares
+    # and the $10 is restored as credit (the exact scenario this finding
+    # flags).
+    reclaim = ledger.record_contribution(
+        "BYDDY",
+        "2026-08-16",
+        0.0,
+        20.0,
+        idempotency_key="slot-1",
+        recorded_at="2026-08-16T15:41:00-04:00",
+    )
+    assert reclaim.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    assert state["credit_tie_batch_width_usd"] == 10.0, (
+        "the reclaimed $10 must widen the tie batch by $10 exactly once, "
+        "not $20 from being registered under both field names"
+    )
+    cached = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    assert cached["restored_credit_tie_offset_usd"] == cached["claim_credit_remainder_tie_offset_usd"]
+
+
+def test_repeated_same_price_reclaims_do_not_re_register_an_unchanged_remainder(tmp_path):
+    """Codex review ("Do not re-register an unchanged remainder on
+    reclaim"): a $14 contribution firing a $10 order leaves a $4 remainder,
+    registered once in the tie batch. Reclaiming that SAME unresolved claim
+    again at the SAME price changes nothing (pending_delta is 0, so
+    _record_withdrawal() no-ops and the withdrawal counter does not move) --
+    the claim's remainder is still the same $4 in the same batch instant, so
+    re-registering it must not widen the batch a second time. Two same-price
+    reclaims back to back must leave the batch width at exactly $4, not $8
+    or $12.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 14.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    assert decision.shares_to_buy == 1
+    assert decision.order_notional_usd == 10.0
+    assert ledger.pending_usd("BYDDY") == 4.0
+
+    for at in ("2026-08-16T15:31:00-04:00", "2026-08-16T15:32:00-04:00"):
+        reclaimed = ledger.record_contribution(
+            "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at=at
+        )
+        assert reclaimed.shares_to_buy == 1
+        assert reclaimed.order_notional_usd == 10.0
+
+    assert ledger.pending_usd("BYDDY") == 4.0
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    assert state["credit_tie_batch_width_usd"] == 4.0, (
+        "two same-price reclaims of the same unresolved claim must not "
+        "widen the tie batch beyond the claim's own unchanged $4 remainder"
+    )
+
+
+def test_preserving_a_fired_claims_remainder_registers_its_credit_in_the_tie_batch_only_once(tmp_path):
+    """Codex review ("Avoid registering the preserved remainder twice"): a
+    $14 contribution firing a $10 order leaves a $4 remainder, already
+    registered in the tie batch when the claim was recorded. Preserving
+    that order (a blocked placement, restoring the $10 deduction) folds
+    the surviving $4 remainder plus the restored $10 into a $14
+    restored_credit_usd -- but that must widen the tie batch by the
+    genuinely NEW $10 only, not by the full $14 (which would double-count
+    the $4 that already widened the batch once). Same withdrawal-counter
+    instant throughout (preserving never calls _record_withdrawal()), so
+    the tie batch must widen by exactly $14 total, not $18.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 14.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    assert decision.shares_to_buy == 1
+    assert decision.order_notional_usd == 10.0
+    assert ledger.pending_usd("BYDDY") == 4.0  # $4 remainder left in the pool
+
+    restored = ledger.preserve_pending(
+        "BYDDY",
+        "2026-08-16",
+        10.0,
+        idempotency_key="slot-1",
+        claim_token=decision.claim_token,
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    assert restored == 14.0
+    assert ledger.pending_usd("BYDDY") == 14.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    assert state["credit_tie_batch_width_usd"] == 14.0, (
+        "the preserved claim's credit must widen the tie batch by $14 exactly "
+        "once, not $18 from the $4 remainder being registered twice"
+    )
+    cached = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    assert cached["restored_credit_tie_offset_usd"] == 0.0
 
 
 def test_a_downward_reprice_that_would_overdraw_the_pool_defers_instead_of_going_negative(tmp_path):
@@ -3839,6 +4025,232 @@ def test_a_legacy_restored_credit_is_snapshotted_before_future_withdrawals(tmp_p
     assert ledger.pending_usd("BYDDY") == 10.0
 
 
+def test_two_legacy_restored_credits_sharing_a_backfilled_snapshot_are_staggered(tmp_path):
+    """Codex review ("Stagger tie offsets when loading legacy credits"): the
+    migration that backfills a missing restored_credit_as_of_withdrawn_usd
+    snapshot (_initialize_restored_credit_aging) used to give every migrated
+    entry a flat $0 tie offset. Two legacy $10 credits with NO snapshot at
+    all (as if written before that field existed) both land on the SAME
+    backfilled as-of value in one migration pass -- with the old flat-$0
+    behavior, a single later $10 withdrawal would age BOTH of them to zero,
+    stranding whichever one's money wasn't actually spent. The fix stagger
+    them against each other (never against the live global tie-batch
+    tracker, to avoid the documented self-collision hazard), matching the
+    ordinary (non-legacy) tie-offset guarantee.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    # All three fires happen BEFORE any preserve, so each independently buys
+    # one $10 share from an empty pool -- none of them draws on another's
+    # restored money (same setup as
+    # test_two_restored_credits_at_the_same_snapshot_are_not_both_charged_
+    # one_withdrawal above).
+    fires = {}
+    for key, at in (
+        ("A", "2026-08-16T15:30:00-04:00"),
+        ("B", "2026-08-16T15:31:00-04:00"),
+        ("C", "2026-08-16T15:32:00-04:00"),
+    ):
+        fires[key] = ledger.record_contribution(
+            "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key=key, recorded_at=at
+        )
+        assert fires[key].order_notional_usd == 10.0
+
+    for key, at in (
+        ("A", "2026-08-16T15:33:00-04:00"),
+        ("B", "2026-08-16T15:34:00-04:00"),
+        ("C", "2026-08-16T15:35:00-04:00"),
+    ):
+        ledger.preserve_pending(
+            "BYDDY", "2026-08-16", 10.0, idempotency_key=key, recorded_at=at,
+            claim_token=fires[key].claim_token,
+        )
+    assert ledger.pending_usd("BYDDY") == 30.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entries = state["recorded_idempotency_keys"]
+    # Simulate A and B (but not C) as legacy writes: restored_credit_usd
+    # present, but no snapshot field at all.
+    for key in ("2026-08-16:A", "2026-08-16:B"):
+        del entries[key]["restored_credit_as_of_withdrawn_usd"]
+        del entries[key]["restored_credit_tie_offset_usd"]
+    state_path.write_text(json.dumps(state, indent=2))
+
+    # C redispatches its own $10 -- a single, cleanly-sized $10 withdrawal
+    # out of the shared $30 pool (a redispatch is capped at the
+    # redispatching claim's OWN restored credit, so C's $10 caps its own
+    # order exactly, regardless of the combined pool total). This is also
+    # the first ledger read/write since the simulated legacy write above,
+    # so it is where the migration backfills A's and B's snapshots in the
+    # SAME pass, landing both on the same as-of value this withdrawal is
+    # about to age against.
+    c_redispatch = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="C",
+        recorded_at="2026-08-16T15:36:00-04:00",
+    )
+    assert c_redispatch.order_notional_usd == 10.0
+    assert ledger.pending_usd("BYDDY") == 20.0
+
+    from dca_whole_share_accumulator import _redispatchable_credit_usd
+
+    state = json.loads(state_path.read_text())
+    entries = state["recorded_idempotency_keys"]
+    withdrawn_total = state["withdrawn_usd_total"]
+    pool = state["pending_usd"]
+    credit_a = _redispatchable_credit_usd(entries["2026-08-16:A"], pool, withdrawn_total)
+    credit_b = _redispatchable_credit_usd(entries["2026-08-16:B"], pool, withdrawn_total)
+    zeroed = [credit for credit in (credit_a, credit_b) if credit == 0.0]
+    survived = [credit for credit in (credit_a, credit_b) if credit == 10.0]
+    assert len(zeroed) == 1 and len(survived) == 1, (
+        f"exactly one of A's (${credit_a}) / B's (${credit_b}) legacy $10 credits "
+        "must be charged for the $10 withdrawal -- not both (the bug) and not neither"
+    )
+
+
+def test_legacy_migration_seeds_the_live_tie_batch_so_new_registrations_continue_after_it(tmp_path):
+    """Codex review ("Seed the live tie batch after migrating legacy
+    credits"): the legacy-credit migration in _read_state() assigns
+    staggered per-entry offsets to the migrated entries themselves, but
+    used to never seed the LIVE state[_CREDIT_TIE_BATCH_ANCHOR_FIELD]/
+    [_CREDIT_TIE_BATCH_WIDTH_FIELD] tracker _allocate_credit_tie_offset()
+    reads. A fresh, ordinary (non-legacy) registration at the SAME
+    withdrawn_total instant -- e.g. a new sub-share contribution recorded
+    before any further withdrawal moves the counter -- would then see no
+    live batch at all, reset to offset $0, and collide with the FIRST
+    migrated legacy entry's own $0 offset.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    fires = {}
+    for key, at in (
+        ("A", "2026-08-16T15:30:00-04:00"),
+        ("B", "2026-08-16T15:31:00-04:00"),
+    ):
+        fires[key] = ledger.record_contribution(
+            "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key=key, recorded_at=at
+        )
+        assert fires[key].order_notional_usd == 10.0
+
+    for key, at in (
+        ("A", "2026-08-16T15:33:00-04:00"),
+        ("B", "2026-08-16T15:34:00-04:00"),
+    ):
+        ledger.preserve_pending(
+            "BYDDY", "2026-08-16", 10.0, idempotency_key=key, recorded_at=at,
+            claim_token=fires[key].claim_token,
+        )
+    assert ledger.pending_usd("BYDDY") == 20.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entries = state["recorded_idempotency_keys"]
+    # Simulate A and B as legacy writes: restored_credit_usd present, but
+    # no snapshot field at all.
+    for key in ("2026-08-16:A", "2026-08-16:B"):
+        del entries[key]["restored_credit_as_of_withdrawn_usd"]
+        del entries[key]["restored_credit_tie_offset_usd"]
+    state_path.write_text(json.dumps(state, indent=2))
+
+    # A fresh sub-share contribution, priced so it can never fire, at the
+    # SAME withdrawn_total instant A's/B's backfilled snapshot lands on.
+    # This is the FIRST ledger read/write since the simulated legacy edit
+    # above, so it is where the migration runs AND, in this same call,
+    # this claim's own remainder registration happens right after it.
+    d_decision = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 5.0, 1000.0, idempotency_key="D",
+        recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert d_decision.shares_to_buy == 0
+
+    state = json.loads(state_path.read_text())
+    entries = state["recorded_idempotency_keys"]
+    d_offset = entries["2026-08-16:D"]["claim_credit_remainder_tie_offset_usd"]
+    assert d_offset == 20.0, (
+        "D's registration must continue AFTER the two migrated $10 legacy "
+        f"credits (offset 20.0), not collide with A's own $0 offset (got {d_offset})"
+    )
+    assert state["credit_tie_batch_width_usd"] == 25.0
+
+
+def test_a_legacy_restored_credit_and_a_legacy_remainder_are_staggered_against_each_other(tmp_path):
+    """Codex review ("Stagger tie offsets when loading legacy credits"): the
+    same finding as the sibling test above, but across the TWO DIFFERENT
+    migrated field types rather than two entries of the SAME type.
+
+    restored_credit_usd and claim_credit_remainder_usd are slices of the
+    exact same fungible pending_usd pool -- the LIVE (non-migration) write
+    sites already tie them against each other through one shared
+    credit_tie_batch_width_usd/credit_tie_batch_anchor_withdrawn_usd axis
+    (_allocate_credit_tie_offset() is called from both
+    record_contribution()'s remainder registration and
+    preserve_pending()'s restored-credit registration). A migration fix
+    that staggers restored-credit entries only against OTHER restored-
+    credit entries, and remainder entries only against OTHER remainder
+    entries, would let a resolved claim (restored credit) and a still-open
+    claim (live remainder) that share a backfilled snapshot both read tie
+    offset $0 despite drawing on the same pool -- reopening the exact
+    collision this fix exists to close, just between the two field types
+    instead of between two same-type entries.
+
+    X fires a clean $10-for-$10 order (no remainder) and is preserved,
+    restoring $10. Y then contributes $5 at a price too high to fire,
+    leaving a live $5 remainder -- both at the SAME withdrawn_usd_total
+    snapshot (no withdrawal moves the counter in between). Both are rolled
+    back to the legacy shape (no snapshot at all) and migrated together in
+    one pass. If they were NOT staggered against each other, both would
+    read offset $0 and a single $10 withdrawal would zero out X's credit
+    without touching Y's live $5 remainder captured in the SAME pool slice
+    it should have already covered.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    day = "2026-08-16"
+    ticker = "BYDDY"
+
+    x = ledger.record_contribution(
+        ticker, day, 10.0, 10.0, idempotency_key="X", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    assert x.order_notional_usd == 10.0
+    ledger.preserve_pending(
+        ticker, day, 10.0, idempotency_key="X", recorded_at="2026-08-16T15:30:00-04:00", claim_token=x.claim_token,
+    )
+    y = ledger.record_contribution(
+        ticker, day, 5.0, 1_000.0, idempotency_key="Y", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    assert y.shares_to_buy == 0
+    assert ledger.pending_usd(ticker) == 15.0
+
+    state_path = tmp_path / ticker / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entries = state["recorded_idempotency_keys"]
+    x_entry = entries[f"{day}:X"]
+    y_entry = entries[f"{day}:Y"]
+    assert x_entry["restored_credit_usd"] == 10.0
+    assert y_entry["claim_credit_remainder_usd"] == 5.0
+    # Simulate both as legacy writes: the value is present, but neither the
+    # snapshot nor the tie-offset field exists at all.
+    del x_entry["restored_credit_as_of_withdrawn_usd"]
+    del x_entry["restored_credit_tie_offset_usd"]
+    del y_entry["claim_credit_remainder_as_of_withdrawn_usd"]
+    del y_entry["claim_credit_remainder_tie_offset_usd"]
+    state_path.write_text(json.dumps(state, indent=2))
+
+    # A fresh, unrelated $0 probe migrates both legacy entries in this one
+    # call, without itself firing or withdrawing anything.
+    probe = ledger.record_contribution(
+        ticker, day, 0.0, 1_000_000.0, idempotency_key="probe", recorded_at="2026-08-16T15:30:30-04:00"
+    )
+    assert probe.shares_to_buy == 0
+    state = json.loads(state_path.read_text())
+    entries = state["recorded_idempotency_keys"]
+    x_offset = entries[f"{day}:X"]["restored_credit_tie_offset_usd"]
+    y_offset = entries[f"{day}:Y"]["claim_credit_remainder_tie_offset_usd"]
+    assert {x_offset, y_offset} == {0.0, 10.0}, (
+        f"X's restored credit (${x_offset}) and Y's live remainder (${y_offset}) "
+        "share the same pool and the same backfilled snapshot -- they must be "
+        "staggered against EACH OTHER (one at $0, the other at $10), not each "
+        "independently reset to $0 against their own field type"
+    )
+
+
 @pytest.mark.parametrize("malformed_shape", [None, []])
 def test_a_malformed_idempotency_key_map_fails_the_ledger_closed(tmp_path, malformed_shape):
     """Regression for "Validate the idempotency-key map before iterating" and
@@ -3950,6 +4362,824 @@ def test_a_corrupted_withdrawal_counter_writes_off_the_entitlements_it_aged(tmp_
     assert _redispatchable_credit_usd(entry, 10.0, repaired["withdrawn_usd_total"]) == 0.0
 
 
+def test_a_corrupted_tie_offset_larger_than_the_reconstructable_bound_writes_off_the_credit(tmp_path):
+    """Codex review
+    (https://github.com/badMade/all-stock-dca/pull/1168#discussion_r3900047284,
+    also raised on PR #1164): ``_read_state()`` validated a persisted
+    ``restored_credit_tie_offset_usd``/``claim_credit_remainder_tie_offset_usd``
+    for being finite and non-negative (``_finite_non_negative()``), but never
+    against the reconstructable bound implied by the OTHER claims tied at that
+    exact same snapshot instant -- the only thing a legitimate tie offset can
+    ever represent (see ``_allocate_credit_tie_offset()``).
+
+    Same setup as ``test_a_corrupted_withdrawal_counter_writes_off_the_entitlements_it_aged``
+    just above: A restores $10, B (a fresh, unrelated claim) withdraws that
+    $10 back out of the shared pool, and C then refills the pool with $10 of
+    its own money the price is too high to spend. Without any corruption, A's
+    restored credit correctly ages to $0 -- the pool cannot prove A's $10
+    survived B's withdrawal. Corrupting A's tie offset to a wildly oversized
+    but still finite, non-negative figure (bug report's example: an offset of
+    1000 against a $10 credit) used to suppress that aging entirely
+    (``max(0, drawn_since_snapshot - tie_offset)`` collapses to 0 for ANY
+    ``drawn_since_snapshot``), leaving A fully redispatchable from the pool
+    C's unrelated money refilled -- exactly the ownership breach the tie
+    offset exists to prevent.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+    # B is a fresh, unrelated claim that drains A's restored credit back out
+    # of the shared pool -- a genuine withdrawal, not a redispatch of A.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="B",
+        recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    # C refills the pool with money that is entirely its own (priced too high
+    # to fire, so it just sits in pending_usd).
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 25.0, idempotency_key="C",
+        recorded_at="2026-08-16T15:32:00-04:00",
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entries = state["recorded_idempotency_keys"]
+    a_entry = entries["2026-08-16:A"]
+    assert a_entry["restored_credit_usd"] == 10.0
+    assert a_entry["restored_credit_tie_offset_usd"] == 0.0
+    # A is the only claim tied at its snapshot, so the legitimate offset is
+    # $0 -- corrupt it to a wildly oversized but still finite, non-negative
+    # figure, matching the bug report's example.
+    a_entry["restored_credit_tie_offset_usd"] = 1000.0
+    state_path.write_text(json.dumps(state, indent=2))
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert retry.shares_to_buy == 0, (
+        "an unprovable tie offset cannot excuse A's credit from B's "
+        "withdrawal, so A must not reach the $10 C put in"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    from dca_whole_share_accumulator import _redispatchable_credit_usd
+
+    repaired = ledger._read_state(state_path, "BYDDY")
+    entry = repaired["recorded_idempotency_keys"]["2026-08-16:A"]
+    assert entry["restored_credit_usd"] == 0.0
+    assert entry["restored_credit_tie_offset_usd"] == 0.0
+    assert _redispatchable_credit_usd(entry, 10.0, repaired["withdrawn_usd_total"]) == 0.0
+
+
+def test_a_corrupted_offset_matching_the_claims_own_amount_is_still_caught(tmp_path):
+    """Codex review (PR #1170 discussion on this same fix, "Exclude the
+    current registration from the offset bound" and "Record the bound
+    before later same-anchor registrations"): two DERIVED-bound attempts in
+    a row both let a corrupted offset rise as far as some other amount
+    present in the ledger (first the claim's own contribution, then a
+    later-registered sibling's) before being caught. The durable, write-once
+    ``credit_tie_offset_audit`` record sidesteps deriving a bound at all --
+    it stores the EXACT offset ``_allocate_credit_tie_offset()`` computed
+    for this exact (claim, field, snapshot), so any deviation, by any
+    amount, in any direction, is caught by a plain equality check.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="B",
+        recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 25.0, idempotency_key="C",
+        recorded_at="2026-08-16T15:32:00-04:00",
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entries = state["recorded_idempotency_keys"]
+    a_entry = entries["2026-08-16:A"]
+    assert a_entry["restored_credit_usd"] == 10.0
+    assert a_entry["restored_credit_tie_offset_usd"] == 0.0
+    audit_key = f"2026-08-16:A:restored_credit_usd:{_snapshot_key(a_entry['restored_credit_as_of_withdrawn_usd'])}"
+    assert state["credit_tie_offset_audit"][audit_key] == 0.0
+    # Corrupt the offset to exactly A's own $10 -- a value a purely derived
+    # bound (this PR's two earlier, rejected attempts) would have accepted,
+    # but which does not match A's own audited $0.
+    a_entry["restored_credit_tie_offset_usd"] = 10.0
+    state_path.write_text(json.dumps(state, indent=2))
+
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:35:00-04:00",
+    )
+    assert retry.shares_to_buy == 0, (
+        "an offset equal to the claim's own contribution is still corrupted -- "
+        "nothing preceded a sole claim at its anchor, so the true bound is $0"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    from dca_whole_share_accumulator import _redispatchable_credit_usd
+
+    repaired = ledger._read_state(state_path, "BYDDY")
+    entry = repaired["recorded_idempotency_keys"]["2026-08-16:A"]
+    assert entry["restored_credit_usd"] == 0.0
+    assert _redispatchable_credit_usd(entry, 10.0, repaired["withdrawn_usd_total"]) == 0.0
+
+
+def test_a_corrupted_offset_matching_a_later_registered_siblings_amount_is_still_caught(tmp_path):
+    """Codex review (PR #1170 discussion on this same fix, "Record the bound
+    before later same-anchor registrations"): the durable per-anchor
+    high-water mark, even with this entry's own current amount excluded,
+    still includes whatever a DIFFERENT claim registered into the SAME
+    anchor AFTER this one. A registers $10 at offset $0; B then registers
+    $10 at the same anchor, offset $10 (history $20). A's true offset is
+    $0 -- nothing preceded it -- but a bound of (history $20 - A's own $10
+    = $10) still accepted a corrupted offset of $10, which is really B's
+    slice, not A's: if a subsequent $10 withdrawal genuinely consumes A's
+    interval, the corrupted offset would let A redispatch B's money. The
+    write-once audit record fixes this exactly: A's audited offset is $0,
+    so ANY other value -- including one that happens to equal a sibling's
+    own amount -- fails the equality check.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    day = "2026-08-16"
+
+    fires = {}
+    for key, at in (
+        ("A", "2026-08-16T15:30:00-04:00"),
+        ("B", "2026-08-16T15:31:00-04:00"),
+    ):
+        fires[key] = ledger.record_contribution(
+            "BYDDY", day, 10.0, 10.0, idempotency_key=key, recorded_at=at
+        )
+        assert fires[key].order_notional_usd == 10.0
+
+    for key, at in (
+        ("A", "2026-08-16T15:32:00-04:00"),
+        ("B", "2026-08-16T15:33:00-04:00"),
+    ):
+        ledger.preserve_pending(
+            "BYDDY", day, 10.0, idempotency_key=key, recorded_at=at, claim_token=fires[key].claim_token
+        )
+    assert ledger.pending_usd("BYDDY") == 20.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entries = state["recorded_idempotency_keys"]
+    a_entry = entries[f"{day}:A"]
+    assert a_entry["restored_credit_tie_offset_usd"] == 0.0
+    assert entries[f"{day}:B"]["restored_credit_tie_offset_usd"] == 10.0
+    # Corrupt A's offset to exactly B's own $10 -- a value the previous
+    # (rejected) bound of (history - A's own amount) would have accepted.
+    a_entry["restored_credit_tie_offset_usd"] = 10.0
+    state_path.write_text(json.dumps(state, indent=2))
+
+    retry = ledger.record_contribution(
+        "BYDDY", day, 0.0, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:35:00-04:00"
+    )
+    assert retry.shares_to_buy == 0, (
+        "A's offset must equal exactly what was audited for it ($0), not a "
+        "value that merely happens to match a sibling's own contribution"
+    )
+    assert ledger.pending_usd("BYDDY") == 20.0
+
+
+def test_a_present_but_unreadable_audit_value_fails_the_entitlement_closed(tmp_path):
+    """Codex review (PR #1170 discussion on this same fix, "Reject
+    malformed present audit records"): a genuinely MISSING audit key is
+    trusted (cannot be disproven), but a key that IS present with an
+    unreadable value (``null``, ``"NaN"``, a JSON boolean, ...) is a
+    different thing -- an audit record was written for this exact
+    registration and has since been corrupted. Routing that through the
+    same "no audit, trust it" path as a genuinely absent key would let a
+    corrupted live offset stand simply by ALSO corrupting its own audit
+    entry, reopening the exact ownership breach this audit trail exists to
+    close.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    day = "2026-08-16"
+
+    first = ledger.record_contribution(
+        "BYDDY", day, 10.0, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    ledger.preserve_pending(
+        "BYDDY", day, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+    ledger.record_contribution(
+        "BYDDY", day, 0.0, 10.0, idempotency_key="B", recorded_at="2026-08-16T15:31:00-04:00",
+    )
+    ledger.record_contribution(
+        "BYDDY", day, 10.0, 25.0, idempotency_key="C", recorded_at="2026-08-16T15:32:00-04:00",
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
+    audit_key = f"{day}:A:restored_credit_usd:{_snapshot_key(a_entry['restored_credit_as_of_withdrawn_usd'])}"
+    assert audit_key in state["credit_tie_offset_audit"]
+    # Corrupt BOTH the live offset AND its own audit entry to something
+    # oversized-but-unreadable -- without the fix, the malformed audit
+    # value is treated exactly like a missing key and the corrupted live
+    # offset is trusted outright.
+    a_entry["restored_credit_tie_offset_usd"] = 1000.0
+    state["credit_tie_offset_audit"][audit_key] = "NaN"
+    state_path.write_text(json.dumps(state, indent=2))
+
+    retry = ledger.record_contribution(
+        "BYDDY", day, 0.0, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:35:00-04:00"
+    )
+    assert retry.shares_to_buy == 0, (
+        "a present-but-unreadable audit entry must fail the entitlement "
+        "closed, not be trusted like a genuinely absent one"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_writing_off_a_mismatch_retires_the_stale_audit_entry(tmp_path):
+    """Codex review (PR #1170 discussion on this same fix, "Persist or
+    retire the audit after writing off an entitlement"): when a mismatch
+    write-off zeroes a claim's live field, the stale audit entry that
+    caused the mismatch must be retired too. Left behind, a caller that
+    goes on to persist this corrected state (every mutating method reads
+    via ``_read_state()`` and later writes the same dict back) still
+    carries the stale audit forward, and the audit/live pair mismatches
+    again on every future load even after the live value is durably $0.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    day = "2026-08-16"
+
+    first = ledger.record_contribution(
+        "BYDDY", day, 10.0, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    ledger.preserve_pending(
+        "BYDDY", day, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
+    as_of = a_entry["restored_credit_as_of_withdrawn_usd"]
+    audit_key = f"{day}:A:restored_credit_usd:{_snapshot_key(as_of)}"
+    assert state["credit_tie_offset_audit"][audit_key] == 0.0
+    # Corrupt the live offset so the next load writes it off.
+    a_entry["restored_credit_tie_offset_usd"] = 1000.0
+    state_path.write_text(json.dumps(state, indent=2))
+
+    repaired = ledger._read_state(state_path, "BYDDY")
+    repaired_a = repaired["recorded_idempotency_keys"][f"{day}:A"]
+    assert repaired_a["restored_credit_usd"] == 0.0
+    assert audit_key not in repaired.get("credit_tie_offset_audit", {}), (
+        "the stale audit entry that caused this mismatch must be retired "
+        "alongside the write-off, not left behind to mismatch again"
+    )
+
+
+def test_a_legacy_initialized_credit_is_not_written_off_by_an_unrelated_same_counter_claim(tmp_path):
+    """Codex review (PR #1170 discussion on this same fix, "Exempt
+    legacy-initialized credits from unrelated history"): a credit upgraded
+    by ``_initialize_restored_credit_aging()`` gets its snapshot/offset
+    assigned directly, without going through ``_allocate_credit_tie_offset()``
+    -- so it carries no ``credit_tie_offset_audit`` entry at all. A fresh,
+    unrelated, CURRENT-format claim later registering at the exact same
+    withdrawal-counter instant must not retroactively make the legacy
+    credit's un-audited offset look wrong: with no audit record for it,
+    validation must trust it rather than write it off.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    day = "2026-08-16"
+
+    # A legacy restored credit: present, but with no snapshot/offset/audit
+    # fields at all, as if written before any of them existed.
+    first = ledger.record_contribution(
+        "BYDDY", day, 10.0, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    ledger.preserve_pending(
+        "BYDDY", day, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
+    del a_entry["restored_credit_as_of_withdrawn_usd"]
+    del a_entry["restored_credit_tie_offset_usd"]
+    state.pop("credit_tie_offset_audit", None)
+    state_path.write_text(json.dumps(state, indent=2))
+
+    # A fresh, unrelated CURRENT-format claim (B) registers at the exact
+    # same withdrawn_usd_total instant this load's migration backfills A's
+    # snapshot to -- exercising _allocate_credit_tie_offset() for B (which
+    # DOES write an audit entry) immediately after A's un-audited migration.
+    b = ledger.record_contribution(
+        "BYDDY", day, 5.0, 100.0, idempotency_key="B", recorded_at="2026-08-16T15:31:00-04:00"
+    )
+    assert b.shares_to_buy == 0
+
+    from dca_whole_share_accumulator import _redispatchable_credit_usd
+
+    repaired = ledger._read_state(state_path, "BYDDY")
+    repaired_a = repaired["recorded_idempotency_keys"][f"{day}:A"]
+    assert repaired_a["restored_credit_usd"] == 10.0, (
+        "the legacy credit has no audit record to fail, so it must be trusted, "
+        "not written off because of an unrelated claim registering afterward"
+    )
+    withdrawn_total = repaired["withdrawn_usd_total"]
+    pool = repaired["pending_usd"]
+    assert _redispatchable_credit_usd(repaired_a, pool, withdrawn_total) == 10.0
+
+
+def test_re_anchoring_after_a_missing_counter_forgets_stale_audits_first(tmp_path):
+    """Codex review (PR #1170 discussion on this same fix, "Synchronize
+    audits when migration rewrites offsets"): the "counter field is
+    entirely ABSENT" upgrade-boundary path re-anchors every existing
+    _AS_OF snapshot to the current (usually $0) counter and forcibly resets
+    every offset to $0 -- without forgetting the old audit entry that
+    offset supersedes. Two credits already tied at withdrawn_usd_total==0.0
+    (A offset $0, B offset $10, both audited) are UNCHANGED by the
+    re-anchor's own as_of rewrite (0.0 -> 0.0), so B's forced offset reset
+    to $0 collides with its own still-present $10 audit entry the moment
+    this same load's validation pass runs -- writing off B's perfectly
+    legitimate $10 credit, not merely logging a stale warning.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    day = "2026-08-16"
+
+    # Built through the real API so both entries have a realistic shape,
+    # then hand-edited to the as_of==0.0 tie this migration path can't
+    # itself distinguish from a coincidental re-anchor collision.
+    first = ledger.record_contribution(
+        "BYDDY", day, 10.0, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    ledger.preserve_pending(
+        "BYDDY", day, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+    second = ledger.record_contribution(
+        "BYDDY", day, 10.0, 10.0, idempotency_key="B", recorded_at="2026-08-16T15:31:00-04:00"
+    )
+    ledger.preserve_pending(
+        "BYDDY", day, 10.0, idempotency_key="B", recorded_at="2026-08-16T15:31:00-04:00", claim_token=second.claim_token,
+    )
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entries = state["recorded_idempotency_keys"]
+    a_entry = entries[f"{day}:A"]
+    b_entry = entries[f"{day}:B"]
+    audit = state["credit_tie_offset_audit"]
+    # Move both credits (and their audit entries) down to as_of==0.0,
+    # tied at offsets $0 and $10 -- exactly the state the re-anchor path
+    # cannot tell apart from "was already there before the counter went
+    # missing".
+    for entry, offset in ((a_entry, 0.0), (b_entry, 10.0)):
+        old_key = f"{day}:{'A' if entry is a_entry else 'B'}:restored_credit_usd:{_snapshot_key(entry['restored_credit_as_of_withdrawn_usd'])}"
+        audit.pop(old_key, None)
+        entry["restored_credit_as_of_withdrawn_usd"] = 0.0
+        entry["restored_credit_tie_offset_usd"] = offset
+        audit[f"{day}:{'A' if entry is a_entry else 'B'}:restored_credit_usd:0.00"] = offset
+    del state["withdrawn_usd_total"]
+    state_path.write_text(json.dumps(state, indent=2))
+
+    from dca_whole_share_accumulator import _redispatchable_credit_usd
+
+    repaired = ledger._read_state(state_path, "BYDDY")
+    repaired_b = repaired["recorded_idempotency_keys"][f"{day}:B"]
+    assert repaired_b["restored_credit_usd"] == 10.0, (
+        "B's legitimate $10 credit must survive the re-anchor -- the forced "
+        "offset reset to $0 must not collide with B's own stale $10 audit "
+        "entry from before the counter went missing"
+    )
+    withdrawn_total = repaired["withdrawn_usd_total"]
+    pool = repaired["pending_usd"]
+    assert _redispatchable_credit_usd(repaired_b, pool, withdrawn_total) == 10.0
+
+
+def test_the_as_of_backfill_migration_forgets_a_stale_audit_at_its_target_key(tmp_path):
+    """Codex review (PR #1170 discussion on this same fix, second example:
+    "backfilling a missing as-of field can re-stagger an audited offset and
+    trigger the same loss"): the as_of-backfill loop (for an entry whose
+    ``restored_credit_as_of_withdrawn_usd`` is entirely ABSENT) assigns a
+    fresh as_of/offset pair directly, not through
+    ``_allocate_credit_tie_offset()``, so it never writes its own audit
+    entry -- but if a stale audit entry already happens to sit at the exact
+    (claim, field, counter) key this backfill is about to target, the
+    freshly-assigned offset must not be judged against it.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    day = "2026-08-16"
+
+    first = ledger.record_contribution(
+        "BYDDY", day, 10.0, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    ledger.preserve_pending(
+        "BYDDY", day, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
+    withdrawn_total = state["withdrawn_usd_total"]
+    assert a_entry["restored_credit_as_of_withdrawn_usd"] == withdrawn_total
+
+    # Simulate a legacy/partially-edited entry: as_of entirely absent, so
+    # the next load's backfill loop will re-anchor it fresh at the CURRENT
+    # counter (unchanged here) with a freshly-staggered $0 offset.
+    del a_entry["restored_credit_as_of_withdrawn_usd"]
+    del a_entry["restored_credit_tie_offset_usd"]
+    # Plant a stale, WRONG audit entry at the exact key the backfill is
+    # about to target -- simulating leftover garbage from some unrelated
+    # earlier registration at this same counter value.
+    state["credit_tie_offset_audit"][f"{day}:A:restored_credit_usd:{_snapshot_key(withdrawn_total)}"] = 999.0
+    state_path.write_text(json.dumps(state, indent=2))
+
+    from dca_whole_share_accumulator import _redispatchable_credit_usd
+
+    repaired = ledger._read_state(state_path, "BYDDY")
+    repaired_a = repaired["recorded_idempotency_keys"][f"{day}:A"]
+    assert repaired_a["restored_credit_usd"] == 10.0, (
+        "the fresh backfilled offset must not be judged against a stale "
+        "audit entry planted at the same target key"
+    )
+    pool = repaired["pending_usd"]
+    assert _redispatchable_credit_usd(repaired_a, pool, repaired["withdrawn_usd_total"]) == 10.0
+
+
+def test_retiring_an_interval_keeps_the_shifted_siblings_audit_in_sync(tmp_path):
+    """Codex review (PR #1170 discussion on this same fix, "Keep audits
+    synchronized when shifting tie offsets"): ``_retire_credit_tie_interval()``
+    shifts a LATER-registered sibling's live offset down to close the gap a
+    retired registration leaves behind, but this PR's audit trail only wrote
+    an audit entry the moment ``_allocate_credit_tie_offset()`` first
+    computed a value -- not when a legitimate shift changes it afterward. A
+    fires $10 leaving a $4 remainder (offset $0); B then adds $4 at the same
+    withdrawal-counter instant (offset $4, audited as $4). Preserving A's
+    order retires A's $4 registration, shifting B's LIVE offset down to $0
+    -- but without syncing the audit too, B's now-stale $4 audit entry would
+    mismatch its own correctly-shifted $0 live value on the very next load,
+    writing off a perfectly legitimate credit.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    day = "2026-08-16"
+
+    first = ledger.record_contribution(
+        "BYDDY", day, 14.0, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    assert first.shares_to_buy == 1
+    assert first.order_notional_usd == 10.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
+    assert a_entry["claim_credit_remainder_usd"] == 4.0
+    assert a_entry["claim_credit_remainder_tie_offset_usd"] == 0.0
+
+    # B ties at the exact same withdrawal-counter instant (no fire, no
+    # withdrawal in between) and is offset by A's own $4 registration.
+    b = ledger.record_contribution(
+        "BYDDY", day, 4.0, 100.0, idempotency_key="B", recorded_at="2026-08-16T15:31:00-04:00"
+    )
+    assert b.shares_to_buy == 0
+    state = json.loads(state_path.read_text())
+    b_entry = state["recorded_idempotency_keys"][f"{day}:B"]
+    assert b_entry["claim_credit_remainder_usd"] == 4.0
+    assert b_entry["claim_credit_remainder_tie_offset_usd"] == 4.0
+
+    # Preserving A's order retires A's $4 registration and shifts B's LIVE
+    # offset down to close the gap.
+    ledger.preserve_pending(
+        "BYDDY", day, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:32:00-04:00", claim_token=first.claim_token,
+    )
+    state = json.loads(state_path.read_text())
+    b_entry = state["recorded_idempotency_keys"][f"{day}:B"]
+    assert b_entry["claim_credit_remainder_tie_offset_usd"] == 0.0, "B's live offset must be shifted"
+    audit_key = f"{day}:B:claim_credit_remainder_usd:{_snapshot_key(b_entry['claim_credit_remainder_as_of_withdrawn_usd'])}"
+    assert state["credit_tie_offset_audit"][audit_key] == 0.0, (
+        "B's audit entry must move with its shifted live offset"
+    )
+
+    from dca_whole_share_accumulator import _claim_credit_remainder_usd
+
+    repaired = ledger._read_state(state_path, "BYDDY")
+    repaired_b = repaired["recorded_idempotency_keys"][f"{day}:B"]
+    assert repaired_b["claim_credit_remainder_usd"] == 4.0, (
+        "B's legitimately-shifted credit must survive reload, not be written "
+        "off by a stale audit entry that never moved with it"
+    )
+    withdrawn_total = repaired["withdrawn_usd_total"]
+    pool = repaired["pending_usd"]
+    assert _claim_credit_remainder_usd(repaired_b, pool, withdrawn_total) == 4.0
+
+
+def test_a_relabeled_restored_credit_gets_its_own_audit_entry(tmp_path):
+    """Codex review (PR #1170 discussion on this same fix, "Record an audit
+    for relabeled restored credits"): when a stale claim reprices to zero
+    shares, its ``claim_credit_remainder_usd`` (already audited) is
+    relabeled onto ``restored_credit_usd`` reusing the SAME offset value --
+    but that reuse only copied the live field, not a matching audit entry
+    under ``restored_credit_usd``'s own audit key. Without one,
+    ``_read_state()`` finds no audit record for (claim, restored_credit_usd,
+    snapshot) and trusts ANY value stored there, including a later
+    corruption.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    day = "2026-08-16"
+
+    first = ledger.record_contribution(
+        "BYDDY", day, 14.0, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    assert first.shares_to_buy == 1
+    assert first.order_notional_usd == 10.0
+
+    # Reclaim A at a price high enough that its frozen $14 total no longer
+    # buys even one share -- the "resolved: repriced to zero shares" branch
+    # that relabels the remainder as restored credit.
+    repriced = ledger.record_contribution(
+        "BYDDY", day, 0.0, 1000.0, idempotency_key="A", recorded_at="2026-08-16T15:31:00-04:00"
+    )
+    assert repriced.shares_to_buy == 0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
+    # The reclaim releases A's WHOLE frozen commitment (its original $10
+    # order plus the $4 remainder) back to pending, not just the remainder.
+    assert a_entry["restored_credit_usd"] == 14.0
+    assert a_entry["restored_credit_tie_offset_usd"] == 0.0
+    audit_key = f"{day}:A:restored_credit_usd:{_snapshot_key(a_entry['restored_credit_as_of_withdrawn_usd'])}"
+    assert state["credit_tie_offset_audit"][audit_key] == 0.0, (
+        "the relabeled restored credit must have its OWN audit entry, not "
+        "rely solely on the remainder's now-superseded one"
+    )
+
+    # Corrupt the relabeled offset -- without the fix, no audit entry exists
+    # under restored_credit_usd's own key, so this would be trusted outright.
+    a_entry["restored_credit_tie_offset_usd"] = 5.0
+    state_path.write_text(json.dumps(state, indent=2))
+
+    from dca_whole_share_accumulator import _redispatchable_credit_usd
+
+    repaired = ledger._read_state(state_path, "BYDDY")
+    repaired_a = repaired["recorded_idempotency_keys"][f"{day}:A"]
+    assert repaired_a["restored_credit_usd"] == 0.0, (
+        "a corrupted offset on the relabeled field must be caught against "
+        "its own audit entry, not silently trusted"
+    )
+    withdrawn_total = repaired["withdrawn_usd_total"]
+    pool = repaired["pending_usd"]
+    assert _redispatchable_credit_usd(repaired_a, pool, withdrawn_total) == 0.0
+
+
+def test_relabeling_a_remainder_with_a_nonzero_offset_forgets_its_own_stale_audit(tmp_path):
+    """Codex review (PR #1170 discussion on this same fix, "Retire the
+    remainder audit when relabeling credit"): the previous fix wrote a NEW
+    audit entry for the relabeled ``restored_credit_usd`` field, but never
+    cleared the remainder's own now-superseded entry before resetting the
+    live ``claim_credit_remainder_tie_offset_usd`` field to $0. When that
+    remainder's offset was $0 to begin with, resetting it to $0 trivially
+    matches its own audit and nothing is exposed -- so this needs a claim
+    whose remainder ties AFTER another claim's own interval, giving it a
+    NONZERO offset, to actually surface the stale mismatch.
+
+    B first registers a $4 interval at the same withdrawal-counter instant.
+    A's own $4 remainder (from a fire that already happened) then reclaims
+    at a price too high to buy anything: this retires A's OLD remainder
+    registration, shifting B's offset down to $0, and re-registers A's
+    WHOLE frozen $14 commitment fresh -- landing AFTER B's now-$0 interval,
+    at a NONZERO offset. Relabeling that onto restored_credit_usd resets
+    the live remainder offset to $0 while its own audit entry (just written
+    moments earlier by that same fresh registration) still holds the
+    nonzero value -- exactly the mismatch this fix must forget.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    day = "2026-08-16"
+
+    first = ledger.record_contribution(
+        "BYDDY", day, 14.0, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    assert first.shares_to_buy == 1
+    assert first.order_notional_usd == 10.0
+
+    # B ties at the exact same withdrawal-counter instant as A's remainder
+    # (no fire, no withdrawal in between).
+    b = ledger.record_contribution(
+        "BYDDY", day, 4.0, 100.0, idempotency_key="B", recorded_at="2026-08-16T15:31:00-04:00"
+    )
+    assert b.shares_to_buy == 0
+
+    # Reclaim A at a price high enough that its frozen $14 total no longer
+    # buys even one share. This retires A's old $4 remainder registration
+    # (shifting B's offset down to $0) and re-registers A's whole $14 fresh,
+    # landing after B's interval at a nonzero offset.
+    repriced = ledger.record_contribution(
+        "BYDDY", day, 0.0, 1000.0, idempotency_key="A", recorded_at="2026-08-16T15:32:00-04:00"
+    )
+    assert repriced.shares_to_buy == 0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
+    assert a_entry["restored_credit_usd"] == 14.0
+    assert a_entry["restored_credit_tie_offset_usd"] > 0.0, (
+        "the setup must give A's relabeled offset a NONZERO value -- "
+        "otherwise resetting the remainder to $0 trivially matches it"
+    )
+    assert a_entry["claim_credit_remainder_usd"] == 0.0
+    assert a_entry["claim_credit_remainder_tie_offset_usd"] == 0.0
+    remainder_audit_key = (
+        f"{day}:A:claim_credit_remainder_usd:{_snapshot_key(a_entry['claim_credit_remainder_as_of_withdrawn_usd'])}"
+    )
+    assert remainder_audit_key not in state["credit_tie_offset_audit"], (
+        "A's superseded remainder audit entry must be forgotten, not left "
+        "behind holding a stale nonzero value that mismatches the reset $0"
+    )
+
+    # A fresh, ordinary load must not treat A's own legitimate reset as
+    # corruption -- no warning-driven write-off, and the relabeled restored
+    # credit must survive untouched.
+    repaired = ledger._read_state(state_path, "BYDDY")
+    repaired_a = repaired["recorded_idempotency_keys"][f"{day}:A"]
+    assert repaired_a["restored_credit_usd"] == 14.0
+
+
+def test_a_claim_moving_to_a_new_snapshot_does_not_write_off_a_tied_siblings_offset(tmp_path):
+    """Codex review (PR #1170 discussion on this same fix, "Preserve offsets
+    after preceding claims move snapshots"): the reconstructable-bound check
+    above must not group claims strictly by their CURRENT ``_AS_OF``
+    snapshot value. A and B tie at the same snapshot (A offset $0, B offset
+    $10). A is later redispatched -- a real withdrawal, advancing the
+    counter -- and preserved again, which overwrites A's OWN snapshot/offset
+    fields in place with no historical trace left behind at the OLD
+    snapshot (see the "prior_*_as_of == withdrawn_total" guards around every
+    _retire_credit_tie_interval() call site: a claim's own real withdrawal
+    deliberately does NOT retire its old interval, precisely so it keeps
+    protecting whichever claim was tied after it). A bound scoped to "still
+    at this exact snapshot" would then see nothing left at A's old snapshot
+    to justify B's $10 offset and write off B's still-legitimate
+    entitlement -- even though the withdrawal that happened came entirely
+    out of A's own slice, not B's.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    day = "2026-08-16"
+
+    fires = {}
+    for key, at in (
+        ("A", "2026-08-16T15:30:00-04:00"),
+        ("B", "2026-08-16T15:31:00-04:00"),
+    ):
+        fires[key] = ledger.record_contribution(
+            "BYDDY", day, 10.0, 10.0, idempotency_key=key, recorded_at=at
+        )
+        assert fires[key].order_notional_usd == 10.0
+
+    for key, at in (
+        ("A", "2026-08-16T15:32:00-04:00"),
+        ("B", "2026-08-16T15:33:00-04:00"),
+    ):
+        ledger.preserve_pending(
+            "BYDDY", day, 10.0, idempotency_key=key, recorded_at=at, claim_token=fires[key].claim_token
+        )
+    assert ledger.pending_usd("BYDDY") == 20.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entries = state["recorded_idempotency_keys"]
+    assert entries[f"{day}:A"]["restored_credit_tie_offset_usd"] == 0.0
+    assert entries[f"{day}:B"]["restored_credit_tie_offset_usd"] == 10.0
+
+    # A redispatches its own $10 -- a real, cleanly-sized withdrawal funded
+    # entirely by A's own restored credit -- and that fire is then preserved
+    # again, moving A on to a brand new snapshot.
+    a_redispatch = ledger.record_contribution(
+        "BYDDY", day, 0.0, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:34:00-04:00"
+    )
+    assert a_redispatch.order_notional_usd == 10.0
+    ledger.preserve_pending(
+        "BYDDY", day, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:35:00-04:00", claim_token=a_redispatch.claim_token,
+    )
+    assert ledger.pending_usd("BYDDY") == 20.0
+
+    state = json.loads(state_path.read_text())
+    entries = state["recorded_idempotency_keys"]
+    a_entry = entries[f"{day}:A"]
+    b_entry = entries[f"{day}:B"]
+    assert a_entry["restored_credit_as_of_withdrawn_usd"] != b_entry["restored_credit_as_of_withdrawn_usd"], (
+        "A must have moved on to a snapshot distinct from B's original one"
+    )
+    assert b_entry["restored_credit_tie_offset_usd"] == 10.0, (
+        "B's own offset/snapshot are untouched by A's move"
+    )
+
+    from dca_whole_share_accumulator import _redispatchable_credit_usd
+
+    repaired = ledger._read_state(state_path, "BYDDY")
+    repaired_b = repaired["recorded_idempotency_keys"][f"{day}:B"]
+    assert repaired_b["restored_credit_usd"] == 10.0, (
+        "B's entitlement must survive reload -- the withdrawal since B's snapshot "
+        "came entirely out of A's own slice, which B's untouched offset already "
+        "accounts for, so there is nothing here to write off"
+    )
+    withdrawn_total = repaired["withdrawn_usd_total"]
+    pool = repaired["pending_usd"]
+    assert _redispatchable_credit_usd(repaired_b, pool, withdrawn_total) == 10.0
+
+
+def test_a_shrinking_sibling_credit_does_not_write_off_a_tied_claims_offset(tmp_path):
+    """Codex review (PR #1170 discussion on this same fix, "Preserve
+    historical width after preceding credits shrink" / "Exclude the claim's
+    sibling credit from its offset bound"): validating a tie offset against
+    the SUM of every other entry's CURRENT recorded amount is unsound in a
+    second way beyond the snapshot-move case above -- a claim's current
+    amount can legitimately shrink below what it was when a SIBLING's offset
+    was originally earned against it. A partial redispatch draws down only
+    part of a claim's credit; preserving that partial fire re-registers the
+    claim at its new, smaller remaining balance (and can leave BOTH a stale
+    ``restored_credit_usd`` and a fresh ``claim_credit_remainder_usd`` on the
+    SAME entry at once, from the two different registrations). A bound based
+    on current amounts would then read less total money in the ledger than
+    what legitimately justified the sibling's offset, and write off a still-
+    valid entitlement.
+
+    A and B tie $10 each at the same snapshot (A offset $0, B offset $10).
+    A is then partially redispatched -- firing on only part of its own
+    credit, leaving a remainder -- which shrinks what A currently holds
+    without touching B at all. B's offset must still validate against the
+    durable historical batch width recorded when both A and B originally
+    registered, not against A's now-smaller current balance.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    day = "2026-08-16"
+
+    fires = {}
+    for key, at in (
+        ("A", "2026-08-16T15:30:00-04:00"),
+        ("B", "2026-08-16T15:31:00-04:00"),
+    ):
+        fires[key] = ledger.record_contribution(
+            "BYDDY", day, 10.0, 10.0, idempotency_key=key, recorded_at=at
+        )
+        assert fires[key].order_notional_usd == 10.0
+
+    for key, at in (
+        ("A", "2026-08-16T15:32:00-04:00"),
+        ("B", "2026-08-16T15:33:00-04:00"),
+    ):
+        ledger.preserve_pending(
+            "BYDDY", day, 10.0, idempotency_key=key, recorded_at=at, claim_token=fires[key].claim_token
+        )
+    assert ledger.pending_usd("BYDDY") == 20.0
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entries = state["recorded_idempotency_keys"]
+    assert entries[f"{day}:A"]["restored_credit_tie_offset_usd"] == 0.0
+    assert entries[f"{day}:B"]["restored_credit_tie_offset_usd"] == 10.0
+
+    # A redispatches at a price that only partially spends its own $10
+    # credit ($10 // $9 = 1 share, $9 notional, $1 left over) -- a real,
+    # smaller withdrawal funded entirely by A's own money, leaving A's
+    # entry with a stale restored_credit_usd (from the original preserve
+    # above) alongside a fresh claim_credit_remainder_usd (from this fire).
+    a_redispatch = ledger.record_contribution(
+        "BYDDY", day, 0.0, 9.0, idempotency_key="A", recorded_at="2026-08-16T15:34:00-04:00"
+    )
+    assert a_redispatch.order_notional_usd == 9.0
+
+    state = json.loads(state_path.read_text())
+    a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
+    assert "restored_credit_usd" in a_entry and "claim_credit_remainder_usd" in a_entry, (
+        "A must carry both a stale restored credit and a fresh remainder at once"
+    )
+
+    from dca_whole_share_accumulator import _redispatchable_credit_usd
+
+    repaired = ledger._read_state(state_path, "BYDDY")
+    repaired_b = repaired["recorded_idempotency_keys"][f"{day}:B"]
+    assert repaired_b["restored_credit_usd"] == 10.0, (
+        "B's entitlement must survive reload -- A's own current balance shrinking "
+        "does not shrink the historical batch width B's offset was validated "
+        "against when both A and B originally tied"
+    )
+    assert repaired_b["restored_credit_tie_offset_usd"] == 10.0
+    withdrawn_total = repaired["withdrawn_usd_total"]
+    pool = repaired["pending_usd"]
+    assert _redispatchable_credit_usd(repaired_b, pool, withdrawn_total) > 0.0
+
+
 def test_a_corrupted_withdrawal_counter_writes_off_a_legacy_entry_too(tmp_path):
     """Regression for "Invalidate legacy fallback credits after counter
     corruption".
@@ -4005,6 +5235,52 @@ def test_a_corrupted_withdrawal_counter_writes_off_a_legacy_entry_too(tmp_path):
         "B's withdrawal, so A must not reach the $10 C put in"
     )
     assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_finite_non_negative_rejects_integer_overflow():
+    """Codex review ("Handle integer overflow while scanning cached
+    claims"): a JSON integer too large to convert to a float (e.g. a
+    persisted ``claim_credit_remainder_usd: 10**400``) raises
+    ``OverflowError`` from ``float()``, not ``TypeError``/``ValueError`` --
+    and every caller of ``_finite_non_negative()`` relies on it to fail
+    closed on exactly this kind of corrupted numeric field.
+    """
+    from dca_whole_share_accumulator import _finite_non_negative
+
+    assert _finite_non_negative(10**400) is None
+    assert _finite_non_negative(-(10**400)) is None
+
+
+def test_a_ledger_wide_integer_overflow_does_not_abort_unrelated_reads(tmp_path):
+    """Regression for "Handle integer overflow while scanning cached
+    claims": left uncaught, a single oversized JSON integer anywhere in
+    ``recorded_idempotency_keys`` raised ``OverflowError`` out of the new
+    tie-offset validation pass in ``_read_state()`` -- which runs on every
+    load -- taking the WHOLE ticker down (even read-only callers like
+    ``pending_usd()``) over one unrelated corrupted field, instead of
+    writing off just that one entitlement.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    first = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    ledger.preserve_pending(
+        "BYDDY", "2026-08-16", 10.0, idempotency_key="A",
+        recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
+    )
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entries = state["recorded_idempotency_keys"]
+    entries["2026-08-16:A"]["restored_credit_usd"] = 10**400
+    state_path.write_text(json.dumps(state, indent=2))
+
+    # Must not raise OverflowError -- the corrupted entry is written off,
+    # not fatal to the whole ticker. pending_usd itself is untouched by the
+    # corruption (a separate field); this call merely proves _read_state()
+    # completes instead of raising.
+    assert ledger.pending_usd("BYDDY") == 10.0
+    assert ledger.events("BYDDY") is not None
 
 
 def test_finite_non_negative_rejects_json_booleans():
@@ -4264,3 +5540,339 @@ def test_a_non_finite_legacy_order_notional_fails_closed(tmp_path):
         "hand back the entire pending pool, including C's contribution"
     )
     assert ledger.pending_usd("BYDDY") == 10.0
+
+
+# --- "Avoid charging one withdrawal to every restored claim" -----------------
+#
+# Two claims restoring/leaving credit at the SAME withdrawn_usd_total snapshot
+# used to age BOTH of them by the FULL withdrawal delta of any later draw,
+# independently -- not a proportional or FIFO share of it, the whole thing,
+# for every claim that happened to tie. A single $10 withdrawal out of a $20
+# pool (two $10 credits, tied at the same snapshot) charged $10 to EACH,
+# stranding one of them at $0 even though only $10 actually left the pool.
+
+
+def test_two_restored_credits_at_the_same_snapshot_are_not_both_charged_one_withdrawal(tmp_path):
+    """Codex review ("Avoid charging one withdrawal to every restored
+    claim"): A and B each restore $10 into the pool at the SAME
+    withdrawn_usd_total snapshot (pool = $20). A single later $10 withdrawal
+    must drain only whichever claim's money it could actually have come
+    from -- not $10 from BOTH independently, which would strand the
+    innocent claim at $0 for no reason tied to its own money ever having
+    been spent.
+
+    C and D are a separate pair of claims used only to produce two clean,
+    independently-sized $10 withdrawals against the shared pool (a
+    redispatch is capped at the redispatching claim's OWN restored credit,
+    so C's/D's $10 caps size their own order exactly, regardless of the
+    combined pool total) -- the withdrawals under test are C's and D's, A
+    and B never redispatch themselves.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    day = "2026-08-16"
+
+    # Four claims, one fire each: $10 contribution at $10/share buys exactly
+    # one share and reserves the whole $10, leaving nothing pending -- purely
+    # a vehicle to get each claim its own $10 order to later preserve.
+    fires = {}
+    for key, at in (
+        ("A", "2026-08-16T15:30:00-04:00"),
+        ("B", "2026-08-16T15:31:00-04:00"),
+        ("C", "2026-08-16T15:32:00-04:00"),
+        ("D", "2026-08-16T15:33:00-04:00"),
+    ):
+        fires[key] = ledger.record_contribution(
+            "BYDDY", day, 10.0, 10.0, idempotency_key=key, recorded_at=at
+        )
+        assert fires[key].order_notional_usd == 10.0
+
+    # Preserve all four -- as if each fire's order failed -- back to back,
+    # with no other pool activity between them, so every restored credit
+    # lands at the exact same withdrawn_usd_total. This is the tie the
+    # Codex finding is about.
+    for key, at in (
+        ("A", "2026-08-16T15:34:00-04:00"),
+        ("B", "2026-08-16T15:35:00-04:00"),
+        ("C", "2026-08-16T15:36:00-04:00"),
+        ("D", "2026-08-16T15:37:00-04:00"),
+    ):
+        ledger.preserve_pending(
+            "BYDDY", day, 10.0, idempotency_key=key, recorded_at=at, claim_token=fires[key].claim_token
+        )
+    assert ledger.pending_usd("BYDDY") == 40.0
+
+    # C redispatches its own $10 -- a single, cleanly-sized $10 withdrawal
+    # out of the shared $40 pool.
+    c_redispatch = ledger.record_contribution(
+        "BYDDY", day, 0.0, 10.0, idempotency_key="C", recorded_at="2026-08-16T15:38:00-04:00"
+    )
+    assert c_redispatch.order_notional_usd == 10.0
+    assert ledger.pending_usd("BYDDY") == 30.0
+
+    # Inspect A's and B's redispatchable credit directly (the same pattern
+    # the existing counter-corruption regression test above uses) rather
+    # than retrying them for real through record_contribution() -- a real
+    # retry that turns out actionable also FIRES, which would spend money
+    # and re-snapshot state, muddying what this test is isolating: whether
+    # aging attributed C's withdrawal to the right claim, not what a live
+    # caller would go on to do about it.
+    from dca_whole_share_accumulator import _redispatchable_credit_usd
+
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_text())
+    entries = state["recorded_idempotency_keys"]
+    withdrawn_total = state["withdrawn_usd_total"]
+    pool = state["pending_usd"]
+    credit_a = _redispatchable_credit_usd(entries["2026-08-16:A"], pool, withdrawn_total)
+    credit_b = _redispatchable_credit_usd(entries["2026-08-16:B"], pool, withdrawn_total)
+    zeroed = [credit for credit in (credit_a, credit_b) if credit == 0.0]
+    survived = [credit for credit in (credit_a, credit_b) if credit == 10.0]
+    assert len(zeroed) == 1 and len(survived) == 1, (
+        f"exactly one of A's (${credit_a}) / B's (${credit_b}) tied $10 credits "
+        "must be charged for C's $10 withdrawal -- not both (the bug) and not "
+        "neither"
+    )
+
+    # D redispatches its own $10 next -- the second, independent withdrawal,
+    # advancing the SAME shared withdrawal counter another $10.
+    d_redispatch = ledger.record_contribution(
+        "BYDDY", day, 0.0, 10.0, idempotency_key="D", recorded_at="2026-08-16T15:39:00-04:00"
+    )
+    assert d_redispatch.order_notional_usd == 10.0
+
+    # Both A and B must now be fully aged out -- no double-spend: across the
+    # two $10 withdrawals (C's and D's, $20 total), A and B were each
+    # charged for exactly one, never more than the $20 actually drawn from
+    # the pool between them.
+    state = json.loads(state_path.read_text())
+    entries = state["recorded_idempotency_keys"]
+    withdrawn_total = state["withdrawn_usd_total"]
+    pool = state["pending_usd"]
+    assert _redispatchable_credit_usd(entries["2026-08-16:A"], pool, withdrawn_total) == 0.0
+    assert _redispatchable_credit_usd(entries["2026-08-16:B"], pool, withdrawn_total) == 0.0, (
+        "the second $10 withdrawal (D's) must zero out the one remaining tied "
+        "claim -- no claim may survive more withdrawals than the pool "
+        "actually took from it"
+    )
+
+
+def test_retire_credit_tie_interval_shifts_later_offsets_instead_of_colliding():
+    """Codex review ("Keep later tie offsets valid when moving a
+    remainder"): retiring a non-tail interval must not corrupt a claim
+    registered AFTER it.
+
+    A registers a $4 interval at offset 0 (batch width becomes 4). B then
+    registers its own $4 interval at offset 4 (batch width becomes 8). If
+    A's old interval is later "taken back" (e.g. to re-register a larger
+    folded credit), naively decrementing the batch width by A's $4 would
+    compact the freed space from the WRONG position -- A's next fresh
+    allocation would land at offset 4, exactly overlapping B's still-live
+    interval. The fix instead shifts B's offset down by the retired width,
+    closing the gap left behind.
+    """
+    from dca_whole_share_accumulator import (
+        _CLAIM_REMAINDER_AS_OF_FIELD,
+        _CLAIM_REMAINDER_TIE_OFFSET_FIELD,
+        _CREDIT_TIE_BATCH_ANCHOR_FIELD,
+        _CREDIT_TIE_BATCH_WIDTH_FIELD,
+        _allocate_credit_tie_offset,
+        _retire_credit_tie_interval,
+    )
+
+    state = {_CREDIT_TIE_BATCH_ANCHOR_FIELD: 0.0, _CREDIT_TIE_BATCH_WIDTH_FIELD: 0.0}
+    a_entry = {_CLAIM_REMAINDER_AS_OF_FIELD: 0.0}
+    b_entry = {_CLAIM_REMAINDER_AS_OF_FIELD: 0.0}
+    recorded_keys = {"2026-01-01:A": a_entry, "2026-01-01:B": b_entry}
+
+    a_entry[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = _allocate_credit_tie_offset(
+        state, 4.0, dedup_key="2026-01-01:A", field="claim_credit_remainder_usd"
+    )
+    b_entry[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] = _allocate_credit_tie_offset(
+        state, 4.0, dedup_key="2026-01-01:B", field="claim_credit_remainder_usd"
+    )
+    assert a_entry[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] == 0.0
+    assert b_entry[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] == 4.0
+    assert state[_CREDIT_TIE_BATCH_WIDTH_FIELD] == 8.0
+
+    # Retire A's registration (as preserve_pending()/record_contribution()'s
+    # reclaim path do before re-allocating fresh for a larger folded total).
+    _retire_credit_tie_interval(
+        state, recorded_keys, 0.0, a_entry[_CLAIM_REMAINDER_TIE_OFFSET_FIELD], 4.0
+    )
+    assert state[_CREDIT_TIE_BATCH_WIDTH_FIELD] == 4.0
+    # B's own interval must be shifted down to close the gap, not left
+    # sitting where a fresh allocation would collide with it.
+    assert b_entry[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] == 0.0
+
+    # A re-registers its larger folded total ($14): must land AFTER B's
+    # now-shifted interval, never overlapping it.
+    a_new_offset = _allocate_credit_tie_offset(
+        state, 14.0, dedup_key="2026-01-01:A", field="claim_credit_remainder_usd"
+    )
+    assert a_new_offset == 4.0
+    assert state[_CREDIT_TIE_BATCH_WIDTH_FIELD] == 18.0
+    # A's interval [4, 18) and B's interval [0, 4) are disjoint.
+    assert a_new_offset >= b_entry[_CLAIM_REMAINDER_TIE_OFFSET_FIELD] + 4.0
+
+
+def test_two_claim_remainders_at_the_same_snapshot_are_not_both_charged_one_withdrawal():
+    """Parallel case for claim_credit_remainder_usd (Codex review: "Avoid
+    charging one withdrawal to every restored claim") -- the same tie, but
+    through _claim_credit_remainder_usd() rather than
+    _redispatchable_credit_usd(). Exercised directly against constructed
+    cache entries (the same pattern as
+    test_a_non_finite_legacy_order_notional_fails_closed's sibling checks
+    above), since claim_credit_remainder_usd's tie can only arise between
+    two DIFFERENT sub-share contributions recorded back to back with no
+    order (and therefore no withdrawal) between them -- awkward to stage
+    through the public API alone, trivial to construct directly.
+    """
+    from dca_whole_share_accumulator import _claim_credit_remainder_usd
+
+    # A and B each left a $10 remainder recorded at the SAME
+    # claim_credit_remainder_as_of_withdrawn_usd snapshot (10 and 20 in the
+    # withdrawal-counter axis respectively -- staggered by
+    # _allocate_credit_interval_start() the way two zero-order fresh
+    # contributions recorded back to back actually would be, NOT the shared
+    # raw counter value the pre-fix code used for both).
+    claim_a = {
+        "claim_credit_remainder_usd": 10.0,
+        "claim_credit_remainder_as_of_withdrawn_usd": 0.0,
+    }
+    claim_b = {
+        "claim_credit_remainder_usd": 10.0,
+        "claim_credit_remainder_as_of_withdrawn_usd": 10.0,
+    }
+    pool = 20.0
+
+    # A single $10 withdrawal (the counter moves from 0 to 10) falls
+    # entirely inside A's [0, 10) slice and none of B's [10, 20) slice.
+    withdrawn_after_first = 10.0
+    a_after_first = _claim_credit_remainder_usd(claim_a, pool, withdrawn_after_first)
+    b_after_first = _claim_credit_remainder_usd(claim_b, pool, withdrawn_after_first)
+    assert a_after_first == 0.0, "A's slice was fully consumed by the $10 withdrawal"
+    assert b_after_first == 10.0, "B's slice starts at 10 -- the withdrawal never reached it"
+
+    # A second $10 withdrawal (counter moves from 10 to 20) falls entirely
+    # inside B's [10, 20) slice.
+    withdrawn_after_second = 20.0
+    a_after_second = _claim_credit_remainder_usd(claim_a, pool, withdrawn_after_second)
+    b_after_second = _claim_credit_remainder_usd(claim_b, pool, withdrawn_after_second)
+    assert a_after_second == 0.0, "already-exhausted A stays at 0, not negative or replenished"
+    assert b_after_second == 0.0, "the second withdrawal now fully consumes B's own slice too"
+    # No double-spend: across both withdrawals, A and B were charged $10
+    # each -- $20 total -- matching exactly the $20 actually withdrawn.
+
+
+def test_allocate_credit_tie_offset_is_backward_compatible_with_no_batch_fields(tmp_path):
+    """Backward compatibility: a ledger state dict written before the
+    credit-tie-batch fields existed carries neither of them at all.
+    _allocate_credit_tie_offset() must treat that exactly like a
+    freshly-started batch -- anchored at the current withdrawal counter,
+    offset $0 -- rather than raising or misbehaving, so every pre-fix ledger
+    keeps working the first time it is written to under the fixed code.
+    """
+    from dca_whole_share_accumulator import _allocate_credit_tie_offset
+
+    legacy_state = {"withdrawn_usd_total": 15.0}
+    assert "credit_tie_batch_anchor_withdrawn_usd" not in legacy_state
+    assert "credit_tie_batch_width_usd" not in legacy_state
+    offset = _allocate_credit_tie_offset(
+        legacy_state, 5.0, dedup_key="2026-01-01:A", field="claim_credit_remainder_usd"
+    )
+    assert offset == 0.0, "the first claim in a freshly-started batch is offset by nothing"
+    assert legacy_state["credit_tie_batch_anchor_withdrawn_usd"] == 15.0
+    assert legacy_state["credit_tie_batch_width_usd"] == 5.0
+
+    # A second allocation at the SAME counter value extends the batch --
+    # offset by the first claim's width -- proving the batch state persists
+    # and is actually read on the next call, matching how a real ledger
+    # round-trips it through disk between record_contribution() calls.
+    second_offset = _allocate_credit_tie_offset(
+        legacy_state, 3.0, dedup_key="2026-01-01:B", field="claim_credit_remainder_usd"
+    )
+    assert second_offset == 5.0
+    assert legacy_state["credit_tie_batch_width_usd"] == 8.0
+
+    # A third allocation after the counter has moved starts a BRAND NEW
+    # batch at offset $0 again, rather than extending the stale one.
+    legacy_state["withdrawn_usd_total"] = 25.0
+    third_offset = _allocate_credit_tie_offset(
+        legacy_state, 2.0, dedup_key="2026-01-01:C", field="claim_credit_remainder_usd"
+    )
+    assert third_offset == 0.0
+    assert legacy_state["credit_tie_batch_anchor_withdrawn_usd"] == 25.0
+    assert legacy_state["credit_tie_batch_width_usd"] == 2.0
+
+
+def test_tied_sub_share_contributions_track_only_their_own_credit(tmp_path):
+    """Codex review ("Track only newly owned credit in the tie batch"): two
+    consecutive sub-share contributions tied at the same withdrawal-counter
+    instant used to record the CUMULATIVE pool total (decision.pending_after_usd)
+    as both the tie-batch width contribution and the claim's own remainder,
+    instead of just the claim's own marginal addition.
+
+    A and B each leave $10 pending with nothing bought (price is well above
+    either contribution) -- the pool holds $20, tied at the same
+    withdrawal-counter instant since neither fired. Before the fix, B's
+    remainder was recorded as $20 (the whole pool) and its tie-batch
+    interval extended to $30 even though the pool never held more than $20.
+    A third claim (C) then fires off the WHOLE pool -- a fresh claim draws
+    on the whole pool by right -- withdrawing the entire $20 in one
+    reservation. A fourth, unrelated claim (D) then contributes its own
+    fresh $10. B's zero-contribution retry must see its own credit fully
+    consumed by C's withdrawal ($0), not the un-fixed $10 that would let it
+    submit an order funded by D's contribution instead of its own.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    day = "2026-08-16"
+    ticker = "BYDDY"
+
+    # A and B: $10 each, priced so nothing buys (sub-share, stays pending).
+    # Recorded back to back with no withdrawal between them, so both tie at
+    # the same withdrawn_usd_total snapshot.
+    a = ledger.record_contribution(
+        ticker, day, 10.0, 100.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00"
+    )
+    assert a.shares_to_buy == 0
+    b = ledger.record_contribution(
+        ticker, day, 10.0, 100.0, idempotency_key="B", recorded_at="2026-08-16T15:31:00-04:00"
+    )
+    assert b.shares_to_buy == 0
+    assert ledger.pending_usd(ticker) == 20.0
+
+    # C: a FRESH claim (its own key, never seen before) at $20/share draws on
+    # the whole existing $20 pool by right and fires immediately, reserving
+    # all of it in one withdrawal.
+    c = ledger.record_contribution(
+        ticker, day, 0.0, 20.0, idempotency_key="C", recorded_at="2026-08-16T15:32:00-04:00"
+    )
+    assert c.shares_to_buy == 1
+    assert c.order_notional_usd == 20.0
+    assert ledger.pending_usd(ticker) == 0.0
+
+    # D: an unrelated fresh $10 contribution, entirely independent of A/B/C.
+    d = ledger.record_contribution(
+        ticker, day, 10.0, 100.0, idempotency_key="D", recorded_at="2026-08-16T15:33:00-04:00"
+    )
+    assert d.shares_to_buy == 0
+    assert ledger.pending_usd(ticker) == 10.0
+
+    # B's zero-contribution retry: its own $10 share of the pool was fully
+    # consumed by C's $20 withdrawal (which drained both A's and B's
+    # tied $10s), so it must have no actionable credit left. Priced at
+    # $8/share -- low enough that the UN-FIXED $10 credit the bug would
+    # report (B's cumulative pending_after_usd, aged by only C's tie-offset
+    # share) buys a real share and spends $8 of D's untouched $10, while the
+    # correct $0 credit buys nothing at all.
+    b_retry = ledger.record_contribution(
+        ticker, day, 0.0, 8.0, idempotency_key="B", recorded_at="2026-08-16T15:34:00-04:00"
+    )
+    assert b_retry.shares_to_buy == 0, (
+        "B's own tied credit was already fully consumed by C's withdrawal -- "
+        "it must not fire using D's untouched contribution"
+    )
+    assert ledger.pending_usd(ticker) == 10.0, (
+        "B's retry must not spend D's contribution -- B's own tied credit "
+        "was already fully consumed by C's withdrawal"
+    )

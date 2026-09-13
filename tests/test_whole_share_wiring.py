@@ -2052,6 +2052,130 @@ def test_immediate_placement_failure_books_a_still_live_order_found_via_terminal
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
 
 
+def test_immediate_placement_failure_normalizes_a_boolean_primary_id_from_terminal_lookup(tmp_path, monkeypatch):
+    """Codex review, PR #1168: "Normalize terminal-inclusive IDs before
+    stringifying". A terminal-inclusive row with a boolean primary id
+    beside a real secondary alias (``{"id": true, "order_id": "REAL"}``)
+    used to be recorded via a raw ``str(_first_usable_order_id_alias(...)
+    or "") or None`` -- the raw ``str(True)`` stringified it into the
+    apparently-valid durable id "True" instead of falling through to the
+    real "order_id" alias. If later history reports the real order,
+    reconciliation would treat "True" as a distinct, unrelated order and
+    restore the same attempt again. Now routed through
+    `_normalized_order_id(_first_usable_order_id_alias(...))`: this
+    module's own `_first_usable_order_id_alias` (Codex review, PR #1169:
+    "Fall through unusable scalar order aliases") already falls through a
+    boolean primary to the real secondary id, and `_normalized_order_id`
+    is the defense-in-depth backstop that still discards a boolean
+    sentinel outright if it were ever the only alias available.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(
+        whole_share_tickers=frozenset({"BYDDY"}), dry_run=False, max_per_order_usd=10.0
+    )
+
+    class _BooleanPrimaryIdBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise RuntimeError("response timeout")
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None
+
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            return {"id": True, "order_id": "RH-BOOL-PRIMARY-1", "state": "confirmed", "cumulative_quantity": "1"}
+
+    broker = _BooleanPrimaryIdBroker(cash=500.0, reference_prices={"BYDDY": 4.0})
+
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=16.0, target_price=4.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    assert outcome["order_id"] == "RH-BOOL-PRIMARY-1"
+
+
+def test_immediate_placement_failure_normalizes_a_non_scalar_secondary_id_from_a_filled_match(tmp_path, monkeypatch):
+    """Codex review, PR #1168: "Normalize secondary IDs before
+    stringifying". When the primary "id" alias is blank and the fallback
+    "order_id" is a malformed non-scalar (a list), `_first_usable_order_
+    id_alias` returns that fallback unchanged, and a raw `str(... or "")`
+    fabricated an apparently-valid id like "['BAD']" before `record_buy()`
+    could ever validate it. If later history reports the real scalar id
+    for the same broker order, reconciliation would treat the fabricated
+    id as an unrelated durable attempt and restore the same order again.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(
+        whole_share_tickers=frozenset({"BYDDY"}), dry_run=False, max_per_order_usd=10.0
+    )
+
+    class _NonScalarSecondaryIdBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise RuntimeError("response timeout")
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {"id": None, "order_id": ["BAD"], "state": "filled", "cumulative_quantity": "1"}
+
+    broker = _NonScalarSecondaryIdBroker(cash=500.0, reference_prices={"BYDDY": 4.0})
+
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=16.0, target_price=4.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    assert outcome["order_id"] != "['BAD']"
+
+
+def test_immediate_placement_failure_normalizes_a_non_scalar_secondary_id_from_a_terminal_partial_fill(
+    tmp_path, monkeypatch
+):
+    """Codex review, PR #1168: "Normalize partial-fill IDs before
+    stringifying". The sibling terminal PARTIAL-FILL branch (a
+    cancelled/rejected order that executed >0 shares before terminating)
+    carried the identical hazard as the filled-match branch above: when
+    the primary "id" alias is blank and the fallback "order_id" is a
+    malformed non-scalar (a list), `_first_usable_order_id_alias` returns
+    that fallback unchanged, and a raw `str(... or "")` fabricated an
+    apparently-valid id like "['BAD']" before `record_buy()` could ever
+    validate it.
+    """
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = StrategyConfig(
+        whole_share_tickers=frozenset({"BYDDY"}), dry_run=False, max_per_order_usd=10.0
+    )
+
+    class _NonScalarSecondaryIdTerminalPartialBroker(DryRunBroker):
+        def place_whole_share_buy(self, ticker, quantity, ref_id):
+            raise RuntimeError("response timeout")
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None
+
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            return {
+                "id": None,
+                "order_id": ["BAD"],
+                "state": "cancelled",
+                "cumulative_quantity": "1",
+                "average_price": "4.00",
+            }
+
+    broker = _NonScalarSecondaryIdTerminalPartialBroker(cash=500.0, reference_prices={"BYDDY": 4.0})
+
+    outcome, _, running_deployed_7d, errors, _ = _process_buy_candidate(
+        _decision(suggested_amount_usd=16.0, target_price=4.0),
+        ctx=_ctx(config, broker),
+        running_deployed_7d=0.0,
+    )
+
+    assert outcome["status"] == "submitted"
+    assert outcome["order_id"] != "['BAD']"
+
+
 def test_immediate_placement_failure_books_a_still_live_order_found_via_live_only_lookup(tmp_path, monkeypatch):
     """Codex review ("Book matched live orders before continuing"): the
     immediate placement-failure branch's FIRST reconciliation attempt --
@@ -5087,7 +5211,8 @@ def test_accepted_order_is_published_before_a_fallible_fill_lookup(tmp_path, mon
 
 def test_planned_amount_reflects_the_accumulated_notional_when_a_fire_is_blocked(tmp_path, monkeypatch):
     """Codex review ("Persist the actual whole-share planned notional"): a
-    fire blocked by a safety gate (here, the max_per_order_usd ceiling)
+    fire blocked by a safety gate (here, an allowance ceiling below the
+    share price)
     must persist the full accumulated order_notional_usd it was about to
     attempt, not the day's own raw contribution.
     """
@@ -6029,17 +6154,17 @@ def test_claim_verification_failure_is_isolated_without_mutating_the_ledger(tmp_
 
 def test_preserve_pending_failure_while_restoring_a_blocked_fire_is_isolated(tmp_path, monkeypatch):
     """Codex review ("Isolate failures while restoring blocked fires"): when
-    a normal pre-placement gate (here, the max_per_order_usd ceiling) blocks
-    a claimed fire, _preserve_and_block's own ledger.preserve_pending() call
-    can itself raise (a lock timeout, unreadable ledger, or write failure) --
-    the same failure-isolation problem already handled for still_claimed().
-    Without this boundary, the exception would escape
-    _process_buy_candidates_batch entirely, aborting unrelated candidates
-    while this ticker gets no data-error outcome and its deducted fire stays
-    unresolved with no record of why.
+    a normal pre-placement gate (here, the whole-share allowance ceiling)
+    blocks a claimed fire, _preserve_and_block's own
+    ledger.preserve_pending() call can itself raise (a lock timeout,
+    unreadable ledger, or write failure) -- the same failure-isolation
+    problem already handled for still_claimed(). Without this boundary,
+    the exception would escape _process_buy_candidates_batch entirely,
+    aborting unrelated candidates while this ticker gets no data-error
+    outcome and its deducted fire stays unresolved with no record of why.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
-    # $50 share price exceeds the default $10 max_per_order_usd ceiling --
+    # $50 share price exceeds the explicit $49.99 whole-share allowance --
     # blocked before any broker round-trip, reaching _preserve_and_block.
     config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 60.0})
@@ -6084,8 +6209,10 @@ def test_preserve_pending_failure_outcome_retains_a_whole_share_marker_for_redis
     )
     assert ledger.pending_usd("BYDDY") == 60.0
 
-    config = StrategyConfig(whole_share_tickers=frozenset({"BYDDY"}), dry_run=False)
-    # $50 share price exceeds the default $10 max_per_order_usd ceiling --
+    config = StrategyConfig(
+        whole_share_tickers=frozenset({"BYDDY"}), dry_run=False, whole_share_max_per_order_usd=49.99
+    )
+    # $50 share price exceeds the explicit $49.99 whole-share allowance --
     # blocked before any broker round-trip, reaching _preserve_and_block.
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 60.0})
 
@@ -6990,9 +7117,9 @@ def test_planned_spend_preview_applies_the_kill_switch_ceiling(tmp_path, monkeyp
 
     Seeds a $150 pending balance -- at $9.90/share, an UNCAPPED preview would
     compute a ~$148.50 notional, comfortably past the $129 tier-escalation
-    threshold -- then engages the kill switch. With the fix, the preview
-    clamps to the $2 kill-switch ceiling (0 shares fit under it), so the
-    live tier-selection call must see approximately $0, not ~$148.50.
+    threshold -- then engages the kill switch. The preview clamps to the $2
+    kill-switch ceiling (0 shares fit under it), so the live tier-selection
+    call must see approximately $0, not ~$148.50.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     ledger = WholeShareAccumulationLedger()
@@ -7147,12 +7274,10 @@ def test_tier_planning_reconciles_the_price_for_a_fresh_whole_share_buy(tmp_path
     run_once(ctx)
 
     assert calls, "select_budget_tier was never called"
-    # With the fix, the preview reconciles to the HIGHER $10.09 quote (same
-    # as execution) -- a $0 pending balance plus the $9.90 contribution
-    # ($9.90 total) does not cover a $10.09 share, so the real plan is $0.
-    # Without the fix, the preview would use Finance's unreconciled $9.90
-    # quote directly (0 shares fit == the SAME price as the total, so it
-    # actually WOULD fire at exactly $9.90) and overstate planned spend.
+    # The preview reconciles to the HIGHER $10.09 quote (same as execution) --
+    # a $0 pending balance plus the $9.90 contribution ($9.90 total) does not
+    # cover a $10.09 share, so the real plan is $0. Using Finance's unreconciled
+    # $9.90 quote directly would overstate planned spend.
     assert calls[0] == pytest.approx(0.0, abs=0.01)
 
 

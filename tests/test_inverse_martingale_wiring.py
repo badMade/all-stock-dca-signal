@@ -317,9 +317,8 @@ def test_kill_switch_capped_rollback_stamps_the_current_stream_not_a_stale_one(t
     assert tracker["accumulated_usd"] == pytest.approx(2.0, abs=0.01)
     assert tracker["fire_attempts"] == 1
     assert tracker["last_evaluated_trading_day"] == TEST_DATES[2].isoformat()
-    # The bug: before the fix, this stayed "morning" (im_pre_fire_state's
-    # own stale stamp from the accumulation phase) instead of reflecting
-    # THIS settlement's own actual stream, "midday".
+    # This must reflect THIS settlement's own actual stream ("midday"),
+    # not the stale "morning" stamp inherited from the accumulation phase.
     assert tracker["last_evaluated_stream"] == "midday"
 
     # A genuine RETRY of the SAME midday slot, same day, must be a pure
@@ -388,14 +387,14 @@ def test_kill_switch_capped_rollback_stamps_the_settlement_as_a_real_evaluation(
     assert settled["accumulated_usd"] == pytest.approx(2.0, abs=0.01)
     assert settled["fire_attempts"] == 1
     assert settled["last_evaluated_stream"] == "midday"
-    # The bug: before the fix, this stayed False (copied unchanged from
-    # im_pre_fire_state's stale guarded-deferral stamp) instead of reflecting
-    # that THIS settlement is itself a genuine, real evaluation.
+    # This must be True to reflect that THIS settlement is itself a genuine,
+    # real evaluation, rather than remaining False (which would be copied
+    # unchanged from im_pre_fire_state's stale guarded-deferral stamp).
     assert settled["last_evaluated_is_real"] is True
 
     # A genuine RETRY of the SAME midday slot, same day, must be a pure
-    # no-op: no new order, fire_attempts unchanged. Before the fix, the
-    # stale last_evaluated_is_real=False would have defeated the
+    # no-op: no new order, fire_attempts unchanged. Without the restamping
+    # above, the stale last_evaluated_is_real=False would have defeated the
     # STATUS_FIRING same-stream retry guard here, submitting a second order.
     r3c, s3c, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 98.5, "day3-midday-retry", stream="midday")
     assert s3c["buy_candidates"] == []
@@ -2485,6 +2484,36 @@ def test_lease_fingerprint_key_rejects_material_that_is_not_full_length_hex(tmp_
     # Must not accept the truncated material as the key -- same fail-closed
     # "record no account identity" outcome as every other unusable-key case.
     assert _lease_fingerprint_key(key_dir) is None
+
+
+def test_lease_fingerprint_key_repairs_unsafe_permissions_on_an_existing_file(tmp_path):
+    """Regression test for "Reject fingerprint keys with unsafe file
+    permissions". The create-if-absent path always writes this file 0600,
+    but an ALREADY-published key can reach ``_published()`` with a wider
+    mode -- a backup restore or manual copy that did not preserve
+    permissions, say. A world/group-readable key file lets any other local
+    reader who also obtains a persisted account fingerprint recover the
+    HMAC key and enumerate the account-number space, defeating the reason
+    this scheme uses a keyed digest instead of an unkeyed one. The mode is
+    tightened in place rather than the key rejected outright: rejecting it
+    would mint a brand new key and permanently strand every fingerprint
+    already computed against the correct material still on disk.
+    """
+    import stat
+
+    from near_close_dca import _LEASE_FINGERPRINT_KEY_FILENAME, _lease_fingerprint_key
+
+    key_dir = tmp_path / "keys"
+    key_dir.mkdir(parents=True)
+    key_path = key_dir / _LEASE_FINGERPRINT_KEY_FILENAME
+    material = "a" * 64
+    key_path.write_text(material, encoding="utf-8")
+    key_path.chmod(0o644)
+
+    key = _lease_fingerprint_key(key_dir)
+
+    assert key == material.encode("utf-8")
+    assert stat.S_IMODE(key_path.stat().st_mode) == 0o600
 
 
 def test_lease_fingerprint_key_directory_is_fsynced_after_publishing(tmp_path, monkeypatch):

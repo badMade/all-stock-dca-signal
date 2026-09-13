@@ -141,6 +141,36 @@ def test_write_tick_csv_overwrites_an_existing_file(tmp_path):
     assert len(written) == 2
 
 
+def test_write_tick_csv_deduplicates_repeated_dates_on_the_initial_write(tmp_path):
+    # Codex review, PR #631 discussion_r3914702431: the `existing is None`
+    # branch (no archive yet, this is the first-ever write) used to return
+    # the filtered download frame verbatim, skipping the keep="last" dedup
+    # the `existing is not None` refresh branch below already applies. A
+    # first Yahoo response that itself carries a duplicate Date (not merged
+    # with anything -- duplicated on its own) created an initial archive
+    # with two rows for the same date instead of one.
+    history_dir = tmp_path / "histories"
+    index = pd.DatetimeIndex(["2024-01-02", "2024-01-02", "2024-01-03"], name="Date")
+    frame = pd.DataFrame(
+        {
+            # The later row for the repeated 2024-01-02 date (450.0) must win,
+            # matching the refresh branch's own keep="last" convention.
+            "Open": [500.0, 505.0, -120.0],
+            "High": [980.0, 985.0, 640.0],
+            "Low": [-610.0, -605.0, -450.0],
+            "Close": [210.0, 450.0, -80.0],
+            "Volume": [0, 0, 0],
+        },
+        index=index,
+    )
+
+    out_path = write_tick_csv(frame, history_dir)
+
+    written = pd.read_csv(out_path, index_col="Date", parse_dates=True)
+    assert list(written.index) == list(pd.DatetimeIndex(["2024-01-02", "2024-01-03"]))
+    assert list(written["Close"]) == [450.0, -80.0]
+
+
 def test_main_writes_to_the_configured_archive_by_default(tmp_path, monkeypatch):
     # The default archive must already exist (mirrors dca_intraday_archive.py's
     # and scripts/refresh_active_ticker_histories.py's identical convention:

@@ -136,7 +136,7 @@ class TestMarketEncoder:
         probe = features.build_panel(history, min_history=60)
         cutoff = pd.Timestamp(probe.calendar[200])
         panel = features.build_panel(history, min_history=60, initial_train_end=cutoff)
-        kwargs = {
+        kwargs: Any = {
             **TINY,
             "alpha": 0.0,
             "beta": 1.0,

@@ -61,7 +61,6 @@ else:
     msvcrt = None  # type: ignore[assignment]
 
 import numpy as np
-
 from data import COMPONENTS, TrainingPanel
 from ledger import Ledger
 from metrics import score_forecast
@@ -1535,10 +1534,10 @@ class WalkForwardHarness:
                 # review: "Deduplicate reveals scored after the calendar is
                 # exhausted").
                 revealed_pairs: set[tuple[str, int]] = set()
-                # Keyed by (model, target_date), same reasoning as step()'s
-                # identical fix: several outstanding entries here can carry
-                # different REAL target dates (each one's own label_end_date),
-                # so one calibrator nudge per model would lump them together
+                # Keyed by (model, target_date), same reasoning as step():
+                # several outstanding entries here can carry different REAL
+                # target dates (each one's own label_end_date), so one
+                # calibrator nudge per model would lump them together
                 # (Codex review: "Calibrate each overdue target date
                 # separately").
                 calibration_batches: dict[tuple[str, str], list[tuple[dict, dict]]] = {}

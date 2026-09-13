@@ -925,6 +925,35 @@ def test_record_rebase_preserves_minimum_order_provenance_after_threshold_crossi
     assert ledger.minimum_order_pending_tickers("2026-08-10") == {"XYZ": 0.50}
 
 
+def test_record_with_idempotency_key_but_nothing_to_rebase_still_places_an_order(
+    tmp_path,
+):
+    # Codex review discussion_r3904287096 ("Rebase only when a matching
+    # preserved credit exists"): a bare idempotency_key alone used to be
+    # enough to set `rebased = True`, so a plain record() call that has
+    # neither a matching preserve_pending() entry NOR an explicit
+    # pending_baseline_usd had every threshold-crossing decision silently
+    # overridden into pending credit, even though there was nothing stale
+    # to rebase against. An existing $0.40 pending plus this $0.20 credit
+    # must still return the policy's normal $1.00 rounded-up order, exactly
+    # as it would without an idempotency_key at all.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-10", 0.40, stream="s0")
+    assert ledger.pending_usd("XYZ", "2026-08-10") == 0.40
+
+    decision = ledger.record(
+        "XYZ",
+        "2026-08-10",
+        0.20,
+        idempotency_key="slot",
+        stream="s1",
+    )
+
+    assert decision.order_amount_usd == 1.0
+    assert decision.pending_after_usd == 0.0
+    assert ledger.pending_usd("XYZ", "2026-08-10") == 0.0
+
+
 def test_settle_partitions_the_submitted_amount_across_provenance_pools(tmp_path):
     # Codex review discussion on commit 0af4768 ("Allocate settlement once
     # across provenance pools"): minimum_pending and a preserve: entry are

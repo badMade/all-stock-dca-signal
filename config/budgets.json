@@ -30,24 +30,27 @@
       "name": "normal",
       "daily_cap_usd": 180.0,
       "weekly_cap_usd": 900.0,
-      "select_when": "planned spend <= $129 and 3x-or-greater signals <= 5",
+      "select_when": "3x-or-greater signals <= 5",
       "escalate_above_planned_spend_usd": 129.0,
+      "escalate_above_planned_spend_usd_note": "NON-GATING. Documentation/monitoring reference only -- tier selection does not key on planned spend. See selection_rule.",
       "escalate_above_high_multiplier_signals": 5
     },
     {
       "name": "elevated",
       "daily_cap_usd": 240.0,
       "weekly_cap_usd": 1200.0,
-      "select_when": "planned spend > $129 or 3x-or-greater signals 6-10",
+      "select_when": "3x-or-greater signals 6-10",
       "escalate_above_planned_spend_usd": 213.0,
+      "escalate_above_planned_spend_usd_note": "NON-GATING. Documentation/monitoring reference only -- tier selection does not key on planned spend. See selection_rule.",
       "escalate_above_high_multiplier_signals": 10
     },
     {
       "name": "high_volatility",
       "daily_cap_usd": 300.0,
       "weekly_cap_usd": 1500.0,
-      "select_when": "planned spend > $213 or 3x-or-greater signals 11-17",
+      "select_when": "3x-or-greater signals 11-17",
       "escalate_above_planned_spend_usd": 272.0,
+      "escalate_above_planned_spend_usd_note": "NON-GATING. Documentation/monitoring reference only -- tier selection does not key on planned spend. See selection_rule.",
       "escalate_above_high_multiplier_signals": 17
     },
     {
@@ -55,11 +58,11 @@
       "daily_cap_usd": 360.0,
       "weekly_cap_usd": 1800.0,
       "requires_rollover_reserve": true,
-      "select_when": "planned spend > $272 or 3x-or-greater signals > 17",
+      "select_when": "3x-or-greater signals > 17",
       "note": "Usable only to the extent prior unused weekly rollover reserve is available."
     }
   ],
-  "selection_rule": "Pick the highest tier triggered by EITHER planned spend or the count of 3x-or-greater signals. A 3x-or-greater signal is a buy candidate whose ladder multiplier is >= 3.0.",
+  "selection_rule": "Pick the tier keyed SOLELY on the count of 3x-or-greater signals in the Gate 7 candidate list (fixed before sizing runs): Normal <=5, Elevated 6-10, High-volatility 11-17, Stress >17. A 3x-or-greater signal is a buy candidate whose ladder multiplier is >= 3.0. Tier selection must NEVER key on planned spend, which is an output of the sizing decision, not an input fixed before it -- each tier's escalate_above_planned_spend_usd is retained only as a non-gating documentation/monitoring reference (see the per-tier escalate_above_planned_spend_usd_note fields).",
   "allocation_priority": "Prioritize allocations by higher multiplier first, then larger percent drop, then ticker (alphabetical) for a deterministic tie-break. Flag any capped tickers.",
   "broker_roles": {
     "robinhood": {

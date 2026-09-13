@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -1284,7 +1285,38 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     must still count toward reporting even when the run as a whole failed
     the scheduled-artifact contract.
     """
-    loaded = [json.loads(Path(p).read_bytes()) for p in paths]
+    # Per-path, not an all-or-nothing comprehension: an artifact tree can
+    # retain a truncated or unreadable run_state.json from a run that was
+    # interrupted mid-write (a crash, a killed process) alongside otherwise
+    # healthy artifacts from every other day. A single corrupt file raising
+    # here previously aborted the ENTIRE weekly dashboard -- every healthy
+    # state's real order/notional evidence discarded along with the one
+    # damaged file -- rather than skipping just the affected artifact and
+    # still reporting on the rest of the week (Codex review: "Isolate
+    # malformed run states during loading").
+    loaded = []
+    for p in paths:
+        try:
+            decoded = json.loads(Path(p).read_bytes())
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"warning: skipping unreadable run_state {p}: {exc}", file=sys.stderr)
+            continue
+        # Syntactically valid JSON with a non-object root (null, a bare
+        # list/number/string) decodes without error, but every consumer
+        # below -- starting with the very next line's data.get(...) --
+        # assumes a dict. Left unchecked, that AttributeError propagated
+        # out of this per-path guard exactly like the raw decode failure
+        # it was added to isolate, aborting the whole weekly dashboard over
+        # one malformed artifact (Codex review: "Validate decoded run
+        # states before retaining them").
+        if not isinstance(decoded, dict):
+            print(
+                f"warning: skipping run_state {p}: expected a JSON object at the top level, "
+                f"got {type(decoded).__name__}",
+                file=sys.stderr,
+            )
+            continue
+        loaded.append(decoded)
     kept = [
         data
         for data in loaded

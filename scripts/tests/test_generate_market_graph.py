@@ -89,6 +89,101 @@ def test_ticker_filter_and_date_window_are_applied(combined_csv, tmp_path):
     assert payload["dates"][-1] <= "2024-02-20"
 
 
+def test_drawdown_window_sees_the_full_lookback_before_the_start_boundary(tmp_path):
+    # Codex review, PR #631 discussion_r3914702425: a --drawdown-window render used to
+    # let the loader's own --start truncation (which keeps just ONE bar before `start` --
+    # a prior-close baseline, not a drawdown lookback; see dca_market_graph._window())
+    # starve _rolling_highs() of an earlier peak still inside the requested drawdown
+    # window. A $200 peak, a run of ~$100 filler days, and a first displayed low of $90
+    # should report roughly -55% drawdown against the TRUE 20-session rolling high, not
+    # roughly -10% against only the single bar the truncated series used to retain.
+    csv_path = tmp_path / "drawdown.csv"
+    rows = ["ticker,date,open,high,low,close,volume,vwap,n"]
+    # The true rolling high, well before the --start boundary below.
+    rows.append("AAA,2024-02-01,195.00,200.00,190.00,195.00,1000,195.00,10")
+    # Flat filler sessions between the peak and the requested window -- the ONLY bar
+    # of these the pre-fix truncated load kept was the last one (2024-02-05).
+    for day in range(2, 6):
+        rows.append(f"AAA,2024-02-{day:02d},100.00,101.00,99.00,100.00,1000,100.00,10")
+    # First displayed session: a deep low relative to the TRUE ($200) peak, not the
+    # nearby ($101) filler high.
+    rows.append("AAA,2024-02-06,95.00,100.00,90.00,92.00,1000,95.00,10")
+    # A couple more sessions so the loader keeps at least 2 bars in the displayed window.
+    for day in range(7, 9):
+        rows.append(f"AAA,2024-02-{day:02d},100.00,101.00,99.00,100.00,1000,100.00,10")
+    csv_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    payload_path = tmp_path / "payload.json"
+    assert run(["--source", "csv", "--csv-path", str(csv_path),
+                "--start", "2024-02-06", "--drawdown-window", "20",
+                "--out", str(tmp_path / "o.html"), "--json-out", str(payload_path),
+                "--no-inline-three"]) == 0
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    scale = payload["scales"]["pct_per_unit"]
+    series = next(s for s in payload["series"] if s["ticker"] == "AAA")
+    # payload channels are stored pre-divided by the shared scale (see build_payload's
+    # `y_low.append(round(low / scale, 4))`); multiplying back out recovers the raw
+    # drawdown fraction regardless of what the scene's scale happened to normalize to.
+    first_low_drawdown = series["yl"][0] * scale
+    assert first_low_drawdown == pytest.approx(-0.55, abs=0.02)
+    assert payload["dates"][0] == "2024-02-06"
+
+
+def test_drawdown_window_return_grouping_ignores_pre_start_history(combined_csv, tmp_path, monkeypatch):
+    # Codex review, PR #631 follow-up comment on the drawdown-window fix above:
+    # loading full history for --drawdown-window's rolling-high lookback must not also
+    # feed that untrimmed history to seriate_or_refuse() -- return-correlation grouping
+    # order/clusters should reflect only the requested --start window, the same window
+    # build_payload(frame_start=...) actually draws, not bars the reader never sees.
+    seen = {}
+    real_seriate = cli.mg.seriate_or_refuse
+
+    def spy(series_list, **kwargs):
+        seen["series"] = series_list
+        return real_seriate(series_list, **kwargs)
+
+    monkeypatch.setattr(cli.mg, "seriate_or_refuse", spy)
+
+    assert run(["--source", "csv", "--csv-path", str(combined_csv),
+                "--start", "2024-02-20", "--drawdown-window", "20",
+                "--group-source", "returns",
+                "--out", str(tmp_path / "o.html"), "--no-inline-three"]) == 0
+
+    assert "series" in seen
+    for series in seen["series"]:
+        # At most ONE bar before --start survives -- the return-correlation
+        # baseline close (Codex review, PR #631 discussion_r3917083227), not
+        # the full pre-start history _rolling_highs() sees.
+        pre_start = [bar for bar in series.bars if bar.timestamp.date().isoformat() < "2024-02-20"]
+        assert len(pre_start) <= 1
+
+
+def test_drawdown_window_excludes_a_ticker_with_no_bars_in_the_window(tmp_path):
+    # Codex review, PR #631 discussion_r3917083213: --drawdown-window's full-history
+    # load (load_start=None) skips the loader's own start-boundary exclusion, so a
+    # ticker whose ENTIRE history predates --start used to survive into the resolved
+    # roster and payload as an all-null series -- included in resolution/ticker counts,
+    # left outside the grouping order, drawing nothing. It must be dropped entirely.
+    csv_path = tmp_path / "absent.csv"
+    rows = ["ticker,date,open,high,low,close,volume,vwap,n"]
+    # AAA: has bars both before and inside the requested window.
+    for day in range(1, 11):
+        rows.append(f"AAA,2024-02-{day:02d},100.00,101.00,99.00,100.00,1000,100.00,10")
+    # CCC: EVERY bar predates --start below -- nothing inside the window at all.
+    for day in range(1, 4):
+        rows.append(f"CCC,2024-02-{day:02d},50.00,51.00,49.00,50.00,1000,50.00,10")
+    csv_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    payload_path = tmp_path / "payload.json"
+    assert run(["--source", "csv", "--csv-path", str(csv_path),
+                "--start", "2024-02-05", "--drawdown-window", "20",
+                "--out", str(tmp_path / "o.html"), "--json-out", str(payload_path),
+                "--no-inline-three"]) == 0
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    tickers = [t for t in payload["tickers"] if not t.startswith("__")]
+    assert tickers == ["AAA"]
+
+
 def test_single_mode_omits_the_centroid_and_switches_the_volume_scale(combined_csv, tmp_path):
     payload_path = tmp_path / "payload.json"
     assert run(["--source", "csv", "--csv-path", str(combined_csv), "--single",

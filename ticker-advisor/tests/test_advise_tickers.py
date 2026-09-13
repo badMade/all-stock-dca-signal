@@ -8,10 +8,9 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import advise_tickers
 import pandas as pd
 import pytest
-
-import advise_tickers
 from advise_tickers import (
     PriceHistoryUnavailable,
     _allocate_default_output_dir,
@@ -1210,6 +1209,54 @@ def test_score_candidate_keeps_last_row_for_duplicate_trading_session(monkeypatc
     assert close.loc[duplicated_session] == 999.0
 
 
+def test_score_candidate_keeps_last_row_for_exact_duplicate_timestamps(monkeypatch):
+    # Codex review, PR #654 follow-up ("Keep duplicate timestamps stable
+    # while sorting"): DataFrame.sort_index()'s default sort (quicksort) is
+    # not guaranteed stable, so rows sharing the exact SAME raw timestamp
+    # (not merely the same normalized session date) can be reordered by the
+    # sort itself, before keep="last" ever runs -- the dedup would then keep
+    # whichever duplicate happens to land last post-sort rather than the
+    # source's actual final correction. Interspersing several EXACT-duplicate
+    # timestamps among distinct sessions exercises the sort, not just the
+    # dedup.
+    full_calendar = pd.bdate_range(end=pd.Timestamp.now().normalize(), periods=5)
+    duplicated_session = full_calendar[0]
+    # Five identical-timestamp rows for the same session, each row's price
+    # marking its position in the ORIGINAL array order (1.0 first ... 5.0
+    # last -- the real final correction), followed by the rest of the
+    # ordinary calendar.
+    candidate_index = pd.DatetimeIndex([duplicated_session] * 5).append(full_calendar[1:])
+    closes = [1.0, 2.0, 3.0, 4.0, 5.0] + [100.0] * 4
+    frame = pd.DataFrame(
+        {"Open": closes, "High": closes, "Low": closes, "Close": closes, "Adj Close": closes, "Volume": 1},
+        index=candidate_index,
+    )
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", lambda ticker, **kwargs: frame)
+
+    captured_close = {}
+
+    def capturing_backtest_score(close):
+        captured_close["close"] = close
+        return {}
+
+    monkeypatch.setattr(advise_tickers, "backtest_score", capturing_backtest_score)
+
+    score_candidate(
+        "STABLESORT",
+        benchmark_returns=None,
+        lookback_years=3,
+        skip_sentiment=True,
+        news_api_key=None,
+        analyzer=None,
+        history_dir=None,
+        benchmark_calendar=full_calendar,
+    )
+
+    close = captured_close["close"]
+    assert not close.index.duplicated().any()
+    assert close.loc[duplicated_session.normalize()] == 5.0
+
+
 def test_score_candidate_sorts_reverse_chronological_intraday_prints(monkeypatch):
     # Codex review, PR #654 ("Sort timestamps before retaining the last
     # session row"): fresh evidence after the keep="last" fix above is
@@ -1862,14 +1909,20 @@ def test_main_normalizes_benchmark_returns_to_candidate_session_dates(tmp_path, 
 
 def test_coerce_datetime_index_handles_mixed_utc_offsets():
     # Codex review, PR #654 ("Normalize mixed-offset object indexes
-    # safely"): an object-dtype index of tz-aware Python datetimes spanning
-    # a DST transition passes _index_is_datetime_like() -- every value IS
-    # still a `date` -- but the plain `pd.DatetimeIndex(index)` constructor
-    # raises "ValueError: Tz-aware datetime.datetime cannot be converted to
-    # datetime64 unless utc=True" when the offsets aren't uniform, outside
-    # any per-signal error-recording guard and aborting the entire
-    # advisory batch. _coerce_datetime_index() must retry with utc=True
-    # instead of propagating that error.
+    # safely"; follow-up "Preserve local dates when coercing mixed-offset
+    # indexes"): an object-dtype index of tz-aware Python datetimes
+    # spanning a DST transition passes _index_is_datetime_like() -- every
+    # value IS still a `date` -- but the plain `pd.DatetimeIndex(index)`
+    # constructor raises "ValueError: Tz-aware datetime.datetime cannot be
+    # converted to datetime64 unless utc=True" when the offsets aren't
+    # uniform, outside any per-signal error-recording guard and aborting
+    # the entire advisory batch. Retrying through utc=True "fixes" the
+    # crash but collapses every value onto a single UTC instant -- for a
+    # positive-offset zone that shifts the local date back by one full
+    # day, exactly the local-date-preservation bug tz_localize(None)
+    # (rather than tz_convert()) exists to avoid elsewhere. The correct
+    # fix drops each value's OWN timezone individually instead, since a
+    # mixed-offset index cannot share one tz-aware dtype at all.
     from datetime import datetime, timedelta, timezone
 
     est = timezone(timedelta(hours=-5))
@@ -1886,7 +1939,33 @@ def test_coerce_datetime_index_handles_mixed_utc_offsets():
     coerced = advise_tickers._coerce_datetime_index(mixed_offset_index)
 
     assert isinstance(coerced, pd.DatetimeIndex)
-    assert coerced.tz is not None
+    # Naive, not tz-aware: each value's own local wall-clock date is kept
+    # (dropping its individual offset), not converted through a shared UTC
+    # instant that would shift a positive-offset date onto the prior day.
+    assert coerced.tz is None
+    assert list(coerced) == [pd.Timestamp(2026, 1, 5), pd.Timestamp(2026, 7, 5)]
+
+
+def test_coerce_datetime_index_preserves_positive_offset_local_dates():
+    # Codex review, PR #654 follow-up ("Preserve local dates when coercing
+    # mixed-offset indexes"): a positive-offset local midnight converted
+    # through UTC first lands on the PREVIOUS UTC calendar day -- e.g.
+    # 2026-01-02 00:00+10:00 is 2026-01-01 14:00 UTC. Mixed with a second,
+    # differently-offset value (forcing the fallback branch), the fix must
+    # still report 2026-01-02 as this value's session date, not 2026-01-01.
+    from datetime import datetime, timedelta, timezone
+
+    aest = timezone(timedelta(hours=10))
+    est = timezone(timedelta(hours=-5))
+    mixed_offset_index = pd.Index(
+        [datetime(2026, 1, 2, 0, 0, tzinfo=aest), datetime(2026, 1, 5, tzinfo=est)],
+        dtype=object,
+    )
+
+    coerced = advise_tickers._coerce_datetime_index(mixed_offset_index)
+
+    assert coerced.tz is None
+    assert list(coerced) == [pd.Timestamp(2026, 1, 2), pd.Timestamp(2026, 1, 5)]
 
 
 def test_score_candidate_sorts_mixed_date_and_datetime_object_index(monkeypatch):
@@ -2545,3 +2624,94 @@ def test_index_is_datetime_like_rejects_nat_only_index():
     # ...and an EMPTY index keeps its prior behaviour: pd.isna([]).all() is
     # vacuously True, but emptiness is not the condition this guards.
     assert advise_tickers._index_is_datetime_like(pd.DatetimeIndex([]))
+
+
+def test_index_is_datetime_like_rejects_all_nat_period_index():
+    # Codex review, PR #654 follow-up ("Reject all-NaT PeriodIndexes before
+    # normalization"): a nonempty daily PeriodIndex holding only NaT is the
+    # same "genuinely typed but carries no calendar information" case the
+    # datetime64 branch above already rejects -- without this, it reached
+    # _normalize_datetime_frame() and produced an all-NaT DatetimeIndex,
+    # whose min()/max() then raised inside
+    # _detect_benchmark_calendar_gaps() (NaTType has no `normalize`).
+    nat_only_period = pd.PeriodIndex([pd.NaT, pd.NaT], freq="D")
+    assert not advise_tickers._index_is_datetime_like(nat_only_period)
+
+    # A single valid period among NaTs is still usable and still accepted.
+    mixed_period = pd.PeriodIndex([pd.NaT, pd.Period("2026-08-03", freq="D")])
+    assert advise_tickers._index_is_datetime_like(mixed_period)
+
+
+def test_main_cancels_queued_scoring_on_interrupt(tmp_path, monkeypatch):
+    # executor.map() submits every candidate up front; an operator's Ctrl-C
+    # while iterating results must not let the whole remaining batch run to
+    # completion before returning control (Codex review: "Cancel queued
+    # scoring work when interrupted"). Simulates the interrupt via the first
+    # score_candidate() call and verifies the executor is torn down with
+    # cancel_futures=True rather than the bare with-block's default
+    # shutdown(wait=True), and that the interrupt is propagated to the
+    # caller rather than hard-terminating the interpreter -- main() is a
+    # reusable function, not just a CLI entry point, so a caller must be
+    # able to run its own cleanup (Codex follow-up review: "Let callers
+    # perform cleanup after an interrupt").
+    import concurrent.futures
+
+    def _raise_price_unavailable(ticker, **kwargs):
+        raise PriceHistoryUnavailable(f"no history for {ticker}")
+
+    def _raise_keyboard_interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", _raise_price_unavailable)
+    monkeypatch.setattr(advise_tickers, "score_candidate", _raise_keyboard_interrupt)
+
+    shutdown_calls = []
+    original_shutdown = concurrent.futures.ThreadPoolExecutor.shutdown
+
+    def _tracking_shutdown(self, *args, **kwargs):
+        shutdown_calls.append((args, kwargs))
+        return original_shutdown(self, *args, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, "shutdown", _tracking_shutdown)
+
+    with pytest.raises(KeyboardInterrupt):
+        advise_tickers.main(
+            ["--candidates", "ZZZZZZ", "YYYYYY", "--skip-sentiment", "--output-dir", str(tmp_path / "out")]
+        )
+
+    assert len(shutdown_calls) == 1
+    _args, kwargs = shutdown_calls[0]
+    assert kwargs.get("wait") is False
+    assert kwargs.get("cancel_futures") is True
+
+
+def test_main_bounds_concurrent_candidate_scoring(tmp_path, monkeypatch):
+    # The unbounded default ThreadPoolExecutor worker count (min(32,
+    # os.cpu_count() + 4)) would let that many candidates issue NewsAPI
+    # requests at once, some of which then hit throttling and silently lose
+    # news evidence while their peers keep it (Codex review: "Bound
+    # parallel NewsAPI requests"). Matches the bound this repo's other
+    # concurrent sentiment collector uses for the same reason
+    # (sentiment_cron.py's MAX_CONCURRENT_TICKERS).
+    import concurrent.futures
+
+    def _raise_price_unavailable(ticker, **kwargs):
+        raise PriceHistoryUnavailable(f"no history for {ticker}")
+
+    monkeypatch.setattr(advise_tickers, "fetch_price_history", _raise_price_unavailable)
+
+    captured_max_workers = []
+    original_init = concurrent.futures.ThreadPoolExecutor.__init__
+
+    def _tracking_init(self, *args, max_workers=None, **kwargs):
+        captured_max_workers.append(max_workers)
+        return original_init(self, *args, max_workers=max_workers, **kwargs)
+
+    monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, "__init__", _tracking_init)
+
+    exit_code = advise_tickers.main(
+        ["--candidates", "ZZZZZZ", "YYYYYY", "--skip-sentiment", "--output-dir", str(tmp_path / "out")]
+    )
+
+    assert exit_code == 2  # both candidates fail to price -- unrelated to this assertion
+    assert captured_max_workers == [advise_tickers.MAX_CONCURRENT_CANDIDATES]

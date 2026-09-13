@@ -26,15 +26,6 @@ Characteristics of this generation:
 * The account is addressed directly rather than through the environment: the
   live text hard-codes it at each call site (here shown redacted), instead of
   reading it from `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` at run time.
-* The `0935` copy is likewise AHEAD of live, for Gate 5 only: as of
-  2026-08-26 `scripts/generate_market_open_candidates.py` exists, so that
-  copy's Gate 5 names the command to run instead of pointing at "the repo's
-  own signal generation" -- which, for this slot, was an entry point that did
-  not exist, so every fire produced no buy list at all. Gates 6, 6.5, 6.7 and
-  7 are unchanged there. Same caveat as the 1230 copy below: until a human
-  applies that body through `update_scheduled_task` and the mirror is
-  re-captured, the ACTUAL live 9:35 task still carries the older Gate 5 and
-  still cannot produce a buy list. See `docs/market_open_signal_entry.md`.
 * Live placement is ON for six slots. The 1230 slot is the exception, and its
   `live-mirror/` copy is currently AHEAD of what was actually captured
   2026-07-31: PR #412 rewrote it so Gates 0/1/3/4/6 call `dca_runner.py`'s
@@ -52,17 +43,8 @@ Characteristics of this generation:
   contains. Diff against a fresh capture before trusting this bullet as
   "what actually runs."
 * Gate 5 tells the executor to run the repo's signal generation and to abort if
-  it errors. That used to abort every day, because no such entry point existed
-  for the seven-slot roster. All seven now have one — see
-  `../../PRODUCTION_READINESS.md` for the slot-to-producer table. Each is scoped
-  to its own slot on purpose (the streams have different executors, decision
-  anchors, and ladders), so pointing one slot's prompt at another slot's
-  producer would silently score it against the wrong logic.
-* A producer existing is not the same as a slot trading: the live task's prompt
-  must actually name the command, and that text lives outside this repo. Until a
-  human applies a rewritten body via `update_scheduled_task` and the mirror is
-  re-captured, the live task still runs whatever was captured — so treat every
-  Gate 5 claim in these files as proposed, not active.
+  it errors — which it does, every day, because no such entry point exists for
+  the seven-slot roster (see `../../PRODUCTION_READINESS.md`).
 * `GATE 6.5 - SAME-DAY TOP-UP GUARD` (step 4.5 in the 1230 slot) invokes
   `scripts/same_day_top_up_gate.py`.
 
