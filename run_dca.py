@@ -1203,19 +1203,37 @@ def _fills_from_orders_csv(orders_csv: Path) -> List[Dict[str, Any]]:
         return []
     fills: List[Dict[str, Any]] = []
     with orders_csv.open(newline="", encoding="utf-8") as handle:
-        for row in csv.DictReader(handle):
-            if (row.get("status") or "").lower() != "filled":
+        reader = csv.reader(handle)
+        try:
+            fieldnames = next(reader)
+        except StopIteration:
+            return fills
+
+        try:
+            idx_status = fieldnames.index("status")
+            idx_avg_fill_price = fieldnames.index("avg_fill_price")
+            idx_quantity_filled = fieldnames.index("quantity_filled")
+            idx_ticker = fieldnames.index("ticker")
+            idx_order_id = fieldnames.index("order_id")
+        except ValueError:
+            return fills
+
+        for row in reader:
+            if len(row) <= max(idx_status, idx_avg_fill_price, idx_quantity_filled, idx_ticker, idx_order_id):
                 continue
-            fill_price = (row.get("avg_fill_price") or "").strip()
-            filled_qty = (row.get("quantity_filled") or "").strip()
+
+            if (row[idx_status] or "").lower() != "filled":
+                continue
+            fill_price = (row[idx_avg_fill_price] or "").strip()
+            filled_qty = (row[idx_quantity_filled] or "").strip()
             if fill_price == "" or fill_price == "-" or filled_qty == "" or filled_qty == "-":
                 continue
             fills.append(
                 {
-                    "ticker": row.get("ticker"),
+                    "ticker": row[idx_ticker],
                     "fill_price": fill_price,
                     "filled_qty": filled_qty,
-                    "order_id": row.get("order_id"),
+                    "order_id": row[idx_order_id],
                 }
             )
     return fills
@@ -1233,11 +1251,22 @@ def _execution_targets_from_orders_csv(orders_csv: Path) -> Dict[str, Optional[f
     if not orders_csv.exists():
         return targets
     with orders_csv.open(newline="", encoding="utf-8") as handle:
-        for row in csv.DictReader(handle):
-            ticker = row.get("ticker")
+        reader = csv.reader(handle)
+        try:
+            fieldnames = next(reader)
+            idx_ticker = fieldnames.index("ticker")
+            idx_target_price = fieldnames.index("target_price")
+        except (StopIteration, ValueError):
+            return targets
+
+        for row in reader:
+            if len(row) <= max(idx_ticker, idx_target_price):
+                continue
+
+            ticker = row[idx_ticker]
             if not ticker:
                 continue
-            raw = row.get("target_price")
+            raw = row[idx_target_price]
             try:
                 targets[ticker] = float(raw) if raw not in (None, "", "-") else None
             except (TypeError, ValueError):
@@ -1258,11 +1287,22 @@ def _execution_targets_by_order_id_from_orders_csv(orders_csv: Path) -> Dict[str
     if not orders_csv.exists():
         return targets
     with orders_csv.open(newline="", encoding="utf-8") as handle:
-        for row in csv.DictReader(handle):
-            order_id = row.get("order_id")
+        reader = csv.reader(handle)
+        try:
+            fieldnames = next(reader)
+            idx_order_id = fieldnames.index("order_id")
+            idx_target_price = fieldnames.index("target_price")
+        except (StopIteration, ValueError):
+            return targets
+
+        for row in reader:
+            if len(row) <= max(idx_order_id, idx_target_price):
+                continue
+
+            order_id = row[idx_order_id]
             if not order_id:
                 continue
-            raw = row.get("target_price")
+            raw = row[idx_target_price]
             try:
                 targets[order_id] = float(raw) if raw not in (None, "", "-") else None
             except (TypeError, ValueError):
@@ -1335,13 +1375,38 @@ def _refresh_fills_from_broker(
     queries = []
 
     with orders_csv.open(newline="", encoding="utf-8") as handle:
-        for row in csv.DictReader(handle):
-            order_id = row.get("order_id")
-            status = (row.get("status") or "").lower()
+        reader = csv.reader(handle)
+        try:
+            fieldnames = next(reader)
+            idx_order_id = fieldnames.index("order_id")
+            idx_status = fieldnames.index("status")
+            idx_ticker = fieldnames.index("ticker")
+        except (StopIteration, ValueError):
+            return refreshed
+
+        try:
+            idx_avg_fill_price = fieldnames.index("avg_fill_price")
+        except ValueError:
+            idx_avg_fill_price = -1
+        try:
+            idx_quantity_filled = fieldnames.index("quantity_filled")
+        except ValueError:
+            idx_quantity_filled = -1
+        try:
+            idx_action_reason = fieldnames.index("action_reason")
+        except ValueError:
+            idx_action_reason = -1
+
+        for row in reader:
+            if len(row) <= max(idx_order_id, idx_status, idx_ticker):
+                continue
+
+            order_id = row[idx_order_id]
+            status = (row[idx_status] or "").lower()
             if not order_id:
                 continue
-            fill_price = (row.get("avg_fill_price") or "").strip()
-            filled_qty = (row.get("quantity_filled") or "").strip()
+            fill_price = (row[idx_avg_fill_price] or "").strip() if idx_avg_fill_price >= 0 and idx_avg_fill_price < len(row) else ""
+            filled_qty = (row[idx_quantity_filled] or "").strip() if idx_quantity_filled >= 0 and idx_quantity_filled < len(row) else ""
             has_complete_fill_data = fill_price not in ("", "-") and filled_qty not in ("", "-")
             # A terminal crash-lease recovery valued ONLY through
             # executed_notional (action_reason ==
@@ -1376,9 +1441,11 @@ def _refresh_fills_from_broker(
             # for recovery rows"). Any such stale entry is dropped from
             # `refreshed` here so the authoritative recovery row -- unpriced
             # on purpose -- is the only one that survives for this order_id.
+
+            action_reason = row[idx_action_reason] if idx_action_reason >= 0 and idx_action_reason < len(row) else None
             if (
                 status == "filled"
-                and row.get("action_reason") == "recovered_inverse_martingale_lease"
+                and action_reason == "recovered_inverse_martingale_lease"
                 and not has_complete_fill_data
             ):
                 if order_id in known:
@@ -1386,7 +1453,7 @@ def _refresh_fills_from_broker(
                 known.add(order_id)
                 refreshed.append(
                     {
-                        "ticker": row.get("ticker"),
+                        "ticker": row[idx_ticker],
                         "fill_price": "",
                         "filled_qty": "",
                         "order_id": order_id,
@@ -1398,7 +1465,7 @@ def _refresh_fills_from_broker(
             # Deduplicate locally before fetching, regardless of lookup outcome, so a CSV
             # with repeated rows for the same order_id never queries it twice.
             known.add(order_id)
-            queries.append((order_id, row.get("ticker"), status))
+            queries.append((order_id, row[idx_ticker], status))
 
     if not queries:
         return refreshed

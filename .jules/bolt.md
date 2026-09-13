@@ -125,3 +125,7 @@ Added `get_order_fills` to `BrokerAdapter` protocol and Robinhood live adapter, 
 ## 2026-10-10 - Avoid text decode when filtering local JSON files via substring check
 **Learning:** When filtering JSON files on a loop using a substring check before `json.loads`, loading the file as bytes (`path.read_bytes()`) and checking against a pre-encoded bytes needle (`needle.encode("utf-8")`) avoids decoding the entire file into a Python string. Although `json.loads` will eventually decode it back to string internally, skipping the explicit text decode provides measurable performance improvements since skipped files avoid text allocation altogether.
 **Action:** When performing substring filtering on local JSON files before parsing, prefer `read_bytes()` with a loop-invariant bytes needle over `read_text(encoding="utf-8")` with a string needle.
+
+## 2026-10-15 - Optimize csv.DictReader loops
+**Learning:** `csv.DictReader` allocates a new Python dictionary for every parsed row, which causes massive overhead in hot loops or large CSVs. However, replacing it with `csv.reader` and manually building a dict via `dict(zip(fieldnames, row))` merely relocates the allocation and yields zero performance benefit.
+**Action:** When refactoring `csv.DictReader` for performance where specific fields are extracted, switch to `csv.reader`, retrieve the index of the required columns once per file (`fieldnames.index(col)`), and extract elements using list indexing directly inside the loop `row[idx]`.
