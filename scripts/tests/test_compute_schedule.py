@@ -206,22 +206,40 @@ def test_compute_cadence_dormant_when_empty(monkeypatch):
 def test_compute_cadence_high_velocity(monkeypatch):
     monkeypatch.setattr(compute_schedule, "run_cmd", lambda cmd: "\n".join(["2026-09-01T12:00:00Z"] * 55))
     schedule, rationale = compute_schedule.compute_cadence()
-    assert schedule == "0 3 * * *"
+    # The fixture puts every commit at 12:00Z, so the quietest three-hour
+    # window is the first all-empty one, starting at hour 0. The hour used
+    # to be a fixed 3 before c4d18a01 taught compute_cadence() to derive it
+    # from commit hour-of-day; these assertions were left behind and broke
+    # main CI from 2026-09-13 until the PR that fixed them.
+    assert schedule == "0 0 * * *"
     assert ">50 commits/mo" in rationale
 
 
 def test_compute_cadence_active_velocity(monkeypatch):
     monkeypatch.setattr(compute_schedule, "run_cmd", lambda cmd: "\n".join(["2026-09-01T12:00:00Z"] * 25))
     schedule, rationale = compute_schedule.compute_cadence()
-    assert schedule == "0 3 * * 1,4"
+    assert schedule == "0 0 * * 1,4"  # hour 0: see test_compute_cadence_high_velocity
     assert "Active velocity" in rationale
 
 
 def test_compute_cadence_standard_velocity(monkeypatch):
     monkeypatch.setattr(compute_schedule, "run_cmd", lambda cmd: "\n".join(["2026-09-01T12:00:00Z"] * 5))
     schedule, rationale = compute_schedule.compute_cadence()
-    assert schedule == "0 3 * * 1"
+    assert schedule == "0 0 * * 1"  # hour 0: see test_compute_cadence_high_velocity
     assert "Standard velocity" in rationale
+
+
+def test_compute_cadence_run_hour_avoids_the_busiest_commit_hours(monkeypatch):
+    # Regression guard for the derived run hour itself: commits clustered at
+    # 00:00Z-02:00Z occupy every three-hour window that starts at 0, 1, or 2,
+    # so the first empty window starts at hour 3. Without this test the hour
+    # assertions above could be satisfied by a constant 0 as easily as by
+    # the quietest-window scan.
+    stamps = ["2026-09-01T00:30:00Z", "2026-09-01T01:30:00Z", "2026-09-01T02:30:00Z"] * 20
+    monkeypatch.setattr(compute_schedule, "run_cmd", lambda cmd: "\n".join(stamps))
+    schedule, rationale = compute_schedule.compute_cadence()
+    assert schedule == "0 3 * * *"
+    assert "at 3:00" in rationale
 
 
 def test_compute_and_sync_override_true_no_schedule_value(tmp_path):
