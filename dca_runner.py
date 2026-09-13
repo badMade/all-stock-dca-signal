@@ -1154,6 +1154,7 @@ def count_compatible_executor_attempts(
         count += 1
     return count
 
+
 # ---------------------------------------------------------------------------
 # Gate 6 -- budget, computed from broker history
 # ---------------------------------------------------------------------------

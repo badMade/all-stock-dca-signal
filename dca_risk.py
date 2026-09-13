@@ -649,6 +649,8 @@ def _unusable_deployed_notional_date_evidence(
                         entry_day = date.fromisoformat(raw_day[:10])
                     except ValueError:
                         entry_day = None
+                if entry_day is None:
+                    has_unusable_claim_date = True
                 if _amount_is_unusable(entry.get("amount_usd")):
                     if entry_day is None:
                         # No explicit date to attribute the unusable amount
@@ -718,23 +720,22 @@ def _unusable_deployed_notional_date_evidence(
                     dates.add(artifact_day)
                     fallback_dates.add(artifact_day)
                 continue
-            if row_notional_unusable:
-                # A reconciliation row can be written after the replay it
-                # repairs. Its own total is unusable, but its claim breakdown
-                # tells us which historical day(s) that uncertainty belongs
-                # to. Do not substitute the later artifact day and either
-                # hide an in-window claim or poison a future-only one.
-                dates.update(claim_dates)
-                if has_unusable_claim_date or not claim_dates:
-                    dates.add(artifact_day)
-                continue
             row_amount = _non_negative_finite_usd(c.get("planned_amount_usd"))
             if row_amount is not None and accounted_usd > row_amount + 1e-9:
                 # The malformed excess belongs to the claim entries that
                 # supplied it.  Using the artifact day here made a recent
                 # reconciliation artifact poison today's evidence window even
-                # when every overfilled claim was explicitly dated outside it.
-                claim_dates: Set[Optional[date]] = set()
+                # when every overfilled claim was explicitly dated outside
+                # it. Reachable even when row_unusable is also True (some
+                # OTHER entry in the same breakdown is individually
+                # malformed): accounted_usd only ever sums entries whose own
+                # amount was independently readable, so an overfill detected
+                # from those alone is real regardless of what else in the
+                # breakdown is broken -- skipping this check on row_unusable
+                # left the current-window entry's own inflated attribution
+                # unflagged (Codex review: "Retain dates for overfilled
+                # readable rows").
+                claim_dates = set()
                 has_unusable_claim_date = False
                 for entry in breakdown:
                     if not isinstance(entry, dict):

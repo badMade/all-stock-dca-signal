@@ -15385,20 +15385,134 @@ def _write_and_validate_scheduled_contract(
             fpath = out / name
             if not fpath.exists():
                 continue
-            try:
-                data = json.loads(fpath.read_bytes())
-            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            if not isinstance(data, dict):
-                continue
-            data["status"] = RUN_STATUS_BLOCKED
-            data["artifact_contract_failure"] = failure
-            rc = data.get("run_classification")
-            if isinstance(rc, dict):
-                rc["valid_scheduled_evidence"] = False
-            fpath.write_text(
-                json.dumps(data, indent=2, sort_keys=True), encoding="utf-8"
-            )
+            # A SINGLE lock-timeout attempt used to give up on this file for
+            # good: `derive_valid_scheduled_evidence()` (scripts/
+            # same_day_pointer.py) trusts `run_state.json`'s own
+            # `artifact_contract_failure` marker directly, with no other
+            # path to learn the contract actually failed -- so skipping the
+            # annotation just once let a compute-only or otherwise
+            # contract-invalid run still be consumed as valid scheduled
+            # evidence for good, not merely until the next retry (Codex
+            # review: "Keep failed contracts ineligible after lock
+            # timeouts"). Retried a bounded number of times instead --
+            # `_write_and_validate_scheduled_contract` still must not raise
+            # (orders may already be placed by the time the contract is
+            # found to have failed, per the original "Keep lock timeouts
+            # inside best-effort contract handling" fix this extends), but
+            # a transient/short-lived contending holder now gets several
+            # chances to clear before this gives up and logs loudly enough
+            # to be found.
+            _annotation_attempts_remaining = 3
+            while True:
+                try:
+                    with cross_process_lock(fpath.with_name(f"{fpath.name}.lock")):
+                        # A transient read failure here (e.g. a race with
+                        # another writer's own rename, or a momentary
+                        # filesystem error) used to just `break` out of this
+                        # entire retry loop on the spot -- silently
+                        # abandoning the annotation after a single failed
+                        # attempt, with no retry and no durable sidecar,
+                        # unlike every other failure mode this loop already
+                        # retries and falls back on. Left unguarded here so
+                        # it propagates to the SAME (TimeoutError, OSError)
+                        # handler below that already retries a bounded
+                        # number of times and persists the undurable-evidence
+                        # sidecar on exhaustion (Codex review: "Retry failed
+                        # reads before abandoning the denial stamp").
+                        _raw_bytes = fpath.read_bytes()
+                        # `result` above validated THIS invocation's own
+                        # artifact set, snapshotted byte-for-byte just before
+                        # that validation call; the retry loop can take
+                        # several lock acquisitions (one full attempt cycle
+                        # per file) across which an overlapping retry
+                        # sharing this directory can publish and validate
+                        # its OWN, successful artifact set. Comparing exact
+                        # bytes -- not `run_id` -- catches that regardless
+                        # of collision: `run_id` is only second-granularity
+                        # (`YYYY-MM-DD-HHMMSS`), so two overlapping retries
+                        # starting within the same second are given the
+                        # IDENTICAL run_id, and an id-only comparison would
+                        # still let this invocation stamp its stale verdict
+                        # onto that other, genuinely successful retry
+                        # (Codex review: "Use a collision-resistant snapshot
+                        # identifier"). ANY change since the snapshot -- from
+                        # any writer, sharing any run_id -- means this
+                        # invocation's validation no longer describes what
+                        # is currently on disk, so left untouched rather
+                        # than corrupted with an unrelated verdict (Codex
+                        # review: "Bind contract-failure stamps to the
+                        # validated snapshot").
+                        if _raw_bytes != _pre_validation_snapshots.get(name):
+                            break
+                        try:
+                            data = json.loads(_raw_bytes)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            break
+                        if not isinstance(data, dict):
+                            break
+                        data["status"] = RUN_STATUS_BLOCKED
+                        data["artifact_contract_failure"] = failure
+                        rc = data.get("run_classification")
+                        if isinstance(rc, dict):
+                            rc["valid_scheduled_evidence"] = False
+                        _stamped_bytes = json.dumps(data, indent=2, sort_keys=True).encode("utf-8")
+                        atomic_write_text(fpath, _stamped_bytes.decode("utf-8"))
+                        # run_state.json's snapshot on RunResult must track
+                        # this invocation's OWN latest write, not just
+                        # write_run_artifacts()'s earlier one: this stamp is
+                        # still THIS invocation's own legitimate follow-up
+                        # write (never a peer's -- the exact-bytes compare
+                        # above already refused to stamp over any change
+                        # since this invocation's own snapshot), so leaving
+                        # the earlier, now-stale value in place would make
+                        # run_daily_compact's later concurrent-writer check
+                        # misread this invocation's own contract-failure
+                        # stamp as a foreign peer's write (Codex review:
+                        # "Capture this invocation's state at publication
+                        # time").
+                        if run_result is not None and name == "run_state.json":
+                            run_result.published_run_state_bytes = _stamped_bytes
+                    break
+                except (TimeoutError, OSError):
+                    # A lock-setup/IO failure (sidecar cannot be created or
+                    # opened -- e.g. transient filesystem error, descriptor
+                    # exhaustion, or permissions) surfaces as a plain OSError
+                    # from cross_process_lock() itself, not just the
+                    # TimeoutError this loop already retries on. Both must
+                    # stay inside this best-effort annotation pass rather
+                    # than escaping `_write_and_validate_scheduled_contract`
+                    # after orders may already have been placed (Codex
+                    # review: "Contain non-timeout failures from the
+                    # annotation lock").
+                    _annotation_attempts_remaining -= 1
+                    if _annotation_attempts_remaining <= 0:
+                        logger.error(
+                            "Could not acquire %s.lock after repeated lock timeouts; "
+                            "%s was NOT annotated with the failed artifact "
+                            "contract and may still read as valid scheduled "
+                            "evidence until manually reconciled",
+                            fpath.name,
+                            fpath,
+                        )
+                        # Durably preserved in its own file rather than lost
+                        # outright now that the primary annotation is given
+                        # up on (Codex review: "Keep contract-invalid state
+                        # denied after prolonged contention") -- see
+                        # `_persist_undurable_evidence_sidecar`'s own
+                        # docstring for why this is a discoverable sidecar
+                        # rather than a raise or a further-extended retry.
+                        _persist_undurable_evidence_sidecar(
+                            out,
+                            "unannotated_contract_failure",
+                            datetime.now(timezone.utc),
+                            {
+                                "run_id": artifacts.get("run_id"),
+                                "artifact_path": str(fpath),
+                                "artifact_contract_failure": failure,
+                            },
+                        )
+                        break
+                    continue
     return result
 
 
