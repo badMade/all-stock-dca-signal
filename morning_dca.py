@@ -490,7 +490,7 @@ DEFAULT_MORNING_DAILY_CAP_USD = 180.0
 DEFAULT_MORNING_WEEKLY_CAP_USD = 900.0
 
 
-def default_pooled_cap_seed_roots() -> tuple[str, ...]:
+def default_all_stream_cap_seed_roots() -> tuple[str, ...]:
     """Every known live stream's root, for the shared budget cap ledger.
 
     Used as ``MorningConfig.cap_seed_roots``'s default_factory (2026-08-02
@@ -534,6 +534,11 @@ def default_pooled_cap_seed_roots() -> tuple[str, ...]:
         stream_root("final_manual_review"),
     )
     return _append_dated_manual_override_cap_seed_roots(roots)
+
+
+def default_pooled_cap_seed_roots() -> tuple[str, ...]:
+    """Return every live stream root used to seed the shared budget cap."""
+    return default_all_stream_cap_seed_roots()
 
 
 def _dated_manual_override_cap_seed_roots() -> tuple[str, ...]:

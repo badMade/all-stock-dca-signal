@@ -52,7 +52,7 @@ if str(Path(__file__).resolve().parent.parent) not in sys.path:
 import morning_dca
 from dca_config import DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES, MissingConfigEnvError
 from dca_live_adapters import FinanceDataProvider, RobinhoodBroker, RobinhoodDataProvider
-from dca_paths import CRON_TRACKING_ROOT_ENV
+from dca_paths import CRON_TRACKING_ROOT_ENV, stream_root
 from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     DEFAULT_MORNING_PREFLIGHT_STATE_ROOT,
@@ -9910,6 +9910,28 @@ def test_morning_live_default_roots_include_market_open(tmp_path, monkeypatch):
     res = ex.run(_now_live(), data, broker=broker)
     assert "NVDA" in broker.placed, f"expected incremental order; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
     assert abs(broker.placed["NVDA"] - 8.0) < 0.01, f"expected $8 incremental; got {broker.placed['NVDA']}"
+
+
+def test_all_streams_share_identical_cap_seed_roots(monkeypatch):
+    from intraday_dca import default_intraday_cap_seed_roots
+    from market_open_dca import default_market_open_cap_seed_roots
+    from morning_dca import default_pooled_cap_seed_roots
+
+    monkeypatch.setattr(morning_dca, "_dated_manual_override_cap_seed_roots", lambda: ())
+    expected = tuple(
+        stream_root(name)
+        for name in (
+            "market_open_dca",
+            "morning_dca",
+            "midday_dca",
+            "intraday_dca",
+            "ce16ba6b",
+            "final_manual_review",
+        )
+    )
+    assert default_pooled_cap_seed_roots() == expected
+    assert default_market_open_cap_seed_roots() == expected
+    assert default_intraday_cap_seed_roots() == expected
 
 
 def test_default_cap_seed_roots_include_dated_manual_overrides(monkeypatch):
