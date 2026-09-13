@@ -255,8 +255,15 @@ review surface), mapped onto this system:
 - **Ledger filesystem boundary**: create, append, resume, and checkpoint verification require
   descriptor-relative, no-follow filesystem operations (supported on Linux and macOS).
   They refuse symlinks below the selected run directory, nonregular shard files, hard-linked
-  shards, and malformed checkpoint paths. Recovery hashes and truncates the same open file;
-  cleanup uses a pinned parent directory. Ordinary interrupted runs still recover their
+  shards on every path that adopts a shard the process did not create, and malformed
+  checkpoint paths. Appends prove ownership by inode instead: the first append creates the
+  shard `O_EXCL` and pins it, later appends require the same inode, so a run survives the
+  cloud-sync and backup agents that hard-link freshly written files (Google Drive for Desktop
+  holds such a link for 7-11 seconds after every append) while still refusing a shard swapped
+  for any other file. Resume, unrecorded-shard cleanup and read-only verification keep the
+  unaliased requirement and wait up to 30 s for a sync agent's link to clear before refusing,
+  re-checking each time that the shard name still resolves to the opened inode.
+  Recovery hashes and truncates the same open file; cleanup uses a pinned parent directory. Ordinary interrupted runs still recover their
   uncheckpointed tails. Windows currently REFUSES these operations because Python does not
   provide the required primitives there; read-only report/inspection readers remain available.
   Use a local copy with ordinary directories and single-linked shard files on a supported

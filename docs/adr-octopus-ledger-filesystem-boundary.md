@@ -23,7 +23,8 @@ library. Treat the operator's selected run directory as the root of authority; r
 selection once when constructing the ledger and open its cached canonical components without
 following replacements. Create missing components relative to pinned parents. Pin the ledger
 and model directories using file descriptors. Below the selected run directory, refuse
-symlink directories and shards, nonregular shards, and shards with multiple hard links.
+symlink directories and shards, nonregular shards, and shards with multiple hard links on
+every path that adopts a shard this process has not created (see the amendment below).
 
 Validate checkpoint keys as portable `model/kind_YYYY.jsonl.gz` paths and validate sizes and
 SHA-256 representations before recovery. Limit enumeration to model directories and their
@@ -68,3 +69,41 @@ validation, swaps before open and after hashing, cleanup-parent replacement, sub
 append, and missing platform capabilities. Existing ledger and harness tests preserve
 crash recovery, missing/tampered shard refusal, checkpoint key compatibility, and
 resume-equals-uninterrupted behavior. No tests use the real ticker archive or send orders.
+
+## Amendment: ownership pinning on the append path (2026-09-13)
+
+The link-count test is an *adoption* check: it establishes that a shard nobody has vouched
+for yet is not a hard link to a file outside the run. Re-running it on every append also made
+the ledger unusable inside a cloud-mirrored or backed-up directory. Google Drive for Desktop
+mirroring a folder hard-links each freshly written file for the 7-11 seconds it spends
+copying it, so a shard under active append is aliased most of the time, and a walk-forward
+run inside such a tree REFUSED mid-run at whichever step happened to land in one of those
+windows. Waiting for the link to clear is not an option at those durations, and the mirror
+re-links after every append.
+
+Appends now prove ownership by identity instead. A shard's first append in a run creates it
+with `O_CREAT | O_EXCL`, so the pinned inode is one nothing else chose; a pre-existing shard
+(a new writer instance over an earlier run's ledger) is adopted only through the unchanged
+unaliased check. Every later append requires the name to resolve to that same
+`(st_dev, st_ino)`, and a pinned shard opens without `O_CREAT`, so a deleted one fails closed
+rather than starting a second shard no checkpoint accounts for.
+
+For the case it covers this is stricter, not looser: a shard swapped for any other file is
+refused, including an ordinary single-linked one that the link-count test accepts. What it
+permits is an extra link to the inode the ledger already owns, which cannot redirect an
+append -- the bytes land on the pinned inode under either name.
+
+`resume()`, unrecorded-shard cleanup and read-only verification have no pin to trust, so they
+keep the unaliased requirement and instead WAIT for it, up to `_ALIAS_SETTLE_SECONDS` (30 s;
+measured, the mirror releases a quiescent shard within about 15 s). A sync agent's link goes
+away when its copy finishes; a planted one is still there at the deadline and is refused with
+the same error as before. Waiting on the link count alone would be a hole -- an attacker could
+drop it to 1 by unlinking the LEDGER's name rather than their own, leaving the descriptor on a
+file only they still name -- so every look also re-checks that the shard name still resolves to
+the opened inode, and refuses immediately if it does not.
+
+Shard enumeration keeps only the regular-file floor. It reports names, it does not act on them:
+every shard it returns is opened and checked by `resume()` moments later, re-checked before an
+unrecorded one is unlinked, or refuses `create()` outright by existing at all. A link count
+taken there, off a directory entry with no descriptor to re-check the name against, could only
+be a weaker copy of that check.

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import ledger
 import numpy as np
 import pandas as pd
 import pytest
@@ -207,3 +208,18 @@ def synthetic_history_dir(tmp_path: Path, market_factor: np.ndarray) -> Path:
     (intraday / "AAA.csv").write_text("trading_day,price\n2021-01-04,50.0\n")
     (history_dir / "AAA-backup.csv").write_text("Date,Open,High,Low,Close\n2021-01-04,1,1,1,1\n")
     return history_dir
+
+
+@pytest.fixture(autouse=True)
+def _fast_alias_settle(monkeypatch) -> None:
+    """Shrink the ledger's alias-settle window for every test.
+
+    ``ledger._ALIAS_SETTLE_SECONDS`` is 30 s in production so a shard a sync
+    agent is copying (Google Drive for Desktop holds a hard link on one for
+    7-11 s after the last write) settles instead of failing an honest run.
+    Tests that assert a REFUSAL on a planted alias would then each sit out
+    that whole window before getting it -- minutes across the suite, for a
+    wait none of them are testing. The two that ARE about the waiting set
+    their own value.
+    """
+    monkeypatch.setattr(ledger, "_ALIAS_SETTLE_SECONDS", 0.2)
