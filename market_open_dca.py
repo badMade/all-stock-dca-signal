@@ -90,6 +90,7 @@ from dca_paths import stream_root
 from morning_dca import (
     MorningConfig,
     MorningDCAExecutor,
+    default_all_stream_cap_seed_roots,
     load_stream_config,
 )
 from near_close_dca import StrategyConfig, _DiagnosticRedactionFilter
@@ -191,14 +192,7 @@ def default_market_open_cap_seed_roots() -> tuple[str, ...]:
     feed only the per-ticker top-up guard's reference price), these feed the
     shared daily/weekly ceiling.
     """
-    return (
-        stream_root("market_open_dca"),
-        stream_root("morning_dca"),
-        stream_root("midday_dca"),
-        stream_root("intraday_dca"),
-        stream_root("ce16ba6b"),
-        stream_root("final_manual_review"),
-    )
+    return default_all_stream_cap_seed_roots()
 
 
 @dataclass(frozen=True)
