@@ -206,36 +206,37 @@ def test_compute_cadence_dormant_when_empty(monkeypatch):
 def test_compute_cadence_high_velocity(monkeypatch):
     monkeypatch.setattr(compute_schedule, "run_cmd", lambda cmd: "\n".join(["2026-09-01T12:00:00Z"] * 55))
     schedule, rationale = compute_schedule.compute_cadence()
-    # The fixture puts every commit at 12:00Z, so the quietest three-hour
-    # window is the first all-empty one, starting at hour 0. The hour used
-    # to be a fixed 3 before c4d18a01 taught compute_cadence() to derive it
-    # from commit hour-of-day; these assertions were left behind and broke
-    # main CI from 2026-09-13 until the PR that fixed them.
-    assert schedule == "0 0 * * *"
+    # The run hour is pinned to 03:00 UTC (scripts/compute_schedule.py:
+    # "CI/tests and self-heal docs rely on this fixed hour"). c4d18a01 had
+    # briefly derived it from the quietest commit window, which broke these
+    # assertions on main from 2026-09-13; #1465 aligned the tests to the
+    # derived hour 0, and PR #1463 then restored the pin, so the merge of the
+    # two lands back on hour 3 with the pin as the documented contract.
+    assert schedule == "0 3 * * *"
     assert ">50 commits/mo" in rationale
 
 
 def test_compute_cadence_active_velocity(monkeypatch):
     monkeypatch.setattr(compute_schedule, "run_cmd", lambda cmd: "\n".join(["2026-09-01T12:00:00Z"] * 25))
     schedule, rationale = compute_schedule.compute_cadence()
-    assert schedule == "0 0 * * 1,4"  # hour 0: see test_compute_cadence_high_velocity
+    assert schedule == "0 3 * * 1,4"  # pinned hour: see test_compute_cadence_high_velocity
     assert "Active velocity" in rationale
 
 
 def test_compute_cadence_standard_velocity(monkeypatch):
     monkeypatch.setattr(compute_schedule, "run_cmd", lambda cmd: "\n".join(["2026-09-01T12:00:00Z"] * 5))
     schedule, rationale = compute_schedule.compute_cadence()
-    assert schedule == "0 0 * * 1"  # hour 0: see test_compute_cadence_high_velocity
+    assert schedule == "0 3 * * 1"  # pinned hour: see test_compute_cadence_high_velocity
     assert "Standard velocity" in rationale
 
 
-def test_compute_cadence_run_hour_avoids_the_busiest_commit_hours(monkeypatch):
-    # Regression guard for the derived run hour itself: commits clustered at
-    # 00:00Z-02:00Z occupy every three-hour window that starts at 0, 1, or 2,
-    # so the first empty window starts at hour 3. Without this test the hour
-    # assertions above could be satisfied by a constant 0 as easily as by
-    # the quietest-window scan.
-    stamps = ["2026-09-01T00:30:00Z", "2026-09-01T01:30:00Z", "2026-09-01T02:30:00Z"] * 20
+def test_compute_cadence_run_hour_is_pinned_regardless_of_commit_hours(monkeypatch):
+    # Regression guard for the pin itself. Under the quietest-window scan
+    # that c4d18a01 introduced, commits clustered at 03:00Z-05:00Z would push
+    # the hour AWAY from 3; the pinned contract keeps 03:00 UTC no matter how
+    # commit times are distributed. The three tests above all use 12:00Z
+    # commits and so cannot tell a pin from a scan that happens to land on 3.
+    stamps = ["2026-09-01T03:30:00Z", "2026-09-01T04:30:00Z", "2026-09-01T05:30:00Z"] * 20
     monkeypatch.setattr(compute_schedule, "run_cmd", lambda cmd: "\n".join(stamps))
     schedule, rationale = compute_schedule.compute_cadence()
     assert schedule == "0 3 * * *"
