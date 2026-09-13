@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 from test_inverse_martingale_wiring import TEST_DATES, _base_config, _run_day
-from test_morning_dca import DecliningBarsProvider, _all_tradable, _now_live
+from test_morning_dca import DecliningBarsProvider, _all_tradable, _live_executor, _now_live
 from test_whole_share_wiring import _ctx, _decision
 
 import dca_runner
@@ -18,7 +18,7 @@ from morning_dca import MORNING_LIVE_MODE, MorningConfig, MorningDCAExecutor
 from near_close_dca import EASTERN, SourceName, StrategyConfig, StrategyState, _process_buy_candidate
 
 
-def _broker(placed, *, review=None, on_place=None):
+def _broker(placed, *, review=None, on_place=None, buying_power=None):
     def place(**kwargs):
         placed.append(kwargs)
         if on_place:
@@ -30,7 +30,7 @@ def _broker(placed, *, review=None, on_place=None):
         enable_live_orders=True,
         place_fn=place,
         orders_fn=lambda **kwargs: {"orders": [], "next": None},
-        buying_power_fn=lambda **kwargs: {"buying_power": "1000"},
+        buying_power_fn=buying_power or (lambda **kwargs: {"buying_power": "1000"}),
         tradability_fn=_all_tradable,
         review_fn=review or (lambda **kwargs: {"approved": True}),
     )
@@ -39,6 +39,64 @@ def _broker(placed, *, review=None, on_place=None):
 def _freeze_clock(monkeypatch, now):
     # Freeze the clock source only: the calendar/session verdict must still run.
     monkeypatch.setattr(near_close_dca, "_live_placement_now", lambda: now, raising=False)
+
+
+@pytest.mark.parametrize("manual", [False, True], ids=["scheduled", "manual"])
+@pytest.mark.parametrize(
+    ("elapsed_seconds", "scheduled_orders"),
+    [(300, 1), (301, 0), (1800, 0)],
+    ids=["slot-end-inclusive", "one-second-late", "thirty-minutes-late"],
+)
+def test_morning_slot_boundary_after_broker_lookup(
+    tmp_path, monkeypatch, manual, elapsed_seconds, scheduled_orders,
+):
+    """A slow lookup must not extend scheduled authorization beyond 10:35 ET."""
+    now = _now_live()
+    _freeze_clock(monkeypatch, now)
+
+    def delayed_buying_power(**kwargs):
+        _freeze_clock(monkeypatch, now + timedelta(seconds=elapsed_seconds))
+        return {"buying_power": "1000"}
+
+    placed = []
+    executor = _live_executor(tmp_path, ("NVDA",))
+    result = executor.run(
+        now, DecliningBarsProvider(SourceName.ROBINHOOD, 100, {"NVDA": 0.10}),
+        broker=_broker(placed, buying_power=delayed_buying_power), manual=manual,
+    )
+    expected_orders = 1 if manual else scheduled_orders
+    assert len(placed) == expected_orders
+    assert executor.ledger.day_attempts(now.date()) == expected_orders
+    outcome = result["artifacts"]["broker_outcomes"]["NVDA"]
+    if expected_orders:
+        assert outcome["status"] == "submitted"
+        assert outcome["order_id"] == "fixture-order-1"
+    else:
+        assert outcome["status"] == "blocked"
+        assert "scheduled slot window" in outcome["skip_reason"]
+
+
+def test_scheduled_slot_end_between_candidates_preserves_first_submission(tmp_path, monkeypatch):
+    """Expiry must block later candidates without erasing an on-time order."""
+    now = _now_live()
+    slot_end = now.replace(minute=35)
+    _freeze_clock(monkeypatch, slot_end)
+    placed = []
+    broker = _broker(
+        placed, on_place=lambda: _freeze_clock(monkeypatch, slot_end + timedelta(seconds=1)),
+    )
+    executor = _live_executor(tmp_path, ("AAPL", "MSFT"))
+    result = executor.run(
+        now, DecliningBarsProvider(SourceName.ROBINHOOD, 100, {"AAPL": 0.10, "MSFT": 0.10}),
+        broker=broker,
+    )
+    assert len(placed) == 1
+    assert executor.ledger.day_attempts(now.date()) == 1
+    artifact = json.loads(Path(result["paths"]["run_state"]).read_text())
+    rows = {row["ticker"]: row for row in artifact["buy_candidates"]}
+    assert rows["AAPL"]["order_id"] == "fixture-order-1"
+    assert rows["MSFT"]["status"] == "blocked"
+    assert "scheduled slot window" in artifact["broker_outcomes"]["MSFT"]["skip_reason"]
 
 
 def test_compact_live_rejects_1700_placement(tmp_path, monkeypatch):
