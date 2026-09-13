@@ -63,6 +63,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Sequence, Set, Tuple, cast
 
+import near_close_dca
 from dca_alerts import GuardedRunConfig, artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
 from dca_common import TopUpContext, build_top_up_outcome
 from dca_config import (
@@ -111,7 +112,6 @@ from near_close_dca import (
     StrategyConfig,
     _DiagnosticRedactionFilter,
     _is_usable_reconciled_order_id,
-    _live_placement_now,
     _live_session_failure,
     _recovered_broker_notional,
     _ticker_sizing,
@@ -7970,12 +7970,12 @@ class MorningDCAExecutor(DCAExecutor):
         # close. Recheck the actual regular session for BOTH run origins,
         # before charging an attempt or calling the placement adapter.
         session_failure = _live_session_failure(trading_day)
-        if not session_failure and not manual:
+        if not session_failure and not manual and now is not None:
             window_start_et = self.profile.get("window_start_et")
             window_end_et = self.profile.get("window_end_et")
             if window_start_et and window_end_et:
                 try:
-                    placement_now = _live_placement_now()
+                    placement_now = near_close_dca._live_placement_now()
                 except Exception as exc:
                     session_failure = f"live session: clock failed ({type(exc).__name__})"
                 else:
