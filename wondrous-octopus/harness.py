@@ -383,6 +383,8 @@ class WalkForwardHarness:
         #: by _release_lock() (called from run()'s finally, or implicitly
         #: on GC if run() is never invoked).
         self._lock_handle = None
+        self._total_steps_in_run: int | None = None
+        self._steps_taken_in_run: int = 0
         # This is deliberately supplied by the CLI before archive/model setup:
         # model fitting and checkpoint loading consume the same hard budget as
         # replay steps.  Direct library callers start their invocation here.
@@ -946,6 +948,15 @@ class WalkForwardHarness:
         end64 = np.datetime64(self.config.end) if self.config.end else None
         steps_taken = 0
         started_monotonic = self.invocation_started_monotonic
+        total_remaining = len(self.panel.calendar) - self.cursor
+        if end64 is not None:
+            cal_dates = self.panel.calendar.astype("datetime64[D]")
+            end_idx = int(np.searchsorted(cal_dates, end64, side="right"))
+            total_remaining = max(0, min(total_remaining, end_idx - self.cursor))
+        if self.config.max_steps_per_run is not None:
+            total_remaining = min(total_remaining, self.config.max_steps_per_run)
+        self._total_steps_in_run = total_remaining
+        self._steps_taken_in_run = 0
         while self.cursor < len(self.panel.calendar):
             date64 = self.panel.calendar[self.cursor]
             # Calendar-day comparison, not a raw timestamp one: an archive
@@ -976,6 +987,7 @@ class WalkForwardHarness:
                 # step finishes, via the check below.
                 self.checkpoint()
                 return "interrupted"
+            self._steps_taken_in_run += 1
             self.step(date64)
             steps_taken += 1
             if self.step_index % self.config.checkpoint_every == 0:
@@ -1394,8 +1406,23 @@ class WalkForwardHarness:
         stats = self.running[primary]
         coverage = (stats.in_band_close / stats.n) if stats.n else 0.0
         mae = (stats.abs_close / stats.n) if stats.n else 0.0
+
+        prefix = ""
+        total_run = getattr(self, "_total_steps_in_run", None)
+        if total_run is not None and total_run > 0:
+            cur = getattr(self, "_steps_taken_in_run", self.step_index)
+            pct = min(100.0, (cur / total_run) * 100)
+            bar_len = 12
+            filled = int(bar_len * cur // total_run)
+            bar = (
+                "=" * filled
+                + (">" if filled < bar_len else "")
+                + " " * (bar_len - filled - (1 if filled < bar_len else 0))
+            )
+            prefix = f"[{bar}] {cur}/{total_run} ({pct:3.0f}%) | "
+
         self.log(
-            f"[{date_iso}] scored {len(matured)} | predicted {n_predicted} | "
+            f"{prefix}[{date_iso}] scored {len(matured)} | predicted {n_predicted} | "
             f"coverage-to-date {coverage:.1%} | close-MAE {mae:.4f} | step {self.step_index}"
         )
         return {"scored": len(matured), "predicted": n_predicted}

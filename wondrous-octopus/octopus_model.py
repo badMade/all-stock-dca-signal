@@ -60,6 +60,7 @@ package stays importable without torch.
 from __future__ import annotations
 
 import hashlib
+import sys
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -352,11 +353,27 @@ class OctopusModel:
         refs = self._resolve_refs([(item[0], item[1]) for item in fit_reservoir.items])
         rng = np.random.default_rng(_derive(seed, "epoch-shuffle"))
         losses: list[float] = []
-        for _epoch in range(self.hyper["fit_epochs"]):
+        is_tty = sys.stdout.isatty()
+        total_epochs = self.hyper["fit_epochs"]
+        for epoch in range(total_epochs):
             order = rng.permutation(len(refs))
+            total_batches = (len(order) + self.hyper["batch_size"] - 1) // self.hyper["batch_size"]
+            batch_idx = 0
             for begin in range(0, len(order), self.hyper["batch_size"]):
                 batch = [refs[index] for index in order[begin : begin + self.hyper["batch_size"]]]
-                losses.append(self._train_batch(batch, lr=self.hyper["lr_fit"]))
+                loss = self._train_batch(batch, lr=self.hyper["lr_fit"])
+                losses.append(loss)
+                batch_idx += 1
+                if is_tty and (batch_idx % 5 == 0 or batch_idx == total_batches):
+                    pct = (batch_idx / total_batches) * 100
+                    sys.stdout.write(
+                        f"\r[fit] octopus: epoch {epoch + 1}/{total_epochs} "
+                        f"[{batch_idx}/{total_batches} ({pct:3.0f}%)] loss: {loss:.4f}  "
+                    )
+                    sys.stdout.flush()
+        if is_tty and total_epochs > 0 and losses:
+            sys.stdout.write(f"\r[fit] octopus: {total_epochs} epochs complete! final loss: {losses[-1]:.4f}             \n")
+            sys.stdout.flush()
         self._market_cache = {}
         return {
             "epochs": self.hyper["fit_epochs"],

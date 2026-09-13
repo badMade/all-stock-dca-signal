@@ -610,20 +610,47 @@ class GbmQuantileModel:
     def _fit_estimators(self, design: np.ndarray, targets: np.ndarray) -> int:
         # Lazy import inside fit: the house pattern for heavy deps (see
         # ml-forecaster/model.py's identically-motivated lazy sklearn import).
+        import sys
         from sklearn.ensemble import HistGradientBoostingRegressor
+
+        total_estimators = len(COMPONENTS) * 4
+        completed = 0
+        is_tty = sys.stdout.isatty()
+
+        def _update_progress(component: str, target_name: str) -> None:
+            if not is_tty:
+                return
+            pct = (completed / total_estimators) * 100
+            bar_len = 24
+            filled = int(bar_len * completed // total_estimators)
+            bar = (
+                "=" * filled
+                + (">" if filled < bar_len else "")
+                + " " * (bar_len - filled - (1 if filled < bar_len else 0))
+            )
+            line = (
+                f"\r[fit] gbm_quantile: [{bar}] {completed:2d}/{total_estimators} "
+                f"({pct:3.0f}%) {component}:{target_name:<5}"
+            )
+            sys.stdout.write(line)
+            sys.stdout.flush()
 
         self._estimators = {}
         for position, component in enumerate(COMPONENTS):
             y = targets[:, position].astype(np.float64)
             fits: dict[str, Any] = {}
             categorical = self._categorical_mask(design.shape[1])
+            _update_progress(component, "point")
             fits["point"] = HistGradientBoostingRegressor(
                 loss="absolute_error",
                 random_state=self._seed,
                 categorical_features=categorical,
                 **self._hist_params,
             ).fit(design, y)
+            completed += 1
+            _update_progress(component, "point")
             for key, quantile in (("p10", 0.1), ("p50", 0.5), ("p90", 0.9)):
+                _update_progress(component, key)
                 fits[key] = HistGradientBoostingRegressor(
                     loss="quantile",
                     quantile=quantile,
@@ -631,7 +658,14 @@ class GbmQuantileModel:
                     categorical_features=categorical,
                     **self._hist_params,
                 ).fit(design, y)
+                completed += 1
+                _update_progress(component, key)
             self._estimators[component] = fits
+
+        if is_tty:
+            bar = "=" * 24
+            sys.stdout.write(f"\r[fit] gbm_quantile: [{bar}] 16/16 (100%) done!                        \n")
+            sys.stdout.flush()
         return len(design)
 
 
