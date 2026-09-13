@@ -54,3 +54,7 @@
 **Vulnerability:** `urllib.request.urlopen` lacked SSRF mitigations for operator-supplied Sheets API URLs in `trading-strategies/strategy_monitor.py`, potentially enabling local file inclusion or internal network requests.
 **Learning:** Checking the `scheme` and `netloc` components of a URL via `urlparse` is insufficient to prevent SSRF if the URL resolves to an internal or restricted IP address, or if DNS rebinding occurs. We must validate the resolved IP addresses against a denylist of private/local subnets.
 **Prevention:** Rely on the centralized `dca_net_utils.assert_safe_destination` utility to validate all operator-supplied URLs before making outbound requests, ensuring both scheme/host checks and IP-level verification are performed.
+## 2026-09-08 - [Secure BaseHTTPRequestHandler Against Slowloris]
+**Vulnerability:** The local `ThreadingHTTPServer` configured via `BaseHTTPRequestHandler` in `dca_console.py` lacked a socket timeout configuration. This meant connections could hang indefinitely during the header-reading phase.
+**Learning:** Adding `self.connection.settimeout()` inside `do_GET` or `do_POST` is insufficient for protection against Slowloris-style attacks, because `socketserver.StreamRequestHandler` parses HTTP headers *before* invoking `do_GET` or `do_POST`.
+**Prevention:** Always define a `timeout` class attribute directly on the `BaseHTTPRequestHandler` subclass (e.g., `timeout = 5`) so the underlying socket configuration applies the timeout immediately upon connection and during the vulnerable header-reading phase.
