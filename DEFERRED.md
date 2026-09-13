@@ -20,8 +20,13 @@ re-derive.
   operator.
 - **Tailscale ACL / Cloudflare Access device-posture examples** restricting which devices
   may reach the console.
-- **HSTS** when served over HTTPS; **in-process TLS** via stdlib `ssl` for LAN use
-  without a proxy.
+- **In-process TLS** via stdlib `ssl` (self-signed or operator-supplied certificate).
+  This is the proper fix for Phase A's plaintext LAN HTTP; this cycle bounds that risk
+  instead (foreground only, disposable credential, rotation before Phase B) because the
+  operator chose LAN-first for build/test. **HSTS** when served over HTTPS.
+- **Customisable launchd label.** Killed in Same Page round 1: arbitrary label text became
+  both a plist path component and copy-pasted shell text without validation. The label is
+  fixed at `com.all-stock-dca.console`.
 
 ## Server
 

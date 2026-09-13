@@ -361,3 +361,73 @@ Per the skill's retry rule, retried **once** with a per-invocation override
 the CLI binary). The config file was not modified. Stdin redirected from `/dev/null` so a
 non-interactive run never blocks on "Reading additional input from stdin".
 
+### Attempt 2 — Codex reply (session `01a0990a-6696-75a1-bd9c-f80077cbea0f`, model override `gpt-5.6-sol`)
+
+Timestamp: 2026-09-13T05:10:20Z
+
+> I’ll audit the Visionary’s plan against the named implementation, tests, docs, CI configuration, and hard invariants, then report only actionable plan-level findings in the requested format. I’ll keep the workspace read-only.
+> The first concrete contradiction is confirmed: the proposed curl proofs place the Basic credential in the process argument list, violating the plan’s own credential invariant. I’m now checking boundary enforcement and deployment/CI assumptions so the final list distinguishes true build blockers from deferred risks.
+> [BLOCKER] credential-in-curl-argv — Rock 1 and Rock 2 expand `console-auth` into `curl -u`, making `user:password` process-visible despite VTO’s absolute no-credential-in-argv rule.
+> [BLOCKER] fail-closed-only-at-cli — The matrix exercises `main()`, but the plan does not require `make_server()` itself to reject credential-free non-loopback access before `ThreadingHTTPServer` opens a socket.
+> [MAJOR] plaintext-lan-basic-auth — Phase A carries the reusable Basic secret, CSRF token, and console data over LAN HTTP, where password length cannot prevent capture and replay ([Cloudflare guidance](https://developers.cloudflare.com/fundamentals/security/protect-your-origin-server/)).
+> [MAJOR] cross-site-get-exception-writes — The exception covers every navigational GET even though `/api/snapshot` and `/api/export` call `_save_summary()`, so these cross-site requests are not the harmless page loads the plan claims.
+> [MINOR] origin-not-bound-to-host — The plan never requires `Origin` to match the effective `Host` or `X-Forwarded-Host`, so the current weakness where both merely belong to allowed sets can survive the rewrite.
+> [MAJOR] auth-file-confidentiality-unproved — Tests omit non-regular and wrong-owner files, while the Windows mode exemption supplies neither an equivalent ACL check nor a fail-closed platform restriction.
+> [MAJOR] hosted-default-date-freezes — `main()` freezes `Settings.day` at startup and the frontend adopts that server default, so a launchd process surviving midnight opens new tabs on stale run data.
+> [MAJOR] restart-breaks-job-buttons — `app.token` changes after a launchd restart while `app.js` bootstraps only when `state.token` is empty, leaving existing tabs unable to launch jobs until manually reloaded.
+> [MAJOR] launchd-drops-octopus-input — VTO promises Wondrous Octopus forecasts, but the renderer emits no `--octopus-run` and `_load_demo_pointer()` is demo-only, so unattended local mode shows forecasts as unconfigured.
+> [MAJOR] kickstart-does-not-reload-plist — Rock 5 rewrites `ProgramArguments` and then only runs `launchctl kickstart -k`, which restarts the already-loaded definition without applying the new proxy flags.
+> [MAJOR] custom-root-splits-service-output — The child receives the root override through its plist environment while log paths use the renderer’s ambient `stream_root()`, allowing logs and console artifacts to land in different trees.
+> [MINOR] custom-label-is-an-unsafe-target — Arbitrary `--label` text becomes both a plist path component and copy-pasted shell text without grammar or containment validation.
+> [MAJOR] verification-omits-coverage-gate — `deploy` code counts toward coverage and CI enforces 90%, but every proof uses plain pytest, so all listed checks can pass while CI fails.
+> [MINOR] focused-tests-variable-is-never-set — `CONSOLE_TESTS` is prose rather than a shell assignment, so fresh-shell proofs expand it to nothing and omit the console tests whose pass counts they claim.
+> [MINOR] new-files-escape-local-literal-scan — The invariant reads `git ls-files`, so the new renderer and test remain invisible to local proofs until indexed even though CI will scan them after commit.
+> [MAJOR] cloudflared-ingress-is-incomplete — Rock 5 does not require the mandatory terminal catch-all ingress rule, so its documented Cloudflare configuration can fail validation ([Cloudflare configuration docs](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/local-management/configuration-file/)).
+> [MINOR] renderer-cannot-produce-phase-a — Rock 4 claims Phase A and Phase B forms, but the renderer has no `--bind` argument and cannot emit the LAN-bound Phase A shape.
+> [MAJOR] hosted-success-is-not-gated — VTO requires phone access over HTTPS, but whole-cycle verification postpones both proxy executions, allowing completion without demonstrating the cycle’s primary outcome.
+> 
+> credential-in-curl-argv — FIX — Replace authenticated curl proofs with a stdin, protected-config, or interactive mechanism that never materializes the secret in argv.
+> fail-closed-only-at-cli — FIX — Require shared validation at `ConsoleAccess` construction or `make_server()` and directly test that invalid access never invokes the server constructor.
+> plaintext-lan-basic-auth — FIX — Restrict direct HTTP to temporary synthetic testing with disposable credentials and require HTTPS before exposing real local data.
+> cross-site-get-exception-writes — FIX — Limit the redirect exception to the initial document route and require API GETs to remain cross-site-rejected.
+> origin-not-bound-to-host — FIX — Specify exact Origin-to-effective-authority matching and add mismatched-alias tests.
+> auth-file-confidentiality-unproved — FIX — Add regular-file and ownership regressions and fail closed for remote hosting on platforms where privacy cannot be verified.
+> hosted-default-date-freezes — FIX — Add rolling local-mode defaults and a midnight rollover regression.
+> restart-breaks-job-buttons — FIX — Include frontend token re-bootstrap behavior and a restart regression without blindly retrying a possibly accepted job.
+> launchd-drops-octopus-input — FIX — Add validated Octopus-path passthrough or narrow the VTO’s hosted feature promise.
+> kickstart-does-not-reload-plist — FIX — Require `bootout` followed by `bootstrap` whenever the rendered plist changes.
+> custom-root-splits-service-output — FIX — Resolve one canonical root and use it for both plist environment and log paths, with an exact custom-root test.
+> custom-label-is-an-unsafe-target — KILL — Use the fixed launchd label this cycle and defer customizable labels.
+> verification-omits-coverage-gate — FIX — Add CI’s exact coverage-gated pytest command to whole-cycle verification.
+> focused-tests-variable-is-never-set — FIX — Define a shell-safe array or spell out the focused test paths in every proof.
+> new-files-escape-local-literal-scan — FIX — Require indexing new files before the invariant proof or add an explicit scan including untracked nonignored files.
+> cloudflared-ingress-is-incomplete — FIX — Specify the terminal catch-all and a `cloudflared` configuration-validation step.
+> renderer-cannot-produce-phase-a — FIX — Declare Phase A manual and remove the renderer claim, or add validated bind passthrough.
+> hosted-success-is-not-gated — FIX — Require one operator-assisted Phase B end-to-end acceptance before cycle completion or redefine success as code-and-runbook readiness.
+> VERDICT: BLOCKED — 18 open finding(s)
+
+### Round 1 — Discuss (Visionary responses, on the record)
+
+| # | Finding | Codex | Visionary response |
+|---|---|---|---|
+| 1 | credential-in-curl-argv | FIX | **Agree.** Proofs now use `curl -K <(printf 'user = "%s"\n' "$(<"$AUTH")")`: the config arrives through a `/dev/fd` path, argv holds only the path. |
+| 2 | fail-closed-only-at-cli | FIX | **Agree.** Validation moves into `ConsoleAccess.__post_init__` (credential shape in Rock 1; the bind/host matrix in Rock 2 once those fields exist). `main()` maps `ValueError` → `parser.error`. New test: `make_server` with an invalid access raises before `ThreadingHTTPServer` is constructed (constructor monkeypatched to fail the test if called). |
+| 3 | plaintext-lan-basic-auth | FIX | **Agree on the risk; bounded rather than eliminated.** The operator explicitly chose LAN-first for build/test (interview gate 1). Bounds: Phase A is a foreground run and never the launchd service (the renderer cannot emit `--bind`, see #17); Phase A uses a disposable credential that the runbook rotates before Phase B; the runbook's first sentence says LAN HTTP is plaintext on the home wifi; in-process TLS stays in `DEFERRED.md` as the proper fix. Not adopting "synthetic data only": the operator's stated purpose for Phase A is testing against real runs. |
+| 4 | cross-site-get-exception-writes | FIX | **Agree.** Exception narrowed to `GET /` only (the document route); every `/api/*` GET stays cross-site-rejected. The `_save_summary()` side effect of `/api/snapshot` is now stated in the plan. |
+| 5 | origin-not-bound-to-host | FIX | **Agree.** When `Origin` is present it must equal `http://` or `https://` + the *effective authority* (the accepted `Host`, or the accepted `X-Forwarded-Host` under `--behind-proxy`). Test: loopback `Host` + `Origin: https://mac.tailnet.ts.net` → 403. |
+| 6 | auth-file-confidentiality-unproved | FIX | **Agree.** `load_auth_file` requires POSIX (`os.name == "posix"`, otherwise raises — the Windows tolerance is dropped for this feature, fail closed), `S_ISREG` on `lstat` (rejects symlinks, FIFOs, directories), `st_uid == os.getuid()`. Tests: symlink, FIFO, directory, wrong owner (monkeypatched `os.getuid`), non-POSIX (monkeypatched `os.name`). |
+| 7 | hosted-default-date-freezes | FIX | **Agree.** `ConsoleApp.default_day()` returns `datetime.now(ET).date()` in local mode and `settings.day` in demo mode; used by `/api/bootstrap`, the `snapshot()` default and the `default_date` field. Test: a monkeypatched clock crossing midnight changes `default_date` without a restart. |
+| 8 | restart-breaks-job-buttons | FIX | **Agree.** `console/app.js`: on a 403 from `POST /api/jobs`, clear `state.token`, re-bootstrap once, retry once. Safe because `do_POST` returns 403 before `submit()`, so a 403 proves the job was never accepted; a second 403 surfaces the error. Lands in Rock 3 (now "restart resilience"). No JS test harness exists; proof is the manual `kickstart -k` step with an open tab. |
+| 9 | launchd-drops-octopus-input | FIX | **Agree.** Renderer gains optional `--octopus-run DIR` (must be an existing directory) passed through to `from.py`; VTO narrowed: forecasts appear only when an Octopus run directory is configured. |
+| 10 | kickstart-does-not-reload-plist | FIX | **Agree.** Runbook: any plist change → `launchctl bootout …` then `launchctl bootstrap …`; `kickstart -k` only restarts an unchanged definition (e.g. after rotating the auth file). |
+| 11 | custom-root-splits-service-output | FIX | **Agree.** Renderer resolves one root (`--cron-tracking-root` or `dca_paths.cron_tracking_root()`), always emits `DCA_CRON_TRACKING_ROOT=<root>` in the plist environment, and derives log paths as `<root>/console/launchd.*.log` from that same value. Custom-root test asserts both agree. |
+| 12 | custom-label-is-an-unsafe-target | KILL | **Agree.** `--label` removed; the label is the fixed `com.all-stock-dca.console`. Recorded in `DEFERRED.md`. |
+| 13 | verification-omits-coverage-gate | FIX | **Agree.** Whole-cycle verification adds CI's exact command: `pytest --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90`. |
+| 14 | focused-tests-variable-is-never-set | FIX | **Agree.** Every proof block starts with an explicit `CONSOLE_TESTS="…"` assignment. |
+| 15 | new-files-escape-local-literal-scan | FIX | **Agree.** Rock 4 and 5 proofs run `git add -N` on the new files before `tests/test_config_invariants.py`. |
+| 16 | cloudflared-ingress-is-incomplete | FIX | **Agree.** `config.yml` ends with `- service: http_status:404`; `cloudflared tunnel ingress validate` runs before `cloudflared service install`. |
+| 17 | renderer-cannot-produce-phase-a | FIX | **Agree (resolved with #3).** The renderer has no `--bind`; the launchd service is loopback-only by design; Rock 4 claims only the Phase B form; Phase A is a documented foreground command. |
+| 18 | hosted-success-is-not-gated | FIX | **Agree, redefined on the record.** Installing and logging in to Tailscale or Cloudflare is the operator's step (account creation/login is outside the Visionary's reach). VTO success criterion 3 becomes: LAN acceptance demonstrated in-cycle, plus Phase B runbooks with an operator acceptance checklist. The plan states the cycle is *code-complete* at commit approval and *deployed* only when the operator completes that checklist. |
+
+Solve: `PLAN.md`, `VTO.md` and `DEFERRED.md` revised accordingly (see the round-2 prompt below for the per-finding resolution list). The Visionary also ran an independent four-lens adversarial review of the same plan (Claude workflow `plan-pressure-test`); its confirmed findings are recorded before round 2 is sent.
+

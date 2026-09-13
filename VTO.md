@@ -8,7 +8,8 @@ The existing local DCA operations console (`from.py` → `dca_console.py`, stdli
 `ThreadingHTTPServer`, browser assets under `console/`) running unattended on the Mac
 that holds the artifact tree, reachable over HTTPS from the operator's phone or laptop
 anywhere, with the same read-mostly surface it has today: daily run ledger, confirmed
-spend, schedule countdowns, Wondrous Octopus forecasts, bounded demo/test jobs.
+spend, schedule countdowns, bounded demo/test jobs, and Wondrous Octopus forecasts when an
+Octopus run directory is configured for the service (`--octopus-run`).
 
 ## Why now
 
@@ -27,8 +28,12 @@ A single operator (the repository owner). Multi-user access and roles are deferr
    on SIGTERM (`Stopping local console.` in the log, exit 0).
 2. From another device on the home LAN, `curl` gets `401` without credentials and `200`
    with them; a phone browser prompts once and renders real runs.
-3. The deployment runbook for each front (Tailscale Serve, Cloudflare Tunnel + Access)
-   ends with a phone loading the console over HTTPS. Same code path for both; only the
+3. **Code-complete** means: LAN acceptance demonstrated from a second device in-cycle,
+   the launchd cycle demonstrated, and a deployment runbook for each front (Tailscale
+   Serve, Cloudflare Tunnel + Access) with an operator acceptance checklist. **Deployed**
+   means the operator has installed and logged in to one front (their step; the Visionary
+   cannot create accounts or log in) and completed that checklist with a phone loading
+   the console over HTTPS off the home wifi. Same code path for both fronts; only the
    runbook differs.
 4. All existing console tests plus the new ones pass; `ruff check .` is clean; the full
    core suite is green; the demo smoke run still works.
@@ -40,8 +45,11 @@ A single operator (the repository owner). Multi-user access and roles are deferr
 - The console never places, reviews, cancels or schedules brokerage orders. Hosting it
   changes nothing about that; the allowlisted actions stay demo/test/report only.
 - Default bind stays `127.0.0.1`. Any non-loopback bind or any external hostname
-  **refuses to start** without a credential file (fail closed, exit 2, before any
-  socket is opened).
+  **refuses to start** without a credential file (fail closed, enforced when the access
+  policy object is constructed, so no caller can open a socket around it).
+- The persistent launchd service is always loopback-bound; a LAN bind is a foreground,
+  build/test-only command over plaintext HTTP with a disposable credential that is rotated
+  before deployment.
 - The credential never appears in argv, the environment, job logs, `/api/bootstrap`,
   snapshots, summaries or the rendered launchd plist. Anything that could echo it goes
   through `dca_console_jobs.redact`.
