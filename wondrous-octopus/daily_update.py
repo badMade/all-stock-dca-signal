@@ -28,20 +28,32 @@ retained), matching run_walkforward.py.
 
 from __future__ import annotations
 
-import argparse
-import csv
-import io
-import json
-import math
+import os
 import sys
 from pathlib import Path
-
-import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # Index 1, not 0 -- see run_walkforward.py's identical bootstrap comment.
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(REPO_ROOT))
+
+from dca_bootstrap import ensure_venv  # noqa: E402
+
+ensure_venv(
+    packages=("numpy", "pandas", "sklearn", "torch"),
+    requirements_files=(
+        REPO_ROOT / "requirements-dev.txt",
+        REPO_ROOT / "wondrous-octopus" / "requirements.txt",
+    ),
+)
+
+import argparse
+import csv
+import io
+import json
+import math
+
+import numpy as np
 
 from typing import Any  # noqa: E402
 

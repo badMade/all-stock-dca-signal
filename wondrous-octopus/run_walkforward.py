@@ -22,26 +22,37 @@ MPS, then CPU.
 
 from __future__ import annotations
 
-import argparse
-import contextlib
-import hashlib
-import json
 import os
-import signal
 import sys
-import threading
-import time
-from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
-
-import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # Index 1, not 0 -- index 0 is this subproject's own directory; see
 # ml-forecaster/train.py's identical bootstrap and its comment.
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(REPO_ROOT))
+
+from dca_bootstrap import ensure_venv  # noqa: E402
+
+ensure_venv(
+    packages=("numpy", "pandas", "sklearn", "torch"),
+    requirements_files=(
+        REPO_ROOT / "requirements-dev.txt",
+        REPO_ROOT / "wondrous-octopus" / "requirements.txt",
+    ),
+)
+
+import argparse
+import contextlib
+import hashlib
+import json
+import signal
+import threading
+import time
+from datetime import datetime, timedelta
+from typing import Any
+
+import numpy as np
 
 import features as _features  # noqa: E402
 

@@ -17,21 +17,33 @@ Exit codes: 0 ok, 1 REFUSED (no run/ledger/checkpoint where required).
 
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+# Index 1, not 0 -- see run_walkforward.py's identical bootstrap comment.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(1, str(REPO_ROOT))
+
+from dca_bootstrap import ensure_venv  # noqa: E402
+
+ensure_venv(
+    packages=("numpy", "pandas", "sklearn", "torch"),
+    requirements_files=(
+        REPO_ROOT / "requirements-dev.txt",
+        REPO_ROOT / "wondrous-octopus" / "requirements.txt",
+    ),
+)
+
 import argparse
 import bisect
 import csv
 import html as html_module
 import json
 import math
-import sys
-from pathlib import Path
 
 import numpy as np
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-# Index 1, not 0 -- see run_walkforward.py's identical bootstrap comment.
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(1, str(REPO_ROOT))
 
 import metrics as metrics_module  # noqa: E402
 from data import COMPONENTS  # noqa: E402
