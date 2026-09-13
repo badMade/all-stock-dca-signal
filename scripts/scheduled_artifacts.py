@@ -1210,8 +1210,12 @@ def csv_qualifying_notional_total(
         return total
     try:
         with csv_path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            # reader.fieldnames is None specifically when the file has NO
+            reader = csv.reader(handle)
+            try:
+                fieldnames = next(reader)
+            except StopIteration:
+                fieldnames = None
+            # fieldnames is None specifically when the file has NO
             # header line at all -- every real writer of this shape calls
             # writer.writeheader() unconditionally on creation, so an
             # EXISTING file with no header at all was caught mid-write
@@ -1224,11 +1228,11 @@ def csv_qualifying_notional_total(
             # incomplete"). Checked BEFORE the `or ()` fallback so it can't
             # be conflated with a header row that simply lacks the columns
             # this reader needs (handled separately below).
-            if reader.fieldnames is None:
+            if fieldnames is None:
                 if skip_sink is not None:
                     skip_sink.append(csv_path)
                 return total
-            fieldnames = reader.fieldnames
+
             # Codex review: "Validate canonical CSV headers before filtering
             # rows". A missing/corrupted "status" header makes row.get
             # ("status") return None for every row, which the qualifying-
@@ -1251,13 +1255,36 @@ def csv_qualifying_notional_total(
                 if skip_sink is not None:
                     skip_sink.append(csv_path)
                 return total
-            for row in reader:
-                status = (row.get("status") or "").lower()
+
+            try:
+                idx_status = fieldnames.index("status")
+            except ValueError:
+                idx_status = -1
+            try:
+                idx_order_id = fieldnames.index("order_id")
+            except ValueError:
+                idx_order_id = -1
+
+            idx_amounts = []
+            for col in ("notional_usd", "amount_usd", "submitted_amount_usd"):
+                try:
+                    idx_amounts.append(fieldnames.index(col))
+                except ValueError:
+                    pass
+
+            raw_rows_lists = list(reader)
+
+            num_fields = len(fieldnames)
+            for raw_row in raw_rows_lists:
+                if len(raw_row) < num_fields:
+                    raw_row.extend([None] * (num_fields - len(raw_row)))
+
+                status = (raw_row[idx_status] if idx_status >= 0 and idx_status < len(raw_row) and raw_row[idx_status] is not None else "").lower()
                 # filled_orders.csv rows are always confirmed fills; a
                 # blank/missing status field still counts as "filled".
                 if blank_status_means_filled and not status:
                     status = "filled"
-                order_id = row.get("order_id") or ""
+                order_id = raw_row[idx_order_id] if idx_order_id >= 0 and idx_order_id < len(raw_row) and raw_row[idx_order_id] is not None else ""
                 # Codex review: "Reserve in-flight canonical orders in weekly
                 # cap seeding". ORDER_ATTEMPT_STATUSES ("submitted", "filled",
                 # "pending", "unconfirmed",
@@ -1290,9 +1317,13 @@ def csv_qualifying_notional_total(
                 # file but never actually read its amount column, so it
                 # always contributed $0 (Codex review: "Read the canonical
                 # submitted amount column").
-                raw = row.get("notional_usd") or row.get("amount_usd") or row.get("submitted_amount_usd")
+                raw = None
+                for idx in idx_amounts:
+                    if idx < len(raw_row) and raw_row[idx] not in (None, "", "-"):
+                        raw = raw_row[idx]
+                        break
                 try:
-                    notional = float(raw) if raw not in (None, "", "-") else None
+                    notional = float(raw) if raw is not None else None
                 except (TypeError, ValueError):
                     notional = None
                 # Reject inf/-inf/nan: an infinite notional would seed the
