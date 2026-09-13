@@ -14,6 +14,19 @@ license = { text = "Proprietary" }
 dependencies = []
 
 [project.optional-dependencies]
+selfheal = [
+    "pytest==9.1.1",
+    "ruff==0.16.2",
+    "pyright==1.1.411",
+    "pytest-cov==7.1.0",
+    "pip-audit==2.10.1",
+    "pip-tools",
+    "types-requests==2.33.0.20260712",
+    "types-PyYAML==6.0.12.20240917",
+    "types-beautifulsoup4==4.12.0.20250516",
+    "types-Pillow"
+]
+
 # Test/lint tooling. Kept in sync with requirements-dev.txt, which pins exact
 # versions for CI; this extra backs the documented `pip install -e '.[dev]'`
 # path. Both must install the same tools or the two paths run different suites:

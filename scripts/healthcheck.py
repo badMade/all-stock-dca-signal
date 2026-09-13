@@ -37,6 +37,10 @@ def main():
     if not run_cmd(["ruff", "check", "."]):
         success = False
 
+    # Types
+    if not run_cmd(["pyright"]):
+        success = False
+
     # Testing
     if not run_cmd(["pytest", "--cov=.", "--cov-report=term-missing:skip-covered", "--cov-fail-under=90"]):
         success = False

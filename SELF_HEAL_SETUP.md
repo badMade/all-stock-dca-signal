@@ -6,7 +6,7 @@ This repository is equipped with an adaptive self-healing workflow, designed to 
 
 The self-heal system is composed of several components:
 
-1. **`scripts/healthcheck.py`**: A deterministic gate script that verifies codebase health. It mirrors ci.yml's checks: `ruff check` for linting, `pytest` (coverage-gated) for tests, the dry-run demo smoke test, and `pip-audit`. It does not run `ruff format --check` -- there is no formatting gate. It exits with code 0 if healthy, 1 if not.
+1. **`scripts/healthcheck.py`**: A deterministic gate script that verifies codebase health. It mirrors ci.yml's checks: `ruff check` for linting, type checking with `pyright`, `pytest` (coverage-gated) for tests, the dry-run demo smoke test, and `pip-audit`. It does not run `ruff format --check` -- there is no formatting gate. It exits with code 0 if healthy, 1 if not.
 2. **`scripts/self_heal.py`**: The repair pipeline. It executes a sequence of idempotent steps (dependency installation, linting auto-fixes, etc.) and re-evaluates health after each step.
 3. **`scripts/compute_schedule.py`**: Telemetry engine. It analyzes commit frequency to compute a suggested cron cadence and writes it both to `.github/self-heal-schedule.yml` and to the `# AUTO-UPDATED` cron line in `.github/workflows/self-heal.yml` (see Triggers below).
 4. **`.github/workflows/self-heal.yml`**: The primary GitHub Actions workflow. It triggers on its own telemetry-computed schedule and reactively on CI failure (see Triggers below). It runs the repair and automatically creates a PR if a fix is found.
@@ -17,6 +17,7 @@ The self-heal system is composed of several components:
 
 `.github/workflows/self-heal.yml` (the repair workflow) triggers two ways:
 
+*   **Manual Dispatch (`workflow_dispatch`):** Allows an operator to manually trigger a self-heal run.
 *   **Scheduled:** Runs on the cron cadence recorded in the `# AUTO-UPDATED` line under its `schedule:` trigger, which `compute-schedule.yml` keeps in sync with the telemetry-computed (or manually overridden) value in `.github/self-heal-schedule.yml`.
 *   **Reactive (CI failure):** Runs when the `CI` workflow (`ci.yml`) completes with a failure on `main`. It only proceeds past the "Check reactive trigger scope" step when the failing job is one `scripts/healthcheck.py` can actually validate (the core lint/test/audit job) -- a failure isolated to an independent sibling suite (production-safe-agent-loop, ticker-advisor, ml-forecaster, wondrous-octopus) is skipped, since the repair pipeline has no way to install or fix those.
 
