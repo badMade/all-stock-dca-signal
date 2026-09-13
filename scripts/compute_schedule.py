@@ -53,23 +53,9 @@ def compute_cadence():
     commits = commits_output.split("\n")
     num_commits = len(commits)
 
-    # Active-period detection
-    hours = [0] * 24
-    for commit in commits:
-        if "T" in commit:
-            try:
-                hour = int(commit.split("T")[1][:2])
-                hours[hour] += 1
-            except (ValueError, IndexError):
-                pass
-
-    quietest_window = 0
-    min_commits = float('inf')
-    for i in range(24):
-        window_commits = hours[i] + hours[(i+1)%24] + hours[(i+2)%24]
-        if window_commits < min_commits:
-            min_commits = window_commits
-            quietest_window = i
+    # Keep the execution hour pinned to 03:00 UTC. The cadence logic only varies
+    # by frequency; CI/tests and self-heal docs rely on this fixed hour.
+    run_hour = 3
 
     # Adjustment triggers check
     try:
@@ -78,8 +64,6 @@ def compute_cadence():
         # Simplified telemetry logic
     except Exception:
         pass
-
-    run_hour = quietest_window
 
     if num_commits > 50:
         return f"0 {run_hour} * * *", f"High PR velocity (>50 commits/mo); running daily at {run_hour}:00."
