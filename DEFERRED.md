@@ -11,7 +11,8 @@ re-derive.
   per-IP state degenerates into a global lockout lever a remote party could pull. The
   right shape: keyed by `X-Forwarded-For` only under `--behind-proxy`, bounded dict,
   delay rather than lockout. Mitigation in place: 12-character minimum password, a
-  documented `secrets.token_urlsafe(24)` generator, one stderr line per failure.
+  documented `secrets.token_urlsafe(24)` generator, and a per-server stderr line rate-limited
+  to one per 5-second interval with a suppressed count.
 - **Proxy identity in the banner.** Show `Tailscale-User-Login` /
   `Cf-Access-Authenticated-User-Email`. Verifying `Cf-Access-Jwt-Assertion` needs RS256
   plus a JWKS fetch, which the stdlib-only rule forbids, so identity would be
@@ -30,6 +31,11 @@ re-derive.
 
 ## Server
 
+- **Loopback alias binds.** `--bind 127.0.0.2` (any 127.x other than 127.0.0.1) constructs
+  without a credential but `hosts()` accepts only `127.0.0.1`/`localhost`, so the console
+  refuses its own advertised URL with a 403 (macOS refuses the bind outright). Fail-closed,
+  off-host unreachable, and outside the launchd path, so left as a usability follow-up
+  (Rock 2 review).
 - **IPv6 / hostname `--bind`.** `HTTPServer` is AF_INET; an IPv4 literal is enough for
   this cycle.
 - **SIGHUP reload of the auth file** so rotation does not need `launchctl kickstart -k`.

@@ -408,7 +408,17 @@ async function startJob(action) {
   state.launching.add(action);
   renderActions(state.snapshot?.actions);
   try {
-    await readJson(await fetch("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json", "X-Console-Token": state.token }, body: JSON.stringify({ action }), signal: AbortSignal.timeout(15000) }));
+    const submit = () => fetch("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json", "X-Console-Token": state.token }, body: JSON.stringify({ action }), signal: AbortSignal.timeout(15000) });
+    let response = await submit();
+    if (response.status === 403) {
+      // A launchd restart rotates the token, and do_POST rejects before submit(), so a 403 proves the job was never
+      // accepted and exactly one retry is safe (Same Page round 1).
+      state.token = null;
+      const bootstrap = await readJson(await fetch("/api/bootstrap", { cache: "no-store", signal: AbortSignal.timeout(15000) }));
+      state.token = bootstrap.token;
+      response = await submit();
+    }
+    await readJson(response);
     await refresh();
     $("jobs").scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
   } catch (error) {

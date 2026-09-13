@@ -1,17 +1,71 @@
 """Loopback HTTP and launcher integration tests for the local DCA console."""
 
+import base64
+import builtins
 import http.client
+import io
 import json
+import os
+import re
+import signal
+import socket
+import subprocess
 import sys
 import threading
-from datetime import date, datetime
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
 import dca_console
-from dca_console import ConsoleApp, Settings, main, make_server
-from dca_console_jobs import JobManager
+from dca_console import AuthFailureLog, ConsoleAccess, ConsoleApp, Settings, load_auth_file, main, make_server
+from dca_console_jobs import JobManager, redact
+
+AUTH_CREDENTIAL = b"dca:s3cret-pw-abcdefg"
+AUTH_PASSWORD = AUTH_CREDENTIAL.partition(b":")[2].decode()
+
+
+def auth_headers(credential: bytes = AUTH_CREDENTIAL, *, scheme: str = "Basic") -> dict[str, str]:
+    return {"Authorization": f"{scheme} {base64.b64encode(credential).decode()}"}
+
+
+def secure_auth_file(path: Path, content: bytes = AUTH_CREDENTIAL + b"\n") -> Path:
+    path.write_bytes(content)
+    path.chmod(0o600)
+    return path
+
+
+def auth_file_error(path: Path) -> str:
+    with pytest.raises(ValueError) as error:
+        load_auth_file(path)
+    return str(error.value)
+
+
+@contextmanager
+def running_server(app, access, failure_log):
+    server = make_server(app, 0, access=access, failure_log=failure_log)
+    worker = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
+    worker.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
 
 
 def test_default_demo_skips_holidays_and_early_close_sessions(monkeypatch):
@@ -45,6 +99,15 @@ def http_server(app):
     server.server_close()
     worker.join(timeout=2)
     assert not worker.is_alive()
+
+
+@pytest.fixture
+def auth_server(app):
+    stream = io.StringIO()
+    access = ConsoleAccess(username="dca", credential=AUTH_CREDENTIAL)
+    failure_log = AuthFailureLog(interval=0, stream=stream)
+    with running_server(app, access, failure_log) as server:
+        yield server, stream, access
 
 
 def request(server, path, *, method="GET", body=None, headers=None):
@@ -85,7 +148,8 @@ def test_http_serves_bootstrap_daily_data_assets_and_download(app, http_server):
     assert app.token not in body.decode()
     assert (app.settings.output / "summaries/local/2026-09-08.json").is_file()
     status, _, body = request(http_server, "/api/health")
-    assert status == 200 and json.loads(body) == {"status": "ok", "mode": "local"}
+    health = json.loads(body)
+    assert status == 200 and health["status"] == "ok" and health["mode"] == "local"
     for route, content_type in (("/", "text/html"), ("/app.js", "text/javascript"), ("/styles.css", "text/css")):
         status, headers, body = request(http_server, route)
         assert status == 200 and body
@@ -290,3 +354,1000 @@ def test_saved_summary_remains_valid_json_with_large_numeric_usage_fields(app):
     saved = app.settings.output / "summaries/local/2026-09-08.json"
     restored = json.loads(saved.read_bytes())
     assert restored["daily"]["costs"]["totals"]["total_artifact_bytes"] == 200_000
+
+
+def test_auth_file_rules_fail_closed(tmp_path, monkeypatch):
+    good = secure_auth_file(tmp_path / "good-auth")
+    messages = []
+
+    missing_message = auth_file_error(tmp_path / "missing-auth")
+    messages.append(missing_message)
+    assert "open" in missing_message.lower() or "exist" in missing_message.lower()
+
+    permissive = secure_auth_file(tmp_path / "permissive-auth")
+    permissive.chmod(0o644)
+    mode_message = auth_file_error(permissive)
+    messages.append(mode_message)
+    assert "mode" in mode_message.lower() or "permission" in mode_message.lower()
+
+    symlink = tmp_path / "linked-auth"
+    symlink.symlink_to(good)
+    symlink_message = auth_file_error(symlink)
+    messages.append(symlink_message)
+    assert "symlink" in symlink_message.lower() or "no-follow" in symlink_message.lower()
+
+    fifo = tmp_path / "fifo-auth"
+    os.mkfifo(fifo, mode=0o600)
+    fifo_result = []
+
+    def read_fifo():
+        try:
+            fifo_result.append(load_auth_file(fifo))
+        except Exception as error:  # noqa: BLE001 - the assertion below diagnoses any wrong exception type
+            fifo_result.append(error)
+
+    fifo_worker = threading.Thread(target=read_fifo, daemon=True)
+    fifo_worker.start()
+    fifo_worker.join(timeout=5)
+    assert not fifo_worker.is_alive(), "A writerless auth FIFO blocked instead of failing closed"
+    assert len(fifo_result) == 1 and isinstance(fifo_result[0], ValueError)
+    fifo_message = str(fifo_result[0])
+    messages.append(fifo_message)
+    assert "regular" in fifo_message.lower()
+
+    directory = tmp_path / "auth-directory"
+    directory.mkdir()
+    directory_message = auth_file_error(directory)
+    messages.append(directory_message)
+    assert "regular" in directory_message.lower()
+
+    oversized_marker = b"oversized-private-content"
+    oversized = secure_auth_file(tmp_path / "oversized-auth", oversized_marker + b"x" * (4096 + 1))
+    size_message = auth_file_error(oversized)
+    messages.append(size_message)
+    assert "size" in size_message.lower() or "4096" in size_message
+    assert oversized_marker.decode() not in size_message
+
+    actual_uid = good.stat().st_uid
+    with monkeypatch.context() as patch:
+        patch.setattr(dca_console.os, "getuid", lambda: actual_uid + 1)
+        owner_message = auth_file_error(good)
+    messages.append(owner_message)
+    assert "own" in owner_message.lower()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(dca_console.os, "name", "not-posix")
+        platform_message = auth_file_error(good)
+    messages.append(platform_message)
+    assert "posix" in platform_message.lower()
+
+    no_colon_content = b"no-colon-private-value"
+    no_colon = secure_auth_file(tmp_path / "no-colon-auth", no_colon_content)
+    colon_message = auth_file_error(no_colon)
+    messages.append(colon_message)
+    assert "colon" in colon_message.lower() or "user:password" in colon_message.lower()
+    assert no_colon_content.decode() not in colon_message
+
+    empty_message = auth_file_error(secure_auth_file(tmp_path / "empty-auth", b""))
+    messages.append(empty_message)
+    assert "line" in empty_message.lower() or "empty" in empty_message.lower()
+
+    two_line_content = AUTH_CREDENTIAL + b"\nsecond-private-line\n"
+    two_line_message = auth_file_error(secure_auth_file(tmp_path / "two-line-auth", two_line_content))
+    messages.append(two_line_message)
+    assert "line" in two_line_message.lower()
+    assert two_line_content.decode() not in two_line_message
+
+    short_content = b"dca:short-pw-xx\n"
+    short_message = auth_file_error(secure_auth_file(tmp_path / "short-auth", short_content))
+    messages.append(short_message)
+    assert "12" in short_message or "password" in short_message.lower()
+    assert short_content.decode() not in short_message
+
+    with pytest.raises(SystemExit) as cli_error:
+        main(["--check", "--auth-file", str(no_colon)])
+    assert cli_error.value.code == 2
+
+    assert all(AUTH_PASSWORD not in message for message in messages)
+    assert load_auth_file(good) == ("dca", AUTH_CREDENTIAL)
+
+
+def test_auth_file_is_read_from_the_checked_descriptor(tmp_path, monkeypatch):
+    path = secure_auth_file(tmp_path / "descriptor-auth")
+    real_open = os.open
+    real_fstat = os.fstat
+    real_read = os.read
+    opened = []
+    checked = []
+    read_from = []
+
+    def tracked_open(opened_path, flags):
+        descriptor = real_open(opened_path, flags)
+        opened.append((opened_path, flags, descriptor))
+        return descriptor
+
+    def tracked_fstat(descriptor):
+        checked.append(descriptor)
+        return real_fstat(descriptor)
+
+    def tracked_read(descriptor, size):
+        read_from.append((descriptor, size))
+        return real_read(descriptor, size)
+
+    def reject_path_open(*args, **kwargs):
+        pytest.fail("Auth content was reopened by path after descriptor validation")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(dca_console.os, "open", tracked_open)
+        patch.setattr(dca_console.os, "fstat", tracked_fstat)
+        patch.setattr(dca_console.os, "read", tracked_read)
+        patch.setattr(builtins, "open", reject_path_open)
+        patch.setattr(Path, "open", reject_path_open)
+        assert load_auth_file(path) == ("dca", AUTH_CREDENTIAL)
+
+    assert len(opened) == 1
+    _, flags, descriptor = opened[0]
+    assert flags & os.O_NOFOLLOW
+    assert flags & os.O_NONBLOCK
+    assert flags & os.O_CLOEXEC
+    assert checked and set(checked) == {descriptor}
+    assert read_from and {item[0] for item in read_from} == {descriptor}
+
+
+def test_basic_auth_required_on_every_route_except_health(app, auth_server, monkeypatch):
+    server, _, _ = auth_server
+    protected_routes = (
+        "/",
+        "/app.js",
+        "/styles.css",
+        "/api/bootstrap",
+        "/api/snapshot",
+        "/api/export",
+        "/api/docs?path=docs/live_wiring.md",
+    )
+    for route in protected_routes:
+        status, headers, body = request(server, route)
+        assert status == 401, route
+        assert headers["WWW-Authenticate"].startswith('Basic realm="DCA console"')
+        assert json.loads(body)["error"]
+
+    status, _, body = request(server, "/api/health")
+    assert status == 200
+    assert json.loads(body)["status"] == "ok"
+
+    monkeypatch.setattr(app, "submit", lambda _: pytest.fail("A request without Basic auth dispatched work"))
+    status, headers, _ = post(server, app.token, "demo-dca")
+    assert status == 401
+    assert headers["WWW-Authenticate"].startswith("Basic realm=")
+
+
+def test_basic_auth_wrong_credentials_are_rejected(auth_server):
+    server, _, _ = auth_server
+    rejected_headers = (
+        auth_headers(b"dca:wrong-private-password"),
+        auth_headers(b"other-user:s3cret-pw-abcdefg"),
+        {"Authorization": "Basic not-valid-base64!"},
+        auth_headers(scheme="Bearer"),
+    )
+    for headers in rejected_headers:
+        status, response_headers, body = request(server, "/api/bootstrap", headers=headers)
+        assert status == 401
+        assert response_headers["WWW-Authenticate"].startswith("Basic realm=")
+        assert json.loads(body)["error"]
+
+
+def test_basic_auth_correct_credentials_pass_and_token_still_required(app, auth_server, monkeypatch):
+    server, _, _ = auth_server
+    headers = auth_headers(scheme="bAsIc")
+    status, _, body = request(server, "/api/bootstrap", headers=headers)
+    assert status == 200
+    assert json.loads(body)["token"] == app.token
+
+    submitted = []
+    monkeypatch.setattr(app, "submit", lambda action: submitted.append(action) or {"id": "example-job"})
+    assert post(server, "", "demo-dca", **headers)[0] == 403
+    assert submitted == []
+    status, _, body = post(server, app.token, "demo-dca", **headers)
+    assert status == 202
+    assert json.loads(body)["job"]["id"] == "example-job"
+    assert submitted == ["demo-dca"]
+
+
+def test_gate_order_is_trusted_then_basic_then_token(app, auth_server):
+    server, stream, _ = auth_server
+    credentials = auth_headers()
+
+    status, headers, _ = request(
+        server, "/api/bootstrap", headers={"Host": "untrusted.example", **credentials},
+    )
+    assert status == 403
+    assert "WWW-Authenticate" not in headers
+
+    status, headers, _ = request(server, "/api/bootstrap")
+    assert status == 401
+    assert headers["WWW-Authenticate"].startswith("Basic realm=")
+
+    status, headers, _ = post(server, "", "demo-dca", **credentials)
+    assert status == 403
+    assert "WWW-Authenticate" not in headers
+
+    lines = stream.getvalue().splitlines()
+    assert len(lines) == 3
+    assert "method=GET" in lines[0] and "route=/api/bootstrap" in lines[0]
+    assert "method=GET" in lines[1] and "route=/api/bootstrap" in lines[1]
+    assert "method=POST" in lines[2] and "route=/api/jobs" in lines[2]
+
+
+def test_password_never_appears_in_responses_or_redaction(auth_server):
+    server, _, access = auth_server
+    responses = [
+        request(server, f"/private/{AUTH_PASSWORD}"),
+        request(server, "/api/bootstrap", headers=auth_headers()),
+        request(server, "/api/bootstrap", headers=auth_headers(b"dca:wrong-private-password")),
+    ]
+    for _, headers, body in responses:
+        rendered_response = json.dumps(headers) + body.decode(errors="replace")
+        assert AUTH_PASSWORD not in rendered_response
+        assert AUTH_CREDENTIAL.decode() not in rendered_response
+
+    rendered_log = redact(f"password fragments: {AUTH_PASSWORD} and {AUTH_CREDENTIAL.decode()}")
+    assert AUTH_PASSWORD not in rendered_log
+    assert AUTH_CREDENTIAL.decode() not in rendered_log
+    assert "[redacted]" in rendered_log.lower()
+    assert AUTH_PASSWORD not in repr(access)
+    assert AUTH_CREDENTIAL.decode() not in repr(access)
+
+
+def test_auth_failure_is_logged_without_credentials(auth_server):
+    server, stream, _ = auth_server
+    wrong_header = auth_headers(b"other-user:s3cret-pw-abcdefg")
+    status, _, _ = request(server, f"/api/bootstrap?attempt={AUTH_PASSWORD}", headers=wrong_header)
+    assert status == 401
+
+    lines = stream.getvalue().splitlines()
+    assert len(lines) == 1
+    line = lines[0]
+    assert "127.0.0.1" in line
+    assert "GET" in line
+    assert "/api/bootstrap" in line
+    assert "attempt" not in line
+    assert "Authorization" not in line and "Basic" not in line
+    assert AUTH_PASSWORD not in line
+    assert base64.b64encode(b"other-user:s3cret-pw-abcdefg").decode() not in line
+
+
+def test_auth_failure_log_line_is_bounded_and_redacted(app):
+    # Constructing access registers the credential with the shared redactor. This
+    # covers direct logger calls as well as the handler path that the prior test uses.
+    ConsoleAccess(username="dca", credential=AUTH_CREDENTIAL)
+    client = ("127.0.0.1", 123)
+
+    def render_direct(target):
+        stream = io.StringIO()
+        failure_log = AuthFailureLog(interval=0, stream=stream)
+        failure_log.record(client, "GET", target)
+        lines = stream.getvalue().splitlines()
+        assert len(lines) == 1
+        assert len(lines[0]) < 256
+        return lines[0], stream.getvalue()
+
+    def render_http(target):
+        stream = io.StringIO()
+        failure_log = AuthFailureLog(interval=0, stream=stream)
+        access = ConsoleAccess(username="dca", credential=AUTH_CREDENTIAL)
+        with running_server(app, access, failure_log) as server:
+            assert request(server, target)[0] == 401
+        lines = stream.getvalue().splitlines()
+        assert len(lines) == 1
+        assert len(lines[0]) < 256
+        return lines[0], stream.getvalue()
+
+    # Exercise the injected per-server object for targets an HTTP client can
+    # represent; direct calls below are reserved for parser-hostile controls.
+    long_line, _ = render_http("/" + "x" * (60 * 1024) + "?ignored-query=yes")
+    assert "ignored-query" not in long_line
+
+    secret_line, _ = render_http(f"/private/{AUTH_PASSWORD}?ignored={AUTH_PASSWORD}")
+    assert AUTH_PASSWORD not in secret_line
+    assert "ignored" not in secret_line
+    assert "[redacted]" in secret_line.lower()
+
+    # Same Page round 2 requires redaction before the route is truncated. Put
+    # half the password on each side of that boundary so either leaked fragment
+    # catches a truncate-first regression even though the complete value is gone.
+    split = len(AUTH_PASSWORD) // 2
+    padding = "x" * (128 - 1 - split)
+    cutoff_line, _ = render_http("/" + padding + AUTH_PASSWORD)
+    assert AUTH_PASSWORD[:split] not in cutoff_line
+    assert AUTH_PASSWORD[split:] not in cutoff_line
+    assert "[red" in cutoff_line.lower()
+
+    # Controls split the registered value on input. They must be removed before
+    # redaction, and none may manufacture a second physical log line.
+    controlled_target = "/control/" + AUTH_PASSWORD[:split] + "\r\n\x00\x1b" + AUTH_PASSWORD[split:]
+    controlled_line, controlled_output = render_direct(controlled_target)
+    assert controlled_output.count("\n") == 1
+    assert "\r" not in controlled_output and "\x00" not in controlled_output and "\x1b" not in controlled_output
+    assert AUTH_PASSWORD[:split] not in controlled_line
+    assert AUTH_PASSWORD[split:] not in controlled_line
+    assert "non-ascii-target" in controlled_line
+
+    # An auth-file password may itself contain characters the fixed-shape
+    # logger must strip or parse as URL delimiters. The raw pre-parse redaction
+    # keeps normalization from exposing the remaining characters (panel,
+    # round 3).
+    transformed_password = "control?private-\x00secret"
+    transformed_access = ConsoleAccess("dca", f"dca:{transformed_password}".encode())
+    assert transformed_access.authorized(auth_headers(f"dca:{transformed_password}".encode()))
+    transformed = transformed_password.replace("\x00", "")
+    transformed_line, _ = render_direct(f"/control/{transformed_password}")
+    assert transformed not in transformed_line
+    assert "[redacted]" in transformed_line.lower()
+
+    # A raw socket preserves the UTF-8 request-target bytes needed to exercise
+    # http.server's ISO-8859-1 decoding, which caused the reviewed printable-
+    # projection leak; a normal HTTP client cannot represent that path (panel
+    # finding, round 1).
+    non_ascii_password = "pässwörd-abcdefg"
+    non_ascii_credential = f"dca:{non_ascii_password}".encode()
+    non_ascii_stream = io.StringIO()
+    non_ascii_log = AuthFailureLog(interval=0, stream=non_ascii_stream)
+    non_ascii_access = ConsoleAccess("dca", non_ascii_credential)
+    wire_spelling = non_ascii_password.encode("utf-8").decode("iso-8859-1")
+    percent_spelling = quote(non_ascii_password, safe="")
+    printable_projection = "".join(
+        character for character in non_ascii_password if 0x20 <= ord(character) <= 0x7e
+    )
+    # Mixed raw/percent encoding defeats finite spelling enumeration, so the
+    # route logger must reject its residual non-ASCII structure instead
+    # (Visionary review, Rock 1 fix round 2).
+    mixed_path = b"/x/p%C3%A4ssw" + "örd-abcdefg".encode("utf-8")
+
+    with running_server(app, non_ascii_access, non_ascii_log) as server:
+        authority = f"127.0.0.1:{server.server_address[1]}".encode("ascii")
+        password_paths = (
+            b"/x/" + non_ascii_password.encode("utf-8"),
+            b"/x/" + percent_spelling.encode("ascii"),
+            mixed_path,
+        )
+        for password_path in password_paths:
+            payload = b"GET " + password_path + b" HTTP/1.1\r\nHost: " + authority + b"\r\nConnection: close\r\n\r\n"
+            with socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=5) as connection:
+                connection.sendall(payload)
+                response = b""
+                while chunk := connection.recv(4096):
+                    response += chunk
+            assert b" 401 " in response.partition(b"\r\n")[0]
+
+    non_ascii_output = non_ascii_stream.getvalue()
+    for exposed in (non_ascii_password, wire_spelling, printable_projection, percent_spelling):
+        assert exposed not in non_ascii_output
+    assert non_ascii_output.count("[redacted]") == 2
+    assert non_ascii_output.count("non-ascii-target") == 1
+
+    # A mostly non-ASCII password has a tiny printable projection. Registering
+    # that projection globally would destroy unrelated job diagnostics.
+    sparse_password = "☃" * 11 + "a"
+    ConsoleAccess("dca", f"dca:{sparse_password}".encode())
+    ordinary_diagnostic = "available actions remain readable"
+    assert redact(ordinary_diagnostic) == ordinary_diagnostic
+
+    malformed_line, malformed_output = render_direct("http://[")
+    assert malformed_output.count("\n") == 1
+    assert "malformed-target" in malformed_line
+    assert "traceback" not in malformed_line.lower()
+
+    # The injected clock exposes the suppression total without sleeping. One
+    # initial line and one post-interval line are the only allowed writes.
+    clock = FakeClock()
+    burst_stream = io.StringIO()
+    burst_log = AuthFailureLog(interval=5.0, clock=clock, stream=burst_stream)
+    for _ in range(50):
+        burst_log.record(client, "GET", "/api/bootstrap")
+    assert len(burst_stream.getvalue().splitlines()) == 1
+    clock.advance(6)
+    burst_log.record(client, "GET", "/api/bootstrap")
+    burst_lines = burst_stream.getvalue().splitlines()
+    assert len(burst_lines) <= 2
+    assert re.search(r"(?:suppressed\D*49|49\D*suppressed)", burst_lines[-1], flags=re.IGNORECASE)
+
+
+def test_auth_failure_limiter_is_thread_safe():
+    ConsoleAccess(username="dca", credential=AUTH_CREDENTIAL)
+    clock = FakeClock()
+    stream = io.StringIO()
+    failure_log = AuthFailureLog(interval=5.0, clock=clock, stream=stream)
+    worker_count = 20
+    barrier = threading.Barrier(worker_count + 1)
+    errors = []
+    errors_lock = threading.Lock()
+
+    def fail_together(worker):
+        try:
+            barrier.wait(timeout=5)
+            failure_log.record(("127.0.0.1", worker), "GET", f"/failure-{worker}")
+        except Exception as error:  # noqa: BLE001 - every worker failure must reach the main assertion
+            with errors_lock:
+                errors.append(error)
+
+    workers = [threading.Thread(target=fail_together, args=(worker,)) for worker in range(worker_count)]
+    for worker in workers:
+        worker.start()
+    barrier.wait(timeout=5)
+    for worker in workers:
+        worker.join(timeout=5)
+    assert all(not worker.is_alive() for worker in workers)
+    assert errors == []
+    assert len(stream.getvalue().splitlines()) == 1
+
+    clock.advance(6)
+    failure_log.record(("127.0.0.1", 321), "GET", "/after-burst")
+    lines = stream.getvalue().splitlines()
+    assert len(lines) <= 2
+    assert re.search(r"(?:suppressed\D*19|19\D*suppressed)", lines[-1], flags=re.IGNORECASE)
+
+
+def test_console_access_construction_fails_closed():
+    authenticated = {"username": "dca", "credential": AUTH_CREDENTIAL}
+    invalid_policies = (
+        {"bind": "192.0.2.10"},
+        {"trusted_hosts": ("mac.tailnet.ts.net",)},
+        {**authenticated, "behind_proxy": True},
+        {
+            **authenticated,
+            "bind": "192.0.2.10",
+            "trusted_hosts": ("mac.tailnet.ts.net",),
+            "behind_proxy": True,
+        },
+        {**authenticated, "bind": "0.0.0.0"},
+        {"bind": "not-an-ip"},
+        {"bind": "::1"},
+    )
+    for policy in invalid_policies:
+        with pytest.raises(ValueError):
+            ConsoleAccess(**policy)
+
+    for trusted_host in ("http://x", "x/y", "x:99999", "x y", "*.ts.net"):
+        with pytest.raises(ValueError):
+            ConsoleAccess(**authenticated, trusted_hosts=(trusted_host,))
+
+
+def test_invalid_access_never_constructs_a_server(app, monkeypatch):
+    monkeypatch.setattr(
+        dca_console,
+        "ThreadingHTTPServer",
+        lambda *args, **kwargs: pytest.fail("An invalid access policy reached server construction"),
+    )
+    with pytest.raises(ValueError):
+        make_server(app, 0, ConsoleAccess(bind="192.0.2.10"))
+
+
+def test_exposure_flags_fail_closed_from_cli(tmp_path, monkeypatch):
+    monkeypatch.setattr(dca_console, "python_packages", lambda _: {})
+    auth_file = secure_auth_file(tmp_path / "console-auth")
+    invalid_argv = (
+        ["--check", "--bind", "192.0.2.10"],
+        ["--check", "--trusted-host", "x"],
+        ["--check", "--behind-proxy", "--auth-file", str(auth_file)],
+        [
+            "--check",
+            "--behind-proxy",
+            "--bind",
+            "192.0.2.10",
+            "--trusted-host",
+            "x",
+            "--auth-file",
+            str(auth_file),
+        ],
+        ["--check", "--bind", "0.0.0.0", "--auth-file", str(auth_file)],
+    )
+    for argv in invalid_argv:
+        with pytest.raises(SystemExit) as error:
+            main(argv)
+        assert error.value.code == 2
+
+
+def test_trusted_hosts_accept_configured_names_and_https_origin(app):
+    access = ConsoleAccess(
+        username="dca",
+        credential=AUTH_CREDENTIAL,
+        trusted_hosts=("mac.tailnet.ts.net",),
+    )
+    failure_log = AuthFailureLog(interval=0, stream=io.StringIO())
+    credentials = auth_headers()
+    with running_server(app, access, failure_log) as server:
+        trusted = {"Host": "mac.tailnet.ts.net", "Origin": "https://mac.tailnet.ts.net", **credentials}
+        assert request(server, "/api/bootstrap", headers=trusted)[0] == 200
+        uppercase = {"Host": "MAC.TAILNET.TS.NET", "Origin": "HTTPS://MAC.TAILNET.TS.NET", **credentials}
+        assert request(server, "/api/bootstrap", headers=uppercase)[0] == 200
+
+        status, _, body = request(
+            server,
+            "/api/bootstrap",
+            headers={"Host": "other.ts.net", **credentials},
+        )
+        assert status == 403
+        assert json.loads(body)["received_host"] == "other.ts.net"
+        assert request(server, "/api/bootstrap", headers=credentials)[0] == 200
+
+
+def test_origin_must_match_effective_authority(app):
+    trusted_host = "mac.tailnet.ts.net"
+    credentials = auth_headers()
+    access = ConsoleAccess(username="dca", credential=AUTH_CREDENTIAL, trusted_hosts=(trusted_host,))
+    with running_server(app, access, AuthFailureLog(interval=0, stream=io.StringIO())) as server:
+        loopback = f"127.0.0.1:{server.server_address[1]}"
+        assert request(
+            server,
+            "/api/bootstrap",
+            headers={"Host": loopback, "Origin": f"https://{trusted_host}", **credentials},
+        )[0] == 403
+        assert request(
+            server,
+            "/api/bootstrap",
+            headers={"Host": trusted_host, "Origin": f"http://{loopback}", **credentials},
+        )[0] == 403
+
+    proxy_access = ConsoleAccess(
+        username="dca",
+        credential=AUTH_CREDENTIAL,
+        trusted_hosts=(trusted_host,),
+        behind_proxy=True,
+    )
+    with running_server(app, proxy_access, AuthFailureLog(interval=0, stream=io.StringIO())) as server:
+        headers = {
+            "X-Forwarded-Host": trusted_host,
+            "Origin": f"https://{trusted_host}",
+            **credentials,
+        }
+        assert request(server, "/api/bootstrap", headers=headers)[0] == 200
+
+
+def test_forwarded_host_is_ignored_unless_behind_proxy(app):
+    trusted_host = "mac.tailnet.ts.net"
+    credentials = auth_headers()
+    direct_access = ConsoleAccess(username="dca", credential=AUTH_CREDENTIAL, trusted_hosts=(trusted_host,))
+    proxy_access = ConsoleAccess(
+        username="dca",
+        credential=AUTH_CREDENTIAL,
+        trusted_hosts=(trusted_host,),
+        behind_proxy=True,
+    )
+    untrusted_base = {"Host": "untrusted.example", "X-Forwarded-Host": trusted_host, **credentials}
+    with running_server(app, direct_access, AuthFailureLog(interval=0, stream=io.StringIO())) as server:
+        assert request(server, "/api/bootstrap", headers=untrusted_base)[0] == 403
+
+    with running_server(app, proxy_access, AuthFailureLog(interval=0, stream=io.StringIO())) as server:
+        assert request(server, "/api/bootstrap", headers=untrusted_base)[0] == 403
+        loopback = f"127.0.0.1:{server.server_address[1]}"
+        assert request(
+            server,
+            "/api/bootstrap",
+            headers={"X-Forwarded-Host": loopback, **credentials},
+        )[0] == 403
+        status, _, body = request(
+            server,
+            "/api/bootstrap",
+            headers={"X-Forwarded-Host": "other.ts.net", **credentials},
+        )
+        assert status == 403
+        diagnostic = json.loads(body)
+        assert diagnostic["received_host"] == loopback
+        assert diagnostic["forwarded_host"] == "other.ts.net"
+
+
+def test_forwarded_host_takes_precedence_as_effective_authority(app):
+    trusted_host = "mac.tailnet.ts.net"
+    headers = {
+        "X-Forwarded-Host": trusted_host,
+        "Origin": f"https://{trusted_host}",
+        **auth_headers(),
+    }
+    proxy_access = ConsoleAccess(
+        username="dca",
+        credential=AUTH_CREDENTIAL,
+        trusted_hosts=(trusted_host,),
+        behind_proxy=True,
+    )
+    with running_server(app, proxy_access, AuthFailureLog(interval=0, stream=io.StringIO())) as server:
+        assert request(server, "/api/bootstrap", headers=headers)[0] == 200
+
+    direct_access = ConsoleAccess(username="dca", credential=AUTH_CREDENTIAL, trusted_hosts=(trusted_host,))
+    with running_server(app, direct_access, AuthFailureLog(interval=0, stream=io.StringIO())) as server:
+        assert request(server, "/api/bootstrap", headers=headers)[0] == 403
+
+
+def test_health_reports_received_and_forwarded_host(http_server):
+    port = http_server.server_address[1]
+    authority = f"127.0.0.1:{port}"
+    status, _, body = request(http_server, "/api/health")
+    assert status == 200
+    assert json.loads(body) == {
+        "status": "ok",
+        "mode": "local",
+        "received_host": authority,
+        "forwarded_host": None,
+    }
+
+    status, _, body = request(
+        http_server,
+        "/api/health",
+        headers={"X-Forwarded-Host": "mac.tailnet.ts.net"},
+    )
+    assert status == 200
+    assert json.loads(body)["forwarded_host"] == "mac.tailnet.ts.net"
+
+
+def test_hosts_for_bind_addresses():
+    port = 8765
+    loopback_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    assert ConsoleAccess().hosts(port) == loopback_hosts
+
+    exposed = ConsoleAccess(username="dca", credential=AUTH_CREDENTIAL, bind="192.0.2.10")
+    assert exposed.hosts(port) == {*loopback_hosts, f"192.0.2.10:{port}"}
+
+    wildcard = ConsoleAccess(
+        username="dca",
+        credential=AUTH_CREDENTIAL,
+        bind="0.0.0.0",
+        trusted_hosts=("MAC.TAILNET.TS.NET",),
+    )
+    assert wildcard.trusted_hosts == ("mac.tailnet.ts.net",)
+    assert wildcard.hosts(port) == {*loopback_hosts, "mac.tailnet.ts.net"}
+    assert f"0.0.0.0:{port}" not in wildcard.hosts(port)
+
+
+def test_non_loopback_bind_banner_warns_about_plaintext():
+    exposed = ConsoleAccess(username="dca", credential=AUTH_CREDENTIAL, bind="192.0.2.10")
+    exposed_banner = dca_console.startup_banner(exposed, 8765)
+    loopback_banner = dca_console.startup_banner(
+        ConsoleAccess(username="dca", credential=AUTH_CREDENTIAL),
+        8765,
+    )
+
+    warning = "plain HTTP: the Basic credential and console token are visible to anyone on this network"
+    assert warning in exposed_banner
+    assert warning not in loopback_banner
+    assert "bind: 192.0.2.10" in exposed_banner
+    assert "port: 8765" in exposed_banner
+    assert "trusted hosts: (none)" in exposed_banner
+    assert "auth: basic user=dca" in exposed_banner
+    for banner in (exposed_banner, loopback_banner):
+        assert AUTH_PASSWORD not in banner
+        assert AUTH_CREDENTIAL.decode() not in banner
+
+    echoed_password = "banner-secret.example"
+    collision = ConsoleAccess(
+        username="dca",
+        credential=f"dca:{echoed_password}".encode(),
+        trusted_hosts=(echoed_password,),
+    )
+    assert echoed_password not in dca_console.startup_banner(collision, 8765)
+
+
+def test_cross_site_navigation_allowed_only_for_document_route(app, monkeypatch):
+    document_headers = {
+        "Sec-Fetch-Site": "cross-site",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+    }
+    failure_log = AuthFailureLog(interval=0, stream=io.StringIO())
+    with running_server(app, ConsoleAccess(), failure_log) as server:
+        assert request(server, "/", headers=document_headers)[0] == 200
+        monkeypatch.setattr(app, "snapshot", lambda *args, **kwargs: pytest.fail("Cross-site read reached snapshot"))
+        monkeypatch.setattr(app, "submit", lambda *args, **kwargs: pytest.fail("Cross-site POST dispatched work"))
+        for route in ("/api/bootstrap", "/api/snapshot", "/api/export"):
+            assert request(server, route, headers=document_headers)[0] == 403
+        assert request(
+            server,
+            "/api/bootstrap",
+            headers={**document_headers, "Sec-Fetch-Site": "cross-site "},
+        )[0] == 403
+        assert request(
+            server,
+            "/",
+            headers={**document_headers, "Sec-Fetch-Mode": "cors"},
+        )[0] == 403
+        assert post(server, app.token, "demo-dca", **document_headers)[0] == 403
+
+    assert not (app.settings.output / "summaries").exists()
+
+
+def test_idle_connection_is_closed_by_handler_timeout(app, monkeypatch):
+    monkeypatch.setattr(dca_console, "HANDLER_TIMEOUT_SECONDS", 0.2)
+    with running_server(
+        app,
+        ConsoleAccess(),
+        AuthFailureLog(interval=0, stream=io.StringIO()),
+    ) as server:
+        with socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=2) as connection:
+            connection.settimeout(2)
+            assert connection.recv(1) == b""
+
+
+def test_server_header_does_not_leak_python_version(auth_server):
+    server, _, _ = auth_server
+    status, headers, _ = request(server, "/api/health")
+    assert status == 200
+    assert headers["Server"] == "DCA-Console"
+    assert "Python" not in headers["Server"]
+    assert sys.version.split()[0] not in headers["Server"]
+
+    # BaseHTTPRequestHandler normally reflects an unsupported method in its
+    # own HTML error before the console's route guards run. Exercise that
+    # hardened pre-handler path with the registered credential spelling.
+    authority = f"127.0.0.1:{server.server_address[1]}".encode()
+    payload = AUTH_PASSWORD.encode() + b" / HTTP/1.1\r\nHost: " + authority + b"\r\nConnection: close\r\n\r\n"
+    with socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=2) as connection:
+        connection.sendall(payload)
+        response = b""
+        while chunk := connection.recv(4096):
+            response += chunk
+    assert b" 501 " in response.partition(b"\r\n")[0]
+    assert AUTH_PASSWORD.encode() not in response
+    assert AUTH_CREDENTIAL not in response
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGTERM lifecycle coverage requires POSIX signals")
+def test_sigterm_stops_console_cleanly(tmp_path):
+    child_env = dict(os.environ)
+    child_env["PYTHONUNBUFFERED"] = "1"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "from.py",
+            "--local",
+            "--no-browser",
+            "--port",
+            "0",
+            "--root",
+            str(tmp_path / "observed"),
+            "--output-dir",
+            str(tmp_path / "console-output"),
+        ],
+        cwd=dca_console.REPO,
+        env=child_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    assert process.stdout is not None
+    output_lines = []
+    ready = threading.Event()
+    output_closed = threading.Event()
+
+    def read_output():
+        # Send SIGTERM as soon as the readiness line is observable. This keeps
+        # the regression on the Same Page round 2 race: the handler must be in
+        # place before an operator or supervisor can react to that banner.
+        try:
+            for line in process.stdout:
+                output_lines.append(line)
+                if "DCA console (local)" in line:
+                    ready.set()
+        finally:
+            output_closed.set()
+
+    reader = threading.Thread(target=read_output, daemon=True)
+    reader.start()
+    try:
+        for _ in range(100):
+            if ready.wait(timeout=0.1) or output_closed.is_set():
+                break
+        if not ready.is_set():
+            pytest.fail("Console did not print its readiness banner:\n" + "".join(output_lines))
+        process.send_signal(signal.SIGTERM)
+        assert process.wait(timeout=20) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        reader.join(timeout=2)
+    stdout = "".join(output_lines)
+    assert "DCA console (local)" in stdout
+    assert "Stopping local console." in stdout
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGTERM handler coverage requires POSIX signals")
+def test_sigterm_handler_raises_and_restores_previous_handler():
+    original_handler = signal.getsignal(signal.SIGTERM)
+
+    def previous_handler(signum, frame):
+        return None
+
+    signal.signal(signal.SIGTERM, previous_handler)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            with dca_console._sigterm_as_keyboard_interrupt():
+                installed_handler = signal.getsignal(signal.SIGTERM)
+                assert installed_handler is not previous_handler
+                installed_handler(signal.SIGTERM, None)
+        assert signal.getsignal(signal.SIGTERM) is previous_handler
+
+        worker_observation = []
+
+        def enter_from_worker():
+            # signal.signal() itself is illegal off the main thread. The
+            # context therefore has to be a no-op there (Same Page round 3),
+            # while preserving the process's already-installed handler.
+            with dca_console._sigterm_as_keyboard_interrupt():
+                worker_observation.append(signal.getsignal(signal.SIGTERM))
+
+        worker = threading.Thread(target=enter_from_worker)
+        worker.start()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert worker_observation == [previous_handler]
+    finally:
+        signal.signal(signal.SIGTERM, original_handler)
+
+
+def test_unpinned_local_default_day_rolls_over_midnight(tmp_path, monkeypatch):
+    moments = [datetime(2026, 9, 10, 23, 59)]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = moments[0]
+            return cls(value.year, value.month, value.day, value.hour, value.minute, tzinfo=tz)
+
+    monkeypatch.setattr(dca_console, "datetime", Clock)
+    monkeypatch.setattr(dca_console, "python_packages", lambda _: {})
+    application = ConsoleApp(Settings(
+        "local", tmp_path / "artifacts", tmp_path / "output", None, sys.executable, sys.executable,
+    ))
+    try:
+        with running_server(
+            application,
+            ConsoleAccess(),
+            AuthFailureLog(interval=0, stream=io.StringIO()),
+        ) as server:
+            first_status, _, first_body = request(server, "/api/bootstrap")
+            first_bootstrap = json.loads(first_body)
+            first_snapshot = application.snapshot()
+
+            moments[0] = datetime(2026, 9, 11, 0, 1)
+            second_status, _, second_body = request(server, "/api/bootstrap")
+            second_bootstrap = json.loads(second_body)
+            second_snapshot = application.snapshot()
+
+        assert first_status == second_status == 200
+        assert first_bootstrap["default_date"] == first_snapshot["daily"]["date"] == "2026-09-10"
+        assert second_bootstrap["default_date"] == second_snapshot["daily"]["date"] == "2026-09-11"
+        assert first_snapshot["default_date"] == first_bootstrap["default_date"]
+        assert second_snapshot["default_date"] == second_bootstrap["default_date"]
+    finally:
+        application.jobs.close()
+
+
+def test_explicit_date_stays_pinned(tmp_path, monkeypatch, capsys):
+    moments = [datetime(2026, 9, 10, 23, 59)]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = moments[0]
+            return cls(value.year, value.month, value.day, value.hour, value.minute, tzinfo=tz)
+
+    monkeypatch.setattr(dca_console, "datetime", Clock)
+    monkeypatch.setattr(dca_console, "python_packages", lambda _: {})
+    pinned_day = date(2026, 9, 8)
+
+    # Existing fixtures pass a concrete day positionally. Both modes must keep
+    # that meaning even though None now denotes a rolling local service.
+    for mode in ("local", "demo"):
+        application = ConsoleApp(Settings(
+            mode,
+            tmp_path / f"{mode}-artifacts",
+            tmp_path / f"{mode}-output",
+            pinned_day,
+            sys.executable,
+            sys.executable,
+        ))
+        try:
+            with running_server(
+                application,
+                ConsoleAccess(),
+                AuthFailureLog(interval=0, stream=io.StringIO()),
+            ) as server:
+                first_status, _, first_body = request(server, "/api/bootstrap")
+                first_snapshot = application.snapshot()
+                moments[0] = datetime(2026, 9, 11, 0, 1)
+                second_status, _, second_body = request(server, "/api/bootstrap")
+                second_snapshot = application.snapshot()
+            assert first_status == second_status == 200
+            for bootstrap in (json.loads(first_body), json.loads(second_body)):
+                assert bootstrap["default_date"] == pinned_day.isoformat()
+            for snapshot in (first_snapshot, second_snapshot):
+                assert snapshot["default_date"] == pinned_day.isoformat()
+                assert snapshot["daily"]["date"] == pinned_day.isoformat()
+        finally:
+            application.jobs.close()
+        moments[0] = datetime(2026, 9, 10, 23, 59)
+
+    # Exercise the CLI construction boundary too: only local mode without an
+    # explicit --date is allowed to carry None into Settings (Same Page round
+    # 2). --check keeps this assertion outside the serving-only signal scope.
+    created_apps = []
+    real_console_app = ConsoleApp
+
+    def capture_app(settings):
+        application = real_console_app(settings)
+        created_apps.append(application)
+        return application
+
+    monkeypatch.setattr(dca_console, "ConsoleApp", capture_app)
+    monkeypatch.setattr(dca_console, "module_catalog", lambda _: [])
+    common = [
+        "--local",
+        "--check",
+        "--root",
+        str(tmp_path / "cli-artifacts"),
+        "--output-dir",
+        str(tmp_path / "cli-output"),
+    ]
+    try:
+        assert main([*common, "--date", pinned_day.isoformat()]) == 0
+        assert created_apps[-1].settings.day == pinned_day
+        assert main(common) == 0
+        assert created_apps[-1].settings.day is None
+        capsys.readouterr()
+    finally:
+        for application in created_apps:
+            application.jobs.close()
+
+
+def test_demo_pipeline_day_is_not_the_calendar_day(tmp_path, monkeypatch):
+    class SaturdayClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 12, 12, tzinfo=tz)
+
+    monkeypatch.setattr(dca_console, "datetime", SaturdayClock)
+    monkeypatch.setattr(dca_console, "python_packages", lambda _: {})
+    application = ConsoleApp(Settings(
+        "local", tmp_path / "artifacts", tmp_path / "output", None, sys.executable, sys.executable,
+    ))
+    commands = []
+
+    def capture_command(argv, log, **kwargs):
+        commands.append(argv)
+        return 1
+
+    monkeypatch.setattr(application, "_command", capture_command)
+    monkeypatch.setattr(application, "snapshot", lambda: {"daily": {"summary": []}})
+    try:
+        # A local page may default to Saturday, but its demo action still needs
+        # the previous complete market session (Same Page round 3).
+        expected_day = dca_console.default_demo_day()
+        assert expected_day != SaturdayClock.now(dca_console.ET).date()
+        assert application._run("demo-dca", "demo-job", lambda _: None) == 1
+        assert len(commands) == 1
+        now_index = commands[0].index("--now")
+        assert commands[0][now_index + 1] == f"{expected_day}T15:45"
+    finally:
+        application.jobs.close()
+
+
+def test_summary_signature_cache_is_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(dca_console, "python_packages", lambda _: {})
+    application = ConsoleApp(Settings(
+        "local", tmp_path / "artifacts", tmp_path / "output", date(2026, 9, 8),
+        sys.executable, sys.executable,
+    ))
+    days = [date(2026, 1, 1) + timedelta(days=offset) for offset in range(100)]
+    try:
+        # Insert newest-first so this proves "most recent days" means calendar
+        # recency, not merely the most recent UI insertion order.
+        for day in reversed(days):
+            application._save_summary(
+                {"date": day.isoformat(), "summary": [], "runs": [], "warnings": []},
+                {"status": "unavailable", "summary": [], "warnings": []},
+            )
+        # One signature per day would otherwise grow for the lifetime of a
+        # launchd service. Retaining the newest window preserves write-skipping
+        # without an unbounded process-local history (Rock 3 review finding).
+        assert len(application.signatures) <= 32
+        assert set(application.signatures) == {day.isoformat() for day in days[-32:]}
+    finally:
+        application.jobs.close()

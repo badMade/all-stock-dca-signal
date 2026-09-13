@@ -1109,3 +1109,981 @@ first round-2 attempt exited 2 before contacting the model. Read-only is enforce
 resumed session with the equivalent config override `-c 'sandbox_mode="read-only"'`
 (the session was also created read-only); no other change.
 
+### Round 2 — Codex reply
+
+Timestamp: 2026-09-13T05:40:22Z
+
+> I’ll re-audit Revision 3 from scratch, then map every round-1 title to either RESOLVED or OPEN and separately identify only material new gaps. I’ll also verify the revised proof mechanics and deployment assumptions against the existing code and CI configuration.
+> The revised plan closes most of the original design gaps. I’m now checking whether its acceptance commands actually run under the shell it explicitly targets, and whether “rolling today” reaches job submission—not just the displayed snapshot.
+> A substantive regression surfaced in the rolling-date fix: as written, every local-mode `snapshot()` ignores `Settings.day`, so explicit `--local --date …` stops working and existing tests that pin a local day fail. The plan needs to distinguish an unpinned hosted service from an explicitly pinned date.
+> Revision 3 closes 14 round-1 findings; four remain open, plus three new material findings.
+> 
+> [BLOCKER] credential-in-curl-argv — RESOLVED: authenticated proofs now pass curl a `/dev/fd` config path without placing the credential in argv.
+> 
+> [BLOCKER] fail-closed-only-at-cli — RESOLVED: `ConsoleAccess.__post_init__` owns the complete exposure matrix before any server can be constructed.
+> 
+> [MAJOR] plaintext-lan-basic-auth — RESOLVED AS AN EXPLICIT DEFER: Phase A is foreground-only, plainly warned, disposable, and followed by mandatory rotation, while TLS is recorded in DEFERRED.md.
+> 
+> [MAJOR] cross-site-get-exception-writes — RESOLVED: only the side-effect-free document route receives navigation tolerance, with API non-invocation and no-write assertions.
+> 
+> [MINOR] origin-not-bound-to-host — RESOLVED: Origin must match the selected effective authority, including proxy and alias-mismatch tests.
+> 
+> [MAJOR] auth-file-confidentiality-unproved — STILL OPEN: pathname `lstat` followed by an unspecified read does not prove the bytes came from the checked inode, allowing a swap in a writable parent to bypass the checks.
+> 
+> [MAJOR] hosted-default-date-freezes — STILL OPEN: making every local `default_day()` use wall-clock today discards explicit `--local --date`, breaking the existing pinned-date test and direct local `snapshot()` semantics.
+> 
+> [MAJOR] restart-breaks-job-buttons — RESOLVED: one 403-specific re-bootstrap and retry is safe because the current POST path rejects before `submit()`.
+> 
+> [MAJOR] launchd-drops-octopus-input — RESOLVED: the renderer passes and tests `--octopus-run`, while VTO conditions the forecast promise on its configuration.
+> 
+> [MAJOR] kickstart-does-not-reload-plist — RESOLVED: changed definitions now use `bootout` followed by `bootstrap`, reserving `kickstart` for unchanged plists.
+> 
+> [MAJOR] custom-root-splits-service-output — RESOLVED: one precedence-resolved root supplies both the service environment and log paths.
+> 
+> [MINOR] custom-label-is-an-unsafe-target — RESOLVED BY REMOVAL: the option is gone and the launchd label is fixed.
+> 
+> [MAJOR] verification-omits-coverage-gate — RESOLVED: whole-cycle verification includes CI’s full `--cov-fail-under=90` command.
+> 
+> [MINOR] focused-tests-variable-is-never-set — STILL OPEN: it is now set as a scalar, but zsh does not word-split `$CONSOLE_TESTS`, so every focused pytest proof receives one invalid space-containing path.
+> 
+> [MINOR] new-files-escape-local-literal-scan — RESOLVED: intent-to-add occurs before invariant scans once the new files exist.
+> 
+> [MAJOR] cloudflared-ingress-is-incomplete — RESOLVED: the terminal `http_status:404` rule and ingress validation are both required.
+> 
+> [MINOR] renderer-cannot-produce-phase-a — RESOLVED: the renderer intentionally has no `--bind` and claims only the loopback Phase B form.
+> 
+> [MAJOR] hosted-success-is-not-gated — STILL OPEN: the generic checklist uses plain curl where Cloudflare Access intercepts it, cannot reliably expose `forwarded_host` on a successful loopback-Host probe, and unconditionally enables `--behind-proxy` contrary to both conditional runbooks.
+> 
+> [MAJOR] auth-failure-logger-is-not-fail-closed — OPEN: truncating before redaction can expose credential fragments, malformed targets can escape into unrate-limited tracebacks, and no synchronized limiter or concurrency regression is required for the threaded server.
+> 
+> [MAJOR] sigterm-handler-installed-after-readiness — OPEN: scoping the handler around `serve_forever` leaves the flushed startup banner before protection, so the planned immediate post-banner SIGTERM can still terminate with `-15`.
+> 
+> [MAJOR] cloudflared-access-curl-url-order — OPEN: PLAN.md places `-si` before the URL, but [cloudflared’s current command definition](https://github.com/cloudflare/cloudflared/blob/master/cmd/cloudflared/access/cmd.go) parses the first argument as the application URL.
+> 
+> credential-in-curl-argv — ACCEPT: no further plan change is needed.
+> 
+> fail-closed-only-at-cli — ACCEPT: construction-time enforcement is the correct boundary.
+> 
+> plaintext-lan-basic-auth — DEFER: retain the stated safeguards and the explicit TLS backlog item.
+> 
+> cross-site-get-exception-writes — ACCEPT: the revised route boundary and regressions are sufficient.
+> 
+> origin-not-bound-to-host — ACCEPT: the effective-authority rule closes the mismatch.
+> 
+> auth-file-confidentiality-unproved — FIX: require `O_NOFOLLOW` opening, `fstat` validation, bounded reading through that same descriptor, and a swap regression.
+> 
+> hosted-default-date-freezes — FIX: distinguish an unpinned hosted service from an explicit or fixture-pinned date and test both behaviors.
+> 
+> restart-breaks-job-buttons — ACCEPT: the bounded retry and manual restart proof are appropriate.
+> 
+> launchd-drops-octopus-input — ACCEPT: passthrough and narrowed success language align.
+> 
+> kickstart-does-not-reload-plist — ACCEPT: the apply sequence is now correct.
+> 
+> custom-root-splits-service-output — ACCEPT: root resolution and tests cover both override sources.
+> 
+> custom-label-is-an-unsafe-target — ACCEPT: the prior KILL has already been applied.
+> 
+> verification-omits-coverage-gate — ACCEPT: the exact gate is present.
+> 
+> focused-tests-variable-is-never-set — FIX: make `CONSOLE_TESTS` a zsh array and invoke pytest with `"${CONSOLE_TESTS[@]}"`.
+> 
+> new-files-escape-local-literal-scan — ACCEPT: the new-file visibility gap is closed.
+> 
+> cloudflared-ingress-is-incomplete — ACCEPT: the required terminal rule and validation are covered.
+> 
+> renderer-cannot-produce-phase-a — ACCEPT: foreground Phase A and rendered Phase B are now honestly separated.
+> 
+> hosted-success-is-not-gated — FIX: make acceptance front-specific, use Access-aware probing, select `--behind-proxy` only from reliable diagnostics, and explicitly perform the second-device acceptance.
+> 
+> auth-failure-logger-is-not-fail-closed — FIX: require exception-safe extraction, redact-before-truncate, control-character normalization, locked limiter state, and cutoff/malformed/concurrent regressions.
+> 
+> sigterm-handler-installed-after-readiness — FIX: require the SIGTERM context to be active before emitting any readiness banner.
+> 
+> cloudflared-access-curl-url-order — FIX: specify `cloudflared access curl https://… -si`.
+> 
+> VERDICT: BLOCKED — 7 open finding(s)
+
+### Round 2 — Discuss (Visionary responses, on the record)
+
+14 round-1 findings confirmed resolved (ACCEPT/DEFER as Codex stated; no disagreement).
+Open items:
+
+| # | Finding | Codex | Visionary response |
+|---|---|---|---|
+| 6 | auth-file-confidentiality-unproved | FIX | **Agree.** `lstat`-then-read is a check/use race. `load_auth_file` now opens with `os.open(path, O_RDONLY \| O_NOFOLLOW \| O_CLOEXEC)` (a symlink fails with `ELOOP`), validates with `os.fstat` on that descriptor (regular file, owner, mode, size ≤ 4096) and reads through the same descriptor, so the bytes provably come from the checked inode. Test asserts `fstat`/`read` use the fd returned by `open` and that no path-based read happens; symlink and oversized-file cases added. |
+| 7 | hosted-default-date-freezes | FIX | **Agree.** `Settings.day` becomes `date \| None`: `None` = unpinned (local mode without `--date`) → `default_day()` is today (ET) at request time; an explicit `--date` or a fixture-provided day pins it → `default_day()` returns it. Demo mode always has a concrete day. Both behaviours tested; existing pinned-day tests keep their semantics. |
+| 14 | focused-tests-variable-is-never-set | FIX | **Agree.** zsh does not word-split `$CONSOLE_TESTS`. Every proof now uses a zsh/bash array: `CONSOLE_TESTS=(…)` and `pytest "${CONSOLE_TESTS[@]}"`. |
+| 18 | hosted-success-is-not-gated | FIX | **Agree.** The acceptance checklist is now front-specific (Tailscale: plain curl from a tailnet device; Cloudflare: `cloudflared access curl <url> -si`), adds `--behind-proxy` only when the 403 body shows the name under `forwarded_host` and not `received_host`, and has an explicit second-device step (phone on cellular, off the home wifi). |
+| 19 | auth-failure-logger-is-not-fail-closed (new) | FIX | **Agree.** The line is built exception-safely (`urlsplit` inside `try/except`; a malformed target logs the fixed text `malformed-target`), control characters are stripped before anything else, **redaction happens before truncation** to 128 characters, and the limiter state is lock-protected. Regressions: credential straddling the cutoff, `\r\n` in the path, malformed target, 20-thread concurrent burst. |
+| 20 | sigterm-handler-installed-after-readiness (new) | FIX | **Agree.** The SIGTERM context is entered before the readiness banner is printed and covers server creation through `serve_forever`; the subprocess test (SIGTERM immediately after the banner) is the regression. |
+| 21 | cloudflared-access-curl-url-order (new) | FIX | **Agree.** `cloudflared access curl https://console.<domain>/api/health -si` (URL first). |
+
+Solve: PLAN.md revised to revision 4 (see "Changes since round 2" at its end).
+
+## Round 3 — revised plan submitted
+
+Timestamp: 2026-09-13T05:43:28Z
+PLAN.md sha256: 720f5babdb0dd9c2…  (VTO.md, DEFERRED.md unchanged since round 2)
+Invocation: `codex exec resume <session> -m gpt-5.6-sol -c 'sandbox_mode="read-only"' --json`
+
+### Prompt sent
+
+> Round 3. PLAN.md is revised to "Revision 4" addressing the seven items you left open in
+> round 2; VTO.md and DEFERRED.md are unchanged since round 2. Re-read PLAN.md end to end;
+> the "Changes since round 2" section at the end is the index. You remain read-only.
+> 
+> Resolutions for the seven open findings:
+> 
+> - auth-file-confidentiality-unproved — `load_auth_file` opens with
+>   `os.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)`, validates with `os.fstat` on that
+>   descriptor (regular file, owner, mode, size ≤ 4096) and reads through the same descriptor
+>   with a bounded `os.read`; tests assert `fstat`/`read` use the fd `open` returned and no
+>   path-based read occurs, plus symlink (ELOOP) and oversized-file cases.
+> - hosted-default-date-freezes — `Settings.day: date | None`; `None` (local mode without
+>   `--date`) is unpinned and `default_day()` returns today in ET at request time; an
+>   explicit `--date` or a fixture-provided day pins it; demo mode always concrete. Tests
+>   cover both, and `main()` with/without `--date`.
+> - focused-tests-variable-is-never-set — `CONSOLE_TESTS=(…)` array, expanded as
+>   `"${CONSOLE_TESTS[@]}"` in every proof.
+> - hosted-success-is-not-gated — the acceptance checklist is now two front-specific
+>   checklists (Tailscale plain curl from a tailnet device; Cloudflare
+>   `cloudflared access curl <url> -si`), `--behind-proxy` is chosen from the probe body
+>   (name under `forwarded_host` and not `received_host`), and a cellular second-device step
+>   is explicit.
+> - auth-failure-logger-is-not-fail-closed — exception-safe extraction (`malformed-target`
+>   fixed text), control characters stripped, redact **then** truncate to 128, lock-protected
+>   limiter; regressions for a credential straddling the cutoff, `\r\n` in the path, a
+>   malformed target, and a 20-thread concurrent burst.
+> - sigterm-handler-installed-after-readiness — the SIGTERM context is entered before the
+>   readiness banner and covers server creation through `serve_forever`.
+> - cloudflared-access-curl-url-order — `cloudflared access curl https://… -si`.
+> 
+> For each of those seven, confirm resolved or still open using the same [SEVERITY]
+> short-title label. New findings are allowed but should be rare this late — flag anything
+> major. End with the same single verdict line as before, as the literal last line:
+> `VERDICT: SAME PAGE` if you have zero open FIX or KILL items, otherwise
+> `VERDICT: BLOCKED — N open finding(s)`.
+
+### PLAN.md revision 4 — sections changed since round 2
+
+````markdown
+## Design decisions
+
+| Topic | Decision | Why |
+|---|---|---|
+| Secret source | `--auth-file PATH`: one line `user:password`; POSIX only (`os.name == "posix"`, otherwise `ValueError` — fail closed, no Windows tolerance for this feature); opened with `os.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)` (a symlink fails with `ELOOP`), validated with `os.fstat` **on that descriptor** (`S_ISREG`; `st_uid == os.getuid()`; `st_mode & 0o077 == 0`; `st_size ≤ 4096`) and read through the same descriptor with a bounded `os.read`, so the bytes provably come from the checked inode; username printable ASCII without `:`; password ≥ 12 chars. Errors name the rule, never the contents | An env var would be copied into every job child by `env = dict(os.environ)` (`dca_console.py:237`), show in `launchctl print` / `ps -E`, and sit inside the plist. A path in argv leaks nothing. Ownership and regular-file checks are what make "0600" mean something, and checking a path then reading it separately is a check/use race a writable parent directory could exploit (Same Page round 2) |
+| Fail-closed construction | All access rules are enforced in `ConsoleAccess.__post_init__`, so an invalid combination cannot be constructed anywhere — not in `main()`, not by a future caller of `make_server()`. `main()` maps `ValueError` → `parser.error` (exit 2) | A CLI-only check would let another entry point open a reachable socket without a credential |
+| Auth scheme | HTTP Basic on every route except `/api/health`, only when a credential is configured; `secrets.compare_digest` on `b"user:password"`; failure → `401` + `WWW-Authenticate: Basic realm="DCA console", charset="UTF-8"` + JSON error | Native browser prompt on a phone; zero frontend change for auth because same-origin `fetch` (`console/app.js:381,384,411`) and the `<a download>` export (`console/index.html:38`) attach credentials automatically |
+| `/api/health` unauthenticated | Still behind the Host/Origin check; body is only `{"status","mode"}` | Lets probes and the launchd runbook work without embedding the password anywhere |
+| `X-Console-Token` | Keep, plus a frontend re-bootstrap: on a 403 from `POST /api/jobs` the page clears `state.token`, fetches `/api/bootstrap` once and retries once | Basic credentials are ambient like cookies; the token (fetched same-origin, no CORS headers) is the CSRF defence. A launchd restart rotates it; `do_POST` checks the token before `submit()` (`dca_console.py:390`), so a 403 proves the job was never accepted and one retry is safe |
+| Rolling default day | `Settings.day` becomes `date \| None`. `None` means *unpinned* (local mode started without `--date`): `ConsoleApp.default_day()` returns `datetime.now(ET).date()` at request time. An explicit `--date`, or a fixture-provided day, *pins* it: `default_day()` returns `settings.day`. Demo mode always has a concrete day (`default_demo_day()`). `default_day()` feeds `/api/bootstrap`, the `snapshot()` default and `default_date` | `main()` freezes `Settings.day` at startup (442); a service that survives midnight would otherwise open new tabs on stale data. `--local --date …` and the existing pinned-day tests must keep their meaning (Same Page round 2) |
+| `--bind ADDR` | IPv4 literal only (`ipaddress.IPv4Address`), default `127.0.0.1`; foreground use only — the launchd renderer has no `--bind`. A non-loopback bind makes the startup banner (pure `startup_banner(access, port)`) print `plain HTTP: the Basic credential and console token are visible to anyone on this network` | `HTTPServer` is AF_INET; hostnames/IPv6 deferred; the persistent service stays loopback-only; the operator must see the plaintext caveat where they start the process |
+| `--trusted-host HOST[:PORT]` (repeatable) | lowercased; hostname regex; no scheme, path, wildcard or whitespace; port ≤ 65535 | Extra names accepted in `Host`. Also accept `https://` origins (today only `http://`, `dca_console.py:344`, which would block POSTs behind an HTTPS proxy) |
+| `hosts(port)` | `{127.0.0.1:port, localhost:port}` ∪ `{bind:port}` when bind is a specific non-loopback IP ∪ `trusted_hosts`; `0.0.0.0` adds nothing | Phase A needs no `--trusted-host`; with `0.0.0.0` the server cannot know which address the client typed |
+| Effective authority and `Origin` | The *effective authority* is the accepted `Host`, or under `--behind-proxy` the accepted `X-Forwarded-Host`. When `Origin` is present it must equal exactly `http://<authority>` or `https://<authority>` | Membership of both in allowed sets is not enough: a loopback `Host` with a tailnet `Origin` (or vice versa) must be refused |
+| `--behind-proxy` | Additionally accept a **configured** name (never a loopback name) from `X-Forwarded-Host`; requires ≥1 `--trusted-host` **and** a loopback bind | A LAN-reachable socket that honours forwarded headers would let any LAN client forge them |
+| Fail-closed matrix (in `__post_init__`) | non-loopback bind without a credential; any `trusted_hosts` without a credential; `behind_proxy` without `trusted_hosts` or with a non-loopback bind; `0.0.0.0` without `trusted_hosts`; malformed bind / host values | Nothing listens on a reachable address without a credential |
+| `Sec-Fetch-Site: cross-site` | Rejected everywhere **except** `GET /` with `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`. Every `/api/*` route, including GETs, stays cross-site-rejected | Cloudflare Access login is a redirect chain through `<team>.cloudflareaccess.com`; Fetch Metadata computes the site over the whole chain, so the first document load after login arrives `cross-site`. The document route is side-effect-free; `/api/snapshot` and `/api/export` are not (they call `_save_summary()`), so they keep the strict rule. Existing test at `tests/test_dca_console.py:122-124` still gets 403 |
+| 403 body | adds `received_host` (≤ 253 chars) and `forwarded_host` | The runbook's "what does the backend see" probe; JSON with `nosniff`, no HTML |
+| Brute-force backoff | Deferred (see `DEFERRED.md`); 12-char minimum, documented generator | Behind either proxy every request is from `127.0.0.1`; per-IP state becomes a global lockout lever |
+| Auth-failure log line | One fixed-shape stderr line per failure, built exception-safely: the route comes from `urlsplit(self.path).path` inside `try/except` (a malformed target logs the fixed text `malformed-target`); everything outside printable ASCII is stripped first; then `redact()`; **then** truncation to 128 characters; prefixed with client address and method. A lock-protected limiter emits at most one line per 5 s per process and reports the suppressed count on the next emitted line | Any unauthenticated LAN/tailnet client can hit 401/403 at line rate; the line must not let it grow `launchd.err.log` unboundedly, inject newlines, or plant a credential-shaped string. Truncating before redaction could leave a fragment the regex no longer recognises; the server is threaded, so limiter state needs a lock (Same Page round 2) |
+| SIGTERM | Context manager installs a handler that raises `KeyboardInterrupt`, reusing the Ctrl+C teardown (`dca_console.py:492-497`); restores the previous handler; entered **before** the readiness banner is printed and covering server creation through `serve_forever` (the serving branch only, not `--once`/`--run`/`--check`) | `server.shutdown()` from the handler would deadlock (same thread as `serve_forever`). A handler installed after the banner would let a SIGTERM sent on seeing the banner hit the default action and exit `-15` (Same Page round 2). Worst-case teardown ≈ 11 s (`dca_console_jobs.py:210-226`), inside the plist's `ExitTimeOut = 30` |
+| Handler hygiene | `Handler.timeout = HANDLER_TIMEOUT_SECONDS` (30; today `None`, only POST bodies get `settimeout(5)` at line 400); `version_string()` override | An idle LAN/proxy connection must not pin a thread; `Server:` should not advertise the Python version |
+| Long uptime | Cap `ConsoleApp.signatures` to the last 32 days | Everything else is already bounded |
+| launchd | `deploy/launchd/render_console_agent.py` renders the plist with `plistlib` (`--print` / `--install`), validates the auth file via `load_auth_file`, takes `--python PATH` (default `<checkout>/.venv/bin/python`; refuses when the chosen interpreter does not exist), resolves **one** artifact root with precedence `--cron-tracking-root` > `$DCA_CRON_TRACKING_ROOT` > `dca_paths` default, always writes it into the plist environment and derives the log paths from that same value, creates the log directory, prints the `launchctl` commands including the apply pair (`bootout … 2>/dev/null || true`, then `bootstrap`). Fixed label `com.all-stock-dca.console`. Optional `--octopus-run DIR` passthrough. No `--bind`. No placeholder template | Same "logic in a script, not the unit" rationale as `deploy/run-drift-check.sh:6-17`; `plistlib` cannot mis-escape; one resolved root means logs and console artifacts can never land in different trees; a fixed label removes an unvalidated path/shell fragment |
+| pyproject | No change | Console is checkout-only; `deploy/` is not shipped |
+| Proxy `Host` semantics (read from source at HEAD, not a live install — uncertainty acknowledged) | Tailscale Serve preserves `Host` and adds `X-Forwarded-Host/-Proto/-For` + `Tailscale-User-*`; cloudflared preserves `Host` unless `httpHostHeader` is set | Accept the configured name in `Host` or (with `--behind-proxy`) `X-Forwarded-Host`; every runbook starts with a `curl -si …/api/health` whose 403 body prints what arrived |
+| Credentials in proofs | `curl -K <(printf 'user = "%s"\n' "$(<"$AUTH")")` | The curl config arrives through a `/dev/fd` path; argv never holds the secret |
+
+### Rock 1 — Basic auth from a 0600 file (loopback-safe, no exposure yet)
+
+**Scope.** Frozen `ConsoleAccess` dataclass beside `Settings` (`username: str = ""`,
+`credential: bytes | None = field(default=None, repr=False)`) with `__post_init__`
+validation of the credential shape; `load_auth_file(path) -> tuple[str, bytes]` with the
+rules above (POSIX only, `O_NOFOLLOW` open, `fstat` on the descriptor, regular file, owner,
+mode, size ≤ 4096, bounded read through that same descriptor, one line, `:`), error
+messages naming the rule but never the contents; `ConsoleAccess.authorized(headers)` (`Basic <b64>`,
+scheme case-insensitive, `base64.b64decode(..., validate=True)`, `compare_digest`);
+`--auth-file`; 401 path on every route except `/api/health` — order `trusted` → 403,
+`authorized` → 401, then token → 403 on POST; `dca_console_jobs.register_secret()`
+consulted by `redact()`; the exception-safe, control-stripped, redact-then-truncate,
+lock-limited auth-failure line from the design table. `make_server(app, port, access=None)`
+keeps today's behaviour by default so all 78 existing tests pass untouched. Frontend untouched.
+
+**Non-goals.** `--bind`, trusted hosts, proxy headers (Rock 2); backoff; UI hint that
+auth is on.
+
+**Files.** `dca_console.py`, `dca_console_jobs.py`, `tests/test_dca_console.py`.
+
+**Tests.** `test_auth_file_rules_fail_closed` (missing, mode 0644, symlink to a good file
+(refused by `O_NOFOLLOW`), FIFO, directory, a file larger than 4096 bytes, wrong owner via
+monkeypatched `os.getuid`, non-POSIX via monkeypatched `os.name`, no colon, empty, two
+lines, 11-char password → `ValueError` whose message lacks the file contents; good file →
+`("dca", b"dca:s3cret-pw-abcdefg")`); `test_auth_file_is_read_from_the_checked_descriptor`
+(monkeypatched `os.open`/`os.fstat`/`os.read` record the descriptor: `fstat` and `read`
+receive the fd `open` returned, and no path-based `open()`/`Path.read_*` happens);
+`test_basic_auth_required_on_every_route_except_health` (every asset, `/api/bootstrap`,
+`/api/snapshot`, `/api/export`, `/api/docs` → 401 with `WWW-Authenticate` starting
+`Basic realm=`; `/api/health` → 200; POST with right token but no credentials → 401 and
+`app.submit` never called); `test_basic_auth_wrong_credentials_are_rejected` (wrong
+password, wrong user, undecodable base64, `Bearer` scheme → 401);
+`test_basic_auth_correct_credentials_pass_and_token_still_required` (bootstrap 200; POST
+with credentials but no token → 403; with both → 202);
+`test_password_never_appears_in_responses_or_redaction` (bodies/headers lack it; `redact()`
+masks it; `repr(access)` lacks it); `test_auth_failure_is_logged_without_credentials`;
+`test_auth_failure_log_line_is_bounded_and_redacted` (a 60 KB request path and a path
+containing the fixture password each yield one short line with the route only and the
+password masked; a password straddling the 128-character cutoff is still masked; a path
+carrying `\r\n` and other control characters yields exactly one line; a malformed request
+target yields the fixed `malformed-target` text and no traceback; a burst of 50 failures
+yields at most two lines plus a suppressed count); `test_auth_failure_limiter_is_thread_safe`
+(20 threads failing concurrently → at most two lines and a consistent suppressed count).
+
+**Proof.**
+```bash
+CONSOLE_TESTS=(tests/test_dca_console.py tests/test_dca_console_jobs.py tests/test_dca_console_data.py tests/test_dca_console_octopus.py tests/test_console_security_logging.py); AUTH=~/.config/all-stock-dca/console-auth
+.venv/bin/python -m ruff check . && .venv/bin/python -m pytest "${CONSOLE_TESTS[@]}" tests/test_config_invariants.py -q \
+
+.venv/bin/python from.py --local --no-browser --port 8765 --auth-file "$AUTH" & pid=$!
+for _ in $(seq 1 40); do curl -sf -o /dev/null http://127.0.0.1:8765/api/health && break; sleep 0.25; done
+curl -s -o /dev/null -w '%{http_code} ' http://127.0.0.1:8765/api/health
+curl -s -o /dev/null -w '%{http_code} ' http://127.0.0.1:8765/api/bootstrap
+curl -s -o /dev/null -w '%{http_code}\n' -K <(printf 'user = "%s"\n' "$(<"$AUTH")") http://127.0.0.1:8765/api/bootstrap
+kill -TERM "$pid"; wait "$pid"; echo "exit=$?"
+```
+Expected: ruff clean; 87 console passes (78 + 9) and the invariants file green; curl
+prints `200 401 200`; then `Stopping local console.` and `exit=0`.
+
+### Rock 3 — Clean SIGTERM, restart resilience, long-uptime bounds
+
+**Scope.** `_sigterm_as_keyboard_interrupt()` context manager entered before the
+readiness banner (472-473) and covering server creation through `serve_forever` (491),
+restoring the previous handler, serving branch only; `Settings.day: date | None` with
+`main()` passing `args.date` (None when absent in local mode) and `ConsoleApp.default_day()`
+(unpinned → today in ET at request time; pinned → `settings.day`) used by `/api/bootstrap`,
+`snapshot()`, `_run` and `default_date`; cap `signatures` (129, 225) to the last 32 days; `console/app.js`:
+on a 403 from `POST /api/jobs`, clear `state.token`, re-bootstrap once, retry once, then
+surface the error.
+
+**Non-goals.** SIGHUP reload; job-file pruning; log rotation.
+
+**Files.** `dca_console.py`, `console/app.js`, `tests/test_dca_console.py`.
+
+**Tests.** `test_sigterm_stops_console_cleanly` (posix-only subprocess: spawn
+`from.py --local --no-browser --port 0 --root <tmp> --output-dir <tmp>`, wait for the
+`DCA console (local)` banner, `send_signal(SIGTERM)`, `wait(timeout=20)` → returncode 0
+and stdout contains `Stopping local console.`);
+`test_sigterm_handler_raises_and_restores_previous_handler`;
+`test_unpinned_local_default_day_rolls_over_midnight` (`Settings(day=None)`, monkeypatched
+clock: bootstrap `default_date` and `snapshot()["daily"]["date"]` change from one ET day to
+the next without a restart); `test_explicit_date_stays_pinned` (local mode with a concrete
+`day`, and demo mode, keep `default_date` and the snapshot default on that day across the
+same clock change; `main(["--local", "--date", …])` produces a pinned `Settings`, and
+without `--date` an unpinned one);
+`test_summary_signature_cache_is_bounded` (100 distinct days → `len(app.signatures) <= 32`).
+
+**Proof.**
+```bash
+CONSOLE_TESTS=(tests/test_dca_console.py tests/test_dca_console_jobs.py tests/test_dca_console_data.py tests/test_dca_console_octopus.py tests/test_console_security_logging.py); AUTH=~/.config/all-stock-dca/console-auth
+.venv/bin/python -m ruff check . && .venv/bin/python -m pytest "${CONSOLE_TESTS[@]}" -q \
+
+.venv/bin/python from.py --local --no-browser --port 8765 --auth-file "$AUTH" & pid=$!
+for _ in $(seq 1 40); do curl -sf -o /dev/null http://127.0.0.1:8765/api/health && break; sleep 0.25; done
+kill -TERM "$pid"; wait "$pid"; echo "exit=$?"
+! lsof -nP -iTCP:8765 -sTCP:LISTEN && echo "port released"
+```
+Expected: 103 passes; `Stopping local console.` then `exit=0` within seconds, then
+`port released`. Manual (after Rock 4): with a tab open, `launchctl kickstart -k
+gui/$(id -u)/com.all-stock-dca.console`, then click "Test DCA pipeline" in the same tab
+without reloading → the job starts.
+
+## Operator acceptance checklist (post-merge; the cycle is *deployed* only when one front passes)
+
+Common first step: rotate the credential file (regenerate it with the one-liner above; the
+Phase A value crossed the LAN in plaintext).
+
+**Tailscale Serve**
+1. Install Tailscale on this Mac and the phone; log in (operator step). `tailscale serve
+   --bg http://127.0.0.1:8765`; `tailscale serve status` shows the tailnet URL and no Funnel.
+2. Probe from a tailnet device (laptop on the tailnet, or the phone):
+   `curl -si https://<mac>.<tailnet>.ts.net/api/health`. Expect a 403 JSON body. Read it:
+   if the name appears under `received_host`, no `--behind-proxy` is needed; only if it
+   appears under `forwarded_host` and `received_host` is something else, add `--behind-proxy`.
+3. Re-render: `render_console_agent.py --auth-file … --trusted-host <mac>.<tailnet>.ts.net
+   [--behind-proxy] --install`; run the printed apply pair (`bootout`, then `bootstrap`);
+   `launchctl print` shows `state = running`. Repeat the probe: expect 200.
+4. Second-device acceptance: phone on cellular, wifi off, Tailscale on:
+   `https://<mac>.<tailnet>.ts.net/` prompts once, shows `LOCAL` mode with the latest
+   scheduled runs, "Export JSON" downloads, a job button starts a job.
+
+**Cloudflare Tunnel + Access**
+1. Install cloudflared on this Mac; log in (operator step). Local pre-check of the Host
+   semantics: `curl -si -H 'Host: console.<domain>' http://127.0.0.1:8765/api/health` →
+   403 with `received_host: console.<domain>`.
+2. `cloudflared tunnel create dca-console`; create the Access application and policy for
+   `console.<domain>` **before** `cloudflared tunnel route dns`; `config.yml` ingress to
+   `http://127.0.0.1:8765` plus the terminal `- service: http_status:404`;
+   `cloudflared tunnel ingress validate`; `cloudflared service install`.
+3. Probe through Access: `cloudflared access curl https://console.<domain>/api/health -si`
+   (a plain `curl` is answered at the edge). Expect a 403 JSON body; choose `--behind-proxy`
+   by the same `received_host` / `forwarded_host` rule as above.
+4. Re-render with `--trusted-host console.<domain> [--behind-proxy] --install`; run the
+   printed apply pair; `launchctl print` shows `state = running`. Repeat the probe: expect 200.
+5. Second-device acceptance: phone on cellular, wifi off: `https://console.<domain>/`
+   completes the Access login, then prompts for Basic once, shows `LOCAL` mode with the
+   latest scheduled runs, "Export JSON" downloads, a job button starts a job. Confirm the
+   Access policy is attached to the hostname before leaving it running.
+
+## Changes since round 2 (Same Page Meeting)
+
+- auth-file-confidentiality-unproved → `O_NOFOLLOW` open, `fstat` on the descriptor,
+  bounded read through it; descriptor test, symlink and oversized-file cases (Rock 1).
+- hosted-default-date-freezes → `Settings.day: date | None`; unpinned local mode rolls,
+  an explicit `--date` or fixture day stays pinned; both tested (Rock 3).
+- focused-tests-variable-is-never-set → `CONSOLE_TESTS` is an array expanded as
+  `"${CONSOLE_TESTS[@]}"` (all proofs).
+- hosted-success-is-not-gated → front-specific acceptance checklists, Access-aware probe,
+  `--behind-proxy` chosen from the probe body, explicit cellular second-device step.
+- auth-failure-logger-is-not-fail-closed → exception-safe extraction, control characters
+  stripped, redact before truncate, lock-protected limiter; cutoff / malformed / concurrent
+  regressions (Rock 1).
+- sigterm-handler-installed-after-readiness → the SIGTERM context is entered before the
+  banner is printed (Rock 3).
+- cloudflared-access-curl-url-order → URL first, flags after (Rock 5, checklist).
+
+````
+
+### Round 3 — Codex reply
+
+Timestamp: 2026-09-13T07:23:03Z
+
+> I’ll audit Revision 4 end to end, then test each of the seven resolutions against the existing call paths and the plan’s exact proof commands. I’ll treat VTO/DEFERRED as unchanged context and report only unresolved items or genuinely material new contradictions.
+> The same-fd credential design is now sound against path swaps, but one fail-closed edge remains under scrutiny: opening a FIFO with blocking `O_RDONLY` happens before `fstat`, so the stated FIFO rejection test may hang unless the open itself is nonblocking.
+> Six prior items look closed. I’m doing one final consistency pass on the proxy probe and the two newly surfaced edge cases before fixing the verdict count.
+> [MAJOR] auth-file-confidentiality-unproved — RESOLVED: `O_NOFOLLOW`, same-descriptor `fstat`, and bounded descriptor reads close the pathname substitution race, with tests enforcing descriptor identity.
+> 
+> [MAJOR] hosted-default-date-freezes — RESOLVED: unpinned local settings now compute the ET day per request while explicit dates and demo mode remain pinned.
+> 
+> [MINOR] focused-tests-variable-is-never-set — RESOLVED: every proof defines `CONSOLE_TESTS` as an array and expands it with `"${CONSOLE_TESTS[@]}"`.
+> 
+> [MAJOR] hosted-success-is-not-gated — STILL OPEN: if a front rewrites `Host` to an accepted loopback authority and places the public name only in `X-Forwarded-Host`, the initial health probe returns 200 without diagnostic fields, leaving the checklist unable to select `--behind-proxy`, whose forwarded-host precedence is also unspecified and untested for this fallback shape.
+> 
+> [MAJOR] auth-failure-logger-is-not-fail-closed — RESOLVED: extraction is exception-safe, control bytes are removed, redaction precedes truncation, and locked rate limiting has adversarial regressions.
+> 
+> [MAJOR] sigterm-handler-installed-after-readiness — RESOLVED: the handler now covers server construction, readiness publication, and `serve_forever`.
+> 
+> [MAJOR] cloudflared-access-curl-url-order — RESOLVED: both occurrences place the URL before forwarded curl flags.
+> 
+> [MAJOR] fifo-auth-file-blocks-before-validation — `os.open` with blocking `O_RDONLY` waits for a FIFO writer before `fstat` can reject it, so startup and the required FIFO regression can hang indefinitely.
+> 
+> [MAJOR] rolling-default-breaks-demo-pipeline — applying the unpinned calendar-day `default_day()` to `_run` replaces the existing recent-full-session selection, causing “Test DCA pipeline” to produce no `run_state.json` on weekends, holidays, and early-close days.
+> 
+> Verdicts:
+> 
+> - auth-file-confidentiality-unproved — ACCEPT: the original confidentiality race is closed.
+> - hosted-default-date-freezes — ACCEPT: rollover and pinning semantics are now explicit and tested.
+> - focused-tests-variable-is-never-set — ACCEPT: the proof commands now expand correctly.
+> - hosted-success-is-not-gated — FIX: force the initial probe into a diagnostic 403, define configured forwarded-host precedence, and test loopback `Host` plus external forwarded host and matching `Origin`.
+> - auth-failure-logger-is-not-fail-closed — ACCEPT: the failure path is bounded, redacted, and concurrency-safe.
+> - sigterm-handler-installed-after-readiness — ACCEPT: the readiness race is closed.
+> - cloudflared-access-curl-url-order — ACCEPT: the invocation order is corrected.
+> - fifo-auth-file-blocks-before-validation — FIX: add `O_NONBLOCK` and make the FIFO regression timeout-bounded.
+> - rolling-default-breaks-demo-pipeline — FIX: use an explicit pinned date when supplied, otherwise retain `default_demo_day()` for `_run`, with a closed-market-day regression.
+> 
+> VERDICT: BLOCKED — 3 open finding(s)
+
+### Round 3 (addendum) — Visionary's second adversarial panel on revision 4
+
+Claude workflow `plan-pressure-test-r4`: three lens reviewers, 9 raw findings, three
+skeptics each (three verifier agents were lost to the operator's session limit; the two
+findings they touched are marked under-verified). 7 survived, 2 did not:
+
+| # | Finding (lens, votes) | Response |
+|---|---|---|
+| P1/P3/P6 | FIFO auth file hangs the `O_RDONLY` open before `fstat` runs (security + correctness + operability, 3/3 each, reproduced on this Mac) | **Agree, FIX.** Same as Codex's `fifo-auth-file-blocks-before-validation`. `O_NONBLOCK` added; FIFO test via `os.mkfifo` with a bounded-time assertion; descriptor test asserts `O_NONBLOCK` is among the recorded flags. |
+| P2/P5/P7 | Rock 4's "default interpreter missing → exit 2" case cannot pass on the Mac where `.venv` exists (3/3, 2/3) | **Agree, FIX.** Renderer exposes module-level `DEFAULT_PYTHON` read at call time; the test monkeypatches it to a missing path; positive counterpart patched to `sys.executable`. |
+| P4 | A process-wide 5-second limiter makes the Rock 1 log tests order-dependent and unpassable as written (correctness, 3/3) | **Agree, FIX.** `AuthFailureLog(interval, clock, stream)` is created per `make_server` call (injectable via `failure_log=`), never module-global; per-line tests use `interval=0` or a fake clock; burst/thread tests use a fresh instance with the real interval; no test relies on wall-clock spacing. |
+| R1 | `X-Forwarded-Host` ignored without `--behind-proxy` lets a Host-rewriting proxy in front of a credential-less loopback console in (security, 0/2) | Refuted: that is today's loopback-trust rule and no plan path fronts a credential-less console (the launchd service requires `--auth-file`). No change. |
+| R2 | The acceptance-checklist probe cannot detect the one case `--behind-proxy` exists for (operability, 1/1 cast, under-verified) | Same as Codex's still-open `hosted-success-is-not-gated`; resolved below. |
+
+### Round 3 — Discuss (Visionary responses, on the record)
+
+| # | Finding | Codex | Visionary response |
+|---|---|---|---|
+| 18 | hosted-success-is-not-gated | FIX | **Agree.** Rather than forcing a 403, `/api/health` now always reports `received_host` and `forwarded_host` (values the client itself sent; nothing sensitive), so the probe is diagnostic on 200 and 403 alike. This is the one existing-test edit of the cycle: the equality assertion at `tests/test_dca_console.py:88` becomes a two-key check. Forwarded-host precedence is now specified: under `--behind-proxy`, a present `X-Forwarded-Host` must be a configured name and becomes the effective authority (Host must still be in `hosts(port)`); present-but-unconfigured → 403; absent → Host rules. Test: loopback `Host` + `X-Forwarded-Host: mac.tailnet.ts.net` + `Origin: https://mac.tailnet.ts.net` → 200 under `--behind-proxy`, 403 without it. Checklist rule: add `--behind-proxy` when the public name appears under `forwarded_host` and not `received_host`. |
+| 22 | fifo-auth-file-blocks-before-validation (new) | FIX | **Agree.** `O_NONBLOCK` added to the open flags (no effect on regular-file reads; a FIFO open returns at once and `S_ISREG` rejects it). FIFO regression: `os.mkfifo`, no writer, `load_auth_file` must raise within a 5-second thread join. |
+| 23 | rolling-default-breaks-demo-pipeline (new) | FIX | **Agree; my error in revision 4.** `_run` keeps its current selection (`settings.day` in demo mode, `default_demo_day()` in local mode); `default_day()` feeds only `/api/bootstrap`, `snapshot()` and `default_date`. Regression: unpinned local `Settings` with the clock on a Saturday → `demo-dca` still targets the previous full session. |
+
+Solve: PLAN.md revised to revision 5 (see "Changes since round 3" at its end).
+
+## Round 4 — revised plan submitted
+
+Timestamp: 2026-09-13T07:25:21Z
+PLAN.md sha256: 3ecb5f9372047f19…  (VTO.md, DEFERRED.md unchanged since round 2)
+
+### Prompt sent
+
+> Round 4. PLAN.md is revised to "Revision 5" addressing the three items you left open in
+> round 3 plus two findings from an independent review; VTO.md and DEFERRED.md are unchanged.
+> Re-read PLAN.md end to end; "Changes since round 3" at the end is the index. You remain
+> read-only.
+> 
+> Resolutions:
+> 
+> - hosted-success-is-not-gated — `/api/health` now always reports `received_host` and
+>   `forwarded_host` (what the client sent), so the probe is diagnostic on 200 and 403 alike;
+>   this is the cycle's one existing-test edit (the equality at tests/test_dca_console.py:88
+>   becomes a two-key check). Forwarded-host precedence is specified: under `--behind-proxy`
+>   a present `X-Forwarded-Host` must be a configured name and becomes the effective
+>   authority while `Host` must still be in `hosts(port)`; present-but-unconfigured → 403;
+>   absent → plain Host rules. New test: loopback Host + `X-Forwarded-Host: mac.tailnet.ts.net`
+>   + `Origin: https://mac.tailnet.ts.net` → 200 with `--behind-proxy`, 403 without. Both
+>   checklists read the body on 200 or 403 and add `--behind-proxy` only when the public name
+>   is under `forwarded_host` and not `received_host`.
+> - fifo-auth-file-blocks-before-validation — `O_NONBLOCK` added to the open flags; the FIFO
+>   regression uses `os.mkfifo` with no writer and must raise within a 5-second thread join;
+>   the descriptor test asserts `O_NOFOLLOW` and `O_NONBLOCK` are among the recorded flags.
+> - rolling-default-breaks-demo-pipeline — `_run` keeps its existing selection
+>   (`settings.day` in demo mode, `default_demo_day()` in local mode, dca_console.py:252);
+>   `default_day()` feeds only bootstrap, snapshot default and default_date; regression:
+>   unpinned local Settings with the clock on a Saturday → `demo-dca` still targets the
+>   previous full session.
+> - (independent review) The auth-failure limiter is a per-server `AuthFailureLog(interval,
+>   clock, stream)` object injectable through `make_server(..., failure_log=None)`, never
+>   module-global; per-line tests use `interval=0` or a fake clock, burst/thread tests a fresh
+>   instance with the real interval.
+> - (independent review) The renderer's default interpreter is a module-level
+>   `DEFAULT_PYTHON` read at call time; the missing-default test monkeypatches it to a
+>   missing path and a positive counterpart patches it to `sys.executable`, so both pass on
+>   the Mac (where `.venv` exists) and in CI (where it does not).
+> 
+> For each of the three round-3 open items, confirm resolved or still open using the same
+> [SEVERITY] short-title label. New findings are allowed but should be rare this late — flag
+> anything major. End with the same single verdict line as before, as the literal last line:
+> `VERDICT: SAME PAGE` if you have zero open FIX or KILL items, otherwise
+> `VERDICT: BLOCKED — N open finding(s)`.
+
+### PLAN.md revision 5 — sections changed since round 3
+
+````markdown
+## Design decisions
+
+| Topic | Decision | Why |
+|---|---|---|
+| Secret source | `--auth-file PATH`: one line `user:password`; POSIX only (`os.name == "posix"`, otherwise `ValueError` — fail closed, no Windows tolerance for this feature); opened with `os.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)` (a symlink fails with `ELOOP`; `O_NONBLOCK` makes a FIFO open return at once instead of waiting for a writer, and has no effect on a regular-file read), validated with `os.fstat` **on that descriptor** (`S_ISREG`; `st_uid == os.getuid()`; `st_mode & 0o077 == 0`; `st_size ≤ 4096`) and read through the same descriptor with a bounded `os.read`, so the bytes provably come from the checked inode; username printable ASCII without `:`; password ≥ 12 chars. Errors name the rule, never the contents | An env var would be copied into every job child by `env = dict(os.environ)` (`dca_console.py:237`), show in `launchctl print` / `ps -E`, and sit inside the plist. A path in argv leaks nothing. Ownership and regular-file checks are what make "0600" mean something, and checking a path then reading it separately is a check/use race a writable parent directory could exploit (Same Page round 2). Without `O_NONBLOCK` a FIFO at `--auth-file` would hang the console and the renderer before `fstat` could reject it, instead of exiting 2 (Same Page round 3) |
+| Fail-closed construction | All access rules are enforced in `ConsoleAccess.__post_init__`, so an invalid combination cannot be constructed anywhere — not in `main()`, not by a future caller of `make_server()`. `main()` maps `ValueError` → `parser.error` (exit 2) | A CLI-only check would let another entry point open a reachable socket without a credential |
+| Auth scheme | HTTP Basic on every route except `/api/health`, only when a credential is configured; `secrets.compare_digest` on `b"user:password"`; failure → `401` + `WWW-Authenticate: Basic realm="DCA console", charset="UTF-8"` + JSON error | Native browser prompt on a phone; zero frontend change for auth because same-origin `fetch` (`console/app.js:381,384,411`) and the `<a download>` export (`console/index.html:38`) attach credentials automatically |
+| `/api/health` unauthenticated and diagnostic | Still behind the Host/Origin check; body is `{"status","mode","received_host","forwarded_host"}` — the two host values are what the client itself sent (≤ 253 chars each, or null) | Lets probes and the launchd runbook work without embedding the password anywhere, and makes the runbook probe diagnostic on a 200 as well as on a 403: a front that rewrites `Host` to the loopback authority and carries the public name only in `X-Forwarded-Host` would otherwise return a bare 200 and the checklist could not tell that `--behind-proxy` is needed (Same Page round 3). This is the cycle's one edit to an existing test: the exact-equality assertion at `tests/test_dca_console.py:88` becomes a check of `status` and `mode` |
+| `X-Console-Token` | Keep, plus a frontend re-bootstrap: on a 403 from `POST /api/jobs` the page clears `state.token`, fetches `/api/bootstrap` once and retries once | Basic credentials are ambient like cookies; the token (fetched same-origin, no CORS headers) is the CSRF defence. A launchd restart rotates it; `do_POST` checks the token before `submit()` (`dca_console.py:390`), so a 403 proves the job was never accepted and one retry is safe |
+| Rolling default day | `Settings.day` becomes `date \| None`. `None` means *unpinned* (local mode started without `--date`): `ConsoleApp.default_day()` returns `datetime.now(ET).date()` at request time. An explicit `--date`, or a fixture-provided day, *pins* it: `default_day()` returns `settings.day`. Demo mode always has a concrete day (`default_demo_day()`). `default_day()` feeds `/api/bootstrap`, the `snapshot()` default and `default_date` **only**; `_run` keeps its existing day selection (`settings.day` in demo mode, `default_demo_day()` in local mode, `dca_console.py:252`), because the demo pipeline needs a full market session, not a calendar day | `main()` freezes `Settings.day` at startup (442); a service that survives midnight would otherwise open new tabs on stale data. `--local --date …` and the existing pinned-day tests must keep their meaning (Same Page round 2) |
+| `--bind ADDR` | IPv4 literal only (`ipaddress.IPv4Address`), default `127.0.0.1`; foreground use only — the launchd renderer has no `--bind`. A non-loopback bind makes the startup banner (pure `startup_banner(access, port)`) print `plain HTTP: the Basic credential and console token are visible to anyone on this network` | `HTTPServer` is AF_INET; hostnames/IPv6 deferred; the persistent service stays loopback-only; the operator must see the plaintext caveat where they start the process |
+| `--trusted-host HOST[:PORT]` (repeatable) | lowercased; hostname regex; no scheme, path, wildcard or whitespace; port ≤ 65535 | Extra names accepted in `Host`. Also accept `https://` origins (today only `http://`, `dca_console.py:344`, which would block POSTs behind an HTTPS proxy) |
+| `hosts(port)` | `{127.0.0.1:port, localhost:port}` ∪ `{bind:port}` when bind is a specific non-loopback IP ∪ `trusted_hosts`; `0.0.0.0` adds nothing | Phase A needs no `--trusted-host`; with `0.0.0.0` the server cannot know which address the client typed |
+| Effective authority and `Origin` | The *effective authority* is the accepted `Host`, or under `--behind-proxy` the accepted `X-Forwarded-Host`. When `Origin` is present it must equal exactly `http://<authority>` or `https://<authority>` | Membership of both in allowed sets is not enough: a loopback `Host` with a tailnet `Origin` (or vice versa) must be refused |
+| `--behind-proxy` | Precedence: when `X-Forwarded-Host` is present it must be a **configured** name (never a loopback name) and becomes the effective authority, while `Host` must still be in `hosts(port)`; present-but-unconfigured → 403; absent → the plain `Host` rules apply. Requires ≥1 `--trusted-host` **and** a loopback bind | A LAN-reachable socket that honours forwarded headers would let any LAN client forge them; the precedence rule is what lets a Host-rewriting front work with `Origin` bound to the public name (Same Page round 3) |
+| Fail-closed matrix (in `__post_init__`) | non-loopback bind without a credential; any `trusted_hosts` without a credential; `behind_proxy` without `trusted_hosts` or with a non-loopback bind; `0.0.0.0` without `trusted_hosts`; malformed bind / host values | Nothing listens on a reachable address without a credential |
+| `Sec-Fetch-Site: cross-site` | Rejected everywhere **except** `GET /` with `Sec-Fetch-Mode: navigate` and `Sec-Fetch-Dest: document`. Every `/api/*` route, including GETs, stays cross-site-rejected | Cloudflare Access login is a redirect chain through `<team>.cloudflareaccess.com`; Fetch Metadata computes the site over the whole chain, so the first document load after login arrives `cross-site`. The document route is side-effect-free; `/api/snapshot` and `/api/export` are not (they call `_save_summary()`), so they keep the strict rule. Existing test at `tests/test_dca_console.py:122-124` still gets 403 |
+| 403 body | adds `received_host` (≤ 253 chars) and `forwarded_host` | The runbook's "what does the backend see" probe; JSON with `nosniff`, no HTML |
+| Brute-force backoff | Deferred (see `DEFERRED.md`); 12-char minimum, documented generator | Behind either proxy every request is from `127.0.0.1`; per-IP state becomes a global lockout lever |
+| Auth-failure log line | One fixed-shape stderr line per failure, built exception-safely: the route comes from `urlsplit(self.path).path` inside `try/except` (a malformed target logs the fixed text `malformed-target`); everything outside printable ASCII is stripped first; then `redact()`; **then** truncation to 128 characters; prefixed with client address and method. The limiter is a small object, `AuthFailureLog(interval=5.0, clock=time.monotonic, stream=sys.stderr)`, created per `make_server` call (injectable as `make_server(app, port, access=None, failure_log=None)`), never module-global; it is lock-protected, emits at most one line per interval and reports the suppressed count on the next emitted line | Any unauthenticated LAN/tailnet client can hit 401/403 at line rate; the line must not let it grow `launchd.err.log` unboundedly, inject newlines, or plant a credential-shaped string. Truncating before redaction could leave a fragment the regex no longer recognises; the server is threaded, so limiter state needs a lock (Same Page round 2); a process-global limiter would make every 401/403 test order-dependent, so tests inject `interval=0` or a fake clock (panel, round 3) |
+| SIGTERM | Context manager installs a handler that raises `KeyboardInterrupt`, reusing the Ctrl+C teardown (`dca_console.py:492-497`); restores the previous handler; entered **before** the readiness banner is printed and covering server creation through `serve_forever` (the serving branch only, not `--once`/`--run`/`--check`) | `server.shutdown()` from the handler would deadlock (same thread as `serve_forever`). A handler installed after the banner would let a SIGTERM sent on seeing the banner hit the default action and exit `-15` (Same Page round 2). Worst-case teardown ≈ 11 s (`dca_console_jobs.py:210-226`), inside the plist's `ExitTimeOut = 30` |
+| Handler hygiene | `Handler.timeout = HANDLER_TIMEOUT_SECONDS` (30; today `None`, only POST bodies get `settimeout(5)` at line 400); `version_string()` override | An idle LAN/proxy connection must not pin a thread; `Server:` should not advertise the Python version |
+| Long uptime | Cap `ConsoleApp.signatures` to the last 32 days | Everything else is already bounded |
+| launchd | `deploy/launchd/render_console_agent.py` renders the plist with `plistlib` (`--print` / `--install`), validates the auth file via `load_auth_file`, takes `--python PATH` (default `<checkout>/.venv/bin/python`; refuses when the chosen interpreter does not exist), resolves **one** artifact root with precedence `--cron-tracking-root` > `$DCA_CRON_TRACKING_ROOT` > `dca_paths` default, always writes it into the plist environment and derives the log paths from that same value, creates the log directory, prints the `launchctl` commands including the apply pair (`bootout … 2>/dev/null || true`, then `bootstrap`). Fixed label `com.all-stock-dca.console`. Optional `--octopus-run DIR` passthrough. No `--bind`. No placeholder template | Same "logic in a script, not the unit" rationale as `deploy/run-drift-check.sh:6-17`; `plistlib` cannot mis-escape; one resolved root means logs and console artifacts can never land in different trees; a fixed label removes an unvalidated path/shell fragment |
+| pyproject | No change | Console is checkout-only; `deploy/` is not shipped |
+| Proxy `Host` semantics (read from source at HEAD, not a live install — uncertainty acknowledged) | Tailscale Serve preserves `Host` and adds `X-Forwarded-Host/-Proto/-For` + `Tailscale-User-*`; cloudflared preserves `Host` unless `httpHostHeader` is set | Accept the configured name in `Host` or (with `--behind-proxy`) `X-Forwarded-Host`; every runbook starts with a `curl -si …/api/health` whose 403 body prints what arrived |
+| Credentials in proofs | `curl -K <(printf 'user = "%s"\n' "$(<"$AUTH")")` | The curl config arrives through a `/dev/fd` path; argv never holds the secret |
+
+### Rock 1 — Basic auth from a 0600 file (loopback-safe, no exposure yet)
+
+**Scope.** Frozen `ConsoleAccess` dataclass beside `Settings` (`username: str = ""`,
+`credential: bytes | None = field(default=None, repr=False)`) with `__post_init__`
+validation of the credential shape; `load_auth_file(path) -> tuple[str, bytes]` with the
+rules above (POSIX only, `O_NOFOLLOW | O_NONBLOCK` open, `fstat` on the descriptor,
+regular file, owner, mode, size ≤ 4096, bounded read through that same descriptor, one
+line, `:`), error messages naming the rule but never the contents; `ConsoleAccess.authorized(headers)` (`Basic <b64>`,
+scheme case-insensitive, `base64.b64decode(..., validate=True)`, `compare_digest`);
+`--auth-file`; 401 path on every route except `/api/health` — order `trusted` → 403,
+`authorized` → 401, then token → 403 on POST; `dca_console_jobs.register_secret()`
+consulted by `redact()`; the exception-safe, control-stripped, redact-then-truncate
+auth-failure line emitted through a per-server `AuthFailureLog` (design table). `make_server(app, port, access=None)`
+keeps today's behaviour by default so all 78 existing tests pass untouched. Frontend untouched.
+
+**Non-goals.** `--bind`, trusted hosts, proxy headers (Rock 2); backoff; UI hint that
+auth is on.
+
+**Files.** `dca_console.py`, `dca_console_jobs.py`, `tests/test_dca_console.py`.
+
+**Tests.** `test_auth_file_rules_fail_closed` (missing, mode 0644, symlink to a good file
+(refused by `O_NOFOLLOW`), a FIFO made with `os.mkfifo` and no writer (must raise within a
+5-second thread join, so a regression to a blocking open fails instead of hanging CI),
+directory, a file larger than 4096 bytes, wrong owner via
+monkeypatched `os.getuid`, non-POSIX via monkeypatched `os.name`, no colon, empty, two
+lines, 11-char password → `ValueError` whose message lacks the file contents; good file →
+`("dca", b"dca:s3cret-pw-abcdefg")`); `test_auth_file_is_read_from_the_checked_descriptor`
+(monkeypatched `os.open`/`os.fstat`/`os.read` record the descriptor and flags: `fstat` and
+`read` receive the fd `open` returned, `O_NOFOLLOW` and `O_NONBLOCK` are among the recorded
+flags, and no path-based `open()`/`Path.read_*` happens);
+`test_basic_auth_required_on_every_route_except_health` (every asset, `/api/bootstrap`,
+`/api/snapshot`, `/api/export`, `/api/docs` → 401 with `WWW-Authenticate` starting
+`Basic realm=`; `/api/health` → 200; POST with right token but no credentials → 401 and
+`app.submit` never called); `test_basic_auth_wrong_credentials_are_rejected` (wrong
+password, wrong user, undecodable base64, `Bearer` scheme → 401);
+`test_basic_auth_correct_credentials_pass_and_token_still_required` (bootstrap 200; POST
+with credentials but no token → 403; with both → 202);
+`test_password_never_appears_in_responses_or_redaction` (bodies/headers lack it; `redact()`
+masks it; `repr(access)` lacks it); `test_auth_failure_is_logged_without_credentials`;
+`test_auth_failure_log_line_is_bounded_and_redacted` (a 60 KB request path and a path
+containing the fixture password each yield one short line with the route only and the
+password masked; a password straddling the 128-character cutoff is still masked; a path
+carrying `\r\n` and other control characters yields exactly one line; a malformed request
+target yields the fixed `malformed-target` text and no traceback; a burst of 50 failures
+yields at most two lines plus a suppressed count). The per-line sub-cases build their
+server with `AuthFailureLog(interval=0, stream=io.StringIO())` (or advance an injected fake
+clock) and assert on that stream; the burst case uses a fresh log with the real interval;
+no sub-case depends on wall-clock spacing. `test_auth_failure_limiter_is_thread_safe`
+(20 threads failing concurrently against one fresh `AuthFailureLog` → at most two lines
+and a consistent suppressed count).
+
+**Proof.**
+```bash
+CONSOLE_TESTS=(tests/test_dca_console.py tests/test_dca_console_jobs.py tests/test_dca_console_data.py tests/test_dca_console_octopus.py tests/test_console_security_logging.py); AUTH=~/.config/all-stock-dca/console-auth
+.venv/bin/python -m ruff check . && .venv/bin/python -m pytest "${CONSOLE_TESTS[@]}" tests/test_config_invariants.py -q \
+
+.venv/bin/python from.py --local --no-browser --port 8765 --auth-file "$AUTH" & pid=$!
+for _ in $(seq 1 40); do curl -sf -o /dev/null http://127.0.0.1:8765/api/health && break; sleep 0.25; done
+curl -s -o /dev/null -w '%{http_code} ' http://127.0.0.1:8765/api/health
+curl -s -o /dev/null -w '%{http_code} ' http://127.0.0.1:8765/api/bootstrap
+curl -s -o /dev/null -w '%{http_code}\n' -K <(printf 'user = "%s"\n' "$(<"$AUTH")") http://127.0.0.1:8765/api/bootstrap
+kill -TERM "$pid"; wait "$pid"; echo "exit=$?"
+```
+Expected: ruff clean; 87 console passes (78 + 9) and the invariants file green; curl
+prints `200 401 200`; then `Stopping local console.` and `exit=0`.
+
+### Rock 2 — `--bind`, `--trusted-host`, `--behind-proxy`, hardened handler (Phase A reachable)
+
+**Scope.** Extend `ConsoleAccess` with `bind`, `trusted_hosts`, `behind_proxy` and move
+the whole fail-closed matrix into `__post_init__`; pure `hosts(port)`,
+`effective_authority(headers, port) -> str | None` and `trusted(headers, port)`; replace
+`_trusted()` (`dca_console.py:339-345`) with the forwarded-host precedence rule; `Origin`
+bound to the effective authority with `http://` or `https://`; `/api/health` body gains
+`received_host` / `forwarded_host` (the one existing-test edit: the equality at
+`tests/test_dca_console.py:88` becomes a two-key check); cross-site tolerance for `GET /` navigations only; 403 diagnostic
+body; `ThreadingHTTPServer((access.bind, port), …)` (line 412); `HANDLER_TIMEOUT_SECONDS
+= 30`; `version_string()`; pure `startup_banner(access, port)` replaces the banner at 472-473 and prints bind,
+port, trusted hosts, `auth: basic user=<name>` (never the password) and, for a
+non-loopback bind, the plaintext warning line; reword the `--port` help (426) and the
+bind-failure message (470); `webbrowser.open` targets the bind IP when it is a specific
+address.
+
+**Non-goals.** IPv6 / hostname binds; in-process TLS; proxy identity headers; UI changes.
+
+**Files.** `dca_console.py`, `tests/test_dca_console.py`.
+
+**Tests.** `test_console_access_construction_fails_closed` (`ConsoleAccess(...)` raises
+`ValueError` for the whole matrix plus `bind="not-an-ip"`, `"::1"`, trusted-host values
+`http://x`, `x/y`, `x:99999`, `x y`, `*.ts.net`);
+`test_invalid_access_never_constructs_a_server` (`ThreadingHTTPServer` monkeypatched to
+`pytest.fail`; `make_server(app, 0, ConsoleAccess(bind="192.0.2.10"))` raises first);
+`test_exposure_flags_fail_closed_from_cli` (`main([...])` → `SystemExit` code 2 for
+`--bind 192.0.2.10` without `--auth-file`, `--trusted-host x` without `--auth-file`,
+`--behind-proxy` without `--trusted-host`, `--behind-proxy --bind 192.0.2.10 …`,
+`--bind 0.0.0.0 --auth-file …` without `--trusted-host`);
+`test_trusted_hosts_accept_configured_names_and_https_origin` (`Host: mac.tailnet.ts.net`
++ `Origin: https://mac.tailnet.ts.net` + credentials → 200; upper-case Host → 200;
+`Host: other.ts.net` → 403 with `received_host == "other.ts.net"`; loopback Host still 200);
+`test_origin_must_match_effective_authority` (loopback `Host` + `Origin:
+https://mac.tailnet.ts.net` → 403; tailnet `Host` + `Origin: http://127.0.0.1:<port>` → 403;
+under `behind_proxy`, `X-Forwarded-Host: mac.tailnet.ts.net` + `Origin:
+https://mac.tailnet.ts.net` → 200);
+`test_forwarded_host_is_ignored_unless_behind_proxy` (`Host: untrusted.example` +
+`X-Forwarded-Host: mac.tailnet.ts.net` → 403 on a non-proxy server and also 403 with
+`behind_proxy=True` because `Host` must still be in `hosts(port)`; `X-Forwarded-Host:
+127.0.0.1:<port>` on the proxy server → 403; `X-Forwarded-Host: other.ts.net` (present but
+unconfigured) → 403); `test_forwarded_host_takes_precedence_as_effective_authority`
+(loopback `Host` + `X-Forwarded-Host: mac.tailnet.ts.net` + `Origin:
+https://mac.tailnet.ts.net` → 200 with `behind_proxy=True`, 403 without it);
+`test_health_reports_received_and_forwarded_host` (200 body carries the `Host` the client
+sent and `null` / the forwarded value; the existing `status`/`mode` keys unchanged);
+`test_hosts_for_bind_addresses` (pure);
+`test_non_loopback_bind_banner_warns_about_plaintext` (pure `startup_banner`: the line
+appears for `bind="192.0.2.10"`, not for loopback, and never contains the password);
+`test_cross_site_navigation_allowed_only_for_document_route` (GET `/` with
+`Sec-Fetch-Site: cross-site, Sec-Fetch-Mode: navigate, Sec-Fetch-Dest: document` → 200;
+the same headers on `/api/bootstrap`, `/api/snapshot` and `/api/export` → 403, no summary
+file is written and a monkeypatched `app.snapshot` is never invoked; `Sec-Fetch-Mode:
+cors` on `/` → 403; POST → 403);
+`test_idle_connection_is_closed_by_handler_timeout` (`HANDLER_TIMEOUT_SECONDS = 0.2`, raw
+socket that sends nothing gets EOF within 2 s); `test_server_header_does_not_leak_python_version`.
+
+**Proof.**
+```bash
+CONSOLE_TESTS=(tests/test_dca_console.py tests/test_dca_console_jobs.py tests/test_dca_console_data.py tests/test_dca_console_octopus.py tests/test_console_security_logging.py); AUTH=~/.config/all-stock-dca/console-auth
+.venv/bin/python -m ruff check . && .venv/bin/python -m pytest "${CONSOLE_TESTS[@]}" tests/test_config_invariants.py -q \
+
+LAN=$(ipconfig getifaddr en0)
+.venv/bin/python from.py --local --no-browser --bind "$LAN" --auth-file "$AUTH" & pid=$!
+for _ in $(seq 1 40); do curl -sf -o /dev/null "http://$LAN:8765/api/health" && break; sleep 0.25; done
+curl -s -o /dev/null -w '%{http_code} ' "http://$LAN:8765/api/health"
+curl -s -o /dev/null -w '%{http_code} ' "http://$LAN:8765/api/snapshot"
+curl -s -o /dev/null -w '%{http_code} ' -K <(printf 'user = "%s"\n' "$(<"$AUTH")") "http://$LAN:8765/api/snapshot"
+curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: evil.example' "http://$LAN:8765/api/health"
+kill -TERM "$pid"; wait "$pid"; echo "exit=$?"
+.venv/bin/python from.py --local --no-browser --bind 0.0.0.0; echo "exit=$?"
+```
+Expected: ruff clean; 100 console passes (87 + 13); the banner shows the plaintext
+warning; curl prints `200 401 200 403`; `Stopping local console.` then `exit=0`; the last
+command prints the fail-closed message and `exit=2`. Then a phone on the same wifi:
+`http://<LAN>:8765` prompts once, shows `LOCAL` mode with real runs, and "Export JSON"
+downloads. (Plaintext on the home wifi; disposable credential.)
+
+### Rock 3 — Clean SIGTERM, restart resilience, long-uptime bounds
+
+**Scope.** `_sigterm_as_keyboard_interrupt()` context manager entered before the
+readiness banner (472-473) and covering server creation through `serve_forever` (491),
+restoring the previous handler, serving branch only; `Settings.day: date | None` with
+`main()` passing `args.date` (None when absent in local mode) and `ConsoleApp.default_day()`
+(unpinned → today in ET at request time; pinned → `settings.day`) used by `/api/bootstrap`,
+`snapshot()` and `default_date` only — `_run` keeps `settings.day` (demo) /
+`default_demo_day()` (local) exactly as at `dca_console.py:252`; cap `signatures` (129,
+225) to the last 32 days; `console/app.js`:
+on a 403 from `POST /api/jobs`, clear `state.token`, re-bootstrap once, retry once, then
+surface the error.
+
+**Non-goals.** SIGHUP reload; job-file pruning; log rotation.
+
+**Files.** `dca_console.py`, `console/app.js`, `tests/test_dca_console.py`.
+
+**Tests.** `test_sigterm_stops_console_cleanly` (posix-only subprocess: spawn
+`from.py --local --no-browser --port 0 --root <tmp> --output-dir <tmp>`, wait for the
+`DCA console (local)` banner, `send_signal(SIGTERM)`, `wait(timeout=20)` → returncode 0
+and stdout contains `Stopping local console.`);
+`test_sigterm_handler_raises_and_restores_previous_handler`;
+`test_unpinned_local_default_day_rolls_over_midnight` (`Settings(day=None)`, monkeypatched
+clock: bootstrap `default_date` and `snapshot()["daily"]["date"]` change from one ET day to
+the next without a restart); `test_explicit_date_stays_pinned` (local mode with a concrete
+`day`, and demo mode, keep `default_date` and the snapshot default on that day across the
+same clock change; `main(["--local", "--date", …])` produces a pinned `Settings`, and
+without `--date` an unpinned one); `test_demo_pipeline_day_is_not_the_calendar_day`
+(unpinned local `Settings` with the clock on a Saturday: `_run("demo-dca")` passes the
+previous full session's date to `--now`, captured from a monkeypatched `_command`);
+`test_summary_signature_cache_is_bounded` (100 distinct days → `len(app.signatures) <= 32`).
+
+**Proof.**
+```bash
+CONSOLE_TESTS=(tests/test_dca_console.py tests/test_dca_console_jobs.py tests/test_dca_console_data.py tests/test_dca_console_octopus.py tests/test_console_security_logging.py); AUTH=~/.config/all-stock-dca/console-auth
+.venv/bin/python -m ruff check . && .venv/bin/python -m pytest "${CONSOLE_TESTS[@]}" -q \
+
+.venv/bin/python from.py --local --no-browser --port 8765 --auth-file "$AUTH" & pid=$!
+for _ in $(seq 1 40); do curl -sf -o /dev/null http://127.0.0.1:8765/api/health && break; sleep 0.25; done
+kill -TERM "$pid"; wait "$pid"; echo "exit=$?"
+! lsof -nP -iTCP:8765 -sTCP:LISTEN && echo "port released"
+```
+Expected: 106 passes; `Stopping local console.` then `exit=0` within seconds, then
+`port released`. Manual (after Rock 4): with a tab open, `launchctl kickstart -k
+gui/$(id -u)/com.all-stock-dca.console`, then click "Test DCA pipeline" in the same tab
+without reloading → the job starts.
+
+### Rock 4 — launchd agent renderer
+
+**Scope.** `deploy/launchd/render_console_agent.py` (stdlib `argparse`, `plistlib`, `os`,
+`pathlib`; `sys.path.insert(1, <checkout>)` per the ticker-advisor precedent, then
+`from dca_paths import cron_tracking_root` and `from dca_console import load_auth_file`).
+Args: `--auth-file` (required), `--python PATH` (argparse default `None`; `main()` falls
+back to the module-level `DEFAULT_PYTHON = CHECKOUT / ".venv" / "bin" / "python"` read at
+call time so tests can monkeypatch it; the chosen interpreter must exist), `--port 8765`, `--trusted-host` (repeatable),
+`--behind-proxy`, `--octopus-run DIR` (optional, must be an existing directory),
+`--cron-tracking-root DIR` (optional), exactly one of `--print` / `--install`. No `--bind`,
+no `--label`. The renderer resolves `ROOT` once with precedence `--cron-tracking-root` >
+`$DCA_CRON_TRACKING_ROOT` > `dca_paths.cron_tracking_root()` default, and uses it for both
+the plist environment and the log paths, so the plist is self-consistent whatever the
+invoking shell exported. Rendered dict:
+
+```
+Label                = com.all-stock-dca.console
+ProgramArguments     = [<python>, <checkout>/from.py, --local, --no-browser,
+                        --port, 8765, --auth-file, <abs path>, (--trusted-host, H)*, (--behind-proxy),
+                        (--octopus-run, <abs dir>)]
+WorkingDirectory     = <checkout>
+RunAtLoad            = true
+KeepAlive            = { SuccessfulExit = false }   # restart on failure; a clean SIGTERM exit (main returns 0) is not restarted
+ThrottleInterval     = 15                            # a persistent bind failure (main returns 1) retries every 15 s, no hot loop
+ExitTimeOut          = 30
+ProcessType          = Background
+StandardOutPath      = <ROOT>/console/launchd.out.log
+StandardErrorPath    = <ROOT>/console/launchd.err.log
+EnvironmentVariables = { PYTHONUNBUFFERED = "1", PATH = "/usr/bin:/bin:/usr/sbin:/sbin", DCA_CRON_TRACKING_ROOT = <ROOT> }
+```
+
+No secret anywhere in the plist. `--install` writes
+`~/Library/LaunchAgents/com.all-stock-dca.console.plist` (0644), creates
+`<ROOT>/console/` (launchd creates log files but not their parent), and prints:
+
+```
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.console.plist   # load + start
+launchctl print gui/$(id -u)/com.all-stock-dca.console | grep -E 'state|pid'             # status
+launchctl kickstart -k gui/$(id -u)/com.all-stock-dca.console                            # restart an UNCHANGED definition (e.g. after rotating the auth file)
+launchctl bootout gui/$(id -u)/com.all-stock-dca.console                                 # stop + unload; REQUIRED before bootstrap whenever the plist changed
+# apply pair, printed last, for a changed plist:
+launchctl bootout gui/$(id -u)/com.all-stock-dca.console 2>/dev/null || true; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.console.plist
+```
+
+`.gitignore` gains `deploy/launchd/*.plist` beside the existing `deploy/*.env` line.
+
+**Non-goals.** Running `launchctl` from the script; a `/Library/LaunchDaemons` variant;
+a LAN-bound (Phase A) service; installing Tailscale or cloudflared.
+
+**Files.** `deploy/launchd/render_console_agent.py` (new), `tests/test_console_launchd.py`
+(new; imports the script via `importlib.util.spec_from_file_location` so coverage counts
+it), `.gitignore`.
+
+**Tests.** Every test passes `--python sys.executable` (CI has no `.venv`; no test may
+assume `<checkout>/.venv` exists). `test_renders_expected_program_arguments_and_paths`
+(loopback-only Phase B form with and without `--trusted-host mac.tailnet.ts.net
+--behind-proxy` and `--octopus-run`; `plistlib.loads` output has the exact
+`ProgramArguments` with `[0] == sys.executable`,
+`Label == "com.all-stock-dca.console"`, `KeepAlive == {"SuccessfulExit": False}`,
+`RunAtLoad`, `ExitTimeOut == 30`, log paths under `<ROOT>/console`, no
+`EnvironmentVariables` key containing `PASSWORD`);
+`test_custom_root_is_used_for_both_environment_and_logs` (`--cron-tracking-root <tmp>` →
+`EnvironmentVariables["DCA_CRON_TRACKING_ROOT"] == <tmp>` and both log paths start with
+`<tmp>/console/`); `test_root_from_environment_is_used_when_flag_absent` (monkeypatched
+`DCA_CRON_TRACKING_ROOT`, no flag → the same root in the env entry and both log paths);
+`test_rendered_plist_contains_no_secret`; `test_renderer_fails_closed` (loose-mode auth
+file, `--behind-proxy` without `--trusted-host`, `--octopus-run` that is not a directory,
+`--python` pointing at a missing file, and — with `DEFAULT_PYTHON` monkeypatched to
+`tmp_path / "missing"` — no `--python` given → exit 2; no `--bind` / `--label` arguments
+exist); `test_default_python_is_used_when_flag_absent` (`DEFAULT_PYTHON` monkeypatched to
+`sys.executable`, no `--python` → `ProgramArguments[0] == sys.executable`);
+`test_install_writes_agent_and_creates_log_dir` (`HOME` → tmp; 0644; log dir exists);
+`test_install_prints_bootout_before_bootstrap` (the printed apply sequence has
+`launchctl bootout` before `launchctl bootstrap`).
+
+**Proof.**
+```bash
+CONSOLE_TESTS=(tests/test_dca_console.py tests/test_dca_console_jobs.py tests/test_dca_console_data.py tests/test_dca_console_octopus.py tests/test_console_security_logging.py); AUTH=~/.config/all-stock-dca/console-auth
+git add -N deploy/launchd tests/test_console_launchd.py \
+&& .venv/bin/python -m ruff check . && .venv/bin/python -m pytest "${CONSOLE_TESTS[@]}" tests/test_console_launchd.py tests/test_config_invariants.py -q \
+&& .venv/bin/python deploy/launchd/render_console_agent.py --auth-file "$AUTH" --print | plutil -lint - \
+&& .venv/bin/python deploy/launchd/render_console_agent.py --auth-file "$AUTH" --install \
+&& { launchctl bootout gui/$(id -u)/com.all-stock-dca.console 2>/dev/null || true; } \
+&& launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.console.plist \
+&& for _ in $(seq 1 40); do curl -sf -o /dev/null http://127.0.0.1:8765/api/health && break; sleep 0.25; done \
+&& curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8765/api/health \
+&& launchctl print gui/$(id -u)/com.all-stock-dca.console | grep -E 'state = |pid = '
+```
+Expected: tests green (106 console + 8 launchd); `plutil` reports OK and exits 0; `200`; `state = running`
+with a pid. Afterwards `launchctl bootout gui/$(id -u)/com.all-stock-dca.console` and
+`tail -2 cron_tracking/console/launchd.out.log` shows `Stopping local console.`
+
+## Operator acceptance checklist (post-merge; the cycle is *deployed* only when one front passes)
+
+Common first step: rotate the credential file (regenerate it with the one-liner above; the
+Phase A value crossed the LAN in plaintext).
+
+**Tailscale Serve**
+1. Install Tailscale on this Mac and the phone; log in (operator step). `tailscale serve
+   --bg http://127.0.0.1:8765`; `tailscale serve status` shows the tailnet URL and no Funnel.
+2. Probe from a tailnet device (laptop on the tailnet, or the phone):
+   `curl -si https://<mac>.<tailnet>.ts.net/api/health`. The JSON body (200 or 403) always
+   carries `received_host` and `forwarded_host`. Read it: if the name appears under
+   `received_host`, no `--behind-proxy` is needed; only if it appears under
+   `forwarded_host` and `received_host` is something else, add `--behind-proxy`.
+3. Re-render: `render_console_agent.py --auth-file … --trusted-host <mac>.<tailnet>.ts.net
+   [--behind-proxy] --install`; run the printed apply pair (`bootout`, then `bootstrap`);
+   `launchctl print` shows `state = running`. Repeat the probe: expect 200.
+4. Second-device acceptance: phone on cellular, wifi off, Tailscale on:
+   `https://<mac>.<tailnet>.ts.net/` prompts once, shows `LOCAL` mode with the latest
+   scheduled runs, "Export JSON" downloads, a job button starts a job.
+
+**Cloudflare Tunnel + Access**
+1. Install cloudflared on this Mac; log in (operator step). Local pre-check of the Host
+   semantics: `curl -si -H 'Host: console.<domain>' http://127.0.0.1:8765/api/health` →
+   403 with `received_host: console.<domain>`.
+2. `cloudflared tunnel create dca-console`; create the Access application and policy for
+   `console.<domain>` **before** `cloudflared tunnel route dns`; `config.yml` ingress to
+   `http://127.0.0.1:8765` plus the terminal `- service: http_status:404`;
+   `cloudflared tunnel ingress validate`; `cloudflared service install`.
+3. Probe through Access: `cloudflared access curl https://console.<domain>/api/health -si`
+   (a plain `curl` is answered at the edge). The JSON body (200 or 403) carries
+   `received_host` / `forwarded_host`; choose `--behind-proxy` by the same rule as above.
+4. Re-render with `--trusted-host console.<domain> [--behind-proxy] --install`; run the
+   printed apply pair; `launchctl print` shows `state = running`. Repeat the probe: expect 200.
+5. Second-device acceptance: phone on cellular, wifi off: `https://console.<domain>/`
+   completes the Access login, then prompts for Basic once, shows `LOCAL` mode with the
+   latest scheduled runs, "Export JSON" downloads, a job button starts a job. Confirm the
+   Access policy is attached to the hostname before leaving it running.
+
+## Changes since round 3 (Same Page Meeting + second panel)
+
+- fifo-auth-file-blocks-before-validation → `O_NONBLOCK` in the open flags; FIFO
+  regression with a bounded-time assertion; descriptor test checks the flags (Rock 1).
+- rolling-default-breaks-demo-pipeline → `_run` keeps its existing day selection;
+  `default_day()` feeds only bootstrap/snapshot/default_date; Saturday regression (Rock 3).
+- hosted-success-is-not-gated → `/api/health` always reports `received_host` /
+  `forwarded_host` (one existing-test edit); forwarded-host precedence specified and
+  tested; checklists read the body on 200 or 403 (Rocks 2, 5).
+- Process-global limiter → per-server `AuthFailureLog` object, injectable; tests use
+  `interval=0` / fake clock (Rock 1).
+- Renderer default interpreter → module-level `DEFAULT_PYTHON` read at call time;
+  missing-default and positive-default tests monkeypatch it (Rock 4).
+
+````
+
+### Round 4 — Codex reply
+
+Timestamp: 2026-09-13T07:30:11Z
+
+> I’ll re-audit Revision 5 against the current implementation and tests, concentrating on the three reopened boundaries and whether the two independent-review additions introduce portability or CI gaps.
+> The runtime fixes themselves are coherent. One test-harness detail remains under scrutiny: a timed join only prevents a FIFO regression from hanging CI if the still-blocked worker is daemonized or explicitly released during cleanup.
+> [MAJOR] hosted-success-is-not-gated — RESOLVED: health diagnostics now cover both statuses, forwarded-host precedence is fail-closed and Origin-bound, the loopback-host fallback is tested, and both checklists require successful reprobe and phone acceptance.
+> 
+> [MAJOR] fifo-auth-file-blocks-before-validation — RESOLVED: `O_NONBLOCK` lets a writerless FIFO reach same-descriptor `fstat` rejection immediately, with flag and bounded-completion regressions planned.
+> 
+> [MAJOR] rolling-default-breaks-demo-pipeline — RESOLVED: `_run` retains its recent-full-session selection independently of the rolling hosted date, with a Saturday regression checking `--now`.
+> 
+> The per-server `AuthFailureLog` and call-time `DEFAULT_PYTHON` designs introduce no new major issue.
+> 
+> Verdicts:
+> 
+> - hosted-success-is-not-gated — ACCEPT: the complete detection-to-acceptance path is now specified and tested.
+> - fifo-auth-file-blocks-before-validation — ACCEPT: the runtime hang is closed.
+> - rolling-default-breaks-demo-pipeline — ACCEPT: existing demo behavior is preserved.
+> 
+> VERDICT: SAME PAGE
+
+### Round 4 — Discuss and close
+
+All three round-3 items ACCEPTed; the two panel-driven additions (per-server
+`AuthFailureLog`, call-time `DEFAULT_PYTHON`) raised no new finding. Codex's one aside —
+that a timed join only protects CI if the still-blocked FIFO worker is a daemon thread or
+released in cleanup — is adopted as an implementation note in the Rock 1 contract
+(`threading.Thread(daemon=True)` for the bounded-time assertion).
+
+**Same Page reached at round 4 of 5.** PLAN.md revision 5 is the agreed build plan; the
+Rocks proceed in the order 1 → 2 → 3, 4 after 1, 5 last, each built by Codex in
+`--sandbox workspace-write` and reviewed/proved by the Visionary.
+
+editorial: removed trailing backslash continuations before blank lines in Rock 1-3 proofs (2026-09-13T07:31:03Z); no semantic change
+editorial (2026-09-13T08:28:30Z): Rock 1 and 2 proof expectations corrected — SIGTERM is unhandled until Rock 3, so their stop step exits 143, not 0 (flagged by the Integrator in the Rock 1 report)
+
+## Rock 1 — Visionary review
+
+Timestamp: 2026-09-13T08:47:04Z. Codex built Rock 1 (`dca_console.py`, `dca_console_jobs.py`,
+`tests/test_dca_console.py`, nine new tests). Its sandbox could not bind loopback ports, so
+13 HTTP-backed tests and the curl proof did not run there. The Visionary read the full diff
+(764 lines) and ran the proof: ruff clean, 292 passed (87 console + 205 invariants), curl
+`200 401 200`, stop step exit 143 (SIGTERM is Rock 3; plan expectation corrected). An
+adversarial diff review (three lenses, three skeptics per finding) confirmed 3 of 8 findings:
+
+| # | Finding | Response |
+|---|---|---|
+| 1 | [MAJOR] Non-ASCII password leaks its printable projection into the auth-failure log — `http.server` decodes the request line as ISO-8859-1, so the UTF-8 `str` registration never matches the wire spelling (reproduced independently by the Visionary: `route=/x/psswrd-abcdefg`) | **FIX round 1.** Register the ISO-8859-1 and percent-encoded spellings; redact the unquoted target too; raw-socket regression test. |
+| 2 | [MINOR] No "why" comment on the `O_NOFOLLOW \| O_NONBLOCK` flags line | **FIX round 1.** House-voice comment citing rounds 2 and 3. |
+| 3 | [MINOR] `urlsplit` moved inside the `try` without a comment | **FIX round 1.** One-line comment. |
+| R1 | Trusted → Basic → token order not pinned by a test with a credential configured (refuted 1/3 as not a code defect, but the observation is true) | **Added to fix round 1** as a cheap regression test. |
+| R2–R5 | Tautological "traceback" assertion; import-time `sys.stderr` binding; unreachable `except AttributeError`; hard-coded 12/4096 in messages | Refuted; no change. |
+
+**Fix round 1 outcome** (2026-09-13T09:09:01Z): Codex registered the ISO-8859-1 and percent-encoded
+spellings, added the unquote redaction pass, both comments, the gate-order test and a
+raw-socket non-ASCII regression. Visionary re-ran the proof: ruff clean, 293 passed (88
+console + 205 invariants; Codex's sandbox again could not bind ports, so the 14 HTTP tests
+ran only here), curl `200 401 200`. Visionary's own reproduction then found a residual
+variant: a mixed encoding of the password (`/x/p%C3%A4ssw` + raw UTF-8 `örd-abcdefg`)
+matches no registered spelling and the printable strip emits `psswrd-abcdefg`. **Fix round
+2 (final)** asks for a structural rule: any route containing a non-printable or non-ASCII
+character is logged as the fixed text `non-ascii-target`, never as a stripped remainder.
+**Fix round 2 outcome — Rock 1 ACCEPTED** (2026-09-13T09:16:15Z): the route field now falls back to
+the fixed text `non-ascii-target` whenever the redacted, unquoted route contains a character
+outside printable ASCII; the controlled-target sub-case and the raw-socket test (now three
+encodings: raw UTF-8, fully percent-encoded, mixed) were updated. Visionary re-ran the proof
+(ruff clean, 293 passed, curl `200 401 200`) and a four-encoding raw-socket reproduction: two
+`[redacted]`, two `non-ascii-target`, no spelling of the password or its projection present.
+Both fix rounds were used; the Rock is accepted without taking the wheel.
+
+## Rock 4 — Visionary review
+
+Timestamp: 2026-09-13T09:48:19Z. Codex built Rock 4 in parallel with Rock 2 (new
+`deploy/launchd/render_console_agent.py`, new `tests/test_console_launchd.py`, one
+`.gitignore` line). Visionary read both files in full and ran the launchd-free proof parts:
+`git add -N`, ruff clean, 8 launchd tests + 205 invariants green, `plutil -lint -` OK,
+rendered plist has absolute paths, one root for environment and logs, no secret. The
+launchd bootstrap/health/bootout cycle is deferred until Rocks 2-3 are accepted (it would
+exercise a half-built console). Adversarial diff review confirmed 3 of 7 findings, all one
+defect:
+
+| # | Finding | Response |
+|---|---|---|
+| 1-3 | [MAJOR] The artifact root is the one path input never absolutized: a relative `--cron-tracking-root` or `$DCA_CRON_TRACKING_ROOT` renders relative log paths and env root, and `--install` mkdirs under the invoking cwd while the console resolves against the checkout; an empty flag becomes `Path('.')` and overrides the env | **FIX round 1.** Parse the flag as text, empty means unset, absolutize lexically through the existing helper; regression test with a relative flag, a relative env value, and an empty flag. |
+| R1-R3 | `--port 0` accepted for a persistent agent | Refuted: mirrors the console's own documented guard; no change. |
+| R4 | `test_renderer_fails_closed` asserts only exit 2 | Refuted: the positive-path tests would catch a wrong rule firing; no change. |
+
+**Fix round 1 outcome — Rock 4 ACCEPTED (code)** (2026-09-13T09:50:05Z): the root is parsed as
+text, empty means unset, and is absolutized lexically through the same helper as the other
+path inputs; regression test covers a relative flag, a relative env value and an empty flag
+from a changed cwd. Visionary verified from a scratch directory (relative flag → absolute
+under that directory; empty flag with env set → env root), ruff clean, 9 launchd + 205
+invariants green. The launchd bootstrap/health/bootout proof runs after Rock 3 (clean
+SIGTERM) lands.
+
+## Rock 2 — Visionary review
+
+Timestamp: 2026-09-13T10:02:19Z. Codex built Rock 2 (`dca_console.py` +352/-52, `tests/test_dca_console.py`
++304, 13 new tests, exactly the one permitted existing-test edit). Its sandbox could not bind
+ports; the Visionary read the full diff and ran the proof: ruff clean, all console + invariants
+tests green, LAN bind banner with the plaintext warning, curl `200 401 200 403`, stop step exit
+143 (Rock 3 pending), `--bind 0.0.0.0` refused with exit 2. Adversarial diff review confirmed
+**zero** of 3 findings; the Visionary adopted two nits directly: reworded the Sec-Fetch-Site
+whitespace-strip comment (the allow-list is the load-bearing check, the strip only normalizes)
+and recorded the `127.0.0.2` alias-bind usability gap in `DEFERRED.md`. **Rock 2 ACCEPTED.**
+The phone-on-wifi check is an operator step listed for commit approval.
+editorial (2026-09-13T10:23:06Z): Rock 4 proof health poll widened from 10 s to 30 s — a cold launchd start of the console takes longer than 10 s because startup probes optional packages in subprocesses; the agent was running with state = running when inspected
+**Rock 4 launchd cycle — ACCEPTED** (2026-09-13T10:23:22Z): with Rock 3 in the tree the Visionary ran
+the full Rock 4 proof: `--print | plutil -lint -` OK, `--install`, `bootstrap` → `state =
+running` with a pid, `/api/health` 200 with `received_host`/`forwarded_host`, hosted console
+401 without credentials and 200 with them, `bootout` → `Stopping local console.` in
+`launchd.out.log`, port released, agent unloaded; `launchd.err.log` holds exactly one
+rate-limited auth-failure line from the credential-less probe. The installed plist was then
+removed so the machine carries no login agent until commit approval; the operator installs
+it with the renderer as the acceptance checklist describes.
+
+## Rock 3 — Visionary review
+
+Timestamp: 2026-09-13T12:22:52Z. Codex built Rock 3 (`dca_console.py`, `console/app.js`,
+`tests/test_dca_console.py`, six new tests). Visionary read the full diff and ran the proof:
+ruff clean, 107 console tests green, `node --check` OK, SIGTERM → `Stopping local console.`,
+`exit=0`, port released. Adversarial diff review confirmed **zero** of 5 findings (seven
+verifier agents were lost to the operator's session limit, leaving two findings unvoted).
+Visionary assessed the unvoted ones directly: the calendar-order signature eviction is
+refuted (every poll re-stamps `generated_at`, so write-skipping never engaged before or
+after); the SIGTERM-between-create-and-start race is real but microsecond-wide, and the
+Visionary closed it with a two-line `is_alive()` guard on the shutdown `join` (console
+tests re-run green). **Rock 3 ACCEPTED**; the open-tab job-button check after
+`kickstart -k` remains an operator step.
+
+## Whole-cycle verification
+
+Timestamp: 2026-09-13T12:29:09Z. `ruff check .` clean. Full suite with CI's gate
+(`--cov-fail-under=90`): 8,790 passed, 4 skipped, coverage 92.90%, **3 failed** — all in
+`scripts/tests/test_compute_schedule.py::test_compute_cadence_*`, which no file in this cycle
+touches; the same three fail identically on a pristine `origin/main` worktree
+(`0 0 * * *` vs expected `0 3 * * *`), so they are pre-existing. `scripts/tests` shows the
+same three and nothing else. `run_dca.py --demo --report` smoke run passes. Launchd cycle,
+LAN curl sequence and SIGTERM stop were proved in-cycle (see the Rock entries above).
+Remaining operator steps: phone on the home wifi against the foreground LAN bind; the
+open-tab job button after `kickstart -k`; and the Phase B acceptance checklist after
+installing Tailscale or cloudflared.
+
+## Rock 5 — Visionary review
+
+Timestamp: 2026-09-13T12:36:26Z. Codex built Rock 5 (`docs/local_console.md` +346, rows in
+`CLAUDE.md`, `docs/repo_map.md`, `docs/README.md`, `MEMORY.md`). Visionary read every diff
+and ran the proof (`DOCS-OK`, all listed suites green). Adversarial docs review confirmed
+2 of 8 findings; the Visionary applied them directly (docs only): the remote-access rule now
+says every `--trusted-host` value requires `--auth-file` (not only "external" names) and the
+flag paragraph states the same dependency; `MEMORY.md`'s pointer to the replaced
+verification record now targets `HANDOFF.md`. Two refuted-but-true wording nits were also
+fixed: the checklist's "one-liner above" now says "generator block above", and
+`DEFERRED.md` describes the auth-failure line as rate-limited per server. Proof re-run:
+`DOCS-OK`. **Rock 5 ACCEPTED.**

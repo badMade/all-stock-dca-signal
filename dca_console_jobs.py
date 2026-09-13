@@ -17,11 +17,41 @@ from uuid import uuid4
 
 from dca_fileio import atomic_write_text
 
+_REGISTERED_SECRETS_LOCK = threading.Lock()
+_REGISTERED_SECRETS: tuple[str, ...] = ()
+
+
+def register_secret(secret: str) -> None:
+    """Keep an in-process secret available to every console redaction boundary."""
+    if not secret:
+        return
+    if not isinstance(secret, str):
+        raise TypeError("registered console secrets must be text")
+    global _REGISTERED_SECRETS
+    with _REGISTERED_SECRETS_LOCK:
+        # The auth-file password must never be moved into the environment merely
+        # so the older environment-value pass below can find it: every console
+        # job inherits a copy of that environment.  Keep an immutable snapshot
+        # instead, and retain old values for the process lifetime so credential
+        # rotation cannot uncover a value already held by an exception or log
+        # buffer (Same Page round 1).
+        _REGISTERED_SECRETS = tuple(sorted({*_REGISTERED_SECRETS, secret}, key=len, reverse=True))
+
 
 def redact(text: str) -> str:
     """Remove credential-shaped values before persisting or showing job output."""
     from near_close_dca import _redacted_diagnostic_text
 
+    # HTTP handlers are threaded, and a future credential reload may register a
+    # replacement while another thread is formatting a failure.  Copy the
+    # immutable tuple under its small dedicated lock, then release the lock
+    # before the deliberately thorough diagnostic sanitizer runs (panel finding,
+    # round 3).  Longest-first replacement prevents an overlapping shorter
+    # secret from leaving the suffix of a longer one visible.
+    with _REGISTERED_SECRETS_LOCK:
+        registered = _REGISTERED_SECRETS
+    for secret in registered:
+        text = text.replace(secret, "[redacted]")
     # Preserve multiline credential delimiters until the shared sanitizer sees them.
     text = _redacted_diagnostic_text(text).replace("[REDACTED]", "[redacted]")
     for name, value in os.environ.items():

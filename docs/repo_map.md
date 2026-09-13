@@ -145,6 +145,7 @@ implementation-status matrix.
 | `scripts/refresh_active_ticker_histories.py` | Restores missing daily-price histories for the universe |
 | `scripts/run_tickers_daily_update.py` | Drives the resumable ticker-history updater |
 | `scripts/backfill_intraday_archive.py` | Seeds the intraday archive from artifacts already on disk |
+| `from.py` → `dca_console.py` | Checkout-only console for viewing run artifacts and running fixed dry-run/test actions; supporting modules live in `dca_console_{data,jobs,octopus}.py`, browser assets in `console/`, and the launchd renderer in `deploy/launchd/`. Never places brokerage orders. |
 
 ---
 
@@ -240,6 +241,7 @@ behavioral ticker grouping for the 3D market graph, and has no path to the guard
 | I want to... | Do this |
 |---|---|
 | Dry-run the whole pipeline | `python run_dca.py --demo --report --now <weekday>T15:45 --artifacts-dir <dir>` |
+| See today's runs from my phone | Start with `python3 from.py --local --no-browser`, then follow [the remote-access runbook](local_console.md#remote-access); the console stays loopback-only unless `--auth-file` protects a reviewed LAN/proxy setup. |
 | Find the command for a task | `python scripts/agent_entry_points.py --search <word>` |
 | Know which entry point owns a slot | Section 1.2 above |
 | Change gate behavior | Decide *which* entry point first (section 1.1). The fix does not propagate. |

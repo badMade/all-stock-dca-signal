@@ -45,6 +45,9 @@ pytest --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90
 # Dry-run smoke test (the third standard pre-handoff check)
 python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo
 
+# Checkout-only local console; remote-access rules: docs/local_console.md#remote-access
+python3 from.py --local --no-browser
+
 # 3D market graph -- emits one self-contained HTML file, no network (docs/market_graph.md)
 python -m scripts.generate_market_graph --source csv --out /tmp/ocean.html
 ```
@@ -92,6 +95,7 @@ research-only failures stay outside self-heal's documented core-only scope.
 | Broker/data | `dca_live_adapters.py` — `RobinhoodDataProvider`, `FinanceDataProvider`, `RobinhoodBroker`, all built from **injected callables** that map 1:1 to Robinhood MCP tools |
 | Money & risk | `dca_risk.py`, `dca_cumulative.py` (cumulative sub-dollar credit ledger), `dca_cost_tracker.py`, `dca_inverse_martingale.py` (opt-in deferred-accumulation sizing mode, off by default — see `docs/inverse_martingale.md`), `dca_whole_share_accumulator.py` (whole-share accumulation for tickers not tradable for fractional buys, e.g. BYDDY; wired into `near_close_dca._run_once_impl` — the 3:30 PM canonical stream only — see `docs/whole_share_accumulation.md`) |
 | Output | `dca_reporting.py`, `dca_alerts.py`, `dca_fileio.py`, `dca_notion_sync.py`, `dca_weekly_dashboard.py` |
+| Local console | `from.py` → `dca_console.py`, `dca_console_{data,jobs,octopus}.py`, `console/`, `deploy/launchd/` — checkout-only; reads artifacts and runs fixed dry-run/test actions, never places brokerage orders |
 | Visualization | `dca_market_graph.py` + `viz/` (the 3D market graph, "The Ocean" — the only pixel output here; `viz/vendor/three.min.js` is the repo's only vendored third-party asset, browser-side only, never imported by Python — see `docs/market_graph.md`) |
 | Reliability engines | `scripts/broker_reconciliation.py`, `run_state_machine.py`, `run_ledger.py`, `idempotency.py`, `scheduler_lease.py`, `reason_codes.py`, `correlation.py`, `same_day_pointer.py`, `same_day_top_up_gate.py`, `file_lock.py` |
 | Ops utilities | `scripts/run_classification.py`, `drift_detection.py`, `backup_strategy.py`, `run_ticker_maintenance.py`, `daily_per_ticker_calibration.py`, `generate_per_ticker_sizing.py`, `workflow_policy.py` |
@@ -208,6 +212,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `AGENTS.md` | The repo-wide agent operating contract (secrets policy, PR expectations) |
 | `docs/repo_map.md` | **Read this before opening a core module.** Structural map of every runner, report producer, and prediction tool: slot-to-entry-point ownership, which reporting modules have a CLI and which are library-only, and which tools can reach live sizing. Complements `scripts/agent_entry_points.py` (that one is task-oriented: "what command do I run") |
 | `docs/README.md` | Doc index + quick-reference facts (universe, ladder, budgets, test window) |
+| `docs/local_console.md` | Checkout-only console setup, API, authentication, LAN/proxy access and launchd runbooks; never places brokerage orders |
 | `docs/live_wiring.md` | Modules, dependency injection, the three entry points, state persistence, local agent quick reference |
 | `scripts/agent_entry_points.py` | Live index of existing entry points to reuse instead of writing new code (`--json`/`--search`) |
 | `docs/reliability_spec.md` | Run-state lifecycle, broker snapshot contract, honest implementation-status matrix |

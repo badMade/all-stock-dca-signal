@@ -41,7 +41,7 @@ The core is Python 3.11+ and standard-library-only. Jobs use the repository
 
 | Component | Responsibility |
 | --- | --- |
-| `from.py` → `dca_console.py` | Loopback UI, fixed actions, snapshots, daily JSON/Markdown summaries |
+| `from.py` → `dca_console.py` | Loopback by default; LAN/proxy with `--auth-file`; fixed actions, snapshots, daily JSON/Markdown summaries |
 | `dca_console_jobs.py` | One active job, streamed/redacted logs, deadlines, persisted job history |
 | `dca_console_data.py` | Observed daily runs, confirmed fills, workload proxies, configured timetable |
 | `dca_console_octopus.py` | Bounded stdlib reads of forecast CSV, daily JSON, report JSON and checkpoint metadata |
@@ -168,6 +168,6 @@ does not submit live orders or create external schedules.
 At the implementation checkpoint, lint and 62 focused console/index tests
 passed, along with core, baseline-forecast, neural-forecast and seven-slot smoke
 checks. Six inverse-Martingale corporate-action tests failed identically on
-pristine pre-console HEAD; see the dated verification record in
-[docs/local_console.md](docs/local_console.md). These results are historical,
+pristine pre-console HEAD; see the historical verification record in
+[HANDOFF.md](HANDOFF.md) ("Verification already completed"). These results are historical,
 not a claim about future repository health. Re-run checks relevant to new work.

@@ -7,24 +7,31 @@ the console reads their documented artifacts and never imports their models.
 from __future__ import annotations
 
 import argparse
+import base64
+import errno
 import hashlib
+import ipaddress
 import json
 import os
+import re
 import secrets
 import shlex
+import signal
+import stat
 import subprocess
 import sys
 import threading
 import time
 import webbrowser
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 from zoneinfo import ZoneInfo
 
-from dca_console_jobs import Command, JobBusy, JobManager, redact
+from dca_console_jobs import Command, JobBusy, JobManager, redact, register_secret
 from dca_fileio import atomic_write_text
 from dca_paths import cron_tracking_root, stream_root
 
@@ -32,6 +39,77 @@ REPO = Path(__file__).resolve().parent
 ET = ZoneInfo("America/New_York")
 ASSETS = {"/": ("index.html", "text/html"), "/app.js": ("app.js", "text/javascript"),
           "/styles.css": ("styles.css", "text/css")}
+MAX_AUTH_FILE_BYTES = 4096
+MIN_AUTH_PASSWORD_CHARACTERS = 12
+HANDLER_TIMEOUT_SECONDS = 30
+MAX_REPORTED_HOST_CHARACTERS = 253
+MAX_SUMMARY_SIGNATURE_DAYS = 32
+_HOSTNAME_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_HOSTNAME_PATTERN = re.compile(rf"{_HOSTNAME_LABEL}(?:\.{_HOSTNAME_LABEL})*")
+
+
+def _configured_authority(value: object) -> str:
+    """Normalize one configured hostname authority or raise a rule-specific error."""
+    if not isinstance(value, str) or not value:
+        raise ValueError("--trusted-host must be a non-empty hostname with an optional port.")
+    try:
+        authority = value.encode("ascii").decode("ascii").lower()
+    except UnicodeError:
+        raise ValueError("--trusted-host must contain ASCII hostname characters only.") from None
+    hostname, separator, port = authority.rpartition(":")
+    if not separator:
+        hostname = authority
+    elif not hostname or not port.isdigit() or int(port) > 65535:
+        raise ValueError("--trusted-host port must be a number no greater than 65535.")
+    if len(hostname) > MAX_REPORTED_HOST_CHARACTERS or _HOSTNAME_PATTERN.fullmatch(hostname) is None:
+        raise ValueError("--trusted-host must be a hostname without a scheme, path, wildcard, or whitespace.")
+    return authority
+
+
+def _single_header(headers, name: str) -> tuple[bool, str | None]:
+    """Return one header without accepting ambiguous duplicate security fields."""
+    try:
+        get_all = getattr(headers, "get_all", None)
+        if callable(get_all):
+            values = get_all(name, [])
+            if not values:
+                return False, None
+            if len(values) != 1 or not isinstance(values[0], str):
+                return True, None
+            return True, values[0]
+        value = headers.get(name)
+    except Exception:
+        return True, None
+    if value is None:
+        return False, None
+    return True, value if isinstance(value, str) else None
+
+
+def _lower_ascii_header(headers, name: str) -> tuple[bool, str | None]:
+    """Read one security header as lowercase ASCII; invalid bytes never match."""
+    present, value = _single_header(headers, name)
+    if value is None:
+        return present, None
+    try:
+        return True, value.encode("ascii").decode("ascii").lower()
+    except UnicodeError:
+        return True, None
+
+
+def _reported_header(headers, name: str) -> str | None:
+    """Bound and redact one client-supplied authority for diagnostic JSON."""
+    try:
+        value = headers.get(name)
+        if value is None:
+            return None
+        # Redaction must precede truncation: a boundary cut can otherwise leave
+        # a credential fragment the shared matcher no longer recognizes (Same
+        # Page round 2).
+        return redact(str(value))[:MAX_REPORTED_HOST_CHARACTERS]
+    except Exception:
+        # Diagnostics are never important enough to weaken a 403 or health
+        # response when a malformed test double/header object raises.
+        return None
 
 
 @dataclass(frozen=True)
@@ -41,11 +119,244 @@ class Settings:
     mode: str
     root: Path
     output: Path
-    day: date
+    day: date | None
     python: str
     research_python: str
     octopus_run: Path | None = None
     config_dir: Path = REPO / "config"
+
+
+@dataclass(frozen=True)
+class ConsoleAccess:
+    """Optional HTTP credential, validated wherever a console server is built."""
+
+    username: str = ""
+    credential: bytes | None = field(default=None, repr=False)
+    bind: str = "127.0.0.1"
+    trusted_hosts: tuple[str, ...] = ()
+    behind_proxy: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.username, str):
+            raise ValueError("The auth username must be text.")
+        if self.credential is None:
+            if self.username:
+                # Keep the unauthenticated compatibility state singular.  A
+                # username with no comparison value must never quietly turn
+                # authentication off for a future make_server() caller (Same
+                # Page round 1).
+                raise ValueError("Console access without a credential requires an empty username.")
+        else:
+            if type(self.credential) is not bytes:
+                raise ValueError("The console credential must be bytes.")
+            if (not self.username or ":" in self.username
+                    or any(not 0x20 <= ord(character) <= 0x7e for character in self.username)):
+                raise ValueError("The auth username must be non-empty printable ASCII without a colon.")
+            if len(self.credential) > MAX_AUTH_FILE_BYTES:
+                raise ValueError("The console credential must not exceed the auth-file size limit.")
+            try:
+                decoded = self.credential.decode("utf-8")
+            except UnicodeDecodeError:
+                raise ValueError("The auth credential must be valid UTF-8.") from None
+            credential_username, separator, password = decoded.partition(":")
+            if not separator or credential_username != self.username:
+                raise ValueError("The auth credential must match its username and contain a colon.")
+            if "\r" in password or "\n" in password:
+                raise ValueError("The auth credential must contain exactly one line.")
+            if len(password) < MIN_AUTH_PASSWORD_CHARACTERS:
+                raise ValueError("The auth password must contain at least 12 characters.")
+
+            # Do not put this value in argv or the environment just to make the
+            # pre-existing redactor discover it: jobs copy both.  Register the
+            # password, full Basic cleartext, and its wire representation so any
+            # later diagnostic path masks all useful forms (Same Page round 1).
+            for value in (password, decoded):
+                register_secret(value)
+                # http.server decodes request-line bytes as ISO-8859-1, while a
+                # browser may percent-encode them.  Register each full spelling,
+                # not a short printable projection, so normalization cannot expose
+                # most of a non-ASCII secret (panel finding, round 1).
+                wire_value = value.encode("utf-8").decode("iso-8859-1")
+                if wire_value != value:
+                    register_secret(wire_value)
+                quoted_value = quote(value, safe="")
+                if quoted_value != value:
+                    register_secret(quoted_value)
+            register_secret(base64.b64encode(self.credential).decode("ascii"))
+
+        if not isinstance(self.bind, str):
+            raise ValueError("--bind must be an IPv4 address literal.")
+        try:
+            bind_address = ipaddress.IPv4Address(self.bind)
+        except ipaddress.AddressValueError:
+            raise ValueError("--bind must be an IPv4 address literal.") from None
+        object.__setattr__(self, "bind", str(bind_address))
+        if not isinstance(self.trusted_hosts, (tuple, list)):
+            raise ValueError("trusted_hosts must be a sequence of --trusted-host values.")
+        normalized_hosts = tuple(dict.fromkeys(_configured_authority(value) for value in self.trusted_hosts))
+        object.__setattr__(self, "trusted_hosts", normalized_hosts)
+        if type(self.behind_proxy) is not bool:
+            raise ValueError("behind_proxy must be a boolean.")
+
+        # All exposure invariants live here rather than in main(): a future
+        # make_server() caller therefore cannot open a reachable socket with an
+        # invalid policy (Rock 2 contract; Same Page round 2).
+        if self.behind_proxy and not normalized_hosts:
+            raise ValueError("--behind-proxy requires at least one --trusted-host.")
+        if bind_address.is_unspecified and not normalized_hosts:
+            raise ValueError("--bind 0.0.0.0 requires at least one --trusted-host.")
+        if self.behind_proxy and not bind_address.is_loopback:
+            raise ValueError("--behind-proxy requires a loopback --bind address.")
+        if not bind_address.is_loopback and self.credential is None:
+            raise ValueError("A non-loopback --bind requires --auth-file.")
+        if normalized_hosts and self.credential is None:
+            raise ValueError("--trusted-host requires --auth-file.")
+
+    def hosts(self, port: int) -> set[str]:
+        """Return the complete set of accepted Host authorities for one port."""
+        allowed = {f"127.0.0.1:{port}", f"localhost:{port}", *self.trusted_hosts}
+        bind_address = ipaddress.IPv4Address(self.bind)
+        if not bind_address.is_loopback and not bind_address.is_unspecified:
+            allowed.add(f"{self.bind}:{port}")
+        return allowed
+
+    def effective_authority(self, headers, port: int) -> str | None:
+        """Return the accepted Host, or a configured forwarded Host in proxy mode."""
+        _, received_host = _lower_ascii_header(headers, "Host")
+        if received_host not in self.hosts(port):
+            return None
+        if not self.behind_proxy:
+            return received_host
+        forwarded_present, forwarded_host = _lower_ascii_header(headers, "X-Forwarded-Host")
+        if not forwarded_present:
+            return received_host
+        if forwarded_host not in self.trusted_hosts or self._loopback_authority(forwarded_host):
+            # A present forwarded authority has precedence and must never fall
+            # back to Host when it is malformed/unconfigured (Same Page round 3).
+            return None
+        return forwarded_host
+
+    def trusted(self, headers, port: int) -> bool:
+        """Return whether Host, forwarded Host and Origin describe one authority."""
+        authority = self.effective_authority(headers, port)
+        if authority is None:
+            return False
+        origin_present, origin = _lower_ascii_header(headers, "Origin")
+        if not origin_present:
+            return True
+        return origin in {f"http://{authority}", f"https://{authority}"}
+
+    @staticmethod
+    def _loopback_authority(authority: str | None) -> bool:
+        if authority is None:
+            return False
+        hostname = authority.rsplit(":", 1)[0] if ":" in authority else authority
+        if hostname == "localhost":
+            return True
+        try:
+            return ipaddress.IPv4Address(hostname).is_loopback
+        except ipaddress.AddressValueError:
+            return False
+
+    def authorized(self, headers) -> bool:
+        """Return whether one strict HTTP Basic header matches this policy."""
+        if self.credential is None:
+            return True
+        get_all = getattr(headers, "get_all", None)
+        if callable(get_all):
+            values = get_all("Authorization", [])
+        else:
+            value = headers.get("Authorization")
+            values = [] if value is None else [value]
+        # Multiple Authorization fields are ambiguous after HTTP combination;
+        # refusing them is the only fail-closed interpretation.
+        if len(values) != 1 or not isinstance(values[0], str):
+            return False
+        parts = values[0].strip().split(None, 1)
+        if len(parts) != 2 or parts[0].casefold() != "basic":
+            return False
+        try:
+            supplied = base64.b64decode(parts[1].encode("ascii"), validate=True)
+        except (UnicodeError, ValueError):
+            return False
+        return secrets.compare_digest(supplied, self.credential)
+
+
+def load_auth_file(path: str | os.PathLike[str]) -> tuple[str, bytes]:
+    """Load one checked Basic credential from the same bounded POSIX descriptor."""
+    if os.name != "posix":
+        raise ValueError("--auth-file is supported on POSIX only.")
+    try:
+        # O_NOFOLLOW turns a symlink into ELOOP, and every later check/read uses
+        # the returned descriptor, closing the writable-parent check/use race
+        # (Same Page round 2). O_NONBLOCK lets a writerless FIFO open at once so
+        # fstat can reject it and the CLI exits 2 instead of hanging the console
+        # and launchd renderer; regular-file reads are unaffected (Same Page
+        # round 3). O_CLOEXEC keeps the descriptor out of every job child.
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    except AttributeError:
+        raise ValueError("--auth-file requires POSIX no-follow and nonblocking file flags.") from None
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ValueError("--auth-file must not be a symlink.") from None
+        raise ValueError("--auth-file must exist and be readable without following symlinks.") from None
+
+    try:
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("--auth-file must be a regular file.")
+            if metadata.st_uid != os.getuid():
+                raise ValueError("--auth-file owner must be the current user.")
+            if metadata.st_mode & 0o077:
+                raise ValueError("--auth-file must not grant group or other permissions.")
+            if not 0 <= metadata.st_size <= MAX_AUTH_FILE_BYTES:
+                raise ValueError("--auth-file must contain at most 4096 bytes.")
+
+            # The pathname is intentionally never opened a second time.  Both
+            # the check and bounded read stay on this descriptor, closing the
+            # writable-parent check/use race identified in Same Page round 2.
+            remaining = MAX_AUTH_FILE_BYTES + 1
+            chunks: list[bytes] = []
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            contents = b"".join(chunks)
+        except OSError:
+            raise ValueError("--auth-file must remain readable through its checked descriptor.") from None
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            # Closing cannot make already-read bytes come from another inode,
+            # and an error here must not replace a more useful rule violation.
+            pass
+
+    if len(contents) > MAX_AUTH_FILE_BYTES:
+        raise ValueError("--auth-file must contain at most 4096 bytes.")
+    try:
+        text = contents.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("--auth-file must contain valid UTF-8.") from None
+    if text.endswith("\n"):
+        text = text[:-1]
+        if text.endswith("\r"):
+            text = text[:-1]
+    if not text:
+        raise ValueError("--auth-file must contain one non-empty line.")
+    if "\r" in text or "\n" in text:
+        raise ValueError("--auth-file must contain exactly one line.")
+    username, separator, password = text.partition(":")
+    if not separator:
+        raise ValueError("--auth-file line must contain a colon.")
+    credential = f"{username}:{password}".encode("utf-8")
+    access = ConsoleAccess(username, credential)
+    return access.username, credential
 
 
 def python_packages(executable: str) -> dict:
@@ -73,6 +384,33 @@ def default_demo_day() -> date:
             return day
         day -= timedelta(days=1)
     raise ValueError("No recent full demo session could be selected; supply --date explicitly.")
+
+
+@contextmanager
+def _sigterm_as_keyboard_interrupt():
+    """Route SIGTERM through the existing Ctrl+C cleanup path while installed."""
+    if threading.current_thread() is not threading.main_thread():
+        # signal.signal() is main-thread-only. A future embedded caller still
+        # gets a usable context manager without weakening the process-wide
+        # handler owned by its main thread (Same Page round 2).
+        yield
+        return
+
+    previous_handler = signal.getsignal(signal.SIGTERM)
+
+    def interrupt(_signum, _frame) -> None:
+        # server.shutdown() deadlocks when called by the same thread that is in
+        # serve_forever(). Raising here deliberately reuses the proven Ctrl+C
+        # unwind and JobManager child teardown (Same Page round 2).
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupt)
+    try:
+        yield
+    finally:
+        # This launcher must not leave a caller's process-wide signal policy
+        # changed after serving stops (Rock 3 handler-hygiene contract).
+        signal.signal(signal.SIGTERM, previous_handler)
 
 
 def module_catalog(python: str) -> list[dict]:
@@ -142,6 +480,15 @@ class ConsoleApp:
         except (OSError, ValueError, KeyError, TypeError):
             pass
 
+    def default_day(self) -> date:
+        """Return the pinned day or today's Eastern date for an unpinned session."""
+        if self.settings.day is not None:
+            return self.settings.day
+        # Local launchd service sessions can survive midnight. Resolve this
+        # through the module's datetime name on every request so a new tab does
+        # not inherit the process-start date (Same Page round 2).
+        return datetime.now(ET).date()
+
     def actions(self) -> list[dict]:
         """List fixed actions, with explicit dependency/setup availability."""
         research = all(self.packages.get(key) is True for key in ("numpy", "pandas", "sklearn"))
@@ -171,7 +518,8 @@ class ConsoleApp:
         from dca_console_data import build_daily_snapshot
         from dca_console_octopus import build_octopus_snapshot
 
-        day = day or self.settings.day
+        request_default_day = self.default_day()
+        day = request_default_day if day is None else day
         key = (day.isoformat(), ticker, period)
         with self.lock:
             cached = self.cache.get(key)
@@ -185,7 +533,7 @@ class ConsoleApp:
                 )
                 octopus = build_octopus_snapshot(self.octopus_run, ticker=ticker, period=period)
                 data = {
-                    "mode": self.settings.mode, "now": now.isoformat(), "default_date": self.settings.day.isoformat(),
+                    "mode": self.settings.mode, "now": now.isoformat(), "default_date": request_default_day.isoformat(),
                     "daily": daily, "octopus": octopus, "warnings": [],
                     "modules": module_catalog(self.settings.python),
                     "paths": {"artifacts": str(self.settings.root), "summaries": str(self.settings.output / "summaries")},
@@ -198,6 +546,10 @@ class ConsoleApp:
                 if len(self.cache) >= 32:
                     self.cache.clear()
                 self.cache[key] = (time.monotonic(), data)
+            # An explicit-date snapshot can remain cached across midnight. The
+            # evidence is still valid, but the UI's new-tab default must roll at
+            # request time rather than lag for the cache TTL (Same Page round 2).
+            data["default_date"] = request_default_day.isoformat()
         return dict(data, jobs=self.jobs.snapshot(), actions=self.actions())
 
     def _save_summary(self, daily: dict, octopus: dict) -> None:
@@ -223,6 +575,12 @@ class ConsoleApp:
         atomic_write_text(folder / f"{day}.json", content)
         atomic_write_text(folder / f"{day}.md", "\n".join(lines) + "\n")
         self.signatures[day] = signature
+        if len(self.signatures) > MAX_SUMMARY_SIGNATURE_DAYS:
+            # A long-running service otherwise retains one digest hash per day
+            # forever. ISO dates sort chronologically, so even an out-of-order
+            # historical request cannot displace a newer day from the bounded
+            # history (Rock 3 uptime bound).
+            del self.signatures[min(self.signatures)]
 
     def submit(self, action: str) -> dict:
         """Dispatch an allowlisted action; API requests cannot supply commands or paths."""
@@ -314,13 +672,145 @@ class ConsoleApp:
         return next((code for code in results if code != 0), 0)
 
 
-def make_server(app: ConsoleApp, port: int) -> ThreadingHTTPServer:
-    """Serve only loopback, fixed assets and allowlisted APIs with same-origin writes."""
+class AuthFailureLog:
+    """Write bounded access failures without letting clients grow stderr at line rate."""
+
+    def __init__(self, interval: float = 5.0, clock=time.monotonic, stream=sys.stderr):
+        self.interval = max(0.0, float(interval))
+        self.clock = clock
+        self.stream = stream
+        self.lock = threading.Lock()
+        self.last_emitted: float | None = None
+        self.suppressed = 0
+
+    @staticmethod
+    def _field(value: object, fallback: str, limit: int) -> str:
+        try:
+            rendered = str(value)
+        except Exception:
+            rendered = fallback
+        # Passwords may themselves contain non-ASCII or control characters.
+        # Mask the unmodified spelling first so normalization cannot reveal its
+        # printable remainder; do not register that remainder globally because
+        # it may be one common character and corrupt every job log (panel,
+        # round 3).
+        try:
+            rendered = redact(rendered)
+        except Exception:
+            rendered = fallback
+        # Strip controls before redaction so a hostile target cannot inject a
+        # second launchd.err.log line.  Redact before truncation because cutting
+        # a secret at the boundary can leave an unrecognizable suffix (Same Page
+        # round 2).
+        printable = "".join(character for character in rendered if 0x20 <= ord(character) <= 0x7e)
+        try:
+            safe = redact(printable)
+        except Exception:
+            safe = fallback
+        return (safe or fallback)[:limit]
+
+    def _line(self, client_address: object, method: object, target: object, suppressed: int) -> str:
+        try:
+            # Parse only after exact raw-value and percent-decoded passes.
+            # urlsplit discards controls and treats '?'/'#' as boundaries;
+            # either transformation could otherwise expose most of an allowed
+            # UTF-8 password before the route-only pass sees it (panel finding,
+            # round 3).
+            safe_target = redact(str(target))
+            # Decode only after raw matches are gone: a literal '%' inside a
+            # registered password must not mutate before it can be masked.
+            safe_target = redact(unquote(safe_target))
+            unparsed_route = safe_target.split("?", 1)[0].split("#", 1)[0]
+            # Legitimate console routes are pure ASCII, so anything else has
+            # no diagnostic value; stripping it can only expose a secret's
+            # printable projection (Visionary review, Rock 1 fix round 2).
+            if any(not 0x20 <= ord(character) <= 0x7e for character in unparsed_route):
+                route = "non-ascii-target"
+            else:
+                route = urlsplit(safe_target).path
+        except Exception:
+            route = "malformed-target"
+        if isinstance(client_address, tuple) and client_address:
+            client_address = client_address[0]
+        client = self._field(client_address, "unknown-client", 64)
+        verb = self._field(method, "unknown-method", 32)
+        route = self._field(route, "malformed-target", 128)
+        skipped = f" suppressed={suppressed}" if suppressed else ""
+        return f"Console auth failure: client={client} method={verb}{skipped} route={route}"
+
+    def record(self, client_address: object, method: object, target: object) -> None:
+        """Record one failure, reporting any suppressed burst on the next line."""
+        try:
+            now = self.clock()
+            with self.lock:
+                if self.last_emitted is not None and now - self.last_emitted < self.interval:
+                    self.suppressed += 1
+                    return
+                suppressed = self.suppressed
+                self.suppressed = 0
+                self.last_emitted = now
+                line = self._line(client_address, method, target, suppressed)
+                self.stream.write(line + "\n")
+                flush = getattr(self.stream, "flush", None)
+                if callable(flush):
+                    flush()
+        except Exception:
+            # Logging is deliberately best-effort: malformed request metadata,
+            # an injected clock, or a closed stderr must never bypass a 401/403.
+            return
+
+
+def make_server(
+    app: ConsoleApp,
+    port: int,
+    access: ConsoleAccess | None = None,
+    failure_log: AuthFailureLog | None = None,
+) -> ThreadingHTTPServer:
+    """Serve fixed assets/APIs under one validated access policy."""
+    access = ConsoleAccess() if access is None else access
+    if not isinstance(access, ConsoleAccess):
+        raise ValueError("access must be a validated ConsoleAccess policy")
+    # This limiter belongs to one server, rather than the module, so separate
+    # consoles and tests cannot suppress each other's diagnostics (panel,
+    # round 3).
+    failure_log = AuthFailureLog() if failure_log is None else failure_log
+
     class Handler(BaseHTTPRequestHandler):
+        # StreamRequestHandler applies this while setting up every accepted
+        # socket. An idle LAN/proxy peer therefore cannot retain a worker thread
+        # forever without sending even a request line (Rock 2 handler finding).
+        timeout = HANDLER_TIMEOUT_SECONDS
+
         def log_message(self, format: str, *args) -> None:
             return
 
-        def _reply(self, code: int, body: bytes, kind: str = "application/json", *, download: str = "") -> None:
+        def version_string(self) -> str:
+            # BaseHTTPRequestHandler otherwise exposes the Python version in
+            # every Server header, which gives an unauthenticated probe needless
+            # implementation detail (Rock 2 handler finding).
+            return "DCA-Console"
+
+        def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
+            # The stdlib implementation interpolates malformed request syntax
+            # and unsupported method names into an HTML body before do_GET or
+            # do_POST can apply redact(). A fixed JSON error closes that
+            # pre-handler credential echo path (Rock 2 hardened-handler review).
+            self.close_connection = True
+            self._reply(
+                code,
+                json.dumps({"error": "HTTP request rejected."}).encode(),
+                extra_headers=(("Connection", "close"),),
+            )
+
+        def _reply(
+            self,
+            code: int,
+            body: bytes,
+            kind: str = "application/json",
+            *,
+            download: str = "",
+            extra_headers: tuple[tuple[str, str], ...] = (),
+        ) -> None:
             self.send_response(code)
             self.send_header("Content-Type", kind + "; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -330,6 +820,8 @@ def make_server(app: ConsoleApp, port: int) -> ThreadingHTTPServer:
             self.send_header("Content-Security-Policy", "default-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'")
             if download:
                 self.send_header("Content-Disposition", f'attachment; filename="{download}"')
+            for name, value in extra_headers:
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
 
@@ -338,38 +830,114 @@ def make_server(app: ConsoleApp, port: int) -> ThreadingHTTPServer:
 
         def _trusted(self) -> bool:
             port_number = self.server.server_address[1]
-            hosts = {f"127.0.0.1:{port_number}", f"localhost:{port_number}"}
-            origin = self.headers.get("Origin")
-            return (self.headers.get("Host") in hosts
-                    and (origin is None or origin in {f"http://{host}" for host in hosts})
-                    and self.headers.get("Sec-Fetch-Site") not in {"cross-site"})
+            if not access.trusted(self.headers, port_number):
+                return False
+            site_present, site = _lower_ascii_header(self.headers, "Sec-Fetch-Site")
+            if site is not None:
+                # Optional HTTP whitespace does not change a structured token,
+                # so a padded value gets the same treatment as its canonical
+                # spelling.  The allow-list on the next line is the load-bearing
+                # fail-closed check; this strip only normalizes (Rock 2 review).
+                site = site.strip(" \t")
+            if site_present and site not in {"same-origin", "same-site", "cross-site", "none"}:
+                return False
+            if site != "cross-site":
+                return True
+            mode_present, fetch_mode = _lower_ascii_header(self.headers, "Sec-Fetch-Mode")
+            destination_present, destination = _lower_ascii_header(self.headers, "Sec-Fetch-Dest")
+            if fetch_mode is not None:
+                fetch_mode = fetch_mode.strip(" \t")
+            if destination is not None:
+                destination = destination.strip(" \t")
+            # Cloudflare Access can leave the first harmless document navigation
+            # marked cross-site after its login redirect chain. The exception is
+            # deliberately route/method/mode/destination exact; every API read
+            # and every write remains rejected (Rock 2 contract).
+            return (
+                self.command == "GET"
+                and self._request_path() == "/"
+                and mode_present
+                and fetch_mode == "navigate"
+                and destination_present
+                and destination == "document"
+            )
+
+        def _authority_diagnostics(self) -> dict[str, str | None]:
+            return {
+                "received_host": _reported_header(self.headers, "Host"),
+                "forwarded_host": _reported_header(self.headers, "X-Forwarded-Host"),
+            }
+
+        def _log_auth_failure(self) -> None:
+            try:
+                failure_log.record(self.client_address, self.command, self.path)
+            except Exception:
+                # Test doubles get the same fail-safe boundary as the concrete
+                # logger; an observability failure cannot become an auth bypass.
+                pass
+
+        def _forbidden(self, message: str) -> None:
+            self._log_auth_failure()
+            # Host values are useful precisely when a proxy was configured
+            # incorrectly, but remain hostile input: redact before bounding and
+            # emit JSON only (Same Page round 3).
+            self._json(403, {"error": redact(message), **self._authority_diagnostics()})
+
+        def _unauthorized(self) -> None:
+            self._log_auth_failure()
+            body = json.dumps({"error": "HTTP Basic authentication is required."}).encode()
+            self._reply(401, body, extra_headers=((
+                "WWW-Authenticate", 'Basic realm="DCA console", charset="UTF-8"',
+            ),))
+
+        def _request_path(self) -> str | None:
+            try:
+                return urlsplit(self.path).path
+            except Exception:
+                return None
 
         def do_GET(self) -> None:
             if not self._trusted():
-                self._json(403, {"error": "This console accepts same-origin loopback requests only."})
+                self._forbidden("This console accepts same-origin loopback requests only.")
                 return
-            url = urlsplit(self.path)
+            route = self._request_path()
+            # Health stays credential-free for local probes.  The trust check
+            # remains first, so this exception never becomes a cross-origin
+            # reachability oracle (Same Page round 1).
+            if route != "/api/health" and not access.authorized(self.headers):
+                self._unauthorized()
+                return
             try:
+                # Malformed targets become 400; handler tracebacks grow launchd.err.log outside the limiter (panel, round 1).
+                url = urlsplit(self.path)
                 if url.path in ASSETS:
                     name, kind = ASSETS[url.path]
                     self._reply(200, (REPO / "console" / name).read_bytes(), kind)
                 elif url.path == "/api/bootstrap":
-                    self._json(200, {"token": app.token, "default_date": app.settings.day.isoformat()})
+                    self._json(200, {"token": app.token, "default_date": app.default_day().isoformat()})
                 elif url.path in {"/api/snapshot", "/api/export"}:
                     query = parse_qs(url.query, max_num_fields=8)
-                    raw_day = query.get("date", [app.settings.day.isoformat()])[0]
-                    day = date.fromisoformat(raw_day)
+                    raw_day = query.get("date", [None])[0]
+                    # Let snapshot() resolve an absent date once for both its
+                    # evidence day and default_date. Besides keeping the rolling
+                    # rule in one place, this avoids a midnight split inside one
+                    # response (Same Page round 2).
+                    day = date.fromisoformat(raw_day) if raw_day is not None else None
                     ticker = query.get("ticker", [""])[0][:32]
                     period = query.get("period", ["all"])[0][:80]
                     data = app.snapshot(day, ticker, period)
                     if url.path == "/api/export":
                         export = {key: data[key] for key in ("mode", "now", "daily", "octopus", "warnings")}
                         self._reply(200, json.dumps(export, indent=2, allow_nan=False).encode(),
-                                    download=f"dca-summary-{day}.json")
+                                    download=f"dca-summary-{data['daily']['date']}.json")
                     else:
                         self._json(200, data)
                 elif url.path == "/api/health":
-                    self._json(200, {"status": "ok", "mode": app.settings.mode})
+                    self._json(200, {
+                        "status": "ok",
+                        "mode": app.settings.mode,
+                        **self._authority_diagnostics(),
+                    })
                 elif url.path == "/api/docs":
                     query = parse_qs(url.query, max_num_fields=1)
                     name = query.get("path", [""])[0]
@@ -387,8 +955,17 @@ def make_server(app: ConsoleApp, port: int) -> ThreadingHTTPServer:
                 self._json(500, {"error": redact(f"Could not read local artifacts: {type(error).__name__}: {error}")})
 
         def do_POST(self) -> None:
-            if not self._trusted() or not secrets.compare_digest(self.headers.get("X-Console-Token", ""), app.token):
-                self._json(403, {"error": "Missing or invalid console token."})
+            # Preserve the deliberate oracle ordering: an untrusted peer sees
+            # 403 before Basic is considered; a trusted peer must pass Basic
+            # before the CSRF token can reveal anything (Same Page round 1).
+            if not self._trusted():
+                self._forbidden("Missing or invalid console token.")
+                return
+            if not access.authorized(self.headers):
+                self._unauthorized()
+                return
+            if not secrets.compare_digest(self.headers.get("X-Console-Token", ""), app.token):
+                self._forbidden("Missing or invalid console token.")
                 return
             if self.path != "/api/jobs":
                 self._json(404, {"error": "Not found"})
@@ -403,13 +980,37 @@ def make_server(app: ConsoleApp, port: int) -> ThreadingHTTPServer:
                     raise ValueError("Supply only a string action")
                 self._json(202, {"job": app.submit(payload["action"])})
             except JobBusy as error:
-                self._json(409, {"error": str(error)})
+                self._json(409, {"error": redact(str(error))})
             except (ValueError, TimeoutError) as error:
-                self._json(400, {"error": str(error)})
+                self._json(400, {"error": redact(str(error))})
             except OSError as error:
                 self._json(500, {"error": redact(str(error))})
 
-    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    return ThreadingHTTPServer((access.bind, port), Handler)
+
+
+def startup_banner(access: ConsoleAccess, port: int) -> str:
+    """Render the non-secret network policy shown before serving requests."""
+    trusted_hosts = ", ".join(access.trusted_hosts) if access.trusted_hosts else "(none)"
+    authentication = f"basic user={access.username}" if access.credential is not None else "none"
+    lines = [
+        "DCA console:",
+        f"  bind: {access.bind}",
+        f"  port: {port}",
+        f"  trusted hosts: {trusted_hosts}",
+        f"  auth: {authentication}",
+    ]
+    # Redact the completed dynamic section, not only individual fields: a
+    # credential can equal a username/host or even span joined trusted-host
+    # values. Keep the required fixed warning outside the generic key/value
+    # sanitizer, which otherwise interprets its prose use of "token" as a
+    # credential assignment (Rock 2 review).
+    banner = redact("\n".join(lines))
+    if not ipaddress.IPv4Address(access.bind).is_loopback:
+        # A valid credential makes a reachable socket intentional, not private:
+        # neither Basic nor the CSRF token is encrypted on this listener.
+        banner += "\n  WARNING: plain HTTP: the Basic credential and console token are visible to anyone on this network"
+    return banner
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -423,7 +1024,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--octopus-run", type=Path, help="Existing Octopus run directory (use with --local)")
     parser.add_argument("--research-python", help="Python with Octopus dependencies; auto-detect repository .venv")
     parser.add_argument("--date", type=date.fromisoformat, help="Day to inspect; demo defaults to previous market session")
-    parser.add_argument("--port", type=int, default=8765, help="Loopback HTTP port; use 0 for an available port")
+    parser.add_argument("--port", type=int, default=8765, help="HTTP port; use 0 for an available port")
+    parser.add_argument("--bind", default="127.0.0.1", help="IPv4 address to listen on (default: 127.0.0.1)")
+    parser.add_argument("--trusted-host", action="append", default=[], metavar="HOST[:PORT]",
+                        help="Additional accepted Host authority; repeat for more names")
+    parser.add_argument("--behind-proxy", action="store_true",
+                        help="Honor a configured X-Forwarded-Host on a loopback listener")
+    parser.add_argument("--auth-file", type=Path, help="POSIX owner-only file containing one user:password line")
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--once", action="store_true", help="Run demo (unless local), save summaries, print JSON and exit")
     parser.add_argument("--run", metavar="ACTION", help="Run one allowlisted action, print its result and exit")
@@ -433,15 +1040,40 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("Use --local with existing --root/--octopus-run; --demo keeps synthetic data isolated.")
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
+    try:
+        if args.auth_file:
+            username, credential = load_auth_file(args.auth_file)
+        else:
+            username, credential = "", None
+        access = ConsoleAccess(
+            username=username,
+            credential=credential,
+            bind=args.bind,
+            trusted_hosts=tuple(args.trusted_host),
+            behind_proxy=args.behind_proxy,
+        )
+    except ValueError as error:
+        # Keep every construction path fail-closed, including --check/--once.
+        # parser.error provides the CLI's established exit-2 contract without
+        # ever printing file contents (Same Page round 1).
+        parser.error(str(error))
     local = bool(args.local or args.root or args.octopus_run)
     root = (args.root or Path(cron_tracking_root())).expanduser().resolve()
     output = (args.output_dir or Path(stream_root("console"))).expanduser().resolve()
     venv_python = REPO / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     python = str(venv_python) if venv_python.is_file() else sys.executable
-    try:
-        selected_day = args.date or (datetime.now(ET).date() if local else default_demo_day())
-    except (RuntimeError, ValueError) as error:
-        parser.error(f"Cannot select a demo session: {error}. Supply --date YYYY-MM-DD.")
+    if local:
+        # None is intentional here: an unpinned local service resolves its date
+        # per request instead of freezing startup's calendar day (Same Page
+        # round 2). An explicit --date retains the established pinned behavior.
+        selected_day = args.date
+    else:
+        try:
+            # Demo mode always pins a full market session because its pipeline
+            # cannot safely use an arbitrary calendar day.
+            selected_day = args.date or default_demo_day()
+        except (RuntimeError, ValueError) as error:
+            parser.error(f"Cannot select a demo session: {error}. Supply --date YYYY-MM-DD.")
     settings = Settings("local" if local else "demo", root if local else output / "demo" / "dca",
                         output, selected_day,
                         python, args.research_python or python,
@@ -464,37 +1096,62 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         finally:
             app.jobs.close()
-    try:
-        server = make_server(app, args.port)
-    except OSError as error:
-        print(f"Cannot open loopback port {args.port}: {error}. Try --port 0.", file=sys.stderr)
-        return 1
-    url = f"http://127.0.0.1:{server.server_address[1]}"
-    print(f"DCA console ({settings.mode}): {url}\nDaily summaries: {output / 'summaries' / settings.mode}\nCtrl+C stops the console.", flush=True)
-
-    def refresh() -> None:
-        while not app.jobs.stop.is_set():
+    # Install SIGTERM before constructing the server and before exposing the
+    # flushed readiness line. A supervisor may stop the process as soon as that
+    # line appears, and must still get the Ctrl+C cleanup path (Same Page round 2).
+    with _sigterm_as_keyboard_interrupt():
+        server = None
+        updater = None
+        try:
             try:
-                # Continue collecting today's summary across midnight without needing an open browser.
-                app.snapshot(datetime.now(ET).date() if local else settings.day)
-            except Exception as error:
-                print(redact(f"Summary refresh failed: {error}"), file=sys.stderr)
-            app.jobs.stop.wait(15)
+                server = make_server(app, args.port, access)
+            except OSError as error:
+                print(
+                    redact(f"Cannot bind {access.bind} on HTTP port {args.port}: {error}. Try --port 0."),
+                    file=sys.stderr,
+                )
+                return 1
+            actual_port = server.server_address[1]
+            browser_host = access.bind if access.bind != "0.0.0.0" else "127.0.0.1"
+            url = f"http://{browser_host}:{actual_port}"
+            # Output paths are operator-controlled and launchd captures this
+            # stream, so give the non-network banner details the same complete
+            # redaction boundary. Retain the original readiness phrase because
+            # operators and the SIGTERM regression synchronize on it.
+            details = redact(
+                f"DCA console ({settings.mode}): {url}\n"
+                f"Daily summaries: {output / 'summaries' / settings.mode}\nCtrl+C stops the console."
+            )
+            print(f"{startup_banner(access, actual_port)}\n{details}", flush=True)
 
-    updater = threading.Thread(target=refresh, daemon=True)
-    updater.start()
-    try:
-        if not local:
-            app.submit("demo-all")
-        if not args.no_browser:
-            webbrowser.open(url)
-        server.serve_forever(poll_interval=0.25)
-    except KeyboardInterrupt:
-        print("\nStopping local console.", flush=True)
-    finally:
-        app.jobs.close()
-        server.server_close()
-        updater.join(timeout=2)
+            def refresh() -> None:
+                while not app.jobs.stop.is_set():
+                    try:
+                        # Continue collecting today's summary across midnight without needing an open browser.
+                        app.snapshot(datetime.now(ET).date() if local else settings.day)
+                    except Exception as error:
+                        print(redact(f"Summary refresh failed: {error}"), file=sys.stderr)
+                    app.jobs.stop.wait(15)
+
+            updater = threading.Thread(target=refresh, daemon=True)
+            updater.start()
+            if not local:
+                app.submit("demo-all")
+            if not args.no_browser:
+                webbrowser.open(url)
+            server.serve_forever(poll_interval=0.25)
+        except KeyboardInterrupt:
+            print("\nStopping local console.", flush=True)
+        finally:
+            app.jobs.close()
+            if server is not None:
+                server.server_close()
+            # A SIGTERM that lands between creating and starting the refresh
+            # thread would otherwise turn the clean stop into a RuntimeError
+            # from join() on a never-started thread (Rock 3 review, unverified
+            # race closed by the Visionary).
+            if updater is not None and updater.is_alive():
+                updater.join(timeout=2)
     return 0
 
 
