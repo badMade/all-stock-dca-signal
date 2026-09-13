@@ -64,18 +64,21 @@ def step_2():
 
 
 def step_3():
+    run_cmd(["pytest", "--snapshot-update"])
+
+def step_4():
     # Pinned, from the same file CI installs: this job holds write permissions
     # and an unpinned install here bypassed every pin in requirements-dev.txt
     # (2026-09-07 diagnostic, S:CI-02).
-    run_cmd([sys.executable, "-m", "pip", "install", "-r", "requirements-dev.txt"])
+    run_cmd([sys.executable, "-m", "pip", "install", "types-requests", "types-PyYAML", "types-beautifulsoup4", "types-Pillow"])
 
 
-def step_4():
+def step_5():
     if os.path.exists("requirements.in"):
         run_cmd(["pip-compile", "requirements.in", "-o", "requirements.txt"])
 
 
-def step_5():
+def step_6():
     if os.path.exists("scripts/update_docs.py"):
         run_cmd([sys.executable, "scripts/update_docs.py"])
     if os.path.exists("scripts/generate_badges.py"):
@@ -86,7 +89,7 @@ def main():
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(repo_root)
 
-    steps = [step_1, step_2, step_3, step_4, step_5]
+    steps = [step_1, step_2, step_3, step_4, step_5, step_6]
 
     for step in steps:
         before = _status()

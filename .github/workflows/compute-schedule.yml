@@ -48,11 +48,29 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Check oscillation guard
+        id: oscillation_guard
+        run: |
+          LAST_UPDATED=$(gh pr list --label self-heal-schedule --state merged --json mergedAt --jq '.[0].mergedAt // empty')
+          if [ -n "$LAST_UPDATED" ]; then
+            DAYS_SINCE=$(( ( $(date +%s) - $(date -d "$LAST_UPDATED" +%s) ) / 86400 ))
+            if [ "$DAYS_SINCE" -lt 14 ]; then
+               echo "Schedule was updated recently ($DAYS_SINCE days ago). Skipping recompute to avoid oscillation."
+               echo "skip=true" >> $GITHUB_OUTPUT
+            else
+               echo "skip=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Compute and Update Schedule
+        if: steps.oscillation_guard.outputs.skip != 'true'
         id: compute
         run: ./scripts/compute_schedule.py
 
       - name: Check for Diff
+        if: steps.oscillation_guard.outputs.skip != 'true'
         id: check_diff
         run: |
           if [ -n "$(git status --porcelain)" ]; then
@@ -63,7 +81,7 @@ jobs:
 
 
       - name: File guard
-        if: steps.check_diff.outputs.diff == 'true'
+        if: steps.oscillation_guard.outputs.skip != 'true' && steps.check_diff.outputs.diff == 'true'
         run: |
           if git diff --name-only | grep -vE '^\.github/(workflows/self-heal\.yml|self-heal-schedule\.yml)$'; then
             echo "Forbidden files modified in schedule update PR, aborting."
@@ -71,7 +89,7 @@ jobs:
           fi
 
       - name: Close stale schedule PR if cadence already matches main
-        if: steps.check_diff.outputs.diff == 'false'
+        if: steps.oscillation_guard.outputs.skip != 'true' && steps.check_diff.outputs.diff == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # A no-diff result means this run's computed cadence already matches
@@ -101,7 +119,7 @@ jobs:
           fi
 
       - name: Create PR
-        if: steps.check_diff.outputs.diff == 'true'
+        if: steps.oscillation_guard.outputs.skip != 'true' && steps.check_diff.outputs.diff == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

@@ -14,8 +14,9 @@ name: Self-Heal Repair Pipeline
 on:
   schedule:
     - cron: '0 3 * * 1' # AUTO-UPDATED
+  workflow_dispatch:
   workflow_run:
-    workflows: ["CI"]
+    workflows: ["CI", "ci"]
     types:
       - completed
 
@@ -285,13 +286,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Same author/branch-prefix filter as "Cleanup stale PRs": an unrelated
-          # PR that merely carries the `self-heal` label would otherwise count as
-          # "existing" forever (Codex review, PR #477). Record its branch name
-          # (if any) rather than just a count -- "Create PR" below pushes onto
-          # that branch instead of skipping outright, so a second, different
-          # fix isn't silently discarded just because an earlier repair PR is
-          # still open (Codex review, PR #477).
+          RECENT_WINDOW="1 day ago"
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+             RECENT_WINDOW="1 second ago" # Always run for manual
+          fi
+
+          RECENT_PR=$(gh pr list --label self-heal --state open --json createdAt --jq "[.[] | select(.createdAt > \"\$(date -d \"$RECENT_WINDOW\" -u +\"%Y-%m-%dT%H:%M:%SZ\")\")][0].createdAt // empty")
+          if [ -n "$RECENT_PR" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+             echo "Recent self-heal PR exists from $RECENT_PR; aborting duplicate run."
+             echo "skip=true" >> $GITHUB_OUTPUT
+          else
+             echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
           EXISTING_BRANCH=$(gh pr list --label self-heal --state open \
             --json headRefName,author \
             -q '[.[] | select(.author.login == "github-actions[bot]" and (.headRefName | startswith("selfheal-repair-")))][0].headRefName // empty')
@@ -301,7 +308,7 @@ jobs:
           echo "existing_branch=${EXISTING_BRANCH}" >> $GITHUB_OUTPUT
 
       - name: Create PR
-        if: steps.repair.outputs.fixed == 'true' && success()
+        if: steps.repair.outputs.fixed == 'true' && steps.check_duplicates.outputs.skip != 'true' && success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -326,6 +333,8 @@ jobs:
             TITLE="[Self-Heal Reactive] CI fix"
           elif [ "${{ github.event_name }}" == "schedule" ]; then
             TITLE="[Self-Heal Scheduled] Drift fixes"
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            TITLE="[Self-Heal Manual] Repair"
           fi
 
           SCHEDULE=$(grep "^schedule:" .github/self-heal-schedule.yml | awk -F"'" '{print $2}' || echo "N/A")
