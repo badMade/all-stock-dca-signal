@@ -35,9 +35,9 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+import features as _features
 import numpy as np
 from data import COMPONENTS, TrainingPanel
-import features as _features
 from model_interface import (
     ForecastRequest,
     OHLCForecast,
@@ -51,7 +51,8 @@ from model_interface import (
     write_metadata,
 )
 
-FEATURE_NAMES: Any = _features.FEATURE_NAMES
+_features_module: Any = _features
+FEATURE_NAMES: Any = _features_module.FEATURE_NAMES
 
 #: Feature-column indices used to express "tomorrow = today" in target space:
 #: ln(O_t / C_t) = ret_open - ret_close, etc. (both returns share the
@@ -329,6 +330,14 @@ class GbmQuantileModel:
         # off: its internal validation split is randomized and would break
         # the refit-on-load exactness this model's checkpointing depends on.
         self._hist_params = {"max_iter": max_iter, "learning_rate": 0.1, "early_stopping": False}
+        # The design matrix is [features..., day_of_week, cluster_id]; the
+        # trailing column is a style-cluster LABEL, and an unmarked integer
+        # column gets threshold-split as an ordered quantity, which would
+        # invent an ordering between arbitrary cluster ids. Declaring it
+        # categorical makes the estimator split on set membership instead.
+        # day_of_week is deliberately left as it was -- pre-existing
+        # behaviour, and changing it is not this change's business.
+        self._categorical_design_columns = (-1,)
         self._estimators: dict[str, dict[str, Any]] = {}
         self._panel: TrainingPanel | None = None
         self._seed = 0
@@ -476,14 +485,34 @@ class GbmQuantileModel:
         hasher.update(np.ascontiguousarray(targets).tobytes())
         return hasher.hexdigest()
 
+    def _categorical_mask(self, n_columns: int) -> np.ndarray:
+        """Boolean mask marking the design matrix's categorical columns."""
+        mask = np.zeros(n_columns, dtype=bool)
+        for column in self._categorical_design_columns:
+            mask[column] = True
+        return mask
+
     @staticmethod
     def _design(requests: Sequence[ForecastRequest]) -> np.ndarray:
         last_rows = batch_last_rows(requests)
+        last_real = [np.flatnonzero(request.window_mask)[-1] for request in requests]
         day_of_week = np.array(
-            [request.day_of_week[np.flatnonzero(request.window_mask)[-1]] for request in requests],
+            [request.day_of_week[position] for request, position in zip(requests, last_real, strict=True)],
             dtype=np.float32,
         )
-        return np.column_stack([last_rows, day_of_week])
+        # The style cluster rides along as its own column; without it the
+        # label would be computed, checkpointed and then never seen by the
+        # model meant to use it. It is declared categorical at fit time (see
+        # _CATEGORICAL_DESIGN_COLUMNS) -- appending the raw integer alone
+        # would let the estimator threshold-split it as an ordered float,
+        # inventing exactly the ordering between arbitrary cluster ids that
+        # keeping the label out of the float feature vector was meant to
+        # avoid (Copilot review). Column order must match _training_matrix.
+        cluster_id = np.array(
+            [request.cluster_id[position] for request, position in zip(requests, last_real, strict=True)],
+            dtype=np.float32,
+        )
+        return np.column_stack([last_rows, day_of_week, cluster_id])
 
     def _usable_mask(self, series, cutoff64: np.datetime64 | None) -> np.ndarray:
         usable = np.isfinite(series.features).all(axis=1) & np.isfinite(series.targets).all(axis=1)
@@ -525,7 +554,13 @@ class GbmQuantileModel:
                 series = self._panel.series[ticker]
                 rows = np.flatnonzero(self._usable_mask(series, cutoff64))
                 blocks_x.append(
-                    np.column_stack([series.features[rows], series.day_of_week[rows].astype(np.float32)])
+                    np.column_stack(
+                        [
+                            series.features[rows],
+                            series.day_of_week[rows].astype(np.float32),
+                            series.cluster_id[rows].astype(np.float32),
+                        ]
+                    )
                 )
                 blocks_y.append(series.targets[rows])
             return np.concatenate(blocks_x), np.concatenate(blocks_y)
@@ -539,7 +574,10 @@ class GbmQuantileModel:
         rng = np.random.default_rng(self._seed)
         chosen = np.sort(rng.choice(total_n, size=self.row_cap, replace=False))
         sample_series = self._panel.series[counts[0][0]]
-        design = np.empty((self.row_cap, sample_series.features.shape[1] + 1), dtype=np.float32)
+        # +2: day_of_week and cluster_id, the two categoricals _design()
+        # appends at predict time. A mismatch here trains the model on a
+        # different column layout than it scores with.
+        design = np.empty((self.row_cap, sample_series.features.shape[1] + 2), dtype=np.float32)
         targets = np.empty((self.row_cap, sample_series.targets.shape[1]), dtype=np.float32)
         write_at = 0
         offset = 0
@@ -553,7 +591,11 @@ class GbmQuantileModel:
                 rows = np.flatnonzero(self._usable_mask(series, cutoff64))[local_rows]
                 k = len(rows)
                 design[write_at : write_at + k] = np.column_stack(
-                    [series.features[rows], series.day_of_week[rows].astype(np.float32)]
+                    [
+                        series.features[rows],
+                        series.day_of_week[rows].astype(np.float32),
+                        series.cluster_id[rows].astype(np.float32),
+                    ]
                 )
                 targets[write_at : write_at + k] = series.targets[rows]
                 write_at += k
@@ -574,12 +616,20 @@ class GbmQuantileModel:
         for position, component in enumerate(COMPONENTS):
             y = targets[:, position].astype(np.float64)
             fits: dict[str, Any] = {}
+            categorical = self._categorical_mask(design.shape[1])
             fits["point"] = HistGradientBoostingRegressor(
-                loss="absolute_error", random_state=self._seed, **self._hist_params
+                loss="absolute_error",
+                random_state=self._seed,
+                categorical_features=categorical,
+                **self._hist_params,
             ).fit(design, y)
             for key, quantile in (("p10", 0.1), ("p50", 0.5), ("p90", 0.9)):
                 fits[key] = HistGradientBoostingRegressor(
-                    loss="quantile", quantile=quantile, random_state=self._seed, **self._hist_params
+                    loss="quantile",
+                    quantile=quantile,
+                    random_state=self._seed,
+                    categorical_features=categorical,
+                    **self._hist_params,
                 ).fit(design, y)
             self._estimators[component] = fits
         return len(design)

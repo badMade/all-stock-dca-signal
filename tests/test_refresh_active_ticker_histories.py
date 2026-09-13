@@ -1,10 +1,11 @@
-"""Tests for the ticker-history refresh utility's archive-availability guard."""
-
+import datetime as dt
 import json
 
 import pytest
 
 from scripts import refresh_active_ticker_histories as refresh
+
+_SAMPLE_TS = int(dt.datetime(2023, 11, 14, tzinfo=dt.timezone.utc).timestamp())
 
 
 def _ticker_config(path):
@@ -87,3 +88,197 @@ def test_an_explicit_history_dir_is_exempt_from_the_default_archive_guard(tmp_pa
     exit_code = refresh.main()
 
     assert exit_code == 0
+
+
+def test_active_symbols_rejects_invalid_active(tmp_path):
+    config_path = tmp_path / "tickers.json"
+    config_path.write_text(json.dumps({"active": "not-a-list"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="must contain an 'active' list"):
+        refresh.active_symbols(config_path)
+
+
+def test_active_symbols_rejects_invalid_whole_share(tmp_path):
+    config_path = tmp_path / "tickers.json"
+    config_path.write_text(json.dumps({"active": ["ABC"], "whole_share": [123]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="'whole_share' list, if present, must be a list"):
+        refresh.active_symbols(config_path)
+
+
+def test_fetch_chart_success(monkeypatch):
+    import subprocess
+
+    chart_payload = {
+        "chart": {
+            "result": [{"symbol": "ABC", "timestamp": [_SAMPLE_TS]}],
+            "error": None,
+        }
+    }
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args[0], returncode=0, stdout=json.dumps(chart_payload), stderr=""
+        ),
+    )
+    result = refresh.fetch_chart("ABC")
+    assert result["symbol"] == "ABC"
+
+
+def test_fetch_chart_empty_result_raises(monkeypatch):
+    import subprocess
+
+    chart_payload = {"chart": {"result": [], "error": {"description": "Ticker not found"}}}
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args[0], returncode=0, stdout=json.dumps(chart_payload), stderr=""
+        ),
+    )
+    with pytest.raises(ValueError, match="Ticker not found"):
+        refresh.fetch_chart("INVALID")
+
+
+def test_chart_rows_success():
+    chart = {
+        "timestamp": [_SAMPLE_TS],
+        "indicators": {
+            "quote": [
+                {
+                    "open": [100.0],
+                    "high": [105.0],
+                    "low": [98.0],
+                    "close": [102.0],
+                    "volume": [1000],
+                }
+            ],
+            "adjclose": [{"adjclose": [101.5]}],
+        },
+        "events": {
+            "dividends": {str(_SAMPLE_TS): {"amount": 0.5}},
+            "splits": {str(_SAMPLE_TS): {"numerator": 2.0, "denominator": 1.0}},
+        },
+    }
+    rows = refresh.chart_rows(chart)
+    assert len(rows) == 1
+    assert rows[0]["Open"] == "100.0"
+    assert rows[0]["Dividends"] == "0.5"
+    assert rows[0]["Stock Splits"] == "2.0"
+
+
+def test_chart_rows_empty_or_missing_raises():
+    with pytest.raises(ValueError, match="no complete daily bars"):
+        refresh.chart_rows({"timestamp": [_SAMPLE_TS], "indicators": {}})
+
+
+def test_write_history(tmp_path):
+    out = tmp_path / "hist" / "ABC.csv"
+    rows = [
+        {
+            "Date": "2026-08-01",
+            "Open": "10.0",
+            "High": "11.0",
+            "Low": "9.0",
+            "Close": "10.5",
+            "Adj Close": "10.5",
+            "Volume": "500",
+            "Dividends": "0.0",
+            "Stock Splits": "0.0",
+        }
+    ]
+    refresh.write_history(out, rows)
+    assert out.is_file()
+    assert "Date,Open,High" in out.read_text(encoding="utf-8")
+
+
+def test_main_live_refresh_and_skips(monkeypatch, tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    config_path = tmp_path / "tickers.json"
+    _ticker_config(config_path)
+
+    sample_chart = {
+        "timestamp": [_SAMPLE_TS],
+        "indicators": {
+            "quote": [{"open": [10.0], "high": [11.0], "low": [9.0], "close": [10.0], "volume": [100]}],
+            "adjclose": [{"adjclose": [10.0]}],
+        },
+    }
+    monkeypatch.setattr(refresh, "fetch_chart", lambda sym: sample_chart)
+
+    # 1. First run writes
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "refresh_active_ticker_histories.py",
+            "--config",
+            str(config_path),
+            "--history-dir",
+            str(history_dir),
+            "--pause-seconds",
+            "0",
+        ],
+    )
+    assert refresh.main() == 0
+    assert (history_dir / "ABC.csv").is_file()
+
+    # 2. Second run skips existing
+    assert refresh.main() == 0
+
+    # 3. Third run with --force overwrites
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "refresh_active_ticker_histories.py",
+            "--config",
+            str(config_path),
+            "--history-dir",
+            str(history_dir),
+            "--force",
+            "--pause-seconds",
+            "0",
+        ],
+    )
+    assert refresh.main() == 0
+
+
+def test_main_unknown_symbol_error(monkeypatch, tmp_path):
+    config_path = tmp_path / "tickers.json"
+    _ticker_config(config_path)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "refresh_active_ticker_histories.py",
+            "--config",
+            str(config_path),
+            "--history-dir",
+            str(tmp_path),
+            "--symbol",
+            "NONEXISTENT",
+        ],
+    )
+    with pytest.raises(SystemExit):
+        refresh.main()
+
+
+def test_main_fetch_failure_returns_1(monkeypatch, tmp_path):
+    config_path = tmp_path / "tickers.json"
+    _ticker_config(config_path)
+
+    def raise_err(sym):
+        raise ValueError("simulated network error")
+
+    monkeypatch.setattr(refresh, "fetch_chart", raise_err)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "refresh_active_ticker_histories.py",
+            "--config",
+            str(config_path),
+            "--history-dir",
+            str(tmp_path),
+            "--pause-seconds",
+            "0",
+        ],
+    )
+    assert refresh.main() == 1

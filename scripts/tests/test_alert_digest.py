@@ -13,7 +13,7 @@ import json
 import os
 from dataclasses import replace
 from datetime import date, datetime, time, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -21,6 +21,7 @@ from scripts.alert_digest import (
     _DECLARED_ET_DATE,
     _DRAFT_WARNING,
     _REPO_ROOT,
+    _RETRY_EVIDENCE,
     AlertRecord,
     _calendar_window_end,
     _classify_coverage_day,
@@ -76,7 +77,7 @@ def _record(alert_id, when, slot, gate, verdict="ABORT", warnings=()):
         source="gmail_draft",
         timestamp_utc=parse_timestamp(when),
         subject=alert_id,
-        body="",
+        body="Reason: executor gate failure",
         slot=slot,
         gate=gate,
         verdict=verdict,
@@ -720,7 +721,7 @@ def _file_record(alert_id, when, slot, gate, warnings=()):
         source="alert_file",
         timestamp_utc=parse_timestamp(when),
         subject=alert_id,
-        body="",
+        body="Reason: executor gate failure",
         slot=slot,
         gate=gate,
         verdict="ABORT",
@@ -783,13 +784,22 @@ def test_collect_records_deduplicates_across_the_two_sources(tmp_path):
     export = tmp_path / "drafts.json"
     export.write_text(
         json.dumps(
-            {"drafts": [_draft("r1", "2026-08-26T18:36:00Z", "ABORT 2:30 PM ET slot Gate 4", "x")]}
+            {
+                "drafts": [
+                    _draft(
+                        "r1",
+                        "2026-08-26T18:36:00Z",
+                        "ABORT 2:30 PM ET slot Gate 4",
+                        "Reason: executor gate failure",
+                    )
+                ]
+            }
         ),
         encoding="utf-8",
     )
     alerts = tmp_path / "alerts"
     alerts.mkdir()
-    (alerts / "2026-08-26-1430ET-gate4.txt").write_text("x", encoding="utf-8")
+    (alerts / "2026-08-26-1430ET-gate4.txt").write_text("Reason: executor gate failure", encoding="utf-8")
     records, _, _ = collect_records(drafts_path=export, alerts_dir=alerts, read_stdin=False)
     assert len(records) == 1
 
@@ -909,7 +919,16 @@ def test_collect_records_survives_two_files_matching_one_draft(tmp_path):
     export = tmp_path / "drafts.json"
     export.write_text(
         json.dumps(
-            {"drafts": [_draft("r1", "2026-08-26T18:36:00Z", "ABORT 2:30 PM ET slot Gate 4", "x")]}
+            {
+                "drafts": [
+                    _draft(
+                        "r1",
+                        "2026-08-26T18:36:00Z",
+                        "ABORT 2:30 PM ET slot Gate 4",
+                        "Reason: executor gate failure",
+                    )
+                ]
+            }
         ),
         encoding="utf-8",
     )
@@ -918,7 +937,7 @@ def test_collect_records_survives_two_files_matching_one_draft(tmp_path):
     for stream in ("morning_dca", "intraday_dca"):
         nested = root / stream / "alerts"
         nested.mkdir(parents=True)
-        (nested / "2026-08-26-1430ET-gate4.txt").write_text("x", encoding="utf-8")
+        (nested / "2026-08-26-1430ET-gate4.txt").write_text("Reason: executor gate failure", encoding="utf-8")
     records, _, _ = collect_records(drafts_path=export, alerts_dir=root, read_stdin=False)
     assert len(records) == 2
 
@@ -1752,14 +1771,13 @@ def test_cross_source_merge_pairs_the_matching_draft_not_merely_the_first():
 
 
 def test_a_record_declaring_no_reason_still_pairs():
-    # The merge stays the default: double-counting one abort is the failure mode
-    # it was added to prevent, so absent evidence cannot contradict anything.
-    draft = _record("d1", "2026-08-26T18:36:00Z", "1430", "Gate 4")
+    # Missing parsed content cannot prove that two same-day firings are one.
+    draft = replace(_record("d1", "2026-08-26T18:36:00Z", "1430", "Gate 4"), body="")
     alert_file = replace(
         _file_record("f1", "2026-08-26T16:00:00Z", "1430", "Gate 4"),
         body="Reason: overlapping executor detected",
     )
-    assert len(merge_cross_source([draft], [alert_file])) == 1
+    assert len(merge_cross_source([draft], [alert_file])) == 2
 
 
 # --- round 7 -----------------------------------------------------------------
@@ -2921,12 +2939,30 @@ def test_a_draft_and_its_successful_retry_message_are_reconciled(tmp_path, capsy
     # non-delivery warning.
     drafts = tmp_path / "drafts.json"
     drafts.write_text(
-        json.dumps({"drafts": [_draft("d1", "2026-08-26T19:30:00Z", "ABORT 1030 ET Gate 4", "x")]}),
+        json.dumps(
+            {
+                "drafts": [
+                    {
+                        **_draft("d1", "2026-08-26T19:30:00Z", "ABORT 1030 ET Gate 4", "Reason: x"),
+                        "threadId": "delivery-1",
+                    }
+                ]
+            }
+        ),
         encoding="utf-8",
     )
     messages = tmp_path / "messages.json"
     messages.write_text(
-        json.dumps({"messages": [_message("m1", "2026-08-26T19:35:00Z", "ABORT 1030 ET Gate 4", "x")]}),
+        json.dumps(
+            {
+                "messages": [
+                    {
+                        **_message("m1", "2026-08-26T19:35:00Z", "ABORT 1030 ET Gate 4", "Reason: x"),
+                        "threadId": "delivery-1",
+                    }
+                ]
+            }
+        ),
         encoding="utf-8",
     )
     assert main(["--drafts", str(drafts), "--messages", str(messages), "--json"]) == 0
@@ -3031,7 +3067,7 @@ def _message_record(alert_id, when, slot, gate, warnings=()):
         source="gmail_message",
         timestamp_utc=parse_timestamp(when),
         subject=alert_id,
-        body="",
+        body="Reason: executor gate failure. Retry email sent.",
         slot=slot,
         gate=gate,
         verdict="ABORT",
@@ -4047,6 +4083,329 @@ def test_a_single_retry_pair_still_reconciles_in_export_order():
     m2 = _message_record("m2", "2026-08-25T15:00:00Z", "1030", "Gate 4")
     merged = _reconcile_drafts_and_messages([d1], [m2])
     assert len(merged) == 1
+    assert _DRAFT_WARNING not in merged[0].warnings
+
+
+def test_later_independent_message_does_not_erase_failed_send():
+    draft = replace(
+        _record("d1", "2026-08-25T14:00:00Z", "1030", "Gate 4", warnings=[_DRAFT_WARNING]),
+        body="Reason: quotes were stale",
+    )
+    message = replace(
+        _message_record("m2", "2026-08-25T15:00:00Z", "1030", "Gate 4"),
+        body="Reason: quotes were stale",
+    )
+    merged = _reconcile_drafts_and_messages([draft], [message])
+    assert len(merged) == 2
+    assert _DRAFT_WARNING in merged[0].warnings
+
+
+@pytest.mark.parametrize(
+    "wording",
+    [
+        "Reason: quotes were stale. No retry was attempted.",
+        "Reason: quotes were stale. The email retry was not sent.",
+        "Reason: quotes were stale. Never resend the email.",
+        "Reason: quotes were stale. The order retry succeeded.",
+    ],
+)
+def test_negated_or_non_email_retry_wording_does_not_erase_failed_send(wording):
+    draft = replace(
+        _record("d1", "2026-08-25T14:00:00Z", "1030", "Gate 4", warnings=[_DRAFT_WARNING]),
+        body="Reason: quotes were stale",
+    )
+    message = replace(
+        _message_record("m2", "2026-08-25T15:00:00Z", "1030", "Gate 4"),
+        body=wording,
+    )
+    merged = _reconcile_drafts_and_messages([draft], [message])
+    assert len(merged) == 2
+    assert any(_DRAFT_WARNING in record.warnings for record in merged)
+
+
+def test_terms_from_different_sentences_and_channels_do_not_prove_email_retry():
+    draft = replace(
+        _record("d1", "2026-08-25T14:00:00Z", "1030", "Gate 4", warnings=[_DRAFT_WARNING]),
+        body="Reason: quotes were stale",
+    )
+    message = replace(
+        _message_record("m2", "2026-08-25T15:00:00Z", "1030", "Gate 4"),
+        body="Reason: quotes were stale. Message center notification sent. The order retry succeeded.",
+    )
+
+    merged = _reconcile_drafts_and_messages([draft], [message])
+
+    assert len(merged) == 2
+    assert any(_DRAFT_WARNING in record.warnings for record in merged)
+
+
+@pytest.mark.parametrize(
+    "wording",
+    [
+        "Reason: quotes were stale. The previous run's email retry succeeded.",
+        "Reason: quotes were stale. An earlier run's email resend was delivered.",
+    ],
+)
+def test_historical_retry_success_does_not_erase_current_failed_send(wording):
+    draft = replace(
+        _record("d1", "2026-08-25T14:00:00Z", "1030", "Gate 4", warnings=[_DRAFT_WARNING]),
+        body="Reason: quotes were stale",
+    )
+    message = replace(
+        _message_record("m2", "2026-08-25T15:00:00Z", "1030", "Gate 4"),
+        body=wording,
+    )
+    merged = _reconcile_drafts_and_messages([draft], [message])
+    assert len(merged) == 2
+    assert any(_DRAFT_WARNING in record.warnings for record in merged)
+
+
+@pytest.mark.parametrize(
+    "wording",
+    [
+        "Reason: quotes were stale. Email retry succeeded but the message was not delivered.",
+        "Reason: quotes were stale. Email retry was successful, but email delivery failed.",
+    ],
+)
+def test_contradicted_retry_success_does_not_erase_failed_send(wording):
+    draft = replace(
+        _record("d1", "2026-08-25T14:00:00Z", "1030", "Gate 4", warnings=[_DRAFT_WARNING]),
+        body="Reason: quotes were stale",
+    )
+    message = replace(
+        _message_record("m2", "2026-08-25T15:00:00Z", "1030", "Gate 4"),
+        body=wording,
+    )
+    merged = _reconcile_drafts_and_messages([draft], [message])
+    assert len(merged) == 2
+    assert any(_DRAFT_WARNING in record.warnings for record in merged)
+
+
+def test_shared_gmail_thread_proves_successful_retry():
+    draft = replace(
+        _record("d1", "2026-08-25T14:00:00Z", "1030", "Gate 4", warnings=[_DRAFT_WARNING]),
+        thread_id="thread-1",
+    )
+    message = replace(
+        _message_record("m2", "2026-08-25T15:00:00Z", "1030", "Gate 4"),
+        body="Reason: executor gate failure",
+        thread_id="thread-1",
+    )
+    merged = _reconcile_drafts_and_messages([draft], [message])
+    assert len(merged) == 1
+    assert _DRAFT_WARNING not in merged[0].warnings
+
+
+def test_exact_gmail_thread_wins_over_nearer_prose_candidate():
+    threaded_draft = replace(
+        _record("threaded", "2026-08-25T14:00:00Z", "1030", "Gate 4", warnings=[_DRAFT_WARNING]),
+        body="Reason: quotes were stale",
+        thread_id="thread-1",
+    )
+    unthreaded_draft = replace(
+        _record("unthreaded", "2026-08-25T14:30:00Z", "1030", "Gate 4", warnings=[_DRAFT_WARNING]),
+        body="Reason: quotes were stale",
+    )
+    message = replace(
+        _message_record("sent", "2026-08-25T15:00:00Z", "1030", "Gate 4"),
+        body="Reason: quotes were stale. Email retry succeeded.",
+        thread_id="thread-1",
+    )
+
+    merged = _reconcile_drafts_and_messages([threaded_draft, unthreaded_draft], [message])
+
+    assert len(merged) == 2
+    assert merged[0].alert_id == "sent"
+    assert _DRAFT_WARNING not in merged[0].warnings
+    assert merged[1].alert_id == "unthreaded"
+    assert _DRAFT_WARNING in merged[1].warnings
+
+
+def test_mismatched_gmail_threads_cannot_pair_via_retry_prose():
+    draft = replace(
+        _record("d1", "2026-08-25T14:00:00Z", "1030", "Gate 4", warnings=[_DRAFT_WARNING]),
+        body="Reason: quotes were stale",
+        thread_id="thread-b",
+    )
+    message = replace(
+        _message_record("m2", "2026-08-25T15:00:00Z", "1030", "Gate 4"),
+        body="Reason: quotes were stale. Email retry succeeded.",
+        thread_id="thread-a",
+    )
+
+    merged = _reconcile_drafts_and_messages([draft], [message])
+
+    assert len(merged) == 2
+    assert any(_DRAFT_WARNING in record.warnings for record in merged)
+
+
+def test_exact_thread_match_bypasses_unparseable_reason_corroboration():
+    # Codex review discussion_r3887554096 ("Let shared thread identity
+    # bypass reason parsing"): both bodies use a free-form reason code the
+    # parser cannot read (_reason_signature returns None for both), so
+    # _corroborates alone would reject the pair -- but the exact, nonempty
+    # Gmail thread match already proves transport identity and must not be
+    # second-guessed by content matching.
+    draft = replace(
+        _record("d1", "2026-08-25T14:00:00Z", "1030", "Gate 4", warnings=[_DRAFT_WARNING]),
+        body="GATE5_DISABLED_XYZ_CODE_9",
+        thread_id="thread-1",
+    )
+    message = replace(
+        _message_record("m1", "2026-08-25T15:00:00Z", "1030", "Gate 4"),
+        body="Email retry succeeded.",
+        thread_id="thread-1",
+    )
+
+    merged = _reconcile_drafts_and_messages([draft], [message])
+
+    assert len(merged) == 1
+    assert merged[0].alert_id == "m1"
+    assert _DRAFT_WARNING not in merged[0].warnings
+
+
+def test_exact_thread_retry_pairs_at_an_equal_timestamp():
+    # Codex review discussion_r3891196433 ("Allow exact-thread retries at
+    # equal timestamps"): an export can assign a failed draft and its
+    # immediately successful retry the identical timestamp. The strict `>=`
+    # ordering check must not reject the pair when an exact, nonempty
+    # thread match already proves which record is the retry.
+    same_time = "2026-08-25T14:00:00Z"
+    draft = replace(
+        _record("d1", same_time, "1030", "Gate 4", warnings=[_DRAFT_WARNING]),
+        body="Reason: quotes were stale",
+        thread_id="thread-1",
+    )
+    message = replace(
+        _message_record("m1", same_time, "1030", "Gate 4"),
+        body="Reason: quotes were stale. Email retry succeeded.",
+        thread_id="thread-1",
+    )
+
+    merged = _reconcile_drafts_and_messages([draft], [message])
+
+    assert len(merged) == 1
+    assert merged[0].alert_id == "m1"
+    assert _DRAFT_WARNING not in merged[0].warnings
+
+
+def test_hyphenated_re_sent_wording_is_recognized_as_retry_evidence():
+    # Codex review discussion_r3888105725 ("Recognize hyphenated re-send
+    # wording"): a hyphen is not a word character, so \bresend\b never
+    # matched "re-sent"/"re-send".
+    assert _RETRY_EVIDENCE.search("Email was re-sent successfully")
+    assert _RETRY_EVIDENCE.search("Email will be re-send shortly") is not None
+
+
+def test_message_center_failure_does_not_contradict_an_email_retry():
+    # Codex review discussion_r3888105723 ("Scope follow-up delivery
+    # failures to email"): a DIFFERENT channel's failure (the in-app
+    # "message center") must not contradict a genuinely successful email
+    # retry just because the word "message" also appears in
+    # _DELIVERY_FAILURE_EVIDENCE's channel alternation.
+    draft = replace(
+        _record("d1", "2026-08-25T14:00:00Z", "1030", "Gate 4", warnings=[_DRAFT_WARNING]),
+        body="Reason: quotes were stale",
+    )
+    message = replace(
+        _message_record("m1", "2026-08-25T15:00:00Z", "1030", "Gate 4"),
+        body="Reason: quotes were stale. Email retry succeeded. Message center notification was not delivered.",
+    )
+
+    merged = _reconcile_drafts_and_messages([draft], [message])
+
+    assert len(merged) == 1
+    assert merged[0].alert_id == "m1"
+    assert _DRAFT_WARNING not in merged[0].warnings
+
+
+def test_comma_separated_retry_status_still_proves_the_retry():
+    # Codex review discussion_r3891196430 ("Keep comma-separated retry
+    # status together"): "Email retry, sent successfully" must not be split
+    # on the bare comma into two clauses that individually fail the
+    # all-three-terms check.
+    draft = replace(
+        _record("d1", "2026-08-25T14:00:00Z", "1030", "Gate 4", warnings=[_DRAFT_WARNING]),
+        body="Reason: quotes were stale",
+    )
+    message = replace(
+        _message_record("m1", "2026-08-25T15:00:00Z", "1030", "Gate 4"),
+        body="Reason: quotes were stale. Email retry, sent successfully.",
+    )
+
+    merged = _reconcile_drafts_and_messages([draft], [message])
+
+    assert len(merged) == 1
+    assert merged[0].alert_id == "m1"
+    assert _DRAFT_WARNING not in merged[0].warnings
+
+
+def test_conditional_retry_success_mention_does_not_prove_delivery():
+    # Codex review discussion_r3896981866 ("Reject conditional retry-success
+    # mentions"): "If the email retry succeeded, no draft will remain"
+    # names all three terms in one clause but asserts nothing -- it is
+    # hypothetical, not delivery proof.
+    draft = _record("d1", "2026-08-25T14:00:00Z", "1030", "Gate 4", warnings=[_DRAFT_WARNING])
+    message = replace(
+        _message_record("m1", "2026-08-25T15:00:00Z", "1030", "Gate 4"),
+        body="Reason: quotes were stale. If the email retry succeeded, no draft will remain.",
+    )
+
+    merged = _reconcile_drafts_and_messages([draft], [message])
+
+    assert len(merged) == 2
+    assert any(_DRAFT_WARNING in record.warnings for record in merged)
+
+
+def test_exact_thread_first_attempt_qualified_failure_still_pairs():
+    # Codex review discussion_r3895361799 ("Honor first-attempt qualifiers
+    # before rejecting thread matches"): a SENT message's own existence is
+    # direct proof of eventual delivery; a body that only narrates the
+    # FIRST attempt's failure ("Email failed on the first attempt") must
+    # not, by itself, block an exact-thread pairing.
+    draft = replace(
+        _record("d1", "2026-08-25T14:00:00Z", "1030", "Gate 4", warnings=[_DRAFT_WARNING]),
+        thread_id="thread-1",
+    )
+    message = replace(
+        _message_record("m1", "2026-08-25T15:00:00Z", "1030", "Gate 4"),
+        body="Email failed on the first attempt; draft created.",
+        thread_id="thread-1",
+    )
+
+    merged = _reconcile_drafts_and_messages([draft], [message])
+
+    assert len(merged) == 1
+    assert merged[0].alert_id == "m1"
+    assert _DRAFT_WARNING not in merged[0].warnings
+
+
+def test_exact_thread_historical_failure_mention_does_not_block_pairing():
+    # Codex review discussion_r3887928796 ("Ignore historical delivery
+    # failures in retry proof"): a follow-up failure mention narrating an
+    # OLDER, unrelated incident ("Email retry succeeded. The previous run's
+    # email was not delivered") is not evidence THIS retry ultimately
+    # failed. The raw _DELIVERY_FAILURE_EVIDENCE follow-up search must
+    # apply the same prior-event screening states_email_failure() already
+    # uses, not reject unconditionally on any later failure phrase.
+    draft = replace(
+        _record("d1", "2026-08-25T14:00:00Z", "1030", "Gate 4", warnings=[_DRAFT_WARNING]),
+        body="Reason: quotes were stale",
+        thread_id="thread-1",
+    )
+    message = replace(
+        _message_record("m1", "2026-08-25T15:00:00Z", "1030", "Gate 4"),
+        body=(
+            "Reason: quotes were stale. Email retry succeeded. "
+            "The previous run's email was not delivered."
+        ),
+        thread_id="thread-1",
+    )
+
+    merged = _reconcile_drafts_and_messages([draft], [message])
+
+    assert len(merged) == 1
+    assert merged[0].alert_id == "m1"
     assert _DRAFT_WARNING not in merged[0].warnings
 
 
@@ -5733,6 +6092,33 @@ def test_gitignored_path_write_claim_survives_a_file_extension_period():
     assert "GITIGNORED_ALERT_PATH" in codes
 
 
+@pytest.mark.parametrize("path_form", ["posix", "windows", "unc"])
+@pytest.mark.parametrize("relative_path", ["artifacts/alerts/x.txt", "cron_tracking/morning_dca/alerts/x.txt"])
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("template, written", [
+    ("Durable alert written to {path}", True),
+    ("{path} was written", True),
+    ("Wrote {path}. This path was not used.", True),
+    ("Did not write {path}.", False),
+    ("{path} is gitignored. Wrote a durable copy elsewhere.", False),
+])
+def test_gitignored_dotted_parent_paths_preserve_claim_scope(
+    tmp_path, monkeypatch, path_form, relative_path, external, template, written,
+):
+    if path_form == "posix":
+        checkout = (tmp_path / "checkout.with.dots").resolve()
+    elif path_form == "windows":
+        checkout = PureWindowsPath("C:/workspace.with.dots/checkout")
+    else:
+        checkout = PureWindowsPath("//server/share.with.dots/checkout")
+    monkeypatch.setattr("scripts.alert_digest._REPO_ROOT", Path(str(checkout)))
+    location = checkout.with_name("external.with.dots") if external else checkout
+    alert_path = location.joinpath(*relative_path.split("/"))
+    body = template.format(path=alert_path)
+    codes = {code for code, _ in detect_channel_warnings(body, source="alert_file")}
+    assert ("GITIGNORED_ALERT_PATH" in codes) == (written and not external)
+
+
 def test_gitignored_path_extension_period_masking_does_not_affect_other_sentences():
     # Regression guard: the exact case _PATH_WRITE_CLAIM was added for --
     # a genuine sentence-ending period elsewhere in the body -- still
@@ -6220,8 +6606,7 @@ def test_reason_signature_free_form_fallback_regression_guards():
     # Regression guard: the pre-existing labelled/causal forms still take
     # priority over the new fallback, and two records that genuinely state
     # NO reason at all (neither cue nor a free-form clause before a verdict
-    # word) still corroborate by default, per this function's own bias
-    # toward merging over double-counting.
+    # word) do not corroborate without event-level identity.
     r1 = _record("a", "2026-08-26T14:30:00Z", "1030", "5", verdict="ABORT")
     r1 = replace(r1, body="Aborted because quotes were stale")
     r2 = _record("b", "2026-08-26T14:35:00Z", "1030", "5", verdict="ABORT")
@@ -6234,7 +6619,7 @@ def test_reason_signature_free_form_fallback_regression_guards():
     r4 = replace(r4, body="GATE5_DISABLED")
     assert _reason_signature(r3) is None
     assert _reason_signature(r4) is None
-    assert _corroborates(r3, r4)
+    assert not _corroborates(r3, r4)
 
 
 def test_file_event_utc_rejects_an_implausible_copied_file_mtime():
@@ -6585,12 +6970,20 @@ def test_ledger_persists_merged_records_alias_keys(tmp_path, capsys):
     # reported as new again for an alert the ledger already reported.
     drafts = tmp_path / "drafts.json"
     drafts.write_text(
-        json.dumps({"drafts": [_draft("d1", "2026-08-26T19:30:00Z", "ABORT 1030 ET Gate 4", "x")]}),
+        json.dumps(
+            {
+                "drafts": [
+                    _draft("d1", "2026-08-26T19:30:00Z", "ABORT 1030 ET Gate 4", "Reason: quotes were stale")
+                ]
+            }
+        ),
         encoding="utf-8",
     )
     alerts_dir = tmp_path / "alerts"
     alerts_dir.mkdir()
-    (alerts_dir / "2026-08-26-1030ET-gate4.txt").write_text("ABORT 1030 ET Gate 4\nx", encoding="utf-8")
+    (alerts_dir / "2026-08-26-1030ET-gate4.txt").write_text(
+        "ABORT 1030 ET Gate 4\nReason: quotes were stale", encoding="utf-8"
+    )
     root = str(tmp_path / "ledger")
 
     main(["--drafts", str(drafts), "--alerts-dir", str(alerts_dir), "--ledger", "--ledger-root", root, "--json"])
@@ -6611,12 +7004,20 @@ def test_ledger_persisted_alias_keys_regression_guards(tmp_path, capsys):
     # is unaffected by also persisting alias keys.
     drafts = tmp_path / "drafts.json"
     drafts.write_text(
-        json.dumps({"drafts": [_draft("d1", "2026-08-26T19:30:00Z", "ABORT 1030 ET Gate 4", "x")]}),
+        json.dumps(
+            {
+                "drafts": [
+                    _draft("d1", "2026-08-26T19:30:00Z", "ABORT 1030 ET Gate 4", "Reason: quotes were stale")
+                ]
+            }
+        ),
         encoding="utf-8",
     )
     alerts_dir = tmp_path / "alerts"
     alerts_dir.mkdir()
-    (alerts_dir / "2026-08-26-1030ET-gate4.txt").write_text("ABORT 1030 ET Gate 4\nx", encoding="utf-8")
+    (alerts_dir / "2026-08-26-1030ET-gate4.txt").write_text(
+        "ABORT 1030 ET Gate 4\nReason: quotes were stale", encoding="utf-8"
+    )
     root = str(tmp_path / "ledger")
 
     main(["--drafts", str(drafts), "--alerts-dir", str(alerts_dir), "--ledger", "--ledger-root", root, "--json"])

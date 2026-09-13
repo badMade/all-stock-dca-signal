@@ -65,11 +65,24 @@ STATE_SCHEMA_VERSION_V2 = "run-classification-v2-preauthorized"
 # identities with the runtime validator").
 MARKET_OPEN_LIVE_SCHEMA_VERSION = "market-open-live-v1"
 INTRADAY_LIVE_SCHEMA_VERSION = "intraday-live-v1"
+# The class-based morning/midday executors (morning_dca.MorningDCAExecutor in
+# live mode, midday_dca.MiddayDCAExecutor) are the same situation: they stamp
+# their own version (mirrored from MORNING_LIVE_SCHEMA_VERSION /
+# MIDDAY_LIVE_SCHEMA_VERSION in those modules) and their own run_type and
+# run_id shape, alongside the same cron ids and slot windows the roster's
+# run_slot() identities use. Only the roster shape was registered here until
+# the 2026-09-07 diagnostic (T:F01), so every scheduled 10:30/12:30 run the
+# class-based executors wrote failed validate_classification() on version
+# alone and dca_risk.classify_stream() filed it as STREAM_OTHER.
+MORNING_LIVE_SCHEMA_VERSION = "morning-live-v2-preauthorized"
+MIDDAY_LIVE_SCHEMA_VERSION = "midday-live-v1"
 ACCEPTED_STATE_SCHEMA_VERSIONS = (
     STATE_SCHEMA_VERSION,
     STATE_SCHEMA_VERSION_V2,
     MARKET_OPEN_LIVE_SCHEMA_VERSION,
     INTRADAY_LIVE_SCHEMA_VERSION,
+    MORNING_LIVE_SCHEMA_VERSION,
+    MIDDAY_LIVE_SCHEMA_VERSION,
 )
 # run_origin of a pass that recovers a FAILED scheduled slot into its own
 # directory (e.g. the Jul 27 2026 12:30 pass, config/scheduled_tasks.json ->
@@ -409,6 +422,14 @@ MARKET_OPEN_LIVE_SCHEDULED_WINDOW_END_ET = "09:50"
 INTRADAY_STREAM = "intraday"
 INTRADAY_LIVE_CRON_ID = "7be82b97"
 INTRADAY_LIVE_RUN_TYPE = "intraday_dca_live"
+# The class-based morning/midday executors' own run_type (mirrored from
+# morning_dca.MORNING_LIVE_RUN_TYPE / midday_dca.MIDDAY_LIVE_RUN_TYPE). They
+# share MORNING_SLOT_STREAM/MIDDAY_SLOT_STREAM, the cron ids and the slot
+# windows with the roster identities above, so validate_classification()
+# dispatches on run_type WITHIN those two streams: this value selects the
+# executor-native identity check, anything else the roster check.
+MORNING_LIVE_RUN_TYPE = "morning_dca_live"
+MIDDAY_LIVE_RUN_TYPE = "midday_dca_live"
 # Date the retime took effect, as the same zero-padded YYYYMMDD string used in
 # run_id (so it can be compared lexicographically without a date parse). The
 # legacy identity tuple is accepted ONLY for a run_id dated strictly before
@@ -472,6 +493,9 @@ LEGACY_SCHEDULED_RUN_ID_RE = re.compile(r"^scheduled_([0-9]{8})_1520ET$")
 MORNING_SLOT_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1030ET$")
 MIDDAY_SLOT_RUN_ID_RE = re.compile(r"^scheduled_[0-9]{8}_1230ET$")
 MARKET_OPEN_LIVE_RUN_ID_RE = re.compile(r"^market_open_live_[0-9]{8}_0935ET$")
+# morning_dca.MorningDCAExecutor.run_id(): '<scheduled_run_id_prefix>_YYYYMMDD_<folder_suffix>'.
+MORNING_LIVE_RUN_ID_RE = re.compile(r"^morning_live_[0-9]{8}_1030ET$")
+MIDDAY_LIVE_RUN_ID_RE = re.compile(r"^midday_live_[0-9]{8}_1230ET$")
 # Keyed by scheduled_for_et: intraday is a single stream shared across all
 # three fire times (morning_dca.MorningDCAExecutor.run_id() stamps the slot
 # into both scheduled_window_start_et/end_et and run_id via the profile's
@@ -932,8 +956,9 @@ def manual_exclusion_roots(base: Optional[Path] = None) -> List[Path]:
     ``midday_dca/manual_reruns/**`` (incl. ``final_manual_override_*``) — so their
     order IDs are excluded from every scheduled-live metric even though they live
     outside the ce16ba6b task root. A ``MANUAL_EXCLUSION_SUBROOTS`` entry
-    containing ``*`` (e.g. the dated ``perplexity_primary_*/manual_override_*``
-    tree the 2026-08-18 manual cap override introduced) is expanded with
+    containing a glob metacharacter (``*``, ``?`` or ``[`` -- e.g. the dated
+    ``perplexity_primary_*/manual_override_*`` tree the 2026-08-18 manual cap
+    override introduced) is expanded with
     ``Path.glob`` against ``cron_tracking_root(base)`` here, so every matching
     directory that actually exists on disk is scanned -- not just one
     hardcoded date/time.
@@ -941,7 +966,7 @@ def manual_exclusion_roots(base: Optional[Path] = None) -> List[Path]:
     roots = [state_root(base) / "manual_runs"]
     parent = cron_tracking_root(base)
     for sub in MANUAL_EXCLUSION_SUBROOTS:
-        if "*" in sub:
+        if any(character in sub for character in "*?["):
             roots.extend(sorted(parent.glob(sub)))
         else:
             roots.append(parent / sub)
@@ -1083,17 +1108,41 @@ def save_raw_input(
     return path
 
 
+#: Every raw input is written by :func:`save_raw_input` as JSON, so this is the
+#: mark of a COMPLETED one. Deliberately a positive test rather than a
+#: ``.tmp`` exclusion: it also skips anything else that finds its way into the
+#: directory.
+_RAW_INPUT_SUFFIX = ".json"
+
+
 def list_raw_inputs_saved(
     trading_day: str,
     base: Optional[Path] = None,
     *,
     raw_dir: Optional[Path] = None,
 ) -> List[str]:
-    """Sorted filenames actually persisted under the run's raw/ directory."""
+    """Sorted filenames actually persisted under the run's raw/ directory.
+
+    Only completed ``.json`` inputs. ``atomic_write_text`` stages every write as
+    a visible ``<name>.<uuid>.tmp`` sibling and removes it on failure, but a
+    process killed mid-write (SIGKILL, power loss) never runs that cleanup, so
+    an orphaned partial file can outlive the attempt that started it. Listing
+    every regular file published that orphan as a successfully persisted input
+    -- one no recorder ever finished or read back -- which is exactly the claim
+    this function exists to make trustworthy (Codex review: "Exclude orphaned
+    temp files from the raw manifest").
+
+    Contents are NOT validated. A file that reached its final name went through
+    ``os.replace`` after its content was fsynced, so it is complete by
+    construction; dropping a ``.json`` that fails to parse would hide genuine
+    corruption behind a silently shorter manifest rather than surfacing it.
+    """
     out_dir = raw_dir if raw_dir is not None else raw_input_dir(trading_day, base)
     if not out_dir.exists():
         return []
-    return sorted(p.name for p in out_dir.iterdir() if p.is_file())
+    return sorted(
+        p.name for p in out_dir.iterdir() if p.is_file() and p.suffix == _RAW_INPUT_SUFFIX
+    )
 
 
 def build_raw_persistence_state(
@@ -1443,6 +1492,61 @@ class ValidationResult:
         return self.ok
 
 
+def _validate_class_based_slot_identity(
+    rc: Mapping[str, Any],
+    errors: List[str],
+    *,
+    label: str,
+    cron_id: str,
+    schema_version: str,
+    scheduled_for_et: str,
+    window_start_et: str,
+    window_end_et: str,
+    run_id_re: "re.Pattern[str]",
+    run_id_shape: str,
+) -> None:
+    """Identity checks shared by the class-based morning/midday executors.
+
+    Mirrors the market_open branch of :func:`validate_classification`: cron
+    id, no afternoon lineage marker, the executor's own state_schema_version,
+    the slot window, and a coherent (scheduled_for_et, window start, run_id)
+    tuple. ``valid_afternoon_evidence`` is the executor's own key (the roster
+    branches check ``valid_afternoon_scheduled_evidence`` instead) and must be
+    False so a native block can never be read as afternoon evidence.
+    """
+    if rc.get("cron_id") != cron_id:
+        errors.append(f"{label} scheduled run must have cron_id={cron_id!r}")
+    if rc.get("supersedes_cron_id") is not None:
+        errors.append(
+            f"{label} scheduled run must not carry supersedes_cron_id "
+            "(that names the afternoon task's lineage)"
+        )
+    if rc.get("state_schema_version") != schema_version:
+        errors.append(
+            f"{label} executor scheduled run must have state_schema_version={schema_version!r}, "
+            f"got {rc.get('state_schema_version')!r}"
+        )
+    if rc.get("scheduled_window_end_et") != window_end_et:
+        errors.append(f"{label} scheduled_window_end_et must be {window_end_et!r}")
+    if rc.get("valid_afternoon_evidence") is not False:
+        errors.append(f"{label} executor scheduled run must have valid_afternoon_evidence=false")
+    run_id = rc.get("run_id")
+    run_id_is_str = isinstance(run_id, str)
+    is_coherent = (
+        rc.get("scheduled_for_et") == scheduled_for_et
+        and rc.get("scheduled_window_start_et") == window_start_et
+        and run_id_is_str
+        and bool(run_id_re.match(run_id))
+    )
+    if run_id_is_str and not is_coherent:
+        errors.append(
+            f"{label} scheduled_for_et, scheduled_window_start_et, and run_id must form the "
+            f"coherent {label} executor tuple ({scheduled_for_et!r}, {window_start_et!r}, "
+            f"{run_id_shape!r}); got scheduled_for_et={rc.get('scheduled_for_et')!r}, "
+            f"scheduled_window_start_et={rc.get('scheduled_window_start_et')!r}, run_id={run_id!r}"
+        )
+
+
 def validate_classification(rc: Optional[Mapping[str, Any]]) -> ValidationResult:
     """Validate a run_classification block against the contract.
 
@@ -1594,6 +1698,37 @@ def validate_classification(rc: Optional[Mapping[str, Any]]) -> ValidationResult
                         f"'intraday_live_YYYYMMDD_{scheduled_for_et.replace(':', '')}ET'); "
                         f"got scheduled_window_start_et={window_start_et!r}, run_id={run_id!r}"
                     )
+        elif stream == MORNING_SLOT_STREAM and rc.get("run_type") == MORNING_LIVE_RUN_TYPE:
+            # The class-based MorningDCAExecutor's own live identity (see
+            # MORNING_LIVE_RUN_TYPE above): same stream, cron id and slot
+            # window as the roster's 1030ET, but its own run_type, run_id
+            # shape and state_schema_version, checked as one coherent tuple
+            # exactly like the market_open/intraday branches above.
+            _validate_class_based_slot_identity(
+                rc,
+                errors,
+                label="morning",
+                cron_id=MORNING_SLOT_CRON_ID,
+                schema_version=MORNING_LIVE_SCHEMA_VERSION,
+                scheduled_for_et=MORNING_SLOT_SCHEDULED_FOR_ET,
+                window_start_et=MORNING_SLOT_SCHEDULED_WINDOW_START_ET,
+                window_end_et=MORNING_SLOT_SCHEDULED_WINDOW_END_ET,
+                run_id_re=MORNING_LIVE_RUN_ID_RE,
+                run_id_shape="morning_live_YYYYMMDD_1030ET",
+            )
+        elif stream == MIDDAY_SLOT_STREAM and rc.get("run_type") == MIDDAY_LIVE_RUN_TYPE:
+            _validate_class_based_slot_identity(
+                rc,
+                errors,
+                label="midday",
+                cron_id=MIDDAY_SLOT_CRON_ID,
+                schema_version=MIDDAY_LIVE_SCHEMA_VERSION,
+                scheduled_for_et=MIDDAY_SLOT_SCHEDULED_FOR_ET,
+                window_start_et=MIDDAY_SLOT_SCHEDULED_WINDOW_START_ET,
+                window_end_et=MIDDAY_SLOT_SCHEDULED_WINDOW_END_ET,
+                run_id_re=MIDDAY_LIVE_RUN_ID_RE,
+                run_id_shape="midday_live_YYYYMMDD_1230ET",
+            )
         elif stream == MORNING_SLOT_STREAM:
             if rc.get("run_type") != SCHEDULED_RUN_TYPE:
                 errors.append(f"morning scheduled run_type must be {SCHEDULED_RUN_TYPE!r}")
@@ -2921,7 +3056,10 @@ _PRICE_COLS = (
 # the broker-native shape, so it is not an executed column; only
 # quantity_filled / cumulative_quantity are (Codex review: "Prefer cumulative
 # quantity over requested quantity").
-_EXECUTED_QUANTITY_COLS = ("quantity_filled", "cumulative_quantity")
+EXECUTED_QUANTITY_COLS = ("quantity_filled", "cumulative_quantity")
+# near_close_dca._EXECUTED_QUANTITY_COLS is an alias of this tuple (2026-09-07
+# diagnostic, P:DUP-05), not a mirror.
+_EXECUTED_QUANTITY_COLS = EXECUTED_QUANTITY_COLS
 # `quantity` stays a LAST-RESORT alias for the recovery artifact shape, which
 # records the filled amount there and carries no cumulative_quantity column.
 _QUANTITY_COLS = (*_EXECUTED_QUANTITY_COLS, "quantity")
@@ -3159,12 +3297,41 @@ def _row_number(row: Mapping[str, Any], cols: Iterable[str]) -> Optional[float]:
     return None
 
 
-#: Candidate statuses that mean a broker order really exists for that row.
-#: Mirrors dca_risk.DEPLOYED_CANDIDATE_STATUSES / morning_dca's
-#: _ORDER_BEARING_CANDIDATE_STATUSES; kept as a local copy rather than an
-#: import to avoid pulling either of those modules' own dependency chains
-#: into this stdlib-plus-dca_fileio/dca_paths script.
-_ORDER_BEARING_CANDIDATE_STATUSES = frozenset({"submitted", "filled", "pending", "unconfirmed"})
+# Candidate statuses that are placed-or-in-flight order evidence, matching
+# scripts.scheduled_artifacts.ORDER_ATTEMPT_STATUSES minus
+# "not_submitted_confirmation_required" (which never reached the broker --
+# it is pending a separate pre-authorization step, not real capital). Also
+# mirrors dca_risk.DEPLOYED_CANDIDATE_STATUSES / morning_dca's
+# _ORDER_BEARING_CANDIDATE_STATUSES. Defined locally rather than imported:
+# this module is invoked in contexts where a package-relative import of a
+# scripts/ sibling is not always safe (see the try/except
+# scripts.scheduled_artifacts/scheduled_artifacts import pattern elsewhere
+# in this codebase), and pulling in dca_risk.py or morning_dca.py's own
+# dependency chains would work against this being a
+# stdlib-plus-dca_fileio/dca_paths script. The set is small and stable
+# enough not to need a shared source of truth. Used by both
+# _rows_from_buy_candidates and _read_csv_rows below: a reconciled
+# "pending"/"unconfirmed" row, or an ambiguous "potentially_submitted"
+# placement (OrderPlacementAmbiguousError) whose true broker-side outcome is
+# unknown, is real outstanding submission evidence too and is conservatively
+# treated as a possibly-live order rather than silently dropped -- this
+# loader is the ONLY path that ever reaches final_manual_review/**
+# artifacts, so excluding any of them let a later scheduled run see no
+# prior notional for a still-live manual order and submit it again (Codex
+# review, PR #1300 discussion_r3920912119: "Retain reconciled in-flight
+# manual orders").
+# THE canonical set. It used to be hand-copied into near_close_dca
+# (_PRIOR_ALLOCATION_STATUSES and an inline literal), morning_dca
+# (_ORDER_BEARING_CANDIDATE_STATUSES), dca_risk (DEPLOYED_CANDIDATE_STATUSES)
+# and dca_cost_tracker (_ORDER_BEARING_STATUSES), each carrying its own
+# "recognize potentially_submitted everywhere" review note -- proof the last
+# status added had to be applied by hand in every copy. Those names are now
+# aliases of this one (2026-09-07 diagnostic, P:DUP-03); this module is
+# standard-library-only and imported by all of them, so it is the safe home.
+PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES = frozenset(
+    {"submitted", "filled", "pending", "unconfirmed", "potentially_submitted"}
+)
+_PLACED_OR_IN_FLIGHT_STATUSES = PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES
 
 
 def _rows_from_buy_candidates(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -3201,11 +3368,14 @@ def _rows_from_buy_candidates(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
         if not (isinstance(ticker, str) and ticker.strip()):
             continue
         status = cand.get("status")
-        # Every ORDER-BEARING status, not only "submitted"/"filled". A
-        # Perplexity manual-override embedded candidate can carry only a
-        # "pending"/"unconfirmed" status -- there is no orders CSV for this
-        # fallback shape to fall back on -- and restricting this filter to
-        # submitted/filled dropped it entirely, so
+        # See _PLACED_OR_IN_FLIGHT_STATUSES's own comment above for why this
+        # is the full placed-or-in-flight set, not just "submitted"/
+        # "filled"/"potentially_submitted". _confirmed_fill stays False for
+        # every status here except "filled" -- only that one is a confirmed
+        # fill. A Perplexity manual-override embedded candidate can carry
+        # only a "pending"/"unconfirmed" status -- there is no orders CSV
+        # for this fallback shape to fall back on -- and restricting this
+        # filter to submitted/filled dropped it entirely, so
         # load_same_day_top_up_context() returned no prior allocation for a
         # valid placed-or-in-flight order and a later scheduled stream could
         # buy the ticker again while the order was still live (Codex review:
@@ -3216,7 +3386,7 @@ def _rows_from_buy_candidates(state: Mapping[str, Any]) -> List[Dict[str, Any]]:
         # over one corrupt fallback artifact instead of just ignoring that
         # candidate (Codex review: "Validate candidate status before set
         # membership").
-        if not isinstance(status, str) or status not in _ORDER_BEARING_CANDIDATE_STATUSES:
+        if not isinstance(status, str) or status not in _PLACED_OR_IN_FLIGHT_STATUSES:
             continue
         row = dict(cand)
         row["ticker"] = ticker
@@ -3289,7 +3459,13 @@ def _read_csv_rows(
     rows: List[Dict[str, Any]] = []
     for row in raw_rows:
         status = (row.get("status") or "").strip().lower()
-        if status and status not in ("submitted", "filled"):
+        # See _PLACED_OR_IN_FLIGHT_STATUSES's own comment above for why this
+        # is the full placed-or-in-flight set, not just "submitted"/
+        # "filled"/"potentially_submitted": a reconciled "pending"/
+        # "unconfirmed" row is real outstanding submission evidence too, not
+        # a rejected one (Codex review, PR #1300 discussion_r3920912119:
+        # "Retain reconciled in-flight manual orders").
+        if status and status not in _PLACED_OR_IN_FLIGHT_STATUSES:
             continue
         # The broker-native recovery shape has no `status` column at all and
         # records its outcome in `state`, so every one of its rows reached the
@@ -3597,8 +3773,6 @@ _ROOTS_NEVER_REACHED_BY_CORE_LOADER = (
     "final_manual_review",
     "perplexity_primary_*/manual_override_*",
 )
-
-
 def _outside_core_loader_reach(run_dir: Path, base: Optional[Path] = None) -> bool:
     """True when ``run_dir`` sits under a root the core loader never scans.
 
@@ -3915,11 +4089,33 @@ def load_same_day_top_up_context(
     """
     result: Dict[str, PriorAllocation] = {}
     seen_order_ids: Set[str] = set()
+    # Fast path: pre-encode the trading day to bytes outside the loop
+    # so we can use a raw substring check to avoid expensive JSON parsing
+    # on artifacts that don't match the trading day.
+    trading_day_bytes = trading_day.encode("utf-8")
     for root in top_up_context_roots(base, stream_roots):
         for path in _iter_run_state_files(root):
             try:
-                state = json.loads(path.read_bytes())
-            except (json.JSONDecodeError, OSError):
+                raw_bytes = path.read_bytes()
+            except OSError:
+                if skip_sink is not None and _mtime_matches_trading_day(path, trading_day):
+                    skip_sink.append(path)
+                continue
+
+            same_day_mtime = None
+            # Skip expensive json.loads if the file doesn't contain the trading day bytes.
+            # Only trust the fast-path if there are no unicode escape sequences (\u),
+            # which could represent the date string differently.
+            if trading_day_bytes not in raw_bytes and b"\\u" not in raw_bytes:
+                same_day_mtime = _mtime_matches_trading_day(path, trading_day)
+                # If mtime is the same day, we must parse to let JSON errors fall through
+                # to the skip_sink logic correctly. Otherwise, we can safely skip.
+                if not same_day_mtime:
+                    continue
+
+            try:
+                state = json.loads(raw_bytes)
+            except json.JSONDecodeError:
                 # An unreadable or mid-write run_state under a manual
                 # top-up-context root is exactly as unverifiable as a
                 # referenced-CSV read failure below -- without recording it,
@@ -3935,7 +4131,8 @@ def load_same_day_top_up_context(
                 # scan_had_failures forever, forcing an unnecessary bounded
                 # reload on every future run (Codex review: "Scope parse
                 # failures to plausible same-day states").
-                if skip_sink is not None and _mtime_matches_trading_day(path, trading_day):
+                same_day_mtime = same_day_mtime if same_day_mtime is not None else _mtime_matches_trading_day(path, trading_day)
+                if skip_sink is not None and same_day_mtime:
                     skip_sink.append(path)
                 continue
             if not isinstance(state, dict) or not is_top_up_context_state(state, trading_day):
@@ -4250,6 +4447,12 @@ __all__ = [
     "STATE_SCHEMA_VERSION",
     "STATE_SCHEMA_VERSION_V2",
     "ACCEPTED_STATE_SCHEMA_VERSIONS",
+    "EXECUTED_QUANTITY_COLS",
+    "PLACED_OR_IN_FLIGHT_CANDIDATE_STATUSES",
+    "MORNING_LIVE_SCHEMA_VERSION",
+    "MIDDAY_LIVE_SCHEMA_VERSION",
+    "MORNING_LIVE_RUN_TYPE",
+    "MIDDAY_LIVE_RUN_TYPE",
     "is_preauthorized_v2",
     "CRON_ID",
     "SUPERSEDES_CRON_ID",

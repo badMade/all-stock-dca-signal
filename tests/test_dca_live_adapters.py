@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time
+from typing import Any, cast
 
 import pytest
 
@@ -29,6 +30,7 @@ from dca_live_adapters import (
     _order_lifecycle_aliases_conflict,
     _order_rows_contradict,
     _parse_rfc3339,
+    _placement_response_has_untrackable_positive_order_id,
     _response_failure,
     _rh_interval,
     _to_float,
@@ -43,6 +45,7 @@ from near_close_dca import (
     BrokerName,
     DryRunBroker,
     OrderFill,
+    OrderPlacementAmbiguousError,
     OrderPlacementRejectedError,
     StrategyConfig,
     WholeSharePlacementTerminalError,
@@ -100,6 +103,11 @@ def test_parse_rfc3339_bad_values_return_none():
     assert _parse_rfc3339("not-a-date") is None
     assert _parse_rfc3339("2023-13-45T99:99:99Z") is None
     assert _parse_rfc3339(12345) is None
+
+
+def test_untrackable_order_id_ignores_error_container_diagnostics():
+    rejected = {"success": False, "error": {"id": 10**400, "state": "rejected", "filled_quantity": 0}}
+    assert _placement_response_has_untrackable_positive_order_id(rejected) is False
 
 
 def test_parse_rfc3339_unparseable_timestamp_string_returns_none():
@@ -533,9 +541,36 @@ def test_finance_provider_folds_a_dividend_into_the_factor():
         bars_fn=lambda *a: [{"date": "2026-08-18", "Stock Splits": 0.0, "Dividends": 2.0, "Close": 98.0}],
         previous_close_fn=lambda *a: 100.0,
     )
-    factor, cursor = prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18))
+    res = prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18))
+    assert res is not None
+    factor, cursor = res
     assert factor == pytest.approx(100.0 / 98.0)
     assert cursor == date(2026, 8, 18)
+
+
+def test_finance_provider_rejects_boolean_dividend_value():
+    # Codex review, PR #1299 (dca_live_adapters.py:4899): bool is a subclass
+    # of int in Python, so float(True)/float(False) succeed as 1.0/0.0
+    # instead of raising. "Dividends": true from a connector must not be
+    # accepted as a fabricated $1 dividend -- rejected (unavailable) the
+    # same way a non-numeric/empty-string dividend value already is,
+    # instead of durably rebasing the inverse-Martingale recovery latch on
+    # data the connector never actually reported.
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [{"date": "2026-08-18", "Stock Splits": 0.0, "Dividends": True, "Close": 98.0}],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
+
+
+def test_finance_provider_rejects_boolean_split_ratio_value():
+    # Same rejection, for the split-ratio field: "Stock Splits": true must
+    # not be accepted as a real 1:1 split ratio.
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [{"date": "2026-08-18", "Stock Splits": True, "Dividends": 0.0}],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
 
 
 def test_finance_provider_combines_a_split_and_dividend_on_the_same_ex_date():
@@ -547,9 +582,11 @@ def test_finance_provider_combines_a_split_and_dividend_on_the_same_ex_date():
         previous_close_fn=lambda *a: 100.0,
     )
 
-    factor, cursor = prov.get_corporate_action_factor(
+    res = prov.get_corporate_action_factor(
         "AAPL", date(2026, 8, 17), date(2026, 8, 18)
     )
+    assert res is not None
+    factor, cursor = res
 
     assert factor == pytest.approx(2.0 * (100.0 / 98.0))
     assert cursor == date(2026, 8, 18)
@@ -627,6 +664,22 @@ def test_finance_provider_catches_a_failure_raised_while_iterating_rows():
         raise RuntimeError("transient lookup failure mid-iteration")
 
     prov = FinanceDataProvider(bars_fn=_bad_rows, previous_close_fn=lambda *a: 100.0)
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
+
+
+@pytest.mark.parametrize("failure", [KeyError("bad payload"), IndexError("missing field")])
+def test_finance_provider_isolates_unexpected_connector_failures(failure):
+    # An injected connector decoding a malformed third-party payload raises
+    # exception types that are not part of its advertised API (KeyError,
+    # IndexError, ...). The provider boundary must fail closed on ANY of them
+    # -- the narrower (OSError, RuntimeError, TypeError, ValueError,
+    # OverflowError) catch this method used to have let these escape and
+    # abort the whole scheduled scan over one ticker's evidence lookup
+    # (PR #1357: "Fix corporate action isolation and state update races").
+    def _failed_lookup(*_args):
+        raise failure
+
+    prov = FinanceDataProvider(bars_fn=_failed_lookup, previous_close_fn=lambda *a: 100.0)
     assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
 
 
@@ -760,9 +813,113 @@ def test_finance_provider_accepts_close_price_and_c_aliases_for_dividends():
             ],
             previous_close_fn=lambda *a: 100.0,
         )
-        factor, cursor = prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18))
+        res = prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18))
+        assert res is not None, key
+        factor, cursor = res
         assert factor == pytest.approx(100.0 / 98.0), key
         assert cursor == date(2026, 8, 18), key
+
+
+def test_finance_provider_get_quote_returns_none_without_a_quote_fn():
+    prov = FinanceDataProvider(bars_fn=lambda *a: [], previous_close_fn=lambda *a: 100.0)
+    assert prov.get_quote("AAPL", _decision_dt()) is None
+
+
+def test_finance_provider_get_quote_accepts_a_mapping():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [],
+        previous_close_fn=lambda *a: 100.0,
+        quote_fn=lambda *a: {"price": 95.5, "as_of": "2026-07-02T15:44:00-04:00"},
+    )
+    quote = prov.get_quote("AAPL", _decision_dt())
+    assert quote is not None
+    price, as_of = quote
+    assert price == pytest.approx(95.5)
+    assert as_of == datetime(2026, 7, 2, 15, 44, tzinfo=EASTERN)
+
+
+def test_finance_provider_get_quote_accepts_a_bare_scalar():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [], previous_close_fn=lambda *a: 100.0, quote_fn=lambda *a: 95.5
+    )
+    quote = prov.get_quote("AAPL", _decision_dt())
+    assert quote is not None
+    price, as_of = quote
+    assert price == pytest.approx(95.5)
+    assert as_of == _decision_dt()
+
+
+def test_finance_provider_get_quote_rejects_a_boolean_price():
+    """Python makes bool a subclass of int, so float(True) == 1.0: an
+    unguarded _to_float(raw_price) would accept a malformed connector
+    response like {"price": true, ...} as an ordinary $1.00 quote, which
+    could turn an ordinary stock into a maximum-drop BUY signal (Codex
+    review: "Reject boolean Finance quote prices")."""
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [],
+        previous_close_fn=lambda *a: 100.0,
+        quote_fn=lambda *a: {"price": True, "as_of": "2026-07-02T15:44:00-04:00"},
+    )
+    assert prov.get_quote("AAPL", _decision_dt()) is None
+
+
+def test_finance_provider_get_quote_rejects_a_boolean_bare_scalar():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [], previous_close_fn=lambda *a: 100.0, quote_fn=lambda *a: False
+    )
+    assert prov.get_quote("AAPL", _decision_dt()) is None
+
+
+def test_finance_provider_get_quote_rejects_a_non_positive_price():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [],
+        previous_close_fn=lambda *a: 100.0,
+        quote_fn=lambda *a: {"price": 0.0, "as_of": "2026-07-02T15:44:00-04:00"},
+    )
+    assert prov.get_quote("AAPL", _decision_dt()) is None
+
+
+def test_finance_provider_get_quote_returns_none_when_the_quote_fn_yields_nothing():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [], previous_close_fn=lambda *a: 100.0, quote_fn=lambda *a: None
+    )
+    assert prov.get_quote("AAPL", _decision_dt()) is None
+
+
+def test_finance_provider_third_positional_argument_still_sets_supports_corporate_actions():
+    """A caller wiring ``FinanceDataProvider(bars_fn, previous_close_fn, False)``
+    predates ``quote_fn`` and must keep setting ``supports_corporate_actions``,
+    not silently reinterpret that boolean as the quote callable (which would
+    also leave ``supports_corporate_actions`` stuck at its True default and
+    later crash ``get_quote()`` calling a bare ``False``) (Codex review:
+    "Preserve the existing third positional argument")."""
+    prov = FinanceDataProvider(lambda *a: [], lambda *a: 100.0, False)
+    assert prov.supports_corporate_actions is False
+    assert prov.get_quote("AAPL", _decision_dt()) is None
+
+
+def test_finance_provider_quote_fn_is_keyword_only():
+    with pytest.raises(TypeError):
+        cast(Any, FinanceDataProvider)(lambda *a: [], lambda *a: 100.0, True, lambda *a: 95.5)
+
+
+def test_finance_provider_accepts_capitalized_date_alias():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [{"Date": "2026-08-18", "Stock Splits": 2.0, "Dividends": 0.0}],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) == (
+        2.0,
+        date(2026, 8, 18),
+    )
+
+
+def test_finance_provider_rejects_whitespace_only_corporate_action_metadata():
+    prov = FinanceDataProvider(
+        bars_fn=lambda *a: [{"date": "2026-08-18", "Stock Splits": " ", "Dividends": "\t"}],
+        previous_close_fn=lambda *a: 100.0,
+    )
+    assert prov.get_corporate_action_factor("AAPL", date(2026, 8, 17), date(2026, 8, 18)) is None
 
 
 # -- RobinhoodBroker -------------------------------------------------------------
@@ -806,6 +963,27 @@ def test_broker_place_sees_past_a_domain_field_wrapper_on_success():
     assert broker.place_market_buy("AAPL", 1.0, "ref1") == "ORD"
 
 
+def test_broker_place_wraps_connector_failure_as_ambiguous():
+    # Codex review, PR #1300 discussion_r3920155064 ("Emit the new
+    # ambiguous-placement status"): when the underlying connector call
+    # itself fails (network timeout, connection reset, ...) before any
+    # broker response was observed, place_market_buy must re-raise as
+    # OrderPlacementAmbiguousError -- distinct from every RuntimeError below,
+    # which reacts to a DEFINITIVE response the broker DID return.
+    accepted_requests = []
+
+    def _raising_place_fn(**kwargs):
+        accepted_requests.append(kwargs.copy())
+        raise TimeoutError("connection reset")
+
+    broker = RobinhoodBroker(account="999000111", enable_live_orders=True, place_fn=_raising_place_fn)
+    with pytest.raises(OrderPlacementAmbiguousError, match="no broker response"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert len(accepted_requests) == 1
+    assert accepted_requests[0]["ref_id"] == "ref1"
+    assert accepted_requests[0]["dollar_amount"] == "1.00"
+
+
 def test_broker_place_raises_on_outer_failure_envelope():
     # A failure envelope carrying an inner order id must not be read as a successful submit.
     broker = RobinhoodBroker(
@@ -839,6 +1017,33 @@ def test_broker_place_classifies_explicit_rejection_with_error_container_id():
     )
     with pytest.raises(OrderPlacementRejectedError, match="rejected"):
         broker.place_market_buy("AAPL", 1.0, "ref1")
+
+
+def test_broker_place_classifies_terminal_state_inside_a_failure_envelope():
+    # Codex review, PR #688 discussion_r3914393246 ("Classify terminal orders
+    # inside failure envelopes"): a failure envelope naming an order whose OWN
+    # state is already terminal (rejected/failed/cancelled/canceled/voided)
+    # PROVES no live order exists -- it must not be treated as an unresolved,
+    # batch-halting failure just because the outer envelope says
+    # "success": false. terminal_broker_row_proves_no_order() reads an absent
+    # fill figure on a declined state as proof, not as ambiguity, so this
+    # raises the SAME OrderPlacementRejectedError (public alias for
+    # FractionalPlacementRejectedError) a multi-ticker batch already catches
+    # to continue past a definitive rejection -- not a bare RuntimeError.
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": False,
+            "data": {"order": {"id": "ORD-DEAD", "state": "rejected"}},
+        },
+    )
+    with pytest.raises(OrderPlacementRejectedError, match="rejected") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    # The id travels with the proven refusal -- an operator still needs it to
+    # look the dead order up (Codex review, PR #859: "Preserve the terminal
+    # order ID from proven rejections").
+    assert exc_info.value.order_id == "ORD-DEAD"
 
 
 def test_broker_place_keeps_bridge_failure_ambiguous_even_with_success_false():
@@ -960,13 +1165,31 @@ def test_broker_place_finds_live_order_nested_in_error_container():
             "error": {"order": {"id": "ORD-NESTED", "state": "queued"}},
         },
     )
-    with pytest.raises(RuntimeError, match="failed") as exc_info:
+    with pytest.raises(AmbiguousPlacementResponseError, match="failed") as exc_info:
         broker.place_market_buy("AAPL", 1.0, "ref1")
-    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+    assert exc_info.value.order_id == "ORD-NESTED"
+
+
+def test_broker_place_finds_live_order_nested_in_nonstandard_failure_container():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": False,
+            "connector_failure": {
+                "context": {"order": {"id": "ORD-HIDDEN", "state": "queued"}}
+            },
+        },
+    )
+
+    with pytest.raises(AmbiguousPlacementResponseError, match="failed") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+
+    assert exc_info.value.order_id == "ORD-HIDDEN"
 
 
 def test_broker_place_handles_cyclic_failure_response_without_looping():
-    response = {"success": False, "message": "timeout"}
+    response: dict[str, Any] = {"success": False, "message": "timeout"}
     response["error"] = response
     broker = RobinhoodBroker(
         account="999000111", enable_live_orders=True, place_fn=lambda **k: response
@@ -1081,6 +1304,22 @@ def test_broker_place_terminal_state_positive_fill_with_zero_cumulative_quantity
             "data": {"order": {
                 "id": "ORD-7", "state": "cancelled",
                 "cumulative_quantity": "0", field: "2.5",
+            }}
+        },
+    )
+    with pytest.raises(RuntimeError, match="terminal state") as exc_info:
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(exc_info.value, OrderPlacementRejectedError)
+
+
+def test_broker_place_terminal_state_zero_quantity_with_nonzero_price_is_ambiguous():
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "data": {"order": {
+                "id": "ORD-7", "state": "cancelled",
+                "cumulative_quantity": "0", "average_price": "100.00",
             }}
         },
     )
@@ -1586,6 +1825,21 @@ def test_broker_whole_share_place_live_multiple_shares_passes_quantity():
     assert calls[0]["quantity"] == "3"
 
 
+def test_broker_whole_share_place_wraps_connector_failure_as_ambiguous():
+    # Codex review, PR #1300 discussion_r3920546926 ("Preserve ambiguity for
+    # whole-share placement timeouts"): the notional path's identical fix
+    # (test_broker_place_wraps_connector_failure_as_ambiguous) previously
+    # wrapped only place_market_buy's connector call, leaving this quantity-
+    # based path's own connector call to surface a plain, unclassified
+    # exception on a response timeout.
+    def _raising_place_fn(**kwargs):
+        raise TimeoutError("connection reset")
+
+    broker = RobinhoodBroker(account="999000111", enable_live_orders=True, place_fn=_raising_place_fn)
+    with pytest.raises(OrderPlacementAmbiguousError, match="no broker response"):
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+
+
 def test_broker_whole_share_place_raises_terminal_error_when_outer_failure_has_an_inner_order_id():
     """Codex review ("Preserve accepted nonterminal orders in failure
     envelopes"): an inner order with a usable id is real evidence of a
@@ -1666,7 +1920,16 @@ def test_broker_whole_share_place_rejects_conflicting_state_and_status():
     working, one terminal) is unresolved evidence -- picking either
     alias silently discards the other's own, possibly-authoritative
     story, so this must route through the same terminal-error path
-    rather than being accepted as a successful submission."""
+    rather than being accepted as a successful submission.
+
+    Updated for Codex review, PR #1251 ("Halt lifecycle-conflicting
+    whole-share responses"): a conflicting pair is no longer packaged as
+    WholeSharePlacementTerminalError (whose caller SKIPS broker-history
+    reconciliation and trusts the response's own state as authoritative
+    terminal fact), since that would let one alias's "terminal" story
+    silently overrule the other alias's "still live" story. It now
+    raises AmbiguousPlacementResponseError, the structurally-ambiguous
+    halt path that forces the real reconciliation lookup instead."""
     broker = RobinhoodBroker(
         account="999000111",
         enable_live_orders=True,
@@ -1674,8 +1937,41 @@ def test_broker_whole_share_place_rejects_conflicting_state_and_status():
             "data": {"order": {"id": "ORD-10", "state": "queued", "status": "rejected"}}
         },
     )
-    with pytest.raises(RuntimeError, match="terminal state"):
+    with pytest.raises(AmbiguousPlacementResponseError, match="conflicting lifecycle aliases") as exc_info:
         broker.place_whole_share_buy("BYDDY", 1, "ref1")
+    assert exc_info.value.structurally_ambiguous is True
+
+
+def test_broker_whole_share_lifecycle_conflict_exception_redacts_order_secrets():
+    """Codex review, PR #1251: "Redact lifecycle-conflict payloads before
+    raising". The AmbiguousPlacementResponseError message for a
+    state/status lifecycle conflict is built from `_log_safe_repr` (no
+    redaction) rather than `_artifact_safe_repr`, even though this
+    exception's message -- unlike a plain log call -- can be
+    interpolated into a caller's `skip_reason` and persisted into a run
+    artifact."""
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "data": {
+                "order": {
+                    "id": "ORD-CONFLICT",
+                    "state": "queued",
+                    "status": "rejected",
+                    "account_number": "999000111",
+                    "access_token": "super-secret-token",
+                }
+            }
+        },
+    )
+    with pytest.raises(AmbiguousPlacementResponseError) as exc_info:
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+
+    message = str(exc_info.value)
+    assert "999000111" not in message
+    assert "super-secret-token" not in message
+    assert "[REDACTED]" in message
 
 
 def test_broker_whole_share_place_live_terminal_error_carries_the_order_payload():
@@ -1724,8 +2020,70 @@ def test_broker_whole_share_place_validates_a_conflicting_orders_collection():
             }
         },
     )
-    with pytest.raises(WholeSharePlacementTerminalError):
+    with pytest.raises(AmbiguousPlacementResponseError) as exc_info:
         broker.place_whole_share_buy("BYDDY", 1, "ref1")
+    assert exc_info.value.structurally_ambiguous is True
+
+
+def test_broker_whole_share_place_halts_on_conflicting_lifecycle_aliases():
+    """Codex review, PR #1251: "Halt lifecycle-conflicting whole-share
+    responses". A response reporting state="rejected" alongside
+    status="queued" is self-contradictory, not an ordinary terminal
+    response: the caller's terminal-only path trusts a
+    WholeSharePlacementTerminalError's own `order.state` as authoritative
+    and SKIPS the broker-history reconciliation lookup entirely, which
+    would have released the reserved claim as a proven zero-fill even
+    though the OTHER alias still says the order is live. This must raise
+    AmbiguousPlacementResponseError instead -- the structurally-ambiguous
+    halt path the caller's generic exception handler does NOT skip the
+    reconciliation lookup for -- so the real broker-history evidence
+    resolves it rather than either alias being trusted blindly."""
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "data": {
+                "order": {
+                    "id": "ORD-CONFLICT",
+                    "state": "rejected",
+                    "status": "queued",
+                    "cumulative_quantity": "0",
+                }
+            }
+        },
+    )
+    with pytest.raises(AmbiguousPlacementResponseError) as exc_info:
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+    assert exc_info.value.structurally_ambiguous is True
+
+
+def test_broker_whole_share_outer_failure_exception_redacts_inner_order_secrets():
+    """Placement diagnostics can flow into durable skip-reason artifacts."""
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders=True,
+        place_fn=lambda **k: {
+            "success": False,
+            "error": "access_token=outer-secret-token",
+            "data": {
+                "order": {
+                    "id": "ORD-SECRET",
+                    "state": "queued",
+                    "account_number": "999000111",
+                    "access_token": "super-secret-token",
+                }
+            },
+        },
+    )
+
+    with pytest.raises(WholeSharePlacementTerminalError) as exc_info:
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+
+    message = str(exc_info.value)
+    assert "999000111" not in message
+    assert "super-secret-token" not in message
+    assert "outer-secret-token" not in message
+    assert "[REDACTED]" in message
 
 
 def test_broker_whole_share_place_accepts_a_singular_order_with_an_equivalent_numeric_collection_id():
@@ -2463,6 +2821,135 @@ def test_broker_order_fill_swallows_lookup_failure():
     assert RobinhoodBroker(order_fill_fn=boom).get_order_fill("ORD-1") is None
 
 
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        pytest.param(lambda row: {"success": False, "orders": [row]}, id="failed_outer"),
+        pytest.param(lambda row: {"data": {"ok": False, "orders": [row]}}, id="failed_inner"),
+        pytest.param(lambda row: {"success": True, "data": {"success": False, "orders": [row]}}, id="contradictory_health"),
+        pytest.param(lambda row: {"isError": True, "orders": [row]}, id="bridge_failure"),
+        pytest.param(lambda row: {"orders": [None]}, id="null_row"),
+        pytest.param(lambda row: {"orders": [None, row]}, id="malformed_then_valid"),
+        pytest.param(lambda row: {"orders": row}, id="object_collection"),
+        pytest.param(lambda row: {"orders": "invalid"}, id="string_collection"),
+        pytest.param(lambda row: {"order": {**row, "order_id": "other-order"}}, id="conflicting_ids"),
+        pytest.param(lambda row: {"order": {**row, "state": "filled", "status": "queued"}}, id="conflicting_lifecycle"),
+        pytest.param(lambda row: {"order": {**row, "filled_quantity": "2"}}, id="conflicting_quantity"),
+        pytest.param(lambda row: {"order": {**row, "executed_notional": "20"}}, id="conflicting_execution"),
+        pytest.param(lambda row: {"order": {**row, "average_price": None, "price": "10"}}, id="limit_price_is_not_fill"),
+        pytest.param(lambda row: {"orders": [row, {**row, "average_price": "20"}]}, id="conflicting_duplicate_rows"),
+        pytest.param(lambda row: {"order": row, "orders": [{**row, "cumulative_quantity": "2"}]}, id="conflicting_representations"),
+    ],
+)
+def test_order_fill_rejects_failed_malformed_or_conflicting_evidence(wrap):
+    """M1: unavailable fill evidence must preserve the accepted order without inventing a fill."""
+    row = {"id": "fill-fixture", "cumulative_quantity": "1", "average_price": "10"}
+    broker = RobinhoodBroker(order_fill_fn=lambda **kwargs: wrap(row))
+
+    assert broker.get_order_fill("fill-fixture") is None
+
+
+@pytest.mark.parametrize("quantity_key", ["cumulative_quantity", "executed_quantity", "filled_quantity", "quantity_filled"])
+def test_order_fill_accepts_consistent_execution_aliases(quantity_key):
+    row = {"id": "fill-fixture", "status": "partially_filled", quantity_key: "0.5", "average_price": "10"}
+    broker = RobinhoodBroker(order_fill_fn=lambda **kwargs: {"orders": [row, dict(row)]})
+
+    fill = broker.get_order_fill("fill-fixture")
+    assert fill is not None
+    assert fill.quantity_filled == pytest.approx(0.5)
+    assert fill.avg_fill_price == pytest.approx(10)
+
+
+@pytest.mark.parametrize("quantity_key", ["cumulative_quantity", "quantity"])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize(
+    "outer_fields",
+    [
+        pytest.param({"executed_notional": "0"}, id="zero_dollars"),
+        pytest.param({"executed_notional": "11"}, id="different_dollars"),
+        pytest.param({"executed_dollar_amount": "11"}, id="different_dollar_alias"),
+        pytest.param({"filled_notional": "11"}, id="different_filled_notional"),
+        pytest.param({"cumulative_quantity": "2"}, id="different_quantity"),
+        pytest.param({"executed_quantity": "0"}, id="zero_quantity"),
+        pytest.param({"filled_quantity": "2"}, id="different_filled_quantity"),
+        pytest.param({"quantity_filled": {"amount": "2"}}, id="wrapped_quantity"),
+        pytest.param({"average_price": "11"}, id="different_average"),
+        pytest.param({"average_price": "NaN"}, id="unreadable_average"),
+        pytest.param({"executed_notional": {"amount": None}}, id="unreadable_dollars"),
+        pytest.param({"executed_quantity": "NaN"}, id="unreadable_quantity"),
+    ],
+)
+def test_order_fill_rejects_conflicting_envelope_execution(quantity_key, nested, outer_fields):
+    """M1: matching outer identity does not excuse contradictory execution evidence."""
+    row = {"id": "fill-fixture", "state": "filled", quantity_key: "1", "average_price": "10"}
+    envelope = {"id": "fill-fixture", "state": "filled", **outer_fields}
+    response = {"data": {**envelope, "order": row}} if nested else {**envelope, "data": {"orders": [row]}}
+    broker = RobinhoodBroker(order_fill_fn=lambda **kwargs: response)
+
+    assert broker.get_order_fill("fill-fixture") is None
+
+
+@pytest.mark.parametrize("quantity_key", ["cumulative_quantity", "quantity"])
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize(
+    "outer_fields",
+    [
+        pytest.param({}, id="identity_only"),
+        pytest.param({"updated_at": "2026-07-08T14:00:00Z"}, id="metadata_only"),
+        pytest.param({"executed_notional": "10.00"}, id="complementary_dollars"),
+        pytest.param({"executed_notional": "10.0005"}, id="reconstructed_dollar_rounding"),
+        pytest.param({"filled_notional": {"amount": "10.0"}}, id="wrapped_dollars"),
+        pytest.param({"cumulative_quantity": "1.00"}, id="equivalent_quantity"),
+        pytest.param({"quantity_filled": {"amount": "1.0"}}, id="equivalent_wrapped_quantity"),
+        pytest.param({"average_price": {"amount": "10.00"}}, id="equivalent_wrapped_average"),
+        pytest.param({"executed_notional": None, "average_price": " ", "filled_quantity": {"amount": " "}}, id="blanks"),
+    ],
+)
+def test_order_fill_preserves_consistent_envelope_execution(quantity_key, nested, outer_fields):
+    row = {"id": "fill-fixture", "state": "filled", quantity_key: "1", "average_price": "10"}
+    envelope = {"id": "fill-fixture", "state": "filled", **outer_fields}
+    response = {"data": {**envelope, "order": row}} if nested else {**envelope, "data": {"orders": [row, dict(row)]}}
+    broker = RobinhoodBroker(order_fill_fn=lambda **kwargs: response)
+
+    fill = broker.get_order_fill("fill-fixture")
+    assert fill is not None
+    assert fill.quantity_filled == pytest.approx(1)
+    assert fill.avg_fill_price == pytest.approx(10)
+
+
+@pytest.mark.parametrize("inner_key", ["executed_notional", "filled_notional"])
+@pytest.mark.parametrize("outer_dollars,inner_dollars", [("10", "11"), ("11", "10"), ("10.0005", "9.9995")])
+def test_order_fill_checks_execution_at_every_identified_envelope_layer(outer_dollars, inner_dollars, inner_key):
+    row = {"id": "fill-fixture", "cumulative_quantity": "1", "average_price": "10"}
+    response = {
+        "id": "fill-fixture", "executed_notional": outer_dollars,
+        "data": {"id": "fill-fixture", inner_key: inner_dollars, "order": row},
+    }
+    assert RobinhoodBroker(order_fill_fn=lambda **kwargs: response).get_order_fill("fill-fixture") is None
+
+
+@pytest.mark.parametrize("inner_fields", [{"executed_notional": "10.0005"}, {"filled_notional": "10.0005"}, {}])
+def test_order_fill_preserves_agreement_between_envelope_layers(inner_fields):
+    row = {"id": "fill-fixture", "cumulative_quantity": "1", "average_price": "10"}
+    response = {
+        "id": "fill-fixture", "executed_notional": "10.0005",
+        "data": {"id": "fill-fixture", **inner_fields, "order": row},
+    }
+    fill = RobinhoodBroker(order_fill_fn=lambda **kwargs: response).get_order_fill("fill-fixture")
+    assert fill is not None
+    assert fill.quantity_filled == pytest.approx(1)
+    assert fill.avg_fill_price == pytest.approx(10)
+
+
+@pytest.mark.parametrize("row_fields", [{"cumulative_quantity": "0", "average_price": "10"}, {"cumulative_quantity": "1"}])
+def test_order_fill_does_not_complete_missing_execution_from_outer_metadata(row_fields):
+    response = {
+        "id": "fill-fixture", "cumulative_quantity": "1", "average_price": "10",
+        "data": {"order": {"id": "fill-fixture", **row_fields}},
+    }
+    assert RobinhoodBroker(order_fill_fn=lambda **kwargs: response).get_order_fill("fill-fixture") is None
+
+
 def test_broker_buying_power_keyword_call_and_failure():
     assert RobinhoodBroker(simulated_buying_power_usd=250.0).available_buying_power() == 250.0
 
@@ -2670,7 +3157,7 @@ def test_robinhood_broker_pagination_follows_a_nested_continuation_pointer():
     even misread the outer bare "cursor" as an echo of itself, ending
     pagination before page 3 -- where the actually-requested order sits --
     was ever reached."""
-    pages = [
+    pages: list[dict[str, Any]] = [
         {
             "cursor": "P2",
             "data": {
@@ -2703,7 +3190,7 @@ def test_robinhood_broker_pagination_carries_an_intervening_continuation_pointer
     between them. Checking only the row-bearing layer and the outer
     settled layer (as an earlier, narrower fix did) skips that
     intervening layer and loses the real continuation pointer entirely."""
-    pages = [
+    pages: list[dict[str, Any]] = [
         {
             "orders": [],
             "data": {
@@ -2855,7 +3342,7 @@ def test_robinhood_broker_pagination_preserves_cursors_traversed_while_resolving
     the outer settled layer whenever the effective orders collection ended
     up empty lost that intermediate P3 pointer entirely, concluding
     history ended at P2 while a live order still sat on P3."""
-    pages = [
+    pages: list[dict[str, Any]] = [
         {"data": {"orders": [{"state": "filled", "ref_id": "other"}], "next_cursor": "P2"}},
         {"data": {"cursor": "P2", "data": {"next_cursor": "P3", "data": {"orders": []}}}},
         {"data": {"orders": [{"state": "filled", "ref_id": "crashed-fire"}]}},
@@ -6994,3 +7481,467 @@ def test_broker_place_agrees_on_a_lifecycle_alias_spelled_differently_across_row
         broker.place_market_buy("AAPL", 1.0, "ref1")
 
 
+# --- C:F1 (2026-09-07 diagnostic): a LIVE broker must fail closed on unwired lookups ---
+#
+# RobinhoodBroker documents that a missing callable "degrades that check to a
+# safe default" -- simulated buying power, "tradable", "no order today". That
+# is the right contract for a dry-run/progressively-wired broker, but with
+# enable_live_orders=True the same defaults are the exact opposite of safe: a
+# partially wired live broker would place real orders against a fabricated
+# $300 of headroom, skip the fractional-tradability check, and run its
+# same-day duplicate gate against an empty history. review_market_buy already
+# refuses in this situation; these tests pin the other three lookups to the
+# same fail-closed rule while leaving the dry-run defaults untouched.
+
+
+def _live_broker_with_only_placement():
+    return RobinhoodBroker(
+        enable_live_orders=True,
+        place_fn=lambda **k: {"id": "RH-1", "state": "queued"},
+    )
+
+
+def test_live_broker_without_buying_power_fn_refuses_to_simulate_headroom():
+    with pytest.raises(RuntimeError, match="no buying_power_fn wired"):
+        _live_broker_with_only_placement().available_buying_power()
+
+
+def test_dry_run_broker_without_buying_power_fn_keeps_the_simulated_default():
+    # The dry-run contract is unchanged: no callable, no live gate, simulated headroom.
+    assert RobinhoodBroker(simulated_buying_power_usd=250.0).available_buying_power() == 250.0
+
+
+def test_live_broker_without_tradability_fn_refuses_to_assume_tradable():
+    broker = _live_broker_with_only_placement()
+    with pytest.raises(RuntimeError, match="no tradability_fn wired"):
+        broker.is_tradable_for_fractional_buy("AAPL")
+    with pytest.raises(RuntimeError, match="no tradability_fn wired"):
+        broker.is_tradable_for_whole_share_buy("BYDDY")
+
+
+def test_dry_run_broker_without_tradability_fn_stays_permissive():
+    assert RobinhoodBroker().is_tradable_for_fractional_buy("AAPL") is True
+    assert RobinhoodBroker().is_tradable_for_whole_share_buy("BYDDY") is True
+
+
+def test_live_broker_without_orders_fn_refuses_to_report_no_order_today():
+    broker = _live_broker_with_only_placement()
+    with pytest.raises(RuntimeError, match="no orders_fn wired"):
+        broker.same_day_strategy_order_exists("AAPL", date(2026, 9, 8))
+
+
+def test_dry_run_broker_without_orders_fn_still_reports_no_order_today():
+    assert RobinhoodBroker().same_day_strategy_order_exists("AAPL", date(2026, 9, 8)) is False
+
+
+# --- 2026-09-07 diagnostic: adapter hardening (S:ADP-01, S:ADP-02, S:ADP-03, S:ADP-04, C:F11) ---
+
+
+def _live_broker(place_fn, **extra):
+    return RobinhoodBroker(account="999000111", enable_live_orders=True, place_fn=place_fn, **extra)
+
+
+def _placed(order):
+    return lambda **k: {"data": {"order": order}}
+
+
+@pytest.mark.parametrize(
+    "mismatch, reason",
+    [
+        ({"symbol": "MSFT"}, "symbol"),
+        ({"side": "sell"}, "side"),
+        ({"ref_id": "someone-elses-ref"}, "ref_id"),
+        ({"client_order_id": "someone-elses-ref"}, "ref_id"),
+        ({"dollar_amount": "5.00"}, "notional"),
+    ],
+)
+def test_live_placement_refuses_a_response_that_does_not_describe_this_request(mismatch, reason):
+    """S:ADP-01. place_market_buy validated only the order id, lifecycle
+    state and fill evidence of the response, never that the order it was
+    handed is the one it asked for. A connector echoing a stale response, a
+    broker-side substitution, or a wrong-order echo was booked as this
+    ticker's buy at the requested notional and consumed budget for the wrong
+    instrument. Any non-blank identity field that disagrees with the request
+    is now an ambiguous placement, which halts the batch with evidence."""
+    order = {"id": "ORD-1", "state": "queued", "symbol": "AAPL", "side": "buy", "ref_id": "ref1", "dollar_amount": "1.00"}
+    order.update(mismatch)
+    with pytest.raises(AmbiguousPlacementResponseError, match=reason) as excinfo:
+        _live_broker(_placed(order)).place_market_buy("AAPL", 1.0, "ref1")
+    assert excinfo.value.structurally_ambiguous is True
+    assert excinfo.value.order_id == "ORD-1"
+
+
+def test_live_placement_accepts_a_response_that_echoes_or_omits_the_request_identity():
+    echoed = {"id": "ORD-1", "state": "queued", "symbol": "aapl", "side": "BUY", "ref_id": "ref1", "dollar_amount": "1.00"}
+    assert _live_broker(_placed(echoed)).place_market_buy("AAPL", 1.0, "ref1") == "ORD-1"
+    bare = {"id": "ORD-2", "state": "queued"}
+    assert _live_broker(_placed(bare)).place_market_buy("AAPL", 1.0, "ref1") == "ORD-2"
+    blank = {"id": "ORD-3", "state": "queued", "symbol": " ", "side": "", "ref_id": None, "dollar_amount": ""}
+    assert _live_broker(_placed(blank)).place_market_buy("AAPL", 1.0, "ref1") == "ORD-3"
+
+
+def test_live_whole_share_placement_refuses_a_response_naming_another_symbol_or_quantity():
+    other_symbol = {"id": "ORD-1", "state": "confirmed", "symbol": "TSLA", "quantity": "1"}
+    with pytest.raises(AmbiguousPlacementResponseError, match="symbol"):
+        _live_broker(_placed(other_symbol)).place_whole_share_buy("BYDDY", 1, "ref1")
+    other_quantity = {"id": "ORD-1", "state": "confirmed", "symbol": "BYDDY", "quantity": "3"}
+    with pytest.raises(AmbiguousPlacementResponseError, match="quantity"):
+        _live_broker(_placed(other_quantity)).place_whole_share_buy("BYDDY", 1, "ref1")
+    echoed = {"id": "ORD-9", "state": "confirmed", "symbol": "BYDDY", "quantity": "1.0000", "ref_id": "ref1"}
+    assert _live_broker(_placed(echoed)).place_whole_share_buy("BYDDY", 1, "ref1") == "ORD-9"
+
+
+def test_terminal_placement_diagnostics_redact_account_shaped_values(caplog):
+    """S:ADP-02. Broker payloads were logged and embedded in exception text
+    through the repr-only _log_safe_repr; the redacting _artifact_safe_repr
+    already existed but was not used at those sites, so an account number
+    echoed by the broker reached the scheduler's log stream and persisted
+    skip_reason fields."""
+    import logging
+
+    # An accepted-looking order with no usable id: the adapter logs and raises
+    # with the response embedded, which is one of the eight sites that used
+    # the repr-only helper.
+    idless = {"state": "queued", "account_number": "123456789"}
+    adapter_logger = logging.getLogger("near_close_dca.live_adapters")
+    adapter_logger.addHandler(caplog.handler)  # the module logger does not propagate to root
+    try:
+        with caplog.at_level("ERROR", logger="near_close_dca.live_adapters"):
+            with pytest.raises(RuntimeError, match="no order id") as excinfo:
+                _live_broker(_placed(idless)).place_market_buy("AAPL", 1.0, "ref1")
+    finally:
+        adapter_logger.removeHandler(caplog.handler)
+    assert "123456789" not in str(excinfo.value)
+    assert "123456789" not in caplog.text
+    assert "[REDACTED]" in caplog.text
+
+
+def test_truthy_non_bool_live_gate_never_places():
+    """C:F11. The adapter gated placement on truthiness while dca_runner
+    requires the literal True; a passthrough like enable_live_orders="false"
+    reached real placement here and was refused there."""
+    calls = []
+    broker = RobinhoodBroker(
+        account="999000111",
+        enable_live_orders="false",  # type: ignore[arg-type]
+        place_fn=lambda **k: calls.append(k) or {"data": {"order": {"id": "X", "state": "queued"}}},
+    )
+    with pytest.raises(RuntimeError, match="live gate disabled"):
+        broker.place_market_buy("AAPL", 1.0, "ref1")
+    with pytest.raises(RuntimeError, match="live gate disabled"):
+        broker.place_whole_share_buy("BYDDY", 1, "ref1")
+    assert calls == []
+
+
+def test_to_float_rejects_booleans_and_tradability_requires_a_real_true():
+    """S:ADP-03. float(True) == 1.0 passed the finiteness check, so a JSON
+    `true` in a price field became a 1.0 close (a ~100% drop, the maximum
+    ladder multiplier); and a string "false" read as tradable by truthiness."""
+    from dca_live_adapters import _to_float
+
+    assert _to_float(True, default=-1.0) == -1.0
+    assert _to_float(False, default=-1.0) == -1.0
+    assert _to_float("1.5") == 1.5
+
+    def tradability(**k):
+        return {"results": [{"symbol": "AAPL", "tradeable": "false", "state": "active", "fractional_tradability": "tradable"}]}
+
+    broker = RobinhoodBroker(account="999000111", tradability_fn=tradability)
+    assert broker.is_tradable_for_fractional_buy("AAPL") is False
+    assert broker.is_tradable_for_whole_share_buy("AAPL") is False
+
+
+def test_same_day_ticker_notional_fails_closed_on_a_non_finite_amount():
+    """S:ADP-04. A bare float() accepted 'NaN'/'inf' strings, and the consumer
+    only trusts the broker figure when it is GREATER than the artifact prior,
+    so a NaN silently disabled the broker ground-truth cross-check."""
+    def orders(**k):
+        return {"data": {"orders": [{"id": "O1", "state": "queued", "symbol": "AAPL", "dollar_amount": "NaN"}]}}
+
+    broker = RobinhoodBroker(account="999000111", orders_fn=orders)
+    with pytest.raises(RuntimeError, match="non-finite"):
+        broker.same_day_ticker_notional_usd("AAPL", date(2026, 9, 8))
+
+
+@pytest.mark.parametrize(
+    ("state", "fill_fields", "expected_total"),
+    [
+        pytest.param("cancelled", {"executed_notional": "6.00"}, 8.0, id="cancelled_executed_notional"),
+        pytest.param("canceled", {"executed_notional": "6.00"}, 8.0, id="canceled_executed_notional"),
+        pytest.param("expired", {"executed_notional": "6.00"}, 8.0, id="expired_executed_notional"),
+        pytest.param("cancelled", {"cumulative_quantity": "0.06", "average_price": "100.00"}, 8.0, id="cancelled_fill_price"),
+        pytest.param("canceled", {"cumulative_quantity": "0.06", "average_price": "100.00"}, 8.0, id="canceled_fill_price"),
+        pytest.param("expired", {"cumulative_quantity": "0.06", "average_price": "100.00"}, 8.0, id="expired_fill_price"),
+        pytest.param("cancelled", {"cumulative_quantity": "0"}, 2.0, id="cancelled_zero_fill"),
+        pytest.param("expired", {"cumulative_quantity": "0"}, 2.0, id="expired_zero_fill"),
+        pytest.param(
+            "cancelled", {"cumulative_quantity": "0.06", "executed_quantity": "0.060", "average_price": "100"},
+            8.0, id="equivalent_terminal_quantities",
+        ),
+        pytest.param(
+            "expired", {"cumulative_quantity": "0.06", "filled_quantity": {"amount": "0.060"}, "average_price": "100"},
+            8.0, id="wrapped_terminal_quantity",
+        ),
+        pytest.param(
+            "cancelled", {"cumulative_quantity": "0", "executed_quantity": "0.00"},
+            2.0, id="equivalent_terminal_zero_quantities",
+        ),
+        pytest.param(
+            "cancelled", {"executed_notional": "6.00", "filled_notional": "6.0005"},
+            8.0, id="terminal_dollar_rounding_tolerance",
+        ),
+        pytest.param("partially_filled", {"executed_notional": "6.00"}, 12.0, id="working_order_keeps_full_commitment"),
+    ],
+)
+def test_same_day_ticker_notional_preserves_terminal_fills(state, fill_fields, expected_total):
+    """H2: termination releases the unfilled remainder, never dollars already spent."""
+    orders = [
+        {
+            "id": "filled-prior", "symbol": "AAPL", "side": "buy", "state": "filled",
+            "dollar_amount": "2.00", "executed_notional": "2.00",
+            "created_at": "2026-07-08T13:35:00Z",
+        },
+        {
+            "id": "partial-prior", "symbol": "AAPL", "side": "buy", "state": state,
+            "dollar_amount": "10.00", "quantity": "0.10",
+            "created_at": "2026-07-08T14:00:00Z", **fill_fields,
+        },
+    ]
+    broker = RobinhoodBroker(orders_fn=lambda **kwargs: {"orders": orders, "next": None})
+
+    # Terminal: $2 + executed $6 (or explicit $0). Working: $2 + the entire $10 commitment.
+    assert broker.same_day_ticker_notional_usd("AAPL", date(2026, 7, 8)) == pytest.approx(expected_total)
+
+
+@pytest.mark.parametrize("state", ["cancelled", "expired"])
+@pytest.mark.parametrize(
+    "fill_fields",
+    [
+        pytest.param({"cumulative_quantity": "0.06", "price": "100.00"}, id="missing_average_fill_price"),
+        pytest.param({"executed_notional": "NaN"}, id="nonfinite_execution"),
+    ],
+)
+def test_same_day_ticker_notional_blocks_unvalued_terminal_fills(state, fill_fields):
+    """Unproven execution value must not become zero or use the requested/limit price."""
+    order = {
+        "id": "unvalued-terminal", "symbol": "AAPL", "side": "buy", "state": state,
+        "dollar_amount": "10.00", "created_at": "2026-07-08T14:00:00Z", **fill_fields,
+    }
+    broker = RobinhoodBroker(orders_fn=lambda **kwargs: {"orders": [order], "next": None})
+
+    with pytest.raises(RuntimeError):
+        broker.same_day_ticker_notional_usd("AAPL", date(2026, 7, 8))
+
+
+@pytest.mark.parametrize("state", ["cancelled", "canceled", "expired"])
+@pytest.mark.parametrize("quantity_key", ["executed_quantity", "filled_quantity", "quantity_filled"])
+@pytest.mark.parametrize("quantity", ["0.07", "0", {"amount": "0.07"}, "NaN"])
+def test_same_day_ticker_notional_blocks_conflicting_terminal_quantities(state, quantity_key, quantity):
+    """H2: every supplied execution quantity must support the settled dollar total."""
+    order = {
+        "id": "terminal-quantity-fixture", "symbol": "AAPL", "side": "buy", "state": state,
+        "created_at": "2026-07-08T14:00:00Z", "dollar_amount": "10.00",
+        "cumulative_quantity": "0.06", "average_price": "100.00", quantity_key: quantity,
+    }
+    broker = RobinhoodBroker(orders_fn=lambda **kwargs: {"orders": [order], "next": None})
+
+    with pytest.raises(RuntimeError, match="unproven executed notional"):
+        broker.same_day_ticker_notional_usd("AAPL", date(2026, 7, 8))
+
+
+# --- Copilot review of PR #1394 ------------------------------------------------
+_SYNTHETIC_ACCOUNT = "123456789"  # synthetic, allow-listed account-shaped value
+
+
+def test_identity_mismatch_text_is_redacted_before_it_reaches_the_exception():
+    """The echoed mismatching value was rendered with the overflow-only
+    ``_log_safe_repr`` and embedded in ``AmbiguousPlacementResponseError``,
+    which callers persist as reconciliation evidence, so a broker-supplied
+    alias carrying an account-shaped or credential-bearing string bypassed
+    the redaction every other placement diagnostic applies."""
+    order = {
+        "id": "ORD-1",
+        "state": "queued",
+        "symbol": "AAPL",
+        "side": "buy",
+        "client_order_id": f"acct-{_SYNTHETIC_ACCOUNT}-token",
+        "dollar_amount": "1.00",
+    }
+    with pytest.raises(AmbiguousPlacementResponseError) as excinfo:
+        _live_broker(_placed(order)).place_market_buy("AAPL", 1.0, "ref1")
+    assert _SYNTHETIC_ACCOUNT not in str(excinfo.value)
+    assert "[REDACTED]" in str(excinfo.value)
+
+
+def test_connector_exception_text_is_redacted_in_the_ambiguous_placement_error():
+    """Both connector-exception branches interpolated the raw ``exc`` into
+    ``OrderPlacementAmbiguousError``; a transport error echoing a request URL
+    with an account number or token in it left the process through the
+    persisted exception text."""
+    from near_close_dca import OrderPlacementAmbiguousError
+
+    def boom(**kwargs):
+        raise RuntimeError(f"POST /orders?account_number={_SYNTHETIC_ACCOUNT} timed out")
+
+    with pytest.raises(OrderPlacementAmbiguousError) as excinfo:
+        _live_broker(boom).place_market_buy("AAPL", 1.0, "ref1")
+    assert _SYNTHETIC_ACCOUNT not in str(excinfo.value)
+    assert "timed out" in str(excinfo.value)
+    with pytest.raises(OrderPlacementAmbiguousError) as excinfo:
+        _live_broker(boom).place_whole_share_buy("BYDDY", 1, "ref2")
+    assert _SYNTHETIC_ACCOUNT not in str(excinfo.value)
+
+
+def test_a_terminal_response_for_another_symbol_is_ambiguous_not_a_clean_rejection():
+    """The identity check ran AFTER the terminal-state branches, so a stale
+    ``rejected`` response naming another symbol was raised as a definitive
+    rejection of THIS ticker: the batch isolated it and moved on, treating
+    the ticker as unbought, although the broker may well hold this ticker's
+    own order. A mismatch is decided before any terminal interpretation and
+    stays structurally ambiguous."""
+    from near_close_dca import FractionalPlacementRejectedError, MarketBuyPlacementTerminalError
+
+    stale_rejection = {"id": "ORD-9", "state": "rejected", "symbol": "MSFT", "side": "buy", "cumulative_quantity": "0"}
+    with pytest.raises(AmbiguousPlacementResponseError) as excinfo:
+        _live_broker(_placed(stale_rejection)).place_market_buy("AAPL", 1.0, "ref1")
+    assert not isinstance(excinfo.value, (FractionalPlacementRejectedError, MarketBuyPlacementTerminalError))
+    assert excinfo.value.structurally_ambiguous is True
+    assert excinfo.value.response_may_have_executed is True
+
+
+def test_a_terminal_whole_share_response_for_another_symbol_is_ambiguous_not_terminal():
+    """Whole-share twin of the test above: ``WholeSharePlacementTerminalError``
+    is special-cased by the caller as authoritative fill evidence for THIS
+    claim, so a stale terminal response naming another symbol or quantity
+    could restore or settle the wrong ticker's credit."""
+    from near_close_dca import WholeSharePlacementTerminalError
+
+    stale_rejection = {
+        "id": "ORD-9",
+        "state": "rejected",
+        "symbol": "MSFT",
+        "side": "buy",
+        "quantity": "1",
+        "cumulative_quantity": "0",
+    }
+    with pytest.raises(AmbiguousPlacementResponseError) as excinfo:
+        _live_broker(_placed(stale_rejection)).place_whole_share_buy("BYDDY", 1, "ref1")
+    assert not isinstance(excinfo.value, WholeSharePlacementTerminalError)
+    assert excinfo.value.structurally_ambiguous is True
+
+
+def test_an_order_id_already_accepted_in_this_run_is_a_stale_echo_not_a_second_order():
+    """A bare ``{id, state}`` response with every identity field omitted is
+    accepted by contract: the live prompts and
+    ``dca_runner._placement_failure_reason`` compare identity fields only when
+    present, because a fresh Robinhood placement omits several of them, and
+    requiring them would fail every real placement closed. The stale-echo
+    shape that contract leaves open is a connector replaying an EARLIER
+    placement's response, and that response names an order id this broker
+    instance already booked for another request; it cannot describe a second
+    one, so it is refused as structurally ambiguous instead of booked twice."""
+    responses = iter([{"id": "ORD-1", "state": "queued"}, {"id": "ORD-1", "state": "queued"}])
+    broker = _live_broker(lambda **kwargs: {"data": {"order": next(responses)}})
+    assert broker.place_market_buy("AAPL", 1.0, "ref1") == "ORD-1"
+    with pytest.raises(AmbiguousPlacementResponseError, match="already accepted") as excinfo:
+        broker.place_market_buy("MSFT", 1.0, "ref2")
+    assert excinfo.value.structurally_ambiguous is True
+    assert excinfo.value.response_may_have_executed is True
+    # The first, legitimate acceptance is still the only booked row.
+    assert [row["ticker"] for row in broker.get_raw_placement_responses()] == ["AAPL"]
+
+
+def test_strict_placement_identity_refuses_a_response_that_names_nothing_it_can_prove():
+    """Copilot review of PR #1394 asked for placement responses to carry
+    sufficient matching identity fields. The default contract compares
+    fields only when present, because a fresh Robinhood placement omits
+    several of them and the live response shape cannot be verified from this
+    repository; requiring them by default would fail every real placement
+    closed. ``require_placement_identity=True`` is the owner-controlled
+    switch for a deployment that HAS verified its connector echoes the
+    symbol and client reference: a bare ``{id, state}`` response is then
+    structurally ambiguous, while a response that echoes both is booked."""
+    strict = _live_broker(_placed({"id": "ORD-1", "state": "queued"}), require_placement_identity=True)
+    with pytest.raises(AmbiguousPlacementResponseError, match="symbol") as excinfo:
+        strict.place_market_buy("AAPL", 1.0, "ref1")
+    assert excinfo.value.structurally_ambiguous is True
+
+    partial = _live_broker(_placed({"id": "ORD-1", "state": "queued", "symbol": "AAPL"}), require_placement_identity=True)
+    with pytest.raises(AmbiguousPlacementResponseError, match="client reference"):
+        partial.place_market_buy("AAPL", 1.0, "ref1")
+
+    echoed = {"id": "ORD-2", "state": "queued", "instrument_symbol": "AAPL", "client_order_uuid": "ref1"}
+    assert _live_broker(_placed(echoed), require_placement_identity=True).place_market_buy("AAPL", 1.0, "ref1") == "ORD-2"
+
+    # The default stays the documented when-present contract.
+    assert _live_broker(_placed({"id": "ORD-3", "state": "queued"})).place_market_buy("AAPL", 1.0, "ref1") == "ORD-3"
+
+
+def test_instrument_symbol_alias_is_compared_like_symbol():
+    """Parity with dca_runner._placement_failure_reason, which already treats
+    ``instrument_symbol`` as a symbol spelling."""
+    order = {"id": "ORD-1", "state": "queued", "instrument_symbol": "MSFT", "side": "buy"}
+    with pytest.raises(AmbiguousPlacementResponseError, match="symbol"):
+        _live_broker(_placed(order)).place_market_buy("AAPL", 1.0, "ref1")
+
+
+def test_a_live_broker_refuses_an_unrecognizable_order_page_instead_of_reading_it_as_empty():
+    """2026-09-07 mock beta run of the executor classes. The
+    ``_iter_same_day_orders`` docstring says a LIVE broker gets the
+    provable-history rule unconditionally (C:F1), but the code applied it only
+    to an unwired ``orders_fn``: a wired callable returning a non-empty page in
+    a shape the adapter does not recognize (``{"results": [...]}``) was read
+    as "no order today" and $0 notional, and the executors' sole duplicate
+    gate re-placed every order on a retry. A live broker now raises on such a
+    page exactly as ``require_provable_history=True`` does; the dry-run broker
+    keeps its established "unwired means no order" contract."""
+    from datetime import date
+
+    unrecognized = lambda **kwargs: {"results": [{"id": "ORD-1", "symbol": "AAPL", "state": "filled"}]}  # noqa: E731
+    live = _live_broker(lambda **kwargs: {"id": "x", "state": "queued"}, orders_fn=unrecognized)
+    with pytest.raises(RuntimeError, match="unrecognizable page"):
+        list(live._iter_same_day_orders("AAPL", date(2026, 9, 4)))
+
+    dry = RobinhoodBroker(account="999000111", enable_live_orders=False, orders_fn=unrecognized)
+    assert list(dry._iter_same_day_orders("AAPL", date(2026, 9, 4))) == []
+@pytest.mark.parametrize("lookup", ["buying_power", "fill"])
+def test_failed_broker_lookup_redacts_log_message_and_exception_chain(lookup, caplog):
+    import logging
+
+    def failed(**kwargs):
+        try:
+            raise RuntimeError("Authorization: Bearer synthetic-inner-token")
+        except RuntimeError as exc:
+            raise OSError("password=synthetic-outer-secret") from exc
+
+    broker = RobinhoodBroker(buying_power_fn=failed, order_fill_fn=failed)
+    if lookup == "buying_power":
+        assert broker.available_buying_power() == 0.0
+    else:
+        assert broker.get_order_fill("token=synthetic-order-secret") is None
+    records = [record for record in caplog.records if record.name == "near_close_dca.live_adapters"]
+    assert len(records) == 1
+    formatted = logging.Formatter().format(records[0])
+    for value in ("synthetic-inner-token", "synthetic-outer-secret", "synthetic-order-secret"):
+        assert value not in formatted
+    assert "[REDACTED]" in formatted
+    assert "OSError" in formatted
+    assert records[0].exc_info is None and not records[0].exc_text
+
+
+@pytest.mark.parametrize("lookup", ["buying_power", "fill"])
+def test_broker_lookup_keeps_safe_fallback_when_exception_stringification_raises(lookup, caplog):
+    class BrokenMessageError(Exception):
+        def __str__(self):
+            raise TypeError("unusable connector error message")
+
+    def failed(**kwargs):
+        raise BrokenMessageError()
+
+    broker = RobinhoodBroker(buying_power_fn=failed, order_fill_fn=failed)
+    if lookup == "buying_power":
+        assert broker.available_buying_power() == 0.0
+    else:
+        assert broker.get_order_fill("synthetic-order") is None
+    assert "BrokenMessageError" in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)

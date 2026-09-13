@@ -8,7 +8,6 @@ untested paths.
 """
 
 import pytest
-
 from circuit_breaker import CircuitBreaker, CircuitBreakerError
 
 

@@ -1,7 +1,4 @@
-# Third-party dependencies for the ticker-market-breadth tool. These are NOT
-# required to run the core near-close graded DCA strategy -- see this
-# subproject's own README.md and the root CLAUDE.md's "Standard library only
-# at runtime" invariant.
-yfinance
+# Independent breadth archive tooling; never imported by the stdlib-only core.
 pandas
+yfinance
 pytest>=8.0.0

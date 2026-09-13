@@ -780,7 +780,7 @@ class TestResume:
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         harness.run()
         metadata_path = tmp_path / "run" / "checkpoint" / "models" / "persistence" / "metadata.json"
-        payload = json.loads(metadata_path.read_text())
+        payload = json.loads(metadata_path.read_bytes())
         payload["residual_window"] = payload["residual_window"] + 1  # tamper: still valid JSON
         metadata_path.write_text(json.dumps(payload))
         registry = {"persistence": baseline_model.PersistenceModel}
@@ -834,7 +834,7 @@ class TestResume:
         config = _config(panel, n_steps=6)
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         del harness  # only its pre-any-step checkpoint matters below
-        state = json.loads((tmp_path / "run" / "checkpoint" / "harness_state.json").read_text())
+        state = json.loads((tmp_path / "run" / "checkpoint" / "harness_state.json").read_bytes())
         assert state["last_processed_date"] == str(np.datetime_as_string(panel.calendar[150], unit="D"))
 
         start_position = int(np.searchsorted(panel.calendar, np.datetime64(config.start)))
@@ -904,7 +904,7 @@ class TestResume:
         harness = WalkForwardHarness.fresh(panel, {"persistence": model}, tmp_path / "run", config, log=_quiet)
         holder["harness"] = harness
         assert harness.run() == "interrupted"
-        state = json.loads((tmp_path / "run" / "checkpoint" / "harness_state.json").read_text())
+        state = json.loads((tmp_path / "run" / "checkpoint" / "harness_state.json").read_bytes())
         assert state["step_index"] == harness.step_index
 
 
@@ -923,7 +923,7 @@ class TestCircuitBreaker:
         assert any("step_ceiling" in line for line in lines)
         # A checkpoint exists, so the trip is a clean bounded stop.
         state_path = tmp_path / "run" / "checkpoint" / "harness_state.json"
-        assert json.loads(state_path.read_text())["step_index"] == 4
+        assert json.loads(state_path.read_bytes())["step_index"] == 4
 
     def test_wallclock_ceiling_trips_before_the_first_model_fits(self, panel, tmp_path):
         # --max-hours 0 used to be checked from the SECOND model onward
@@ -1617,6 +1617,59 @@ class TestLiveHelpers:
         ]
         assert ccc_entries  # CCC's first-ever forecast was issued
 
+    def test_rebind_predicts_a_ticker_whose_terminal_row_predates_the_market(self, synthetic_history_dir, tmp_path):
+        # The sibling test above admits a ticker whose OWN terminal row sits
+        # on the market-wide final date, so eligible_on(terminal_date) finds
+        # it. This one covers the case that a "prefer this branch" merge
+        # silently reverted and no test caught: a ticker whose restored /
+        # newly warmed-up CSV is one or more sessions BEHIND the rest of the
+        # archive. eligible_on() keys strictly on the market-wide final
+        # date, so such a ticker never appears there even though its own
+        # terminal row is eligible and finite -- and with the cursor already
+        # exhausted no later replay step revisits it, dropping that first
+        # forecast forever (Codex review: "Forecast newly eligible tickers
+        # from their own terminal row").
+        probe = features.build_panel(synthetic_history_dir, min_history=60)
+        as_of = pd.Timestamp(probe.calendar[220])
+        initial_train_end = pd.Timestamp(probe.calendar[150])
+        truncated = features.build_panel(
+            synthetic_history_dir, tickers=["AAA", "BBB"], min_history=60,
+            as_of=as_of, initial_train_end=initial_train_end,
+        )
+        config = _config(truncated, n_steps=None)
+        harness = WalkForwardHarness.fresh(
+            panel=truncated, models=_models(config), run_dir=tmp_path / "run", config=config, log=_quiet
+        )
+        harness.run()
+        assert harness.cursor >= len(harness.panel.calendar)
+
+        # Shorten CCC's archive by three sessions so its own final row lands
+        # strictly before the market-wide one AAA/BBB still define. Done on
+        # the CSV (not by splicing the built panel) so the rebuilt panel's
+        # calendar/date_index stay internally consistent, exactly as a
+        # one-session-behind restored file would be in production.
+        # Cut by DATE, not by row count: the as_of cutoff below already trims
+        # every ticker's tail, so dropping a few trailing CSV rows would be
+        # absorbed by it and leave CCC ending on the market date after all.
+        lagging_last_date = pd.Timestamp(probe.calendar[217])
+        ccc_csv = synthetic_history_dir / "CCC.csv"
+        ccc_frame = pd.read_csv(ccc_csv)
+        ccc_frame = ccc_frame[pd.to_datetime(ccc_frame["Date"]) <= lagging_last_date]
+        ccc_frame.to_csv(ccc_csv, index=False)
+        admitted = features.build_panel(
+            synthetic_history_dir, tickers=["AAA", "BBB", "CCC"], min_history=60,
+            as_of=as_of, initial_train_end=initial_train_end,
+        )
+        assert admitted.series["CCC"].dates[-1] < admitted.calendar[-1]  # genuinely lagging
+        harness.set_panel(admitted)
+        assert harness.cursor >= len(harness.panel.calendar)
+
+        harness.rebind_unresolved()
+        ccc_entries = [
+            entry for entry in harness.outstanding.get(harness_module.UNRESOLVED_KEY, []) if entry["ticker"] == "CCC"
+        ]
+        assert ccc_entries  # forecast from CCC's OWN terminal row, not the market's
+
     def test_rebind_reforecasts_a_ticker_whose_dropped_entry_is_still_eligible(self, panel, tmp_path, monkeypatch):
         # The terminal-row check's `already_forecast` set used to be built
         # from the ORIGINAL list popped from UNRESOLVED_KEY, not the
@@ -2217,11 +2270,11 @@ class TestLiveHelpers:
         config = _config(panel, n_steps=6, max_hours_per_run=1.0)
         harness = WalkForwardHarness.fresh(panel, _models(config), tmp_path / "run", config, log=_quiet)
         harness.run()
-        before = (tmp_path / "run" / "checkpoint" / "harness_state.json").read_text()
+        before = (tmp_path / "run" / "checkpoint" / "harness_state.json").read_text(encoding="utf-8")
         harness.invocation_started_monotonic = -3601.0  # already 1+ hour elapsed
         with pytest.raises(HarnessError, match="budget exhausted during recovery retrain"):
             harness.retrain(panel)
-        assert (tmp_path / "run" / "checkpoint" / "harness_state.json").read_text() == before
+        assert (tmp_path / "run" / "checkpoint" / "harness_state.json").read_text(encoding="utf-8") == before
 
 
 class TestReplayEndBoundary:

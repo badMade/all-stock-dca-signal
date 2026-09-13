@@ -6,7 +6,6 @@ import gzip
 import os
 
 import pytest
-
 from ledger import Ledger, LedgerError
 
 
@@ -76,6 +75,50 @@ class TestAppendAndRead:
         assert synced_fds  # os.fsync() was actually called on the written shard
         ledger.append([_record(model="gbm_quantile")])
         assert len(synced_fds) == 2  # one fsync per shard-group write
+
+    def test_available_years_lists_the_shard_years_for_one_model_and_kind(self, tmp_path):
+        # Lets a streaming reader pull one year at a time instead of
+        # holding a whole multi-decade run in memory (stacking.replay).
+        ledger = Ledger.create(tmp_path)
+        ledger.append(
+            [
+                _record(kind="score", model="gbm_quantile", origin="2019-12-31"),
+                _record(kind="score", model="gbm_quantile", origin="2020-07-01"),
+                _record(kind="score", model="gbm_quantile", origin="2020-07-02"),
+                _record(kind="forecast", model="gbm_quantile", origin="2022-01-03"),
+                _record(kind="score", model="persistence", origin="2021-05-04"),
+            ]
+        )
+        assert ledger.available_years(model="gbm_quantile", kind="score") == ["2019", "2020"]
+        assert ledger.available_years(model="gbm_quantile", kind="forecast") == ["2022"]
+        assert ledger.available_years(model="persistence", kind="score") == ["2021"]
+        # A model this run never wrote is empty, not an error: the caller
+        # decides whether that is fatal.
+        assert ledger.available_years(model="octopus", kind="score") == []
+
+    def test_available_years_ignores_names_the_ledger_would_refuse(self, tmp_path):
+        # _shard_parts() accepts exactly four digits, so a stray file whose
+        # "year" is not a four-digit number is not a shard this module would
+        # write or resume, and must not be reported as a readable year.
+        ledger = Ledger.create(tmp_path)
+        ledger.append([_record(kind="score", model="good", origin="2020-06-01")])
+        (ledger.root / "good" / "score_12345.jsonl.gz").write_bytes(b"")
+        (ledger.root / "good" / "score_notayear.jsonl.gz").write_bytes(b"")
+        assert ledger.available_years(model="good", kind="score") == ["2020"]
+
+    def test_available_years_honours_the_checkpoint_bounded_view(self, tmp_path):
+        # iter_records() skips a shard created entirely after the last
+        # checkpoint (not durable). Discovery reporting that year anyway let
+        # a caller's "no records for this model" guard pass on a shard that
+        # then yields nothing -- silence where a refusal was owed (Copilot
+        # review regression).
+        ledger = Ledger.create(tmp_path)
+        ledger.append([_record(kind="score", model="good", origin="2020-06-01")])
+        bounded = Ledger(tmp_path, read_fingerprints={})
+        assert bounded.available_years(model="good", kind="score") == []
+        assert list(bounded.iter_records(model="good", kind="score")) == []
+        # Unbounded readers still see it.
+        assert Ledger(tmp_path).available_years(model="good", kind="score") == ["2020"]
 
     def test_unknown_record_type_is_refused(self, tmp_path):
         ledger = Ledger.create(tmp_path)
@@ -224,8 +267,8 @@ class TestVerifyShardsIsReadOnly:
 
         original_relative_to = pathlib.Path.relative_to
 
-        def _fake_relative_to(self, other, **kwargs):
-            real = original_relative_to(self, other, **kwargs)
+        def _fake_relative_to(self, *args, **kwargs):
+            real = original_relative_to(self, *args, **kwargs)
             if str(real).endswith(".jsonl.gz"):
                 return _FakeWindowsRelPath(real.as_posix())
             return real

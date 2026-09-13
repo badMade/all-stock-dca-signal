@@ -15,7 +15,6 @@ import sys
 import threading
 from datetime import timedelta, timezone
 from pathlib import Path
-from typing import cast
 
 import numpy as np
 import pandas as pd
@@ -163,8 +162,10 @@ def _normalize_session_index(frame: pd.DataFrame) -> pd.DataFrame:
     matches every other dedup in this module: a later-written row wins.
     """
     frame = frame.copy()
-    frame.index = pd.DatetimeIndex(frame.index).normalize()
-    return cast(pd.DataFrame, frame[np.logical_not(frame.index.duplicated(keep="last"))])
+    idx = frame.index
+    if isinstance(idx, pd.DatetimeIndex):
+        frame.index = idx.normalize()
+    return frame[~frame.index.duplicated(keep="last")]
 
 # In both cases, a live yfinance fetch is preferred over ranking on
 # stale/incomplete data -- EVERY health/backtest metric, not just beta/alpha,
@@ -300,7 +301,9 @@ def _load_from_archive(ticker: str, history_dir: Path, *, now: pd.Timestamp | No
         # closing dates -- the archive keeping a possibly-partial today's
         # bar while the live path always excludes it (Antigravity review
         # on PR #403: "Exclude today's bar from archived histories").
-        indexed = indexed[indexed.index.normalize() < resolved_now.normalize()]
+        idx = indexed.index
+        assert isinstance(idx, pd.DatetimeIndex)
+        indexed = indexed[idx.normalize() < resolved_now.normalize()]
         if indexed.empty:
             return None
         # A duplicate Date row (a source anomaly, or a prior interrupted/
@@ -398,8 +401,8 @@ def _tz_naive(frame: pd.DataFrame) -> pd.DataFrame:
     both paths to tz-naive here, once, is simpler and more robust than
     guarding every join site downstream.
     """
-    idx = pd.DatetimeIndex(frame.index)
-    if idx.tz is not None:
+    idx = frame.index
+    if isinstance(idx, pd.DatetimeIndex) and idx.tz is not None:
         frame = frame.copy()
         frame.index = idx.tz_localize(None)
     return frame
@@ -455,7 +458,7 @@ def _validate_live_frame(frame: pd.DataFrame) -> pd.DataFrame | None:
     # (Antigravity review on PR #403: "Deduplicate live price dates
     # before scoring").
     frame = frame.sort_index(kind="stable")
-    frame = cast(pd.DataFrame, frame[np.logical_not(frame.index.duplicated(keep="last"))])
+    frame = frame[~frame.index.duplicated(keep="last")]
     try:
         # notna()-only validation still accepts a string/object-dtype
         # column ("Close" holding "N/A", say) -- a nonempty, correctly-
@@ -530,7 +533,7 @@ def _ensure_usable_price_columns(
         # Column Handling in _ensure_usable_price_columns"). Keep the
         # FIRST occurrence, matching pandas' own de-duplication
         # convention.
-        frame = cast(pd.DataFrame, frame.loc[:, np.logical_not(frame.columns.duplicated())])
+        frame = frame.loc[:, ~frame.columns.duplicated()]
     # +/-inf in a price column (a corrupt source row, or a division-by-
     # zero artifact upstream) isn't a valid price -- notna() alone treats
     # it as "present," so a frame with a stray inf could pass the coverage
@@ -667,7 +670,7 @@ def _column_is_fresh(series: pd.Series, *, now: pd.Timestamp | None = None) -> b
         # isolation) that doesn't carry that guarantee.
         return True
     last_valid = series.last_valid_index()
-    if last_valid is None:
+    if last_valid is None or not isinstance(last_valid, pd.Timestamp):
         return False
     # _resolve_now(), not a fresh _now_utc_naive() call, so this shares
     # the caller's single run-level cutoff (Antigravity review on PR
@@ -677,7 +680,7 @@ def _column_is_fresh(series: pd.Series, *, now: pd.Timestamp | None = None) -> b
 
 def _windowed(frame: pd.DataFrame, last_row: pd.Timestamp, lookback_years: int) -> pd.DataFrame:
     cutoff = last_row - pd.DateOffset(years=lookback_years)
-    return cast(pd.DataFrame, frame[frame.index >= cutoff])
+    return frame[frame.index >= cutoff]
 
 
 def _archive_deficiency(
@@ -855,9 +858,9 @@ def fetch_price_history(
     # as provisional and score from the last confirmed-final close
     # instead (Antigravity review on PR #403: "Exclude an unfinished
     # live daily bar").
-    downloaded = cast(
-        pd.DataFrame, downloaded[pd.DatetimeIndex(downloaded.index).normalize() < resolved_now.normalize()]
-    )
+    d_idx = downloaded.index
+    assert isinstance(d_idx, pd.DatetimeIndex)
+    downloaded = downloaded[d_idx.normalize() < resolved_now.normalize()]
     if downloaded.empty:
         return _use_fallback_or_raise("live data had no confirmed-final session before today")
     # A delisted/inactive symbol can still return structurally valid,

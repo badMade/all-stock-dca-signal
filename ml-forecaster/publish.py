@@ -535,7 +535,7 @@ def blocking_reasons(
                             )
 
     if baseline_mae is None:
-        reasons.append(baseline_mae_error or "naive baseline MAE is unavailable")
+        reasons.append(baseline_mae_error or "unable to determine baseline MAE")
     elif new_mae >= baseline_mae:
         reasons.append(
             f"new model out-of-sample MAE {new_mae:.6f} is not strictly better than the naive "

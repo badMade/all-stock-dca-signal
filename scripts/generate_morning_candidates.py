@@ -175,7 +175,6 @@ def preflight_admitted_tickers(trading_day, tickers, config):
         preflight_run_state_root=config.preflight_run_state_root,
         preflight_forbidden_roots=config.preflight_forbidden_roots,
         preflight_bounded_recovery=config.preflight_bounded_recovery,
-        manual=False,
     )
     return admitted
 

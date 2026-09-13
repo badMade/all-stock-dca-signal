@@ -64,13 +64,14 @@ spread, whitelist, or circuit-breaker requirements.
 
 ## Active ticker universe
 
-57 active symbols (see [`config/tickers.json`](../config/tickers.json)):
+65 active symbols (see [`config/tickers.json`](../config/tickers.json)):
 
 ```
 DFTX TRIN AAAU SPCX EVR LUNR IRDM DXYZ LITE ASML DRAM STX
 MSFT AAPL AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR
 INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN RKLB
-GE VRT CAT QQQ QCOM ABBV JPM VT QBUT RVI VCX TRLV
+GE VRT CAT QQQ QCOM ABBV JPM VT QBUT RVI VCX TRLV LLY TSLA
+VIAV CIEN ANET CSCO FFIV COHR
 ```
 
 - **Excluded:** none today.
@@ -206,14 +207,15 @@ effect worth tracking: budget-tier selection counts **3x-or-greater** signals,
 and 3x now needs a 6% drop rather than 4%, so escalation to
 Elevated/High-volatility/Stress is less frequent for the same market conditions.
 
-> **This table is the fallback, not the live curve.** As of 2026-08-16
+> **This table is the fallback, not the live curve.** As of 2026-09-11
 > [`config/per_ticker_sizing.json`](../config/per_ticker_sizing.json) is
-> `status: active` and carries an entry for all 57 active symbols (plus the two
+> `status: active` and carries an entry for all 65 active symbols (plus the two
 > whole-share symbols, which the ladder evaluates identically). 47 are
 > **per-ticker, volatility-calibrated** (percentile-derived,
-> 1x/1.5x/2.5x/4x/5x, $1.00 base); the 11 in `fallback_tickers` (SPCX, DRAM,
-> CBRS, SATA, GFUZ, VT, QBUT, RVII, RVI, VCX, TRLV) lack the 252 sessions of history the calibration
-> requires and carry a copy of the global fallback ladder instead.
+> 1x/1.5x/2.5x/4x/5x, $1.00 base); the 20 in `fallback_tickers` (SPCX, DRAM,
+> CBRS, SATA, GFUZ, VT, QBUT, RVII, RVI, VCX, TRLV, BYDDY, LLY, TSLA, VIAV,
+> CIEN, ANET, CSCO, FFIV, COHR) lack the 252 sessions of history the
+> calibration requires and carry a copy of the global fallback ladder instead.
 > `graded_buy_multiplier` reads a ticker's calibrated tiers first and falls back
 > to the shared table above only for symbols with no entry — currently none. The
 > table above therefore governs the fallback path and the test suite, while

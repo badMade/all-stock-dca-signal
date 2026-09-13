@@ -68,7 +68,7 @@ def _open_ledger(run_dir: Path) -> Ledger:
         # already refuses this exact case (Codex review: "Refuse inspection
         # when no checkpoint bounds the ledger").
         raise Refused(f"no checkpoint under {run_dir}; ledger bytes without a checkpoint are not proven durable")
-    read_fingerprints = json.loads(state_path.read_text(encoding="utf-8"))["ledger"]
+    read_fingerprints = json.loads(state_path.read_bytes())["ledger"]
     return Ledger(run_dir, read_fingerprints=read_fingerprints)
 
 
@@ -97,13 +97,13 @@ def _load_state(run_dir: Path) -> dict:
     for name in ("checkpoint", "checkpoint.prev"):
         path = run_dir / name / "harness_state.json"
         if path.exists():
-            return json.loads(path.read_text())
+            return json.loads(path.read_bytes())
     raise Refused(f"no checkpoint under {run_dir}")
 
 
 def _load_run_meta(run_dir: Path) -> dict | None:
     meta_path = run_dir / "run_meta.json"
-    return json.loads(meta_path.read_text()) if meta_path.exists() else None
+    return json.loads(meta_path.read_bytes()) if meta_path.exists() else None
 
 
 def _current_universe(run_meta: dict | None) -> set[str] | None:
@@ -494,7 +494,7 @@ def _load_report(run_dir: Path) -> dict:
     # (streamed from the ledger) and idempotent.
     write_report(run_dir)
     path = run_dir / "report" / "report.json"
-    return json.loads(path.read_text())
+    return json.loads(path.read_bytes())
 
 
 def _view_summary(args: argparse.Namespace) -> int:
@@ -504,7 +504,7 @@ def _view_summary(args: argparse.Namespace) -> int:
     run_meta = None
     meta_path = args.run_dir / "run_meta.json"
     if meta_path.exists():
-        run_meta = json.loads(meta_path.read_text())
+        run_meta = json.loads(meta_path.read_bytes())
     text = render_analysis(
         report,
         run_meta=run_meta,
@@ -666,7 +666,7 @@ def _svg_ribbon(ticker: str, rows: list[dict], *, width: int = 720, height: int 
         f'<svg viewBox="0 0 {width} {height}" role="img" style="max-width:100%">'
         f'<text x="{pad}" y="10" font-size="12" fill="#333">{html_module.escape(ticker)} '
         "— predicted band vs actual close "
-        f"({rows[0]['target_date']} → {rows[-1]['target_date']})</text>"
+        f"({html_module.escape(rows[0]['target_date'])} → {html_module.escape(rows[-1]['target_date'])})</text>"
         f"{band_polygons}{mid_polylines}{dots}</svg>"
     )
 
@@ -685,7 +685,7 @@ def _view_html(args: argparse.Namespace) -> int:
     model = _pick_model(ledger.models(), args.model)
     state = _load_state(args.run_dir)
     meta_path = args.run_dir / "run_meta.json"
-    run_meta = json.loads(meta_path.read_text()) if meta_path.exists() else None
+    run_meta = json.loads(meta_path.read_bytes()) if meta_path.exists() else None
     analysis_text = render_analysis(
         report,
         run_meta=run_meta,
@@ -733,7 +733,11 @@ def _view_html(args: argparse.Namespace) -> int:
         # (Codex review: "Preserve per-ticker origin dates in the HTML
         # forecast table").
         latest_origin = max(row["origin_date"] for row in tomorrow)
-        sections.append(f"<h2>Tomorrow ({model}, as of {latest_origin}, adjusted $)</h2>")
+        # Checkpoints and ledger labels are artifact data, including dates
+        # and model names. Render them as text just like ticker labels.
+        sections.append(
+            f"<h2>Tomorrow ({html_module.escape(model)}, as of {html_module.escape(latest_origin)}, adjusted $)</h2>"
+        )
         header = (
             "<tr><th>ticker</th><th>open</th><th>high</th><th>low</th><th>close</th>"
             "<th>close p10</th><th>close p90</th></tr>"
@@ -741,7 +745,7 @@ def _view_html(args: argparse.Namespace) -> int:
         body = "".join(
             f"<tr><td>{html_module.escape(row['ticker'])}"
             + (
-                f" <small>(from {row['origin_date']})</small>"
+                f" <small>(from {html_module.escape(row['origin_date'])})</small>"
                 if row["origin_date"] != latest_origin
                 else ""
             )

@@ -178,3 +178,146 @@ def test_run_cmd_returns_none_when_executable_missing():
 def test_run_cmd_rejects_string_commands():
     with pytest.raises(TypeError, match="argument sequence"):
         compute_schedule.run_cmd("git log --since=30 days ago --format=%aI")
+
+
+def test_run_cmd_nonzero_exit(monkeypatch):
+    import subprocess
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args=args[0], returncode=1, stdout="", stderr="err")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert compute_schedule.run_cmd(["git", "status"]) is None
+
+
+def test_compute_cadence_git_log_fails(monkeypatch):
+    monkeypatch.setattr(compute_schedule, "run_cmd", lambda cmd: None)
+    with pytest.raises(RuntimeError, match="refusing to compute a cadence"):
+        compute_schedule.compute_cadence()
+
+
+def test_compute_cadence_dormant_when_empty(monkeypatch):
+    monkeypatch.setattr(compute_schedule, "run_cmd", lambda cmd: "")
+    schedule, rationale = compute_schedule.compute_cadence()
+    assert schedule == "0 2 * * 0"
+    assert "dormant" in rationale
+
+
+def test_compute_cadence_high_velocity(monkeypatch):
+    monkeypatch.setattr(compute_schedule, "run_cmd", lambda cmd: "\n".join(["2026-09-01T12:00:00Z"] * 55))
+    schedule, rationale = compute_schedule.compute_cadence()
+    assert schedule == "0 3 * * *"
+    assert ">50 commits/mo" in rationale
+
+
+def test_compute_cadence_active_velocity(monkeypatch):
+    monkeypatch.setattr(compute_schedule, "run_cmd", lambda cmd: "\n".join(["2026-09-01T12:00:00Z"] * 25))
+    schedule, rationale = compute_schedule.compute_cadence()
+    assert schedule == "0 3 * * 1,4"
+    assert "Active velocity" in rationale
+
+
+def test_compute_cadence_standard_velocity(monkeypatch):
+    monkeypatch.setattr(compute_schedule, "run_cmd", lambda cmd: "\n".join(["2026-09-01T12:00:00Z"] * 5))
+    schedule, rationale = compute_schedule.compute_cadence()
+    assert schedule == "0 3 * * 1"
+    assert "Standard velocity" in rationale
+
+
+def test_compute_and_sync_override_true_no_schedule_value(tmp_path):
+    schedule_file = tmp_path / "self-heal-schedule.yml"
+    schedule_file.write_text("override: true\nrationale: 'Missing schedule.'\n")
+    workflow_file = tmp_path / "self-heal.yml"
+
+    res = compute_schedule.compute_and_sync(
+        schedule_file=str(schedule_file),
+        workflow_file=str(workflow_file),
+    )
+    assert res == 0
+
+
+def test_compute_and_sync_override_true_workflow_cron_already_matches(tmp_path):
+    schedule_file = tmp_path / "self-heal-schedule.yml"
+    schedule_file.write_text("schedule: '0 3 * * 1'\noverride: true\nrationale: 'Manual.'\n")
+    workflow_file = tmp_path / "self-heal.yml"
+    workflow_file.write_text("  - cron: '0 3 * * 1' # AUTO-UPDATED\n")
+
+    res = compute_schedule.compute_and_sync(
+        schedule_file=str(schedule_file),
+        workflow_file=str(workflow_file),
+    )
+    assert res == 0
+
+
+def test_compute_and_sync_same_schedule_updates_out_of_sync_workflow(tmp_path):
+    schedule_file = tmp_path / "self-heal-schedule.yml"
+    schedule_file.write_text("schedule: '0 3 * * 1'\nrationale: 'Same.'\n")
+    workflow_file = tmp_path / "self-heal.yml"
+    workflow_file.write_text("  - cron: '0 1 * * 1' # AUTO-UPDATED\n")
+
+    res = compute_schedule.compute_and_sync(
+        schedule_file=str(schedule_file),
+        workflow_file=str(workflow_file),
+        cadence_fn=lambda: ("0 3 * * 1", "Same."),
+    )
+    assert res == 0
+    assert "cron: '0 3 * * 1' # AUTO-UPDATED" in workflow_file.read_text()
+
+
+def test_compute_and_sync_main(monkeypatch):
+    called = []
+
+    def fake_compute_and_sync(**kwargs):
+        called.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(compute_schedule, "compute_and_sync", fake_compute_and_sync)
+    with pytest.raises(SystemExit) as exc:
+        compute_schedule.main()
+    assert exc.value.code == 0
+    assert len(called) == 1
+
+
+def test_sync_workflow_cron_with_mocked_ruamel_yaml(monkeypatch, tmp_path):
+    class CommentValue:
+        def __init__(self, val):
+            self.value = val
+
+    class ItemCA:
+        def __init__(self):
+            self.items = {"cron": [None, None, CommentValue("# AUTO-UPDATED")]}
+
+    class ScheduleItem(dict):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.ca = ItemCA()
+
+    class FakeYAML:
+        def __init__(self):
+            self.preserve_quotes = False
+
+        def load(self, f):
+            return {
+                "on": {
+                    "schedule": [
+                        {"non_cron": True},
+                        ScheduleItem({"cron": "0 2 * * *"}),
+                    ]
+                }
+            }
+
+        def dump(self, data, f):
+            f.write("dumped: true")
+
+    import types
+    fake_mod = types.ModuleType("ruamel.yaml")
+    fake_mod.YAML = FakeYAML  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ruamel", fake_mod)
+    monkeypatch.setitem(sys.modules, "ruamel.yaml", fake_mod)
+
+    workflow_file = tmp_path / "self-heal.yml"
+    workflow_file.write_text("initial")
+
+    changed = compute_schedule.sync_workflow_cron(str(workflow_file), "0 4 * * *")
+    assert changed is True
+    assert workflow_file.read_text() == "dumped: true"

@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import math
 
+import model_interface
 import numpy as np
 import pytest
-
-import model_interface
 from data import COMPONENTS
 
 
@@ -240,6 +239,7 @@ def test_last_real_row_respects_padding():
         features_window=window,
         window_mask=mask,
         day_of_week=np.zeros(4, dtype=np.int8),
+        cluster_id=np.zeros(4, dtype=np.int8),
         window_dates=np.full(4, np.datetime64("NaT"), dtype="datetime64[ns]"),
         ref_close=100.0,
         adj_ratio=1.0,
@@ -268,3 +268,58 @@ def test_make_request_pads_with_nat_dates_using_the_series_own_unit(synthetic_hi
     assert np.isnat(request.window_dates[:pad]).all()
     assert not np.isnat(request.window_dates[pad:]).any()
     np.testing.assert_array_equal(request.window_dates[pad:], series.dates[: row_index + 1])
+
+
+# ---------------------------------------------------------------------------
+# cluster_id must travel with the window, not just sit on the panel.
+#
+# Storing the style-cluster label on TickerSeries proves nothing on its own:
+# requests and revealed rows carry day_of_week today and nothing else
+# categorical, so an implementation could compute clusters perfectly and
+# still never show them to a model (Copilot review: "This verifies only that
+# cluster_id is stored on TickerSeries, not that either model consumes it").
+# These tests make the transport a contract.
+# ---------------------------------------------------------------------------
+
+
+def _cluster_panel(synthetic_history_dir):
+    import features
+
+    return features.build_panel(synthetic_history_dir, min_history=60, n_clusters=2, cluster_window=120)
+
+
+def test_make_request_carries_the_cluster_window_alongside_day_of_week(synthetic_history_dir):
+    panel = _cluster_panel(synthetic_history_dir)
+    series = panel.series["AAA"]
+    window_len = 16
+    row_index = 200
+    request = model_interface.make_request(series, row_index, window_len)
+    assert request.cluster_id.shape == request.day_of_week.shape
+    assert request.cluster_id.dtype == np.int8
+    np.testing.assert_array_equal(
+        request.cluster_id, series.cluster_id[row_index + 1 - window_len : row_index + 1]
+    )
+
+
+def test_make_revealed_carries_the_same_cluster_window(synthetic_history_dir):
+    panel = _cluster_panel(synthetic_history_dir)
+    series = panel.series["AAA"]
+    window_len = 16
+    row_index = 200
+    revealed = model_interface.make_revealed(series, row_index, window_len)
+    np.testing.assert_array_equal(
+        revealed.cluster_id, series.cluster_id[row_index + 1 - window_len : row_index + 1]
+    )
+
+
+def test_cluster_window_is_front_padded_with_the_unassigned_label(synthetic_history_dir):
+    # Same padding rule day_of_week already follows, and 0 is already the
+    # "not assigned yet" label, so a padded row and a pre-refit row read
+    # alike to the model rather than pointing at a real cluster.
+    panel = _cluster_panel(synthetic_history_dir)
+    series = panel.series["AAA"]
+    row_index, window_len = 2, 16
+    request = model_interface.make_request(series, row_index, window_len)
+    pad = window_len - (row_index + 1)
+    assert (request.cluster_id[:pad] == 0).all()
+    np.testing.assert_array_equal(request.cluster_id[pad:], series.cluster_id[: row_index + 1])

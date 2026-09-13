@@ -137,7 +137,24 @@ source this slot runs on:
 }
 ```
 
-Mapping from the Robinhood MCP responses:
+**Robinhood-primary, confirmed 2026-09-09** (see `docs/safeguards.md`'s
+market-data-source-policy `slot_overrides.0935ET` entry): fetch every ticker's
+payload from Robinhood into `sources.robinhood`. This is the same exception
+1030ET already carries, extended to this slot for the same reason -- live
+executor sessions here have no reliable Finance MCP connector access, and the
+repo's own fail-closed Gate 5 correctly refuses to fabricate `sources.finance`
+from Robinhood data rather than substitute silently. GFUZ is no longer a
+special case: every ticker on this slot, GFUZ included, is scored from
+Robinhood the same way. `sources.yahoo_finance_yfinance` is an accepted key
+but **not a usable fallback** -- as with 1030ET, the "missing primary can be
+met by yfinance instead" allowance in `scripts/stream_candidates.py`'s
+`run_cli()` is gated on `spec.source is SourceName.FINANCE`, which is no
+longer true here, so a `robinhood` entry in `source_errors` still aborts even
+when yfinance data is present. `sources.finance` and `sources.alpaca` are not
+accepted keys at all for this slot -- either raises `"unsupported key(s)"`,
+not a validation/context acceptance.
+
+Mapping for the payload:
 
 | Field here | Robinhood source |
 |---|---|
@@ -160,10 +177,10 @@ for one is valid for the other:
 - A `quote` is honored only when its `as_of` is present, not in the future, and
   within one 5-minute interval of the decision moment; otherwise the completed
   09:30 bar's close is the decision price, exactly as live.
-- `sources.robinhood` is required and is the **only** permitted source key. A
-  `finance` payload is rejected rather than ignored: the executor evaluates one
-  provider, so supplying a second one would look like a dual-source cross-check
-  that never happened.
+- `sources.robinhood` is required and is the policy-selected PRIMARY signal source
+  for this slot (see the market-data source note above). `sources.yahoo_finance_yfinance`
+  is accepted as a key but never substitutes for a missing/errored `robinhood`
+  entry on this slot; `sources.finance` and `sources.alpaca` are rejected outright.
 - Listing `"robinhood"` in `source_errors` **aborts**. This slot has one source, so
   a failed fetch leaves nothing to score, and a zero-candidate document would be
   indistinguishable from a genuinely quiet tape that Gate 5 ends silently on.
@@ -266,9 +283,12 @@ before you apply it:
   the fields each row already carries. A row on the full ($2.00-scale) base
   qualified below *both* the prior close and the prior low, so it is dropped
   unless the fresh price is still below both; a row on the reduced base, or with
-  `unknown_prior_low`, qualified on the prior close alone and is dropped only if
-  the fresh price is no longer below it. Never resized — dropping is the
-  conservative direction and needs no sizing math in the prompt.
+  `unknown_prior_low`, qualified on the prior close alone and is dropped if the
+  fresh price is no longer below it. Every row is also dropped when the refreshed
+  price is above its saved Gate 5 decision price. That conservative comparison
+  rejects a recovery into a shallower ladder tier even when the quote remains
+  below the same close/low references. Never resized — dropping needs no sizing
+  math in the prompt.
 
   An earlier revision told the executor to *re-run this command* on the refreshed
   quotes instead. **That does not work, and must not be restored:** the entry
@@ -278,49 +298,64 @@ before you apply it:
   same completed 09:30 bar and returns byte-identical sizing while appearing to
   have refreshed. The drop-only rule closes the gap that re-run was meant to
   close (a recovered ticker can no longer carry its $2.00-base size into
-  placement) without pretending a refresh happened.
+  placement) without pretending a refresh happened. The saved-decision-price
+  check additionally closes the stale-tier case without reimplementing the
+  ladder: only a flat or deeper refreshed quote can retain the saved amount.
 
-  Because the step only drops, it can never exceed what Gate 6 authorized, so no
-  second budget pass is needed.
+  Because the step only drops, it cannot exceed the immediately preceding Gate 6
+  approval. That approval is still only a snapshot: Gate 7 repeats the shared
+  budget and buying-power guard before every order so intervening activity cannot
+  overrun the daily/weekly caps or available funds.
 
-  **Two known limitations remain open for a human decision**, both recorded in
-  the prompt itself so nobody reads the step as safer than it is:
-
-  1. The rule catches a candidate that recovers past its close/low *references*,
-     not one that recovers *within* them. A ticker that qualified on a 5% drop
-     and has since recovered to 2% is still below both, so it survives carrying
-     its 5x-sized amount into placement. This is not a regression from wiring
-     Gate 5 up — the refresh step has always kept Gate 5's amount and dropped
-     only on lost qualification — but it is now reachable on every fire that
-     places. Closing it needs the ladder re-evaluated at the refresh moment,
-     i.e. a real post-anchor evaluation mode in the entry point, since a second
-     decision anchor changes which bars are complete and therefore which
-     multiplier applies. That is a live-sizing change, not prompt wording. The
-     conservative interim alternative is one line: drop every row whose
-     refreshed price is not at least as deep as the drop that sized it.
-  (A second limitation recorded here previously — that the candidates file
-  carried no `prior_logged_reference_price`, leaving `same_day_top_up_gate.py`
-  on the broker's average *fill* price when a hand-placed market-open recovery
-  buy happened earlier the same day — is **closed**. It was recorded as needing
-  plumbing rather than wording, and that was wrong: the 1230ET prompt already
-  closed the same gap in wording alone, and the mechanism it uses is generic.
-  Gate 6.5 in all six executor-class prompts now performs a mandatory scan of
-  its own slot's prior-allocation roots — for this slot the three
-  `market_open_dca.default_market_open_prior_allocation_roots()` returns — and
-  passes the validated `prior_logged_reference_price` together with the
-  `prior_logged_reference_order_id` the gate requires to bind it. The gate
-  honours the override only when that ID matches the broker's own latest
-  qualifying order for the ticker, so an unpaired price is ignored rather than
-  applied, and the broker-fill fallback survives only for a completed scan that
-  found no validated match, or found one carrying no logged price.)
+  Before taking the freshness-sensitive broker and quote snapshots, the prompt
+  resolves every configured market-open prior-allocation root and runs
+  `python3 -m scripts.prior_reference_bindings --trading-day <day> --root <root> ...`.
+  That tested, read-only helper uses the canonical allocation loader and returns
+  the logged price together with the broker order ID that owns it; legacy
+  evidence without a one-to-one binding remains explicitly unresolved. A logged
+  target/decision reference is accepted only for a confirmed fill whose persisted order ID
+  exactly matches the latest same-day broker order for that ticker. The row then
+  carries `prior_logged_reference_price` and
+  `prior_logged_reference_order_id` through the top-up gate. An incomplete scan,
+  missing/invalid reference, or unbound order ID routes the ticker to manual
+  review instead of allowing the gate's average-fill fallback; this preserves the
+  configured target/decision-price-first policy under positive slippage. The
+  enriched rows are written to the candidate file only after that scan, so the
+  top-up CLI cannot read the pre-enrichment rows. A readable empty artifact scan
+  is accepted for a ticker only when the fully paginated broker history also has
+  no qualifying prior same-day fill. A broker or manual-UI fill with no matching
+  allocation artifact is therefore sent to manual review rather than using its
+  average fill price as a fallback reference.
+  It then fetches broker history and refreshes candidate quotes immediately
+  before the gate. The gate reports `logged_reference_bound`,
+  `reference_source`, and `reference_order_id`; placement requires those fields
+  to prove that every supplied logged reference became the effective reference.
 - **Gate 9 writes the artifact set** (`run_state.json`, `run_summary.json`,
   `market_open_signals.csv`, header-only-when-empty `submitted_orders.csv`, plus
   the `latest_market_open_run.json` pointer) on every outcome, into that same
   `$ROOT`. It previously only notified, which left a successful run's real orders
   invisible to reconciliation, drift detection and every later slot's
   prior-allocation scan.
+- **Gate 7 rechecks every mutable placement guard before every order**, not just
+  before the first order in a batch. Each sequential submission gets fresh,
+  fully paginated history; a new buying-power lookup and shared daily/weekly
+  budget calculation for the remaining batch; and a recount of every same-day
+  buy attempt against the shared `max_orders_per_day` limit, including canceled
+  and rejected attempts. The final quote supplies both a new decision price and
+  a validated bid/ask spread immediately before placement. That price must still
+  pass the Gate 6.5 prior-reference, no-recovery, and close/low base checks;
+  spread validation alone cannot authorize a recovered candidate. Newly visible
+  manual, recurring, DRIP, or broker-UI buys drop an affected ticker for manual
+  review because its prior top-up result is stale and no newly scanned logged
+  reference can be bound.
+  Broker order IDs successfully submitted earlier by the current run are excluded
+  from rogue classification, but their current states are still inspected and a
+  later rejection/cancellation stops the remainder. Matching tickers or
+  deterministic reference IDs alone are not enough to claim the interlock
+  exclusion. A final ET-window check follows the refreshes, preventing their
+  runtime from carrying placement beyond 10:00 ET.
 
-Gates 6, 6.7, 7 and 8 are unchanged, and Gate 6.5 remains the last word on size.
+Gate 6.5 remains the last word on size.
 
 ## The trend-window coverage check does not apply here
 
@@ -354,3 +389,4 @@ The first four run on the shared core in `scripts/stream_candidates.py`; 1530ET
 predates it and calls `near_close_dca.evaluate_source_signal`, that stream's own
 engine. Each command is scoped to its own slot: pointing one at another slot
 scores against the wrong logic.
+

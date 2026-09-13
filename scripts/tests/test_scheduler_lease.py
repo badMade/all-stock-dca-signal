@@ -26,7 +26,6 @@ def test_acquire_then_second_holder_is_blocked(tmp_path):
     # A recovery runner for the same window cannot acquire while it's live.
     r2 = lease_b.acquire("recovery-runner", now=1001.0)
     assert not r2.acquired
-    assert r2.current_holder is not None
     assert r2.current_holder.holder_id == "scheduled-runner"
     assert r2.reason == "held_by_live_holder"
 
@@ -337,7 +336,6 @@ def test_reclaim_stale_restores_a_lease_refreshed_mid_reclaim(tmp_path):
 
     assert result.acquired is False
     assert result.reason == "holder_refreshed_during_reclaim"
-    assert result.current_holder is not None
     assert result.current_holder.holder_id == "original"
     # The original holder's lease is restored at the canonical path, not
     # left stranded under a .reclaim. temp name.
@@ -381,11 +379,8 @@ def test_reclaim_stale_loses_the_race_to_create_the_new_lease(tmp_path, monkeypa
 
     assert result.acquired is False
     assert result.reason == "lost_after_reclaim"
-    assert result.current_holder is not None
     assert result.current_holder.holder_id == "other-reclaimer"
-    read_lease = lease.read()
-    assert read_lease is not None
-    assert read_lease.holder_id == "other-reclaimer"  # the winner's lease is intact
+    assert lease.read().holder_id == "other-reclaimer"  # the winner's lease is intact
 
 
 def test_release_restores_a_lease_taken_by_a_racing_reclaim(tmp_path, monkeypatch):

@@ -1,6 +1,14 @@
 """Tests for scoring.py -- pure stdlib, no third-party deps needed."""
 
-from scoring import TickerScore, classify, combine_scores, rank
+from scoring import (
+    TickerScore,
+    _extract_backtest_component,
+    _extract_health_component,
+    _extract_sentiment_component,
+    classify,
+    combine_scores,
+    rank,
+)
 
 
 def _health(sharpe=1.0, sortino=1.0, max_drawdown=-0.1, cagr=0.2, calmar=2.0, beta=1.0, alpha=0.05):
@@ -44,7 +52,6 @@ def test_combine_scores_ranks_higher_metrics_higher():
 
     scores = combine_scores(raw)
 
-    assert scores["STRONG"].composite is not None and scores["WEAK"].composite is not None
     assert scores["STRONG"].composite > scores["WEAK"].composite
     assert scores["STRONG"].classification == "ADD"
     assert scores["WEAK"].classification == "REJECT"
@@ -64,6 +71,50 @@ def test_missing_signal_excluded_not_defaulted_to_zero():
     assert scores["ONLY_HEALTH"].sub_scores["sentiment"] is None
     assert any("backtest signal unavailable" in note for note in scores["ONLY_HEALTH"].rationale)
     assert any("sentiment signal unavailable" in note for note in scores["ONLY_HEALTH"].rationale)
+
+
+def test_extract_health_component_rejects_a_truthy_non_mapping():
+    """Codex review ("Validate signal component mappings before
+    extraction"): a malformed producer emitting a list/string instead of
+    the documented {"sharpe": ..., "calmar": ...} health dict must degrade
+    this component to unavailable (None), not raise AttributeError out of
+    .get() on a non-dict."""
+    assert _extract_health_component(["not", "a", "mapping"], "sharpe") is None
+    assert _extract_health_component("also not a mapping", "sharpe") is None
+
+
+def test_extract_backtest_component_rejects_a_truthy_non_mapping():
+    """Same regression as health, one level up: a truthy non-mapping
+    ``backtest`` value must not reach .get()."""
+    assert _extract_backtest_component(["not", "a", "mapping"], "ma_crossover") is None
+
+
+def test_extract_backtest_component_rejects_a_truthy_non_mapping_strategy_value():
+    """Same regression, one level deeper: backtest[strategy_name] itself
+    can be a truthy non-mapping (e.g. a malformed producer emitting a bare
+    string in place of the expected {"sharpe": ...} dict)."""
+    assert _extract_backtest_component({"ma_crossover": "not a mapping"}, "ma_crossover") is None
+
+
+def test_extract_sentiment_component_rejects_a_truthy_non_mapping():
+    assert _extract_sentiment_component(["not", "a", "mapping"]) is None
+
+
+def test_combine_scores_survives_a_malformed_health_value_for_one_candidate():
+    """The same regression exercised end to end: one candidate with a
+    malformed health value must only lose that ONE component, not abort
+    combine_scores() for the whole batch."""
+    raw = {
+        "MALFORMED": {"health": ["not", "a", "mapping"], "backtest": None, "sentiment": None},
+        "OK1": {"health": _health(sharpe=1.0), "backtest": None, "sentiment": None},
+        "OK2": {"health": _health(sharpe=0.5), "backtest": None, "sentiment": None},
+    }
+
+    scores = combine_scores(raw)
+
+    assert scores["MALFORMED"].sub_scores["health"] is None
+    assert scores["OK1"].sub_scores["health"] is not None
+    assert scores["OK2"].sub_scores["health"] is not None
 
 
 def test_combine_scores_records_partially_excluded_health_component():
@@ -276,10 +327,7 @@ def test_scale_dominant_metric_does_not_drown_out_the_other():
 
     scores = combine_scores(raw)
 
-    best_health = scores["BEST_SHARPE"].sub_scores["health"]
-    worst_health = scores["WORST_SHARPE"].sub_scores["health"]
-    assert best_health is not None and worst_health is not None
-    assert best_health > worst_health
+    assert scores["BEST_SHARPE"].sub_scores["health"] > scores["WORST_SHARPE"].sub_scores["health"]
 
 
 def test_raw_errors_surface_in_rationale():

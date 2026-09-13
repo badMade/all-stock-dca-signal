@@ -307,7 +307,7 @@ def load_tickers(config_dir: Path) -> Dict[str, Any]:
     return out
 
 
-def _config_float(raw: Any, *, field: str) -> float:
+def _config_float(raw: object, *, field: str) -> float:
     """``float(raw)`` for a numeric config field, rejecting booleans first.
 
     ``float(True)`` is ``1.0``, so a schema-invalid ``true`` in an alternate
@@ -345,7 +345,7 @@ def _config_float(raw: Any, *, field: str) -> float:
 #: which is what stops these from becoming a second, quietly-diverging set of
 #: limits -- the failure mode this PR has hit repeatedly.
 DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES = 3
-DEFAULT_MAX_ORDERS_PER_DAY = 8
+DEFAULT_MAX_ORDERS_PER_DAY = 120
 
 #: Emitted by :func:`load_budgets` when there is no ``budgets.json`` AT ALL,
 #: and resolved (and popped) by :func:`load_strategy_config`. Distinguishes
@@ -542,7 +542,7 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
     # as the refusal above -- with no budgets.json there is no circuit_breakers
     # mapping to index at all, and the absent-file fallback leaves the breaker
     # exactly where it was before this loader learned to read the key.
-    if budgets_present and isinstance(circuit_breakers, dict):
+    if budgets_present:
         max_streak = circuit_breakers["max_consecutive_placement_failures"]
         if isinstance(max_streak, bool) or not isinstance(max_streak, int) or max_streak < 1:
             raise ValueError(
@@ -1324,12 +1324,9 @@ def load_strategy_config(
         # value and is refused by the final invariant check below, loudly,
         # rather than being silently widened into validity.
         try:
-            if _effective_max_per_order is not None and base.whole_share_max_per_order_usd is not None:
-                merged["whole_share_max_per_order_usd"] = min(
-                    _effective_max_per_order, base.whole_share_max_per_order_usd
-                )
-            else:
-                merged["whole_share_max_per_order_usd"] = _effective_max_per_order
+            merged["whole_share_max_per_order_usd"] = min(
+                _effective_max_per_order, base.whole_share_max_per_order_usd
+            )
         except TypeError:
             # A non-numeric base value is not this branch's to diagnose; leave
             # it for the validation below and the dataclass itself.

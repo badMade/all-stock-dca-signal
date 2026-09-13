@@ -17,31 +17,16 @@ Runnable with ``pytest`` or ``python test_market_open_dca.py``.
 """
 
 import json
-import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
 import pytest
+from test_morning_dca import DecliningBarsProvider, FixedDropProvider
 
-# Moved into tests/ from the repo root (2026-08-23). ``pytest``/``python -m
-# pytest`` already resolve these first-party imports via pyproject.toml's
-# `pythonpath = [".", "tests"]`, but this file's own docstring documents a
-# second, direct-execution contract (``python tests/test_market_open_dca.py``)
-# that pythonpath doesn't cover -- running a script directly only adds ITS
-# OWN directory (tests/) to sys.path, not the repo root, so every import
-# below would otherwise raise ModuleNotFoundError under that path before the
-# `__main__` guard's own pytest.main() call ever runs (Codex review: "Retain
-# direct execution for relocated tests").
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-from test_morning_dca import DecliningBarsProvider, FixedDropProvider  # noqa: E402
-
-from conftest import FIXTURE_ACCOUNT_NUMBER  # noqa: E402
-from dca_paths import CRON_TRACKING_ROOT_ENV, stream_root  # noqa: E402
-from market_open_dca import (  # noqa: E402
+from conftest import FIXTURE_ACCOUNT_NUMBER
+from dca_paths import CRON_TRACKING_ROOT_ENV, stream_root
+from market_open_dca import (
     DEFAULT_MARKET_OPEN_DAILY_CAP_USD,
     DEFAULT_MARKET_OPEN_WEEKLY_CAP_USD,
     MARKET_OPEN_LIVE_CRON_ID,
@@ -53,10 +38,14 @@ from market_open_dca import (  # noqa: E402
     default_market_open_prior_allocation_roots,
     load_market_open_config,
 )
-from morning_dca import EXEC_AUTO_BUY_ELIGIBLE, Bar  # noqa: E402
-from near_close_dca import EASTERN, Action, SourceName, StrategyConfig, load_prior_same_day_allocations  # noqa: E402
+from morning_dca import EXEC_AUTO_BUY_ELIGIBLE, Bar
+from near_close_dca import EASTERN, Action, SourceName, StrategyConfig, load_prior_same_day_allocations
 
 TRADING_DAY = date(2026, 7, 8)
+
+
+# Live simulations use their supplied historical clock; session/calendar gates stay enabled.
+pytestmark = pytest.mark.usefixtures("historical_live_clock")
 
 
 def _now_market_open():
@@ -84,7 +73,7 @@ class _Broker:
         return None
 
     def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes) -> Optional[dict]:
-        return self.same_day_strategy_order_exists_with_ref_id_prefix(ticker, trading_day, ref_id_prefixes)
+        return None
 
     def strategy_order_with_ref_id(self, ticker, trading_day, ref_id) -> Optional[dict]:
         return None
@@ -92,27 +81,29 @@ class _Broker:
     def same_day_ticker_notional_usd(self, ticker, trading_day) -> float:
         return 0.0
 
+    supports_concurrent_fill_lookup: bool = False
+
     def is_tradable_for_fractional_buy(self, ticker) -> bool:
         return True
 
+    def is_tradable_for_whole_share_buy(self, ticker) -> bool:
+        return True
+
     def review_market_buy(self, ticker, notional_usd) -> tuple[bool, str]:
+        return True, "ok"
+
+    def review_whole_share_buy(self, ticker, quantity) -> tuple[bool, str]:
         return True, "ok"
 
     def place_market_buy(self, ticker, notional_usd, ref_id) -> str:
         self.placed[ticker] = notional_usd
         return f"ORDER-{ticker}"
 
-    def get_order_fill(self, order_id) -> Any:
-        return None
-
-    def is_tradable_for_whole_share_buy(self, ticker) -> bool:
-        return True
-
-    def review_whole_share_buy(self, ticker, quantity) -> tuple[bool, str]:
-        return True, "ok"
-
     def place_whole_share_buy(self, ticker, quantity, ref_id) -> str:
         return f"ORDER-WS-{ticker}"
+
+    def get_order_fill(self, order_id) -> Any:
+        return None
 
     def get_raw_placement_responses(self) -> list:
         return []
@@ -278,8 +269,14 @@ def test_market_open_prior_allocation_roots_are_deliberately_narrow():
 
 def test_market_open_cap_seed_roots_span_every_sibling_stream():
     cap_roots = default_market_open_cap_seed_roots()
-    for sibling in ("market_open_dca", "morning_dca", "midday_dca", "intraday_dca", "ce16ba6b"):
-        assert stream_root(sibling) in cap_roots
+    assert cap_roots == (
+        stream_root("market_open_dca"),
+        stream_root("morning_dca"),
+        stream_root("midday_dca"),
+        stream_root("intraday_dca"),
+        stream_root("ce16ba6b"),
+        stream_root("final_manual_review"),
+    )
 
 
 # --- Artifact-root separation ----------------------------------------------
@@ -405,7 +402,7 @@ def test_default_roots_include_market_opens_own_manual_run_tree(tmp_path):
 
 def test_default_market_open_prior_allocation_roots_includes_own_root():
     roots = default_market_open_prior_allocation_roots()
-    assert any(str(r).rstrip("/").endswith("market_open_dca") for r in roots)
+    assert any(r.rstrip("/").endswith("market_open_dca") for r in roots)
 
 
 def test_bundled_config_prior_allocation_roots_includes_own_root():
@@ -467,3 +464,23 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# --- 2026-09-07 diagnostic T:F13 ---------------------------------------------
+def test_market_open_default_config_tolerates_an_unresolvable_account_and_fails_closed(tmp_path, monkeypatch):
+    """MarketOpenDCAExecutor._load_default_config is the override that decides
+    how the 9:35 stream behaves when no explicit config is passed and the live
+    account cannot be resolved: it must construct (allow_unpinned_account) and
+    then fail closed at run time with blocked evidence, never raise before an
+    executor exists and leave the slot with no artifact at all."""
+    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+    (tmp_path / "market_open_dca.json").write_text(
+        json.dumps({
+            "live_task": {"broker_account": "robinhood:${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}"},
+            "artifact_paths": {"live_run_state_root": str(tmp_path / "market_open")},
+        }),
+        encoding="utf-8",
+    )
+    ex = MarketOpenDCAExecutor(config_dir=str(tmp_path))
+    assert ex.config.target_account_number is None
+    assert ex.config.live_execution_enabled is False  # ships disabled, and a missing key must not flip it

@@ -47,7 +47,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout PR head
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0 # full history needed for git diff against origin/<base>
           persist-credentials: false
@@ -70,7 +70,23 @@ jobs:
           # metadata.json below (Codex review, PR #219: "Pin and recheck the
           # reviewed base SHA"). fetch-depth: 0 above ensures BASE_SHA's
           # commit is present in this checkout's history.
-          git diff "${BASE_SHA}...HEAD" > review_input/diff.patch
+          # Some PRs come from a history that is disconnected from BASE_SHA
+          # (e.g., after aggressive rebases/force-pushes). In that case
+          # triple-dot fails with "no merge base", so fail closed only on
+          # truly broken git state and fall back to two-dot for artifact
+          # generation (review remains pinned to BASE_SHA either way).
+          # HEAD may be GitHub's synthetic merge commit; metadata describes
+          # HEAD_SHA, so this diagnostic diff must describe that same commit.
+          # The privileged consumer independently computes its review input.
+          if git merge-base "${BASE_SHA}" "${HEAD_SHA}" >/dev/null; then
+            git diff --no-ext-diff --no-textconv --no-color "${BASE_SHA}...${HEAD_SHA}" > review_input/diff.patch
+          else
+            status=$?
+            if [ "$status" -ne 1 ]; then
+              exit "$status"
+            fi
+            git diff --no-ext-diff --no-textconv --no-color "${BASE_SHA}..${HEAD_SHA}" > review_input/diff.patch
+          fi
           # Metadata is written by a script, not interpolated into a shell
           # heredoc, so a PR number/SHA/ref value can never be treated as
           # shell or JSON syntax -- the standard mitigation for expressions
@@ -95,7 +111,7 @@ jobs:
           cat review_input/metadata.json
 
       - name: Upload review input artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pr-review-input
           path: review_input/

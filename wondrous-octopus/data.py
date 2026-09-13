@@ -131,9 +131,9 @@ def load_history_csv(path: Path) -> pd.DataFrame:
     # Naive (no-offset) Date columns are unaffected: utc=True localizes
     # them as UTC directly, and the tz-aware branch just below converts
     # right back to naive -- the same end result as before this change.
-    date_col: Any = pd.to_datetime(frame["Date"], errors="coerce", utc=True)
-    if getattr(date_col.dtype, "tz", None) is not None:
-        date_col = date_col.dt.tz_convert("UTC").dt.tz_localize(None)
+    parsed_date: Any = pd.to_datetime(frame["Date"], errors="coerce", utc=True)
+    if getattr(getattr(parsed_date, "dtype", None), "tz", None) is not None:
+        parsed_date = parsed_date.dt.tz_convert("UTC").dt.tz_localize(None)
     # Calendar-day precision, not a raw timestamp: every downstream consumer
     # (TickerSeries.dates/label_end_dates, TrainingPanel.calendar/date_index,
     # the harness's origin-date re-anchoring, Octopus's training-reference
@@ -147,7 +147,7 @@ def load_history_csv(path: Path) -> pd.DataFrame:
     # system -- closes the whole bug class instead of teaching each
     # comparison site to tolerate a raw timestamp. No downstream code reads
     # sub-day precision (nothing in this tree touches .dt.hour/.dt.time).
-    frame["Date"] = date_col.dt.normalize()
+    frame["Date"] = parsed_date.dt.normalize()
     for column in _NUMERIC_RAW_COLUMNS:
         if column in frame.columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
@@ -239,7 +239,7 @@ def adjusted_ohlc(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     return frame, dropped
 
 
-def truncate_as_of(frame: pd.DataFrame, as_of: Any) -> pd.DataFrame:
+def truncate_as_of(frame: pd.DataFrame, as_of: pd.Timestamp | None) -> pd.DataFrame:
     """Drop rows dated on or after ``as_of``'s own calendar day.
 
     The calendar-day-EXCLUSIVE rule from ml-forecaster/features.py's
@@ -284,6 +284,14 @@ class TickerSeries:
     dates: np.ndarray  # datetime64[ns], sorted ascending, unique
     features: np.ndarray  # (n, F) float32
     day_of_week: np.ndarray  # (n,) int8, Monday=0 -- embedded/encoded per model
+    #: (n,) int8 style-cluster label, 0 = not assigned yet (the correlation
+    #: window has not filled). Kept OUT of ``features`` for the same reason
+    #: day_of_week is: it is a categorical, and a float column where 3 sits
+    #: between 2 and 4 would invent an ordering the labels do not have. Both
+    #: models consume it as a category -- embedded by the octopus, appended
+    #: as a column the GBM can split on -- so it travels with every request
+    #: window rather than living only on the panel.
+    cluster_id: np.ndarray
     targets: np.ndarray  # (n, 4) float32 -- next-row log-returns vs this row's close
     label_end_dates: np.ndarray  # (n,) datetime64[ns], NaT on the last row
     ref_close: np.ndarray  # (n,) float64, ADJUSTED close (log-return <-> price pivot)

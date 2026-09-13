@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 from dca_fileio import atomic_open_w, atomic_write_text
+from dca_paths import STREAM_ARTIFACT_DIRS
 
 
 def load_run_state(path: str | Path) -> Dict[str, Any]:
@@ -279,22 +280,6 @@ def fills_from_order_history_payload(
         if not isinstance(order, dict):
             continue
         order_id = order.get("order_id") or order.get("id") or order.get("broker_order_id")
-        # Normalized to a string immediately, matching how a reconciled
-        # order id is persisted everywhere else in this pipeline
-        # (near_close_dca._reconcile_ambiguous_fractional_placement's own
-        # ``str(...).strip()``): a supported broker can report a raw
-        # NUMERIC order id in this history payload, while both
-        # ``order_id_to_ticker`` (built from the persisted, string-keyed
-        # buy_candidates/broker_outcomes) and the caller's own
-        # ``missing_ids`` filter downstream are string-keyed. Comparing
-        # the raw numeric id directly against either read as "not found"
-        # -- the fill's ticker never resolved, and even a resolved fill's
-        # id never matched a scheduled id in the filter that follows --
-        # silently dropping a recovered fill from `orders.csv`/coverage
-        # reporting (Codex review, PR #911 round 37: "Normalize recovered
-        # IDs before raw-fill lookup").
-        if order_id is not None:
-            order_id = str(order_id).strip()
         ticker = order.get("ticker") or order.get("symbol") or order.get("instrument_symbol")
         if not ticker and order_id_to_ticker and order_id is not None:
             ticker = order_id_to_ticker.get(str(order_id))
@@ -449,24 +434,45 @@ def build_missing_fills(
     neither side has an order_id to disambiguate with.
     """
     filled_tickers = {f.get("ticker") or f.get("symbol") for f in fills}
-    fills_by_ticker: Dict[Any, List[Dict[str, Any]]] = {}
+
+    # ⚡ Bolt Optimization: pre-compute, once per call, the only two facts the
+    # candidate loop needs about a ticker's fills -- the set of normalized
+    # order ids its fills carry, and whether any of its fills carries NO id --
+    # so each candidate below costs O(1) set lookups instead of a linear scan.
+    # Bolt round 1 pre-normalized the ids but kept them in per-ticker
+    # (fill, id) tuple lists, so the loop still rebuilt a list per candidate
+    # that was only ever tested as a boolean, scanned the tuples linearly for
+    # membership, and carried a fill dict it never read (Antigravity review of
+    # PR #1377: "eliminate the per-candidate list allocation", "remove the
+    # unused dict", "use O(1) set lookups per ticker"). A ticker gets an entry
+    # in ``fill_order_ids_by_ticker`` only when at least one of its fills
+    # carries an id, so the set is never empty and its mere presence is
+    # exactly the "at least one same-ticker fill carries an order_id" test.
+    fill_order_ids_by_ticker: Dict[Any, set[str]] = {}
+    tickers_with_unidentified_fill: set[Any] = set()
     for f in fills:
-        fills_by_ticker.setdefault(f.get("ticker") or f.get("symbol"), []).append(f)
+        ticker = f.get("ticker") or f.get("symbol")
+        nid = _normalize_order_id(f.get("order_id"))
+        if nid:
+            fill_order_ids_by_ticker.setdefault(ticker, set()).add(nid)
+        else:
+            tickers_with_unidentified_fill.add(ticker)
+
     missing: List[Dict[str, Any]] = []
     for candidate in buy_candidates:
         if candidate.get("top_up_skipped"):
             continue
         ticker = candidate.get("ticker")
         candidate_order_ids = _candidate_order_ids(candidate)
-        ticker_fills_with_order_id = [
-            f for f in fills_by_ticker.get(ticker, []) if _normalize_order_id(f.get("order_id"))
-        ]
-        if candidate_order_ids and ticker_fills_with_order_id:
-            covered = any(
-                _normalize_order_id(f.get("order_id")) in candidate_order_ids
-                for f in ticker_fills_with_order_id
-            )
-        elif not candidate_order_ids and ticker_fills_with_order_id:
+        ticker_fill_order_ids = fill_order_ids_by_ticker.get(ticker)
+        if candidate_order_ids and ticker_fill_order_ids:
+            # Exact-id mode: covered iff any of the candidate's ids (scalar
+            # order_id plus aggregated whole_share_order_ids) is among this
+            # ticker's fill ids. A no-id same-ticker fill deliberately does
+            # NOT rescue an id-bearing candidate here -- once both sides can
+            # disambiguate, only an exact match counts.
+            covered = not ticker_fill_order_ids.isdisjoint(candidate_order_ids)
+        elif not candidate_order_ids and ticker_fill_order_ids:
             # This candidate has no order_id of its own (e.g. failed or
             # blocked before placement ever assigned one), but at least one
             # same-ticker fill carries one -- an ID-bearing fill belongs to a
@@ -476,10 +482,7 @@ def build_missing_fills(
             # missing beside recoveries"). Only a fill that ALSO carries no
             # order_id -- genuinely undisambiguated on both sides -- can
             # still satisfy the ticker fallback.
-            covered = any(
-                not _normalize_order_id(f.get("order_id"))
-                for f in fills_by_ticker.get(ticker, [])
-            )
+            covered = ticker in tickers_with_unidentified_fill
         else:
             covered = ticker in filled_tickers
         if covered:
@@ -796,13 +799,7 @@ def _model_usage_log_helper():
 # scripts/foreground_primary.py, which is standard-library-only by contract)
 # so a foreground pointer's declared stream can be checked against the root
 # it is actually supposed to live under.
-_FOREGROUND_STREAM_SUBDIRS = {
-    "market_open": "market_open_dca",
-    "morning": "morning_dca",
-    "midday": "midday_dca",
-    "intraday": "intraday_dca",
-    "afternoon": "ce16ba6b",
-}
+_FOREGROUND_STREAM_SUBDIRS = dict(STREAM_ARTIFACT_DIRS)
 
 
 def _foreground_expected_roots() -> Dict[str, str]:
@@ -902,7 +899,7 @@ def write_foreground_primary_report(
     # silently dropping FINDING_FOREGROUND_DRIFT (Codex review: "Materialize
     # foreground artifact iterables before both passes").
     artifacts = list(foreground_primary_artifacts) if foreground_primary_artifacts is not None else None
-    foreground: Any = detect(artifacts, trading_day=trading_day, expected_roots=_foreground_expected_roots())
+    foreground = detect(artifacts, trading_day=trading_day, expected_roots=_foreground_expected_roots())
     # Reconciled against foreground.accepted_artifacts, NOT the raw artifacts
     # list: the raw list can carry a rejected candidate (prior-day, unmarked,
     # or an invalid pointer) that happens to claim an order_id absent from
@@ -973,16 +970,12 @@ def generate_scheduled_reports(
     fills: Sequence[Dict[str, Any]],
     output_dir: str | Path,
     base: Optional[str | Path] = None,
-    model_usage_log_root: Optional[str | Path] = None,
-    model_usage_model_requested: Optional[str] = None,
-    model_usage_model_actual: Optional[str] = None,
-    model_usage_model_routing_mode: Optional[str] = None,
-    model_usage_reason_for_premium_model: Optional[str] = None,
-    *,
+    *args: Any,
     foreground_primary_artifacts: Optional[Iterable[str | Path | Mapping[str, Any]]] = None,
     close_window_summary: Optional[Dict[str, Any]] = None,
     model_usage_config: Optional[ModelUsageConfig] = None,
     blocking_findings: Sequence[str] = (),
+    **kwargs: Any,
 ) -> Dict[str, str]:
     """Task 67aa802b entry point: post-trade reports for the SCHEDULED run only.
 
@@ -1004,14 +997,12 @@ def generate_scheduled_reports(
     override the corresponding ``model_usage_config`` field, so old and new
     call sites can both be satisfied.
 
-    The ``model_usage_log_root``/``model_usage_model_*``/
-    ``model_usage_reason_for_premium_model`` parameters are the pre-existing
-    interface documented at ``docs/cost_tracking.md:206-220`` and are kept
-    in their original positional-or-keyword slots (unchanged) for the
-    externally managed 67aa802b scheduler, which still calls this entry
-    point with them -- including positionally. ``model_usage_config`` is
-    the new keyword-only alternative; any of the legacy parameters that is
-    passed (non-``None``) overrides the corresponding ``model_usage_config``
+    The legacy ``model_usage_log_root``/``model_usage_model_*``/
+    ``model_usage_reason_for_premium_model`` parameters are still accepted
+    via ``*args`` and ``**kwargs`` for backward compatibility with the
+    externally managed 67aa802b scheduler. ``model_usage_config`` is
+    the preferred keyword-only alternative; any of the legacy parameters that is
+    passed overrides the corresponding ``model_usage_config``
     field, so old and new call sites can both be satisfied.
 
     ``foreground_primary_artifacts`` opts into the Jul 30 2026 foreground primary
@@ -1061,15 +1052,23 @@ def generate_scheduled_reports(
     # only the new alternative silently got root=None (skipping the audit-log
     # append) and lost every routing override it set (Codex review: "Apply
     # ModelUsageConfig before logging").
+    # Intercept legacy positional-or-keyword arguments for backward compatibility
+    # with the externally managed 67aa802b scheduler.
+    _log_root = kwargs.get("model_usage_log_root", args[0] if len(args) > 0 else None)
+    _req = kwargs.get("model_usage_model_requested", args[1] if len(args) > 1 else None)
+    _act = kwargs.get("model_usage_model_actual", args[2] if len(args) > 2 else None)
+    _mode = kwargs.get("model_usage_model_routing_mode", args[3] if len(args) > 3 else None)
+    _reason = kwargs.get("model_usage_reason_for_premium_model", args[4] if len(args) > 4 else None)
+
     config = model_usage_config or ModelUsageConfig()
-    effective_log_root = model_usage_log_root if model_usage_log_root is not None else config.log_root
+    effective_log_root = _log_root if _log_root is not None else config.log_root
     routing_overrides = {
-        "model_requested": model_usage_model_requested if model_usage_model_requested is not None else config.model_requested,
-        "model_actual": model_usage_model_actual if model_usage_model_actual is not None else config.model_actual,
-        "model_routing_mode": model_usage_model_routing_mode if model_usage_model_routing_mode is not None else config.model_routing_mode,
+        "model_requested": _req if _req is not None else config.model_requested,
+        "model_actual": _act if _act is not None else config.model_actual,
+        "model_routing_mode": _mode if _mode is not None else config.model_routing_mode,
         "reason_for_premium_model": (
-            model_usage_reason_for_premium_model
-            if model_usage_reason_for_premium_model is not None
+            _reason
+            if _reason is not None
             else config.reason_for_premium_model
         ),
     }
@@ -1204,16 +1203,7 @@ def generate_scheduled_reports(
                         for key in ("order_id", "broker_order_id"):
                             oid = c.get(key)
                             if oid:
-                                # Normalized the SAME way
-                                # fills_from_order_history_payload() now
-                                # normalizes the raw payload's own order id
-                                # before looking it up here -- a numeric id
-                                # stored unnormalized in this map would
-                                # never match that string-keyed lookup
-                                # (Codex review, PR #911 round 37:
-                                # "Normalize recovered IDs before raw-fill
-                                # lookup").
-                                ticker_by_order_id[str(oid).strip()] = c["ticker"]
+                                ticker_by_order_id[oid] = c["ticker"]
                     broker_outcomes = state.get("broker_outcomes")
                     if not isinstance(broker_outcomes, dict):
                         broker_outcomes = {}
@@ -1257,7 +1247,7 @@ def generate_scheduled_reports(
     assert selection.state is not None
     try:
         report_paths = generate_reports(
-            dict(selection.state or {}),
+            dict(selection.state),
             fills,
             output_dir,
             require_scheduled=True,

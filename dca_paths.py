@@ -93,6 +93,25 @@ def stream_root(*parts: str) -> str:
     return os.path.join(cron_tracking_root(), *parts)
 
 
+# The artifact directory each live stream writes under, keyed by the stream
+# name the run_classification block carries (CLAUDE.md "Run classification").
+# The afternoon keeps the legacy ce16ba6b root for continuity. One canonical
+# map so dca_alerts and dca_reporting agree on where a stream's files live
+# (2026-09-07 diagnostic, T:F08).
+STREAM_ARTIFACT_DIRS = {
+    "market_open": "market_open_dca",
+    "morning": "morning_dca",
+    "midday": "midday_dca",
+    "intraday": "intraday_dca",
+    "afternoon": "ce16ba6b",
+}
+
+
+def stream_artifact_dir(stream: str) -> str:
+    """The artifact directory name for ``stream``; an unknown stream maps to itself."""
+    return STREAM_ARTIFACT_DIRS.get(stream, stream)
+
+
 def rebase_bundled_root(value: Any) -> Any:
     """Re-root a bundled config path onto the configured artifact tree.
 
@@ -181,8 +200,10 @@ __all__ = [
     "BUNDLED_CRON_TRACKING_ROOT",
     "CRON_TRACKING_ROOT_ENV",
     "DEFAULT_CRON_TRACKING_ROOT",
+    "STREAM_ARTIFACT_DIRS",
     "cron_tracking_root",
     "rebase_bundled_root",
     "rebase_bundled_roots_in",
+    "stream_artifact_dir",
     "stream_root",
 ]

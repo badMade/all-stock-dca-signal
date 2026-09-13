@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-import pytest
-
 import daily_update
 import features as _features
+import numpy as np
+import pytest
 import run_walkforward
 
 features: Any = _features
@@ -113,6 +113,7 @@ class TestArgumentRefusals:
         code = run_walkforward.main(["--demo", "--resume", str(tmp_path / "some-run")])
         assert code == 1
         assert "--demo does not support --resume" in capsys.readouterr().err
+
 
     def test_archive_with_zero_usable_tickers_is_refused_exit_1_not_2(self, tmp_path, capsys):
         # features.build_panel() raises a plain ValueError already prefixed
@@ -349,6 +350,33 @@ class TestParseIsoDate:
 
 
 class TestDemo:
+    def test_main_restores_the_process_signal_handlers(self, tmp_path, capsys):
+        # _install_early_signal_handlers()/_install_signal_handlers() replace
+        # SIGINT/SIGTERM so a signal can reach the (possibly not-yet-existing)
+        # harness. In a long-lived process that calls main() more than once,
+        # leaving them installed means a later signal is delivered to a run
+        # that already finished -- effectively ignored -- while the host's own
+        # handlers never come back (Codex review: "Restore the process signal
+        # handlers after the run"). A full demo run is the cheapest path that
+        # actually gets past the install, so assert on it rather than on a
+        # refusal that returns before any handler is replaced.
+        def _sentinel_int(*_args):  # pragma: no cover - never invoked
+            pass
+
+        def _sentinel_term(*_args):  # pragma: no cover - never invoked
+            pass
+
+        previous_int = signal.signal(signal.SIGINT, _sentinel_int)
+        previous_term = signal.signal(signal.SIGTERM, _sentinel_term)
+        try:
+            assert run_walkforward.main(["--demo", "--run-dir", str(tmp_path / "demo-run")]) == 0
+            capsys.readouterr()
+            assert signal.getsignal(signal.SIGINT) is _sentinel_int
+            assert signal.getsignal(signal.SIGTERM) is _sentinel_term
+        finally:
+            signal.signal(signal.SIGINT, previous_int)
+            signal.signal(signal.SIGTERM, previous_term)
+
     def test_demo_run_meta_is_written_before_the_initial_checkpoint(self, tmp_path, monkeypatch):
         # Same fix, same reasoning, as the non-demo fresh-run path (Codex
         # review: "Publish run metadata with the initial checkpoint"): a
@@ -376,7 +404,7 @@ class TestDemo:
         assert code == 0
         assert (run_dir / "report" / "report.json").exists()
         assert (run_dir / "report" / "report.md").exists()
-        report = json.loads((run_dir / "report" / "report.json").read_text())
+        report = json.loads((run_dir / "report" / "report.json").read_bytes())
         assert set(report["models"]) == {"persistence", "gbm_quantile"}
         # Both models scored a meaningful number of forecasts.
         assert min(report["n_scored"].values()) > 100
@@ -429,7 +457,7 @@ class TestDemo:
         # demo GBM iteration count").
         run_dir = tmp_path / "demo-run"
         assert run_walkforward.main(["--demo", "--run-dir", str(run_dir), "--checkpoint-every", "50"]) == 0
-        metadata = json.loads((run_dir / "checkpoint" / "models" / "gbm_quantile" / "metadata.json").read_text())
+        metadata = json.loads((run_dir / "checkpoint" / "models" / "gbm_quantile" / "metadata.json").read_bytes())
         assert metadata["max_iter"] == 20
 
     def test_demo_records_the_archive_path_as_absolute(self, tmp_path, monkeypatch):
@@ -445,7 +473,7 @@ class TestDemo:
         monkeypatch.chdir(tmp_path)
         relative_run_dir = Path("demo-run")
         assert run_walkforward.main(["--demo", "--run-dir", str(relative_run_dir), "--checkpoint-every", "50"]) == 0
-        recorded = json.loads((relative_run_dir / "run_meta.json").read_text())["history_dir"]
+        recorded = json.loads((relative_run_dir / "run_meta.json").read_bytes())["history_dir"]
         assert Path(recorded).is_absolute()
         assert Path(recorded) == (tmp_path / relative_run_dir / "demo_archive").resolve()
 
@@ -515,7 +543,7 @@ class TestDemo:
         run_dir = tmp_path / "demo-run"
         assert run_walkforward.main(["--demo", "--run-dir", str(run_dir), "--checkpoint-every", "50"]) == 0
         before = run_walkforward.write_report(run_dir)
-        before_report = json.loads(before.read_text())
+        before_report = json.loads(before.read_bytes())
         from ledger import Ledger
 
         shard = next((run_dir / "ledger" / "persistence").glob("score_*.jsonl.gz"))
@@ -524,7 +552,7 @@ class TestDemo:
         with shard.open("ab") as handle:
             handle.write(gzip.compress((json_module.dumps(fake) + "\n").encode(), mtime=0))
         after = run_walkforward.write_report(run_dir)
-        after_report = json.loads(after.read_text())
+        after_report = json.loads(after.read_bytes())
         assert after_report["n_scored"] == before_report["n_scored"]
 
     def test_report_files_are_written_with_explicit_utf8(self, tmp_path, monkeypatch):
@@ -569,7 +597,14 @@ class TestResumeCli:
         # a non-ASCII history path stored in run_meta.json could then fail
         # decoding or mojibake under a non-UTF-8 locale, even though
         # _write_run_meta() explicitly wrote it as UTF-8 (Codex review
-        # regression: "Decode persisted run metadata as UTF-8").
+        # regression: "Decode persisted run metadata as UTF-8"). These
+        # reads now go through Path.read_bytes() + json.loads(bytes)
+        # (perf: skip the redundant text decode) -- json.loads decodes
+        # raw bytes per RFC 8259's own UTF-8/16/32 auto-detection, never
+        # the platform locale, so the mojibake risk is gone by
+        # construction rather than by an explicit encoding kwarg. Assert
+        # the spied files go through read_bytes and never a bare,
+        # locale-dependent read_text().
         import pathlib
 
         run_dir = tmp_path / "run"
@@ -580,18 +615,25 @@ class TestResumeCli:
         ]
         assert run_walkforward.main(original) == 3
 
-        seen_encodings = []
+        seen_reads = []
         original_read_text = pathlib.Path.read_text
+        original_read_bytes = pathlib.Path.read_bytes
 
         def spy_read_text(self, *args, **kwargs):
             if self.name in ("run_meta.json", "harness_state.json"):
-                seen_encodings.append(kwargs.get("encoding"))
+                seen_reads.append("read_text")
             return original_read_text(self, *args, **kwargs)
 
+        def spy_read_bytes(self, *args, **kwargs):
+            if self.name in ("run_meta.json", "harness_state.json"):
+                seen_reads.append("read_bytes")
+            return original_read_bytes(self, *args, **kwargs)
+
         monkeypatch.setattr(pathlib.Path, "read_text", spy_read_text)
+        monkeypatch.setattr(pathlib.Path, "read_bytes", spy_read_bytes)
         assert run_walkforward.main(["--resume", str(run_dir)]) == 0
-        assert seen_encodings  # sanity: the spied files were actually read
-        assert all(encoding == "utf-8" for encoding in seen_encodings)
+        assert seen_reads  # sanity: the spied files were actually read
+        assert all(kind == "read_bytes" for kind in seen_reads)
 
     def test_resume_without_run_meta_is_refused(self, synthetic_history_dir, tmp_path, capsys):
         # A resume without run_meta.json has no universe/model-hyper
@@ -719,7 +761,7 @@ class TestResumeCli:
             ]
         )
         assert code == 0
-        before = (run_dir / "run_meta.json").read_text()
+        before = (run_dir / "run_meta.json").read_bytes()
         assert json.loads(before)["model_selection"] == "persistence"
 
         code = run_walkforward.main(
@@ -730,7 +772,7 @@ class TestResumeCli:
             ]
         )
         assert code == 1
-        after = (run_dir / "run_meta.json").read_text()
+        after = (run_dir / "run_meta.json").read_bytes()
         assert after == before
         assert json.loads(after)["model_selection"] == "persistence"
 
@@ -862,9 +904,9 @@ class TestResumeCli:
         ]
         assert run_walkforward.main(base + ["--end", "2021-11-15", "--run-dir", str(run_dir)]) == 0
         state_path = run_dir / "checkpoint" / "harness_state.json"
-        state = json.loads(state_path.read_text())
+        state = json.loads(state_path.read_bytes())
         state["config"]["seed"] = state["config"]["seed"] + 1  # config_hash now stale
-        state_path.write_text(json.dumps(state, sort_keys=True))
+        state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
         code = run_walkforward.main(base + ["--end", "2021-12-01", "--resume", str(run_dir)])
         assert code == 1
         assert "corrupted" in capsys.readouterr().err
@@ -882,7 +924,7 @@ class TestResumeCli:
         ]
         assert run_walkforward.main(base + ["--end", "2021-11-15", "--run-dir", str(run_dir)]) == 0
         assert run_walkforward.main(base + ["--end", "2021-12-01", "--resume", str(run_dir)]) == 0
-        report = json.loads((run_dir / "report" / "report.json").read_text())
+        report = json.loads((run_dir / "report" / "report.json").read_bytes())
         assert report["n_scored"]["persistence"] > 0
 
 
@@ -1018,6 +1060,59 @@ class TestWallClockBudgetBeforeReport:
         assert (run_dir / "report" / "report.json").exists()
 
 
+class TestSignalHandlerRestoration:
+    """main() must hand SIGINT/SIGTERM back to whoever owned them."""
+
+    @staticmethod
+    def _dispositions():
+        import signal
+
+        return (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
+
+    def test_main_restores_original_handlers_after_a_successful_run(self, tmp_path, capsys):
+        # _dispatch() re-points both signals at a temporary _InterruptFlag and
+        # then at the harness; leaving them installed on the way out disarms a
+        # long-lived host process that calls main() twice or embeds this CLI
+        # as a library -- its NEXT Ctrl-C reaches stale state that nothing
+        # reads any more and is effectively ignored (Codex review: "Restore
+        # process signal handlers after walk-forward runs").
+        import signal
+
+        def _sentinel(_signum, _frame):  # pragma: no cover - never invoked
+            raise AssertionError("test sentinel handler must not run")
+
+        previous = [signal.signal(number, _sentinel) for number in (signal.SIGINT, signal.SIGTERM)]
+        try:
+            assert self._dispositions() == (_sentinel, _sentinel)
+            code = run_walkforward.main(["--demo", "--run-dir", str(tmp_path / "run")])
+            capsys.readouterr()
+            assert code == 0
+            assert self._dispositions() == (_sentinel, _sentinel)
+        finally:
+            for number, handler in zip((signal.SIGINT, signal.SIGTERM), previous, strict=True):
+                signal.signal(number, handler)
+
+    def test_main_restores_original_handlers_after_a_refusal(self, tmp_path, capsys):
+        # Restoration happens on EVERY exit path, including the ones main()
+        # turns into an exit code rather than letting propagate.
+        import signal
+
+        def _sentinel(_signum, _frame):  # pragma: no cover - never invoked
+            raise AssertionError("test sentinel handler must not run")
+
+        previous = [signal.signal(number, _sentinel) for number in (signal.SIGINT, signal.SIGTERM)]
+        try:
+            code = run_walkforward.main(
+                ["--run-dir", str(tmp_path / "run"), "--history-dir", str(tmp_path / "nope")]
+            )
+            capsys.readouterr()
+            assert code == 1  # REFUSED
+            assert self._dispositions() == (_sentinel, _sentinel)
+        finally:
+            for number, handler in zip((signal.SIGINT, signal.SIGTERM), previous, strict=True):
+                signal.signal(number, handler)
+
+
 class TestEarlySignalHandling:
     def test_interrupt_flag_handler_sets_requested(self):
         # _InterruptFlag exists precisely because a signal can arrive
@@ -1039,6 +1134,7 @@ class TestEarlySignalHandling:
         # (Codex review regression: "Install signal handlers before
         # initial fitting").
         import baseline_model
+        import numpy as np
         from harness import HarnessConfig, WalkForwardHarness
 
         panel = features.build_panel(synthetic_history_dir, min_history=60)
@@ -1086,7 +1182,7 @@ class TestHistoryDirAnchoring:
             ]
         )
         assert code == 0
-        recorded = json.loads((run_dir / "run_meta.json").read_text())["history_dir"]
+        recorded = json.loads((run_dir / "run_meta.json").read_bytes())["history_dir"]
         assert Path(recorded).is_absolute()
         assert Path(recorded) == synthetic_history_dir.resolve()
 
@@ -1121,7 +1217,7 @@ class TestRunMetaUniverseRefresh:
         target = tmp_path / "run_meta.json"
         run_walkforward._atomic_write_text(target, "hello")
 
-        assert target.read_text() == "hello"
+        assert target.read_text(encoding="utf-8") == "hello"
         # At least one fsync for the temp file's own contents, plus
         # whatever _fsync_dir()'s own os.fsync(fd) call on the directory
         # adds on top.
@@ -1147,7 +1243,7 @@ class TestRunMetaUniverseRefresh:
             "--checkpoint-every", "50",
         ]
         assert run_walkforward.main(original) == 0
-        original_meta = json.loads((run_dir / "run_meta.json").read_text())
+        original_meta = json.loads((run_dir / "run_meta.json").read_bytes())
         assert "CCC" not in original_meta["universe"]["tickers"]  # too short at this cutoff
 
         later_now = f"{all_dates[200]}T18:00"
@@ -1155,7 +1251,7 @@ class TestRunMetaUniverseRefresh:
             ["--run-dir", str(run_dir), "--history-dir", str(synthetic_history_dir), "--now", later_now]
         )
         assert code == 0
-        refreshed_meta = json.loads((run_dir / "run_meta.json").read_text())
+        refreshed_meta = json.loads((run_dir / "run_meta.json").read_bytes())
         assert "CCC" in refreshed_meta["universe"]["tickers"]
         assert refreshed_meta["universe"]["n_tickers"] > original_meta["universe"]["n_tickers"]
         # The frozen selection RULE itself must stay untouched.
@@ -1179,7 +1275,7 @@ class TestRunMetaUniverseRefresh:
             "--checkpoint-every", "50",
         ]
         assert run_walkforward.main(original) == 0
-        before = (run_dir / "run_meta.json").read_text()
+        before = (run_dir / "run_meta.json").read_bytes()
 
         # _atomic_write_text() no longer uses Path.write_text() (it now
         # fsyncs the handle directly -- Codex review: "Fsync mandatory run
@@ -1197,25 +1293,24 @@ class TestRunMetaUniverseRefresh:
         def _crashing_open(self, *args, **kwargs):
             handle = original_open(self, *args, **kwargs)
             if "run_meta.json.tmp" in self.name:
-                class _CrashingHandle:
-                    def __init__(self, target):
-                        self._target = target
+                class _CrashingFile:
+                    def __init__(self, inner):
+                        self._inner = inner
 
-                    def write(self, data, *a, **kw):
-                        self._target.write(data[: len(data) // 2])
+                    def write(self, data):
+                        self._inner.write(data[: len(data) // 2])
                         raise OSError("simulated kill mid-write")
 
                     def __enter__(self):
-                        self._target.__enter__()
                         return self
 
-                    def __exit__(self, *a, **kw):
-                        return self._target.__exit__(*a, **kw)
+                    def __exit__(self, *args):
+                        return self._inner.__exit__(*args)
 
                     def __getattr__(self, name):
-                        return getattr(self._target, name)
+                        return getattr(self._inner, name)
 
-                return _CrashingHandle(handle)
+                return _CrashingFile(handle)
             return handle
 
         monkeypatch.setattr(pathlib.Path, "open", _crashing_open)
@@ -1224,4 +1319,4 @@ class TestRunMetaUniverseRefresh:
             ["--run-dir", str(run_dir), "--history-dir", str(synthetic_history_dir), "--now", later_now]
         )
         assert code == 2  # runtime failure, per daily_update.main()'s documented contract
-        assert (run_dir / "run_meta.json").read_text() == before  # untouched, not corrupted
+        assert (run_dir / "run_meta.json").read_bytes() == before  # untouched, not corrupted

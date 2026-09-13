@@ -6,6 +6,16 @@ This repository is intended to be safe for Codex-style agentic workflows: code r
 
 These instructions apply to the entire repository.
 
+## Project memory
+
+Read [MEMORY.md](MEMORY.md) when working on runners, reports, schedules, prediction
+tools, or the local interface. It preserves the program map and the user's simple
+`from.py` launcher workflow. Confirm operational details against current code and
+`python3 scripts/agent_entry_points.py`; the memory is a navigation aid, not live
+trading authorization or proof of scheduler execution.
+When resuming the local-console work, also read [HANDOFF.md](HANDOFF.md) for its
+working-tree state, verification results, and remaining integration setup.
+
 ## Project overview
 
 - Core project: a standard-library-only Python implementation of a near-close / morning graded DCA strategy, including config loading, risk checks, reporting, cost tracking, and broker-agnostic live adapters.

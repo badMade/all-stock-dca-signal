@@ -153,23 +153,42 @@ live Perplexity-era roster and have not yet been reconciled with the
 seven-slot model's naming above; that reconciliation is separate from, and
 does not change, which roster is actually placing orders today.
 
-**Perplexity compatible-executor carve-out (2026-08-07, expires 2026-08-14).**
-Six of the seven Cowork-scheduled Claude tasks (935, 1030, 1130, 330, 130,
-230 -- all but 1230) now implement `claude/PERPLEXITY-CLAUDE-COORDINATION.md`
-§3's Gate 4 addition: a competing-executor order tagged `placed_agent='agentic'`
-no longer aborts the run outright. It stands down per-ticker instead (that
-ticker excluded from this slot's candidate list; everything else proceeds
-normally), and only a rogue (non-`'agentic'`, non-Geoff) order still triggers
-the full abort-and-alert. This was directed by Geoff on 2026-08-07 despite the
-value being **accepted, not confirmed**: the order data that prompted the
-request (330's 3:30 PM abort) is at least as consistent with a duplicate
-firing of that same Claude task as with a genuine Perplexity fill, since both
-would carry the same `'agentic'` tag and there is currently no way to tell
-them apart. See the coordination doc's 2026-08-07 update note for the full
-caveat. **Re-review by 2026-08-14** -- the carve-out reverts automatically to
-the prior full-abort behavior in each task's prompt text after that date
-unless renewed. The 1230 slot is unchanged (§5.5: its Gate 4 runs in
-`dca_runner.py` code, not prompt text, and its live placement is off anyway).
+**Perplexity compatible-executor carve-out (2026-08-07, expired 2026-08-14,
+renewed and confirmed 2026-09-09).** Six of the seven Cowork-scheduled Claude
+tasks (935, 1030, 1130, 330, 130, 230 -- all but 1230) implement
+`claude/PERPLEXITY-CLAUDE-COORDINATION.md` §3's Gate 4 addition: a
+competing-executor order tagged `placed_agent='agentic'` no longer aborts the
+run outright. It stands down per-ticker instead (that ticker excluded from
+this slot's candidate list; everything else proceeds normally), and only a
+rogue (non-`'agentic'`, non-Geoff) order still triggers the full
+abort-and-alert. Directed by Geoff on 2026-08-07 with the value **accepted,
+not confirmed** (the order data that prompted the original request was at
+least as consistent with a duplicate firing of that same Claude task as with
+a genuine Perplexity fill), the carve-out lapsed unreviewed on its
+2026-08-14 deadline and reverted each task's prompt text to full-abort
+behavior -- which is exactly what a real 1130ET Gate 4 abort surfaced on
+2026-09-09 (a six-order batch, 11:47-48 ET, `placed_agent='agentic'`). Geoff
+confirmed directly that day that the batch was the intended Perplexity
+backup covering a failing Claude run, not a duplicate session, and the
+carve-out is renewed on that basis -- see the coordination doc §3's
+confirmation record for the order data and the ambiguity this still does not
+resolve (this field cannot distinguish Perplexity's fills from a genuine
+duplicate Claude session; the tradeoff is accepted, not eliminated). No
+re-review deadline is set this time; renewing on a deadline again would
+just repeat the same silent lapse. The six live-mirror prompts' Gate 4 text
+needs repasting into the live Cowork tasks (`claude/dca-executor-prompts/README.md`)
+before this confirmation takes effect live. The 1230 slot's Gate 4 is still
+unchanged by this carve-out
+(§5.5: its Gate 4 runs in `dca_runner.py` code, not prompt text). Geoff
+directed on 2026-09-02 that order placement be on for all scheduled buy
+runs, and the 1230 slot's `live-mirror/` text has been updated accordingly
+to authorize placement -- but per `claude/dca-executor-prompts/README.md`'s
+own policy, editing that committed copy changes nothing about what is
+actually deployed: until a human applies this text via
+`update_scheduled_task` and the mirror is re-captured, the ACTUAL live 1230
+task remains whatever was captured 2026-07-31 (the `assess()`-based,
+placement-OFF version), not the authorized-for-placement text now committed
+here. See that README for the full caveat.
 
 ## Market-data source policy
 
@@ -188,6 +207,30 @@ unless renewed. The 1230 slot is unchanged (§5.5: its Gate 4 runs in
   Finance connector cannot resolve it (see
   `config/tickers.json:special_handling.GFUZ` and
   [morning_dca.md](morning_dca.md#gfuz-special-handling)).
+- **1030ET slot exception:** the 1030 AM morning slot's Gate 5 entry point
+  (`scripts/generate_morning_candidates.py`, `MORNING_SPEC.source`, cron
+  `42173154`) uses **Robinhood as its PRIMARY** source for this slot only, and
+  has **no automatic fallback**: Finance and Alpaca are not accepted
+  `--market-data` keys for this slot at all (an unsupported-key error, not
+  validation/context), and a `yfinance` payload present alongside a
+  `robinhood` fetch failure does not get substituted -- a genuine Robinhood
+  outage aborts this slot's Gate 5. Confirmed 2026-09-09 as this slot's
+  deliberate policy rather than the Finance-primary default every other slot
+  uses -- see
+  [morning_signal_entry.md](morning_signal_entry.md#market-data-source-for-this-slot)
+  and `config/scheduled_tasks.json:market_data_source_policy.slot_overrides`.
+- **0935ET slot exception:** the 9:35 AM market-open slot's Gate 5 entry point
+  (`scripts/generate_market_open_candidates.py`, `MARKET_OPEN_SPEC.source`,
+  cron `2ba19526`) uses **Robinhood as its PRIMARY** source too, for the same
+  reason and with the same no-fallback contract as the 1030ET exception above
+  (Finance/Alpaca rejected outright, `yfinance` accepted but non-substituting).
+  GFUZ is no longer a special case on this slot -- every ticker, GFUZ
+  included, is scored from Robinhood the same way, so the GFUZ exception
+  above no longer applies to this slot's Gate 5 CLI specifically (it still
+  applies wherever else GFUZ's own special handling is documented). Confirmed
+  2026-09-09 -- see
+  [market_open_signal_entry.md](market_open_signal_entry.md#input-file-shape)
+  and `config/scheduled_tasks.json:market_data_source_policy.slot_overrides`.
 
 See the `market_data_source_policy` block in
 [`config/budgets.json`](../config/budgets.json) and

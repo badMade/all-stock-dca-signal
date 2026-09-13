@@ -131,6 +131,7 @@ def test_document_is_consumable_by_the_market_graph(two_regime_archive):
     # so a same-shaped local dataclass exercises the identical consumption path.
     from dataclasses import dataclass
     from datetime import datetime, timedelta
+    from typing import Any, cast
 
     @dataclass(frozen=True)
     class Bar:
@@ -149,10 +150,13 @@ def test_document_is_consumable_by_the_market_graph(two_regime_archive):
     series = [
         mg.BarSeries(
             ticker=ticker,
-            bars=tuple(
-                Bar(timestamp=datetime(2024, 1, 1) + timedelta(days=i), open=10, high=11,
-                    low=9, close=10 + (i % 3), volume=1000)
-                for i in range(10)
+            bars=cast(
+                Any,
+                tuple(
+                    Bar(timestamp=datetime(2024, 1, 1) + timedelta(days=i), open=10, high=11,
+                        low=9, close=10 + (i % 3), volume=1000)
+                    for i in range(10)
+                ),
             ),
         )
         for ticker in document["ticker_order"]
@@ -241,7 +245,7 @@ def test_cli_reports_a_zero_row_ticker_as_dropped(tmp_path, capsys):
         "--all-tickers-in-archive", "--clusters", "2",
     ])
     assert code == 0
-    document = json.loads(out.read_text(encoding="utf-8"))
+    document = json.loads(out.read_bytes())
     assert "STUB" in document["dropped_tickers"]
     captured = capsys.readouterr()
     assert "dropped (too little history)" in captured.out
@@ -338,7 +342,7 @@ def test_cli_writes_a_grouping_document(two_regime_archive, tmp_path, capsys):
         "--all-tickers-in-archive",
     ])
     assert code == 0
-    document = json.loads(out.read_text(encoding="utf-8"))
+    document = json.loads(out.read_bytes())
     assert document["source"] == "ml-forecaster"
     assert len(document["clusters"]) == 2
     assert "wrote" in capsys.readouterr().out
@@ -462,7 +466,7 @@ def test_cli_normalizes_the_case_of_an_explicit_ticker_list(two_regime_archive, 
         "--tickers", *spelling, "--clusters", "2",
     ])
     assert code == 0
-    document = json.loads(out.read_text(encoding="utf-8"))
+    document = json.loads(out.read_bytes())
     assert set(document["ticker_order"]) == {"CALMA", "CALMB", "WILDA", "WILDB"}
 
 
@@ -488,5 +492,5 @@ def test_cli_honours_an_explicit_ticker_list(two_regime_archive, tmp_path):
         "--tickers", "CALMA", "CALMB", "WILDA", "WILDB", "--clusters", "2",
     ])
     assert code == 0
-    document = json.loads(out.read_text(encoding="utf-8"))
+    document = json.loads(out.read_bytes())
     assert set(document["ticker_order"]) == {"CALMA", "CALMB", "WILDA", "WILDB"}

@@ -27,6 +27,7 @@ from __future__ import annotations
 import decimal
 import logging
 import math
+import traceback
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
@@ -39,20 +40,26 @@ from near_close_dca import (
     AmbiguousPlacementResponseError,
     Bar,
     FractionalPlacementRejectedError,
+    MarketBuyPlacementTerminalError,
     OrderFill,
+    OrderPlacementAmbiguousError,
     SourceName,
     WholeSharePlacementTerminalError,
+    _DiagnosticRedactionFilter,
     _is_blank_broker_field,
     _normalize_broker_lifecycle_alias,
     _normalized_order_id,
     _reconciled_order_may_have_executed,
     _recovered_broker_notional,
+    _redacted_diagnostic_text,
     _unwrap_fill_alias_value,
     nyse_holidays,
     terminal_broker_row_proves_no_order,
 )
 
 logger = logging.getLogger("near_close_dca.live_adapters")
+# Parent logger filters do not run for propagated child records.
+logger.addFilter(_DiagnosticRedactionFilter())
 
 
 def _log_safe_repr(value: Any) -> str:
@@ -76,6 +83,12 @@ def _log_safe_repr(value: Any) -> str:
         return repr(value)
     except ValueError:
         return f"<{type(value).__name__}: unrepresentable -- contains an oversized numeric value>"
+
+
+def _artifact_safe_repr(value: Any) -> str:
+    """Render broker data for an exception that may be persisted in artifacts."""
+    return _redacted_diagnostic_text(_log_safe_repr(value))
+
 
 # Sentinel distinguishing "not yet fetched" from a cached ``None`` (quote genuinely
 # unavailable) in the signal-time quote memo, so a legitimately-absent quote is
@@ -500,6 +513,301 @@ _MAX_ORDER_PAGES = 20
 # still-effectively-unbounded-for-legitimate-input backstop, exactly the
 # role `_MAX_ORDER_PAGES` plays for pagination.
 _MAX_ENVELOPE_DESCENT_DEPTH = 50
+
+_ERROR_CONTAINER_KEYS = frozenset(
+    {
+        "error",
+        "errors",
+        "error_messages",
+        "rejections",
+        "alerts",
+        "warnings",
+        "pre_trade_alerts",
+        "messages",
+        "checks",
+    }
+)
+
+_PLACEMENT_EXECUTION_FIELDS = frozenset(
+    {
+        "cumulative_quantity",
+        "executed_quantity",
+        "filled_quantity",
+        "quantity_filled",
+        "executed_notional",
+        "executed_dollar_amount",
+        "filled_notional",
+    }
+)
+
+_TERMINAL_NO_ACCEPTANCE_ORDER_STATES = frozenset(
+    {"rejected", "failed", "cancelled", "canceled", "voided", "expired"}
+)
+
+_FILL_EVIDENCE_POSITIVE_OR_UNREADABLE = "positive_or_unreadable"
+_FILL_EVIDENCE_EXPLICIT_ZERO = "explicit_zero"
+_FILL_EVIDENCE_NONE_REPORTED = "none_reported"
+_MAX_PLACEMENT_RESPONSE_CONTAINERS = 2048
+
+
+def _placement_response_dicts(value: object) -> Iterator[Dict[str, Any]]:
+    """Yield every order-bearing mapping in a placement response envelope."""
+    # Do not expose diagnostic IDs on error containers as order IDs, but still
+    # descend into them because connectors may nest a real order below one.
+    pending = [(value, False)]
+    visited = set()
+    visited_count = 0
+    while pending:
+        current, is_direct_error_container = pending.pop()
+        if isinstance(current, dict):
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            visited_count += 1
+            if visited_count > _MAX_PLACEMENT_RESPONSE_CONTAINERS:
+                # A response too large to inspect completely cannot prove a
+                # placement was rejected or unfilled.  Stop here and let the
+                # conservative callers retain ambiguity.
+                yield {"_placement_response_incomplete": True}
+                return
+            # Preserve state/fill evidence from an error envelope.  Its
+            # diagnostic `id` is not an order identity, however.
+            if is_direct_error_container:
+                current = {**current, "_placement_error_container": True}
+            yield current
+            for key, val in current.items():
+                if isinstance(val, (dict, list, tuple)):
+                    pending.append((val, key in _ERROR_CONTAINER_KEYS))
+        elif isinstance(current, (list, tuple)):
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            visited_count += 1
+            if visited_count > _MAX_PLACEMENT_RESPONSE_CONTAINERS:
+                yield {"_placement_response_incomplete": True}
+                return
+            for item in current:
+                if isinstance(item, (dict, list, tuple)):
+                    pending.append((item, is_direct_error_container))
+
+
+def _is_usable_order_id(order_id: object) -> bool:
+    """Whether one candidate value is a usable broker order identifier."""
+    if not order_id or isinstance(order_id, bool):
+        return False
+    if not isinstance(order_id, (str, int, float)):
+        return False
+    if isinstance(order_id, str) and not order_id.strip():
+        return False
+    if isinstance(order_id, (int, float)):
+        try:
+            if not math.isfinite(order_id) or order_id <= 0:
+                return False
+        except (OverflowError, TypeError, ValueError):
+            return False
+    return True
+
+
+def _usable_order_ids(candidate: object) -> List[Any]:
+    """Every usable order id one mapping names."""
+    if not isinstance(candidate, dict):
+        return []
+    found = []
+    seen = set()
+    for key in ("id", "order_id"):
+        if key == "id" and candidate.get("_placement_error_container"):
+            continue
+        order_id = candidate.get(key)
+        if not _is_usable_order_id(order_id):
+            continue
+        identity = (type(order_id).__name__, str(order_id).strip())
+        if identity in seen:
+            continue
+        seen.add(identity)
+        found.append(order_id)
+    return found
+
+
+def _placement_response_has_order_id(response: object) -> bool:
+    """Return whether any response envelope carries a usable order id."""
+    return any(
+        bool(_usable_order_ids(envelope))
+        for envelope in _placement_response_dicts(response)
+    )
+
+
+def _placement_response_has_untrackable_positive_order_id(response: object) -> bool:
+    """Whether a response names a positive numeric ID too large to track safely."""
+    for envelope in _placement_response_dicts(response):
+        for key in ("id", "order_id"):
+            if key == "id" and envelope.get("_placement_error_container"):
+                continue
+            value = envelope.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            try:
+                if value > 0 and not math.isfinite(value):
+                    return True
+            except (OverflowError, TypeError, ValueError):
+                # A giant positive Python integer cannot be converted by
+                # math.isfinite(), but is still acceptance evidence.
+                try:
+                    if value > 0:
+                        return True
+                except (TypeError, ValueError):
+                    pass
+    return False
+
+
+def _order_identity_groups(
+    envelopes: List[Dict[str, Any]],
+) -> List[Tuple[Any, List[Dict[str, Any]]]]:
+    """The distinct orders this response names, each with its own envelopes."""
+    groups: List[Tuple[Any, List[Dict[str, Any]]]] = []
+    by_id: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for envelope in envelopes:
+        for order_id in _usable_order_ids(envelope):
+            key = (type(order_id).__name__, str(order_id).strip())
+            group = by_id.get(key)
+            if group is not None:
+                group.append(envelope)
+                continue
+            by_id[key] = [envelope]
+            groups.append((order_id, by_id[key]))
+    return groups
+
+
+def _is_finite_zero(value: Any) -> bool:
+    """Whether a number is a readable, finite zero."""
+    if isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value) and value == 0
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def _fill_evidence(envelope: Dict[str, Any]) -> str:
+    """What an envelope says about how much of an order executed."""
+    saw_explicit_zero = False
+    for key in _PLACEMENT_EXECUTION_FIELDS:
+        if key not in envelope:
+            continue
+        value = envelope[key]
+        if _is_blank_broker_field(value):
+            continue
+        if isinstance(value, bool):
+            return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
+        if isinstance(value, (int, float)):
+            if _is_finite_zero(value):
+                saw_explicit_zero = True
+                continue
+            return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                continue
+            try:
+                numeric = float(text)
+            except (ValueError, OverflowError):
+                return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
+            if _is_finite_zero(numeric):
+                saw_explicit_zero = True
+                continue
+            return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
+        return _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
+    return _FILL_EVIDENCE_EXPLICIT_ZERO if saw_explicit_zero else _FILL_EVIDENCE_NONE_REPORTED
+
+
+def _combined_fill_evidence(envelopes: List[Dict[str, Any]]) -> str:
+    """_fill_evidence over several envelopes, combined conservatively."""
+    verdict = _FILL_EVIDENCE_NONE_REPORTED
+    for envelope in envelopes:
+        evidence = _fill_evidence(envelope)
+        if evidence == _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE:
+            return evidence
+        if evidence == _FILL_EVIDENCE_EXPLICIT_ZERO:
+            verdict = evidence
+    return verdict
+
+
+def _placement_response_proves_zero_execution(response: object) -> bool:
+    """Return true only when every represented order explicitly reports zero execution."""
+    envelopes = list(_placement_response_dicts(response))
+    if not envelopes:
+        return False
+
+    identities = _order_identity_groups(envelopes)
+
+    # An envelope that names two distinct orders cannot attribute its state or
+    # fill fields to either one.  Do not reuse one zero-fill proof for both.
+    if any(len(_usable_order_ids(envelope)) > 1 for envelope in envelopes):
+        return False
+
+    # Every named order must report a terminal non-acceptance state.
+    for _, group in identities:
+        states = [
+            envelope.get("state") for envelope in group if envelope.get("state") is not None
+        ]
+        if not states:
+            return False
+        for state in states:
+            if not (
+                isinstance(state, str)
+                and state.strip().lower() in _TERMINAL_NO_ACCEPTANCE_ORDER_STATES
+            ):
+                return False
+
+    unattributed = [e for e in envelopes if not _usable_order_ids(e)]
+    unattributed_evidence = _combined_fill_evidence(unattributed)
+    if unattributed_evidence == _FILL_EVIDENCE_POSITIVE_OR_UNREADABLE:
+        return False
+
+    if identities:
+        share_unattributed = len(identities) == 1
+        for _, group in identities:
+            scope = group + unattributed if share_unattributed else group
+            if _combined_fill_evidence(scope) != _FILL_EVIDENCE_EXPLICIT_ZERO:
+                return False
+        return True
+
+    # No order identities were named in the response.
+    if unattributed_evidence != _FILL_EVIDENCE_EXPLICIT_ZERO:
+        return False
+    for e in unattributed:
+        state = e.get("state")
+        if state is not None:
+            if not (
+                isinstance(state, str)
+                and state.strip().lower() in _TERMINAL_NO_ACCEPTANCE_ORDER_STATES
+            ):
+                return False
+    return True
+
+
+def _placement_response_has_acceptance_evidence(response: object) -> bool:
+    """Return whether a failure envelope may nevertheless describe accepted spend."""
+    for envelope in _placement_response_dicts(response):
+        if envelope.get("_placement_response_incomplete") is True:
+            return True
+        state = str(envelope.get("state", "")).strip().lower()
+        if state in _LIVE_ORDER_STATES:
+            return True
+        for key in _PLACEMENT_EXECUTION_FIELDS:
+            if key not in envelope or _is_blank_broker_field(envelope[key]):
+                continue
+            if isinstance(envelope[key], bool):
+                return True
+            try:
+                value = float(envelope[key])
+            except (TypeError, ValueError, OverflowError):
+                return True
+            if not math.isfinite(value) or value != 0:
+                return True
+    return False
+
 
 # Review-endpoint `state` strings recognized as an explicit APPROVAL --
 # used by `_interpret_review`'s per-layer blocking scan as an ALLOWLIST,
@@ -2246,7 +2554,13 @@ def _to_float(value: Any, default: float = 0.0) -> float:
     can never slip through a numeric comparison — a NaN buying power would make
     ``buying_power < amount`` false and bypass the gate.
     """
-    if value is None:
+    if value is None or isinstance(value, bool):
+        # float(True) == 1.0 passes the finiteness check below, so a JSON
+        # `true` in a price or balance field read as a 1.0 close/quote -- a
+        # ~100% drop that selects the maximum ladder multiplier, the exact
+        # spurious-max-BUY the close<=0 guard exists to prevent.
+        # dca_config._config_float already rejects bool the same way
+        # (2026-09-07 diagnostic, S:ADP-03).
         return default
     try:
         result = float(value)
@@ -2268,6 +2582,92 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 #: exists for a different comparison and is loose enough to mask a real
 #: fill-figure conflict here).
 _FILL_EVIDENCE_NUMERIC_TOLERANCE = 1e-9
+# Half a cent: the request is sent as f"{notional:.2f}", so a faithful echo can
+# differ from the float request by rounding only.
+_PLACEMENT_IDENTITY_NOTIONAL_TOLERANCE_USD = 0.005
+
+
+def _placement_response_identity_mismatch(
+    order: Dict[str, Any],
+    *,
+    ticker: str,
+    ref_id: str,
+    notional_usd: Optional[float] = None,
+    quantity: Optional[int] = None,
+    require_identity: bool = False,
+) -> Optional[str]:
+    """Why ``order`` does not describe the request that produced it, or ``None``.
+
+    ``place_market_buy``/``place_whole_share_buy`` validated the order id,
+    lifecycle state and fill evidence of a placement response but never that
+    the order they were handed is the one they asked for: a connector wrapper
+    echoing a stale or previous response, a broker-side symbol substitution,
+    or a wrong-order echo was booked as this ticker's buy at the requested
+    size and consumed budget and caps for the wrong instrument (2026-09-07
+    diagnostic, S:ADP-01).
+
+    Only NON-BLANK fields are compared -- Robinhood omits some of these on a
+    fresh placement and an absent field says nothing -- and a present field
+    that disagrees is decisive: another symbol, another side, another client
+    reference, or another size. The echoed value is rendered with
+    ``_artifact_safe_repr`` (redacted, not just overflow-safe): this text is
+    embedded in ``AmbiguousPlacementResponseError``, which callers persist as
+    reconciliation evidence, so a broker-supplied alias carrying an
+    account-shaped or credential-bearing string must not travel with it
+    (Copilot review, PR #1394: "Redact echoed mismatch values").
+
+    ``require_identity=True`` is the owner-controlled strict mode
+    (``RobinhoodBroker(require_placement_identity=True)``): a response that
+    echoes neither a symbol nor a client reference is then refused too, so a
+    stale replay with every identity field omitted cannot be booked. Off by
+    default because the live connector's response shape cannot be verified
+    from this repository and requiring the fields blind would fail every real
+    placement closed (Copilot review, PR #1394: "Reject placement responses
+    missing required identity fields").
+    """
+    symbol_seen = False
+    for symbol_key in ("symbol", "instrument_symbol"):
+        symbol = order.get(symbol_key)
+        if _is_blank_broker_field(symbol):
+            continue
+        symbol_seen = True
+        if not isinstance(symbol, str) or symbol.strip().upper() != ticker.upper():
+            return f"{symbol_key} {_artifact_safe_repr(symbol)} is not the requested {ticker!r}"
+    side = order.get("side")
+    if not _is_blank_broker_field(side):
+        if not isinstance(side, str) or side.strip().lower() != "buy":
+            return f"side {_artifact_safe_repr(side)} is not 'buy'"
+    reference_seen = False
+    for alias in ("ref_id", "client_order_id", "client_order_uuid", "client_id"):
+        value = order.get(alias)
+        if _is_blank_broker_field(value):
+            continue
+        reference_seen = True
+        if not isinstance(value, str) or value.strip() != ref_id:
+            return f"{alias} {_artifact_safe_repr(value)} is not the requested ref_id {ref_id!r}"
+    if require_identity and not symbol_seen:
+        return "response carries no symbol to prove it describes this request (strict placement identity)"
+    if require_identity and not reference_seen:
+        return "response carries no client reference to prove it describes this request (strict placement identity)"
+    if notional_usd is not None:
+        for key in ("dollar_amount", "notional"):
+            raw = order.get(key)
+            if _is_blank_broker_field(raw):
+                continue
+            reported = _to_float(raw, default=math.nan)
+            if not math.isfinite(reported):
+                return f"{key} {_artifact_safe_repr(raw)} is not a usable notional"
+            if abs(reported - notional_usd) > _PLACEMENT_IDENTITY_NOTIONAL_TOLERANCE_USD:
+                return f"{key} {reported!r} is not the requested notional {notional_usd:.2f}"
+    if quantity is not None:
+        raw = order.get("quantity")
+        if not _is_blank_broker_field(raw):
+            reported = _to_float(raw, default=math.nan)
+            if not math.isfinite(reported):
+                return f"quantity {_artifact_safe_repr(raw)} is not a usable quantity"
+            if abs(reported - float(quantity)) > _FILL_EVIDENCE_NUMERIC_TOLERANCE:
+                return f"quantity {reported!r} is not the requested quantity {quantity}"
+    return None
 
 #: Sub-cent money tolerance for comparing a RECONSTRUCTED notional
 #: (``quantity * average_price``) against a directly-reported one --
@@ -4434,6 +4834,7 @@ HistoricalsFn = Callable[..., Dict[str, Any]]  # (symbols, start_time, end_time,
 QuotesFn = Callable[..., Dict[str, Any]]        # (symbols) -> dict
 BarsFn = Callable[..., Any]                     # generic finance bars -> iterable of bar-like mappings
 PrevCloseFn = Callable[..., Any]                # generic finance previous close -> price or mapping
+QuoteFn = Callable[..., Any]                    # generic finance quote -> price or mapping
 
 
 class RobinhoodDataProvider:
@@ -4503,6 +4904,76 @@ class RobinhoodDataProvider:
             adjustment_type=self._adjustment_type,
         )
         return self._parse_bars(response, ticker)
+
+
+    def get_batch_intraday_bars(
+        self,
+        tickers: List[str],
+        start: datetime,
+        end: datetime,
+        interval_minutes: int,
+    ) -> Dict[str, List[Bar]]:
+        """Fetch one historicals batch and return ``{symbol: [Bar, ...]}``.
+
+        Three kinds of row are dropped without a log line, on purpose, because
+        each is routine in a healthy Robinhood response and logging them would
+        drown the one drop that IS worth a warning (a non-positive close):
+
+        * result blocks whose ``symbol`` is missing or was not requested --
+          the batch endpoint can echo related symbols, and a signal computed
+          for a ticker the caller never asked about must never reach sizing;
+        * bars flagged ``interpolated`` -- Robinhood synthesises those to fill
+          gaps, so they carry no trade and would fake a price the market never
+          printed;
+        * bars whose ``begins_at`` does not parse -- a bar with no usable
+          timestamp cannot be placed in the session, so it is safer to lose
+          than to misfile.
+
+        A symbol whose every bar was dropped is omitted from the result rather
+        than mapped to ``[]`` so callers treat it exactly like a symbol the
+        broker returned nothing for (2026-09-07 diagnostic P:COMMENT-03).
+        """
+        interval = _rh_interval(interval_minutes)
+        response = self._historicals_fn(
+            symbols=tickers,
+            start_time=_to_utc_iso(start),
+            end_time=_to_utc_iso(end),
+            interval=interval,
+            bounds=self._bounds,
+            adjustment_type=self._adjustment_type,
+        )
+        data = _unwrap(response)
+        results = data.get("results") or []
+        grouped = {}
+        for result in results:
+            symbol = result.get("symbol")
+            if not symbol or symbol not in tickers:
+                continue  # unrequested/related symbol: never feed sizing
+
+            bars = []
+            for raw in result.get("bars") or []:
+                if raw.get("interpolated"):
+                    continue  # gap-filler with no trade behind it
+                timestamp = _parse_rfc3339(raw.get("begins_at"))
+                if timestamp is None:
+                    continue  # unplaceable in the session; drop, don't misfile
+                close = _to_float(raw.get("close_price"), default=-1.0)
+                if close <= 0:
+                    logger.warning("dropping %s bar with invalid close_price=%r", symbol, raw.get("close_price"))
+                    continue
+                bars.append(
+                    Bar(
+                        timestamp=timestamp,
+                        open=_to_float(raw.get("open_price")),
+                        high=_to_float(raw.get("high_price")),
+                        low=_to_float(raw.get("low_price")),
+                        close=close,
+                        volume=_to_float(raw.get("volume")),
+                    )
+                )
+            if bars:
+                grouped[symbol] = bars
+        return grouped
 
     def get_previous_close_bar(self, ticker: str, as_of: datetime) -> Optional[Bar]:
         if self._quotes_fn is not None:
@@ -4680,11 +5151,20 @@ class FinanceDataProvider:
     The reconciliation logic in :mod:`near_close_dca` compares a finance-side and a
     Robinhood-side signal before ordering, so the finance provider should be a genuinely
     independent source (e.g. yfinance/Yahoo, a vendor OHLCV API, or a second Robinhood
-    query at a different granularity). Wire it with two callables:
+    query at a different granularity). Wire it with two required callables and
+    an optional quote callable:
 
     * ``bars_fn(ticker, start, end, interval_minutes) -> iterable`` yielding bar-like
       mappings with ``timestamp`` (datetime or ISO string) and ``open/high/low/close/volume``.
     * ``previous_close_fn(ticker, as_of) -> float | mapping`` returning the prior close.
+    * ``quote_fn(ticker, as_of) -> float | mapping`` returning a current quote when
+      the connector supports one; omitting it preserves completed-bar semantics.
+      Keyword-only, and added after ``supports_corporate_actions`` rather than
+      before it, so an existing positional caller of
+      ``FinanceDataProvider(bars_fn, previous_close_fn, False)`` keeps setting
+      ``supports_corporate_actions`` rather than silently reinterpreting that
+      boolean as ``quote_fn`` (Codex review: "Preserve the existing third
+      positional argument").
 
     Keys are matched leniently (``close``/``close_price``, ``timestamp``/``begins_at``/``t``)
     so most vendor payloads work without a bespoke adapter.
@@ -4714,10 +5194,37 @@ class FinanceDataProvider:
         bars_fn: BarsFn,
         previous_close_fn: PrevCloseFn,
         supports_corporate_actions: bool = True,
+        *,
+        quote_fn: Optional[QuoteFn] = None,
     ) -> None:
         self._bars_fn = bars_fn
         self._previous_close_fn = previous_close_fn
+        self._quote_fn = quote_fn
         self.supports_corporate_actions = supports_corporate_actions
+
+    def get_quote(self, ticker: str, as_of: datetime) -> Optional[Tuple[float, Optional[datetime]]]:
+        """Return the connector quote when the Finance wiring supplies one."""
+        if self._quote_fn is None:
+            return None
+        result = self._quote_fn(ticker, as_of)
+        if result is None:
+            return None
+        if isinstance(result, dict):
+            raw_price = result.get("price") or result.get("last_trade_price")
+            timestamp = _parse_rfc3339(result.get("as_of") or result.get("timestamp"))
+        else:
+            raw_price = result
+            timestamp = as_of
+        # bool is an int subclass, so float(True) == 1.0 would otherwise sail
+        # through _to_float as an ordinary $1.00 quote. A malformed connector
+        # response like {"price": true, "as_of": ...} would then be accepted
+        # as a positive price and could turn an ordinary stock into a
+        # maximum-drop BUY signal (Codex review: "Reject boolean Finance quote
+        # prices").
+        if isinstance(raw_price, bool):
+            return None
+        price = _to_float(raw_price)
+        return (price, timestamp) if price > 0 else None
 
     def get_intraday_bars(
         self,
@@ -4880,7 +5387,13 @@ class FinanceDataProvider:
                 )
                 if split_key is None or dividend_key is None:
                     return None
-                raw_day = row.get("date") or row.get("timestamp") or row.get("begins_at") or row.get("t")
+                raw_day = (
+                    row.get("date")
+                    or row.get("Date")
+                    or row.get("timestamp")
+                    or row.get("begins_at")
+                    or row.get("t")
+                )
                 if isinstance(raw_day, datetime):
                     aware_day = raw_day if raw_day.tzinfo is not None else raw_day.replace(tzinfo=EASTERN)
                     row_day = aware_day.astimezone(EASTERN).date()
@@ -4893,7 +5406,25 @@ class FinanceDataProvider:
                     continue
                 raw_ratio = row[split_key]
                 raw_dividend = row[dividend_key]
-                if raw_ratio in (None, "") or raw_dividend in (None, ""):
+                if raw_ratio is None or raw_dividend is None:
+                    return None
+                # Providers sometimes serialize unavailable numeric metadata as
+                # whitespace rather than an empty string. Keep that on the
+                # same fail-closed path: it is not evidence of a zero action.
+                split_blank = isinstance(raw_ratio, str) and not raw_ratio.strip()
+                dividend_blank = isinstance(raw_dividend, str) and not raw_dividend.strip()
+                if split_blank or dividend_blank:
+                    return None
+                # bool is a subclass of int in Python, so float(True)/
+                # float(False) succeed as 1.0/0.0 instead of raising --
+                # "Dividends": true survived as a fabricated $1 dividend and
+                # "Stock Splits": true as a real 1:1 split ratio, letting the
+                # inverse-Martingale recovery-latch path durably rebase
+                # itself on corporate-action data that was never actually
+                # reported (Codex review, PR #1299: "Reject boolean
+                # corporate-action values"). Rejected the same way the
+                # non-numeric/empty-string case just above already is.
+                if isinstance(raw_ratio, bool) or isinstance(raw_dividend, bool):
                     return None
                 ratio = float(raw_ratio)
                 dividend = float(raw_dividend)
@@ -4939,7 +5470,16 @@ class FinanceDataProvider:
                     probe_day += timedelta(days=1)
             elif cursor is not None:
                 cursor = None
-        except (OSError, RuntimeError, TypeError, ValueError, OverflowError):
+        except Exception:  # noqa: BLE001 - provider boundary must fail closed
+            # Injected connectors also decode/iterate third-party payloads here.
+            # A malformed response may raise exceptions such as KeyError or
+            # IndexError that are not part of the connector's advertised API;
+            # no provider failure may abort evaluation of the remaining tickers
+            # (PR #1357: "Fix corporate action isolation and state update
+            # races"). The narrower (OSError, RuntimeError, TypeError,
+            # ValueError, OverflowError) tuple this used to catch let exactly
+            # those payload-shape errors escape past the strategy's own
+            # per-ticker isolation and abort the whole scheduled scan.
             return None
         if cursor is None or cursor != as_of or not math.isfinite(factor) or factor <= 0:
             return None
@@ -4949,10 +5489,16 @@ class FinanceDataProvider:
 class RobinhoodBroker:
     """``BrokerAdapter`` for Robinhood equities via injected MCP callables.
 
-    All callables are optional; a missing callable degrades that check to a safe
-    default (permissive review/tradability, no same-day order, simulated buying power)
-    so the broker is usable in progressively-wired environments. Real placement is
-    gated behind ``enable_live_orders`` **and** a ``place_fn``.
+    All callables are optional; while ``enable_live_orders`` is False a missing
+    callable degrades that check to a safe default (permissive review/tradability,
+    no same-day order, simulated buying power) so the broker is usable in
+    progressively-wired environments. With ``enable_live_orders`` True those same
+    defaults are the opposite of safe -- a partially wired live broker would place
+    real orders against a fabricated buying-power figure, skip the tradability
+    check, and run its duplicate gate against an empty history -- so every lookup
+    whose callable is missing raises instead (2026-09-07 diagnostic, C:F1; the
+    rule ``review_market_buy`` has always applied, extended to the other three).
+    Real placement is gated behind ``enable_live_orders`` **and** a ``place_fn``.
 
     Callable signatures (keyword args mirror the Robinhood MCP tools):
 
@@ -4999,6 +5545,7 @@ class RobinhoodBroker:
         time_in_force: str = "gfd",
         simulated_buying_power_usd: float = 300.0,
         supports_concurrent_fill_lookup: bool = False,
+        require_placement_identity: bool = False,
     ) -> None:
         self._account = account
         self._buying_power_fn = buying_power_fn
@@ -5011,18 +5558,45 @@ class RobinhoodBroker:
         self._time_in_force = time_in_force
         self._simulated_buying_power_usd = simulated_buying_power_usd
         self._raw_placement_responses: List[Dict[str, Any]] = []
+        # Order ids this instance has already booked as successful placements;
+        # see _refuse_replayed_order_id.
+        self._accepted_order_ids: set = set()
+        # Strict placement identity: refuse a placement response that echoes
+        # neither a symbol nor a client reference. Off by default; see
+        # _placement_response_identity_mismatch's docstring.
+        self.require_placement_identity = require_placement_identity
         self.supports_concurrent_fill_lookup = supports_concurrent_fill_lookup
 
     def account_number(self) -> str:
         return self._account
 
+    def _refuse_unwired_live_lookup(self, callable_name: str, consequence: str) -> None:
+        """Raise when a lookup callable is missing while the live gate is on.
+
+        Truthiness, not ``is True``, on purpose: a misconfigured truthy value
+        (``"false"``, ``1``) must fail closed here even though placement itself
+        requires the literal ``True``. Only a genuinely dry-run broker may fall
+        through to the simulated default the caller supplies.
+        """
+        if self.enable_live_orders:
+            raise RuntimeError(
+                f"live orders enabled but no {callable_name} wired; refusing to {consequence}"
+            )
+
     def available_buying_power(self) -> float:
         if self._buying_power_fn is None:
+            self._refuse_unwired_live_lookup(
+                "buying_power_fn",
+                f"assume ${self._simulated_buying_power_usd:.2f} of simulated buying power",
+            )
             return self._simulated_buying_power_usd
         try:
             result = self._buying_power_fn(account_number=self._account)
-        except Exception:  # noqa: BLE001 - never let buying-power lookup crash a scan
-            logger.exception("buying-power lookup failed; treating as 0")
+        except Exception as exc:  # noqa: BLE001 - never let buying-power lookup crash a scan
+            logger.error(
+                "buying-power lookup failed; treating as 0: %s",
+                _redacted_diagnostic_text("".join(traceback.format_exception_only(exc)).strip()),
+            )
             return 0.0
         # Accept either a scalar or a raw MCP dict (per the module-level callable contract).
         if isinstance(result, dict):
@@ -5050,7 +5624,12 @@ class RobinhoodBroker:
             for _layer in (result, *_data_layers):
                 _layer_error = _is_error_response(_layer)
                 if _layer_error is not None:
-                    logger.warning("buying-power lookup reported a failure: %s", _layer_error)
+                    # _artifact_safe_repr, not the raw error text (S:ADP-02,
+                    # 2026-09-07 diagnostic): a broker/connector error string
+                    # can echo request context (account number, URLs), and
+                    # this is the same class of leak the placement-response
+                    # logging elsewhere in this module already redacts.
+                    logger.warning("buying-power lookup reported a failure: %s", _artifact_safe_repr(_layer_error))
                     return 0.0
             # Scanned across every layer `_unwrap_traversed_layers` walks
             # through, not just the single layer `_unwrap` settles on: the
@@ -5075,7 +5654,9 @@ class RobinhoodBroker:
                 ):
                     if key in data:
                         return _to_float(data.get(key))
-            logger.warning("buying-power response had no recognizable amount field: %s", result)
+            logger.warning(
+                "buying-power response had no recognizable amount field: %s", _artifact_safe_repr(result)
+            )
             return 0.0
         return _to_float(result)
 
@@ -5109,13 +5690,20 @@ class RobinhoodBroker:
         and release the balance for a duplicate purchase (Codex review:
         "Preserve leases when order history is unavailable").
 
-        It is opt-in rather than the default because the ordinary duplicate-order
-        gate has the OPPOSITE established contract -- an unwired adapter reports
-        "no order today" and lets a buy proceed (see
-        ``test_robinhood_broker_same_day_lookup_without_orders_fn``, and
-        ``morning_dca.py``'s use of it as its sole duplicate gate). Flipping that
-        is a real improvement but a separate, broader change than this one.
+        It is opt-in for the DRY-RUN broker, whose ordinary duplicate-order gate
+        keeps the established contract that an unwired adapter reports "no order
+        today" and lets a simulated buy proceed. A LIVE broker (``enable_live_orders``
+        True) gets the provable-history rule unconditionally: ``morning_dca.py``
+        uses this lookup as its sole duplicate gate, so an unwired live adapter
+        answering "no order today" is precisely the same-day double-buy the
+        2026-07-23 incident recorded (2026-09-07 diagnostic, C:F1). That rule
+        covers BOTH silent shapes for a live broker, not only the unwired one:
+        the 2026-09-07 mock beta run showed a wired callable returning a
+        non-empty page the adapter cannot recognize was still read as "no
+        order today", and the executors' sole duplicate gate re-placed every
+        order on a retry.
         """
+        require_provable_history = require_provable_history or self.enable_live_orders
         if self._orders_fn is None:
             if require_provable_history:
                 raise RuntimeError(
@@ -5549,11 +6137,11 @@ class RobinhoodBroker:
         return None
 
     def same_day_ticker_notional_usd(self, ticker: str, trading_day: date) -> float:
-        """Sum the dollar notional of every live same-day order for ``ticker``.
+        """Sum same-day commitments and terminal executed dollars for ``ticker``.
 
         Unlike the two methods above, this is NOT scoped to any particular
-        ref-id convention -- it sums every live-state order the broker itself
-        reports for this ticker/day, regardless of which stream or executor
+        ref-id convention -- it includes every live-state order and any fills
+        from terminal orders, regardless of which stream or executor
         (this roster, a legacy morning_dca.py/midday_dca.py run, or a manual
         fill) placed it. Ground truth for a guarded top-up's incremental
         delta, which must never trust an artifact-derived prior allocation
@@ -5562,22 +6150,60 @@ class RobinhoodBroker:
         """
         total = 0.0
         for order in self._same_day_orders(ticker, trading_day):
-            if str(order.get("state", "")).lower() not in _LIVE_ORDER_STATES:
+            if _order_lifecycle_aliases_conflict(order):
+                raise RuntimeError(f"same-day order for {ticker} reports conflicting lifecycle states")
+            state = _normalize_broker_lifecycle_alias(order.get("state")) or _normalize_broker_lifecycle_alias(
+                order.get("status")
+            )
+            if state in _TERMINAL_BROKER_ORDER_STATES:
+                # Compare all executed-share aliases without changing the
+                # settled-value parser's separate dollar-rounding tolerance.
+                execution_quantities = {key: order[key] for key in _FILL_EVIDENCE_QUANTITY_ALIASES if key in order}
+                if _order_rows_contradict(execution_quantities, execution_quantities):
+                    raise RuntimeError(f"same-day terminal order for {ticker} has unproven executed notional")
+                # Cancellation releases only the unfilled remainder. The
+                # requested notional/quantity is not the terminal execution;
+                # reuse the existing settled-value parser instead. A zero
+                # also needs proof: missing fill evidence is not no spending.
+                executed = _recovered_broker_notional(order)
+                if executed is None or (executed == 0 and not terminal_broker_row_proves_no_order(order)):
+                    raise RuntimeError(f"same-day terminal order for {ticker} has unproven executed notional")
+                total += executed
                 continue
-            try:
-                total += float(order.get("dollar_amount") or order.get("notional") or 0)
-            except (TypeError, ValueError):
+            if state not in _LIVE_ORDER_STATES:
                 continue
+            raw = order.get("dollar_amount") or order.get("notional") or 0
+            amount = _to_float(raw, default=math.nan)
+            if not math.isfinite(amount):
+                # Fail closed, not skip: the consumer (near_close_dca's guarded
+                # top-up) trusts this figure only when it is GREATER than the
+                # artifact-derived prior, so a NaN (which compares False) or a
+                # dropped unparseable row silently disabled the broker
+                # ground-truth cross-check for this ticker instead of blocking
+                # it. Its own except path already treats a raise as "cannot
+                # prove" (2026-09-07 diagnostic, S:ADP-04).
+                raise RuntimeError(
+                    f"same-day order for {ticker} reports a non-finite or unparseable notional "
+                    f"({_log_safe_repr(raw)}); refusing to sum it"
+                )
+            total += amount
         return total
+
+    def same_day_ticker_orders(self, ticker: str, trading_day: date) -> List[Dict[str, Any]]:
+        """Return every broker row used to reconcile same-day ticker exposure."""
+        return list(self._same_day_orders(ticker, trading_day))
 
     def is_tradable_for_fractional_buy(self, ticker: str) -> bool:
         if self._tradability_fn is None:
+            self._refuse_unwired_live_lookup("tradability_fn", f"assume {ticker} is fractional-tradable")
             return True
         data = _unwrap(self._tradability_fn(account_number=self._account, symbols=[ticker]))
         for result in data.get("results") or []:
             if result.get("symbol") != ticker:
                 continue
-            if not result.get("tradeable", False) or result.get("state") != "active":
+            # `is True`, not truthiness: a string "false" is truthy
+            # (2026-09-07 diagnostic, S:ADP-03).
+            if result.get("tradeable") is not True or result.get("state") != "active":
                 return False
             return str(result.get("fractional_tradability", "")) == "tradable"
         return False
@@ -5597,6 +6223,7 @@ class RobinhoodBroker:
         available, with no pre-placement tradability check at all).
         """
         if self._tradability_fn is None:
+            self._refuse_unwired_live_lookup("tradability_fn", f"assume {ticker} is tradeable and active")
             return True
         data = _unwrap(self._tradability_fn(account_number=self._account, symbols=[ticker]))
         # Compared case-insensitively: unlike "active" (schema-enforced
@@ -5612,7 +6239,7 @@ class RobinhoodBroker:
         for result in data.get("results") or []:
             if str(result.get("symbol", "")).upper() != ticker.upper():
                 continue
-            return bool(result.get("tradeable", False)) and result.get("state") == "active"
+            return result.get("tradeable") is True and result.get("state") == "active"
         return False
 
     def review_market_buy(self, ticker: str, notional_usd: float) -> Tuple[bool, str]:
@@ -5631,8 +6258,50 @@ class RobinhoodBroker:
         )
         return _interpret_review(response)
 
+    def _refuse_replayed_order_id(self, order_id: Any, *, ticker: str, order: Dict[str, Any]) -> None:
+        """Raise if ``order_id`` was already booked by this broker instance.
+
+        A bare ``{id, state}`` response with every identity field omitted is
+        accepted by contract: the live-mirror prompts and
+        ``dca_runner._placement_failure_reason`` compare symbol, side,
+        client reference and size only WHEN PRESENT, because a fresh
+        Robinhood placement omits several of them, and requiring them would
+        fail every real placement closed. The stale-echo shape that contract
+        leaves open is a connector replaying an EARLIER placement's response
+        verbatim -- and that response names an order id this instance already
+        accepted for a different request, which cannot also describe this
+        one. Refused as structurally ambiguous (may have executed) so the
+        caller halts and reconciles from history rather than booking the
+        same order twice (Copilot review, PR #1394: "Reject placement
+        responses missing required identity fields", resolved by this
+        replay guard instead of a field requirement).
+        """
+        if order_id is None:
+            return
+        key = str(order_id)
+        if key not in self._accepted_order_ids:
+            return
+        logger.error(
+            "place_equity_order for %s returned order id %s, which this run already accepted for an earlier request: %s",
+            ticker,
+            key,
+            _artifact_safe_repr(order),
+        )
+        raise AmbiguousPlacementResponseError(
+            f"live placement for {ticker} returned order id {key}, which this run already accepted for an "
+            f"earlier request; response={_artifact_safe_repr(order)}",
+            order_id=key,
+            response_notional_usd=_recovered_broker_notional(order),
+            response_may_have_executed=True,
+            structurally_ambiguous=True,
+        )
+
     def place_market_buy(self, ticker: str, notional_usd: float, ref_id: str) -> str:
-        if not (self.enable_live_orders and self._place_fn is not None):
+        # `is True`, not truthiness, matching dca_runner.execute_plan's own
+        # literal-boolean gate: a passthrough like enable_live_orders="false"
+        # is a truthy string and reached real placement here while the runner
+        # refused the same value (2026-09-07 diagnostic, C:F11).
+        if not (self.enable_live_orders is True and self._place_fn is not None):
             # run_once only calls a live broker's place_market_buy on the non-dry-run path
             # (dry-run uses a DRY-RUN-SIM sentinel without touching the broker). Reaching
             # here with the live gate disabled is a misconfiguration; returning a
@@ -5642,20 +6311,61 @@ class RobinhoodBroker:
                 f"(enable_live_orders={self.enable_live_orders}, "
                 f"place_fn={'set' if self._place_fn else 'None'}); use dry_run=True for simulated runs"
             )
-        response = self._place_fn(
-            account_number=self._account,
-            symbol=ticker,
-            side="buy",
-            type="market",
-            dollar_amount=f"{notional_usd:.2f}",
-            time_in_force=self._time_in_force,
-            ref_id=ref_id,
-        )
+        try:
+            response = self._place_fn(
+                account_number=self._account,
+                symbol=ticker,
+                side="buy",
+                type="market",
+                dollar_amount=f"{notional_usd:.2f}",
+                time_in_force=self._time_in_force,
+                ref_id=ref_id,
+            )
+        except OrderPlacementAmbiguousError:
+            # A wrapping adapter (e.g. morning_dca._PersistingBrokerAdapter,
+            # when the placement response is a raw-input pointer it could
+            # not read back) can raise this directly instead of the
+            # underlying connector call raising a generic exception --
+            # already the right, specific error; pass it through unwrapped
+            # rather than nesting it inside another one below.
+            raise
+        except Exception as exc:  # noqa: BLE001 - the connector call itself
+            # (network timeout, connection reset, MCP transport error, ...)
+            # gave no broker response at all, unlike every raise below this
+            # point, which reacts to a definitive response the broker DID
+            # return (a failure envelope, no order id, or a terminal state).
+            # Whether this order actually reached and was accepted by the
+            # broker is genuinely unknown here -- re-raise as the distinct
+            # ambiguous-placement error so the caller records
+            # "potentially_submitted" and conservatively reserves this
+            # notional instead of treating the ticker as unbought (Codex
+            # review, PR #1300 discussion_r3920155064: "Emit the new
+            # ambiguous-placement status").
+            raise OrderPlacementAmbiguousError(
+                f"placement connector call for {ticker} failed with no broker response: {_artifact_safe_repr(exc)}"
+            ) from exc
         outer_failure = _response_failure(response)
         if outer_failure is not None:
             # A failure envelope that still carries an inner order id (e.g.
             # {"success": false, "data": {"order": {...}}}) must not be read as success.
-            logger.error("place_equity_order for %s reported failure: %s", ticker, _log_safe_repr(response))
+            logger.error("place_equity_order for %s reported failure: %s", ticker, _artifact_safe_repr(response))
+            # Normalize the complete response before any shape-specific
+            # unwrapping. Connectors may place an accepted order below an
+            # arbitrary failure/context wrapper rather than ``data`` or
+            # ``error``; losing that identity would prevent exact-reference
+            # reconciliation and could exclude real spend from cap accounting.
+            _response_envelopes = list(_placement_response_dicts(response))
+            _response_order_groups = _order_identity_groups(_response_envelopes)
+            _response_has_acceptance = _placement_response_has_acceptance_evidence(response)
+            _response_traversal_incomplete = any(
+                layer.get("_placement_response_incomplete") is True for layer in _response_envelopes
+            )
+            _response_single_order_id = (
+                _response_order_groups[0][0] if len(_response_order_groups) == 1 else None
+            )
+            _response_structurally_ambiguous = (
+                _response_traversal_incomplete or len(_response_order_groups) > 1
+            )
             data = _unwrap_seeking_order_evidence(response)
             # A structured "error" value is real order evidence too, not just a
             # message: `_is_error_response` above already treats a truthy "error"
@@ -5930,6 +6640,13 @@ class RobinhoodBroker:
                 if envelope_order_id and not _order_identity_conflicts and not ambiguous_nested_orders
                 else None
             )
+            if (
+                _carryable_failure_order_id is None
+                and _response_has_acceptance
+                and _response_single_order_id is not None
+                and not _response_structurally_ambiguous
+            ):
+                _carryable_failure_order_id = _response_single_order_id
             if _failure_is_broker_authored(
                 response,
                 order,
@@ -5974,7 +6691,12 @@ class RobinhoodBroker:
                     # possibly-live orders the batch never accounted for
                     # (Codex review, PR #859 round 31: "Honor ambiguity
                     # before proving an ID-bearing failure").
-                    if envelope_order_id and not ambiguous_nested_orders and not _unresolved_sibling_orders:
+                    if (
+                        envelope_order_id
+                        and not ambiguous_nested_orders
+                        and not _unresolved_sibling_orders
+                        and not _response_has_acceptance
+                    ):
                         if terminal_broker_row_proves_no_order(_evidence_order):
                             raise FractionalPlacementRejectedError(
                                 f"live placement for {ticker} was explicitly rejected: {outer_failure}",
@@ -5988,6 +6710,7 @@ class RobinhoodBroker:
                     elif (
                         not ambiguous_nested_orders
                         and not _unresolved_sibling_orders
+                        and not _response_has_acceptance
                         and not _envelope_order_id_unrepresentable
                         and not _reconciled_order_may_have_executed(_evidence_order)
                         and _failure_envelope_state_permits_proven_rejection(_evidence_order)
@@ -6040,11 +6763,20 @@ class RobinhoodBroker:
                     # success path's own marker exists to close (Codex
                     # review, PR #1164: "Preserve sibling-order ambiguity
                     # through reconciliation").
-                    structurally_ambiguous=bool(
-                        _order_identity_conflicts or ambiguous_nested_orders or _unresolved_sibling_orders
+                    structurally_ambiguous=(
+                        _order_identity_conflicts
+                        or ambiguous_nested_orders
+                        or _unresolved_sibling_orders
+                        or _response_structurally_ambiguous
                     ),
                 )
-            if ambiguous_nested_orders or _unresolved_sibling_orders or _order_identity_conflicts:
+            if (
+                ambiguous_nested_orders
+                or _unresolved_sibling_orders
+                or _order_identity_conflicts
+                or _response_has_acceptance
+                or _response_structurally_ambiguous
+            ):
                 # No usable envelope-level id survived above, but the
                 # response still names 2+ conflicting candidate orders --
                 # either through the "orders" collection itself
@@ -6283,7 +7015,7 @@ class RobinhoodBroker:
             # Fail fast: run_once treats any returned id as a submitted order and records
             # the notional against daily/weekly budgets. Returning "" would book a phantom
             # buy with no order to reconcile, so raise instead of reporting false success.
-            logger.error("place_equity_order returned no order id for %s: %s", ticker, _log_safe_repr(data))
+            logger.error("place_equity_order returned no order id for %s: %s", ticker, _artifact_safe_repr(data))
             state = str(order.get("state") or order.get("status") or "").lower()
             # The SHARED classifier decides, not a local state list: it applies
             # _reconcile_ambiguous_fractional_placement's own rule, so fill
@@ -6343,10 +7075,10 @@ class RobinhoodBroker:
                 # PR #1164: "Preserve ambiguity for ID-less success
                 # responses").
                 raise AmbiguousPlacementResponseError(
-                    f"live placement for {ticker} returned no order id; response={_log_safe_repr(data)}",
+                    f"live placement for {ticker} returned no order id; response={_artifact_safe_repr(data)}",
                     structurally_ambiguous=True,
                 )
-            raise RuntimeError(f"live placement for {ticker} returned no order id; response={_log_safe_repr(data)}")
+            raise RuntimeError(f"live placement for {ticker} returned no order id; response={_artifact_safe_repr(data)}")
         # Falls back to "status" too, the SAME alias the ID-LESS branch just
         # above and terminal_broker_row_proves_no_order itself already read:
         # an ID-bearing response reporting its terminal lifecycle only
@@ -6482,6 +7214,38 @@ class RobinhoodBroker:
                 order, _merged_order_collection_view(data, response).get("orders")
             )
         )
+        # Identity FIRST, before any terminal-state interpretation below: a
+        # stale "rejected" response naming another symbol, side, client
+        # reference or size was otherwise raised as a definitive rejection
+        # of THIS ticker (isolated, batch continues, ticker treated as
+        # unbought) while the broker may well hold this ticker's own order.
+        # A mismatch is structurally ambiguous whatever lifecycle state it
+        # reports, so the caller reconciles from history instead of trusting
+        # it either way (Copilot review, PR #1394: "Validate identity before
+        # interpreting terminal responses"; 2026-09-07 diagnostic, S:ADP-01).
+        identity_mismatch = _placement_response_identity_mismatch(
+            order,
+            ticker=ticker,
+            ref_id=ref_id,
+            notional_usd=notional_usd,
+            require_identity=self.require_placement_identity,
+        )
+        if identity_mismatch is not None:
+            logger.error(
+                "place_equity_order for %s returned an order that does not describe this request (%s): %s",
+                ticker,
+                identity_mismatch,
+                _artifact_safe_repr(order),
+            )
+            raise AmbiguousPlacementResponseError(
+                f"live placement for {ticker} returned an order that does not describe this request: "
+                f"{identity_mismatch}; response={_artifact_safe_repr(order)}",
+                order_id=str(order_id),
+                response_notional_usd=_recovered_broker_notional(order),
+                response_may_have_executed=True,
+                structurally_ambiguous=True,
+            )
+        self._refuse_replayed_order_id(order_id, ticker=ticker, order=order)
         if (
             state in _TERMINAL_BROKER_ORDER_STATES
             and not ambiguous_nested_orders
@@ -6517,16 +7281,34 @@ class RobinhoodBroker:
         ):
             # An id in a terminal-failure state means no live order exists; reporting it as
             # submitted would consume budget and block a retry, so raise instead.
-            # Reaching HERE means the row is terminal but not PROVEN: it also
-            # reported a positive or unreadable fill. The caller reconciles it
-            # against order history, where the same classifier reads the
-            # authoritative row, instead of writing the fill off unseen (Codex
-            # review, PR #859: "Preserve execution evidence in terminal
-            # placement responses") -- and the id travels with it, because a
-            # history that has not indexed this order yet would otherwise leave
-            # the artifact with no reconciliation key for the very fill an
-            # operator has to investigate (Codex review, PR #859: "Retain IDs
-            # from ambiguous terminal responses"). Still unproven, still halts.
+            #
+            # Two shapes reach this branch and are told apart below:
+            #
+            # 1. The row is terminal but not PROVEN zero-fill (it reported a
+            #    positive or unreadable fill), with no other identity/collection
+            #    conflict -- unlike a genuinely ambiguous placement failure (e.g.
+            #    a connector timeout, after which the broker may have silently
+            #    accepted the order), this response DOES name one single,
+            #    terminal order; it merely can't be proven a clean zero-fill
+            #    rejection. That is exactly the case the distinct
+            #    MarketBuyPlacementTerminalError exists for -- raising it lets a
+            #    multi-ticker batch caller catch it and safely continue to the
+            #    next candidate instead of halting the whole batch (Codex
+            #    review, PR #688: "Continue after definitive broker rejections").
+            #
+            # 2. The response ALSO carries a structural conflict -- disagreeing
+            #    lifecycle aliases, disagreeing order identities, 2+ candidate
+            #    orders in a nested collection, an order row disputing the
+            #    envelope's own success claim, or an unresolved sibling order
+            #    named under some other key -- so it is not just terminal, it
+            #    is genuinely ambiguous about WHICH order (or how many) this
+            #    call actually placed. Those cases keep raising the richer
+            #    AmbiguousPlacementResponseError so the caller preserves every
+            #    identity and fill figure this response names, instead of
+            #    collapsing them onto the one order MarketBuyPlacementTerminalError
+            #    would carry (Codex review, PR #859/#911/#1164: "Preserve
+            #    execution evidence / structural ambiguity in terminal
+            #    placement responses").
             #
             # `_lifecycle_alias_conflict` covers a WORKING-preferred,
             # terminal-contradicted row that never reaches `state in
@@ -6554,14 +7336,35 @@ class RobinhoodBroker:
             # representations sat outside reconciliation and cap
             # accounting entirely (Codex review, PR #859 round 33: "Keep
             # ambiguous collections unresolved for working orders").
-            logger.error("place_equity_order for %s returned terminal state %s: %s", ticker, state, _log_safe_repr(data))
+            _structurally_ambiguous = bool(
+                _lifecycle_alias_conflict
+                or _order_identity_conflicts
+                or ambiguous_nested_orders
+                or _order_disputes_success
+                or _collection_lifecycle_conflict
+                or _unresolved_sibling_orders
+            )
+            if not _structurally_ambiguous:
+                # Redacted AND overflow-safe: this text reaches the scheduler's
+                # log stream and persisted skip_reason fields, and a bare
+                # f-string on `data` raised ValueError on an oversized int
+                # instead of the intended terminal error (2026-09-07
+                # diagnostic, S:ADP-02).
+                logger.error(
+                    "place_equity_order for %s returned terminal state %s: %s", ticker, state, _artifact_safe_repr(data)
+                )
+                raise MarketBuyPlacementTerminalError(
+                    f"live placement for {ticker} came back in terminal state {state}; response={_artifact_safe_repr(data)}",
+                    order,
+                )
+            logger.error("place_equity_order for %s returned terminal state %s: %s", ticker, state, _artifact_safe_repr(data))
             # This exact response's own recovered execution notional, so
             # reconciliation can refuse to silently discard it if a later
             # history match reports a different (or no) executed amount
             # for the same id (Codex review, PR #859 round 39: "Retain
             # response fill evidence through reconciliation").
             raise AmbiguousPlacementResponseError(
-                f"live placement for {ticker} came back in terminal state {state}; response={_log_safe_repr(data)}",
+                f"live placement for {ticker} came back in terminal state {state}; response={_artifact_safe_repr(data)}",
                 order_id=order_id,
                 response_notional_usd=_recovered_broker_notional(_evidence_order),
                 response_may_have_executed=_reconciled_order_may_have_executed(_evidence_order),
@@ -6581,7 +7384,7 @@ class RobinhoodBroker:
                 # that as resolving the sibling's own unproven state too
                 # (Codex review, PR #1164: "Preserve sibling-order
                 # ambiguity through reconciliation").
-                structurally_ambiguous=bool(
+                structurally_ambiguous=(
                     _order_identity_conflicts or ambiguous_nested_orders or _unresolved_sibling_orders
                 ),
             )
@@ -6592,6 +7395,7 @@ class RobinhoodBroker:
             "order_id": str(order_id),
             **order,
         })
+        self._accepted_order_ids.add(str(order_id))
         return str(order_id)
 
     def review_whole_share_buy(self, ticker: str, quantity: int) -> Tuple[bool, str]:
@@ -6629,24 +7433,45 @@ class RobinhoodBroker:
         """
         if quantity <= 0:
             raise ValueError("quantity must be positive for a whole-share buy")
-        if not (self.enable_live_orders and self._place_fn is not None):
+        # `is True`, not truthiness, matching dca_runner.execute_plan's own
+        # literal-boolean gate: a passthrough like enable_live_orders="false"
+        # is a truthy string and reached real placement here while the runner
+        # refused the same value (2026-09-07 diagnostic, C:F11).
+        if not (self.enable_live_orders is True and self._place_fn is not None):
             raise RuntimeError(
                 f"place_whole_share_buy called for {ticker} with the live gate disabled "
                 f"(enable_live_orders={self.enable_live_orders}, "
                 f"place_fn={'set' if self._place_fn else 'None'}); use dry_run=True for simulated runs"
             )
-        response = self._place_fn(
-            account_number=self._account,
-            symbol=ticker,
-            side="buy",
-            type="market",
-            quantity=str(quantity),
-            time_in_force=self._time_in_force,
-            ref_id=ref_id,
-        )
+        try:
+            response = self._place_fn(
+                account_number=self._account,
+                symbol=ticker,
+                side="buy",
+                type="market",
+                quantity=str(quantity),
+                time_in_force=self._time_in_force,
+                ref_id=ref_id,
+            )
+        except OrderPlacementAmbiguousError:
+            # See place_market_buy's identical pass-through just above.
+            raise
+        except Exception as exc:  # noqa: BLE001 - see place_market_buy's
+            # identical wrapping just above: the connector call itself
+            # (network timeout, connection reset, MCP transport error, ...)
+            # gave no broker response at all, unlike every raise below this
+            # point, which reacts to a definitive response the broker DID
+            # return. Whether this whole-share order actually reached and
+            # was accepted by the broker is genuinely unknown here (Codex
+            # review, PR #1300 discussion_r3920546926: "Preserve ambiguity
+            # for whole-share placement timeouts").
+            raise OrderPlacementAmbiguousError(
+                f"whole-share placement connector call for {ticker} failed with no broker response: {_artifact_safe_repr(exc)}"
+            ) from exc
         outer_failure = _response_failure(response)
         if outer_failure is not None:
-            logger.error("place_equity_order (whole-share) for %s reported failure: %s", ticker, _log_safe_repr(response))
+            logger.error("place_equity_order (whole-share) for %s reported failure: %s", ticker, _artifact_safe_repr(response))
+            artifact_safe_failure = _redacted_diagnostic_text(outer_failure)
             # An outer failure envelope (e.g. {"success": false, "data":
             # {"order": {...}}}) can still carry an inner order that reached
             # the broker and reports its own terminal state and
@@ -6673,10 +7498,16 @@ class RobinhoodBroker:
             # a bare RuntimeError, discarding the very evidence this branch
             # exists to preserve (Codex review: "Preserve bare orders in
             # outer failure envelopes").
+            # Keep this extraction identical to the success-envelope path:
+            # a nested order wins when present, while the unwrapped payload
+            # itself remains the candidate for brokers that return a bare
+            # order in ``data``.  Besides making the supported response
+            # shapes explicit, this also avoids treating a non-mapping
+            # ``order`` member as authoritative over a usable bare payload.
             inner_order = None
             if isinstance(outer_failure_data, dict):
-                nested = outer_failure_data.get("order")
-                inner_order = nested if isinstance(nested, dict) else outer_failure_data
+                nested_order = outer_failure_data.get("order")
+                inner_order = nested_order if isinstance(nested_order, dict) else outer_failure_data
             if isinstance(inner_order, dict):
                 inner_order_id = inner_order.get("id") or inner_order.get("order_id")
                 inner_state = str(inner_order.get("state", "")).lower()
@@ -6701,11 +7532,11 @@ class RobinhoodBroker:
                 if inner_order_id:
                     raise WholeSharePlacementTerminalError(
                         f"live whole-share placement for {ticker} reported an outer failure "
-                        f"({outer_failure}), but its inner order carries evidence of a real "
-                        f"broker attempt (state={inner_state or 'unknown'}); response={_log_safe_repr(outer_failure_data)}",
+                        f"({artifact_safe_failure}), but its inner order carries evidence of a real "
+                        f"broker attempt (state={inner_state or 'unknown'}); response={_artifact_safe_repr(outer_failure_data)}",
                         order=inner_order,
                     )
-            raise RuntimeError(f"live whole-share placement for {ticker} failed: {outer_failure}")
+            raise RuntimeError(f"live whole-share placement for {ticker} failed: {artifact_safe_failure}")
         data = _unwrap_seeking_order_evidence(response)
         # Validated against a conflicting "orders" collection alongside
         # the singular "order" row, the same way `place_market_buy`'s
@@ -6744,10 +7575,10 @@ class RobinhoodBroker:
                 or {},
             )
         if _ambiguous_nested_orders:
-            raise WholeSharePlacementTerminalError(
+            raise AmbiguousPlacementResponseError(
                 f"live whole-share placement for {ticker} named a singular order alongside a "
-                f"conflicting orders collection this call cannot resolve; response={_log_safe_repr(data)}",
-                order=order,
+                f"conflicting orders collection this call cannot resolve; response={_artifact_safe_repr(data)}",
+                structurally_ambiguous=True,
             )
         order_id = _first_usable_order_id_alias(order)
         # The SAME usable-ID validation the fractional path already applies
@@ -6808,8 +7639,8 @@ class RobinhoodBroker:
             if not _is_unusable_live_placement_order_id(_secondary_order_id):
                 order_id = _secondary_order_id
         if not order_id:
-            logger.error("place_equity_order (whole-share) returned no order id for %s: %s", ticker, _log_safe_repr(data))
-            raise RuntimeError(f"live whole-share placement for {ticker} returned no order id; response={_log_safe_repr(data)}")
+            logger.error("place_equity_order (whole-share) returned no order id for %s: %s", ticker, _artifact_safe_repr(data))
+            raise RuntimeError(f"live whole-share placement for {ticker} returned no order id; response={_artifact_safe_repr(data)}")
         # Falls back to "status" when "state" is blank/absent, normalized
         # via the SAME `_normalize_broker_lifecycle_alias` the fractional
         # placement path already uses, not a bare `order.get("state", "")`:
@@ -6837,6 +7668,81 @@ class RobinhoodBroker:
         # this call guessing (Codex review, PR #1169: "Honor the status
         # alias in whole-share placement responses").
         _lifecycle_alias_conflict = _order_lifecycle_aliases_conflict(order)
+        # A CONFLICTING alias pair -- e.g. state="rejected" alongside
+        # status="queued" -- is NOT the same shape as an ordinary,
+        # self-consistent terminal response: `state` above already picked
+        # ONE alias (state, when present, wins over status) and trusting
+        # it here would make the terminal-only path below -- which skips
+        # the broker-history lookup entirely and reads the response's own
+        # `state` as authoritative (see `_process_whole_share_candidate`'s
+        # own "A WholeSharePlacementTerminalError already carries the
+        # broker's OWN immediate response" comment) -- release the
+        # reserved claim as a proven zero-fill even though the OTHER
+        # alias still says the order is live. Routed through
+        # `AmbiguousPlacementResponseError` instead -- the SAME
+        # structurally-ambiguous halt path the singular-vs-collection
+        # conflict above already uses -- which the caller's generic
+        # `except Exception` handler does NOT special-case the way it
+        # does `WholeSharePlacementTerminalError`, so it falls through to
+        # the real broker-history reconciliation lookup rather than
+        # trusting either alias (Codex review, PR #1251: "Halt lifecycle-
+        # conflicting whole-share responses").
+        # Identity FIRST, before the lifecycle-conflict and terminal branches
+        # below: WholeSharePlacementTerminalError is special-cased by the
+        # caller as authoritative fill evidence for THIS claim, so a stale
+        # terminal response naming another symbol or quantity could restore
+        # or settle the wrong ticker's credit. A mismatch stays structurally
+        # ambiguous and goes through the real broker-history reconciliation
+        # (Copilot review, PR #1394: "Validate identity before interpreting
+        # terminal responses"; 2026-09-07 diagnostic, S:ADP-01).
+        identity_mismatch = _placement_response_identity_mismatch(
+            order,
+            ticker=ticker,
+            ref_id=ref_id,
+            quantity=quantity,
+            require_identity=self.require_placement_identity,
+        )
+        if identity_mismatch is not None:
+            logger.error(
+                "place_equity_order (whole-share) for %s returned an order that does not describe this request (%s): %s",
+                ticker,
+                identity_mismatch,
+                _artifact_safe_repr(order),
+            )
+            raise AmbiguousPlacementResponseError(
+                f"live placement for {ticker} returned an order that does not describe this request: "
+                f"{identity_mismatch}; response={_artifact_safe_repr(order)}",
+                order_id=str(order_id) if order_id is not None else None,
+                response_notional_usd=_recovered_broker_notional(order),
+                response_may_have_executed=True,
+                structurally_ambiguous=True,
+            )
+        self._refuse_replayed_order_id(order_id, ticker=ticker, order=order)
+        if _lifecycle_alias_conflict:
+            logger.error(
+                "place_equity_order (whole-share) for %s reported conflicting lifecycle aliases "
+                "(state=%r, status=%r): %s",
+                ticker,
+                order.get("state"),
+                order.get("status"),
+                # Redacted here too (S:ADP-02, 2026-09-07 diagnostic): no log
+                # sink in this repo redacts on the caller's behalf, so a raw
+                # `data` here would echo account_number/URLs into whatever
+                # transport the external scheduler's logging handler sends
+                # to, the same exposure the raised exception below already
+                # guards against.
+                _artifact_safe_repr(data),
+            )
+            raise AmbiguousPlacementResponseError(
+                f"live whole-share placement for {ticker} reported conflicting lifecycle aliases "
+                f"(state={order.get('state')!r}, status={order.get('status')!r}); "
+                # Redacted (not `_log_safe_repr`): this message can be
+                # interpolated into a persisted `skip_reason` and later
+                # written into a run artifact (Codex review, PR #1251:
+                # "Redact lifecycle-conflict payloads before raising").
+                f"response={_artifact_safe_repr(data)}",
+                structurally_ambiguous=True,
+            )
         # "expired" is a terminal, non-live state exactly like the others
         # here (see _LIVE_ORDER_STATES's own comment above, which already
         # excludes it) -- without rejecting it too, the caller would treat
@@ -6848,9 +7754,12 @@ class RobinhoodBroker:
         # reconciliation the caller already applies to any other raised
         # exception, which inspects the real cumulative fill via the
         # terminal-inclusive lookup before restoring or settling credit.
-        if state in {"rejected", "failed", "cancelled", "canceled", "voided", "expired"} or _lifecycle_alias_conflict:
+        if state in {"rejected", "failed", "cancelled", "canceled", "voided", "expired"}:
             logger.error(
-                "place_equity_order (whole-share) for %s returned terminal state %s: %s", ticker, state, data
+                "place_equity_order (whole-share) for %s returned terminal state %s: %s",
+                ticker,
+                state,
+                _artifact_safe_repr(data),
             )
             # Carries the order payload rather than a bare RuntimeError --
             # this response is ALREADY authoritative terminal evidence
@@ -6862,7 +7771,7 @@ class RobinhoodBroker:
             # review: "Reconcile terminal fills from the placement
             # response").
             raise WholeSharePlacementTerminalError(
-                f"live whole-share placement for {ticker} came back in terminal state {state}; response={_log_safe_repr(data)}",
+                f"live whole-share placement for {ticker} came back in terminal state {state}; response={_artifact_safe_repr(data)}",
                 order=order,
             )
         self._raw_placement_responses.append({
@@ -6870,6 +7779,7 @@ class RobinhoodBroker:
             "order_id": str(order_id),
             **order,
         })
+        self._accepted_order_ids.add(str(order_id))
         return str(order_id)
 
     def get_raw_placement_responses(self) -> List[Dict[str, Any]]:
@@ -6886,25 +7796,59 @@ class RobinhoodBroker:
         if not order_id or self._order_fill_fn is None:
             return None
         try:
-            data = _unwrap(self._order_fill_fn(account_number=self._account, order_id=order_id))
-        except Exception:  # noqa: BLE001 - a fill-lookup outage must not abort the run
+            response = self._order_fill_fn(account_number=self._account, order_id=order_id)
+        except Exception as exc:  # noqa: BLE001 - a fill-lookup outage must not abort the run
             # The order is already placed by the time we look up its fill; a transient
             # get_equity_orders failure should leave it recorded as submitted/unfilled,
             # not crash run_once before the durable artifacts are written.
-            logger.exception("order-fill lookup failed for %s; recording as unfilled", order_id)
+            # A separate line keeps a labeled order ID from swallowing the error
+            # type when the complete diagnostic is redacted again by the logger.
+            logger.error(
+                "order-fill lookup failed for %s; recording as unfilled:\n%s",
+                _artifact_safe_repr(order_id),
+                _redacted_diagnostic_text("".join(traceback.format_exception_only(exc)).strip()),
+            )
             return None
+        # Fill lookup follows an accepted placement. Failed or contradictory
+        # evidence must leave that order submitted/unfilled, never fabricate a
+        # fill or raise before the caller can persist the accepted order.
+        layers, truncated = _all_data_layers(response)
+        if truncated or _response_failure(response) or any(_is_error_response(layer) for layer in layers):
+            return None
+        data = _unwrap(response)
         # Accept list mode ({"orders": [...]}), a single-order envelope ({"order": {...}},
         # the same nesting place_market_buy accepts), or a bare top-level order object.
         single = data.get("order") if isinstance(data.get("order"), dict) else None
         if single is None and (data.get("id") or data.get("order_id")):
             single = data
-        orders = data.get("orders") or ([single] if single else [])
+        orders = data.get("orders")
+        if orders is None:
+            orders = []
+        if not isinstance(orders, list) or any(not isinstance(order, dict) for order in orders):
+            return None
+        orders = [*orders, *([single] if single is not None else [])]
+        matched = []
         for order in orders:
             # place_market_buy accepts either "id" or "order_id"; match on both here so a
             # history wrapper that keys fills by "order_id" is not misread as an unfilled gap.
-            oid = order.get("id") or order.get("order_id")
-            if str(oid) != str(order_id):
+            oid = _first_usable_order_id_alias(order)
+            if _normalized_order_identifier(oid) != _normalized_order_identifier(order_id):
                 continue
+            if (
+                _is_error_response(order)
+                or _order_identifier_aliases_conflict(order)
+                or _order_rows_contradict(order, order)
+                or _envelope_layers_conflict_with_order(order, response, *layers)
+                or (matched and _order_rows_contradict(matched[0], order))
+            ):
+                return None
+            # Keep one agreed representation, so repeated same-ID rows do not
+            # turn a single-order lookup into pairwise comparisons.
+            if matched:
+                matched[0] = _merge_envelope_layers_prefer_innermost_nonblank(matched[0], order)
+            else:
+                matched.append(order)
+        for order in matched:
             # Plain "quantity" is the REQUESTED amount, not what executed --
             # scoped to state == "filled" for the same reason
             # near_close_dca._recovered_broker_notional's own quantity_field
@@ -6914,17 +7858,46 @@ class RobinhoodBroker:
             # for an order that moved nothing, marking a correctly-$0
             # recovery as "filled" in build_execution_record() (Codex
             # review: "Do not turn confirmed zero-fill orders into fills").
-            order_state = str(order.get("state", "")).strip().lower()
-            if not _is_blank_broker_field(order.get("cumulative_quantity")):
-                quantity_source = order.get("cumulative_quantity")
+            order_state = _normalize_broker_lifecycle_alias(order.get("state")) or _normalize_broker_lifecycle_alias(
+                order.get("status")
+            )
+            quantities = [
+                _unwrap_fill_alias_value(order.get(key)) for key in _FILL_EVIDENCE_QUANTITY_ALIASES
+                if not _is_blank_broker_field(_unwrap_fill_alias_value(order.get(key)))
+            ]
+            if quantities:
+                quantity_source = quantities[0]
             elif order_state == "filled":
                 quantity_source = order.get("quantity")
             else:
                 quantity_source = None
             filled_qty = _to_float(quantity_source) if quantity_source is not None else 0.0
-            avg_price = _to_float(order.get("average_price") or order.get("price"))
+            # A requested limit price is not an average execution price.
+            avg_price = _to_float(_unwrap_fill_alias_value(order.get("average_price")))
             if filled_qty <= 0 or avg_price <= 0:
                 return None
+            # Compare explicitly identified envelopes against the selected
+            # execution, including the filled-only requested-quantity fallback.
+            # Overlay supplied fields for comparison only: sparse metadata must
+            # neither contradict a fill by omission nor supply a missing fill.
+            fill_evidence = {key: order[key] for key in _FILL_EVIDENCE_ALIASES if key in order}
+            fill_evidence.update(cumulative_quantity=filled_qty, average_price=avg_price)
+            envelope_evidence = fill_evidence
+            for layer in (response, *layers):
+                if not isinstance(layer, dict) or _normalized_order_identifier(
+                    _first_usable_order_id_alias(layer)
+                ) != _normalized_order_identifier(order_id):
+                    continue
+                layer_fill = {
+                    key: layer[key] for key in (*_FILL_EVIDENCE_ALIASES, "average_price")
+                    if key in layer and not _is_blank_broker_field(_unwrap_fill_alias_value(layer[key]))
+                }
+                layer_evidence = {**envelope_evidence, **layer_fill}
+                if _order_rows_contradict(fill_evidence, layer_evidence) or _order_rows_contradict(
+                    envelope_evidence, layer_evidence
+                ):
+                    return None
+                envelope_evidence = layer_evidence
             return OrderFill(
                 avg_fill_price=avg_price,
                 quantity_filled=filled_qty,
@@ -6932,6 +7905,9 @@ class RobinhoodBroker:
                 order_filled_at=_parse_rfc3339(order.get("last_transaction_at") or order.get("updated_at")),
             )
         return None
+
+    def get_order_fills(self, order_ids: list[str]) -> dict[str, Optional[OrderFill]]:
+        return {order_id: self.get_order_fill(order_id) for order_id in order_ids}
 
 
 # -- module helpers --------------------------------------------------------------

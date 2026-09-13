@@ -113,6 +113,50 @@ def test_write_and_load_compact_sync(tmp_path):
     assert "## Latest Run" in md_path.read_text()
 
 
+def test_write_compact_sync_string_path(tmp_path):
+    summary = {
+        "run_id": "r-456",
+        "trading_day": "2023-01-02",
+        "coverage": {"buy_candidates": 3},
+    }
+    # Pass a string path rather than a Path object
+    str_path = str(tmp_path)
+    paths = write_compact_sync(summary, str_path)
+
+    md_path = Path(paths["markdown"])
+    payload_path = Path(paths["payload"])
+
+    assert md_path.exists()
+    assert payload_path.exists()
+
+    assert "## Latest Run" in md_path.read_text()
+
+    # Verify the JSON payload content
+    payload_data = json.loads(payload_path.read_bytes())
+    assert payload_data["run_id"] == "r-456"
+    assert payload_data["trading_day"] == "2023-01-02"
+    assert payload_data["metrics"]["coverage"]["buy_candidates"] == 3
+    assert "## Latest Run" in payload_data["markdown"]
+
+
+def test_write_compact_sync_nested_dir(tmp_path):
+    summary = {
+        "run_id": "r-789",
+        "trading_day": "2023-01-03",
+    }
+    # Use a nested directory that does not exist yet to test parents=True
+    nested_dir = tmp_path / "deep" / "nested" / "dir"
+    paths = write_compact_sync(summary, nested_dir)
+
+    md_path = Path(paths["markdown"])
+    payload_path = Path(paths["payload"])
+
+    assert md_path.exists()
+    assert payload_path.exists()
+    assert md_path.parent == nested_dir
+    assert payload_path.parent == nested_dir
+
+
 def test_load_latest_run_summary_success(tmp_path):
     summary_path = tmp_path / "latest_run_summary.json"
     summary_path.write_text('{"run_id": "r-123", "trading_day": "2023-01-01"}')

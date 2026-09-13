@@ -59,7 +59,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -112,7 +112,7 @@ jobs:
           echo "python_version=${PY_VERSION:-3.11}" >> $GITHUB_OUTPUT
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ steps.scope_check.outputs.python_version || '3.11' }}
 
@@ -187,7 +187,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: self-heal-logs
           path: |
@@ -233,7 +233,7 @@ jobs:
              exit 1
           fi
 
-          if git diff --cached --name-only | grep -E '(\.github/workflows/ci\.yml|\.env|secrets/|src/.*/migrations/)'; then
+          if git diff --cached --name-only | grep -E '(\.github/workflows/|\.env|secrets/|src/.*/migrations/)'; then
              echo "Forbidden files modified, aborting PR."
              exit 1
           fi

@@ -76,7 +76,6 @@ TEST_BUYING_POWER_USD = 1000.0
 def _order(
     symbol, amount, created_at_utc, *,
     placed_agent="agentic", side="buy", state="filled", executed_dollar_amount=None,
-    client_order_id=None,
 ):
     """Build a normalized broker order row as ``dca_runner`` should accept it."""
     return dca_runner.BrokerOrder(
@@ -87,7 +86,6 @@ def _order(
         placed_agent=placed_agent,
         state=state,
         executed_dollar_amount=executed_dollar_amount,
-        client_order_id=client_order_id,
     )
 
 
@@ -304,6 +302,51 @@ def test_roundtrip_preserves_seeded_prior_context_bookkeeping(tmp_path):
     loaded.reconcile_prior_allocation("AAPL", day, amount_usd=4.0, attempt_count=2)
     assert loaded.day_notional(day) == pytest.approx(4.0)
     assert loaded.buys_today("AAPL", day) == 2
+
+
+def test_roundtrip_preserves_per_run_recovery_baseline(tmp_path):
+    """Codex review discussion_r3882856878 ("Persist recovery baselines
+    across partial reconciliation failures"): own_recovered_attempt_run_ids/
+    own_recovered_amount_by_ticker_day_run_id/
+    own_recovered_attempts_by_ticker_day_run_id must survive a process
+    restart -- state_transaction() can persist a partial recovery (one
+    unresolved reference group resolved, a later one raised) and, without
+    this bookkeeping surviving reload, a LATER invocation that resolves
+    another group from the same source run would re-add the already-
+    persisted amount/attempt from that run's full aggregate."""
+    state = StrategyState()
+    day = date(2026, 7, 28)
+    state.book_reconciled_attempt_notional("XYZ", day, 2.0, order_id="O1", source_run_id="R1")
+
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(state, path)
+    loaded = dca_runner.load_strategy_state(path)
+
+    assert loaded.own_recovered_attempt_run_ids[("XYZ", day)] == {"R1"}
+    assert loaded.own_recovered_amount_by_ticker_day_run_id[("XYZ", day, "R1")] == pytest.approx(2.0)
+    assert loaded.own_recovered_attempts_by_ticker_day_run_id[("XYZ", day, "R1")] == 1
+
+
+def test_state_with_recovered_amount_for_an_unknown_run_id_fails_closed(tmp_path):
+    """A recovered amount/attempt entry can never exist for a run_id absent
+    from own_recovered_attempt_run_ids -- book_reconciled_attempt_notional()
+    always adds to all three fields together, so a document naming a run_id
+    in the amount/attempts maps but not in the run-id set is corrupt."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "buys_by_ticker_by_day": {"XYZ": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 2.0},
+        "submitted_notional_by_week": {"2026-31": 2.0},
+        "own_recovered_attempt_run_ids": {},
+        "own_recovered_amount_by_ticker_day_run_id": {"XYZ": {"2026-07-28": {"R1": 2.0}}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
 
 
 def test_state_with_seeded_ticker_attempts_exceeding_the_buy_ledger_fails_closed(tmp_path):
@@ -524,6 +567,7 @@ def test_state_with_a_zero_tracked_baseline_missing_its_proven_attempts_entry_st
         "seeded_prior_context_proven_attempts_by_ticker_day": {},
         "seeded_prior_context_registered_id_count_by_ticker_day": {},
         "recorded_attempt_order_ids": {},
+        "reconciled_fractional_placement_refs": [],
         "weekly_rollover_reserve_usd": 0.0,
         "finalized_budget_days": [],
         "reserve_week_key": None,
@@ -971,7 +1015,7 @@ def test_schema_version_2_float_sentinel_is_rejected(tmp_path):
     path = tmp_path / "state.json"
     dca_runner.save_strategy_state(state, path)
 
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw = json.loads(path.read_bytes())
     assert raw["schema_version"] == dca_runner.STATE_SCHEMA_VERSION
     raw["schema_version"] = 2.0
     path.write_text(json.dumps(raw), encoding="utf-8")
@@ -1004,6 +1048,7 @@ def test_schema_version_2_document_requires_seeded_prior_context_counters(tmp_pa
         "reserve_week_key": None,
         "selected_tier": None,
         "recorded_attempt_order_ids": {},
+        "reconciled_fractional_placement_refs": [],
     }
     path = tmp_path / "state.json"
 
@@ -1054,6 +1099,7 @@ def test_schema_version_2_document_requires_every_serializer_written_field(tmp_p
         "reserve_week_key": None,
         "selected_tier": None,
         "recorded_attempt_order_ids": {},
+        "reconciled_fractional_placement_refs": [],
     }
     path = tmp_path / "state.json"
 
@@ -1105,8 +1151,8 @@ def test_zero_proven_attempt_baseline_round_trips(tmp_path):
 def test_save_strategy_state_writes_the_current_schema_version(tmp_path):
     path = tmp_path / "state.json"
     dca_runner.save_strategy_state(StrategyState(), path)
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    assert raw["schema_version"] == dca_runner.STATE_SCHEMA_VERSION == 2
+    raw = json.loads(path.read_bytes())
+    assert raw["schema_version"] == dca_runner.STATE_SCHEMA_VERSION == 3
     assert "recorded_attempt_order_ids" in raw
     assert "seeded_prior_context_proven_attempts_by_ticker_day" in raw
     assert "seeded_prior_context_registered_id_count_by_ticker_day" in raw
@@ -1165,6 +1211,298 @@ def test_schema_version_2_document_requires_the_allocation_baseline_field(tmp_pa
     }))
     with pytest.raises(dca_runner.StateCorruptError):
         dca_runner.load_strategy_state(path)
+
+
+def test_schema_version_3_document_requires_notional_applied_order_ids(tmp_path):
+    """Codex review, PR #1251: "Preserve the first notional top-up for
+    recorded attempts". STATE_SCHEMA_VERSION bumped 2 -> 3 when
+    notional_applied_order_ids was added -- save_strategy_state always
+    serializes it (see _state_to_json), so a document CLAIMING
+    schema_version=3 but missing it is corruption, not a legacy omission,
+    the same "Require the provenance key after migrating durable state"
+    reasoning that already governs recorded_attempt_order_ids at the
+    schema 1 -> 2 boundary."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 3,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "submitted_order_count_by_day": {"2026-07-28": 1},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "recorded_attempt_order_ids": {},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+        # notional_applied_order_ids deliberately omitted.
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_schema_version_2_document_migrates_a_zero_dollar_attempt_as_unapplied(tmp_path):
+    """The mirror case: a genuinely OLDER schema_version=2 document, written
+    before notional_applied_order_ids existed at all, never had this key
+    and is not corrupt for lacking it -- a one-way migration path exactly
+    like the schema 1 -> 2 boundary's own.
+
+    Codex review, PR #1251: "Preserve schema-2 notional provenance during
+    migration" / "Keep zero-dollar schema-2 attempts eligible for top-up".
+    A first attempt at the migration fix blanket-copied every schema-2
+    recorded id into notional_applied_order_ids as "already applied" --
+    correct for a real charge, but wrong for a genuinely zero-dollar
+    attempt (`record_buy(..., 0.0, order_id="ORD-X")`), which permanently
+    lost its own eligibility for a first real top-up. The per-day
+    submitted notional (present since schema 1) disambiguates the two: a
+    ZERO day total for a day with exactly one recorded id proves that id's
+    charge was never topped up, so it must stay OUT of notional_applied_
+    order_ids. This process's own next save_strategy_state() upgrades the
+    file to schema_version=3 for good."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 0.0},
+        "submitted_notional_by_week": {"2026-31": 0.0},
+        "submitted_order_count_by_day": {"2026-07-28": 1},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    loaded = dca_runner.load_strategy_state(path)
+    assert loaded.notional_applied_order_ids == {}
+    assert loaded.recorded_attempt_order_ids[("AAPL", date(2026, 7, 28))] == {"ORD-X"}
+
+    # A genuinely unresolved zero-dollar attempt must still get its first
+    # real top-up after migration -- not a permanent no-op.
+    loaded.book_reconciled_attempt_notional("AAPL", date(2026, 7, 28), 4.0, order_id="ORD-X")
+    assert loaded.day_notional(date(2026, 7, 28)) == 4.0
+
+    # This process's own next save upgrades the file to schema_version=3.
+    dca_runner.save_strategy_state(loaded, path)
+    raw = json.loads(path.read_bytes())
+    assert raw["schema_version"] == dca_runner.STATE_SCHEMA_VERSION == 3
+    assert "notional_applied_order_ids" in raw
+
+
+def test_schema_version_2_document_fails_closed_on_an_ambiguous_mixed_day(tmp_path):
+    """Codex review, PR #1251: "Keep zero-dollar schema-2 attempts eligible
+    for top-up". A day with MORE than one recorded order id (across one or
+    more tickers) and a nonzero submitted notional is genuinely ambiguous
+    under schema 2 -- there is no per-id provenance to say which id(s)
+    actually earned that money, so guessing "every id was paid" (like the
+    single-id case safely can) risks masking a real unresolved zero-dollar
+    attempt forever. This must fail closed instead of asserting an answer
+    it cannot know."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 2}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "submitted_order_count_by_day": {"2026-07-28": 2},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X", "ORD-Y"]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError) as exc_info:
+        dca_runner.load_strategy_state(path)
+    assert "no per-id provenance" in str(exc_info.value.__cause__)
+
+
+def test_schema_version_2_document_fails_closed_on_a_day_with_an_anonymous_attempt(tmp_path):
+    """Codex review, PR #1251: "Fail closed on schema-2 days with
+    anonymous attempts". A day can have exactly ONE recorded id yet still
+    be ambiguous: `buys_by_ticker_by_day` counts TWO attempts for the day
+    (one id-bearing zero-dollar attempt, one anonymous/id-less attempt --
+    even for a different ticker), so the day's nonzero submitted notional
+    could belong to either. The earlier fix only compared recorded-id
+    COUNT across tickers, missing this shape entirely: it would have
+    marked the lone id "applied" even though the id-less attempt is
+    equally likely to be the one that earned the money."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}, "MSFT": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "submitted_order_count_by_day": {"2026-07-28": 2},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        # Only AAPL's attempt is identified; MSFT's is anonymous.
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError) as exc_info:
+        dca_runner.load_strategy_state(path)
+    assert "no per-id provenance" in str(exc_info.value.__cause__)
+
+
+def test_reconciliation_replay_after_schema_2_migration_does_not_double_book(tmp_path):
+    """Codex review, PR #1251: "Preserve schema-2 notional provenance
+    during migration". The direct behavioral consequence of the previous
+    test's own migration fix: a schema-2 document's recorded id is
+    conservatively treated as already-topped-up, so a reconciliation pass
+    for that SAME id after loading must be a true no-op -- not a second
+    addition of its notional on top of whatever schema 2 already booked."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 2,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "submitted_order_count_by_day": {"2026-07-28": 1},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    loaded = dca_runner.load_strategy_state(path)
+    trading_day = date(2026, 7, 28)
+
+    loaded.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="ORD-X")
+
+    assert loaded.day_notional(trading_day) == 4.0, (
+        "a reconciliation replay for an id already recorded under schema 2 must not add "
+        "its notional a second time"
+    )
+    assert loaded.week_notional(trading_day) == 4.0
+
+
+def test_state_with_a_notional_applied_id_missing_from_recorded_attempts_fails_closed(tmp_path):
+    """notional_applied_order_ids is only ever populated for an id already
+    present in recorded_attempt_order_ids -- record_buy and
+    book_reconciled_attempt_notional both add to the latter at the same
+    time or earlier than the former. A persisted id claiming its notional
+    was applied for a (ticker, day) that recorded_attempt_order_ids never
+    even attempted is impossible from any legitimate write path."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 3,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 4.0},
+        "submitted_notional_by_week": {"2026-31": 4.0},
+        "submitted_order_count_by_day": {"2026-07-28": 1},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
+        "notional_applied_order_ids": {"AAPL": {"2026-07-28": ["ORD-Y"]}},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
+
+
+def test_state_with_an_applied_id_but_zero_day_notional_fails_closed(tmp_path):
+    """Codex review, PR #1251: "Reject applied IDs that have no booked
+    notional". Every legitimate writer of notional_applied_order_ids adds
+    an id ONLY in the same call that also adds a NONZERO amount to
+    submitted_notional_by_day. A recorded id claiming its notional was
+    applied for a (ticker, day) whose day notional is zero (or absent) is
+    therefore impossible from any legitimate write path -- a damaged or
+    manually repaired state carrying that shape would make a later
+    reconciliation replay for that id a permanent no-op, understating
+    daily/weekly spend."""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": 3,
+        "buys_by_ticker_by_day": {"AAPL": {"2026-07-28": 1}},
+        "submitted_notional_by_day": {"2026-07-28": 0.0},
+        "submitted_notional_by_week": {"2026-31": 0.0},
+        "submitted_order_count_by_day": {"2026-07-28": 1},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "recorded_attempt_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
+        "notional_applied_order_ids": {"AAPL": {"2026-07-28": ["ORD-X"]}},
+        "reconciled_fractional_placement_refs": [],
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+    }))
+    with pytest.raises(dca_runner.StateCorruptError) as exc_info:
+        dca_runner.load_strategy_state(path)
+    assert "zero or absent" in str(exc_info.value.__cause__)
+
+
+def test_notional_applied_order_ids_round_trips_through_save_and_load(tmp_path):
+    """A durable per-order marker distinguishing "an attempt was recorded"
+    from "the real notional was applied" must survive a process restart
+    -- that is the entire point of persisting it (Codex review, PR #1251:
+    "Preserve the first notional top-up for recorded attempts")."""
+    state = StrategyState()
+    day = date(2026, 7, 28)
+    # An id-bearing zero-dollar charge (an unresolved placement's own
+    # immediate charge) -- recorded_attempt_order_ids gets ORD-X, but
+    # notional_applied_order_ids does not, since notional_usd is 0.
+    state.record_buy("AAPL", day, 0.0, order_id="ORD-X")
+    assert "ORD-X" not in state.notional_applied_order_ids.get(("AAPL", day), set())
+
+    path = tmp_path / "state.json"
+    dca_runner.save_strategy_state(state, path)
+    reloaded = dca_runner.load_strategy_state(path)
+    assert "ORD-X" not in reloaded.notional_applied_order_ids.get(("AAPL", day), set())
+
+    # A later process's reconciliation call supplies the real amount.
+    reloaded.book_reconciled_attempt_notional("AAPL", day, 4.0, order_id="ORD-X")
+    assert reloaded.day_notional(day) == 4.0
+    assert "ORD-X" in reloaded.notional_applied_order_ids[("AAPL", day)]
+
+    dca_runner.save_strategy_state(reloaded, path)
+    twice_reloaded = dca_runner.load_strategy_state(path)
+    assert "ORD-X" in twice_reloaded.notional_applied_order_ids[("AAPL", day)]
+
+    # A REPLAYED reconciliation for the same id, across a THIRD process,
+    # must remain a true no-op.
+    twice_reloaded.book_reconciled_attempt_notional("AAPL", day, 4.0, order_id="ORD-X")
+    assert twice_reloaded.day_notional(day) == 4.0
 
 
 def test_state_with_aliased_ticker_spellings_in_recorded_attempt_order_ids_fails_closed(tmp_path):
@@ -1280,6 +1618,7 @@ def test_legacy_state_without_order_count_backfills_from_buy_counts(tmp_path):
             "finalized_budget_days": [],
             "reserve_week_key": None,
             "selected_tier": None,
+            "reconciled_fractional_placement_refs": [],
         })
     )
     loaded = dca_runner.load_strategy_state(path)
@@ -1580,6 +1919,7 @@ def test_state_with_a_buy_count_but_no_notional_loads_successfully(tmp_path):
         "finalized_budget_days": [],
         "reserve_week_key": None,
         "selected_tier": None,
+        "reconciled_fractional_placement_refs": [],
     }))
     state = dca_runner.load_strategy_state(path)
     assert state.buys_today("AAPL", date(2026, 7, 28)) == 1
@@ -1642,6 +1982,7 @@ def test_state_with_a_delisted_historical_ticker_loads_successfully(tmp_path):
         "finalized_budget_days": [],
         "reserve_week_key": None,
         "selected_tier": None,
+        "reconciled_fractional_placement_refs": [],
     }))
     state = dca_runner.load_strategy_state(path)
     assert state.buys_today("ZZZZ_DELISTED", date(2026, 7, 28)) == 1
@@ -1942,6 +2283,7 @@ def test_state_with_a_tampered_selected_tier_loads_with_it_discarded(tmp_path):
             "weekly_cap_usd": 999999.0,  # tampered: real stress cap is 1800.0
             "uses_rollover_reserve": True,
         },
+        "reconciled_fractional_placement_refs": [],
     }))
     state = dca_runner.load_strategy_state(path)
     assert state.selected_tier is None
@@ -2046,9 +2388,48 @@ def test_state_with_a_legitimately_zeroed_rollover_reserve_loads_fine(tmp_path):
         "finalized_budget_days": [],  # no earlier finalized week at all
         "reserve_week_key": "2026-31",
         "selected_tier": None,
+        "reconciled_fractional_placement_refs": [],
     }))
     state = dca_runner.load_strategy_state(path)
     assert state.weekly_rollover_reserve_usd == 0.0
+
+
+def test_state_missing_only_the_reconciliation_ledger_fails_closed(tmp_path):
+    """codex review discussion_r3882861920 ("Require the new reconciliation
+    ledger in persisted state"): save_strategy_state has always emitted
+    reconciled_fractional_placement_refs, but it was never listed in
+    _STATE_REQUIRED_KEYS -- so a CURRENT schema_version document missing
+    ONLY this field (e.g. a rollback to an older binary, or any other
+    partial loss) loaded as an EMPTY idempotency ledger instead of being
+    rejected as corrupt. An otherwise-complete current-schema document
+    lacking this one field must fail closed exactly like it already does
+    for the other required fields. (A genuinely older schema_version=2 (or
+    1) document predates this field entirely and is covered by the
+    separate one-way migration paths -- see _SCHEMA_2_STATE_REQUIRED_KEYS/
+    _LEGACY_STATE_REQUIRED_KEYS -- not this check.)"""
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({
+        "schema_version": dca_runner.STATE_SCHEMA_VERSION,
+        "buys_by_ticker_by_day": {},
+        "submitted_notional_by_day": {},
+        "submitted_notional_by_week": {},
+        "submitted_order_count_by_day": {},
+        "earlier_week_cross_stream_seeded_usd": {},
+        "earlier_week_cross_stream_poison_usd": {},
+        "seeded_prior_context_amount_by_ticker_day": {},
+        "seeded_prior_context_attempts_by_ticker_day": {},
+        "seeded_prior_context_proven_attempts_by_ticker_day": {},
+        "seeded_prior_context_registered_id_count_by_ticker_day": {},
+        "recorded_attempt_order_ids": {},
+        "notional_applied_order_ids": {},
+        "weekly_rollover_reserve_usd": 0.0,
+        "finalized_budget_days": [],
+        "reserve_week_key": None,
+        "selected_tier": None,
+        # reconciled_fractional_placement_refs deliberately omitted.
+    }))
+    with pytest.raises(dca_runner.StateCorruptError):
+        dca_runner.load_strategy_state(path)
 
 
 def test_state_with_a_zeroed_but_unjustified_rollover_reserve_fails_closed(tmp_path):
@@ -2215,58 +2596,6 @@ def test_state_transaction_saves_a_mutation_even_when_the_block_raises(tmp_path)
     assert reloaded.day_notional(date(2026, 7, 28)) == pytest.approx(8.0)
 
 
-def test_state_transaction_preserves_the_body_exception_alongside_a_callback_failure(tmp_path):
-    """Codex review ("Preserve the transaction-body exception when callbacks
-    fail"): a `raise` executed from the `finally` block that runs queued
-    ``pending_durable_commit_callbacks`` REPLACES whatever exception is
-    already propagating out of the `with` block's own body -- if that body
-    raised (the actual reason this transaction is unwinding) and a queued
-    callback ALSO then raises, the callback's exception must not silently
-    discard the original body exception. Both must be retrievable by a
-    caller inspecting the raised error.
-    """
-    path = tmp_path / "state.json"
-    dca_runner.save_strategy_state(StrategyState(), path)
-
-    def _failing_callback():
-        raise RuntimeError("simulated marker-write failure")
-
-    with pytest.raises(ExceptionGroup) as exc_info:
-        with dca_runner.state_transaction(path) as state:
-            state.pending_durable_commit_callbacks.append(_failing_callback)
-            raise ValueError("simulated run_pipeline failure")
-
-    exceptions = exc_info.value.exceptions
-    assert any(isinstance(exc, ValueError) for exc in exceptions)
-    assert any(isinstance(exc, RuntimeError) for exc in exceptions)
-
-
-def test_state_transaction_groups_a_keyboard_interrupt_without_masking_it(tmp_path):
-    """Codex review ("Use BaseExceptionGroup when grouping callback
-    interrupts"): plain ``ExceptionGroup`` raises TypeError if asked to
-    wrap a direct ``BaseException`` (e.g. ``KeyboardInterrupt``/
-    ``SystemExit``) rather than an ``Exception``. The callback-error
-    collection here deliberately catches ``BaseException``, so a callback
-    interrupted by Ctrl-C mid-write -- combined with the transaction
-    body's own in-flight exception -- must not raise an unrelated
-    TypeError that masks BOTH original failures.
-    """
-    path = tmp_path / "state.json"
-    dca_runner.save_strategy_state(StrategyState(), path)
-
-    def _interrupted_callback():
-        raise KeyboardInterrupt()
-
-    with pytest.raises(BaseExceptionGroup) as exc_info:
-        with dca_runner.state_transaction(path) as state:
-            state.pending_durable_commit_callbacks.append(_interrupted_callback)
-            raise ValueError("simulated run_pipeline failure")
-
-    exceptions = exc_info.value.exceptions
-    assert any(isinstance(exc, ValueError) for exc in exceptions)
-    assert any(isinstance(exc, KeyboardInterrupt) for exc in exceptions)
-
-
 def test_state_transaction_serializes_two_overlapping_callers(tmp_path):
     """Two overlapping scheduled invocations must not both load the same
     prior state and independently save over each other's mutations -- the
@@ -2326,6 +2655,7 @@ def _fake_msvcrt(locking_side_effects):
     fake: Any = types.ModuleType("msvcrt")
     fake.locking = locking
     fake.LK_LOCK = 1
+    fake.LK_NBLCK = 2
     fake.LK_UNLCK = 0
     fake.calls = calls
     return fake
@@ -2339,7 +2669,13 @@ def test_acquire_exclusive_lock_retries_only_the_documented_windows_contention_e
     lock; that specific, documented condition must keep retrying until the
     lock is free, matching fcntl.flock(LOCK_EX)'s indefinite-block behavior
     on POSIX."""
-    monkeypatch.setattr(dca_runner.os, "name", "nt")
+    # `_acquire_exclusive_lock` branches on the module-level `_LOCK_IS_WINDOWS`
+    # constant (computed once from `os.name` at import time), not a live
+    # `os.name` read -- patching `os.name` here has no effect on which branch
+    # runs and would silently exercise the POSIX `fcntl.flock` path instead
+    # (crashing on the fake lock file's fileno()) rather than the Windows
+    # path this test means to cover.
+    monkeypatch.setattr(dca_runner, "_LOCK_IS_WINDOWS", True)
     fake = _fake_msvcrt([PermissionError(), PermissionError(), None])
     monkeypatch.setitem(sys.modules, "msvcrt", fake)
 
@@ -2352,6 +2688,73 @@ def test_acquire_exclusive_lock_retries_only_the_documented_windows_contention_e
 
     dca_runner._acquire_exclusive_lock(_FakeLockFile())
     assert len(fake.calls) == 3
+    # Copilot review of PR #1394: LK_LOCK blocks inside msvcrt for roughly ten
+    # seconds per attempt, so a caller-supplied deadline shorter than that was
+    # never honoured on Windows; every attempt must be the non-blocking mode
+    # and the polling loop alone owns the deadline.
+    assert {mode for _fd, mode, _n in fake.calls} == {fake.LK_NBLCK}
+
+
+def test_acquire_exclusive_lock_honours_a_sub_second_deadline_on_windows(monkeypatch):
+    """Copilot review of PR #1394: with LK_LOCK, a 0.2 s deadline could not be
+    honoured because each attempt blocked ~10 s inside msvcrt. With LK_NBLCK
+    the deadline is enforced by this function's own clock."""
+    monkeypatch.setattr(dca_runner, "_LOCK_IS_WINDOWS", True)
+    fake = _fake_msvcrt([PermissionError() for _ in range(1000)])
+    monkeypatch.setitem(sys.modules, "msvcrt", fake)
+
+    class _FakeLockFile:
+        name = "state.lock"
+
+        def seek(self, offset):
+            pass
+
+        def fileno(self):
+            return 3
+
+    started = time_module.monotonic()
+    with pytest.raises(TimeoutError):
+        dca_runner._acquire_exclusive_lock(_FakeLockFile(), timeout_seconds=0.2)
+    assert time_module.monotonic() - started < 2.0
+    assert 1 < len(fake.calls) < 1000
+
+
+def test_acquire_exclusive_lock_retries_only_posix_contention_not_every_oserror(monkeypatch):
+    """Copilot review of PR #1394: the POSIX branch caught every OSError, so a
+    permanent failure (a bad descriptor, a filesystem error) was slept on and
+    misreported as a lock timeout. Only BlockingIOError, the LOCK_NB
+    contention signal, is contention; anything else surfaces immediately."""
+    import errno
+    import fcntl
+
+    monkeypatch.setattr(dca_runner, "_LOCK_IS_WINDOWS", False)
+    attempts = []
+
+    def bad_descriptor(fd, flags):
+        attempts.append(flags)
+        raise OSError(errno.EBADF, "Bad file descriptor")
+
+    monkeypatch.setattr(fcntl, "flock", bad_descriptor)
+
+    class _FakeLockFile:
+        name = "state.lock"
+
+    with pytest.raises(OSError) as excinfo:
+        dca_runner._acquire_exclusive_lock(_FakeLockFile(), timeout_seconds=0.5)
+    assert not isinstance(excinfo.value, TimeoutError)
+    assert excinfo.value.errno == errno.EBADF
+    assert len(attempts) == 1  # never retried
+
+    attempts.clear()
+
+    def contended(fd, flags):
+        attempts.append(flags)
+        raise BlockingIOError(errno.EWOULDBLOCK, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(fcntl, "flock", contended)
+    with pytest.raises(TimeoutError):
+        dca_runner._acquire_exclusive_lock(_FakeLockFile(), timeout_seconds=0.1)
+    assert len(attempts) > 1
 
 
 def test_acquire_exclusive_lock_propagates_a_non_contention_windows_error(monkeypatch):
@@ -2361,7 +2764,10 @@ def test_acquire_exclusive_lock_propagates_a_non_contention_windows_error(monkey
     forever instead of propagating so state_transaction() can fail closed
     and the scheduled run can persist evidence and alert (Codex review:
     "Stop retrying permanent Windows lock errors")."""
-    monkeypatch.setattr(dca_runner.os, "name", "nt")
+    # See the sibling retry test above: the Windows branch is selected via
+    # the import-time `_LOCK_IS_WINDOWS` constant, not a live `os.name`
+    # check.
+    monkeypatch.setattr(dca_runner, "_LOCK_IS_WINDOWS", True)
     fake = _fake_msvcrt([OSError("disk I/O error")])
     monkeypatch.setitem(sys.modules, "msvcrt", fake)
 
@@ -2718,10 +3124,7 @@ def test_assess_gate4_grace_period_defaults_to_off_and_still_aborts():
     another AI (Perplexity) may be trading the same Robinhood account this
     week, without weakening Gate 4 for every other caller or every other
     week."""
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="dca-runner-0935-2026-07-28-AAPL",
-    )
+    colliding = _order("AAPL", 2.0, _utc(2026, 7, 28, 13, 45))
     r = dca_runner.assess(**_clean_kwargs(orders=[colliding]))
     assert r["verdict"] == "ABORT"
     assert r["reason"] == "orders already present in the 0935 ET window, a second executor may be live"
@@ -2742,81 +3145,19 @@ def test_assess_gate4_grace_period_allows_proceed_despite_collision():
     clock to decide whether the grace period is active, and never silently
     re-derives an expiry -- the caller (executor prompt / scheduler) is
     responsible for checking config/scheduled_tasks.json's dated grace
-    window before passing True, keeping assess() pure and unit-testable.
-
-    Compatibility is granted only via an explicit caller-vouched
-    grace_compatible_client_order_ids entry (Codex review: "Reject this
-    runner's own collisions during partner grace") -- even for this
-    module's own dca-runner- marker, which the caller must vouch for
-    itself rather than getting it automatically."""
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="dca-runner-0935-2026-07-28-AAPL",
-    )
+    window before passing True, keeping assess() pure and unit-testable."""
+    colliding = _order("AAPL", 2.0, _utc(2026, 7, 28, 13, 45))
     r = dca_runner.assess(
         **_clean_kwargs(
             orders=[colliding],
             candidates=[("MSFT", 2.0)],
             sole_executor_grace_period_active=True,
-            grace_compatible_client_order_ids=frozenset({"dca-runner-0935-2026-07-28-AAPL"}),
         )
     )
     assert r["verdict"] == "PROCEED"
     assert r["gate4_grace_period_applied"] is True
     assert r["gate4_collisions"] == ["AAPL"]
     assert [o["ticker"] for o in r["plan"]["to_place"]] == ["MSFT"]
-
-
-def test_assess_gate4_grace_rejects_this_runners_own_marker_without_explicit_vouching():
-    # Codex review discussion ("Reject this runner's own collisions during
-    # partner grace"): this module's own dca-runner-<slot>-<day>-<ticker>
-    # naming convention is fully deterministic from public inputs, so a
-    # match proves nothing about who actually wrote the order -- it must
-    # NOT be treated as automatically compatible. Per
-    # claude/dca-executor-prompts/4-executor-1230-cron_30_16.txt, a
-    # dca-runner- collision is documented as a genuine duplicate execution
-    # of this same roster and must abort, not be silently waved through.
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="dca-runner-0935-2026-07-28-AAPL",
-    )
-    r = dca_runner.assess(
-        **_clean_kwargs(
-            orders=[colliding],
-            candidates=[("MSFT", 2.0)],
-            sole_executor_grace_period_active=True,
-        )
-    )
-    assert r["verdict"] == "ABORT"
-    assert r["colliding_orders"] == ["AAPL"]
-    assert "gate4_grace_period_applied" not in r
-
-
-def test_assess_gate4_grace_requires_marker_buy_and_normalizes_exclusion():
-    """Generic provenance and wrong-side rows stay rogue; vouched-for buys dedupe canonically."""
-    base = _clean_kwargs(
-        candidates=[("AAPL", 2.0), ("MSFT", 2.0)],
-        sole_executor_grace_period_active=True,
-        grace_compatible_client_order_ids=frozenset({"dca-runner-0935-2026-07-28-AAPL"}),
-    )
-    created = _utc(2026, 7, 28, 13, 45)
-
-    for collision in (
-        _order("AAPL", 2.0, created),
-        _order(
-            "AAPL", 2.0, created, side="sell",
-            client_order_id="dca-runner-0935-2026-07-28-AAPL",
-        ),
-    ):
-        assert dca_runner.assess(**(base | {"orders": [collision]}))["verdict"] == "ABORT"
-
-    compatible = _order(
-        " aapl ", 2.0, created,
-        client_order_id="dca-runner-0935-2026-07-28-AAPL",
-    )
-    result = dca_runner.assess(**(base | {"orders": [compatible]}))
-    assert result["verdict"] == "PROCEED"
-    assert [row["ticker"] for row in result["plan"]["to_place"]] == ["MSFT"]
 
 
 @pytest.mark.parametrize("placed_agent", [None, "unknown-executor", "user"])
@@ -2840,10 +3181,7 @@ def test_assess_gate4_grace_period_does_not_override_non_agentic_collision(place
 def test_assess_gate4_grace_period_aborts_mixed_compatible_and_rogue_window():
     """Any rogue signal wins even when a compatible executor is also present."""
     orders = [
-        _order(
-            "AAPL", 2.0, _utc(2026, 7, 28, 13, 45), placed_agent="agentic",
-            client_order_id="dca-runner-0935-2026-07-28-AAPL",
-        ),
+        _order("AAPL", 2.0, _utc(2026, 7, 28, 13, 45), placed_agent="agentic"),
         _order("MSFT", 2.0, _utc(2026, 7, 28, 13, 46), placed_agent="rogue"),
     ]
     r = dca_runner.assess(
@@ -2869,238 +3207,6 @@ def test_assess_gate4_grace_period_flag_alone_does_not_fabricate_a_collision():
     assert r["verdict"] == "PROCEED"
     assert "gate4_grace_period_applied" not in r
     assert "gate4_collisions" not in r
-
-
-def test_assess_gate4_grace_accepts_a_caller_named_coordinating_executor_id():
-    # Codex review discussion_r3899712471 / discussion_r3904287105 ("Identify
-    # the executor the grace period is meant to accept" / "Match the
-    # compatible executor rather than this runner"): this module's own
-    # dca-runner-<slot>-<day>-<ticker> marker can never match a separate
-    # coordinating executor's (e.g. Perplexity's) own order ids, since this
-    # module has no way to predict or validate a foreign id format.
-    # grace_compatible_client_order_ids lets the caller (the scheduler, which
-    # knows this week's coordination partner) explicitly name the SPECIFIC
-    # order id it already knows belongs to that executor, without weakening
-    # the fail-closed default for any other unrecognized same-window order.
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="perplexity-order-98765",
-    )
-    r = dca_runner.assess(
-        **_clean_kwargs(
-            orders=[colliding],
-            candidates=[("MSFT", 2.0)],
-            sole_executor_grace_period_active=True,
-            grace_compatible_client_order_ids=frozenset({"perplexity-order-98765"}),
-        )
-    )
-    assert r["verdict"] == "PROCEED"
-    assert r["gate4_grace_period_applied"] is True
-    assert r["gate4_collisions"] == ["AAPL"]
-    assert [o["ticker"] for o in r["plan"]["to_place"]] == ["MSFT"]
-
-
-def test_assess_gate4_grace_still_aborts_an_unnamed_agentic_order():
-    # The other side of the same fix: an agentic-tagged order whose id is
-    # NEITHER this module's own marker NOR in the caller-supplied set must
-    # still fail closed -- grace_compatible_client_order_ids narrows what is
-    # trusted, it never broadens trust to "any agentic order".
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="some-other-unrecognized-id",
-    )
-    r = dca_runner.assess(
-        **_clean_kwargs(
-            orders=[colliding],
-            candidates=[("MSFT", 2.0)],
-            sole_executor_grace_period_active=True,
-            grace_compatible_client_order_ids=frozenset({"perplexity-order-98765"}),
-        )
-    )
-    assert r["verdict"] == "ABORT"
-    assert r["colliding_orders"] == ["AAPL"]
-    assert "gate4_grace_period_applied" not in r
-
-
-def test_assess_gate4_grace_rejects_a_blank_client_order_id_match():
-    # Codex review discussion_r3905208219 / PR #1175's own
-    # discussion_r3904568657-family finding on this same code: a caller
-    # (e.g. a scheduler collecting vouched ids from broker rows) can
-    # represent a missing identifier as "" rather than omitting it. A
-    # colliding agentic order with an equally blank client_order_id must
-    # never be treated as compatible just because "" happens to be present
-    # in the caller-supplied set -- a blank id is not identifying evidence
-    # of anything.
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="",
-    )
-    r = dca_runner.assess(
-        **_clean_kwargs(
-            orders=[colliding],
-            candidates=[("MSFT", 2.0)],
-            sole_executor_grace_period_active=True,
-            grace_compatible_client_order_ids=frozenset({""}),
-        )
-    )
-    assert r["verdict"] == "ABORT"
-    assert r["colliding_orders"] == ["AAPL"]
-    assert "gate4_grace_period_applied" not in r
-
-
-def test_assess_gate4_grace_converts_a_malformed_collision_symbol_into_abort():
-    # Codex review ("Convert malformed grace-collision symbols into
-    # ABORT"): _is_grace_compatible_order accepts a colliding order based
-    # on its buy-attempt/placed_agent/client_order_id fields, never
-    # inspecting `.symbol` -- so a grace-compatible collision can still
-    # carry a non-string symbol. Excluding its ticker from Gate 6's
-    # candidate set requires normalizing that symbol, which raises
-    # ValueError on anything but a real string; that must become the same
-    # redacted ABORT the identical malformed row already gets when grace
-    # is inactive, not an uncaught exception escaping assess()'s
-    # documented never-raises verdict contract.
-    colliding = _order(
-        {"account": "leaked-account-id"}, 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="perplexity-order-98765",
-    )
-    r = dca_runner.assess(
-        **_clean_kwargs(
-            orders=[colliding],
-            candidates=[("MSFT", 2.0)],
-            sole_executor_grace_period_active=True,
-            grace_compatible_client_order_ids=frozenset({"perplexity-order-98765"}),
-        )
-    )
-    assert r["verdict"] == "ABORT"
-    assert r["colliding_orders"] == ["<non-string symbol, type=dict>"]
-    assert "gate4_grace_period_applied" not in r
-
-
-@pytest.mark.parametrize("malformed", [1, True, 3.5, object()])
-def test_assess_gate4_grace_rejects_non_iterable_client_order_ids_without_raising(malformed):
-    # Codex review discussion_r3900269476 ("Reject non-iterable grace-ID
-    # inputs without raising"): grace_compatible_client_order_ids is an
-    # external scheduler-facing surface, and a truthy non-iterable value
-    # (an int, a bool, ...) reached a bare comprehension and raised
-    # TypeError from inside assess(), which documents a never-raises
-    # verdict contract. It must instead fail closed -- normalize to an
-    # empty set and ABORT on the collision like any other unrecognized
-    # order, not escape as an uncaught exception.
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="some-other-unrecognized-id",
-    )
-    r = dca_runner.assess(
-        **_clean_kwargs(
-            orders=[colliding],
-            candidates=[("MSFT", 2.0)],
-            sole_executor_grace_period_active=True,
-            grace_compatible_client_order_ids=malformed,
-        )
-    )
-    assert r["verdict"] == "ABORT"
-    assert r["colliding_orders"] == ["AAPL"]
-    assert "gate4_grace_period_applied" not in r
-
-
-def test_normalize_grace_compatible_client_order_ids_rejects_bare_string():
-    # A raw string IS iterable (char-by-char), so it would silently pass
-    # through the old bare comprehension instead of raising -- but yields a
-    # set of single letters, not the id itself, which is a malformed input
-    # the same way a non-iterable is and must normalize the same way: to
-    # empty, not to a per-character set that could accidentally "match" a
-    # single-character order id.
-    assert dca_runner._normalize_grace_compatible_client_order_ids("abc") == frozenset()
-
-
-def test_assess_gate4_grace_contains_an_exception_raised_mid_iteration():
-    # Codex review discussion_r3904674550 ("Contain exceptions raised while
-    # iterating grace IDs"): the earlier fix only caught a flatly
-    # non-iterable value's TypeError. A caller-supplied generator (or other
-    # one-shot iterable) that raises a DIFFERENT exception partway through
-    # being consumed -- e.g. yields one id then raises RuntimeError -- must
-    # be contained the same way, not escape assess()'s never-raises verdict
-    # contract.
-    def _bad_generator():
-        yield "perplexity-order-98765"
-        raise RuntimeError("boom mid-iteration")
-
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="some-other-unrecognized-id",
-    )
-    r = dca_runner.assess(
-        **_clean_kwargs(
-            orders=[colliding],
-            candidates=[("MSFT", 2.0)],
-            sole_executor_grace_period_active=True,
-            grace_compatible_client_order_ids=_bad_generator(),
-        )
-    )
-    assert r["verdict"] == "ABORT"
-    assert r["colliding_orders"] == ["AAPL"]
-    assert "gate4_grace_period_applied" not in r
-
-
-def test_assess_gate4_grace_contains_a_raising_truthiness_check():
-    # Codex review discussion_r3905551234 ("Catch failures while checking
-    # grace-ID emptiness"): the earlier fix's `if not value` emptiness
-    # check ran BEFORE the try/except guarding the rest of the
-    # normalization, so a caller-supplied collection whose own
-    # __bool__/__len__ raises still escaped assess()'s never-raises
-    # verdict contract. The emptiness check itself must be inside the
-    # guarded section.
-    class _RaisingTruthiness:
-        def __iter__(self):
-            return iter(["perplexity-order-98765"])
-
-        def __bool__(self):
-            raise RuntimeError("boom in __bool__")
-
-    colliding = _order(
-        "AAPL", 2.0, _utc(2026, 7, 28, 13, 45),
-        client_order_id="some-other-unrecognized-id",
-    )
-    r = dca_runner.assess(
-        **_clean_kwargs(
-            orders=[colliding],
-            candidates=[("MSFT", 2.0)],
-            sole_executor_grace_period_active=True,
-            grace_compatible_client_order_ids=_RaisingTruthiness(),
-        )
-    )
-    assert r["verdict"] == "ABORT"
-    assert r["colliding_orders"] == ["AAPL"]
-    assert "gate4_grace_period_applied" not in r
-
-
-def test_normalize_grace_compatible_client_order_ids_fails_closed_on_raising_iterable():
-    # Codex review discussion ("Fail closed when the grace-ID iterable
-    # raises"): a lazy/custom iterable can raise something other than
-    # TypeError partway through iteration -- e.g. yield one id, then raise
-    # RuntimeError. That must normalize to empty (fail closed), not
-    # propagate out of assess()'s documented never-raises verdict contract.
-    def _raising_ids():
-        yield "perplexity-order-98765"
-        raise RuntimeError("boom")
-
-    assert (
-        dca_runner._normalize_grace_compatible_client_order_ids(_raising_ids())
-        == frozenset()
-    )
-
-
-def test_normalize_grace_compatible_client_order_ids_drops_blank_entries():
-    # Codex review discussion_r3905208219 ("Reject blank grace-compatible
-    # order IDs"): a blank or whitespace-only entry carries no identifying
-    # evidence and must be dropped at normalization time, not merely
-    # rejected later at the match site -- and a real id with incidental
-    # surrounding whitespace should still normalize (stripped) rather than
-    # fail to match its stripped counterpart on the order side.
-    normalized = dca_runner._normalize_grace_compatible_client_order_ids(
-        ["", "   ", "perplexity-order-98765", "  spaced-id  "]
-    )
-    assert normalized == frozenset({"perplexity-order-98765", "spaced-id"})
 
 
 # ===========================================================================
@@ -7320,12 +7426,15 @@ def test_execute_plan_requires_orders_when_placement_is_enabled():
         )
 
 
-def test_execute_plan_refuses_a_ticker_already_bought_today_per_broker_history():
+def test_execute_plan_refuses_a_ticker_already_bought_today_per_broker_history(monkeypatch):
     """BudgetSnapshot carries only totals, not per-ticker identities: without
     independently reverifying against broker history, a caller-built Plan
     naming a ticker already bought earlier today would pass every other
     check and submit a second same-day buy (Codex review: "Recheck same-day
-    ticker history before placement")."""
+    ticker history before placement"). Like assess(), the refusal applies
+    only while config/budgets.json's one_order_per_ticker_per_day is True
+    (2026-09-07 diagnostic, C:F2)."""
+    monkeypatch.setattr(dca_runner, "ONE_ORDER_PER_TICKER_PER_DAY", True)
     calls = []
     broker = dca_runner.build_runner_broker(
         place_fn=lambda **kw: calls.append(kw) or {"id": "ok"},
@@ -7387,13 +7496,14 @@ def test_execute_plan_allows_a_ticker_not_bought_today_alongside_unrelated_histo
     assert result.submitted == ["AAPL"]
 
 
-def test_execute_plan_still_blocks_a_ticker_whose_earlier_buy_today_was_cancelled():
+def test_execute_plan_still_blocks_a_ticker_whose_earlier_buy_today_was_cancelled(monkeypatch):
     """A cancelled/rejected buy with no fill still consumed the day's
     one-order-per-ticker attempt, even though it consumed no budget:
     ``counts_toward_budget`` is False for a fill-less dead order, but the
     same-day dedup must use the broader ``is_buy_attempt`` instead, or a
     rejected order would make its ticker eligible again the same day (Codex
     review: "Keep canceled orders in the daily ticker interlock")."""
+    monkeypatch.setattr(dca_runner, "ONE_ORDER_PER_TICKER_PER_DAY", True)
     calls = []
     broker = dca_runner.build_runner_broker(
         place_fn=lambda **kw: calls.append(kw) or {"id": "ok"},
@@ -7932,7 +8042,7 @@ def test_execute_plan_redacts_a_string_mismatched_client_reference(ref_id_field)
             "state": "queued",
             "symbol": "AAPL",
             "side": "buy",
-            ref_id_field: f"{secret_account_number}-token_xxxxxxxxxxxxxxxxxxxxxxxx",
+            ref_id_field: f"{secret_account_number}-token_{'x' * 24}",
         },
         enable_live_orders=True,
         dry_run=False,
@@ -7961,7 +8071,7 @@ def test_execute_plan_redacts_a_string_mismatched_client_reference(ref_id_field)
     )
     assert [f.ticker for f in result.failures] == ["AAPL"]
     assert secret_account_number not in result.failures[0].reason
-    assert "token_xxxxxxxxxxxxxxxxxxxxxxxx" not in result.failures[0].reason
+    assert f"token_{'x' * 24}" not in result.failures[0].reason
     assert "[REDACTED-TOKEN]" in result.failures[0].reason
 
 
@@ -8912,10 +9022,12 @@ def _three_ticker_plan(tickers):
     return plan, snapshot, tier, candidates
 
 
-def _execute(plan, broker, snapshot, tier, candidates):
+def _execute(plan, broker, snapshot, tier, candidates, *, orders=None):
+    if orders is None:
+        orders = []
     return dca_runner.execute_plan(
         plan, broker, run_id="test-run-2026-07-28", snapshot=snapshot,
-        trading_day=date(2026, 7, 28), orders=[], tier=tier,
+        trading_day=date(2026, 7, 28), orders=orders, tier=tier,
         buying_power_usd=TEST_BUYING_POWER_USD,
         orders_account_number=TEST_ACCOUNT_NUMBER,
         now=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
@@ -9430,6 +9542,36 @@ def test_a_cancelled_order_reporting_an_explicit_zero_fill_is_still_isolated():
     assert calls == [o.ticker for o in plan.to_place]
     assert len(result.submitted) == 2
     assert result.halted_on is None
+    assert result.attempt_records == []
+
+
+def test_an_id_less_rejection_still_gets_a_synthetic_attempt_record():
+    """A proven refusal with no usable order id is invisible to later history
+    fetches, so it still needs a synthetic zero-notional attempt row."""
+    calls = []
+
+    def place_fn(**kw):
+        calls.append(kw["symbol"])
+        if len(calls) == 1:
+            return {"success": False, "error": "not tradable for fractional buys"}
+        return {"id": f"ORD-{kw['symbol']}"}
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=place_fn, enable_live_orders=True, dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL", "MSFT", "NVDA"])
+
+    result = _execute(plan, broker, snapshot, tier, candidates)
+
+    assert calls == [o.ticker for o in plan.to_place]
+    assert len(result.submitted) == 2
+    assert result.halted_on is None
+    assert len(result.attempt_records) == 1
+    assert result.attempt_records[0].symbol == plan.to_place[0].ticker
+    assert result.attempt_records[0].dollar_amount == 0.0
+    assert result.attempt_records[0].created_at == datetime(2026, 7, 28, 9, 43, tzinfo=ET)
+    assert dca_runner.budget_snapshot(result.attempt_records, snapshot.day).day_order_count == 1
 
 
 def test_the_reported_incident_shape_is_isolated_without_any_fill_evidence():
@@ -10208,6 +10350,46 @@ def test_a_raised_place_fn_halts_because_nothing_can_be_established():
     assert "cannot be established from here" in result.failure_reason
     # Still named per ticker so Gate 9 reports it.
     assert result.failures[0].reason == "place_fn raised RuntimeError"
+    assert len(result.attempt_records) == 1
+    reservation = result.attempt_records[0]
+    assert reservation.symbol == plan.to_place[0].ticker
+    assert reservation.dollar_amount == plan.to_place[0].amount_usd
+    assert reservation.state == "potentially_submitted"
+    assert reservation.client_order_id == "dca-runner-0935-2026-07-28-AAPL"
+    assert reservation.ref_id == "dca-runner-0935-2026-07-28-AAPL"
+    reserved = dca_runner.budget_snapshot(result.attempt_records, snapshot.day)
+    assert reserved.day_notional_usd == plan.to_place[0].amount_usd
+    assert reserved.day_order_count == 1
+
+
+def test_an_ambiguous_reference_blocks_retry_until_reconciled():
+    """The exact placement reference remains reserved and cannot be placed twice."""
+    calls = []
+
+    def accepted_then_times_out(**kw):
+        calls.append(kw)
+        raise RuntimeError("connector timeout with secret connector detail")
+
+    broker = dca_runner.build_runner_broker(
+        place_fn=accepted_then_times_out,
+        enable_live_orders=True,
+        dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    plan, snapshot, tier, candidates = _three_ticker_plan(["AAPL"])
+    orders = []
+
+    first = _execute(plan, broker, snapshot, tier, candidates, orders=orders)
+
+    assert len(calls) == 1
+    assert orders[0].ref_id == calls[0]["ref_id"]
+    assert orders[0].state == "potentially_submitted"
+    assert "secret connector detail" not in first.failure_reason
+
+    refreshed_snapshot = dca_runner.budget_snapshot(orders, snapshot.day)
+    with pytest.raises(ValueError, match="orders already present"):
+        _execute(plan, broker, refreshed_snapshot, tier, candidates, orders=orders)
+    assert len(calls) == 1
 
 
 def test_a_broker_refusal_still_isolates_after_the_raise_policy_change():
@@ -10346,9 +10528,11 @@ def test_execute_plan_recheck_the_clock_halts_the_remainder_when_the_window_clos
         snapshot=snapshot,
         tier=tier,
     )
-    # The 0935 slot's window is 09:30-10:00 ET (see SLOTS); the first now_fn
-    # call (before AAPL) is still inside it, the second (before MSFT) is not.
+    # The 0935 slot's window is 09:30-10:00 ET (see SLOTS); the first two
+    # now_fn calls (the one-time freshness check, then before AAPL) are still
+    # inside it, the third (before MSFT) is not.
     clock_readings = iter([
+        datetime(2026, 7, 28, 9, 43, tzinfo=ET),
         datetime(2026, 7, 28, 9, 43, tzinfo=ET),
         datetime(2026, 7, 28, 10, 5, tzinfo=ET),
     ])
@@ -10391,10 +10575,12 @@ def test_execute_plan_now_fn_raising_halts_the_remainder_without_propagating():
         snapshot=snapshot,
         tier=tier,
     )
-    clock_readings = iter([datetime(2026, 7, 28, 9, 43, tzinfo=ET)])
+    # One reading for the one-time freshness check, one for AAPL's own
+    # placement; MSFT's call then raises.
+    clock_readings = iter([datetime(2026, 7, 28, 9, 43, tzinfo=ET)] * 2)
 
     def _now_fn():
-        return next(clock_readings)  # raises StopIteration on the second call
+        return next(clock_readings)  # raises StopIteration on the third call
 
     result = dca_runner.execute_plan(
         plan, broker, run_id="test-run-2026-07-28", snapshot=snapshot,
@@ -10494,50 +10680,6 @@ def test_now_fn_returning_a_malformed_value_is_redacted_to_its_type():
     assert secret_account_number not in result.failure_reason
     assert "shh" not in result.failure_reason
     assert "dict" in result.failure_reason
-
-
-def test_execute_plan_recheck_the_clock_catches_history_going_stale_mid_batch():
-    """The pre-loop orders_fetched_at freshness check only proves the
-    history was fresh when the batch started. now_fn's fresh reading is
-    rechecked against orders_fetched_at before every placement too, so
-    history that goes stale partway through a slow or large batch halts the
-    remainder instead of letting a later order rely on order history that no
-    longer represents an intervening manual or scheduled buy (Codex review:
-    "Measure history freshness against the fresh placement clock")."""
-    calls = []
-    broker = dca_runner.build_runner_broker(
-        place_fn=lambda **kw: calls.append(kw["symbol"]) or {"id": "ok"},
-        enable_live_orders=True,
-        dry_run=False,
-        account_number=TEST_ACCOUNT_NUMBER,
-    )
-    snapshot = dca_runner.budget_snapshot([], date(2026, 7, 28))
-    tier = BudgetTier("normal", 180.0, 900.0)
-    candidates = [dca_runner.Candidate("AAPL", 2.0), dca_runner.Candidate("MSFT", 2.0)]
-    plan = dca_runner.plan_orders(candidates=candidates, snapshot=snapshot, tier=tier)
-    orders_fetched_at = datetime(2026, 7, 28, 9, 35, tzinfo=ET)
-    # Both readings stay inside the 0935 slot's 09:30-10:00 ET window, so
-    # only the orders-freshness check (not the window check) can be why the
-    # second order halts. The second reading is 130s past orders_fetched_at,
-    # just over MAX_ORDERS_FETCH_AGE_SECONDS (120s).
-    clock_readings = iter([
-        datetime(2026, 7, 28, 9, 36, tzinfo=ET),
-        datetime(2026, 7, 28, 9, 37, 10, tzinfo=ET),
-    ])
-    result = dca_runner.execute_plan(
-        plan, broker, run_id="test-run-2026-07-28", snapshot=snapshot,
-        trading_day=date(2026, 7, 28), orders=[], tier=tier, buying_power_usd=TEST_BUYING_POWER_USD,
-        orders_account_number=TEST_ACCOUNT_NUMBER,
-        now=datetime(2026, 7, 28, 9, 36, tzinfo=ET),
-        slot_id="0935",
-        orders_fetched_at=orders_fetched_at,
-        candidates=candidates,
-        now_fn=lambda: next(clock_readings),
-    )
-    assert calls == ["AAPL"]  # MSFT never attempted
-    assert result.submitted == ["AAPL"]
-    assert result.halted_on == "MSFT"
-    assert "freshness window" in result.failure_reason
 
 
 def test_execute_plan_submits_sequentially_never_in_parallel():
@@ -12036,8 +12178,10 @@ def test_assess_dedupe_keeps_the_allocation_priority_winner_for_tier_selection()
 
 # ---------------------------------------------------------------------------
 # Daily order-count cap (config/budgets.json circuit_breakers.max_orders_per_day)
-# Added 2026-07-31 at Geoff's direction: at most 8 orders a day across all seven
-# slots and manual buying, changeable by editing that one config number.
+# Added 2026-07-31 at Geoff's direction: at most dca_runner.MAX_ORDERS_PER_DAY
+# orders a day across all seven slots and manual buying, changeable by editing
+# that one config number (120 as of 2026-09-11; see config/budgets.json's own
+# max_orders_per_day_note for why it moved from the original 8).
 # ---------------------------------------------------------------------------
 
 
@@ -12045,10 +12189,30 @@ def _count_cap_tier():
     return dca_runner.select_budget_tier(0.0, 0)
 
 
-def _count_cap_cands(n):
-    """n whitelisted 1x candidates at the $2 base, so nothing is refused for
-    sizing reasons and only the count cap can stop the batch."""
-    return [dca_runner.Candidate(t, 2.0, 1.0) for t in sorted(dca_runner.ACTIVE_TICKERS)[:n]]
+#: plan_orders() refuses any ticker outside dca_runner.ACTIVE_TICKERS (the
+#: real roster has 59 entries), so a test exercising "more candidates than
+#: the cap allows" now that MAX_ORDERS_PER_DAY is 120 needs a wider
+#: whitelist than the real roster provides. Synthetic, test-only tickers,
+#: swapped in per-test via _patch_wide_whitelist() rather than sliced from
+#: the real roster.
+_WIDE_TEST_WHITELIST = frozenset(f"CAND{i:04d}" for i in range(200))
+
+
+def _patch_wide_whitelist(monkeypatch):
+    monkeypatch.setattr(dca_runner, "ACTIVE_TICKERS", _WIDE_TEST_WHITELIST)
+
+
+def _count_cap_cands(n, amount_usd=1.0):
+    """n 1x candidates, so nothing is refused for sizing reasons. Defaults to
+    the $1 reduced base: now that MAX_ORDERS_PER_DAY (120) is well above what
+    the $2 base would clear before the $180 daily dollar cap does (90
+    orders), tests isolating the COUNT cap need the cheaper base so the
+    dollar cap stays out of the way; test_the_dollar_caps_still_bind... below
+    passes amount_usd=2.0 explicitly since it exercises the dollar cap
+    instead. Callers must first patch in _WIDE_TEST_WHITELIST via
+    _patch_wide_whitelist() when n can exceed the real ACTIVE_TICKERS
+    roster's 59 entries."""
+    return [dca_runner.Candidate(t, amount_usd, 1.0) for t in sorted(_WIDE_TEST_WHITELIST)[:n]]
 
 
 def _count_cap_snapshot(day_order_count, *, day_notional_usd=0.0):
@@ -12060,31 +12224,40 @@ def _count_cap_snapshot(day_order_count, *, day_notional_usd=0.0):
     )
 
 
-def test_the_daily_order_count_cap_stops_the_batch_at_the_configured_limit():
-    """Twelve placeable candidates, cap of 8, dollar headroom to spare: exactly
-    8 are planned and the rest are skipped for the count, not the notional."""
-    plan = dca_runner.plan_orders(_count_cap_cands(12), _count_cap_snapshot(0), _count_cap_tier())
-    assert len(plan.to_place) == dca_runner.MAX_ORDERS_PER_DAY == 8
+def test_the_daily_order_count_cap_stops_the_batch_at_the_configured_limit(monkeypatch):
+    """Four more placeable candidates than the configured cap, dollar headroom
+    to spare: exactly the cap's worth are planned and the rest are skipped for
+    the count, not the notional."""
+    _patch_wide_whitelist(monkeypatch)
+    cap = dca_runner.MAX_ORDERS_PER_DAY
+    plan = dca_runner.plan_orders(_count_cap_cands(cap + 4), _count_cap_snapshot(0), _count_cap_tier())
+    assert len(plan.to_place) == cap
     assert len(plan.skipped) == 4
     assert {reason for _, reason in plan.skipped} == {dca_runner.SKIPPED_DAILY_ORDER_COUNT_CAP}
 
 
-def test_the_daily_order_count_cap_counts_orders_already_placed_today():
-    """The cap is shared across the whole day, not per run: six orders already
-    submitted leaves room for two, whoever placed them."""
-    plan = dca_runner.plan_orders(_count_cap_cands(5), _count_cap_snapshot(6), _count_cap_tier())
+def test_the_daily_order_count_cap_counts_orders_already_placed_today(monkeypatch):
+    """The cap is shared across the whole day, not per run: a day already two
+    short of the cap leaves room for exactly two, whoever placed them."""
+    _patch_wide_whitelist(monkeypatch)
+    cap = dca_runner.MAX_ORDERS_PER_DAY
+    plan = dca_runner.plan_orders(_count_cap_cands(5), _count_cap_snapshot(cap - 2), _count_cap_tier())
     assert len(plan.to_place) == 2
     assert {reason for _, reason in plan.skipped} == {dca_runner.SKIPPED_DAILY_ORDER_COUNT_CAP}
 
 
-def test_the_daily_order_count_cap_places_nothing_once_the_day_is_full():
-    plan = dca_runner.plan_orders(_count_cap_cands(3), _count_cap_snapshot(8), _count_cap_tier())
+def test_the_daily_order_count_cap_places_nothing_once_the_day_is_full(monkeypatch):
+    _patch_wide_whitelist(monkeypatch)
+    plan = dca_runner.plan_orders(
+        _count_cap_cands(3), _count_cap_snapshot(dca_runner.MAX_ORDERS_PER_DAY), _count_cap_tier()
+    )
     assert plan.to_place == []
     assert len(plan.skipped) == 3
 
 
 def test_the_daily_order_count_cap_is_changeable(monkeypatch):
     """The limit is a config number, not a constant baked into the planner."""
+    _patch_wide_whitelist(monkeypatch)
     monkeypatch.setattr(dca_runner, "MAX_ORDERS_PER_DAY", 3)
     assert len(dca_runner.plan_orders(
         _count_cap_cands(9), _count_cap_snapshot(0), _count_cap_tier()).to_place) == 3
@@ -12093,13 +12266,176 @@ def test_the_daily_order_count_cap_is_changeable(monkeypatch):
         _count_cap_cands(9), _count_cap_snapshot(0), _count_cap_tier()).to_place) == 9
 
 
-def test_the_dollar_caps_still_bind_independently_of_the_count_cap():
+def test_the_dollar_caps_still_bind_independently_of_the_count_cap(monkeypatch):
     """The count cap is additional to the daily notional cap, not a replacement:
-    a day under 8 orders but at its dollar ceiling still stops."""
+    a day nowhere near the order-count cap but at its dollar ceiling still
+    stops."""
+    _patch_wide_whitelist(monkeypatch)
     snapshot = _count_cap_snapshot(0, day_notional_usd=179.0)
-    plan = dca_runner.plan_orders(_count_cap_cands(3), snapshot, _count_cap_tier())
+    plan = dca_runner.plan_orders(_count_cap_cands(3, amount_usd=2.0), snapshot, _count_cap_tier())
     assert plan.to_place == []
     assert dca_runner.SKIPPED_DAILY_CAP in {reason for _, reason in plan.skipped}
+
+
+# ---------------------------------------------------------------------------
+# dca_runner.count_compatible_executor_attempts
+#
+# Implemented (dca_runner.py:1075), but NOT YET WIRED into any live path --
+# no caller invokes it yet. Written 2026-09-11 alongside the max_orders_per_day
+# cap fix, for the still-open gap that fix's own config note flags: the 3:30 PM
+# canonical path (near_close_dca.py's _seed_prior_allocations) seeds
+# day_order_count purely from this repo's own local run artifacts, with no
+# visibility into orders the standing Perplexity backup executor places
+# directly against the same broker account (see
+# claude/PERPLEXITY-CLAUDE-COORDINATION.md). The other six live-mirror
+# prompts already route through dca_runner.plan_orders() fed by freshly
+# fetched broker history, which -- per budget_snapshot()'s own "count every
+# order regardless of placed_agent" policy -- is already account-wide
+# PROVIDED the fetch is complete and fresh; this function is meant for the
+# one path that is not: a caller (run_dca.py, or whatever fetches broker
+# data ahead of the 3:30 PM run) would call this once per run and fold the
+# result into near_close_dca's own local seed as an additional attempt
+# count, additive to (never a replacement for) that local seeding.
+#
+# Spec:
+#   count_compatible_executor_attempts(
+#       orders: Sequence[BrokerOrder],
+#       trading_day: date,
+#       *,
+#       self_client_ref_prefix: str,          # required, no default
+#       compatible_agent_value: str = "agentic",
+#   ) -> int
+#
+# An order counts toward the result when ALL of:
+#   - order.is_buy_attempt (mirrors budget_snapshot()'s own "REJECTED and
+#     CANCELLED attempts still consume one" contract -- over-counting is the
+#     safe direction for a count ceiling)
+#   - its created_at falls on trading_day in America/New_York (same
+#     _require_aware(...).astimezone(ET).date() == trading_day convention
+#     budget_snapshot() already uses)
+#   - order.placed_agent == compatible_agent_value EXACTLY (fail-safe:
+#     anything else -- None, "user", "recurring", "drip", or any other
+#     value -- is never compatible, mirroring Gate 4's own classification)
+#   - its client_order_id is PRESENT and does NOT start with
+#     self_client_ref_prefix. self_client_ref_prefix is REQUIRED (must be a
+#     nonempty string, or the function raises ValueError -- an empty prefix
+#     would make str.startswith("") true for every order, silently zeroing
+#     the count): claude/PERPLEXITY-CLAUDE-COORDINATION.md's own Sec 4
+#     documents that a bare placed_agent of "agentic" is not sufficient to
+#     attribute an order to Perplexity specifically, because Claude's own
+#     live orders carry the identical "agentic" tag -- without excluding
+#     this engine's own client-reference prefix
+#     (dca-runner-<slot>-<trading_day>-<TICKER>, per that same doc), this
+#     function would double-count THIS engine's own attempts (already
+#     reflected in its local seeding) as if they belonged to the compatible
+#     executor. A MISSING client_order_id fails closed (does not count):
+#     the 1530ET live-mirror prompt documents that a refreshed broker fetch
+#     can return client_order_id as null even for an order THIS engine
+#     placed, so a missing reference cannot prove the order is not self.
+# ---------------------------------------------------------------------------
+
+
+_SELF_PREFIX = "dca-runner-1530-2026-09-11-"
+
+
+def _compat_order(symbol, *, hour=10, minute=0, day=date(2026, 9, 11),
+                   placed_agent="agentic", side="buy", state="filled",
+                   client_order_id=None):
+    return dca_runner.BrokerOrder(
+        symbol=symbol,
+        side=side,
+        dollar_amount=2.0,
+        created_at=datetime(day.year, day.month, day.day, hour, minute, tzinfo=dca_runner.ET).astimezone(
+            timezone.utc
+        ),
+        placed_agent=placed_agent,
+        state=state,
+        client_order_id=client_order_id,
+    )
+
+
+def test_compatible_executor_attempts_counts_agentic_orders_not_self():
+    """A Perplexity-attributable order (agentic, no self-prefix) counts; this
+    engine's own order (agentic, self-prefix) does not -- it is already
+    reflected in this engine's own local seeding."""
+    orders = [
+        _compat_order("AAPL", client_order_id="some-other-client-ref-AAPL"),
+        _compat_order("MSFT", client_order_id=f"{_SELF_PREFIX}MSFT"),
+    ]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 1
+
+
+def test_compatible_executor_attempts_excludes_manual_and_unrecognized_agents():
+    """Fail-safe: only an exact compatible_agent_value match counts. Manual,
+    recurring, drip, and unrecognized/None provenance are never compatible,
+    mirroring Gate 4's own classification."""
+    orders = [
+        _compat_order("AAPL", placed_agent="user", client_order_id="ref-1"),
+        _compat_order("MSFT", placed_agent="recurring", client_order_id="ref-2"),
+        _compat_order("GOOG", placed_agent=None, client_order_id="ref-3"),
+        _compat_order("TSLA", placed_agent="some_other_bot", client_order_id="ref-4"),
+    ]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 0
+
+
+def test_compatible_executor_attempts_excludes_other_days():
+    """Matching on the same _require_aware(...).astimezone(ET).date() ==
+    trading_day convention budget_snapshot() already uses."""
+    orders = [
+        _compat_order("AAPL", day=date(2026, 9, 10), client_order_id="ref-1"),
+        _compat_order("MSFT", day=date(2026, 9, 12), client_order_id="ref-2"),
+    ]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 0
+
+
+def test_compatible_executor_attempts_counts_cancelled_and_rejected():
+    """is_buy_attempt semantics: a cancelled or rejected compatible attempt
+    still consumed one of the shared daily slots -- over-counting is the
+    safe direction for a count ceiling (config/budgets.json's own
+    max_orders_per_day_note)."""
+    orders = [
+        _compat_order("AAPL", state="cancelled", client_order_id="ref-1"),
+        _compat_order("MSFT", state="rejected", client_order_id="ref-2"),
+    ]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 2
+
+
+def test_compatible_executor_attempts_excludes_sells():
+    orders = [_compat_order("AAPL", side="sell", client_order_id="ref-1")]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 0
+
+
+def test_compatible_executor_attempts_fails_closed_on_missing_client_order_id():
+    """A missing client_order_id cannot prove an agentic order is NOT this
+    engine's own -- the 1530ET live-mirror prompt documents that a
+    refreshed broker fetch can return client_order_id as null even for an
+    order THIS engine placed. Must not count it (PR review: "fail closed
+    when the identifier is absent instead")."""
+    orders = [_compat_order("AAPL", client_order_id=None)]
+    assert dca_runner.count_compatible_executor_attempts(
+        orders, date(2026, 9, 11), self_client_ref_prefix=_SELF_PREFIX
+    ) == 0
+
+
+def test_compatible_executor_attempts_rejects_empty_self_prefix():
+    """An empty self_client_ref_prefix would make str.startswith("") true
+    for every order, silently zeroing the count instead of raising -- must
+    fail loudly instead."""
+    orders = [_compat_order("AAPL", client_order_id="ref-1")]
+    with pytest.raises(ValueError):
+        dca_runner.count_compatible_executor_attempts(
+            orders, date(2026, 9, 11), self_client_ref_prefix=""
+        )
 
 
 def test_budget_snapshot_counts_todays_buy_attempts_including_dead_ones():
@@ -12339,6 +12675,28 @@ def test_plan_orders_refuses_a_calibrated_topup_below_the_broker_minimum():
     plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
     assert plan.to_place == []
     assert plan.refused == [("TRIN", dca_runner.REFUSED_BELOW_BROKER_MINIMUM_ORDER_SIZE)]
+
+
+def test_plan_orders_rejects_a_boolean_calibrated_multiplier():
+    """Codex review ("Reject boolean calibrated multipliers"): bool is a
+    numeric subtype in Python, so a JSON `true` multiplier equals 1.0 and
+    would otherwise match DFTX's real configured 1.0x tier in
+    _configured_calibration_bounds() -- treating malformed external
+    evidence as legitimate calibrated placement evidence. Without the
+    isinstance(cand.multiplier, bool) guard at the plan_orders() minimum-
+    order-size precheck, this refused under REFUSED_BELOW_BROKER_MINIMUM_
+    ORDER_SIZE (an "expected broker-minimum skip") instead of the correct
+    REFUSED_INCONSISTENT_MULTIPLIER ("corrupted sizing evidence") that
+    _candidate_multiplier_notional_mismatch() already gives every other
+    boolean-multiplier candidate."""
+    candidate = dca_runner.Candidate(
+        "DFTX", 0.50, multiplier=True, drop_pct=1.5,
+        sizing_base_usd=1.0, sizing_min_drop_pct=1.1437, sizing_max_drop_pct=2.5541,
+    )
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert plan.to_place == []
+    assert plan.refused == [("DFTX", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
 
 
 def test_estimated_multiplier_trusts_a_reduced_calibrated_topup():
@@ -14268,3 +14626,260 @@ def test_a_same_id_sibling_with_an_unreadable_state_is_unaccounted():
     # ABSENT is unchanged: an echo that simply does not restate the state
     # says nothing, exactly like an echo that omits `dollar_amount`.
     assert halts({"data": primary, "orders": [{"id": "A"}]}) is False
+
+
+# ===========================================================================
+# 2026-09-07 diagnostic: dca_runner gate-sequence findings C:F2, C:F3, C:F4,
+# C:F7, C:F12, C:F13
+# ===========================================================================
+
+
+def _live_runner_broker(calls):
+    return dca_runner.build_runner_broker(
+        place_fn=lambda **kw: calls.append(kw["symbol"]) or {"id": f"ok-{kw['symbol']}"},
+        enable_live_orders=True,
+        dry_run=False,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+
+
+def _execute_bought_today_plan(broker, earlier):
+    plan = dca_runner.Plan(to_place=[dca_runner.PlannedOrder("AAPL", 2.0)])
+    return dca_runner.execute_plan(
+        plan,
+        broker,
+        run_id="test-run-2026-07-28",
+        snapshot=dca_runner.budget_snapshot(earlier, date(2026, 7, 28)),
+        tier=BudgetTier("normal", 180.0, 900.0),
+        trading_day=date(2026, 7, 28),
+        orders=earlier,
+        orders_account_number=TEST_ACCOUNT_NUMBER,
+        now=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        now_fn=lambda: datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        slot_id="0935",
+        orders_fetched_at=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
+        buying_power_usd=TEST_BUYING_POWER_USD,
+        candidates=[("AAPL", 2.0)],
+    )
+
+
+def test_execute_plan_bought_today_refusal_follows_one_order_per_ticker_per_day_like_assess(monkeypatch):
+    """C:F2. assess() only excludes a ticker bought earlier today when
+    ONE_ORDER_PER_TICKER_PER_DAY is True (config/budgets.json ships False, and
+    the same-day top-up gate handles repeats); _validate_execute_plan applied
+    the exclusion unconditionally, so whenever any candidate had been bought
+    in an earlier slot the WHOLE batch was refused and no other ticker got its
+    buy either. The two halves must read the same switch."""
+    earlier = [_order("AAPL", 2.0, _utc(2026, 7, 28, 13, 0))]  # 09:00 ET, before the 0935 window
+
+    monkeypatch.setattr(dca_runner, "ONE_ORDER_PER_TICKER_PER_DAY", False)
+    calls = []
+    result = _execute_bought_today_plan(_live_runner_broker(calls), earlier)
+    assert calls == ["AAPL"]
+    assert result.submitted == ["AAPL"]
+
+    monkeypatch.setattr(dca_runner, "ONE_ORDER_PER_TICKER_PER_DAY", True)
+    calls = []
+    with pytest.raises(ValueError, match="already bought today"):
+        _execute_bought_today_plan(_live_runner_broker(calls), earlier)
+    assert calls == []
+
+
+def test_assess_gate4_grace_period_treats_missing_provenance_as_rogue():
+    """C:F3. BrokerOrder.placed_agent defaulted to 'agentic', the exact value
+    the grace path treats as the compatible executor, so a broker-history
+    wrapper that never populates provenance made every collision (a manual
+    app order included) look compatible during a grace window. Unknown
+    provenance must fail closed like any other non-agentic writer."""
+    unattributed = dca_runner.BrokerOrder(
+        symbol="AAPL", side="buy", dollar_amount=2.0, created_at=_utc(2026, 7, 28, 13, 45)
+    )
+    assert unattributed.placed_agent is None
+    r = dca_runner.assess(
+        **_clean_kwargs(
+            orders=[unattributed],
+            candidates=[("MSFT", 2.0)],
+            sole_executor_grace_period_active=True,
+        )
+    )
+    assert r["verdict"] == "ABORT"
+    assert "second executor" in r["reason"]
+
+
+def test_state_transaction_fails_closed_instead_of_blocking_on_a_held_lock(tmp_path):
+    """C:F4. state_transaction() took the strategy-state lock with a blocking
+    flock and no timeout, so one hung holder wedged every later slot's
+    process for the day with no evidence and no alert, while every other
+    reliability engine in the repo bounds its wait and raises."""
+    import fcntl
+
+    state_path = tmp_path / "strategy_state.json"
+    lock_path = dca_runner._state_lock_path(state_path)
+    with open(lock_path, "w", encoding="utf-8") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+        started = time_module.monotonic()
+        with pytest.raises(TimeoutError):
+            with dca_runner.state_transaction(state_path, lock_timeout_seconds=0.2):
+                pass  # pragma: no cover - must not be reached
+        assert time_module.monotonic() - started < 5.0
+
+
+def test_execute_plan_halts_a_batch_whose_history_ages_past_the_freshness_window():
+    """Copilot review of PR #1394, revisiting C:F7. Proving freshness once
+    before the first placement and then passing ``orders_fetched_at=None``
+    disabled the bound for every later placement: Gate 4 only checked the
+    initial snapshot, so a manual order or another executor landing during a
+    slow batch would have let later orders run on arbitrarily stale totals
+    and exceed the caps. The bound is checked before EVERY placement again;
+    a batch that outlives it halts with the remainder unplaced (the
+    fail-closed outcome) and names the freshness window as the reason."""
+    calls = []
+    broker = _live_runner_broker(calls)
+    snapshot = dca_runner.budget_snapshot([], date(2026, 7, 28))
+    tier = BudgetTier("normal", 180.0, 900.0)
+    candidates = [dca_runner.Candidate("AAPL", 2.0), dca_runner.Candidate("MSFT", 2.0)]
+    plan = dca_runner.plan_orders(candidates=candidates, snapshot=snapshot, tier=tier)
+    orders_fetched_at = datetime(2026, 7, 28, 9, 35, tzinfo=ET)
+    common = dict(
+        run_id="test-run-2026-07-28",
+        snapshot=snapshot,
+        trading_day=date(2026, 7, 28),
+        orders=[],
+        tier=tier,
+        buying_power_usd=TEST_BUYING_POWER_USD,
+        orders_account_number=TEST_ACCOUNT_NUMBER,
+        now=datetime(2026, 7, 28, 9, 36, tzinfo=ET),
+        slot_id="0935",
+        orders_fetched_at=orders_fetched_at,
+        candidates=candidates,
+    )
+
+    # Readings: pre-loop proof at 60 s, first placement at 95 s (fresh),
+    # second placement at 130 s (past MAX_ORDERS_FETCH_AGE_SECONDS = 120).
+    ticks = []
+
+    def slow_clock():
+        ticks.append(None)
+        return datetime(2026, 7, 28, 9, 36, tzinfo=ET) + timedelta(seconds=35 * (len(ticks) - 1))
+
+    result = dca_runner.execute_plan(plan, broker, now_fn=slow_clock, **common)
+    assert calls == ["AAPL"]
+    assert result.halted_on == "MSFT"
+    assert "freshness window" in result.failure_reason
+
+    # A fetch that is ALREADY stale on the fresh clock still halts before
+    # the first placement: the caller-supplied `now` cannot mask it.
+    calls.clear()
+    stale = iter([datetime(2026, 7, 28, 9, 37, 10, tzinfo=ET)])
+    result = dca_runner.execute_plan(plan, broker, now_fn=lambda: next(stale), **common)
+    assert calls == []
+    assert result.submitted == []
+    assert result.halted_on == "AAPL"
+    assert "freshness window" in result.failure_reason
+
+
+def test_execute_plan_dry_run_still_validates_the_plan_it_would_have_placed(monkeypatch):
+    """C:F13. With placement disabled execute_plan returned an empty result
+    before _validate_execute_plan ever ran, so a dry-run rehearsal of the
+    exact live call could not surface a plan the live call would refuse.
+    Validation now runs whenever the live-path arguments are supplied and its
+    refusal is reported on the result instead of raised."""
+    monkeypatch.setattr(dca_runner, "ONE_ORDER_PER_TICKER_PER_DAY", True)
+    calls = []
+    broker = dca_runner.build_runner_broker(
+        place_fn=lambda **kw: calls.append(kw["symbol"]) or {"id": "ok"},
+        enable_live_orders=False,
+        dry_run=True,
+        account_number=TEST_ACCOUNT_NUMBER,
+    )
+    earlier = [_order("AAPL", 2.0, _utc(2026, 7, 28, 13, 0))]  # 09:00 ET, before the 0935 window
+    result = _execute_bought_today_plan(broker, earlier)
+    assert calls == []
+    assert result.placement_enabled is False
+    assert result.failure_reason is None
+    assert result.validation_failure is not None
+    assert "already bought today" in result.validation_failure
+
+    # A bare dry run with none of the live-path arguments stays silent, as before.
+    bare = dca_runner.execute_plan(dca_runner.Plan(to_place=[dca_runner.PlannedOrder("AAPL", 2.0)]), broker)
+    assert bare.placement_enabled is False
+    assert bare.validation_failure is None
+
+
+def test_runner_and_adapter_agree_on_fill_evidence_for_every_shape():
+    """2026-09-07 diagnostic P:DUP-01. dca_runner carried its own copies of
+    dca_live_adapters' fill-evidence classifiers; the two entry points must
+    read a placement response's fill fields identically, so the runner now
+    imports the adapter's helpers and this pins the shared verdicts."""
+    import dca_live_adapters
+
+    assert dca_runner._combined_fill_evidence is dca_live_adapters._combined_fill_evidence
+    assert dca_runner._FILL_EVIDENCE_EXPLICIT_ZERO is dca_live_adapters._FILL_EVIDENCE_EXPLICIT_ZERO
+    assert set(dca_runner._PARTIAL_FILL_EVIDENCE_KEYS) == set(dca_live_adapters._PLACEMENT_EXECUTION_FIELDS)
+    for envelope, expected in (
+        ({"executed_notional": " "}, "none_reported"),
+        ({"executed_notional": None}, "none_reported"),
+        ({"cumulative_quantity": "0", "executed_dollar_amount": "0.0"}, "explicit_zero"),
+        ({"cumulative_quantity": 0, "executed_dollar_amount": 5}, "positive_or_unreadable"),
+        ({"filled_quantity": True}, "positive_or_unreadable"),
+        ({"filled_quantity": "abc"}, "positive_or_unreadable"),
+        ({}, "none_reported"),
+    ):
+        assert dca_live_adapters._fill_evidence(envelope) == expected, envelope
+        assert dca_runner._combined_fill_evidence([envelope]) == expected, envelope
+
+
+def test_idempotency_stream_slot_ids_match_the_runner_roster():
+    """scripts.idempotency.STREAM_SLOT_IDS mirrors dca_runner.SLOTS' labels
+    (kept as a literal there so every entry point can import it without the
+    runner); this pins the two together."""
+    from scripts.idempotency import STREAM_SLOT_IDS
+
+    # The runner labels the 3:30 PM slot "final"; every stream contract calls it "afternoon".
+    label_to_stream = {"market-open": "market_open", "final": "afternoon"}
+    by_label: dict[str, list[str]] = {}
+    for slot_id, spec in dca_runner.SLOTS.items():
+        assert spec.label is not None
+        stream = label_to_stream.get(spec.label) or spec.label
+        by_label.setdefault(stream, []).append(slot_id)
+    assert {k: tuple(sorted(v)) for k, v in by_label.items()} == {
+        k: tuple(sorted(v)) for k, v in STREAM_SLOT_IDS.items()
+    }
+
+
+def test_a_same_slot_second_run_aborts_at_gate_4_with_the_first_runs_orders_in_history():
+    """2026-09-07 diagnostic T:F12. The 2026-08-07 suspected same-task double
+    fire (eight 'agentic' orders overlapping the slot's own lastRunAt) had no
+    regression test: with the first run's placements in broker history, a
+    second assess() for the same slot and day must ABORT at Gate 4 with zero
+    placements, and execute_plan must refuse the same plan."""
+    first = dca_runner.assess(**_clean_kwargs(candidates=[("AAPL", 2.0), ("MSFT", 2.0)]))
+    assert first["verdict"] == "PROCEED"
+    placed_at = _utc(2026, 7, 28, 13, 44)  # 09:44 ET, inside the 0935 slot window
+    history = [_order(o["ticker"], o["amount_usd"], placed_at, placed_agent="agentic") for o in first["plan"]["to_place"]]
+
+    second = dca_runner.assess(**_clean_kwargs(orders=history, candidates=[("AAPL", 2.0), ("MSFT", 2.0)]))
+    assert second["verdict"] == "ABORT"
+    assert "second executor" in second["reason"]
+    assert second["plan"]["to_place"] == [] if "plan" in second else True
+
+    calls = []
+    plan = dca_runner.Plan(to_place=[dca_runner.PlannedOrder("AAPL", 2.0), dca_runner.PlannedOrder("MSFT", 2.0)])
+    with pytest.raises(ValueError, match="second executor"):
+        dca_runner.execute_plan(
+            plan,
+            _live_runner_broker(calls),
+            run_id="test-run-2026-07-28",
+            snapshot=dca_runner.budget_snapshot(history, date(2026, 7, 28)),
+            tier=BudgetTier("normal", 180.0, 900.0),
+            trading_day=date(2026, 7, 28),
+            orders=history,
+            orders_account_number=TEST_ACCOUNT_NUMBER,
+            now=datetime(2026, 7, 28, 9, 45, tzinfo=ET),
+            now_fn=lambda: datetime(2026, 7, 28, 9, 45, tzinfo=ET),
+            slot_id="0935",
+            orders_fetched_at=datetime(2026, 7, 28, 9, 45, tzinfo=ET),
+            buying_power_usd=TEST_BUYING_POWER_USD,
+            candidates=[("AAPL", 2.0), ("MSFT", 2.0)],
+        )
+    assert calls == []

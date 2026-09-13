@@ -43,7 +43,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 # This module is a documented standalone CLI (``python scripts/drift_detection.py``),
 # and direct invocation puts only ``scripts/`` on sys.path -- so the repo root is
@@ -56,6 +56,12 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from dca_fileio import atomic_write_text  # noqa: E402 - needs the sys.path setup above
+from dca_net_utils import (  # noqa: E402
+    BlockedFileHandler,
+    BlockedFTPHandler,
+    PinnedHTTPHandler,
+    PinnedHTTPSHandler,
+)
 from dca_net_utils import (  # noqa: E402
     UnsafeDestinationError as _UnsafeDestinationError,
 )
@@ -114,6 +120,9 @@ _PLACED_ORDER_STATUSES = frozenset({"submitted", "filled", "pending", "unconfirm
 # --- Column aliases (schema-tolerant lookups) --------------------------------
 
 SYMBOL_COLUMNS = ("ticker", "symbol")
+# The broker order ID column, mirroring scheduled_artifacts.SUBMITTED_ORDERS_FIELDS.
+# It is what makes two records for the same ticker distinguishable.
+ORDER_ID_COLUMNS = ("order_id",)
 AUTO_BUY_COLUMNS = ("auto_buy_signal", "auto_buy", "autobuy")
 # Morning/midday executor rows use execution_status="auto_buy_eligible" instead
 # of a boolean auto_buy column; detect it here so those rows aren't silently
@@ -214,9 +223,86 @@ def parse_amount(value: Any) -> float:
         return 0.0
 
 
+#: Delimiters near_close_dca appends to a broker_outcomes key when it needs a
+#: SYNTHETIC identity for a second order on one ticker: "AAPL:<order-id>" for
+#: the same-slot retry reinjection's collision handling, "AAPL#imart-recovery"
+#: for a recovered inverse-martingale lease. Neither character can appear in a
+#: real symbol, which is exactly why those producers chose them.
+_SYNTHETIC_SYMBOL_DELIMITERS = (":", "#")
+
+
+def _normalize_symbol(value: Any) -> Optional[str]:
+    """A bare ticker from a symbol field or a synthetic outcome key.
+
+    Applied to BOTH evidence sources deliberately. Each of these keys reaches
+    the canonical CSV's ticker column too, through
+    ``scheduled_artifacts.submitted_order_rows``'s identical
+    ``outcome.get("ticker") or key`` fallback, so normalizing only the run-state
+    side would turn a legacy artifact that suffixed both into a mismatch --
+    manufacturing exactly the missing-record report this function exists to
+    make trustworthy. What matters for the comparison is that the two sides are
+    normalized the SAME way (Antigravity review: "Robust ticker normalization
+    for lease recovery keys in drift detection").
+    """
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    for delimiter in _SYNTHETIC_SYMBOL_DELIMITERS:
+        text = text.split(delimiter, 1)[0]
+    return text
+
+
 def _symbol(row: Mapping[str, Any]) -> Optional[str]:
-    value = _get(row, SYMBOL_COLUMNS)
-    return str(value).strip().upper() if value is not None else None
+    return _normalize_symbol(_get(row, SYMBOL_COLUMNS))
+
+
+def _order_id(row: Mapping[str, Any]) -> Optional[str]:
+    """The broker order ID on a row, or None when it carries none.
+
+    Blank strings are None, not distinct IDs: submitted_orders.csv is written
+    with ``restval=""``, so an outcome with no order_id reaches the CSV as an
+    empty cell rather than a missing column.
+    """
+    value = _get(row, ORDER_ID_COLUMNS)
+    text = str(value).strip() if value is not None else ""
+    return text or None
+
+
+@dataclass(frozen=True)
+class _OrderTally:
+    """How many orders one evidence source records for a symbol, and their IDs.
+
+    ``ids`` holds the distinct order IDs the source named; ``unidentified``
+    counts the records that named none. It is tallied DIRECTLY rather than
+    derived as ``total - len(ids)``, because a source can repeat an ID: a
+    damaged CSV carrying ``A`` twice has two records and one distinct ID, and
+    the derived form called that a blank-ID row. That phantom row then
+    "covered" a genuinely missing order -- state ``{A, B}`` against a CSV of
+    ``{A, A}`` reconciled, with B's canonical record absent (Codex review:
+    "Do not count duplicate IDs as unidentified orders").
+    """
+
+    ids: frozenset
+    unidentified: int
+
+
+def _tally_orders(records: Iterable[tuple]) -> Dict[str, _OrderTally]:
+    """Group ``(symbol, order_id)`` pairs into one :class:`_OrderTally` each."""
+    ids: Dict[str, set] = {}
+    blanks: Dict[str, int] = {}
+    for symbol, order_id in records:
+        if not symbol:
+            continue
+        bucket = ids.setdefault(symbol, set())
+        blanks.setdefault(symbol, 0)
+        if order_id:
+            bucket.add(order_id)
+        else:
+            blanks[symbol] += 1
+    return {
+        symbol: _OrderTally(ids=frozenset(symbol_ids), unidentified=blanks[symbol])
+        for symbol, symbol_ids in ids.items()
+    }
 
 
 def read_csv_rows(path: Path) -> List[Dict[str, str]]:
@@ -247,36 +333,38 @@ class RunArtifacts:
     buy_candidate_rows: List[Dict[str, str]] = field(default_factory=list)
 
     @property
-    def csv_submitted_symbols(self) -> set:
-        """Symbols confirmed submitted by the CANONICAL order-record CSV."""
-        symbols = set()
-        for row in self.order_rows:
-            if row.get("status") in _NOT_ACTUALLY_SUBMITTED_STATUSES:
-                continue
-            sym = _symbol(row)
-            if sym:
-                symbols.add(sym)
-        return symbols
+    def csv_submitted_orders(self) -> Dict[str, _OrderTally]:
+        """Per-symbol order counts and IDs from the CANONICAL order record."""
+        return _tally_orders(
+            (_symbol(row), _order_id(row))
+            for row in self.order_rows
+            if row.get("status") not in _NOT_ACTUALLY_SUBMITTED_STATUSES
+        )
 
     @property
-    def run_state_only_submitted_symbols(self) -> set:
-        """Symbols confirmed submitted ONLY by run_state.json, not any order CSV.
+    def csv_submitted_symbols(self) -> set:
+        """Symbols confirmed submitted by the CANONICAL order-record CSV."""
+        return set(self.csv_submitted_orders)
+
+    @property
+    def state_submitted_orders(self) -> Dict[str, _OrderTally]:
+        """Per-symbol order counts and IDs from ``run_state.json``.
+
+        Counts OUTCOMES, not symbols. One ticker can hold several distinct
+        physical orders in a single run_state -- near_close_dca's retry
+        reinjection keys the second one ``"AAPL:<order-id>"`` precisely so both
+        survive the merge -- and collapsing them to a symbol threw away the very
+        distinction that makes a missing canonical row detectable (Codex review:
+        "Compare state and CSV orders by order ID").
 
         Morning/midday executors record submitted orders in
         run_state["broker_outcomes"]/["buy_candidates"] rather than a separate
-        order CSV; any PLACED-status ticker there (not just the exact
+        order CSV; any PLACED-status entry there (not just the exact
         "submitted" string -- a restored same-slot retry row can carry
         "filled"/"pending"/"unconfirmed") is real evidence an order reached
         the broker, even when submitted_orders.csv is missing/empty/damaged.
-        Kept SEPARATE from csv_submitted_symbols rather than merged into one
-        "reconciled" set: a symbol confirmed ONLY here still means the
-        canonical order-record artifact is genuinely absent, which must
-        still surface as drift (with reconciliation-only guidance, never a
-        rerun recommendation) rather than reconciling silently as if nothing
-        were wrong (Codex review, PR #538: "Keep missing order artifacts
-        visible after reconciliation").
         """
-        symbols = set()
+        records = []
         state = self.run_state or {}
         outcomes = state.get("broker_outcomes", {})
         if isinstance(outcomes, dict):
@@ -296,15 +384,17 @@ class RunArtifacts:
                     # adjustment rows from drift detection too").
                     and not outcome.get("whole_share_settlement_adjustment")
                 ):
-                    # A same-day retry's second order can be keyed under a
-                    # composite "<ticker>:<order-id>" mapping key
-                    # (scripts.scheduled_artifacts.submitted_order_rows()
-                    # supports this), with the real symbol carried in
-                    # outcome["ticker"]. Using the raw mapping key left the
-                    # composite string unmatched against the plain-ticker
-                    # signal row, producing a false missing-order alert
-                    # despite a real submission (Codex review: "Use the
-                    # outcome ticker for fallback reconciliation").
+                    # The outcome's OWN ticker first: a merged/retried artifact
+                    # can key a second order for the same ticker as
+                    # "AAPL:<order-id>" (near_close_dca's reinjection collision
+                    # handling) or "AAPL#imart-recovery" (a recovered
+                    # inverse-martingale lease), so the mapping key is an
+                    # identity, not necessarily a symbol. Both of today's
+                    # producers put the real ticker in the outcome, so the key
+                    # is only reached for an artifact that omitted it -- and
+                    # _normalize_symbol strips the synthetic suffix there
+                    # (Codex review: "Use the outcome ticker for fallback
+                    # reconciliation").
                     #
                     # Codex review, PR #593 ("Fall back from blank outcome
                     # tickers"): a TRUTHY fallback, not a key-absence one.
@@ -320,19 +410,73 @@ class RunArtifacts:
                     # emits ``outcome.get("ticker") or key`` -- resolves the
                     # very same shape to the key, so anything else guarantees
                     # the two disagree about the symbol.
-                    sym = str(outcome.get("ticker") or key).strip().upper()
-                    if sym:
-                        symbols.add(sym)
+                    records.append((_normalize_symbol(outcome.get("ticker") or key), _order_id(outcome)))
+        # A placed buy_candidates row for a ticker broker_outcomes already
+        # covers is the SAME order seen from the candidate side (the afternoon
+        # stream writes both), not a second one -- tallying it again would
+        # either duplicate the id (harmless) or, for a row that carries no
+        # order_id, invent a phantom unidentified order that the CSV can never
+        # account for. Only a ticker with candidate evidence alone contributes.
+        covered = {symbol for symbol, _ in records if symbol}
         for candidate in state.get("buy_candidates") or []:
             if (
                 isinstance(candidate, dict)
                 and candidate.get("status") in _PLACED_ORDER_STATUSES
                 and not candidate.get("whole_share_settlement_adjustment")
             ):
-                sym = str(candidate.get("ticker") or "").strip().upper()
-                if sym:
-                    symbols.add(sym)
-        return symbols - self.csv_submitted_symbols
+                sym = _normalize_symbol(candidate.get("ticker") or "")
+                if sym and sym not in covered:
+                    records.append((sym, _order_id(candidate)))
+        return _tally_orders(records)
+
+    @property
+    def state_submitted_symbols(self) -> set:
+        """Symbols ``run_state.json`` says reached the broker (see
+        :attr:`state_submitted_orders`)."""
+        return set(self.state_submitted_orders)
+
+    @property
+    def run_state_only_submitted_symbols(self) -> set:
+        """Symbols run_state.json confirms that the canonical order CSV does not fully carry.
+
+        Kept SEPARATE from csv_submitted_symbols rather than merged into one
+        "reconciled" set: a symbol confirmed ONLY here still means the
+        canonical order-record artifact is genuinely absent, which must
+        still surface as drift (with reconciliation-only guidance, never a
+        rerun recommendation) rather than reconciling silently as if nothing
+        were wrong (Codex review, PR #538: "Keep missing order artifacts
+        visible after reconciliation"). A COMPLETELY absent order CSV is the
+        same failure, not an exemption: every live stream writes
+        submitted_orders.csv today, so "run_state records a placed order and
+        no order CSV exists at all" is the most severe version of this
+        disagreement.
+
+        The comparison is per ORDER, not per symbol. Set subtraction called a
+        symbol reconciled as soon as the CSV carried any row for it, so a
+        run_state holding two distinct orders for one ticker -- exactly what
+        near_close_dca's collision-suffixed reinjection preserves -- matched a
+        CSV with only one of them and the missing canonical record went
+        unreported (Codex review: "Compare state and CSV orders by order ID").
+        """
+        csv_orders = self.csv_submitted_orders
+        missing = set()
+        for symbol, state_tally in self.state_submitted_orders.items():
+            csv_tally = csv_orders.get(symbol)
+            if csv_tally is None:
+                missing.add(symbol)
+                continue
+            # IDs match exactly; whatever is left over on each side is matched by
+            # COUNT of genuinely blank-ID records. A state order whose ID the CSV
+            # does not list is accounted for by a CSV row that named no ID at all
+            # -- the canonical writer copies order_id through, but an id-less row
+            # is a damaged record rather than proof of a different order, and
+            # treating it as a mismatch would report drift for every legacy row.
+            # Only when the state's unmatched orders OUTNUMBER those spare rows is
+            # a canonical record genuinely absent.
+            unmatched = len(state_tally.ids - csv_tally.ids) + state_tally.unidentified
+            if unmatched > csv_tally.unidentified:
+                missing.add(symbol)
+        return missing
 
     @property
     def submitted_symbols(self) -> set:
@@ -453,6 +597,9 @@ class SymbolDrift:
         }
 
 
+DriftSymbol = SymbolDrift
+
+
 @dataclass
 class DriftReport:
     run_dir: str
@@ -543,6 +690,17 @@ CAUSE_PREFLIGHT_MISSING = "morning_preflight_missing_or_invalid"
 # (Codex review, PR #538: "Keep missing order artifacts visible after
 # reconciliation").
 CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED = "order_artifact_missing_run_state_confirmed"
+
+# Run-level causes whose guidance is ALREADY reconcile-first whenever any
+# submission evidence exists: CAUSE_RAW_MISSING's action is rewritten to "Do
+# NOT re-run" in detect_drift() the moment run_state/CSV evidence shows a
+# placed order, and the other two describe a placement that may have gone
+# through. detect_drift()'s mixed-report override (a run-state-confirmed
+# symbol beside genuinely missing ones) leaves these alone so the more
+# specific failure narrative is not replaced by the generic missing-CSV one.
+_RECONCILE_FIRST_RUN_CAUSES = frozenset(
+    {CAUSE_RAW_MISSING, CAUSE_RAW_MISSING_AFTER_PARTIAL_SUBMISSION, CAUSE_BROKER_PLACEMENT_AMBIGUOUS}
+)
 
 
 def _row_block_evidence(row: Mapping[str, Any]) -> List[str]:
@@ -655,7 +813,10 @@ _ACTION_BY_CAUSE = {
         "submitted_orders.csv is missing/empty/damaged for it -- the canonical "
         "order-record artifact itself is the drift condition here. Do NOT "
         "resubmit: reconcile/regenerate the missing CSV artifact from "
-        "run_state.json's broker_outcomes/buy_candidates evidence instead."
+        "run_state.json's broker_outcomes/buy_candidates evidence instead. "
+        "Reconcile broker order history for every affected symbol before "
+        "deciding whether any truly missing orders should be retried; do not "
+        "re-run the live task first."
     ),
     CAUSE_RAW_MISSING: (
         "raw/ is missing: the run computed signals without persisting connector "
@@ -808,10 +969,11 @@ def detect_drift(run_dir: Path) -> DriftReport:
 
     affected: List[SymbolDrift] = []
     for symbol, amount, auto_buy, row_evidence in expected:
-        if symbol in csv_submitted:
-            # The CANONICAL order-record artifact confirms this symbol --
-            # genuinely no drift.
-            continue
+        # Checked BEFORE the CSV-confirmed short-circuit, not after it: the
+        # per-order comparison behind run_state_only_submitted_symbols can
+        # flag a symbol the CSV does carry a row for -- two distinct orders in
+        # run_state, one of them missing its canonical row -- and skipping on
+        # "the CSV names this symbol" would hide exactly that second order.
         if symbol in run_state_only_submitted:
             # run_state.json confirms the order reached the broker, but the
             # canonical submitted_orders.csv artifact itself is missing/
@@ -825,9 +987,17 @@ def detect_drift(run_dir: Path) -> DriftReport:
                     expected_amount_usd=amount,
                     auto_buy_signal=auto_buy,
                     suspected_cause=CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED,
-                    evidence=row_evidence,
+                    evidence=row_evidence
+                    + [
+                        f"run_state records {symbol} submitted; "
+                        f"{art.order_source_name or ORDER_CSV_NAMES[0]} does not"
+                    ],
                 )
             )
+            continue
+        if symbol in csv_submitted:
+            # The CANONICAL order-record artifact confirms this symbol --
+            # genuinely no drift.
             continue
         # A per-row guard explanation overrides the generic run-level cause.
         if row_evidence and run_cause in (CAUSE_UNKNOWN, CAUSE_RUN_STATE_ERROR):
@@ -844,6 +1014,33 @@ def detect_drift(run_dir: Path) -> DriftReport:
             )
         )
 
+    # A state-only submission does NOT depend on a matching signal row. The
+    # loop above walks `expected`, which is built entirely from signals.csv, so
+    # a run with no signal rows never examined run_state_only_submitted at all
+    # -- and MorningDCAExecutor._write_failure_artifacts synthesizes exactly
+    # that: `signal_rows: []` alongside the broker_outcomes for orders it had
+    # already placed. The detector then reported no drift for a real order with
+    # no canonical record, which is the precise case the state-only reporting
+    # exists for (Codex review: "Report state-only orders without signal
+    # rows"). Reported here from the run_state's own evidence, with no expected
+    # amount to claim (signals.csv never named one) and auto_buy_signal False,
+    # since no signal asserted it.
+    _already_reported = {drift.symbol for drift in affected}
+    for symbol in sorted(run_state_only_submitted - _already_reported):
+        affected.append(
+            SymbolDrift(
+                symbol=symbol,
+                expected_amount_usd=0.0,
+                auto_buy_signal=False,
+                suspected_cause=CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED,
+                evidence=[
+                    f"run_state records {symbol} submitted; "
+                    f"{art.order_source_name or ORDER_CSV_NAMES[0]} does not "
+                    "(no matching signal row)"
+                ],
+            )
+        )
+
     drift_detected = bool(affected)
     # The report-level cause is the run cause unless every affected row is a
     # deliberate per-row block or a run-state-confirmed-but-CSV-missing
@@ -853,6 +1050,24 @@ def detect_drift(run_dir: Path) -> DriftReport:
     elif affected and all(
         s.suspected_cause == CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED for s in affected
     ):
+        report_cause = CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED
+    elif (
+        affected
+        and run_cause not in _RECONCILE_FIRST_RUN_CAUSES
+        and any(s.suspected_cause == CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED for s in affected)
+    ):
+        # A MIXED report: at least one affected symbol is a real order with a
+        # missing canonical record, beside others that appear genuinely
+        # missing. Surfacing run_cause here would hand on-call an action that
+        # says "re-run the live task" (CAUSE_ORDERS_EMPTY/_MISSING,
+        # CAUSE_UNKNOWN, ...) and duplicate the state-recorded order, so the
+        # reconcile-first cause wins: reconcile every affected symbol before
+        # deciding whether a targeted retry is safe (Codex review: "Fix mixed
+        # drift retry guidance"). The raw-persistence and ambiguous-placement
+        # run causes are exempt because their own action text already forbids
+        # re-running whenever submission evidence exists (see the
+        # has_submitted_order_evidence rewrite below and _ACTION_BY_CAUSE) and
+        # names the more specific failure; replacing them would lose that.
         report_cause = CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED
     elif drift_detected:
         report_cause = run_cause
@@ -1036,7 +1251,13 @@ def send_slack_alert(
 
     payload = json.dumps(build_slack_payload(report)).encode("utf-8")
     request = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - operator-supplied webhook
+
+    class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirectHandler, PinnedHTTPHandler, PinnedHTTPSHandler, BlockedFileHandler, BlockedFTPHandler)
+    with opener.open(request, timeout=timeout) as response:  # noqa: S310 - operator-supplied webhook
         return 200 <= response.status < 300
 
 

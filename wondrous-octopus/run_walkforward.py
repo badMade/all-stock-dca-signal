@@ -23,6 +23,7 @@ MPS, then CPU.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -32,6 +33,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -40,8 +42,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # ml-forecaster/train.py's identical bootstrap and its comment.
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(REPO_ROOT))
-
-from typing import Any, Callable, Iterable  # noqa: E402
 
 import features as _features  # noqa: E402
 
@@ -340,7 +340,7 @@ def _build_panel(
             max_tickers=knobs["max_tickers"],
             as_of=pd.Timestamp(_parse_now(args.now)) if args.now else None,
             end=pd.Timestamp(config.end) if config.end else None,
-            initial_train_end=pd.Timestamp(config.initial_train_end),
+            initial_train_end=pd.Timestamp(config.initial_train_end) if config.initial_train_end else None,
             min_history=config.min_history,
         )
     except ValueError as error:
@@ -391,7 +391,7 @@ def write_report(run_dir: Path) -> Path:
         # review: "Refuse reports when no checkpoint fingerprints
         # exist").
         raise Refused(f"no checkpoint under {run_dir}; ledger bytes without a checkpoint are not proven durable")
-    read_fingerprints = json.loads(state_path.read_text(encoding="utf-8"))["ledger"]
+    read_fingerprints = json.loads(state_path.read_bytes())["ledger"]
     ledger = Ledger(run_dir, read_fingerprints=read_fingerprints)
     models = ledger.models()
     if not models:
@@ -399,11 +399,11 @@ def write_report(run_dir: Path) -> Path:
     universe = None
     meta_path = run_dir / "run_meta.json"
     if meta_path.exists():
-        universe = json.loads(meta_path.read_text(encoding="utf-8")).get("universe")
-    def _make_stream(model_name: str) -> Callable[[], Iterable[dict[str, Any]]]:
-        return lambda: ledger.iter_records(model=model_name, kind="score")
+        universe = json.loads(meta_path.read_bytes()).get("universe")
+    def _make_stream(m: str):
+        return lambda: ledger.iter_records(model=m, kind="score")
 
-    streams: dict[str, Callable[[], Iterable[dict[str, Any]]]] = {model: _make_stream(model) for model in models}
+    streams = {model: _make_stream(model) for model in models}
     diagnostics = _diagnostic_summary(ledger, models)
     report = metrics_module.build_report(streams, universe=universe, diagnostics=diagnostics)  # type: ignore[arg-type]
     report_dir = run_dir / "report"
@@ -507,8 +507,6 @@ def _install_signal_handlers(harness: WalkForwardHarness) -> None:
 class _InterruptFlag:
     """A plain flag SIGINT/SIGTERM can set before any harness exists."""
 
-    requested: bool
-
     def __init__(self) -> None:
         self.requested: bool = False
 
@@ -545,6 +543,40 @@ def _install_early_signal_handlers() -> _InterruptFlag:
     return flag
 
 
+@contextlib.contextmanager
+def _restoring_signal_handlers():
+    """Hand SIGINT/SIGTERM back to whoever owned them before this call.
+
+    _install_early_signal_handlers() and _install_signal_handlers() both
+    replace the process-wide disposition of these two signals, and the
+    replacements close over state that only means something for the duration
+    of ONE walk-forward invocation: a temporary _InterruptFlag nobody reads
+    afterwards, then a completed harness whose request_interrupt() sets a
+    field its finished run() loop will never consult again. Leaving them
+    installed on the way out silently disarms the host: a long-lived process
+    that calls main() twice, or embeds this CLI entry point as a library,
+    delivers its NEXT Ctrl-C to that stale state and the signal is swallowed
+    instead of interrupting anything (Codex review: "Restore process signal
+    handlers after walk-forward runs").
+
+    Restores on EVERY exit path (return, refusal, crash, KeyboardInterrupt),
+    which is why it wraps _dispatch() from outside main()'s except clauses
+    rather than living inside one of them.
+    """
+    saved = [(number, signal.getsignal(number)) for number in (signal.SIGINT, signal.SIGTERM)]
+    try:
+        yield
+    finally:
+        for number, handler in saved:
+            # A handler read back as None means the disposition was set from
+            # outside Python (or is otherwise not expressible here); there is
+            # nothing meaningful to restore, so leave that signal alone
+            # rather than raising a TypeError out of a finally block that is
+            # very often already unwinding a real failure.
+            if handler is not None:
+                signal.signal(number, handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
@@ -574,7 +606,8 @@ def main(argv: list[str] | None = None) -> int:
         original_sigint = signal.getsignal(signal.SIGINT)
         original_sigterm = signal.getsignal(signal.SIGTERM)
     try:
-        return _dispatch(args)
+        with _restoring_signal_handlers():
+            return _dispatch(args)
     except (Refused, HarnessError, LedgerError, TrainingDataChanged, ValueError) as error:
         # GbmQuantileModel.fit() and OctopusModel.fit() raise plain
         # ValueError for a "no trainable window at or before cutoff"
@@ -850,7 +883,7 @@ def _verify_resume_universe(run_dir: Path, panel) -> None:
     meta_path = Path(run_dir) / "run_meta.json"
     if not meta_path.exists():
         return
-    recorded = json.loads(meta_path.read_text(encoding="utf-8")).get("universe", {}).get("tickers_sha256")
+    recorded = json.loads(meta_path.read_bytes()).get("universe", {}).get("tickers_sha256")
     if recorded and recorded != _tickers_hash(panel):
         raise Refused(
             "resumed universe differs from the recorded run (ticker set hash mismatch); "
@@ -891,9 +924,10 @@ def _verify_resume_config_hash(run_dir: Path, requested_config: HarnessConfig) -
     state_path = _checkpoint_state_path(run_dir)
     if state_path is None:
         return
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    cfg_dict: dict[str, Any] = {**state["config"], "models": tuple(state["config"]["models"])}
-    stored_config = HarnessConfig(**cfg_dict)
+    state = json.loads(state_path.read_bytes())
+    config_kwargs: dict[str, Any] = dict(state["config"])
+    config_kwargs["models"] = tuple(config_kwargs["models"])
+    stored_config = HarnessConfig(**config_kwargs)
     if stored_config.config_hash() == requested_config.config_hash():
         return
     stored = stored_config.as_dict()
@@ -925,7 +959,7 @@ def _verify_resume_not_before_cursor(run_dir: Path, panel) -> None:
     state_path = _checkpoint_state_path(run_dir)
     if state_path is None:
         return
-    last_processed = json.loads(state_path.read_text(encoding="utf-8")).get("last_processed_date")
+    last_processed = json.loads(state_path.read_bytes()).get("last_processed_date")
     if not last_processed:
         return
     if len(panel.calendar) == 0 or panel.calendar[-1] < np.datetime64(last_processed):
@@ -940,8 +974,8 @@ def _resume_metadata(run_dir: Path) -> tuple[dict, dict]:
     """Load the frozen CLI metadata and harness config for a resume."""
     meta_path = Path(run_dir) / "run_meta.json"
     state_path = _checkpoint_state_path(run_dir)
-    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
-    state = json.loads(state_path.read_text(encoding="utf-8")) if state_path is not None else {}
+    meta = json.loads(meta_path.read_bytes()) if meta_path.exists() else {}
+    state = json.loads(state_path.read_bytes()) if state_path is not None else {}
     return meta, state.get("config", {})
 
 
@@ -1025,7 +1059,7 @@ def _verify_resume_model_hyper(run_dir: Path, args: argparse.Namespace, knobs: d
     meta_path = Path(run_dir) / "run_meta.json"
     if not meta_path.exists():
         return
-    recorded = json.loads(meta_path.read_text(encoding="utf-8")).get("model_hyper")
+    recorded = json.loads(meta_path.read_bytes()).get("model_hyper")
     if not recorded:
         return  # run predates hyper recording; nothing to validate against
     requested = _model_hyper(args, knobs)
@@ -1117,7 +1151,7 @@ def refresh_run_meta_universe(run_dir: Path, panel) -> None:
     meta_path = Path(run_dir) / "run_meta.json"
     if not meta_path.exists():
         return
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta = json.loads(meta_path.read_bytes())
     universe = meta.get("universe")
     if universe is None:
         return
@@ -1147,7 +1181,7 @@ def _run(harness: WalkForwardHarness, run_dir: Path, *, interrupt_flag: _Interru
     # write_report() for a completed run.
     status = harness.run(release_lock=False)
     try:
-        if status in ("interrupted", "budget_tripped"):
+        if status in {"interrupted", "budget_tripped"}:
             # Both are CLEAN bounded stops with a valid checkpoint -- the
             # circuit-breaker trip already printed its banner.
             print(f"{status}: checkpoint saved under {run_dir}. Resume with --resume {run_dir}")

@@ -775,7 +775,7 @@ def refresh_latest_pointer(
     run_state_path: str | Path,
     stream: str,
     trading_day: str,
-    run_state: Optional[Dict[str, object]] = None,
+    run_state: Optional[Mapping[str, Any]] = None,
     valid_scheduled_evidence: Optional[bool] = None,
     pointer_status: str = STATUS_VALID,
     updated_at_utc: Optional[str] = None,

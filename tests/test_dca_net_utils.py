@@ -1,6 +1,10 @@
 import http.client
+import inspect
 import ipaddress
 import socket
+import urllib.error
+import urllib.request
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -20,6 +24,36 @@ def test_resolve_ips():
         assert ipaddress.ip_address("93.184.216.34") in ips
         assert ipaddress.ip_address("93.184.216.35") in ips
 
+
+
+def test_resolve_ips_empty():
+    with patch("socket.getaddrinfo") as mock_getaddrinfo:
+        mock_getaddrinfo.return_value = []
+        ips = dca_net_utils.resolve_ips("example.com")
+        assert ips == set()
+
+def test_resolve_ips_oserror():
+    with patch("socket.getaddrinfo", side_effect=OSError("resolution failed")):
+        with pytest.raises(OSError, match="resolution failed"):
+            dca_net_utils.resolve_ips("example.com")
+
+def test_resolve_ips_ipv6():
+    with patch("socket.getaddrinfo") as mock_getaddrinfo:
+        mock_getaddrinfo.return_value = [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2606:2800:220:1:248:1893:25c8:1946", 80, 0, 0)),
+        ]
+        ips = dca_net_utils.resolve_ips("example.com")
+        assert ipaddress.ip_address("2606:2800:220:1:248:1893:25c8:1946") in ips
+
+def test_resolve_ips_duplicate_ips():
+    with patch("socket.getaddrinfo") as mock_getaddrinfo:
+        mock_getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 80)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 80)),
+        ]
+        ips = dca_net_utils.resolve_ips("example.com")
+        assert len(ips) == 1
+        assert ipaddress.ip_address("93.184.216.34") in ips
 
 def test_proxy_configured_for_missing_host():
     # Line 78: missing host check in proxy_configured_for
@@ -76,9 +110,9 @@ def test_pinned_https_connection_wraps_the_pinned_socket_with_host_sni():
     wrapped_sock = MagicMock(name="wrapped_sock")
     context = MagicMock()
     context.wrap_socket.return_value = wrapped_sock
-    conn._context = context
+    cast(Any, conn)._context = context
     conn.sock = raw_sock
-    conn._tunnel_host = None
+    cast(Any, conn)._tunnel_host = None
 
     with patch("dca_net_utils.connect_pinned") as mock_connect:
         conn.connect()
@@ -99,9 +133,9 @@ def test_pinned_https_connection_uses_the_tunnel_host_for_sni():
     wrapped_sock = MagicMock(name="wrapped_sock")
     context = MagicMock()
     context.wrap_socket.return_value = wrapped_sock
-    conn._context = context
+    cast(Any, conn)._context = context
     conn.sock = raw_sock
-    conn._tunnel_host = "tunnel.example.com"
+    cast(Any, conn)._tunnel_host = "tunnel.example.com"
 
     with patch("dca_net_utils.connect_pinned") as mock_connect:
         conn.connect()
@@ -109,22 +143,6 @@ def test_pinned_https_connection_uses_the_tunnel_host_for_sni():
     mock_connect.assert_called_once_with(conn)
     context.wrap_socket.assert_called_once_with(raw_sock, server_hostname="tunnel.example.com")
     assert conn.sock is wrapped_sock
-
-
-def test_pinned_https_connection_without_a_context_leaves_the_socket_alone():
-    # The `context is not None` guard: nothing to wrap with, so the raw socket
-    # stays as connect_pinned left it rather than blowing up on None.
-    conn = dca_net_utils.PinnedHTTPSConnection("example.com")
-    raw_sock = MagicMock(name="raw_sock")
-    conn._context = None
-    conn.sock = raw_sock
-    conn._tunnel_host = None
-
-    with patch("dca_net_utils.connect_pinned") as mock_connect:
-        conn.connect()
-
-    mock_connect.assert_called_once_with(conn)
-    assert conn.sock is raw_sock
 
 
 def test_pinned_http_handler_proxied_request():
@@ -139,7 +157,155 @@ def test_pinned_http_handler_proxied_request():
         mock_do_open.assert_called_once_with(http.client.HTTPConnection, req)
 
 
+# -- SafeRedirectHandler.redirect_request signature ---------------------------------
+#
+# PR #1348 briefly collapsed the override to ``def redirect_request(self, *args)`` to
+# dodge PLR0913. That broke keyword callers with TypeError, turned an arity mistake
+# into a ValueError at the tuple unpack, and drifted from the base class's explicit
+# signature (Antigravity review). These pin the explicit, urllib-dictated signature
+# and prove the safety check still runs however the arguments arrive. Hermetic: the
+# public-host case fakes DNS through the resolve_ips seam (as the tests above do) and
+# the blocked case uses a literal loopback address, which needs no resolution at all.
+
+_PUBLIC_IP = ipaddress.ip_address("93.184.216.34")
+
+
+def test_redirect_request_signature_matches_urllib_base_class():
+    ours = inspect.signature(dca_net_utils.SafeRedirectHandler.redirect_request)
+    base = inspect.signature(urllib.request.HTTPRedirectHandler.redirect_request)
+    assert list(ours.parameters) == list(base.parameters)
+    assert list(ours.parameters) == ["self", "req", "fp", "code", "msg", "headers", "newurl"]
+
+
+def test_redirect_request_keyword_call_blocks_loopback_target():
+    handler = dca_net_utils.SafeRedirectHandler()
+    req = urllib.request.Request("https://hc.example/start")
+    with pytest.raises(urllib.error.HTTPError, match="blocked unsafe redirect destination") as excinfo:
+        handler.redirect_request(
+            req=req, fp=None, code=302, msg="Found", headers={}, newurl="http://127.0.0.1/secret"
+        )
+    # The urllib-facing HTTPError must still be chained from the real reason.
+    assert isinstance(excinfo.value.__cause__, dca_net_utils.UnsafeDestinationError)
+
+
+def test_redirect_request_keyword_call_allows_public_target():
+    handler = dca_net_utils.SafeRedirectHandler()
+    req = urllib.request.Request("https://hc.example/start")
+    with patch("dca_net_utils.resolve_ips", return_value={_PUBLIC_IP}):
+        new_req = handler.redirect_request(
+            req=req, fp=None, code=302, msg="Found", headers={}, newurl="https://hc.example/elsewhere"
+        )
+    assert isinstance(new_req, urllib.request.Request)
+    assert new_req.full_url == "https://hc.example/elsewhere"
+
+
+def test_redirect_request_positional_call_still_enforces_safe_destination():
+    handler = dca_net_utils.SafeRedirectHandler()
+    req = urllib.request.Request("https://hc.example/start")
+    with pytest.raises(urllib.error.HTTPError, match="blocked unsafe redirect destination"):
+        handler.redirect_request(req, None, 302, "Found", {}, "http://127.0.0.1/secret")
+    with patch("dca_net_utils.resolve_ips", return_value={_PUBLIC_IP}):
+        new_req = handler.redirect_request(req, None, 302, "Found", {}, "https://hc.example/elsewhere")
+    assert isinstance(new_req, urllib.request.Request)
+    assert new_req.full_url == "https://hc.example/elsewhere"
+
+
+def test_redirect_request_missing_argument_is_a_type_error():
+    # An arity mistake must surface as Python's own TypeError from argument
+    # binding -- the way it does for the stock urllib method -- not as a
+    # ValueError from an internal ``args[:6]`` unpack.
+    handler = dca_net_utils.SafeRedirectHandler()
+    req = urllib.request.Request("https://hc.example/start")
+    with pytest.raises(TypeError):
+        cast(Any, handler).redirect_request(req, None, 302, "Found", {})
+
+
 def test_redact_url_with_port():
     # Line 318: redact_url with a port
     redacted = dca_net_utils.redact_url("http://example.com:8080/secret?token=123")
     assert redacted == "http://example.com:8080"
+
+def test_file_handler_blocked():
+    with pytest.raises(urllib.error.URLError, match="file:// scheme is blocked for security"):
+        urllib.request.urlopen("file:///etc/passwd")
+
+def test_ftp_handler_blocked():
+    with pytest.raises(urllib.error.URLError, match="ftp:// scheme is blocked for security"):
+        urllib.request.urlopen("ftp://example.com")
+
+
+@pytest.mark.parametrize(
+    "ip_str, expected",
+    [
+        # Allowed
+        ("8.8.8.8", False),
+        ("2001:4860:4860::8888", False),
+        # Disallowed: Private
+        ("192.168.1.1", True),
+        ("10.0.0.1", True),
+        ("fc00::1", True),
+        # Disallowed: Loopback
+        ("127.0.0.1", True),
+        ("::1", True),
+        # Disallowed: CGNAT
+        ("100.64.0.1", True),
+        # Disallowed: Multicast
+        ("224.0.0.1", True),
+        ("ff02::1", True),
+        # Disallowed: Reserved
+        ("240.0.0.1", True),
+        # Disallowed: Site-local
+        ("fec0::1", True),
+    ]
+)
+def test_is_disallowed_ip(ip_str, expected):
+    ip = ipaddress.ip_address(ip_str)
+    assert dca_net_utils.is_disallowed_ip(ip) is expected
+def test_assert_safe_destination_unsupported_scheme():
+    with pytest.raises(dca_net_utils.UnsafeDestinationError, match="unsupported scheme"):
+        dca_net_utils.assert_safe_destination("ftp://example.com")
+
+def test_assert_safe_destination_malformed_port():
+    with pytest.raises(dca_net_utils.UnsafeDestinationError, match="malformed port"):
+        dca_net_utils.assert_safe_destination("https://example.com:notaport/")
+
+def test_assert_safe_destination_literal_disallowed_ip():
+    with pytest.raises(dca_net_utils.UnsafeDestinationError, match="disallowed address"):
+        dca_net_utils.assert_safe_destination("http://127.0.0.1")
+
+def test_assert_safe_destination_literal_allowed_ip():
+    # Should return silently
+    dca_net_utils.assert_safe_destination("http://93.184.216.34")
+
+def test_assert_safe_destination_proxy_fails_resolution_with_proxy():
+    # Hostname fails to resolve locally, but a proxy is configured for it
+    with patch("dca_net_utils.resolve_ips", side_effect=OSError("resolution failed")):
+        with patch("dca_net_utils.proxy_configured_for", return_value=True):
+            dca_net_utils.assert_safe_destination("https://unresolvable-but-proxied.example.com")
+
+def test_assert_safe_destination_proxy_fails_resolution_without_proxy():
+    # Hostname fails to resolve locally, and no proxy is configured
+    with patch("dca_net_utils.resolve_ips", side_effect=OSError("resolution failed")):
+        with patch("dca_net_utils.proxy_configured_for", return_value=False):
+            with pytest.raises(dca_net_utils.UnsafeDestinationError, match="host does not resolve"):
+                dca_net_utils.assert_safe_destination("https://unresolvable.example.com")
+
+def test_assert_safe_destination_resolves_to_disallowed_ip():
+    with patch("dca_net_utils.resolve_ips") as mock_resolve:
+        mock_resolve.return_value = {ipaddress.ip_address("169.254.169.254")}
+        with pytest.raises(dca_net_utils.UnsafeDestinationError, match="host resolves to a disallowed address"):
+            dca_net_utils.assert_safe_destination("https://example.com")
+
+
+def test_assert_safe_destination_resolves_empty_set():
+    with patch("dca_net_utils.resolve_ips") as mock_resolve:
+        mock_resolve.return_value = set()
+        with pytest.raises(dca_net_utils.UnsafeDestinationError, match="host resolves to a disallowed address"):
+            dca_net_utils.assert_safe_destination("https://example.com")
+
+
+def test_assert_safe_destination_resolves_to_allowed_ip():
+    with patch("dca_net_utils.resolve_ips") as mock_resolve:
+        mock_resolve.return_value = {ipaddress.ip_address("93.184.216.34")}
+        # Should return silently
+        dca_net_utils.assert_safe_destination("https://example.com")

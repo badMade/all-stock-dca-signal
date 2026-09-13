@@ -49,6 +49,18 @@ class EntryPoint:
 
 ENTRY_POINTS: tuple[EntryPoint, ...] = (
     EntryPoint(
+        need="Launch the local DCA interface with daily summaries, timing, and Octopus research",
+        command="python3 from.py [--local --root <cron-root> --octopus-run <run-dir>] [--once] [--check]",
+        exists_path="from.py",
+        doc_ref="docs/local_console.md",
+        notes=(
+            "Default launches isolated DCA and Octopus demos plus a loopback browser UI. "
+            "--local observes existing artifacts; --once emits a summary and exits. "
+            "No live orders or automatic external scheduler registration. "
+            "--run test-signals exercises all seven existing candidate entry points."
+        ),
+    ),
+    EntryPoint(
         need="Dry-run the full DCA pipeline for one slot, no broker/network calls",
         command="python run_dca.py --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir <dir>",
         exists_path="run_dca.py",
@@ -71,6 +83,20 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         doc_ref="claude/dca-executor-prompts/live-mirror/1030ET-1030-dca-recurring-buy.txt",
         symbols=("main",),
         notes="The printed JSON's buy_usd per ticker is authoritative. Never recompute it by hand.",
+    ),
+    EntryPoint(
+        need="Load validated logged-reference/order bindings from prior-allocation artifacts",
+        command=(
+            "python3 -m scripts.prior_reference_bindings --trading-day <YYYY-MM-DD> "
+            "--root <resolved-prior-root> [--root <resolved-prior-root> ...]"
+        ),
+        exists_path="scripts/prior_reference_bindings.py",
+        doc_ref="docs/market_open_signal_entry.md",
+        symbols=("load_reference_bindings", "main"),
+        notes=(
+            "Read-only and fail-closed on missing roots or unreadable artifacts. The returned "
+            "order_id must still be matched to the latest order in fully paginated broker history."
+        ),
     ),
     EntryPoint(
         need="Decide whether a run is scheduled or manual, and where its artifacts belong",
@@ -285,6 +311,21 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
             "minutes before ITS OWN anchor (10:30 / 12:30 / 13:30). No --deployed-last-7d-usd, "
             "same reason as the 0935ET row. The three fires share ONE pooled budget and nothing "
             "here knows that: pooling is the executing agent's Gate 6/6.5, as the prompts have it."
+        ),
+    ),
+    EntryPoint(
+        need="Refresh and re-size 0935ET candidates from post-anchor quotes",
+        command=(
+            "python3 -m scripts.refresh_market_open_candidates "
+            "--candidates <file> --quotes <file>"
+        ),
+        exists_path="scripts/refresh_market_open_candidates.py",
+        doc_ref="docs/market_open_signal_entry.md",
+        symbols=("refresh_market_open_candidates", "main"),
+        notes=(
+            "Gate 6.5 placement-boundary path. Intentionally consumes explicit quotes "
+            "after 09:35 and reuses the executor ladder plus shared dynamic-base selector; "
+            "it is not a re-run of the fixed-anchor Gate 5 evaluator."
         ),
     ),
     EntryPoint(

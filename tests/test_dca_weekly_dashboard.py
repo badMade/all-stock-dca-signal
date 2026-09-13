@@ -12,6 +12,7 @@ from dca_weekly_dashboard import (
     _has_submitted_evidence,
     _is_manual_run_state,
     _iso_week_of_state,
+    _merge_partial_state_into_keeper,
     _require_base_amount,
     _this_run_submitted_notional,
     build_budget_reserve_effectiveness,
@@ -44,6 +45,110 @@ def test_build_graded_vs_fixed_uses_per_candidate_dynamic_base():
     report = build_graded_vs_fixed(run_states)
     assert "$9.00" in report  # graded: 2 + 4 + 3
     assert "$5.00" in report  # fixed: 1 (own base) + 2 (own base) + 2 (fallback), not 2 * 3 = 6
+
+
+def test_build_graded_vs_fixed_excludes_adjustment_rows_from_candidate_count_and_fixed_baseline():
+    # Codex review ("Exclude adjustment rows from candidate analytics"): a
+    # whole_share_settlement_adjustment row corrects an ALREADY-counted
+    # physical candidate, not a second one -- counting it here (and giving
+    # it its own fixed-baseline 1x allocation) inflates both the candidate
+    # count and the fixed baseline for one physical order. Its dollar delta
+    # ($2) is still real deployed capital and stays in the graded total.
+    run_states = [
+        {
+            "trading_day": "2026-07-24",
+            "budget": {"base_amount_usd": 2.0},
+            "buy_candidates": [
+                {"ticker": "BYDDY", "planned_amount_usd": 10.0, "selected_base_amount_usd": 2.0},
+                {
+                    "ticker": "BYDDY",
+                    "planned_amount_usd": 2.0,
+                    "whole_share_settlement_adjustment": True,
+                },
+            ],
+        }
+    ]
+    report = build_graded_vs_fixed(run_states)
+    assert "$12.00" in report  # graded: 10 + 2 (the adjustment's real delta)
+    assert "$2.00" in report  # fixed: only the ORIGINAL candidate's own $2 base
+    assert "| 2026-07-24 | 1 |" in report  # candidate count: 1, not 2
+
+
+def test_build_sector_matrix_excludes_adjustment_rows_from_candidate_count():
+    # Codex review ("Exclude adjustment rows from candidate analytics"):
+    # same exclusion as build_graded_vs_fixed's sibling test, applied to
+    # the sector matrix's own candidate/notional aggregation.
+    run_states = [
+        {
+            "trading_day": "2026-07-24",
+            "buy_candidates": [
+                {"ticker": "BYDDY", "planned_amount_usd": 10.0},
+                {
+                    "ticker": "BYDDY",
+                    "planned_amount_usd": 2.0,
+                    "whole_share_settlement_adjustment": True,
+                },
+            ],
+        }
+    ]
+    report = build_sector_matrix(run_states, {"BYDDY": "Consumer"})
+    assert "| Consumer | 1 | $12.00 |" in report
+def test_build_performance_snapshot_empty_states():
+    report = build_performance_snapshot([])
+    assert "| Run days | 0 |" in report
+    assert "| Buy candidates | 0 |" in report
+    assert "| Orders submitted | 0 |" in report
+    assert "| Planned notional | $0.00 |" in report
+    assert "| Executed notional | $0.00 |" in report
+    assert "| Week notional / cap | $0.00 / $0.00 |" in report
+
+
+def test_build_performance_snapshot_missing_fields():
+    # Test fallback mechanisms when expected budget and counts fields are missing
+    run_states = [
+        {
+            "trading_day": "2026-07-24",
+            # Missing "counts" entirely
+            # Missing "budget" entirely
+            # These will fallback to {}
+            "buy_candidates": [
+                {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 15.0},
+            ]
+        }
+    ]
+    report = build_performance_snapshot(run_states)
+    assert "| Run days | 1 |" in report
+    assert "| Buy candidates | 0 |" in report
+    assert "| Orders submitted | 0 |" in report
+    assert "| Planned notional | $15.00 |" in report
+    # Note: _this_run_submitted_notional fallback parses buy_candidates and extracts planned_amount_usd for executed notional fallback
+    assert "| Executed notional | $15.00 |" in report
+    assert "| Week notional / cap | $0.00 / $0.00 |" in report
+
+
+def test_build_performance_snapshot_renders_happy_path():
+    run_states = [
+        {
+            "trading_day": "2026-07-24",
+            "counts": {"buy_candidates": 2, "submitted": 1},
+            "budget": {
+                "day_notional_usd": 15.0,
+                "week_notional_usd": 15.0,
+                "weekly_cap_usd": 100.0,
+            },
+            "buy_candidates": [
+                {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 15.0},
+                {"ticker": "BBB", "status": "not_submitted", "planned_amount_usd": 10.0}
+            ]
+        }
+    ]
+    report = build_performance_snapshot(run_states)
+    assert "| Run days | 1 |" in report
+    assert "| Buy candidates | 2 |" in report
+    assert "| Orders submitted | 1 |" in report
+    assert "| Planned notional | $25.00 |" in report
+    assert "| Executed notional | $15.00 |" in report
+    assert "| Week notional / cap | $15.00 / $100.00 |" in report
 
 
 def test_build_performance_snapshot_counts_partial_submission_artifact():
@@ -1043,6 +1148,160 @@ def test_require_base_amount_rejects_boolean_run_level_base(tmp_path):
 
     with pytest.raises(ValueError, match="non-numeric"):
         _require_base_amount(loaded[0])
+
+
+def test_require_base_amount_coerces_a_non_mapping_budget(tmp_path):
+    # Codex review, PR #1300 discussion_r3920988296 ("Normalize malformed
+    # budget containers before accumulation"): a truthy non-dict budget
+    # (e.g. "budget": ["bad"], from a structurally rejected retained
+    # artifact this function deliberately admits) survived the bare
+    # `rs.get("budget") or {}` fallback -- a non-empty list is truthy --
+    # so budget.get("base_amount_usd") raised AttributeError before ever
+    # reaching the usable ladder.base_amount_usd fallback.
+    run_state = tmp_path / "list_budget.json"
+    run_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-23",
+                "budget": ["bad"],
+                "ladder": {"base_amount_usd": 2.0},
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 4.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([run_state])
+
+    assert _require_base_amount(loaded[0]) == 2.0
+
+
+def test_load_json_files_survives_a_non_mapping_budget(tmp_path):
+    # Codex review, PR #1300 discussion_r3920988296 ("Normalize malformed
+    # budget containers before accumulation"): a schema-rejected artifact
+    # carrying "budget": ["bad"] (a truthy non-dict) survived the bare
+    # `data.get("budget") or {}` fallback -- a non-empty list is truthy --
+    # so the immediately following .get() call raised AttributeError and
+    # aborted the whole weekly dashboard, even though load_json_files()
+    # deliberately admits artifacts without validating them first.
+    malformed = tmp_path / "malformed_budget.json"
+    malformed.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "trading_day": "2026-08-21",
+                "budget": ["bad"],
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Must not raise -- this is the regression.
+    loaded = load_json_files([malformed])
+
+    assert len(loaded) == 1
+    report = build_performance_snapshot(loaded)
+    assert "$5.00" in report
+
+
+
+def test_build_budget_reserve_effectiveness_basic_rendering():
+    from dca_weekly_dashboard import build_budget_reserve_effectiveness
+
+    run_states = [
+        {
+            "trading_day": "2026-07-20",
+            "budget": {
+                "budget_tier": "conservative",
+                "day_notional_usd": 150.50,
+                "daily_cap_usd": 200.00,
+                "weekly_rollover_reserve_usd": 50.25,
+                "remaining_spend_today_usd": 49.50,
+            },
+        },
+        {
+            "trading_day": "2026-07-21",
+            "budget": {
+                "budget_tier": "aggressive",
+                "day_notional_usd": 300.00,
+                "daily_cap_usd": 500.00,
+                "weekly_rollover_reserve_usd": 100.00,
+                "remaining_spend_today_usd": 200.00,
+            },
+        },
+        {
+            # Missing budget tier, should render 'n/a'
+            "trading_day": "2026-07-22",
+            "budget": {
+                "day_notional_usd": 50.00,
+                "daily_cap_usd": 100.00,
+                "weekly_rollover_reserve_usd": 0.00,
+                "remaining_spend_today_usd": 50.00,
+            },
+        },
+        {
+            # Fallback legacy fields
+            "trading_day": "2026-07-23",
+            "budget": {
+                "budget_tier": "legacy",
+                "day_notional_usd": 100.00,
+                "daily_base_cap_usd": 150.00,
+                "carry_forward_reserve_usd": 25.00,
+                "remaining_spend_today_usd": 50.00,
+            },
+        },
+        {
+            # Missing fields should default to 0.00
+            "trading_day": "2026-07-24",
+        }
+    ]
+
+    report = build_budget_reserve_effectiveness(run_states)
+
+    assert "## Budget and reserve effectiveness" in report
+    assert "| Day | Tier | Spent $ | Daily cap $ | Rollover reserve $ | Remaining $ |" in report
+    assert "| 2026-07-20 | conservative | $150.50 | $200.00 | $50.25 | $49.50 |" in report
+    assert "| 2026-07-21 | aggressive | $300.00 | $500.00 | $100.00 | $200.00 |" in report
+    assert "| 2026-07-22 | n/a | $50.00 | $100.00 | $0.00 | $50.00 |" in report
+    assert "| 2026-07-23 | legacy | $100.00 | $150.00 | $25.00 | $50.00 |" in report
+    assert "| 2026-07-24 | n/a | $0.00 | $0.00 | $0.00 | $0.00 |" in report
+
+
+def test_build_budget_reserve_effectiveness_survives_a_non_mapping_budget():
+    # Codex review, PR #1300 discussion_r3920988296 ("Normalize malformed
+    # budget containers before accumulation"): a truthy non-dict budget
+    # survived the bare `rs.get("budget", {})` default (only fires when the
+    # key is ABSENT, not when present with a non-dict value) and crashed
+    # the very next budget.get(...) call with AttributeError.
+    run_states = [{"trading_day": "2026-07-24", "budget": ["bad"]}]
+
+    # Must not raise -- this is the regression.
+    report = build_budget_reserve_effectiveness(run_states)
+    assert "2026-07-24" in report
+
+
+def test_build_graded_vs_fixed_survives_a_non_mapping_budget_on_a_blocked_state():
+    # Same fix, applied to the blocked-state precheck inside
+    # build_graded_vs_fixed(): only "ladder" was previously coerced there,
+    # not "budget" itself, leaving budget.get("base_amount_usd") just below
+    # unguarded against a truthy non-dict value.
+    run_states = [
+        {
+            "status": "blocked",
+            "trading_day": "2026-08-23",
+            "budget": ["bad"],
+            "ladder": {"base_amount_usd": 2.0},
+            "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 4.0}],
+        }
+    ]
+
+    # Must not raise -- this is the regression.
+    report = build_graded_vs_fixed(run_states)
+    assert "2026-08-23" in report
 
 
 def test_load_json_files_requires_boolean_settlement_adjustment_marker(tmp_path):
@@ -2445,12 +2704,56 @@ def test_load_json_files_ignores_unhashable_ticker(tmp_path):
         encoding="utf-8",
     )
 
+    # Codex review, PR #1300 discussion_r3921082069 ("Drop malformed
+    # candidate tickers before aggregation"), superseding this test's
+    # original "$9.00 in report" assertion: merely NOT crashing was not
+    # enough -- the PR #654 fix above stopped short of the crash but still
+    # let the row aggregate under the ticker=None it was normalized to,
+    # reporting a real $9 executed/planned notional for a candidate with no
+    # usable ticker identity at all. It must now be dropped entirely
+    # instead of counted.
+    # Must not raise -- this is the regression.
+    loaded = load_json_files([malformed])
+
+    assert len(loaded) == 1
+    assert loaded[0]["buy_candidates"] == []
+    report = build_performance_snapshot(loaded)
+    assert "$9.00" not in report
+    assert "| Buy candidates | 0 |" in report
+
+
+def test_load_json_files_skips_a_candidate_with_a_malformed_ticker(tmp_path):
+    # Codex review, PR #1300 discussion_r3921082069 ("Drop malformed
+    # candidate tickers before aggregation"): a retained blocked artifact
+    # with a submitted-shaped candidate whose ticker is missing/non-string
+    # (e.g. a JSON array) was normalized to ticker=None but still processed
+    # -- the later identity/count/notional passes then counted None as a
+    # real candidate and submission and added its full amount to the
+    # dashboard, e.g. a "planned_amount_usd": 100 row with an array-valued
+    # ticker reported as a genuine $100 order.
+    malformed = tmp_path / "malformed_ticker.json"
+    malformed.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-21",
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "submitted_amount_usd": 5.0},
+                    {"ticker": ["not", "a", "string"], "status": "submitted", "planned_amount_usd": 100.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
     # Must not raise -- this is the regression.
     loaded = load_json_files([malformed])
 
     assert len(loaded) == 1
     report = build_performance_snapshot(loaded)
-    assert "$9.00" in report
+    assert "$5.00" in report
+    assert "$105.00" not in report
+    assert "100.00" not in report
 
 
 def test_load_json_files_ignores_unhashable_broker_outcome_order_id(tmp_path):
@@ -2582,6 +2885,43 @@ def test_backfill_planned_amount_replaces_non_finite_existing_value(tmp_path):
     report = build_performance_snapshot(loaded)
     assert "nan" not in report.lower()
     assert "inf" not in report.lower()
+
+
+def test_backfill_planned_amount_replaces_a_boolean_existing_value(tmp_path):
+    # Codex review, PR #1300 discussion_r3920765651 ("Reject boolean amounts
+    # during planned-notional backfill"): bool is a subclass of int in
+    # Python, so float(True) succeeds as 1.0 -- a retained row's existing
+    # planned_amount_usd of `true` was therefore treated as "already has a
+    # valid amount" and never replaced by the real submitted amount,
+    # rendering that order as $1 of planned spend instead of $7, exactly
+    # like the non-finite-string case the sibling test above already
+    # covers.
+    boolean_existing = tmp_path / "boolean_existing_planned.json"
+    boolean_existing.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-08-17",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAA",
+                        "status": "submitted",
+                        "submitted_amount_usd": 7.0,
+                        "planned_amount_usd": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([boolean_existing])
+
+    assert len(loaded) == 1
+    row = next(r for r in loaded[0]["buy_candidates"] if r.get("ticker") == "AAA")
+    assert row["planned_amount_usd"] == 7.0
+    report = build_performance_snapshot(loaded)
+    assert "$1.00" not in report
 
 
 def test_load_json_files_filters_manual_run_flag_and_accepts_str_paths(tmp_path: Path):
@@ -3184,6 +3524,205 @@ def test_load_json_files_deduplicates_orders_across_run_state_files(tmp_path):
     assert "$200.00" not in report
 
 
+def test_load_json_files_folds_reconciled_id_into_its_ambiguous_predecessor(tmp_path):
+    # Codex review, PR #1300 discussion_r3920642635 ("Fold reconciled IDs
+    # into their ambiguous predecessor"): an earlier variant of an explicit
+    # run records a "potentially_submitted" row with NO order_id -- the
+    # placement connector raised before returning one -- and a LATER variant
+    # of the SAME run (same run_classification.run_id) reconciles that same
+    # request to a filled order that finally HAS an id. Cross-state dedup is
+    # keyed on order_id, so the ambiguous row was never registered and the
+    # identified row matched nothing: both states survived and the dashboard
+    # reported two run days, two candidates, two submissions and double the
+    # notional for ONE physical order.
+    earlier_state = tmp_path / "run_state_ambiguous.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1530ET"},
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "potentially_submitted", "submitted_amount_usd": 100.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "run_state_reconciled.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1530ET"},
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "filled", "order_id": "X", "submitted_amount_usd": 100.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Orders submitted | 1 |" in report
+    assert "| Executed notional | $100.00 |" in report
+    assert "$200.00" not in report
+
+
+def test_load_json_files_counts_matching_candidate_and_outcome_as_one_placement(tmp_path):
+    # Codex review, PR #1300 discussion_r3920155073 ("Count matching
+    # candidate and outcome as one placement"): the earlier state below
+    # carries BOTH an id-less "potentially_submitted" buy_candidates row for
+    # AAA AND its matching broker_outcomes["AAA"] entry -- the ordinary shape
+    # for one physical order (a candidate half plus the broker's own outcome
+    # half). _note_ambiguous_placement() used to be invoked once per
+    # representation, bumping the per-ticker count in
+    # _ambiguous_placements_seen_this_state to 2 even though there is only
+    # ONE order here. Promotion into
+    # _ambiguous_placements_claimed_across_states only accepts count == 1,
+    # so the double-count silently disabled the very correlation
+    # test_load_json_files_folds_reconciled_id_into_its_ambiguous_predecessor
+    # exercises above: the later reconciled state's identified row would
+    # match nothing, and both states would survive, double-counting one
+    # order's notional.
+    earlier_state = tmp_path / "run_state_ambiguous_pair.json"
+    earlier_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1530ET"},
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "potentially_submitted", "submitted_amount_usd": 100.0}
+                ],
+                "broker_outcomes": {
+                    "AAA": {"status": "potentially_submitted", "submitted_amount_usd": 100.0}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    later_state = tmp_path / "run_state_ambiguous_pair_reconciled.json"
+    later_state.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1530ET"},
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "filled", "order_id": "X", "submitted_amount_usd": 100.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([earlier_state, later_state])
+    report = build_performance_snapshot(loaded)
+    assert "| Orders submitted | 1 |" in report
+    assert "| Executed notional | $100.00 |" in report
+    assert "$200.00" not in report
+
+
+def test_load_json_files_keeps_ambiguous_rows_of_different_runs_separate(tmp_path):
+    # The correlation above must demand a SHARED explicit run identity: two
+    # genuinely different runs that each placed an AAA order -- one still
+    # ambiguous, one reconciled -- are two physical orders, and folding them
+    # would erase real capital from the dashboard. Same ticker, same day,
+    # DIFFERENT run_classification.run_id, so both must survive.
+    ambiguous_state = tmp_path / "run_state_other_run_ambiguous.json"
+    ambiguous_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1030ET"},
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "potentially_submitted", "submitted_amount_usd": 100.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    identified_state = tmp_path / "run_state_other_run_identified.json"
+    identified_state.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1530ET"},
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "filled", "order_id": "X", "submitted_amount_usd": 100.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([ambiguous_state, identified_state])
+    report = build_performance_snapshot(loaded)
+    # Executed notional is the capital-preservation signal: both physical
+    # orders must still be counted. (The candidate/submission COUNTS for an
+    # id-less row follow this module's own pre-existing id-less accounting
+    # and are deliberately not asserted here.)
+    assert "| Executed notional | $200.00 |" in report
+
+
+def test_load_json_files_keeps_two_ambiguous_placements_for_one_ticker_separate(tmp_path):
+    # When ONE state holds two id-less ambiguous placements for the same
+    # ticker, there is no safe way to tell which one a later identified row
+    # reconciles, so no correlation may be registered at all -- the same "no
+    # competing candidate it could be mistaken for" rule the id-less
+    # matching pass already applies. Both ambiguous rows plus the later
+    # identified order must survive rather than one being silently folded.
+    ambiguous_state = tmp_path / "run_state_two_ambiguous.json"
+    ambiguous_state.write_text(
+        json.dumps(
+            {
+                "status": "blocked",
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1530ET"},
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "potentially_submitted", "submitted_amount_usd": 100.0},
+                    {"ticker": "AAA", "status": "potentially_submitted", "submitted_amount_usd": 250.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    identified_state = tmp_path / "run_state_two_ambiguous_later.json"
+    identified_state.write_text(
+        json.dumps(
+            {
+                "status": "completed",
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1530ET"},
+                "budget": {"weekly_cap_usd": 500.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "filled", "order_id": "X", "submitted_amount_usd": 100.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([ambiguous_state, identified_state])
+    report = build_performance_snapshot(loaded)
+    # $100 + $250 ambiguous + $100 identified: every dollar still reported,
+    # so nothing was folded into an ambiguous predecessor it may not belong
+    # to. Distinct amounts make the sum unambiguous.
+    assert "| Executed notional | $450.00 |" in report
+
+
 def test_load_json_files_prefers_dated_claim_metadata_over_undated(tmp_path):
     # Codex review, PR #654 ("Preserve dated claim metadata over undated
     # replacements"): the candidate row for a $20 Monday order carries a
@@ -3752,6 +4291,57 @@ def test_load_json_files_collapses_fully_duplicate_state_variants(tmp_path):
     assert "| Run days | 1 |" in report
 
 
+def test_load_json_files_preserves_distinct_run_when_only_one_side_has_a_run_id(tmp_path):
+    # Codex review, PR #1300 discussion_r3920988299 ("Preserve distinct
+    # same-stream runs after order deduplication"): the identified state
+    # below carries a real run_classification.run_id -- positive evidence of
+    # a SPECIFIC scheduled execution -- while the later, coincidentally
+    # same-day, same-ticker state carries NONE at all. _states_share_run_
+    # identity()'s trading_day fallback only compares two PRESENT ids (or
+    # falls back to trading_day when BOTH are absent); it silently ignores
+    # an id present on only one side, so these two states -- one identified,
+    # one not -- used to read as "one run," and once row-level dedup removed
+    # every row from the run_id-less state (it duplicated the identified
+    # state's own $5 order), that whole state was dropped from the returned
+    # list entirely instead of surviving as its own distinct zero-order
+    # execution, losing whatever coverage/budget data it carried and
+    # understating the true run count.
+    identified_state = tmp_path / "asymmetric_run_id_identified.json"
+    identified_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "run_classification": {"run_id": "scheduled_20260720_1030ET"},
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    unidentified_state = tmp_path / "asymmetric_run_id_unidentified.json"
+    unidentified_state.write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-20",
+                "counts": {"buy_candidates": 1, "submitted": 1},
+                "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0, "weekly_cap_usd": 100.0},
+                "buy_candidates": [
+                    {"ticker": "AAA", "status": "submitted", "order_id": "X", "submitted_amount_usd": 5.0}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([identified_state, unidentified_state])
+    # Both states survive: the run_id-less one is a distinct (now
+    # zero-order) execution, not an empty husk of the identified one.
+    assert len(loaded) == 2
+
+
 def test_load_json_files_preserves_state_with_no_orders_at_all(tmp_path):
     # A state that genuinely never had any candidate/outcome evidence (a
     # real "nothing to buy today" run) must NOT be collapsed by the
@@ -3982,6 +4572,45 @@ def test_load_json_files_reconciles_outcome_amounts_before_crediting_removals(tm
     assert len(loaded) == 2
     later_loaded = loaded[1]
     assert later_loaded["budget"]["day_notional_usd"] == 3.0
+
+
+def test_merge_partial_state_into_keeper_rebuilds_weekly_total_without_source_week_fields(tmp_path):
+    # Codex review, PR #1300 discussion_r3921019928 ("Rebuild weekly totals
+    # when merging a partial variant"): source has surviving unique rows
+    # (this call moves them) and a real day_notional_usd, but reports
+    # NEITHER week_notional_usd NOR hypothetical_week_spend_usd of its own,
+    # so _state_week_notional(source) returns None. The keeper's OLDER
+    # cumulative weekly total used to be left completely unchanged in this
+    # case, even though the source's own day-notional contribution (the
+    # same figure the function adds to the keeper's DAY total a few lines
+    # later) is genuinely new capital for the week -- understating the
+    # week's true spend by exactly that contribution.
+    keeper = {
+        "trading_day": "2026-07-20",
+        "counts": {"buy_candidates": 1, "submitted": 1},
+        "budget": {"day_notional_usd": 5.0, "week_notional_usd": 20.0, "weekly_cap_usd": 100.0},
+        "buy_candidates": [
+            {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+        ],
+    }
+    source = {
+        "trading_day": "2026-07-20",
+        "counts": {"buy_candidates": 1, "submitted": 1},
+        # Deliberately NO week_notional_usd/hypothetical_week_spend_usd.
+        "budget": {"day_notional_usd": 3.0, "weekly_cap_usd": 100.0},
+        "buy_candidates": [
+            {"ticker": "BBB", "order_id": "Y", "status": "submitted", "submitted_amount_usd": 3.0}
+        ],
+    }
+
+    _merge_partial_state_into_keeper(source, keeper)
+
+    # Day total still merges as before (sanity check this is the same call).
+    assert keeper["budget"]["day_notional_usd"] == pytest.approx(8.0)
+    # Weekly total must now reflect the moved $3 order too: 20.0 (prior
+    # cumulative) + 3.0 (source's surviving row-local contribution), not
+    # the stale 20.0 the missing-week-fields fallback used to leave behind.
+    assert keeper["budget"]["week_notional_usd"] == pytest.approx(23.0)
 
 
 def test_load_json_files_merges_later_fill_amount_into_keeper(tmp_path):
@@ -7076,3 +7705,558 @@ def test_load_json_files_preserves_completed_placement_semantics_when_merging(tm
     report = build_performance_snapshot(loaded)
     assert "| Orders submitted | 2 |" in report
     assert "| Executed notional | $8.00 |" in report
+
+
+def test_load_json_files_does_not_promote_statusless_rows_from_a_non_completed_source(tmp_path):
+    # Codex review, PR #1300 discussion_r3920546935 ("Restrict statusless-row
+    # promotion to completed states"): the sibling test above
+    # (test_load_json_files_preserves_completed_placement_semantics_when_
+    # merging) covers a genuinely "completed" source correctly promoting its
+    # statusless row -- this covers the gap the old `!= "blocked"` check let
+    # through: a "failed" (or any other non-"blocked", non-affirmatively-
+    # "completed") source provides no placement guarantee for its own
+    # statusless rows either, so its statusless row must stay statusless
+    # (excluded from counts.submitted / executed notional) once merged into
+    # the blocked keeper, exactly like the keeper's own statusless rows
+    # already are.
+    blocked_keeper = tmp_path / "non_completed_source_blocked.json"
+    blocked_keeper.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:30:00",
+                status="blocked",
+                counts={"buy_candidates": 1, "submitted": 1},
+                budget={"day_notional_usd": 5.0, "week_notional_usd": 5.0, "base_amount_usd": 1.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0}
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+    failed_source = tmp_path / "non_completed_source_failed.json"
+    failed_source.write_text(
+        json.dumps(
+            _partial_merge_state(
+                generated_at="2026-07-20T10:35:00",
+                status="failed",
+                counts={"buy_candidates": 2, "submitted": 1},
+                budget={"day_notional_usd": 5.0, "week_notional_usd": 5.0, "base_amount_usd": 1.0},
+                buy_candidates=[
+                    {"ticker": "AAA", "order_id": "X", "status": "submitted", "submitted_amount_usd": 5.0},
+                    # Statusless: this "failed" variant provides no placement
+                    # evidence for it, unlike a genuinely completed run's row.
+                    {"ticker": "BBB", "order_id": "Y", "submitted_amount_usd": 3.0, "planned_amount_usd": 3.0},
+                ],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_json_files([blocked_keeper, failed_source])
+    assert len(loaded) == 1
+    survivor = loaded[0]
+    moved = [row for row in survivor["buy_candidates"] if row["order_id"] == "Y"][0]
+    # Y must NOT be stamped "submitted"/"filled"/etc -- the failed source
+    # gave it no placement evidence.
+    assert moved.get("status") is None
+    assert survivor["status"] == "blocked"
+
+
+def test_merge_authoritative_amount_promotes_keeper_status_to_the_source():
+    # Codex review, PR #1300 discussion_r3920466853 ("Promote retained
+    # duplicates to the authoritative fill status"): an earlier state
+    # records the order as "pending" and a later duplicate records the SAME
+    # order as "filled" -- the merge already copies the later fill amount
+    # into the keeper, but must ALSO promote the keeper's own row/outcome
+    # status, or the returned normalized state reports the corrected filled
+    # notional while both representations still read "pending", losing the
+    # only terminal reconciliation evidence.
+    from dca_weekly_dashboard import _merge_authoritative_amount_into_keeper
+
+    keeper_row = {"ticker": "AAA", "order_id": "X", "status": "pending", "submitted_amount_usd": 5.0}
+    keeper_outcome = {"order_id": "X", "status": "pending", "submitted_amount_usd": 5.0}
+    keeper_state = {
+        "trading_day": "2026-07-20",
+        "budget": {"day_notional_usd": 5.0, "week_notional_usd": 5.0},
+    }
+    keeper_entry = ((2026, 30), keeper_row, keeper_outcome, keeper_state)
+    filled_duplicate = {
+        "ticker": "AAA",
+        "order_id": "X",
+        "status": "filled",
+        "submitted_amount_usd": 7.0,
+    }
+
+    _merge_authoritative_amount_into_keeper(keeper_entry, 7.0, filled_duplicate)
+
+    assert keeper_row["submitted_amount_usd"] == 7.0
+    assert keeper_row["status"] == "filled"
+    assert keeper_outcome["status"] == "filled"
+
+
+def test_merge_authoritative_amount_never_downgrades_a_stronger_keeper_status():
+    # The no-downgrade half of the same fix: when the source does NOT
+    # outrank the keeper overall (both representations already at least as
+    # strong), neither representation's status is touched, matching the
+    # existing rule that already protects the amount in this case.
+    from dca_weekly_dashboard import _merge_authoritative_amount_into_keeper
+
+    keeper_row = {"ticker": "AAA", "order_id": "X", "status": "filled", "submitted_amount_usd": 7.0}
+    keeper_outcome = {"order_id": "X", "status": "filled", "submitted_amount_usd": 7.0}
+    keeper_state = {
+        "trading_day": "2026-07-20",
+        "budget": {"day_notional_usd": 7.0, "week_notional_usd": 7.0},
+    }
+    keeper_entry = ((2026, 30), keeper_row, keeper_outcome, keeper_state)
+    stale_submitted_duplicate = {
+        "ticker": "AAA",
+        "order_id": "X",
+        "status": "submitted",
+        "submitted_amount_usd": 5.0,
+    }
+
+    _merge_authoritative_amount_into_keeper(keeper_entry, 5.0, stale_submitted_duplicate)
+
+    assert keeper_row["status"] == "filled"
+    assert keeper_outcome["status"] == "filled"
+    assert keeper_row["submitted_amount_usd"] == 7.0
+
+
+def test_states_share_run_identity_rejects_distinct_intraday_slots_without_run_ids():
+    # Codex review, PR #1300 discussion_r3920257833 ("Keep distinct
+    # same-stream intraday slots separate"): "intraday" is one stream shared
+    # across three distinct daily slots (11:30/13:30/14:30). Two same-day
+    # intraday states with no usable run_id and the SAME stream previously
+    # fell all the way through to the historical trading_day-only "same run"
+    # verdict -- so if a later slot's state held only recovery evidence for
+    # an order already present in an earlier slot's state, the husk collapse
+    # absorbed the later slot as a duplicate of the earlier one, dropping a
+    # real run day and its coverage/status data.
+    # run_classification.scheduled_for_et is the slot identity available
+    # even without a run_id, and disagreeing is provable proof these are
+    # different runs.
+    from dca_weekly_dashboard import _states_share_run_identity
+
+    slot_1130 = {
+        "trading_day": "2026-07-20",
+        "run_classification": {"stream": "intraday", "scheduled_for_et": "11:30"},
+    }
+    slot_1330 = {
+        "trading_day": "2026-07-20",
+        "run_classification": {"stream": "intraday", "scheduled_for_et": "13:30"},
+    }
+    assert _states_share_run_identity(slot_1130, slot_1330) is False
+
+    # A matching scheduled_for_et still falls through to the historical
+    # trading_day-only verdict.
+    slot_1130_again = {
+        "trading_day": "2026-07-20",
+        "run_classification": {"stream": "intraday", "scheduled_for_et": "11:30"},
+    }
+    assert _states_share_run_identity(slot_1130, slot_1130_again) is True
+
+    # scheduled_for_et present on only one side is not proof either way --
+    # falls through to the historical behaviour, same as an absent stream.
+    no_slot = {"trading_day": "2026-07-20", "run_classification": {"stream": "intraday"}}
+    assert _states_share_run_identity(slot_1130, no_slot) is True
+
+
+def test_this_run_submitted_notional_rejects_non_finite_broker_only_amount():
+    # Codex review, PR #1300 discussion_r3920642631 ("Validate broker-only
+    # notionals before totaling them"): the broker_outcomes-only fallback
+    # (reached when a completed/legacy state has placement evidence ONLY in
+    # broker_outcomes, with no matching candidate row) previously read
+    # submitted_amount_usd with the bare _num(), which accepts negative
+    # values, booleans, NaN, and infinities -- unlike the candidate-row pass
+    # just above it, which already validates with _finite_ordinary_amount().
+    # A malformed outcome-only amount could poison the whole executed total
+    # as $nan/$inf, or silently reduce it via a bogus negative.
+    nan_outcome_only = {
+        "broker_outcomes": {
+            "AAA": {"ticker": "AAA", "order_id": "X", "status": "filled", "submitted_amount_usd": "NaN"},
+        },
+    }
+    assert _this_run_submitted_notional(nan_outcome_only) == 0.0
+
+    negative_outcome_only = {
+        "broker_outcomes": {
+            "AAA": {"ticker": "AAA", "order_id": "X", "status": "filled", "submitted_amount_usd": -5.0},
+        },
+    }
+    assert _this_run_submitted_notional(negative_outcome_only) == 0.0
+
+    # A genuinely usable outcome-only figure still counts normally.
+    usable_outcome_only = {
+        "broker_outcomes": {
+            "AAA": {"ticker": "AAA", "order_id": "X", "status": "filled", "submitted_amount_usd": 7.0},
+        },
+    }
+    assert _this_run_submitted_notional(usable_outcome_only) == 7.0
+
+def test_build_weekly_dashboard_renders_all_sections_correctly():
+    # Covers the top-level composition function, which lacked direct tests.
+    run_states = [
+        {
+            "status": "completed",
+            "trading_day": "2026-07-24",
+            "counts": {"buy_candidates": 1},
+            "budget": {
+                "base_amount_usd": 2.0,
+                "hypothetical_day_spend_usd": 4.0,
+                "week_notional_usd": 4.0,
+                "weekly_cap_usd": 100.0,
+            },
+            "orders_submitted_count": 1,
+            "buy_candidates": [
+                {"ticker": "AAA", "status": "filled", "planned_amount_usd": 4.0},
+            ],
+            "broker_outcomes": {"AAA": {"status": "filled", "submitted_amount_usd": 4.0}},
+        }
+    ]
+    summaries = [
+        {
+            "trading_day": "2026-07-24",
+            "coverage": {"buy_candidates": 1, "fills": 1, "coverage_pct": 100.0, "missing_fills": 0},
+            "execution_quality": {"priced_fills": 1, "target_price_missing": 0, "avg_slippage_pct": 0.1, "max_slippage_pct": 0.1, "worst_ticker": "AAA"},
+        }
+    ]
+    sector_map = {"AAA": "Tech"}
+
+    report = build_weekly_dashboard(run_states, summaries, sector_map, week_label="2026-W30")
+
+    # Expected headers
+    assert "# Weekly Performance Dashboard — 2026-W30" in report
+    assert "## Performance snapshot" in report
+    assert "## Graded DCA vs fixed daily DCA" in report
+    assert "## Sector performance matrix" in report
+    assert "## Budget and reserve effectiveness" in report
+    assert "## Execution quality" in report
+    assert "## Coverage and missed opportunities" in report
+    assert "## Weekly review notes" in report
+
+    # Check some content from the components
+    assert "Tech" in report  # Sector matrix
+    assert "100.0%" in report # Coverage
+    assert "0.1%" in report # Execution quality
+
+
+def test_build_sector_matrix():
+    run_states = [
+        {
+            "buy_candidates": [
+                {"ticker": "AAPL", "planned_amount_usd": 150.0},
+                {"ticker": "MSFT", "planned_amount_usd": 250.0},
+                {"ticker": "V", "planned_amount_usd": 100.0},
+                {"ticker": "AAPL", "planned_amount_usd": 50.0, "reason": "settlement_adjustment"}
+            ]
+        },
+        {
+            "buy_candidates": [
+                {"ticker": "JPM", "planned_amount_usd": 200.0},
+                {"ticker": "UNKNOWN", "planned_amount_usd": 50.0}
+            ]
+        }
+    ]
+
+    sector_map = {
+        "AAPL": "Technology",
+        "MSFT": "Technology",
+        "V": "Financials",
+        "JPM": "Financials"
+    }
+
+    report = build_sector_matrix(run_states, sector_map)
+
+    assert "| Financials | 2 | $300.00 |" in report
+    assert "| Technology | 3 | $450.00 |" in report
+    assert "| Unclassified | 1 | $50.00 |" in report
+
+def test_build_sector_matrix_empty():
+    run_states = [
+        {
+            "buy_candidates": []
+        }
+    ]
+    report = build_sector_matrix(run_states)
+    assert "| _no candidates_ | 0 | $0.00 |" in report
+def test_build_weekly_review_notes_empty():
+    from dca_weekly_dashboard import build_weekly_review_notes
+    res = build_weekly_review_notes([], [])
+    assert "- Runs analyzed: 0 day(s)." in res
+    assert "- All buy candidates were covered by fills." in res
+    assert "- Add qualitative notes here before the Notion dashboard refresh." in res
+
+def test_build_weekly_review_notes_all_zeros():
+    from dca_weekly_dashboard import build_weekly_review_notes
+    run_states = [{"manual_review_tickers": []}]
+    summaries = [
+        {"coverage": {"missing_fills": 0}, "execution_quality": {"target_price_missing": 0}}
+    ]
+    res = build_weekly_review_notes(run_states, summaries)
+    assert "- Runs analyzed: 1 day(s)." in res
+    assert "- All buy candidates were covered by fills." in res
+
+def test_build_weekly_review_notes_with_issues():
+    from dca_weekly_dashboard import build_weekly_review_notes
+    run_states = [
+        {"manual_review_tickers": ["AAA", "BBB"]},
+        {"manual_review_tickers": ["CCC"]}
+    ]
+    summaries = [
+        {"coverage": {"missing_fills": 2}, "execution_quality": {"target_price_missing": 1}},
+        {"coverage": {"missing_fills": 3}, "execution_quality": {"target_price_missing": 2}}
+    ]
+    res = build_weekly_review_notes(run_states, summaries)
+    assert "- Runs analyzed: 2 day(s)." in res
+    assert "- 5 buy candidate(s) had no fill — review broker rejects / caps." in res
+    assert "- 3 fill(s) lacked a target price; slippage excluded — check signal capture." in res
+    assert "- 3 manual-review flag(s) across the week — reconcile finance vs Robinhood." in res
+
+def test_build_execution_quality():
+    from dca_weekly_dashboard import build_execution_quality
+    summaries = [
+        {
+            "trading_day": "2026-07-20",
+            "execution_quality": {
+                "priced_fills": 5,
+                "target_price_missing": 1,
+                "avg_slippage_pct": 0.15,
+                "max_slippage_pct": 0.42,
+                "worst_ticker": "AAPL"
+            }
+        },
+        {
+            "trading_day": "2026-07-21",
+            "execution_quality": {
+                "priced_fills": 3,
+                "target_price_missing": 0,
+                "avg_slippage_pct": 0.25,
+                "max_slippage_pct": 0.50,
+                "worst_ticker": "TSLA"
+            }
+        },
+        {
+            "trading_day": "2026-07-22",
+        },
+        {
+            "trading_day": "2026-07-23",
+            "execution_quality": {
+                "priced_fills": 2
+            }
+        }
+    ]
+    report = build_execution_quality(summaries)
+    assert "| 2026-07-20 | 5 | 1 | 0.15% | 0.42% | AAPL |" in report
+    assert "| 2026-07-21 | 3 | 0 | 0.25% | 0.5% | TSLA |" in report
+    assert "| 2026-07-22 | 0 | 0 | n/a | n/a | n/a |" in report
+    assert "| 2026-07-23 | 2 | 0 | n/a | n/a | n/a |" in report
+    assert "| **Week avg** | | | **0.2%** | | |" in report
+
+
+# The two tests below come from PR #1332, which was opened in parallel with
+# #1313 (merged first) under the same two test names. They are kept under
+# distinct names because they pin different things: the section and table
+# headers, a settlement-adjustment row counting as an ordinary candidate,
+# and the empty-input case with NO run states at all (#1313 covers a run
+# state whose buy_candidates list is empty).
+def test_build_sector_matrix_renders_header_and_unclassified_rows():
+    run_states = [
+        {
+            "buy_candidates": [
+                {"ticker": "AAPL", "planned_amount_usd": 100.50},
+                {"ticker": "GOOGL", "planned_amount_usd": 200.00},
+                {"ticker": "UNKNOWN", "planned_amount_usd": 50.00},
+                {"ticker": "SETTLE", "planned_amount_usd": 10.00, "description": "Settlement Adjustment (10.00)"},
+            ]
+        },
+        {
+            "buy_candidates": [
+                {"ticker": "AAPL", "planned_amount_usd": 50.00},
+            ]
+        }
+    ]
+    sector_map = {"AAPL": "Technology", "GOOGL": "Technology"}
+
+    result = build_sector_matrix(run_states, sector_map)
+
+    assert "## Sector performance matrix" in result
+    assert "| Sector | Candidates | Planned $ |" in result
+    assert "| Technology | 3 | $350.50 |" in result
+    assert "| Unclassified | 2 | $60.00 |" in result
+
+
+def test_build_sector_matrix_with_no_run_states():
+    run_states = []
+
+    result = build_sector_matrix(run_states)
+
+    assert "## Sector performance matrix" in result
+    assert "| _no candidates_ | 0 | $0.00 |" in result
+
+
+def test_build_execution_quality_empty():
+    from dca_weekly_dashboard import build_execution_quality
+    report = build_execution_quality([])
+    assert "## Execution quality" in report
+    assert "| **Week avg** | | | **n/a** | | |" in report
+
+
+def test_write_weekly_dashboard_creates_file(tmp_path):
+    import os
+
+    from dca_weekly_dashboard import write_weekly_dashboard
+
+    run_states = [
+        {
+            "trading_day": "2026-07-20",
+            "status": "completed",
+            "buy_candidates": [],
+            "budget": {
+                "base_amount_usd": 3.0,
+                "day_notional_usd": 3.0,
+                "weekly_rollover_reserve_usd": 0.0,
+                "remaining_spend_today_usd": 3.0,
+            },
+        }
+    ]
+
+    # Use tmp_path from pytest
+    result_path = write_weekly_dashboard(run_states=run_states, output_dir=tmp_path, week_label="Week 42")
+
+    assert result_path == str(tmp_path / "weekly_performance_dashboard.md")
+    assert os.path.exists(result_path)
+
+    with open(result_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    assert "Weekly Performance Dashboard — Week 42" in content
+    assert "2026-07-20" in content
+
+
+def test_write_weekly_dashboard_creates_file_and_directories(tmp_path):
+    import os
+
+    from dca_weekly_dashboard import write_weekly_dashboard
+
+    run_states = [
+        {
+            "trading_day": "2026-07-20",
+            "status": "completed",
+            "buy_candidates": [],
+            "budget": {
+                "base_amount_usd": 3.0,
+                "day_notional_usd": 3.0,
+                "weekly_rollover_reserve_usd": 0.0,
+                "remaining_spend_today_usd": 3.0,
+            },
+        }
+    ]
+
+    # Path with non-existent subdirectories
+    output_dir = tmp_path / "deep" / "nested" / "dir"
+
+    result_path = write_weekly_dashboard(run_states=run_states, output_dir=output_dir, week_label="Week 42")
+
+    assert result_path == str(output_dir / "weekly_performance_dashboard.md")
+    assert os.path.exists(result_path)
+
+    with open(result_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    assert "Weekly Performance Dashboard — Week 42" in content
+    assert "2026-07-20" in content
+def test_build_coverage_missed_happy_path():
+    run_states = [
+        {
+            "trading_day": "2023-10-01",
+            "counts": {"buy_candidates": 5},
+            "manual_review_tickers": ["AAPL", "GOOG"],
+        },
+    ]
+    summaries = [
+        {
+            "trading_day": "2023-10-01",
+            "coverage": {
+                "buy_candidates": 5,
+                "fills": 4,
+                "coverage_pct": 80.0,
+                "missing_fills": 1,
+            }
+        }
+    ]
+    result = build_coverage_missed(run_states, summaries)
+    assert "## Coverage and missed opportunities" in result
+    assert "| 2023-10-01 | 5 | 4 | 80.0% | 1 | 2 |" in result
+
+
+def test_build_coverage_missed_missing_data():
+    run_states = [
+        {
+            # No trading_day
+            "counts": {"buy_candidates": 3},
+            "manual_review_tickers": [],
+        },
+        {
+            "trading_day": "2023-10-03",
+            # missing counts and manual review
+        }
+    ]
+    summaries = []
+
+    result = build_coverage_missed(run_states, summaries)
+    assert "| ? | 3 | n/a | n/a | n/a | 0 |" in result
+    assert "| 2023-10-03 | 0 | n/a | n/a | n/a | 0 |" in result
+
+
+def test_build_coverage_missed_edge_cases():
+    # Empty lists
+    result_empty = build_coverage_missed([], [])
+    assert "## Coverage and missed opportunities" in result_empty
+    # No rows should be added beyond the header (4 lines total, including empty ones)
+    assert len(result_empty.strip().split("\n")) == 4
+
+    # Explicit zeros to ensure they don't render as "n/a"
+    run_states = [
+        {
+            "trading_day": "2023-11-01",
+            "counts": {"buy_candidates": 0},
+            "manual_review_tickers": [],
+        }
+    ]
+    summaries = [
+        {
+            "trading_day": "2023-11-01",
+            "coverage": {
+                "buy_candidates": 0,
+                "fills": 0,
+                "coverage_pct": 0.0,
+                "missing_fills": 0,
+            }
+        }
+    ]
+    result_zeros = build_coverage_missed(run_states, summaries)
+    assert "| 2023-11-01 | 0 | 0 | 0.0% | 0 | 0 |" in result_zeros
+
+    # Only run_states, no matching summary for the day
+    run_states_no_summary = [
+        {
+            "trading_day": "2023-11-02",
+            "counts": {"buy_candidates": 10},
+        }
+    ]
+    result_no_summary = build_coverage_missed(run_states_no_summary, [])
+    assert "| 2023-11-02 | 10 | n/a | n/a | n/a | 0 |" in result_no_summary
+
+    # Coverage has buy_candidates but missing counts in run_states
+    run_states_no_counts = [
+        {"trading_day": "2023-11-03"}
+    ]
+    summaries_with_cov = [
+        {
+            "trading_day": "2023-11-03",
+            "coverage": {"buy_candidates": 5}
+        }
+    ]
+    result_cov_candidates = build_coverage_missed(run_states_no_counts, summaries_with_cov)
+    assert "| 2023-11-03 | 5 | n/a | n/a | n/a | 0 |" in result_cov_candidates

@@ -67,8 +67,6 @@ from typing import Any, Callable, Sequence
 import numpy as np
 import pandas as pd
 import torch  # type: ignore[import-not-found,import-untyped]
-from torch import nn  # type: ignore[import-not-found,import-untyped]
-
 from data import COMPONENTS, TrainingPanel
 from market_encoder import MarketDayEncoder
 from model_interface import (
@@ -85,6 +83,7 @@ from model_interface import (
     write_metadata,
 )
 from replay_buffer import ReservoirBuffer
+from torch import nn  # type: ignore[import-not-found,import-untyped]
 
 #: Feature columns holding the day's own bar -- the reconstruction target.
 _BAR_SLICE = slice(0, 4)
@@ -106,6 +105,13 @@ def resolve_device(requested: str) -> str:
     return "cpu"
 
 
+#: Embedding-table size for the style cluster. Sized once at construction
+#: and checkpointed with the weights, so it is a ceiling rather than the
+#: panel's actual k -- a panel clustered more finely clamps into it instead
+#: of failing a resume on a shape mismatch.
+_MAX_CLUSTERS = 16
+
+
 class _OctopusNet(nn.Module):
     def __init__(
         self,
@@ -120,6 +126,7 @@ class _OctopusNet(nn.Module):
         vocab_size: int,
         n_latents: int,
         market_summary_dim: int,
+        n_clusters: int = _MAX_CLUSTERS,
     ) -> None:
         super().__init__()
         self.window_len = window_len
@@ -148,6 +155,26 @@ class _OctopusNet(nn.Module):
             n_heads=n_heads,
             ticker_embedding=self.ticker_embedding,
         )
+        # Constructed LAST on purpose. Every nn.Module above draws its
+        # initial weights from the same torch RNG stream, so inserting a new
+        # parameter earlier would shift every later tensor's initialization
+        # and silently change the trajectory of runs that are otherwise
+        # unaffected by this feature -- which showed up as the mask-ticker
+        # reconstruction diagnostic regressing on a fixed seed. Appending
+        # leaves every pre-existing parameter initialized exactly as before.
+        # +1 because index 0 is the reserved "not assigned yet" label a
+        # ticker wears until the correlation window has filled.
+        # Sized to a FIXED capacity, not to the panel that happened to fit
+        # this model. bind_panel() swaps panels during a live cycle and
+        # expands only the ticker embedding, so a table sized from the
+        # initial panel would either clamp genuinely new styles together or,
+        # for a model first fit on a single-cluster universe, drop them
+        # entirely -- silently, in forecasts and online updates alike
+        # (Copilot review). A constant capacity is also what makes the
+        # state_dict layout stable across a resume. +1 because index 0 is
+        # the reserved "not assigned yet" label a ticker wears until the
+        # correlation window has filled.
+        self.cluster_embedding = nn.Embedding(n_clusters + 1, d_model)
         causal = torch.triu(torch.ones(window_len, window_len, dtype=torch.bool), diagonal=1)
         self.register_buffer("causal_mask", causal)
 
@@ -157,6 +184,7 @@ class _OctopusNet(nn.Module):
         market: torch.Tensor,  # (B, L, d)
         ticker_ids: torch.Tensor,  # (B,)
         day_of_week: torch.Tensor,  # (B, L)
+        cluster_id: torch.Tensor | None = None,  # (B, L)
         mask_positions: torch.Tensor | None = None,  # (B, L) bool
         mask_mode: str | None = None,
     ) -> torch.Tensor:
@@ -171,6 +199,15 @@ class _OctopusNet(nn.Module):
             + self.ticker_embedding(ticker_ids.long()).unsqueeze(1)
             + self.dow_embedding(day_of_week.long())
         )
+        if cluster_id is not None:
+            # cluster_id is stored compactly as int8 in panel and request
+            # artifacts, and nn.Embedding needs Long/Int indices -- the same
+            # normalization ticker_ids and day_of_week already get here.
+            # Clamped because the table is sized for the configured k and a
+            # panel built with a larger one must degrade to a valid index
+            # rather than index out of bounds mid-forecast.
+            clusters = cluster_id.to(dtype=torch.long).clamp(0, self.cluster_embedding.num_embeddings - 1)
+            base = base + self.cluster_embedding(clusters)
         f = self.feat_proj(windows)
         m = self.market_proj(market)
         tok = base + f + m
@@ -279,6 +316,7 @@ class OctopusModel:
             vocab_size=len(self._vocab),
             n_latents=self.hyper["n_latents"],
             market_summary_dim=panel.market_summary.shape[1],
+            n_clusters=_MAX_CLUSTERS,
         ).to(self.device)
         self._optimizer = torch.optim.AdamW(self._net.parameters(), lr=self.hyper["lr_fit"])
         self._replay = ReservoirBuffer(self.hyper["replay_capacity"], _derive(seed, "replay"))
@@ -339,7 +377,11 @@ class OctopusModel:
                 tensors = self._tensors_from_requests(chunk)
                 market = self._market_tensor(tensors["cal_pos"], in_graph_final=False)
                 tok = self._net.tokens(
-                    tensors["windows"], market, tensors["ticker_ids"], tensors["day_of_week"]
+                    tensors["windows"],
+                    market,
+                    tensors["ticker_ids"],
+                    tensors["day_of_week"],
+                    tensors["cluster_id"],
                 )
                 raw = self._net.causal_forward(tok, tensors["padding"])
                 raw = raw.view(len(chunk), len(COMPONENTS), 1 + len(QUANTILES)).cpu().numpy()
@@ -419,6 +461,7 @@ class OctopusModel:
                     market,
                     tensors["ticker_ids"],
                     tensors["day_of_week"],
+                    tensors["cluster_id"],
                     mask_positions=final_only,
                     mask_mode=mode,
                 )
@@ -545,6 +588,7 @@ class OctopusModel:
             vocab_size=len(model._vocab),
             n_latents=model.hyper["n_latents"],
             market_summary_dim=panel.market_summary.shape[1],
+            n_clusters=_MAX_CLUSTERS,
         ).to(model.device)
         state = {
             key[len("net.") :]: torch.from_numpy(np.array(value))
@@ -654,18 +698,21 @@ class OctopusModel:
         windows = np.stack([self._normalize(request.features_window) for request in requests])
         masks = np.stack([request.window_mask for request in requests])
         dows = np.stack([np.clip(request.day_of_week, 0, 6) for request in requests]).astype(np.int64)
+        clusters = np.stack(
+            [np.clip(request.cluster_id, 0, _MAX_CLUSTERS) for request in requests]
+        ).astype(np.int64)
         ids = np.array([self._ticker_id(request.ticker) for request in requests], dtype=np.int64)
         cal_pos = np.stack([self._calendar_positions(request.window_dates) for request in requests])
         return {
             "windows": torch.from_numpy(windows).to(self.device),
             "padding": torch.from_numpy(~masks).to(self.device),
             "day_of_week": torch.from_numpy(dows).long().to(self.device),
+            "cluster_id": torch.from_numpy(clusters).long().to(self.device),
             "ticker_ids": torch.from_numpy(ids).to(self.device),
             "cal_pos": torch.from_numpy(cal_pos).to(self.device),
         }
 
     def _tensors_from_rows(self, refs: list[tuple[str, int]]) -> dict[str, torch.Tensor]:
-        assert self._panel is not None
         from model_interface import make_request
 
         assert self._panel is not None
@@ -791,7 +838,11 @@ class OctopusModel:
 
         # -- forward (causal) loss ------------------------------------------
         tok = self._net.tokens(
-            tensors["windows"], market, tensors["ticker_ids"], tensors["day_of_week"]
+            tensors["windows"],
+            market,
+            tensors["ticker_ids"],
+            tensors["day_of_week"],
+            tensors["cluster_id"],
         )
         raw = self._net.causal_forward(tok, tensors["padding"]).view(batch, len(COMPONENTS), 1 + len(QUANTILES))
         targets = tensors["targets"]
@@ -817,6 +868,7 @@ class OctopusModel:
                 market.detach(),
                 tensors["ticker_ids"],
                 tensors["day_of_week"],
+                tensors["cluster_id"],
                 mask_positions=mask_positions,
                 mask_mode=mode,
             )

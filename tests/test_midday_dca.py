@@ -61,6 +61,9 @@ from near_close_dca import (  # noqa: E402
     graded_buy_multiplier,
 )
 
+# Live simulations use their supplied historical clock; session/calendar gates stay enabled.
+pytestmark = pytest.mark.usefixtures("historical_live_clock")
+
 
 def _now_midday():
     """Decision timestamp for the 12:30 PM ET live execution."""
@@ -247,25 +250,23 @@ def test_midday_default_prior_allocation_roots_include_market_open_and_intraday(
     # against morning_dca's IMPORT-TIME constants. conftest's autouse
     # _isolate_cron_tracking_root sets that variable per test, so drop it here
     # to compare the unset default against the unset default.
-    monkeypatch.delenv("DCA_CRON_TRACKING_ROOT", raising=False)
     # Codex review ("Feed market-open fills into later top-up guards"; "Include
     # the 11:30 intraday run in midday context"): the midday guard's own
     # hardcoded default prior_allocation_roots must scan the 9:35 market-open
     # and 11:30/13:30/14:30 intraday roots in addition to morning/afternoon,
     # so those earlier same-day fills offset the 12:30 desired amount instead
     # of being re-bought as first allocations.
-    from morning_dca import (
-        DEFAULT_AFTERNOON_TASK_ROOT,
-        DEFAULT_INTRADAY_TASK_ROOT,
-        DEFAULT_MARKET_OPEN_TASK_ROOT,
-        DEFAULT_MORNING_LIVE_STATE_ROOT,
-    )
-
-    roots = MiddayConfig().prior_allocation_roots
-    assert DEFAULT_MARKET_OPEN_TASK_ROOT in roots
-    assert DEFAULT_MORNING_LIVE_STATE_ROOT in roots
-    assert DEFAULT_INTRADAY_TASK_ROOT in roots
-    assert DEFAULT_AFTERNOON_TASK_ROOT in roots
+    # Constants must be imported after removing the ambient override; deleting
+    # it in this already-imported test process cannot change those constants.
+    probe = """
+from dca_paths import DEFAULT_CRON_TRACKING_ROOT
+from midday_dca import MiddayConfig
+roots = MiddayConfig().prior_allocation_roots
+for stream in ('market_open_dca', 'morning_dca', 'intraday_dca', 'ce16ba6b'):
+    assert f'{DEFAULT_CRON_TRACKING_ROOT}/{stream}' in roots
+"""
+    env = {k: v for k, v in os.environ.items() if k not in (CRON_TRACKING_ROOT_ENV, "DCA_CONFIG_DIR")}
+    subprocess.run([sys.executable, "-c", probe], cwd=Path(__file__).resolve().parent.parent, env=env, check=True)
 
 
 def test_midday_default_prior_allocation_roots_resolve_at_construction_time():
@@ -767,6 +768,9 @@ class _TopUpDuplicateBroker:
     def available_buying_power(self):
         return 500.0
 
+    def same_day_ticker_notional_usd(self, ticker, trading_day):
+        return 14.0 if self.duplicate else 2.0
+
     def same_day_strategy_order_exists(self, ticker, trading_day):
         self.broad_duplicate_calls += 1
         return True
@@ -930,7 +934,7 @@ def test_guarded_midday_top_up_ignores_cross_stream_duplicate_for_incremental_or
     res = ex.run(_now_midday(), data, broker=cast(Any, broker))
 
     assert broker.broad_duplicate_calls == 0
-    assert broker.same_stream_calls == 1
+    assert broker.same_stream_calls == 2
     assert broker.placed == [("BIG", 8.0, "midday-dca-topup-2026-07-08-BIG")]
     assert res["artifacts"]["broker_outcomes"]["BIG"]["status"] == "submitted"
 
@@ -1185,6 +1189,7 @@ def test_load_midday_config_appends_dated_manual_override_to_configured_cap_seed
 
     cfg = load_midday_config(str(cfg_dir))
 
+    assert cfg.cap_seed_roots is not None
     assert configured_root in cfg.cap_seed_roots
     assert str(override_dir) in cfg.cap_seed_roots
 
@@ -1417,17 +1422,23 @@ def test_midday_executor_default_init_loads_shipped_config(monkeypatch):
     # Same reason as the prior-allocation-roots test above: this asserts the
     # loaded state_root against an import-time constant, so the autouse
     # $DCA_CRON_TRACKING_ROOT isolation must be dropped for the comparison.
-    monkeypatch.delenv("DCA_CRON_TRACKING_ROOT", raising=False)
-    ex = MiddayDCAExecutor()
-    assert ex.config.base_buy_amount_usd == 2.0
+    probe = """
+from datetime import date
+from midday_dca import MiddayDCAExecutor, DEFAULT_MIDDAY_LIVE_STATE_ROOT
+from near_close_dca import StrategyConfig
+ex = MiddayDCAExecutor()
+assert ex.config.base_buy_amount_usd == 2.0
     # Shared Normal-tier ceiling (near_close_dca.BUDGET_TIERS[0]), not the old
     # isolated 90.0 per-stream half-share -- see midday_dca.py's
     # DEFAULT_MIDDAY_DAILY_CAP_USD comment (pooling fix, 2026-08-02).
-    assert ex.config.morning_daily_cap_usd == 180.0
-    assert date(2026, 7, 2) in ex.config.approved_test_dates
-    assert date(2026, 8, 28) in ex.config.approved_test_dates
-    assert ex.state_root == DEFAULT_MIDDAY_LIVE_STATE_ROOT
-    assert ex.config.sizing_tiers == StrategyConfig().sizing_tiers
+assert ex.config.morning_daily_cap_usd == 180.0
+assert date(2026, 7, 2) in ex.config.approved_test_dates
+assert date(2026, 8, 28) in ex.config.approved_test_dates
+assert ex.state_root == DEFAULT_MIDDAY_LIVE_STATE_ROOT
+assert ex.config.sizing_tiers == StrategyConfig().sizing_tiers
+"""
+    env = {k: v for k, v in os.environ.items() if k not in (CRON_TRACKING_ROOT_ENV, "DCA_CONFIG_DIR")}
+    subprocess.run([sys.executable, "-c", probe], cwd=Path(__file__).resolve().parent.parent, env=env, check=True)
 
 
 def test_midday_ledger_namespace_isolated_from_morning_and_afternoon(tmp_path):
@@ -1716,3 +1727,26 @@ def test_unconfigured_state_root_resolves_at_executor_construction_time():
         check=True,
     )
     assert out.stdout.strip() == "/srv/midday-fallback-probe/midday_dca", out.stdout
+
+
+def test_load_midday_config_with_an_unresolvable_account_pins_none_and_warns(tmp_path, monkeypatch, caplog):
+    """2026-09-07 diagnostic T:F13. The allow_unpinned_account branch must set
+    target_account_number to None EXPLICITLY (the dataclass default is the
+    import-time module constant, a real account on a configured machine) and
+    say so, so the live run records account_pinning_failed rather than trading
+    an unintended account."""
+    import logging
+
+    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+    (tmp_path / "midday_dca.json").write_text(
+        json.dumps({"live_task": {"broker_account": "robinhood:${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}"}}),
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING):
+        cfg = load_midday_config(str(tmp_path), allow_unpinned_account=True)
+    assert cfg.target_account_number is None
+    assert "fail closed" in caplog.text
+    from dca_config import MissingConfigEnvError
+
+    with pytest.raises(MissingConfigEnvError):
+        load_midday_config(str(tmp_path), allow_unpinned_account=False)

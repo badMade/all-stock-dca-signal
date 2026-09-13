@@ -7,6 +7,7 @@ data -- never the real (gitignored, possibly-absent) ticker_data/ archive.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -30,12 +31,17 @@ def make_synthetic_ohlcv(
     high = close * (1.0 + rng.uniform(0.0, 0.01, size=n))
     low = close * (1.0 - rng.uniform(0.0, 0.01, size=n))
     open_ = np.concatenate([[close[0]], close[:-1]]) * (1.0 + rng.normal(0.0, 0.002, size=n))
-    frame = pd.DataFrame(
-        {"Date": dates, "Open": open_, "High": high, "Low": low, "Close": close, "Adj Close": close}
-    )
+    data: dict[str, Any] = {
+        "Date": dates,
+        "Open": open_,
+        "High": high,
+        "Low": low,
+        "Close": close,
+        "Adj Close": close,
+    }
     if with_volume:
-        frame["Volume"] = rng.integers(500_000, 5_000_000, size=n)
-    return frame
+        data["Volume"] = rng.integers(500_000, 5_000_000, size=n)
+    return pd.DataFrame(data)
 
 
 def write_ticker_csv(history_dir: Path, ticker: str, frame: pd.DataFrame) -> Path:
@@ -53,3 +59,16 @@ def synthetic_history_dir(tmp_path: Path) -> Path:
     write_ticker_csv(history_dir, "BBB", make_synthetic_ohlcv(seed=2, drift=-0.0002))
     write_ticker_csv(history_dir, "CCC", make_synthetic_ohlcv(seed=3, drift=0.0001, with_volume=False))
     return history_dir
+
+
+@pytest.fixture
+def dip_dataset(tmp_path: Path) -> pd.DataFrame:
+    from features import build_dataset
+
+    history_dir = tmp_path / "ticker_data"
+    history_dir.mkdir()
+    write_ticker_csv(history_dir, "AAA", make_synthetic_ohlcv(seed=31, n=260, drift=0.0004))
+    write_ticker_csv(history_dir, "BBB", make_synthetic_ohlcv(seed=32, n=260, drift=-0.0002))
+    write_ticker_csv(history_dir, "CCC", make_synthetic_ohlcv(seed=33, n=260, drift=0.0001))
+    dataset = build_dataset(history_dir, ["AAA", "BBB", "CCC"])
+    return dataset[dataset["dip_day"]].reset_index(drop=True)

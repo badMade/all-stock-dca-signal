@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import smtplib
+import ssl
 import sys
 import traceback
 import urllib.error
@@ -37,7 +38,7 @@ from datetime import date, datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Third-party imports
@@ -457,12 +458,14 @@ class SentimentAnalyzer:
             return []
 
         # Batch inference — HuggingFace pipeline handles batching internally
-        raw_results = self._pipeline(texts)
+        raw_results: Any = self._pipeline(texts)
 
         output = []
         for text, label_scores in zip(texts, raw_results):
             # label_scores is a list of {'label': str, 'score': float}
-            score_map = {item["label"].lower(): item["score"] for item in label_scores}
+            score_map: dict[str, float] = {
+                str(item["label"]).lower(): float(item["score"]) for item in label_scores
+            }
             pos = score_map.get("positive", 0.0)
             neg = score_map.get("negative", 0.0)
             neu = score_map.get("neutral", 0.0)
@@ -611,10 +614,14 @@ class SECCollector:
 
     FILING_TYPES = ["8-K", "10-K", "10-Q"]
     MAX_FILINGS = 3  # filings per form type (9 total per ticker)
-    HEADERS = {
-        "User-Agent": "SentimentMonitor/1.0 (contact@example.com)",
-        "Accept-Encoding": "gzip, deflate",
-    }
+
+    @property
+    def headers(self) -> dict:
+        import os
+        return {
+            "User-Agent": os.environ.get("SEC_EDGAR_USER_AGENT", "SentimentMonitor/1.0 (contact@example.com)"),
+            "Accept-Encoding": "gzip, deflate",
+        }
 
     def fetch_filings(self, ticker: str) -> List[Dict]:
         """
@@ -641,7 +648,7 @@ class SECCollector:
                 resp = requests.get(
                     url,
                     params=params,
-                    headers=self.HEADERS,
+                    headers=self.headers,
                     timeout=15,
                 )
                 resp.raise_for_status()
@@ -916,7 +923,7 @@ class EmailBriefing:
         try:
             with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30) as server:
                 server.ehlo()
-                server.starttls()
+                server.starttls(context=ssl.create_default_context())
                 server.login(self.smtp_user, self.smtp_password)
                 server.sendmail(self.smtp_user, [self.recipient], msg.as_string())
             logger.info("Email sent to %s via %s:%d", self.recipient, self.smtp_host, self.smtp_port)

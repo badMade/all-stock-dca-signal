@@ -1,4 +1,4 @@
-Send that for me---
+---
 name: tickers-daily-update-DEPRECATED
 description: "DEPRECATED / DO NOT USE -- superseded by .claude/skills/tickers-daily-update/SKILL.md. Retained for historical context only."
 ---

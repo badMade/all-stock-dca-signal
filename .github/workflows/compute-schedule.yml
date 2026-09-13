@@ -38,13 +38,13 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -118,7 +118,15 @@ jobs:
           # treats 4+ leading spaces as a code block, which silently broke
           # this PR body's rendering before (Codex review, PR #389, same
           # defect self-heal.yml already avoids with printf).
-          BODY="$(printf '## Self-Heal Schedule Update\n\n**Summary:** Updates the self-heal cadence in `.github/self-heal-schedule.yml` to `%s` (%s).\n\n**Tests/checks run:** None -- this workflow only rewrites schedule metadata and, when present, the marked cron line in `self-heal.yml`; it does not touch application code.\n\n**Known limitations:** `self-heal.yml` currently has no `schedule:` trigger, so this cadence change has no effect on when the self-heal repair job runs until one is added (see that workflow'"'"'s own header for why).\n\n**Secrets:** None added -- this run only edits YAML schedule metadata.\n\nReview before merging.\n' "$NEW_SCHEDULE" "$RATIONALE")"
+          # "Known limitations" used to claim self-heal.yml has no `schedule:`
+          # trigger at all, so a cadence change here would have no effect --
+          # false, and misleading to reviewers of every monthly cadence PR:
+          # self-heal.yml DOES declare a `schedule:` trigger, with its own
+          # cron line marked `# AUTO-UPDATED` for exactly this workflow to
+          # rewrite (see the "marked cron line in self-heal.yml" step below).
+          # Corrected to describe what actually happens (Codex review, PR
+          # #1299: "Remove the false no-schedule limitation").
+          BODY="$(printf '## Self-Heal Schedule Update\n\n**Summary:** Updates the self-heal cadence in `.github/self-heal-schedule.yml` to `%s` (%s).\n\n**Tests/checks run:** None -- this workflow only rewrites schedule metadata and, when present, the marked (`# AUTO-UPDATED`) cron line in `self-heal.yml`; it does not touch application code.\n\n**Effect:** `self-heal.yml` already declares a `schedule:` trigger, so once merged this cadence takes effect on its next scheduled run -- there is no separate step required to wire one up.\n\n**Secrets:** None added -- this run only edits YAML schedule metadata.\n\nReview before merging.\n' "$NEW_SCHEDULE" "$RATIONALE")"
 
           # Same bot-owned filter as the "Close stale schedule PR" step above
           # -- see that step's comment for why `--label` alone isn't a safe

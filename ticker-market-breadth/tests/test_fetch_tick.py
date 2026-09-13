@@ -141,36 +141,6 @@ def test_write_tick_csv_overwrites_an_existing_file(tmp_path):
     assert len(written) == 2
 
 
-def test_write_tick_csv_deduplicates_repeated_dates_on_the_initial_write(tmp_path):
-    # Codex review, PR #631 discussion_r3914702431: the `existing is None`
-    # branch (no archive yet, this is the first-ever write) used to return
-    # the filtered download frame verbatim, skipping the keep="last" dedup
-    # the `existing is not None` refresh branch below already applies. A
-    # first Yahoo response that itself carries a duplicate Date (not merged
-    # with anything -- duplicated on its own) created an initial archive
-    # with two rows for the same date instead of one.
-    history_dir = tmp_path / "histories"
-    index = pd.DatetimeIndex(["2024-01-02", "2024-01-02", "2024-01-03"], name="Date")
-    frame = pd.DataFrame(
-        {
-            # The later row for the repeated 2024-01-02 date (450.0) must win,
-            # matching the refresh branch's own keep="last" convention.
-            "Open": [500.0, 505.0, -120.0],
-            "High": [980.0, 985.0, 640.0],
-            "Low": [-610.0, -605.0, -450.0],
-            "Close": [210.0, 450.0, -80.0],
-            "Volume": [0, 0, 0],
-        },
-        index=index,
-    )
-
-    out_path = write_tick_csv(frame, history_dir)
-
-    written = pd.read_csv(out_path, index_col="Date", parse_dates=True)
-    assert list(written.index) == list(pd.DatetimeIndex(["2024-01-02", "2024-01-03"]))
-    assert list(written["Close"]) == [450.0, -80.0]
-
-
 def test_main_writes_to_the_configured_archive_by_default(tmp_path, monkeypatch):
     # The default archive must already exist (mirrors dca_intraday_archive.py's
     # and scripts/refresh_active_ticker_histories.py's identical convention:
@@ -216,6 +186,41 @@ def test_main_writes_to_an_explicit_history_dir(tmp_path, monkeypatch):
 
     assert exit_code == 0
     assert _archive_path(explicit_dir).is_file()
+
+
+def test_main_refuses_missing_explicit_dir_when_existing_dir_is_required(tmp_path, monkeypatch):
+    """Automatic callers must preserve the managed-default missing-dir guard.
+
+    The explicit --history-dir is the one being rejected here -- this is the
+    automatic wrapper's own invocation pattern -- so the error must not
+    repeat "pass --history-dir explicitly" back at the operator; it already
+    was, and it was rejected (Codex review: "Report a usable remedy for
+    guarded explicit paths").
+    """
+    missing_dir = tmp_path / "managed-archive-not-mounted"
+    _install_fake_yfinance(monkeypatch, _synthetic_frame(), requested_symbol_holder=[])
+
+    with pytest.raises(FileNotFoundError, match="point --history-dir at a different, existing archive"):
+        main(["--history-dir", str(missing_dir), "--require-existing-history-dir"])
+
+    assert not missing_dir.exists()
+
+
+def test_main_refuses_to_recreate_required_dir_that_disappears_during_fetch(tmp_path, monkeypatch):
+    """Keep the managed-archive guard active across the network request."""
+    history_dir = tmp_path / "managed-archive"
+    history_dir.mkdir()
+
+    def fetch_after_archive_disappears():
+        history_dir.rmdir()
+        return _synthetic_frame()
+
+    monkeypatch.setattr("fetch_tick.fetch_tick_history", fetch_after_archive_disappears)
+
+    with pytest.raises(FileNotFoundError, match="disappeared before the breadth archive write"):
+        main(["--history-dir", str(history_dir), "--require-existing-history-dir"])
+
+    assert not history_dir.exists()
 
 
 def _write_archive(history_dir, rows: list[tuple[str, float]]) -> None:

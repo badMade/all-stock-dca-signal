@@ -27,6 +27,7 @@ import logging
 import os
 import shutil
 import smtplib
+import ssl
 import sys
 import traceback
 import urllib.error
@@ -83,7 +84,7 @@ SEC_EFTS_URL = "https://efts.sec.gov/LATEST/search-index"
 
 # SEC requires a descriptive User-Agent per their policy:
 # https://www.sec.gov/developer
-SEC_USER_AGENT = "MondaySentimentBot/1.0 contact@example.com"
+SEC_USER_AGENT = os.environ.get("SEC_EDGAR_USER_AGENT", "MondaySentimentBot/1.0 contact@example.com")
 
 # FinBERT model from HuggingFace
 FINBERT_MODEL = "ProsusAI/finbert"
@@ -1010,7 +1011,7 @@ def send_email(
     try:
         with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
             server.ehlo()
-            server.starttls()
+            server.starttls(context=ssl.create_default_context())
             server.ehlo()
             server.login(smtp_user, smtp_password)
             server.sendmail(smtp_user, recipient, msg.as_string())

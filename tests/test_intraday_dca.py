@@ -17,31 +17,16 @@ Runnable with ``pytest`` or ``python test_intraday_dca.py``.
 """
 
 import json
-import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
 import pytest
+from test_morning_dca import DecliningBarsProvider
 
-# Moved into tests/ from the repo root (2026-08-23). ``pytest``/``python -m
-# pytest`` already resolve these first-party imports via pyproject.toml's
-# `pythonpath = [".", "tests"]`, but this file's own docstring documents a
-# second, direct-execution contract (``python tests/test_intraday_dca.py``)
-# that pythonpath doesn't cover -- running a script directly only adds ITS
-# OWN directory (tests/) to sys.path, not the repo root, so every import
-# below would otherwise raise ModuleNotFoundError under that path before the
-# `__main__` guard's own pytest.main() call ever runs (Codex review: "Retain
-# direct execution for relocated tests").
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-from test_morning_dca import DecliningBarsProvider  # noqa: E402
-
-from conftest import FIXTURE_ACCOUNT_NUMBER  # noqa: E402
-from dca_paths import CRON_TRACKING_ROOT_ENV, stream_root  # noqa: E402
-from intraday_dca import (  # noqa: E402
+from conftest import FIXTURE_ACCOUNT_NUMBER
+from dca_paths import CRON_TRACKING_ROOT_ENV, stream_root
+from intraday_dca import (
     DEFAULT_INTRADAY_DAILY_CAP_USD,
     DEFAULT_INTRADAY_WEEKLY_CAP_USD,
     INTRADAY_LIVE_CRON_ID,
@@ -54,12 +39,16 @@ from intraday_dca import (  # noqa: E402
     default_intraday_prior_allocation_roots,
     load_intraday_config,
 )
-from morning_dca import Bar  # noqa: E402
-from near_close_dca import EASTERN, ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, SourceName, StrategyConfig  # noqa: E402
+from morning_dca import Bar
+from near_close_dca import EASTERN, ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, SourceName, StrategyConfig
 
 TRADING_DAY = date(2026, 7, 8)
 
 SLOT_TIMES = {"1130": time(11, 30), "1330": time(13, 30), "1430": time(14, 30)}
+
+
+# Live simulations use their supplied historical clock; session/calendar gates stay enabled.
+pytestmark = pytest.mark.usefixtures("historical_live_clock")
 
 
 def _now_slot(slot):
@@ -517,3 +506,36 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# --- 2026-09-07 diagnostic T:F06: the intraday pointer contract ---------------
+def test_intraday_scheduled_run_writes_only_its_own_pointer(tmp_path):
+    """The one stream that fires three times a day had no test pinning that a
+    scheduled run writes latest_intraday_run.json and never another stream's
+    pointer (market_open, midday and morning each have this pair)."""
+    root = tmp_path / "intraday"
+    ex = IntradayDCAExecutor(_cfg(tmp_path, live_execution_enabled=False), slot="1130")
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.05})
+    res = ex.run(_now_slot("1130"), data, broker=_Broker())
+    assert "latest_intraday_run" in res["paths"]
+    pointer = root / "latest_intraday_run.json"
+    assert pointer.exists()
+    pdata = json.loads(pointer.read_bytes())
+    assert pdata["stream"] == "intraday"
+    assert pdata["trading_day"] == TRADING_DAY.isoformat()
+    for other in ("latest_morning_run.json", "latest_midday_run.json", "latest_market_open_run.json", "latest_scheduled_run.json"):
+        assert not (root / other).exists()
+        assert not (tmp_path / other).exists()
+
+
+def test_intraday_manual_run_never_touches_the_pointer(tmp_path):
+    root = tmp_path / "intraday"
+    ex = IntradayDCAExecutor(_cfg(tmp_path, live_execution_enabled=False), slot="1330")
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.05})
+    res = ex.run(_now_slot("1330"), data, broker=_Broker(), manual=True)
+    rc = res["artifacts"]["run_classification"]
+    assert rc["run_origin"] == "manual"
+    assert rc["manual_run"] is True
+    assert rc["run_id"].startswith("manual_intraday_live_")
+    assert "latest_intraday_run" not in res["paths"]
+    assert not (root / "latest_intraday_run.json").exists()

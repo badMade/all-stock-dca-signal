@@ -15,14 +15,14 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
-import pandas as pd
-import pytest
-
-from conftest import make_synthetic_ohlcv, write_ticker_csv
+from typing import Any, cast
 
 import model as model_module
+import pandas as pd
+import pytest
 import train as train_module
+
+from conftest import make_synthetic_ohlcv, write_ticker_csv
 
 ML_FORECASTER_DIR = Path(__file__).resolve().parent.parent
 
@@ -58,7 +58,7 @@ def test_main_scores_adjustments_from_build_feature_frames_latest_row_not_the_st
     assert exit_code == 0
 
     run_dir = _find_run_dir(models_dir, "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     fitted = model_module.TrainedModel.load(run_dir / "model.json")
 
     feature_frame = train_module.build_feature_frame(history_dir, ["AAA"])
@@ -108,7 +108,7 @@ def test_main_excludes_archive_rows_after_now_for_a_historical_replay(tmp_path):
     assert exit_code == 0
 
     run_dir = _find_run_dir(tmp_path / "models", replay_now.date().isoformat())
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     fitted = model_module.TrainedModel.load(run_dir / "model.json")
 
     # What SHOULD be scored: the row at/before replay_now, from a properly
@@ -240,7 +240,7 @@ def test_main_defaults_to_the_active_ticker_config_not_the_full_archive(tmp_path
     assert exit_code == 0
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert set(report["tickers"]) == {"AAA", "BBB"}
 
     stderr = capsys.readouterr().err
@@ -376,7 +376,7 @@ def test_main_excludes_a_ticker_listed_in_both_active_and_excluded(tmp_path):
     assert exit_code == 0
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert set(report["tickers"]) == {"AAA"}
 
 
@@ -522,7 +522,7 @@ def test_main_all_tickers_in_archive_flag_restores_full_archive_discovery(tmp_pa
     assert exit_code == 0
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert set(report["tickers"]) == {"AAA", "BBB", "CCC", "DDD"}
 
 
@@ -566,7 +566,7 @@ def test_two_same_date_runs_do_not_overwrite_each_others_artifacts(tmp_path):
     )
     assert exit_code_1 == 0
     run_dir_1 = _find_run_dir(models_dir, "2024-06-01")
-    report_1 = json.loads((run_dir_1 / "eval_report.json").read_text(encoding="utf-8"))
+    report_1 = json.loads((run_dir_1 / "eval_report.json").read_bytes())
     model_json_1_before = (run_dir_1 / "model.json").read_text(encoding="utf-8")
 
     exit_code_2 = train_module.main(
@@ -582,9 +582,9 @@ def test_two_same_date_runs_do_not_overwrite_each_others_artifacts(tmp_path):
 
     # The FIRST run's artifacts are untouched by the second run.
     assert (run_dir_1 / "model.json").read_text(encoding="utf-8") == model_json_1_before
-    assert json.loads((run_dir_1 / "eval_report.json").read_text(encoding="utf-8")) == report_1
+    assert json.loads((run_dir_1 / "eval_report.json").read_bytes()) == report_1
     # Each run's model_version is distinct, tying it to its own run directory.
-    report_2 = json.loads((run_dir_2 / "eval_report.json").read_text(encoding="utf-8"))
+    report_2 = json.loads((run_dir_2 / "eval_report.json").read_bytes())
     assert report_1["model_version"] != report_2["model_version"]
 
 
@@ -622,7 +622,7 @@ def test_main_excludes_a_stale_ticker_snapshot_from_adjustments(tmp_path, capsys
     assert exit_code == 0
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert "FRESH" in report["adjustments"]
     assert "STALE" not in report["adjustments"]
 
@@ -656,7 +656,7 @@ def test_main_dry_run_refuses_when_every_snapshot_is_stale(tmp_path, capsys):
     assert exit_code == 0  # --dry-run itself never fails
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert report["status"] == "blocked_no_fresh_snapshot"
     assert report["adjustments"] == {}
 
@@ -691,7 +691,7 @@ def test_main_live_refuses_and_does_not_publish_when_every_snapshot_is_stale(tmp
     assert exit_code == 1
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert report["status"] == "blocked_no_fresh_snapshot"
     assert "publish_result" not in report  # guarded_publish() was never even called
 
@@ -793,7 +793,7 @@ def test_main_shortens_published_staleness_budget_by_the_snapshots_own_age(tmp_p
     start_date = pd.bdate_range(end=target_last_business_day, periods=45)[0]
     write_ticker_csv(
         history_dir, "AAA",
-        make_synthetic_ohlcv(seed=41, n=45, start=start_date.date().isoformat(), drift=0.0004),
+        make_synthetic_ohlcv(seed=41, n=45, start=cast(Any, start_date).date().isoformat(), drift=0.0004),
     )
     write_ticker_csv(
         history_dir, "BBB",
@@ -868,7 +868,7 @@ def test_main_live_refuses_to_publish_a_replay_that_drifts_from_the_real_wall_cl
     assert exit_code == 1
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert report["status"] == "blocked_replay_not_current"
 
     stderr = capsys.readouterr().err
@@ -903,7 +903,7 @@ def test_main_live_refuses_a_forward_dated_now_even_within_the_staleness_budget(
     start_date = pd.bdate_range(end=target_last_business_day, periods=45)[0]
     write_ticker_csv(
         history_dir, "AAA",
-        make_synthetic_ohlcv(seed=41, n=45, start=start_date.date().isoformat(), drift=0.0004),
+        make_synthetic_ohlcv(seed=41, n=45, start=cast(Any, start_date).date().isoformat(), drift=0.0004),
     )
     write_ticker_csv(
         history_dir, "BBB",
@@ -925,7 +925,7 @@ def test_main_live_refuses_a_forward_dated_now_even_within_the_staleness_budget(
     assert exit_code == 1
 
     run_dir = _find_run_dir(tmp_path / "models", future_now.date().isoformat())
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert report["status"] == "blocked_replay_not_current"
 
     stderr = capsys.readouterr().err
@@ -946,7 +946,7 @@ def test_main_dry_run_is_unaffected_by_a_forward_dated_now(tmp_path):
     start_date = pd.bdate_range(end=target_last_business_day, periods=45)[0]
     write_ticker_csv(
         history_dir, "AAA",
-        make_synthetic_ohlcv(seed=41, n=45, start=start_date.date().isoformat(), drift=0.0004),
+        make_synthetic_ohlcv(seed=41, n=45, start=cast(Any, start_date).date().isoformat(), drift=0.0004),
     )
     write_ticker_csv(
         history_dir, "BBB",
@@ -1014,7 +1014,7 @@ def test_main_live_refuses_a_replay_snapshot_stale_relative_to_the_real_publish_
     assert exit_code == 1
 
     run_dir = _find_run_dir(tmp_path / "models", replay_now_dt.date().isoformat())
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert report["status"] == "blocked_no_fresh_snapshot"
     assert "AAA" not in report["adjustments"]
 
@@ -1052,7 +1052,7 @@ def test_main_dry_run_is_unaffected_by_replay_drift(tmp_path):
     assert exit_code == 0
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert report["status"] == "dry_run_not_published"
 
 
@@ -1124,7 +1124,7 @@ def test_main_records_a_non_default_horizon_in_model_and_report(tmp_path):
     assert exit_code == 0
 
     run_dir = _find_run_dir(tmp_path / "models", "2024-06-01")
-    report = json.loads((run_dir / "eval_report.json").read_text(encoding="utf-8"))
+    report = json.loads((run_dir / "eval_report.json").read_bytes())
     assert report["horizon_trading_days"] == 10
 
     saved_model = model_module.TrainedModel.load(run_dir / "model.json")
@@ -1335,11 +1335,10 @@ def test_main_passes_the_model_artifact_path_and_a_working_scorer_to_guarded_pub
     run_dir = _find_run_dir(models_dir, "2024-06-01")
     model_json_path = run_dir / "model.json"
     # Whatever form it is stored in, it must resolve back to the real artifact
-    # (Codex review: "Store a portable incumbent model reference"). This run
-    # points --models-dir outside the configured ML artifact root, which is the
-    # documented "operator meant this exact location" case, so it stays
-    # absolute; see test_model_artifact_path_under_the_root_is_stored_relative
-    # for the portable form.
+    # (Codex review: "Store a portable incumbent model reference"). --models-dir
+    # is under the configured ML artifact root here, so it is stored root-
+    # relative; see test_an_external_relative_models_dir_is_refused_rather_
+    # than_published for the out-of-root case, which publishing now refuses.
     stored = captured_kwargs["model_artifact_path"]
     assert train_module._resolve_artifact_reference(stored) == model_json_path
 
@@ -1437,13 +1436,10 @@ def test_model_artifact_path_under_the_root_is_stored_relative(tmp_path, monkeyp
     assert stored == "models/2026-08-17-abc/model.json"
     assert train_module._resolve_artifact_reference(stored) == inside.resolve()
 
-    # A path OUTSIDE the root has no portable reference at all: an absolute
-    # path is tied to the publishing host and this value is persisted into the
-    # version-controlled published config, so a prior version that stored it
-    # absolute anyway made the incumbent unloadable from another
-    # checkout/host and silently degraded model selection there (Codex
-    # review: "Reject external model paths instead of publishing them"). The
-    # caller must not publish -- refused, not silently stored.
+    # A path OUTSIDE the root has no portable reference at all -- an absolute
+    # path is exactly as host-tied as the original bug this function fixes,
+    # so publishing is refused rather than silently degraded (Codex review:
+    # "Keep external model references portable").
     outside = tmp_path / "elsewhere" / "model.json"
     with pytest.raises(ValueError, match="outside the ML artifact root"):
         train_module._portable_artifact_reference(outside)
@@ -1526,23 +1522,17 @@ def test_a_legacy_working_directory_relative_reference_still_loads(tmp_path, mon
     assert missing == root / "nowhere/model.json"
 
 
-def test_an_external_relative_models_dir_is_rejected(tmp_path, monkeypatch):
-    """Regression test for "Preserve external relative model paths when
-    publishing" / "Reject external model paths instead of publishing them".
+def test_an_external_relative_models_dir_is_refused_rather_than_published(tmp_path, monkeypatch):
+    """Regression test for "Keep external model references portable".
 
-    `--models-dir ../models` puts the artifact outside the configured ML root
-    AND names it relatively. Returning that string unchanged made it
-    indistinguishable from a root-relative reference, and
-    `_resolve_artifact_reference` rebases every relative reference onto the
-    root -- so the next retrain looked under `<ml root>/../models` instead of
-    where the model was really saved, failed to load the incumbent, and
-    silently fell back to the weaker skill-ratio comparison. Storing it
-    absolute instead (a since-removed intermediate fix) only traded that bug
-    for a different host-specific published config a later retrain on
-    another host/checkout still could not load. Rejecting it outright is the
-    only fail-closed option: the operator gets an actionable error naming the
-    two real fixes -- move --models-dir under the shared root, or publish
-    manually.
+    `--models-dir ../models` puts the artifact outside the configured ML
+    root. An earlier version stored that as an absolute path so it would at
+    least round-trip on THIS host -- but that value is persisted into the
+    version-controlled published config, so the next retrain on any OTHER
+    checkout/host could not load the incumbent, and since the shared
+    holdout gate now treats scorer failure as blocking, no retrain could
+    publish again until an operator repaired the path by hand. Refusing to
+    publish at all, with an actionable message, is the fail-closed fix.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     import importlib

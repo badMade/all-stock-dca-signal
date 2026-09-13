@@ -13,9 +13,14 @@ a guardrail that fails opaquely gets bypassed by a future editor rather than
 understood.
 """
 
+import json
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -40,6 +45,127 @@ def _all_steps(doc):
 
 def _job(doc, job_id):
     return (doc.get("jobs") or {})[job_id]
+
+
+def _trusted_diff_step():
+    return next(
+        (step for step in _job(POST, "review")["steps"] if step.get("name") == "Compute trusted review diff"),
+        {},
+    )
+
+
+@pytest.fixture
+def review_git_repository(tmp_path):
+    """An offline commit pair whose checked-out tip is deliberately unrelated."""
+    env = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "Test Author",
+        "GIT_AUTHOR_EMAIL": "test@example.invalid",
+        "GIT_COMMITTER_NAME": "Test Author",
+        "GIT_COMMITTER_EMAIL": "test@example.invalid",
+    }
+
+    def git(*args):
+        return subprocess.check_output(["git", *args], cwd=tmp_path, env=env, text=True).strip()
+
+    git("init", "--quiet")
+    path = tmp_path / "change.txt"
+    path.write_text("baseline\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "--quiet", "-m", "base")
+    base = git("rev-parse", "HEAD")
+    path.write_text("review this actual change\n", encoding="utf-8")
+    git("commit", "--quiet", "-am", "head")
+    head = git("rev-parse", "HEAD")
+    git("checkout", "--quiet", "--detach", base)
+    path.write_text("unrelated default branch tip\n", encoding="utf-8")
+    git("commit", "--quiet", "-am", "default branch")
+    (tmp_path / "review_input").mkdir()
+    (tmp_path / "review_input" / "metadata.json").write_text(
+        json.dumps({"pr_number": 7, "head_sha": head, "base_sha": base}), encoding="utf-8"
+    )
+    (tmp_path / "review_input" / "diff.patch").write_text("forged harmless diff\n", encoding="utf-8")
+    return tmp_path, env, git, base, head
+
+
+def _compute_trusted_diff(repository, *, base=None, head=None):
+    root, env, _, actual_base, actual_head = repository
+    step = _trusted_diff_step()
+    assert step.get("run"), "privileged consumer must compute its own immutable commit-pair diff"
+    return subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=root,
+        env={**env, "EXPECTED_BASE_SHA": base or actual_base, "EXPECTED_HEAD_SHA": head or actual_head},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_trusted_diff_ignores_forged_artifact_and_the_checked_out_tip(review_git_repository):
+    root, _, git, base, head = review_git_repository
+    checkout_before = git("rev-parse", "HEAD")
+    result = _compute_trusted_diff(review_git_repository)
+    assert result.returncode == 0, result.stderr
+    generate = next(step for step in _job(POST, "review")["steps"] if step.get("name") == "Generate PR Review")
+    source = generate["env"]["DIFF_FILE"]
+    assert source != "review_input/diff.patch"
+    content = (root / source).read_text(encoding="utf-8")
+    assert content.strip() == git("diff", "--no-ext-diff", "--no-textconv", f"{base}...{head}")
+    assert "review this actual change" in content
+    assert "forged" not in content and "unrelated default branch tip" not in content
+    assert git("rev-parse", "HEAD") == checkout_before
+
+
+def test_trusted_diff_preserves_disconnected_history_fallback(review_git_repository):
+    root, _, git, base, _ = review_git_repository
+    git("checkout", "--quiet", "--orphan", "disconnected")
+    (root / "change.txt").write_text("separate history\n", encoding="utf-8")
+    git("commit", "--quiet", "-am", "separate root")
+    head = git("rev-parse", "HEAD")
+    result = _compute_trusted_diff(review_git_repository, head=head)
+    assert result.returncode == 0, result.stderr
+    assert (root / "trusted_review_input/diff.patch").read_text().strip() == git("diff", f"{base}..{head}")
+
+
+def test_trusted_diff_disables_external_programs_and_text_conversion(review_git_repository):
+    root, env, git, _, _ = review_git_repository
+    # These commands cannot run successfully. A real plain-text diff proves
+    # the consumer bypasses both Git's external-diff and textconv hooks.
+    env["GIT_EXTERNAL_DIFF"] = str(root / "missing-external-diff")
+    (root / ".gitattributes").write_text("change.txt diff=synthetic\n", encoding="utf-8")
+    git("config", "diff.synthetic.textconv", str(root / "missing-textconv"))
+    result = _compute_trusted_diff(review_git_repository)
+    assert result.returncode == 0, result.stderr
+    assert "review this actual change" in (root / "trusted_review_input/diff.patch").read_text()
+
+
+def test_trusted_diff_refuses_a_blob_even_when_its_object_id_exists(review_git_repository):
+    _, _, git, _, head = review_git_repository
+    blob = git("rev-parse", f"{head}:change.txt")
+    result = _compute_trusted_diff(review_git_repository, head=blob)
+    assert result.returncode != 0
+    assert not (review_git_repository[0] / "trusted_review_input/diff.patch").exists()
+
+
+@pytest.mark.parametrize("head", ["HEAD", "0" * 40, "--output=unexpected-file"])
+def test_trusted_diff_rejects_non_commit_or_mutable_inputs(review_git_repository, head):
+    result = _compute_trusted_diff(review_git_repository, head=head)
+    assert result.returncode != 0
+    assert not (review_git_repository[0] / "trusted_review_input/diff.patch").exists()
+
+
+def test_trusted_diff_has_history_and_runs_before_secret_bearing_generation():
+    steps = _job(POST, "review")["steps"]
+    checkout = next(step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@"))
+    assert checkout["with"].get("fetch-depth") == 0
+    step = _trusted_diff_step()
+    assert step and "--no-ext-diff" in step["run"] and "--no-textconv" in step["run"]
+    assert steps.index(step) < next(i for i, item in enumerate(steps) if item.get("name") == "Generate PR Review")
+    assert step["env"]["EXPECTED_HEAD_SHA"] == "${{ needs.validate-provenance.outputs.head_sha }}"
+    assert step["env"]["EXPECTED_BASE_SHA"] == "${{ needs.validate-provenance.outputs.base_sha }}"
 
 
 # --- The privileged workflow never checks out PR-head-controlled code --------
@@ -260,10 +386,13 @@ def test_the_privileged_review_job_pins_an_exact_antigravity_sdk_version():
     steps = review.get("steps") or []
     install = next(s for s in steps if s.get("name") == "Install Antigravity SDK")
     run = install.get("run", "")
-    match = re.search(r"pip install google-antigravity(\S*)", run)
+    manifest_match = re.search(r"pip install -r (\S+)", run)
+    assert manifest_match is not None, run
+    manifest = Path(__file__).resolve().parents[2] / manifest_match.group(1)
+    match = re.search(r"^google-antigravity(\S*)$", manifest.read_text(), re.MULTILINE)
     assert match is not None, run
     assert match.group(1).startswith("=="), (
-        f"google-antigravity must be pinned with '==', found {match.group(1)!r} in: {run!r}"
+        f"google-antigravity must be pinned with '==', found {match.group(1)!r} in: {manifest}"
     )
 
 
@@ -300,9 +429,14 @@ def test_the_analyzer_diffs_against_the_pinned_base_sha_not_the_moving_branch_ti
     steps = analyze.get("steps") or []
     compute = next(s for s in steps if s.get("name") == "Compute diff and metadata")
     run = compute.get("run", "")
-    assert '"${BASE_SHA}...HEAD"' in run, (
+    assert '"${BASE_SHA}...${HEAD_SHA}"' in run, (
         f"diff must be computed against the pinned BASE_SHA, not a moving branch ref: {run!r}"
     )
+    assert '"${BASE_SHA}..${HEAD_SHA}"' in run, (
+        "analyzer must fall back to a BASE_SHA-pinned two-dot diff when "
+        "BASE_SHA and HEAD have no merge base"
+    )
+    assert "git merge-base" in run, "analyzer should detect merge-base availability before using triple-dot"
     assert '"origin/${BASE_REF}...HEAD"' not in run, run
 
 
@@ -321,6 +455,19 @@ def test_validate_provenance_also_outputs_a_base_sha():
             script += with_block["script"]
     assert "pr.base.sha" in script, "the provenance step must read pr.base.sha"
     assert 'core.setOutput("base_sha"' in script
+
+
+def test_validate_provenance_uses_workflow_run_head_sha_not_live_pr_head():
+    """workflow_run.head_sha is immutable for the triggering run; PR-head
+    fields can drift if a new commit lands before the privileged workflow runs."""
+    job = _job(POST, "validate-provenance")
+    script = ""
+    for step in job.get("steps") or []:
+        with_block = step.get("with") or {}
+        if "script" in with_block:
+            script += with_block["script"]
+    assert "run.head_sha" in script
+    assert 'core.setOutput("head_sha", run.head_sha);' in script
 
 
 def test_the_dedup_check_also_compares_the_current_base_sha():

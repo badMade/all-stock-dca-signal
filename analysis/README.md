@@ -12,7 +12,6 @@ one, so the history stays intact.
 | `2026-06-29-revised-ladder/` | Backtest of a revised graded-buy ladder against 30 trading days of daily bars, plus a same-day intraday tier preview. |
 | `2026-07-17-live-reliability/` | Reliability fixes applied 2026-07-17 to align the version-controlled schedule manifest with live scheduler state for the three pre-authorized live tasks. |
 | `2026-07-23-live-reliability-fixes/` | Supersedes the 2026-06-29 audit's schedule/stream assumptions: records the switch from the single `ce16ba6b` task to four Robinhood-only scheduled streams plus a read-only monitor, and a same-day recovery changelog. |
-| `market-graph-3d/` | Offline matplotlib renderer for 3D market graph animations ("The Ocean"), stills, and visual diagnostics. |
 
 None of these folders are on the live buy path — see `docs/live_wiring.md` and
 `docs/run_classification.md` for the code that actually gates and classifies runs today.

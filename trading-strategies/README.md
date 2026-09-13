@@ -8,12 +8,14 @@ Three modular Python tools for backtesting, sentiment monitoring, and weekly str
 
 Backtest a **Moving Average Crossover** and/or **RSI Reversion** strategy on any list of tickers with realistic transaction costs and slippage.
 
-### Install
+### Backtester Installation
+
 ```bash
 pip install vectorbt yfinance pandas numpy pandas-ta rich
 ```
 
-### Usage
+### Backtester Usage
+
 ```bash
 # Run both strategies on default tickers (AAPL, MSFT, GOOGL, NVDA, SPY)
 python backtest.py
@@ -25,9 +27,10 @@ python backtest.py --tickers AAPL TSLA NVDA --strategy ma_crossover --fast-windo
 python backtest.py --strategy rsi_reversion --commission 0.0005 --slippage 0.0002
 ```
 
-### Key flags
+### Backtester Key Flags
+
 | Flag | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `--tickers` | AAPL MSFT GOOGL NVDA SPY | Space-separated ticker list |
 | `--strategy` | `both` | `ma_crossover`, `rsi_reversion`, or `both` |
 | `--start` | 5 years ago | Start date (YYYY-MM-DD) |
@@ -40,7 +43,8 @@ python backtest.py --strategy rsi_reversion --commission 0.0005 --slippage 0.000
 | `--commission` | 0.001 | Per-trade commission (10 bps) |
 | `--slippage` | 0.0005 | Price impact slippage (5 bps) |
 
-### Output
+### Backtester Output
+
 - Per-ticker metrics table: Sharpe, Sortino, Max Drawdown, CAGR, Calmar, Win Rate, Total Trades
 - Benchmark comparison (SPY buy-and-hold)
 - Aggregated portfolio-level metrics
@@ -51,14 +55,16 @@ python backtest.py --strategy rsi_reversion --commission 0.0005 --slippage 0.000
 
 Scores recent news headlines and SEC filings for a watchlist of tickers using **ProsusAI/FinBERT**, tracks 30-day rolling sentiment, and emails a daily briefing flagging significant shifts.
 
-### Install
+### Sentiment Monitor Installation
+
 ```bash
 pip install transformers torch requests pandas numpy jinja2
 ```
 
-### Environment variables
+### Sentiment Monitor Environment Variables
+
 | Variable | Required | Description |
-|---|---|---|
+| --- | --- | --- |
 | `NEWS_API_KEY` | Yes | [newsapi.org](https://newsapi.org) free key |
 | `SMTP_USER` | Yes | Sender Gmail address |
 | `SMTP_PASSWORD` | Yes | Gmail [App Password](https://myaccount.google.com/apppasswords) |
@@ -67,7 +73,8 @@ pip install transformers torch requests pandas numpy jinja2
 | `SMTP_PORT` | No | Default: `587` |
 | `WATCHLIST` | No | Comma-separated tickers (overrides default) |
 
-### Usage
+### Sentiment Monitor Usage
+
 ```bash
 export NEWS_API_KEY=your_key
 export SMTP_USER=you@gmail.com
@@ -84,16 +91,18 @@ python sentiment_monitor.py --dry-run
 python sentiment_monitor.py --tickers AAPL TSLA NVDA --threshold 2.0
 ```
 
-### Key flags
+### Sentiment Monitor Key Flags
+
 | Flag | Default | Description |
-|---|---|---|
+| --- | --- | --- |
 | `--tickers` | AAPL TSLA NVDA META AMZN | Watchlist |
 | `--days` | 7 | News lookback window |
 | `--threshold` | 1.5 | Z-score threshold for "significant shift" |
 | `--dry-run` | False | Print email HTML, skip sending |
 | `--history-file` | `./sentiment_history.json` | Path to rolling history store |
 
-### How it works
+### Sentiment Monitor Workflow
+
 1. Fetches last N days of headlines (NewsAPI) + last 3 SEC filings per ticker (EDGAR, free)
 2. Batch-scores all texts through FinBERT in one pass
 3. Computes a weighted sentiment score: `(positive − negative) × confidence`
@@ -107,14 +116,16 @@ python sentiment_monitor.py --tickers AAPL TSLA NVDA --threshold 2.0
 
 Every Monday, computes Sharpe, Sortino, Max Drawdown, CAGR, Beta, Alpha, and Calmar for 5 quant strategies, appends results to a Google Sheet, and emails an alert if any strategy breaches a threshold.
 
-### Install
+### Strategy Monitor Installation
+
 ```bash
 pip install yfinance vectorbt pandas numpy requests scipy jinja2
 ```
 
-### Environment variables
+### Strategy Monitor Environment Variables
+
 | Variable | Required | Description |
-|---|---|---|
+| --- | --- | --- |
 | `SMTP_USER` | Yes | Sender Gmail address |
 | `SMTP_PASSWORD` | Yes | Gmail App Password |
 | `RECIPIENT_EMAIL` | Yes | Your email address |
@@ -124,10 +135,12 @@ pip install yfinance vectorbt pandas numpy requests scipy jinja2
 | `GOOGLE_SHEET_ID` | No | Override the default sheet ID |
 | `GOOGLE_SHEET_URL` | No | Override the default sheet URL |
 
-### Google Sheet
+### Strategy Monitor Google Sheet
+
 Results are appended to the **[Strategy Monitor](https://docs.google.com/spreadsheets/d/1vGR8HJ4KRM6YCHj3_W38cksIryEFALSouyS-WIxrYGI/edit)** spreadsheet (`Weekly_Report` tab) each run.
 
-### Usage
+### Strategy Monitor Usage
+
 ```bash
 export SMTP_USER=you@gmail.com
 export SMTP_PASSWORD=your_app_password
@@ -144,18 +157,20 @@ python strategy_monitor.py --force-alert
 python strategy_monitor.py --config my_config.json
 ```
 
-### Default strategies monitored
+### Default Strategies Monitored
+
 | Strategy | Tickers | Signal |
-|---|---|---|
+| --- | --- | --- |
 | MA_Crossover | SPY | 50/200-day MA crossover |
 | RSI_Reversion | QQQ | RSI(14), 30/70 thresholds |
 | Momentum | AAPL MSFT GOOGL NVDA AMZN | 12-1 month momentum |
 | Low_Volatility | XLU XLRE XLP XLV XLF | Minimum variance |
 | Value_Factor | BRK-B JPM BAC WFC C | Price-to-52wk-high proxy |
 
-### Alert thresholds (configurable in `THRESHOLDS` dict)
+### Alert Thresholds
+
 | Metric | Threshold |
-|---|---|
+| --- | --- |
 | Sharpe Ratio | < 0.5 |
 | Sortino Ratio | < 0.7 |
 | Max Drawdown | < −15% |
@@ -166,11 +181,13 @@ python strategy_monitor.py --config my_config.json
 ## Scheduling (recommended)
 
 To run `strategy_monitor.py` every Monday at 7 AM automatically, add to crontab:
-```
+
+```cron
 0 7 * * 1 cd /path/to/trading-strategies && python strategy_monitor.py >> monitor.log 2>&1
 ```
 
 For `sentiment_monitor.py` every weekday at 6 AM:
-```
+
+```cron
 0 6 * * 1-5 cd /path/to/trading-strategies && python sentiment_monitor.py >> sentiment.log 2>&1
 ```

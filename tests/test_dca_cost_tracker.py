@@ -7,23 +7,10 @@ test_dca_cost_tracker.py``.
 """
 
 import json
-import sys
 import tempfile
 from pathlib import Path
 
-# Moved into tests/ from the repo root (2026-08-23). ``pytest``/``python -m
-# pytest`` already resolve `import dca_cost_tracker` via pyproject.toml's
-# `pythonpath = [".", "tests"]`, but this file's own docstring documents a
-# second, direct-execution contract (``python tests/test_dca_cost_tracker.py``)
-# that pythonpath doesn't cover -- running a script directly only adds ITS OWN
-# directory (tests/) to sys.path, not the repo root, so `from dca_cost_tracker
-# import ...` below would otherwise raise ModuleNotFoundError under that path
-# (Codex review: "Retain direct execution for relocated tests").
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-from dca_cost_tracker import (  # noqa: E402
+from dca_cost_tracker import (
     COST_TRACKER_TITLE,
     _month_prefix,
     _num,
@@ -425,31 +412,6 @@ def test_collect_skips_unparseable_files(tmp_path):
     assert [state["trading_day"] for state in states] == ["2026-06-29"]
 
 
-def test_collect_keeps_blocked_stub_with_submitted_evidence(tmp_path):
-    # Codex review on PR #420 ("Retain blocked artifacts that contain
-    # submitted orders"): morning/midday's _blocked_live_result() can now
-    # write status="blocked" while buy_candidates/broker_outcomes still carry
-    # a real earlier submission -- that must not disappear from the monthly
-    # usage rollup just because the run as a whole is flagged blocked.
-    _write_runs(tmp_path, [_run_state("2026-06-29")])
-    partial_block_dir = tmp_path / "runs/2026-06-30-partial-block"
-    partial_block_dir.mkdir(parents=True, exist_ok=True)
-    (partial_block_dir / "run_state.json").write_text(
-        json.dumps(
-            {
-                "trading_day": "2026-06-30",
-                "status": "blocked",
-                "buy_candidates": [{"ticker": "AAA", "status": "submitted"}],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    states = collect_month_run_states(tmp_path, 2026, 6)
-    days = sorted(rs["trading_day"] for rs in states)
-    assert days == ["2026-06-29", "2026-06-30"]
-
-
 def test_aggregate_sums_and_component_breakdown():
     run_states = [
         _run_state("2026-06-29", finance_calls_attempted=3, orders_placed_count=2),
@@ -533,6 +495,60 @@ def test_markdown_no_components():
     md = build_cost_tracker_markdown({})
     assert "| _no runs_ | 0 | - | 0 |" in md
 
+def test_build_cost_tracker_markdown_comprehensive():
+    # Empty/minimal aggregate
+    md_empty = build_cost_tracker_markdown({})
+    assert "unknown" in md_empty
+    assert "- Runs analyzed: 0" in md_empty
+    assert "- Runs needing manual recovery: 0" in md_empty
+    assert "Estimated total proxy units (not credits): 0.0" in md_empty
+    assert "| _no runs_ | 0 | - | 0 |" in md_empty
+
+    # Fully populated aggregate
+    agg = {
+        "month_label": "2026-07",
+        "disclaimer": "Test Disclaimer",
+        "run_count": 5,
+        "manual_recovery_runs": 1,
+        "estimated_total_proxy_units": 150.5,
+        "components": [
+            {
+                "component": "compA",
+                "count": 10.0,
+                "proxy_weight": 2.5,
+                "estimated_proxy_units": 25.0,
+            },
+            {
+                "component": "compB",
+                "count": 5.0,
+                "proxy_weight": 1.0,
+                "estimated_proxy_units": 5.0,
+            }
+        ],
+        "totals": {
+            "metricX": 100.0,
+            "metricY": 50.0
+        }
+    }
+
+    md_full = build_cost_tracker_markdown(agg)
+    assert "## Automation Cost Tracker — 2026-07" in md_full
+    assert "> Test Disclaimer" in md_full
+    assert "- Runs analyzed: 5" in md_full
+    assert "- Runs needing manual recovery: 1" in md_full
+    assert "Estimated total proxy units (not credits): 150.5" in md_full
+
+    assert "| compA | 10.0 | 2.5 | 25.0 |" in md_full
+    assert "| compB | 5.0 | 1.0 | 5.0 |" in md_full
+
+    # We shouldn't strictly assert metricX/Y because USAGE_PROXY_NUMERIC_FIELDS controls the exact fields.
+    # Instead, we verify that missing numeric proxy fields fall back to 0.0
+    from dca_common import USAGE_PROXY_NUMERIC_FIELDS
+    for field in USAGE_PROXY_NUMERIC_FIELDS:
+        assert f"| {field} | 0.0 |" in md_full or f"| {field} | " in md_full
+
+
+
 
 def test_generate_cost_tracker_writes_files(tmp_path):
     _write_runs(tmp_path, [_run_state("2026-06-29"), _run_state("2026-06-30")])
@@ -607,6 +623,152 @@ def test_find_run_state_files(tmp_path):
     assert find_run_state_files(empty_dir) == []
 
 
+
+def test_collect_retains_blocked_run_with_unparseable_evaluated_count(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "counts": {"evaluated": "not-a-number"}
+            }
+        ),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 2
+
+def test_collect_retains_blocked_run_with_invalid_evaluated_count(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "counts": {"evaluated": float("nan")}
+            }
+        ),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 2
+
+def test_collect_retains_blocked_run_with_signal_rows(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "signal_rows": [{"ticker": "AAPL"}]
+            }
+        ),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 2
+
+def test_collect_retains_blocked_run_with_unparseable_submitted_count(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "orders_submitted_count": "not-a-number"
+            }
+        ),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 2
+
+def test_collect_retains_blocked_run_with_outcome_bearing_status(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "broker_outcomes": {"AAA": {"status": "submitted"}}
+            }
+        ),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 2
+
+def test_collect_skips_malformed_candidate(tmp_path):
+    # Tests line 205 (malformed candidate list)
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "buy_candidates": ["not-a-dict"]
+            }
+        ),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    # The malformed candidate should be skipped by the loop in _is_empty_blocked_stub,
+    # meaning the loop finishes and returns True (it IS an empty blocked stub),
+    # so the run state is DROPPED from states.
+    assert len(states) == 1
+
+def test_collect_retains_blocked_run_with_candidate_order_id(tmp_path):
+    _write_runs(tmp_path, [_run_state("2026-06-29")])
+    blocked_dir = tmp_path / "runs/2026-06-30-blocked"
+    blocked_dir.mkdir(parents=True, exist_ok=True)
+    (blocked_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-06-30",
+                "status": "blocked",
+                "buy_candidates": [{"order_id": "ORD123"}]
+            }
+        ),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 2
+
+
+
+def test_collect_skips_missing_trading_day(tmp_path):
+    # Needs the prefix in the text to pass the fast substring filter
+    (tmp_path / "runs").mkdir()
+    (tmp_path / "runs/run_state.json").write_text(
+        json.dumps({"some_key": "2026-06-something", "status": "ok"}),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 0
+
+def test_collect_skips_mismatched_trading_day_type(tmp_path):
+    (tmp_path / "runs").mkdir()
+    (tmp_path / "runs/run_state.json").write_text(
+        json.dumps({"trading_day": 20260630, "some_string": "2026-06-30"}),
+        encoding="utf-8",
+    )
+    states = collect_month_run_states(tmp_path, 2026, 6)
+    assert len(states) == 0
+
+
 def _run_all():
     import inspect
 
@@ -654,3 +816,63 @@ def test_a_blocked_run_with_only_broker_outcome_evidence_is_retained():
         )
         is True
     )
+
+def test_aggregate_usage_empty_run_states():
+    from dca_cost_tracker import aggregate_usage
+    agg = aggregate_usage([], month_label="2026-06")
+    assert agg["run_count"] == 0
+    assert agg["manual_recovery_runs"] == 0
+    assert agg["estimated_total_proxy_units"] == 0.0
+
+def test_aggregate_usage_all_zero_usage():
+    from dca_cost_tracker import aggregate_usage
+    run_states = [{"usage_proxy": {}}]
+    agg = aggregate_usage(run_states, month_label="2026-06")
+    assert agg["run_count"] == 1
+    assert agg["estimated_total_proxy_units"] == 0.0
+
+def test_aggregate_usage_manual_recovery_and_totals():
+    from dca_cost_tracker import aggregate_usage
+    run_states = [
+        {
+            "usage_proxy": {
+                "tickers_scanned": 10.0,
+                "finance_calls_attempted": 5.0,
+                "manual_recovery_required": True,
+            }
+        },
+        {
+            "usage_proxy": {
+                "tickers_scanned": 5.0,
+                "robinhood_calls_attempted": 2.0,
+                "manual_recovery_required": False,
+            }
+        }
+    ]
+    agg = aggregate_usage(run_states, month_label="2026-06")
+    assert agg["run_count"] == 2
+    assert agg["manual_recovery_runs"] == 1
+    assert agg["totals"]["tickers_scanned"] == 15.0
+    assert agg["totals"]["finance_calls_attempted"] == 5.0
+    assert agg["totals"]["robinhood_calls_attempted"] == 2.0
+
+    # Check that estimated_total_proxy_units is correctly calculated based on the weights
+    # Component weights from COMPONENT_DEFINITIONS:
+    # tickers_scanned is NOT in COMPONENT_DEFINITIONS, so it contributes 0 to the estimate.
+    # finance_calls_attempted -> finance_data (weight: 1.0) => 5.0 * 1.0 = 5.0
+    # robinhood_calls_attempted -> robinhood_data (weight: 1.0) => 2.0 * 1.0 = 2.0
+    # Expected estimated_total_proxy_units: 5.0 + 2.0 = 7.0
+    assert agg["estimated_total_proxy_units"] == 7.0
+
+def test_aggregate_usage_invalid_usage_fallback():
+    from dca_cost_tracker import aggregate_usage
+    # Covers fallback path
+    run_states = [
+        {
+            "counts": {"evaluated": 10}
+        }
+    ]
+    agg = aggregate_usage(run_states, month_label="2026-06")
+    assert agg["run_count"] == 1
+    assert agg["totals"]["tickers_scanned"] == 10.0
+    assert agg["totals"]["signal_rows_written"] == 10.0

@@ -13,7 +13,6 @@ configured tree at load time.
 
 from __future__ import annotations
 
-import importlib
 import ntpath
 import os
 import subprocess
@@ -75,16 +74,41 @@ def test_stream_root_joins_multiple_segments(monkeypatch):
     assert stream_root("morning_dca", "20260728_1030ET") == "/srv/dca/morning_dca/20260728_1030ET"
 
 
+def test_operational_history_paths_are_isolated_from_ambient_environment(tmp_path):
+    """Test execution must never inherit the operator's history or publication target."""
+    from dca_intraday_archive import configured_intraday_archive_dir
+    from dca_ticker_paths import configured_ticker_history_dir
+
+    history = configured_ticker_history_dir()
+    archive = configured_intraday_archive_dir()
+    assert history.is_relative_to(tmp_path)
+    assert archive.is_relative_to(tmp_path)
+    # A missing managed history must remain missing until a test creates it.
+    assert not history.exists()
+
+
 @pytest.mark.parametrize("module_name,attr,suffix", STREAM_ROOTS)
-def test_every_stream_root_defaults_to_the_repo_relative_path(module_name, attr, suffix):
+def test_every_stream_root_defaults_to_the_repo_relative_path(monkeypatch, module_name, attr, suffix):
     """Pin that every stream constant derives from the shared repo-relative root.
 
     These were 15 separate hardcoded absolute strings before the consolidation;
     this asserts they all derive from DEFAULT_CRON_TRACKING_ROOT, which is now
     the repo-local cron_tracking/ directory rather than the legacy Linux path.
+
+    This checks via a separate interpreter so that it avoids conftest.py's
+    autouse monkeypatch of DCA_CRON_TRACKING_ROOT (which breaks local imports)
+    without using the dangerous importlib.reload() anti-pattern.
     """
-    module = importlib.import_module(module_name)
-    assert getattr(module, attr) == f"{DEFAULT_CRON_TRACKING_ROOT}/{suffix}"
+    env = {key: value for key, value in os.environ.items() if key != CRON_TRACKING_ROOT_ENV}
+    probe = (
+        "import importlib\n"
+        f"print(getattr(importlib.import_module({module_name!r}), {attr!r}))\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], cwd=REPO_ROOT, env=env,
+        capture_output=True, text=True, check=True,
+    )
+    assert out.stdout.strip() == f"{DEFAULT_CRON_TRACKING_ROOT}/{suffix}"
 
 
 def test_every_stream_root_follows_the_override():
@@ -129,6 +153,26 @@ def test_rebase_rewrites_a_bundled_path(monkeypatch):
         rebase_bundled_root(f"{BUNDLED_CRON_TRACKING_ROOT}/morning_dca/20260728_1030ET/")
         == "/srv/dca/morning_dca/20260728_1030ET/"
     )
+
+
+def test_rebase_bundled_root_bare(monkeypatch):
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/srv/dca")
+    assert rebase_bundled_root(BUNDLED_CRON_TRACKING_ROOT) == "/srv/dca"
+
+
+def test_rebase_bundled_root_trailing_slash(monkeypatch):
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/srv/dca")
+    assert rebase_bundled_root(f"{BUNDLED_CRON_TRACKING_ROOT}/") == "/srv/dca/"
+
+
+def test_rebase_bundled_root_trailing_backslash(monkeypatch):
+    import ntpath
+    monkeypatch.setattr(os, "sep", "\\")
+    monkeypatch.setattr(os.path, "join", ntpath.join)
+    monkeypatch.setattr(os.path, "splitdrive", ntpath.splitdrive)
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "C:\\srv\\dca")
+    assert rebase_bundled_root(f"{BUNDLED_CRON_TRACKING_ROOT}\\") == "C:\\srv\\dca\\"
+
 
 
 def test_rebase_is_a_no_op_when_configured_root_matches_bundled(monkeypatch):
@@ -464,3 +508,84 @@ def test_bundled_config_paths_rebase_onto_the_repo_default(monkeypatch):
 def test_an_explicit_unrelated_absolute_path_is_still_untouched(monkeypatch):
     monkeypatch.delenv(CRON_TRACKING_ROOT_ENV, raising=False)
     assert rebase_bundled_root("/srv/elsewhere/midday_dca") == "/srv/elsewhere/midday_dca"
+def test_rebase_bundled_roots_in(monkeypatch):
+    """Test rebase_bundled_roots_in correctly rewrites paths recursively."""
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/new_root")
+
+    input_data = {
+        "path1": f"{BUNDLED_CRON_TRACKING_ROOT}/test1",
+        "path2": f"{BUNDLED_CRON_TRACKING_ROOT}/test2",
+        "nested": {
+            "path3": f"{BUNDLED_CRON_TRACKING_ROOT}/test3",
+            "not_a_path": "just a string",
+            "number": 42,
+        },
+        "list_paths": [
+            f"{BUNDLED_CRON_TRACKING_ROOT}/test4",
+            "another string"
+        ]
+    }
+
+    expected_output = {
+        "path1": "/new_root/test1",
+        "path2": "/new_root/test2",
+        "nested": {
+            "path3": "/new_root/test3",
+            "not_a_path": "just a string",
+            "number": 42,
+        },
+        "list_paths": [
+            "/new_root/test4",
+            "another string"
+        ]
+    }
+
+    assert rebase_bundled_roots_in(input_data) == expected_output
+
+def test_cron_tracking_root_returns_default_when_unset(monkeypatch):
+    monkeypatch.delenv(CRON_TRACKING_ROOT_ENV, raising=False)
+    assert cron_tracking_root() == DEFAULT_CRON_TRACKING_ROOT
+
+
+def test_cron_tracking_root_returns_configured_when_set(monkeypatch):
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/foo/bar")
+    assert cron_tracking_root() == "/foo/bar"
+
+
+def test_cron_tracking_root_ignores_empty_string(monkeypatch):
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "")
+    assert cron_tracking_root() == DEFAULT_CRON_TRACKING_ROOT
+
+
+def test_cron_tracking_root_strips_trailing_separators(monkeypatch):
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/foo/bar/")
+    assert cron_tracking_root() == "/foo/bar"
+
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/foo/bar//")
+    assert cron_tracking_root() == "/foo/bar"
+
+
+def test_cron_tracking_root_keeps_root_slash(monkeypatch):
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/")
+    assert cron_tracking_root() == "/"
+
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "//")
+    assert cron_tracking_root() == "/"
+
+
+def test_cron_tracking_root_keeps_windows_drive_root(monkeypatch):
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "C:\\")
+
+    # We must patch os.sep and os.path.splitdrive to simulate Windows on Linux CI
+    import ntpath
+    monkeypatch.setattr(os, "sep", "\\")
+    monkeypatch.setattr(os.path, "splitdrive", ntpath.splitdrive)
+
+    assert cron_tracking_root() == "C:\\"
+
+
+def test_rebase_returns_trailing_configured_if_parts_empty(monkeypatch):
+    monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, "/foo/bar")
+    # This should match BUNDLED_CRON_TRACKING_ROOT and suffix will be "/"
+    # parts will be empty
+    assert rebase_bundled_root(f"{BUNDLED_CRON_TRACKING_ROOT}/") == "/foo/bar/"

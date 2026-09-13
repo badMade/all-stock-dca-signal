@@ -50,7 +50,7 @@ def _acquire_lock(lock_path: Path, timeout_s: float = 30.0, poll_s: float = 0.05
                 break
             except FileExistsError:
                 if time.monotonic() > deadline:
-                    raise TimeoutError(f"could not acquire {lock_path} within {timeout_s}s")
+                    raise TimeoutError(f"could not acquire {lock_path} within {timeout_s}s") from None
                 time.sleep(poll_s)
         yield
     finally:
@@ -114,7 +114,7 @@ class SuggestionPublisher(ABC):
         if not self._output_path.exists():
             return None
         try:
-            data = json.loads(self._output_path.read_text())
+            data = json.loads(self._output_path.read_bytes())
             return data.get("eval_metric", {}).get("mae")
         except (json.JSONDecodeError, OSError):
             return None  # an unreadable prior file imposes no floor, same as today's publish.py

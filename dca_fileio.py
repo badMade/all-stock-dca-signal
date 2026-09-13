@@ -17,7 +17,7 @@ import csv
 import os
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Any, Dict, Generator, NamedTuple, Sequence
+from typing import IO, Any, Dict, Iterator, NamedTuple, Sequence
 from uuid import uuid4
 
 
@@ -43,7 +43,7 @@ def atomic_open_w(
     *,
     encoding: str = "utf-8",
     newline: str | None = None,
-) -> Generator[IO[str], None, None]:
+) -> Iterator[IO[str]]:
     """Context manager yielding a text handle whose contents replace ``path`` atomically.
 
     Drop-in for ``path.open("w", ...)`` in artifact writers (including
@@ -373,10 +373,19 @@ def order_csv_covers(path: Path, expected_rows: Sequence[Dict[str, Any]]) -> boo
         return True
     try:
         with path.open(newline="", encoding="utf-8") as handle:
-            present = {
-                str(row.get("order_id") or f"ticker:{row.get('ticker')}")
-                for row in csv.DictReader(handle)
-            }
+            reader = csv.reader(handle)
+            header = next(reader, None)
+            present = set()
+            if header is not None:
+                try:
+                    id_idx = header.index("order_id") if "order_id" in header else -1
+                    t_idx = header.index("ticker") if "ticker" in header else -1
+                    for row in reader:
+                        order_id = row[id_idx] if id_idx != -1 and len(row) > id_idx else None
+                        ticker = row[t_idx] if t_idx != -1 and len(row) > t_idx else None
+                        present.add(str(order_id or f"ticker:{ticker}"))
+                except ValueError:
+                    pass
     except (OSError, UnicodeDecodeError, csv.Error):
         return False
     return expected.issubset(present)

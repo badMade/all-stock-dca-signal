@@ -255,7 +255,7 @@ def test_settle_fails_closed_on_a_malformed_settled_order_ids_field(tmp_path):
 
     day_dir = tmp_path / "2026-08-20"
     state_path = day_dir / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     state["settled_order_ids"] = []
     state_path.write_text(json.dumps(state))
 
@@ -280,7 +280,7 @@ def test_settle_fails_closed_on_a_null_settled_order_ids_field(tmp_path):
 
     day_dir = tmp_path / "2026-08-20"
     state_path = day_dir / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     assert isinstance(state["settled_order_ids"], dict) and state["settled_order_ids"]
     state["settled_order_ids"] = None
     state_path.write_text(json.dumps(state))
@@ -315,6 +315,175 @@ def test_settle_normalizes_a_whitespace_padded_order_id(tmp_path):
     ledger.settle("XYZ", "2026-08-14", 1.0, order_id="  order-123  ")
 
     assert ledger.pending_usd("XYZ", "2026-08-14") == 1.0
+def test_discard_minimum_order_pending_amount_reports_what_this_call_removed(tmp_path):
+    # Codex review, PR #680 discussion_r3925291346 ("Restore only credit this
+    # call actually discarded"): the bool form returns True both when this
+    # call cleared the balance AND when it was already gone, so a caller that
+    # later needs to undo its discard cannot tell the two apart. The amount
+    # form must report exactly what THIS call removed.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-15", 0.20, stream="morning")
+
+    removed = ledger.discard_minimum_order_pending_amount("XYZ", "2026-08-15", 0.20)
+
+    assert removed == 0.20
+    assert ledger.minimum_order_pending_tickers("2026-08-15") == {}
+    assert ledger.pending_usd("XYZ", "2026-08-15") == 0.0
+    assert ledger.events("2026-08-15")[-1]["decision"] == "discarded"
+
+
+def test_discard_minimum_order_pending_amount_is_zero_when_balance_already_absent(tmp_path):
+    # A concurrent retry settled the observed $0.20 before this call took the
+    # ledger lock. The bool form still says True ("nothing left to discard"),
+    # but this call removed NOTHING -- so it must report 0.0, not the stale
+    # observed amount, and must not write a "discarded" event. Restoring
+    # $0.20 on this outcome would re-credit money the concurrent order spent.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-16", 0.20, stream="morning")
+    ledger.settle("XYZ", "2026-08-16", 1.00, stream="concurrent", order_id="ORD-1")
+    events_before = len(ledger.events("2026-08-16"))
+
+    removed = ledger.discard_minimum_order_pending_amount("XYZ", "2026-08-16", 0.20)
+
+    assert removed == 0.0
+    assert ledger.discard_minimum_order_pending("XYZ", "2026-08-16", 0.20) is True
+    assert len(ledger.events("2026-08-16")) == events_before
+    assert ledger.pending_usd("XYZ", "2026-08-16") == 0.0
+
+
+def test_discard_minimum_order_pending_amount_is_none_when_refused(tmp_path):
+    # Same refusal case as the bool form's False: a concurrent update raised
+    # the balance to order-qualifying, so nothing was touched and nothing may
+    # be restored. (A change that merely stays sub-threshold is NOT a
+    # refusal -- see test_discard_still_clears_a_balance_that_changed_but_
+    # stayed_sub_threshold above; the amount form then reports the FRESH
+    # amount it actually cleared.)
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-17", 0.30, stream="morning")
+    stale_baseline = ledger.pending_usd("XYZ", "2026-08-17")
+    ledger.record("XYZ", "2026-08-17", 0.10, stream="concurrent")
+    ledger.record(
+        "XYZ",
+        "2026-08-17",
+        0.10,
+        idempotency_key="slot-b",
+        pending_baseline_usd=stale_baseline,
+        stream="s-b",
+    )
+    assert ledger.minimum_order_pending_tickers("2026-08-17") == {"XYZ": 0.50}
+
+    removed = ledger.discard_minimum_order_pending_amount("XYZ", "2026-08-17", 0.30)
+
+    assert removed is None
+    assert ledger.minimum_order_pending_tickers("2026-08-17") == {"XYZ": 0.50}
+    assert ledger.pending_usd("XYZ", "2026-08-17") == 0.50
+
+
+def test_discard_minimum_order_pending_amount_reports_the_fresh_amount_it_cleared(tmp_path):
+    # The other half of the same contract: a balance that moved but stayed
+    # sub-threshold is discarded at its CURRENT value, and the amount form
+    # reports that fresh figure -- the only thing a later rollback may put
+    # back -- rather than the caller's stale observation.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-17", 0.20, stream="morning")
+    ledger.record("XYZ", "2026-08-17", 0.10, stream="concurrent")
+
+    removed = ledger.discard_minimum_order_pending_amount("XYZ", "2026-08-17", 0.20)
+
+    assert removed == 0.30
+    assert ledger.minimum_order_pending_tickers("2026-08-17") == {}
+    assert ledger.pending_usd("XYZ", "2026-08-17") == 0.0
+
+
+def test_restore_refuses_when_the_ledger_changed_after_the_discard(tmp_path):
+    # Codex review, PR #680 discussion_r3925440982 ("Make post-discard
+    # restoration compare-and-swap"): between a successful discard and the
+    # caller's decision to roll it back, a concurrent retry settled the
+    # recovered broker order -- observing zero pending credit and durably
+    # recording its order_id. Restoring now would resurrect spendable credit
+    # that same order can never consume again, because its settlement is
+    # deduplicated by that id. The rollback must refuse.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-19", 0.20, stream="morning")
+
+    discard = ledger.discard_minimum_order_pending_tracked("XYZ", "2026-08-19", 0.20)
+    assert discard.removed_usd == 0.20
+    assert discard.refused is False
+
+    # A concurrent settlement lands, advancing the ledger revision.
+    ledger.settle("XYZ", "2026-08-19", 1.00, stream="concurrent", order_id="ORD-1")
+
+    restored = ledger.restore_minimum_order_pending(
+        "XYZ", "2026-08-19", discard.removed_usd, expected_revision=discard.revision
+    )
+
+    assert restored is False
+    assert ledger.minimum_order_pending_tickers("2026-08-19") == {}
+    assert "discard_restored" not in {event["decision"] for event in ledger.events("2026-08-19")}
+
+
+def test_restore_applies_when_nothing_changed_after_the_discard(tmp_path):
+    # The same compare-and-swap must still ALLOW the rollback it exists to
+    # protect: no concurrent mutation, so the credit comes back.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-20", 0.20, stream="morning")
+
+    discard = ledger.discard_minimum_order_pending_tracked("XYZ", "2026-08-20", 0.20)
+    restored = ledger.restore_minimum_order_pending(
+        "XYZ", "2026-08-20", discard.removed_usd, expected_revision=discard.revision
+    )
+
+    assert restored is True
+    assert ledger.minimum_order_pending_tickers("2026-08-20") == {"XYZ": 0.20}
+    assert ledger.events("2026-08-20")[-1]["decision"] == "discard_restored"
+
+
+def test_settle_with_already_debited_records_provenance_without_debiting(tmp_path):
+    # Codex review, PR #680 discussion_r3925440968 ("Keep post-discard
+    # settlement from consuming newer credit"): the dollars this order
+    # consumed were already removed by the caller's own discard, and a
+    # DIFFERENT stream has since credited fresh money for the ticker.
+    # Settling must register the order id and audit the amount without
+    # touching that newer balance.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-21", 0.20, stream="morning")
+    discard = ledger.discard_minimum_order_pending_tracked("XYZ", "2026-08-21", 0.20)
+    assert discard.removed_usd == 0.20
+    ledger.record("XYZ", "2026-08-21", 0.30, stream="newer-stream")
+    assert ledger.pending_usd("XYZ", "2026-08-21") == 0.30
+
+    ledger.settle(
+        "XYZ", "2026-08-21", 1.00, stream="afternoon", order_id="ORD-OLD", already_debited_usd=discard.removed_usd
+    )
+
+    # The newer $0.30 is untouched -- it was never this order's to spend.
+    assert ledger.pending_usd("XYZ", "2026-08-21") == 0.30
+    assert ledger.minimum_order_pending_tickers("2026-08-21") == {"XYZ": 0.30}
+    last = ledger.events("2026-08-21")[-1]
+    assert last["decision"] == "settled_already_discarded"
+    assert last["already_discarded_usd"] == 0.20
+    assert last["order_id"] == "ORD-OLD"
+    # Still idempotent per broker order id.
+    ledger.settle(
+        "XYZ", "2026-08-21", 1.00, stream="afternoon", order_id="ORD-OLD", already_debited_usd=discard.removed_usd
+    )
+    assert ledger.pending_usd("XYZ", "2026-08-21") == 0.30
+    assert [e["decision"] for e in ledger.events("2026-08-21")].count("settled_already_discarded") == 1
+
+
+def test_restore_after_amount_discard_round_trips_exactly(tmp_path):
+    # The amount the discard reports is precisely what restore must put back:
+    # discard -> restore leaves both pools where they started.
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-18", 0.20, stream="morning")
+
+    removed = ledger.discard_minimum_order_pending_amount("XYZ", "2026-08-18", 0.20)
+    assert removed is not None
+    ledger.restore_minimum_order_pending("XYZ", "2026-08-18", removed)
+
+    assert ledger.minimum_order_pending_tickers("2026-08-18") == {"XYZ": 0.20}
+    assert ledger.pending_usd("XYZ", "2026-08-18") == 0.20
+    assert ledger.events("2026-08-18")[-1]["decision"] == "discard_restored"
 
 
 def test_ledger_persists_pending_balance_and_auditable_events(tmp_path):
@@ -394,7 +563,9 @@ def test_settle_with_an_order_id_is_idempotent_against_a_repeat_call(tmp_path):
     ledger = CumulativeCreditLedger(tmp_path)
     ledger.preserve_pending("xyz", "2026-08-03", 2.0, idempotency_key="slot-1")
 
-    ledger.settle("xyz", "2026-08-03", 1.0, stream="morning", order_id="ORDER-1")
+    # The original placement may return surrounding whitespace that duplicate
+    # recovery strips. Both forms must still identify the same broker order.
+    ledger.settle("xyz", "2026-08-03", 1.0, stream="morning", order_id=" ORDER-1 ")
     assert ledger.pending_usd("xyz", "2026-08-03") == 1.0
 
     # A repeat call with the SAME order id must change nothing further.
@@ -402,10 +573,38 @@ def test_settle_with_an_order_id_is_idempotent_against_a_repeat_call(tmp_path):
     assert ledger.pending_usd("xyz", "2026-08-03") == 1.0
     events = ledger.events("2026-08-03")
     assert sum(1 for e in events if e["decision"] == "settled") == 1
+    state = json.loads((tmp_path / "2026-08-03" / "ledger.json").read_bytes())
+    assert state["settled_order_ids"] == {
+        "ORDER-1": {"ticker": "XYZ", "submitted_amount_usd": 1.0}
+    }
 
     # A DIFFERENT order id still settles normally.
     ledger.settle("xyz", "2026-08-03", 1.0, stream="morning", order_id="ORDER-2")
     assert ledger.pending_usd("xyz", "2026-08-03") == 0.0
+
+
+def test_settle_normalizes_persisted_order_ids_before_deduplication(tmp_path):
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("xyz", "2026-08-03", 2.0, idempotency_key="slot-1")
+    ledger.settle("xyz", "2026-08-03", 1.0, stream="morning", order_id="ORDER-1")
+
+    state_path = tmp_path / "2026-08-03" / "ledger.json"
+    state = json.loads(state_path.read_bytes())
+    state["settled_order_ids"] = {
+        " ORDER-1 ": {"ticker": "XYZ", "submitted_amount_usd": 1.0},
+        " 123 ": {"ticker": "XYZ", "submitted_amount_usd": 1.0},
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    ledger.preserve_pending("xyz", "2026-08-03", 1.0, idempotency_key="slot-2")
+
+    ledger.settle("xyz", "2026-08-03", 1.0, stream="morning", order_id="ORDER-1")
+
+    assert ledger.pending_usd("xyz", "2026-08-03") == 2.0
+    migrated = json.loads(state_path.read_bytes())
+    assert migrated["settled_order_ids"] == {
+        "ORDER-1": {"ticker": "XYZ", "submitted_amount_usd": 1.0},
+        "123": {"ticker": "XYZ", "submitted_amount_usd": 1.0},
+    }
 
 
 def test_settle_requires_a_ticker():
@@ -1000,6 +1199,63 @@ def test_partial_settlement_does_not_rebuild_paid_preserved_credit(tmp_path):
     assert retry.pending_after_usd == 0.20
 
 
+def test_provenance_snapshot_returns_partially_settled_values_atomically(tmp_path, monkeypatch):
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.record("XYZ", "2026-08-11", 0.40, stream="morning")
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.80, idempotency_key="slot-1")
+    ledger.settle("XYZ", "2026-08-11", 1.0, stream="afternoon")
+    reads = 0
+    original_read_state = ledger._read_state
+
+    def counting_read_state(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        return original_read_state(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "_read_state", counting_read_state)
+
+    snapshot = ledger.provenance_snapshot("XYZ", "2026-08-11", "slot-1")
+
+    assert reads == 1
+    assert snapshot.pending_usd == 0.20
+    assert snapshot.preserved_credit_usd == 0.20
+    assert snapshot.settled_credit_usd == 0.60
+    # The reconcile-vs-skip flag rides along from the SAME locked read
+    # (mirrors has_preserved_entry_for_slot): True for this slot's existing
+    # entry, False for a slot that never preserved anything.
+    assert snapshot.has_preserved_entry is True
+    assert ledger.provenance_snapshot("XYZ", "2026-08-11", "slot-2").has_preserved_entry is False
+
+
+def test_provenance_snapshot_reports_a_zeroed_preserve_entry_as_existing(tmp_path):
+    """A preserve entry reconciled down to $0 still exists and must be reported.
+
+    _compute_top_up gates reconcile-vs-skip on this flag rather than on
+    ``preserved_credit_usd > 0``: a zeroed entry that is NOT reconciled
+    falls through to a fresh preserve_pending() call with the same key,
+    whose own dedup swallows the revived decline (Codex review, PR #656
+    discussion_r3838839294: "Reconcile zeroed preserve entries before
+    re-preserving").
+    """
+    ledger = CumulativeCreditLedger(tmp_path)
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.80, idempotency_key="slot-1")
+    ledger.reconcile_preserved_credit(
+        "XYZ",
+        "2026-08-11",
+        "slot-1",
+        0.0,
+        expected_settled_credit_usd=0.0,
+        expected_outstanding_credit_usd=0.80,
+    )
+
+    snapshot = ledger.provenance_snapshot("XYZ", "2026-08-11", "slot-1")
+
+    assert snapshot.preserved_credit_usd == 0.0
+    assert snapshot.settled_credit_usd == 0.0
+    assert snapshot.has_preserved_entry is True
+    assert ledger.has_preserved_entry_for_slot("XYZ", "2026-08-11", "slot-1") is True
+
+
 def test_reconcile_preserved_credit_replaces_its_pending_contribution(tmp_path):
     ledger = CumulativeCreditLedger(tmp_path)
     ledger.record("XYZ", "2026-08-11", 0.40, stream="morning")
@@ -1174,7 +1430,7 @@ def test_legacy_preserve_without_settlement_accounting_fails_closed(tmp_path):
     ledger = CumulativeCreditLedger(tmp_path)
     ledger.preserve_pending("XYZ", "2026-08-11", 0.20, idempotency_key="slot-1")
     path = tmp_path / "2026-08-11" / "ledger.json"
-    state = json.loads(path.read_text(encoding="utf-8"))
+    state = json.loads(path.read_bytes())
     del state["recorded_idempotency_keys"]["preserve:XYZ:slot-1"]["settled_credit_usd"]
     path.write_text(json.dumps(state), encoding="utf-8")
 
@@ -1191,15 +1447,112 @@ def test_partial_settlement_keeps_legacy_preserve_fail_closed(tmp_path):
     ledger = CumulativeCreditLedger(tmp_path)
     ledger.preserve_pending("XYZ", "2026-08-11", 0.40, idempotency_key="slot-1")
     path = tmp_path / "2026-08-11" / "ledger.json"
-    state = json.loads(path.read_text(encoding="utf-8"))
+    state = json.loads(path.read_bytes())
     entry = state["recorded_idempotency_keys"]["preserve:XYZ:slot-1"]
     del entry["settled_credit_usd"]
     path.write_text(json.dumps(state), encoding="utf-8")
 
     ledger.settle("XYZ", "2026-08-11", 0.10)
 
-    updated = json.loads(path.read_text(encoding="utf-8"))
+    updated = json.loads(path.read_bytes())
     entry = updated["recorded_idempotency_keys"]["preserve:XYZ:slot-1"]
     assert entry["incremental_credit_usd"] == 0.30
     assert "settled_credit_usd" not in entry
     assert ledger.recorded_decision("XYZ", "2026-08-11", "slot-1") is not None
+
+
+def test_cumulative_credit_edge_cases(tmp_path):
+    ledger = CumulativeCreditLedger(tmp_path)
+
+    # 1. Empty ticker validations and None idempotency keys
+    with pytest.raises(ValueError, match="ticker is required"):
+        ledger.record("", "2026-08-11", 0.50)
+    with pytest.raises(ValueError, match="ticker is required"):
+        ledger.preserve_pending("  ", "2026-08-11", 0.50)
+    with pytest.raises(ValueError, match="ticker is required"):
+        ledger.reconcile_preserved_credit("", "2026-08-11", "slot-1", 0.50, expected_outstanding_credit_usd=0.0)
+    assert ledger.recorded_decision("", "2026-08-11", "slot-1") is None
+    assert ledger.recorded_decision("XYZ", "2026-08-11", None) is None
+    assert ledger.preserved_credit_for_slot("", "2026-08-11", "slot-1") == 0.0
+    assert ledger.preserved_credit_for_slot("XYZ", "2026-08-11", None) == 0.0
+    assert ledger.has_preserved_entry_for_slot("", "2026-08-11", "slot-1") is False
+    assert ledger.has_preserved_entry_for_slot("XYZ", "2026-08-11", None) is False
+    assert ledger.settled_credit_for_slot("", "2026-08-11", "slot-1") == 0.0
+    assert ledger.settled_credit_for_slot("XYZ", "2026-08-11", None) == 0.0
+    assert ledger.settled_credit_for_slot("XYZ", "2026-08-11", "slot-unknown") == 0.0
+    assert ledger.pending_usd("", "2026-08-11") == 0.0
+
+    # 2. record with pending_baseline_usd and no idempotency_key
+    decision = ledger.record("XYZ", "2026-08-11", 0.10, pending_baseline_usd=0.40)
+    assert decision.order_amount_usd == 1.0
+
+    # 3. preserve_pending with 0 additional credit when pending is 0
+    res = ledger.preserve_pending("ABC", "2026-08-11", 0.0)
+    assert res == 0.0
+
+    # 4. reconcile_preserved_credit when cached is None
+    res = ledger.reconcile_preserved_credit(
+        "ABC", "2026-08-11", "nonexistent-key", 0.20, expected_outstanding_credit_usd=0.0
+    )
+    assert res == 0.0
+
+    # 5. reconcile_preserved_credit when already consumed and outstanding_credit <= 0
+    ledger.preserve_pending("XYZ", "2026-08-11", 0.20, idempotency_key="slot-consumed")
+    assert ledger.has_preserved_entry_for_slot("XYZ", "2026-08-11", "slot-consumed") is True
+    ledger.settle("XYZ", "2026-08-11", 1.0)
+    res = ledger.reconcile_preserved_credit(
+        "XYZ",
+        "2026-08-11",
+        "slot-consumed",
+        0.0,
+        expected_settled_credit_usd=0.20,
+        expected_outstanding_credit_usd=0.0,
+    )
+    assert res == ledger.pending_usd("XYZ", "2026-08-11")
+
+    # 6. discard_minimum_order_pending when amount <= 0
+    assert ledger.discard_minimum_order_pending("NONEXISTENT", "2026-08-11") is True
+
+    # 7. discard_minimum_order_pending when pending_after > 0
+    ledger.preserve_pending("DUAL", "2026-08-11", 0.20)
+    ledger.record("DUAL", "2026-08-11", 0.10)
+    assert ledger.discard_minimum_order_pending("DUAL", "2026-08-11") is True
+    assert ledger.pending_usd("DUAL", "2026-08-11") == 0.20
+
+    # 8. Settle loop break when available <= 0, and legacy entry without settled_credit_usd
+    ledger.preserve_pending("MULTI", "2026-08-11", 0.20, idempotency_key="m1")
+    ledger.preserve_pending("MULTI", "2026-08-11", 0.20, idempotency_key="m2")
+    # Remove settled_credit_usd from m1 to test branch where key is absent
+    m_state_path = tmp_path / "2026-08-11" / "ledger.json"
+    m_state = json.loads(m_state_path.read_bytes())
+    m_state["recorded_idempotency_keys"]["preserve:MULTI:m1"].pop("settled_credit_usd", None)
+    m_state_path.write_text(json.dumps(m_state), encoding="utf-8")
+    ledger.settle("MULTI", "2026-08-11", 0.20)
+
+    # 9. _read_state corrupt / invalid json / invalid structure
+    day_dir = tmp_path / "2026-08-99"
+    day_dir.mkdir(parents=True, exist_ok=True)
+    state_file = day_dir / "ledger.json"
+    state_file.write_text("{not valid json", encoding="utf-8")
+    with pytest.raises(ValueError, match="could not read cumulative credit ledger"):
+        CumulativeCreditLedger(tmp_path).pending_usd("XYZ", "2026-08-99")
+
+    state_file.write_text(json.dumps({"version": 2}), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid cumulative credit ledger"):
+        CumulativeCreditLedger(tmp_path).pending_usd("XYZ", "2026-08-99")
+
+    # 10. _money numeric & finite checks
+    from dca_cumulative import _money
+
+    with pytest.raises(ValueError, match="credit amounts must be numeric"):
+        _money("invalid_numeric")
+    with pytest.raises(ValueError, match="credit amounts must be finite"):
+        _money(float("nan"))
+    with pytest.raises(ValueError, match="credit amounts must be finite"):
+        _money(float("inf"))
+
+    # 11. apply_cumulative_credit total == 0
+    zero_dec = apply_cumulative_credit(0.0, 0.0)
+    assert zero_dec.order_amount_usd == 0.0
+    assert zero_dec.pending_after_usd == 0.0
+

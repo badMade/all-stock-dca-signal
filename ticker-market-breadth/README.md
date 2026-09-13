@@ -85,10 +85,11 @@ outcome from the daily run.
 **Interpreter selection for the automatic subprocess call.** `scripts/
 run_tickers_daily_update.py` normally runs under a plain, stdlib-only
 interpreter that does NOT have this subproject's `yfinance`/`pandas`
-installed -- launching the subprocess with that same interpreter would
-always fail with `ModuleNotFoundError`. `_default_breadth_fetch_python()`
-auto-detects a `.venv` next to `fetch_tick.py` (i.e. this subproject's own
-documented install path above) and prefers it when present; set
+installed, so launching the subprocess with that same interpreter would
+usually fail with `ModuleNotFoundError`. `_default_breadth_fetch_python()`
+auto-detects an executable `.venv` next to `fetch_tick.py` (i.e. this
+subproject's own documented install path above) and prefers it when
+present; set
 `DCA_BREADTH_FETCH_PYTHON` (or pass `--breadth-fetch-python` to
 `run_tickers_daily_update.py`) to point at a different interpreter
 explicitly, e.g. one where these dependencies were installed some other way.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from datetime import date, datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
@@ -2176,7 +2177,7 @@ def test_keyword_overrides_cannot_bypass_the_budget_field_validation():
     import tempfile
     from pathlib import Path
 
-    rejected = {
+    rejected: dict[str, list[Any]] = {
         "max_consecutive_placement_failures": ["3", False, True, 0, -1, 1.5],
         "max_orders_per_day": [0, -1, True, "8", 2.5],
         "max_per_order_usd": [0, -1, True, float("nan"), float("inf")],
@@ -2191,7 +2192,8 @@ def test_keyword_overrides_cannot_bypass_the_budget_field_validation():
         for field, values in rejected.items():
             for value in values:
                 with pytest.raises(ValueError):
-                    load_strategy_config(config_dir=config_dir, **{field: value})  # type: ignore[arg-type]
+                    kwargs: dict[str, Any] = {field: value}
+                    load_strategy_config(config_dir=config_dir, **kwargs)
 
         # The valid direction is untouched, including a deliberate zero on a
         # sizing field, where zero is meaningful rather than malformed.

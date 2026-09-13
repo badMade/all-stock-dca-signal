@@ -27,9 +27,7 @@ from datetime import date
 from unittest.mock import patch
 
 import pytest
-
 from market_data_ingest.dolthub_options import (
-    OptionChainRow,
     _build_query,
     fetch_option_chain,
 )

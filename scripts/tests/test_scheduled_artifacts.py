@@ -55,6 +55,7 @@ from scripts.scheduled_artifacts import (  # noqa: E402
     placement_unreachable_state_fields,
     read_run_state,
     resolve_live_account_number,
+    serialize_submitted_orders_csv,
     submitted_order_rows,
     validate_run_artifacts,
     write_scheduled_run_artifacts,
@@ -274,6 +275,23 @@ def test_partial_unplaced_planned_order_is_compute_only_failure():
         ],
     }
     assert is_compute_only_terminal_failure(status_only)
+
+
+def test_potentially_submitted_candidate_entered_placement():
+    # Codex review, PR #1300 discussion_r3920546913: "Treat ambiguous orders
+    # as having entered placement". A candidate whose placement connector
+    # raised OrderPlacementAmbiguousError carries a positive planned amount
+    # and no order_id -- exactly the shape _has_unplaced_planned_order()
+    # otherwise reads as "never entered placement" -- but this status
+    # deliberately reserves a possibly-live order rather than leaving it
+    # unplaced, so it must not be treated as a compute-only terminal failure.
+    state = {
+        "order_submit_status": "submitted",
+        "buy_candidates": [
+            {"ticker": "A", "planned_amount_usd": 5.0, "status": "potentially_submitted"},
+        ],
+    }
+    assert not is_compute_only_terminal_failure(state)
 
 
 def test_placement_unreachable_requires_false_completed_order_evidence():
@@ -592,6 +610,20 @@ def test_submitted_orders_csv_has_header_when_empty(tmp_path):
     rows = list(csv.reader(path.open()))
     assert rows and rows[0] == list(SUBMITTED_ORDERS_FIELDS)
     assert len(rows) == 1  # header only, no data rows
+
+
+def test_submitted_orders_serializer_matches_writer_bytes(tmp_path):
+    rows = [
+        {
+            "ticker": "AAPL",
+            "order_id": "order-1",
+            "submitted_amount_usd": 2.5,
+            "status": "submitted",
+        }
+    ]
+    expected = serialize_submitted_orders_csv(rows)
+    path = write_submitted_orders_csv(tmp_path, rows)
+    assert path.read_bytes() == expected
 
 
 def test_submitted_order_rows_include_pending_and_unconfirmed():
@@ -1156,3 +1188,57 @@ def test_read_run_state_returns_none_rather_than_raising(tmp_path):
 
     write_scheduled_run_artifacts(tmp_path, _live_run_state())
     assert read_run_state(tmp_path)["run_id"] == "midday_live_20260727_1230ET"
+
+
+def test_write_submitted_orders_csv_does_not_clobber_a_peer_replacement_during_serialization(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Open the atomic write before serializing
+    rows"): ``atomic_open_w`` snapshots the destination's identity at
+    ``with`` entry and refuses the final rename if that identity changed by
+    the time the write body finishes. ``write_submitted_orders_csv`` used to
+    serialize its rows BEFORE opening ``atomic_open_w`` -- unlike
+    ``_write_csv`` (``write_signals_csv``'s writer), which opens first and
+    serializes directly into the handle -- leaving a window, for as long as
+    serialization took, during which an overlapping scheduled invocation
+    could replace the destination first. This invocation's snapshot would
+    then be taken AFTER that replacement and silently discard it on
+    ``os.replace``, with no error.
+
+    Monkeypatches ``serialize_submitted_orders_csv`` to replace the
+    destination file as a side effect DURING serialization -- standing in
+    for that overlapping peer -- and proves the write now raises the same
+    "changed while this write was in progress" error
+    ``test_a_destination_replaced_mid_write_is_not_clobbered`` (test_dca_
+    fileio.py) proves for an ordinary mid-write replacement, and that the
+    peer's file survives untouched.
+    """
+    import scripts.scheduled_artifacts as scheduled_artifacts
+    from dca_fileio import atomic_write_text
+
+    target = tmp_path / "submitted_orders.csv"
+    atomic_write_text(target, "original\n")
+
+    real_serialize = scheduled_artifacts.serialize_submitted_orders_csv
+
+    def serialize_then_peer_replaces_destination(rows, *, fieldnames=SUBMITTED_ORDERS_FIELDS):
+        serialized = real_serialize(rows, fieldnames=fieldnames)
+        # The peer's own write completes in full via its own atomic swap
+        # (a NEW inode at the same path, exactly like `write_submitted_
+        # orders_csv`'s own `atomic_open_w` would produce -- a plain
+        # truncating `open`/`write_text` reuses the SAME inode and would
+        # not exercise the identity check this test is proving) WHILE this
+        # invocation is still serializing its own rows.
+        atomic_write_text(target, "peer's own submitted_orders.csv\n")
+        return serialized
+
+    monkeypatch.setattr(
+        scheduled_artifacts, "serialize_submitted_orders_csv", serialize_then_peer_replaces_destination
+    )
+
+    with pytest.raises(OSError, match="changed while this write was in progress"):
+        write_submitted_orders_csv(
+            tmp_path, [{"ticker": "AAPL", "order_id": "o1", "status": "submitted"}]
+        )
+
+    assert target.read_text(encoding="utf-8") == "peer's own submitted_orders.csv\n"

@@ -15,7 +15,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Any, cast
 from zoneinfo import ZoneInfo
@@ -38,6 +38,7 @@ try:
     ERROR_CLASS_MISSING_SPREAD_DATA,
     FINAL_MANUAL_OVERRIDE_RUN_TYPE,
     INTRADAY_RECOVERY_SLOTS,
+    MANUAL_EXCLUSION_SUBROOTS,
     ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
     ORDER_SUBMIT_STATUS_ERROR,
     ORDER_SUBMIT_STATUS_NO_ORDERS,
@@ -1302,6 +1303,45 @@ def test_save_raw_input_persists_before_compute():
         assert p1.exists()
         # Compute reads the persisted file, not an in-memory response.
         assert json.loads(p1.read_bytes())["AAPL"] == 190.0
+        assert list_raw_inputs_saved(TRADING_DAY, base) == [
+            "historicals_batch1.json",
+            "quotes_batch1.json",
+        ]
+
+
+def test_list_raw_inputs_saved_excludes_orphaned_temp_files():
+    # atomic_write_text stages every write as a visible <name>.<uuid>.tmp
+    # sibling and removes it on failure, but a process killed mid-write never
+    # runs that cleanup. Listing every regular file published the orphan as a
+    # successfully persisted input -- one no recorder ever finished or read back
+    # (Codex review: "Exclude orphaned temp files from the raw manifest").
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        save_raw_input(TRADING_DAY, quotes_batch_filename(1), {"AAPL": 190.0}, base=base)
+        raw_dir = raw_input_dir(TRADING_DAY, base)
+        # Exactly what a SIGKILL during atomic_write_text leaves behind.
+        (raw_dir / "historicals_batch1.json.0123456789abcdef.tmp").write_text(
+            '{"AAPL": [1, 2', encoding="utf-8"
+        )
+
+        saved = list_raw_inputs_saved(TRADING_DAY, base)
+
+        assert saved == ["quotes_batch1.json"]
+        # And build_raw_persistence_state, which makes the same claim, agrees.
+        assert build_raw_persistence_state(TRADING_DAY, base=base)["raw_inputs_saved"] == saved
+
+
+def test_list_raw_inputs_saved_keeps_a_completed_file_that_does_not_parse():
+    # A file that reached its final name went through os.replace after its
+    # content was fsynced, so it is complete by construction. Dropping it for
+    # failing to parse would hide genuine corruption behind a silently shorter
+    # manifest instead of surfacing it.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        save_raw_input(TRADING_DAY, quotes_batch_filename(1), {"AAPL": 190.0}, base=base)
+        raw_dir = raw_input_dir(TRADING_DAY, base)
+        (raw_dir / "historicals_batch1.json").write_text("not json at all", encoding="utf-8")
+
         assert list_raw_inputs_saved(TRADING_DAY, base) == [
             "historicals_batch1.json",
             "quotes_batch1.json",
@@ -3127,6 +3167,38 @@ def test_outside_core_loader_reach_is_anchored_at_the_artifact_root():
     assert not _outside_core_loader_reach(Path("/mnt/relocated/final_manual_review/r"), base)
 
 
+def test_top_up_context_reads_orders_csv_under_perplexity_manual_override():
+    """A referenced CSV in the external override tree is not core-loader coverage."""
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = (
+            base.parent / "perplexity_primary_20260818" / "manual_override_1555ET"
+        )
+        run_dir.mkdir(parents=True)
+        orders_path = run_dir / "submitted_orders.csv"
+        orders_path.write_text(
+            "symbol,amount,order_id,status,avg_fill_price,quantity\n"
+            "MRVL,3.0,PPX-CAP-CSV-1,filled,189.36,0.01584284\n"
+        )
+        state = {
+            "trading_day": "2026-08-18",
+            "run_classification": {
+                "run_origin": "manual_user_cap_override",
+                "manual_run": True,
+                "same_day_top_up_context_only": True,
+                "valid_scheduled_evidence": False,
+            },
+            "artifacts": {"orders_csv_path": str(orders_path)},
+        }
+        (run_dir / "run_state.json").write_text(json.dumps(state, indent=2))
+
+        ctx = load_same_day_top_up_context("2026-08-18", base=base)
+        assert ctx["MRVL"].prior_usd == 3.0
+        assert ctx["MRVL"].reference_price == 189.36
+        assert ctx["MRVL"].order_ids == ["PPX-CAP-CSV-1"]
+
+
 def test_top_up_context_buy_candidates_still_skipped_outside_final_manual_review():
     # Companion to the test above: a run WITH buy_candidates under a root the
     # core loader DOES reach (e.g. ce16ba6b/manual_runs, scanned by both
@@ -3714,13 +3786,13 @@ def test_merge_prior_sums_attempt_count_across_merged_sources():
     # must ADD its own attempt count on top, not overwrite or ignore it.
     dst = {}
     _merge_prior(
-        dst,
+        cast(Any, dst),
         {"GFUZ": {"prior_usd": 2.0, "reference_price": None, "order_ids": ["ORD-1"], "attempt_count": 1}},
         "run1",
         run_ts=100,
     )
     _merge_prior(
-        dst,
+        cast(Any, dst),
         {"GFUZ": {"prior_usd": 3.0, "reference_price": None, "order_ids": ["ORD-2"], "attempt_count": 1}},
         "run2",
         run_ts=200,
@@ -3868,11 +3940,60 @@ def test_rows_from_buy_candidates_survives_a_malformed_collection():
     assert rows[0]["_confirmed_fill"] is True
 
 
+def test_rows_from_buy_candidates_includes_potentially_submitted():
+    # Codex review, PR #1300 discussion_r3920826586 ("Include ambiguous
+    # manual orders in top-up context"): this loader is the ONLY path that
+    # ever reaches final_manual_review/** artifacts (outside the core
+    # prior-allocation scan roots), so excluding an ambiguous placement
+    # (OrderPlacementAmbiguousError) here let load_same_day_top_up_context()
+    # omit a manual/final-review order that timed out after possibly
+    # reaching the broker, letting a later scheduled run submit it again.
+    rows = _rows_from_buy_candidates(
+        {"buy_candidates": [{"ticker": "AAPL", "status": "potentially_submitted", "planned_amount_usd": 5.0}]}
+    )
+    assert [r["ticker"] for r in rows] == ["AAPL"]
+    # Not a confirmed fill -- only "filled" is.
+    assert rows[0]["_confirmed_fill"] is False
+
+    # Codex review, PR #1300 discussion_r3920912119 ("Retain reconciled
+    # in-flight manual orders"): "pending"/"unconfirmed" (a reconciliation
+    # pass can demote "submitted" to either) must be recognized too, not
+    # just "potentially_submitted".
+    for reconciled_status in ("pending", "unconfirmed"):
+        rows = _rows_from_buy_candidates(
+            {"buy_candidates": [{"ticker": "BBB", "status": reconciled_status, "planned_amount_usd": 5.0}]}
+        )
+        assert [r["ticker"] for r in rows] == ["BBB"], reconciled_status
+
+
+def test_read_csv_rows_includes_potentially_submitted(tmp_path):
+    # Same fix as test_rows_from_buy_candidates_includes_potentially_submitted
+    # above, applied to the bare-CSV fallback reader.
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,order_id,status,amount_usd\nAAPL,ORD-1,potentially_submitted,5.00\n",
+        encoding="utf-8",
+    )
+    rows = _read_csv_rows(csv_path)
+    assert [r["ticker"] for r in rows] == ["AAPL"]
+
+    # Codex review, PR #1300 discussion_r3920912119 ("Retain reconciled
+    # in-flight manual orders"): "pending"/"unconfirmed" must be recognized
+    # too, not just "potentially_submitted".
+    pending_csv_path = tmp_path / "pending_orders.csv"
+    pending_csv_path.write_text(
+        "ticker,order_id,status,amount_usd\nBBB,ORD-2,pending,5.00\n",
+        encoding="utf-8",
+    )
+    pending_rows = _read_csv_rows(pending_csv_path)
+    assert [r["ticker"] for r in pending_rows] == ["BBB"]
+
+
 @pytest.mark.parametrize("malformed_status", [[], {}, 1, 1.5, True])
 def test_rows_from_buy_candidates_ignores_an_unhashable_status(malformed_status):
     # Codex review ("Validate candidate status before set membership"): an
     # unhashable status (a malformed [] or {} from corrupt JSON) raised
-    # TypeError out of `status not in _ORDER_BEARING_CANDIDATE_STATUSES` --
+    # TypeError out of `status not in _PLACED_OR_IN_FLIGHT_STATUSES` --
     # frozenset membership testing hashes its argument -- aborting the whole
     # load_same_day_top_up_context() scan over one corrupt candidate instead
     # of ignoring it the way every other malformed field here is ignored.
@@ -4695,7 +4816,7 @@ _CONTEXT_ELIGIBILITY_FLAGS = (
 )
 
 
-def _records_with_context_flags(node, name="<root>"):
+def _records_with_context_flags(node: Any, name: str = "<root>") -> Any:
     """Yield (name, record, flags) for every dict carrying run_origin + context flags.
 
     Walks nested collections (recovery_context_run_outcomes.runs, the intraday
@@ -4703,7 +4824,8 @@ def _records_with_context_flags(node, name="<root>"):
     since that nesting is exactly where the stale copies kept hiding.
     """
     if isinstance(node, dict):
-        flags = node.get("flags") if isinstance(node.get("flags"), dict) else node
+        flags_raw = node.get("flags")
+        flags: dict[str, Any] = flags_raw if isinstance(flags_raw, dict) else node
         if node.get("run_origin") is not None and "valid_recovery_context" in flags:
             yield name, node, flags
         for key, value in node.items():
@@ -5290,3 +5412,91 @@ def test_state_root_and_cron_tracking_root_resolve_at_call_time():
     # references) -- which is exactly why state_root() naming it directly
     # was wrong.
     assert lines[2] == str(Path(__file__).resolve().parents[2] / "cron_tracking" / "ce16ba6b"), out.stdout
+
+
+def test_manual_exclusion_subroots_has_no_duplicate_entries():
+    # Codex review, PR #680 discussion_r3914220641 ("Deduplicate the
+    # manual-override scan root"): the perplexity_primary_*/manual_override_*
+    # glob was listed twice in MANUAL_EXCLUSION_SUBROOTS. _scan_recovery_runs
+    # (and generate_credit_usage_proxy_report.py's derived
+    # MANUAL_SCAN_SUBROOTS) walk each tuple entry once and do not dedupe
+    # NO_RUN_ID rows within a single pass, so a repeated entry double-counts
+    # every matching run.
+    assert len(MANUAL_EXCLUSION_SUBROOTS) == len(set(MANUAL_EXCLUSION_SUBROOTS))
+
+
+def _executor_native_scheduled_block(executor, now: datetime) -> dict:
+    """The run_classification block a class-based executor actually writes for a
+    scheduled live run, built by the executor itself rather than a hand-typed
+    literal so this test cannot drift from the executor."""
+    return executor.run_classification(now, manual=False)
+
+
+def test_validate_classification_accepts_the_class_based_morning_and_midday_executor_identities():
+    """2026-09-07 diagnostic T:F01: morning_dca.MorningDCAExecutor (live mode) and
+    midday_dca.MiddayDCAExecutor stamp their OWN run_type, run_id shape and
+    state_schema_version ('morning-live-v2-preauthorized', 'midday-live-v1'),
+    exactly as the market_open/intraday executors do (see the test above), but
+    only the roster's run_slot() shapes for stream='morning'/'midday' were
+    registered here. Every scheduled 10:30/12:30 run the class-based executors
+    wrote therefore failed on version alone, and dca_risk.classify_stream()
+    filed it under STREAM_OTHER instead of STREAM_SCHEDULED.
+    """
+    from dca_risk import STREAM_SCHEDULED, classify_stream
+    from midday_dca import MiddayConfig, MiddayDCAExecutor
+    from morning_dca import MORNING_LIVE_MODE, MorningConfig, MorningDCAExecutor
+
+    now = datetime(2026, 9, 8, 14, 30, tzinfo=timezone.utc)  # 10:30 ET
+    morning = _executor_native_scheduled_block(
+        MorningDCAExecutor(MorningConfig(tickers=("AAPL",)), mode=MORNING_LIVE_MODE), now
+    )
+    assert morning["state_schema_version"] == "morning-live-v2-preauthorized"
+    assert morning["run_id"] == "morning_live_20260908_1030ET"
+    res = validate_classification(morning)
+    assert res.ok, res.errors
+    assert is_scheduled_state({"run_classification": morning}) is True
+    assert classify_stream({"run_classification": morning}) == STREAM_SCHEDULED
+
+    midday_now = datetime(2026, 9, 8, 16, 30, tzinfo=timezone.utc)  # 12:30 ET
+    midday = _executor_native_scheduled_block(MiddayDCAExecutor(MiddayConfig(tickers=("AAPL",))), midday_now)
+    assert midday["state_schema_version"] == "midday-live-v1"
+    assert midday["run_id"] == "midday_live_20260908_1230ET"
+    res = validate_classification(midday)
+    assert res.ok, res.errors
+    assert classify_stream({"run_classification": midday}) == STREAM_SCHEDULED
+
+    # The roster shapes for the same streams (run_dca.run_slot()'s 1030ET/1230ET,
+    # run_type='scheduled_live_test', run_id='scheduled_..._1030ET') stay valid.
+    roster_morning = build_scheduled_classification(
+        "2026-09-08",
+        "2026-09-08T14:30:01Z",
+        stream="morning",
+        cron_id="42173154",
+        supersedes_cron_id=None,
+        scheduled_for_et="10:30",
+        scheduled_window_start_et="10:25",
+        scheduled_window_end_et="10:35",
+        run_id="scheduled_20260908_1030ET",
+        valid_afternoon_scheduled_evidence=False,
+    )
+    assert validate_classification(roster_morning).ok, validate_classification(roster_morning).errors
+
+    # Adversarial: the executor-native identity must be coherent, not merely
+    # version-whitelisted. Mixing the native run_type with the roster's run_id
+    # shape, a foreign cron id, or the wrong slot window is rejected.
+    mixed_run_id = dict(morning)
+    mixed_run_id["run_id"] = "scheduled_20260908_1030ET"
+    assert not validate_classification(mixed_run_id).ok
+
+    wrong_cron = dict(midday)
+    wrong_cron["cron_id"] = "42173154"
+    assert not validate_classification(wrong_cron).ok
+
+    wrong_window = dict(morning)
+    wrong_window["scheduled_window_end_et"] = "12:35"
+    assert not validate_classification(wrong_window).ok
+
+    # A native block must never pass as AFTERNOON evidence.
+    afternoon_claim = dict(morning)
+    afternoon_claim["stream"] = "afternoon"
+    assert not validate_classification(afternoon_claim).ok

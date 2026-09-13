@@ -11,6 +11,7 @@ Runnable with ``pytest`` or ``python test_morning_dca.py``.
 
 import contextlib
 import csv
+import math
 import os
 import re
 import subprocess
@@ -35,8 +36,22 @@ from typing import Any, Dict, Optional, Tuple, cast
 
 import pytest
 
+# Moved into tests/ from the repo root (2026-08-23). ``pytest``/``python -m
+# pytest`` already resolve `import morning_dca`/`near_close_dca`/etc. via
+# pyproject.toml's `pythonpath = [".", "tests"]`, but this file's own
+# docstring documents a second, direct-execution contract (``python
+# tests/test_morning_dca.py``) that pythonpath doesn't cover -- running a
+# script directly only adds ITS OWN directory (tests/) to sys.path, not the
+# repo root (Codex review: "Retain direct execution for relocated tests").
+# A bare `if` guard (no assignment), like the `os.environ.setdefault` call
+# above: ruff's E402 exempts conditionals, so every import below still
+# needs no `noqa`.
+if str(Path(__file__).resolve().parent.parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import morning_dca
 from dca_config import DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES, MissingConfigEnvError
+from dca_live_adapters import FinanceDataProvider, RobinhoodBroker, RobinhoodDataProvider
 from dca_paths import CRON_TRACKING_ROOT_ENV
 from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
@@ -57,6 +72,7 @@ from morning_dca import (
     MorningDCAExecutor,
     MorningLedger,
     MorningSignal,
+    RawInputPersistenceError,
     TopUpOutcome,
     _csv_qualifying_notional_total,
     _forbidden_preflight_root_reason,
@@ -65,6 +81,7 @@ from morning_dca import (
     _RawInputRecorder,
     _same_stream_order_exists,
     _sanitize_budget_ledger_filename,
+    _stable_broker_order_id,
     load_max_consecutive_placement_failures,
     load_max_orders_per_day,
     load_morning_config,
@@ -83,8 +100,45 @@ from near_close_dca import (
     _nth_weekday_of_month,
     account_pinning_failure,
 )
+from scripts.file_lock import cross_process_lock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+# C:F1 (2026-09-07 diagnostic): a LIVE RobinhoodBroker now refuses to answer a
+# lookup whose callable is unwired (simulated buying power, "tradable", "no
+# order today" are dry-run defaults only), so fixtures that exercise placement
+# wire the three lookups explicitly with permissive stubs.
+# Live simulations use their supplied historical clock; session/calendar gates stay enabled.
+pytestmark = pytest.mark.usefixtures("historical_live_clock")
+
+
+def _no_orders_today(**_kwargs):
+    # An explicit, provable empty page (an ``orders`` list), not a bare
+    # ``results`` page: a live broker now refuses a page shape it cannot
+    # recognize instead of reading it as "no order today" (2026-09-07 mock
+    # beta run of the executor classes).
+    return {"orders": [], "next": None}
+
+
+def _all_tradable(**kwargs):
+    return {
+        "results": [
+            {"symbol": symbol, "tradeable": True, "state": "active", "fractional_tradability": "tradable"}
+            for symbol in kwargs.get("symbols", ())
+        ]
+    }
+
+
+def _ample_buying_power(**_kwargs):
+    return {"buying_power": "300"}
+
+
+_LIVE_LOOKUP_STUBS = {
+    "buying_power_fn": _ample_buying_power,
+    "orders_fn": _no_orders_today,
+    "tradability_fn": _all_tradable,
+}
 
 
 def _now_live():
@@ -345,10 +399,10 @@ def test_signal_zero_multiplier_below_configured_minimum_drop_normalizes_to_no_a
     # customized config can set minimum_drop_vs_previous_close BELOW the
     # first positive sizing tier (0.1%). A drop of 0.05% then clears the
     # configured minimum (0.01%) but multiplier_for_drop() still returns 0x
-    # for it. If this falls into the BUY branch with
+    # for it. Before the fix this fell into the BUY branch with
     # multiplier=0.0/hypothetical=0.0 -- action=BUY with a zeroed amount,
     # which downstream serializes auto_buy_signal=true even though
-    # _buy_candidates() (multiplier > 0) still excludes it, it triggers a false
+    # _buy_candidates() (multiplier > 0) still excludes it, a false
     # execution-gap alert. The signal must be normalized to a genuine
     # no-action/skip result instead.
     cfg = MorningConfig(
@@ -2069,6 +2123,61 @@ def test_load_morning_config_reads_config_file(tmp_path):
     assert cfg.morning_run_state_root == "/custom/morning/root"
 
 
+def test_load_morning_config_appends_dated_manual_override_to_configured_cap_seed_roots(
+    tmp_path, monkeypatch
+):
+    # Codex review, PR #656 follow-up on discussion_r3839652545: "Add
+    # override roots to configured cap seeds". default_pooled_cap_seed_
+    # roots()'s own perplexity_primary_*/manual_override_* glob fix is
+    # bypassed by every production stream config, which supplies an
+    # EXPLICIT artifact_paths.cap_seed_roots list that replaces the
+    # default_factory output wholesale. The loader must still append any
+    # existing dated override root on top of that configured list.
+    from morning_dca import load_morning_config
+
+    cron_root = tmp_path / "cron_tracking"
+    override_dir = cron_root / "perplexity_primary_20260818" / "manual_override_1555ET"
+    override_dir.mkdir(parents=True)
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(cron_root))
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    configured_root = str(cron_root / "midday_dca")
+    (cfg_dir / "morning_dca.json").write_text(
+        json.dumps({"artifact_paths": {"cap_seed_roots": [configured_root]}}),
+        encoding="utf-8",
+    )
+
+    cfg = load_morning_config(str(cfg_dir))
+
+    assert cfg.cap_seed_roots is not None
+    assert configured_root in cfg.cap_seed_roots
+    assert str(override_dir) in cfg.cap_seed_roots
+
+
+def test_load_morning_config_respects_an_explicitly_empty_cap_seed_roots(tmp_path, monkeypatch):
+    # An explicit [] deliberately disables cap seeding entirely (mirrors
+    # prior_allocation_roots' own empty-list contract) -- appending the
+    # override root here would silently reactivate cap seeding an operator
+    # explicitly turned off.
+    from morning_dca import load_morning_config
+
+    cron_root = tmp_path / "cron_tracking"
+    (cron_root / "perplexity_primary_20260818" / "manual_override_1555ET").mkdir(parents=True)
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(cron_root))
+
+    cfg_dir = tmp_path / "config"
+    cfg_dir.mkdir()
+    (cfg_dir / "morning_dca.json").write_text(
+        json.dumps({"artifact_paths": {"cap_seed_roots": []}}),
+        encoding="utf-8",
+    )
+
+    cfg = load_morning_config(str(cfg_dir))
+
+    assert cfg.cap_seed_roots == ()
+
+
 
 def test_load_morning_config_reads_approved_dates_from_trading_window(tmp_path):
     from morning_dca import load_morning_config
@@ -3181,7 +3290,7 @@ def test_maybe_block_for_holiday_seeds_prior_spend_in_budget_ledger(tmp_path):
 
     assert res is not None
     assert "budget_ledger" in res["paths"]
-    ledger_data = json.loads(Path(res["paths"]["budget_ledger"]).read_text(encoding="utf-8"))
+    ledger_data = json.loads(Path(res["paths"]["budget_ledger"]).read_bytes())
     assert ledger_data["hypothetical_week_spend_usd"] == 50.0
     assert ledger_data["remaining_weekly_usd"] == 850.0
 
@@ -3224,7 +3333,7 @@ def test_maybe_block_for_holiday_seeds_same_day_pooled_spend(tmp_path):
 
     assert res is not None
     assert "budget_ledger" in res["paths"]
-    ledger_data = json.loads(Path(res["paths"]["budget_ledger"]).read_text(encoding="utf-8"))
+    ledger_data = json.loads(Path(res["paths"]["budget_ledger"]).read_bytes())
     assert ledger_data["hypothetical_day_spend_usd"] == 30.0
     assert ledger_data["remaining_daily_usd"] == 150.0
     assert ledger_data["hypothetical_week_spend_usd"] == 30.0
@@ -3931,7 +4040,7 @@ def test_raw_sequence_numbers_come_from_existing_suffixes_not_a_file_count(tmp_p
     assert recorder.error is None
     assert recorder.saved_filenames == ["quote_CCC_4.json"]
     # The pre-existing _3 file is untouched.
-    assert json.loads((raw_dir / "quote_BBB_3.json").read_text()) == {"original": True}
+    assert json.loads((raw_dir / "quote_BBB_3.json").read_bytes()) == {"original": True}
     assert (raw_dir / "quote_CCC_4.json").exists()
 
 
@@ -3950,6 +4059,57 @@ def test_raw_sequence_ignores_non_numeric_suffixes(tmp_path):
 
     assert recorder.error is None
     assert recorder.saved_filenames == ["quote_DDD_3.json"]
+
+
+def test_concurrent_raw_recorders_never_allocate_the_same_sequence_number(tmp_path):
+    """Two overlapping scheduler attempts for the same dated slot must never
+    collide on a sequence number and silently overwrite each other's evidence.
+
+    Codex review, PR #688 discussion_r3917126971 ("Allocate raw sequence
+    numbers atomically"): two concurrent ``_RawInputRecorder`` instances for
+    the SAME raw_dir used to both scan the directory, both see the same max
+    ``_seq``, and both write, e.g., ``prior_close_AAPL_1.json`` -- the second
+    write silently destroying the first attempt's own audit evidence.
+    ``persist()`` now reserves its sequence number under
+    ``scripts.file_lock.cross_process_lock`` (a real file lock, held for the
+    scan-then-write together), so two recorders hammering the same directory
+    from separate threads must still produce as many DISTINCT, non-colliding
+    filenames as calls made -- never a silent overwrite.
+    """
+    import concurrent.futures
+
+    import morning_dca as _md
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+
+    recorder_a = _md._RawInputRecorder(raw_dir, "2026-07-08")
+    recorder_b = _md._RawInputRecorder(raw_dir, "2026-07-08")
+
+    def _persist(recorder, key):
+        return recorder.persist("quote", key, {"key": key})
+
+    # Interleave writes from both recorders across a real thread pool so the
+    # lock is actually contended, not just called twice sequentially.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = []
+        for i in range(10):
+            futures.append(pool.submit(_persist, recorder_a, f"A{i}"))
+            futures.append(pool.submit(_persist, recorder_b, f"B{i}"))
+        for future in futures:
+            future.result()
+
+    assert recorder_a.error is None
+    assert recorder_b.error is None
+    all_filenames = recorder_a.saved_filenames + recorder_b.saved_filenames
+    # 20 writes must produce 20 DISTINCT filenames -- a collision would mean
+    # two writes share a filename and one silently clobbered the other.
+    assert len(all_filenames) == 20
+    assert len(set(all_filenames)) == 20
+    # Every file that was reported saved must actually exist on disk with its
+    # own content -- proving no write silently overwrote another's.
+    on_disk = {p.name for p in raw_dir.glob("*.json")}
+    assert set(all_filenames) <= on_disk
 
 
 def test_live_gate_manual_bypasses_approved_window(tmp_path):
@@ -4501,6 +4661,58 @@ def test_blocked_retry_validates_outcome_only_order_amount_and_status(
         assert row["status"] == "failed"
         assert row["ambiguous_placement_exception"] is True
         assert row["synthesized_from_broker_outcome"] is True
+
+
+def test_ambiguous_same_ticker_rows_keep_unknown_notional_marker_across_retries(tmp_path):
+    """An amountless sibling prevents ticker-only evidence from resolving a marker."""
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",))
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    now = _now_live()
+    first_executor = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = first_executor.run_state_dir(now)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state = {
+        "run_id": "ambiguous-aapl",
+        "trading_day": now.date().isoformat(),
+        "buy_candidates": [
+            {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0},
+            {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": None},
+        ],
+        "broker_outcomes": {
+            "AAPL": {"ticker": "AAPL", "status": "filled", "submitted_amount_usd": 3.0}
+        },
+        "unreconstructable_submitted_tickers": ["AAPL"],
+    }
+    (run_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.10})
+    carried = first_executor.run(now, data, broker=None)["artifacts"]
+
+    assert carried["unreconstructable_submitted_tickers"] == ["AAPL"]
+    assert len([row for row in carried["buy_candidates"] if row.get("ticker") == "AAPL"]) == 2
+
+    class RecordingBroker(FakeLiveBroker):
+        def __init__(self):
+            self.placements = []
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placements.append((ticker, notional_usd, ref_id))
+            return super().place_market_buy(ticker, notional_usd, ref_id)
+
+    retry_executor = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = RecordingBroker()
+    retried = retry_executor.run(now + timedelta(minutes=1), data, broker=broker)
+
+    assert retry_executor.ledger.remaining_daily(now.date()) == 0.0
+    assert retry_executor.ledger.remaining_weekly(now.date()) == 0.0
+    assert retried["artifacts"]["unreconstructable_submitted_tickers"] == ["AAPL"]
+    assert broker.placements == []
 
 
 @pytest.mark.parametrize("pre_terminal_status", ["pending", "unconfirmed"])
@@ -5146,6 +5358,242 @@ def test_morning_evaluate_top_up_routes_subdollar_ladder_increment_to_pending_cr
     assert outcome.cumulative_credit_decline_usd == 0.30
 
 
+def test_morning_top_up_deducts_partially_settled_slot_credit():
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=2.0,
+        hypothetical_amount_usd=2.0,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(signal, prior, settled_credit_for_slot_usd=0.80)
+
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.cumulative_credit_decline_usd == 0.20
+
+
+def test_morning_evaluate_top_up_sub_dollar_floor_still_deducts_reflected_settlement():
+    # Codex review, PR #656 follow-up: "Keep the settled deduction for
+    # non-ladder floors". settled_credit_reflected_in_prior=True only means
+    # prior.amount_usd (and therefore ladder_incremental) already nets out
+    # the settled amount -- it does NOT mean price_step_incremental/
+    # decline_usd (computed purely from prices) reflect it too. Those must
+    # still deduct settled_credit_for_slot_usd directly, or this sub-dollar
+    # floor recomputes the FULL pre-settlement decline and a recovered
+    # order's idempotent settlement no-ops, letting a later stream
+    # repurchase the already-paid portion.
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="own_slot",
+        source="scheduled",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=50.0,
+        previous_close=100.0,
+        drop_pct=50.0,
+        multiplier=1.3,
+        hypothetical_amount_usd=1.3,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(
+        signal,
+        prior,
+        settled_credit_for_slot_usd=0.80,
+        settled_credit_reflected_in_prior=True,
+    )
+
+    # decline_usd = 100 - 50 = 50.0, the dominant floor; minus the settled
+    # $0.80 (still owed here since it never touched prior.amount_usd) gives
+    # $49.20 -- NOT $50.00 (settlement wrongly dropped) and NOT $49.20 minus
+    # a second ladder-side deduction (ladder_incremental itself is only
+    # $0.30, already net, so it never becomes the binding floor here).
+    assert outcome.cumulative_credit_decline_usd == 49.20
+    assert outcome.incremental_order_amount == 49.20
+
+
+def test_morning_evaluate_top_up_full_dollar_ladder_surfaces_preserved_slot_credit():
+    # Codex review: "Deduct settled credit from full-dollar retries too". A
+    # ladder increment >= $1 used to return with cumulative_credit_decline_usd
+    # left at its None default, so _compute_top_up's reconciliation and
+    # _place_broker_orders' settle-on-placement both silently skipped this
+    # slot's own outstanding preserved credit, orphaning it forever. The
+    # ladder branch must surface it on the outcome even though the ladder's
+    # own sizing math never touches the credit ledger.
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(signal, prior, preserved_credit_for_slot_usd=0.20)
+
+    assert outcome.incremental_order_amount > 1.0
+    assert outcome.cumulative_credit_decline_usd == 0.20
+
+    # No outstanding preserved credit for this slot -> unchanged (None), as
+    # before this fix, so an ordinary ladder order without any credit
+    # provenance still never touches the ledger.
+    plain_outcome = ex._evaluate_top_up(signal, prior)
+    assert plain_outcome.cumulative_credit_decline_usd is None
+
+
+def test_morning_evaluate_top_up_full_dollar_ladder_deducts_settled_slot_credit():
+    # Codex review: "Deduct settled credit in the full-dollar branch". A
+    # partially settled preserved slot ($0.80 already paid, $0.20 still
+    # outstanding) that later crosses back above the $1 ladder threshold used
+    # to size its retry from the FULL desired - prior.amount_usd, ignoring
+    # settled_credit_for_slot_usd entirely and repurchasing the paid $0.80. The
+    # full-dollar branch must subtract it just like the sub-dollar branch
+    # already does.
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(
+        signal, prior, settled_credit_for_slot_usd=0.80, preserved_credit_for_slot_usd=0.20
+    )
+
+    unsettled_outcome = ex._evaluate_top_up(signal, prior, preserved_credit_for_slot_usd=0.20)
+    assert outcome.incremental_order_amount == pytest.approx(
+        unsettled_outcome.incremental_order_amount - 0.80
+    )
+
+
+def test_morning_evaluate_top_up_routes_post_settlement_sub_dollar_remainder_to_credit_policy():
+    # Codex review, PR #656 follow-up on discussion_r3837494241 ("Route
+    # post-settlement sub-dollar amounts through credit handling"):
+    # ladder_incremental itself is $1.20 (>= the $1 broker minimum, so the
+    # full-dollar branch is entered), but settled_credit_for_slot_usd=$0.80
+    # brings the remainder down to $0.40 -- below the broker minimum. That
+    # $0.40 must be routed through apply_cumulative_credit() and stay
+    # pending (not returned as a directly placeable sub-$1 order the broker
+    # would reject).
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=2.2,
+        hypothetical_amount_usd=2.2,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(signal, prior, settled_credit_for_slot_usd=0.80)
+
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.top_up_skipped is True
+    assert outcome.cumulative_credit_decline_usd == 0.40
+
+
+def test_morning_full_dollar_retry_keeps_outstanding_preserve_as_ledger_basis():
+    """A grown ladder retry must not reconstruct the paid preserve portion."""
+    ex = MorningDCAExecutor(MorningConfig())
+    prior = PriorSameDayAllocation(
+        "AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="manual_am",
+        source="manual",
+        selected_base_amount_usd=1.0,
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=2.0,
+        hypothetical_amount_usd=2.0,
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(
+        signal,
+        prior,
+        settled_credit_for_slot_usd=0.50,
+        preserved_credit_for_slot_usd=0.30,
+    )
+
+    # The $1 ladder increment is netted by the already-paid $0.50 before it
+    # reaches cumulative-credit sizing (1.00 - 0.50 = 0.50). That recomputed
+    # net decline, not a stale prior preserve snapshot, must be carried for
+    # reconciliation so ladder growth between retries is not lost.
+    assert outcome.incremental_order_amount == 1.0
+    assert outcome.cumulative_credit_decline_usd == 0.50
+
+
 def test_morning_evaluate_top_up_routes_subdollar_ladder_increment_to_a_dollar_order():
     # Same ladder-tier-crossing shape as above but with existing pending
     # credit from an earlier slot already at $0.25: $0.25 (existing) + $0.30
@@ -5181,6 +5629,36 @@ def test_morning_evaluate_top_up_routes_subdollar_ladder_increment_to_a_dollar_o
     assert outcome.incremental_order_amount == 1.0
     assert outcome.top_up_skipped is False
     assert outcome.cumulative_credit_decline_usd == 0.30
+
+
+def test_morning_retry_keeps_partial_preserve_out_of_minimum_order_pool(tmp_path):
+    from dca_cumulative import CumulativeCreditLedger
+
+    prior_root = tmp_path / "prior"
+    _write_prior_run_state(prior_root, "AAPL", amount_usd=1.0, decision_price=100.0, selected_base_amount_usd=1.0)
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        prior_allocation_roots=(str(prior_root),),
+        cap_seed_roots=None,
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "credits")
+    now = datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=EASTERN)
+    slot_key = ex._credit_idempotency_key(now, manual=False)
+    ex.credit_ledger.preserve_pending("AAPL", "2026-07-08", 1.0, idempotency_key=slot_key)
+    ex.credit_ledger.settle("AAPL", "2026-07-08", 0.80, stream="midday")
+    signal = MorningSignal(
+        ticker="AAPL", source="finance", action=Action.BUY, reason="test",
+        current_price=99.2, previous_close=100.0, drop_pct=0.8, multiplier=1.8,
+        hypothetical_amount_usd=1.8, selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._compute_top_up(now, [signal])["AAPL"]
+    state = json.loads((tmp_path / "credits" / "2026-07-08" / "ledger.json").read_bytes())
+
+    assert outcome.cumulative_credit_decline_usd == 0.20
+    assert ex.credit_ledger.pending_usd("AAPL", "2026-07-08") == 0.20
+    assert state["minimum_order_pending_usd_by_ticker"] == {}
 
 
 def test_morning_compute_top_up_persists_pending_credit_and_is_retry_safe(tmp_path):
@@ -5243,6 +5721,741 @@ def test_morning_compute_top_up_persists_pending_credit_and_is_retry_safe(tmp_pa
     assert ex.credit_ledger.pending_usd("AAPL", "2026-07-08") == 0.30
 
 
+def test_morning_compute_top_up_fails_closed_when_settlement_provenance_read_fails(tmp_path, monkeypatch):
+    """An unreadable settlement snapshot is a run failure, never a quiet skip.
+
+    The morning stream reads pending/preserved/settled provenance for a
+    retried slot from ONE locked ``provenance_snapshot`` read (PR #1051). If
+    that read fails, the executor must raise rather than emit a healthy
+    no-incremental outcome for the ticker: a completed-no-orders artifact
+    would mask the outage, and a later retry could then rebuild the
+    already-paid $0.80 below from scratch. The ledger itself must be left
+    untouched (the $0.20 remainder still pending).
+    """
+    from dca_cumulative import CumulativeCreditLedger
+
+    prior_root = tmp_path / "prior"
+    _write_prior_run_state(prior_root, "AAPL", amount_usd=1.0, decision_price=100.0, selected_base_amount_usd=1.0)
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",))
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(prior_root),),
+        cap_seed_roots=None,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "credits")
+    now = datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=EASTERN)
+    slot_key = ex._credit_idempotency_key(now, manual=False)
+    ex.credit_ledger.preserve_pending("AAPL", "2026-07-08", 1.0, idempotency_key=slot_key)
+    ex.credit_ledger.settle("AAPL", "2026-07-08", 0.80)
+    monkeypatch.setattr(
+        ex.credit_ledger,
+        "provenance_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("temporary read failure")),
+    )
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.20,
+        previous_close=100.0,
+        drop_pct=0.8,
+        multiplier=1.3,
+        hypothetical_amount_usd=1.3,
+        selected_base_amount_usd=1.0,
+    )
+
+    with pytest.raises(RuntimeError, match="ledger balance read failed for AAPL"):
+        ex._compute_top_up(now, [signal])
+
+    assert ex.credit_ledger.pending_usd("AAPL", "2026-07-08") == 0.20
+    assert ex.credit_ledger.settled_credit_for_slot("AAPL", "2026-07-08", slot_key) == 0.80
+
+
+@pytest.mark.parametrize(
+    "expected_remainder",
+    [0.10, 0.30, 0.20],
+)
+def test_morning_partial_preserve_retry_does_not_create_minimum_order_provenance(
+    tmp_path, monkeypatch, expected_remainder
+):
+    from dataclasses import replace
+
+    from dca_cumulative import CumulativeCreditLedger
+
+    prior_root = tmp_path / "prior"
+    _write_prior_run_state(prior_root, "AAPL", amount_usd=1.0, decision_price=100.0, selected_base_amount_usd=1.0)
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",))
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(prior_root),),
+        cap_seed_roots=None,
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "credits")
+    now = datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=EASTERN)
+    slot_key = ex._credit_idempotency_key(now, manual=False)
+    ex.credit_ledger.preserve_pending("AAPL", "2026-07-08", 1.00, idempotency_key=slot_key)
+    ex.credit_ledger.settle("AAPL", "2026-07-08", 0.80, stream="afternoon")
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.20,
+        previous_close=100.0,
+        drop_pct=0.8,
+        multiplier=1.3,
+        hypothetical_amount_usd=1.3,
+        selected_base_amount_usd=1.0,
+    )
+    evaluate_top_up = ex._evaluate_top_up
+
+    def adjusted_retry(*args, **kwargs):
+        return replace(
+            evaluate_top_up(*args, **kwargs),
+            cumulative_credit_decline_usd=expected_remainder,
+        )
+
+    monkeypatch.setattr(ex, "_evaluate_top_up", adjusted_retry)
+
+    outcome = ex._compute_top_up(now, [signal])["AAPL"]
+
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.cumulative_credit_decline_usd == expected_remainder
+    assert ex.credit_ledger.preserved_credit_for_slot("AAPL", "2026-07-08", slot_key) == expected_remainder
+    assert ex.credit_ledger.pending_usd("AAPL", "2026-07-08") == expected_remainder
+    assert ex.credit_ledger.minimum_order_pending_tickers("2026-07-08") == {}
+
+
+def test_morning_scheduled_duplicate_recovery_settles_preserved_credit(tmp_path):
+    # Codex review: "Settle reconciled preserves during duplicate recovery".
+    # reconcile_preserved_credit durably updates a slot's preserve entry
+    # BEFORE the broker call. If the process crashes after the broker
+    # confirms the order but before the ORIGINAL attempt's own settle() call,
+    # every later retry just keeps finding the same same-stream duplicate and
+    # (before this fix) never settled -- permanently stranding the preserved
+    # credit as pending even though its order already went through, letting a
+    # later pass (e.g. the 15:30 aggregate top-up) repurchase it. The
+    # scheduled duplicate-recovery branch must settle the ledger too.
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
+
+    class _DuplicateBroker(FakeLiveBroker):
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {"id": "ORDER-AAPL", "dollar_amount": 1.0}
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):  # pragma: no cover
+            raise AssertionError("a genuine duplicate must never place a new order")
+
+    cfg = MorningConfig(tickers=("AAPL",), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+    slot_key = "morning-2026-07-08-1030"
+    ex.credit_ledger.preserve_pending(
+        "AAPL", trading_day.isoformat(), 0.20, idempotency_key=slot_key
+    )
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.20
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+    # A prior allocation known -- has_prior_allocation is True, routing this
+    # candidate into the same-stream ref-id duplicate check instead of the
+    # broader same-day check.
+    outcome = TopUpOutcome(
+        ticker="AAPL",
+        desired_amount=5.0,
+        decision_price=90.0,
+        prior_same_day_amount=1.0,
+        prior_same_day_reference_price=100.0,
+        prior_same_day_run_id="manual_am",
+        prior_same_day_source="manual",
+        incremental_order_amount=1.0,
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        top_up_skipped=False,
+        effective_base_amount_usd=1.0,
+        cumulative_credit_decline_usd=0.20,
+    )
+    broker = _DuplicateBroker()
+    outcomes = ex._place_broker_orders(
+        [signal],
+        trading_day,
+        broker,
+        {"AAPL": outcome},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+    assert outcomes["AAPL"]["status"] == "submitted"
+    assert outcomes["AAPL"]["duplicate_preserved"] is True
+    assert "AAPL" not in broker.placed
+    # The recovered duplicate's settle() call must retire the preserved
+    # credit exactly as a fresh confirmed placement would have.
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+    assert ex.credit_ledger.preserved_credit_for_slot("AAPL", trading_day.isoformat(), slot_key) == 0.0
+    events = ex.credit_ledger.events(trading_day.isoformat())
+    assert events[-1]["decision"] == "settled"
+    assert events[-1]["submitted_amount_usd"] == 1.0
+
+
+def test_morning_compute_top_up_skips_settled_deduction_when_prior_already_reflects_it(tmp_path):
+    # Codex review, PR #656 discussion_r3837494241 ("Avoid deducting settled
+    # credit already included in prior spend"): when a caller's
+    # prior_allocation_roots is configured to include THIS stream's OWN
+    # scheduled root (config/morning_dca.json and config/midday_dca.json
+    # deliberately exclude it by default, but nothing stops an override),
+    # prior.amount_usd already reflects an earlier settling order's dollar
+    # amount from that same root. ladder_incremental = desired -
+    # prior.amount_usd is then already net of it, so ALSO subtracting
+    # settled_credit_for_slot_usd (as _evaluate_top_up's full-dollar branch does
+    # by default) would double-deduct the same paid amount and under-order
+    # the retry.
+    from dca_cumulative import CumulativeCreditLedger
+
+    state_root = tmp_path / "morning_live"
+    trading_day = date(2026, 7, 8)
+    now = datetime(2026, 7, 8, 10, 30, tzinfo=EASTERN)
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(state_root),
+        prior_allocation_roots=(str(state_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    # Seed a prior artifact directly under the stream's own root, with THIS
+    # EXACT slot's own run_id, reflecting an EARLIER settling order for this
+    # ticker (as if an earlier retry of this same slot already placed a
+    # $1.00 order).
+    _seed_prior(
+        state_root, "AAPL", 1.0,
+        reference_price=100.0, trading_date=trading_day, selected_base_amount_usd=1.0,
+        run_id=ex.run_id(now, manual=False),
+    )
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
+    slot_key = ex._credit_idempotency_key(now, manual=False)
+    # Preserve $1.00 for this slot, then partially settle $0.80 of it (as a
+    # duplicate-recovery settle() call from an earlier attempt would have) --
+    # leaving settled_credit_for_slot_usd=0.80 and preserved_credit_for_slot_usd=0.20
+    # outstanding, matching test_morning_top_up_deducts_partially_settled_
+    # slot_credit's own numbers.
+    ex.credit_ledger.preserve_pending(
+        "AAPL", trading_day.isoformat(), 1.0, idempotency_key=slot_key
+    )
+    ex.credit_ledger.settle(
+        "AAPL", trading_day.isoformat(), 0.80, final_session=False, stream="morning",
+    )
+    assert ex.credit_ledger.settled_credit_for_slot("AAPL", trading_day.isoformat(), slot_key) == 0.80
+    assert ex.credit_ledger.preserved_credit_for_slot("AAPL", trading_day.isoformat(), slot_key) == 0.20
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcomes = ex._compute_top_up(now, [signal])
+    outcome = outcomes["AAPL"]
+
+    # prior.amount_usd == 1.0 (from the seeded artifact under this stream's
+    # own root, whose run_id matches this exact slot) already reflects the
+    # settling order. ladder_incremental = desired(5.0) - prior(1.0) = 4.0
+    # must NOT be further reduced by the separately-tracked
+    # settled_credit_for_slot_usd(0.80) -- that would double-count the same
+    # $0.80 and under-order by that amount.
+    assert outcome.prior_same_day_amount == 1.0
+    assert outcome.incremental_order_amount == 4.0
+
+
+def test_morning_compute_top_up_still_deducts_settled_credit_when_prior_is_from_an_unrelated_run(tmp_path):
+    # Codex review, PR #656 discussion_r3839800765 ("Verify that prior
+    # allocation contains the settlement"): a magnitude-only comparison
+    # (loaded prior >= settled amount) is not sufficient. Here the ticker
+    # already has an UNRELATED $2.00 prior allocation from a DIFFERENT run
+    # (a different run_id) -- large enough to satisfy that magnitude
+    # inequality on its own ($2.00 >= $0.80) -- while the actual $0.80
+    # settling order's own artifact was never loaded at all (e.g. lost in a
+    # crash). The old magnitude-only check would wrongly conclude the prior
+    # reflects the settlement and skip the deduction, letting this retry
+    # repurchase the $0.80; the run_id check must catch this.
+    from dca_cumulative import CumulativeCreditLedger
+
+    state_root = tmp_path / "morning_live"
+    trading_day = date(2026, 7, 8)
+    now = datetime(2026, 7, 8, 10, 30, tzinfo=EASTERN)
+    _seed_prior(
+        state_root, "AAPL", 2.0,
+        reference_price=100.0, trading_date=trading_day, selected_base_amount_usd=1.0,
+        run_id="some_other_run_20260708",
+    )
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(state_root),
+        prior_allocation_roots=(str(state_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
+    slot_key = ex._credit_idempotency_key(now, manual=False)
+    ex.credit_ledger.preserve_pending(
+        "AAPL", trading_day.isoformat(), 1.0, idempotency_key=slot_key
+    )
+    ex.credit_ledger.settle(
+        "AAPL", trading_day.isoformat(), 0.80, final_session=False, stream="morning",
+    )
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcomes = ex._compute_top_up(now, [signal])
+    outcome = outcomes["AAPL"]
+
+    # desired ($5) - prior.amount_usd ($2) = $3 ladder increment. The
+    # unrelated $2 prior (wrong run_id) must NOT be mistaken for reflecting
+    # the $0.80 settlement, so settled_credit_for_slot_usd is still subtracted:
+    # $3.00 - $0.80 = $2.20.
+    assert outcome.prior_same_day_amount == 2.0
+    assert outcome.incremental_order_amount == 2.20
+
+
+def test_morning_compute_top_up_skips_settled_deduction_when_this_slot_is_any_contributor(tmp_path):
+    # Codex review, PR #656 follow-up: "Check all contributors for the
+    # loaded settlement". ticker_prior.run_id names only the MOST RECENT
+    # contributor (for reference_price ownership) -- a newer same-day
+    # allocation for this ticker can overwrite run_id to itself while THIS
+    # slot's own settled spend remains folded into amount_usd via
+    # contributing_run_ids. An exact run_id equality wrongly concludes "not
+    # loaded" in that case and re-deducts settled_credit_for_slot_usd, under-
+    # ordering the retry by the already-paid amount.
+    from dca_cumulative import CumulativeCreditLedger
+
+    state_root = tmp_path / "morning_live"
+    trading_day = date(2026, 7, 8)
+    now = datetime(2026, 7, 8, 10, 30, tzinfo=EASTERN)
+    own_run_id = MorningDCAExecutor(
+        MorningConfig(tickers=("AAPL",), morning_run_state_root=str(state_root)),
+        mode=MORNING_LIVE_MODE,
+    ).run_id(now, manual=False)
+
+    # THIS slot's own earlier contribution ($0.80, matching the settled
+    # amount below), followed by a NEWER unrelated run for the same ticker
+    # (both strictly before `now`'s 10:30 boundary_et, so both are read as
+    # prior context) that becomes the reference-owning run_id.
+    own_dir = state_root / f"{trading_day.strftime('%Y%m%d')}_1000ET"
+    own_dir.mkdir(parents=True, exist_ok=True)
+    (own_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": trading_day.isoformat(),
+            "generated_at": f"{trading_day.isoformat()}T10:00:00-04:00",
+            "run_classification": {"run_id": own_run_id, "run_origin": "scheduled", "stream": "morning"},
+            "buy_candidates": [
+                {
+                    "ticker": "AAPL", "status": "filled", "planned_amount_usd": 0.80,
+                    "target_price": 100.0, "selected_base_amount_usd": 1.0,
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+    newer_dir = state_root / f"{trading_day.strftime('%Y%m%d')}_1015ET"
+    newer_dir.mkdir(parents=True, exist_ok=True)
+    (newer_dir / "run_state.json").write_text(
+        json.dumps({
+            "trading_day": trading_day.isoformat(),
+            "generated_at": f"{trading_day.isoformat()}T10:15:00-04:00",
+            "run_classification": {"run_id": "newer_unrelated_run", "run_origin": "manual", "stream": "morning"},
+            "buy_candidates": [
+                {
+                    "ticker": "AAPL", "status": "filled", "planned_amount_usd": 1.20,
+                    "target_price": 99.0, "selected_base_amount_usd": 1.0,
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(state_root),
+        prior_allocation_roots=(str(state_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
+    ex.credit_ledger.preserve_pending(
+        "AAPL", trading_day.isoformat(), 1.0, idempotency_key=own_run_id
+    )
+    ex.credit_ledger.settle(
+        "AAPL", trading_day.isoformat(), 0.80, final_session=False, stream="morning",
+    )
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcomes = ex._compute_top_up(now, [signal])
+    outcome = outcomes["AAPL"]
+
+    # Combined prior amount_usd = $0.80 + $1.20 = $2.00; desired $5 - $2 =
+    # $3 ladder increment. The $0.80 settlement IS reflected in that $2.00
+    # (via this slot's own contributing_run_ids membership, even though
+    # run_id now names the newer $1.20 contributor), so
+    # settled_credit_for_slot_usd must NOT be subtracted again: incremental
+    # stays at $3.00, not $2.20.
+    assert outcome.prior_same_day_amount == 2.0
+    assert outcome.incremental_order_amount == 3.0
+
+
+def test_morning_compute_top_up_skips_settled_deduction_when_prior_root_is_an_ancestor(tmp_path):
+    # Codex review, PR #656 follow-up on discussion_r3837494241 ("Recognize
+    # ancestor roots that include the scheduled stream"): the fix above only
+    # tested EXACT equality between self.state_root and each configured
+    # root. An explicit override can instead name a common ANCESTOR of
+    # self.state_root (e.g. the whole cron-tracking parent directory) --
+    # load_prior_same_day_allocations_multi scans that root recursively, so
+    # it still picks up this stream's own scheduled dated-slot artifacts
+    # from underneath it, and the same double-deduction risk applies even
+    # though state_root never equals the configured root literally.
+    from dca_cumulative import CumulativeCreditLedger
+
+    cron_root = tmp_path / "cron_tracking"
+    state_root = cron_root / "morning_dca"
+    trading_day = date(2026, 7, 8)
+    now = datetime(2026, 7, 8, 10, 30, tzinfo=EASTERN)
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(state_root),
+        # The ANCESTOR of state_root, not state_root itself.
+        prior_allocation_roots=(str(cron_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    _seed_prior(
+        state_root, "AAPL", 1.0,
+        reference_price=100.0, trading_date=trading_day, selected_base_amount_usd=1.0,
+        run_id=ex.run_id(now, manual=False),
+    )
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
+    slot_key = ex._credit_idempotency_key(now, manual=False)
+    ex.credit_ledger.preserve_pending(
+        "AAPL", trading_day.isoformat(), 1.0, idempotency_key=slot_key
+    )
+    ex.credit_ledger.settle(
+        "AAPL", trading_day.isoformat(), 0.80, final_session=False, stream="morning",
+    )
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcomes = ex._compute_top_up(now, [signal])
+    outcome = outcomes["AAPL"]
+
+    assert outcome.prior_same_day_amount == 1.0
+    assert outcome.incremental_order_amount == 4.0
+
+
+def test_morning_compute_top_up_still_deducts_settled_credit_when_prior_understates_it(tmp_path):
+    # Codex review, PR #656 follow-up on discussion_r3837494241 ("Base
+    # settlement deduction on the loaded allocation"): root coverage alone
+    # does not prove the settling order is reflected in THIS ticker's
+    # loaded prior. A crash after settle(order_id=...) succeeded but before
+    # the original attempt's own run-state artifact was persisted leaves
+    # prior.amount_usd smaller than settled_credit_for_slot_usd even though the
+    # configured root covers this stream's own scheduled root. In that
+    # case settled_credit_for_slot_usd must still be deducted -- skipping it
+    # would let the retry reconcile the paid amount back into the
+    # preserved balance, reviving credit a later stream could repurchase.
+    from dca_cumulative import CumulativeCreditLedger
+
+    cron_root = tmp_path / "cron_tracking"
+    state_root = cron_root / "morning_dca"
+    trading_day = date(2026, 7, 8)
+    now = datetime(2026, 7, 8, 10, 30, tzinfo=EASTERN)
+    # The persisted prior artifact only reflects a stale $0.20 -- much less
+    # than the $0.80 this slot's ledger already shows settled, simulating
+    # the crash-before-persist window.
+    _seed_prior(
+        state_root, "AAPL", 0.20,
+        reference_price=100.0, trading_date=trading_day, selected_base_amount_usd=1.0,
+    )
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(state_root),
+        prior_allocation_roots=(str(cron_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
+    slot_key = ex._credit_idempotency_key(now, manual=False)
+    ex.credit_ledger.preserve_pending(
+        "AAPL", trading_day.isoformat(), 1.0, idempotency_key=slot_key
+    )
+    ex.credit_ledger.settle(
+        "AAPL", trading_day.isoformat(), 0.80, final_session=False, stream="morning",
+    )
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcomes = ex._compute_top_up(now, [signal])
+    outcome = outcomes["AAPL"]
+
+    # desired ($5) - prior.amount_usd ($0.20) - settled_credit_for_slot_usd
+    # ($0.80) = $4.00: the settled amount is still subtracted since the
+    # stale $0.20 prior does not yet reflect it.
+    assert outcome.prior_same_day_amount == 0.20
+    assert outcome.incremental_order_amount == 4.0
+
+
+def test_morning_compute_top_up_reconciles_a_zeroed_preserve_entry_on_revival(tmp_path):
+    # Codex review, PR #656 discussion_r3838839294 ("Reconcile zeroed
+    # preserve entries before re-preserving"): a preserve entry that a PRIOR
+    # retry already reconciled down to $0.00 (a temporary price recovery)
+    # still EXISTS in the ledger under this slot's idempotency key. Gating
+    # the reconcile call on preserved_credit_for_slot() > 0 alone treats that
+    # zeroed-but-existing entry as "nothing to reconcile" -- so when THIS
+    # retry's price declines again and recomputes a fresh positive credit,
+    # the revived amount must still reach reconcile_preserved_credit here,
+    # or it is later silently dropped by preserve_pending()'s own dedup
+    # check finding the stale entry already present.
+    from dca_cumulative import CumulativeCreditLedger
+
+    prior_root = tmp_path / "prior"
+    trading_day = date(2026, 7, 8)
+    now = datetime(2026, 7, 8, 10, 30, tzinfo=EASTERN)
+    _seed_prior(
+        prior_root, "AAPL", 1.0,
+        reference_price=100.0, trading_date=trading_day, selected_base_amount_usd=1.0,
+    )
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=1.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        prior_allocation_roots=(str(prior_root),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
+    slot_key = ex._credit_idempotency_key(now, manual=False)
+
+    # An earlier attempt of THIS SAME slot preserved a $1.00 threshold-
+    # crossing credit that got blocked before placement...
+    ex.credit_ledger.preserve_pending(
+        "AAPL", trading_day.isoformat(), 1.00, idempotency_key=slot_key, stream="morning",
+    )
+    # ...then a later retry (before this one) reconciled it down to $0.00
+    # because the price temporarily recovered.
+    ex.credit_ledger.reconcile_preserved_credit(
+        "AAPL", trading_day.isoformat(), slot_key, 0.0,
+        expected_settled_credit_usd=0.0, expected_outstanding_credit_usd=1.00,
+        expected_pending_usd=1.00, stream="morning", recorded_at=now.isoformat(),
+    )
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+    assert ex.credit_ledger.preserved_credit_for_slot("AAPL", trading_day.isoformat(), slot_key) == 0.0
+    assert ex.credit_ledger.has_preserved_entry_for_slot("AAPL", trading_day.isoformat(), slot_key) is True
+
+    # THIS retry's price has fallen again, producing a small ($0.10) fresh
+    # sub-dollar decline that stays pending (below the $0.50 discard/round-up
+    # threshold) rather than crossing to an order.
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.90,
+        previous_close=100.0,
+        drop_pct=0.1,
+        multiplier=1.1,
+        hypothetical_amount_usd=1.1,
+        selected_base_amount_usd=1.0,
+    )
+    outcomes = ex._compute_top_up(now, [signal])
+    outcome = outcomes["AAPL"]
+
+    assert outcome.cumulative_credit_decline_usd == 0.10
+    assert outcome.incremental_order_amount == 0.0
+    # The revived $0.10 decline must actually reach the ledger's shared
+    # pending balance via reconcile_preserved_credit -- not be silently
+    # dropped because preserve_pending()'s dedup found the stale zeroed
+    # entry and returned early.
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.10
+    assert ex.credit_ledger.preserved_credit_for_slot("AAPL", trading_day.isoformat(), slot_key) == 0.10
+    events = ex.credit_ledger.events(trading_day.isoformat())
+    assert events[-1]["decision"] == "reconciled_preserved_pending"
+
+
+def test_morning_scheduled_duplicate_recovery_settlement_is_idempotent(tmp_path):
+    # Codex review: "Make duplicate-recovery settlement idempotent". If the
+    # ORIGINAL attempt's own settle() already applied this exact broker order
+    # (e.g. it succeeded but the process crashed before the run artifact was
+    # persisted), a later retry that reaches the same-stream duplicate-
+    # recovery path must not settle() it a SECOND time and double-subtract
+    # from the shared pending balance.
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
+
+    class _DuplicateBroker(FakeLiveBroker):
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return {"id": "ORDER-AAPL", "dollar_amount": 1.0}
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):  # pragma: no cover
+            raise AssertionError("a genuine duplicate must never place a new order")
+
+    cfg = MorningConfig(tickers=("AAPL",), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+    slot_key = "morning-2026-07-08-1030"
+    ex.credit_ledger.preserve_pending(
+        "AAPL", trading_day.isoformat(), 0.20, idempotency_key=slot_key
+    )
+    # Simulate the ORIGINAL attempt's own settle() call already having
+    # applied this exact recovered order before the crash.
+    ex.credit_ledger.settle(
+        "AAPL",
+        trading_day.isoformat(),
+        1.0,
+        final_session=False,
+        stream="morning",
+        order_id="ORDER-AAPL",
+    )
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=90.0,
+        previous_close=100.0,
+        drop_pct=10.0,
+        multiplier=5.0,
+        hypothetical_amount_usd=5.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcome = TopUpOutcome(
+        ticker="AAPL",
+        desired_amount=5.0,
+        decision_price=90.0,
+        prior_same_day_amount=1.0,
+        prior_same_day_reference_price=100.0,
+        prior_same_day_run_id="manual_am",
+        prior_same_day_source="manual",
+        incremental_order_amount=1.0,
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        top_up_skipped=False,
+        effective_base_amount_usd=1.0,
+        cumulative_credit_decline_usd=0.20,
+    )
+    broker = _DuplicateBroker()
+    outcomes = ex._place_broker_orders(
+        [signal],
+        trading_day,
+        broker,
+        {"AAPL": outcome},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+    assert outcomes["AAPL"]["status"] == "submitted"
+    # The already-settled balance must stay at zero -- the repeat settle()
+    # call for the same order id must be a no-op, not a second deduction.
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+    events = ex.credit_ledger.events(trading_day.isoformat())
+    assert sum(1 for e in events if e["decision"] == "settled") == 1
+
+
 def test_morning_top_up_guard_buys_incremental_when_prior_fill_exists(tmp_path):
     # Prior manual fill of $4.50 at $99.0 before the 10:30 AM live run. Stock
     # has dropped 3% to $97.0 (below the $99.0 reference). 3% drop → 1.5x →
@@ -5293,6 +6506,305 @@ def test_morning_top_up_guard_buys_incremental_when_prior_fill_exists(tmp_path):
     assert row.get("top_up_guard_result") == TOP_UP_INCREMENTAL
     assert row.get("incremental_order_amount") == 2.0
     assert broker.placed.get("TOPUP") == 2.0, "broker should place $2.00 incremental order"
+
+
+def test_morning_duplicate_recovery_settles_the_preserved_credit(tmp_path):
+    # If the first scheduled top-up attempt reaches the broker but dies before
+    # its settle() call, a retry lands in the duplicate branch and records the
+    # broker order as submitted. That outcome carries status="submitted", so
+    # the post-loop preserve pass skipped it, and it never reaches the settle()
+    # call in the placement path either -- so the credit that ALREADY funded a
+    # real order stayed pending, and the 15:30 aggregate pass could buy it a
+    # second time (Codex review: "Settle preserved credit when recovering a
+    # duplicate").
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
+
+    class _DuplicateBroker(FakeLiveBroker):
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            # The first attempt's order is already sitting at the broker.
+            return {"id": "ORDER-ALREADY-PLACED", "dollar_amount": 1.0}
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):  # pragma: no cover
+            raise AssertionError("a duplicate must never place a second order")
+
+    cfg = MorningConfig(tickers=("AAPL",), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+    # The credit the crashed first attempt left pending after it had already
+    # funded the real broker order.
+    ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.30, stream="morning")
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.30
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.0,
+        previous_close=100.0,
+        drop_pct=1.0,
+        multiplier=1.0,
+        hypothetical_amount_usd=1.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcome = TopUpOutcome(
+        ticker="AAPL",
+        desired_amount=1.30,
+        decision_price=99.0,
+        prior_same_day_amount=1.0,
+        prior_same_day_reference_price=100.0,
+        prior_same_day_run_id="morning_am",
+        prior_same_day_source="morning",
+        incremental_order_amount=1.0,
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        top_up_skipped=False,
+        effective_base_amount_usd=1.0,
+        cumulative_credit_decline_usd=0.30,
+    )
+    broker = _DuplicateBroker()
+    outcomes = ex._place_broker_orders(
+        [signal],
+        trading_day,
+        broker,
+        {"AAPL": outcome},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+
+    assert outcomes["AAPL"]["status"] == "submitted"
+    assert outcomes["AAPL"]["duplicate_preserved"] is True
+    assert outcomes["AAPL"]["order_id"] == "ORDER-ALREADY-PLACED"
+    # The credit is settled against the recovered order, not left pending for
+    # the 15:30 aggregate pass to spend a second time.
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+    assert ex.credit_ledger.events(trading_day.isoformat())[-1]["decision"] == "settled"
+
+    # Repeated recoveries settle EXACTLY ONCE for this order id. Clearing down
+    # to zero is not enough on its own: if another stream adds fresh pending
+    # credit for the ticker in between, a second settlement would consume that
+    # instead, and it never funded this order (Codex review: "Settle a
+    # recovered duplicate only once").
+    ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.45, stream="midday")
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.45
+
+    ex._place_broker_orders(
+        [signal],
+        trading_day,
+        broker,
+        {"AAPL": outcome},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+
+    # The other stream's $0.45 is untouched.
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.45
+
+
+def test_morning_duplicate_recovery_settles_once_for_an_order_with_no_id(tmp_path):
+    """A recovered duplicate whose broker dict carries NO usable id must still
+    be settled exactly once.
+
+    Two independent fixes settle a recovered duplicate: _process_candidate's
+    own call (keyed on recovered_order_id) and the post-loop credit pass's
+    (keyed on outcome["order_id"]). The post-loop guard -- top_up present,
+    cumulative_credit_decline_usd present, incremental_order_amount > 0 -- is a
+    strict SUBSET of _process_candidate's, so it fired on every recovery that
+    had already settled. For an order dict carrying a real id the ledger's
+    order-id dedup absorbed the repeat, but when the dict has no id the two
+    disagree: _process_candidate falls back to the synthetic "legacy-dup-..."
+    key while the post-loop pass passes order_id=None, which disables
+    settle()'s `if order_id:` dedup entirely and subtracts the amount from the
+    shared pending pool a second time -- consuming credit that never funded
+    this order (Codex review: "Make duplicate-recovery settlement idempotent";
+    "Require an ID for idempotent duplicate settlement").
+
+    The ``duplicate_credit_settled`` flag closed that gap, but its own
+    regression tests all use a duplicate carrying a REAL order id, where the
+    ledger's dedup masks a second settle() and only the audit event goes
+    wrong. This case is the one where the flag is load-bearing for the
+    BALANCE: without it the repeat is not deduped at all and real credit is
+    destroyed, so pin it separately.
+    """
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
+
+    class _IdlessDuplicateBroker(FakeLiveBroker):
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            # A real order dict, but with no "id"/"order_id" field at all.
+            return {"dollar_amount": 1.0}
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):  # pragma: no cover
+            raise AssertionError("a duplicate must never place a second order")
+
+    cfg = MorningConfig(tickers=("AAPL",), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+    ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.30, stream="morning")
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.0,
+        previous_close=100.0,
+        drop_pct=1.0,
+        multiplier=1.0,
+        hypothetical_amount_usd=1.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcome = TopUpOutcome(
+        ticker="AAPL",
+        desired_amount=1.30,
+        decision_price=99.0,
+        prior_same_day_amount=1.0,
+        prior_same_day_reference_price=100.0,
+        prior_same_day_run_id="morning_am",
+        prior_same_day_source="morning",
+        incremental_order_amount=1.0,
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        top_up_skipped=False,
+        effective_base_amount_usd=1.0,
+        cumulative_credit_decline_usd=0.30,
+    )
+    broker = _IdlessDuplicateBroker()
+    outcomes = ex._place_broker_orders(
+        [signal], trading_day, broker, {"AAPL": outcome}, remaining_daily=180.0, remaining_weekly=900.0
+    )
+
+    assert outcomes["AAPL"]["duplicate_preserved"] is True
+    assert outcomes["AAPL"]["order_id"] is None
+    # Settled exactly once: the $0.30 that funded the real order is cleared,
+    # and the settlement is recorded as such rather than as an ignored repeat.
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+    assert ex.credit_ledger.events(trading_day.isoformat())[-1]["decision"] == "settled"
+
+    # Another stream's fresh credit must survive this recovery -- the second,
+    # unkeyed settle() used to consume it.
+    ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.45, stream="midday")
+    ex._place_broker_orders(
+        [signal], trading_day, broker, {"AAPL": outcome}, remaining_daily=180.0, remaining_weekly=900.0
+    )
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.45
+
+
+def test_morning_original_settlement_is_keyed_so_the_first_recovery_is_deduped(tmp_path):
+    # The order-scoped guard has to be written by the attempt that PLACED the
+    # order, not only by the recovery that rediscovers it. Writing it from the
+    # recovery branch alone would leave the FIRST recovery after a successful
+    # original settlement undeduplicated: it would find no key, settle again,
+    # and consume whatever fresh credit another stream had added in the
+    # meantime (Codex review: "Key the original settlement with the broker
+    # order ID").
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
+
+    class _PlacingBroker(FakeLiveBroker):
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ) -> Optional[dict[str, Any]]:
+            return None
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placed[ticker] = notional_usd
+            return "ORDER-AAPL"
+
+    class _DuplicateBroker(_PlacingBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            # The retry rediscovers the SAME physical order.
+            return {"id": "ORDER-AAPL", "dollar_amount": 1.0}
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):  # pragma: no cover
+            raise AssertionError("a duplicate must never place a second order")
+
+    cfg = MorningConfig(tickers=("AAPL",), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+    ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.30, stream="morning")
+
+    signal = MorningSignal(
+        ticker="AAPL", source="finance", action=Action.BUY, reason="test",
+        current_price=99.0, previous_close=100.0, drop_pct=1.0, multiplier=1.0,
+        hypothetical_amount_usd=1.0, selected_base_amount_usd=1.0,
+    )
+    outcome = TopUpOutcome(
+        ticker="AAPL", desired_amount=1.30, decision_price=99.0,
+        prior_same_day_amount=1.0, prior_same_day_reference_price=100.0,
+        prior_same_day_run_id="morning_am", prior_same_day_source="morning",
+        incremental_order_amount=1.0, top_up_guard_result=TOP_UP_INCREMENTAL,
+        top_up_skipped=False, effective_base_amount_usd=1.0,
+        cumulative_credit_decline_usd=0.30,
+    )
+
+    # The ORIGINAL placement settles successfully, keyed on ORDER-AAPL.
+    ex._place_broker_orders(
+        [signal], trading_day, _PlacingBroker(), {"AAPL": outcome},
+        remaining_daily=180.0, remaining_weekly=900.0,
+    )
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+
+    # Another stream now adds fresh credit for the same ticker.
+    # Sub-threshold so it stays PENDING rather than flushing to an order.
+    ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.45, stream="midday")
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.45
+
+    # The FIRST recovery of that same order must be deduped, not settle again.
+    ex._place_broker_orders(
+        [signal], trading_day, _DuplicateBroker(), {"AAPL": outcome},
+        remaining_daily=180.0, remaining_weekly=900.0,
+    )
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.45
 
 
 def test_morning_place_broker_orders_settles_credit_ledger_after_confirmed_submission(tmp_path):
@@ -5381,6 +6893,85 @@ def test_morning_place_broker_orders_settles_credit_ledger_after_confirmed_submi
     assert events[-1]["submitted_amount_usd"] == 1.0
 
 
+def test_morning_terminal_partial_fill_settles_credit_ledger(tmp_path):
+    """A terminal partial fill must not leave its consumed credit pending."""
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import TOP_UP_INCREMENTAL, MarketBuyPlacementTerminalError
+
+    class _PartiallyFillingBroker(FakeLiveBroker):
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(
+            self, ticker, trading_day, ref_id_prefixes
+        ):
+            return None
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise MarketBuyPlacementTerminalError(
+                "cancelled after partial fill",
+                {
+                    "id": "ORDER-PARTIAL",
+                    "cumulative_quantity": "0.01",
+                    "average_price": "50.00",
+                },
+            )
+
+    cfg = MorningConfig(tickers=("AAPL",), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+    ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.50, stream="morning")
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=50.0,
+        previous_close=51.0,
+        drop_pct=1.0,
+        multiplier=1.0,
+        hypothetical_amount_usd=1.0,
+        selected_base_amount_usd=1.0,
+    )
+    top_up = TopUpOutcome(
+        ticker="AAPL",
+        desired_amount=1.0,
+        decision_price=50.0,
+        prior_same_day_amount=0.0,
+        prior_same_day_reference_price=51.0,
+        prior_same_day_run_id="manual_am",
+        prior_same_day_source="manual",
+        incremental_order_amount=1.0,
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        top_up_skipped=False,
+        effective_base_amount_usd=1.0,
+        cumulative_credit_decline_usd=0.50,
+    )
+
+    outcomes = ex._place_broker_orders(
+        [signal],
+        trading_day,
+        _PartiallyFillingBroker(),
+        {"AAPL": top_up},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+
+    assert outcomes["AAPL"]["status"] == "submitted"
+    assert outcomes["AAPL"]["submitted_amount_usd"] == 0.50
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+    events = ex.credit_ledger.events(trading_day.isoformat())
+    assert events[-1]["decision"] == "settled"
+    assert events[-1]["submitted_amount_usd"] == 0.50
+
+
 def test_morning_place_broker_orders_quarantines_credits_on_ambiguous_placement(tmp_path):
     """An ambiguous placement must settle/quarantine its credit rather than calling preserve_pending."""
     from dca_cumulative import CumulativeCreditLedger
@@ -5447,6 +7038,61 @@ def _isolation_signal(ticker):
         hypothetical_amount_usd=2.0,
         selected_base_amount_usd=2.0,
     )
+
+
+def test_settled_slot_credit_is_deducted_before_the_minimum_order_threshold():
+    """A partial settlement must leave credit pending, not make a $0.60 order."""
+    from near_close_dca import PriorSameDayAllocation
+
+    ex = MorningDCAExecutor(MorningConfig(tickers=("AAPL",)), mode=MORNING_LIVE_MODE)
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.60,
+        previous_close=100.0,
+        drop_pct=0.4,
+        multiplier=1.8,
+        hypothetical_amount_usd=1.8,
+        selected_base_amount_usd=1.0,
+    )
+    prior = PriorSameDayAllocation(
+        ticker="AAPL",
+        amount_usd=1.0,
+        reference_price=100.0,
+        run_id="prior",
+        source="morning",
+        selected_base_amount_usd=1.0,
+    )
+
+    outcome = ex._evaluate_top_up(
+        signal,
+        prior,
+        settled_credit_for_slot_usd=0.40,
+    )
+
+    assert outcome.incremental_order_amount == 0.0
+    assert outcome.top_up_skipped is True
+    assert outcome.cumulative_credit_decline_usd == 0.40
+
+
+def test_credit_ledger_read_failure_aborts_top_up_computation(tmp_path):
+    """An unreadable ledger is a run failure, never a normal top-up skip."""
+
+    class _UnreadableLedger:
+        def recorded_decision(self, *args, **kwargs):
+            raise OSError("ledger unavailable")
+
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        prior_allocation_roots=(str(tmp_path / "prior"),),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = cast(Any, _UnreadableLedger())
+
+    with pytest.raises(RuntimeError, match="ledger idempotency read failed"):
+        ex._compute_top_up(_now_live(), [_isolation_signal("AAPL")])
 
 
 def test_an_ambiguous_placement_exception_halts_the_executor_batch(tmp_path):
@@ -5519,7 +7165,7 @@ def test_run_persists_ambiguous_placement_marker_in_candidate_rows(tmp_path):
 
     row = result["artifacts"]["buy_candidates"][0]
     assert row["ambiguous_placement_exception"] is True
-    persisted = json.loads(Path(result["paths"]["run_state"]).read_text())
+    persisted = json.loads(Path(result["paths"]["run_state"]).read_bytes())
     assert persisted["buy_candidates"][0]["ambiguous_placement_exception"] is True
     assert result["artifacts"]["budget"]["hypothetical_day_spend_usd"] == 3.0
     assert result["artifacts"]["budget"]["hypothetical_week_spend_usd"] == 3.0
@@ -6458,6 +8104,64 @@ def test_earlier_weekday_pending_with_unusable_notional_fails_closed(tmp_path, n
     assert ex.ledger.week_planned(now.date()) == 450.0
 
 
+def test_ambiguous_same_ticker_rows_preserve_unknown_notional_marker_and_close_caps(tmp_path):
+    """An amountless sibling keeps an unknown-notional submission ambiguous."""
+    state_root = tmp_path / "live"
+    run_dir = state_root / "20260630_1030ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "ambiguous-aapl-orders",
+                "trading_day": "2026-06-30",
+                "generated_at": "2026-06-30T10:29:00-04:00",
+                "unreconstructable_submitted_tickers": ["AAPL"],
+                "buy_candidates": [
+                    {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 10.0},
+                    {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": None},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",), trading_date=date(2026, 6, 30))
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        morning_run_state_root=str(state_root),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(),
+        morning_daily_cap_usd=90.0,
+        morning_weekly_cap_usd=450.0,
+        approved_test_dates=frozenset({date(2026, 6, 30)}),
+    )
+    now = datetime.combine(date(2026, 6, 30), time(10, 30), tzinfo=EASTERN)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+
+    class _RecordingBroker(FakeLiveBroker):
+        def __init__(self):
+            self.market_buys = []
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.market_buys.append((ticker, notional_usd, ref_id))
+            return super().place_market_buy(ticker, notional_usd, ref_id)
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.08})
+    first_broker = _RecordingBroker()
+    first = ex.run(now, data, broker=first_broker)
+    assert first_broker.market_buys == []
+    assert ex._cap_seed_scan_incomplete is True
+    assert ex.ledger.remaining_daily(now.date()) == 0.0
+    assert ex.ledger.remaining_weekly(now.date()) == 0.0
+    assert first["artifacts"]["unreconstructable_submitted_tickers"] == ["AAPL"]
+
+    retry = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    retry_broker = _RecordingBroker()
+    retry.run(now + timedelta(minutes=1), data, broker=retry_broker)
+    assert retry_broker.market_buys == []
+    assert retry.ledger.remaining_daily(now.date()) == 0.0
+    assert retry.ledger.remaining_weekly(now.date()) == 0.0
+
+
 def test_seed_ledger_from_prior_runs_includes_ambiguous_placement_notional(tmp_path):
     """An ambiguous placement candidate from a prior run must be reserved in the ledger."""
     state_root = tmp_path / "live"
@@ -6491,6 +8195,142 @@ def test_seed_ledger_from_prior_runs_includes_ambiguous_placement_notional(tmp_p
     ex._seed_ledger_from_prior_runs(now)
 
     assert ex.ledger.week_planned(date(2026, 6, 30)) == 15.0
+
+
+def test_seed_ledger_keeps_unknown_marker_when_same_ticker_rows_are_ambiguous(tmp_path):
+    """A known fill cannot resolve an id-less marker when a sibling row is amountless."""
+    state_root = tmp_path / "live"
+    run_dir = state_root / "20260630_1030ET"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "ambiguous-physical-rows",
+                "trading_day": "2026-06-30",
+                "unreconstructable_submitted_tickers": ["AAPL"],
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "filled",
+                        "order_id": "distinct-fill",
+                        "planned_amount_usd": 5.0,
+                    },
+                    {
+                        "ticker": "AAPL",
+                        "status": "pending",
+                        "order_id": None,
+                        "planned_amount_usd": None,
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        morning_run_state_root=str(state_root),
+        cap_seed_roots=(),
+        morning_daily_cap_usd=90.0,
+        morning_weekly_cap_usd=450.0,
+        approved_test_dates=frozenset({date(2026, 6, 30)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = datetime.combine(date(2026, 6, 30), time(10, 30), tzinfo=EASTERN)
+
+    ex._seed_ledger_from_prior_runs(now)
+
+    assert ex.ledger.remaining_daily(now.date()) == 0.0
+    assert ex.ledger.remaining_weekly(now.date()) == 0.0
+    assert any(
+        row.get("ticker") == "AAPL"
+        and row.get("synthesized_from_unreconstructable_submission") is True
+        for row in ex._prior_same_day_candidate_rows
+    ), "the durable unknown-notional marker must survive fixed-slot carry-forward"
+
+    class _RecordingBroker(FakeLiveBroker):
+        def __init__(self):
+            self.place_calls = []
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.place_calls.append((ticker, notional_usd, ref_id))
+            return super().place_market_buy(ticker, notional_usd, ref_id)
+
+    retry = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _RecordingBroker()
+    result = retry.run(
+        now,
+        DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.03}),
+        broker=broker,
+    )
+
+    assert broker.place_calls == []
+    assert result["artifacts"]["unreconstructable_submitted_tickers"] == ["AAPL"]
+
+
+@pytest.mark.parametrize(
+    ("broker_rows", "resolved"),
+    [
+        ([{"id": "fill-1", "state": "filled", "cumulative_quantity": "2", "average_price": "6"}], True),
+        (
+            [
+                {"id": "fill-1", "state": "filled", "cumulative_quantity": "2", "average_price": "6"},
+                {"id": "fill-2", "state": "filled", "average_price": "6"},
+            ],
+            False,
+        ),
+    ],
+    ids=("single-proven-fill", "ambiguous-price-only-second-row"),
+)
+def test_no_id_marker_reconciliation_counts_all_same_ticker_broker_rows(
+    tmp_path, broker_rows, resolved
+):
+    """A no-ID marker resolves only from one total row with a proven notional."""
+
+    class Broker(FakeLiveBroker):
+        def same_day_ticker_orders(self, ticker, trading_day):
+            return broker_rows
+
+    now = _now_live()
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        cap_seed_roots=(),
+        approved_test_dates=frozenset({now.date()}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(now)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "unknown-no-id",
+                "trading_day": now.date().isoformat(),
+                "buy_candidates": [],
+                "unreconstructable_submitted_tickers": ["AAPL"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ex._seed_ledger_from_prior_runs(now, broker=Broker())
+
+    if resolved:
+        assert ex._cap_seed_scan_incomplete is False
+        assert ex.ledger.day_planned(now.date()) == pytest.approx(12.0)
+        assert ex._prior_same_day_candidate_rows == [
+            {
+                "ticker": "AAPL",
+                "status": "filled",
+                "order_id": "fill-1",
+                "buy_multiplier": None,
+                "planned_amount_usd": 12.0,
+                "reconciled_from_broker_fill": True,
+            }
+        ]
+    else:
+        assert ex._cap_seed_scan_incomplete is True
+        assert ex.ledger.week_planned(now.date()) == pytest.approx(ex.ledger.weekly_cap_usd)
+        assert ex._prior_same_day_candidate_rows[0]["synthesized_from_unreconstructable_submission"] is True
 
 
 def test_cap_seed_scan_finds_sibling_suffix_fills_under_the_current_stream_root(tmp_path):
@@ -6927,21 +8767,21 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.03})
 
-    # Step 1: manual run at 9:00 AM — buys TICK ($4.50), writes artifact to manual_runs/.
+    # Step 1: manual run at 9:35 AM — buys TICK ($4.50), writes artifact to manual_runs/.
     # Use an earlier timestamp so the artifact's generated_at is before the 10:30 AM
     # boundary used by the scheduled run's cap-seeding scan (boundary check is strict <).
-    _now_manual = datetime.combine(date(2026, 7, 8), time(9, 0), tzinfo=EASTERN)
+    _now_manual = datetime.combine(date(2026, 7, 8), time(9, 35), tzinfo=EASTERN)
     broker = _SimpleBroker()
     ex.run(_now_manual, data, broker=broker, manual=True)
     manual_amount = broker.placed.get("TICK", 0.0)
     assert manual_amount == 4.5
 
     # Step 2: an external fill of $4 appears in manual_runs/ (simulates another executor/session)
-    ext_dir1 = manual_root / "20260708_0901ET"
+    ext_dir1 = manual_root / "20260708_0936ET"
     ext_dir1.mkdir(parents=True, exist_ok=True)
     (ext_dir1 / "run_state.json").write_text(
         _json.dumps({
-            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:01:00-04:00",
+            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:36:00-04:00",
             "run_classification": {"run_origin": "manual", "manual_run": True},
             "buy_candidates": [{"ticker": "EXT1", "status": "submitted",
                                 "planned_amount_usd": 4.0, "decision_price": 55.0}],
@@ -6958,11 +8798,11 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     )
 
     # Step 4: another external $4 fill appears in manual_runs/
-    ext_dir2 = manual_root / "20260708_0902ET"
+    ext_dir2 = manual_root / "20260708_0937ET"
     ext_dir2.mkdir(parents=True, exist_ok=True)
     (ext_dir2 / "run_state.json").write_text(
         _json.dumps({
-            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:02:00-04:00",
+            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:37:00-04:00",
             "run_classification": {"run_origin": "manual", "manual_run": True},
             "buy_candidates": [{"ticker": "EXT2", "status": "submitted",
                                 "planned_amount_usd": 4.0, "decision_price": 55.0}],
@@ -7302,6 +9142,7 @@ def test_morning_top_up_guard_no_prior_run_when_default_roots_empty(tmp_path):
 def _seed_prior(
     root, ticker, amount_usd, *,
     status="filled", reference_price=95.0, trading_date=None, selected_base_amount_usd=None,
+    run_id="test_prior",
 ):
     """Write a prior-fill run_state.json for one ticker under root.
 
@@ -7311,6 +9152,12 @@ def _seed_prior(
     missing_prior_base/manual review (Codex review: "Fail closed when the
     first allocation base is unknown") rather than silently recomputing from
     this run's own price.
+
+    ``run_id`` defaults to a generic fixture value; pass the real
+    ``MorningDCAExecutor.run_id(now, manual=...)`` value when a test needs
+    this seeded artifact to be recognized as THIS EXACT slot's own
+    contribution (see prior_reflects_settlement's run_id-equality check in
+    _compute_top_up).
     """
     if trading_date is None:
         trading_date = _now_live().date()
@@ -7325,7 +9172,7 @@ def _seed_prior(
     state = {
         "trading_day": trading_date.isoformat(),
         "generated_at": f"{trading_date.isoformat()}T09:00:00-04:00",
-        "run_classification": {"run_id": "test_prior", "run_origin": "manual", "stream": "morning"},
+        "run_classification": {"run_id": run_id, "run_origin": "manual", "stream": "morning"},
         "buy_candidates": [candidate],
     }
     (run_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
@@ -7375,6 +9222,78 @@ def test_morning_live_applies_prior_manual_offset_incremental(tmp_path):
     assert abs(broker.placed["NVDA"] - 8.0) < 0.01, f"expected $8 incremental; got {broker.placed['NVDA']}"
     rows = {r["ticker"]: r for r in res["artifacts"].get("buy_candidates", [])}
     assert rows["NVDA"]["top_up_guard_result"] == "incremental_top_up"
+
+
+@pytest.mark.parametrize(
+    ("broker_prior_usd", "expected_increment_usd"),
+    [(2.0, 8.0), (8.0, 2.0)],
+    ids=["artifact_matches_broker", "artifact_understates_broker"],
+)
+def test_morning_live_top_up_accounts_for_broker_spend(
+    tmp_path, monkeypatch, broker_prior_usd, expected_increment_usd
+):
+    """Missing artifact spending must not be purchased again by a later stream."""
+    monkeypatch.setenv("DCA_TICKER_HISTORY_DIR", str(tmp_path / "history"))
+    monkeypatch.setenv("DCA_INTRADAY_ARCHIVE_DIR", str(tmp_path / "intraday"))
+    for name in (
+        "DCA_HEARTBEAT_URL_MORNING", "DCA_HEARTBEAT_URL",
+        "DCA_ALERT_SLACK_WEBHOOK", "DCA_DRIFT_SLACK_WEBHOOK",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    now = _now_live()
+    prior_root = _seed_prior(
+        tmp_path / "prior", "NVDA", 2.0, reference_price=95.0, selected_base_amount_usd=2.0
+    )
+    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(prior_root),),
+        cap_seed_roots=(str(prior_root),),
+        approved_test_dates=frozenset({now.date()}),
+    )
+    prior_order = {
+        "id": "earlier-stream-order",
+        "symbol": "NVDA",
+        "side": "buy",
+        "state": "filled",
+        "dollar_amount": str(broker_prior_usd),
+        "created_at": now.replace(hour=9, minute=35).isoformat(),
+        "ref_id": f"market-open-dca-{now.date().isoformat()}-NVDA",
+    }
+    placed = []
+
+    def place(**kwargs):
+        placed.append((kwargs["symbol"], float(kwargs["dollar_amount"])))
+        return {"order": {"id": "morning-top-up-order", "state": "confirmed"}}
+
+    assert cfg.target_account_number is not None
+    broker = RobinhoodBroker(
+        account=cfg.target_account_number,
+        enable_live_orders=True,
+        orders_fn=lambda **kwargs: {"orders": [prior_order], "next": None},
+        buying_power_fn=_ample_buying_power,
+        tradability_fn=_all_tradable,
+        review_fn=lambda **kwargs: {"approved": True},
+        place_fn=place,
+    )
+    assert broker.same_day_ticker_notional_usd("NVDA", now.date()) == broker_prior_usd
+    executor = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    result = executor.run(now, data, broker=broker, manual=False)
+
+    # The preserved $2 base and 10% decline produce a $10 ladder target.
+    # Only its remainder after the broker-confirmed prior is still unallocated.
+    assert placed == [("NVDA", expected_increment_usd)]
+    rows = {row["ticker"]: row for row in result["artifacts"]["buy_candidates"]}
+    assert rows["NVDA"]["top_up_guard_result"] == "incremental_top_up"
+    assert rows["NVDA"]["incremental_order_amount"] == expected_increment_usd
+    persisted = json.loads(Path(result["paths"]["run_state"]).read_text(encoding="utf-8"))
+    outcome = persisted["broker_outcomes"]["NVDA"]
+    assert outcome["status"] == "submitted"
+    assert outcome["order_id"] == "morning-top-up-order"
+    assert outcome["submitted_amount_usd"] == expected_increment_usd
 
 
 class _RefIdTrackingBroker(FakeLiveBroker):
@@ -7453,7 +9372,7 @@ def test_morning_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id(tm
 
     # Step 1: manual run, 3% drop -> 1.5x * $3 = $4.50 placed with the
     # ORDINARY ref_id (top-up computation is disabled for manual+MORNING).
-    manual_now = datetime.combine(date(2026, 7, 8), time(9, 0), tzinfo=EASTERN)
+    manual_now = datetime.combine(date(2026, 7, 8), time(9, 35), tzinfo=EASTERN)
     manual_data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.03})
     manual_res = ex.run(manual_now, manual_data, broker=broker, manual=True)
     assert broker.placed.get("NVDA") == pytest.approx(4.5)
@@ -7555,6 +9474,125 @@ def test_morning_scheduled_top_up_duplicate_preserves_original_submitted_amount(
         r["ticker"]: r for r in retry["artifacts"].get("buy_candidates", [])
     }
     assert on_disk_rows["NVDA"].get("planned_amount_usd") == pytest.approx(15.0)
+
+
+@pytest.mark.parametrize("carried_status", ["pending", "unconfirmed"])
+def test_morning_scheduled_duplicate_with_pending_prior_preserves_sent_amount(tmp_path, carried_status):
+    # Codex review, PR #1364 discussion_r3946703223 ("Preserve amounts for
+    # pending retry orders"): a pending/unconfirmed carried row proves the
+    # order exists, and the dollars persisted alongside are the notional this
+    # executor SENT. The broker's eventual figure can only be at or below
+    # that, so the sent amount is the conservative one for cap accounting.
+    # This test used to assert the opposite (that a duplicate-check response
+    # without a notional falls back to the retry's fresh, smaller amount);
+    # that let an $8 pending order be re-persisted as $4 into the fixed
+    # dated-slot run_state path and freed cap headroom already consumed.
+    class _DuplicateWithoutAmountBroker(_RefIdTrackingBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            for t, rid in self._ref_ids:
+                if t == ticker and any(rid.startswith(p) for p in ref_id_prefixes):
+                    return {"id": f"ORDER-{ticker}"}
+            return None
+
+    live_root = tmp_path / "live"
+    prior_root = tmp_path / "prior"
+    prior_root.mkdir(parents=True, exist_ok=True)
+    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        base_buy_amount_usd=2.0,
+        max_per_order_usd=10.0,
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(prior_root),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _DuplicateWithoutAmountBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+
+    first = ex.run(_now_live(), data, broker=broker)
+    run_state_path = Path(first["paths"]["run_state"])
+    prior = json.loads(run_state_path.read_bytes())
+    row = prior["buy_candidates"][0]
+    row["status"] = carried_status
+    sent_amount = 8.0
+    row["planned_amount_usd"] = sent_amount
+    row["submitted_amount_usd"] = sent_amount
+    prior["broker_outcomes"]["NVDA"]["status"] = carried_status
+    prior["broker_outcomes"]["NVDA"]["submitted_amount_usd"] = sent_amount
+    run_state_path.write_text(json.dumps(prior), encoding="utf-8")
+
+    # Force the retry's fresh incremental down to $4.00 ($10 target minus a new
+    # $6 prior allocation), so a fallback to the recomputed amount would be
+    # visibly SMALLER than what was actually sent.
+    _seed_prior(prior_root, "NVDA", 6.0, reference_price=95.0, selected_base_amount_usd=2.0)
+
+    retry = ex.run(_now_live() + timedelta(minutes=1), data, broker=broker)
+    nvda_outcome = retry["artifacts"].get("broker_outcomes", {}).get("NVDA", {})
+    assert nvda_outcome.get("status") == "submitted", nvda_outcome
+    retry_row = next(
+        row for row in retry["artifacts"].get("buy_candidates", []) if row["ticker"] == "NVDA"
+    )
+    # The persisted duplicate carries the $8 that was sent, not the $4 the
+    # retry recomputed, so the dated-slot artifact never understates spend;
+    # the candidate row is rewritten to the same preserved figure.
+    assert nvda_outcome.get("submitted_amount_usd") == pytest.approx(sent_amount)
+    assert retry_row["planned_amount_usd"] == pytest.approx(sent_amount)
+    assert nvda_outcome.get("submitted_amount_usd") != pytest.approx(4.0)
+    assert nvda_outcome.get("duplicate_preserved") is True
+
+
+def test_morning_scheduled_duplicate_with_pending_prior_without_amount_fails_closed(tmp_path):
+    # If both the carried pending row and matching broker order omit notional,
+    # the fresh retry computation is not authoritative evidence of what was
+    # accepted. Reserve the per-order ceiling so cap reconstruction cannot
+    # manufacture headroom by rewriting the order at a smaller amount.
+    class _DuplicateWithoutAmountBroker(_RefIdTrackingBroker):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            for t, rid in self._ref_ids:
+                if t == ticker and any(rid.startswith(p) for p in ref_id_prefixes):
+                    return {"id": f"ORDER-{ticker}"}
+            return None
+
+    live_root = tmp_path / "live"
+    prior_root = tmp_path / "prior"
+    prior_root.mkdir(parents=True, exist_ok=True)
+    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        base_buy_amount_usd=3.0,
+        max_per_order_usd=15.0,
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(prior_root),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _DuplicateWithoutAmountBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+
+    first = ex.run(_now_live(), data, broker=broker)
+    run_state_path = Path(first["paths"]["run_state"])
+    prior = json.loads(run_state_path.read_bytes())
+    row = prior["buy_candidates"][0]
+    row["status"] = "pending"
+    row.pop("planned_amount_usd", None)
+    row["submitted_amount_usd"] = None
+    prior["broker_outcomes"]["NVDA"]["status"] = "pending"
+    prior["broker_outcomes"]["NVDA"]["submitted_amount_usd"] = None
+    run_state_path.write_text(json.dumps(prior), encoding="utf-8")
+    _seed_prior(prior_root, "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=2.0)
+
+    retry = ex.run(_now_live() + timedelta(minutes=1), data, broker=broker)
+    nvda_outcome = retry["artifacts"].get("broker_outcomes", {}).get("NVDA", {})
+    assert nvda_outcome.get("status") == "submitted", nvda_outcome
+    retry_row = next(
+        row for row in retry["artifacts"].get("buy_candidates", []) if row["ticker"] == "NVDA"
+    )
+    assert nvda_outcome.get("submitted_amount_usd") == pytest.approx(cfg.max_per_order_usd)
+    assert retry_row["planned_amount_usd"] == pytest.approx(cfg.max_per_order_usd)
+    assert nvda_outcome.get("submitted_amount_usd") != pytest.approx(12.0)
 
 
 def test_morning_scheduled_duplicate_check_preserved_when_cap_fully_consumed(tmp_path):
@@ -7885,7 +9923,9 @@ def test_default_cap_seed_roots_include_dated_manual_overrides(monkeypatch):
         lambda: (override_root,),
     )
 
-    assert override_root in MorningConfig().cap_seed_roots
+    roots = MorningConfig().cap_seed_roots
+    assert roots is not None
+    assert override_root in roots
 
 
 def test_morning_live_scheduled_artifact_not_prior_context_on_retry(tmp_path):
@@ -8138,17 +10178,17 @@ def test_morning_cap_seeding_own_amount_scoped_to_cap_roots(tmp_path):
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.03})
 
     # Step 1: manual run buys TICK ($4.50) → _own_recorded[day]=4.50
-    _now_manual = datetime.combine(date(2026, 7, 8), time(9, 0), tzinfo=EASTERN)
+    _now_manual = datetime.combine(date(2026, 7, 8), time(9, 35), tzinfo=EASTERN)
     broker = _SimpleBroker()
     ex.run(_now_manual, data, broker=broker, manual=True)
     assert broker.placed.get("TICK") == 4.5
 
     # Step 2: an external $4 fill appears in external_cap_root (NOT under manual_runs)
-    ext_dir = external_cap_root / "20260708_0901ET"
+    ext_dir = external_cap_root / "20260708_0936ET"
     ext_dir.mkdir(parents=True, exist_ok=True)
     (ext_dir / "run_state.json").write_text(
         _json.dumps({
-            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:01:00-04:00",
+            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:36:00-04:00",
             "run_classification": {"run_origin": "manual", "manual_run": True},
             "buy_candidates": [{"ticker": "EXT", "status": "submitted",
                                 "planned_amount_usd": 4.0, "decision_price": 55.0}],
@@ -8396,15 +10436,40 @@ def test_same_stream_order_exists_normalizes_legacy_boolean_adapters(tmp_path):
     assert _same_stream_order_exists(_LegacyBoolBroker(False), "NVDA", trading_day, "morning") is None
     # Legacy None -> no duplicate -> None.
     assert _same_stream_order_exists(_LegacyBoolBroker(None), "NVDA", trading_day, "morning") is None
-    # Legacy True -> duplicate found, but with no order details to preserve;
-    # must be a dict (supports .get(...)) rather than the bare True.
+    # Legacy True -> duplicate found, with no REAL order details to preserve,
+    # but must still be a dict (supports .get(...)) carrying a synthesized,
+    # deterministic "id" -- not the bare True, and not a dict with no id at
+    # all. Without an id here, the caller's duplicate-recovery settle() call
+    # passes order_id=None through, disabling settle()'s own per-order_id
+    # dedup: a retry that finds this same legacy-boolean duplicate again
+    # would subtract the same dollars from the shared pending balance a
+    # second time (Codex review, PR #656 discussion_r3837494237: "Require an
+    # ID for idempotent duplicate settlement"). Deterministic and stable
+    # across repeat calls for the SAME ticker/day/stream, so settle()'s
+    # dedup set actually recognizes the retry.
     result = _same_stream_order_exists(cast(Any, _LegacyBoolBroker(True)), "NVDA", trading_day, "morning")
-    assert result == {}
     assert result is not None
-    assert result.get("id") is None
+    assert result.get("id") == "legacy-bool-dup:morning:2026-07-08:NVDA"
+    assert result.get("dollar_amount") is None
+    again = _same_stream_order_exists(cast(Any, _LegacyBoolBroker(True)), "NVDA", trading_day, "morning")
+    assert again is not None
+    assert again.get("id") == result.get("id")
     # A real order dict passes through unchanged so real order_id/amount survive.
     order = {"id": "O1", "dollar_amount": 7.5}
     assert _same_stream_order_exists(_LegacyBoolBroker(order), "NVDA", trading_day, "morning") == order
+
+
+def test_stable_broker_order_id_rejects_missing_and_blank_ids():
+    assert _stable_broker_order_id(None) is None
+    assert _stable_broker_order_id({}) is None
+    assert _stable_broker_order_id({"id": "   "}) is None
+    assert _stable_broker_order_id({"order_id": " ORDER-1 "}) == "ORDER-1"
+    assert _stable_broker_order_id({"id": "   ", "order_id": " ORDER-1 "}) == "ORDER-1"
+
+
+@pytest.mark.parametrize("invalid_primary", [False, 0, [], {}])
+def test_stable_broker_order_id_uses_fallback_for_malformed_primary_id(invalid_primary):
+    assert _stable_broker_order_id({"id": invalid_primary, "order_id": " ORDER-1 "}) == "ORDER-1"
 
 
 def test_morning_live_same_stream_check_ignores_manual_fill_ref_id(tmp_path):
@@ -8502,6 +10567,37 @@ def test_raw_input_recorder_persists_and_lists_files(tmp_path):
         assert (tmp_path / "raw" / name).exists()
 
 
+def test_raw_input_recorder_namespaces_filenames_across_retry_attempts(tmp_path):
+    # Codex review, PR #538 discussion_r3809442201 ("Namespace persisted raw
+    # inputs by retry attempt"): a scheduled retry builds a brand-new recorder
+    # over the SAME dated-slot raw_dir. Its filenames must never collide with
+    # (and overwrite) the previous attempt's -- especially when that earlier
+    # attempt already submitted an order the raw evidence justified.
+    raw_dir = tmp_path / "raw"
+    first_attempt = _RawInputRecorder(raw_dir, "2026-07-08")
+    first_attempt.persist("prior_close", "AAPL", {"close": 100.0})
+    first_attempt.persist("quote", "AAPL", {"price": 99.5})
+    assert first_attempt.error is None
+    first_names = set(first_attempt.saved_filenames)
+    assert len(first_names) == 2
+
+    second_attempt = _RawInputRecorder(raw_dir, "2026-07-08")
+    second_attempt.persist("prior_close", "AAPL", {"close": 101.0})
+    assert second_attempt.error is None
+    second_names = set(second_attempt.saved_filenames)
+
+    # The second attempt's filename(s) must be brand new, not a name the first
+    # attempt already used -- overwriting it would destroy the first attempt's
+    # persisted evidence.
+    assert not (first_names & second_names)
+    # And the first attempt's files must still be on disk, untouched.
+    for name in first_names:
+        assert (raw_dir / name).exists()
+    first_close_filename = next(n for n in first_names if n.startswith("prior_close"))
+    on_disk_first_close = json.loads((raw_dir / first_close_filename).read_bytes())
+    assert on_disk_first_close["close"] == 100.0
+
+
 def test_raw_input_recorder_records_error_without_raising(tmp_path):
     # A file (not a directory) sitting at the target raw/ path makes mkdir()
     # fail; persist() must record the failure rather than propagate it, so a
@@ -8532,6 +10628,727 @@ def test_persisting_market_data_provider_records_bar_and_quote_responses(tmp_pat
     assert wrapped.source == data.source
 
 
+def test_persisting_market_data_provider_computes_from_round_tripped_payload(tmp_path):
+    class _MutableProvider(DecliningBarsProvider):
+        def get_quote(self, ticker, as_of):
+            return (99.0, as_of)
+
+    data = _MutableProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.03})
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(data, recorder)
+    quote = wrapped.get_quote("AAPL", _now_live())
+
+    # JSON round-tripping changes the connector tuple to a list. Returning
+    # that persisted shape proves computation does not retain the connector's
+    # original in-memory object; datetime restoration keeps the provider API.
+    assert isinstance(quote, list)
+    assert quote[0] == 99.0
+    assert isinstance(quote[1], datetime)
+
+
+def test_persisting_robinhood_provider_normalizes_pointer_before_parsing(tmp_path):
+    missing = tmp_path / "missing-historicals.json"
+    provider = RobinhoodDataProvider(historicals_fn=lambda **kwargs: {"output_path": str(missing)})
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+    now = _now_live()
+
+    bars = wrapped.get_intraday_bars(
+        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
+    )
+
+    assert bars == []
+    assert recorder.saved_filenames == []
+    assert recorder.error is not None
+    assert "could not read output_path" in recorder.error
+
+
+def test_raw_input_recorder_rejects_missing_current_session_context_pointer(tmp_path):
+    missing = tmp_path / "missing-context.json"
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+
+    persisted = recorder.persist("historicals", "AAPL", {"current_session_context": str(missing)})
+
+    assert persisted is None
+    assert recorder.saved_filenames == []
+    assert recorder.error is not None
+    assert "could not read output_path" in recorder.error
+
+
+def test_raw_input_recorder_normalizes_current_session_context_pointer(tmp_path):
+    context = tmp_path / "context.json"
+    context.write_text(json.dumps({"results": [{"symbol": "AAPL"}]}), encoding="utf-8")
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+
+    persisted = recorder.persist("historicals", "AAPL", {"current_session_context": str(context)})
+
+    assert persisted == {"results": [{"symbol": "AAPL"}]}
+    archived = json.loads((tmp_path / "raw" / recorder.saved_filenames[0]).read_bytes())
+    assert archived["current_session_context"] == str(context)
+    assert archived["output_path"] == str(context)
+    assert archived["normalized"] is True
+
+
+def test_persisting_finance_provider_archives_connectors_before_parsing(tmp_path):
+    bars_payload = [
+        {
+            "timestamp": "2026-07-08T10:20:00-04:00",
+            "open": 99.0,
+            "high": 100.0,
+            "low": 98.0,
+            "close": 99.5,
+            "volume": 10,
+            "vendor_trace_id": "bars-raw-evidence",
+        }
+    ]
+    close_payload = {"price": "101.25", "vendor_trace_id": "close-raw-evidence"}
+    provider = FinanceDataProvider(
+        bars_fn=lambda *args: bars_payload,
+        previous_close_fn=lambda *args: close_payload,
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+    now = _now_live()
+
+    bars = wrapped.get_intraday_bars(
+        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
+    )
+    previous_close = wrapped.get_previous_close_bar("AAPL", now)
+
+    assert len(bars) == 1
+    assert previous_close is not None and previous_close.close == 101.25
+    payloads = [json.loads((tmp_path / "raw" / name).read_bytes()) for name in recorder.saved_filenames]
+    assert any(payload.get("data") == bars_payload for payload in payloads)
+    assert close_payload in payloads
+
+
+def test_persisting_robinhood_provider_parses_intraday_bars_after_raw_round_trip(tmp_path):
+    # Codex review, PR #538 discussion_r3837449172 ("Preserve RFC3339 strings for
+    # Robinhood parsing"): _restore_raw_datetimes() used to eagerly convert every
+    # ordinary RFC3339 "begins_at" string into a real datetime object on replay.
+    # RobinhoodDataProvider._parse_bars() -> _parse_rfc3339() only accepts strings,
+    # so every intraday bar silently failed to parse (empty result, no
+    # recorder.error) -- starving the Robinhood signal path of data. This proves
+    # bars survive persist-then-replay and parse correctly for the Robinhood path.
+    historicals_payload = {
+        "results": [
+            {
+                "symbol": "AAPL",
+                "bars": [
+                    {
+                        "begins_at": "2026-07-08T14:20:00Z",
+                        "open_price": "99.0",
+                        "high_price": "100.0",
+                        "low_price": "98.0",
+                        "close_price": "99.5",
+                        "volume": "10",
+                    }
+                ],
+            }
+        ]
+    }
+    provider = RobinhoodDataProvider(historicals_fn=lambda **kwargs: historicals_payload)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+    now = _now_live()
+
+    bars = wrapped.get_intraday_bars(
+        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
+    )
+
+    assert recorder.error is None
+    assert len(bars) == 1
+    assert bars[0].close == 99.5
+
+
+def test_persisting_finance_provider_materializes_generator_bars_payload(tmp_path):
+    # Codex review, PR #538 discussion_r3821694971 ("Materialize iterable Finance
+    # bar payloads"): a Finance bars_fn may legitimately return a generator (a
+    # valid iterable per FinanceDataProvider's documented contract). Before the
+    # fix, _raw_json_safe() left it unchanged, json.dumps() inside
+    # save_raw_input() raised on the un-serializable generator, and the run
+    # blocked instead of processing the market data that was actually available.
+    def _bars_gen(*args):
+        yield {
+            "timestamp": "2026-07-08T10:20:00-04:00",
+            "open": 99.0, "high": 100.0, "low": 98.0, "close": 99.5, "volume": 10,
+        }
+
+    provider = FinanceDataProvider(
+        bars_fn=lambda *args: _bars_gen(*args),
+        previous_close_fn=lambda *args: None,
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+    now = _now_live()
+
+    bars = wrapped.get_intraday_bars(
+        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
+    )
+
+    assert recorder.error is None
+    assert len(bars) == 1
+    assert bars[0].close == 99.5
+
+
+def test_persisting_finance_provider_preserves_bare_date_bar_timestamp(tmp_path):
+    # Codex review, PR #538 discussion_r3821694980 ("Preserve bare-date bar
+    # timestamps across persistence"): a bare datetime.date timestamp (the
+    # documented yfinance/pandas shape) must anchor at 16:00 ET on replay, just
+    # as dca_live_adapters._coerce_bar() anchors it for the ORIGINAL in-memory
+    # value. Losing the date/datetime distinction on the persist round trip
+    # would have it parsed as midnight ET instead -- a silent 16-hour shift.
+    bar_date = date(2026, 7, 8)
+    provider = FinanceDataProvider(
+        bars_fn=lambda *args: [
+            {"timestamp": bar_date, "open": 99.0, "high": 100.0, "low": 98.0, "close": 99.5, "volume": 10}
+        ],
+        previous_close_fn=lambda *args: None,
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+    now = _now_live()
+
+    bars = wrapped.get_intraday_bars(
+        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
+    )
+
+    assert recorder.error is None
+    assert len(bars) == 1
+    expected = datetime.combine(bar_date, time(16, 0), tzinfo=EASTERN)
+    assert bars[0].timestamp == expected
+
+
+class _FakeNumpyScalar:
+    """Mimics a numpy scalar's ``.item()`` interface without a numpy dependency.
+
+    numpy.int64/numpy.bool_ are not subclasses of the plain Python int/bool
+    equivalents json.dumps() accepts, but they DO expose ``.item()`` -- the
+    standard NumPy accessor that returns the equivalent plain Python value.
+    This repo is standard-library-only at runtime (CLAUDE.md), so the
+    production fix duck-types on ``.item()`` rather than importing numpy;
+    this fake proves that duck-typed path without adding a runtime numpy
+    dependency to the test.
+    """
+
+    def __init__(self, value):
+        self._value = value
+
+    def item(self):
+        return self._value
+
+
+def test_persisting_finance_provider_serializes_vendor_scalar_bar_fields(tmp_path):
+    # Codex review, PR #538 discussion_r3837489856 ("Serialize vendor scalar
+    # values before archiving Finance bars"): a pandas/NumPy-backed Finance
+    # bar can carry a numpy.int64 volume or numpy.bool_ flag. Before the fix,
+    # _raw_json_safe()'s fallback left such a scalar unchanged, json.dumps()
+    # raised TypeError, persist() set recorder.error, and the scheduled run
+    # blocked even though FinanceDataProvider._coerce_bar() could consume the
+    # original numeric value fine.
+    provider = FinanceDataProvider(
+        bars_fn=lambda *args: [
+            {
+                "timestamp": "2026-07-08T10:20:00-04:00",
+                "open": 99.0,
+                "high": 100.0,
+                "low": 98.0,
+                "close": 99.5,
+                "volume": _FakeNumpyScalar(12345),
+                "is_regular_session": _FakeNumpyScalar(True),
+            }
+        ],
+        previous_close_fn=lambda *args: None,
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+    now = _now_live()
+
+    bars = wrapped.get_intraday_bars(
+        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
+    )
+
+    assert recorder.error is None
+    assert len(bars) == 1
+    assert bars[0].volume == 12345
+    archived = json.loads((tmp_path / "raw" / recorder.saved_filenames[0]).read_bytes())
+    archived_bar = archived["data"][0]
+    assert archived_bar["volume"] == 12345
+    assert archived_bar["is_regular_session"] is True
+
+
+def test_persisting_market_data_provider_clears_copied_quote_cache_before_wrapping(tmp_path):
+    # Codex review, PR #538 discussion_r3837489860 ("Clear copied provider
+    # caches before wrapping connectors"): _wrap_raw_connectors() only takes
+    # a SHALLOW copy.copy() of the inner provider, which leaves a populated
+    # RobinhoodDataProvider._signal_quote_cache/_signal_quote_as_of pointing
+    # at the SAME cache dict the caller's original instance still owns. If
+    # that cache is not reset on the copy, the persisting wrapper serves the
+    # stale cached quote without ever invoking the newly wrapped
+    # _quotes_fn -- so no raw artifact is written and no recorder.error is
+    # raised, even though a quote lookup nominally happened.
+    call_count = {"n": 0}
+
+    def _quotes_fn(**kwargs):
+        call_count["n"] += 1
+        return {"results": [{"quote": {"symbol": "AAPL", "last_trade_price": "101.00"}}]}
+
+    provider = RobinhoodDataProvider(
+        historicals_fn=lambda **kwargs: {"results": []}, quotes_fn=_quotes_fn
+    )
+    now = _now_live()
+    # Pre-populate the cache exactly as an earlier caller reusing this same
+    # provider instance at this same `as_of` would have.
+    provider.get_quote("AAPL", now)
+    assert call_count["n"] == 1
+    assert provider._signal_quote_cache
+
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+
+    quote = wrapped.get_quote("AAPL", now)
+
+    assert quote is not None
+    # The wrapped _quotes_fn must actually have been invoked again -- not
+    # served from the stale copied cache.
+    assert call_count["n"] == 2
+    assert recorder.saved_filenames, "raw artifact must be written when the connector is actually invoked"
+
+
+def test_persisting_broker_adapter_detaches_raw_placement_responses_before_wrapping(tmp_path):
+    # Codex review, PR #654 discussion_r3837443188 ("Detach mutable broker state
+    # before wrapping connectors"): _wrap_raw_connectors() only takes a SHALLOW
+    # copy.copy() of the inner broker, which leaves the copy's
+    # _raw_placement_responses pointing at the SAME list object the caller's
+    # original (unwrapped) broker instance still owns. If that list is not
+    # replaced on the copy, placing an order through the persisting wrapper
+    # appends the response onto the SHARED list, so a caller that later reuses
+    # the original broker for a different run would see -- and could
+    # misattribute -- this run's order response via its own
+    # get_raw_placement_responses().
+    broker = RobinhoodBroker(
+        place_fn=lambda **kwargs: {"order": {"id": "order-789", "state": "confirmed"}},
+        enable_live_orders=True,
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(broker, recorder)
+
+    wrapped.place_market_buy("AAPL", 10.0, "ref-1")
+
+    # The wrapper's own view sees the placement...
+    assert wrapped.get_raw_placement_responses()
+    # ...but the ORIGINAL, unwrapped broker instance must NOT: its list must
+    # be independent of whatever the wrapper's copy accumulated.
+    assert broker.get_raw_placement_responses() == []
+
+
+def test_persisting_robinhood_adapters_archive_connector_envelopes_before_parsing(tmp_path):
+    quote_payload = {"results": [{"quote": {"symbol": "AAPL", "last_trade_price": "99.00"}}]}
+    buying_power_payload = {"data": {"buying_power": "137.00", "unparsed": "evidence"}}
+    provider = RobinhoodDataProvider(
+        historicals_fn=lambda **kwargs: {"results": []}, quotes_fn=lambda **kwargs: quote_payload
+    )
+    broker = RobinhoodBroker(buying_power_fn=lambda **kwargs: buying_power_payload)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+
+    assert _PersistingMarketDataProvider(provider, recorder).get_quote("AAPL", _now_live())[0] == 99.0
+    assert _PersistingBrokerAdapter(broker, recorder).available_buying_power() == 137.0
+
+    payloads = [json.loads((tmp_path / "raw" / name).read_bytes()) for name in recorder.saved_filenames]
+    assert quote_payload in payloads
+    assert buying_power_payload in payloads
+
+
+def test_persisting_broker_adapter_preserves_outer_failure_flag_on_place(tmp_path):
+    # A connector can report failure as data (rather than raising) while still carrying
+    # an inner order id -- the outer "success": false must survive the raw-persist round
+    # trip so RobinhoodBroker.place_market_buy() raises instead of treating the id as a
+    # submitted order (see PR #560 review discussion r3816204627).
+    failed_placement = {"success": False, "data": {"order": {"id": "order-123", "state": "confirmed"}}}
+    broker = RobinhoodBroker(
+        place_fn=lambda **kwargs: failed_placement,
+        enable_live_orders=True,
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(broker, recorder)
+
+    with pytest.raises(RuntimeError, match="failed"):
+        wrapped.place_market_buy("AAPL", 10.0, "ref-1")
+
+    assert recorder.error is None
+    payloads = [json.loads((tmp_path / "raw" / name).read_bytes()) for name in recorder.saved_filenames]
+    assert failed_placement in payloads
+
+
+def test_persisting_broker_adapter_preserves_outer_failure_flag_on_orders_lookup(tmp_path):
+    # An unsuccessful order-history response with an empty inner "orders" list must not
+    # be read as "no same-day orders exist"; the outer failure flag has to survive so the
+    # duplicate-order guard fails closed instead of silently passing.
+    failed_lookup = {"success": False, "data": {"orders": []}}
+    broker = RobinhoodBroker(orders_fn=lambda **kwargs: failed_lookup)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(broker, recorder)
+
+    with pytest.raises(RuntimeError, match="failed"):
+        wrapped.same_day_strategy_order_exists("AAPL", date(2026, 7, 8))
+
+    assert recorder.error is None
+
+
+def test_persisting_broker_adapter_preserves_is_error_envelope_on_orders_lookup(tmp_path):
+    # An mcp-bridge {"isError": true, ...} envelope carries no truthy "error"/
+    # "success"/"ok" field of its own -- without an explicit isError check,
+    # persist() unwrapped straight to the inner "data": {"orders": []}, which the
+    # duplicate-order guard would read as "no same-day orders exist" even though the
+    # underlying broker lookup actually failed (Codex review, PR #538
+    # discussion_r3837449174: "Preserve isError envelopes during replay").
+    failed_lookup = {"isError": True, "data": {"orders": []}}
+    broker = RobinhoodBroker(orders_fn=lambda **kwargs: failed_lookup)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(broker, recorder)
+
+    with pytest.raises(RuntimeError, match="failed"):
+        wrapped.same_day_strategy_order_exists("AAPL", date(2026, 7, 8))
+
+    assert recorder.error is None
+
+
+def test_persisting_broker_adapter_preserves_submitted_order_when_persist_write_fails(tmp_path, monkeypatch):
+    # If the connector call itself succeeds (a real order was submitted) but writing
+    # the raw archive fails afterward, the in-memory response must still reach
+    # place_market_buy so the submitted order id is not lost -- only the raw-persist
+    # write failure (recorder.error) should trip the run to fail closed, not the
+    # already-completed broker action being treated as if it never happened (see PR
+    # #560 review discussion r3816306601).
+    placed = {"order": {"id": "order-456", "state": "confirmed"}}
+    broker = RobinhoodBroker(place_fn=lambda **kwargs: placed, enable_live_orders=True, **_LIVE_LOOKUP_STUBS)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(broker, recorder)
+
+    # Make the raw-archive write fail so save_raw_input() raises inside persist().
+    # save_raw_input() writes via dca_fileio.atomic_write_text (temp file + fsync +
+    # os.replace, not Path.write_text), so the failure is injected at that call
+    # rather than by monkeypatching Path.write_text, which the atomic writer never
+    # invokes.
+    (tmp_path / "raw").mkdir(parents=True, exist_ok=True)
+    import scripts.run_classification as _run_classification_module
+
+    def _failing_atomic_write_text(path, *args, **kwargs):
+        if Path(path).parent == tmp_path / "raw":
+            raise OSError("disk full")
+        raise AssertionError("unexpected atomic_write_text call in this test")
+
+    monkeypatch.setattr(
+        _run_classification_module, "atomic_write_text", _failing_atomic_write_text
+    )
+    order_id = wrapped.place_market_buy("AAPL", 10.0, "ref-1")
+
+    assert order_id == "order-456"
+    assert recorder.error is not None
+    assert "failed to persist" in recorder.error
+
+
+def test_persisting_provider_archives_the_raw_connector_response_before_parsing(tmp_path):
+    # The persist-before-compute contract is about the CONNECTOR's response,
+    # not the adapter's parsed return value. Archiving only the parsed Bar
+    # would mean a malformed payload -- the case the archive exists for --
+    # left no raw record at all, because the parse raised before anything
+    # reached the recorder (Codex review: "Persist connector payloads before
+    # parsing them"). The injected MCP callables are wrapped so the raw dict
+    # is on disk before the adapter ever sees it.
+    def _exploding_historicals(**kwargs):
+        return {"results": [{"symbol": kwargs["symbols"][0], "historicals": "not-a-list"}]}
+
+    provider = RobinhoodDataProvider(historicals_fn=_exploding_historicals)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+    now = _now_live()
+    try:
+        wrapped.get_intraday_bars(
+            ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=5
+        )
+    except Exception:  # noqa: BLE001 - whether parsing raises is the adapter's business
+        pass
+
+    archived = [name for name in recorder.saved_filenames if name.startswith("historicals_")]
+    assert archived, f"raw connector payload was not archived: {recorder.saved_filenames}"
+    payload = json.loads((tmp_path / "raw" / archived[0]).read_bytes())
+    assert payload["results"][0]["historicals"] == "not-a-list"
+
+
+def test_each_run_intercepts_its_own_private_view_of_the_provider(tmp_path):
+    # The decorator rebinds a SHALLOW COPY, so the caller's provider is never
+    # mutated and each run's interception is bound to its own recorder. Rebinding
+    # the caller's object could not survive two runs overlapping on one shared
+    # instance: the second wrapper replaced the first, so the first run's later
+    # connector calls archived into the second run's raw/ -- or nowhere at all --
+    # while its recorder stayed error-free and it went on placing orders (Codex
+    # review: "Archive connector responses for every overlapping run").
+    def _historicals(**kwargs):
+        return {"results": [{"symbol": kwargs["symbols"][0], "historicals": []}]}
+
+    def _quotes(**kwargs):
+        return {"results": [{"symbol": kwargs["symbols"][0], "last_trade_price": "1.0"}]}
+
+    provider = RobinhoodDataProvider(historicals_fn=_historicals, quotes_fn=_quotes)
+    first = _RawInputRecorder(tmp_path / "run1" / "raw", "2026-07-08")
+    run_one = _PersistingMarketDataProvider(provider, first)
+    second = _RawInputRecorder(tmp_path / "run2" / "raw", "2026-07-08")
+    run_two = _PersistingMarketDataProvider(provider, second)
+
+    # The caller's provider is untouched by either run, at any point.
+    assert provider._historicals_fn is _historicals
+    assert provider._quotes_fn is _quotes
+    assert run_one._inner is not provider
+    assert run_two._inner is not provider
+    assert run_one._inner is not run_two._inner
+
+    now = _now_live()
+    for run in (run_two, run_one):
+        try:
+            run.get_intraday_bars(
+                ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=5
+            )
+        except Exception:  # noqa: BLE001 - only the archiving side matters here
+            pass
+
+    # Each run archived its OWN call, in its own directory. The first run calling
+    # second -- after the later run was constructed -- is the overlap case.
+    assert any(n.startswith("historicals_") for n in first.saved_filenames), (
+        f"the earlier run stopped archiving once a later one started: {first.saved_filenames}"
+    )
+    assert any(n.startswith("historicals_") for n in second.saved_filenames), (
+        f"the later run captured nothing: {second.saved_filenames}"
+    )
+    # Exactly one connector payload each -- neither run picked up the other's.
+    for recorder in (first, second):
+        connector_files = [n for n in recorder.saved_filenames if n.startswith("historicals_")]
+        assert len(connector_files) == 1, recorder.saved_filenames
+    # Only ONE layer of wrapping, however many runs share the provider.
+    assert run_two._inner._historicals_fn._raw_connector_original is _historicals
+    assert run_two._inner._quotes_fn._raw_connector_original is _quotes
+
+
+def test_the_callers_provider_is_never_mutated_by_a_run(tmp_path):
+    # The completed slot's raw/ directory is closed to later calls because the
+    # caller's provider was never rebound in the first place: manual, watchlist
+    # and preflight calls -- none of which install a recorder, and all of which
+    # the raw-input policy exempts -- reach the untouched original.
+    def _historicals(**kwargs):
+        return {"results": [{"symbol": kwargs["symbols"][0], "historicals": []}]}
+
+    provider = RobinhoodDataProvider(historicals_fn=_historicals)
+    recorder = _RawInputRecorder(tmp_path / "run1" / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+
+    assert wrapped._inner is not provider
+    assert provider._historicals_fn is _historicals
+
+    now = _now_live()
+    try:
+        provider.get_intraday_bars(
+            ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=5
+        )
+    except Exception:  # noqa: BLE001 - only the archiving side matters here
+        pass
+
+    assert recorder.saved_filenames == [], (
+        f"a post-run call contaminated the completed slot's archive: {recorder.saved_filenames}"
+    )
+
+
+def test_an_uncopyable_provider_fails_the_run_closed(tmp_path):
+    # The copy is what keeps concurrent runs apart. Falling back to mutating an
+    # uncopyable provider would reinstate the exact fail-open the copy exists
+    # to prevent -- a second run replacing the callables while the first keeps
+    # placing orders with no persistence error (Codex review: "Fail closed
+    # instead of sharing an uncopyable provider").
+    class _Uncopyable:
+        source = SourceName.ROBINHOOD
+
+        def __init__(self, fn):
+            self._historicals_fn = fn
+
+        def __copy__(self):
+            raise TypeError("not copyable")
+
+    def _historicals(**kwargs):
+        return {"results": []}
+
+    provider = _Uncopyable(_historicals)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+
+    with pytest.raises(RawInputPersistenceError, match="_Uncopyable"):
+        _PersistingMarketDataProvider(provider, recorder)
+
+    # And the caller's provider is left exactly as it arrived.
+    assert provider._historicals_fn is _historicals
+
+
+def test_a_copy_that_returns_the_same_object_is_rejected(tmp_path):
+    # A successful copy is not automatically a PRIVATE one: __copy__ is
+    # caller-defined and may return self (a singleton, a cached connection
+    # wrapper). Rebinding would then land on the shared original and every
+    # overlapping-run hazard is back, this time with no exception to notice it
+    # by (Codex review: "Verify that the provider copy is actually private").
+    class _SelfCopying:
+        source = SourceName.ROBINHOOD
+
+        def __init__(self, fn):
+            self._historicals_fn = fn
+
+        def __copy__(self):
+            return self
+
+    def _historicals(**kwargs):
+        return {"results": []}
+
+    provider = _SelfCopying(_historicals)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+
+    with pytest.raises(RawInputPersistenceError, match="returned the same object"):
+        _PersistingMarketDataProvider(provider, recorder)
+
+    # The shared provider is left exactly as it arrived.
+    assert provider._historicals_fn is _historicals
+
+
+def test_a_copy_sharing_attribute_storage_is_rejected(tmp_path):
+    # A distinct object can still share attribute storage: a __copy__ that
+    # hands its own __dict__ to the new instance passes the identity check
+    # while every rebinding still lands on the caller's provider, silently
+    # restoring the overlapping-run fail-open (Codex review: "Verify copied
+    # providers do not share attribute storage").
+    class _SharedDict:
+        source = SourceName.ROBINHOOD
+
+        def __init__(self, fn):
+            self._historicals_fn = fn
+
+        def __copy__(self):
+            twin = _SharedDict.__new__(_SharedDict)
+            twin.__dict__ = self.__dict__  # distinct object, same storage
+            return twin
+
+    def _historicals(**kwargs):
+        return {"results": []}
+
+    provider = _SharedDict(_historicals)
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+
+    with pytest.raises(RawInputPersistenceError, match="shares attribute storage"):
+        _PersistingMarketDataProvider(provider, recorder)
+
+    # The probe used to detect the sharing is fully undone.
+    assert provider._historicals_fn is _historicals
+
+
+def test_a_scheduled_run_blocks_when_the_provider_cannot_be_isolated(tmp_path):
+    # The refusal reaches the caller as a normal blocked run_state -- written
+    # before evaluate(), so nothing was computed and nothing placed -- rather
+    # than as an escaping exception.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+
+    class _UncopyableProvider(DecliningBarsProvider):
+        _historicals_fn: Any = None
+
+        def __copy__(self):
+            raise TypeError("not copyable")
+
+    data = _UncopyableProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    # The decorator only copies a provider that exposes a connector callable
+    # to intercept (the bars come from the provider itself here; the callable
+    # is never reached), so give it one -- exactly the shape the live
+    # RobinhoodDataProvider has.
+    data._historicals_fn = lambda **kwargs: {"results": []}
+    broker = FakeLiveBroker()
+    res = ex.run(_now_live(), data, broker=broker)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["error_class"] == "missing_or_invalid_raw_inputs"
+    assert "cannot isolate the injected market-data provider" in artifacts["block_reason"]
+    assert artifacts["broker_outcomes"] == {}
+    assert Path(res["paths"]["run_state"]).exists()
+
+
+def test_persisting_adapters_do_not_mutate_caller_owned_broker_or_provider(tmp_path):
+    # The wrappers must not leave a recorder-bound connector callable installed on the
+    # caller's RobinhoodDataProvider/RobinhoodBroker instance after wrapping: a later
+    # manual/watchlist run reusing the same instance must see the ORIGINAL connector,
+    # not one bound to this (short-lived, possibly since-deleted) run's raw/ directory
+    # (see PR #560 review discussion r3816306593).
+    provider = RobinhoodDataProvider(
+        historicals_fn=lambda **kwargs: {"results": []}, quotes_fn=lambda **kwargs: {"results": []}
+    )
+    broker = RobinhoodBroker(buying_power_fn=lambda **kwargs: {"buying_power": "1.00"})
+    original_historicals_fn = provider._historicals_fn
+    original_quotes_fn = provider._quotes_fn
+    original_buying_power_fn = broker._buying_power_fn
+
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped_provider = _PersistingMarketDataProvider(provider, recorder)
+    wrapped_broker = _PersistingBrokerAdapter(broker, recorder)
+    wrapped_provider.get_quote("AAPL", _now_live())
+    wrapped_broker.available_buying_power()
+
+    assert provider._historicals_fn is original_historicals_fn
+    assert provider._quotes_fn is original_quotes_fn
+    assert broker._buying_power_fn is original_buying_power_fn
+    # The decorators still operate on wrapped connectors internally.
+    assert wrapped_provider._inner is not provider
+    assert wrapped_broker._inner is not broker
+
+
+def test_scheduled_live_run_blocks_all_orders_when_one_market_fetch_raises(tmp_path):
+    """A per-ticker connector outage IS caught by evaluate_signal() and
+    degrades that one ticker to NO_DATA for reporting purposes, but the
+    scheduled-live raw-persistence wrapper (_PersistingMarketDataProvider)
+    records the SAME exception onto raw_recorder.error before re-raising it
+    for evaluate_signal to catch. run() checks raw_recorder.error right after
+    evaluate() (before any placement), so one ticker's connector outage fails
+    the whole batch closed rather than silently placing orders from a batch
+    whose raw evidence is incomplete (CLAUDE.md "Fail closed, always")."""
+
+    class _PartialOutageProvider(DecliningBarsProvider):
+        def get_previous_close_bar(self, ticker, as_of):
+            if ticker == "BBB":
+                raise RuntimeError("connector outage")
+            return super().get_previous_close_bar(ticker, as_of)
+
+    class _RecordingBroker(FakeLiveBroker):
+        def __init__(self):
+            self.place_calls = []
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.place_calls.append((ticker, notional_usd, ref_id))
+            return super().place_market_buy(ticker, notional_usd, ref_id)
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
+    cfg = MorningConfig(
+        tickers=("AAA", "BBB"),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    broker = _RecordingBroker()
+    data = _PartialOutageProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05, "BBB": 0.05})
+
+    result = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE).run(_now_live(), data, broker=broker)
+
+    assert result["artifacts"]["status"] == "blocked"
+    assert result["artifacts"]["error_class"] == "missing_or_invalid_raw_inputs"
+    assert "connector outage" in result["artifacts"]["raw_persistence_error"]
+    assert broker.place_calls == []
+
+
 def test_persisting_broker_adapter_records_buying_power_and_tradability(tmp_path):
     broker = FakeLiveBroker()
     recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
@@ -8541,11 +11358,41 @@ def test_persisting_broker_adapter_records_buying_power_and_tradability(tmp_path
     assert recorder.error is None
     assert any(name.startswith("buying_power_") for name in recorder.saved_filenames)
     assert any(name.startswith("tradability_AAPL_") for name in recorder.saved_filenames)
-    # Optional non-protocol broker methods still forward through __getattr__.
+    # The guarded same-stream duplicate query is also raw input, rather than
+    # being forwarded unrecorded through __getattr__.
     assert (
         wrapped.same_day_strategy_order_exists_with_ref_id_prefix("AAPL", date(2026, 7, 8), [])
         is None
     )
+    assert any(name.startswith("orders_since_midnight_AAPL_") for name in recorder.saved_filenames)
+
+
+def test_persisting_broker_keeps_placement_responses_for_final_drain(tmp_path):
+    class BufferedBroker(FakeLiveBroker):
+        def __init__(self):
+            super().__init__()
+            self.responses = [{"id": "order-1", "state": "queued"}]
+
+        def get_raw_placement_responses(self):
+            responses, self.responses = self.responses, []
+            return responses
+
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(cast(Any, BufferedBroker()), recorder)
+    assert wrapped.place_market_buy("AAPL", 5.0, "ref-1")
+    assert wrapped.get_raw_placement_responses() == [{"id": "order-1", "state": "queued"}]
+    assert wrapped.get_raw_placement_responses() == []
+
+
+def test_persisting_broker_preserves_order_id_when_response_drain_fails(tmp_path):
+    class DrainFailureBroker(FakeLiveBroker):
+        def get_raw_placement_responses(self):
+            raise OSError("unavailable")
+
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(cast(Any, DrainFailureBroker()), recorder)
+    assert wrapped.place_market_buy("AAPL", 5.0, "ref-1")
+    assert recorder.error and "drain placement responses" in recorder.error
 
 
 def test_persisting_broker_adapter_records_placement_response(tmp_path):
@@ -8636,15 +11483,423 @@ def test_scheduled_live_run_fails_closed_when_raw_persistence_fails_before_place
     assert Path(res["paths"]["run_state"]).exists()
 
 
+def test_blocked_live_result_carries_raw_persistence_fields(tmp_path):
+    # Codex review on PR #420 ("Retain the standard raw-persistence failure
+    # fields"): the fresh blocked-stub path in _blocked_live_result() bypasses
+    # the normal end-of-run() block that stamps raw_input_dir/raw_inputs_saved/
+    # raw_persistence_error, so a blocked scheduled run must not lose those
+    # documented machine-readable fields just because the failure happened
+    # before broker placement.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "raw").write_text("not a directory", encoding="utf-8")
+
+    broker = FakeLiveBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, broker=broker)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["raw_input_dir"] == str(run_dir / "raw")
+    assert artifacts["raw_inputs_saved"] == []
+    assert "failed to persist" in artifacts["raw_persistence_error"]
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_bytes())
+    assert "raw_persistence_error" in on_disk
+
+
+class _PartialSubmitThenRawFailBroker(FakeLiveBroker):
+    """Submits the first candidate, then breaks raw persistence for the next.
+
+    Simulates a raw-persistence failure that happens mid-loop, AFTER an
+    earlier candidate has already been submitted -- the scenario Codex/Copilot
+    review flagged on PR #420 ("Preserve orders submitted before a later
+    persistence failure" / "Surface persistence failures on scheduled
+    retries"): the already-placed order must survive in the final artifact
+    instead of being discarded by a blank ``broker_outcomes={}`` stub.
+    """
+
+    def __init__(self, raw_dir):
+        self._raw_dir = raw_dir
+        self._tradability_calls = 0
+
+    def is_tradable_for_fractional_buy(self, ticker):
+        self._tradability_calls += 1
+        if self._tradability_calls > 1:
+            # Corrupt the raw directory so the NEXT persisted broker response
+            # (this tradability check, for the second candidate) fails to
+            # save -- but only after the first candidate has already been
+            # fully placed.
+            if self._raw_dir.is_dir():
+                import shutil
+
+                shutil.rmtree(self._raw_dir)
+            self._raw_dir.write_text("not a directory", encoding="utf-8")
+        return True
+
+
+def test_blocked_live_run_preserves_earlier_submission_on_later_raw_failure(tmp_path):
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
+    cfg = MorningConfig(
+        tickers=("AAA", "BBB"),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+    broker = _PartialSubmitThenRawFailBroker(raw_dir)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05, "BBB": 0.05})
+
+    res = ex.run(_now_live(), data, broker=broker)
+    artifacts = res["artifacts"]
+
+    assert artifacts["status"] == "blocked"
+    assert artifacts["error_class"] == "missing_or_invalid_raw_inputs"
+    assert artifacts["broker_outcomes"]["AAA"]["status"] == "submitted"
+    submitted_rows = [c for c in artifacts["buy_candidates"] if c.get("status") == "submitted"]
+    assert {c["ticker"] for c in submitted_rows} == {"AAA"}
+    trading_day = _now_live().astimezone(EASTERN).date()
+    assert ex.ledger.day_planned(trading_day) == artifacts["broker_outcomes"]["AAA"]["submitted_amount_usd"]
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_bytes())
+    assert on_disk["broker_outcomes"]["AAA"]["status"] == "submitted"
+
+
+def test_blocked_partial_submission_run_denies_scheduled_evidence(tmp_path):
+    # Codex review, PR #538 discussion_r3837449173 ("Deny scheduled evidence
+    # for partial persistence failures"): _apply_no_order_classification() sees
+    # a "submitted" outcome with no failed/blocked rows of its own (the later
+    # candidate never got evaluated at all) and returns EARLY without setting
+    # run_classification_outcome/is_trading_failure. Without an explicit
+    # scheduled_evidence_denied marker, derive_valid_scheduled_evidence() would
+    # incorrectly treat this failed partial run as valid "the scheduled slot
+    # ran successfully" evidence.
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
+    cfg = MorningConfig(
+        tickers=("AAA", "BBB"),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+    broker = _PartialSubmitThenRawFailBroker(raw_dir)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05, "BBB": 0.05})
+
+    res = ex.run(_now_live(), data, broker=broker)
+    artifacts = res["artifacts"]
+
+    assert artifacts["status"] == "blocked"
+    assert artifacts["broker_outcomes"]["AAA"]["status"] == "submitted"
+    assert artifacts["run_classification_outcome"] == "failed_after_partial_submission"
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["scheduled_evidence_denied"] is True
+    assert derive_valid_scheduled_evidence(artifacts) is False
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_bytes())
+    assert on_disk["scheduled_evidence_denied"] is True
+    assert derive_valid_scheduled_evidence(on_disk) is False
+
+
+def test_blocked_live_retry_clears_stale_raw_failure_metadata(tmp_path):
+    # Codex review on PR #420 ("Clear stale failure metadata when rewriting a
+    # retry"): when the preserved artifact came from a raw-persistence
+    # failure (error_class/raw_persistence_error set) and a LATER retry fails
+    # for an unrelated, non-raw reason (missing broker), the rewritten
+    # artifact must not keep attributing the current wiring failure to the
+    # earlier, different raw-input error.
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
+    cfg = MorningConfig(
+        tickers=("AAA", "BBB"),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+    broker = _PartialSubmitThenRawFailBroker(raw_dir)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05, "BBB": 0.05})
+
+    first = ex.run(_now_live(), data, broker=broker)
+    assert first["artifacts"]["status"] == "blocked"
+    assert first["artifacts"]["error_class"] == "missing_or_invalid_raw_inputs"
+    assert "raw_persistence_error" in first["artifacts"]
+    run_state_path = Path(first["paths"]["run_state"])
+
+    # The first attempt's broker deliberately corrupted raw/ (a file instead
+    # of a directory) to force its own raw-persistence failure -- repair it so
+    # the second attempt's own raw writes succeed and its failure is purely
+    # the (unrelated) missing-broker wiring problem under test.
+    if raw_dir.is_file():
+        raw_dir.unlink()
+
+    # Second attempt at the SAME slot: a wiring failure unrelated to raw
+    # persistence. The earlier submission must survive, but the stale raw
+    # error_class/raw_persistence_error must NOT be carried forward.
+    second = ex.run(_now_live(), data, broker=None)
+
+    assert second["artifacts"]["status"] == "blocked"
+    assert second["artifacts"]["block_reason"] == "missing broker adapter for scheduled live execution"
+    # The stale "missing_or_invalid_raw_inputs" from the FIRST attempt must not
+    # bleed into this attempt's own, unrelated wiring failure -- a generic
+    # before-placement fallback is stamped instead, never the earlier value.
+    from scripts.run_classification import ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT
+
+    assert second["artifacts"]["error_class"] == ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT
+    assert "raw_persistence_error" not in second["artifacts"]
+    submitted_rows = [c for c in second["artifacts"]["buy_candidates"] if c.get("status") == "submitted"]
+    assert {c["ticker"] for c in submitted_rows} == {"AAA"}
+    on_disk = json.loads(run_state_path.read_bytes())
+    assert on_disk["error_class"] == ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT
+    assert "raw_persistence_error" not in on_disk
+    assert on_disk["broker_outcomes"]["AAA"]["status"] == "submitted"
+
+
+def test_blocked_retry_after_full_earlier_submission_denies_scheduled_evidence(tmp_path):
+    # Codex review, PR #538 discussion_r3837489852 ("Deny scheduled evidence
+    # for preserved blocked retries"). Distinct from
+    # test_blocked_partial_submission_run_denies_scheduled_evidence (which
+    # covers raw persistence failing WITHIN the same run, right after a
+    # partial submission, via raw_persistence_partial_block): here an EARLIER
+    # attempt at this slot fully completed and submitted an order, and a
+    # LATER retry is blocked for an unrelated wiring reason (a missing broker
+    # adapter) that never touches raw persistence at all. The wholesale-
+    # preservation path in _blocked_live_result() copied the earlier
+    # attempt's success classification unchanged, so
+    # derive_valid_scheduled_evidence() still reported this failed retry as
+    # valid scheduled evidence.
+    from scripts.same_day_pointer import derive_valid_scheduled_evidence
+
+    preflight_root = tmp_path / "preflight"
+    _seed_preflight(preflight_root, ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(preflight_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 95.0})
+
+    first = ex.run(_now_live(), data, broker=broker, manual=False)
+    assert first["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
+    assert derive_valid_scheduled_evidence(first["artifacts"]) is True
+
+    # Second attempt at the SAME scheduled slot: this time the broker wiring
+    # itself is missing, an unrelated failure from the earlier submission.
+    second = ex.run(_now_live(), data, broker=None)
+
+    artifacts = second["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["block_reason"] == "missing broker adapter for scheduled live execution"
+    # The earlier submission must still be intact and paired with its signals...
+    assert artifacts["broker_outcomes"]["AAA"]["status"] == "submitted"
+    # ...but THIS attempt's own failure must not be hidden behind it.
+    assert artifacts["run_classification_outcome"] == "failed_after_partial_submission"
+    assert artifacts["is_trading_failure"] is True
+    assert artifacts["scheduled_evidence_denied"] is True
+    assert derive_valid_scheduled_evidence(artifacts) is False
+    on_disk = json.loads(Path(second["paths"]["run_state"]).read_bytes())
+    assert on_disk["scheduled_evidence_denied"] is True
+    assert derive_valid_scheduled_evidence(on_disk) is False
+
+
+def test_blocked_retry_preserves_raw_input_references_after_full_submission(tmp_path):
+    # Codex review, PR #538 discussion_r3837489853 ("Preserve original
+    # raw-input references on blocked retries"). Same scenario as the
+    # scheduled-evidence-denial test above (earlier attempt fully submitted,
+    # later retry blocked by a missing broker) but asserting the OTHER half
+    # of that finding: the earlier attempt's raw_input_dir/raw_inputs_saved
+    # must survive being layered with THIS attempt's own (non-raw) failure,
+    # since the original raw files that justified the submitted order are
+    # still on disk and this retry's own raw_recorder is never even passed
+    # to _blocked_live_result() on the missing-broker path.
+    preflight_root = tmp_path / "preflight"
+    _seed_preflight(preflight_root, ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(preflight_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 95.0})
+
+    first = ex.run(_now_live(), data, broker=broker, manual=False)
+    assert first["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
+    original_raw_input_dir = first["artifacts"].get("raw_input_dir")
+    original_raw_inputs_saved = first["artifacts"].get("raw_inputs_saved")
+    assert original_raw_input_dir
+    assert original_raw_inputs_saved
+
+    second = ex.run(_now_live(), data, broker=None)
+
+    artifacts = second["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["broker_outcomes"]["AAA"]["status"] == "submitted"
+    assert artifacts["raw_input_dir"] == original_raw_input_dir
+    assert artifacts["raw_inputs_saved"] == original_raw_inputs_saved
+    on_disk = json.loads(Path(second["paths"]["run_state"]).read_bytes())
+    assert on_disk["raw_input_dir"] == original_raw_input_dir
+    assert on_disk["raw_inputs_saved"] == original_raw_inputs_saved
+
+
+def test_blocked_retry_merges_raw_filenames_with_preserved_submission(tmp_path):
+    # Codex review, PR #654 discussion_r3837649719 ("Retain earlier raw
+    # filenames when rewriting a blocked retry"): unlike the missing-broker
+    # scenario above (where THIS retry's raw_recorder is never even passed to
+    # _blocked_live_result()), a retry that saves at least one NEW raw file
+    # before its own raw persistence fails was replacing the preserved
+    # artifact's raw_inputs_saved list outright instead of merging with it --
+    # even though the earlier attempt's raw files are still on disk under a
+    # lower sequence number in the very same raw_dir.
+    preflight_root = tmp_path / "preflight"
+    _seed_preflight(preflight_root, ("AAA",))
+    cfg = MorningConfig(
+        tickers=("AAA",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(preflight_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 95.0})
+
+    first = ex.run(_now_live(), data, broker=broker, manual=False)
+    assert first["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
+    original_raw_inputs_saved = first["artifacts"]["raw_inputs_saved"]
+    assert original_raw_inputs_saved
+
+    # Simulate a second attempt whose own raw_recorder manages to save one
+    # new file (a later ticker's prior-close, say) before hitting an error.
+    raw_recorder = _RawInputRecorder(Path(first["artifacts"]["raw_input_dir"]), "2026-07-08")
+    new_filename = "prior_close_ZZZZ_99.json"
+    raw_recorder.saved_filenames.append(new_filename)
+    raw_recorder.error = "simulated failure on a later ticker"
+
+    result = ex._blocked_live_result(
+        _now_live(),
+        f"raw input persistence failed: {raw_recorder.error}",
+        [],
+        "robinhood",
+        error_class="missing_or_invalid_raw_inputs",
+        raw_recorder=raw_recorder,
+    )
+
+    artifacts = result["artifacts"]
+    assert artifacts["broker_outcomes"]["AAA"]["status"] == "submitted"
+    assert artifacts["raw_inputs_saved"][: len(original_raw_inputs_saved)] == original_raw_inputs_saved
+    assert new_filename in artifacts["raw_inputs_saved"]
+    on_disk = json.loads(Path(result["paths"]["run_state"]).read_bytes())
+    assert on_disk["raw_inputs_saved"][: len(original_raw_inputs_saved)] == original_raw_inputs_saved
+    assert new_filename in on_disk["raw_inputs_saved"]
+
+
+def test_blocked_live_retry_preserves_evidence_from_partial_run_state(tmp_path):
+    # Codex review on PR #420 ("Validate preserved artifacts before rewriting
+    # them"): a preserved run_state that only has the minimal shape
+    # _existing_submitted_run_state() actually validates (a submitted
+    # buy_candidates/broker_outcomes row) -- and is otherwise missing
+    # run_classification/budget/signal_rows -- must not raise KeyError when
+    # the next blocked retry rewrites it. Regression for
+    # {"buy_candidates": [{"status": "submitted"}]}.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({"buy_candidates": [{"ticker": "SMALL", "status": "submitted"}]}),
+        encoding="utf-8",
+    )
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, broker=None)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["block_reason"] == "missing broker adapter for scheduled live execution"
+    submitted_rows = [c for c in artifacts["buy_candidates"] if c.get("status") == "submitted"]
+    assert {c["ticker"] for c in submitted_rows} == {"SMALL"}
+    assert Path(res["paths"]["run_state"]).exists()
+
+
+def test_blocked_live_retry_falls_back_when_preserved_fields_are_wrong_typed(tmp_path):
+    # Codex review, PR #538 discussion_r3837489862 ("Validate preserved field
+    # types before rewriting retries"). Distinct from
+    # test_blocked_live_retry_preserves_evidence_from_partial_run_state
+    # (which covers those keys being ABSENT): here run_classification,
+    # signal_rows, and budget are all PRESENT but hold invalid values (null),
+    # exactly the shape a presence-only check would wave through and
+    # write_artifacts() would then subscript/iterate and raise on. This must
+    # fall back to the graft-based path instead of raising.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "stale-run-id",
+                "run_classification": None,
+                "signal_rows": None,
+                "budget": None,
+                "buy_candidates": [{"ticker": "SMALL", "status": "submitted"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, broker=None)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["block_reason"] == "missing broker adapter for scheduled live execution"
+    assert isinstance(artifacts["run_classification"], dict)
+    assert isinstance(artifacts["signal_rows"], list)
+    assert isinstance(artifacts["budget"], dict)
+    submitted_rows = [c for c in artifacts["buy_candidates"] if c.get("status") == "submitted"]
+    assert {c["ticker"] for c in submitted_rows} == {"SMALL"}
+    assert Path(res["paths"]["run_state"]).exists()
+
+
 class _Unserializable:
     def __repr__(self):
         return "<unserializable>"
 
 
 class _BadTradabilityBroker(FakeLiveBroker):
+    def __init__(self):
+        self.place_calls = []
+
     def is_tradable_for_fractional_buy(self, ticker) -> Any:
         return _Unserializable()
 
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        self.place_calls.append((ticker, notional_usd, ref_id))
+        return super().place_market_buy(ticker, notional_usd, ref_id)
 
 def test_raw_persistence_failure_during_this_candidate_blocks_this_candidate(tmp_path):
     # Codex review ("Recheck persistence before submitting the current
@@ -8664,7 +11919,8 @@ def test_raw_persistence_failure_during_this_candidate_blocks_this_candidate(tmp
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    res = ex.run(_now_live(), data, broker=_BadTradabilityBroker())
+    broker = _BadTradabilityBroker()
+    res = ex.run(_now_live(), data, broker=cast(Any, broker))
     artifacts = res["artifacts"]
 
     outcome = artifacts.get("broker_outcomes", {}).get("SMALL")
@@ -8696,9 +11952,174 @@ def test_raw_persistence_failure_during_this_candidate_blocks_this_candidate(tmp
     assert artifacts["is_trading_failure"] is True
     assert artifacts["scheduled_evidence_denied"] is True
     assert artifacts["run_classification"]["valid_scheduled_evidence"] is False
+
+
+class _BuyingPowerFailureBroker(FakeLiveBroker):
+    def available_buying_power(self):
+        raise ConnectionError("broker temporarily unavailable")
+
+
+def test_scheduled_live_run_persists_block_when_buying_power_lookup_fails(tmp_path, monkeypatch):
+    """A transient account lookup failure must leave durable scheduled evidence."""
+    heartbeat_results = []
+    monkeypatch.setattr("dca_alerts.send_heartbeat", lambda _stream, *, ok: heartbeat_results.append(ok))
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    live_root = tmp_path / "live"
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    res = ex.run(_now_live(), data, broker=_BuyingPowerFailureBroker())
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["block_reason"] == (
+        "failed to retrieve broker buying power: broker temporarily unavailable"
+    )
+    assert artifacts["error_class"] == "buying_power_lookup_failed"
+    assert artifacts["broker_outcomes"] == {}
+    assert heartbeat_results == [False]
+    assert Path(res["paths"]["run_state"]).exists()
+    pointer = json.loads((live_root / ex.latest_pointer_name).read_bytes())
+    assert pointer["run_state_path"] == res["paths"]["run_state"]
+
+
+def test_scheduled_live_run_fails_the_heartbeat_when_a_trading_failure_is_recorded(tmp_path, monkeypatch):
+    """A recorded trading failure must clear a FAILED heartbeat, not a healthy one.
+
+    Codex review, PR #688 discussion_r3925372792 ("Fail the heartbeat for
+    placement failures"): _apply_no_order_classification() stamps
+    is_trading_failure=True on the artifact when a placement attempt itself
+    failed (timeout, terminal rejection) after passing every earlier gate --
+    the call still returns normally rather than raising, so without
+    guarded_run's result_ok predicate reading this field an intended order
+    lost to a placement failure read as a healthy run and cleared the dead-
+    man switch exactly like a genuinely clean, zero-order day.
+    """
+    heartbeat_results = []
+    monkeypatch.setattr("dca_alerts.send_heartbeat", lambda _stream, *, ok: heartbeat_results.append(ok))
+
+    def _reject_for_small(**kwargs):
+        return {"data": {"order": {"id": "ord-1", "state": "rejected", "cumulative_quantity": "0"}}}
+
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    broker = RobinhoodBroker(place_fn=_reject_for_small, enable_live_orders=True, **_LIVE_LOOKUP_STUBS)
+
+    res = ex.run(_now_live(), data, broker=broker)
+
+    artifacts = res["artifacts"]
+    assert artifacts["is_trading_failure"] is True
+    # The mocked connector returns a definitive terminal "rejected" state (not
+    # a raw timeout with no broker response observed), so this is a PROVEN
+    # rejection -- "failed" -- not the "potentially_submitted" status reserved
+    # for a genuinely ambiguous OrderPlacementAmbiguousError outcome (Codex
+    # review, PR #1300 discussion_r3920155064: "Emit the new
+    # ambiguous-placement status" describes that separate, timeout-shaped
+    # scenario, not this one).
+    assert artifacts["broker_outcomes"]["SMALL"]["status"] == "failed"
+    # The heartbeat must report the run as FAILED, never healthy, even though
+    # the call returned a structured result instead of raising.
+    assert heartbeat_results == [False]
+
+
+def test_blocked_buying_power_failure_retains_raw_input_metadata(tmp_path):
+    # Codex review, PR #538 discussion_r3837449175 ("Retain raw-input metadata
+    # on buying-power failures"): market data and earlier broker checks are
+    # already persisted via the raw recorder by the time the buying-power
+    # lookup raises _BuyingPowerLookupError, but the _blocked_live_result()
+    # call in that branch omitted raw_recorder -- so the blocked artifact had
+    # no raw_input_dir/raw_inputs_saved fields even though the raw files
+    # actually exist on disk, breaking the audit/reporting contract that
+    # promises those fields whenever raw inputs were captured.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    live_root = tmp_path / "live"
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    res = ex.run(_now_live(), data, broker=_BuyingPowerFailureBroker())
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    assert artifacts["error_class"] == "buying_power_lookup_failed"
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+    assert artifacts["raw_input_dir"] == str(raw_dir)
+    assert artifacts["raw_inputs_saved"]
     on_disk = json.loads(Path(res["paths"]["run_state"]).read_bytes())
+    assert on_disk["raw_input_dir"] == str(raw_dir)
+    assert on_disk["raw_inputs_saved"]
     assert on_disk["scheduled_evidence_denied"] is True
-    assert on_disk["error_class"] == "missing_or_invalid_raw_inputs"
+    assert on_disk["error_class"] == "buying_power_lookup_failed"
+
+
+def test_scheduled_live_run_blocks_when_production_broker_swallows_buying_power_failure(tmp_path, monkeypatch):
+    """A real ``RobinhoodBroker`` never lets a buying-power connector error escape.
+
+    PR #1299 discussion_r3925731478 ("Propagate swallowed buying-power
+    connector failures"): unlike the test-double brokers above,
+    ``RobinhoodBroker.available_buying_power()`` catches ANY exception from
+    its injected ``_buying_power_fn`` and returns a clean ``0.0`` -- so
+    ``broker.available_buying_power()`` never raises and the
+    ``_BuyingPowerLookupError`` branch in ``_process_candidate`` is never
+    reached. Without ``_RawInputRecorder.record_error()`` also stamping the
+    unified ``error`` field for this failure (see its own docstring), the
+    run would read the swallowed ``0.0`` as a genuine, deliberate
+    insufficient-buying-power skip and publish a clean completed result,
+    even though the broker connector never actually answered -- silently
+    suppressing recovery for a real outage. Assert the run instead fails
+    closed via ``block_if_raw_persistence_failed()``, which reads
+    ``raw_recorder.error``.
+    """
+    heartbeat_results = []
+    monkeypatch.setattr("dca_alerts.send_heartbeat", lambda _stream, *, ok: heartbeat_results.append(ok))
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    live_root = tmp_path / "live"
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+
+    def _raising_buying_power_fn(**kwargs):
+        raise ConnectionError("broker temporarily unavailable")
+
+    broker = RobinhoodBroker(
+        buying_power_fn=_raising_buying_power_fn,
+        orders_fn=_no_orders_today,
+        tradability_fn=_all_tradable,
+        enable_live_orders=True,
+    )
+
+    res = ex.run(_now_live(), data, broker=broker)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    outcome = artifacts["broker_outcomes"]["SMALL"]
+    assert outcome["status"] == "blocked"
+    assert outcome["blocked_by_raw_persistence"] is True
+    assert "broker temporarily unavailable" in outcome["skip_reason"]
+    assert heartbeat_results == [False]
 
 
 class _FailAfterFirstTradabilityBroker(FakeLiveBroker):
@@ -9069,6 +12490,68 @@ def _live_executor(tmp_path, tickers):
         prior_allocation_roots=(str(tmp_path / "empty_prior"),),
     )
     return MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+
+
+def _lock_is_held(lock_path: Path) -> bool:
+    """True when ``lock_path`` cannot be acquired right now."""
+    if not lock_path.exists():
+        return False
+    try:
+        with cross_process_lock(lock_path, timeout_seconds=0.05):
+            return False
+    except (TimeoutError, OSError):
+        return True
+
+
+class TestScheduledSlotLock:
+    """A scheduled live attempt is serialized against other attempts for its slot.
+
+    Without the lock, an external-scheduler retry that overlaps the original
+    invocation has nothing serializing the two: both can pass the broker's
+    check-then-place duplicate guard before either order becomes visible, and
+    submit the same ticker allocation twice (Codex review: "Restore the
+    scheduled-slot lock around live execution").
+    """
+
+    def test_scheduled_live_run_holds_the_slot_lock_through_placement(self, tmp_path):
+        ex = _live_executor(tmp_path, ("NVDA",))
+        lock_path = ex._slot_lock_path(_now_live())
+        held: list[bool] = []
+
+        # The broker call is the deepest point of the attempt: if the lock is
+        # held there, it covers the calendar gate, raw recording and placement.
+        class _LockObservingBroker(_TopUpBroker):
+            def place_market_buy(self, *args, **kwargs):
+                held.append(_lock_is_held(lock_path))
+                return super().place_market_buy(*args, **kwargs)
+
+        data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+        res = ex.run(_now_live(), data, broker=_LockObservingBroker())
+
+        assert res["artifacts"]["broker_outcomes"]["NVDA"]["status"] == "submitted"
+        assert held == [True], "the slot lock was not held while placing the order"
+        # Released on the way out, so the next scheduled attempt is not blocked.
+        assert not _lock_is_held(lock_path)
+
+    def test_manual_and_watchlist_runs_never_take_the_slot_lock(self, tmp_path):
+        # live_schedule_hardening_2026_07_20's applies_to is scoped to the
+        # scheduled live task, so a manual retry must not be blocked by a
+        # scheduled attempt's lock (nor take one of its own).
+        ex = _live_executor(tmp_path, ("NVDA",))
+        now = _now_live()
+        lock_path = ex._slot_lock_path(now)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+        holder = cross_process_lock(lock_path)
+        holder.__enter__()
+        try:
+            data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+            res = ex.run(now, data, broker=_TopUpBroker(), manual=True)
+        finally:
+            holder.__exit__(None, None, None)
+
+        assert res["artifacts"].get("status") != "blocked"
+        assert res["paths"].get("run_state")
 
 
 def test_morning_live_run_writes_the_complete_root_level_artifact_set(tmp_path):
@@ -9596,9 +13079,478 @@ def test_confirmation_required_survives_the_morning_no_order_classification(tmp_
     assert artifacts["orders_submitted_count"] == 0
 
 
+def test_raising_placement_connector_retains_ambiguous_broker_outcome(tmp_path):
+    """A placement timeout is retained without raw-persistence reclassification."""
+
+    placement_attempts = []
+
+    def _raise_after_possible_submission(**kwargs):
+        placement_attempts.append(kwargs["symbol"])
+        raise TimeoutError("broker response timed out")
+
+    ex = _live_executor(tmp_path, ("NVDA", "AAPL"))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10, "AAPL": 0.10})
+    broker = RobinhoodBroker(
+        place_fn=_raise_after_possible_submission,
+        enable_live_orders=True,
+        **_LIVE_LOOKUP_STUBS,
+    )
+
+    res = ex.run(_now_live(), data, broker=broker)
+
+    artifacts = res["artifacts"]
+    assert set(placement_attempts) == {"NVDA", "AAPL"}
+    for ticker in ("NVDA", "AAPL"):
+        outcome = artifacts["broker_outcomes"][ticker]
+        assert outcome["status"] == "potentially_submitted"
+        assert "placement ambiguous" in outcome["skip_reason"]
+        assert outcome["order_id"] is None
+    assert "raw_persistence_error" not in artifacts
+    assert artifacts.get("error_class") != "missing_or_invalid_raw_inputs"
+
+
+def test_definitive_placement_rejection_continues_the_batch(tmp_path):
+    """A terminal broker rejection for one ticker must not halt later candidates.
+
+    Unlike a genuinely ambiguous placement failure (timeout, connection reset --
+    covered by test_raising_placement_connector_retains_ambiguous_broker_outcome
+    above), a response the broker's OWN placement call already reports as a
+    PROVEN zero-fill rejection (a terminal state with an explicit zero
+    cumulative_quantity) PROVES no live order exists for that ticker.
+    RobinhoodBroker.place_market_buy raises the distinct
+    FractionalPlacementRejectedError (public alias OrderPlacementRejectedError)
+    for this proven case, and _process_candidate must catch it separately to
+    `continue` rather than `break` the batch (Codex review, PR #688: "Continue
+    after definitive broker rejections"; PR #859: "Preserve the terminal order
+    ID from proven rejections").
+    """
+    from near_close_dca import OrderPlacementRejectedError
+
+    def _place_fn(**kwargs):
+        if kwargs["symbol"] == "AAPL":
+            return {
+                "data": {
+                    "order": {
+                        "id": "ORD-REJECTED",
+                        "state": "rejected",
+                        "cumulative_quantity": "0",
+                    }
+                }
+            }
+        return {"data": {"order": {"id": f"ORD-{kwargs['symbol']}", "state": "confirmed"}}}
+
+    ex = _live_executor(tmp_path, ("AAPL", "NVDA"))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.10, "NVDA": 0.10})
+    broker = RobinhoodBroker(place_fn=_place_fn, enable_live_orders=True, **_LIVE_LOOKUP_STUBS)
+
+    # Sanity-check the adapter itself raises the specific type this test relies on.
+    with pytest.raises(OrderPlacementRejectedError):
+        broker.place_market_buy("AAPL", 1.0, "ref-sanity-check")
+
+    res = ex.run(_now_live(), data, broker=broker)
+
+    artifacts = res["artifacts"]
+    aapl_outcome = artifacts["broker_outcomes"]["AAPL"]
+    assert aapl_outcome["status"] == "failed"
+    assert "broker rejected placement" in aapl_outcome["skip_reason"]
+    assert aapl_outcome["order_id"] == "ORD-REJECTED"
+    # The later, unrelated candidate must still have been attempted and
+    # submitted -- the definitive rejection above must not have halted it.
+    nvda_outcome = artifacts["broker_outcomes"]["NVDA"]
+    assert nvda_outcome["status"] == "submitted"
+    assert nvda_outcome["order_id"] == "ORD-NVDA"
+    assert "raw_persistence_error" not in artifacts
+    assert artifacts.get("error_class") != "missing_or_invalid_raw_inputs"
+
+
+def test_terminal_partial_fill_is_booked_before_continuing_batch(tmp_path):
+    """A cancelled fractional order can still have spent real buying power."""
+
+    placement_attempts = []
+
+    def _place_fn(**kwargs):
+        placement_attempts.append(kwargs["symbol"])
+        if kwargs["symbol"] == "AAPL":
+            return {
+                "data": {
+                    "order": {
+                        "id": "ORD-PARTIAL",
+                        "state": "cancelled",
+                        "cumulative_quantity": "0.06",
+                        "average_price": "100.00",
+                    }
+                }
+            }
+        return {"data": {"order": {"id": "ORD-NVDA", "state": "confirmed"}}}
+
+    ex = _live_executor(tmp_path, ("AAPL", "NVDA"))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.10, "NVDA": 0.10})
+    broker = RobinhoodBroker(
+        place_fn=_place_fn,
+        buying_power_fn=lambda **_kwargs: {"buying_power": "15"},
+        orders_fn=_no_orders_today,
+        tradability_fn=_all_tradable,
+        enable_live_orders=True,
+    )
+
+    res = ex.run(_now_live(), data, broker=broker)
+
+    outcomes = res["artifacts"]["broker_outcomes"]
+    assert placement_attempts == ["AAPL"]
+    assert outcomes["AAPL"]["status"] == "submitted"
+    assert outcomes["AAPL"]["order_id"] == "ORD-PARTIAL"
+    assert outcomes["AAPL"]["submitted_amount_usd"] == 6.0
+    assert outcomes["NVDA"]["status"] == "blocked"
+    assert outcomes["NVDA"]["skip_reason"] == "insufficient buying power"
+    assert res["artifacts"]["orders_submitted_count"] == 1
+    assert ex.ledger.day_planned(date(2026, 7, 8)) == 6.0
+
+
+@pytest.mark.parametrize(
+    "unreadable_quantity",
+    [None, "not-a-number", math.nan, math.inf, True, False, 10**4000],
+    ids=["absent", "nonnumeric", "nan", "infinite", "true_boolean", "false_boolean", "oversized"],
+)
+def test_terminal_rejection_with_unreadable_quantity_halts_the_batch(tmp_path, monkeypatch, unreadable_quantity):
+    """An unreconcilable terminal fill must halt the batch, never fall through.
+
+    A cancelled/rejected order whose ``cumulative_quantity`` is missing (or
+    otherwise unreadable) proves nothing about whether capital moved -- it is
+    neither the "exactly zero, proven non-fill" case nor a reconcilable
+    partial fill. The `except MarketBuyPlacementTerminalError` handler used to
+    fall through the bottom of its `if filled_quantity == 0` check with no
+    `return` in every other case, which inside an `except` block means
+    control falls all the way past every sibling `except` clause to the
+    NORMAL SUCCESS PATH below -- silently overwriting the "failed" outcome
+    this handler had just recorded as "submitted" and moving on to place the
+    next ticker as if the run were healthy. Reproduces exactly that: a
+    cancelled AAPL order recorded as a $10 submission with NVDA placed right
+    after it (Codex review, PR #1361 discussion_r3939066629: "Security: Halt
+    when terminal fill evidence is unreadable").
+    """
+
+    placement_attempts = []
+    heartbeat_results = []
+    monkeypatch.setattr("dca_alerts.send_heartbeat", lambda _stream, *, ok: heartbeat_results.append(ok))
+
+    def _place_fn(**kwargs):
+        placement_attempts.append(kwargs["symbol"])
+        if kwargs["symbol"] == "AAPL":
+            return {
+                "data": {
+                    "order": {
+                        "id": "ORD-CANCELLED",
+                        # "cancelled" (unlike "rejected"/"failed"/"voided")
+                        # is not a DECLINED state: the order EXISTED before
+                        # being killed, so it needs an EXPLICIT zero fill to
+                        # be proven a clean non-fill
+                        # (terminal_broker_row_proves_no_order). Every
+                        # parameter is unreadable, not a proven zero.
+                        "state": "cancelled",
+                        "cumulative_quantity": unreadable_quantity,
+                    }
+                }
+            }
+        return {"data": {"order": {"id": "ORD-NVDA", "state": "confirmed"}}}
+
+    ex = _live_executor(tmp_path, ("AAPL", "NVDA"))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.10, "NVDA": 0.10})
+    broker = RobinhoodBroker(
+        place_fn=_place_fn,
+        buying_power_fn=lambda **_kwargs: {"buying_power": "1000"},
+        orders_fn=_no_orders_today,
+        tradability_fn=_all_tradable,
+        enable_live_orders=True,
+    )
+
+    res = ex.run(_now_live(), data, broker=broker)
+
+    outcomes = res["artifacts"]["broker_outcomes"]
+    # NVDA must never be attempted: the batch halts on AAPL's unreconcilable
+    # terminal rejection instead of falling through to place it.
+    assert placement_attempts == ["AAPL"]
+    assert outcomes["AAPL"]["status"] == "failed"
+    assert outcomes["AAPL"]["order_id"] == "ORD-CANCELLED"
+    assert outcomes["AAPL"].get("ambiguous_placement_exception") is True
+    assert outcomes["AAPL"]["submitted_amount_usd"] == 10.0
+    assert res["artifacts"]["is_trading_failure"] is True
+    assert res["artifacts"]["scheduled_evidence_denied"] is True
+    assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
+    assert ex.ledger.day_planned(date(2026, 7, 8)) == 10.0
+    assert "NVDA" not in outcomes or outcomes["NVDA"]["status"] != "submitted"
+    assert heartbeat_results == [False]
+
+
+def test_terminal_rejection_with_zero_quantity_and_nonzero_price_halts_the_batch(tmp_path, monkeypatch):
+    """Contradictory terminal fill evidence (0 qty, non-zero price) is ambiguous."""
+
+    placement_attempts = []
+    heartbeat_results = []
+    monkeypatch.setattr("dca_alerts.send_heartbeat", lambda _stream, *, ok: heartbeat_results.append(ok))
+
+    def _place_fn(**kwargs):
+        placement_attempts.append(kwargs["symbol"])
+        if kwargs["symbol"] == "AAPL":
+            return {
+                "data": {
+                    "order": {
+                        "id": "ORD-CANCELLED",
+                        "state": "cancelled",
+                        "cumulative_quantity": "0",
+                        "average_price": "100.00",
+                    }
+                }
+            }
+        return {"data": {"order": {"id": "ORD-NVDA", "state": "confirmed"}}}
+
+    ex = _live_executor(tmp_path, ("AAPL", "NVDA"))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.10, "NVDA": 0.10})
+    broker = RobinhoodBroker(
+        place_fn=_place_fn,
+        buying_power_fn=lambda **_kwargs: {"buying_power": "1000"},
+        orders_fn=_no_orders_today,
+        tradability_fn=_all_tradable,
+        enable_live_orders=True,
+    )
+
+    res = ex.run(_now_live(), data, broker=broker)
+    outcomes = res["artifacts"]["broker_outcomes"]
+    assert placement_attempts == ["AAPL"]
+    assert outcomes["AAPL"]["status"] == "failed"
+    assert outcomes["AAPL"].get("ambiguous_placement_exception") is True
+    assert res["artifacts"]["is_trading_failure"] is True
+    assert res["artifacts"]["scheduled_evidence_denied"] is True
+    assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
+    assert heartbeat_results == [False]
+    assert "NVDA" not in outcomes or outcomes["NVDA"]["status"] != "submitted"
+
+
+@pytest.mark.parametrize(
+    "unusable_price",
+    [None, "not-a-number", math.nan, math.inf, 0, -1, True, False, 10**4000],
+    ids=["absent", "nonnumeric", "nan", "infinite", "zero", "negative", "true_boolean", "false_boolean", "oversized"],
+)
+def test_terminal_rejection_with_positive_quantity_and_no_usable_price_halts_the_batch(
+    tmp_path, monkeypatch, unusable_price
+):
+    """A positive fill quantity with no usable average_price is unreconcilable.
+
+    Same fall-through bug as the unreadable-quantity case: a positive
+    cumulative_quantity without a usable average_price cannot be booked as a
+    reconcilable fill (no price to compute notional from), and is not the
+    proven-zero case either, so it must halt the batch rather than silently
+    becoming "submitted" (Codex review, PR #1361 discussion_r3939066629).
+    """
+
+    placement_attempts = []
+    heartbeat_results = []
+    monkeypatch.setattr("dca_alerts.send_heartbeat", lambda _stream, *, ok: heartbeat_results.append(ok))
+
+    def _place_fn(**kwargs):
+        placement_attempts.append(kwargs["symbol"])
+        if kwargs["symbol"] == "AAPL":
+            return {
+                "data": {
+                    "order": {
+                        "id": "ORD-REJECTED",
+                        "state": "rejected",
+                        "cumulative_quantity": "0.05",
+                        "average_price": unusable_price,
+                    }
+                }
+            }
+        return {"data": {"order": {"id": "ORD-NVDA", "state": "confirmed"}}}
+
+    ex = _live_executor(tmp_path, ("AAPL", "NVDA"))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.10, "NVDA": 0.10})
+    broker = RobinhoodBroker(
+        place_fn=_place_fn,
+        buying_power_fn=lambda **_kwargs: {"buying_power": "1000"},
+        orders_fn=_no_orders_today,
+        tradability_fn=_all_tradable,
+        enable_live_orders=True,
+    )
+
+    res = ex.run(_now_live(), data, broker=broker)
+
+    outcomes = res["artifacts"]["broker_outcomes"]
+    assert placement_attempts == ["AAPL"]
+    assert outcomes["AAPL"]["status"] == "failed"
+    assert outcomes["AAPL"].get("ambiguous_placement_exception") is True
+    assert res["artifacts"]["is_trading_failure"] is True
+    assert res["artifacts"]["scheduled_evidence_denied"] is True
+    assert res["artifacts"]["run_classification"]["valid_scheduled_evidence"] is False
+    assert "NVDA" not in outcomes or outcomes["NVDA"]["status"] != "submitted"
+    assert heartbeat_results == [False]
+
+
+def test_terminal_partial_fill_response_is_archived_for_raw_replay(tmp_path):
+    """A terminal partial fill's own broker payload must reach the raw
+    placement-response archive, even though the broker RAISED instead of
+    returning normally.
+
+    The normal (non-exception) placement path archives its response via
+    RobinhoodBroker.place_market_buy's own append to
+    ``self._raw_placement_responses`` (read back for raw/orders_after_place.json),
+    but that append is never reached when place_market_buy raises
+    MarketBuyPlacementTerminalError instead -- so a terminal partial fill
+    recorded as "submitted" here would otherwise be missing from the raw
+    archive even though a per-ticker place_*.json file exists for it (Codex
+    review, PR #688 discussion_r3925372800: "Archive terminal partial-fill
+    responses").
+    """
+
+    def _place_fn(**kwargs):
+        if kwargs["symbol"] == "AAPL":
+            return {
+                "data": {
+                    "order": {
+                        "id": "ORD-PARTIAL",
+                        "state": "cancelled",
+                        "cumulative_quantity": "0.06",
+                        "average_price": "100.00",
+                    }
+                }
+            }
+        return {"data": {"order": {"id": f"ORD-{kwargs['symbol']}", "state": "confirmed"}}}
+
+    ex = _live_executor(tmp_path, ("AAPL",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.10})
+    broker = RobinhoodBroker(
+        place_fn=_place_fn,
+        buying_power_fn=lambda **_kwargs: {"buying_power": "15"},
+        orders_fn=_no_orders_today,
+        tradability_fn=_all_tradable,
+        enable_live_orders=True,
+    )
+
+    res = ex.run(_now_live(), data, broker=broker)
+
+    assert res["artifacts"]["broker_outcomes"]["AAPL"]["status"] == "submitted"
+    archived = broker.get_raw_placement_responses()
+    matching = [row for row in archived if row.get("ticker") == "AAPL"]
+    assert len(matching) == 1, "the terminal partial-fill response must reach the raw archive"
+    assert matching[0]["order_id"] == "ORD-PARTIAL"
+    assert matching[0]["state"] == "cancelled"
+    assert matching[0]["cumulative_quantity"] == "0.06"
+
+
+def test_scheduled_live_run_drains_placement_responses_onto_the_callers_broker(tmp_path):
+    """The caller's own broker object must retain fill evidence after run().
+
+    A scheduled live run wraps the caller-supplied broker in
+    ``_PersistingBrokerAdapter``, which -- to avoid leaking THIS run's orders
+    onto the caller's instance for a later, unrelated run -- works against a
+    DETACHED copy with its own, empty ``_raw_placement_responses`` list (see
+    ``_PersistingBrokerAdapter._wrap_raw_connectors``'s own comment). Without
+    draining that copy's buffer back onto the caller's broker before
+    ``_run_impl`` returns, the caller -- which has no reference to the
+    short-lived wrapper or its detached copy once ``run()`` returns -- sees
+    only its own, still-empty buffer and loses this run's fill evidence
+    entirely, even though a per-ticker outcome and CSV row exist for it
+    (Codex review, PR #688 discussion_r3917126964: "Retain placement
+    responses after detaching broker state").
+    """
+
+    def _place_fn(**kwargs):
+        return {"data": {"order": {"id": f"ORD-{kwargs['symbol']}", "state": "confirmed"}}}
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    broker = RobinhoodBroker(place_fn=_place_fn, enable_live_orders=True, **_LIVE_LOOKUP_STUBS)
+
+    # Sanity check: nothing recorded on the caller's own instance before the run.
+    assert broker.get_raw_placement_responses() == []
+
+    res = ex.run(_now_live(), data, broker=broker)
+
+    assert res["artifacts"]["broker_outcomes"]["NVDA"]["status"] == "submitted"
+    # The caller's OWN broker object -- not some internal wrapper it never
+    # sees -- must carry the order's raw response so it can still build its
+    # own raw/orders_after_place.json after the call returns.
+    drained = broker.get_raw_placement_responses()
+    assert len(drained) == 1
+    assert drained[0]["ticker"] == "NVDA"
+    assert drained[0]["order_id"] == "ORD-NVDA"
+
+
+def test_generic_placement_exception_halt_preserves_credit_for_unreached_candidate(tmp_path):
+    """A candidate the batch never reaches must not lose its computed credit.
+
+    When an EARLIER ticker's placement raises an unexpected exception type
+    (not OrderPlacementAmbiguousError),
+    _place_broker_orders `break`s the batch -- so a LATER candidate whose
+    already-computed cumulative_credit_decline_usd crossed the order
+    threshold (incremental_order_amount > 0) never gets an `outcomes` entry
+    at all. The post-loop credit-preservation pass must still durably record
+    that decline as pending rather than silently dropping it because there is
+    no outcome to check (Codex review, PR #688: "Preserve credits for
+    candidates skipped by the batch halt").
+    """
+    from dca_cumulative import CumulativeCreditLedger
+
+    class _UnexpectedPlacementExceptionBroker(_TopUpBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            if ticker == "AAPL":
+                raise RuntimeError("unexpected broker connector crash")
+            return super().place_market_buy(ticker, notional_usd, ref_id)
+
+    # TOPUP: prior same-day fill of $4.50 at reference $99.0, base $3.00.
+    # 3% drop to $97.0 -> ladder_incremental == 0 but the $2.00 price-step
+    # floor routes through the cumulative-credit policy, crossing the order
+    # threshold immediately (cumulative_credit_decline_usd == 2.0,
+    # incremental_order_amount == 2.0) -- see
+    # test_morning_top_up_guard_buys_incremental_when_prior_fill_exists for
+    # the identical math worked out in isolation.
+    prior_root = tmp_path / "prior"
+    _write_prior_run_state(
+        prior_root, "TOPUP", amount_usd=4.50, decision_price=99.0, selected_base_amount_usd=3.0
+    )
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL", "TOPUP"))
+    cfg = MorningConfig(
+        tickers=("AAPL", "TOPUP"),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(prior_root),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+        # A 10% drop's 5x graded multiplier * $3 base = $15, over the default
+        # $10 per-order ceiling -- that gate runs BEFORE the broker call, so
+        # a raised ceiling is needed here for AAPL's placement (not just its
+        # ladder eligibility) to actually be attempted.
+        max_per_order_usd=20.0,
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "credits")
+    broker = _UnexpectedPlacementExceptionBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.10, "TOPUP": 0.03})
+
+    res = ex.run(_now_live(), data, broker=broker)
+
+    artifacts = res["artifacts"]
+    # AAPL's unexpected placement exception halted the batch before TOPUP was reached --
+    # TOPUP gets only a "never attempted" skip record, never a placement
+    # outcome of its own.
+    assert artifacts["broker_outcomes"]["AAPL"]["status"] == "failed"
+    assert "ambiguous placement exception" in artifacts["broker_outcomes"]["AAPL"]["skip_reason"]
+    assert artifacts["broker_outcomes"]["TOPUP"].get("placement_breaker_halted") is True
+    assert artifacts["broker_outcomes"]["TOPUP"].get("status") in ("skipped", "blocked")
+    # TOPUP was never placed, but its already-computed credit must still be
+    # durably preserved as pending for a later slot / the 3:30 PM session to
+    # pick up -- not silently lost because the batch halted before it had an
+    # outcomes entry at all.
+    assert ex.credit_ledger.pending_usd("TOPUP", "2026-07-08") == 2.0
+
+
 def test_morning_provider_errors_are_not_a_clean_ladder_no_op(tmp_path):
-    """evaluate_signal catches a raising provider and emits NO_DATA, so the run
-    looks empty without any ticker having been evaluated (Codex review)."""
+    """evaluate_signal() itself catches a raising provider and emits NO_DATA --
+    but for a SCHEDULED live run, the same exception was already recorded onto
+    raw_recorder.error by the wrapping _PersistingMarketDataProvider before
+    evaluate_signal ever sees it, and run() checks raw_recorder.error right
+    after evaluate() completes, before any placement. So the run never even
+    reaches the NO_DATA/classify_no_order_run() path this docstring used to
+    describe -- it fails closed as a startup failure instead of a healthy
+    empty ladder no-op (CLAUDE.md "Fail closed, always")."""
 
     class _RaisingProvider(DecliningBarsProvider):
         def get_previous_close_bar(self, ticker, as_of):
@@ -9609,9 +13561,11 @@ def test_morning_provider_errors_are_not_a_clean_ladder_no_op(tmp_path):
     res = ex.run(_now_live(), data, broker=_TopUpBroker())
 
     artifacts = res["artifacts"]
-    assert artifacts["run_classification_outcome"] == "completed_no_orders"
-    assert artifacts["error_class"] == "degraded_market_data"
-    assert artifacts["is_trading_failure"] is False
+    assert artifacts["status"] == "blocked"
+    assert artifacts["run_classification_outcome"] == "failed_scheduled_run_startup"
+    assert artifacts["error_class"] == "missing_or_invalid_raw_inputs"
+    assert "provider is down" in artifacts["raw_persistence_error"]
+    assert artifacts["is_trading_failure"] is True
 
 
 def test_a_raising_broker_check_is_not_a_healthy_no_order_run(tmp_path):
@@ -11375,3 +15329,663 @@ def test_a_rejected_risk_guard_call_leaves_sizing_untouched():
             kill_switch_7d_deploy_fraction=0.4,
         )
     assert executor._sizing_config is before
+
+
+def test_ambiguous_placement_is_recorded_as_potentially_submitted(tmp_path):
+    """Codex review, PR #1300 discussion_r3920155064 ("Emit the new
+    ambiguous-placement status"): a placement connector exception that does
+    NOT prove the broker rejected the order (OrderPlacementAmbiguousError,
+    e.g. a response timeout) must be classified "potentially_submitted" --
+    distinct from the definitive "failed" status the previous test asserts
+    -- with the planned notional still reserved, not dropped."""
+    from near_close_dca import OrderPlacementAmbiguousError
+
+    class _AmbiguousBroker(_TopUpBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise OrderPlacementAmbiguousError(f"placement connector call for {ticker} timed out")
+
+    ex = _live_executor(tmp_path, ("NVDA",))
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    res = ex.run(_now_live(), data, broker=_AmbiguousBroker())
+
+    artifacts = res["artifacts"]
+    outcome = artifacts["broker_outcomes"]["NVDA"]
+    assert outcome["status"] == "potentially_submitted"
+    assert outcome["order_id"] is None
+    assert "ambiguous" in outcome["skip_reason"]
+    assert outcome["submitted_amount_usd"] > 0
+
+
+
+def test_blocked_live_retry_preserves_potentially_submitted_evidence(tmp_path):
+    # Codex review, PR #1300 discussion_r3920155079 ("Preserve in-flight
+    # statuses on blocked retries"): _existing_submitted_run_state()
+    # previously recognized only "submitted"/"filled", so an existing
+    # same-slot artifact reconciled to "pending", "unconfirmed", or
+    # "potentially_submitted" (an ambiguous placement -- see
+    # OrderPlacementAmbiguousError) looked like nothing to preserve. A later
+    # retry that blocks before placement then overwrote the dated
+    # run_state.json with an empty blocked artifact instead of preserving
+    # the still-unresolved broker order and its raw-input references.
+    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
+    cfg = MorningConfig(
+        tickers=("SMALL",),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    run_dir = ex.run_state_dir(_now_live())
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_state.json").write_text(
+        json.dumps({"buy_candidates": [{"ticker": "SMALL", "status": "potentially_submitted"}]}),
+        encoding="utf-8",
+    )
+
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    res = ex.run(_now_live(), data, broker=None)
+
+    artifacts = res["artifacts"]
+    assert artifacts["status"] == "blocked"
+    preserved_rows = [c for c in artifacts["buy_candidates"] if c.get("status") == "potentially_submitted"]
+    assert {c["ticker"] for c in preserved_rows} == {"SMALL"}
+    assert Path(res["paths"]["run_state"]).exists()
+
+
+
+class _AmbiguousThenRawFailBroker(FakeLiveBroker):
+    """Places the first candidate ambiguously, then breaks raw persistence
+    for the next.
+
+    Simulates the scenario Codex flagged on PR #1300 discussion_r3920257824
+    ("Preserve ambiguous placements when raw persistence fails"): with the
+    real RobinhoodBroker wrapped by _PersistingBrokerAdapter, a placement
+    timeout can produce BOTH a "potentially_submitted" outcome AND
+    raw_recorder.error on the very same run, since the connector failure is
+    what makes the placement ambiguous in the first place. The already-
+    ambiguous order must survive in the final artifact instead of being
+    discarded by a blank broker_outcomes={} stub.
+    """
+
+    def __init__(self, raw_dir):
+        self._raw_dir = raw_dir
+        self._tradability_calls = 0
+
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        from near_close_dca import OrderPlacementAmbiguousError
+
+        raise OrderPlacementAmbiguousError(f"placement connector call for {ticker} timed out")
+
+    def is_tradable_for_fractional_buy(self, ticker):
+        self._tradability_calls += 1
+        if self._tradability_calls > 1:
+            # Corrupt the raw directory so the NEXT persisted broker response
+            # (this tradability check, for the second candidate) fails to
+            # save -- but only after the first candidate's ambiguous
+            # placement has already happened.
+            if self._raw_dir.is_dir():
+                import shutil
+
+                shutil.rmtree(self._raw_dir)
+            self._raw_dir.write_text("not a directory", encoding="utf-8")
+        return True
+
+
+
+def test_blocked_live_run_preserves_ambiguous_placement_on_later_raw_failure(tmp_path):
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
+    cfg = MorningConfig(
+        tickers=("AAA", "BBB"),
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    raw_dir = ex.run_state_dir(_now_live()) / "raw"
+    broker = _AmbiguousThenRawFailBroker(raw_dir)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05, "BBB": 0.05})
+
+    res = ex.run(_now_live(), data, broker=broker)
+    artifacts = res["artifacts"]
+
+    assert artifacts["status"] == "blocked"
+    # The ambiguous placement must survive, not be wiped by an empty
+    # broker_outcomes={} stub -- the pre-fix behavior, since the old
+    # any_submitted check only recognized the literal "submitted" status.
+    assert artifacts["broker_outcomes"]["AAA"]["status"] == "potentially_submitted"
+    assert artifacts["broker_outcomes"]["BBB"]["status"] == "blocked"
+    assert "raw input persistence failed" in artifacts["broker_outcomes"]["BBB"]["skip_reason"]
+    on_disk = json.loads(Path(res["paths"]["run_state"]).read_bytes())
+    assert on_disk["broker_outcomes"]["AAA"]["status"] == "potentially_submitted"
+
+
+
+def test_carried_forward_order_rows_includes_potentially_submitted():
+    # Same fix as _submitted_keys above, applied to the submitted_orders.csv
+    # carry-forward path: an ambiguous placement preserved only as a
+    # buy_candidates row (not in this call's own broker_outcomes) must still
+    # reach the CSV, or a later run's cap-seeding scan of that CSV would not
+    # see the reservation.
+    from morning_dca import _carried_forward_order_rows
+
+    buy_candidates = [
+        {
+            "ticker": "CCC",
+            "status": "potentially_submitted",
+            "order_id": None,
+            "planned_amount_usd": 12.0,
+        }
+    ]
+    rows = _carried_forward_order_rows({}, buy_candidates)
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == "CCC"
+    assert rows[0]["status"] == "potentially_submitted"
+    assert rows[0]["submitted_amount_usd"] == 12.0
+
+    # Codex review, PR #1300 discussion_r3920709301 ("Retain pending orders
+    # in retry aggregates"): a "pending"/"unconfirmed" row must reach
+    # submitted_orders.csv the same way, not just "potentially_submitted".
+    pending_rows = [
+        {"ticker": "FFF", "status": "pending", "order_id": None, "planned_amount_usd": 8.0}
+    ]
+    pending_extra = _carried_forward_order_rows({}, pending_rows)
+    assert len(pending_extra) == 1
+    assert pending_extra[0]["ticker"] == "FFF"
+    assert pending_extra[0]["status"] == "pending"
+
+
+
+def test_morning_place_broker_orders_preserves_credit_for_every_candidate_after_raw_persistence_break(
+    tmp_path,
+):
+    # Codex review, PR #676 discussion_r3914291526 and discussion_r3919946257
+    # ("Preserve credits for every candidate skipped by the break"): a raw
+    # persistence failure detected while evaluating the FIRST candidate used
+    # to record a blocked outcome only for that ticker before breaking out of
+    # the loop. The post-loop preserve_pending pass skips any ticker with no
+    # entry in ``outcomes``, so every later, never-evaluated candidate lost
+    # its already-computed threshold-crossing credit decline. Both AAA (the
+    # ticker actually being evaluated when the failure was noticed) and BBB
+    # (a later candidate that never got its own loop iteration) must come
+    # back blocked with their pending credit preserved.
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_NO_PRIOR_RUN
+
+    class _Broker(FakeLiveBroker):
+        def __init__(self):
+            self.placed = {}
+            self._recorder = type(
+                "_Recorder", (), {"error": "simulated raw persistence failure"}
+            )()
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            self.placed[ticker] = notional_usd
+            return f"ORDER-{ticker}"
+
+    cfg = MorningConfig(tickers=("AAA", "BBB"), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+
+    def _signal(ticker):
+        return MorningSignal(
+            ticker=ticker,
+            source="finance",
+            action=Action.BUY,
+            reason="test",
+            current_price=99.0,
+            previous_close=100.0,
+            drop_pct=1.0,
+            multiplier=1.0,
+            hypothetical_amount_usd=1.0,
+            selected_base_amount_usd=1.0,
+        )
+
+    def _top_up(ticker, decline_usd):
+        return TopUpOutcome(
+            ticker=ticker,
+            desired_amount=1.30,
+            decision_price=99.0,
+            prior_same_day_amount=0.0,
+            prior_same_day_reference_price=None,
+            prior_same_day_run_id=None,
+            prior_same_day_source=None,
+            incremental_order_amount=1.0,
+            top_up_guard_result=TOP_UP_NO_PRIOR_RUN,
+            top_up_skipped=False,
+            effective_base_amount_usd=1.0,
+            cumulative_credit_decline_usd=decline_usd,
+        )
+
+    broker = _Broker()
+    outcomes = ex._place_broker_orders(
+        [_signal("AAA"), _signal("BBB")],
+        trading_day,
+        broker,
+        {"AAA": _top_up("AAA", 0.30), "BBB": _top_up("BBB", 0.45)},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+
+    assert outcomes["AAA"]["status"] == "blocked"
+    assert outcomes["BBB"]["status"] == "blocked"
+    assert not broker.placed
+    assert ex.credit_ledger.pending_usd("AAA", trading_day.isoformat()) == 0.30
+    assert ex.credit_ledger.pending_usd("BBB", trading_day.isoformat()) == 0.45
+
+
+
+class _AmbiguousThenLegacyDupBroker(FakeLiveBroker):
+    """Raises OrderPlacementAmbiguousError on the FIRST place_market_buy for
+    a ticker, then reports that ticker's ordinary-ref_id attempt as a
+    same-stream duplicate on a later call -- but WITHOUT a dollar_amount
+    field, simulating a legacy adapter that can confirm the order exists at
+    the broker without being able to report its notional (Codex review, PR
+    #1300 discussion_r3920826583: "Preserve ambiguous amounts when retry
+    dedup lacks broker details").
+    """
+
+    from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER as _acct
+    supports_concurrent_fill_lookup: bool = False
+
+    def __init__(self):
+        self._attempted_ref_ids = []
+        self._raise_next = True
+
+    def account_number(self) -> str:
+        return self._acct
+
+    def available_buying_power(self) -> float:
+        return 1000.0
+
+    def is_tradable_for_fractional_buy(self, ticker) -> bool:
+        return True
+
+    def review_market_buy(self, ticker, notional_usd):
+        return True, "ok"
+
+    def place_market_buy(self, ticker, notional_usd, ref_id) -> str:
+        self._attempted_ref_ids.append((ticker, ref_id))
+        if self._raise_next:
+            self._raise_next = False
+            from near_close_dca import OrderPlacementAmbiguousError
+
+            raise OrderPlacementAmbiguousError(f"placement connector call for {ticker} timed out")
+        return f"ORDER-{ticker}"
+
+    def same_day_strategy_order_exists(self, ticker, trading_day) -> bool:
+        return any(t == ticker for t, _ in self._attempted_ref_ids)
+
+    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+        for t, rid in self._attempted_ref_ids:
+            if t == ticker and any(rid.startswith(p) for p in ref_id_prefixes):
+                return {"id": f"ORDER-{ticker}"}
+        return None
+
+
+
+def test_morning_scheduled_top_up_duplicate_preserves_ambiguous_amount_without_broker_details(tmp_path):
+    # Codex review, PR #1300 discussion_r3920826583 ("Preserve ambiguous
+    # amounts when retry dedup lacks broker details"): mirrors
+    # test_morning_scheduled_top_up_duplicate_preserves_original_submitted_amount
+    # above, but the first attempt's placement was AMBIGUOUS
+    # (potentially_submitted, $15) rather than a confirmed submission, and
+    # the retry's duplicate lookup can confirm the order exists but not its
+    # dollar amount -- forcing the dup_amount fallback chain to reach
+    # prior_submitted_amounts. Excluding "potentially_submitted" from that
+    # map let it fall through to the freshly recomputed (smaller) $12
+    # incremental instead, understating cap usage for an order that may
+    # already be live.
+    live_root = tmp_path / "live"
+    prior_root = tmp_path / "prior"
+    prior_root.mkdir(parents=True, exist_ok=True)
+    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
+    cfg = MorningConfig(
+        tickers=("NVDA",),
+        base_buy_amount_usd=3.0,
+        max_per_order_usd=15.0,
+        morning_run_state_root=str(live_root),
+        preflight_run_state_root=str(pf_root),
+        prior_allocation_roots=(str(prior_root),),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    broker = _AmbiguousThenLegacyDupBroker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+
+    # First scheduled attempt: no prior allocation -> full $15 desired,
+    # placement raises OrderPlacementAmbiguousError.
+    first = ex.run(_now_live(), data, broker=broker)
+    first_outcome = first["artifacts"]["broker_outcomes"]["NVDA"]
+    assert first_outcome["status"] == "potentially_submitted"
+    assert first_outcome["submitted_amount_usd"] == pytest.approx(15.0)
+
+    # A $3 external fill for NVDA appears afterward.
+    _seed_prior(prior_root, "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=2.0)
+
+    # Scheduled retry: has_prior_allocation is now True, freshly recomputed
+    # incremental is $15 - $3 = $12, and the broker's duplicate lookup finds
+    # the earlier attempt's ref_id but reports no dollar_amount.
+    retry_now = _now_live() + timedelta(minutes=1)
+    retry = ex.run(retry_now, data, broker=broker)
+    nvda_outcome = retry["artifacts"]["broker_outcomes"]["NVDA"]
+    assert nvda_outcome["status"] == "submitted"
+    assert nvda_outcome["submitted_amount_usd"] == pytest.approx(15.0), (
+        f"duplicate retry must preserve the ambiguous first attempt's ORIGINAL "
+        f"$15, not the freshly recomputed $12 incremental; got {nvda_outcome}"
+    )
+
+
+
+def test_persisting_broker_adapter_treats_unreadable_placement_pointer_as_ambiguous(tmp_path):
+    # Codex review, PR #1300 discussion_r3920988293 ("Treat unreadable
+    # placement pointers as ambiguous"): the placement connector call
+    # itself SUCCEEDS here (unlike the connector-timeout case
+    # OrderPlacementAmbiguousError already covers), returning only an
+    # unresolvable output_path pointer with no order id anywhere inline.
+    # persist() cannot read that file, so persisted is None -- falling
+    # through to the generic "return the raw payload" branch would hand
+    # place_market_buy an id-less envelope it reads as a DEFINITIVE "no
+    # order id" rejection, dropping the notional even though the broker's
+    # real answer (which we simply failed to read back locally) is
+    # genuinely unknown.
+    from near_close_dca import OrderPlacementAmbiguousError
+
+    missing = tmp_path / "missing-placement-response.json"
+    broker = RobinhoodBroker(
+        place_fn=lambda **kwargs: {"output_path": str(missing)},
+        enable_live_orders=True,
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingBrokerAdapter(broker, recorder)
+
+    with pytest.raises(OrderPlacementAmbiguousError):
+        wrapped.place_market_buy("AAPL", 10.0, "ref-1")
+
+    assert recorder.error is not None
+    assert "could not read output_path" in recorder.error
+
+
+
+def test_persisting_finance_provider_restores_native_datetime_after_raw_round_trip(tmp_path):
+    native_timestamp = datetime(2026, 7, 8, 10, 20, tzinfo=EASTERN)
+    provider = FinanceDataProvider(
+        bars_fn=lambda *args: [
+            {
+                "timestamp": native_timestamp,
+                "open": 99.0,
+                "high": 100.0,
+                "low": 98.0,
+                "close": 99.5,
+                "volume": 10,
+            }
+        ],
+        previous_close_fn=lambda *args: None,
+    )
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(provider, recorder)
+    now = _now_live()
+
+    bars = wrapped.get_intraday_bars(
+        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
+    )
+
+    assert len(bars) == 1
+    assert bars[0].timestamp == native_timestamp
+    archived = json.loads((tmp_path / "raw" / recorder.saved_filenames[0]).read_bytes())
+    assert archived["data"][0]["timestamp"] == {"__datetime__": native_timestamp.isoformat()}
+
+
+
+def test_persisting_market_data_provider_persists_result_when_wrapped_connector_is_bypassed(tmp_path):
+    class CachedProvider:
+        source = "test"
+
+        def __init__(self):
+            # Its presence makes the decorator wrap a recognized connector,
+            # but get_quote deliberately serves an independent cache.
+            self._quotes_fn = lambda **kwargs: pytest.fail("cached lookup must bypass connector")
+
+        def get_quote(self, ticker, as_of):
+            return (101.0, as_of)
+
+    recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
+    wrapped = _PersistingMarketDataProvider(CachedProvider(), recorder)
+    now = _now_live()
+
+    quote = wrapped.get_quote("AAPL", now)
+    assert quote[0] == 101.0
+    assert quote[1] == now
+    assert any(name.startswith("quote_AAPL_") for name in recorder.saved_filenames)
+
+
+
+def test_place_broker_orders_settles_ambiguous_credit_exactly_once(tmp_path):
+    # Codex review, PR #1300 discussion_r3920344722 ("Avoid settling and
+    # re-preserving the same ambiguous credit"): an ambiguous placement
+    # (OrderPlacementAmbiguousError) that is also a cumulative-credit top-up
+    # settles the existing pending balance in its own except-block -- but the
+    # GENERIC blocked-placement pass afterward previously did not exclude
+    # "potentially_submitted", so it immediately called preserve_pending()
+    # with the same decline, restoring a balance settle() just cleared and
+    # leaving the ledger at neither the settled ($0.00) nor the never-
+    # happened ($0.55) figure.
+    from dca_cumulative import CumulativeCreditLedger
+    from near_close_dca import TOP_UP_INCREMENTAL, OrderPlacementAmbiguousError
+
+    class _AmbiguousBroker(FakeLiveBroker):
+        def account_number(self):
+            return "999000111"
+
+        def available_buying_power(self):
+            return 1000.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            raise OrderPlacementAmbiguousError(f"placement connector call for {ticker} timed out")
+
+    cfg = MorningConfig(tickers=("AAPL",), base_buy_amount_usd=1.0)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
+    trading_day = date(2026, 7, 8)
+    ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.25, stream="morning")
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.25
+
+    signal = MorningSignal(
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.0,
+        previous_close=100.0,
+        drop_pct=1.0,
+        multiplier=1.0,
+        hypothetical_amount_usd=1.0,
+        selected_base_amount_usd=1.0,
+    )
+    outcome = TopUpOutcome(
+        ticker="AAPL",
+        desired_amount=1.30,
+        decision_price=99.0,
+        prior_same_day_amount=1.0,
+        prior_same_day_reference_price=100.0,
+        prior_same_day_run_id="manual_am",
+        prior_same_day_source="manual",
+        incremental_order_amount=1.0,
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        top_up_skipped=False,
+        effective_base_amount_usd=1.0,
+        cumulative_credit_decline_usd=0.30,
+    )
+    outcomes = ex._place_broker_orders(
+        [signal],
+        trading_day,
+        _AmbiguousBroker(),
+        {"AAPL": outcome},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
+    )
+    assert outcomes["AAPL"]["status"] == "potentially_submitted"
+    # Settled exactly once by the except-block -- not ALSO preserve_pending()d
+    # by the generic blocked-placement pass afterward.
+    assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
+    events = ex.credit_ledger.events(trading_day.isoformat())
+    assert events[-1]["decision"] == "settled"
+    assert events[-1]["submitted_amount_usd"] == 1.0
+
+
+
+def test_seed_ledger_carries_forward_an_already_seeded_potentially_submitted_row(tmp_path):
+    """Codex review, PR #1300 discussion_r3920642630 ("Carry ambiguous
+    orders through normal retries"): _seed_ledger_from_prior_runs's
+    already-seeded branch loads today's OWN scheduled-path submitted/filled
+    rows into self._prior_same_day_candidate_rows so a same-day retry
+    carries them forward into the artifact it's about to overwrite. Only
+    recognizing the literal "submitted"/"filled" strings dropped an
+    ambiguous "potentially_submitted" row from that carry-forward, even
+    though a normal (non-blocked) retry with no new submission for that
+    ticker would otherwise silently rewrite run_state.json/
+    submitted_orders.csv without it.
+    """
+    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",), trading_date=date(2026, 6, 30))
+    cfg = MorningConfig(
+        tickers=("AAPL",),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        preflight_run_state_root=str(pf_root),
+        cap_seed_roots=(),
+        approved_test_dates=frozenset({date(2026, 6, 30)}),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    now = datetime.combine(date(2026, 6, 30), time(10, 30), tzinfo=EASTERN)
+
+    scheduled_dir = ex.run_state_dir(now)
+    scheduled_dir.mkdir(parents=True, exist_ok=True)
+    (scheduled_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "already-seeded-run",
+                "trading_day": "2026-06-30",
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "potentially_submitted",
+                        "order_id": None,
+                        "planned_amount_usd": 5.0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Force the already-seeded branch: this run_id's spend is already in
+    # self.ledger from an earlier call this same process made, so only the
+    # carry-forward loading matters here, not the cap-seeding total.
+    ex._seeded_prior_run_ids.add("already-seeded-run")
+
+    ex._seed_ledger_from_prior_runs(now)
+
+    assert len(ex._prior_same_day_candidate_rows) == 1
+    assert ex._prior_same_day_candidate_rows[0]["ticker"] == "AAPL"
+    assert ex._prior_same_day_candidate_rows[0]["status"] == "potentially_submitted"
+
+
+
+def test_startup_failure_counts_a_potentially_submitted_in_flight_order(tmp_path):
+    # Codex review, PR #1300 discussion_r3920546920 ("Count ambiguous
+    # orders in crash-recovery artifacts"): if an ambiguous placement is
+    # recorded and any LATER step raises before the normal artifact write
+    # completes, _write_startup_failure_artifacts's own submitted count
+    # must still recognize "potentially_submitted" alongside "submitted" --
+    # otherwise it retained the row but reported orders_submitted_count=0
+    # and not_submitted_error, contradicting the row it just preserved.
+    ex = _live_executor(tmp_path, ("AAA",))
+    ex._in_flight_broker_outcomes = {
+        "AAA": {
+            "status": "potentially_submitted",
+            "order_id": None,
+            "submitted_amount_usd": 5.0,
+            "skip_reason": "placement ambiguous: timed out",
+        }
+    }
+    ex._in_flight_signals_by_ticker = {}
+
+    ex._write_startup_failure_artifacts(_now_live(), RuntimeError("later boom"))
+
+    run_dir = ex.run_state_dir(_now_live())
+    run_state = json.loads((run_dir / "run_state.json").read_bytes())
+    assert run_state["orders_submitted_count"] == 1
+    assert run_state["buy_candidates"][0]["status"] == "potentially_submitted"
+
+
+
+def test_submitted_keys_counts_potentially_submitted_outcomes():
+    # Codex review, PR #1300 discussion_r3920344709 ("Count ambiguous morning
+    # placements as in-flight"): _submitted_keys feeds
+    # _apply_no_order_classification's orders_submitted_count -- excluding
+    # "potentially_submitted" (an ambiguous placement connector failure) let
+    # a run whose only outcome is this status be recorded as
+    # orders_submitted_count=0/completed_no_orders, contradicting the
+    # possibly-live order.
+    from morning_dca import _submitted_keys
+
+    outcomes = {"AAA": {"status": "potentially_submitted", "order_id": None}}
+    assert _submitted_keys(outcomes, []) == {"ticker:AAA"}
+
+    # Also recognized when carried forward as a buy_candidates row (a
+    # same-slot retry's preserved evidence, not this call's own outcomes).
+    buy_candidates = [{"ticker": "BBB", "status": "potentially_submitted", "order_id": None}]
+    assert _submitted_keys({}, buy_candidates) == {"ticker:BBB"}
+
+    # Codex review, PR #1300 discussion_r3920709301 ("Retain pending orders
+    # in retry aggregates"): "pending"/"unconfirmed" (a reconciliation pass
+    # can demote "submitted" to either between retries) must be recognized
+    # too, not just "potentially_submitted".
+    pending_outcomes = {"DDD": {"status": "pending", "order_id": "o-1"}}
+    assert _submitted_keys(pending_outcomes, []) == {"o-1"}
+    unconfirmed_rows = [{"ticker": "EEE", "status": "unconfirmed", "order_id": None}]
+    assert _submitted_keys({}, unconfirmed_rows) == {"ticker:EEE"}
+
+
+
+
+
+def test_same_stream_order_exists_asks_for_every_entry_points_family(tmp_path):
+    """2026-09-07 diagnostic C:F5, executor side: the check must name the
+    run_dca.run_slot() engine's graded-dca-{stream}-... and dca_runner's
+    dca-runner-{slot}-... ref ids alongside its own {stream}-dca-... pair."""
+    from scripts.idempotency import same_stream_ref_id_prefixes
+
+    asked = []
+
+    class _Recorder:
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            asked.append(tuple(ref_id_prefixes))
+            return {"id": "ORD-1", "ref_id": "graded-dca-morning-2026-07-08-AAPL"}
+
+    found = _same_stream_order_exists(cast(Any, _Recorder()), "AAPL", date(2026, 7, 8), "morning")
+    assert found == {"id": "ORD-1", "ref_id": "graded-dca-morning-2026-07-08-AAPL"}
+    assert asked == [same_stream_ref_id_prefixes("morning", date(2026, 7, 8), "AAPL")]
+    assert "graded-dca-morning-2026-07-08-AAPL" in asked[0]
+    assert "dca-runner-1030-2026-07-08-AAPL" in asked[0]
+    assert "morning-dca-manual-2026-07-08-AAPL" not in asked[0]

@@ -1,6 +1,7 @@
 """Tests for the opt-in whole-share accumulation module (see docs/whole_share_accumulation.md)."""
 
 import json
+from typing import Any, cast
 
 import pytest
 
@@ -499,7 +500,7 @@ def test_reclaim_fences_owner_when_both_attempts_have_the_same_recorded_at(tmp_p
     # Force the lease to appear stale while retaining the same logical time
     # that both scheduled attempts will present.
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state = json.loads(state_path.read_bytes())
     state["recorded_idempotency_keys"]["2026-08-16:slot-1"]["claimed_at"] = "2026-08-16T15:20:00-04:00"
     state_path.write_text(json.dumps(state), encoding="utf-8")
 
@@ -803,7 +804,7 @@ def test_a_pre_upgrade_ledger_entry_still_redispatches(tmp_path):
     )
     # Rewrite the persisted entry into its pre-upgrade shape.
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
     del entry["restored_credit_usd"]
     state_path.write_text(json.dumps(state, indent=2))
@@ -833,7 +834,7 @@ def test_pre_restored_credit_entry_starts_aging_before_later_withdrawals(tmp_pat
         claim_token=first.claim_token,
     )
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:a"]
     del entry["restored_credit_usd"]
     del entry["restored_credit_as_of_withdrawn_usd"]
@@ -842,7 +843,7 @@ def test_pre_restored_credit_entry_starts_aging_before_later_withdrawals(tmp_pat
     ledger.record_contribution(
         "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="b", recorded_at="2026-08-16T15:31:00-04:00"
     )
-    migrated = json.loads(state_path.read_text())["recorded_idempotency_keys"]["2026-08-16:a"]
+    migrated = json.loads(state_path.read_bytes())["recorded_idempotency_keys"]["2026-08-16:a"]
     assert migrated["restored_credit_usd"] == 10.0
     assert migrated["restored_credit_as_of_withdrawn_usd"] == 10.0
 
@@ -883,7 +884,7 @@ def test_a_pre_upgrade_entry_still_may_not_spend_an_unrelated_contribution(tmp_p
 
     # Rewrite the ledger as a build predating restored_credit_usd left it.
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     del state["recorded_idempotency_keys"]["2026-08-16:slot-1"]["restored_credit_usd"]
     state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
 
@@ -912,7 +913,7 @@ def test_a_zero_restored_credit_entry_is_honored_as_a_real_cap(tmp_path):
     """
     ledger = _preserved_fire_with_unrelated_pending(tmp_path)
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     state["recorded_idempotency_keys"]["2026-08-16:slot-1"]["restored_credit_usd"] = 0.0
     state_path.write_text(json.dumps(state, indent=2))
 
@@ -959,7 +960,7 @@ def test_a_zero_share_reclaim_keeps_the_claim_redispatchable(tmp_path):
     assert reclaimed.shares_to_buy == 0
     # The reservation is back in the pool, in full.
     assert ledger.pending_usd("BYDDY") == 10.0
-    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())[
+    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())[
         "recorded_idempotency_keys"
     ]["2026-08-16:slot-1"]
     assert entry["resolved"] is True
@@ -1062,7 +1063,7 @@ def test_a_zero_share_reclaim_writes_off_a_remainder_another_claim_already_spent
     assert reclaimed.shares_to_buy == 0
     assert ledger.pending_usd("XYZ") == 10.0  # only A's own reservation returns
 
-    entry = json.loads((tmp_path / "XYZ" / "ledger.json").read_text())[
+    entry = json.loads((tmp_path / "XYZ" / "ledger.json").read_bytes())[
         "recorded_idempotency_keys"
     ]["2026-08-16:claim-a"]
     assert entry["restored_credit_usd"] == 10.0, (
@@ -1130,7 +1131,7 @@ def test_an_upward_reprice_draw_is_capped_at_the_surviving_claim_remainder(tmp_p
         "C's untouched $2, not left stranded"
     )
 
-    entry = json.loads((tmp_path / "XYZ" / "ledger.json").read_text())[
+    entry = json.loads((tmp_path / "XYZ" / "ledger.json").read_bytes())[
         "recorded_idempotency_keys"
     ]["2026-08-16:claim-a"]
     assert entry["order_notional_usd"] == 0.0, "A's reservation was released, not re-fired"
@@ -1237,7 +1238,7 @@ def test_a_positive_reprice_writes_off_a_remainder_another_claim_already_spent(t
     assert reclaimed.order_notional_usd == 8.0
     assert ledger.pending_usd("XYZ") == 2.0  # only A's own $2 release returns
 
-    entry = json.loads((tmp_path / "XYZ" / "ledger.json").read_text())[
+    entry = json.loads((tmp_path / "XYZ" / "ledger.json").read_bytes())[
         "recorded_idempotency_keys"
     ]["2026-08-16:claim-a"]
     assert entry["claim_credit_remainder_usd"] == 2.0, (
@@ -1354,7 +1355,7 @@ def test_an_upward_reprice_records_its_extra_draw_on_the_pool(tmp_path):
     ledger.record_contribution(
         "BYDDY", "2026-08-16", 0.0, 14.0, idempotency_key="slot-1", recorded_at="2026-08-16T15:35:00-04:00"
     )
-    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())
+    state = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())
     assert state["withdrawn_usd_total"] == 14.0, (
         "the $10 original reservation plus the $4 the upward reprice drew"
     )
@@ -1812,7 +1813,7 @@ def test_reconcile_unresolved_whole_share_claim_uses_the_original_claim_timestam
             return {"id": "RH-1", "state": "filled", "quantity": "1"}
 
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _MatchingBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _MatchingBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     assert reconciled == {"order_id": "RH-1", "shares_purchased": 1, "order_notional_usd": 10.0}
@@ -1844,7 +1845,7 @@ def test_reconcile_unresolved_whole_share_claim_requires_an_exact_ref_id_match(t
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _NoExactMatchBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _NoExactMatchBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     assert reconciled is None
@@ -1852,7 +1853,8 @@ def test_reconcile_unresolved_whole_share_claim_requires_an_exact_ref_id_match(t
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None  # still unresolved
 
 
-def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_order(tmp_path):
+@pytest.mark.parametrize("working_state", ["new", "queued", "confirmed", "partially_filled"])
+def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_order(tmp_path, working_state):
     """Codex review ("Defer settling recovered orders until they are
     terminal"): when the exact matching order is still queued or
     working (not yet terminal), its final filled quantity is not yet
@@ -1872,16 +1874,23 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_order(tmp_pa
     )
     unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
 
-    class _StillQueuedBroker:
+    class _StillWorkingBroker:
         def account_number(self) -> str:
             return "test-account"
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
-            return {"id": "RH-QUEUED-1", "state": "queued", "cumulative_quantity": "0", "quantity": "1"}
+            return {
+                "id": "RH-WORKING-1",
+                "state": working_state,
+                # In particular, a partial fill is cumulative progress, not
+                # a terminal quantity that is safe to settle yet.
+                "cumulative_quantity": "0.5" if working_state == "partially_filled" else "0",
+                "quantity": "1",
+            }
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _StillQueuedBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _StillWorkingBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     # Codex review ("Book live orders discovered during claim recovery"):
@@ -1890,7 +1899,7 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_order(tmp_pa
     # LEDGER claim itself stays exactly as reserved/unresolved as before.
     assert reconciled == {
         "live_order_found": True,
-        "order_id": "RH-QUEUED-1",
+        "order_id": "RH-WORKING-1",
         "planned_notional_usd": 10.0,
         "planned_quantity": 1,
     }
@@ -1920,12 +1929,77 @@ def test_reconcile_unresolved_whole_share_claim_settles_a_terminal_filled_order(
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _FilledBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _FilledBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     assert reconciled == {"order_id": "RH-FILLED-1", "shares_purchased": 1, "order_notional_usd": 10.0}
     assert ledger.shares_purchased_total("BYDDY") == 1
     assert ledger.pending_usd("BYDDY") == 0.0
+
+
+@pytest.mark.parametrize("blank_cumulative", [None, "", " "])
+def test_reconcile_still_falls_back_when_the_cumulative_field_is_blank(tmp_path, blank_cumulative):
+    """A broker null/blank ``cumulative_quantity`` is an ABSENCE marker, exactly
+    like a missing key (Codex review: "Treat null recovery quantities as
+    absent"): it says nothing about executed size, so the terminal "filled"
+    match falls through to a USABLE submitted ``quantity`` and settles
+    normally rather than being read as a malformed fill.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0,
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+
+    class _NoCumulativeFieldBroker:
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {
+                "id": "RH-NOCUM-1",
+                "state": "filled",
+                "cumulative_quantity": blank_cumulative,
+                "quantity": "1",
+            }
+
+    assert unresolved is not None
+    reconciled = _reconcile_unresolved_whole_share_claim(
+        ledger, cast(Any, _NoCumulativeFieldBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+    )
+
+    assert reconciled == {"order_id": "RH-NOCUM-1", "shares_purchased": 1, "order_notional_usd": 10.0}
+    assert ledger.shares_purchased_total("BYDDY") == 1
+
+
+@pytest.mark.parametrize("blank_quantity", [None, "", " "])
+def test_reconcile_uses_the_claim_size_when_both_size_fields_are_blank(tmp_path, blank_quantity):
+    """The last resort: a terminal "filled" response whose quantity fields are
+    null or blank, just as when they are missing, settles on the claim's own
+    planned size -- the documented answer for a response that said nothing
+    about size at all.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0,
+        idempotency_key="afternoon-BYDDY", recorded_at="2026-08-16T15:30:00-04:00",
+    )
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+
+    class _SizelessBroker:
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return {
+                "id": "RH-NOSIZE-1",
+                "state": "filled",
+                "cumulative_quantity": blank_quantity,
+                "quantity": blank_quantity,
+            }
+
+    assert unresolved is not None
+    reconciled = _reconcile_unresolved_whole_share_claim(
+        ledger, cast(Any, _SizelessBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+    )
+
+    assert reconciled == {"order_id": "RH-NOSIZE-1", "shares_purchased": 1, "order_notional_usd": 10.0}
+    assert ledger.shares_purchased_total("BYDDY") == 1
 
 
 def test_reconcile_unresolved_whole_share_claim_settles_a_partial_fill_before_cancellation(tmp_path):
@@ -1968,7 +2042,7 @@ def test_reconcile_unresolved_whole_share_claim_settles_a_partial_fill_before_ca
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _PartialFillThenCanceledBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _PartialFillThenCanceledBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     assert reconciled is not None
@@ -1991,7 +2065,10 @@ def test_reconcile_unresolved_whole_share_claim_settles_a_partial_fill_before_ca
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is None
 
 
-def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_any_state_fallback_match(tmp_path):
+@pytest.mark.parametrize("working_state", ["new", "confirmed", "partially_filled"])
+def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_any_state_fallback_match(
+    tmp_path, working_state
+):
     """Codex review ("Verify terminal state after the any-state fallback"):
     the terminal-inclusive any-state fallback carries no state filter of its
     own, so it can surface a LIVE order that only became visible in the
@@ -2020,11 +2097,15 @@ def test_reconcile_unresolved_whole_share_claim_defers_a_still_live_any_state_fa
 
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # The SAME order is now visible, still working -- not terminal.
-            return {"id": "RH-RACE-1", "state": "confirmed", "cumulative_quantity": "0"}
+            return {
+                "id": "RH-RACE-1",
+                "state": working_state,
+                "cumulative_quantity": "1" if working_state == "partially_filled" else "0",
+            }
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _RaceConditionStillLiveBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
+        ledger, cast(Any, _RaceConditionStillLiveBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved
     )
 
     assert reconciled is None
@@ -2066,11 +2147,66 @@ def test_reconcile_unresolved_whole_share_claim_falls_back_to_quantity_for_a_fil
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _FilledViaAnyStateNoCumulativeQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY",
+        ledger, cast(Any, _FilledViaAnyStateNoCumulativeQuantityBroker()), "BYDDY", "afternoon", "afternoon-BYDDY",
         "2026-08-16", unresolved,
     )
 
     assert reconciled == {"order_id": "RH-FILLED-ANY-STATE-1", "shares_purchased": 1, "order_notional_usd": 10.0}
+    assert ledger.shares_purchased_total("BYDDY") == 1
+    assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is None
+
+
+@pytest.mark.parametrize("blank_cumulative", ["", " "])
+def test_reconcile_falls_back_to_quantity_for_a_filled_any_state_match_with_a_blank_cumulative(
+    tmp_path, blank_cumulative
+):
+    """The test above, but with a BLANK cumulative_quantity rather than an
+    absent key -- the broker's other spelling of "this field says nothing".
+
+    The any-state "filled" fallback used a bare ``is None`` check to decide
+    whether to read ``quantity`` instead, so only the absent-key spelling
+    reached that fallback. An empty or whitespace-only string pinned
+    raw_terminal_quantity to a value that parses as unknown, and the filled
+    order was booked as an unresolved live order rather than settled -- its
+    real, already-executed purchase left permanently uncredited while the
+    claim stayed reserved. ``_process_whole_share_candidate``'s own copy of
+    this fallback has always used ``_is_blank_broker_field`` here; the two
+    copies had drifted (Codex review: "Treat whitespace-only cumulative
+    quantities as absent").
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    recorded_at = "2026-08-16T15:30:00-04:00"
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="afternoon-BYDDY", recorded_at=recorded_at
+    )
+    unresolved = ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY")
+
+    class _FilledViaAnyStateBlankCumulativeBroker:
+        def account_number(self) -> str:
+            return "test-account"
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None  # live-only lookup missed the (eventually consistent) order
+
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+            # Filled, and the executed size is reported ONLY in "quantity" --
+            # cumulative_quantity is present but blank, which says nothing.
+            return {
+                "id": "RH-FILLED-ANY-STATE-BLANK-1",
+                "state": "filled",
+                "cumulative_quantity": blank_cumulative,
+                "quantity": "1",
+            }
+
+    assert unresolved is not None
+    reconciled = _reconcile_unresolved_whole_share_claim(
+        ledger, cast(Any, _FilledViaAnyStateBlankCumulativeBroker()), "BYDDY", "afternoon", "afternoon-BYDDY",
+        "2026-08-16", unresolved,
+    )
+
+    assert reconciled == {
+        "order_id": "RH-FILLED-ANY-STATE-BLANK-1", "shares_purchased": 1, "order_notional_usd": 10.0
+    }
     assert ledger.shares_purchased_total("BYDDY") == 1
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is None
 
@@ -2104,13 +2240,19 @@ def test_reconcile_unresolved_whole_share_claim_does_not_fall_back_to_quantity_f
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _CanceledViaAnyStateNoCumulativeQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY",
+        ledger, cast(Any, _CanceledViaAnyStateNoCumulativeQuantityBroker()), "BYDDY", "afternoon", "afternoon-BYDDY",
         "2026-08-16", unresolved,
     )
 
-    # No cumulative_quantity, and "quantity" is not trusted for a
-    # non-filled terminal order -- nothing settled.
-    assert reconciled is None
+    # No cumulative_quantity, and "quantity" is not trusted as a fill for a
+    # non-filled terminal order. Nothing settles, but the attempt remains
+    # conservatively bookable for risk accounting.
+    assert reconciled == {
+        "live_order_found": True,
+        "order_id": "RH-CANCELED-ANY-STATE-1",
+        "planned_notional_usd": 10.0,
+        "planned_quantity": 1,
+    }
     assert ledger.shares_purchased_total("BYDDY") == 0
 
 
@@ -2152,13 +2294,18 @@ def test_reconcile_unresolved_whole_share_claim_does_not_treat_requested_quantit
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _RejectedNoCumulativeQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16",
+        ledger, cast(Any, _RejectedNoCumulativeQuantityBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16",
         unresolved,
     )
 
-    # Nothing was settled, and nothing was released either -- an unknown
-    # quantity leaves the claim exactly as record_contribution left it.
-    assert reconciled is None
+    # Nothing was settled or released. The claim stays unresolved while the
+    # real broker attempt is returned for conservative risk accounting.
+    assert reconciled == {
+        "live_order_found": True,
+        "order_id": "RH-REJECTED-NO-FILL-INFO-1",
+        "planned_notional_usd": 20.0,
+        "planned_quantity": 2,
+    }
     assert ledger.shares_purchased_total("BYDDY") == 0
     assert ledger.pending_usd("BYDDY") == 0.0
     assert ledger.unresolved_claim("BYDDY", "2026-08-16", "afternoon-BYDDY") is not None
@@ -2217,7 +2364,7 @@ def test_reconcile_unresolved_whole_share_claim_releases_a_confirmed_zero_fill_c
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _ZeroFillRejectedBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
+        ledger, cast(Any, _ZeroFillRejectedBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
         now_iso="2026-08-16T15:45:00-04:00",  # 1 second after claimed_at -- not stale
     )
 
@@ -2265,11 +2412,16 @@ def test_reconcile_unresolved_whole_share_claim_leaves_the_claim_reserved_when_t
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _TerminalNoQuantityBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
+        ledger, cast(Any, _TerminalNoQuantityBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
         now_iso="2026-08-16T15:45:00-04:00",  # 1 second after claimed_at -- not stale
     )
 
-    assert reconciled is None
+    assert reconciled == {
+        "live_order_found": True,
+        "order_id": "RH-CANCELLED-1",
+        "planned_notional_usd": 10.0,
+        "planned_quantity": 1,
+    }
     assert ledger.shares_purchased_total("BYDDY") == 0
     # NOT released -- the claim is left exactly as record_contribution left it.
     assert ledger.pending_usd("BYDDY") == 0.0
@@ -2309,7 +2461,7 @@ def test_reconcile_unresolved_whole_share_claim_leaves_the_claim_untouched_when_
 
     assert unresolved is not None
     reconciled = _reconcile_unresolved_whole_share_claim(
-        ledger, _TerminalLookupRaisesBroker(), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
+        ledger, cast(Any, _TerminalLookupRaisesBroker()), "BYDDY", "afternoon", "afternoon-BYDDY", "2026-08-16", unresolved,
         now_iso="2026-08-16T15:45:00-04:00",  # well past staleness
     )
 
@@ -2540,6 +2692,31 @@ def test_a_claim_repriced_to_zero_shares_is_resolved_and_cannot_re_spend_consume
     assert second_reclaim.shares_to_buy == 0
     assert ledger.pending_usd("BYDDY") == 0.0
 
+    # Even if newer activity subsequently replenishes the shared pool, the
+    # already-resolved slot-1 key cannot redispatch against dollars that
+    # belong to that newer activity: both its read-only preview and a real
+    # retry stay at zero shares and leave the replenished $10 untouched.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 10.0, 20.0, idempotency_key="slot-3", recorded_at="2026-08-16T15:53:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+    preview = ledger.cached_fire_decision(
+        "BYDDY", "2026-08-16", "slot-1", "2026-08-16T16:04:00-04:00", 10.0
+    )
+    assert preview is not None
+    assert preview.shares_to_buy == 0
+    assert preview.order_notional_usd == 0.0
+    resolved_retry = ledger.record_contribution(
+        "BYDDY",
+        "2026-08-16",
+        0.0,
+        10.0,
+        idempotency_key="slot-1",
+        recorded_at="2026-08-16T16:04:00-04:00",
+    )
+    assert resolved_retry.shares_to_buy == 0
+    assert ledger.pending_usd("BYDDY") == 10.0
+
 
 def test_a_zero_share_reclaim_registers_its_credit_in_the_tie_batch_only_once(tmp_path):
     """Codex review ("Avoid registering the reclaimed credit twice"): a
@@ -2575,7 +2752,7 @@ def test_a_zero_share_reclaim_registers_its_credit_in_the_tie_batch_only_once(tm
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     assert state["credit_tie_batch_width_usd"] == 10.0, (
         "the reclaimed $10 must widen the tie batch by $10 exactly once, "
         "not $20 from being registered under both field names"
@@ -2612,7 +2789,7 @@ def test_repeated_same_price_reclaims_do_not_re_register_an_unchanged_remainder(
 
     assert ledger.pending_usd("BYDDY") == 4.0
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     assert state["credit_tie_batch_width_usd"] == 4.0, (
         "two same-price reclaims of the same unresolved claim must not "
         "widen the tie batch beyond the claim's own unchanged $4 remainder"
@@ -2651,7 +2828,7 @@ def test_preserving_a_fired_claims_remainder_registers_its_credit_in_the_tie_bat
     assert ledger.pending_usd("BYDDY") == 14.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     assert state["credit_tie_batch_width_usd"] == 14.0, (
         "the preserved claim's credit must widen the tie batch by $14 exactly "
         "once, not $18 from the $4 remainder being registered twice"
@@ -2958,6 +3135,111 @@ def test_settle_with_a_clamped_smaller_notional_auto_restores_the_shortfall(tmp_
     )
     assert ledger.shares_purchased_total("BYDDY") == 1
     assert ledger.pending_usd("BYDDY") == 10.0
+
+
+def test_settle_releases_placed_for_an_explicit_zero_fill(tmp_path):
+    """discussion_r3838771878: a claim marked "placed" (execute_claimed()
+    durably recorded a broker submission) that settles with EXACTLY ZERO
+    shares purchased -- a confirmed terminal zero-fill, e.g. a "filled"
+    order whose own cumulative_quantity is 0 -- must release "placed", not
+    just "placing". Unlike a real (non-zero) settlement, where "placed"
+    staying True is accurate terminal history of a genuine purchase, a
+    zero-fill claim's shortfall restores its ENTIRE deduction (nothing was
+    ever actually bought), so leaving "placed" set here would permanently
+    block every later zero-contribution retry under this same idempotency
+    slot from redispatching that fully-restored credit -- the ledger.settle()
+    docstring's OWN example scenario.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    decision = ledger.record_contribution("BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1")
+    assert decision.shares_to_buy == 1
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+    # execute_claimed() durably marks "placing" before the broker call, and
+    # "placed" once the broker confirms acceptance -- simulate that here by
+    # directly claiming the pending fire the same way execute_claimed()
+    # would (the exact call is exercised elsewhere; this test is scoped to
+    # settle()'s own release behavior).
+    ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", None, lambda: "RH-ZERO-FILL-1",
+        claim_token=decision.claim_token,
+    )
+
+    # The broker order terminally confirmed a ZERO fill -- nothing was
+    # actually purchased -- so settle() restores the entire $10 deduction.
+    ledger.settle(
+        "BYDDY", "2026-08-16", 0, 0.0, stream="morning", idempotency_key="slot-1",
+        claim_token=decision.claim_token,
+    )
+    assert ledger.pending_usd("BYDDY") == 10.0
+
+    # "placed" must be released -- a later zero-contribution retry under
+    # this SAME slot must be free to redispatch the fully-restored credit.
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 10.0, idempotency_key="slot-1", recorded_at="2026-08-16T16:05:00-04:00"
+    )
+    assert retry.shares_to_buy == 1
+    assert ledger.pending_usd("BYDDY") == 0.0
+
+
+def test_settle_marks_placed_true_for_a_recovered_positive_fill(tmp_path):
+    """Codex review ("Mark recovered positive fills as placed"): if the
+    process dies after the broker accepts an order but before
+    execute_claimed() persists its post-call update, the durable claim is
+    left at placing=true, placed=false. A LATER reconciliation that
+    confirms a positive terminal fill calls settle(), which clears
+    "placing" but -- before this fix -- never touched "placed", leaving it
+    at its stale False. That shape (resolved=true, placed=false,
+    placing=false) is exactly what the zero-contribution redispatch gate
+    treats as safe to retry, so a claim that ALREADY bought shares could
+    be redispatched a second time. settle() must mark "placed" True for
+    any confirmed non-zero fill, not just leave it untouched.
+    """
+    ledger = WholeShareAccumulationLedger(tmp_path)
+    decision = ledger.record_contribution("BYDDY", "2026-08-16", 10.0, 10.0, idempotency_key="slot-1")
+    assert decision.shares_to_buy == 1
+
+    ledger.execute_claimed(
+        "BYDDY", "2026-08-16", "slot-1", None, lambda: "RH-CRASH-1",
+        claim_token=decision.claim_token,
+    )
+
+    # Simulate the crash window: execute_claimed() above durably set
+    # "placed" True on success -- roll it back to False here (leaving
+    # "placing" cleared, exactly as execute_claimed() itself already
+    # leaves it) to reproduce a process that died before the "placed"
+    # write landed.
+    state_path = tmp_path / "BYDDY" / "ledger.json"
+    state = json.loads(state_path.read_bytes())
+    entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
+    assert entry["placed"] is True
+    entry["placed"] = False
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    # A later reconciliation confirms the order actually filled for 1 share.
+    # The full $10 deduction is fully accounted for by the fill (shortfall
+    # is 0), so this alone leaves no money in the pool to redispatch.
+    ledger.settle(
+        "BYDDY", "2026-08-16", 1, 10.0, stream="morning", idempotency_key="slot-1",
+        claim_token=decision.claim_token,
+    )
+
+    # An UNRELATED later contribution (a different idempotency_key) adds
+    # new money to BYDDY's shared pool without fully consuming it (price
+    # too high to afford a share) -- this is the money the bug lets a
+    # stale, already-placed claim wrongly redispatch against.
+    ledger.record_contribution(
+        "BYDDY", "2026-08-16", 5.0, 100.0, idempotency_key="slot-2", recorded_at="2026-08-16T16:00:00-04:00"
+    )
+    assert ledger.pending_usd("BYDDY") == 5.0
+
+    # A zero-contribution retry under the OLD slot-1 (already placed and
+    # settled with a REAL fill) must stay blocked -- it must not redispatch
+    # using the unrelated money slot-2 just added to the shared pool.
+    retry = ledger.record_contribution(
+        "BYDDY", "2026-08-16", 0.0, 5.0, idempotency_key="slot-1", recorded_at="2026-08-16T16:05:00-04:00"
+    )
+    assert retry.shares_to_buy == 0
 
 
 def test_settle_shortfall_uses_the_ledgers_own_rounded_price_not_submitted_notional(tmp_path):
@@ -3701,7 +3983,7 @@ def test_a_null_restored_credit_snapshot_is_written_off_not_unaged(tmp_path):
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
     assert entry["restored_credit_usd"] == 10.0
     entry["restored_credit_as_of_withdrawn_usd"] = None
@@ -3761,7 +4043,7 @@ def test_a_zero_share_reprice_records_the_credit_it_released(tmp_path):
     assert reclaim.shares_to_buy == 0
     assert ledger.pending_usd("BYDDY") == 10.0
 
-    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())[
+    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())[
         "recorded_idempotency_keys"
     ]["2026-08-16:A"]
     assert entry["resolved"] is True
@@ -3816,7 +4098,7 @@ def test_a_reclaim_keeps_the_remainder_aged_against_an_intervening_withdrawal(tm
         recorded_at="2026-08-16T15:41:00-04:00",
     )
     assert (reclaim.shares_to_buy, reclaim.order_notional_usd) == (2, 16.0)
-    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())[
+    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())[
         "recorded_idempotency_keys"
     ]["2026-08-16:A"]
     assert entry["claim_credit_remainder_usd"] == 0.0, (
@@ -3835,7 +4117,7 @@ def test_a_reclaim_keeps_the_remainder_aged_against_an_intervening_withdrawal(tm
         recorded_at="2026-08-16T15:43:00-04:00", claim_token=reclaim.claim_token,
     )
     assert ledger.pending_usd("BYDDY") == 20.0
-    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_text())[
+    entry = json.loads((tmp_path / "BYDDY" / "ledger.json").read_bytes())[
         "recorded_idempotency_keys"
     ]["2026-08-16:A"]
     assert entry["restored_credit_usd"] == 16.0, (
@@ -3881,7 +4163,7 @@ def test_a_non_finite_restored_credit_cannot_redispatch_the_whole_pool(tmp_path)
     assert ledger.pending_usd("BYDDY") == 25.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
     entry["restored_credit_usd"] = "NaN"
     state_path.write_text(json.dumps(state, indent=2))
@@ -3913,7 +4195,7 @@ def test_an_unusable_withdrawal_counter_does_not_abort_the_ticker(tmp_path):
         recorded_at="2026-08-16T15:30:00-04:00",
     )
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     state["withdrawn_usd_total"] = "bad"
     state_path.write_text(json.dumps(state, indent=2))
 
@@ -3927,7 +4209,7 @@ def test_an_unusable_withdrawal_counter_does_not_abort_the_ticker(tmp_path):
 
     # Normalized on the way in, so the counter is a usable number again and
     # this fire's own withdrawal was recorded against it.
-    persisted = json.loads(state_path.read_text())
+    persisted = json.loads(state_path.read_bytes())
     assert isinstance(persisted["withdrawn_usd_total"], (int, float))
     assert persisted["withdrawn_usd_total"] >= 0.0
 
@@ -3946,7 +4228,7 @@ def test_an_absent_withdrawal_counter_does_not_invalidate_legacy_entitlements(tm
     """
     ledger = _preserved_fire_with_unrelated_pending(tmp_path)
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:slot-1"]
     assert entry["restored_credit_usd"] == 10.0
     # Simulate a legacy ledger that predates this field entirely.
@@ -3963,7 +4245,7 @@ def test_an_absent_withdrawal_counter_does_not_invalidate_legacy_entitlements(tm
     )
     assert retry.order_notional_usd == 10.0
 
-    persisted = json.loads(state_path.read_text())
+    persisted = json.loads(state_path.read_bytes())
     assert isinstance(persisted["withdrawn_usd_total"], (int, float))
     assert persisted["withdrawn_usd_total"] >= 0.0
 
@@ -3992,7 +4274,7 @@ def test_a_legacy_restored_credit_is_snapshotted_before_future_withdrawals(tmp_p
         recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
     )
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
     assert entry["restored_credit_usd"] == 10.0
     # Simulate a legacy write: restored_credit_usd present, but no snapshot
@@ -4067,7 +4349,7 @@ def test_two_legacy_restored_credits_sharing_a_backfilled_snapshot_are_staggered
     assert ledger.pending_usd("BYDDY") == 30.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     # Simulate A and B (but not C) as legacy writes: restored_credit_usd
     # present, but no snapshot field at all.
@@ -4093,7 +4375,7 @@ def test_two_legacy_restored_credits_sharing_a_backfilled_snapshot_are_staggered
 
     from dca_whole_share_accumulator import _redispatchable_credit_usd
 
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     withdrawn_total = state["withdrawn_usd_total"]
     pool = state["pending_usd"]
@@ -4141,7 +4423,7 @@ def test_legacy_migration_seeds_the_live_tie_batch_so_new_registrations_continue
     assert ledger.pending_usd("BYDDY") == 20.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     # Simulate A and B as legacy writes: restored_credit_usd present, but
     # no snapshot field at all.
@@ -4161,7 +4443,7 @@ def test_legacy_migration_seeds_the_live_tie_batch_so_new_registrations_continue
     )
     assert d_decision.shares_to_buy == 0
 
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     d_offset = entries["2026-08-16:D"]["claim_credit_remainder_tie_offset_usd"]
     assert d_offset == 20.0, (
@@ -4219,7 +4501,7 @@ def test_a_legacy_restored_credit_and_a_legacy_remainder_are_staggered_against_e
     assert ledger.pending_usd(ticker) == 15.0
 
     state_path = tmp_path / ticker / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     x_entry = entries[f"{day}:X"]
     y_entry = entries[f"{day}:Y"]
@@ -4239,7 +4521,7 @@ def test_a_legacy_restored_credit_and_a_legacy_remainder_are_staggered_against_e
         ticker, day, 0.0, 1_000_000.0, idempotency_key="probe", recorded_at="2026-08-16T15:30:30-04:00"
     )
     assert probe.shares_to_buy == 0
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     x_offset = entries[f"{day}:X"]["restored_credit_tie_offset_usd"]
     y_offset = entries[f"{day}:Y"]["claim_credit_remainder_tie_offset_usd"]
@@ -4277,7 +4559,7 @@ def test_a_malformed_idempotency_key_map_fails_the_ledger_closed(tmp_path, malfo
         recorded_at="2026-08-16T15:30:00-04:00",
     )
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     state["recorded_idempotency_keys"] = malformed_shape
     state_path.write_text(json.dumps(state, indent=2))
 
@@ -4325,7 +4607,7 @@ def test_a_corrupted_withdrawal_counter_writes_off_the_entitlements_it_aged(tmp_
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     assert state["withdrawn_usd_total"] > 0.0
     state["withdrawn_usd_total"] = "bad"
     state_path.write_text(json.dumps(state, indent=2))
@@ -4409,7 +4691,7 @@ def test_a_corrupted_tie_offset_larger_than_the_reconstructable_bound_writes_off
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     a_entry = entries["2026-08-16:A"]
     assert a_entry["restored_credit_usd"] == 10.0
@@ -4471,7 +4753,7 @@ def test_a_corrupted_offset_matching_the_claims_own_amount_is_still_caught(tmp_p
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     a_entry = entries["2026-08-16:A"]
     assert a_entry["restored_credit_usd"] == 10.0
@@ -4540,7 +4822,7 @@ def test_a_corrupted_offset_matching_a_later_registered_siblings_amount_is_still
     assert ledger.pending_usd("BYDDY") == 20.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     a_entry = entries[f"{day}:A"]
     assert a_entry["restored_credit_tie_offset_usd"] == 0.0
@@ -4590,7 +4872,7 @@ def test_a_present_but_unreadable_audit_value_fails_the_entitlement_closed(tmp_p
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
     audit_key = f"{day}:A:restored_credit_usd:{_snapshot_key(a_entry['restored_credit_as_of_withdrawn_usd'])}"
     assert audit_key in state["credit_tie_offset_audit"]
@@ -4633,7 +4915,7 @@ def test_writing_off_a_mismatch_retires_the_stale_audit_entry(tmp_path):
     )
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
     as_of = a_entry["restored_credit_as_of_withdrawn_usd"]
     audit_key = f"{day}:A:restored_credit_usd:{_snapshot_key(as_of)}"
@@ -4674,7 +4956,7 @@ def test_a_legacy_initialized_credit_is_not_written_off_by_an_unrelated_same_cou
         "BYDDY", day, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
     )
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
     del a_entry["restored_credit_as_of_withdrawn_usd"]
     del a_entry["restored_credit_tie_offset_usd"]
@@ -4736,7 +5018,7 @@ def test_re_anchoring_after_a_missing_counter_forgets_stale_audits_first(tmp_pat
     )
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     a_entry = entries[f"{day}:A"]
     b_entry = entries[f"{day}:B"]
@@ -4790,7 +5072,7 @@ def test_the_as_of_backfill_migration_forgets_a_stale_audit_at_its_target_key(tm
     )
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
     withdrawn_total = state["withdrawn_usd_total"]
     assert a_entry["restored_credit_as_of_withdrawn_usd"] == withdrawn_total
@@ -4842,7 +5124,7 @@ def test_retiring_an_interval_keeps_the_shifted_siblings_audit_in_sync(tmp_path)
     assert first.order_notional_usd == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
     assert a_entry["claim_credit_remainder_usd"] == 4.0
     assert a_entry["claim_credit_remainder_tie_offset_usd"] == 0.0
@@ -4853,7 +5135,7 @@ def test_retiring_an_interval_keeps_the_shifted_siblings_audit_in_sync(tmp_path)
         "BYDDY", day, 4.0, 100.0, idempotency_key="B", recorded_at="2026-08-16T15:31:00-04:00"
     )
     assert b.shares_to_buy == 0
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     b_entry = state["recorded_idempotency_keys"][f"{day}:B"]
     assert b_entry["claim_credit_remainder_usd"] == 4.0
     assert b_entry["claim_credit_remainder_tie_offset_usd"] == 4.0
@@ -4863,7 +5145,7 @@ def test_retiring_an_interval_keeps_the_shifted_siblings_audit_in_sync(tmp_path)
     ledger.preserve_pending(
         "BYDDY", day, 10.0, idempotency_key="A", recorded_at="2026-08-16T15:32:00-04:00", claim_token=first.claim_token,
     )
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     b_entry = state["recorded_idempotency_keys"][f"{day}:B"]
     assert b_entry["claim_credit_remainder_tie_offset_usd"] == 0.0, "B's live offset must be shifted"
     audit_key = f"{day}:B:claim_credit_remainder_usd:{_snapshot_key(b_entry['claim_credit_remainder_as_of_withdrawn_usd'])}"
@@ -4913,7 +5195,7 @@ def test_a_relabeled_restored_credit_gets_its_own_audit_entry(tmp_path):
     assert repriced.shares_to_buy == 0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
     # The reclaim releases A's WHOLE frozen commitment (its original $10
     # order plus the $4 remainder) back to pending, not just the remainder.
@@ -4990,7 +5272,7 @@ def test_relabeling_a_remainder_with_a_nonzero_offset_forgets_its_own_stale_audi
     assert repriced.shares_to_buy == 0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
     assert a_entry["restored_credit_usd"] == 14.0
     assert a_entry["restored_credit_tie_offset_usd"] > 0.0, (
@@ -5055,7 +5337,7 @@ def test_a_claim_moving_to_a_new_snapshot_does_not_write_off_a_tied_siblings_off
     assert ledger.pending_usd("BYDDY") == 20.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     assert entries[f"{day}:A"]["restored_credit_tie_offset_usd"] == 0.0
     assert entries[f"{day}:B"]["restored_credit_tie_offset_usd"] == 10.0
@@ -5073,7 +5355,7 @@ def test_a_claim_moving_to_a_new_snapshot_does_not_write_off_a_tied_siblings_off
     )
     assert ledger.pending_usd("BYDDY") == 20.0
 
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     a_entry = entries[f"{day}:A"]
     b_entry = entries[f"{day}:B"]
@@ -5144,7 +5426,7 @@ def test_a_shrinking_sibling_credit_does_not_write_off_a_tied_claims_offset(tmp_
     assert ledger.pending_usd("BYDDY") == 20.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     assert entries[f"{day}:A"]["restored_credit_tie_offset_usd"] == 0.0
     assert entries[f"{day}:B"]["restored_credit_tie_offset_usd"] == 10.0
@@ -5159,7 +5441,7 @@ def test_a_shrinking_sibling_credit_does_not_write_off_a_tied_claims_offset(tmp_
     )
     assert a_redispatch.order_notional_usd == 9.0
 
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     a_entry = state["recorded_idempotency_keys"][f"{day}:A"]
     assert "restored_credit_usd" in a_entry and "claim_credit_remainder_usd" in a_entry, (
         "A must carry both a stale restored credit and a fresh remainder at once"
@@ -5215,7 +5497,7 @@ def test_a_corrupted_withdrawal_counter_writes_off_a_legacy_entry_too(tmp_path):
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     # Simulate a legacy write: A's entry predates restored_credit_usd
     # entirely -- no field, not even a null one -- but still carries the
     # positive order_notional_usd its preserve_pending() call recorded.
@@ -5270,7 +5552,7 @@ def test_a_ledger_wide_integer_overflow_does_not_abort_unrelated_reads(tmp_path)
         recorded_at="2026-08-16T15:30:00-04:00", claim_token=first.claim_token,
     )
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     entries["2026-08-16:A"]["restored_credit_usd"] = 10**400
     state_path.write_text(json.dumps(state, indent=2))
@@ -5332,7 +5614,7 @@ def test_a_boolean_withdrawal_counter_writes_off_the_entitlements_it_aged(tmp_pa
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     state["withdrawn_usd_total"] = False
     state_path.write_text(json.dumps(state, indent=2))
 
@@ -5427,7 +5709,7 @@ def test_a_malformed_restored_credit_does_not_inherit_the_legacy_entitlement(tmp
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
     # PRESENT but unreadable, and the entry still carries its order_notional_usd.
     entry["restored_credit_usd"] = "Infinity"
@@ -5477,7 +5759,7 @@ def test_a_null_restored_credit_does_not_inherit_the_legacy_entitlement(tmp_path
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
     # PRESENT as JSON null, and the entry still carries its order_notional_usd.
     entry["restored_credit_usd"] = None
@@ -5522,7 +5804,7 @@ def test_a_non_finite_legacy_order_notional_fails_closed(tmp_path):
     assert ledger.pending_usd("BYDDY") == 10.0
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entry = state["recorded_idempotency_keys"]["2026-08-16:A"]
     # restored_credit_usd genuinely ABSENT (a pre-upgrade entry), but its
     # order_notional_usd is corrupted.
@@ -5619,7 +5901,7 @@ def test_two_restored_credits_at_the_same_snapshot_are_not_both_charged_one_with
     from dca_whole_share_accumulator import _redispatchable_credit_usd
 
     state_path = tmp_path / "BYDDY" / "ledger.json"
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     withdrawn_total = state["withdrawn_usd_total"]
     pool = state["pending_usd"]
@@ -5644,7 +5926,7 @@ def test_two_restored_credits_at_the_same_snapshot_are_not_both_charged_one_with
     # two $10 withdrawals (C's and D's, $20 total), A and B were each
     # charged for exactly one, never more than the $20 actually drawn from
     # the pool between them.
-    state = json.loads(state_path.read_text())
+    state = json.loads(state_path.read_bytes())
     entries = state["recorded_idempotency_keys"]
     withdrawn_total = state["withdrawn_usd_total"]
     pool = state["pending_usd"]
@@ -5875,4 +6157,20 @@ def test_tied_sub_share_contributions_track_only_their_own_credit(tmp_path):
     assert ledger.pending_usd(ticker) == 10.0, (
         "B's retry must not spend D's contribution -- B's own tied credit "
         "was already fully consumed by C's withdrawal"
+    )
+
+
+def test_compute_virtual_contribution_usd_keeps_its_strategy_config_annotation():
+    """2026-09-07 diagnostic X:OWN-04: PR #1312 replaced the TYPE_CHECKING-guarded
+    ``StrategyConfig`` import with ``config: Any`` to silence an unused-import
+    lint, erasing the type on this module's one public entry point. ruff never
+    flags a TYPE_CHECKING import that an annotation uses, so the guard costs
+    nothing at runtime (``near_close_dca`` still imports this module first, so
+    the import must stay behind the guard to avoid the cycle) and keeps a wrong
+    object passed as ``config`` visible to static checkers."""
+    import inspect
+
+    annotation = inspect.signature(compute_virtual_contribution_usd).parameters["config"].annotation
+    assert annotation == "StrategyConfig", (
+        f"config must be annotated as StrategyConfig behind a TYPE_CHECKING import, got {annotation!r}"
     )

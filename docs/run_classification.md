@@ -7,10 +7,11 @@
 > the OLD three-stream naming -- those five tasks are still the account's
 > ONLY currently-functioning live execution, not a stream that has been
 > replaced. A seven-slot Claude roster is the intended eventual replacement;
-> every one of those seven prompts hard-aborts at Gate 5 until a
-> signal-generation entry point is wired (see `PRODUCTION_READINESS.md`),
-> so it runs alongside the five tasks referenced below, not instead of them.
-> See [`safeguards.md`](safeguards.md#live-execution-roster) for the current
+> its Gate 5 has had a real entry point per slot since 2026-08-26 and
+> placement was authorized for all seven slots on 2026-09-02 (see
+> `PRODUCTION_READINESS.md`, "Status, 2026-08-26"); the older "hard-aborts at
+> Gate 5" wording elsewhere predates that. See
+> [`safeguards.md`](safeguards.md#live-execution-roster) for the current
 > roster.
 
 Prevents **manual runs** of the graded DCA task from being confused with
@@ -513,7 +514,7 @@ are **never** afternoon scheduled evidence, slippage, reliability, fill-count, o
 cost-basis evidence. See the `live_schedule_hardening_2026_07_20` block in
 [`../config/run_classification.json`](../config/run_classification.json) and
 `config/scheduled_tasks.json`'s
-`live_schedule_hardening_2026_07_20.afternoon_1520`.
+`live_schedule_hardening_2026_07_20.afternoon_1530`.
 
 ## Pointer output normalization (added 2026-07-20)
 
@@ -830,13 +831,15 @@ outcome, including a zero-order, blocked, or failed run:
   whether a run happened at all.
 - `write_scheduled_run_artifacts()` is the single entry point that writes all
   four; hand-rolling a subset is exactly how the two gaps above happened.
-- **Only three of the five live streams have an in-repo producer**, so only those
-  can be enforced by repo code: `42173154` and `a6239dae` through
-  `MorningDCAExecutor`, and `10ce362c` through `near_close_dca`. The market-open
-  `2ba19526` and intraday `7be82b97` tasks carry `no_python_entry_point=true`:
-  an external scheduler/agent runs them directly from the manifest, the same
-  arrangement other manifest-only external scheduled tasks (e.g. `bb4f6ef1`) use.
-  For those two the contract is the task
+- **Every live stream now has an in-repo producer**: `42173154` and `a6239dae`
+  through `MorningDCAExecutor`/`MiddayDCAExecutor`, `10ce362c` through
+  `near_close_dca`, and the market-open `2ba19526` and intraday `7be82b97`
+  tasks through `market_open_dca.MarketOpenDCAExecutor` and
+  `intraday_dca.IntradayDCAExecutor` -- both of which SHIP with
+  `live_execution_enabled=false` in their config, so an external
+  scheduler/agent still runs those two directly from the manifest (the
+  manifest's `no_python_entry_point=true` predates the executors). For those
+  two the contract is the task
   text the executor must follow, and the repo supplies the tested helpers
   (`write_scheduled_run_artifacts`, `validate_run_artifacts`,
   `classify_no_order_run`) rather than a producer. See
@@ -1127,4 +1130,4 @@ completed order evidence false while still proving the scheduled task fired.
 
 Tests: [`scripts/tests/test_scheduled_artifacts.py`](../scripts/tests/test_scheduled_artifacts.py)
 and the preflight/live artifact tests in
-[`test_morning_dca.py`](../tests/test_morning_dca.py).
+[`test_morning_dca.py`](../test_morning_dca.py).

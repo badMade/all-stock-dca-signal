@@ -128,12 +128,30 @@ def adjusted_low_drops(history_path: Path, start_date: str) -> list[float]:
     """Return split/dividend-adjusted prior-close-to-low falls as percentages."""
     prices = []
     with history_path.open(newline="", encoding="utf-8") as handle:
-        for row in csv.DictReader(handle):
-            try:
-                if row["Date"] >= start_date:
-                    prices.append((float(row["Close"]), float(row["Adj Close"]), float(row["Low"])))
-            except (KeyError, ValueError):
-                continue
+        reader = csv.reader(handle)
+        header = next(reader, None)
+        if header is not None:
+            d_idx = header.index("Date") if "Date" in header else -1
+            c_idx = header.index("Close") if "Close" in header else -1
+            ac_idx = header.index("Adj Close") if "Adj Close" in header else -1
+            l_idx = header.index("Low") if "Low" in header else -1
+            for row in reader:
+                try:
+                    d_val = row[d_idx] if d_idx != -1 and len(row) > d_idx else None
+                    c_val = row[c_idx] if c_idx != -1 and len(row) > c_idx else None
+                    ac_val = row[ac_idx] if ac_idx != -1 and len(row) > ac_idx else None
+                    l_val = row[l_idx] if l_idx != -1 and len(row) > l_idx else None
+
+                    if (
+                        d_val is not None
+                        and c_val is not None
+                        and ac_val is not None
+                        and l_val is not None
+                        and d_val >= start_date
+                    ):
+                        prices.append((float(c_val), float(ac_val), float(l_val)))
+                except (ValueError, TypeError):
+                    continue
     drops = []
     for (_, prior_adjusted_close, _), (close, adjusted_close, low) in zip(prices, prices[1:], strict=False):
         if min(close, adjusted_close, low, prior_adjusted_close) <= 0:

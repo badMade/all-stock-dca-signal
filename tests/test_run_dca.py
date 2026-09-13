@@ -1526,7 +1526,12 @@ def test_compute_auto_derived_prior_allocations_sums_attempt_count_across_the_af
                 "generated_at": f"{trading_day.isoformat()}T09:00:00-04:00",
                 "run_classification": {"run_origin": "manual", "run_id": "afternoon_manual_am"},
                 "buy_candidates": [
-                    {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 2.0},
+                    {
+                        "ticker": "AAPL",
+                        "status": "filled",
+                        "planned_amount_usd": 2.0,
+                        "unapproved_execution_basis": "executed_unbounded",
+                    },
                 ],
             }
         ),
@@ -1564,6 +1569,7 @@ def test_compute_auto_derived_prior_allocations_sums_attempt_count_across_the_af
     assert scan_had_failures is False
     assert allocations["AAPL"].amount_usd == pytest.approx(5.0)
     assert allocations["AAPL"].attempt_count == 2
+    assert allocations["AAPL"].unresolved_live_exposure is True
 
 
 def test_compute_auto_derived_prior_allocations_deduplicates_a_mirrored_run_across_the_merge(
@@ -4569,6 +4575,12 @@ def test_cli_refuses_without_demo(tmp_path):
     assert rc == 2
 
 
+def test_cli_bare_defaults_to_demo(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.argv", ["run_dca.py"])
+    rc = main(None)
+    assert rc == 0
+
+
 def test_cli_demo_does_not_touch_the_real_cron_tracking_root(tmp_path, monkeypatch):
     """Regression test for "Keep CLI demos out of the live accumulator".
 
@@ -5662,7 +5674,7 @@ def test_build_frozen_providers_persists_live_corporate_action_evidence(tmp_path
     as_of = date(2026, 8, 18)
     assert cast(Any, finance).get_corporate_action_factor("AAPL", since, as_of) == (2.0, as_of)
 
-    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_text(encoding="utf-8"))
+    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_bytes())
     assert persisted["ticker"] == "AAPL"
     assert persisted["since"] == since.isoformat()
     assert persisted["as_of"] == as_of.isoformat()
@@ -5715,8 +5727,49 @@ def test_build_frozen_providers_serializes_concurrent_action_retries(tmp_path):
     assert not first.is_alive() and not second.is_alive()
     assert calls == ["AAPL"]
     assert results == [(2.0, as_of), (2.0, as_of)]
-    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_text(encoding="utf-8"))
+    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_bytes())
     assert persisted["factor"] == 2.0
+
+
+def test_corporate_action_persistence_holds_snapshot_lock(tmp_path, monkeypatch):
+    """Delayed evidence writes cannot overlap another retry's raw swap."""
+    from contextlib import contextmanager
+
+    import run_dca
+    import scripts.file_lock as file_lock
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "finance_bars_batch1.json").write_text('{"results": []}', encoding="utf-8")
+    held = False
+    observed_lock_paths = []
+
+    @contextmanager
+    def recording_lock(path, *args, **kwargs):
+        nonlocal held
+        observed_lock_paths.append(Path(path))
+        held = True
+        try:
+            yield
+        finally:
+            held = False
+
+    class LiveFinance(DemoDataProvider):
+        def get_corporate_action_factor(self, ticker, since, as_of):
+            assert held
+            return 2.0, as_of
+
+    monkeypatch.setattr(file_lock, "cross_process_lock", recording_lock)
+    finance, _ = run_dca._build_frozen_providers_from_raw(
+        LiveFinance(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD), raw_dir
+    )
+
+    as_of = date(2026, 8, 18)
+    assert cast(Any, finance).get_corporate_action_factor("AAPL", date(2026, 8, 17), as_of) == (
+        2.0,
+        as_of,
+    )
+    assert observed_lock_paths == [tmp_path / ".corporate_actions.lock"]
 
 
 def test_build_frozen_providers_replays_persisted_corporate_action_evidence(tmp_path):
@@ -5759,12 +5812,17 @@ def test_build_frozen_providers_replays_persisted_corporate_action_evidence(tmp_
     )
     assert cast(Any, finance).get_corporate_action_factor("AAPL", since, as_of) == (3.0, as_of)
     assert live_calls == []
+    # A cache hit costs nothing externally -- near_close_dca's inverse-
+    # Martingale wiring reads this flag to skip counting it against
+    # usage_proxy.finance_calls_attempted.
+    assert cast(Any, finance).get_corporate_action_factor.served_from_cache is True
 
     # A query the persisted snapshot never saw still falls through to live.
     other_since = date(2026, 8, 10)
     assert cast(Any, finance).get_corporate_action_factor("AAPL", other_since, as_of) == (999.0, as_of)
     assert live_calls == [("AAPL", other_since, as_of)]
-    original = _json.loads((raw_dir / "corporate_action_AAPL.json").read_text(encoding="utf-8"))
+    assert cast(Any, finance).get_corporate_action_factor.served_from_cache is False
+    original = _json.loads((raw_dir / "corporate_action_AAPL.json").read_bytes())
     assert original["factor"] == 3.0
     distinct_query = _json.loads(
         (raw_dir / f"corporate_action_AAPL_{other_since.isoformat()}_{as_of.isoformat()}.json").read_text(
@@ -5912,7 +5970,7 @@ def test_build_frozen_providers_rejects_a_malformed_fresh_corporate_action(tmp_p
         LiveFinance(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD), raw_dir,
     )
     assert cast(Any, finance).get_corporate_action_factor("AAPL", since, as_of) is None
-    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_text(encoding="utf-8"))
+    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_bytes())
     assert persisted["factor"] is None
     assert persisted["cursor"] is None
 
@@ -5928,6 +5986,7 @@ def test_run_pipeline_refreshes_raw_input_manifest_after_compute_time_persistenc
     import json as _json
 
     import run_dca
+    import scripts.file_lock as file_lock
 
     config = load_strategy_config(approved_test_dates=frozenset({_now().date()}), dry_run=False)
     scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
@@ -5963,6 +6022,35 @@ def test_run_pipeline_refreshes_raw_input_manifest_after_compute_time_persistenc
 
     monkeypatch.setattr(run_dca, "run_daily_compact", compute_time_writer)
 
+    real_lock = file_lock.cross_process_lock
+    real_build_persistence_state = run_dca.build_raw_persistence_state
+    action_lock_depth = 0
+    manifest_lock_observations = []
+
+    def _is_action_lock(path) -> bool:
+        return Path(path) == scheduled_dir / ".corporate_actions.lock"
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def observed_lock(path, *args, **kwargs):
+        nonlocal action_lock_depth
+        with real_lock(path, *args, **kwargs):
+            if _is_action_lock(path):
+                action_lock_depth += 1
+            try:
+                yield
+            finally:
+                if _is_action_lock(path):
+                    action_lock_depth -= 1
+
+    def observed_build_persistence_state(*args, **kwargs):
+        manifest_lock_observations.append(action_lock_depth > 0)
+        return real_build_persistence_state(*args, **kwargs)
+
+    monkeypatch.setattr(file_lock, "cross_process_lock", observed_lock)
+    monkeypatch.setattr(run_dca, "build_raw_persistence_state", observed_build_persistence_state)
+
     result = run_pipeline(
         _now(), config, StrategyState(),
         DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
@@ -5974,6 +6062,46 @@ def test_run_pipeline_refreshes_raw_input_manifest_after_compute_time_persistenc
         run_state = _json.load(handle)
     assert "corporate_action_AAPL.json" in run_state["raw_inputs_saved"]
     assert (scheduled_dir / "raw" / "corporate_action_AAPL.json").exists()
+    # Both the initial manifest and the post-compute refresh are read while
+    # the action-snapshot lock excludes another invocation's raw swap.
+    assert manifest_lock_observations == [True, True]
+
+
+def test_frozen_provider_snapshots_archive_fallback_over_null_live_evidence(tmp_path):
+    """Archive evidence that replaces a null live answer must be replayable."""
+    import json as _json
+
+    from run_dca import _build_frozen_providers_from_raw
+
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "finance_bars_batch1.json").write_text(
+        _json.dumps({"results": []}), encoding="utf-8"
+    )
+    since = date(2026, 8, 17)
+    as_of = date(2026, 8, 18)
+
+    class UnavailableLiveActions(DemoDataProvider):
+        def get_corporate_action_factor(self, ticker, since, as_of):
+            return None
+
+    finance, _ = _build_frozen_providers_from_raw(
+        UnavailableLiveActions(SourceName.FINANCE),
+        DemoDataProvider(SourceName.ROBINHOOD),
+        raw_dir,
+    )
+    assert cast(Any, finance).get_corporate_action_factor("AAPL", since, as_of) is None
+    assert cast(Any, finance).persist_archive_corporate_action_factor(
+        "AAPL", since, as_of, (0.5, as_of)
+    )
+
+    persisted = _json.loads((raw_dir / "corporate_action_AAPL.json").read_bytes())
+    assert persisted["factor"] == pytest.approx(0.5)
+    assert persisted["cursor"] == as_of.isoformat()
+    assert persisted["source"] == "ticker_history_archive"
+    # The ordinary lookup now replays the captured fallback and does not
+    # depend on whatever the mutable global archive contains later.
+    assert cast(Any, finance).get_corporate_action_factor("AAPL", since, as_of) == (0.5, as_of)
 
 
 def test_run_pipeline_manifest_refresh_skips_a_concurrently_modified_run_state(
@@ -6063,6 +6191,134 @@ def test_run_pipeline_manifest_refresh_skips_a_concurrently_modified_run_state(
     assert run_state["run_id"] == concurrent_run_id_holder["value"]
     assert "corporate_action_AAPL.json" not in run_state.get("raw_inputs_saved", [])
     assert "skipping raw-input manifest refresh" in caplog.text
+
+
+def test_run_pipeline_manifest_refresh_holds_run_state_lock(tmp_path, monkeypatch):
+    """The manifest refresh's read/modify/replace of run_state.json must all
+    happen under the same ``run_state.json.lock`` sidecar write_run_artifacts
+    itself takes for the primary publication -- a byte-comparison CAS guard
+    alone (see the concurrent-modification test above) still leaves a window
+    between its final compare and os.replace that a concurrent retry can win
+    (PR #1357: "Fix corporate action isolation and state update races").
+    Proven by observing the refresh's own CSV-byte sizing read -- the call that
+    sits between its read of run_state.json and its rewrite -- and requiring
+    that it ran with the lock held, pinned to the refresh (not some other lock
+    site) by only counting reads made after the post-compute rescan and before
+    the on-disk manifest lists the compute-time file."""
+    import json as _json
+    from contextlib import contextmanager
+
+    import run_dca
+    import scripts.file_lock as file_lock
+
+    config = load_strategy_config(approved_test_dates=frozenset({_now().date()}), dry_run=False)
+    scheduled_dir = tmp_path / "scheduled_runs" / "20260706_1530ET"
+    broker = DryRunBroker(account=config.target_account_number)
+
+    good_inputs = {
+        "quotes_batch1.json": {"results": [{"quote": {"symbol": "AAPL"}}]},
+        "historicals_batch1.json": {"results": [{"symbol": "AAPL", "interval": 5, "items": []}]},
+        "finance_bars_batch1.json": {"results": [{"ticker": "AAPL", "interval_minutes": 5, "bars": []}]},
+        "finance_close_batch1.json": {"results": [{"ticker": "AAPL", "previous_close": 149.0}]},
+    }
+
+    real_run_daily_compact = run_dca.run_daily_compact
+
+    def compute_time_writer(*args, **kwargs):
+        # Simulate a live corporate-action lookup persisting new evidence
+        # mid-compute, so the post-compute rescan finds a changed manifest
+        # and the refresh's read-modify-write actually runs.
+        raw_dir = scheduled_dir / "raw"
+        (raw_dir / "corporate_action_AAPL.json").write_text(
+            _json.dumps(
+                {
+                    "ticker": "AAPL", "since": "2026-07-05", "as_of": "2026-07-06",
+                    "factor": 1.0, "cursor": "2026-07-06",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return real_run_daily_compact(*args, **kwargs)
+
+    monkeypatch.setattr(run_dca, "run_daily_compact", compute_time_writer)
+
+    # run_dca imports cross_process_lock at call time from scripts.file_lock,
+    # so patching the module attribute is what its manifest refresh sees.
+    # The real lock is still taken underneath -- only the held-state of the
+    # run_state.json sidecar is tracked on top of it.
+    real_lock = file_lock.cross_process_lock
+    run_state_lock_depth = 0
+
+    @contextmanager
+    def observed_lock(path, *args, **kwargs):
+        nonlocal run_state_lock_depth
+        is_run_state_lock = Path(path).name == "run_state.json.lock"
+        with real_lock(path, *args, **kwargs):
+            if is_run_state_lock:
+                run_state_lock_depth += 1
+            try:
+                yield
+            finally:
+                if is_run_state_lock:
+                    run_state_lock_depth -= 1
+
+    monkeypatch.setattr(file_lock, "cross_process_lock", observed_lock)
+
+    real_build_persistence_state = run_dca.build_raw_persistence_state
+    rescans = 0
+
+    def counting_build_persistence_state(*args, **kwargs):
+        nonlocal rescans
+        rescans += 1
+        return real_build_persistence_state(*args, **kwargs)
+
+    monkeypatch.setattr(run_dca, "build_raw_persistence_state", counting_build_persistence_state)
+
+    real_existing_csv_artifacts = run_dca._existing_csv_artifacts
+    observations = []
+
+    def csv_artifacts_observing_lock(run_dir):
+        run_state_path = run_dir / "run_state.json"
+        try:
+            on_disk = _json.loads(run_state_path.read_bytes())
+        except (OSError, ValueError):
+            on_disk = {}
+        observations.append(
+            {
+                "locked": run_state_lock_depth > 0,
+                # The initial pre-compute manifest capture is rescan 1; the
+                # post-compute refresh is rescan 2.
+                "after_refresh_rescan": rescans >= 2,
+                "manifest_lists_action": (
+                    "corporate_action_AAPL.json" in on_disk.get("raw_inputs_saved", [])
+                ),
+            }
+        )
+        return real_existing_csv_artifacts(run_dir)
+
+    monkeypatch.setattr(run_dca, "_existing_csv_artifacts", csv_artifacts_observing_lock)
+
+    result = run_pipeline(
+        _now(), config, StrategyState(),
+        DemoDataProvider(SourceName.FINANCE), DemoDataProvider(SourceName.ROBINHOOD),
+        cast(Any, broker), artifacts_dir=scheduled_dir,
+        raw_connector_inputs=good_inputs,
+    )
+    assert "raw_persistence_error" not in result
+    with open(result["run_state_path"], encoding="utf-8") as handle:
+        run_state = _json.load(handle)
+    # The refresh really ran and published the compute-time file.
+    assert "corporate_action_AAPL.json" in run_state["raw_inputs_saved"]
+    # Its sizing read happened after the rescan, before the manifest was
+    # rewritten -- i.e. inside the refresh's read-modify-write -- and every
+    # such read held run_state.json.lock.
+    refresh_reads = [
+        o for o in observations if o["after_refresh_rescan"] and not o["manifest_lists_action"]
+    ]
+    assert refresh_reads, observations
+    assert all(o["locked"] for o in refresh_reads), observations
+    # Nothing leaked the lock past the pipeline's return.
+    assert run_state_lock_depth == 0
 
 
 def test_run_pipeline_skips_post_processing_when_ownership_not_verified(
@@ -7729,6 +7985,146 @@ def test_run_pipeline_reverifies_ownership_at_the_report_generation_write_site(
     assert persisted == peer_state
 
 
+def test_run_pipeline_keeps_ownership_across_full_report_publication(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Keep ownership while publishing full
+    reports"): the sibling test above
+    (`..._reverifies_ownership_at_the_report_generation_write_site`) proves
+    a peer publishing between the pre-merge recheck and report generation's
+    own locked READ of `run_state.json` is caught. But that read-site lock
+    itself released the moment the read completed -- fills/targets
+    computation (including `_refresh_fills_from_broker`'s network calls)
+    and the two actual DURABLE WRITES, `generate_reports()` and
+    `write_compact_sync()`, all ran afterward with no lock held at all. A
+    peer publishing in THAT gap -- after the read-site lock released but
+    before the writes actually happen -- went completely undetected.
+
+    This proves the fix closes that specific gap: a peer claiming the
+    directory between the report-generation read lock and the point where
+    reports are actually published is caught by the new write-site lock
+    immediately preceding `generate_reports`/`write_compact_sync`, and
+    neither write runs against the peer's directory."""
+    import json
+
+    import run_dca
+    import scripts.file_lock as file_lock_mod
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    run_state_path = tmp_path / "artifacts" / "run_state.json"
+
+    # A separate invocation's own genuinely different, already-published
+    # state -- standing in for a peer publishing in the gap between report
+    # generation's own locked read and the locked writes that follow it.
+    peer_state = {
+        "run_id": "peer-b-1030et-after-report-read",
+        "trading_day": "peer",
+        "buy_candidates": [
+            {
+                "ticker": "MSFT",
+                "status": "submitted",
+                "order_id": "PEER-B-AFTER-REPORT-READ-ORDER",
+            }
+        ],
+        "usage_proxy": {},
+    }
+
+    real_cross_process_lock = file_lock_mod.cross_process_lock
+    _run_state_lock_calls = {"count": 0}
+
+    def claim_directory_before_third_run_state_lock(path, *args, **kwargs):
+        if Path(path).name == "run_state.json.lock":
+            _run_state_lock_calls["count"] += 1
+            # 1st acquisition: the standalone pre-merge recheck. 2nd: report
+            # generation's own locked read of run_state.json -- both left
+            # alone, confirming ownership fine at each of those points. The
+            # 3rd is the NEW write-site lock immediately before
+            # generate_reports()/write_compact_sync() -- inject the peer's
+            # publish immediately before THAT one is acquired, simulating
+            # the peer winning the race in the gap this fix closes (the
+            # fills/broker-refresh work that runs, deliberately unlocked,
+            # between the 2nd and 3rd acquisitions).
+            if _run_state_lock_calls["count"] == 3:
+                run_state_path.write_text(json.dumps(peer_state), encoding="utf-8")
+        return real_cross_process_lock(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        file_lock_mod, "cross_process_lock", claim_directory_before_third_run_state_lock
+    )
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        generate_full_reports=True,
+    )
+    # Proves the injection actually landed at the intended (3rd) point.
+    assert _run_state_lock_calls["count"] >= 3
+    # The read-site lock alone would have seen ownership as fine (the peer
+    # had not published yet) -- only the NEW write-site lock catches this.
+    assert result.get("directory_ownership_verified") is False
+    assert "reports" not in result
+    assert "notion_sync" not in result
+    # Neither durable write actually ran against the peer's directory.
+    assert not (tmp_path / "artifacts" / "latest_run_summary.json").exists()
+    # B's on-disk state must survive completely untouched.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
+
+
+def test_run_pipeline_propagates_report_write_failures_instead_of_ownership_loss(
+    tmp_path, monkeypatch
+):
+    """Codex review (finding: "Do not swallow report write failures as
+    ownership loss"): the write-site lock the sibling test above proves
+    (`..._keeps_ownership_across_full_report_publication`) originally wrapped
+    the ENTIRE `with cross_process_lock(...):` block -- including the calls
+    to `generate_reports()`/`write_compact_sync()` themselves -- in a single
+    `try/except (TimeoutError, OSError):`. A genuine write failure inside
+    those calls (a full disk, a permission change, an atomic rename failing)
+    is also an `OSError`, so it landed in the SAME except and got
+    misclassified as an ownership-check failure: `directory_ownership_
+    verified` was set to False and a normal-looking result was returned,
+    instead of the exception propagating the way it did before this lock
+    existed (through `guarded_run`, so a caller like the demo CLI would
+    correctly exit non-zero on an incomplete publish).
+
+    This proves the fix distinguishes the two: ownership is still verified
+    (ordinary ownership ownership-loss paths are unaffected -- see the
+    sibling tests), but once verified, a write failure from
+    `generate_reports()` itself must raise, not silently report success."""
+    import dca_reporting
+    import run_dca
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    def _boom(*args, **kwargs):
+        raise OSError("disk full while writing latest_run_summary.json")
+
+    monkeypatch.setattr(dca_reporting, "generate_reports", _boom)
+
+    with pytest.raises(OSError, match="disk full"):
+        run_dca._run_pipeline_impl(
+            now=_now_for_slot("1030ET"),
+            config=config,
+            state=StrategyState(),
+            finance_data=DemoDataProvider(SourceName.FINANCE),
+            robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+            broker=build_broker(config),
+            artifacts_dir=tmp_path / "artifacts",
+            scheduled=True,
+            generate_full_reports=True,
+        )
+
+
 def test_run_pipeline_binds_post_run_snapshot_for_owned_blocked_runs(
     tmp_path, monkeypatch
 ):
@@ -7854,6 +8250,19 @@ def test_run_slot_without_a_guarded_prior_allocation_still_blocks_a_same_day_rep
             captured.setdefault("asked", []).append(ticker)
             return True
 
+    # A bare tmp_path as artifacts_dir (not nested under a "scheduled_runs"
+    # segment) makes _default_prior_allocation_state_root's documented
+    # fallback land on tmp_path.parent -- the pytest session's SHARED base
+    # temp directory once other tests' tmp_path fixtures are siblings under
+    # it -- and the same-day scan can then pick up an unrelated test's
+    # leftover run_state.json for this same fixed demo trading day. Nesting
+    # under the canonical <task_root>/scheduled_runs/YYYYMMDD_1530ET/ layout
+    # (config/scheduled_tasks.json; see the sibling tests above using the
+    # same shape) keeps the derived root confined to this test's own
+    # tmp_path, matching how a real scheduled run is actually rooted.
+    task_root = tmp_path / "cron_tracking" / "ce16ba6b"
+    scheduled_dir = task_root / "scheduled_runs" / "20260706_1530ET"
+
     result = run_slot(
         "1530ET",
         now=_now_for_slot("1530ET"),
@@ -7862,7 +8271,7 @@ def test_run_slot_without_a_guarded_prior_allocation_still_blocks_a_same_day_rep
         finance_data=DemoDataProvider(SourceName.FINANCE),
         robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
         broker=cast(Any, _RecordingBroker(account=config.target_account_number)),
-        artifacts_dir=tmp_path,
+        artifacts_dir=scheduled_dir,
     )
 
     # The broker, not local bookkeeping, is the authority (Gate 6).
@@ -8188,3 +8597,168 @@ def test_configure_logging_invalid_level(mock_basic_config):
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
+
+
+def test_prior_allocation_live_state_roots_handles_config_failures(monkeypatch, tmp_path):
+    from run_dca import _resolve_cross_stream_prior_allocation_roots
+
+    monkeypatch.setattr(
+        "run_dca.load_morning_config",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("bad morning")),
+    )
+    monkeypatch.setattr(
+        "run_dca.load_midday_config",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("bad midday")),
+    )
+    roots = _resolve_cross_stream_prior_allocation_roots(tmp_path, tmp_path / "afternoon")
+    assert isinstance(roots, tuple)
+
+
+def test_validated_corporate_action_result_edge_cases():
+    from datetime import date
+
+    from run_dca import _validated_corporate_action_result
+
+    assert _validated_corporate_action_result(None, date(2026, 7, 8)) is None
+    assert _validated_corporate_action_result((1.0, "not-a-valid-date"), date(2026, 7, 8)) is None
+    assert _validated_corporate_action_result((1.0, 12345), date(2026, 7, 8)) is None
+    assert _validated_corporate_action_result((-1.0, date(2026, 7, 8)), date(2026, 7, 8)) is None
+    assert _validated_corporate_action_result((float("inf"), date(2026, 7, 8)), date(2026, 7, 8)) is None
+    assert _validated_corporate_action_result((1.0, date(2026, 7, 9)), date(2026, 7, 8)) is None
+
+
+def test_execution_targets_edge_cases(tmp_path):
+    from run_dca import (
+        _execution_targets_by_order_id_from_orders_csv,
+        _execution_targets_from_orders_csv,
+    )
+
+    missing = tmp_path / "nonexistent.csv"
+    assert _execution_targets_from_orders_csv(missing) == {}
+    assert _execution_targets_by_order_id_from_orders_csv(missing) == {}
+
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,order_id,target_price\n"
+        ",ord-empty-ticker,10.0\n"
+        "AAPL,,15.0\n"
+        "MSFT,ord-bad-target,bad_number\n",
+        encoding="utf-8",
+    )
+    targets = _execution_targets_from_orders_csv(csv_path)
+    assert targets.get("AAPL") == 15.0
+    assert targets.get("MSFT") is None
+
+    targets_by_id = _execution_targets_by_order_id_from_orders_csv(csv_path)
+    assert targets_by_id.get("ord-empty-ticker") == 10.0
+    assert targets_by_id.get("ord-bad-target") is None
+
+
+def test_refresh_fills_from_broker_edge_cases(tmp_path):
+    from run_dca import _refresh_fills_from_broker
+
+    missing = tmp_path / "nonexistent.csv"
+
+    class _DummyBroker:
+        account_number: str = "dummy"
+
+        def get_order_fill(self, oid):
+            raise RuntimeError("lookup error")
+
+    broker = cast(Any, _DummyBroker())
+    assert _refresh_fills_from_broker(missing, broker, []) == []
+
+    csv_path = tmp_path / "orders.csv"
+    csv_path.write_text(
+        "ticker,order_id,status,avg_fill_price,quantity_filled\n"
+        "AAPL,,submitted,,\n"
+        "NVDA,ord-fail,submitted,,\n",
+        encoding="utf-8",
+    )
+    refreshed = _refresh_fills_from_broker(csv_path, broker, [])
+    assert refreshed == []
+
+
+def test_read_prior_allocation_rows_handles_read_failure(tmp_path):
+    from run_dca import _prior_submitted_order_rows
+
+    run_dir = tmp_path / "slot_run"
+    run_dir.mkdir()
+    unreadable = run_dir / "submitted_orders.csv"
+    unreadable.mkdir()  # directory instead of file causes OSError on open()
+    assert _prior_submitted_order_rows(run_dir) == []
+
+
+def test_run_drift_check_with_drift(monkeypatch, tmp_path):
+    import scripts.drift_detection as dd
+    from run_dca import _run_drift_check
+    from scripts.drift_detection import DriftReport, SymbolDrift
+
+    report = DriftReport(
+        run_dir=str(tmp_path),
+        drift_detected=True,
+        affected_symbols=[
+            SymbolDrift(
+                symbol="AAPL",
+                expected_amount_usd=10.0,
+                auto_buy_signal=True,
+                suspected_cause="missing",
+            )
+        ],
+        run_suspected_cause="broker_error",
+        recommended_action="retry",
+        signals_present=True,
+        orders_present=True,
+        submitted_orders_empty=False,
+        raw_dir_present=True,
+        expected_symbol_count=1,
+        submitted_symbol_count=0,
+    )
+    monkeypatch.setattr(dd, "detect_drift", lambda run_dir: report)
+    slack_calls = []
+    monkeypatch.setattr(dd, "send_slack_alert", lambda rep, env_var: slack_calls.append((rep, env_var)))
+
+    result = _run_drift_check(tmp_path)
+    assert result is not None
+    assert (tmp_path / "drift_report.json").exists()
+    assert (tmp_path / "drift_report.md").exists()
+    assert len(slack_calls) == 1
+
+
+def test_redacted_strings_scrubs_account_shaped_values_in_persisted_placement_rows():
+    """2026-09-07 diagnostic S:ADP-05. raw/orders_after_place.json spreads the
+    broker's whole order dict per row; account identifiers echoed by the
+    broker were persisted verbatim under cron_tracking/ and synced onward."""
+    import json
+
+    from run_dca import _redacted_strings
+
+    rows = [
+        {
+            "ticker": "AAPL",
+            "order_id": "ORD-1",
+            "account_number": "123456789",
+            "account": "https://api.broker.example/accounts/123456789/",
+            "dollar_amount": 2.0,
+            "nested": {"note": "account_number=123456789"},
+            "tags": ["account_number: 123456789", 7],
+        }
+    ]
+    scrubbed = _redacted_strings(rows)
+    assert scrubbed[0]["ticker"] == "AAPL"
+    assert scrubbed[0]["dollar_amount"] == 2.0
+    assert scrubbed[0]["tags"][1] == 7
+    assert "123456789" not in json.dumps(scrubbed)
+    assert "123456789" in json.dumps(rows)  # the input is not mutated
+
+
+def test_redacted_strings_scrubs_account_shaped_dictionary_keys_too():
+    """Copilot review of PR #1394: only VALUES were scrubbed, so a broker
+    payload whose key carries the identifier ({"account_number=<n>": ...})
+    still leaked it into raw/orders_after_place.json."""
+    from run_dca import _redacted_strings
+
+    synthetic_account = "123456789"  # synthetic, allow-listed account-shaped value
+    scrubbed = _redacted_strings({f"account_number={synthetic_account}": {f"nested {synthetic_account}": "v"}})
+    assert synthetic_account not in repr(scrubbed)
+    assert len(scrubbed) == 1 and len(next(iter(scrubbed.values()))) == 1

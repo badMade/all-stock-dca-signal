@@ -17,6 +17,23 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     )
 
 
+# Environment variables whose values must never appear in this script's output.
+# The "Generate PR Review" step runs with GEMINI_API_KEY set, and a provider SDK
+# error can echo the request it made, query-string key included. GitHub masks a
+# registered secret in the job log, but only the exact registered string, so the
+# script redacts the value itself before printing (2026-09-07 diagnostic S:CI-03).
+_SECRET_ENV_VARS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
+
+
+def _redact_secrets(text: str) -> str:
+    """Return ``text`` with every configured provider key replaced by a marker."""
+    for name in _SECRET_ENV_VARS:
+        value = os.environ.get(name)
+        if value:
+            text = text.replace(value, "[REDACTED]")
+    return text
+
+
 def _emit_skipped_note(exc: Exception) -> None:
     """Log the underlying error and emit a clean skipped-review note (then exit 0).
 
@@ -24,7 +41,10 @@ def _emit_skipped_note(exc: Exception) -> None:
     ref, missing optional tooling, provider rate limits / outages) must not fail
     this check and block the pull request.
     """
-    print(f"Antigravity PR review skipped due to error: {exc}", file=sys.stderr)
+    print(
+        f"Antigravity PR review skipped due to error: {type(exc).__name__}: {_redact_secrets(str(exc))}",
+        file=sys.stderr,
+    )
     if _is_rate_limit_error(exc):
         print(
             "> ⚠️ Automated AI review was skipped because the model "
@@ -47,10 +67,9 @@ def _load_diff() -> "str | None":
 
       * set -- reads a precomputed diff file. This is the privileged
         workflow_run job's path: that job's checkout never touches PR code
-        (see antigravity-pr-review-post.yml's header), so there is no local
-        git history to diff against. The diff arrives as TEXT, computed
-        earlier by the unprivileged analyzer job and downloaded as an
-        artifact.
+        (see antigravity-pr-review-post.yml's header). Trusted consumer code
+        computes this file from the validated immutable base/head commits;
+        the analyzer's downloaded diff is diagnostic data only.
       * unset -- runs `git diff` against a live checkout, exactly as this
         script did before the two-workflow split. Kept for local/manual runs
         against a real PR checkout; nothing in the shipped workflows relies on

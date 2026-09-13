@@ -452,10 +452,13 @@ def extract_metrics(portfolio: "vbt.Portfolio", label: str = "") -> Dict:
     -------
     dict with the extracted metrics.
     """
+    p: Any = portfolio
     try:
-        stats = portfolio.stats()
+        stats = p.stats()
     except Exception as e:
         print(f"  [WARN] stats() failed for {label}: {e}")
+        stats = pd.Series(dtype=float)
+    if stats is None:
         stats = pd.Series(dtype=float)
 
     def _get(stat_name: str, default=np.nan):
@@ -473,7 +476,7 @@ def extract_metrics(portfolio: "vbt.Portfolio", label: str = "") -> Dict:
     sortino = _get("Sortino Ratio")
     if np.isnan(sortino):
         try:
-            returns = portfolio.returns()
+            returns = p.returns()
             neg_returns = returns[returns < 0]
             downside_std = neg_returns.std() * np.sqrt(252)
             ann_return = (1 + returns.mean()) ** 252 - 1
@@ -485,7 +488,7 @@ def extract_metrics(portfolio: "vbt.Portfolio", label: str = "") -> Dict:
     max_dd = _get("Max Drawdown [%]")
     if np.isnan(max_dd):
         try:
-            max_dd = portfolio.max_drawdown() * 100
+            max_dd = p.max_drawdown() * 100
         except Exception:
             max_dd = np.nan
 
@@ -493,8 +496,8 @@ def extract_metrics(portfolio: "vbt.Portfolio", label: str = "") -> Dict:
     cagr = _get("Annualized Return [%]")
     if np.isnan(cagr):
         try:
-            total_return = portfolio.total_return()
-            n_years = len(portfolio.returns()) / 252
+            total_return = p.total_return()
+            n_years = len(p.returns()) / 252
             cagr = ((1 + total_return) ** (1 / n_years) - 1) * 100 if n_years > 0 else np.nan
         except Exception:
             cagr = np.nan
@@ -511,7 +514,7 @@ def extract_metrics(portfolio: "vbt.Portfolio", label: str = "") -> Dict:
     total_trades = _get("Total Trades")
     if np.isnan(total_trades):
         try:
-            total_trades = portfolio.trades.count()
+            total_trades = p.trades.count()
         except Exception:
             total_trades = np.nan
 
@@ -602,7 +605,7 @@ def print_aggregate_metrics(results: List[Dict], title: str) -> None:
 
     numeric_keys = ["Sharpe", "Sortino", "MaxDD (%)", "CAGR (%)", "Calmar",
                     "Win Rate (%)", "Total Trades"]
-    aggregated: dict[str, Any] = {}
+    aggregated = {}
     for key in numeric_keys:
         vals = []
         for r in results:

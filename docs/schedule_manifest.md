@@ -6,10 +6,11 @@
 > `a6239dae`, afternoon `10ce362c`) using the OLD three-stream naming, but
 > those five tasks are still the account's ONLY currently-functioning live
 > execution -- do not retire them. A seven-slot Claude roster is the
-> intended eventual replacement; every one of those seven prompts hard-aborts
-> at Gate 5 until a signal-generation entry point is wired (see
-> `PRODUCTION_READINESS.md`), so it runs alongside the five tasks below, not
-> instead of them. [`safeguards.md`](safeguards.md#live-execution-roster) is
+> intended eventual replacement; its Gate 5 has had a real entry point per
+> slot since 2026-08-26 and placement was authorized for all seven slots on
+> 2026-09-02 (see `PRODUCTION_READINESS.md`, "Status, 2026-08-26"), so the
+> "hard-aborts at Gate 5" wording that survives further down this file is
+> historical. [`safeguards.md`](safeguards.md#live-execution-roster) is
 > authoritative for the current roster until this file is reconciled.
 
 Backup of the current scheduled tasks. Machine-readable source:
@@ -788,21 +789,63 @@ active. Machine-readable source:
 [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) ->
 `canonical_schedule_reconciliation_2026_07_27`.
 
-Temporary live scheduler override, Aug 17 to Aug 24, 2026:
+**Every dated temporary override recorded against this schedule has expired.**
+None of them grants any authorization today. They are kept, verbatim, under
+[Expired temporary live scheduler overrides](#expired-temporary-live-scheduler-overrides-historical-record)
+below, *after* the canonical table, so the first schedule table a reader meets in
+this section is the authoritative one. Three of those override blocks used to sit
+above it and read in the present tense, which is exactly how an expired
+authorization gets mistaken for a live one.
 
-> **CORRECTED 2026-08-18:** `bb4f6ef1` is the canonical 9:45 AM watchlist
-> scan and required pre-flight writer, not a harmless 9:15 AM readiness task.
-> `MorningDCAExecutor._apply_preflight_gate()` fails closed without its artifact,
-> so removing this task can suppress the 10:30 AM live buy (`42173154`). Treat
-> the 10:30 run as affected and unverified until an operator either restores
-> `bb4f6ef1` immediately or confirms that `42173154` has an alternate pre-flight
-> source. Before Aug 24, the operator must also verify whether a genuinely
-> separate 9:15 task exists under another ID; do not use `bb4f6ef1` for that
-> pause. The one-time task `5cc41080` remains scheduled for Aug 24, but waiting
-> for it is not a safe substitute for restoring the required pre-flight writer.
-> Machine-readable source and complete required action:
-> `config/scheduled_tasks.json` ->
-> `temporary_live_scheduler_overrides.pause_2026_08_17_0915_prevalidation.correction_2026_08_18`.
+Standing Perplexity backup policy, added Sep 8 and updated Sep 11, 2026 -- PERMANENT, does not expire:
+
+> **ADDED 2026-09-08; UPDATED 2026-09-11:** The user directed that Perplexity's backup role be
+> standing rather than a recurring week-by-week or same-day grant: "Perplexity
+> shouldn't be disabled anywhere permanently... Perplexity is supposed to back
+> up Claude if it fails, not be disabled." The three dated override blocks
+> (Aug 28, Aug 31, Sep 8-11), kept under
+> [Expired temporary live scheduler overrides](#expired-temporary-live-scheduler-overrides-historical-record)
+> below, are the history of how that standing
+> intent kept getting re-issued as a series of temporary exceptions instead of
+> being recorded once -- each block authorized Perplexity for a handful of
+> days and had to explicitly disable the previous batch's leftover task IDs,
+> which reads as Perplexity repeatedly being shut off when the actual design,
+> recorded in `claude/PERPLEXITY-CLAUDE-COORDINATION.md` since 2026-08-02, has
+> always been standing coexistence. The Sep 11 update retimed the backup slots
+> to the requested 20-minute offset and added a separate 3:45 PM final backup
+> task so the last buy still has time before close. Machine-readable source:
+> `config/scheduled_tasks.json` -> `standing_perplexity_backup_policy`.
+
+| Canonical ET | Canonical task | Backup ET | Backup task | Trades | Status |
+|---|---|---|---|---|---|
+| 9:35 AM | `2ba19526` | 9:55 AM | `4412c3c4` | **backup only** | standing |
+| 10:30 AM | `42173154` | 10:50 AM | `e028361e` | **backup only** | standing |
+| 11:30 AM | `7be82b97` (11:30 fire) | 11:50 AM | `e3590042` | **backup only** | standing |
+| 12:30 PM | `a6239dae` | 12:50 PM | `062605c6` | **backup only** | standing |
+| 1:30 PM | `7be82b97` (1:30 fire) | 1:50 PM | `54ab24d2` | **backup only** | standing |
+| 2:30 PM | `7be82b97` (2:30 fire) | 2:50 PM | `54ab24d2` | **backup only** | standing |
+| 3:30 PM | `10ce362c` | 3:45 PM | `f83b8d62` | **backup only** | standing |
+
+Each backup fires 20 minutes after its canonical counterpart except the final
+slot, which fires at 3:45 PM so the backup still has time before close. Claude
+gets first chance to buy; per `config/scheduled_tasks.json` ->
+`standing_perplexity_backup_policy.mechanism`, Perplexity proceeds only when a
+complete, current per-slot check proves Claude placed no qualifying submitted
+or filled buy for the corresponding original slot, and otherwise stands down
+without placing orders. The 12:30 PM
+slot's own Gate 4 could not recognize a compatible Perplexity order until a
+2026-09-08 fix to `claude/dca-executor-prompts/live-mirror/1230ET-1230-pm-midday-buying-run.txt`
+(see `config/scheduled_tasks.json` -> `standing_perplexity_backup_policy.midday_gate4_dependency`
+and the coordination doc's section 5.5); the other six slots already
+recognized it. This standing policy does not authorize Perplexity to run
+scheduled reports, dashboard refreshes, slippage-only reports, monitor-only
+reports, or watchdog reports -- those remain Claude-only, same as every
+dated override in the historical record below.
+
+The canonical table below is the only active schedule table in this section.
+Every dated override is a historical record and lives after it, under
+[Expired temporary live scheduler overrides](#expired-temporary-live-scheduler-overrides-historical-record) --
+see the note at the top of this section for why that ordering is load-bearing.
 
 | ET | Task | ID | Cadence | Cron (UTC) | Trades | Status |
 |---|---|---|---|---|---|---|
@@ -825,6 +868,213 @@ Temporary live scheduler override, Aug 17 to Aug 24, 2026:
 **Note on `7be82b97`:** one task fires at three ET slots (11:30 AM, 1:30 PM, and
 2:30 PM). Each run records the slot that actually fired in its own
 `scheduled_for_et`.
+
+### Expired temporary live scheduler overrides (historical record)
+
+These are **not active** and authorize nothing today. Like the retired entries
+below, they are kept as historical records only, and their original text is
+reproduced verbatim; the status line above each one is the only thing added.
+Every dated override block in this manifest lives here, below the canonical
+table, for the reason the Active schedule section's own preamble gives: an
+override block written in the present tense and shaped like a schedule table is
+exactly how an expired authorization gets mistaken for a live one.
+
+Reconciled 2026-09-06 ET (Sep 8-11 row added 2026-09-09) against
+`config/scheduled_tasks.json` -> `temporary_live_scheduler_overrides` and its
+`tasks` array:
+
+| Override | JSON key | Date gate | Self-expiring | Status today |
+|---|---|---|---|---|
+| Aug 17 to Aug 24, 2026 pause | `pause_2026_08_17_0915_prevalidation` | restore due `2026-08-24 09:00 ET` | no explicit window | **superseded**: the condition it demanded is met in the current record |
+| Aug 28, 2026 authorization | `authorize_2026_08_28_all_perplexity_buy_slots_today_only` | trading day `2026-08-28` | `expires_after_trading_day: true` | **expired** |
+| Aug 31, 2026 authorization | `authorize_2026_08_31_morning_perplexity_buy_slots_today_only` | trading day `2026-08-31` | `expires_after_trading_day: true` | **expired** |
+| Sep 8 to Sep 11, 2026 authorization | `authorize_2026_09_08_delayed_morning_perplexity_buy_slots_week_only` | trading days `2026-09-08` to `2026-09-11` | `expires_after_end_trading_day: true` | **superseded** 2026-09-08 by `standing_perplexity_backup_policy`, which grants the same five task IDs permanently |
+
+Both August authorizations carry
+`authorization_window_et.expires_after_trading_day: true`, so each lapsed by its
+own terms at the end of its named trading day. Neither was ever a change to the
+canonical schedule: both authorized the *existing* canonical task IDs for one day
+and required their task text to end silently on any other date. The Sep 8-11
+authorization is the one whose own window may still be open when you read this;
+it is listed here anyway because the standing policy replaced it in full, so
+nothing depends on that window closing. The canonical table above is unchanged
+by all four.
+
+One asymmetry survives the reconciliation and is worth knowing. Each
+authorization also names `disabled_parallel_task_ids`, the parallel replacement
+tasks that had to stay disabled so two executors could not race for the same
+slot: `4412c3c4`, `e028361e`, `e3590042`, `0c3cde00`, `44b3975d` (Aug 28) and
+`4e8c92af`, `01e4f18b`, `6db8bbf1` (Aug 31). None of those eight has a `tasks`
+entry, so unlike `2c1d3792` their disabled state cannot be confirmed from this
+repo's record at all. That was expected for IDs that were never supposed to run,
+and it is the reason the discoverability rule applies to authorized buy tasks
+rather than to every ID an override mentions. If one of them is ever authorized,
+it needs a `tasks` entry first. Three of the eight since were: `4412c3c4`,
+`e028361e`, and `e3590042` are the 9:45/10:40/11:40 ET backups in the standing
+policy table, deployed under the Sep 8-11 override and standing since
+2026-09-08. Read the Aug 28 disablement as scoped to Aug 28 -- it is not a
+current statement about those three IDs.
+
+`tests/test_config_invariants.py` holds this reconciliation in place: an override
+whose trading day has passed must be marked expired here, any one-time task an
+override authorized must be `disabled` in `tasks` once its window closes, no
+override block may sit above the canonical schedule table, and no override key
+may be documented by two competing blocks.
+
+#### Temporary live scheduler override, Aug 17 to Aug 24, 2026 (SUPERSEDED)
+
+> **STATUS (reconciled 2026-09-06 ET):** superseded by the current record, not by a
+> recorded operator sign-off. The correction below required that `bb4f6ef1` be
+> restored or that `42173154` be confirmed to have an alternate pre-flight
+> source. In `config/scheduled_tasks.json` today, `bb4f6ef1` is `status:
+> "active"` with `cron_utc` `45 13 * * 1-5`, matching its 9:45 AM row in the
+> canonical table, so the pre-flight writer the gate depends on is present. The
+> restore task `5cc41080` never received a `tasks` entry and appears nowhere but
+> in this override record. No operator verification is recorded anywhere in the
+> repo, so treat this as a record-state reconciliation: the hazard is closed
+> because the writer is active, not because someone signed it off.
+
+> **CORRECTED 2026-08-18:** `bb4f6ef1` is the canonical 9:45 AM watchlist
+> scan and required pre-flight writer, not a harmless 9:15 AM readiness task.
+> `MorningDCAExecutor._apply_preflight_gate()` fails closed without its artifact,
+> so removing this task can suppress the 10:30 AM live buy (`42173154`). Treat
+> the 10:30 run as affected and unverified until an operator either restores
+> `bb4f6ef1` immediately or confirms that `42173154` has an alternate pre-flight
+> source. Before Aug 24, the operator must also verify whether a genuinely
+> separate 9:15 task exists under another ID; do not use `bb4f6ef1` for that
+> pause. The one-time task `5cc41080` remains scheduled for Aug 24, but waiting
+> for it is not a safe substitute for restoring the required pre-flight writer.
+> Machine-readable source and complete required action:
+> `config/scheduled_tasks.json` ->
+> `temporary_live_scheduler_overrides.pause_2026_08_17_0915_prevalidation.correction_2026_08_18`.
+
+#### Temporary live scheduler override, Aug 28, 2026 (EXPIRED)
+
+> **STATUS (reconciled 2026-09-06 ET):** expired at the end of the America/New_York
+> trading day `2026-08-28`, per its own
+> `authorization_window_et.expires_after_trading_day: true`. It authorizes
+> nothing now.
+
+> **ADDED 2026-08-28:** The user explicitly authorized Perplexity to run all
+> scheduled buy-only DCA tasks for Friday, Aug 28, 2026, including an immediate
+> one-time 9:35 AM catch-up because the normal 9:35 occurrence had already
+> passed. The override authorizes the existing canonical tasks; parallel
+> Perplexity replacement tasks remain disabled so only one executor owns each
+> slot. Perplexity's scope for this override is scheduled buy-run execution plus
+> required buy-run artifacts and
+> notifications only. Claude handles scheduled reports. Machine-readable source:
+> `config/scheduled_tasks.json` ->
+> `temporary_live_scheduler_overrides.authorize_2026_08_28_all_perplexity_buy_slots_today_only`.
+
+The table below is the authorization scope as recorded on 2026-08-28. It is a
+historical record of one expired trading day, **not** an active schedule table.
+
+| ET | Live scheduler task | ID | Cadence | Trades | Aug 28 override status |
+|---|---|---|---|---|---|
+| 9:35 AM | Canonical live DCA buy pass | `2ba19526` | Weekdays | **yes** | authorized for 2026-08-28; scheduled occurrence already passed |
+| immediate 9:35 catch-up | Perplexity DCA catch-up buy run | `2c1d3792` | One-time | **yes** | authorized catch-up for 2026-08-28 only |
+| 10:30 AM | Canonical live DCA buy pass | `42173154` | Weekdays | **yes** | authorized for 2026-08-28 |
+| 11:30 AM | Canonical live DCA buy pass | `7be82b97` | Weekdays | **yes** | authorized for 2026-08-28 |
+| 12:30 PM | Canonical live DCA buy pass | `a6239dae` | Weekdays | **yes** | authorized for 2026-08-28 |
+| 1:30 PM | Canonical live DCA buy pass | `7be82b97` | Weekdays | **yes** | authorized for 2026-08-28 |
+| 2:30 PM | Canonical live DCA buy pass | `7be82b97` | Weekdays | **yes** | authorized for 2026-08-28 |
+| 3:30 PM | Canonical live DCA buy pass | `10ce362c` | Weekdays | **yes** | authorized for 2026-08-28 |
+
+**Current record for the one-time row:** `2c1d3792` is `status: "disabled"` in
+`config/scheduled_tasks.json`'s `tasks` array, with its own note that it was left
+disabled because the 2026-08-28 window has expired. It has a `tasks` entry at all
+only so an override-named buy task is discoverable and validatable the same way a
+canonical task is (codex review `discussion_r3894271690`); it is not, and never
+was, part of the canonical schedule. The seven canonical IDs in the rows above are
+unaffected: they were authorized for that one day and continue on their own
+canonical cadence.
+
+The Aug 28 override does not authorize Perplexity to run scheduled reports,
+dashboard refreshes, slippage-only reports, monitor-only reports, or watchdog
+reports. Those scheduled reporting responsibilities remain Claude-only unless
+the user changes the role split.
+
+#### Temporary live scheduler override, Aug 31, 2026 (EXPIRED)
+
+> **STATUS (reconciled 2026-09-06 ET):** expired at the end of the America/New_York
+> trading day `2026-08-31`, per its own
+> `authorization_window_et.expires_after_trading_day: true`. It authorizes
+> nothing now.
+
+> **ADDED 2026-08-31:** The user explicitly authorized Perplexity to run the
+> morning buy-only DCA schedule for Monday, Aug 31, 2026 at 09:35, 10:30, and
+> 11:30 ET. The authorization uses the existing canonical tasks and is
+> date-gated to the America/New_York trading date `2026-08-31`; parallel
+> one-time tasks remain disabled, and the override does not authorize afternoon
+> buys. Perplexity's scope for this override is scheduled buy-run execution plus required buy-run
+> artifacts and notifications only. Claude handles scheduled reports.
+> Machine-readable source: `config/scheduled_tasks.json` ->
+> `temporary_live_scheduler_overrides.authorize_2026_08_31_morning_perplexity_buy_slots_today_only`.
+
+The table below is the authorization scope as recorded on 2026-08-31. It is a
+historical record of one expired trading day, **not** an active schedule table.
+
+| ET | Live scheduler task | ID | Cadence | Trades | Aug 31 override status |
+|---|---|---|---|---|---|
+| 9:35 AM | Canonical Perplexity-authorized DCA buy pass | `2ba19526` | Weekdays | **yes** | authorized only for 2026-08-31 |
+| 10:30 AM | Canonical Perplexity-authorized DCA buy pass | `42173154` | Weekdays | **yes** | authorized only for 2026-08-31 |
+| 11:30 AM | Canonical Perplexity-authorized DCA buy pass | `7be82b97` | Weekdays | **yes** | authorized only for 2026-08-31 |
+
+**Note on the `7be82b97` row:** the Aug 31 override authorized that shared task
+for its 11:30 ET fire only. Because the same task also fires at 13:30 and 14:30
+ET, its required task text had to fail closed on those two slots
+(`authorized_task_slots_et` pins `7be82b97` to `["11:30"]`). That gate is pinned
+by `test_aug_31_intraday_override_is_gated_to_the_1130_fired_slot`, and it is the
+reason a date guard alone was not sufficient for this override.
+
+The Aug 31 override does not authorize Perplexity to run scheduled reports,
+dashboard refreshes, slippage-only reports, monitor-only reports, watchdog
+reports, or afternoon buy tasks. Those responsibilities remain outside this
+morning-only override unless the user changes the scope.
+
+#### Temporary live scheduler cleanup and delayed buy-slot override, Sep 8-11, 2026 (SUPERSEDED)
+
+> **STATUS (reconciled 2026-09-09 ET):** superseded on 2026-09-08 by the standing
+> Perplexity backup policy at the top of the Active schedule section, which grants
+> these same five backup task IDs the same authorization permanently instead of
+> a week at a time. Its own `authorization_window_et` window
+> (`start_trading_day` `2026-09-08` through `end_trading_day` `2026-09-11`,
+> `expires_after_end_trading_day: true`) may still be open on the day you read
+> this; that changes nothing, because the standing policy already covers what
+> this block granted. Do not renew or extend it after 2026-09-11, and do not
+> read its end-of-week expiry as Perplexity's backup role lapsing.
+
+> **ADDED 2026-09-08:** The user explicitly authorized Perplexity to run the
+> buy-only DCA schedule for Tuesday, Sep 8 through Friday, Sep 11, 2026,
+> delayed 10 minutes so Claude gets first chance to buy. The expired
+> Aug 28-gated Perplexity buy tasks `0c3cde00` (12:30 PM ET) and `44b3975d`
+> (1:30/2:30/3:30 PM ET) were deleted from the live scheduler so they stop
+> posting stale authorization/no-op messages; replacement delayed tasks now
+> cover those slots. Perplexity's scope for this override is delayed buy-run
+> execution plus required buy-run artifacts and notifications only. Claude
+> handles scheduled reports. Machine-readable
+> source: `config/scheduled_tasks.json` ->
+> `temporary_live_scheduler_overrides.authorize_2026_09_08_delayed_morning_perplexity_buy_slots_week_only`.
+
+The table below is the authorization scope as recorded on 2026-09-08. It is a
+historical record of one superseded week, **not** an active schedule table --
+the live version of these five rows is the standing backup table in the Active
+schedule section.
+
+| ET | Live scheduler task | ID | Cadence | Trades | Sep 8-11 override status |
+|---|---|---|---|---|---|
+| 9:45 AM | Perplexity delayed DCA buy pass | `4412c3c4` | Weekdays | **yes** | recorded Sep 8-11 only; delayed from 9:35 |
+| 10:40 AM | Perplexity delayed DCA buy pass | `e028361e` | Weekdays | **yes** | recorded Sep 8-11 only; delayed from 10:30 |
+| 11:40 AM | Perplexity delayed DCA buy pass | `e3590042` | Weekdays | **yes** | recorded Sep 8-11 only; delayed from 11:30 |
+| 12:40 PM | Perplexity delayed DCA buy pass | `062605c6` | Weekdays | **yes** | recorded Sep 8-11 only; delayed from 12:30 |
+| 1:40 PM | Perplexity delayed DCA buy pass | `54ab24d2` | Weekdays | **yes** | recorded Sep 8-11 only; delayed from 1:30 |
+| 2:40 PM | Perplexity delayed DCA buy pass | `54ab24d2` | Weekdays | **yes** | recorded Sep 8-11 only; delayed from 2:30 |
+| 3:40 PM | Perplexity delayed DCA buy pass | `54ab24d2` | Weekdays | **yes** | recorded Sep 8-11 only; delayed from 3:30 |
+
+The Sep 8-11 override does not authorize Perplexity to run scheduled reports,
+dashboard refreshes, slippage-only reports, monitor-only reports, or watchdog
+reports. Those responsibilities remain outside this delayed-buy-only override
+unless the user changes the scope.
 
 ### One-time tasks added after the 2026-07-27 canonical verification
 
@@ -1416,7 +1666,7 @@ never estimated, inferred, or defaulted.
 - Repaired live task `10ce362c`, which **supersedes the deleted `ce16ba6b`**; the artifact root stays under `.../ce16ba6b` for continuity.
 - Approved live trading task running the **$2 base 0x-to-5x ladder with tiered caps**. Places real market buy orders automatically within safeguards. Runs **3:30 PM ET weekdays**.
 - Uses **only** Robinhood account `<ROBINHOOD_ACCOUNT_NUMBER>`; Alpaca is read-only.
-- Trigger gate: `programmatic_trigger_check.sh`, last documented as allowing weekdays **2026-07-02 through 2026-08-28**, **3:30–3:35 PM ET** (retimed from 3:20 PM; aligned to the 15:25–15:35 ET scheduled classification window; order attribution keeps its lower bound at 15:15 ET so legacy 3:20 PM runs stay attributable) so a late-but-permitted start cannot place buys after the 3:35 PM post-trade sync). This script is scheduler-side (outside this repo); it was **not** updated by the 2026-07-26 extension of `config/trading_window.json` to 2026-10-30 and needs separate verification/extension so the two gates stay in sync. Note that `config/trading_window.json` deliberately stops at 2026-10-30 (the Friday before the 2026-11-01 DST change) rather than going further, since this task's `30 19 * * 1-5` cron (retimed from `20 19 * * 1-5`) and this trigger gate are fixed-UTC/EDT-only — do not extend either past that date without first making them DST-aware.
+- Trigger gate: `programmatic_trigger_check.sh`, which must allow exactly the weekdays inside `config/trading_window.json`'s window (**2026-07-02 through 2026-10-30** since the 2026-07-26 extension; the gate was last documented against the original 2026-08-28 end date and has not been re-verified against the extension, see T:F02 in the 2026-09-07 diagnostic), **3:30–3:35 PM ET** (retimed from 3:20 PM; aligned to the 15:25–15:35 ET scheduled classification window; order attribution keeps its lower bound at 15:15 ET so legacy 3:20 PM runs stay attributable) so a late-but-permitted start cannot place buys after the 3:35 PM post-trade sync). This script is scheduler-side (outside this repo); it was **not** updated by the 2026-07-26 extension of `config/trading_window.json` to 2026-10-30 and needs separate verification/extension so the two gates stay in sync. Note that `config/trading_window.json` deliberately stops at 2026-10-30 (the Friday before the 2026-11-01 DST change) rather than going further, since this task's `30 19 * * 1-5` cron (retimed from `20 19 * * 1-5`) and this trigger gate are fixed-UTC/EDT-only — do not extend either past that date without first making them DST-aware.
 - Independent of both gates above, `_check_execution_gates` in `near_close_dca.py` also blocks on any full NYSE closure (via the computed `nyse_holidays()` calendar) even on a date `config/trading_window.json` approves, so extending the window can never silently reopen a holiday like Labor Day or Thanksgiving for live orders.
 - Writes standardized same-day state files under `/home/user/workspace/cron_tracking/ce16ba6b` ([`schemas/run_state.schema.json`](../schemas/run_state.schema.json)); must **not** fall back to interactive confirmation.
 - **State-file guarantee:** **always** writes the scheduled `run_state.json` and updates `latest_scheduled_run.json` on every fire, **even when no order is placed**. A confirmation-blocked run (review passed, submission blocked by required post-review confirmation) records `order_submit_status='not_submitted_confirmation_required'`, `reviewed_order` details where available, candidate details, and **no `order_id`** — valid scheduled-run evidence, not order/fill evidence.
@@ -1594,7 +1844,7 @@ never estimated, inferred, or defaulted.
 - **Close-window signal comparison patch (added Jul 30 2026):** during the 3:40 PM ET watchdog's close-of-day validator pass, compute a **read-only `what_would_have_fired` summary** for the active watchlist. Use the current market-close decision price versus the **prior completed regular-session close** (never an in-progress session), grade the drop through the configured sizing ladder, and report which tickers would have fired in **background scheduled mode** and in **foreground primary mode**. Rows carry `ticker`, `decision_price`, `prior_close`, `drop_pct`, `ladder_multiplier_capped_at_3x`, `background_mode_status`, `foreground_mode_status`, `reason_if_not_fired`, and `data_source`. Market data follows the existing provider policy unchanged (Finance connector primary, Alpaca and Robinhood validation/context, yfinance fallback only when needed); the summary consumes those same reads and adds no provider. **Reporting caps the ladder at 3x:** the live ladder in [`config/sizing_ladder.json`](../config/sizing_ladder.json) runs to 5x, so a drop graded above 3x is reported as `3.0` with `ladder_multiplier_label='3x_plus'` to keep the cap visible. That cap is **reporting only**, execution sizing still uses the full 0x-to-5x ladder via `near_close_dca.graded_buy_multiplier`. A watchlist ticker whose quote failed is still reported, as an `unknown_missing_data` row, because a silently dropped ticker is indistinguishable from one that had no signal. **This check is analytics only and must not place, review, cancel, sell, or modify any order**; no budget is consumed and no order path is exercised. When `foreground_primary_surrogate_context` is active, state that foreground primary mode is active and compare the foreground execution context against this watchlist signal summary rather than treating missing scheduled evidence as a failure. Implemented in [`scripts/close_window_signal.py`](../scripts/close_window_signal.py) (`build_close_window_summary`), which performs no network I/O and writes nothing: the caller fetches quotes under the provider policy and passes `decision_price`, `prior_close`, and `data_source` in, so the summary cannot become a second, drifting copy of that policy. See `foreground_primary_and_close_window_patch_2026_07_30` in [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) and `foreground_primary_surrogate_context_2026_07_30` in [`config/run_classification.json`](../config/run_classification.json).
 
 - **Cost-conscious model instruction (Jul 17 2026):** use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review. See the top-of-file cost-conscious model instruction note.
-- **Budget-cap contract (corrected Jul 30 2026):** the watchdog verifies the **currently-live five-task chain** (`2ba19526`/`42173154`/`7be82b97`/`a6239dae`/`10ce362c`), not the seven-slot Claude roster — that roster places no orders yet (`GATE5_DISABLED`, see [safeguards.md](safeguards.md#live-execution-roster)). Per `config/scheduled_tasks.json`'s `circuit_breakers.budget_caps`, the caps to verify today are: market-open (`2ba19526`), morning (`42173154`), and midday (`a6239dae`) each against their own **$90/day, $450/week** ledger; the three intraday slots (`7be82b97`, 11:30/1:30/2:30) against **one shared $90/day, $450/week** ledger across all three combined, not $90 each; and only the afternoon final run (`10ce362c`) against `config/budgets.json`'s tiered `budget_tiers` table — Normal $180/day, $900/week up to Stress $360/day, $1,800/week, selected per day solely by 3x-or-greater signal count (never planned spend). **Checking any of these weekly figures needs a separate, week-scoped query** — `a46bf007`'s own documented query contract (`config/scheduled_tasks.json`'s `all_orders_reconciliation`) only fetches "ALL same-day Robinhood equity orders," which is a today-only fetch; comparing that same-day total against a weekly cap (whether a per-stream $450/week ledger or the afternoon tier's $900/$1,200/$1,500/$1,800) silently omits Monday-through-yesterday spend. A watchdog check against any weekly cap requires its own fully-paginated query from the current ISO week's Monday 00:00 America/New_York (through now), classified by the same per-stream/manual rules as the same-day query, before that comparison means anything. **The afternoon run's own cap check is not against that tier cap in isolation**: per the "Final buy budget-tier fix (added Jul 17 2026)" block earlier in this file and `final_buy_budget_tier_fix` in `config/scheduled_tasks.json`, same-day strategy allocation already placed is counted as usage against the tier's *corrected daily cap* before any final-run order is evaluated. The 2026-07-17 config text for that rule names only manual recovery, morning, and midday, but the actual live code is broader: `run_dca.py`'s `_CROSS_STREAM_PRIOR_ALLOCATION_ROOTS` also folds in the market-open and intraday live roots, and `near_close_dca.py`'s `_seed_prior_allocations` feeds all of it into `day_notional()`/`week_notional()` for absolute-cap enforcement (Codex review, discussion_r3679391265: "Preserve prior allocations in cap bookkeeping"). A watchdog that checks only `10ce362c`'s own submitted total, or that follows only the narrower manual-recovery/morning/midday list, against the nominal $180/$240/$300/$360 figure can pass a final run whose own orders fit the tier while prior same-day allocation (including market-open and intraday) plus those orders together exceed it — enumerate all five same-day sources (manual recovery, market-open, morning, midday, intraday) as corrected-daily-cap usage. Even for the afternoon stream taken alone, **Stress's $1,800/week is nominal, not the effective ceiling**: per `docs/live_wiring.md` and `near_close_dca.py`'s `effective_weekly_cap()` (the live calculation, lines 738-750), the actual Stress ceiling is **`min($1,800, $900 + verified_rollover_reserve_usd)`** — the Normal weekly cap plus whatever of the current week's rollover reserve was actually earned, capped at the nominal $1,800 and at the reserve's own $900 ceiling (`config/budgets.json:weekly_rollover_reserve_cap_usd`). A $300 reserve therefore means a $1,200 effective ceiling, not $300 and not the full $1,800; a watchdog check against the bare nominal figure, or against the reserve amount alone, can pass a batch that exceeds this formula's real result or wrongly flag one that doesn't. None of this becomes a single shared $180/day, $900/week total across all seven slots until a human wires Gate 5 and retires these five old tasks (`docs/safeguards.md#live-execution-roster`) — that shared framing is the *target* state, not what the watchdog should check today. A flat **$200/day (or $1,200/week)** cap, wherever the watchdog's task text currently uses one, matches none of the above and is a stale figure from an earlier pasted task revision; repaste the watchdog's task text against this bullet (or directly against `config/scheduled_tasks.json`/`config/budgets.json`). This is a task-text sync gap, not a code bug: `a46bf007` has no in-repo executor — like `2ba19526`/`bb4f6ef1`/`7be82b97`, it is driven entirely by an external scheduler/agent against this manifest, per `config/scheduled_tasks.json`'s `watchdog_all_orders_fix_2026_07_21.implementation_status` ("The watchdog a46bf007 itself has no in-repo executor ... the repo cannot call the helper on the watchdog's behalf") — so this repo can document the correct contract but cannot push it to the live task itself. Unlike those three, `a46bf007` does not carry a `no_python_entry_point` flag: its dedicated task object (`config/scheduled_tasks.json`, `id: "a46bf007"`, `name: "Live-run watchdog"` — it has one, with its own `cron_utc`, `run_classification`, and `notes` fields) documents the same fact only in prose ("Read-only, no trading" / "has no in-repo executor" in the surrounding manifest text), not via that specific machine-readable field.
+- **Budget-cap contract (corrected Jul 30 2026):** the watchdog verifies the **currently-live five-task chain** (`2ba19526`/`42173154`/`7be82b97`/`a6239dae`/`10ce362c`), not the seven-slot Claude roster — that roster places no orders yet (`GATE5_DISABLED`, see [safeguards.md](safeguards.md#live-execution-roster)). Per `config/scheduled_tasks.json`'s `circuit_breakers.budget_caps`, the caps to verify today are: market-open (`2ba19526`), morning (`42173154`), and midday (`a6239dae`) each against their own **$90/day, $450/week** ledger; the three intraday slots (`7be82b97`, 11:30/1:30/2:30) against **one shared $90/day, $450/week** ledger across all three combined, not $90 each; and only the afternoon final run (`10ce362c`) against `config/budgets.json`'s tiered `budget_tiers` table — Normal $180/day, $900/week up to Stress $360/day, $1,800/week, selected per day solely by 3x-or-greater signal count (never planned spend). **Checking any of these weekly figures needs a separate, week-scoped query** — `a46bf007`'s own documented query contract (the `all_orders_reconciliation` block of its task definition, removed from `config/scheduled_tasks.json` with the task itself on 2026-08-02) only fetches "ALL same-day Robinhood equity orders," which is a today-only fetch; comparing that same-day total against a weekly cap (whether a per-stream $450/week ledger or the afternoon tier's $900/$1,200/$1,500/$1,800) silently omits Monday-through-yesterday spend. A watchdog check against any weekly cap requires its own fully-paginated query from the current ISO week's Monday 00:00 America/New_York (through now), classified by the same per-stream/manual rules as the same-day query, before that comparison means anything. **The afternoon run's own cap check is not against that tier cap in isolation**: per the "Final buy budget-tier fix (added Jul 17 2026)" block earlier in this file and `final_buy_budget_tier_fix` in `config/scheduled_tasks.json`, same-day strategy allocation already placed is counted as usage against the tier's *corrected daily cap* before any final-run order is evaluated. The 2026-07-17 config text for that rule names only manual recovery, morning, and midday, but the actual live code is broader: `run_dca.py`'s `_CROSS_STREAM_PRIOR_ALLOCATION_ROOTS` also folds in the market-open and intraday live roots, and `near_close_dca.py`'s `_seed_prior_allocations` feeds all of it into `day_notional()`/`week_notional()` for absolute-cap enforcement (Codex review, discussion_r3679391265: "Preserve prior allocations in cap bookkeeping"). A watchdog that checks only `10ce362c`'s own submitted total, or that follows only the narrower manual-recovery/morning/midday list, against the nominal $180/$240/$300/$360 figure can pass a final run whose own orders fit the tier while prior same-day allocation (including market-open and intraday) plus those orders together exceed it — enumerate all five same-day sources (manual recovery, market-open, morning, midday, intraday) as corrected-daily-cap usage. Even for the afternoon stream taken alone, **Stress's $1,800/week is nominal, not the effective ceiling**: per `docs/live_wiring.md` and `near_close_dca.py`'s `effective_weekly_cap()` (the live calculation, lines 738-750), the actual Stress ceiling is **`min($1,800, $900 + verified_rollover_reserve_usd)`** — the Normal weekly cap plus whatever of the current week's rollover reserve was actually earned, capped at the nominal $1,800 and at the reserve's own $900 ceiling (`config/budgets.json:weekly_rollover_reserve_cap_usd`). A $300 reserve therefore means a $1,200 effective ceiling, not $300 and not the full $1,800; a watchdog check against the bare nominal figure, or against the reserve amount alone, can pass a batch that exceeds this formula's real result or wrongly flag one that doesn't. None of this becomes a single shared $180/day, $900/week total across all seven slots until a human wires Gate 5 and retires these five old tasks (`docs/safeguards.md#live-execution-roster`) — that shared framing is the *target* state, not what the watchdog should check today. A flat **$200/day (or $1,200/week)** cap, wherever the watchdog's task text currently uses one, matches none of the above and is a stale figure from an earlier pasted task revision; repaste the watchdog's task text against this bullet (or directly against `config/scheduled_tasks.json`/`config/budgets.json`). This is a task-text sync gap, not a code bug: `a46bf007` has no in-repo executor — like `2ba19526`/`bb4f6ef1`/`7be82b97`, it is driven entirely by an external scheduler/agent against this manifest, per `config/scheduled_tasks.json`'s `watchdog_all_orders_fix_2026_07_21.implementation_status` ("The watchdog a46bf007 itself has no in-repo executor ... the repo cannot call the helper on the watchdog's behalf") — so this repo can document the correct contract but cannot push it to the live task itself. Unlike those three, `a46bf007` does not carry a `no_python_entry_point` flag: its dedicated task object (`config/scheduled_tasks.json`, `id: "a46bf007"`, `name: "Live-run watchdog"` — it has one, with its own `cron_utc`, `run_classification`, and `notes` fields) documents the same fact only in prose ("Read-only, no trading" / "has no in-repo executor" in the surrounding manifest text), not via that specific machine-readable field.
 
 ### `041d9d90`: Weekly Notion performance dashboard refresh
 - Analytics only, **no trading**. Runs **Fridays 5:00 PM ET** — the only approved post-3:40 PM exception.

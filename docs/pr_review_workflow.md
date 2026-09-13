@@ -11,7 +11,8 @@ Two workflow files implement the automated Antigravity PR review:
   Review (Post)") -- privileged, triggered on `workflow_run` when the analyze
   workflow completes. Holds `GEMINI_API_KEY` and `pull-requests: write`.
   Validates that the triggering run is genuinely what it claims to be, then
-  downloads the diff artifact, generates the review, and posts the comment.
+  cross-checks artifact metadata, computes its own diff from the validated
+  immutable base/head commits, generates the review, and posts the comment.
 
 ## Why two workflows
 
@@ -48,7 +49,9 @@ it just changes what has to be verified:
    job's checkout step has no `ref:` at all -- omitting it checks out
    `github.sha`, which for a `workflow_run` event is the default branch's
    current commit. The PR still reaches this job, but only as the diff
-   **text**, downloaded as an artifact, never as code that gets executed.
+   **text**, computed from fetched commit objects, never as code that gets
+   executed. The full-history fetch uses checkout's ephemeral authentication;
+   `persist-credentials: false` still removes that authentication afterward.
 2. **The triggering run's identity must be validated, not assumed.** The
    `workflows:` filter on the trigger restricts by name at GitHub's level, but
    the job re-validates explicitly: the triggering workflow's name, that its
@@ -56,11 +59,17 @@ it just changes what has to be verified:
    this repository (not a fork), and that it has an associated PR. Any
    failure here is logged per-check and fails the job (`validate-provenance`
    in the workflow file).
-3. **A downloaded artifact must be checked against what was validated.**
+3. **A downloaded artifact cannot establish which code was reviewed.**
    `actions/download-artifact` fetches by run ID; the job cross-checks the
-   artifact's own recorded PR number and head SHA against the validated
-   values before trusting its contents, so an artifact from the wrong run
-   (or a malformed one) is caught rather than silently used.
+   artifact's own recorded PR number, head SHA, and base SHA against the
+   validated values, catching wrong-run or malformed metadata. The analyzer
+   can still substitute arbitrary diff text with correct metadata. Trusted
+   consumer code therefore validates both SHAs as available commit objects
+   and computes its own diff into `trusted_review_input/diff.patch`, which
+   is the reviewer's only workflow input. The downloaded diff remains
+   diagnostic data. Both paths use explicit base/head SHAs, with a two-dot
+   fallback only for disconnected histories. External diff programs and
+   text conversion are disabled; no PR code is checked out or executed.
 
 `scripts/tests/test_pr_review_workflow_trust_boundary.py` encodes all three of
 these as structural assertions against the workflow YAML -- not just that the
@@ -70,12 +79,11 @@ naming the specific thing that drifted, if any of them regress.
 
 ## Bootstrapping note
 
-`workflow_run` only fires for a consumer workflow that already exists on the
-default branch. Until the two-workflow split itself is merged, the privileged
-post-workflow will not run for PRs against this branch -- the analyze
-workflow still runs and uploads artifacts, but nothing consumes them yet. This
-is expected, not a regression: the same PR that introduces this split cannot
-receive a privileged review of itself.
+The two-workflow split is live on the default branch (see
+`.github/workflows/antigravity-pr-review.yml`'s own header), so the privileged
+post-workflow now runs for every PR. `workflow_run` only fires for a consumer
+workflow that already exists on the default branch, which is why the PR that
+introduced the split could not receive a privileged review of itself.
 
 ## Visible changes
 
@@ -88,6 +96,12 @@ receive a privileged review of itself.
   are all unchanged.
 
 ## Workflow policy checks
+
+The trusted reviewer install and CI dependency audit share
+`requirements-pr-review.txt`. The SDK remains exactly pinned; CI resolves
+and audits its full transitive graph for both supported Python versions
+alongside the research dependencies. Resolution disables source builds and
+does not run the reviewer SDK.
 
 `scripts/workflow_policy.py` statically enforces three org-wide policies
 against every file in `.github/workflows/*.yml`, run as ordinary pytest tests

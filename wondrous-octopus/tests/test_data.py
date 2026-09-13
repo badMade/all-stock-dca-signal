@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import data
 import numpy as np
 import pandas as pd
 import pytest
+
 import conftest
-import data
 
 make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
 write_ticker_csv = conftest.write_ticker_csv
@@ -31,13 +32,13 @@ class TestDiscoverAvailableTickers:
 
 class TestLoadHistoryCsv:
     def test_missing_required_column_raises(self, tmp_path):
-        path = tmp_path / "XXX.csv"
+        path = tmp_path / "DUMMY.csv"
         path.write_text("Date,Open,High,Low\n2021-01-04,1,2,0.5\n")
         with pytest.raises(ValueError, match="missing required column"):
             data.load_history_csv(path)
 
     def test_corrupt_rows_are_dropped_individually(self, tmp_path):
-        path = tmp_path / "XXX.csv"
+        path = tmp_path / "DUMMY.csv"
         path.write_text(
             "Date,Open,High,Low,Close\n"
             "2021-01-04,10,11,9,10.5\n"
@@ -49,7 +50,7 @@ class TestLoadHistoryCsv:
         assert [d.strftime("%Y-%m-%d") for d in frame["Date"]] == ["2021-01-04", "2021-01-07"]
 
     def test_duplicate_dates_keep_last_written_row(self, tmp_path):
-        path = tmp_path / "XXX.csv"
+        path = tmp_path / "DUMMY.csv"
         path.write_text(
             "Date,Open,High,Low,Close\n2021-01-04,10,11,9,10.0\n2021-01-04,10,12,9,11.0\n",
         )
@@ -58,7 +59,7 @@ class TestLoadHistoryCsv:
         assert frame.loc[0, "Close"] == 11.0
 
     def test_timezone_aware_dates_normalize_to_naive(self, tmp_path):
-        path = tmp_path / "XXX.csv"
+        path = tmp_path / "DUMMY.csv"
         path.write_text("Date,Open,High,Low,Close\n2021-01-04T00:00:00Z,10,11,9,10.0\n")
         frame = data.load_history_csv(path)
         assert getattr(frame["Date"].dt, "tz", None) is None
@@ -74,7 +75,7 @@ class TestLoadHistoryCsv:
         # WHOLE ticker, even though every row here is perfectly valid
         # (Codex review: "Parse DST-varying timezone offsets in one UTC
         # pass").
-        path = tmp_path / "XXX.csv"
+        path = tmp_path / "DUMMY.csv"
         path.write_text(
             "Date,Open,High,Low,Close\n"
             "2021-11-05T09:30:00-04:00,10,11,9,10.0\n"  # EDT, before the fall-back
@@ -96,7 +97,7 @@ class TestLoadHistoryCsv:
         # origins/queued reveals/training references by calendar day").
         # Normalizing here, the only place every row enters the system,
         # closes the whole bug class at its source.
-        path = tmp_path / "XXX.csv"
+        path = tmp_path / "DUMMY.csv"
         path.write_text("Date,Open,High,Low,Close\n2021-01-04T16:00:00,10,11,9,10.0\n")
         frame = data.load_history_csv(path)
         assert frame.loc[0, "Date"] == pd.Timestamp("2021-01-04")
@@ -107,7 +108,7 @@ class TestLoadHistoryCsv:
         # differ by time-of-day now collide -- confirm the existing
         # keep="last" contract still applies (deterministic on sort order),
         # not that they silently double the ticker's row count.
-        path = tmp_path / "XXX.csv"
+        path = tmp_path / "DUMMY.csv"
         path.write_text(
             "Date,Open,High,Low,Close\n"
             "2021-01-04T09:30:00,10,11,9,10.0\n"

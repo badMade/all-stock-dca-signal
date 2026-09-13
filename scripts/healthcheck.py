@@ -13,7 +13,7 @@ import tempfile
 
 def run_cmd(cmd):
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, shell=False)  # nosec B603 - explicit shell=False
         if result.returncode != 0:
             print(f"Command '{' '.join(cmd)}' failed with exit code {result.returncode}")
             if result.stdout.strip():

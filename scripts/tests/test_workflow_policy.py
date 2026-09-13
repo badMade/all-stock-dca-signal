@@ -14,6 +14,7 @@ Two kinds of test here, deliberately kept separate:
     exemption in a real file just to prove the escape hatch works.
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -94,6 +95,72 @@ def test_no_real_workflow_declares_a_policy_exception():
             f"{file} declares x-policy-exceptions; update this test to assert "
             "on the specific exception(s) once one is added deliberately"
         )
+
+
+def test_ci_audits_locked_and_independent_dependency_trees():
+    """CI must audit sibling dependencies without expanding self-heal's scope."""
+    root = Path(__file__).resolve().parents[2]
+    audit = REAL_DOCS[".github/workflows/ci.yml"]["jobs"]["research-audit"]
+    scope_check = next(
+        step for step in REAL_DOCS[".github/workflows/self-heal.yml"]["jobs"]["repair"]["steps"]
+        if step.get("id") == "scope_check"
+    )
+    match = re.search(r"grep -qE '([^']+)'", scope_check["run"])
+    assert match is not None
+    scope_pattern = match.group(1)
+    assert re.search(scope_pattern, "Dependency & secret audit")
+    assert re.search(scope_pattern, "Lint & test (core DCA) (3.12)")
+    assert not re.search(scope_pattern, f"{audit['name']} (3.11)")
+    assert not re.search(scope_pattern, f"{audit['name']} (3.12)")
+    assert set(audit["strategy"]["matrix"]["python-version"]) == {"3.11", "3.12"}
+    commands = "\n".join(step.get("run", "") for step in audit["steps"])
+    assert "uv export --locked --all-extras --no-emit-project" in commands
+    assert "pip-audit --locked" in commands
+    assert "uv pip compile" in commands and "--no-build" in commands
+    for manifest in (
+        "production-safe-agent-loop/requirements.txt",
+        "ticker-advisor/requirements.txt",
+        "ml-forecaster/requirements.txt",
+        "wondrous-octopus/requirements.txt",
+        "ticker-market-breadth/requirements.txt",
+        "trading-strategies/requirements.txt",
+        "analysis/market-graph-3d/requirements.txt",
+    ):
+        assert (root / manifest).is_file(), f"Missing documented install manifest: {manifest}"
+        assert manifest in commands, f"CI does not audit {manifest}"
+
+
+def test_ci_audits_the_same_exact_sdk_pin_the_privileged_reviewer_installs():
+    """Reviewer transitives must enter the audit through its actual install input."""
+    root = Path(__file__).resolve().parents[2]
+    manifest = "requirements-pr-review.txt"
+    review = REAL_DOCS[".github/workflows/antigravity-pr-review-post.yml"]["jobs"]["review"]
+    install = next(step for step in review["steps"] if step.get("name") == "Install Antigravity SDK")
+    assert f"pip install -r {manifest}" in install["run"]
+    pins = [line.strip() for line in (root / manifest).read_text().splitlines() if line.strip() and not line.startswith("#")]
+    assert len(pins) == 1 and re.fullmatch(r"google-antigravity==\d+(?:\.\d+)+", pins[0])
+    audit = REAL_DOCS[".github/workflows/ci.yml"]["jobs"]["research-audit"]
+    commands = "\n".join(step.get("run", "") for step in audit["steps"])
+    assert f"uv pip compile {manifest}" in commands
+    assert "pylock.pr-review.toml" in commands
+    assert commands.index(f"uv pip compile {manifest}") < commands.index("pip-audit --locked")
+
+
+def test_ci_runs_the_documented_market_breadth_suite():
+    """The breadth tool's independent test/lint gates must run in CI too."""
+    jobs = REAL_DOCS[".github/workflows/ci.yml"]["jobs"]
+    assert "ticker-market-breadth" in jobs
+    steps = jobs["ticker-market-breadth"]["steps"]
+    assert any(
+        step.get("working-directory") == "ticker-market-breadth"
+        and "python -m pytest tests/" in step.get("run", "")
+        for step in steps
+    )
+    assert any(
+        "ruff check --isolated --select=E,F,B --line-length=120 ticker-market-breadth"
+        in step.get("run", "")
+        for step in steps
+    )
 
 
 # --- Synthetic fixtures: the violation and exception mechanisms themselves ---

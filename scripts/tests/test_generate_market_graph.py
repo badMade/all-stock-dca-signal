@@ -72,8 +72,8 @@ def test_json_out_writes_a_schema_valid_payload(combined_csv, tmp_path):
     payload_path = tmp_path / "nested" / "payload.json"
     assert run(["--source", "csv", "--csv-path", str(combined_csv), "--out", str(out),
                 "--json-out", str(payload_path), "--no-inline-three"]) == 0
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    schema = json.loads((REPO_ROOT / "schemas" / "market_graph_payload.schema.json").read_text())
+    payload = json.loads(payload_path.read_bytes())
+    schema = json.loads((REPO_ROOT / "schemas" / "market_graph_payload.schema.json").read_bytes())
     jsonschema.validate(payload, schema)
 
 
@@ -83,7 +83,7 @@ def test_ticker_filter_and_date_window_are_applied(combined_csv, tmp_path):
                 "--tickers", "AAA", "--start", "2024-02-05", "--end", "2024-02-20",
                 "--out", str(tmp_path / "o.html"), "--json-out", str(payload_path),
                 "--no-inline-three"]) == 0
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    payload = json.loads(payload_path.read_bytes())
     assert [t for t in payload["tickers"] if not t.startswith("__")] == ["AAA"]
     assert payload["dates"][0] >= "2024-02-05"
     assert payload["dates"][-1] <= "2024-02-20"
@@ -118,7 +118,7 @@ def test_drawdown_window_sees_the_full_lookback_before_the_start_boundary(tmp_pa
                 "--start", "2024-02-06", "--drawdown-window", "20",
                 "--out", str(tmp_path / "o.html"), "--json-out", str(payload_path),
                 "--no-inline-three"]) == 0
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    payload = json.loads(payload_path.read_bytes())
     scale = payload["scales"]["pct_per_unit"]
     series = next(s for s in payload["series"] if s["ticker"] == "AAA")
     # payload channels are stored pre-divided by the shared scale (see build_payload's
@@ -179,7 +179,7 @@ def test_drawdown_window_excludes_a_ticker_with_no_bars_in_the_window(tmp_path):
                 "--start", "2024-02-05", "--drawdown-window", "20",
                 "--out", str(tmp_path / "o.html"), "--json-out", str(payload_path),
                 "--no-inline-three"]) == 0
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    payload = json.loads(payload_path.read_bytes())
     tickers = [t for t in payload["tickers"] if not t.startswith("__")]
     assert tickers == ["AAA"]
 
@@ -190,7 +190,7 @@ def test_single_mode_omits_the_centroid_and_switches_the_volume_scale(combined_c
                 "--tickers", "AAA",
                 "--out", str(tmp_path / "o.html"), "--json-out", str(payload_path),
                 "--no-inline-three"]) == 0
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    payload = json.loads(payload_path.read_bytes())
     assert "__MARKET__" not in payload["tickers"]
     assert payload["scales"]["volume"]["mode"] == "per_ticker_log"
     assert payload["whole_market"] is False
@@ -214,7 +214,7 @@ def test_trail_flag_reaches_the_payload(combined_csv, tmp_path):
     run(["--source", "csv", "--csv-path", str(combined_csv), "--trail", "42",
          "--out", str(tmp_path / "o.html"), "--json-out", str(payload_path),
          "--no-inline-three"])
-    assert json.loads(payload_path.read_text())["meta"]["default_trail"] == 42
+    assert json.loads(payload_path.read_bytes())["meta"]["default_trail"] == 42
 
 
 def test_group_source_none_skips_clustering(combined_csv, tmp_path):
@@ -222,7 +222,7 @@ def test_group_source_none_skips_clustering(combined_csv, tmp_path):
     run(["--source", "csv", "--csv-path", str(combined_csv), "--group-source", "none",
          "--out", str(tmp_path / "o.html"), "--json-out", str(payload_path),
          "--no-inline-three"])
-    payload = json.loads(payload_path.read_text())
+    payload = json.loads(payload_path.read_bytes())
     assert payload["grouping"]["source"] == "none"
     assert payload["grouping"]["clusters"] == []
 
@@ -239,7 +239,7 @@ def test_group_source_file_applies_a_supplied_grouping(combined_csv, tmp_path):
                 "--group-source", "file", "--groups-file", str(groups),
                 "--out", str(tmp_path / "o.html"), "--json-out", str(payload_path),
                 "--no-inline-three"]) == 0
-    payload = json.loads(payload_path.read_text())
+    payload = json.loads(payload_path.read_bytes())
     assert payload["grouping"]["source"] == "ml-forecaster"
     assert payload["grouping"]["clusters"][0]["label"] == "pair"
     assert payload["tickers"][:2] == ["BBB", "AAA"]
@@ -281,7 +281,7 @@ def test_run_dir_source_replays_persisted_broker_responses(tmp_path):
     assert run(["--source", "run-dir", "--run-dir", str(tmp_path / "run"),
                 "--out", str(tmp_path / "o.html"), "--json-out", str(payload_path),
                 "--no-inline-three"]) == 0
-    assert "AMD" in json.loads(payload_path.read_text())["tickers"]
+    assert "AMD" in json.loads(payload_path.read_bytes())["tickers"]
 
 
 # ---------------------------------------------------------------------------

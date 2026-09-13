@@ -24,7 +24,7 @@ import math
 import re
 import threading
 from datetime import date, datetime
-from typing import Any, Callable
+from typing import Any, Callable, Mapping, Sequence, cast
 
 import numpy as np
 import pandas as pd
@@ -147,7 +147,7 @@ def _beta_alpha(returns: pd.Series, benchmark: pd.Series, rf_daily: float) -> tu
     # summation, not a hard zero -- confirmed empirically, not a hypothetical.
     if bm_col.std(ddof=0) < _ZERO_VARIANCE_TOLERANCE:
         return float("nan"), float("nan")
-    regression = stats.linregress(bm_col, ret_col)
+    regression: Any = stats.linregress(bm_col, ret_col)
     slope = float(regression.slope)
     alpha_annualized = (ret_col.mean() - rf_daily - slope * (bm_col.mean() - rf_daily)) * TRADING_DAYS
     return slope, alpha_annualized
@@ -192,10 +192,10 @@ def generate_ma_crossover_signals(
     close: pd.Series, fast_window: int = 50, slow_window: int = 200
 ) -> tuple[pd.Series, pd.Series]:
     """Golden/death-cross entries and exits, boolean series aligned to ``close``."""
-    fast = close.rolling(fast_window).mean()
-    slow = close.rolling(slow_window).mean()
-    entries = (fast > slow) & (fast.shift(1) <= slow.shift(1))
-    exits = (fast < slow) & (fast.shift(1) >= slow.shift(1))
+    fast: pd.Series = cast(Any, close.rolling(fast_window).mean())
+    slow: pd.Series = cast(Any, close.rolling(slow_window).mean())
+    entries: pd.Series = (fast > slow) & (fast.shift(1) <= slow.shift(1))
+    exits: pd.Series = (fast < slow) & (fast.shift(1) >= slow.shift(1))
     return entries.fillna(False), exits.fillna(False)
 
 
@@ -203,9 +203,7 @@ def _wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     """Standard Wilder RSI, hand-rolled to avoid a pandas_ta dependency.
 
     (pandas_ta's current PyPI releases require Python >=3.12, an
-    unnecessary version constraint to take on for a ~10-line, well-known
-    formula that trading-strategies/backtest.py otherwise pulls the whole
-    library in for.)
+    unnecessary floor when the RSI formula is ~10 lines of pandas math.)
     """
     delta = close.diff()
     gain = delta.clip(lower=0.0)
@@ -224,26 +222,26 @@ def _wilder_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     avg_gain = np.full(len(close), np.nan)
     avg_loss = np.full(len(close), np.nan)
     if len(close) > period:
-        gain_values = gain.to_numpy()
-        loss_values = loss.to_numpy()
-        avg_gain[period] = np.nanmean(gain_values[1 : period + 1])
-        avg_loss[period] = np.nanmean(loss_values[1 : period + 1])
+        gain_values: np.ndarray = np.asarray(gain, dtype=float)
+        loss_values: np.ndarray = np.asarray(loss, dtype=float)
+        avg_gain[period] = float(np.nanmean(gain_values[1 : period + 1]))
+        avg_loss[period] = float(np.nanmean(loss_values[1 : period + 1]))
         for i in range(period + 1, len(close)):
             avg_gain[i] = (avg_gain[i - 1] * (period - 1) + gain_values[i]) / period
             avg_loss[i] = (avg_loss[i - 1] * (period - 1) + loss_values[i]) / period
-    avg_gain = pd.Series(avg_gain, index=close.index)
-    avg_loss = pd.Series(avg_loss, index=close.index)
+    avg_gain_s = pd.Series(avg_gain.tolist(), index=close.index)
+    avg_loss_s = pd.Series(avg_loss.tolist(), index=close.index)
 
-    relative_strength = avg_gain / avg_loss
-    rsi = 100.0 - (100.0 / (1.0 + relative_strength))
-    rsi = rsi.where(avg_loss != 0, 100.0)
+    relative_strength = avg_gain_s / avg_loss_s
+    rsi: pd.Series = cast(Any, 100.0 - (100.0 / (1.0 + relative_strength)))
+    rsi = rsi.where(avg_loss_s != 0, 100.0)
     # A fully flat window (no gains AND no losses) has no relative strength
     # at all -- 100.0 above is only correct for "gains with zero losses"
     # (strictly rising), not "nothing moved." Treat a flat window as neutral
     # rather than falsely overbought, or generate_rsi_reversion_signals would
     # fire spurious exit signals on a static price (Antigravity code review
     # on PR #403).
-    return rsi.where((avg_gain != 0) | (avg_loss != 0), 50.0)
+    return rsi.where((avg_gain_s != 0) | (avg_loss_s != 0), 50.0)
 
 
 def generate_rsi_reversion_signals(
@@ -274,9 +272,7 @@ def _portfolio_metrics(
     slippage: float,
     init_cash: float,
 ) -> dict[str, float]:
-    import importlib
-
-    vbt = importlib.import_module("vectorbt")
+    import vectorbt as vbt
 
     # entries/exits are computed from day T's close (a crossover or RSI
     # threshold that's only knowable once that close prints) -- pairing them
@@ -295,21 +291,21 @@ def _portfolio_metrics(
     # install (Codex review on PR #403: "Cast shifted signals back to
     # boolean"). Explicit astype(bool) keeps the dtype correct regardless of
     # pandas' downcast behavior.
-    entries = entries.shift(1).fillna(False).astype(bool)
-    exits = exits.shift(1).fillna(False).astype(bool)
+    entries_shifted = cast(pd.Series, entries.shift(1).fillna(False).astype(bool))
+    exits_shifted = cast(pd.Series, exits.shift(1).fillna(False).astype(bool))
 
-    portfolio = vbt.Portfolio.from_signals(
-        close, entries, exits, fees=commission, slippage=slippage, init_cash=init_cash, freq="1D"
+    portfolio: Any = vbt.Portfolio.from_signals(
+        close, entries_shifted, exits_shifted, fees=commission, slippage=slippage, init_cash=init_cash, freq="1D"
     )
 
-    def _safe(getter: Callable[[], Any]) -> float:
+    def _safe(getter: Callable[[], object]) -> float:
         # vectorbt's convenience metrics raise/warn on a portfolio with zero
         # trades rather than returning NaN outright, and the exact set of
         # available stat keys/methods has shifted across releases -- degrade
         # any single metric to NaN instead of failing the whole candidate.
         try:
             value = getter()
-            return float(value) if value is not None else float("nan")
+            return float(cast(Any, value)) if value is not None else float("nan")
         except Exception:
             return float("nan")
 
@@ -405,9 +401,11 @@ SEC_MAX_REQUESTS_PER_SECOND = 8.0
 # extract a bounded, tag-stripped snippet from it -- capped well short of
 # a full 10-K (often hundreds of KB) since only a representative excerpt is
 # needed for FinBERT sentiment, not the complete filing.
-_HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 _WHITESPACE_RUN_PATTERN = re.compile(r"\s+")
 _MAX_FILING_SNIPPET_CHARS = 4000
+_MAX_FILING_DOCUMENT_BYTES = 2 * 1024 * 1024
+_MAX_FILING_DOCUMENT_CHARS = 2 * 1024 * 1024
+_FILING_DOWNLOAD_CHUNK_BYTES = 64 * 1024
 # Modern filings are inline-XBRL: a <head> full of CSS/metadata and an
 # <ix:header> block of hidden tagged facts routinely precede the visible
 # narrative, and a naive strip-tags-then-truncate can consume the entire
@@ -415,14 +413,14 @@ _MAX_FILING_SNIPPET_CHARS = 4000
 # actual prose -- FinBERT would then score filing metadata, not filing
 # CONTENT, the same "score CONTENT, not metadata" line this module already
 # draws elsewhere (Codex review on PR #429: "Extract visible filing prose
-# before truncating"). DOTALL so ".*?" spans the (frequently multi-line)
-# block content; non-greedy so a document with more than one such block
-# doesn't collapse everything between the first open tag and the last close
-# tag of the same name into one match.
-_HTML_HIDDEN_BLOCK_PATTERN = re.compile(
-    r"<(script|style|head|ix:header)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL
+# before truncating"). Separate opening/closing scans avoid retrying a
+# whole-document wildcard at every unclosed tag, which is quadratic.
+_HTML_HIDDEN_TAG_PATTERNS = tuple(
+    (re.compile(rf"<{tag}\b", re.IGNORECASE), re.compile(rf"</{tag}\s*>", re.IGNORECASE))
+    for tag in ("script", "style", "head", "ix:header")
 )
-_HTML_BODY_PATTERN = re.compile(r"<body\b[^>]*>(.*)</body\s*>", re.IGNORECASE | re.DOTALL)
+_HTML_BODY_OPEN_PATTERN = re.compile(r"<body\b", re.IGNORECASE)
+_HTML_BODY_CLOSE_PATTERN = re.compile(r"</body\s*>", re.IGNORECASE)
 
 
 class _SecRateLimiter:
@@ -501,33 +499,90 @@ def _sec_filing_document_url(hit: dict, source: dict) -> str | None:
     return f"https://www.sec.gov/Archives/edgar/data/{cik_number}/{accession_no_nodash}/{filename}"
 
 
-def _extract_filing_snippet(raw_document: object) -> str | None:
+def _remove_hidden_filing_blocks(document: str) -> str:
+    """Remove complete hidden blocks in a fixed number of forward-only passes."""
+    for opening, closing in _HTML_HIDDEN_TAG_PATTERNS:
+        parts = []
+        cursor = 0
+        while match := opening.search(document, cursor):
+            tag_end = document.find(">", match.end())
+            if tag_end < 0:
+                break
+            end = closing.search(document, tag_end + 1)
+            if end is None:
+                # No later opener of this kind can have a closing tag either.
+                break
+            parts.extend((document[cursor:match.start()], " "))
+            cursor = end.end()
+        if cursor:
+            parts.append(document[cursor:])
+            document = "".join(parts)
+    return document
+
+
+def _strip_filing_tags(document: str) -> str:
+    """Strip the same <...> spans without rescanning every unmatched '<'."""
+    parts = []
+    cursor = 0
+    search_from = 0
+    while (start := document.find("<", search_from)) >= 0:
+        end = document.find(">", start + 1)
+        if end < 0:
+            break
+        search_from = end + 1
+        if end == start + 1:
+            continue  # The previous <[^>]+> pattern also preserved empty <>.
+        parts.extend((document[cursor:start], " "))
+        cursor = end + 1
+    parts.append(document[cursor:])
+    return "".join(parts)
+
+
+def _reject_filing_redirect(response, **_kwargs) -> None:
+    """Stop redirect bodies before Requests eagerly consumes them internally."""
+    if 300 <= response.status_code < 400:
+        response.close()
+        raise ValueError("SEC filing document redirect refused")
+
+
+def _extract_filing_snippet(raw_document: str) -> str | None:
     """Reduce a fetched filing document to a bounded, sentiment-scorable text snippet.
 
     Filing documents are HTML (occasionally plain text) and can run to
     hundreds of KB for a 10-K -- far more than FinBERT's tokenizer needs or
     a sentiment excerpt should require. Strips markup, collapses
-    whitespace, and caps the result well short of the full document.
+    whitespace, and caps the result well short of the full document. Refuses
+    oversized raw text before preprocessing, including injected documents.
     Returns None for a document that reduces to nothing usable (a blank
     document, or one that was entirely markup with no text content).
     """
     if not isinstance(raw_document, str):
         return None
+    if len(raw_document) > _MAX_FILING_DOCUMENT_CHARS:
+        raise ValueError(f"SEC filing document exceeds {_MAX_FILING_DOCUMENT_CHARS} character limit")
     # Drop <script>/<style>/<head>/<ix:header> blocks (content included, not
     # just the tags) before anything else -- otherwise their content would
     # still be present as plain text after generic tag-stripping below, and
     # could consume the truncation budget before any visible prose is
-    # reached (see the module-level comment on _HTML_HIDDEN_BLOCK_PATTERN).
-    without_hidden_blocks = _HTML_HIDDEN_BLOCK_PATTERN.sub(" ", raw_document)
+    # reached (see the module-level comment on _HTML_HIDDEN_TAG_PATTERNS).
+    without_hidden_blocks = _remove_hidden_filing_blocks(raw_document)
     # Prefer the <body> content specifically when present -- narrows to the
     # visible document even when boilerplate outside <body> (a <head> this
     # particular document didn't close properly, XML/DOCTYPE preamble)
     # wasn't already caught above. Falls back to the whole (already-
     # cleaned) document for a plain-text filing or a fragment with no
     # <body> tag at all.
-    body_match = _HTML_BODY_PATTERN.search(without_hidden_blocks)
-    visible_html = body_match.group(1) if body_match else without_hidden_blocks
-    without_tags = _HTML_TAG_PATTERN.sub(" ", visible_html)
+    visible_html = without_hidden_blocks
+    body_start = _HTML_BODY_OPEN_PATTERN.search(without_hidden_blocks)
+    if body_start is not None:
+        tag_end = without_hidden_blocks.find(">", body_start.end())
+        if tag_end >= 0:
+            body_end = None
+            for closing in _HTML_BODY_CLOSE_PATTERN.finditer(without_hidden_blocks, tag_end + 1):
+                body_end = closing.start()
+            if body_end is not None:
+                visible_html = without_hidden_blocks[tag_end + 1:body_end]
+    without_tags = _strip_filing_tags(visible_html)
     collapsed = _WHITESPACE_RUN_PATTERN.sub(" ", without_tags).strip()
     if not collapsed:
         return None
@@ -540,10 +595,10 @@ def fetch_sec_filings(
     limit: int = 3,
     days: int | None = None,
     timeout: float = 10.0,
-    fetcher: Callable[[], Any] | None = None,
+    fetcher: Callable[[], dict] | None = None,
     document_fetcher: Callable[[str], str] | None = None,
     errors: list[str] | None = None,
-    as_of: date | None = None,
+    as_of: "date | None" = None,
 ) -> list[dict[str, str]]:
     """Recent SEC EDGAR full-text-search hits for ``ticker``, as ``{"text": ...}`` items.
 
@@ -587,12 +642,13 @@ def fetch_sec_filings(
     starving the SEC-only sentiment fallback for users without a NewsAPI
     key (Codex review on PR #429: "Fetch SEC filing content before
     requiring _text"). A per-hit document fetch failure (403, timeout,
-    unparseable response) excludes just that hit -- matching this
+    unparseable or oversized response) excludes just that hit -- matching this
     function's existing "degrade, don't raise" contract -- rather than
     aborting the whole candidate's SEC signal.
     """
-    if fetcher is None:
-        def fetcher() -> dict:
+    active_fetcher = fetcher
+    if active_fetcher is None:
+        def default_fetcher() -> dict:
             import os
             from datetime import datetime, timedelta, timezone
 
@@ -616,21 +672,45 @@ def fetch_sec_filings(
             response = requests.get(SEC_EDGAR_FULL_TEXT_SEARCH_URL, params=params, headers=headers, timeout=timeout)
             response.raise_for_status()
             return response.json()
+        active_fetcher = default_fetcher
 
-    if document_fetcher is None:
-        def document_fetcher(url: str) -> str:
+    active_doc_fetcher = document_fetcher
+    if active_doc_fetcher is None:
+        def default_doc_fetcher(url: str) -> str:
             import os
 
             import requests
 
             headers = {"User-Agent": os.environ.get("SEC_EDGAR_USER_AGENT", _DEFAULT_SEC_EDGAR_USER_AGENT)}
             _sec_rate_limiter.acquire()
-            response = requests.get(url, headers=headers, timeout=timeout)
-            response.raise_for_status()
-            return response.text
+            # Requests consumes redirect bodies even when preparing _next for
+            # allow_redirects=False. Its response hook runs before that read.
+            with requests.get(
+                url, headers=headers, timeout=timeout, stream=True, allow_redirects=False,
+                hooks={"response": _reject_filing_redirect},
+            ) as response:
+                response.raise_for_status()
+                try:
+                    declared_size = int(response.headers.get("Content-Length", ""))
+                except (TypeError, ValueError):
+                    declared_size = 0
+                if declared_size > _MAX_FILING_DOCUMENT_BYTES:
+                    raise ValueError(f"SEC filing document exceeds {_MAX_FILING_DOCUMENT_BYTES} byte limit")
+                payload = bytearray()
+                for chunk in response.iter_content(chunk_size=_FILING_DOWNLOAD_CHUNK_BYTES):
+                    # iter_content yields decompressed bytes, so a missing or
+                    # misleading Content-Length cannot bypass this bound.
+                    if len(chunk) > _MAX_FILING_DOCUMENT_BYTES - len(payload):
+                        raise ValueError(f"SEC filing document exceeds {_MAX_FILING_DOCUMENT_BYTES} byte limit")
+                    payload.extend(chunk)
+                try:
+                    return payload.decode(response.encoding or "utf-8", errors="replace")
+                except LookupError:
+                    return payload.decode("utf-8", errors="replace")
+        active_doc_fetcher = default_doc_fetcher
 
     try:
-        payload = fetcher()
+        payload = active_fetcher()
     except Exception as exc:  # noqa: BLE001 -- one candidate's SEC lookup failing must not abort the batch
         if errors is not None:
             errors.append(f"SEC EDGAR fetch failed for {ticker}: {_sanitize_fetch_error(exc)}")
@@ -779,15 +859,14 @@ def fetch_sec_filings(
             document_url = _sec_filing_document_url(hit, source)
             if document_url is not None:
                 try:
-                    raw_document = document_fetcher(document_url)
+                    raw_document = active_doc_fetcher(document_url)
+                    if raw_document is not None:
+                        snippet = _extract_filing_snippet(raw_document)
                 except Exception as exc:  # noqa: BLE001 -- one hit's document fetch must not abort the batch
                     if errors is not None:
                         errors.append(
                             f"SEC filing document fetch failed for {ticker}: {_sanitize_fetch_error(exc)}"
                         )
-                    raw_document = None
-                if raw_document is not None:
-                    snippet = _extract_filing_snippet(raw_document)
         if snippet:
             filings.append({"ticker": ticker, "text": snippet, "form": form_type})
     return filings
@@ -800,9 +879,9 @@ def fetch_news_headlines(
     days: int = 7,
     page_size: int = 20,
     timeout: float = 10.0,
-    fetcher: Callable[[], Any] | None = None,
+    fetcher: Callable[[], dict] | None = None,
     errors: list[str] | None = None,
-    as_of: datetime | None = None,
+    as_of: "datetime | None" = None,
 ) -> list[dict[str, str]]:
     """Recent NewsAPI headlines for ``ticker``, as ``{"text": ...}`` items.
 
@@ -828,8 +907,9 @@ def fetch_news_headlines(
     if not news_api_key:
         return []
 
-    if fetcher is None:
-        def fetcher() -> dict:
+    active_fetcher = fetcher
+    if active_fetcher is None:
+        def default_fetcher() -> dict:
             from datetime import datetime, timedelta, timezone
 
             import requests
@@ -877,8 +957,10 @@ def fetch_news_headlines(
             response.raise_for_status()
             return response.json()
 
+        active_fetcher = default_fetcher
+
     try:
-        payload = fetcher()
+        payload = active_fetcher()
     except Exception as exc:  # noqa: BLE001 -- one candidate's NewsAPI lookup failing must not abort the batch
         if errors is not None:
             errors.append(f"NewsAPI fetch failed for {ticker}: {_sanitize_fetch_error(exc)}")
@@ -959,7 +1041,7 @@ def _dedupe_items(items: list[dict[str, str]]) -> list[dict[str, str]]:
     return deduped
 
 
-def compute_ticker_sentiment(scored_items: list[dict[str, Any]]) -> float | None:
+def compute_ticker_sentiment(scored_items: Sequence[Mapping[str, Any]]) -> float | None:
     """Confidence-weighted average of ``(positive - negative)`` across scored items.
 
     Pure function, no model/network dependency -- takes the output of
@@ -973,7 +1055,8 @@ def compute_ticker_sentiment(scored_items: list[dict[str, Any]]) -> float | None
     if total_weight <= 0:
         return 0.0
     weighted_sum = sum(
-        (float(item["positive"]) - float(item["negative"])) * float(item["confidence"]) for item in scored_items
+        (float(item["positive"]) - float(item["negative"])) * float(item["confidence"])
+        for item in scored_items
     )
     return weighted_sum / total_weight
 
@@ -1003,16 +1086,17 @@ def _resolve_finbert_revision(
     ``sentiment_unavailable_reason``) rather than crashing it, the same
     path any other constructor failure already takes.
     """
-    if resolver is None:
+    active_resolver = resolver
+    if active_resolver is None:
 
-        def resolver(name: str, rev: str) -> str | None:
-            import importlib
-
-            HfApi = importlib.import_module("huggingface_hub").HfApi
+        def default_resolver(name: str, rev: str) -> str | None:
+            from huggingface_hub import HfApi
 
             return HfApi().model_info(name, revision=rev).sha
 
-    resolved = resolver(model_name, revision)
+        active_resolver = default_resolver
+
+    resolved = active_resolver(model_name, revision)
     if not isinstance(resolved, str) or not resolved:
         raise ValueError(f"could not resolve a concrete commit SHA for {model_name}@{revision!r}: got {resolved!r}")
     return resolved
@@ -1027,18 +1111,22 @@ class FinbertSentimentAnalyzer:
     construct its own.
     """
 
+    # Class-level guard for ``_get_inference_lock``'s lazy creation of the
+    # per-instance ``_inference_lock``. Lives on the class (not in
+    # ``__init__``) precisely so it exists on EVERY instance regardless of
+    # how that instance was built -- it is the one thing the lazy path can
+    # rely on when ``__init__`` never ran.
+    _inference_lock_guard = threading.Lock()
+
     def __init__(
         self,
         model_name: str = "ProsusAI/finbert",
         revision: str | None = None,
         revision_resolver: Callable[[str, str], str | None] | None = None,
     ) -> None:
-        import importlib
         import os
 
-        transformers = importlib.import_module("transformers")
-        AutoModelForSequenceClassification = transformers.AutoModelForSequenceClassification
-        AutoTokenizer = transformers.AutoTokenizer
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
         # Resolve the revision ONCE and pass the SAME value to BOTH
         # downloads -- two separate from_pretrained() calls against the
@@ -1081,7 +1169,36 @@ class FinbertSentimentAnalyzer:
         self._labels = [self._model.config.id2label[i] for i in range(len(self._model.config.id2label))]
         self._inference_lock = threading.Lock()
 
-    def score_texts(self, texts: list[str], *, batch_size: int = 16) -> list[dict[str, Any]]:
+    def _get_inference_lock(self) -> threading.Lock:
+        """Return this instance's inference lock, creating it if ``__init__`` never ran.
+
+        ``__init__`` sets ``_inference_lock`` eagerly, but a caller that
+        builds the analyzer via ``__new__`` to skip the multi-GB model
+        download (tests/test_sentiment.py does exactly this to exercise
+        ``score_texts`` model-free) never reaches it: CI on PR #1358 failed
+        test_finbert_score_texts_normalizes_probability_fields_to_builtin_floats
+        with ``AttributeError: 'FinbertSentimentAnalyzer' object has no
+        attribute '_inference_lock'`` for that reason once the lock landed on
+        the branch. Rather than let ``score_texts`` depend on a construction
+        path it cannot see, create the lock on first use -- under the
+        class-level guard, so two threads racing into ``score_texts`` on such
+        an instance still end up sharing ONE lock instead of each minting its
+        own (which would silently void the serialization the lock exists for:
+        PR #644's parallel ``score_candidate`` execution). Instances that ran
+        ``__init__`` keep their eagerly-created lock untouched.
+        """
+        lock = getattr(self, "_inference_lock", None)
+        if lock is None:
+            with type(self)._inference_lock_guard:
+                # Re-check under the guard: another thread may have won the
+                # race between the unguarded read above and acquiring it.
+                lock = getattr(self, "_inference_lock", None)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._inference_lock = lock
+        return lock
+
+    def score_texts(self, texts: list[str], *, batch_size: int = 16) -> list[dict[str, object]]:
         """Run FinBERT over ``texts``, chunked by ``batch_size`` to bound peak memory.
 
         Returns one dict per input text (same order), each with:
@@ -1096,34 +1213,36 @@ class FinbertSentimentAnalyzer:
         """
         if not texts:
             return []
-        import importlib
+        import torch
 
-        torch = importlib.import_module("torch")
-
-        results: list[dict[str, Any]] = []
+        results: list[dict[str, object]] = []
         # A candidate's news + SEC items are scored in one call; chunking
         # bounds peak memory for an unusually large batch rather than
         # tokenizing/running the whole list through the model in one forward
         # pass (Antigravity code review on PR #403).
         for start in range(0, len(texts), batch_size):
             chunk = texts[start : start + batch_size]
-            with self._inference_lock:
-                inputs = self._tokenizer(chunk, return_tensors="pt", padding=True, truncation=True, max_length=512)
+            # Via the accessor, not the attribute: it tolerates an instance
+            # that skipped __init__ (see _get_inference_lock's docstring for
+            # the PR #1358 CI failure) without weakening the serialization.
+            with self._get_inference_lock():
+                tokenizer: Any = self._tokenizer
+                inputs = tokenizer(chunk, return_tensors="pt", padding=True, truncation=True, max_length=512)
                 with torch.no_grad():
                     logits = self._model(**inputs).logits
                 probabilities = torch.nn.functional.softmax(logits, dim=-1).tolist()
 
             for text, probability_row in zip(chunk, probabilities, strict=True):
-                by_label: dict[str, float] = dict(zip(self._labels, probability_row, strict=True))
+                by_label = dict(zip(self._labels, probability_row, strict=True))
                 label = max(by_label, key=lambda k: by_label[k])
                 results.append(
                     {
                         "text": text,
-                        "positive": by_label.get("positive", 0.0),
-                        "negative": by_label.get("negative", 0.0),
-                        "neutral": by_label.get("neutral", 0.0),
+                        "positive": float(by_label.get("positive", 0.0)),
+                        "negative": float(by_label.get("negative", 0.0)),
+                        "neutral": float(by_label.get("neutral", 0.0)),
                         "label": label,
-                        "confidence": by_label[label],
+                        "confidence": float(by_label[label]),
                     }
                 )
         return results
@@ -1133,11 +1252,11 @@ def sentiment_score(
     ticker: str,
     *,
     news_api_key: str | None = None,
-    analyzer: FinbertSentimentAnalyzer | Any | None = None,
+    analyzer: "FinbertSentimentAnalyzer | None" = None,
     days: int = 7,
     sec_limit: int = 3,
-    as_of: datetime | None = None,
-) -> dict[str, Any] | None:
+    as_of: "datetime | None" = None,
+) -> dict[str, object] | None:
     """News + SEC-filing sentiment for ``ticker``, or ``None`` if no text was found.
 
     Bypasses ``sentiment_monitor.py``'s ``run_pipeline``/``EmailBriefing``
@@ -1187,7 +1306,7 @@ def sentiment_score(
     active_analyzer = analyzer if analyzer is not None else FinbertSentimentAnalyzer()
     scored = active_analyzer.score_texts([item["text"] for item in all_items])
     score = compute_ticker_sentiment(scored)
-    result: dict[str, Any] = {
+    result: dict[str, object] = {
         "score": score,
         "n_news_headlines": len(news_items),
         "n_sec_filings": len(sec_items),

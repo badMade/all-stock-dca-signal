@@ -41,8 +41,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
-import yaml  # type: ignore
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 
@@ -95,6 +93,12 @@ def load_workflows(directory: Path = WORKFLOWS_DIR) -> Dict[str, dict]:
     out: Dict[str, dict] = {}
     paths = sorted(set(directory.glob("*.yml")) | set(directory.glob("*.yaml")))
     for path in paths:
+        # Imported here, not at module level: `scripts` ships in the wheel and
+        # this is the one module in it with a third-party dependency, so an
+        # installed copy must not ImportError merely by being imported
+        # (2026-09-07 diagnostic, S:STD-01). PyYAML is a dev dependency.
+        import yaml
+
         doc = yaml.safe_load(path.read_text(encoding="utf-8"))
         out[str(path.relative_to(REPO_ROOT))] = _normalize_on_key(doc)
     return out

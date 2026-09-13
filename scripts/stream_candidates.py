@@ -76,7 +76,7 @@ import os
 import sys
 from dataclasses import dataclass
 from dataclasses import field as dataclasses_field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
@@ -105,6 +105,7 @@ from scripts.generate_buy_candidates import (  # noqa: E402
     _REQUIRED_CONFIG_FILENAMES as _SHARED_REQUIRED_CONFIG_FILENAMES,
 )
 from scripts.generate_buy_candidates import (  # noqa: E402
+    _parse_bar,
     _planner_incompatible,
     _require_populated_config,
     _StaticMarketData,
@@ -150,38 +151,18 @@ class StreamSpec:
     (with only a log warning) when its file is missing -- the same silent
     fallback ``_require_populated_config`` exists to prevent for the others."""
 
-    source: SourceName = SourceName.ROBINHOOD
-    """The single market-data source this slot's executor evaluates.
+    source: SourceName = SourceName.FINANCE
+    """The policy-selected primary source this slot's executor evaluates.
     ``MorningDCAExecutor.evaluate()`` takes ONE combined provider, so there is no
-    second source to reconcile against and none is accepted.
+    second source to reconcile inside the executor; additional accepted payload
+    objects remain explicitly labeled validation/context evidence.
 
-    KNOWN DIVERGENCE, open for a human decision -- do not "fix" this by flipping
-    the default. ``config/scheduled_tasks.json``'s ``market_data_source_policy``
-    names **Finance** the primary market-data source, with Robinhood as
-    validation/context (GFUZ excepted), and ``config/midday_dca.json``'s
-    ``raw_input_generation.data_sources`` repeats that for the midday stream's
-    raw inputs. Serving these entry points from Robinhood therefore does not
-    match that policy's letter, and it was flagged in review ("Preserve the
-    Finance-primary signal source").
-
-    Two facts make it not a one-line change:
-
-    1. **Cadence.** ``StrategyConfig.finance_interval_minutes`` is 15;
-       ``robinhood_interval_minutes`` is 5. At the 09:35 anchor the first
-       15-minute bar does not COMPLETE until 09:45, so a Finance-primary
-       market-open payload cannot produce a completed decision bar at all --
-       Finance-primary is impossible for 0935ET, not merely undesirable.
-    2. **One interval per provider.** ``MorningConfig.interval_minutes`` is a
-       single value (default 5, the Robinhood cadence; neither stream config
-       overrides it) used for the request window, the completed-bar anchor and
-       the staleness check. Feeding 15-minute Finance bars to an executor
-       configured for 5 would have its own staleness rule reject them.
-
-    So honouring Finance-primary here means deciding a per-source interval for
-    this executor family, and for the market-open slot deciding what "primary"
-    can even mean five minutes into the session. That is a live-sizing policy
-    call with money attached, not a refactor, and it is deliberately NOT made in
-    the change that introduced these entry points."""
+    ``config/scheduled_tasks.json`` names Finance as primary and Robinhood as
+    validation/context (and execution) evidence. The CLI therefore scores only
+    the Finance object, while accepting a Robinhood object without silently
+    substituting its prices. This preserves the executor's one-provider signal
+    API and, critically, prevents execution-broker data from becoming the
+    universal signal source merely because it is present in the payload."""
 
     requires_deployed_last_7d_usd: bool = False
     """Whether this slot's Gate 5 producer contract requires the trailing-7-day
@@ -214,6 +195,18 @@ class StreamSpec:
     three intraday slots stay three literals rather than three modules."""
 
     doc_ref: str = ""
+
+    source_interval_minutes: Optional[int] = None
+    """Provider bar cadence when it differs from the executor default."""
+
+    trend_min_bars: Optional[int] = None
+    """Provider-specific sample count for the executor's 60-minute trend."""
+
+    evaluation_delay_minutes: int = 0
+    """Allowed live-window delay between the scheduled slot and its snapshot."""
+
+    ticker_source_overrides: Mapping[str, SourceName] = dataclasses.field(default_factory=dict)
+    """Documented ticker-specific primary sources (currently GFUZ/Robinhood)."""
 
 
 # The policy this entry point depends on actually being present in a stream
@@ -403,18 +396,17 @@ def _require_parseable_stream_config(path: Path, expected_stream: str) -> None:
     # The earlier revision of this validator scoped itself to "the MONEY, not the
     # whole schema". That was the wrong line to draw: this field gates placement
     # as directly as the ladder does, it just does not carry a dollar sign.
-    if "trend_min_bars" in parsed:
-        value = parsed["trend_min_bars"]
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ValueError(
-                f"{path}'s 'trend_min_bars' must be an integer of at least 1, got {value!r}"
-                + (
-                    ": Python treats bool as an int, so the loader would read it as "
-                    f"{int(value)} and validate a 60-minute downtrend on that many bars"
-                    if isinstance(value, bool)
-                    else ""
-                )
+    value = parsed.get("trend_min_bars")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(
+            f"{path}'s 'trend_min_bars' must be present and be an integer of at least 1, got {value!r}"
+            + (
+                ": Python treats bool as an int, so the loader would read it as "
+                f"{int(value)} and validate a 60-minute downtrend on that many bars"
+                if isinstance(value, bool)
+                else ""
             )
+        )
 
     ledger = parsed["budget_ledger"]
     if not isinstance(ledger, dict):
@@ -470,7 +462,27 @@ class StreamMarketData(_StaticMarketData):
     """
 
     def __init__(self, *args: Any, ticker_errors: Sequence[str] = (), **kwargs: Any) -> None:
+        source = args[0] if args else kwargs.get("source")
+        payloads = args[1] if len(args) > 1 else kwargs.get("per_ticker", {})
         super().__init__(*args, **kwargs)
+        if source in {SourceName.FINANCE, SourceName.YFINANCE_FALLBACK}:
+            # _StaticMarketData intentionally discards Finance quotes for the
+            # final-buy adapter. Retain the executor-class connector quote.
+            for ticker, payload in payloads.items():
+                raw_quote = payload.get("quote") if isinstance(payload, Mapping) else None
+                if not isinstance(raw_quote, Mapping):
+                    continue
+                # JSON booleans are numbers to Python, but they are not market
+                # prices. Keep this path aligned with FinanceDataProvider.
+                if isinstance(raw_quote.get("price"), bool):
+                    continue
+                try:
+                    price = float(raw_quote["price"])
+                    quote_time = datetime.fromisoformat(str(raw_quote["as_of"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if math.isfinite(price) and price > 0 and quote_time.tzinfo is not None:
+                    self._quotes[ticker] = (price, quote_time)
         self._ticker_errors = frozenset(ticker_errors)
 
     def _raise_if_errored(self, ticker: str) -> None:
@@ -490,7 +502,40 @@ class StreamMarketData(_StaticMarketData):
 
     def get_quote(self, ticker: str, as_of: datetime):
         self._raise_if_errored(ticker)
+        if self.source is SourceName.FINANCE:
+            quote = self._quotes.get(ticker)
+            if quote is None:
+                return None
+            _price, quote_time = quote
+            if quote_time is None or quote_time > as_of:
+                return None
+            if as_of - quote_time > timedelta(minutes=self._quote_staleness_minutes):
+                return None
+            return quote
         return super().get_quote(ticker, as_of)
+
+
+class RoutedStreamMarketData:
+    """Route each ticker to its policy-selected provider without relabeling data."""
+
+    def __init__(self, default: StreamMarketData, overrides: Mapping[str, StreamMarketData]) -> None:
+        self.default = default
+        self.overrides = dict(overrides)
+
+    def source_for_ticker(self, ticker: str) -> str:
+        return self.overrides.get(ticker, self.default).source.value
+
+    def _provider(self, ticker: str) -> StreamMarketData:
+        return self.overrides.get(ticker, self.default)
+
+    def get_previous_close_bar(self, ticker: str, as_of: datetime):
+        return self._provider(ticker).get_previous_close_bar(ticker, as_of)
+
+    def get_intraday_bars(self, ticker: str, start: datetime, end: datetime, interval_minutes: int):
+        return self._provider(ticker).get_intraday_bars(ticker, start, end, interval_minutes)
+
+    def get_quote(self, ticker: str, as_of: datetime):
+        return self._provider(ticker).get_quote(ticker, as_of)
 
 
 def _validate_tickers(
@@ -513,6 +558,103 @@ def _validate_tickers(
     unknown = [t for t in tickers if not isinstance(t, str) or t not in permitted]
     if unknown:
         raise ValueError(f"{label} names ticker(s) not in this config's active universe: {unknown!r}")
+
+
+def _require_bars_match_configured_cadence(
+    label: str,
+    payloads: Mapping[str, Mapping[str, Any]],
+    *,
+    interval_minutes: float,
+) -> None:
+    """Reject ``intraday_bars`` spaced closer together than ``interval_minutes``.
+
+    Neither ``StreamMarketData``/``_StaticMarketData`` nor
+    ``MorningDCAExecutor._trend_validated`` check the SPACING between bars --
+    only that enough usable bars fall inside the trend window. A caller who
+    fetches a finer cadence than this stream is configured for (five-minute
+    Robinhood-shaped bars against a spec resolved to a 15-minute Finance
+    cadence, say) can satisfy ``trend_min_bars`` from a slice of the 60-minute
+    window many times narrower than that count was calibrated for, and nothing
+    downstream rejects it (Codex review, PR #917 discussion on
+    ``scripts/generate_midday_candidates.py``: "Reject five-minute bars under
+    the Finance cadence"). ``MIDDAY_SPEC``'s ``trend_min_bars=4`` at a
+    15-minute cadence assumes each bar represents 15 real minutes of price
+    action; four 5-minute bars cover only 20 of the 60 minutes that count was
+    chosen to represent, yet pass the executor's own count-and-coverage checks
+    unchanged.
+
+    Zero-spacing (duplicate) timestamps are deliberately left to
+    ``_StaticMarketData``'s own duplicate-timestamp rejection, which names the
+    exact repeated timestamps and is the more specific error for that case;
+    this only rejects bars that are distinct but closer together than the
+    resolved cadence allows. A payload that fails to parse at all is left to
+    whichever validation runs it through ``_parse_bar`` next -- that error
+    names the malformed field, this one should not mask it with a generic
+    cadence complaint.
+    """
+    minimum_spacing = timedelta(minutes=interval_minutes)
+    for ticker in sorted(payloads):
+        payload = payloads[ticker]
+        if not isinstance(payload, Mapping):
+            continue
+        raw_bars = payload.get("intraday_bars") or []
+        try:
+            timestamps = sorted(_parse_bar(bar).timestamp for bar in raw_bars)
+        except (KeyError, TypeError, ValueError):
+            continue
+        for earlier, later in zip(timestamps, timestamps[1:], strict=False):
+            gap = later - earlier
+            if gap and gap < minimum_spacing:
+                raise ValueError(
+                    f"{label}[{ticker!r}].intraday_bars has bars {gap} apart "
+                    f"({earlier.isoformat()} -> {later.isoformat()}), closer together than "
+                    f"this stream's configured {interval_minutes:g}-minute cadence. A payload "
+                    "fetched at a finer interval than the stream is configured for can satisfy "
+                    "trend_min_bars from a much narrower slice of the 60-minute trend window "
+                    "than that count was calibrated for, and nothing downstream of this check "
+                    "rejects it"
+                )
+
+
+def _primary_payload_is_fresh(
+    payload: Any,
+    *,
+    trading_day: date,
+    nominal_time: time,
+    interval_minutes: int,
+    evaluation_delay_minutes: int,
+) -> bool:
+    """Return whether primary evidence can supply a current decision price."""
+    if not isinstance(payload, Mapping) or not payload.get("previous_close_bar"):
+        return False
+    nominal = datetime.combine(trading_day, nominal_time, tzinfo=EASTERN)
+    evaluation = nominal + timedelta(minutes=evaluation_delay_minutes)
+    # A quote collected for the nominal snapshot remains valid throughout a
+    # delayed evaluation window.  Include one provider interval of lookback so
+    # a just-before-fire quote (for example 09:34:50 for 09:35) is not lost.
+    quote_start = nominal - timedelta(minutes=interval_minutes)
+    quote = payload.get("quote")
+    if isinstance(quote, Mapping):
+        try:
+            quote_time = datetime.fromisoformat(str(quote["as_of"]))
+            quote_price = float(quote["price"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        else:
+            if (
+                quote_time.tzinfo is not None
+                and quote_start <= quote_time <= evaluation
+                and math.isfinite(quote_price)
+                and quote_price > 0
+                and not isinstance(quote.get("price"), bool)
+            ):
+                return True
+    try:
+        bars = [_parse_bar(bar) for bar in payload.get("intraday_bars", [])]
+    except (KeyError, TypeError, ValueError):
+        return False
+    bar_start = nominal - timedelta(minutes=interval_minutes)
+    return any(bar_start <= bar.timestamp <= evaluation for bar in bars)
 
 
 def _guarded_sizing_config(
@@ -692,12 +834,15 @@ def build_document(
     trading_day: date,
     config: Any,
     market_data: Mapping[str, Mapping[str, Any]],
+    alternate_market_data: Optional[Mapping[str, Mapping[str, Any]]] = None,
     source_errors: Sequence[str] = (),
     ticker_errors: Sequence[str] = (),
+    alternate_ticker_errors: Sequence[str] = (),
     already_covered_tickers: Sequence[str] = (),
     deployed_last_7d_usd: Optional[float] = None,
     config_dir: Optional[Path] = None,
     check_planner_compatibility: bool = True,
+    decision_time_et: Optional[time] = None,
 ) -> Dict[str, Any]:
     """Run ``spec``'s executor over ``market_data`` and return its Gate 5 document.
 
@@ -748,11 +893,14 @@ def build_document(
         allow_extra=frozenset(config.excluded_tickers),
     )
 
-    unsupported_error_sources = sorted(set(tuple(source_errors)) - {spec.source.value})
+    accepted_error_sources = {spec.source.value} | {
+        source.value for source in spec.ticker_source_overrides.values()
+    }
+    unsupported_error_sources = sorted(set(tuple(source_errors)) - accepted_error_sources)
     if unsupported_error_sources:
         raise ValueError(
             f"--market-data's 'source_errors' names unsupported source(s) "
-            f"{unsupported_error_sources!r}; only {spec.source.value!r} applies to this slot, "
+            f"{unsupported_error_sources!r}; only {sorted(accepted_error_sources)!r} apply to this slot, "
             "and an unrecognized marker would silently mark nothing as failed"
         )
     if spec.source.value in tuple(source_errors):
@@ -804,10 +952,18 @@ def build_document(
     scoring_config = dataclasses.replace(
         config,
         excluded_tickers=frozenset(config.excluded_tickers) | frozenset(already_covered_tickers),
+        interval_minutes=spec.source_interval_minutes or config.interval_minutes,
+        trend_min_bars=spec.trend_min_bars or config.trend_min_bars,
     )
     scored_universe = tuple(
         t for t in scoring_config.tickers if t not in scoring_config.excluded_tickers
     )
+    # Captured before spec.universe_filter narrows scored_universe below: this is
+    # the input _apply_preflight_gate needs to compute gated_out_tickers
+    # correctly (config tickers minus admitted), the same set evaluate() would
+    # have passed it. See the _apply_preflight_gate call further down for why
+    # this module calls it explicitly instead of via evaluate().
+    preflight_gate_input = scored_universe
     # Narrowed by the same universe filter the executor itself will apply, BEFORE
     # the completeness check and the parse below. Only the 1030ET spec sets one
     # (the inherited 09:45 pre-flight gate); everywhere else this is a no-op.
@@ -855,7 +1011,10 @@ def build_document(
         for ticker, payload in scored_payloads.items()
         if not isinstance(payload, Mapping)
         or not payload.get("previous_close_bar")
-        or not payload.get("intraday_bars")
+        or (
+            not payload.get("intraday_bars")
+            and not (spec.source_interval_minutes and payload.get("quote"))
+        )
     )
     if incomplete:
         raise ValueError(
@@ -879,12 +1038,98 @@ def build_document(
         # the authority -- passing the config's real interval keeps this
         # pre-filter from ever being the stricter of the two and silently
         # dropping a quote the live path would have honored.
-        quote_staleness_minutes=scoring_config.interval_minutes,
+        quote_staleness_minutes=scoring_config.interval_minutes + spec.evaluation_delay_minutes,
         trading_day=trading_day,
         ticker_errors=ticker_errors,
     )
+    alternate_market_data = alternate_market_data or {}
+    _validate_tickers(
+        "--market-data's 'ticker_errors.robinhood'", alternate_ticker_errors, universe
+    )
+    override_providers: Dict[str, StreamMarketData] = {}
+    for ticker, override_source in spec.ticker_source_overrides.items():
+        if ticker not in scored_universe:
+            continue
+        # A ticker whose Robinhood fetch RAISED is the normal per-ticker
+        # exception shape a caller reports via alternate_ticker_errors (or a
+        # blanket source_errors entry for the whole source), with no payload
+        # to retain -- fabricating one would misrepresent what was fetched.
+        # Skipping the override provider entirely for that ticker used to
+        # route it to the empty Finance provider instead, where it scored as
+        # a quiet NO_DATA with provider_error=false and no entry in
+        # provider_error_tickers, indistinguishable from a symbol Finance
+        # simply omits (GFUZ's documented, harmless case) rather than a
+        # failed primary fetch Gate 9 needs to see (Codex review: "Route
+        # errored overrides even when their payload is absent"). Building the
+        # provider on an empty per-ticker map when there is no payload still
+        # raises on access via ticker_errors below, the same as the
+        # payload-present error path.
+        if override_source is not SourceName.ROBINHOOD:
+            raise ValueError(f"unsupported ticker source override {ticker}={override_source.value}")
+        # Always install configured routing, even when the source legitimately
+        # returned no object. Falling back to the default provider here would
+        # score a source the policy explicitly did not select for this ticker.
+        override_providers[ticker] = StreamMarketData(
+            override_source,
+            {ticker: alternate_market_data[ticker]} if ticker in alternate_market_data else {},
+            quote_staleness_minutes=config.interval_minutes + spec.evaluation_delay_minutes,
+            trading_day=trading_day,
+            ticker_errors=(
+                tuple(alternate_ticker_errors) + (ticker,)
+                if override_source.value in source_errors
+                else alternate_ticker_errors
+            ),
+        )
+    routed_provider = RoutedStreamMarketData(provider, override_providers)
+
+    # Cadence-spacing guard (Codex review, PR #917: "Reject five-minute bars
+    # under the Finance cadence"). Checked per ticker against the cadence that
+    # ticker will ACTUALLY be scored under: an override ticker (GFUZ) is routed
+    # entirely to its Robinhood provider above and graded at ``config``'s raw
+    # (Robinhood-native) interval -- see the per-ticker executor rebuild below
+    # -- so its bars are validated against that, not against the resolved
+    # default source's cadence. Every other scored ticker is graded under
+    # ``scoring_config.interval_minutes``, the resolved default (Finance-primary
+    # unless a spec overrides it).
+    _require_bars_match_configured_cadence(
+        f"--market-data's 'sources.{spec.source.value}'",
+        {
+            ticker: payload
+            for ticker, payload in scored_payloads.items()
+            if ticker not in override_providers
+        },
+        interval_minutes=scoring_config.interval_minutes,
+    )
+    if override_providers:
+        # An override ticker whose Robinhood fetch is itself marked errored --
+        # via `--alternate-ticker-errors` or a blanket `source_errors` entry for
+        # "robinhood" -- is left in `override_providers` above so its
+        # StreamMarketData raises on access and the executor reports the
+        # documented NO_DATA/provider_error result for it, same as any other
+        # errored ticker. Feeding its leftover payload through the cadence
+        # check anyway would abort the WHOLE run over a fetch this run already
+        # knows is unusable, instead of scoring the rest of the universe
+        # (Codex review: "Skip errored overrides in cadence validation").
+        # Mirrors the same exclusion `scored_payloads` already applies for the
+        # primary source's own `ticker_errors`.
+        _require_bars_match_configured_cadence(
+            "--alternate-market-data",
+            {
+                ticker: alternate_market_data[ticker]
+                for ticker in override_providers
+                if ticker in alternate_market_data
+                and ticker not in set(alternate_ticker_errors)
+                and spec.ticker_source_overrides[ticker].value not in source_errors
+            },
+            interval_minutes=config.interval_minutes,
+        )
 
     executor = spec.executor_cls(config=scoring_config, mode=spec.live_mode, **spec.executor_kwargs)
+    # A pre-placement rerun must move the executor's own decision boundary, not
+    # merely ``now``: evaluate_signal derives its quote/bar cutoff from this
+    # attribute. This keeps refreshed sizing inside the real signal engine.
+    if decision_time_et is not None:
+        executor.decision_time = decision_time_et
     guard_engaged = False
     if deployed_last_7d_usd is not None:
         guarded_sizing = _guarded_sizing_config(
@@ -901,8 +1146,60 @@ def build_document(
     # Using the slot's nominal time rather than the wall clock keeps the document
     # a pure function of its inputs, so the same payload re-run later produces
     # the same candidates.
-    now = datetime.combine(trading_day, executor.decision_time, tzinfo=EASTERN)
-    signals = executor.evaluate(now, provider)
+    now = datetime.combine(trading_day, executor.decision_time, tzinfo=EASTERN) + timedelta(
+        minutes=spec.evaluation_delay_minutes
+    )
+    if spec.evaluation_delay_minutes:
+        executor.decision_time = now.timetz().replace(tzinfo=None)
+        nominal = now - timedelta(minutes=spec.evaluation_delay_minutes)
+        executor.quote_window_start = nominal - timedelta(minutes=scoring_config.interval_minutes)
+    # evaluate() -- which this module deliberately never calls, so that an
+    # override-routed ticker (GFUZ) can be scored through its own per-ticker
+    # executor below -- is also the only place _apply_preflight_gate() runs,
+    # and that is what populates executor.preflight_gate for the document's own
+    # "preflight_gate" field (null on every slot but 1030ET, a no-op there).
+    # preflight_admitted_tickers (this module's universe_filter for 1030ET)
+    # already narrowed scored_universe to the same verdict for payload parsing,
+    # but its own docstring is explicit that the diagnostic it discards is
+    # exactly this: "recomputed and published by evaluate() itself, which is
+    # what the document's preflight_gate field reports." Calling the gate a
+    # second time, on the SAME pre-narrowing input evaluate() would have used,
+    # is what makes that promise true now that evaluate() itself is bypassed.
+    # The returned (already-known) admitted list is discarded; only the
+    # diagnostic side effect on executor.preflight_gate is wanted here.
+    executor._apply_preflight_gate(now, list(preflight_gate_input))
+    signals: List[MorningSignal] = []
+    # Tracked per ticker so the trend-window coverage probe below can read
+    # bars through the SAME executor (cadence) and provider each ticker was
+    # actually scored with -- an override ticker (GFUZ) is graded by its own
+    # ticker_executor at config's raw Robinhood cadence, not scoring_config's
+    # resolved Finance one, and its bars live behind routed_provider's
+    # override, not the plain Finance-only provider.
+    executors_by_ticker: Dict[str, Any] = {}
+    for ticker in scored_universe:
+        ticker_executor = executor
+        if ticker in override_providers and spec.source_interval_minutes:
+            # The exception is a real source switch, including cadence. Finance
+            # is 15-minute/start-stamped; Robinhood remains 5-minute. Reusing
+            # Finance's anchor for GFUZ would unnecessarily discard its
+            # completed 09:30 broker bar at the 09:35 decision.
+            ticker_config = dataclasses.replace(
+                scoring_config,
+                interval_minutes=config.interval_minutes,
+                trend_min_bars=config.trend_min_bars,
+            )
+            ticker_executor = spec.executor_cls(config=ticker_config, mode=spec.live_mode)
+            # Keep an override on the slot's nominal anchor.  The delayed
+            # anchor belongs to the default connector, whose snapshot may be
+            # collected throughout the live window; an override snapshot is
+            # collected at the nominal fire and must remain usable then.
+            if deployed_last_7d_usd is not None:
+                ticker_guard = _guarded_sizing_config(
+                    ticker_executor, config_dir, trading_day, deployed_last_7d_usd
+                )
+                _apply_sizing_config(ticker_executor, ticker_guard)
+        executors_by_ticker[ticker] = ticker_executor
+        signals.append(ticker_executor.evaluate_signal(ticker, now, routed_provider))
 
     rows = [_signal_to_row(signal) for signal in signals]
     # A BUY the executor did not mark auto-buy eligible is a
@@ -971,7 +1268,7 @@ def build_document(
     # published: its supporting bars never reach back to the start of the
     # 60-minute window its trend was graded on. See _trend_window_uncovered.
     incomplete_trend_window = _trend_window_uncovered(
-        executor, provider, [row["ticker"] for row in buy_rows], now
+        executors_by_ticker, routed_provider, [row["ticker"] for row in buy_rows], now
     )
     withheld = set(contradictory_base) | set(incomplete_trend_window)
     placeable_rows = sorted(
@@ -1063,8 +1360,18 @@ def build_document(
         "stream": spec.stream,
         "cron_id": spec.cron_id,
         "trading_day": trading_day.isoformat(),
-        "decision_time_et": executor.profile["scheduled_for_et"],
+        # Persist the effective decision anchor the executor actually used after
+        # any --decision-time-et override and any spec-driven delay adjustment.
+        # This keeps refreshed reruns and delayed slots auditable: a reader can
+        # tell exactly which cutoff produced the published prices and sizing.
+        "decision_time_et": executor.decision_time.strftime("%H:%M"),
+        # Exposed separately for backwards-compatible readers that already key
+        # on this field name for "effective evaluation anchor".
+        "evaluation_time_et": now.strftime("%H:%M"),
         "source": spec.source.value,
+        "ticker_source_overrides_applied": {
+            ticker: routed_provider.source_for_ticker(ticker) for ticker in sorted(override_providers)
+        },
         # Recorded rather than assumed: a reader diffing two slots' documents
         # needs to see in the evidence whether this one's signals were graded
         # with or without a validated 60-minute downtrend.
@@ -1205,12 +1512,24 @@ TREND_LOOKBACK_MINUTES = 60
 
 
 def _trend_window_uncovered(
-    executor: Any,
-    provider: "StreamMarketData",
+    executors: Mapping[str, Any],
+    provider: "RoutedStreamMarketData",
     tickers: Sequence[str],
     decision_dt: datetime,
 ) -> List[str]:
     """Tickers whose supplied bars never reach back to the trend window's start.
+
+    ``executors`` maps each candidate ticker to the SAME executor it was
+    scored with -- the shared default one for most tickers, or a ticker's own
+    rebuilt ``ticker_executor`` for a source override (GFUZ), which is graded
+    at ``config``'s raw Robinhood cadence rather than the resolved default.
+    Reading a single shared executor's cadence for every ticker previously
+    misjudged an override ticker's coverage against the wrong interval, and
+    ``provider`` must be the ``RoutedStreamMarketData`` those signals were
+    actually evaluated against -- a plain Finance-only provider has no bars at
+    all for a ticker Finance omits, so the probe saw zero bars and withheld a
+    trend the override's own Robinhood evidence had already validated (Codex
+    review: "Probe override bars through the routed provider").
 
     ``MorningDCAExecutor._trend_validated`` asks two questions of the 60 minutes
     before the decision anchor: are there at least ``trend_min_bars`` usable bars
@@ -1244,23 +1563,24 @@ def _trend_window_uncovered(
     whole universe down with it, unlike the payload-completeness check above,
     where an absent bar list is unambiguously a broken fetch.
     """
-    # Trend-exempt slots have no window to cover. 0935ET is the live case: at
-    # 09:35 the window's start would be 08:35, pre-market, so a "full" window is
-    # impossible by construction and demanding one would withhold every candidate
-    # on every fire.
-    if not executor.profile["validate_trend"]:
-        return []
-    interval = timedelta(minutes=executor.config.interval_minutes)
-    window_start = decision_dt - timedelta(minutes=TREND_LOOKBACK_MINUTES)
-    # The same anchor the executor grades against: the decision bar, not the
-    # wall clock. Asking the provider for everything up to it keeps this reading
-    # exactly the bars _trend_validated would have seen.
-    anchor = completed_bar_anchor(
-        decision_dt, executor.config.interval_minutes, executor.sizing_config
-    )
-    reach_by = window_start + interval
     uncovered: List[str] = []
     for ticker in tickers:
+        executor = executors[ticker]
+        # Trend-exempt slots have no window to cover. 0935ET is the live case:
+        # at 09:35 the window's start would be 08:35, pre-market, so a "full"
+        # window is impossible by construction and demanding one would
+        # withhold every candidate on every fire.
+        if not executor.profile["validate_trend"]:
+            continue
+        interval = timedelta(minutes=executor.config.interval_minutes)
+        window_start = decision_dt - timedelta(minutes=TREND_LOOKBACK_MINUTES)
+        # The same anchor the executor grades against: the decision bar, not
+        # the wall clock. Asking the provider for everything up to it keeps
+        # this reading exactly the bars _trend_validated would have seen.
+        anchor = completed_bar_anchor(
+            decision_dt, executor.config.interval_minutes, executor.sizing_config
+        )
+        reach_by = window_start + interval
         # Bounded to [window_start, anchor] -- the SAME interval
         # _trend_validated counts bars over -- and not to everything the payload
         # happens to carry. Probing from datetime.min instead let a single bar
@@ -1332,6 +1652,14 @@ def build_parser(
         help="Path to the pre-fetched market-data JSON. See the module docstring for its shape.",
     )
     parser.add_argument("--config-dir", type=Path, default=get_config_dir())
+    parser.add_argument(
+        "--decision-time-et",
+        type=time.fromisoformat,
+        help=(
+            "Optional refreshed ET decision anchor (HH:MM[:SS]); reruns the executor's own "
+            "price, base, and ladder sizing at that time."
+        ),
+    )
     parser.add_argument(
         "--already-covered-tickers",
         nargs="*",
@@ -1489,16 +1817,20 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
     if "sources" not in payload or not isinstance(payload["sources"], dict):
         raise ValueError("--market-data must contain a top-level 'sources' object")
     sources = payload["sources"]
-    unexpected_sources = sorted(set(sources) - {spec.source.value})
+    # The executor API evaluates one provider, but the repository-wide policy
+    # also asks the fetcher to retain Robinhood validation/context evidence.
+    # Accept that evidence without ever selecting it for ordinary signal math.
+    fallback_source = SourceName.YFINANCE_FALLBACK.value
+    accepted_sources = {spec.source.value, SourceName.ROBINHOOD.value, fallback_source}
+    unexpected_sources = sorted(set(sources) - accepted_sources)
     if unexpected_sources:
         raise ValueError(
             f"--market-data's 'sources' has unsupported key(s) {unexpected_sources!r}: this "
-            "slot's executor evaluates a SINGLE market-data provider "
-            f"({spec.source.value}), so any other source's payload would be silently discarded "
-            "rather than cross-checked. Remove it rather than letting this run look "
-            "dual-sourced when it is not"
+            f"slot accepts the {spec.source.value!r} policy primary plus Robinhood "
+            "validation/context evidence and the configured yfinance fallback only"
         )
-    if spec.source.value not in sources:
+    finance_primary = spec.source is SourceName.FINANCE
+    if spec.source.value not in sources and not (finance_primary and fallback_source in sources):
         raise ValueError(
             f"--market-data's 'sources' is missing the required {spec.source.value!r} object; a "
             "genuinely failed fetch is spelled by listing it in source_errors (which aborts), "
@@ -1511,6 +1843,15 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
         or not isinstance(source_errors, Sequence)
     ):
         raise ValueError("--market-data's 'source_errors', if present, must be a list")
+    try:
+        unexpected_source_errors = sorted(set(source_errors) - accepted_sources)
+    except TypeError as exc:
+        raise ValueError("--market-data's 'source_errors' entries must be source-name strings") from exc
+    if unexpected_source_errors:
+        raise ValueError(
+            "--market-data's 'source_errors' names unsupported source(s) "
+            f"{unexpected_source_errors!r}; accepted sources are {sorted(accepted_sources)!r}"
+        )
     # An explicit `"ticker_errors": null` survives .get(..., {}) unchanged and
     # would read exactly like an omitted key downstream -- silently "no
     # per-ticker errors" instead of the malformed evidence it is. Caught here, at
@@ -1521,19 +1862,25 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
     ticker_errors_by_source = payload.get("ticker_errors", {})
     if not isinstance(ticker_errors_by_source, Mapping):
         raise ValueError("--market-data's 'ticker_errors', if present, must be an object")
-    unexpected_error_sources = sorted(set(ticker_errors_by_source) - {spec.source.value})
+    unexpected_error_sources = sorted(set(ticker_errors_by_source) - accepted_sources)
     if unexpected_error_sources:
         raise ValueError(
             f"--market-data's 'ticker_errors' has unsupported key(s) "
-            f"{unexpected_error_sources!r}; only {spec.source.value!r} applies to this slot"
+            f"{unexpected_error_sources!r}; only {sorted(accepted_sources)!r} apply to this slot"
         )
-    ticker_errors = ticker_errors_by_source.get(spec.source.value, [])
-    if ticker_errors is None:
+    # The policy primary's per-ticker error list is checked for an explicit
+    # null HERE, at the JSON boundary with the rest of the shape checks, rather
+    # than after the fallback decision below. Two reasons: the fallback
+    # selection reads this list to decide whether Finance is incomplete, and
+    # treating a null as "no errors" there would let a malformed payload steer
+    # the whole universe onto -- or away from -- the yfinance fallback; and once
+    # the fallback IS selected, the later effective-source check no longer looks
+    # at the primary's list at all, so a null would pass through unreported.
+    if ticker_errors_by_source.get(spec.source.value, []) is None:
         raise ValueError(
             f"--market-data's 'ticker_errors.{spec.source.value}', if present, must be a list, "
             "got null"
         )
-
     _require_populated_config(args.config_dir)
     _require_parseable_stream_config(args.config_dir / spec.stream_config_filename, spec.stream)
     # allow_unpinned_account=True matches each executor's own default loader:
@@ -1541,14 +1888,84 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
     # $ROBINHOOD_AGENTIC_ACCOUNT_NUMBER to be exported just to GENERATE a
     # candidate list would block Gate 5 on a credential Gate 5 does not use.
     config = spec.config_loader(args.config_dir, allow_unpinned_account=True)
+    covered = set(args.already_covered_tickers)
+    remaining_tickers = [
+        t for t in config.tickers if t not in config.excluded_tickers and t not in covered
+    ]
+    # Finance is policy-primary, but the checked-in policy explicitly selects
+    # labeled yfinance evidence when that connector is unavailable or its
+    # response is incomplete/unresolved.  Switch the entire scoring provider
+    # rather than mixing unlabeled rows from two sources.
+    scored_tickers = set(config.tickers) - set(config.excluded_tickers) - set(args.already_covered_tickers)
+    # A ticker with an explicit source route is not evidence about the health
+    # or completeness of the default provider.  In particular, Finance's
+    # expected omission/error for GFUZ must neither trigger a universe-wide
+    # fallback nor hide an unresolved ordinary Finance ticker.
+    primary_scored_tickers = scored_tickers - set(spec.ticker_source_overrides)
+    primary_payload = sources.get(spec.source.value, {})
+    # A null here was already rejected at the JSON boundary above, so this is
+    # a real (possibly empty) list by the time the fallback decision reads it.
+    primary_ticker_errors = set(ticker_errors_by_source.get(spec.source.value, [])) & primary_scored_tickers
+    primary_incomplete = any(
+        not _primary_payload_is_fresh(
+            item,
+            trading_day=trading_day,
+            nominal_time=spec.executor_cls(config=config, mode=spec.live_mode, **spec.executor_kwargs).decision_time,
+            interval_minutes=spec.source_interval_minutes or config.interval_minutes,
+            evaluation_delay_minutes=spec.evaluation_delay_minutes,
+        )
+        for ticker in primary_scored_tickers
+        for item in (primary_payload.get(ticker),)
+    )
+    use_fallback = finance_primary and (
+        spec.source.value in source_errors
+        or spec.source.value not in sources
+        or bool(primary_ticker_errors)
+        or primary_incomplete
+    )
+    effective_spec = spec
+    if use_fallback:
+        if fallback_source not in sources or fallback_source in source_errors:
+            raise ValueError("Finance data is unavailable/incomplete and the configured yfinance fallback is unavailable")
+        effective_spec = dataclasses.replace(spec, source=SourceName.YFINANCE_FALLBACK)
+    # Checked against the source actually being scored, AFTER the fallback
+    # decision: on main this check sat before it and read the primary only,
+    # which is right for a single-source slot but would abort a Finance-primary
+    # slot whose empty/absent primary payload the policy says to serve from the
+    # labelled yfinance fallback instead (#1362 x this branch's fallback).
+    if remaining_tickers and not sources.get(effective_spec.source.value):
+        raise ValueError(
+            f"--market-data has no usable 'sources.{effective_spec.source.value}' payload "
+            "(absent, empty, or listed in 'source_errors'); this slot scores exactly one "
+            "market-data source at a time, so this is a data-evidence failure to abort on, "
+            "not a quiet tape"
+        )
+
+    # Same null check for the source actually being scored, which only differs
+    # from the primary (already checked above) when the fallback was selected.
+    ticker_errors = ticker_errors_by_source.get(effective_spec.source.value, [])
+    if ticker_errors is None:
+        raise ValueError(
+            f"--market-data's 'ticker_errors.{effective_spec.source.value}', if present, must be "
+            "a list, got null"
+        )
+    alternate_ticker_errors = ticker_errors_by_source.get(SourceName.ROBINHOOD.value, [])
+    if alternate_ticker_errors is None or isinstance(alternate_ticker_errors, (str, bytes)):
+        raise ValueError("--market-data's 'ticker_errors.robinhood', if present, must be a list")
 
     document = build_document(
-        spec,
+        effective_spec,
         trading_day=trading_day,
         config=config,
-        market_data=sources[spec.source.value],
-        source_errors=source_errors,
+        market_data=sources[effective_spec.source.value],
+        alternate_market_data=sources.get(SourceName.ROBINHOOD.value, {}),
+        # Context-source outages are evidence for the caller/report, not a
+        # reason to relabel or replace the Finance-primary signal provider.
+        source_errors=tuple(
+            s for s in source_errors if not (use_fallback and s == spec.source.value)
+        ),
         ticker_errors=ticker_errors,
+        alternate_ticker_errors=alternate_ticker_errors,
         already_covered_tickers=args.already_covered_tickers,
         deployed_last_7d_usd=getattr(args, "deployed_last_7d_usd", None),
         config_dir=args.config_dir,
@@ -1557,6 +1974,11 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
         # elsewhere, rows were sized from a different ladder than the one being
         # validated against, so the verdict is untrustworthy in both directions.
         check_planner_compatibility=True,
+        decision_time_et=args.decision_time_et,
+    )
+    document["validation_context_sources_present"] = sorted(set(sources) - {effective_spec.source.value})
+    document["validation_context_source_errors"] = sorted(
+        s for s in source_errors if s != effective_spec.source.value
     )
 
     # allow_nan=False: defense in depth alongside the payload's own finite-value

@@ -328,6 +328,38 @@ def test_load_states_keeps_recovered_deployment_evidence(tmp_path):
     assert by_day.get(date(2026, 7, 6)) == 25.0
 
 
+def test_load_states_keeps_partially_blocked_states_with_placed_evidence(tmp_path):
+    # Codex review, PR #1300 discussion_r3920912125 ("Keep partial blocked
+    # states in risk scans"): raw persistence failing AFTER an order was
+    # already placed writes a fully populated status:"blocked" artifact for
+    # that real candidate, with NO artifact_contract_failure marker at all
+    # (unlike the compute-only-terminal-state case the sibling test above
+    # covers). Dropping it here understated deployed_last_7d_usd_by_stream
+    # for that morning/midday stream. A pure date-gate stub with no order
+    # evidence must still be dropped.
+    import json as _json
+
+    from dca_risk import _load_states
+
+    root = tmp_path / "scheduled_runs"
+    partial = _scheduled_state("2026-07-06", 42.0)
+    partial["status"] = "blocked"  # no artifact_contract_failure marker
+    d1 = root / "20260706_1520ET"
+    d1.mkdir(parents=True)
+    (d1 / "run_state.json").write_text(_json.dumps(partial), encoding="utf-8")
+    d2 = root / "20260707_1520ET"
+    d2.mkdir(parents=True)
+    (d2 / "run_state.json").write_text(
+        _json.dumps({"trading_day": "2026-07-07", "status": "blocked"}), encoding="utf-8"
+    )
+
+    states = _load_states(root)
+    assert any(s.get("trading_day") == "2026-07-06" for s in states)
+    assert not any(s.get("trading_day") == "2026-07-07" for s in states)
+    by_day = deployed_by_day(states)
+    assert by_day.get(date(2026, 7, 6)) == 42.0
+
+
 def test_normal_case_no_kill_switch_preserves_ladder():
     """Deployment below 40% of monthly leaves the full graded ladder intact."""
     as_of = date(2026, 7, 8)
@@ -811,6 +843,32 @@ def test_deployed_usd_counts_restored_in_flight_statuses():
     assert deployed_usd(state) == 60.0
 
 
+def test_deployed_usd_counts_potentially_submitted_without_the_legacy_flag():
+    # Codex review, PR #1299 (dca_risk.py:93): "potentially_submitted" is a
+    # valid schema status on its own -- the legacy ambiguous_placement_
+    # exception boolean flag is not required to accompany it. A recovered/
+    # imported run state carrying only the status (no flag) must still count
+    # as deployed capital, or deployed_usd()/deployed_usd_by_claim_date()
+    # understate rolling deployment and let a later live run reuse
+    # kill-switch headroom for an order that may still exist at the broker.
+    state = {
+        "buy_candidates": [
+            {"status": "potentially_submitted", "planned_amount_usd": 12.0},
+        ]
+    }
+    assert deployed_usd(state) == 12.0
+
+
+def test_deployed_usd_by_claim_date_counts_potentially_submitted_without_the_legacy_flag():
+    state = {
+        "trading_day": "2026-06-29",
+        "buy_candidates": [
+            {"status": "potentially_submitted", "planned_amount_usd": 12.0},
+        ],
+    }
+    assert deployed_usd_by_claim_date(state) == {date(2026, 6, 29): 12.0}
+
+
 def test_deployed_usd_by_claim_date_counts_restored_in_flight_statuses():
     state = {
         "trading_day": "2026-06-29",
@@ -1081,6 +1139,68 @@ def test_deployed_usd_by_claim_date_counts_ambiguous_placement_reservations():
 def test_deployed_usd_by_claim_date_falls_back_to_deployed_usd_without_candidates():
     state = {"trading_day": "2026-08-16", "budget": {"day_notional_usd": 75.0}}
     assert deployed_usd_by_claim_date(state) == {date(2026, 8, 16): 75.0}
+
+
+def test_deployed_usd_by_claim_date_dedupes_a_repeated_order_id():
+    """codex review discussion_r3887931343 ("Deduplicate recovered copies in
+    deployment accounting"): duplicate historical artifacts for the same
+    accepted order share one order_id. seen_order_ids, when threaded in,
+    must skip a second occurrence of an already-seen order_id entirely."""
+    state = {
+        "trading_day": "2026-08-16",
+        "buy_candidates": [
+            {"status": "submitted", "planned_amount_usd": 10.0, "order_id": "ORD-DUP-1"},
+            {"status": "submitted", "planned_amount_usd": 10.0, "order_id": "ORD-DUP-1"},
+        ],
+    }
+    seen: set = set()
+    assert deployed_usd_by_claim_date(state, seen_order_ids=seen) == {date(2026, 8, 16): 10.0}
+    assert seen == {"ORD-DUP-1"}
+
+    # No seen_order_ids given: unchanged, backward-compatible behavior sums
+    # both rows.
+    assert deployed_usd_by_claim_date(state) == {date(2026, 8, 16): 20.0}
+
+
+def test_deployed_usd_by_claim_date_never_dedupes_rows_without_an_order_id():
+    """Legacy evidence with no order_id at all must never be deduplicated
+    against another such row -- there is no identity to compare."""
+    state = {
+        "trading_day": "2026-08-16",
+        "buy_candidates": [
+            {"status": "submitted", "planned_amount_usd": 10.0},
+            {"status": "submitted", "planned_amount_usd": 10.0},
+        ],
+    }
+    seen: set = set()
+    assert deployed_usd_by_claim_date(state, seen_order_ids=seen) == {date(2026, 8, 16): 20.0}
+
+
+def test_deployed_by_day_counts_a_duplicated_order_id_once():
+    """Integration check: deployed_by_day (the function apply_risk_guard's
+    kill-switch seeding actually calls) threads ONE seen_order_ids set
+    across its whole sweep over states, so the SAME broker order recorded
+    in TWO durable artifacts (e.g. duplicate historical copies of one
+    fractional placement's evidence) is summed once, not once per copy."""
+    state_a = _scheduled_state("2026-08-16", 10.0)
+    state_a["buy_candidates"][0]["order_id"] = "ORD-DUP-1"
+    state_b = _scheduled_state("2026-08-16", 10.0)
+    state_b["buy_candidates"][0]["order_id"] = "ORD-DUP-1"
+
+    per_day = deployed_by_day([state_a, state_b], stream=STREAM_SCHEDULED)
+    assert per_day == {date(2026, 8, 16): 10.0}
+
+    # Distinct order ids are never deduplicated against each other.
+    state_c = _scheduled_state("2026-08-16", 10.0)
+    state_c["buy_candidates"][0]["order_id"] = "ORD-DISTINCT-2"
+    per_day_distinct = deployed_by_day([state_a, state_c], stream=STREAM_SCHEDULED)
+    assert per_day_distinct == {date(2026, 8, 16): 20.0}
+
+    # Legacy evidence with no order_id at all is never deduplicated.
+    state_d = _scheduled_state("2026-08-16", 10.0)
+    state_e = _scheduled_state("2026-08-16", 10.0)
+    per_day_legacy = deployed_by_day([state_d, state_e], stream=STREAM_SCHEDULED)
+    assert per_day_legacy == {date(2026, 8, 16): 20.0}
 
 
 def test_deployed_by_day_buckets_a_reconciled_claim_under_its_own_trading_day():

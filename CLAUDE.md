@@ -30,7 +30,7 @@ python -m pip install --upgrade pip && pip install -r requirements-dev.txt
 # Lint (ruff, line-length 120, rules E,F,I,B; E501 ignored)
 ruff check .
 
-# Tests — ~3,500 tests, ~45s for the whole suite. Tests live under tests/ (2026-08-23:
+# Tests — ~8,300 tests, ~5 min for the whole suite. Tests live under tests/ (2026-08-23:
 # moved out of the repo root, which used to hold one test_<module>.py flat beside every
 # module); pyproject.toml's pythonpath = [".", "tests"] keeps both `import near_close_dca`
 # and cross-test imports (e.g. `from test_morning_dca import ...`) resolving from there.
@@ -66,19 +66,26 @@ ruff check --isolated --select=E,F,B --line-length=120 ticker-market-breadth
 ```
 
 CI (`.github/workflows/ci.yml`) runs lint + coverage-gated tests on Python 3.11 and 3.12, the
-demo smoke test, `pip-audit` on `requirements-dev.txt`, and the `production-safe-agent-loop`,
+demo smoke test, `pip-audit` on pinned dev tooling and the resolved transitive dependencies
+from `uv.lock` plus each independent research manifest, and the `production-safe-agent-loop`,
 `ticker-advisor`, `ml-forecaster` (the sizing-adjustment ML retrain pipeline, see
 `docs/ticker_advisory.md`'s "Implemented: the ml-forecaster sibling tool" section),
 `wondrous-octopus` (walk-forward OHLC forecasting, see `docs/wondrous_octopus.md`), and
 `ticker-market-breadth` (yfinance `^TICK` NYSE breadth-index archive fetch, data only --
 see `ticker-market-breadth/README.md`) suites each in their own job. Dev tool versions are
 **pinned** in `requirements-dev.txt` on purpose — bump deliberately.
+The `dev` extra uses the same exact pins. It also installs `pip-audit`, `uv`, and
+Pyright; Pyright uses the existing `[tool.pyright]` configuration but is not a CI
+gate while its existing diagnostics remain unresolved. Audit lock exports and
+manifest resolutions are temporary CI artifacts, not research package installs.
+The research audit has a separate job name and runs on both CI Python versions;
+research-only failures stay outside self-heal's documented core-only scope.
 
 ## Architecture
 
 | Layer | Modules |
 |---|---|
-| Strategy core | `near_close_dca.py` (~8.7k lines: signals, graded ladder, budgets, safeguards, run artifacts, `build_broker`, `StrategyConfig`/`StrategyState`) |
+| Strategy core | `near_close_dca.py` (~40k lines: signals, graded ladder, budgets, safeguards, run artifacts, `build_broker`, `StrategyConfig`/`StrategyState`) |
 | Stream executors | `morning_dca.py` defines `MorningDCAExecutor`; `market_open_dca.py` (9:35, cron `2ba19526`), `midday_dca.py` (12:30, `a6239dae`), `intraday_dca.py` (11:30 / 1:30 / 2:30, `7be82b97`) are thin subclasses that override identity constants and a few flags only |
 | Orchestration | `run_dca.py` — `run_pipeline()`, `run_slot()`, `main()` (CLI); `dca_runner.py` — the gate-sequence live runner (Gate 0 market day → Gate 1 time sanity → Gate 3 window → Gate 4 sole-executor → Gate 6 budget → Gate 7 placement → Gate 9 evidence) |
 | Config & paths | `dca_config.py` (discovery, `expand_config_env`, fail-closed loading), `dca_paths.py` (`cron_tracking_root()`, `stream_root()`), `dca_ticker_paths.py` |
@@ -88,7 +95,7 @@ see `ticker-market-breadth/README.md`) suites each in their own job. Dev tool ve
 | Visualization | `dca_market_graph.py` + `viz/` (the 3D market graph, "The Ocean" — the only pixel output here; `viz/vendor/three.min.js` is the repo's only vendored third-party asset, browser-side only, never imported by Python — see `docs/market_graph.md`) |
 | Reliability engines | `scripts/broker_reconciliation.py`, `run_state_machine.py`, `run_ledger.py`, `idempotency.py`, `scheduler_lease.py`, `reason_codes.py`, `correlation.py`, `same_day_pointer.py`, `same_day_top_up_gate.py`, `file_lock.py` |
 | Ops utilities | `scripts/run_classification.py`, `drift_detection.py`, `backup_strategy.py`, `run_ticker_maintenance.py`, `daily_per_ticker_calibration.py`, `generate_per_ticker_sizing.py`, `workflow_policy.py` |
-| Data contracts | `config/` (17 JSON files) validated against `schemas/` (21 JSON schemas) |
+| Data contracts | `config/*.json` validated against `schemas/*.json` (`tests/test_config_invariants.py` is the gate) |
 
 ### Three entry points coexist — know which one you are editing
 
@@ -102,8 +109,12 @@ A fix applied to one does **not** propagate to the others. Full detail in `docs/
 
 Consequences to internalize before changing anything:
 
-- **Duplicated logic drifts silently.** `run_slot()` carries its own copy of the morning
-  preflight gate. Fixing `_apply_preflight_gate()` will not reach `run_slot()`, or vice versa.
+- **Duplicated logic drifts silently.** The three entry points seed their daily/weekly caps
+  from three different sources: `dca_runner`'s Gate 6 sums broker order history, the
+  executor classes scan same-day run artifacts, and `near_close_dca.within_caps` reads
+  `StrategyState` plus artifact seeding. A cap fix applied to one does not reach the others.
+  (The morning preflight gate used to be the example here; both callers now share
+  `morning_preflight_eligible_tickers()`.)
 - **"No in-repo caller" ≠ dead code.** The executor classes, `dca_runner.py`,
   `dca_cost_tracker.py`, `dca_weekly_dashboard.py`, and `scripts/same_day_top_up_gate.py`
   have zero in-repo callers *by design*. Deleting them breaks live automation this repo
@@ -146,7 +157,7 @@ These are enforced by tests or by fail-closed runtime code. Violating one fails 
 | Variable | Default | Effect |
 |---|---|---|
 | `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` | — | Required for live runs; not needed for `--demo` or tests |
-| `DCA_CRON_TRACKING_ROOT` | `/home/user/workspace/cron_tracking` | Root of the whole per-stream artifact tree. Read at import time |
+| `DCA_CRON_TRACKING_ROOT` | `<checkout>/cron_tracking` (production exports the shared tree explicitly) | Root of the whole per-stream artifact tree. Read at import time |
 | `DCA_CONFIG_DIR` | `config/` beside the modules | Where `config/*.json` is loaded from |
 | `DCA_ATTEMPT_LOG_ROOT` | `<cron root>/attempt_log` | Failed-start marker tree; read at call time |
 | `DCA_INTRADAY_LIVE_STATE_ROOT`, `DCA_MARKET_OPEN_LIVE_STATE_ROOT` | derived | *Replace* (not extend) recovery/prior-allocation search roots |
@@ -195,6 +206,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | File | Contents |
 |---|---|
 | `AGENTS.md` | The repo-wide agent operating contract (secrets policy, PR expectations) |
+| `docs/repo_map.md` | **Read this before opening a core module.** Structural map of every runner, report producer, and prediction tool: slot-to-entry-point ownership, which reporting modules have a CLI and which are library-only, and which tools can reach live sizing. Complements `scripts/agent_entry_points.py` (that one is task-oriented: "what command do I run") |
 | `docs/README.md` | Doc index + quick-reference facts (universe, ladder, budgets, test window) |
 | `docs/live_wiring.md` | Modules, dependency injection, the three entry points, state persistence, local agent quick reference |
 | `scripts/agent_entry_points.py` | Live index of existing entry points to reuse instead of writing new code (`--json`/`--search`) |

@@ -160,7 +160,7 @@ def test_write_average_cost_snapshot_writes_json_atomically(tmp_path: Path):
     written_path = write_average_cost_snapshot(snapshot, output_dir=tmp_path)
 
     assert written_path == tmp_path / AVERAGE_COST_SNAPSHOT_FILENAME
-    on_disk = json.loads(written_path.read_text(encoding="utf-8"))
+    on_disk = json.loads(written_path.read_bytes())
     assert on_disk == snapshot
 
 

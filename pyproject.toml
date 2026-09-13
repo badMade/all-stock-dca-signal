@@ -14,9 +14,6 @@ license = { text = "Proprietary" }
 dependencies = []
 
 [project.optional-dependencies]
-selfheal = [
-    "ruamel.yaml>=0.17",
-]
 # Test/lint tooling. Kept in sync with requirements-dev.txt, which pins exact
 # versions for CI; this extra backs the documented `pip install -e '.[dev]'`
 # path. Both must install the same tools or the two paths run different suites:
@@ -24,20 +21,23 @@ selfheal = [
 # silent pass, and without pytest-cov the documented coverage command cannot run
 # at all (Codex review, PR #219).
 dev = [
-    "pytest>=7.4",
-    "ruff>=0.5",
-    "jsonschema>=4.25",
-    "referencing>=0.36",
-    "pytest-cov>=7.0",
+    "pytest==9.1.1",
+    "ruff==0.16.2",
+    "jsonschema==4.26.0",
+    "referencing==0.37.0",
+    "pytest-cov==7.1.0",
     # scripts/workflow_policy.py imports yaml; without it here, `pip install
     # -e '.[dev]'` collects fine on an environment where jsonschema/referencing
     # happen to pull PyYAML in transitively and fails collection everywhere
     # else, since it isn't a documented dependency of either (Codex review,
     # PR #219: "Include PyYAML in the dev extra").
-    "pyyaml>=6.0",
-    "types-requests>=2.32",
-    "types-PyYAML>=6.0",
-    "types-beautifulsoup4>=4.12",
+    "pyyaml==6.0.3",
+    "types-requests==2.33.0.20260712",
+    "types-PyYAML==6.0.12.20240917",
+    "types-beautifulsoup4==4.12.0.20250516",
+    "pip-audit==2.10.1",
+    "pyright==1.1.411",
+    "uv==0.12.10",
 ]
 # Heavy, undeclared-elsewhere deps used only by the trading-strategies/ research
 # tools (backtester, sentiment monitor). Not needed to run the DCA strategy.
@@ -132,6 +132,14 @@ py-modules = [
     # this module to aggregate and write them. Without it here it only
     # imports from a source checkout, not an installed wheel.
     "dca_average_cost_snapshot",
+    # The live-DCA-side boundary module a second sizing suggester imports to
+    # combine adjustment files (docs/repo_map.md, dca-sizing-signals/README.md).
+    # No in-repo caller by design, which is exactly why nothing noticed it
+    # shipped in no wheel (2026-09-07 diagnostic P:PACKAGING-02).
+    "sizing_adjustment_reader",
+    # Deliberately NOT listed: dca_console, dca_console_data, dca_console_jobs,
+    # dca_console_octopus (and the from.py launcher) are the local developer
+    # console and only ever run from a source checkout.
 ]
 # scripts/run_classification.py is the run-classification contract used by both
 # the live artifact writer (near_close_dca.build_run_artifacts) and readers
@@ -172,6 +180,12 @@ packages = ["scripts"]
     # to defaults (both modes fully off) for a checkout that intended them active.
     "config/inverse_martingale.json",
     "config/ml_sizing_adjustment.json",
+    # Read by dca_config.load_near_close_overrides for the afternoon task; a
+    # missing file yields {} silently, so an installed wheel ignored every
+    # override a checkout honoured. tests/test_config_invariants.py now derives
+    # this list from dca_config's own _read_json call sites (2026-09-07
+    # diagnostic, P:PACKAGING-01).
+    "config/near_close_dca.json",
 ]
 
 # Browser assets for the 3D market graph, resolved at runtime by
@@ -212,7 +226,7 @@ python_files = ["test_*.py"]
 # of import resolve regardless of whether the suite is invoked as `pytest` or
 # `python -m pytest` (the latter already adds the cwd to sys.path via `-m`,
 # but CI's `pytest --cov=. ...` does not).
-pythonpath = [".", "tests"]
+pythonpath = [".", "tests", "dca-sizing-signals"]
 # production-safe-agent-loop/ and ticker-advisor/ are self-contained tools
 # with their own deps (production-safe-agent-loop: anthropic, requests,
 # beautifulsoup4; ticker-advisor: pandas, vectorbt, transformers/torch, ...)
@@ -231,11 +245,6 @@ source = ["."]
 omit = [
     "test_*.py",
     "*/tests/*",
-    # The root tests/ directory itself (moved out of the repo root 2026-08-23).
-    # "*/tests/*" alone does not match it: coverage.py's fnmatch-style patterns
-    # need a path segment before "tests/", and this one has none since it's
-    # already at the source root.
-    "tests/*",
     "conftest.py",
     # Research/analysis tooling: heavy third-party deps, no tests, and excluded
     # from the lint gate for the same reason (see [tool.ruff] extend-exclude).
@@ -300,28 +309,24 @@ ignore = ["E501"]
 
 [tool.pyright]
 extraPaths = [
+    "tests",
     "scripts",
     "ml-forecaster",
     "ticker-advisor",
     "production-safe-agent-loop",
     "wondrous-octopus",
-    "trading-strategies",
     "dca-sizing-signals",
-    "ticker-market-breadth",
-    "tests",
 ]
 typeCheckingMode = "basic"
 reportGeneralTypeIssues = false
-
-[tool.pyrefly]
-search-path = [
-    "scripts",
-    "ml-forecaster",
-    "ticker-advisor",
-    "production-safe-agent-loop",
-    "wondrous-octopus",
-    "trading-strategies",
-    "dca-sizing-signals",
-    "ticker-market-breadth",
-    "tests",
+executionEnvironments = [
+    { root = "wondrous-octopus", extraPaths = ["wondrous-octopus", "."] },
+    { root = "ml-forecaster", extraPaths = ["ml-forecaster", "."] },
+    { root = "ticker-advisor", extraPaths = ["ticker-advisor", "."] },
+    { root = "production-safe-agent-loop", extraPaths = ["production-safe-agent-loop", "."] },
+    { root = "dca-sizing-signals", extraPaths = ["dca-sizing-signals", "."] },
+    { root = ".", extraPaths = ["tests", "scripts"] },
 ]
+
+
+

@@ -1,6 +1,46 @@
-# DCA Operational TODOs
+# DCA Operational Notes
 
 This file tracks follow-up work from live DCA incidents so the same failure modes are not lost in chat history.
+
+## Handoff - 2026-09-08 standing Perplexity backup policy
+
+- Status: user direction: "Perplexity shouldn't be disabled anywhere permanently... Perplexity is supposed to back up Claude if it fails, not be disabled." Also: "make sure that if Claude fails on a run that there is a mechanism to run it with perplexity."
+- What this supersedes: the recurring pattern below (Aug 17, Aug 28, Aug 31, Sep 8-11 handoffs) of one-off, date-gated Perplexity buy authorizations that had to be reissued every few days, each disabling the previous batch's leftover task IDs. That churn read as Perplexity repeatedly being disabled; the actual standing intent, recorded in `claude/PERPLEXITY-CLAUDE-COORDINATION.md` since 2026-08-02 ("Long term, Claude is primary and Perplexity is backup"), was never disablement.
+- What changed: `config/scheduled_tasks.json` -> `standing_perplexity_backup_policy` (new top-level key, non-expiring) is now the authoritative record. It covers all seven Claude slots, each backed up by a Perplexity task firing 10 minutes later: 09:35->09:45 (`4412c3c4`), 10:30->10:40 (`e028361e`), 11:30->11:40 (`e3590042`), 12:30->12:40 (`062605c6`), 13:30->13:40, 14:30->14:40, 15:30->15:40 (all three afternoon backups are one task, `54ab24d2`). All five backup task IDs were already live in the scheduler under the Sep 8-11 handoff below; nothing new was deployed to make this current, only the authorization's status changed from temporary to standing.
+- The Sep 8-11 handoff below is marked superseded, not deleted, for audit history. Do not renew or extend it after 2026-09-11 -- the standing policy already covers what renewal would have re-granted.
+- Real gap found and fixed in the same change: the 12:30 PM slot's own Gate 4 (`claude/dca-executor-prompts/live-mirror/1230ET-1230-pm-midday-buying-run.txt`) called `dca_runner.gate_sole_executor` directly, which ignores `placed_agent` entirely and has no compatible-executor branch -- so a genuine `062605c6` backup fill in that window would have aborted the whole midday batch as a rogue collision, the opposite of standing backup. The other six slots (including all three `7be82b97` fires) already recognized a compatible Perplexity order in prose per `claude/PERPLEXITY-CLAUDE-COORDINATION.md` section 3. Fixed by adding the same recognition to the 1230 prompt's Gate 4 script and Gate 5's candidate exclusion, mirroring the existing pattern rather than inventing a new one; see the coordination doc's updated section 5.5.
+- `docs/schedule_manifest.md` carries the same standing table, positioned above the (now superseded) dated override blocks per this repo's own "authoritative table first" convention.
+- Deployment caveat unchanged from every other entry here: this repo's config documents the intended standing policy; it does not and cannot create or remove tasks in Perplexity's own live scheduler. All five backup task IDs are already deployed there as of this handoff.
+
+## Handoff - 2026-09-08 delayed morning scheduler cleanup
+
+- Status: User explicitly authorized Perplexity to run only the delayed morning buy-only DCA schedule for Sep 8-11, 2026 so Claude gets first chance to buy first.
+- Active Perplexity buy slots for this week-limited override: 09:45, 10:40, and 11:40 ET.
+- Live scheduler task IDs left active for the override: `4412c3c4` at 09:45, `e028361e` at 10:40, and `e3590042` at 11:40. Expired Aug 28-gated buy tasks `0c3cde00` (12:30) and `44b3975d` (13:30/14:30/15:30) were deleted from the live scheduler.
+- Authorization is date-gated to America/New_York trading days `2026-09-08` through `2026-09-11` only. It does not authorize 12:30 buys, afternoon buys, or any buys outside those delayed morning windows.
+- Role split: Perplexity handles delayed scheduled buy-run execution plus required buy-run artifacts and notifications only. Claude handles scheduled reports and gets first chance to buy.
+- Safety scope remains unchanged: buy-only Robinhood Agentic account <ROBINHOOD_ACCOUNT_NUMBER>, active whitelist only, regular-hours only, no `review_equity_order`, no per-order confirmation, no sells, no cancellations, no options, no crypto, no margin, and no account-setting changes.
+- Repo mirror: `config/scheduled_tasks.json` records this under `temporary_live_scheduler_overrides.authorize_2026_09_08_delayed_morning_perplexity_buy_slots_week_only`; `docs/schedule_manifest.md` mirrors the same dated override.
+
+## Handoff - 2026-08-31 morning scheduler override
+
+- Status: User explicitly authorized Perplexity to run the morning buy-only DCA schedule for Monday, Aug 31, 2026 at 09:35, 10:30, and 11:30 ET.
+- Active Perplexity buy slots for this same-day override: 09:35, 10:30, and 11:30 ET.
+- Live scheduler task IDs for the override are the existing canonical tasks: `2ba19526` at 09:35, `42173154` at 10:30, and `7be82b97` at 11:30. Parallel one-time IDs `4e8c92af`, `01e4f18b`, and `6db8bbf1` must remain disabled.
+- Authorization is date-gated to America/New_York trading day `2026-08-31` only. It does not reactivate the recurring Aug 28-gated buy slots or authorize afternoon buys.
+- Role split: Perplexity handles scheduled buy-run execution plus required buy-run artifacts and notifications only. Claude handles scheduled reports. Perplexity buy tasks must not perform dashboard reporting, Notion report refreshes, slippage-only reports, monitor-only reports, or watchdog-only reporting.
+- Safety scope remains unchanged: buy-only Robinhood Agentic account <ROBINHOOD_ACCOUNT_NUMBER>, active whitelist only, regular-hours only, no `review_equity_order`, no per-order confirmation, no sells, no cancellations, no options, no crypto, no margin, and no account-setting changes.
+- Repo mirror: `config/scheduled_tasks.json` records this under `temporary_live_scheduler_overrides.authorize_2026_08_31_morning_perplexity_buy_slots_today_only`; `docs/schedule_manifest.md` mirrors the same dated override.
+
+## Handoff - 2026-08-28 intraday scheduler override
+
+- Status: User explicitly authorized Perplexity to run all scheduled buy-only DCA tasks for Friday, Aug 28, 2026, including the missed 09:35 ET run as a same-day catch-up.
+- Active Perplexity buy slots for this same-day override: 09:35 catch-up, 10:30, 11:30, 12:30, 13:30, 14:30, and 15:30 ET.
+- Live scheduler task IDs for the override: `2c1d3792` one-time 09:35 catch-up, then canonical IDs `42173154` at 10:30, `7be82b97` at 11:30/13:30/14:30, `a6239dae` at 12:30, and `10ce362c` at 15:30. Canonical ID `2ba19526` remains the authorized 09:35 task, although its scheduled occurrence had already passed before the catch-up was created. Parallel replacement IDs `4412c3c4`, `e028361e`, `e3590042`, `0c3cde00`, and `44b3975d` must remain disabled.
+- Authorization is date-gated to America/New_York trading day `2026-08-28` only. Recurring slots should silently no-op after that date unless the user gives a new authorization.
+- Role split: Perplexity handles scheduled buy-run execution plus required buy-run artifacts and notifications only. Claude handles scheduled reports. Perplexity buy tasks must not perform dashboard reporting, Notion report refreshes, slippage-only reports, monitor-only reports, or watchdog-only reporting.
+- Safety scope remains unchanged: buy-only Robinhood Agentic account <ROBINHOOD_ACCOUNT_NUMBER>, active whitelist only, regular-hours only, no `review_equity_order`, no per-order confirmation, no sells, no cancellations, no options, no crypto, no margin, and no account-setting changes.
+- Repo mirror: `config/scheduled_tasks.json` records this under `temporary_live_scheduler_overrides.authorize_2026_08_28_all_perplexity_buy_slots_today_only`; `docs/schedule_manifest.md` mirrors the same dated override.
 
 ## Handoff - 2026-08-21 close
 
@@ -24,6 +64,7 @@ This file tracks follow-up work from live DCA incidents so the same failure mode
   - Investigate Aug 21 15:30 Alpaca validation unavailability if cross-broker validation remains required for final-pass confidence.
   - Confirm whether the Aug 17-21 disabled gates should be extended, removed, or replaced before the next trading week.
   - Keep the Aug 18 manual override artifacts excluded from scheduled-live metrics via the existing manual override classification rules.
+
 
 ## 2026-08-03 follow-ups
 

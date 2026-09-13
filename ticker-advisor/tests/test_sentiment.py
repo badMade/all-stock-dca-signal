@@ -9,6 +9,7 @@ needs the model stack, guarded below with importorskip.
 
 import os
 import sys
+import threading
 import types
 from unittest import mock
 
@@ -168,6 +169,113 @@ def test_finbert_sentiment_analyzer_real_model():
     assert entry["label"] in {"positive", "negative", "neutral"}
     assert 0.0 <= entry["confidence"] <= 1.0
     assert entry["positive"] + entry["negative"] + entry["neutral"] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_finbert_score_texts_normalizes_probability_fields_to_builtin_floats():
+    # The serialized advisory artifacts should keep emitting plain Python
+    # floats even if the underlying tensor library hands us numpy scalar
+    # types; otherwise numerically-identical scores can still drift in
+    # downstream JSON snapshots and callers (Code Review on stacked-base
+    # merge validation: "Restore explicit float conversion").
+    import contextlib
+
+    import numpy as np
+
+    class _FakeModel:
+        def __call__(self, **kwargs):
+            return types.SimpleNamespace(logits=object())
+
+    class _FakeSoftmaxResult:
+        def tolist(self):
+            return [[np.float32(0.7), np.float32(0.2), np.float32(0.1)]]
+
+    fake_torch = types.SimpleNamespace(
+        no_grad=contextlib.nullcontext,
+        nn=types.SimpleNamespace(
+            functional=types.SimpleNamespace(softmax=lambda logits, dim=-1: _FakeSoftmaxResult())
+        ),
+    )
+    analyzer = signals.FinbertSentimentAnalyzer.__new__(signals.FinbertSentimentAnalyzer)
+    analyzer._labels = ["positive", "negative", "neutral"]
+    analyzer._tokenizer = lambda texts, **kwargs: {"input_ids": texts}
+    analyzer._model = _FakeModel()
+    # __new__ skips __init__, so EVERY private attribute score_texts reads
+    # has to be set by hand here -- including the inference lock that PR
+    # #644's parallel score_candidate execution added. CI on PR #1358 failed
+    # this test with "AttributeError: 'FinbertSentimentAnalyzer' object has
+    # no attribute '_inference_lock'" once that lock reached the branch.
+    # signals.py now also creates the lock lazily (covered by
+    # test_finbert_inference_lock_is_created_lazily_when_init_is_bypassed
+    # below); set it explicitly anyway so this test models a fully-built
+    # analyzer rather than leaning on that fallback.
+    analyzer._inference_lock = threading.Lock()
+
+    # main (#1149) switched score_texts from importlib.import_module("torch")
+    # to a plain `import torch`, so the stub has to live in sys.modules,
+    # where the import statement looks first; patching importlib no
+    # longer intercepts anything.
+    with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+        scored = analyzer.score_texts(["headline"])
+
+    entry = scored[0]
+    assert type(entry["positive"]) is float
+    assert type(entry["negative"]) is float
+    assert type(entry["neutral"]) is float
+    assert type(entry["confidence"]) is float
+
+
+def test_finbert_inference_lock_is_created_lazily_when_init_is_bypassed():
+    # Regression for the CI failure on PR #1358: an analyzer built via
+    # __new__ (the model-free construction path the test above uses) has no
+    # _inference_lock, and score_texts raised AttributeError on
+    # `with self._inference_lock:`. _get_inference_lock() must mint one on
+    # demand -- and hand back the SAME lock on every call, so concurrent
+    # callers still serialize on a single lock instead of each getting their
+    # own (which would silently void the lock's purpose).
+    import contextlib
+
+    analyzer = signals.FinbertSentimentAnalyzer.__new__(signals.FinbertSentimentAnalyzer)
+    assert "_inference_lock" not in vars(analyzer)
+
+    lock = analyzer._get_inference_lock()
+    assert lock is analyzer._get_inference_lock()
+    assert lock is analyzer._inference_lock
+    # It really is a usable, currently-unheld lock.
+    assert lock.acquire(blocking=False)
+    lock.release()
+
+    # An analyzer that DID get its lock eagerly (as __init__ does) keeps that
+    # exact lock rather than having the accessor replace it.
+    eager = signals.FinbertSentimentAnalyzer.__new__(signals.FinbertSentimentAnalyzer)
+    eager._inference_lock = threading.Lock()
+    assert eager._get_inference_lock() is eager._inference_lock
+
+    # And the end-to-end shape of the original failure: score_texts on an
+    # instance that never had the lock set must run, not raise.
+    class _FakeSoftmaxResult:
+        def tolist(self):
+            return [[0.7, 0.2, 0.1]]
+
+    fake_torch = types.SimpleNamespace(
+        no_grad=contextlib.nullcontext,
+        nn=types.SimpleNamespace(
+            functional=types.SimpleNamespace(softmax=lambda logits, dim=-1: _FakeSoftmaxResult())
+        ),
+    )
+    bare = signals.FinbertSentimentAnalyzer.__new__(signals.FinbertSentimentAnalyzer)
+    bare._labels = ["positive", "negative", "neutral"]
+    bare._tokenizer = lambda texts, **kwargs: {"input_ids": texts}
+    bare._model = lambda **kwargs: types.SimpleNamespace(logits=object())
+
+    # main (#1149) switched score_texts from importlib.import_module("torch")
+    # to a plain `import torch`, so the stub has to live in sys.modules,
+    # where the import statement looks first; patching importlib no
+    # longer intercepts anything.
+    with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+        scored = bare.score_texts(["headline"])
+
+    assert scored[0]["label"] == "positive"
+    assert bare._get_inference_lock() is bare._inference_lock
 
 
 def test_finbert_sentiment_analyzer_passes_same_revision_to_both_downloads():

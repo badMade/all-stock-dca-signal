@@ -108,7 +108,21 @@ MARKET_OPEN_SPEC = StreamSpec(
     config_loader=load_market_open_config,
     live_mode=MARKET_OPEN_LIVE_MODE,
     stream_config_filename="market_open_dca.json",
+    # Robinhood-primary (confirmed 2026-09-09, see docs/market_open_signal_entry.md):
+    # this slot's live executor sessions have no reliable Finance MCP connector
+    # access, and the repo's own fail-closed design correctly refused to fabricate
+    # sources.finance from Robinhood data rather than silently substitute. GFUZ no
+    # longer needs a ticker_source_overrides carve-out -- every ticker on this slot
+    # is scored from Robinhood now, the same source GFUZ always used.
     source=SourceName.ROBINHOOD,
+    # source_interval_minutes left at the executor default (None -> 5 minutes):
+    # that was a Finance-only override (Finance published start-stamped 15-minute
+    # bars). Robinhood's native cadence is 5 minutes, the same as every other
+    # Robinhood-primary slot (see MORNING_SPEC in generate_morning_candidates.py).
+    # Gate checks may finish after 09:35. Grade the connector snapshot at the
+    # configured 09:50 live-window boundary so an obtainable in-window quote is
+    # not rejected merely because it arrived after the nominal schedule time.
+    evaluation_delay_minutes=15,
     # See the module docstring: deliberately off for this slot.
     requires_deployed_last_7d_usd=False,
     doc_ref="docs/market_open_signal_entry.md",
@@ -125,11 +139,14 @@ def generate_market_open_candidates(
     trading_day,
     config,
     market_data: Mapping[str, Mapping[str, Any]],
+    alternate_market_data: Optional[Mapping[str, Mapping[str, Any]]] = None,
     source_errors: Sequence[str] = (),
     ticker_errors: Sequence[str] = (),
+    alternate_ticker_errors: Sequence[str] = (),
     already_covered_tickers: Sequence[str] = (),
     config_dir=None,
     check_planner_compatibility: bool = True,
+    decision_time_et=None,
 ) -> dict:
     """Run the market-open executor's own evaluation and return the Gate 5 document."""
     return build_document(
@@ -137,11 +154,14 @@ def generate_market_open_candidates(
         trading_day=trading_day,
         config=config,
         market_data=market_data,
+        alternate_market_data=alternate_market_data,
         source_errors=source_errors,
         ticker_errors=ticker_errors,
+        alternate_ticker_errors=alternate_ticker_errors,
         already_covered_tickers=already_covered_tickers,
         config_dir=config_dir,
         check_planner_compatibility=check_planner_compatibility,
+        decision_time_et=decision_time_et,
     )
 
 

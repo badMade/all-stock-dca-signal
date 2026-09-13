@@ -19,9 +19,18 @@ prompt text. Select all, copy, paste. No trimming.
 live-execution tasks from the prior three(ish)-stream scheduler (`2ba19526` 9:35
 market-open, `42173154` 10:30 morning, `7be82b97` 11:30/1:30/2:30 intraday, `a6239dae`
 12:30 midday, `10ce362c` 3:30 final) -- these are the account's ONLY currently-functioning
-scheduled DCA execution. Every one of the seven new prompt files below ends every fire at
-Gate 5 with the `GATE5_DISABLED` verdict (no callable signal-generation entry point exists
-yet; see `PRODUCTION_READINESS.md`), so none of them can place a single order today. As of
+scheduled DCA execution.
+
+STATUS UPDATE (2026-09-07): the paragraph that follows is HISTORICAL. Since 2026-08-26 every
+one of the seven slots has a real, tested Gate 5 entry point (`PRODUCTION_READINESS.md`,
+"Status, 2026-08-26") and placement was authorized for all seven on 2026-09-02; the canonical
+prompt text is `live-mirror/*.txt`, and `docs/safeguards.md#live-execution-roster` is
+authoritative for what is live. The reasoning below about running the two schedules side by
+side still applies wherever a slot is not yet authorized.
+
+Historically, every one of the seven new prompt files below ended every fire at
+Gate 5 with the `GATE5_DISABLED` verdict (no callable signal-generation entry point existed
+yet; see `PRODUCTION_READINESS.md`), so none of them could place a single order. As of
 2026-07-30 this verdict alerts on every fire (see each file's Gate 5/Gate 9 and
 `PRODUCTION_READINESS.md`) -- it no longer places nothing silently, only
 places nothing. Retiring the five old tasks before Gate 5 is resolved leaves the account

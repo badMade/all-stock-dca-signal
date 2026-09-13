@@ -31,12 +31,12 @@ jobs:
       # NOTE: actions are pinned by tag, not commit SHA. Tags are mutable, so
       # SHA pinning is the stronger posture; the dependabot config in this
       # directory keeps these current in the meantime.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -68,25 +68,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements-dev.txt
 
-      # The core strategy has no runtime third-party dependencies, so this
-      # audits the dev/CI tooling -- the only third-party code that actually
-      # runs here. trading-strategies/requirements.txt is deliberately excluded:
-      # it is unpinned research tooling that never runs in CI, and auditing
-      # floating requirements produces noise rather than signal.
-      - name: Audit pinned dev dependencies
+      - name: Install pinned audit tooling
         run: |
-          python -m pip install --upgrade pip pip-audit
-          pip-audit --requirement requirements-dev.txt --strict
+          python -m pip install --upgrade pip==26.2.1
+          python -m pip install -r requirements-dev.txt
+
+      - name: Audit pinned dev dependencies
+        run: pip-audit --requirement requirements-dev.txt --strict
 
       # Secret scanning is NOT a step here on purpose. The specific leak this
       # repo actually had -- the brokerage account number in config/, docs/, and
@@ -99,17 +97,68 @@ jobs:
       # needs no third-party action in the pipeline, and rejects the commit at
       # push time rather than after it has already landed.
 
+  # Keep this outside the core audit job: self-heal only reproduces the
+  # core lint/test/dev-audit surface and must not claim to repair research.
+  research-audit:
+    name: Dependency audit (research)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install pinned audit tooling
+        run: |
+          python -m pip install --upgrade pip==26.2.1
+          python -m pip install -r requirements-dev.txt
+
+      # Export the committed graph, then resolve each independent install
+      # manifest without building or installing its heavy ML dependencies.
+      # pip-audit reads the exact transitive versions from these temporary
+      # PEP 751 locks; it does not directly read uv.lock.
+      - name: Audit runtime, research, and reviewer dependency trees
+        run: |
+          audit_dir="$RUNNER_TEMP/dca-dependency-audit"
+          mkdir -p "$audit_dir"
+          uv export --locked --all-extras --no-emit-project --format pylock.toml --output-file "$audit_dir/pylock.root.toml"
+          # The privileged reviewer installs this same exact SDK pin from
+          # its trusted default-branch checkout. Resolve its full graph too.
+          uv pip compile requirements-pr-review.txt --python-version "${{ matrix.python-version }}" --no-build --format pylock.toml --output-file "$audit_dir/pylock.pr-review.toml"
+          for manifest in \
+            production-safe-agent-loop/requirements.txt \
+            ticker-advisor/requirements.txt \
+            ml-forecaster/requirements.txt \
+            wondrous-octopus/requirements.txt \
+            ticker-market-breadth/requirements.txt \
+            trading-strategies/requirements.txt \
+            analysis/market-graph-3d/requirements.txt; do
+            scope="${manifest%/requirements.txt}"
+            uv pip compile "$manifest" --python-version "${{ matrix.python-version }}" --no-build --format pylock.toml --output-file "$audit_dir/pylock.${scope//\//-}.toml"
+          done
+          pip-audit --locked "$audit_dir" --strict
+
   production-safe-agent-loop:
     name: Lint & test (production-safe-agent-loop)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -138,12 +187,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -180,12 +229,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -217,37 +266,6 @@ jobs:
         working-directory: ml-forecaster
         run: python -m pytest tests/
 
-  ticker-market-breadth:
-    name: Lint & test (ticker-market-breadth)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
-          pip install -r ticker-market-breadth/requirements.txt
-
-      - name: Ruff lint
-        # Excluded from the root pyproject.toml's ruff scope, same reasoning
-        # as the other sibling subprojects above.
-        run: ruff check --isolated --select=E,F,B --line-length=120 ticker-market-breadth
-
-      - name: Run tests
-        # No test makes a real network call -- yfinance is monkeypatched out
-        # (see tests/test_fetch_tick.py's own docstring).
-        working-directory: ticker-market-breadth
-        run: python -m pytest tests/
-
   wondrous-octopus:
     name: Lint & test (wondrous-octopus)
     runs-on: ubuntu-latest
@@ -255,12 +273,12 @@ jobs:
     # download plus the transformer tests' training time.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           # Cache the ~200 MB CPU torch wheel between runs (the other
@@ -296,4 +314,33 @@ jobs:
 
       - name: Run tests
         working-directory: wondrous-octopus
+        run: python -m pytest tests/
+
+  ticker-market-breadth:
+    name: Lint & test (ticker-market-breadth)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            ticker-market-breadth/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt -r ticker-market-breadth/requirements.txt
+
+      - name: Ruff lint
+        run: ruff check --isolated --select=E,F,B --line-length=120 ticker-market-breadth
+
+      - name: Run tests
+        working-directory: ticker-market-breadth
         run: python -m pytest tests/

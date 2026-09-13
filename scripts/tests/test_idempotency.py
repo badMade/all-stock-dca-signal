@@ -124,3 +124,57 @@ def test_build_idempotency_key_rejects_empty_fields():
             strategy_version="v2",
             tier="elevated"
         )
+
+
+# --- 2026-09-07 diagnostic C:F5: one prefix set for the same slot across entry points ---
+from datetime import date  # noqa: E402
+
+from scripts.idempotency import STREAM_SLOT_IDS, same_stream_ref_id_prefixes  # noqa: E402
+
+
+def test_same_stream_prefixes_name_every_entry_points_family_for_the_slot():
+    prefixes = same_stream_ref_id_prefixes("morning", date(2026, 9, 8), "AAPL")
+    assert prefixes == (
+        "morning-dca-topup-2026-09-08-AAPL",  # class-based executor, guarded top-up
+        "morning-dca-2026-09-08-AAPL",  # class-based executor, plain
+        "graded-dca-morning-topup-2026-09-08-AAPL",  # run_dca.run_slot() engine, guarded top-up
+        "graded-dca-morning-2026-09-08-AAPL",  # run_dca.run_slot() engine, plain
+        "dca-runner-1030-2026-09-08-AAPL",  # dca_runner
+    )
+    # Manual and inverse-Martingale kinds never collide with a scheduled retry.
+    assert not any("-manual-" in p or "-imart-" in p for p in prefixes)
+
+
+def test_afternoon_keeps_the_unprefixed_legacy_graded_dca_family():
+    prefixes = same_stream_ref_id_prefixes("afternoon", date(2026, 9, 8), "AAPL")
+    assert "graded-dca-2026-09-08-AAPL" in prefixes
+    assert "graded-dca-topup-2026-09-08-AAPL" in prefixes
+    assert "dca-runner-1530-2026-09-08-AAPL" in prefixes
+    assert not any(p.startswith("graded-dca-afternoon") for p in prefixes)
+
+
+def test_intraday_covers_all_three_runner_slots_and_an_unknown_stream_has_no_runner_family():
+    intraday = same_stream_ref_id_prefixes("intraday", date(2026, 9, 8), "TICK")
+    assert {p for p in intraday if p.startswith("dca-runner-")} == {
+        "dca-runner-1130-2026-09-08-TICK",
+        "dca-runner-1330-2026-09-08-TICK",
+        "dca-runner-1430-2026-09-08-TICK",
+    }
+    assert STREAM_SLOT_IDS["intraday"] == ("1130", "1330", "1430")
+    unknown = same_stream_ref_id_prefixes("weird", date(2026, 9, 8), "TICK")
+    assert not any(p.startswith("dca-runner-") for p in unknown)
+    assert "weird-dca-2026-09-08-TICK" in unknown
+
+
+def test_a_slot_qualified_intraday_namespace_maps_to_that_one_runner_slot():
+    """Copilot review of PR #1394: IntradayDCAExecutor passes its
+    ``_idempotency_stream()`` value (``intraday-1330``) as the stream, which
+    ``STREAM_SLOT_IDS`` did not recognise, so the runner's
+    ``dca-runner-1330-...`` family was never part of the duplicate check and a
+    cross-entry-point retry of that slot could still double-place."""
+    prefixes = same_stream_ref_id_prefixes("intraday-1330", date(2026, 9, 8), "TICK")
+    assert "intraday-1330-dca-2026-09-08-TICK" in prefixes
+    assert "intraday-1330-dca-topup-2026-09-08-TICK" in prefixes
+    assert {p for p in prefixes if p.startswith("dca-runner-")} == {"dca-runner-1330-2026-09-08-TICK"}
+    # A qualifier that is not one of the stream's roster slots adds nothing.
+    assert not any(p.startswith("dca-runner-") for p in same_stream_ref_id_prefixes("intraday-0000", date(2026, 9, 8), "TICK"))

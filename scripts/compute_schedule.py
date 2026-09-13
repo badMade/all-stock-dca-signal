@@ -27,7 +27,7 @@ def run_cmd(cmd: Sequence[str]):
         raise TypeError("run_cmd requires an argument sequence, not a shell-style string command")
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, shell=False)  # nosec B603 - fixed command, explicit shell=False
     except OSError:
         return None
 

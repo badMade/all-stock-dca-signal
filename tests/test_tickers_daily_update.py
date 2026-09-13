@@ -10,35 +10,14 @@ import pytest
 from scripts.run_tickers_daily_update import (
     _default_breadth_fetch_python,
     _fetch_breadth_series,
+    _universe_tickers,
+    main,
     run_incremental_update,
 )
 
 
 def _write_updater(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
-
-
-@pytest.fixture(autouse=True)
-def _no_real_breadth_fetch_by_default(monkeypatch, tmp_path):
-    """Every test in this module gets a nonexistent default breadth-fetch
-    script unless it overrides `breadth_fetch_script` itself.
-
-    `run_incremental_update` now runs the NYSE TICK breadth fetch by
-    default (fetch_breadth_series=True) as part of "tying it to the daily
-    downloads". Without this fixture, every pre-existing test above would
-    actually spawn the real ticker-market-breadth/fetch_tick.py subprocess
-    -- which needs yfinance and would attempt a live Yahoo Finance network
-    call, violating this suite's no-network-calls invariant and depending
-    on whether yfinance happens to be installed in whatever environment
-    runs it. `_fetch_breadth_series` degrades to "skipped" for a missing
-    script, so this keeps every unrelated test hermetic and fast; the
-    dedicated tests below override `breadth_fetch_script` explicitly to
-    exercise the real behavior against a stub.
-    """
-    monkeypatch.setattr(
-        "scripts.run_tickers_daily_update.DEFAULT_BREADTH_FETCH_SCRIPT",
-        tmp_path / "no-breadth-fetch-script-here.py",
-    )
 
 
 def test_missing_history_dir_error_names_the_override_env_var(tmp_path):
@@ -304,6 +283,35 @@ def test_fetch_breadth_series_reports_completed_on_success(tmp_path):
         "import argparse\n"
         "parser = argparse.ArgumentParser()\n"
         "parser.add_argument('--history-dir')\n"
+        "parser.add_argument('--require-existing-history-dir', action='store_true')\n"
+        "args = parser.parse_args()\n"
+        "assert args.require_existing_history_dir\n"
+        "print('wrote 5 rows to ' + args.history_dir)\n",
+    )
+
+    result = _fetch_breadth_series(history_dir=history_dir, breadth_fetch_script=script, timeout_seconds=5)
+
+    assert result["status"] == "completed"
+    assert "wrote 5 rows" in result["detail"]
+
+
+def test_fetch_breadth_series_falls_back_for_a_script_that_predates_the_guard_flag(tmp_path):
+    """Codex review ("Preserve compatibility with overridden breadth
+    scripts"): an old or custom --breadth-fetch-script override that
+    supports --history-dir but not --require-existing-history-dir must not
+    report every breadth refresh as "failed" forever -- argparse rejects the
+    unrecognized flag with exit code 2 on every call. Retry once without the
+    flag and report "completed" with a detail explaining the guard wasn't
+    enforced for that run.
+    """
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    script = tmp_path / "legacy_fetch_tick.py"
+    _write_updater(
+        script,
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--history-dir', required=True)\n"
         "args = parser.parse_args()\n"
         "print('wrote 5 rows to ' + args.history_dir)\n",
     )
@@ -312,6 +320,32 @@ def test_fetch_breadth_series_reports_completed_on_success(tmp_path):
 
     assert result["status"] == "completed"
     assert "wrote 5 rows" in result["detail"]
+    assert "does not support it" in result["detail"]
+    assert "--require-existing-history-dir" in result["detail"]
+
+
+def test_fetch_breadth_series_does_not_fall_back_on_an_unrelated_argparse_error(tmp_path):
+    """The exit-code-2 fallback is narrow: a script that DOES recognize
+    --require-existing-history-dir but exits 2 for some other argparse
+    reason (e.g. a different bad argument) must still be reported as
+    "failed", not silently retried without the guard.
+    """
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    script = tmp_path / "fake_fetch_tick.py"
+    _write_updater(
+        script,
+        "import argparse\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--history-dir')\n"
+        "parser.add_argument('--require-existing-history-dir', action='store_true')\n"
+        "parser.error('unrecognized arguments: --some-other-flag')\n",
+    )
+
+    result = _fetch_breadth_series(history_dir=history_dir, breadth_fetch_script=script, timeout_seconds=5)
+
+    assert result["status"] == "failed"
+    assert "exited 2" in result["detail"]
 
 
 def test_fetch_breadth_series_honors_an_explicit_python_override(tmp_path):
@@ -405,7 +439,9 @@ def test_fetch_breadth_series_resolves_a_relative_history_dir(tmp_path, monkeypa
         "import argparse\n"
         "parser = argparse.ArgumentParser()\n"
         "parser.add_argument('--history-dir')\n"
+        "parser.add_argument('--require-existing-history-dir', action='store_true')\n"
         "args = parser.parse_args()\n"
+        "assert args.require_existing_history_dir\n"
         "print('received-history-dir:' + args.history_dir)\n",
     )
 
@@ -474,6 +510,31 @@ def test_default_breadth_fetch_python_prefers_the_subprojects_own_venv(tmp_path)
     venv_python = tmp_path / ".venv" / "bin" / "python"
     venv_python.parent.mkdir(parents=True)
     venv_python.write_text("", encoding="utf-8")
+    venv_python.chmod(0o755)
+
+    assert _default_breadth_fetch_python(script) == str(venv_python)
+
+
+def test_default_breadth_fetch_python_skips_a_non_executable_placeholder(tmp_path):
+    """A placeholder file at the documented venv path should not shadow a
+    working fallback interpreter."""
+    script = tmp_path / "fetch_tick.py"
+    script.write_text("", encoding="utf-8")
+    venv_python = tmp_path / ".venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("", encoding="utf-8")
+    venv_python.chmod(0o644)
+
+    assert _default_breadth_fetch_python(script) == sys.executable
+
+
+def test_default_breadth_fetch_python_accepts_the_windows_scripts_layout(tmp_path):
+    script = tmp_path / "fetch_tick.py"
+    script.write_text("", encoding="utf-8")
+    venv_python = tmp_path / ".venv" / "Scripts" / "python.exe"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.write_text("", encoding="utf-8")
+    venv_python.chmod(0o755)
 
     assert _default_breadth_fetch_python(script) == str(venv_python)
 
@@ -525,6 +586,23 @@ def test_fetch_breadth_series_reports_failed_when_the_interpreter_cannot_launch(
         breadth_fetch_script=script,
         timeout_seconds=5,
         breadth_fetch_python=str(tmp_path / "does-not-exist" / "python"),
+    )
+
+    assert result["status"] == "failed"
+    assert "could not launch" in result["detail"]
+
+
+def test_fetch_breadth_series_treats_an_empty_interpreter_override_as_explicit(tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    script = tmp_path / "fake_fetch_tick.py"
+    _write_updater(script, "print('should never run')\n")
+
+    result = _fetch_breadth_series(
+        history_dir=history_dir,
+        breadth_fetch_script=script,
+        timeout_seconds=5,
+        breadth_fetch_python="",
     )
 
     assert result["status"] == "failed"
@@ -622,3 +700,108 @@ def test_run_incremental_update_breadth_fetch_failure_does_not_fail_the_run(tmp_
 
     assert result["status"] == "completed"
     assert result["breadth_fetch"]["status"] == "failed"
+
+
+def test_universe_tickers_requires_active_list(tmp_path):
+    cfg_file = tmp_path / "tickers.json"
+    cfg_file.write_text(json.dumps({"active": "not-a-list"}), encoding="utf-8")
+    with pytest.raises(ValueError, match="must contain an active ticker list"):
+        _universe_tickers(cfg_file)
+
+
+def test_universe_tickers_requires_whole_share_to_be_list_of_strings(tmp_path):
+    cfg_file = tmp_path / "tickers.json"
+    cfg_file.write_text(json.dumps({"active": ["AAPL"], "whole_share": [123]}), encoding="utf-8")
+    with pytest.raises(ValueError, match="must be a list of strings"):
+        _universe_tickers(cfg_file)
+
+
+def test_run_incremental_update_rejects_missing_updater_script(tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    nonexistent = tmp_path / "does_not_exist.py"
+    with pytest.raises(FileNotFoundError, match="configured ticker updater does not exist"):
+        run_incremental_update(updater_script=nonexistent, history_dir=history_dir)
+
+
+def test_run_incremental_update_rejects_nonpositive_max_invocations(tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    updater = tmp_path / "updater.py"
+    _write_updater(updater, "print('ALL_DONE')\n")
+    with pytest.raises(ValueError, match="max_invocations must be at least one"):
+        run_incremental_update(updater_script=updater, history_dir=history_dir, max_invocations=0)
+
+
+def test_run_incremental_update_emits_error_when_no_progress_line(tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    updater = tmp_path / "updater.py"
+    _write_updater(updater, "print('something random without expected pattern')\n")
+    result = run_incremental_update(
+        updater_script=updater,
+        history_dir=history_dir,
+        artifacts_dir=tmp_path / "events",
+        fetch_breadth_series=False,
+    )
+    assert result["status"] == "partial"
+    assert any("emitted no recognized progress line" in err for err in result["errors"])
+
+
+def test_main_cli_missing_updater_script(monkeypatch):
+    monkeypatch.delenv("DCA_TICKER_DAILY_UPDATE_SCRIPT", raising=False)
+    monkeypatch.setattr(sys, "argv", ["run_tickers_daily_update.py"])
+    with pytest.raises(SystemExit):
+        main()
+
+
+def test_main_cli_success(monkeypatch, tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    updater = tmp_path / "updater.py"
+    _write_updater(updater, "print('ALL_DONE')\n")
+    ticker_cfg = tmp_path / "tickers.json"
+    ticker_cfg.write_text(json.dumps({"active": ["AAPL"]}), encoding="utf-8")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_tickers_daily_update.py",
+            "--updater-script",
+            str(updater),
+            "--history-dir",
+            str(history_dir),
+            "--ticker-config",
+            str(ticker_cfg),
+            "--artifacts-dir",
+            str(tmp_path / "events"),
+            "--skip-breadth-fetch",
+        ],
+    )
+    assert main() == 0
+
+
+def test_main_cli_failure(monkeypatch, tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    updater = tmp_path / "updater.py"
+    _write_updater(updater, "import sys\nsys.exit(2)\n")
+    ticker_cfg = tmp_path / "tickers.json"
+    ticker_cfg.write_text(json.dumps({"active": ["AAPL"]}), encoding="utf-8")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_tickers_daily_update.py",
+            "--updater-script",
+            str(updater),
+            "--history-dir",
+            str(history_dir),
+            "--ticker-config",
+            str(ticker_cfg),
+            "--artifacts-dir",
+            str(tmp_path / "events"),
+            "--skip-breadth-fetch",
+        ],
+    )
+    assert main() == 1

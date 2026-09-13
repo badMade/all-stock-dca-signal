@@ -33,8 +33,44 @@ for Geoff).
 The 1230 (12:30 PM) slot's Gate 4 is NOT covered by this update: per §5.5
 below, it runs through `dca_runner.assess()`'s `gate_sole_executor()`, which
 deliberately ignores `placed_agent` entirely, so the carve-out cannot be
-applied there without a real code change to `dca_runner.py`. Low urgency in
-practice, since that slot's live placement is still off pending validation.
+applied there without a real code change to `dca_runner.py`. This gap
+carried low urgency while that slot's live placement was off pending
+validation; as of 2026-09-02 the 1230 slot's `live-mirror/` text has been
+updated to authorize placement (see `docs/safeguards.md#live-execution-roster`),
+but per `claude/dca-executor-prompts/README.md`'s own policy that change is
+not yet deployed -- the ACTUAL live 1230 task remains the 2026-07-31,
+placement-OFF capture until a human applies the updated text via
+`update_scheduled_task` and the mirror is re-captured. So the missing
+carve-out is a gap that will become live collision-handling exposure once
+that deployment happens, not one that is live today -- extending §3's
+carve-out to `dca_runner.py` should be in place before that deployment,
+not treated as a lower-priority follow-up after it.
+
+**Update 2026-09-10 -- 09:35 collision, widened offsets, placement-time
+recheck (§4).** The 09:35 canonical run (cron `2ba19526`) fired at
+approximately 09:43 ET (scheduler jitter) and was still sequentially
+placing its 45-order batch when the then-configured 09:45 fire time for
+standing backup task `4412c3c4` arrived. §4's reconciliation check below
+ran once, against a same-window order history that did not yet contain
+most of the canonical batch, so it excluded only the handful of tickers
+already filled by 09:45 -- not the roughly 26 more the canonical run placed
+afterward, nor as a batch. Result: approximately 29 extra
+`placed_agent='agentic'` orders, duplicating roughly 26 tickers and adding
+3 the canonical run did not intend (RGTI, QBTS, and GOOG, which the
+canonical run had deliberately excluded via its own GOOG/GOOGL dedup). No
+budget cap was breached, and nothing here was a rogue or unrecognized
+executor -- the backup did exactly what §4 told it to do, off a stale
+snapshot. Two fixes, both recorded in `config/scheduled_tasks.json`'s
+`standing_perplexity_backup_policy`: the canonical-to-backup offset is
+widened per slot, sized to jitter history plus realistic batch-placement
+time rather than a flat delay (see `backup_fires_at_et_basis`); and §4's
+check below must now re-run immediately before Perplexity places its own
+orders, not only once at the offset fire time (see
+`placement_time_revalidation_required`) -- this is the part that actually
+closes the gap, since no fixed offset can guarantee a still-running batch
+has finished. The paste-ready text in §4 below is updated accordingly; per
+this document's own standing caveat, Perplexity cannot read this repo, so a
+human still needs to apply the updated text to Perplexity's live prompts.
 
 ## 1. What "first come, first serve" actually means here
 
@@ -272,6 +308,27 @@ into Perplexity's five task prompts, the same way the top-up guard was.
 > special case to escalate or report loudly; a slot Claude already handled,
 > in whole or in part, is the expected, designed outcome of running both
 > executors side by side, not a fault.
+>
+> IMMEDIATELY BEFORE PLACING -- REVALIDATE, DO NOT PLACE OFF THE EARLIER
+> SNAPSHOT. Added 2026-09-10 after a 09:35 collision where this check ran
+> once while Claude's own canonical run was still mid-batch, so the window
+> it inspected did not yet contain most of Claude's orders and excluded only
+> the few already filled. The check above can go stale for exactly that
+> reason: Claude's run may still be placing when this task's own offset
+> timer fires. Immediately before placing your FIRST order for this slot --
+> after sizing is complete but before submitting anything -- repeat the SAME
+> check above from scratch: call `get_equity_orders` again, follow every
+> pagination cursor to completion, and reclassify every order now in the
+> window. If this fresh check finds a Claude-attributable order for a ticker
+> still on your candidate list, drop that ticker before placing anything,
+> exactly as the original check would have excluded it had the order existed
+> the first time. If this fresh check finds a new UNRECOGNIZED order that
+> was not present the first time, treat it the same as any unrecognized
+> order under this task's existing safety rules -- escalate/alert, do not
+> silently stand down. Do not place any order for this slot without having
+> performed this immediately-pre-placement recheck; one check performed
+> minutes earlier is not sufficient when Claude's own batch can still be
+> running.
 
 This is the Perplexity-side mirror of §3's Gate 4 addition: whichever engine's
 qualifying order shows up first in the window wins that ticker, and the other
@@ -321,10 +378,43 @@ deliberately ignores `placed_agent` entirely (see its docstring: "Manual and
 automated buying draw on one shared pool"), a different design choice made
 for a different reason. Extending the recognized-compatible-executor idea to
 that path is a real code change to `dca_runner.py`, not a prompt-text edit,
-and is left as a separate, explicit follow-up -- not attempted here. It is
-lower urgency in practice: that slot's live placement is already OFF pending
-validation, so today it cannot place a duplicate order regardless of what
-Gate 4 decides.
+and is left as a separate, explicit follow-up -- not attempted here. This was
+lower urgency while that slot's live placement was off pending validation,
+since it could not place a duplicate order regardless of what Gate 4
+decided; as of 2026-09-02 the 1230 slot's `live-mirror/` text has been
+updated to authorize placement (see §1's 2026-09-02 update note above and
+`docs/safeguards.md#live-execution-roster`), though that change is not yet
+deployed to the actual live task (see §1's note for the deployment
+distinction). Once it is, a rogue-classified Perplexity order in that
+slot's window would cause a real abort-and-alert (fail-safe, not a
+duplicate order) rather than a theoretical one -- this follow-up should be
+prioritized ahead of that deployment, not after it.
+
+**Fixed 2026-09-08, prompt-text only, no `dca_runner.py` change.** Two
+corrections to the paragraph above: it said this slot "calls
+`dca_runner.assess()`" -- it does not, and never did. `docs/live_wiring.md`'s
+own "Not yet wired to the live prompts" section documents that none of the
+seven scheduled prompts call `assess()`/`execute_plan()`; the 1230 prompt's
+Gate 4 script calls `r.gate_sole_executor(orders, collision_slot, day)`
+directly, the same low-level function the other six slots restate in prose
+around, not the `assess()` wrapper. It also said closing this gap "is a real
+code change to `dca_runner.py`" -- it is not: `dca_runner.py` already ships a
+compatible-executor classifier (the `sole_executor_grace_period_active`
+kwarg on `assess()`/`execute_plan()`, tested in `tests/test_dca_runner.py`),
+but neither function is reachable from any live prompt, so that mechanism
+was unusable here regardless. The actual fix mirrors what the other six
+slots already do: classify `gate_sole_executor()`'s raw collision list by
+`placed_agent == "agentic"` in the prompt's own Gate 4 script (no external
+grace-period flag or expiry -- this is the standing policy now, not a
+temporary carve-out), abort only on a rogue signal, and on a compatible-only
+window pass the covered tickers to Gate 5 via
+`--already-covered-tickers` (`scripts/stream_candidates.py`'s shared CLI
+flag, already wired through `scripts/generate_midday_candidates.py`, the
+same flag the 0935 prompt already documents using for the identical
+purpose). See the prompt's Gate 4 script, its Gate 5 section, and the two
+per-order revalidation paragraphs (all four now say the same thing about
+compatible collisions instead of three of them contradicting the fourth).
+Context: `config/scheduled_tasks.json` -> `standing_perplexity_backup_policy`.
 
 ## 6. What this supersedes
 

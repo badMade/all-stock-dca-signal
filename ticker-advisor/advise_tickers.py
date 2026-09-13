@@ -240,7 +240,7 @@ def _load_legacy_symbol_corrections(repo_root: Path) -> dict[str, str]:
     """
     path = repo_root / "config" / "tickers.json"
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_bytes())
         # Syntactically valid JSON with a non-object top level (null, a
         # bare list, ...) makes .get() raise AttributeError, OUTSIDE this
         # except clause, aborting the whole CLI with a traceback before any
@@ -276,7 +276,7 @@ def _load_current_universe(repo_root: Path) -> tuple[frozenset[str], frozenset[s
     """
     path = repo_root / "config" / "tickers.json"
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_bytes())
         # Same non-object-top-level risk as _load_legacy_symbol_corrections
         # above (Codex review on PR #403: "Validate the ticker-config root
         # before reading mappings") -- raise here so the except clause
@@ -457,7 +457,7 @@ def _detect_benchmark_calendar_gaps(benchmark_calendar: pd.DatetimeIndex) -> lis
     """
     if benchmark_calendar.empty:
         return []
-    import pandas_market_calendars as mcal  # type: ignore
+    import pandas_market_calendars as mcal
 
     nyse_sessions = mcal.get_calendar("NYSE").schedule(
         start_date=benchmark_calendar.min(), end_date=benchmark_calendar.max()
@@ -525,11 +525,17 @@ def _signal_has_usable_metric(raw: dict[str, object], signal: str) -> bool:
     weighted metric usability, not container presence").
     """
     if signal == "health":
-        return any(_extract_health_component(raw.get("health"), c) is not None for c in _HEALTH_COMPONENTS)
+        return any(
+            _extract_health_component(cast(dict[str, float] | None, raw.get("health")), c) is not None
+            for c in _HEALTH_COMPONENTS
+        )
     if signal == "backtest":
-        return any(_extract_backtest_component(raw.get("backtest"), s) is not None for s in _BACKTEST_STRATEGIES)
+        return any(
+            _extract_backtest_component(cast(dict[str, dict[str, float]] | None, raw.get("backtest")), s) is not None
+            for s in _BACKTEST_STRATEGIES
+        )
     if signal == "sentiment":
-        return _extract_sentiment_component(raw.get("sentiment")) is not None
+        return _extract_sentiment_component(cast(dict[str, object] | None, raw.get("sentiment"))) is not None
     return False
 
 
@@ -549,17 +555,38 @@ def _signal_has_normalizable_metric(raw_scores: dict[str, dict[str, object]], si
     tickers = list(raw_scores)
     if signal == "health":
         return any(
-            sum(1 for t in tickers if _extract_health_component(raw_scores[t].get("health"), c) is not None) >= 2
+            sum(
+                1
+                for t in tickers
+                if _extract_health_component(cast(dict[str, float] | None, raw_scores[t].get("health")), c) is not None
+            )
+            >= 2
             for c in _HEALTH_COMPONENTS
         )
     if signal == "backtest":
         return any(
-            sum(1 for t in tickers if _extract_backtest_component(raw_scores[t].get("backtest"), s) is not None) >= 2
+            sum(
+                1
+                for t in tickers
+                if _extract_backtest_component(
+                    cast(dict[str, dict[str, float]] | None, raw_scores[t].get("backtest")), s
+                )
+                is not None
+            )
+            >= 2
             for s in _BACKTEST_STRATEGIES
         )
     if signal == "sentiment":
         return (
-            sum(1 for t in tickers if _extract_sentiment_component(raw_scores[t].get("sentiment")) is not None) >= 2
+            sum(
+                1
+                for t in tickers
+                if _extract_sentiment_component(
+                    cast(dict[str, object] | None, raw_scores[t].get("sentiment"))
+                )
+                is not None
+            )
+            >= 2
         )
     return False
 
@@ -597,7 +624,19 @@ def _index_is_datetime_like(index: pd.Index) -> bool:
     annualization downstream if treated as one ordinary session (Codex
     review, PR #654: "Reject non-daily PeriodIndex frequencies"; "Reject
     multiplied daily period frequencies").
+
+    A `MultiIndex` is rejected up front, before any `pd.isna()` call below --
+    `pd.isna(multi_index)` raises `NotImplementedError` rather than returning
+    a mask, which is OUTSIDE this function's caller's per-signal error-
+    recording guards and would abort the entire benchmark setup or candidate
+    scoring instead of taking the documented degraded no-calendar path (Codex
+    review, PR #1300 discussion_r3920155086: "Handle MultiIndex before
+    calling pd.isna"). An alternate price-history source can return one (e.g.
+    `(session, ticker)`); it is never datetime-like by this function's own
+    contract regardless of what its levels contain.
     """
+    if isinstance(index, pd.MultiIndex):
+        return False
     if isinstance(index, pd.PeriodIndex):
         if len(index) == 0:
             return False
@@ -694,7 +733,16 @@ def _normalize_datetime_frame(frame: pd.DataFrame) -> pd.DataFrame:
     before dropping timezones"). keep="last" on the final dedup retains
     the session's real closing print over a stale earlier one, matching
     pricing.py's own canonical normalization (Codex review, PR #654: "Keep
-    the final row for duplicate trading sessions").
+    the final row for duplicate trading sessions"). `_index_is_datetime_like()`
+    deliberately accepts an index mixing real dated labels with NaT (only an
+    ALL-NaT index is rejected -- see that function's own comment), but
+    nothing else here ever drops the NaT-labeled row itself; left in, it
+    sorts to the end of the frame and a caller computes a return from the
+    last dated session to this unknown-date observation, treating it as
+    another real trading period (Codex review, PR #1300
+    discussion_r3920155076: "Drop NaT rows before treating the index as
+    usable"). Dropped immediately after coercion, before sorting/dedup/
+    return calculation.
     """
     # kind="stable": DataFrame.sort_index()'s default (quicksort) is NOT
     # guaranteed stable, so two rows sharing the exact same raw timestamp
@@ -704,12 +752,18 @@ def _normalize_datetime_frame(frame: pd.DataFrame) -> pd.DataFrame:
     # source's actual final correction, silently swapping in a stale
     # duplicate (Codex review, PR #654 follow-up: "Keep duplicate
     # timestamps stable while sorting").
-    frame = frame.set_axis(_coerce_datetime_index(frame.index)).sort_index(kind="stable")
+    frame = frame.set_axis(_coerce_datetime_index(frame.index))
+    frame = frame.loc[frame.index.notna()]
+    frame = frame.sort_index(kind="stable")
+    assert isinstance(frame.index, pd.DatetimeIndex)
     normalized = frame.index
     if normalized.tz is not None:
         normalized = normalized.tz_localize(None)
-    frame = frame.set_axis(normalized.normalize())
-    return frame[~frame.index.duplicated(keep="last")]
+    frame = frame.set_axis(cast(Any, normalized).normalize())
+    assert isinstance(frame.index, pd.DatetimeIndex)
+    dup_mask: list[bool] = [not bool(d) for d in frame.index.duplicated(keep="last")]
+    frame = frame.loc[dup_mask]
+    return frame
 
 
 def score_candidate(
@@ -719,7 +773,7 @@ def score_candidate(
     lookback_years: int,
     skip_sentiment: bool,
     news_api_key: str | None,
-    analyzer: FinbertSentimentAnalyzer | Any | None,
+    analyzer: FinbertSentimentAnalyzer | None,
     history_dir: Path | None,
     sentiment_unavailable_reason: str | None = None,
     benchmark_calendar: pd.DatetimeIndex | None = None,
@@ -746,11 +800,16 @@ def score_candidate(
         # candidates (or candidates on opposite sides of midnight)
         # different effective cutoffs (Antigravity review on PR #403:
         # "Anchor price cutoffs to the run timestamp").
+        now_ts: pd.Timestamp | None = None
+        if run_as_of is not None:
+            now_val = pd.Timestamp(run_as_of)
+            assert isinstance(now_val, pd.Timestamp)
+            now_ts = now_val
         frame = fetch_price_history(
             ticker,
             lookback_years=lookback_years,
             history_dir=history_dir,
-            now=pd.Timestamp(run_as_of) if run_as_of is not None else None,
+            now=now_ts,
         )
     except PriceHistoryUnavailable as exc:
         errors.append(str(exc))
@@ -823,7 +882,7 @@ def score_candidate(
                 normalized_benchmark_calendar = benchmark_calendar
                 if normalized_benchmark_calendar.tz is not None:
                     normalized_benchmark_calendar = normalized_benchmark_calendar.tz_localize(None)
-                normalized_benchmark_calendar = normalized_benchmark_calendar.normalize()
+                normalized_benchmark_calendar = cast(Any, normalized_benchmark_calendar).normalize()
                 expected_sessions = normalized_benchmark_calendar[
                     (normalized_benchmark_calendar >= frame.index.min())
                     & (normalized_benchmark_calendar <= frame.index.max())
@@ -855,6 +914,7 @@ def score_candidate(
                 )
 
         raw_close = frame["Adj Close" if "Adj Close" in frame.columns else "Close"]
+        assert isinstance(raw_close, pd.Series)
         returns = _price_returns(frame)
 
         # dropna() on the raw price series compacts observations on
@@ -867,10 +927,23 @@ def score_candidate(
         # anything, so only an INTERNAL gap disqualifies the series
         # (Codex review on PR #403: "Preserve missing sessions in
         # backtest inputs").
-        first_valid = raw_close.first_valid_index()
-        last_valid = raw_close.last_valid_index()
-        has_internal_gap = (
-            first_valid is not None and last_valid is not None and raw_close.loc[first_valid:last_valid].isna().any()
+        # Positional (iloc), not label-based (loc[first_valid:last_valid]):
+        # the non-datetime-like branches above (both with and without a
+        # benchmark calendar) deliberately leave a rejected index
+        # UNCHANGED -- including any duplicate labels an alternate source's
+        # raw index can carry -- so a label-based slice between two
+        # first/last-valid LABELS raises KeyError ("cannot get slice bound
+        # for non-unique label") on such a frame, and main() does not catch
+        # exceptions from score_candidate(), aborting the entire advisory
+        # run instead of taking this function's own documented best-effort
+        # degraded path (Codex review, PR #1300 discussion_r3921082074:
+        # "Normalize duplicate labels before gap slicing"). Working from a
+        # plain boolean array of valid positions sidesteps label uniqueness
+        # entirely, for every index shape this function accepts.
+        _valid_positions = raw_close.notna().to_numpy().nonzero()[0]
+        has_internal_gap = bool(
+            len(_valid_positions)
+            and raw_close.iloc[_valid_positions[0]:_valid_positions[-1] + 1].isna().any()
         )
 
         # _price_returns()'s pct_change-before-dropna ordering excludes
@@ -936,10 +1009,10 @@ def score_candidate(
             # simply had nothing to report" (Codex review on PR #403:
             # "Preserve SEC request failures in the report").
             sentiment_result = raw["sentiment"]
-            if isinstance(sentiment_result, dict):
-                sentiment_errors = sentiment_result.get("errors")
-                if isinstance(sentiment_errors, list):
-                    errors.extend(sentiment_errors)
+            if isinstance(sentiment_result, dict) and sentiment_result.get("errors"):
+                sent_errors = sentiment_result["errors"]
+                if isinstance(sent_errors, (list, tuple)):
+                    errors.extend(str(e) for e in sent_errors)
     elif not skip_sentiment and analyzer is None and sentiment_unavailable_reason:
         # Distinguishes "sentiment ran and genuinely found nothing" (also
         # raw["sentiment"] is None, but no error) from "sentiment never ran
@@ -1204,8 +1277,10 @@ def main(argv: list[str] | None = None) -> int:
         # cutoffs to the SAME single run instant every candidate below
         # also uses (Antigravity review on PR #403: "Anchor price cutoffs
         # to the run timestamp").
+        now_ts = pd.Timestamp(now)
+        assert isinstance(now_ts, pd.Timestamp)
         benchmark_frame = fetch_price_history(
-            args.benchmark, lookback_years=args.lookback_years, history_dir=args.history_dir, now=pd.Timestamp(now)
+            args.benchmark, lookback_years=args.lookback_years, history_dir=args.history_dir, now=now_ts
         )
         # fetch_price_history() attaches this via frame.attrs when it fell
         # back to a stale/incomplete local archive after a live refresh
@@ -1276,6 +1351,7 @@ def main(argv: list[str] | None = None) -> int:
             # range -- see score_candidate()'s own comment on why (Antigravity
             # review on PR #403: "Detect missing index sessions as
             # price-history gaps").
+            assert isinstance(benchmark_frame.index, pd.DatetimeIndex)
             benchmark_calendar = benchmark_frame.index
         benchmark_calendar_gaps = (
             _detect_benchmark_calendar_gaps(benchmark_calendar) if benchmark_calendar is not None else []
@@ -1306,7 +1382,10 @@ def main(argv: list[str] | None = None) -> int:
             # benchmark PRICE data exists for these dates -- benchmark_
             # returns is intentionally left untouched -- only calendar
             # membership is being corrected here.
-            benchmark_calendar = benchmark_calendar.union(pd.DatetimeIndex(benchmark_calendar_gaps))
+            assert benchmark_calendar is not None
+            union_calendar = benchmark_calendar.union(pd.DatetimeIndex(benchmark_calendar_gaps))
+            assert isinstance(union_calendar, pd.DatetimeIndex)
+            benchmark_calendar = union_calendar
     except PriceHistoryUnavailable as exc:
         # Not just beta/alpha -- score_candidate()'s missing-session
         # detection also depends entirely on this same benchmark_calendar
@@ -1571,13 +1650,18 @@ def main(argv: list[str] | None = None) -> int:
     # render_proposed_diff Output Fields Are Always Empty"). Legacy
     # symbols have no matching bucket here (they're neither invalid-shape
     # nor active/excluded) and stay recorded only in run_metadata.
-    diff["skipped_invalid_symbol_shape"] = list(diff["skipped_invalid_symbol_shape"]) + invalid_shaped
-    diff["skipped_already_active"] = list(diff["skipped_already_active"]) + [
-        t for t in ineligible_universe_symbols if t in active_tickers
-    ]
-    diff["skipped_explicitly_excluded"] = list(diff["skipped_explicitly_excluded"]) + [
-        t for t in ineligible_universe_symbols if t in excluded_tickers
-    ]
+    skipped_invalid = diff.get("skipped_invalid_symbol_shape")
+    diff["skipped_invalid_symbol_shape"] = (
+        list(skipped_invalid) if isinstance(skipped_invalid, (list, tuple)) else []
+    ) + invalid_shaped
+    skipped_active = diff.get("skipped_already_active")
+    diff["skipped_already_active"] = (
+        list(skipped_active) if isinstance(skipped_active, (list, tuple)) else []
+    ) + [t for t in ineligible_universe_symbols if t in active_tickers]
+    skipped_excluded = diff.get("skipped_explicitly_excluded")
+    diff["skipped_explicitly_excluded"] = (
+        list(skipped_excluded) if isinstance(skipped_excluded, (list, tuple)) else []
+    ) + [t for t in ineligible_universe_symbols if t in excluded_tickers]
     diff["run_metadata"] = run_metadata
 
     # Every artifact's content is rendered BEFORE any of them is written --

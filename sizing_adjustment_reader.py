@@ -90,7 +90,7 @@ def _read_if_fresh(path: Path, ticker: str, max_staleness_hours: float) -> float
     if not path.exists():
         return None
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_bytes())
         if data.get("ticker") != ticker:
             return None
         generated_at = datetime.fromisoformat(data["generated_at"])

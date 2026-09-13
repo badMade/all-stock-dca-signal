@@ -6,7 +6,7 @@
 # to the selected E/F/I/B sets, and a new pytest major can change collection
 # behavior. Bump these intentionally (dependabot opens the PR).
 pytest==9.1.1
-ruff==0.16.2
+ruff==0.16.6
 # schemas/*.json are a load-bearing contract (run_state, run_classification,
 # pointers, cost tracker). Every schema test used to guard its import with
 # `except ImportError: return`, so with jsonschema absent from this file the
@@ -28,6 +28,10 @@ pytest-cov==7.1.0
 # happened to pull it in.
 pyyaml==6.0.3
 # Self-Heal Optional Deps
-types-requests==2.32.0.20241016
-types-PyYAML==6.0.12.20240917
+types-requests==2.33.0.20260712
+types-PyYAML==6.0.12.20260815
 types-beautifulsoup4==4.12.0.20250516
+# Audit/type tooling uses the same reproducible installation path as lint/tests.
+pip-audit==2.10.1
+pyright==1.1.411
+uv==0.12.10

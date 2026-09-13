@@ -223,3 +223,100 @@ def test_standalone_run_refuses_to_publish_when_the_archive_dir_is_missing(tmp_p
     assert result["status"] == "blocked_archive_unavailable"
     assert result["archive_unavailable"]["reason"] == "history_dir_missing"
     assert output.read_text(encoding="utf-8") == '{"status": "existing"}\n'
+
+
+def test_blocked_upstream_ticker_update(tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    ticker_config = tmp_path / "tickers.json"
+    output = tmp_path / "per_ticker_sizing.json"
+    artifacts_dir = tmp_path / "artifacts"
+    update_event = tmp_path / "ticker_update_event.json"
+    _ticker_config(ticker_config)
+    update_event.write_text(json.dumps({"status": "failed", "changed_active_tickers": ["ABC"]}), encoding="utf-8")
+
+    result = calibration.rebuild_after_ticker_update(
+        history_dir=history_dir,
+        ticker_config=ticker_config,
+        output=output,
+        artifacts_dir=artifacts_dir,
+        now=datetime(2026, 8, 3, 22, 30, tzinfo=timezone.utc),
+        ticker_update_event=update_event,
+    )
+    assert result["status"] == "blocked_upstream_ticker_update"
+
+
+def test_blocked_missing_updated_history(tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    ticker_config = tmp_path / "tickers.json"
+    output = tmp_path / "per_ticker_sizing.json"
+    artifacts_dir = tmp_path / "artifacts"
+    update_event = tmp_path / "ticker_update_event.json"
+    _ticker_config(ticker_config)
+    update_event.write_text(json.dumps({"status": "completed", "changed_active_tickers": ["XYZ"]}), encoding="utf-8")
+
+    result = calibration.rebuild_after_ticker_update(
+        history_dir=history_dir,
+        ticker_config=ticker_config,
+        output=output,
+        artifacts_dir=artifacts_dir,
+        now=datetime(2026, 8, 3, 22, 30, tzinfo=timezone.utc),
+        ticker_update_event=update_event,
+    )
+    assert result["status"] == "blocked_missing_updated_history"
+    assert result["missing_histories"] == ["XYZ"]
+
+
+def test_malformed_changed_active_tickers_treated_as_empty(tmp_path):
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    ticker_config = tmp_path / "tickers.json"
+    output = tmp_path / "per_ticker_sizing.json"
+    artifacts_dir = tmp_path / "artifacts"
+    update_event = tmp_path / "ticker_update_event.json"
+    _ticker_config(ticker_config)
+    update_event.write_text(json.dumps({"status": "completed", "changed_active_tickers": [123]}), encoding="utf-8")
+
+    result = calibration.rebuild_after_ticker_update(
+        history_dir=history_dir,
+        ticker_config=ticker_config,
+        output=output,
+        artifacts_dir=artifacts_dir,
+        now=datetime(2026, 8, 3, 22, 30, tzinfo=timezone.utc),
+        ticker_update_event=update_event,
+    )
+    assert result["status"] == "skipped_no_active_ticker_change"
+
+
+def test_calibration_main_cli(monkeypatch, tmp_path):
+    import sys
+
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    ticker_config = tmp_path / "tickers.json"
+    output = tmp_path / "per_ticker_sizing.json"
+    artifacts_dir = tmp_path / "artifacts"
+    _ticker_config(ticker_config)
+    (history_dir / "ABC.csv").write_text(
+        "Date,Open,High,Low,Close,Adj Close,Volume\n"
+        "2026-08-03,100,101,99,100,100,1000\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "daily_per_ticker_calibration.py",
+            "--history-dir",
+            str(history_dir),
+            "--ticker-config",
+            str(ticker_config),
+            "--output",
+            str(output),
+            "--artifacts-dir",
+            str(artifacts_dir),
+            "--force",
+        ],
+    )
+    assert calibration.main() == 0

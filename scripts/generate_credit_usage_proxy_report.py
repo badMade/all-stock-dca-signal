@@ -168,6 +168,29 @@ def _did_not_run_model_usage_rows(task_id: str) -> Any:
 # ADDITIONAL roots outside that tree) -- codex review discussion_r3658263744.
 MANUAL_SCAN_SUBROOTS = tuple(MANUAL_EXCLUSION_SUBROOTS) + ("ce16ba6b/manual_runs",)
 
+
+def _manual_scan_bases(cron_root: Path, subroot: str) -> List[Path]:
+    """Resolve one MANUAL_SCAN_SUBROOTS entry to its existing directories.
+
+    MANUAL_SCAN_SUBROOTS is built directly from MANUAL_EXCLUSION_SUBROOTS,
+    which since the 2026-08-18 manual cap override incident can contain a
+    wildcard entry (``perplexity_primary_*/manual_override_*``).
+    scripts.run_classification.manual_exclusion_roots() already expands that
+    with Path.glob() against cron_tracking_root(); this report's two scans
+    below used to do a flat ``cron_root / subroot`` join instead, which is
+    never an existing directory for a subroot containing "*" -- so every
+    perplexity_primary_*/manual_override_* run was silently omitted from
+    both the recovery/manual rows and the usage counters even though
+    manual_exclusion_roots() already excludes its order IDs from scheduled-
+    live metrics elsewhere (Codex review, PR #680 discussion_r3838729845:
+    "Expand wildcard roots in the credit-usage scanner"). Mirrors
+    manual_exclusion_roots()'s own glob-detection test exactly.
+    """
+    if any(character in subroot for character in "*?["):
+        return sorted(p for p in cron_root.glob(subroot) if p.is_dir())
+    base = cron_root / subroot
+    return [base] if base.is_dir() else []
+
 # First path component of a MANUAL_SCAN_SUBROOTS entry -> the stream it
 # belongs to, used as a fallback when a manual run's own run_classification
 # doesn't carry a stream field -- codex review discussion_r3658511853 (a
@@ -2179,10 +2202,7 @@ def _scan_recovery_runs(
     seen_manual_dirs: set = set()
 
     for subroot in MANUAL_SCAN_SUBROOTS:
-        bases = sorted(cron_root.glob(subroot)) if "*" in subroot else [cron_root / subroot]
-        for base in bases:
-            if not base.is_dir():
-                continue
+        for base in _manual_scan_bases(cron_root, subroot):
             for run_state_path in base.rglob(RUN_STATE_FILENAME):
                 run_state = _load_json(run_state_path)
                 if not isinstance(run_state, dict):
@@ -2303,10 +2323,7 @@ def _scan_recovery_runs(
     # (the only date evidence an orphan CSV carries), never assumed to be
     # today's when the path has no day stamp.
     for subroot in MANUAL_SCAN_SUBROOTS:
-        bases = sorted(cron_root.glob(subroot)) if "*" in subroot else [cron_root / subroot]
-        for base in bases:
-            if not base.is_dir():
-                continue
+        for base in _manual_scan_bases(cron_root, subroot):
             # Every documented order-artifact name, not submitted_orders.csv
             # alone: a manual override that recorded its attempts only in
             # filled_orders.csv would otherwise never be DISCOVERED here, the same

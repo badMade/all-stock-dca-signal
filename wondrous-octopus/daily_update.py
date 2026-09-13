@@ -110,7 +110,7 @@ def _daily_artifacts_are_complete(summary_path: Path) -> bool:
     if not summary_path.exists():
         return False
     try:
-        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        summary = json.loads(summary_path.read_bytes())
     except (OSError, json.JSONDecodeError):
         return False
     forecasts_csv = summary.get("next_day_forecasts_csv")
@@ -135,7 +135,7 @@ def _load_stored_config(run_dir: Path) -> HarnessConfig:
         state_path = fallback if fallback.exists() else state_path
     if not state_path.exists():
         raise Refused(f"no checkpoint under {run_dir}; run run_walkforward.py first")
-    stored = json.loads(state_path.read_text(encoding="utf-8"))["config"]
+    stored = json.loads(state_path.read_bytes())["config"]
     stored["models"] = tuple(stored["models"])
     config = HarnessConfig(**stored)
     config.end = None  # the live cycle always runs to the newest closed day
@@ -166,7 +166,7 @@ def _load_run_meta(run_dir: Path) -> dict:
             "required to safely continue this run (rerun run_walkforward.py, or restore run_meta.json "
             "from a backup)"
         )
-    return json.loads(meta_path.read_text(encoding="utf-8"))
+    return json.loads(meta_path.read_bytes())
 
 
 def _load_selection(meta: dict) -> dict:
@@ -333,7 +333,7 @@ def _dollar_cell(log_return: float, ref_close: float) -> object:
     return round(_dollar(log_return, ref_close), 4)
 
 
-def _current_universe_unresolved(harness: Any) -> list[dict]:
+def _current_universe_unresolved(harness: WalkForwardHarness) -> list[dict]:
     """``outstanding[UNRESOLVED_KEY]`` entries for tickers still in the
     CURRENT (rebuilt-this-invocation) panel.
 
@@ -357,7 +357,7 @@ def _current_universe_unresolved(harness: Any) -> list[dict]:
     ]
 
 
-def _write_next_day_forecasts(run_dir: Path, harness: Any, last_date: str) -> Path | None:
+def _write_next_day_forecasts(run_dir: Path, harness: WalkForwardHarness, last_date: str) -> Path | None:
     """Tomorrow's OHLC for all tickers, in adjusted dollars, as a ready CSV.
 
     Sourced from ``outstanding[UNRESOLVED_KEY]`` -- by construction, exactly
@@ -407,7 +407,7 @@ def _write_next_day_forecasts(run_dir: Path, harness: Any, last_date: str) -> Pa
 
 
 def _day_scores(
-    run_dir: Path, harness: Any, last_date: str, *, records: list[dict] | None = None
+    run_dir: Path, harness: WalkForwardHarness, last_date: str, *, records: list[dict] | None = None
 ) -> dict:
     """Per-model summary of the scores that matured on the processed day(s).
 
@@ -473,7 +473,7 @@ def _day_scores(
     return summary
 
 
-def _encoder_health(run_dir: Path, harness: Any) -> dict:
+def _encoder_health(run_dir: Path, harness: WalkForwardHarness) -> dict:
     ledger = Ledger(run_dir)
     for model in harness.config.models:
         retrained_after = metrics_module.latest_retrain_date(ledger.iter_records(model=model, kind="retrain"))
@@ -486,8 +486,8 @@ def _encoder_health(run_dir: Path, harness: Any) -> dict:
 
 def _emit_daily_artifacts(
     run_dir: Path,
-    harness: Any,
-    config: Any,
+    harness: WalkForwardHarness,
+    config: HarnessConfig,
     last_date: str,
     rebound: int,
     days_processed: list[str],

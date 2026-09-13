@@ -92,14 +92,10 @@ for ticker in sorted(set(daily_bars) | set(minute_bars)):
 with open("market_open_signal_results.json", "w") as fh:
     json.dump(results, fh, indent=2)
 
-buys = [
-    r
-    for r in results
-    if r["action"] == "buy" and isinstance(r.get("multiplier"), (int, float)) and r["multiplier"] > 0
-]
+buys = [r for r in results if r["action"] == "buy" and r["multiplier"] > 0]
 print(f"Total evaluated: {len(results)}")
 print(f"BUY candidates: {len(buys)}")
-for r in sorted(buys, key=lambda r: -float(r["multiplier"])):
+for r in sorted(buys, key=lambda r: -r["multiplier"]):
     print(
         f"  {r['ticker']:6s} mult={r['multiplier']:.2f} "
         f"px={r['current_price']:.4f} prev_close={r['previous_close']:.4f} "

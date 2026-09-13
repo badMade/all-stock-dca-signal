@@ -6,3 +6,4 @@
 # this heavy-dep subproject.
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+pythonpath = [".", ".."]

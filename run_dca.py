@@ -26,14 +26,15 @@ from __future__ import annotations
 
 import argparse
 import base64
-import concurrent.futures
 import csv
 import json
 import logging
 import math
 import os
 import shutil
+import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -73,8 +74,10 @@ from near_close_dca import (
     SourceName,
     StrategyConfig,
     StrategyState,
+    _DiagnosticRedactionFilter,
     _earlier_selected_base,
     _existing_csv_artifacts,
+    _redacted_diagnostic_text,
     _settle_usage_bytes,
     _write_and_validate_scheduled_contract,
     build_broker,
@@ -111,6 +114,7 @@ from scripts.scheduled_artifacts import (
 )
 
 logger = logging.getLogger("near_close_dca.run")
+logger.addFilter(_DiagnosticRedactionFilter())
 
 # Root for ad hoc intraday scheduled-recovery streams (e.g. the Jul 24 2026
 # 2:30 PM ET intraday_1430 recovery -- see config/scheduled_tasks.json
@@ -899,6 +903,50 @@ def _build_frozen_providers_from_raw(
             # opt-out when freezing providers").
             supports_corporate_actions=getattr(original_finance, "supports_corporate_actions", True),
         )
+
+        def _persist_archive_corporate_action_factor_unlocked(
+            ticker: str, since: "date", as_of: "date", result: object, *, _raw_dir=raw_dir
+        ) -> bool:
+            """Snapshot archive fallback evidence before the strategy consumes it."""
+            validated = _validated_corporate_action_result(result, as_of)
+            if validated is None:
+                return False
+            symbol = ticker.strip().upper()
+            payload = {
+                "ticker": symbol,
+                "since": since.isoformat(),
+                "as_of": as_of.isoformat(),
+                "factor": validated[0],
+                "cursor": validated[1].isoformat(),
+                "source": "ticker_history_archive",
+            }
+            try:
+                save_raw_input("", f"corporate_action_{symbol}.json", payload, raw_dir=_raw_dir)
+            except (OSError, ValueError):
+                return False
+            return True
+
+        def _persist_archive_corporate_action_factor(
+            ticker: str, since: "date", as_of: "date", result: object, *, _raw_dir=raw_dir
+        ) -> bool:
+            """Persist archive evidence without crossing a retry's raw/ swap."""
+            from scripts.file_lock import cross_process_lock
+
+            try:
+                with cross_process_lock(_raw_dir.parent / ".corporate_actions.lock"):
+                    return _persist_archive_corporate_action_factor_unlocked(
+                        ticker, since, as_of, result, _raw_dir=_raw_dir
+                    )
+            except (OSError, TimeoutError):
+                return False
+
+        # near_close_dca invokes this only when a live lookup could not
+        # confirm the action window and the mutable ticker-history archive did.
+        # Keeping the callback on the frozen provider makes persistence part of
+        # the evidence hand-off rather than an after-the-fact manifest refresh.
+        frozen_finance.persist_archive_corporate_action_factor = (  # type: ignore[attr-defined]
+            _persist_archive_corporate_action_factor
+        )
         # Corporate actions are intentionally a same-run live query, not a
         # property of the intraday OHLC snapshot above.  Preserve that live
         # capability just as the Robinhood spread breaker above preserves its
@@ -958,7 +1006,7 @@ def _build_frozen_providers_from_raw(
                     if not candidate_path.is_file():
                         continue
                     try:
-                        cached = json.loads(candidate_path.read_text(encoding="utf-8"))
+                        cached = json.loads(candidate_path.read_bytes())
                     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                         cached = None
                     if (
@@ -1160,7 +1208,7 @@ def _fills_from_orders_csv(orders_csv: Path) -> List[Dict[str, Any]]:
                 continue
             fill_price = (row.get("avg_fill_price") or "").strip()
             filled_qty = (row.get("quantity_filled") or "").strip()
-            if fill_price in ("", "-") or filled_qty in ("", "-"):
+            if fill_price == "" or fill_price == "-" or filled_qty == "" or filled_qty == "-":
                 continue
             fills.append(
                 {
@@ -1355,20 +1403,36 @@ def _refresh_fills_from_broker(
     if not queries:
         return refreshed
 
-    def _fetch(query_tuple):
-        oid, tkr, row_status = query_tuple
+    if hasattr(broker, "get_order_fills"):
+        order_ids = [q[0] for q in queries]
         try:
-            return oid, tkr, row_status, broker.get_order_fill(oid)
-        except Exception:  # noqa: BLE001 - a fill re-query must never crash reporting
-            logger.exception("fill refresh failed for %s", oid)
-            return oid, tkr, row_status, None
+            fills_map = broker.get_order_fills(order_ids)
+        except Exception:  # noqa: BLE001
+            logger.exception("batch fill refresh failed")
+            fills_map = {}
 
-    if getattr(broker, "supports_concurrent_fill_lookup", False):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            # Use map to preserve the order of elements from queries
-            results = list(executor.map(_fetch, queries))
+        results = []
+        for oid, tkr, row_status in queries:
+            try:
+                # Need to handle potential KeyError if the batch result was partial or empty map was returned
+                results.append((oid, tkr, row_status, fills_map.get(oid)))
+            except Exception: # noqa: BLE001
+                results.append((oid, tkr, row_status, None))
     else:
-        results = [_fetch(query) for query in queries]
+        def _fetch(query_tuple):
+            oid, tkr, row_status = query_tuple
+            try:
+                return oid, tkr, row_status, broker.get_order_fill(oid)
+            except Exception:  # noqa: BLE001 - a fill re-query must never crash reporting
+                logger.exception("fill refresh failed for %s", oid)
+                return oid, tkr, row_status, None
+
+        if getattr(broker, "supports_concurrent_fill_lookup", False):
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                # Use map to preserve the order of elements from queries
+                results = list(executor.map(_fetch, queries))
+        else:
+            results = [_fetch(query) for query in queries]
 
     for order_id, ticker, row_status, fill in results:
         if fill is not None and fill.quantity_filled > 0 and fill.avg_fill_price > 0:
@@ -1643,6 +1707,9 @@ def _compute_auto_derived_prior_allocations(
             contributing_order_ids=merged_contributing_order_ids,
             uncertain_contributor_ids=merged_uncertain_contributor_ids,
             attempt_run_ids=merged_attempt_run_ids,
+            unresolved_live_exposure=(
+                existing.unresolved_live_exposure or alloc.unresolved_live_exposure
+            ),
             # Either source may only know a conservative sentinel for this
             # ticker.  Preserve that uncertainty through the cross-stream
             # merge: losing it makes the later bounded reload regard the
@@ -1978,6 +2045,93 @@ def _accepted_order_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ]
 
 
+def _pipeline_result_ok(result: Any) -> bool:
+    """Predicate for guarded_run to determine if a pipeline run succeeded.
+
+    The raw-persistence failure path and the preflight-blocked path
+    both report their failure as a returned result (each with its own
+    targeted alert) instead of raising; either must ping a FAILED
+    heartbeat, not clear the dead-man's switch (Codex review: "Route
+    the preflight-blocked result through guarded_run"). A directory-
+    ownership conflict (an overlapping invocation or a different
+    account claimed the shared artifacts directory) is the same
+    shape of silent failure: _run_pipeline_impl returns a normal-
+    looking result with directory_ownership_verified=False and
+    otherwise no error field this predicate already checks, so
+    without this clause a scheduled live run whose artifact
+    publication was rejected -- any live placements possibly
+    surviving only in a manual-reconciliation sidecar -- still
+    cleared the success heartbeat and sent no failure alert (Codex
+    review: "Fail the heartbeat on directory ownership conflicts").
+    """
+    return not (
+        isinstance(result, dict)
+        and (
+            result.get("raw_persistence_error")
+            or result.get("error_class") == ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT
+            or result.get("directory_ownership_verified") is False
+        )
+    )
+
+
+def _log_pipeline_model_usage(
+    result: Dict[str, Any],
+    now: datetime,
+    scheduled: bool,
+    cron_id: str,
+    model_usage_log_root: Optional[str | Path],
+    model_usage_model_requested: Optional[str],
+    model_usage_model_actual: Optional[str],
+    model_usage_model_routing_mode: Optional[str],
+    model_usage_reason_for_premium_model: Optional[str],
+) -> None:
+    """Extract run_id from run_state_path and log model usage."""
+    run_state_path = result.get("run_state_path")
+    run_id = None
+    if run_state_path:
+        try:
+            run_id = json.loads(
+                # ⚡ Bolt Optimization: Keep I/O in binary; json.loads accepts bytes and decodes internally before parsing
+                Path(run_state_path).read_bytes()
+            ).get("run_id")
+        except (OSError, json.JSONDecodeError):
+            run_id = None
+    routing_overrides = {
+        "model_requested": model_usage_model_requested,
+        "model_actual": model_usage_model_actual,
+        "model_routing_mode": model_usage_model_routing_mode,
+        "reason_for_premium_model": model_usage_reason_for_premium_model,
+    }
+    log_model_usage(
+        root=model_usage_log_root,
+        run_id=run_id,
+        cron_id=cron_id,
+        run_origin="scheduled" if scheduled else "manual",
+        artifact_path=run_state_path,
+        triggered_at_utc=now.astimezone(timezone.utc),
+        **{k: v for k, v in routing_overrides.items() if v is not None},
+    )
+
+
+def _redacted_strings(node: Any) -> Any:
+    """Copy of ``node`` with every string value AND every string key passed
+    through :func:`near_close_dca._redacted_diagnostic_text`; containers
+    recurse, other scalars pass through unchanged. Keys too: a broker payload
+    can carry the identifier in a key (``{"account_number=<n>": ...}``), and
+    scrubbing values alone left it in ``raw/orders_after_place.json`` (Copilot
+    review, PR #1394)."""
+    if isinstance(node, str):
+        return _redacted_diagnostic_text(node)
+    if isinstance(node, dict):
+        return {
+            (_redacted_diagnostic_text(key) if isinstance(key, str) else key): _redacted_strings(value)
+            for key, value in node.items()
+        }
+    if isinstance(node, list):
+        return [_redacted_strings(value) for value in node]
+    return node
+
+
 def run_pipeline(
     now: datetime,
     config: StrategyConfig,
@@ -2078,30 +2232,16 @@ def run_pipeline(
             stream=stream_name,
             preflight_gate=preflight_gate,
         )
-        run_state_path = result.get("run_state_path")
-        run_id = None
-        if run_state_path:
-            try:
-                run_id = json.loads(
-                    # ⚡ Bolt Optimization: Keep I/O in binary; json.loads accepts bytes and decodes internally before parsing
-                    Path(run_state_path).read_bytes()
-                ).get("run_id")
-            except (OSError, json.JSONDecodeError):
-                run_id = None
-        routing_overrides = {
-            "model_requested": model_usage_model_requested,
-            "model_actual": model_usage_model_actual,
-            "model_routing_mode": model_usage_model_routing_mode,
-            "reason_for_premium_model": model_usage_reason_for_premium_model,
-        }
-        log_model_usage(
-            root=model_usage_log_root,
-            run_id=run_id,
-            cron_id=cron_id,
-            run_origin="scheduled" if scheduled else "manual",
-            artifact_path=run_state_path,
-            triggered_at_utc=now.astimezone(timezone.utc),
-            **{k: v for k, v in routing_overrides.items() if v is not None},
+        _log_pipeline_model_usage(
+            result,
+            now,
+            scheduled,
+            cron_id,
+            model_usage_log_root,
+            model_usage_model_requested,
+            model_usage_model_actual,
+            model_usage_model_routing_mode,
+            model_usage_reason_for_premium_model,
         )
         return result
 
@@ -2143,14 +2283,7 @@ def run_pipeline(
             # surviving only in a manual-reconciliation sidecar -- still
             # cleared the success heartbeat and sent no failure alert (Codex
             # review: "Fail the heartbeat on directory ownership conflicts").
-            result_ok=lambda result: not (
-                isinstance(result, dict)
-                and (
-                    result.get("raw_persistence_error")
-                    or result.get("error_class") == ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT
-                    or result.get("directory_ownership_verified") is False
-                )
-            ),
+            result_ok=_pipeline_result_ok,
         ),
     )
 
@@ -2206,17 +2339,16 @@ def run_slot(
     slot_tickers = config.tickers
     preflight_gate: Optional[Dict[str, Any]] = None
     if stream_name == MORNING_STREAM:
-        # The 10:30 slot must not scan the configured universe unconditionally:
-        # config/morning_dca.json's live_task.preflight_artifact_resolution
-        # requires a missing or invalid same-day 9:45 pre-flight artifact to
-        # reduce the eligible universe to ZERO, the same fail-closed contract
-        # MorningDCAExecutor._apply_preflight_gate() enforces for its own,
-        # separate morning-live entry point. Routed only through the generic
-        # pipeline, run_slot("1030ET") never called that gate at all, so a
-        # missing/invalid preflight artifact silently let it scan every
-        # configured ticker and place live orders without the required morning
-        # eligibility evidence (Codex review: "Route the morning slot through
-        # its required preflight gate"). allow_unpinned_account=True: this
+        # The 10:30 slot admits its universe through the SAME
+        # morning_preflight_eligible_tickers() MorningDCAExecutor.
+        # _apply_preflight_gate() uses, so the two entry points cannot drift on
+        # ticker admission. Its contract is NON-BLOCKING as of 2026-08-02 (see
+        # the branch below): a missing, forbidden-root or empty same-day 9:45
+        # preflight artifact degrades to the full configured universe with a
+        # recorded warning, not to zero. Routed only through the generic
+        # pipeline, run_slot("1030ET") once skipped the gate entirely (Codex
+        # review: "Route the morning slot through its required preflight
+        # gate"). allow_unpinned_account=True: this
         # call only needs the preflight root/forbidden-roots/bounded-recovery
         # fields, not an account -- the broker/account this slot actually
         # trades through is the caller-supplied ``broker`` above.
@@ -2229,7 +2361,6 @@ def run_slot(
             preflight_run_state_root=morning_config.preflight_run_state_root,
             preflight_forbidden_roots=morning_config.preflight_forbidden_roots,
             preflight_bounded_recovery=morning_config.preflight_bounded_recovery,
-            manual=False,
         )
         if preflight_gate.get("warning"):
             # NON-BLOCKING as of 2026-08-02: morning_preflight_eligible_
@@ -2849,170 +2980,17 @@ def _persist_raw_inputs(
 
     return raw_persistence_state, finance_data, robinhood_data, None
 
-def _run_pipeline_impl(
+
+def _resolve_prior_allocations(
     now: datetime,
+    scheduled: bool,
     config: StrategyConfig,
-    state: StrategyState,
-    finance_data: MarketDataProvider,
-    robinhood_data: MarketDataProvider,
-    broker: BrokerAdapter,
-    *,
     artifacts_dir: str | Path,
-    run_label: str = "daily",
-    scheduled: bool = True,
-    generate_full_reports: bool = False,
-    ignore_trend_filter: bool = False,
-    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
-    prior_allocation_state_root: Optional[str | Path] = None,
-    deployment_history_root: Optional[str | Path] = None,
-    classification_state_root: Optional[str | Path] = None,
-    config_dir: Optional[str | Path] = None,
-    raw_connector_inputs: Optional[Mapping[str, Any]] = None,
-    required_raw_filenames: Optional[frozenset] = None,
-    classification_overrides: Optional[Dict[str, Any]] = None,
-    correlation_id: Optional[str] = None,
-    stream: str = "afternoon",
-    preflight_gate: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Run one compact DCA cycle and (optionally) the full post-trade report set.
-
-    Returns the merged dict of artifact/report paths and summary metrics. The compact
-    daily path always runs; ``generate_full_reports=True`` additionally renders the
-    slippage/coverage reports and the compact Notion sync from the run artifacts
-    (heavier work reserved for Friday/manual runs).
-
-    The same-day prior-run offset/top-up guard is scheduled-run-only. For a
-    scheduled run, ``prior_allocation_state_root`` defaults to the cron task root
-    derived from ``artifacts_dir`` (see ``_default_prior_allocation_state_root``)
-    so the guard activates without every caller having to wire it explicitly;
-    pass ``prior_same_day_allocations`` directly to override, or an explicit
-    ``prior_allocation_state_root`` to scan a different tree. Manual runs never
-    auto-load prior allocations, so a manual invocation is never guard-active.
-
-    ``deployment_history_root`` feeds the trailing-7-day kill-switch (see
-    ``dca_risk.apply_risk_guard``): it should point at the directory containing
-    prior days' ``run_state.json`` artifacts. Defaults to ``artifacts_dir``'s
-    parent, since the live task's per-day directories are its siblings.
-
-    ``raw_connector_inputs`` lets the scheduler hand in raw connector responses
-    before signal computation. Scheduled runs persist these under the run's
-    ``raw/`` directory and stamp the saved-file manifest into ``run_state.json``;
-    if persistence or normalization fails, the pipeline writes the documented
-    no-order error run_state and returns without computing or placing.
-
-    ``required_raw_filenames`` declares the complete set of filenames the
-    scheduler expects to be present in ``raw_connector_inputs`` for a live run.
-    When provided and ``dry_run=False``, any missing filename is treated as a
-    persistence failure and routes through the fail-closed error state rather
-    than proceeding to compute with an incomplete raw payload set.
-
-    ``classification_state_root`` is passed through to ``near_close_dca.run_once``
-    for a scheduled run: it is where ``latest_scheduled_run.json`` is
-    written/updated (see ``scripts.run_classification``). Opt-in only: when not
-    given, no ``latest_scheduled_run.json`` write is attempted at all, so a
-    caller must pass the real cron_tracking root explicitly to enable it.
-
-    ``config_dir`` is forwarded to ``load_morning_config``/``load_midday_config``
-    when resolving the sibling morning/midday roots below (see
-    ``_resolve_cross_stream_prior_allocation_roots``); ``None`` uses their own
-    default resolution (``DCA_CONFIG_DIR`` env var, then the bundled config/
-    directory), matching how ``config`` itself is normally loaded.
-
-    ``classification_overrides`` and ``correlation_id`` are forwarded to
-    ``near_close_dca.run_daily_compact`` so a non-afternoon roster slot (see
-    ``run_slot``) stamps its OWN ``run_classification`` identity and a
-    deterministic ``correlation_id`` into ``run_state.json``, instead of the
-    afternoon-only defaults ``build_run_artifacts`` otherwise falls back to.
-    ``None`` (the default for both) reproduces the unmodified afternoon path.
-
-    ``preflight_gate`` is ``run_slot``'s morning-preflight diagnostic dict
-    (see ``morning_preflight_eligible_tickers``). It is stamped onto the
-    returned result dict as ``result["preflight_gate"]`` -- NOT forwarded into
-    ``build_run_artifacts``/``run_daily_compact`` itself, which accepts no
-    such parameter (a prior version of this docstring claimed otherwise; that
-    was aspirational, not actual behavior -- Codex review: "Emit the advisory
-    preflight warning from run_slot"). For durable observability it is also
-    read back into the ``run_state.json`` that ``build_run_artifacts`` already
-    wrote to disk (best-effort read-modify-write via ``result["run_state_path"]``,
-    since ``run_daily_compact`` returns after that file is already published --
-    Codex review: "Persist preflight diagnostics in the canonical artifact").
-    ``run_slot`` also logs ``preflight_gate["warning"]`` when present, so a
-    degraded full-universe evaluation (missing, forbidden-root, or
-    valid-but-empty same-day preflight) is never silently indistinguishable
-    from a normal one, whether an operator reads the log, the in-memory
-    result, or the persisted artifact.
-
-    NON-BLOCKING as of 2026-08-02 (Geoff: "should not block any later runs"):
-    this function used to short-circuit into a startup-failure-shaped blocked
-    run_state here when ``preflight_gate`` reported ``preflight_missing_block``
-    (Codex review: "Route the preflight-blocked result through guarded_run",
-    "Apply the calendar gate before the preflight early return"). That
-    diagnostic flag is never set anymore --
-    ``morning_preflight_eligible_tickers`` degrades to the full configured
-    universe with a warning instead of blocking -- so this function no longer
-    special-cases it at all; a missing/invalid same-day preflight artifact
-    now just means ``run_slot`` passed through the full universe already, and
-    this function evaluates it normally like any other run.
-    """
-    # Drain any leftover raw placement responses from a prior run on this broker
-    # instance (e.g. a manual run_pipeline() call that preceded this scheduled one).
-    # Without this, a non-scheduled manual call would leave its responses in the
-    # buffer and the next scheduled run would write them into its orders_after_place.json.
-    getattr(broker, "get_raw_placement_responses", lambda: [])()
-    if ignore_trend_filter and not config.ignore_trend_filter:
-        import dataclasses as _dc
-
-        config = _dc.replace(config, ignore_trend_filter=True)
-    # Auto-apply the final-buy trend override for scheduled runs in the final-buy
-    # window (task 10ce362c, retimed to 3:30 PM ET on 2026-07-27). The lower bound
-    # is 15:15 ET only for pre-retime legacy dates, so a legacy 3:20 PM run stays
-    # attributable to the scheduled window; on/after the retime it narrows to the
-    # canonical 15:25 ET classification window start, so a delayed/replayed or
-    # misfired invocation between 15:15 and 15:24 ET does not skip the downtrend
-    # check outside the window the manifest actually permits (15:30-15:32 ET
-    # starts) -- codex review discussion_r3657271692.
-    # This is restricted to scheduled live runs so manual, demo, and morning/midday callers
-    # are unaffected — they run outside this window and/or with scheduled=False.
-    elif scheduled and not config.dry_run and not config.ignore_trend_filter:
-        _now_et = now.astimezone(EASTERN).time()
-        _window_start = _final_buy_trend_override_window_start(now)
-        if _window_start <= _now_et <= time(15, 35):
-            import dataclasses as _dc
-
-            config = _dc.replace(config, ignore_trend_filter=True)
-            logger.info(
-                "final-buy window (%s ET): applied ignore_trend_filter=True for scheduled run",
-                _now_et.strftime("%H:%M"),
-            )
-    # _persist_raw_inputs() below computes its own LOCAL trading_day_raw for its
-    # own internal use, but this function needs the same value again much later
-    # (the post-compute raw-input manifest rescan) -- computed here too, once,
-    # from the same `now` so the two never drift, since a function-local value
-    # inside the helper is invisible to this caller's own later scope.
-    trading_day_raw = now.astimezone(EASTERN).date().isoformat()
-    (
-        raw_persistence_state,
-        finance_data,
-        robinhood_data,
-        failure_result,
-    ) = _persist_raw_inputs(
-        scheduled,
-        now,
-        config,
-        finance_data,
-        robinhood_data,
-        artifacts_dir,
-        raw_connector_inputs,
-        required_raw_filenames,
-        run_label,
-        state,
-        classification_overrides,
-        correlation_id,
-        classification_state_root,
-    )
-    if failure_result is not None:
-        return failure_result
-
+    config_dir: Optional[str | Path],
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]],
+    prior_allocation_state_root: Optional[str | Path],
+) -> Tuple[float, bool, Optional[Dict[str, PriorSameDayAllocation]]]:
+    """Resolve same-day and earlier-week allocations."""
     earlier_week_notional_usd = 0.0
     earlier_week_scan_had_failures = False
     if scheduled and prior_same_day_allocations is None:
@@ -3650,6 +3628,183 @@ def _run_pipeline_impl(
             )
             if _explicit_root_unreconstructable_sink:
                 earlier_week_scan_had_failures = True
+
+    return earlier_week_notional_usd, earlier_week_scan_had_failures, prior_same_day_allocations
+
+
+def _run_pipeline_impl(
+    now: datetime,
+    config: StrategyConfig,
+    state: StrategyState,
+    finance_data: MarketDataProvider,
+    robinhood_data: MarketDataProvider,
+    broker: BrokerAdapter,
+    *,
+    artifacts_dir: str | Path,
+    run_label: str = "daily",
+    scheduled: bool = True,
+    generate_full_reports: bool = False,
+    ignore_trend_filter: bool = False,
+    prior_same_day_allocations: Optional[Dict[str, PriorSameDayAllocation]] = None,
+    prior_allocation_state_root: Optional[str | Path] = None,
+    deployment_history_root: Optional[str | Path] = None,
+    classification_state_root: Optional[str | Path] = None,
+    config_dir: Optional[str | Path] = None,
+    raw_connector_inputs: Optional[Mapping[str, Any]] = None,
+    required_raw_filenames: Optional[frozenset] = None,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
+    stream: str = "afternoon",
+    preflight_gate: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run one compact DCA cycle and (optionally) the full post-trade report set.
+
+    Returns the merged dict of artifact/report paths and summary metrics. The compact
+    daily path always runs; ``generate_full_reports=True`` additionally renders the
+    slippage/coverage reports and the compact Notion sync from the run artifacts
+    (heavier work reserved for Friday/manual runs).
+
+    The same-day prior-run offset/top-up guard is scheduled-run-only. For a
+    scheduled run, ``prior_allocation_state_root`` defaults to the cron task root
+    derived from ``artifacts_dir`` (see ``_default_prior_allocation_state_root``)
+    so the guard activates without every caller having to wire it explicitly;
+    pass ``prior_same_day_allocations`` directly to override, or an explicit
+    ``prior_allocation_state_root`` to scan a different tree. Manual runs never
+    auto-load prior allocations, so a manual invocation is never guard-active.
+
+    ``deployment_history_root`` feeds the trailing-7-day kill-switch (see
+    ``dca_risk.apply_risk_guard``): it should point at the directory containing
+    prior days' ``run_state.json`` artifacts. Defaults to ``artifacts_dir``'s
+    parent, since the live task's per-day directories are its siblings.
+
+    ``raw_connector_inputs`` lets the scheduler hand in raw connector responses
+    before signal computation. Scheduled runs persist these under the run's
+    ``raw/`` directory and stamp the saved-file manifest into ``run_state.json``;
+    if persistence or normalization fails, the pipeline writes the documented
+    no-order error run_state and returns without computing or placing.
+
+    ``required_raw_filenames`` declares the complete set of filenames the
+    scheduler expects to be present in ``raw_connector_inputs`` for a live run.
+    When provided and ``dry_run=False``, any missing filename is treated as a
+    persistence failure and routes through the fail-closed error state rather
+    than proceeding to compute with an incomplete raw payload set.
+
+    ``classification_state_root`` is passed through to ``near_close_dca.run_once``
+    for a scheduled run: it is where ``latest_scheduled_run.json`` is
+    written/updated (see ``scripts.run_classification``). Opt-in only: when not
+    given, no ``latest_scheduled_run.json`` write is attempted at all, so a
+    caller must pass the real cron_tracking root explicitly to enable it.
+
+    ``config_dir`` is forwarded to ``load_morning_config``/``load_midday_config``
+    when resolving the sibling morning/midday roots below (see
+    ``_resolve_cross_stream_prior_allocation_roots``); ``None`` uses their own
+    default resolution (``DCA_CONFIG_DIR`` env var, then the bundled config/
+    directory), matching how ``config`` itself is normally loaded.
+
+    ``classification_overrides`` and ``correlation_id`` are forwarded to
+    ``near_close_dca.run_daily_compact`` so a non-afternoon roster slot (see
+    ``run_slot``) stamps its OWN ``run_classification`` identity and a
+    deterministic ``correlation_id`` into ``run_state.json``, instead of the
+    afternoon-only defaults ``build_run_artifacts`` otherwise falls back to.
+    ``None`` (the default for both) reproduces the unmodified afternoon path.
+
+    ``preflight_gate`` is ``run_slot``'s morning-preflight diagnostic dict
+    (see ``morning_preflight_eligible_tickers``). It is stamped onto the
+    returned result dict as ``result["preflight_gate"]`` -- NOT forwarded into
+    ``build_run_artifacts``/``run_daily_compact`` itself, which accepts no
+    such parameter (a prior version of this docstring claimed otherwise; that
+    was aspirational, not actual behavior -- Codex review: "Emit the advisory
+    preflight warning from run_slot"). For durable observability it is also
+    read back into the ``run_state.json`` that ``build_run_artifacts`` already
+    wrote to disk (best-effort read-modify-write via ``result["run_state_path"]``,
+    since ``run_daily_compact`` returns after that file is already published --
+    Codex review: "Persist preflight diagnostics in the canonical artifact").
+    ``run_slot`` also logs ``preflight_gate["warning"]`` when present, so a
+    degraded full-universe evaluation (missing, forbidden-root, or
+    valid-but-empty same-day preflight) is never silently indistinguishable
+    from a normal one, whether an operator reads the log, the in-memory
+    result, or the persisted artifact.
+
+    NON-BLOCKING as of 2026-08-02 (Geoff: "should not block any later runs"):
+    this function used to short-circuit into a startup-failure-shaped blocked
+    run_state here when ``preflight_gate`` reported ``preflight_missing_block``
+    (Codex review: "Route the preflight-blocked result through guarded_run",
+    "Apply the calendar gate before the preflight early return"). That
+    diagnostic flag is never set anymore --
+    ``morning_preflight_eligible_tickers`` degrades to the full configured
+    universe with a warning instead of blocking -- so this function no longer
+    special-cases it at all; a missing/invalid same-day preflight artifact
+    now just means ``run_slot`` passed through the full universe already, and
+    this function evaluates it normally like any other run.
+    """
+    # Drain any leftover raw placement responses from a prior run on this broker
+    # instance (e.g. a manual run_pipeline() call that preceded this scheduled one).
+    # Without this, a non-scheduled manual call would leave its responses in the
+    # buffer and the next scheduled run would write them into its orders_after_place.json.
+    getattr(broker, "get_raw_placement_responses", lambda: [])()
+    if ignore_trend_filter and not config.ignore_trend_filter:
+        import dataclasses as _dc
+
+        config = _dc.replace(config, ignore_trend_filter=True)
+    # Auto-apply the final-buy trend override for scheduled runs in the final-buy
+    # window (task 10ce362c, retimed to 3:30 PM ET on 2026-07-27). The lower bound
+    # is 15:15 ET only for pre-retime legacy dates, so a legacy 3:20 PM run stays
+    # attributable to the scheduled window; on/after the retime it narrows to the
+    # canonical 15:25 ET classification window start, so a delayed/replayed or
+    # misfired invocation between 15:15 and 15:24 ET does not skip the downtrend
+    # check outside the window the manifest actually permits (15:30-15:32 ET
+    # starts) -- codex review discussion_r3657271692.
+    # This is restricted to scheduled live runs so manual, demo, and morning/midday callers
+    # are unaffected — they run outside this window and/or with scheduled=False.
+    elif scheduled and not config.dry_run and not config.ignore_trend_filter:
+        _now_et = now.astimezone(EASTERN).time()
+        _window_start = _final_buy_trend_override_window_start(now)
+        if _window_start <= _now_et <= time(15, 35):
+            import dataclasses as _dc
+
+            config = _dc.replace(config, ignore_trend_filter=True)
+            logger.info(
+                "final-buy window (%s ET): applied ignore_trend_filter=True for scheduled run",
+                _now_et.strftime("%H:%M"),
+            )
+    # _persist_raw_inputs() below computes its own LOCAL trading_day_raw for its
+    # own internal use, but this function needs the same value again much later
+    # (the post-compute raw-input manifest rescan) -- computed here too, once,
+    # from the same `now` so the two never drift, since a function-local value
+    # inside the helper is invisible to this caller's own later scope.
+    trading_day_raw = now.astimezone(EASTERN).date().isoformat()
+    (
+        raw_persistence_state,
+        finance_data,
+        robinhood_data,
+        failure_result,
+    ) = _persist_raw_inputs(
+        scheduled,
+        now,
+        config,
+        finance_data,
+        robinhood_data,
+        artifacts_dir,
+        raw_connector_inputs,
+        required_raw_filenames,
+        run_label,
+        state,
+        classification_overrides,
+        correlation_id,
+        classification_state_root,
+    )
+    if failure_result is not None:
+        return failure_result
+
+    earlier_week_notional_usd, earlier_week_scan_had_failures, prior_same_day_allocations = _resolve_prior_allocations(
+        now,
+        scheduled,
+        config,
+        artifacts_dir,
+        config_dir,
+        prior_same_day_allocations,
+        prior_allocation_state_root,
+    )
     if deployment_history_root is None:
         deployment_history_root = Path(artifacts_dir).parent
     result = run_daily_compact(
@@ -3799,16 +3954,24 @@ def _run_pipeline_impl(
             # failed (Codex review: "Guard the post-compute manifest
             # rescan").
             try:
-                _refreshed_persistence = build_raw_persistence_state(
-                    trading_day_raw, raw_dir=Path(str(_raw_input_dir))
-                )
+                from scripts.file_lock import cross_process_lock
+
+                _raw_input_dir_obj = Path(str(_raw_input_dir))
+                # Keep the canonical raw snapshot stable from the directory
+                # rescan through this invocation's decision about whether the
+                # manifest changed at all. A concurrent retry uses the same
+                # sidecar while swapping raw.tmp -> raw, so without this lock
+                # the rescan can observe a different invocation's snapshot and
+                # publish its filenames into this run's state.
+                with cross_process_lock(_raw_input_dir_obj.parent / ".corporate_actions.lock"):
+                    _refreshed_persistence = build_raw_persistence_state(
+                        trading_day_raw, raw_dir=_raw_input_dir_obj
+                    )
                 if _refreshed_persistence.get("raw_inputs_saved") != raw_persistence_state.get(
                     "raw_inputs_saved"
                 ):
                     _run_state_path = result.get("run_state_path")
                     if _run_state_path:
-                        from scripts.file_lock import cross_process_lock
-
                         _run_state_path_obj = Path(_run_state_path)
                         # Hold the same per-run cross_process_lock() convention
                         # every other shared-artifact read-modify-write in this
@@ -4167,7 +4330,15 @@ def _run_pipeline_impl(
                     for o in prior_orders
                     if (o.get("order_id") or o.get("id")) not in new_ids
                 ]
-                atomic_write_text(oap_path, json.dumps({"orders": merged}, indent=2) + "\n")
+                # The rows spread the broker's whole order dict (**order in
+                # RobinhoodBroker.place_market_buy), which can echo the account
+                # number and account URLs; this file lives under cron_tracking/
+                # and is synced onward by reporting tooling, so every string in
+                # it goes through the same redaction the run artifacts get
+                # (2026-09-07 diagnostic, S:ADP-05).
+                atomic_write_text(
+                    oap_path, json.dumps({"orders": _redacted_strings(merged)}, indent=2) + "\n"
+                )
                 result["orders_after_place_path"] = str(oap_path)
 
             # Codex review (finding: "Keep ownership through the downstream
@@ -4266,7 +4437,7 @@ def _run_pipeline_impl(
                     _report_run_state_bytes: Optional[bytes] = _report_lock_path_obj.read_bytes()
                 except OSError:
                     _report_run_state_bytes = None
-            if _report_run_state_bytes != _known_run_state_bytes:
+            if _report_run_state_bytes is None or _report_run_state_bytes != _known_run_state_bytes:
                 result["directory_ownership_verified"] = False
                 logger.warning(
                     "run_state at %s changed concurrently immediately before "
@@ -4335,12 +4506,109 @@ def _run_pipeline_impl(
     _apply_execution_targets_to_candidates(
         run_state.get("buy_candidates") or [], targets, targets_by_order_id
     )
-    report_paths = generate_reports(run_state, fills, out)
-    summary = json.loads(
-        # ⚡ Bolt Optimization: json.loads accepts bytes directly, skipping string allocation
-        Path(report_paths["latest_run_summary"]).read_bytes()
-    )
-    sync_paths = write_compact_sync(summary, out)
+    # Codex review (finding: "Keep ownership while publishing full
+    # reports"): the lock+compare a little further up (`_report_run_state_
+    # bytes`) only protects the READ that produced `run_state` -- it
+    # released the moment that `with` block ended, several lines before
+    # `fills`/`targets` were even computed. Everything from there through
+    # here -- `_refresh_fills_from_broker` (network calls to the broker)
+    # and the two DURABLE WRITES below, `generate_reports()` (writes
+    # `latest_run_summary.json`, slippage reports, etc. into `out`) and
+    # `write_compact_sync()` (writes the Notion sync payload, also into
+    # `out`) -- ran completely unprotected. If a peer claims this
+    # directory (replaces `run_state.json`) any time after that earlier
+    # lock released, these writes would land in the peer's directory and
+    # corrupt/overwrite its evidence -- exactly the class of bug the last
+    # three rounds of fixes closed everywhere else in this function. A
+    # standalone recheck immediately before the writes would only narrow
+    # this gap, not close it (the raw-response merge above already learned
+    # that lesson the hard way -- see its own comment). So this mirrors
+    # `_merge_and_write_orders_after_place` exactly: a single closure that
+    # verifies ownership and then performs BOTH durable writes while STILL
+    # HOLDING the same `run_state.json.lock` acquisition that verified it
+    # -- no gap at all between the check and the writes it protects. The
+    # broker calls above are deliberately left OUTSIDE this lock -- there
+    # is no correctness reason to hold a file lock across a network call,
+    # and doing so risks the 30s default `cross_process_lock` timeout under
+    # a slow broker response.
+    report_paths: Dict[str, Any] = {}
+    summary: Dict[str, Any] = {}
+    sync_paths: Dict[str, Any] = {}
+    _reports_ownership_verified = True
+
+    def _verify_ownership_and_publish_reports() -> None:
+        nonlocal report_paths, summary, sync_paths
+        report_paths = generate_reports(run_state, fills, out)
+        summary = json.loads(
+            # ⚡ Bolt Optimization: json.loads accepts bytes directly, skipping string allocation
+            Path(report_paths["latest_run_summary"]).read_bytes()
+        )
+        sync_paths = write_compact_sync(summary, out)
+
+    if _pre_merge_run_state_path and _known_run_state_bytes is not None:
+        from scripts.file_lock import cross_process_lock
+
+        _final_lock_path_obj = Path(_pre_merge_run_state_path)
+        # Codex review (finding: "Do not swallow report write failures as
+        # ownership loss"): a single `try/except (TimeoutError, OSError):`
+        # wrapped around the WHOLE `with cross_process_lock(...):` block
+        # (an earlier version of this fix) could not tell "the lock itself
+        # could not be acquired/verified" apart from "the lock was fine,
+        # but generate_reports()/write_compact_sync() then raised OSError
+        # publishing the reports" (a full disk, a permission change, an
+        # atomic rename failing) -- both landed in the same except and got
+        # misreported as `directory_ownership_verified = False`, so a
+        # genuine publication failure returned a normal-looking result
+        # instead of propagating, exactly the failure mode `guarded_run`
+        # relied on this exception escaping to catch before this lock
+        # existed. The lock is entered manually here (not via `with`) so
+        # only ITS acquisition is covered by this except; the write call
+        # below runs in a separate `try/finally` that guarantees the lock
+        # is released but lets any OSError it raises propagate untouched.
+        try:
+            _final_lock_ctx = cross_process_lock(
+                _final_lock_path_obj.with_name(f"{_final_lock_path_obj.name}.lock")
+            )
+            _final_lock_ctx.__enter__()
+        except (TimeoutError, OSError):
+            # Fail closed (the same reasoning as every other ownership-loss
+            # branch in this function): an unverifiable check immediately
+            # before publishing reports must not be treated as "ownership
+            # fine, proceed".
+            logger.warning(
+                "failed to reverify ownership of %s immediately before "
+                "publishing full reports",
+                _pre_merge_run_state_path,
+                exc_info=True,
+            )
+            _reports_ownership_verified = False
+        else:
+            try:
+                try:
+                    _final_current_bytes: Optional[bytes] = _final_lock_path_obj.read_bytes()
+                except OSError:
+                    _final_current_bytes = None
+                if _final_current_bytes != _known_run_state_bytes:
+                    _reports_ownership_verified = False
+                else:
+                    _verify_ownership_and_publish_reports()
+            finally:
+                _final_lock_ctx.__exit__(None, None, None)
+    else:
+        # No bound snapshot to compare against at all -- publish directly,
+        # matching this function's pre-existing behavior for that case.
+        _verify_ownership_and_publish_reports()
+
+    if not _reports_ownership_verified:
+        result["directory_ownership_verified"] = False
+        logger.warning(
+            "run_state at %s changed concurrently immediately before "
+            "publishing full reports; skipping report/Notion-sync writes "
+            "to avoid corrupting another run's artifacts",
+            _pre_merge_run_state_path,
+        )
+        return result
+
     result["reports"] = report_paths
     result["notion_sync"] = sync_paths
     logger.info("Generated full post-trade reports in %s", out)
@@ -4430,6 +4698,8 @@ def _demo_runtime(
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    if argv is None and len(sys.argv) == 1:
+        argv = ["--demo"]
     parser = argparse.ArgumentParser(
         description="Near-close graded DCA orchestrator (dry-run CLI)."
     )

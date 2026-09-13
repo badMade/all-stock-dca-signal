@@ -23,28 +23,126 @@ report false differences.
 
 Characteristics of this generation:
 
+* The 0935 Gate 5 provider instructions were aligned on 2026-09-12 with
+  the slot's confirmed 2026-09-09 Robinhood-primary policy: 5-minute bars,
+  Robinhood payloads for every ticker, and no automatic provider fallback.
+  This corrects the committed mirror; external deployment remains unverified.
 * The account is addressed directly rather than through the environment: the
   live text hard-codes it at each call site (here shown redacted), instead of
   reading it from `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` at run time.
-* Live placement is ON for six slots. The 1230 slot is the exception, and its
+* The `0935` copy is likewise AHEAD of live, for Gates 5 and 7: as of
+  2026-08-26 `scripts/generate_market_open_candidates.py` exists, so that
+  copy's Gate 5 names the command to run (see the Gate 5 bullet below for the
+  whole slot-to-producer table) instead of pointing at "the repo's own signal
+  generation" -- which, for this slot, was an entry point that did not exist,
+  so every fire produced no buy list at all. Gate 7 also adds the final
+  placement-boundary price-eligibility refresh and restarts the complete
+  per-order revalidation sequence whenever that final quote expires. Gates 6,
+  6.5 and 6.7 are unchanged there. Same caveat as the 1230 copy below: until a
+  human applies that body through `update_scheduled_task` and the mirror is
+  re-captured, the ACTUAL live 9:35 task still carries the older Gates 5 and 7,
+  still cannot produce a buy list, and lacks Gate 7's new placement-boundary
+  price safety check. See `docs/market_open_signal_entry.md`.
+* ALL SEVEN copies are AHEAD of live for Gate 2 as of 2026-09-08. The 9:35
+  fire that day never reached a gate: the sandboxed shell tool refused to
+  start on four consecutive attempts, each timing out at 120-180 seconds, so
+  the `ls -d /sessions/*/mnt/all-stock-dca` probe never ran. Gate 2 had no
+  branch for "the shell itself is dead", so the executor improvised one --
+  retried until roughly a third of the window was gone, then reported the
+  repo-access reason whose remedy is "reconnect the folder", which nothing
+  had shown to be disconnected, and labelled the abort "GATE 1 - REPO
+  REACHABLE" (the TIME SANITY bucket in `scripts/alert_digest.py`'s
+  `Failing gate: Gate N` grouping). Every mirror now carries a bounded
+  liveness probe, the distinct reason `executor shell tool unavailable, repo
+  probes could not run`, the shell-restore remedy, and the canonical gate
+  number, both in Gate 2's body and in the truncation-safe prefix. Same
+  caveat as every other bullet here: until a human applies these bodies via
+  `update_scheduled_task` and the mirrors are re-captured, the live tasks
+  still have no dead-shell branch and will improvise again.
+* Gate 1 was corrected on 2026-09-08 after the 1:30 PM slot was killed by a
+  timezone misread. The run sampled 11:31, reported it as "11:31 AM ET" and
+  aborted as an off-schedule scheduler fault; 11:31 at that instant was
+  UTC-06:00 and New York was 1:31 PM, inside the 1:25-1:55 window. The slot was
+  on time. Six of the seven mirrors said only "Get the current ET time", which
+  a host in another zone answers confidently and wrongly -- the 1230 mirror
+  already derived it correctly as `datetime.now(ZoneInfo('America/New_York'))`
+  and is the precedent the other six now follow. Gate 1 also pins the only two
+  offsets a real ET timestamp carries (-04:00 / -05:00), routes the value
+  through `dca_runner._require_aware()`, and classifies a whole-hour
+  discrepancy as a probable timezone misread rather than a scheduler fault.
+  Fail-closed is unchanged: an out-of-window converted time still aborts.
+* Gate 2 and Gate 7 were corrected again on 2026-09-08 after three more slots
+  failed the same day and two 2026-09-04 alerts surfaced a second failure
+  class. The 10:30 and 11:30 fires lost the shell but kept FILE access, and
+  both read repo files successfully before still reporting repo access as the
+  failure -- which disproved two claims the morning's own fix had made: that a
+  dead shell means the repo is unreachable, and that it means no artifact is
+  possible. Gate 2 now reads `config/trading_window.json` as a fallback probe,
+  reports a readable repo with a distinct reason, and labels the alert by the
+  gate that actually failed (a successful read PASSES Gate 2; the run dies at
+  Gate 1 or Gate 5 instead). When a file write still works it must persist the
+  Gate 9 set, sourcing the path from the stream's own config rather than
+  `dca_paths`, and write the durable alert to the configured destination and
+  not the gitignored `artifacts/` tree the 11:30 fire used. Gate 7 gained a
+  branch for a `place_equity_order` refused by the platform before the broker
+  sees it ("Blocked by classifier", 2026-09-04 1:30 PM): a whole-batch stop,
+  one retry only, no `max_orders_per_day` attempt consumed, and the resolved
+  Gate 6.5 `buy_usd` amounts carried into the alert verbatim so they can be
+  placed by hand. Same caveat as every bullet here: none of it runs until a
+  human applies these bodies and re-captures the mirrors.
+* Gate 2 also gained a FOURTH repo probe,
+  `find /home/user -maxdepth 3 -type d -name all-stock-dca`, in the same
+  change. The original three only ever looked under `/sessions/*/mnt/`, which
+  is the Cowork mount layout and not the only place this checkout lives:
+  `config/intraday_dca.json` names `/home/user/workspace/cron_tracking` as the
+  live artifact root for the sibling executor on cron `4412c3c4`, and a Claude
+  session's own clone can sit at `/home/user/all-stock-dca`. In either
+  environment all three original probes come back empty and Gate 2 reports a
+  disconnected folder for a repo that was readable the whole time. The fourth
+  probe folds into the same deduplicated union, the same
+  exactly-one-surviving-checkout rule, and the same required-config-files
+  check, so it is not a back door into an arbitrary tree.
+* Live placement is authorized for all seven slots as of 2026-09-02, per
+  Geoff's explicit direction that order placement be on for all scheduled
+  buy runs. The 1230 slot was the one exception up to that point, and its
   `live-mirror/` copy is currently AHEAD of what was actually captured
   2026-07-31: PR #412 rewrote it so Gates 0/1/3/4/6 call `dca_runner.py`'s
   individual gate functions directly -- `market_day_status`,
   `gate_time_sanity`, `gate_trading_window`, `gate_sole_executor`,
   `budget_snapshot`, `plan_orders` -- rather than `dca_runner.assess()`,
   since `assess()` bakes in dynamic budget-tier escalation that
-  `config/midday_dca.json` forbids for this slot, and its placement (Gate 7)
-  stays explicitly OFF pending validation. Per this file's own policy above,
+  `config/midday_dca.json` forbids for this slot. That PR's own placement
+  (Gate 7) text stayed explicitly OFF pending validation of this slot's
+  Gate 5 signal-generation producer; this repo's copy has since been
+  updated to bring Gate 7 up to the same authorized standard as the other
+  six slots, superseding that OFF text. Per this file's own policy above,
   editing the committed copy changes nothing about the live task: until a
   human applies this text via `update_scheduled_task` and the mirror is
   re-captured, the ACTUAL live 1230 task is still whatever was captured
-  2026-07-31 (the `assess()`-based version this bullet used to describe),
-  not what `live-mirror/1230ET-1230-pm-midday-buying-run.txt` currently
-  contains. Diff against a fresh capture before trusting this bullet as
-  "what actually runs."
+  2026-07-31 (the `assess()`-based, placement-OFF version this bullet used
+  to describe), not what `live-mirror/1230ET-1230-pm-midday-buying-run.txt`
+  currently contains. Diff against a fresh capture before trusting this
+  bullet as "what actually runs."
 * Gate 5 tells the executor to run the repo's signal generation and to abort if
-  it errors — which it does, every day, because no such entry point exists for
-  the seven-slot roster (see `../../PRODUCTION_READINESS.md`).
+  it errors. As of 2026-08-26 all seven slots have their own committed,
+  tested producer, and every live-mirror prompt in this directory already
+  names its command: `0935ET` -> `scripts/generate_market_open_candidates.py`,
+  `1030ET` -> `scripts/generate_morning_candidates.py`, `1130`/`1330`/`1430ET`
+  -> `scripts/generate_intraday_candidates.py --slot {1130,1330,1430}`,
+  `1230ET` -> `scripts/generate_midday_candidates.py`, `1530ET` ->
+  `scripts/generate_buy_candidates.py` (see `../../PRODUCTION_READINESS.md`).
+  Each producer is scoped to its own slot on purpose (the streams have
+  different executors, decision anchors, and ladders), so pointing one slot's
+  prompt at another slot's producer would silently score it against the wrong
+  logic. None of these Gate 5 producers places an order or touches a broker --
+  Gates 6/6.5/6.7/7 remain prompt-driven, so Gate 5 no longer aborts every
+  day by default for any slot, but that says nothing about whether Gate 7
+  is authorized to place what Gate 5 finds.
+* A producer existing is not the same as a slot trading: the live task's prompt
+  must actually name the command, and that text lives outside this repo. Until a
+  human applies a rewritten body via `update_scheduled_task` and the mirror is
+  re-captured, the live task still runs whatever was captured -- so treat every
+  Gate 5 claim in these files as proposed, not active.
 * `GATE 6.5 - SAME-DAY TOP-UP GUARD` (step 4.5 in the 1230 slot) invokes
   `scripts/same_day_top_up_gate.py`.
 
