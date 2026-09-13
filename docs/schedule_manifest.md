@@ -863,7 +863,6 @@ see the note at the top of this section for why that ordering is load-bearing.
 | 9:55 AM | Monthly DCA automation cost review | `bec4a6ee` | First weekday gate | `55 13 1-7 * 1-5` | no | active |
 | 5:15 PM | Month-end DCA volatility risk refresh, EDT | `c9fb1fb8` | Days 25-31, final eligible market-day gate | `15 21 25-31 3-10 *` | no | active |
 | 5:15 PM | Month-end DCA volatility risk refresh, EST | `17a3b2a9` | Seasonal EST months, final eligible market-day gate | `15 22 25-31 1,2,11,12 *` | no | active |
-| One-time future | Evaluate graded DCA live test continuation | `f7411889` | One-time | one-shot 2026-08-15 11:45 AM ET | no | active |
 
 **Note on `7be82b97`:** one task fires at three ET slots (11:30 AM, 1:30 PM, and
 2:30 PM). Each run records the slot that actually fired in its own
@@ -1083,17 +1082,22 @@ byte-identical since verification. On 2026-08-02 the user gave explicit,
 direct instructions to remove `e3e6f09e` (3:05 PM monitor-only signal check)
 and `a46bf007` (3:40 PM live-run watchdog) entirely, and to retime `67aa802b`
 (3:35 PM -> 5:00 PM ET daily) and `041d9d90` (Fridays 5:00 PM -> 5:30 PM ET);
-the table above reflects that change (17 -> 15 rows). See
+the table above reflects that change (17 -> 15 rows). It contained one
+pre-existing one-time entry (`f7411889`) from before the 2026-07-27
+verification; on 2026-09-13 that entry was retired under the same
+explicit-direct-user-instruction precedent (15 -> 14 rows) and replaced by a
+new one-time entry, `d2b6c23e`, scoped to the current window (see below and
+`retired_on_2026_09_13` in `config/scheduled_tasks.json`). See
 `config/scheduled_tasks.json`'s `canonical_schedule_reconciliation_2026_07_27.canonical_schedule_et_immutability_note`
-for the full reasoning. It already contains one pre-existing one-time entry
-(`f7411889`) from before the 2026-07-27 verification, which stays in place.
-New one-time, non-recurring tasks are recorded here instead of being appended
-to the canonical table, so it stays intact and diffable. Both this table and
-the canonical table above are active schedule sources.
+for the full reasoning. New one-time, non-recurring tasks are recorded here
+instead of being appended to the canonical table, so it stays intact and
+diffable. Both this table and the canonical table above are active schedule
+sources.
 
 | Fires | Task | ID | Trades | Status | Scheduler-registered |
 |---|---|---|---|---|---|
 | 2026-07-27 4:30 PM ET | One-time DCA credit-usage proxy report with recovery runs | `onetime-1630-credit-usage-proxy-2026-07-27` | no | active | **yes**: `cron_utc` `30 20 27 7 *`, executor `scripts/generate_credit_usage_proxy_report.py` |
+| 2026-10-16 11:45 AM ET | One-time reminder: evaluate continuing past Oct 30 | `d2b6c23e` | no | active | no (reminder only, no scheduler executor) |
 
 ### Retired from the active schedule on 2026-07-27
 These entries are **not active** and must never appear in an active schedule
@@ -1109,7 +1113,13 @@ table. They are kept as historical records only.
 
 `e3e6f09e` (monitor-only signal check, formerly 3:05 PM) is **paused**, not
 retired: it is represented but not firing, and is not expected daily evidence
-while paused. `f7411889` remains a one-time reminder, not a recurring stream.
+while paused.
+
+### Retired from the active schedule on 2026-09-13
+
+| ID | Former slot | Reason |
+|---|---|---|
+| `f7411889` | One-time, fired 2026-08-15 11:45 AM ET | Existed to evaluate continuing live testing past 2026-08-28. `config/trading_window.json` had already extended the approved end date to 2026-10-30 on 2026-07-26, and this reminder was never rescheduled to match (a gap this file's own Test window section, mirrored in `docs/safeguards.md`, had flagged as unresolved). Superseded by `d2b6c23e`. |
 
 ## Run-plumbing contracts for every live stream (added 2026-07-27)
 
@@ -1887,8 +1897,11 @@ never estimated, inferred, or defaulted.
 - **Registered with the scheduler:** `cron_utc` `30 20 27 7 *` (20:30 UTC = 4:30 PM EDT on 2026-07-27) and an executable command now run [`scripts/generate_credit_usage_proxy_report.py`](../scripts/generate_credit_usage_proxy_report.py), a real script that reads persisted same-day artifacts and produces the report. As with every task's `cron_utc`, invoking it at the scheduled time is the external scheduler's responsibility.
 - The id is **repo-internal**: no 8-hex scheduler id was supplied for this task. Full contract: [credit_usage_proxy_report.md](credit_usage_proxy_report.md), machine-readable source `credit_usage_proxy_report_2026_07_27`.
 
-### `f7411889` — One-time reminder
-- Reminder only, **no trading**. Fires **2026-08-15 11:45 AM ET** to evaluate continuing live testing past 2026-08-28. Stale as of the 2026-07-26 extension of `config/trading_window.json` to 2026-10-30 — this scheduler-side task needs to be rescheduled (or re-scoped) to match; it was not touched by that config change. A good target is mid-to-late October, ahead of the 2026-10-30 end date and the 2026-11-01 DST transition the window deliberately stops before.
+### `f7411889` — One-time reminder (retired 2026-09-13)
+- Reminder only, **no trading**. Fired **2026-08-15 11:45 AM ET** to evaluate continuing live testing past 2026-08-28. It went stale after the 2026-07-26 extension of `config/trading_window.json` to 2026-10-30 and was never rescheduled to match. Retired per user instruction; the task object is kept in `config/scheduled_tasks.json`'s `tasks` array with `status='disabled'` as a historical record (see `retired_not_in_canonical_schedule` and `retired_on_2026_09_13`), not deleted. Superseded by `d2b6c23e` below.
+
+### `d2b6c23e` — One-time reminder
+- Reminder only, **no trading**. Fires **2026-10-16 11:45 AM ET** — roughly two weeks ahead of the current 2026-10-30 `config/trading_window.json` end date, mirroring `f7411889`'s ~13-day lead time before its 2026-08-28 deadline — to evaluate continuing live testing past the 2026-10-30 window, ahead of the 2026-11-01 EDT->EST transition the window deliberately stops before (the live tasks' cron schedules are fixed-UTC/EDT-only). Supersedes `f7411889`. Recorded in `config/scheduled_tasks.json`'s `canonical_schedule_reconciliation_2026_07_27.one_time_additions_after_canonical_verification`, not the canonical table, per that block's own convention for one-time additions.
 
 ### `c9fb1fb8` / `17a3b2a9` — Month-end DCA volatility risk table refresh
 - **Analytics and reporting only — no trading.** No order reviews, no order submissions,

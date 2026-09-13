@@ -339,8 +339,12 @@ of the sizing decision. Tier selection never keys on planned spend.
   3:20 PM to align with the canonical 3:30 PM ET final live task); confirm/extend
   it independently, since extending `config/trading_window.json` alone does not
   change that external script.
-- A one-time reminder (`f7411889`) fires 2026-08-15 to decide on continuation —
-  reschedule it too now that the window runs through Oct 30.
+- The one-time reminder that fired 2026-08-15 to decide on continuation past
+  2026-08-28 (`f7411889`) was never rescheduled after the window extended to
+  Oct 30 and was retired 2026-09-13. It is superseded by a new one-time
+  reminder (`d2b6c23e`), firing 2026-10-16 11:45 AM ET, ahead of the current
+  Oct 30 end date. See `config/scheduled_tasks.json`'s `retired_on_2026_09_13`
+  and [schedule_manifest.md](schedule_manifest.md#f7411889--one-time-reminder-retired-2026-09-13).
 
 ## Operational rules
 
