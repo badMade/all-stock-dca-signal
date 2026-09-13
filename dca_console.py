@@ -359,6 +359,39 @@ def load_auth_file(path: str | os.PathLike[str]) -> tuple[str, bytes]:
     return access.username, credential
 
 
+# The probe answers with import names; a reason shown to an operator has to name
+# what ``pip install`` actually takes, so scikit-learn is never reported as the
+# "sklearn" spec name (console clarity round).
+RESEARCH_PACKAGES = ("numpy", "pandas", "sklearn")
+PACKAGE_DISTRIBUTIONS = {"sklearn": "scikit-learn"}
+
+
+def missing_packages(packages: dict, names: tuple[str, ...]) -> list[str]:
+    """Name the probed packages an action still needs, in requirement order."""
+    return [PACKAGE_DISTRIBUTIONS.get(name, name) for name in names if packages.get(name) is not True]
+
+
+def dependency_reason(packages: dict, names: tuple[str, ...]) -> str:
+    """Explain which research dependency blocks an action, or why none is known.
+
+    One shared "install the requirements" line stood next to every research
+    button, so an operator who already had NumPy and pandas installed could not
+    tell which package was actually missing, and a probe that never answered
+    read as a missing package (console clarity round).
+    """
+    probe_error = packages.get("error")
+    if isinstance(probe_error, str):
+        # A failed probe is not evidence of a missing package. Pointing pip at an
+        # interpreter that never answered sends the operator the wrong way, so
+        # report the probe itself and where its details are printed.
+        return f"{probe_error} for --research-python; run --check to see which interpreter was probed."
+    missing = missing_packages(packages, names)
+    if not missing:
+        return ""
+    return (f"Install {', '.join(missing)} in --research-python's environment; "
+            "wondrous-octopus/requirements.txt covers them.")
+
+
 def python_packages(executable: str) -> dict:
     """Probe optional package availability without importing research modules."""
     names = ("numpy", "pandas", "sklearn", "torch", "pytest", "ruff")
@@ -491,20 +524,29 @@ class ConsoleApp:
 
     def actions(self) -> list[dict]:
         """List fixed actions, with explicit dependency/setup availability."""
-        research = all(self.packages.get(key) is True for key in ("numpy", "pandas", "sklearn"))
-        research_reason = "Install wondrous-octopus/requirements.txt in --research-python's environment."
+        # Every reason below names exactly what is missing. A shared research
+        # string could not distinguish one absent package from a failed probe,
+        # and the update action reported both blockers whichever one applied
+        # (console clarity round).
+        research_reason = dependency_reason(self.packages, RESEARCH_PACKAGES)
+        research = not research_reason
+        neural_reason = dependency_reason(self.packages, (*RESEARCH_PACKAGES, "torch"))
+        update_reason = " ".join(part for part in (
+            "Supply --octopus-run with an existing Octopus run directory." if self.octopus_run is None else "",
+            research_reason,
+        ) if part)
         definitions = [
             ("demo-all", "Run full demo", "DCA pipeline + Octopus replay + daily summary.", True, ""),
             ("demo-dca", "Test DCA pipeline", "Run the real dry-run pipeline and reporting with synthetic market data.", True, ""),
             ("demo-octopus", "Test Octopus pipeline", "Replay synthetic data through persistence and GBM baselines.", research, research_reason),
             ("demo-neural", "Test neural Octopus", "Replay synthetic data through the actual PyTorch Octopus model.",
-             research and self.packages.get("torch") is True, research_reason),
+             not neural_reason, neural_reason),
             ("reports", "Save daily reports", "Generate dated JSON / Markdown daily summaries and confirmed-purchase exports.",
              self.settings.root.is_dir(), "No artifact directory is available yet."),
             ("test-signals", "Test all seven signal slots", "Run the existing seven-slot regression tests locally.",
              self.dev_packages.get("pytest") is True, "Install requirements-dev.txt in the Python environment."),
             ("octopus-update", "Update Octopus day", "Score, update and forecast using the configured research checkpoint and local archive.",
-             research and self.octopus_run is not None, "Supply --octopus-run and install research dependencies."),
+             research and self.octopus_run is not None, update_reason),
             ("octopus-estimate", "Estimate archive replay", "Read the archive and estimate a quick replay; fits no models.",
              research, research_reason),
         ]

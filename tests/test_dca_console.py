@@ -1351,3 +1351,84 @@ def test_summary_signature_cache_is_bounded(tmp_path, monkeypatch):
         assert set(application.signatures) == {day.isoformat() for day in days[-32:]}
     finally:
         application.jobs.close()
+
+
+@contextmanager
+def probed_console(tmp_path, monkeypatch, packages, octopus_run=None):
+    """Build a console whose research probe reports exactly ``packages``."""
+    monkeypatch.setattr(dca_console, "python_packages", lambda _: packages)
+    application = ConsoleApp(Settings(
+        "local", tmp_path / "artifacts", tmp_path / "output", date(2026, 9, 8),
+        sys.executable, sys.executable, octopus_run,
+    ))
+    try:
+        yield application
+    finally:
+        application.jobs.close()
+
+
+def action_state(application, action_id: str) -> tuple[bool, str]:
+    action = next(item for item in application.actions() if item["id"] == action_id)
+    return action["available"], action["reason"]
+
+
+def test_research_action_reason_names_only_the_missing_packages(tmp_path, monkeypatch):
+    """One shared "install the requirements" line could not say which package was
+    missing, so an operator with NumPy already installed had nothing to act on."""
+    packages = {"numpy": True, "pandas": False, "sklearn": False, "torch": False}
+    with probed_console(tmp_path, monkeypatch, packages) as application:
+        for action_id in ("demo-octopus", "octopus-estimate"):
+            available, reason = action_state(application, action_id)
+            assert available is False
+            # scikit-learn, not "sklearn": the reason has to name what pip takes.
+            assert "pandas" in reason and "scikit-learn" in reason
+            assert "numpy" not in reason
+            assert "--research-python" in reason and "wondrous-octopus/requirements.txt" in reason
+
+
+def test_neural_action_reason_names_torch_alone_when_the_rest_is_installed(tmp_path, monkeypatch):
+    packages = {"numpy": True, "pandas": True, "sklearn": True, "torch": False}
+    with probed_console(tmp_path, monkeypatch, packages) as application:
+        assert action_state(application, "demo-octopus") == (True, "")
+        available, reason = action_state(application, "demo-neural")
+        assert available is False
+        assert "torch" in reason
+        assert "pandas" not in reason and "scikit-learn" not in reason
+
+
+def test_failed_research_probe_is_reported_instead_of_a_pip_instruction(tmp_path, monkeypatch):
+    """A probe that never answered is not evidence of a missing package; sending
+    the operator to pip against that interpreter is the wrong next step."""
+    with probed_console(tmp_path, monkeypatch, {"error": "Python runtime is unavailable"}) as application:
+        available, reason = action_state(application, "demo-octopus")
+        assert available is False
+        assert "Python runtime is unavailable" in reason
+        assert "--research-python" in reason
+        assert "Install" not in reason and "requirements.txt" not in reason
+
+
+def test_octopus_update_reason_separates_the_run_directory_from_dependencies(tmp_path, monkeypatch):
+    installed = {"numpy": True, "pandas": True, "sklearn": True, "torch": True}
+    missing = {"numpy": True, "pandas": True, "sklearn": False, "torch": False}
+    run_dir = tmp_path / "octopus-run"
+    run_dir.mkdir()
+
+    with probed_console(tmp_path, monkeypatch, installed) as application:
+        available, reason = action_state(application, "octopus-update")
+        assert available is False
+        assert "--octopus-run" in reason
+        assert "Install" not in reason and "scikit-learn" not in reason
+
+    with probed_console(tmp_path, monkeypatch, missing, octopus_run=run_dir) as application:
+        available, reason = action_state(application, "octopus-update")
+        assert available is False
+        assert "scikit-learn" in reason
+        assert "--octopus-run" not in reason
+
+    with probed_console(tmp_path, monkeypatch, missing) as application:
+        available, reason = action_state(application, "octopus-update")
+        assert available is False
+        assert "--octopus-run" in reason and "scikit-learn" in reason
+
+    with probed_console(tmp_path, monkeypatch, installed, octopus_run=run_dir) as application:
+        assert action_state(application, "octopus-update") == (True, "")

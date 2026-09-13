@@ -30,6 +30,12 @@ scikit-learn. The neural Octopus smoke test also needs PyTorch. Missing research
 dependencies leave the core interface usable, disable the individual research
 buttons, and mark the combined demo as incomplete in its job log.
 
+A disabled button states exactly what blocks it: the packages still missing
+from `--research-python` under their `pip install` names, the probe error when
+that interpreter never answered (`--check` prints which one was probed), and,
+for **Update Octopus day**, whether the missing piece is `--octopus-run`, the
+dependencies, or both.
+
 ## Everyday interface
 
 - Daily summaries: select a date, inspect observed runs, statuses, candidate
