@@ -111,6 +111,7 @@ from near_close_dca import (
     StrategyConfig,
     _DiagnosticRedactionFilter,
     _is_usable_reconciled_order_id,
+    _live_placement_now,
     _live_session_failure,
     _recovered_broker_notional,
     _ticker_sizing,
@@ -7969,6 +7970,22 @@ class MorningDCAExecutor(DCAExecutor):
         # close. Recheck the actual regular session for BOTH run origins,
         # before charging an attempt or calling the placement adapter.
         session_failure = _live_session_failure(trading_day)
+        if not session_failure and not manual:
+            window_start_et = self.profile.get("window_start_et")
+            window_end_et = self.profile.get("window_end_et")
+            if window_start_et and window_end_et:
+                try:
+                    placement_now = _live_placement_now()
+                except Exception as exc:
+                    session_failure = f"live session: clock failed ({type(exc).__name__})"
+                else:
+                    now_et_time = placement_now.astimezone(EASTERN).time()
+                    if not (
+                        time.fromisoformat(window_start_et)
+                        <= now_et_time
+                        <= time.fromisoformat(window_end_et)
+                    ):
+                        session_failure = "outside scheduled slot window"
         if session_failure:
             outcomes[ticker] = {"status": "blocked", "skip_reason": session_failure, "deliberate_skip": True}
             return (
