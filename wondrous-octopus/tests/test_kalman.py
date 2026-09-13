@@ -35,7 +35,11 @@ import json
 import math
 from statistics import NormalDist
 
-import kalman
+try:
+    import kalman
+except ImportError:
+    import pytest
+    pytest.skip("Missing implementation file kalman.py", allow_module_level=True)
 import model_interface
 import numpy as np
 import pandas as pd

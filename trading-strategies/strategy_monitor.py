@@ -1088,6 +1088,14 @@ class SheetsWriter:
         if parsed_url.scheme.lower() != "https" or parsed_url.netloc.lower() != "api.pipedream.com":
             logger.error("SheetsWriter: blocked unsafe Sheets API URL %s", url)
             return False
+
+        from dca_net_utils import assert_safe_destination as _assert_safe_destination
+        try:
+            _assert_safe_destination(url)
+        except Exception as exc:
+            logger.error("SheetsWriter: blocked unsafe Sheets API URL %s (%s)", url, exc)
+            return False
+
         payload = json.dumps({
             "spreadsheetId": self.spreadsheet_id,
             "worksheetId":   self.sheet_name,
