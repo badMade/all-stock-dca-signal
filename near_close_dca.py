@@ -14321,13 +14321,24 @@ def _regular_session_failure(now: datetime, trading_day: date) -> Optional[str]:
     return None
 
 
-def _live_session_failure(trading_day: date) -> Optional[str]:
-    """Sample a fresh placement clock and return a safe blocking reason."""
+def _live_session_failure(
+    trading_day: date, *, scheduled_window: Optional[Tuple[str, str]] = None,
+) -> Optional[str]:
+    """Check the fresh placement clock against the session and optional slot."""
     try:
         now = _live_placement_now()
     except Exception as exc:
         return f"live session: clock failed ({type(exc).__name__})"
-    return _regular_session_failure(now, trading_day)
+    failure = _regular_session_failure(now, trading_day)
+    if failure or scheduled_window is None:
+        return failure
+    try:
+        start, end = map(time.fromisoformat, scheduled_window)
+        if not start <= now.astimezone(EASTERN).time() <= end:
+            return "live session: outside scheduled slot window"
+    except (TypeError, ValueError):
+        return "live session: invalid scheduled slot window"
+    return None
 
 
 class _LiveSessionBlockedError(RuntimeError):

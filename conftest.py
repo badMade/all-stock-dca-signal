@@ -92,10 +92,14 @@ def historical_live_clock(monkeypatch, request):
             ctx = bound.arguments.get("ctx")
             if ctx is not None:
                 now = ctx.now
-            # Direct executor placement tests supply a trading_day without
-            # running a scan. Their synthetic session is noon on that day.
+            # Direct placement tests need an in-slot clock for scheduled
+            # executors; manual and other callers keep the synthetic noon.
             if now is None and "trading_day" in bound.arguments:
-                now = datetime.combine(bound.arguments["trading_day"], time(12), tzinfo=near_close_dca.EASTERN)
+                executor = bound.arguments.get("self")
+                decision_time = time(12)
+                if isinstance(executor, morning_dca.MorningDCAExecutor) and not bound.arguments.get("manual", False):
+                    decision_time = executor.profile["decision_time_et"]
+                now = datetime.combine(bound.arguments["trading_day"], decision_time, tzinfo=near_close_dca.EASTERN)
             if clock.get() is not None or not isinstance(now, datetime):
                 return function(*args, **kwargs)
             token = clock.set(now)
