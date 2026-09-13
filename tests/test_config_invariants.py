@@ -2412,10 +2412,13 @@ def test_midday_live_mirror_requires_qualifying_in_window_afternoon_evidence():
     assert "if missing_pairs:" in text
 
 
-def test_market_open_and_midday_gate_5_fetch_configured_yfinance_fallback():
-    """Prompt-driven fetches must satisfy the stream candidate fallback contract."""
+def test_midday_gate_5_fetches_configured_yfinance_fallback():
+    """Finance-primary midday fetches must satisfy the fallback contract.
+
+    Market-open is Robinhood-primary; test_provider_prompt_contract covers its
+    payload against the actual slot spec rather than applying this policy to it.
+    """
     prompts = {
-        "market open": _market_open_live_mirror_text(),
         "midday": _midday_live_mirror_text(),
     }
     for slot, text in prompts.items():

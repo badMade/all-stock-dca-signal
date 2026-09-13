@@ -23,6 +23,10 @@ report false differences.
 
 Characteristics of this generation:
 
+* The 0935 Gate 5 provider instructions were aligned on 2026-09-12 with
+  the slot's confirmed 2026-09-09 Robinhood-primary policy: 5-minute bars,
+  Robinhood payloads for every ticker, and no automatic provider fallback.
+  This corrects the committed mirror; external deployment remains unverified.
 * The account is addressed directly rather than through the environment: the
   live text hard-codes it at each call site (here shown redacted), instead of
   reading it from `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` at run time.
