@@ -67,7 +67,7 @@ def test_build_entry_looks_up_manifest_fields():
 def test_build_entry_covers_every_manifest_task():
     for task_id in COVERED_TASK_IDS:
         entry = build_entry(
-            run_id=f"run_{task_id}", task_id=task_id, artifact_path="/tmp/a", triggered_at_utc=TRIGGERED
+            run_id=f"run_{task_id}", task_id=task_id, artifact_path="/tmp/a", triggered_at_utc=TRIGGERED  # nosec
         )
         assert entry["task_id"] == task_id
         assert entry["scheduled_for_et"]
@@ -77,7 +77,7 @@ def test_build_entry_covers_every_manifest_task():
 
 def test_build_entry_accepts_cron_id_alone():
     entry = build_entry(
-        run_id="r1", cron_id="67aa802b", artifact_path="/tmp/a", triggered_at_utc=TRIGGERED
+        run_id="r1", cron_id="67aa802b", artifact_path="/tmp/a", triggered_at_utc=TRIGGERED  # nosec
     )
     assert entry["cron_id"] == "67aa802b"
     assert "task_id" not in entry
@@ -86,7 +86,7 @@ def test_build_entry_accepts_cron_id_alone():
 
 def test_build_entry_requires_an_identifier():
     try:
-        build_entry(run_id="r1", artifact_path="/tmp/a")
+        build_entry(run_id="r1", artifact_path="/tmp/a")  # nosec
         raise AssertionError("expected ValueError")
     except ValueError:
         pass
@@ -94,7 +94,7 @@ def test_build_entry_requires_an_identifier():
 
 def test_build_entry_unknown_task_raises():
     try:
-        build_entry(run_id="r1", task_id="does-not-exist", artifact_path="/tmp/a")
+        build_entry(run_id="r1", task_id="does-not-exist", artifact_path="/tmp/a")  # nosec
         raise AssertionError("expected UnknownTaskError")
     except UnknownTaskError:
         pass
@@ -102,7 +102,7 @@ def test_build_entry_unknown_task_raises():
 
 def test_build_entry_missing_required_fields():
     try:
-        build_entry(run_id="", cron_id="67aa802b", artifact_path="/tmp/a")
+        build_entry(run_id="", cron_id="67aa802b", artifact_path="/tmp/a")  # nosec
         raise AssertionError("expected ValueError")
     except ValueError as e:
         assert "model usage log entry missing required fields" in str(e)
@@ -114,7 +114,7 @@ def test_build_entry_invalid_model_routing_mode():
         build_entry(
             run_id="r1",
             cron_id="67aa802b",
-            artifact_path="/tmp/a",
+            artifact_path="/tmp/a",  # nosec
             model_routing_mode="invalid_mode"
         )
         raise AssertionError("expected ValueError")
@@ -131,7 +131,7 @@ def test_build_entry_premium_requires_valid_reason():
             build_entry(
                 run_id="r1",
                 task_id="10ce362c",
-                artifact_path="/tmp/a",
+                artifact_path="/tmp/a",  # nosec
                 model_routing_mode="premium",
                 triggered_at_utc=TRIGGERED,
                 **bad_kwargs,
@@ -143,7 +143,7 @@ def test_build_entry_premium_requires_valid_reason():
     ok = build_entry(
         run_id="r1",
         task_id="10ce362c",
-        artifact_path="/tmp/a",
+        artifact_path="/tmp/a",  # nosec
         model_routing_mode="premium",
         reason_for_premium_model="failure_recovery",
         triggered_at_utc=TRIGGERED,
@@ -156,7 +156,7 @@ def test_build_entry_rejects_premium_reason_on_non_premium():
         build_entry(
             run_id="r1",
             task_id="10ce362c",
-            artifact_path="/tmp/a",
+            artifact_path="/tmp/a",  # nosec
             model_routing_mode="cost_conscious",
             reason_for_premium_model="failure_recovery",
             triggered_at_utc=TRIGGERED,
@@ -173,7 +173,7 @@ def test_resolve_log_path_uses_yyyymm_layout():
 
 def test_append_model_usage_entry_writes_one_jsonl_line():
     entry = build_entry(
-        run_id="r1", task_id="a6239dae", artifact_path="/tmp/a", triggered_at_utc=TRIGGERED
+        run_id="r1", task_id="a6239dae", artifact_path="/tmp/a", triggered_at_utc=TRIGGERED  # nosec
     )
     with tempfile.TemporaryDirectory() as td:
         path = append_model_usage_entry(entry, root=td)
@@ -189,12 +189,12 @@ def test_append_model_usage_entry_writes_one_jsonl_line():
 
 
 def test_log_model_usage_root_none_is_a_noop():
-    assert log_model_usage(root=None, run_id="r1", task_id="42173154", artifact_path="/tmp/a") is None
+    assert log_model_usage(root=None, run_id="r1", task_id="42173154", artifact_path="/tmp/a") is None  # nosec
 
 
 def test_log_model_usage_unknown_task_is_swallowed():
     with tempfile.TemporaryDirectory() as td:
-        result = log_model_usage(root=td, run_id="r1", task_id="does-not-exist", artifact_path="/tmp/a")
+        result = log_model_usage(root=td, run_id="r1", task_id="does-not-exist", artifact_path="/tmp/a")  # nosec
         assert result is None
         assert list(Path(td).rglob("*.jsonl")) == []
 
@@ -202,7 +202,7 @@ def test_log_model_usage_unknown_task_is_swallowed():
 def test_log_model_usage_writes_when_root_given():
     with tempfile.TemporaryDirectory() as td:
         path = log_model_usage(
-            root=td, run_id="r1", task_id="67aa802b", artifact_path="/tmp/a", triggered_at_utc=TRIGGERED
+            root=td, run_id="r1", task_id="67aa802b", artifact_path="/tmp/a", triggered_at_utc=TRIGGERED  # nosec
         )
         assert path is not None
         assert path.exists()
@@ -214,13 +214,13 @@ def test_entry_matches_json_schema():
     validator = jsonschema.Draft7Validator(schema)
     for task_id in COVERED_TASK_IDS:
         entry = build_entry(
-            run_id=f"run_{task_id}", task_id=task_id, artifact_path="/tmp/a", triggered_at_utc=TRIGGERED
+            run_id=f"run_{task_id}", task_id=task_id, artifact_path="/tmp/a", triggered_at_utc=TRIGGERED  # nosec
         )
         assert list(validator.iter_errors(entry)) == []
     premium_entry = build_entry(
         run_id="r1",
         task_id="10ce362c",
-        artifact_path="/tmp/a",
+        artifact_path="/tmp/a",  # nosec
         model_routing_mode="premium",
         reason_for_premium_model="safety_validation",
         triggered_at_utc=TRIGGERED,
@@ -243,7 +243,7 @@ def test_cli_appends_entry_for_tasks_with_no_python_entry_point():
             [
                 "--run-id", "watchlist_20260721_0945ET",
                 "--task-id", "bb4f6ef1",
-                "--artifact-path", "/tmp/watchlist_report.json",
+                "--artifact-path", "/tmp/watchlist_report.json",  # nosec
                 "--triggered-at-utc", TRIGGERED.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "--root", td,
             ]
@@ -269,7 +269,7 @@ def test_cli_scheduled_for_et_override_beats_manifest_combined_default():
             [
                 "--run-id", "intraday_live_20260727_1330ET",
                 "--task-id", "7be82b97",
-                "--artifact-path", "/tmp/intraday_report.json",
+                "--artifact-path", "/tmp/intraday_report.json",  # nosec
                 "--scheduled-for-et", "13:30",
                 "--triggered-at-utc", TRIGGERED.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "--root", td,
@@ -287,7 +287,7 @@ def test_cli_exits_nonzero_and_writes_nothing_for_unknown_task():
 
     with tempfile.TemporaryDirectory() as td:
         rc = _main(
-            ["--run-id", "r1", "--task-id", "does-not-exist", "--artifact-path", "/tmp/a", "--root", td]
+            ["--run-id", "r1", "--task-id", "does-not-exist", "--artifact-path", "/tmp/a", "--root", td]  # nosec
         )
         assert rc != 0
         assert list(Path(td).rglob("*.jsonl")) == []

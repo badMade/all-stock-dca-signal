@@ -636,7 +636,7 @@ def test_manual_consumer_rerun_excluded_from_scheduled_evidence(tmp_path):
                 "stream": "slippage",
                 "triggered_at_utc": "2026-07-27T20:10:00Z",
                 "model_routing_mode": "cost_conscious",
-                "artifact_path": "/tmp/does-not-exist-slippage-manual.json",
+                "artifact_path": "/tmp/does-not-exist-slippage-manual.json",  # nosec
             }
         )
         + "\n",

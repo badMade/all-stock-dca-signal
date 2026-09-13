@@ -2240,7 +2240,7 @@ def test_book_recovered_lease_backfills_a_known_id_when_already_on_disk(monkeypa
     )
 
     im_already_on_disk = near_close_dca._book_recovered_lease_durably(
-        im_recovery, state, trading_day, deployment_history_root="/tmp/does-not-matter"
+        im_recovery, state, trading_day, deployment_history_root="/tmp/does-not-matter"  # nosec
     )
 
     assert im_already_on_disk is True
@@ -2279,7 +2279,7 @@ def test_book_recovered_lease_marks_the_backfilled_id_as_notional_applied(monkey
         order_id="ORD-RECOVERED",
     )
     near_close_dca._book_recovered_lease_durably(
-        im_recovery, state, trading_day, deployment_history_root="/tmp/does-not-matter"
+        im_recovery, state, trading_day, deployment_history_root="/tmp/does-not-matter"  # nosec
     )
 
     assert state.notional_applied_order_ids.get(("AAPL", trading_day)) == {"ORD-RECOVERED"}
@@ -31179,15 +31179,15 @@ def test_account_number_for_unresolved_evidence_distinguishes_no_identity_from_f
         def account_number(self):
             return "999000111"
 
-    assert near_close_dca._account_number_for_unresolved_evidence(None, "/tmp/x") is None
+    assert near_close_dca._account_number_for_unresolved_evidence(None, "/tmp/x") is None  # nosec
     assert (
-        near_close_dca._account_number_for_unresolved_evidence(_NoIdentityBroker(), "/tmp/x")
+        near_close_dca._account_number_for_unresolved_evidence(_NoIdentityBroker(), "/tmp/x")  # nosec
         is None
     )
 
     monkeypatch.setattr(near_close_dca, "_broker_account_fingerprint", lambda broker, key_dir: None)
     assert (
-        near_close_dca._account_number_for_unresolved_evidence(_RealIdentityBroker(), "/tmp/x")
+        near_close_dca._account_number_for_unresolved_evidence(_RealIdentityBroker(), "/tmp/x")  # nosec
         == near_close_dca._ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL
     )
 
@@ -31210,7 +31210,7 @@ def test_account_number_for_unresolved_evidence_fails_closed_on_a_probe_error(mo
 
     monkeypatch.setattr(near_close_dca, "_broker_account_fingerprint", lambda broker, key_dir: None)
     assert (
-        near_close_dca._account_number_for_unresolved_evidence(_FlakyIdentityBroker(), "/tmp/x")
+        near_close_dca._account_number_for_unresolved_evidence(_FlakyIdentityBroker(), "/tmp/x")  # nosec
         == near_close_dca._ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL
     )
 

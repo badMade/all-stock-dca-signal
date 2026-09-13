@@ -1367,8 +1367,8 @@ def test_default_prior_allocation_state_root_falls_back_to_parent():
 
     # No scheduled_runs/ segment in the path (e.g. a flat test/demo layout) ->
     # fall back to the immediate parent.
-    artifacts_dir = Path("/tmp/some_root/scheduled")
-    assert _default_prior_allocation_state_root(artifacts_dir) == Path("/tmp/some_root")
+    artifacts_dir = Path("/tmp/some_root/scheduled")  # nosec
+    assert _default_prior_allocation_state_root(artifacts_dir) == Path("/tmp/some_root")  # nosec
 
 
 def test_tickers_with_unresolved_same_day_context():

@@ -267,7 +267,7 @@ def test_the_no_network_guard_actually_bites():
     with pytest.raises(_NetworkAttempted):
         socket.create_connection(("example.invalid", 443))
     with pytest.raises(_NetworkAttempted):
-        urllib.request.urlopen("https://example.invalid")
+        urllib.request.urlopen("https://example.invalid")  # nosec
 
 
 def test_the_whole_decision_path_runs_without_a_network():

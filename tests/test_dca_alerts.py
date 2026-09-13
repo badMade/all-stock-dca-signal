@@ -1036,7 +1036,7 @@ def test_run_pipeline_scheduled_live_failure_alerts_and_reraises(monkeypatch):
             None,  # type: ignore[arg-type]
             None,  # type: ignore[arg-type]
             None,  # type: ignore[arg-type]
-            artifacts_dir="/tmp/unused",
+            artifacts_dir="/tmp/unused",  # nosec
             scheduled=True,
         )
     assert pings == [("afternoon", False)]

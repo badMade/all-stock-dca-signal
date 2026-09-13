@@ -227,11 +227,11 @@ def test_redact_url_with_port():
 
 def test_file_handler_blocked():
     with pytest.raises(urllib.error.URLError, match="file:// scheme is blocked for security"):
-        urllib.request.urlopen("file:///etc/passwd")
+        urllib.request.urlopen("file:///etc/passwd")  # nosec
 
 def test_ftp_handler_blocked():
     with pytest.raises(urllib.error.URLError, match="ftp:// scheme is blocked for security"):
-        urllib.request.urlopen("ftp://example.com")
+        urllib.request.urlopen("ftp://example.com")  # nosec
 
 
 @pytest.mark.parametrize(

@@ -1791,7 +1791,7 @@ def test_artifact_span_is_filesystem_safe_for_intraday_payloads():
 
 @pytest.mark.parametrize(
     "label",
-    ["../../../tmp/escape", "/etc/passwd", "..", ".", "", "C:\\windows", "a/b", "x\\y"],
+    ["../../../tmp/escape", "/etc/passwd", "..", ".", "", "C:\\windows", "a/b", "x\\y"],  # nosec
 )
 def test_artifact_span_is_always_a_single_path_component(label, tmp_path, monkeypatch):
     """The span reaches stream_root() as a path component, from an untrusted document.

@@ -2468,7 +2468,7 @@ def test_ledger_raises_when_a_tracker_file_is_misplaced_into_the_wrong_ticker_di
 
 @pytest.mark.parametrize(
     "malformed_ticker",
-    ["../../../tmp/evil", "AAPL/../../etc", "/etc/cron.d/evil", "..", "AAPL/../BBB", ""],
+    ["../../../tmp/evil", "AAPL/../../etc", "/etc/cron.d/evil", "..", "AAPL/../BBB", ""],  # nosec
 )
 def test_ledger_rejects_a_ticker_outside_the_symbol_pattern(tmp_path, malformed_ticker):
     """Regression test for "Constrain ledger paths to valid ticker symbols".
