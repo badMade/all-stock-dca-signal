@@ -73,9 +73,10 @@ from morning_dca import (
     MorningDCAExecutor,
     load_stream_config,
 )
-from near_close_dca import StrategyConfig
+from near_close_dca import StrategyConfig, _DiagnosticRedactionFilter
 
 _log = logging.getLogger(__name__)
+_log.addFilter(_DiagnosticRedactionFilter())
 
 
 # --- Intraday stream identity / classification constants ---------------------

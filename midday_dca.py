@@ -66,9 +66,11 @@ from morning_dca import (
 )
 from near_close_dca import (
     StrategyConfig,
+    _DiagnosticRedactionFilter,
 )
 
 _log = logging.getLogger(__name__)
+_log.addFilter(_DiagnosticRedactionFilter())
 
 # --- Midday stream identity / classification constants ----------------------
 MIDDAY_STREAM = "midday"
