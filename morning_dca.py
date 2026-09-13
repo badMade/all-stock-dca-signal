@@ -490,10 +490,10 @@ DEFAULT_MORNING_DAILY_CAP_USD = 180.0
 DEFAULT_MORNING_WEEKLY_CAP_USD = 900.0
 
 
-def default_all_stream_cap_seed_roots() -> tuple[str, ...]:
+def default_pooled_cap_seed_roots() -> tuple[str, ...]:
     """Every known live stream's root, for the shared budget cap ledger.
 
-    Returned by ``MorningConfig.cap_seed_roots``'s default_factory (2026-08-02
+    Used as ``MorningConfig.cap_seed_roots``'s default_factory (2026-08-02
     pooling fix). Before this, the field's bare default was ``None`` -- no
     cap seeding at all -- while DEFAULT_MORNING_DAILY_CAP_USD/
     DEFAULT_MIDDAY_DAILY_CAP_USD were raised from an isolated $90/$450
@@ -509,8 +509,9 @@ def default_all_stream_cap_seed_roots() -> tuple[str, ...]:
     ``prior_allocation_roots``, not this field.
 
     Defined ahead of :class:`MorningConfig` (unlike the other default-root
-    helpers further down this module) specifically so the thin default-factory
-    wrapper can call it when the class body executes.
+    helpers further down this module) specifically so it can be used as that
+    class's own field default_factory -- a dataclass field's default_factory
+    must already be a bound name when the class body executes.
 
     Resolved at CALL time (not import time) via :func:`stream_root`, so a
     ``$DCA_CRON_TRACKING_ROOT`` set between import and construction is
@@ -533,11 +534,6 @@ def default_all_stream_cap_seed_roots() -> tuple[str, ...]:
         stream_root("final_manual_review"),
     )
     return _append_dated_manual_override_cap_seed_roots(roots)
-
-
-def default_pooled_cap_seed_roots() -> tuple[str, ...]:
-    """Return every live stream root used to seed the shared budget cap."""
-    return default_all_stream_cap_seed_roots()
 
 
 def _dated_manual_override_cap_seed_roots() -> tuple[str, ...]:

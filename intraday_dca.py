@@ -71,7 +71,6 @@ from dca_paths import stream_root
 from morning_dca import (
     MorningConfig,
     MorningDCAExecutor,
-    default_all_stream_cap_seed_roots,
     load_stream_config,
 )
 from near_close_dca import StrategyConfig, _DiagnosticRedactionFilter
@@ -198,7 +197,14 @@ def default_intraday_cap_seed_roots() -> tuple[str, ...]:
     Every live stream including this one, so the three slots share one pooled
     ceiling and a restart/retry re-seeds from this stream's own prior fills.
     """
-    return default_all_stream_cap_seed_roots()
+    return (
+        stream_root("intraday_dca"),
+        stream_root("market_open_dca"),
+        stream_root("morning_dca"),
+        stream_root("midday_dca"),
+        stream_root("ce16ba6b"),
+        stream_root("final_manual_review"),
+    )
 
 
 @dataclass(frozen=True)
