@@ -270,7 +270,7 @@ def test_the_destination_owner_is_preserved(tmp_path):
     target = tmp_path / "run_state.json"
     atomic_write_text(target, "{}")
     os.chown(target, 12345, 12345)
-    os.chmod(target, 0o620)
+    os.chmod(target, 0o600)
 
     atomic_write_text(target, '{"second": true}')
 
@@ -287,7 +287,7 @@ def test_the_write_aborts_when_ownership_cannot_be_reproduced(tmp_path, monkeypa
     target = tmp_path / "run_state.json"
     atomic_write_text(target, "{}")
     os.chown(target, 12345, 12345)
-    os.chmod(target, 0o620)
+    os.chmod(target, 0o600)
 
     def _denied(*_args, **_kwargs):
         raise PermissionError("operation not permitted")

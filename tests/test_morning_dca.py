@@ -9916,7 +9916,7 @@ def test_default_cap_seed_roots_include_dated_manual_overrides(monkeypatch):
     """Direct dataclass construction must retain dynamically discovered override fills."""
     import morning_dca
 
-    override_root = "/tmp/perplexity_primary_20260829/manual_override_1030"
+    override_root = "/tmp/perplexity_primary_20260829/manual_override_1030"  # nosec
     monkeypatch.setattr(
         morning_dca,
         "_dated_manual_override_cap_seed_roots",

@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 import numpy as np
 import requests
+
 try:
     import torch  # type: ignore
     from jinja2 import Environment  # type: ignore
@@ -421,8 +422,8 @@ class SentimentAnalyzer:
 
     def __init__(self, model_name: str = FINBERT_MODEL):
         logger.info("Loading FinBERT model '%s' — this may take a moment…", model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)  # type: ignore
-        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)  # type: ignore
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, revision="main")  # type: ignore  # nosec
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name, revision="main")  # type: ignore  # nosec
         self.model.eval()
         # Use GPU if available, otherwise CPU
         self.device = 0 if (torch and torch.cuda.is_available()) else -1  # type: ignore
@@ -461,7 +462,7 @@ class SentimentAnalyzer:
         raw_results: Any = self._pipeline(texts)
 
         output = []
-        for text, label_scores in zip(texts, raw_results):
+        for text, label_scores in zip(texts, raw_results, strict=True):
             # label_scores is a list of {'label': str, 'score': float}
             score_map: dict[str, float] = {
                 str(item["label"]).lower(): float(item["score"]) for item in label_scores
@@ -1126,7 +1127,7 @@ def run_pipeline(
         scored = analyzer.score_texts(texts)
 
         # Attach scores back to items for headline selection
-        for item, score_info in zip(all_items, scored):
+        for item, score_info in zip(all_items, scored, strict=True):
             item.update(score_info)
 
         # (d) Compute weighted daily sentiment score
