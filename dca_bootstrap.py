@@ -40,6 +40,17 @@ def _check_packages_installed(python_bin: Path, packages: Sequence[str]) -> bool
     return result.returncode == 0
 
 
+def _missing_packages(packages: Sequence[str]) -> list[str]:
+    """Return the subset of ``packages`` not importable in THIS interpreter."""
+    missing = []
+    for pkg in packages:
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing.append(pkg)
+    return missing
+
+
 def ensure_venv(
     *,
     packages: Sequence[str] = (),
@@ -48,7 +59,18 @@ def ensure_venv(
 ) -> None:
     """Ensure the target virtual environment exists and is running.
 
-    If the current interpreter is not ``venv_dir``'s python:
+    0. If every requested ``package`` is already importable in the CURRENTLY
+       RUNNING interpreter -- whatever it is: the caller's own virtualenv, or
+       a CI job that already installed everything into the system
+       interpreter -- this is a true no-op. Re-execing into a separate
+       ``venv_dir`` from here would install a second, independent copy of
+       every dependency (an unpinned package can resolve to a much heavier
+       default build than whatever is already satisfied, e.g. torch's full
+       CUDA wheel) and then replace the running process outright, which is
+       destructive when the caller is a test process rather than a
+       standalone script.
+
+    Otherwise, if the current interpreter is not ``venv_dir``'s python:
     1. Creates ``venv_dir`` if missing.
     2. Checks if requested ``packages`` are importable in ``.venv``; if not,
        installs dependencies using pip.
@@ -58,16 +80,14 @@ def ensure_venv(
     1. Verifies in-process whether all requested ``packages`` are importable.
     2. If any are missing, runs ``pip install`` to complete first-time setup.
     """
+    if packages and not _missing_packages(packages):
+        return
+
     venv_python = get_venv_python(venv_dir)
 
     # 1. Already executing within the target venv
     if _is_running_in_venv(venv_python):
-        missing = []
-        for pkg in packages:
-            try:
-                __import__(pkg)
-            except ImportError:
-                missing.append(pkg)
+        missing = _missing_packages(packages)
 
         if not missing:
             return
