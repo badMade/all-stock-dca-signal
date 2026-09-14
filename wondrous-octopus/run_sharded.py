@@ -16,11 +16,14 @@ Crash & Power Outage Safety:
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Sequence
+
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 OCTOPUS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = OCTOPUS_DIR.parent

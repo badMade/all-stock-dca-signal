@@ -143,7 +143,7 @@ class _OctopusNet(nn.Module):
         layer = nn.TransformerEncoderLayer(
             d_model, n_heads, dim_feedforward=ffn, dropout=dropout, batch_first=True
         )
-        self.trunk = nn.TransformerEncoder(layer, num_layers)
+        self.trunk = nn.TransformerEncoder(layer, num_layers, enable_nested_tensor=False)
         self.forward_head = nn.Sequential(
             nn.Linear(d_model, ffn), nn.GELU(), nn.Linear(ffn, len(COMPONENTS) * (1 + len(QUANTILES)))
         )
