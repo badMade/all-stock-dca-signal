@@ -115,8 +115,8 @@ def test_ensure_venv_ignores_ambient_packages_when_none_requested(tmp_path, monk
     monkeypatch.setattr(subprocess, "run", _fake_run)
     execv_calls: list[tuple] = []
     monkeypatch.setattr(os, "execv", lambda *a: execv_calls.append(a))
-
     ensure_venv(venv_dir=venv_dir)
-
+    ensure_venv(venv_dir=venv_dir)
     assert venv_python.is_file()
+    assert execv_calls
     assert execv_calls

@@ -79,6 +79,7 @@ def ensure_venv(
     If the current interpreter is already ``venv_dir``'s python:
     1. Verifies in-process whether all requested ``packages`` are importable.
     2. If any are missing, runs ``pip install`` to complete first-time setup.
+
     """
     if packages and not _missing_packages(packages):
         return
@@ -88,7 +89,6 @@ def ensure_venv(
     # 1. Already executing within the target venv
     if _is_running_in_venv(venv_python):
         missing = _missing_packages(packages)
-
         if not missing:
             return
 

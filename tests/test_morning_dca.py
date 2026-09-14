@@ -9289,7 +9289,7 @@ def test_morning_live_top_up_accounts_for_broker_spend(
     rows = {row["ticker"]: row for row in result["artifacts"]["buy_candidates"]}
     assert rows["NVDA"]["top_up_guard_result"] == "incremental_top_up"
     assert rows["NVDA"]["incremental_order_amount"] == expected_increment_usd
-    persisted = json.loads(Path(result["paths"]["run_state"]).read_text(encoding="utf-8"))
+    persisted = json.loads(Path(result["paths"]["run_state"]).read_bytes())
     outcome = persisted["broker_outcomes"]["NVDA"]
     assert outcome["status"] == "submitted"
     assert outcome["order_id"] == "morning-top-up-order"
