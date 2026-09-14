@@ -372,7 +372,10 @@ class OctopusModel:
                     )
                     sys.stdout.flush()
         if is_tty and total_epochs > 0 and losses:
-            sys.stdout.write(f"\r[fit] octopus: {total_epochs} epochs complete! final loss: {losses[-1]:.4f}             \n")
+            sys.stdout.write(
+                f"\r[fit] octopus: {total_epochs} epochs complete! "
+                f"final loss: {losses[-1]:.4f}             \n"
+            )
             sys.stdout.flush()
         self._market_cache = {}
         return {

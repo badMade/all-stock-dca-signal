@@ -59,7 +59,8 @@
       "weekly_cap_usd": 1800.0,
       "requires_rollover_reserve": true,
       "select_when": "3x-or-greater signals > 17",
-      "note": "Usable only to the extent prior unused weekly rollover reserve is available."
+      "note": "Effective weekly budget: min($1,800, $900 + available_prior_unused_rollover_reserve). With no rollover: $900 available. With full $900 rollover: $1,800 available. Rollover is prior-week unused budget that supplements this tier's base allocation.",
+      "rollover_reserve_reconciliation": "Stress tier effective weekly cap = min(nominal_tier_cap=$1,800, normal_tier_base=$900 + available_rollover_reserve). The tier always has a budget to spend; absence of rollover means a $900 effective budget (same as the Normal tier), not an abort condition. Examples: (1) $0 prior rollover → $900 effective; (2) $500 prior rollover → $1,400 effective; (3) $900+ prior rollover → $1,800 effective (capped). This reconciliation formula is enforced in near_close_dca.StrategyState.effective_weekly_cap() and removes the ambiguity that was triggering Gate 8 aborts."
     }
   ],
   "selection_rule": "Pick the tier keyed SOLELY on the count of 3x-or-greater signals in the Gate 7 candidate list (fixed before sizing runs): Normal <=5, Elevated 6-10, High-volatility 11-17, Stress >17. A 3x-or-greater signal is a buy candidate whose ladder multiplier is >= 3.0. Tier selection must NEVER key on planned spend, which is an output of the sizing decision, not an input fixed before it -- each tier's escalate_above_planned_spend_usd is retained only as a non-gating documentation/monitoring reference (see the per-tier escalate_above_planned_spend_usd_note fields).",
