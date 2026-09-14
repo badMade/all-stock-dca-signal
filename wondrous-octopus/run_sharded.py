@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Sequence
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+os.environ.setdefault("DCA_LEDGER_MAX_LINKS", "2" if sys.platform == "darwin" else "1")
 
 OCTOPUS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = OCTOPUS_DIR.parent

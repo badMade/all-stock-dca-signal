@@ -38,6 +38,7 @@ from typing import Any
 
 # Enable PyTorch CPU fallback for ops not yet implemented in Apple Silicon MPS backend
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+os.environ.setdefault("DCA_LEDGER_MAX_LINKS", "2" if sys.platform == "darwin" else "1")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # Index 1, not 0 -- index 0 is this subproject's own directory; see
