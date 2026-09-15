@@ -300,7 +300,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             action = (
                 f"RESUME from {shard_dir}/checkpoint"
                 if mode == "resume"
-                else ("ALREADY COMPLETED" if mode == "completed" else f"FRESH START (checkpoints every {args.checkpoint_every} steps)")
+                else (
+                    "ALREADY COMPLETED"
+                    if mode == "completed"
+                    else f"FRESH START (checkpoints every {args.checkpoint_every} steps)"
+                )
             )
             print(f"  Shard {i}: {len(s)} tickers -> {action}")
         print("\nDry run finished. Pass without --dry-run to execute.")

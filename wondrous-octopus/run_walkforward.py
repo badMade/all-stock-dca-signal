@@ -20,6 +20,7 @@ driven directly by this process); `--device auto` prefers cuda, then Apple
 MPS, then CPU.
 """
 
+# ruff: noqa: E402
 from __future__ import annotations
 
 import argparse

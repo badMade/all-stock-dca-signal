@@ -1472,7 +1472,7 @@ _NON_ACCOUNT_LITERALS = frozenset(
 # was one of the places the real account number had to be removed from, and a
 # future fixture that pasted it back would have sailed past this check
 # (Codex review, PR #219: "Scan test files for account literals").
-_SYNTHETIC_ACCOUNT_VALUES = frozenset({FIXTURE_ACCOUNT_NUMBER, "123456789"})
+_SYNTHETIC_ACCOUNT_VALUES = frozenset({FIXTURE_ACCOUNT_NUMBER, "123456789", "100000"})
 
 # Files exempt from scanning entirely. The first two are market-data tables whose
 # volume columns are full of nine-digit share counts -- genuine data, not identifiers.

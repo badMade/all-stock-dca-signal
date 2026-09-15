@@ -12490,7 +12490,7 @@ def test_plan_orders_accepts_complete_per_ticker_calibration():
     """A valid calibrated tier must not be checked against the global curve."""
     candidate = dca_runner.Candidate(
         "TRIN", 5.0, multiplier=5.0, drop_pct=3.1,
-        sizing_base_usd=1.0, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
+        sizing_base_usd=1.0, sizing_min_drop_pct=3.0733, sizing_max_drop_pct=None,
     )
     snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
     plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
@@ -12543,7 +12543,7 @@ def test_plan_orders_refuses_oversized_calibration_integer_instead_of_crashing()
     survive that rather than aborting the whole plan_orders() call."""
     candidate = dca_runner.Candidate(
         "TRIN", 5.0, multiplier=5.0, drop_pct=3.1,
-        sizing_base_usd=10**1000, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
+        sizing_base_usd=10**1000, sizing_min_drop_pct=3.0733, sizing_max_drop_pct=None,
     )
     snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
     plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
@@ -12574,7 +12574,7 @@ def test_plan_orders_keeps_kill_switch_capped_calibrated_candidate_eligible():
     drop_pct -- the floor tier's own finite upper bound must not refuse it."""
     candidate = dca_runner.Candidate(
         "TRIN", 1.0, multiplier=1.0, drop_pct=5.0,
-        sizing_base_usd=1.0, sizing_min_drop_pct=0.1185, sizing_max_drop_pct=0.5585,
+        sizing_base_usd=1.0, sizing_min_drop_pct=0.124, sizing_max_drop_pct=0.5413,
     )
     snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
     plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
@@ -12588,7 +12588,7 @@ def test_plan_orders_refuses_a_sub_threshold_drop_for_a_capped_minimum_calibrate
     the floor, it never fabricates one."""
     candidate = dca_runner.Candidate(
         "TRIN", 1.0, multiplier=1.0, drop_pct=0.05,
-        sizing_base_usd=1.0, sizing_min_drop_pct=0.1185, sizing_max_drop_pct=0.5585,
+        sizing_base_usd=1.0, sizing_min_drop_pct=0.124, sizing_max_drop_pct=0.5413,
     )
     snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
     plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
@@ -12603,7 +12603,7 @@ def test_plan_orders_accepts_a_reduced_same_day_topup_calibrated_amount():
     an exact target."""
     candidate = dca_runner.Candidate(
         "TRIN", 3.0, multiplier=5.0, drop_pct=3.5,
-        sizing_base_usd=1.0, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
+        sizing_base_usd=1.0, sizing_min_drop_pct=3.0733, sizing_max_drop_pct=None,
     )
     snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
     plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
@@ -12614,7 +12614,7 @@ def test_plan_orders_accepts_a_reduced_same_day_topup_calibrated_amount():
 def test_plan_orders_still_refuses_a_calibrated_amount_above_the_full_allocation_ceiling():
     candidate = dca_runner.Candidate(
         "TRIN", 6.0, multiplier=5.0, drop_pct=3.5,
-        sizing_base_usd=1.0, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
+        sizing_base_usd=1.0, sizing_min_drop_pct=3.0733, sizing_max_drop_pct=None,
     )
     snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
     plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
@@ -12630,7 +12630,7 @@ def test_parse_candidate_rows_preserves_calibration_fields_on_a_prebuilt_candida
     candidate plan_orders() accepts directly."""
     candidate = dca_runner.Candidate(
         "TRIN", 5.0, multiplier=5.0, drop_pct=3.1,
-        sizing_base_usd=1.0, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
+        sizing_base_usd=1.0, sizing_min_drop_pct=3.0733, sizing_max_drop_pct=None,
     )
     parsed = dca_runner._parse_candidate_rows([candidate])
     assert parsed == [candidate]
@@ -12640,7 +12640,7 @@ def test_assess_accepts_a_calibrated_candidate_carried_through_parsing():
     r = dca_runner.assess(**_clean_kwargs(
         candidates=[dca_runner.Candidate(
             "TRIN", 5.0, multiplier=5.0, drop_pct=3.1,
-            sizing_base_usd=1.0, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
+            sizing_base_usd=1.0, sizing_min_drop_pct=3.0733, sizing_max_drop_pct=None,
         )],
     ))
     assert r["verdict"] == "PROCEED"
@@ -12654,7 +12654,7 @@ def test_plan_orders_accepts_a_configured_ticker_with_complete_calibration_evide
     supplied and an actually-qualifying drop, must still be accepted."""
     candidate = dca_runner.Candidate(
         "DFTX", 5.0, multiplier=5.0, drop_pct=11.5,
-        sizing_base_usd=1.0, sizing_min_drop_pct=11.0446, sizing_max_drop_pct=None,
+        sizing_base_usd=1.0, sizing_min_drop_pct=11.0453, sizing_max_drop_pct=None,
     )
     snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
     plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
@@ -12669,7 +12669,7 @@ def test_plan_orders_refuses_a_calibrated_topup_below_the_broker_minimum():
     top-up must be refused here, not forwarded to native placement."""
     candidate = dca_runner.Candidate(
         "TRIN", 0.50, multiplier=5.0, drop_pct=3.5,
-        sizing_base_usd=1.0, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
+        sizing_base_usd=1.0, sizing_min_drop_pct=3.0733, sizing_max_drop_pct=None,
     )
     snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
     plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
@@ -12706,7 +12706,7 @@ def test_estimated_multiplier_trusts_a_reduced_calibrated_topup():
     back to a plain notional-division estimate that undercounts it."""
     candidate = dca_runner.Candidate(
         "TRIN", 3.0, multiplier=5.0, drop_pct=3.5,
-        sizing_base_usd=1.0, sizing_min_drop_pct=3.0727, sizing_max_drop_pct=None,
+        sizing_base_usd=1.0, sizing_min_drop_pct=3.0733, sizing_max_drop_pct=None,
     )
     assert dca_runner._estimated_multiplier(candidate) == 5.0
 

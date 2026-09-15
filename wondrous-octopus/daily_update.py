@@ -26,9 +26,9 @@ Exit codes: 0 processed-or-NOOP, 1 REFUSED, 2 runtime failure (checkpoint
 retained), matching run_walkforward.py.
 """
 
+# ruff: noqa: E402
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 

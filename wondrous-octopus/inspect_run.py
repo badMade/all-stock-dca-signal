@@ -15,9 +15,9 @@ Views (composable with --run-dir):
 Exit codes: 0 ok, 1 REFUSED (no run/ledger/checkpoint where required).
 """
 
+# ruff: noqa: E402
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
