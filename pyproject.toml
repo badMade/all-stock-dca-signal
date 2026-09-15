@@ -17,7 +17,7 @@ dependencies = []
 selfheal = [
     "pytest==9.1.1",
     "ruff==0.16.2",
-    "pyright==1.1.411",
+    "pyright==1.1.414",
     "pytest-cov==7.1.0",
     "pip-audit==2.10.1",
     "pip-tools",
@@ -49,7 +49,7 @@ dev = [
     "types-PyYAML==6.0.12.20240917",
     "types-beautifulsoup4==4.12.0.20250516",
     "pip-audit==2.10.1",
-    "pyright==1.1.411",
+    "pyright==1.1.414",
     "uv==0.12.10",
 ]
 # Heavy, undeclared-elsewhere deps used only by the trading-strategies/ research
