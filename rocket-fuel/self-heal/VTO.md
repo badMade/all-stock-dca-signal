@@ -16,11 +16,19 @@ A closed loop with four parts:
 2. **Remember.** Each incident is reduced to a stable **fingerprint** and written to an
    append-only ledger that knows what has been seen before, how many times it has been
    attacked, and how those attempts ended.
-3. **Heal.** Only genuinely *new* (or still-unrepaired) fingerprints are dispatched to the
-   repair pipeline. A repair opens a pull request; it never merges itself.
-4. **Govern.** One fail-closed gate stands in front of the dispatch step and enforces every
-   limit the operator asked for: one run per day, a spend ceiling, a per-failure attempt
-   cap, and a circuit breaker.
+3. **Heal — narrowly, and honestly labelled.** Only genuinely *new* fingerprints **that have a
+   repair adapter** are dispatched. This cycle ships exactly one adapter (lint/format); every
+   other incident class is report-only by construction. A repair opens a pull request; it
+   never merges itself.
+4. **Govern.** One fail-closed gate stands in front of the *repair* step — and **only** the
+   repair step — enforcing one run per day, a spend ceiling, a per-failure attempt cap, a
+   latched breaker and a cumulative epoch bound.
+
+**Observation is never gated (Revision 4, 2026-09-14).** Same Page round 2 found that gating
+collection behind the same governor that gates repair creates an observation blackout: the
+system would stop recording crashes at the moment it began failing. Steps 1-2 therefore run on
+every scheduled tick regardless of breaker, budget or epoch state. A latched breaker means
+"stop fixing things", never "stop looking".
 
 ## Why now
 
@@ -47,10 +55,20 @@ GitHub Actions as the repair sandbox.
 ## Success criteria for this cycle
 
 - A crash written to any configured source is, within one day, present in the incident
-  store with a stable fingerprint and a redacted excerpt.
+  store with a stable fingerprint and a redacted excerpt — **including when every repair limit
+  is exhausted and the breaker is latched.**
 - Re-running the collector over unchanged sources produces **zero** new incidents.
 - The self-heal dispatch cannot fire twice in one UTC day, and raising that ceiling later
   is a config edit, not a code change.
+- **Total work is bounded, not merely throttled.** A rolling-window lifetime cap on total
+  dispatches and a breaker that latches until a human clears it together make unbounded
+  repair work impossible, independent of how the per-day and per-fingerprint limits are
+  configured. (Added in Revision 3: Same Page round 1, finding 3, established that a daily
+  bucket, a re-mintable fingerprint and a self-expiring breaker only *delay* a runaway. The
+  earlier claim that any one of four mechanisms alone halted one was false and is withdrawn.)
+- **The pipeline cannot grant itself permission.** No repair code path can widen a budget,
+  clear the breaker, or re-mint its own eligibility; admission is evaluated by a separate
+  component from durable state, before any work — including collection — begins.
 - A single failure fingerprint can consume at most a bounded, configured number of repair
   attempts in its entire lifetime, after which it is quarantined and surfaced to a human.
 - Every refusal to dispatch names a machine-readable reason code and is written to the

@@ -1,374 +1,228 @@
-# PLAN — Automated self-healing with a diagnostic memory
+# PLAN — Diagnostic observation, with narrow automatic repair
 
-Build plan for the `rocket-fuel/self-heal` cycle. Vision and non-negotiables live in
-`rocket-fuel/self-heal/VTO.md`; deferred items in `rocket-fuel/self-heal/DEFERRED.md`.
-This plan is the subject of the Same Page Meeting and is revised on the record until
-`VERDICT: SAME PAGE`. **Revision 2** — Revision 1 as submitted to Same Page round 1, plus two
-Clarity-Break corrections folded into Rock 7 at the operator's direction (2026-09-14).
+Build plan for the `rocket-fuel/self-heal` cycle. Vision in `VTO.md`, deferrals in
+`DEFERRED.md`, full reasoning record in `SAME-PAGE-LOG.md`.
 
-## Starting point (facts, verified 2026-09-14 on this checkout)
+**Revision 4.** Round 2 returned `BLOCKED — 22 open`; two findings resolved, one new BLOCKER.
+Revision 4 is a **scope cut**, taken by the operator on 2026-09-14, not another elaboration.
+Revisions 2 and 3 are preserved at `PLAN-rev2.md.bak` and `PLAN-rev3.md.bak`.
 
-- `scripts/self_heal.py` (4,067 bytes): six idempotent repair steps (`pip install -e .`,
-  `ruff check --fix --extend-exclude claude .` + `ruff format --exclude claude .`,
-  `pytest --snapshot-update`, pinned type-stub install, `pip-compile` when
-  `requirements.in` exists, optional doc/badge regeneration). After each step it compares
-  `git status --porcelain` before/after and, only when *that* step changed something,
-  runs `check_health()`; `sys.exit(0)` on the first step that both changed the tree and
-  passed healthcheck, else `sys.exit(1)`. It takes no arguments, reads no config, has no
-  concept of a failure identity, and keeps no record of having run.
-- `scripts/healthcheck.py` (2,325 bytes): `ruff check .`, `pyright`, `pytest --cov=.
-  --cov-fail-under=90`, the `run_dca.py --demo --report --now 2026-08-03T15:45` smoke test
-  into a `tempfile.TemporaryDirectory` outside the worktree, and `pip-audit --requirement
-  requirements-dev.txt --strict`. Prints the failing command's stdout/stderr; exit 0/1.
-- `.github/workflows/self-heal.yml`: triggers are `schedule` (`0 3 * * 1`),
-  `workflow_dispatch`, and `workflow_run` on CI completion. The job `if:` admits only
-  `schedule` on `refs/heads/main` and `workflow_run` with `conclusion == 'failure'` and
-  `head_branch == 'main'`, and excludes `selfheal-` ref names. It holds `contents: write`,
-  `pull-requests: write`, `actions: read`, `issues: write`; `timeout-minutes: 15`;
-  `concurrency` group `selfheal-${{ github.ref }}` with `cancel-in-progress` false on main.
-  A `scope_check` step narrows reactive runs to the `Lint & test (core DCA)` and
-  `Dependency & secret audit` jobs and picks the matching Python version. A stale-PR
-  cleanup step closes only `github-actions[bot]`-authored `selfheal-repair-*` PRs older
-  than 7 days by `updatedAt`. **Note the header comment's trust-boundary argument and the
-  contradicting `workflow_dispatch:` line three lines below it — see Finding A.**
-- `.gitignore` excludes `*.log` (so every `stdout.log`), `cron_tracking/`, `artifacts/`,
-  `deploy/*.env`, `deploy/launchd/*.plist`, `.claude/`, and `ticker_data`. `analysis/` is
-  **not** ignored; `git status` currently shows `analysis/real-octopus-run/shard_{1..4}/
-  checkpoint/` and `shard_1/ledger/` as untracked.
-- Live crash sample, `analysis/real-octopus-run/shard_1/stdout.log` (642 bytes, 2026-09-14
-  07:27): one line beginning `RUNTIME FAILURE (NotImplementedError): The operator
-  'aten::_nested_tensor_from_mask_left_aligned' is not currently implemented for the MPS
-  device.` followed by `The last checkpoint (if any) is retained; --resume can continue the
-  run.` This is the canonical test fixture for Rock 1.
-- `cron_tracking/` holds eleven stream roots (`console`, `cumulative_dca_credits`,
-  `intraday_dca`, `market_open_dca`, `midday_dca`, `morning_dca`, `per_ticker_calibration`,
-  `scheduled_runs`, `ticker_history_update`, `whole_share_accumulation`,
-  `wondrous_octopus`), most partitioned by `YYYY-MM-DD`.
-- Reusable engines already present: `scripts/file_lock.py` (`cross_process_lock`, flock
-  with a portable fallback), `scripts/reason_codes.py` (module-level string constants plus
-  `is_valid_reason` / `is_fail_closed`), `scripts/model_usage_log.py` (`build_entry`,
-  `resolve_log_path`, `append_model_usage_entry`, `log_model_usage` — best-effort,
-  never raises into its caller; schema `schemas/model_usage_log.schema.json`),
-  `scripts/idempotency.py`, `dca_paths.cron_tracking_root()` / `stream_root()`,
-  `scripts/workflow_policy.py` (timeout / concurrency / `persist-credentials` policy over
-  `.github/workflows/*.yml`).
-- Redaction precedent: `dca_console_jobs.redact()` masks env values whose **names** match
-  `SECRET|TOKEN|PASSWORD|API_KEY|ACCOUNT_NUMBER`, labelled secrets, and any 6–12 digit run.
-- `pyproject.toml` `[tool.setuptools] py-modules` is an explicit flat list with a comment
-  trail recording each time a module was forgotten; `packages = ["scripts"]`, so new
-  `scripts/*.py` ship automatically, but new top-level config needs a `data-files` entry.
-- Test layout: `tests/test_<module>.py` for core modules, `scripts/tests/test_<script>.py`
-  for scripts (`test_healthcheck.py` and `test_model_usage_log.py` already exist there).
-  `scripts/tests` is **inside** the root pytest sweep, contrary to CLAUDE.md's "Two suites sit
-  outside the root `pytest` sweep" claim: `testpaths = ["."]`, `addopts` names only the six
-  sibling research trees in its `--ignore` list, and there is no `collect_ignore` or
-  `norecursedirs` anywhere (verified: `pytest --collect-only -q | grep -c scripts/tests` = 38).
-  ci.yml's core job runs bare `pytest --cov=. --cov-fail-under=90` at line 58, so those tests
-  already run in CI and already count toward the coverage gate; the `python -m pytest tests/`
-  calls at lines 183-346 belong to the sibling subproject jobs, not to `scripts/tests`.
-  **Consequence for this plan:** every new `scripts/self_heal_*.py` module falls under
-  `[tool.coverage.run] source = ["."]` and is therefore held to the 90% gate automatically —
-  a constraint, not a courtesy. The per-Rock proof commands below name a targeted
-  `scripts/tests/test_*.py` file only to iterate faster; Rock 7's proof runs the full sweep.
+## What changed, and why
 
-## Architecture
+Round 2's new BLOCKER — *repair admission suppresses failure detection* — showed that
+Revisions 2 and 3 had the operator's priorities inverted. The operator's first requirement was
+**"whenever the self-healing automation runs. Period. I want crash logs, debug reports, all of
+that. Saved."** Both revisions gated *collection* behind the same governor that gates *repair*,
+so the system would stop recording crashes at exactly the moment it began failing — when
+evidence matters most.
 
-Three cooperating engines, one config file, one committed hand-off tree. The split follows
-interview Q2: **local collector, CI healer.**
+Revision 4 therefore splits the product into two halves with **independent** gating:
+
+| Half | Gated by | Runs when | May open a PR |
+|---|---|---|---|
+| **Observation** — collect, redact, fingerprint, store, report | Nothing but its own resource caps | **Always**, every scheduled tick, even with the breaker latched and every budget spent | No |
+| **Repair** — dispatch an adapter, verify, publish | The full admission guard | Only when every limit permits | Yes |
+
+A latched breaker now means *"stop fixing things"*, never *"stop looking"*. That is the
+correct reading of the operator's requirement and it dissolves the new BLOCKER.
+
+The second change is a deletion. Round 2 kept findings 1, 13 and 18 open for one reason: Rock
+7 retained the hosted healer as a **second dispatcher** that bypasses the adapter registry.
+Revision 4 deletes it (see "Deletions" below) rather than defending it.
+
+The third change is honesty about what gets fixed automatically. Per Codex's answer to open
+question 4, one adapter is an acceptable MVP **only if the product says so**. It now does:
+this cycle ships *universal observation* and *lint/format-only repair*.
+
+## Deletions (finding 1, 13, 18 — resolved by removal)
+
+- **`.github/workflows/self-heal.yml` is deleted in full.** It is the second dispatcher, it
+  carries `contents: write` on a reactive trigger, it contains the `workflow_dispatch:` line
+  that contradicts its own header comment, and it invokes a healer that cannot accept an
+  incident. It is also already ineffective: it can see neither `cron_tracking/` nor any
+  `*.log`, both gitignored. Deleting it resolves Correction 1 by removal.
+- **`scripts/self_heal.py` is reduced to the `lint_format` adapter's implementation.** Its two
+  steps that work (`ruff check --fix`, `ruff format`) move into `selfheal/adapters/lint_format.py`
+  with errors propagated and timeouts enforced. `step_3`'s `pytest --snapshot-update` is
+  **deleted** — it is an unrecognized argument on this checkout and has silently no-opped since
+  it was written (finding 12). The remaining steps (`pip install -e .`, unpinned stub installs,
+  `pip-compile`) are not repairs of any detected incident and are dropped.
+- The existing `CI` workflow is untouched and becomes the sole verifier of repair PRs.
+
+## Package layout
 
 ```
-  LOCAL MAC (launchd, once daily)                 GITHUB ACTIONS (repair sandbox)
-  ────────────────────────────────                ──────────────────────────────
-  scripts/self_heal_daily.py
-    1. diagnostic_collector.py  ── sweeps ──▶ raw incidents (gitignored)
-    2. incident_fingerprint.py  ── reduces ─▶ stable fingerprint + redacted excerpt
-    3. incident_ledger.py       ── records ─▶ novelty verdict, attempt history
-    4. self_heal_governor.py    ── gates ──▶ DISPATCH or a reason code
-    5. on DISPATCH: commit sanitized
-       digest + ledger mirror to the
-       `self-heal-diagnostics` branch,  ────push───▶  workflow_run/push trigger
-       push                                          │
-                                                     ▼
-                                          .github/workflows/self-heal.yml
-                                            a. re-run self_heal_governor.py  ← same caps,
-                                               against the committed ledger     enforced twice
-                                            b. scripts/self_heal.py repair steps
-                                            c. scripts/healthcheck.py
-                                            d. open labeled PR (never merge)
-                                            e. write the outcome back to the
-                                               ledger on the diagnostics branch
+selfheal/
+  __init__.py      __main__.py      cli.py
+  config.py        # strict fail-closed runtime load (finding 19)
+  reasons.py       # reason-code constants, house pattern of scripts/reason_codes.py
+  redaction.py     # recursive whole-object sanitization (finding 10)
+  fingerprint.py   # keyed, sanitized-input-only identity (finding 11)
+  observe.py       # THE UNGATED HALF: collect -> redact -> ledger -> report
+  sources/         # bounded collectors, one per diagnostic source
+  ledger.py        # one authoritative sequenced store (findings 2, 17, 21)
+  admission.py     # THE GATE, repair only (findings 3, 4, 6, 7)
+  adapters/        # incident -> repair contract (finding 13); lint_format only
+  repair.py        # reserve -> repair -> verify -> publish -> settle
+  publication.py   # nothing unredacted or unverified leaves (findings 10, 11)
+tests/selfheal/
 ```
 
-The governor runs **on both sides**. Local enforcement stops a wasted push; CI enforcement
-is the one that actually binds, because a hosted run triggered by any path (including the
-weekly cron) must obey the same caps.
+## Half 1 — Observation (ungated)
 
-### Why a dedicated `self-heal-diagnostics` branch, not `main`
+`python -m selfheal observe`. Runs on every launchd tick regardless of admission state.
+Read-only with respect to the repository; writes only to its own artifact tree; never creates
+a branch, commit or PR. Its own resource caps — per-source monotonic deadline, byte cap,
+incident cap, process-group termination — are the only limits that apply, and exceeding one
+records a *degraded source* incident rather than dropping evidence silently (finding 4).
 
-A daily digest commit to `main` would add a commit per day to the audit history of a live
-trading repository and would race the operator's own concurrent commits (a known hazard in
-this checkout). A long-lived orphan branch carrying only `diagnostics/` keeps the hand-off
-auditable, keeps `main`'s history clean, and makes "self-heal reacting to its own output"
-structurally impossible to confuse with a real change to `main`.
+**Durable evidence is written before anything fallible (finding 5).** The very first action,
+before config load, before the ledger, before any lock, is to create
+`$DCA_CRON_TRACKING_ROOT/self_heal/runs/<run_id>/envelope.json` and open `_emergency.log`
+`O_APPEND`. An envelope with no final status is what the next run's reconciler converts into a
+durable failure record. Round 2 correctly noted Revision 3 created these *after* fallible
+config/ledger/lock work; Revision 4 moves them to the top.
 
-## Component 1 — `scripts/incident_fingerprint.py`
+Sources: `octopus_shard`, `cron_artifacts`, `console_jobs`, `ci_runs`, `healthcheck`.
+Round-2 requirements carried in: an ordered high-watermark with a resumable gap policy keyed by
+run attempt for `ci_runs` (finding 14), and — since no Rock may assume behaviour it does not
+build — `console_jobs` is **collected as-is**, with `dca_console_jobs.py`'s lack of incremental
+persistence recorded in `DEFERRED.md` rather than assumed away (finding 15).
 
-Pure functions, no I/O. Two public entry points.
+Output: a redacted incident per fingerprint, an updated ledger, and a daily digest the
+operator reads. **This half alone satisfies operator requirement #1 in full.**
 
-`normalize(text: str) -> str` strips, in order:
+## Half 2 — Repair (gated)
 
-| Pattern | Replacement | Why |
-|---|---|---|
-| ISO-8601 and `HH:MM:SS` timestamps | `<TS>` | same crash, different second |
-| `0x[0-9a-f]{6,}` | `<ADDR>` | object addresses |
-| `/Users/<name>/…`, `$HOME` | `~` | machine-specific, and a PII leak |
-| absolute paths inside the checkout | repo-relative | CI path ≠ local path |
-| `pid=\d+`, `PID \d+` | `<PID>` | |
-| `\b\d{6,12}\b` | `<NUM>` | account-shaped literals; see redaction |
-| `shard_\d+` | `shard_<N>` | one MPS bug, four shards, one fingerprint |
-| trailing whitespace, ANSI SGR escapes | removed | |
+`python -m selfheal repair`. Runs only after `admission.evaluate()` admits.
 
-`fingerprint(kind, frames, message) -> str` returns the first 16 hex chars of
-`sha256(kind + "\x00" + "\x00".join(frames[:5]) + "\x00" + normalize(message))`, where
-`frames` are only the **repo-owned** traceback frames (path under the checkout, third-party
-and stdlib frames dropped) each reduced to `relpath:function` — deliberately *without* the
-line number, so a fix that shifts lines elsewhere in the file does not mint a new identity
-for an unchanged bug.
+**Termination rests on two mechanisms, and neither is a throttle (finding 3).**
 
-Rationale for dropping line numbers: the alternative — including them — makes every
-unrelated edit above the crash site look like a brand-new failure, which is exactly the
-runaway-work condition the governor exists to prevent.
+- **A latched breaker.** Three consecutive unsuccessful repairs latch it `open` with **no
+  automatic cooldown**. Only `--reset-breaker`, run by a human, clears it. No repair code path
+  writes the field. Round 2 noted a failure-only latch can be dodged by alternating outcomes;
+  Revision 4 therefore latches on *any* three unsuccessful repairs within an epoch, not on
+  three *consecutive* ones.
+- **A cumulative epoch bound, not a rolling window.** Round 2 was right that `7 per rolling 30
+  days` permits seven more forever. Revision 4 uses an **epoch**: a monotonic counter of
+  admitted-or-abandoned repairs that never resets on its own. At `max_repairs_per_epoch`
+  (default **10**) the system stops repairing until a human runs `--new-epoch`. Per Codex's
+  answer to question 3, **refusals do not count** — they perform no repair — while an admitted
+  repair that crashes or is abandoned does count, so a crash loop cannot mine the counter.
 
-## Component 2 — `scripts/diagnostic_collector.py`
+Observation continues throughout both states. A latched breaker or exhausted epoch produces a
+loud digest entry, not silence.
 
-One `Source` protocol, five registered implementations, each a pure `scan(root) ->
-list[Incident]`:
+Other admission gates (kill switch, single-run lock, daily rate limit default **1**, clock
+sanity, Actions-minute budget, per-fingerprint attempts default **3**, adapter-exists,
+wall-clock remaining, novelty) are fairness and cost controls, and are explicitly *not* the
+termination argument.
 
-1. `octopus_shard` — `analysis/real-octopus-run/shard_*/stdout.log`: lines matching
-   `^RUNTIME FAILURE \((?P<kind>\w+)\):` and any Python traceback block.
-2. `cron_artifacts` — `$DCA_CRON_TRACKING_ROOT/**/run_state.json` in a terminal failure
-   state, plus `$DCA_ATTEMPT_LOG_ROOT` failed-start markers.
-3. `console_jobs` — `cron_tracking/console/**` job output with a nonzero exit.
-4. `ci_runs` — `gh run list --branch main --status failure --limit 20 --json …`. Skipped
-   with a recorded reason when `gh` is absent or unauthenticated; never fatal.
-5. `healthcheck` — runs `scripts/healthcheck.py`, captures stdout/stderr on nonzero exit,
-   attributes each failing command as its own incident.
+**Reservation (findings 2, 6).** A single authoritative `reservations.json` guarded by
+`cross_process_lock` — not one file per run, which Round 2 correctly noted is no mutex at all
+— holds the shared budget. Worst-case cost is debited before any repair work; `settle()`
+replaces it with actuals. Actions minutes are settled **asynchronously** by the next run's
+reconciler reading the completed CI run, since they are unknowable at PR-creation time
+(finding 6). An unsettled reservation older than `max_wall_clock_seconds` is charged at worst
+case.
 
-Every `Incident` is a frozen dataclass serialized to JSON:
+**The adapter contract (finding 13).** `matches()` / `repair()` / `verify()`, where `verify()`
+proves *that incident* is gone, not merely that the suite is green. Exactly one adapter ships:
+`lint_format`. Every other incident class is **report-only by construction** — there is no code
+path that dispatches an incident without an adapter, so the shard-1 MPS `NotImplementedError`
+is reported to the operator and can never consume a slot or latch the breaker (finding 18).
 
-```json
-{"fingerprint":"a1b2…","source":"octopus_shard","origin":"analysis/real-octopus-run/shard_1/stdout.log",
- "kind":"NotImplementedError","signature":"…normalized one-liner…","excerpt":"…redacted, ≤4 KiB…",
- "severity":"high","first_seen_utc":"…","last_seen_utc":"…","occurrences":3,"collector_version":1}
-```
+## Publication
 
-**Redaction runs on `excerpt` and `signature` before either is written anywhere**, using a
-`redact()` lifted from `dca_console_jobs.py`'s rules and extended with: the literal value of
-`$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` when set, every env value whose *name* matches the
-existing regex, `~` substitution, and the `\b\d{6,12}\b` rule. A unit test asserts a
-synthetic account number planted in a fixture never appears in any emitted artifact.
+`publication.release()`: recursive whole-object sanitization; a staged-bytes scan of the exact
+content to be published using the repository's own `_ACCOUNT_SHAPED` **and** `_LABELED_ACCOUNT`
+patterns **plus** absolute-home-path and every named environment-secret value (finding 10,
+widened per round 2); write-time containment that refuses to write unredacted text to any path
+`git check-ignore` does not confirm as ignored. A hit aborts publication and latches the
+breaker.
 
-**Redaction is enforced at write time, not at commit time — this is load-bearing.** The
-operating reality of this checkout is blanket `git add`-style commits straight to `main`:
-during this very cycle, `analysis/real-octopus-run/` went from four untracked directories to
-20 tracked files (including `checkpoint/models/octopus/weights.npz` and the gzipped ledger
-diagnostics) without any action from this plan, and this cycle's own `PLAN.md`, `VTO.md` and
-the 436 KB `rounds/round-1.jsonl` Codex transcript were committed to `main` mid-review. Any
-design that says "the unredacted copy is safe because we won't commit that path" is therefore
-wrong by construction here. The rule the collector enforces instead:
-
-  * unredacted incident text may be written **only** under `$DCA_CRON_TRACKING_ROOT/self_heal/`,
-    which `.gitignore`'s `cron_tracking/` rule covers and which `$DCA_CRON_TRACKING_ROOT` may
-    repoint — so the writer resolves the configured root and **refuses to write** if it is not
-    inside a gitignored path, rather than assuming;
-  * every other sink (`diagnostics/**`, stdout, the daily report, an alert body) receives
-    redacted text only, because redaction happens in the `Incident` constructor, before the
-    value is reachable by any writer.
-
-Rock 1's proof therefore includes a test that walks every path the collector wrote during a
-fixture run, asserts each unredacted-bearing file is inside a `git check-ignore`-confirmed
-path, and greps every non-ignored artifact for the planted account number.
-
-Raw, unredacted incidents are written under `$DCA_CRON_TRACKING_ROOT/self_heal/incidents/`
-— already gitignored — so the operator can still read the full crash locally.
-
-## Component 3 — `scripts/incident_ledger.py`
-
-Append-only JSONL under `$DCA_CRON_TRACKING_ROOT/self_heal/ledger/incidents.jsonl`, with a
-sanitized mirror at `diagnostics/ledger.jsonl` on the diagnostics branch. Every append takes
-`file_lock.cross_process_lock`. A compacted `diagnostics/index.json` holds current state per
-fingerprint so a reader need not replay the whole log.
-
-Per-fingerprint state machine:
-
-```
-   new ──dispatch──▶ dispatched ──PR merged & healthcheck green──▶ repaired
-    │                    │
-    │                    ├──repair produced no diff, or CI still red──▶ refused ──▶ (back to new, attempts+1)
-    │                    │
-    └────────────────────┴──attempts > max_attempts_per_fingerprint──▶ quarantined (terminal)
-```
-
-`quarantined` is terminal and is **never** dispatched again. It is surfaced in the digest
-and in the daily report so a human sees it. Clearing it is an explicit operator action
-(`--unquarantine <fingerprint>`).
-
-Novelty verdict: a fingerprint is dispatch-eligible iff state ∈ {`new`, `refused`} **and**
-`attempts < max_attempts_per_fingerprint`.
-
-## Component 4 — `scripts/self_heal_governor.py` (the limits)
-
-`evaluate(now, ledger, config, spend) -> Decision`. `Decision` is
-`(dispatch: bool, fingerprint: str | None, reason: str)`, where `reason` is a constant from
-a new `scripts/self_heal_reasons.py` following the `scripts/reason_codes.py` house pattern.
-Checks run in this fixed order and **short-circuit on the first refusal**:
-
-| # | Gate | Config key | Default | Refusal reason |
-|---|---|---|---|---|
-| 0 | Kill switch | `enabled` / `$DCA_SELF_HEAL_DISABLED` | `true` / unset | `DISABLED` |
-| 1 | Self-origin drop | — | — | `SELF_ORIGIN_DROPPED` |
-| 2 | Daily rate limit | `max_runs_per_day` | **1** | `RATE_LIMITED_DAILY` |
-| 3 | Circuit breaker | `consecutive_failure_threshold`, `breaker_cooldown_hours` | **3**, **72** | `BREAKER_OPEN` |
-| 4 | Per-fingerprint attempts | `max_attempts_per_fingerprint` | **3** | `FINGERPRINT_QUARANTINED` |
-| 5 | Token/USD budget | `daily_token_budget`, `daily_usd_budget`, `monthly_usd_budget` | **200000**, **2.00**, **20.00** | `BUDGET_EXHAUSTED_TOKENS` / `_USD` |
-| 6 | Actions minutes | `monthly_actions_minutes` | **300** | `BUDGET_EXHAUSTED_MINUTES` |
-| 7 | Wall clock | `max_wall_clock_seconds` | **1800** | `WALL_CLOCK_EXCEEDED` |
-| 8 | Novelty | — | — | `NO_NOVEL_INCIDENTS` |
-
-Every evaluation — dispatch or refusal — is appended to the ledger with its reason, so the
-answer to "why did nothing happen yesterday?" is always in the record.
-
-**Loop prevention, stated explicitly.** Four independent mechanisms, any one of which alone
-halts a runaway:
-
-- Gate 2 caps *dispatches per day* at 1. Even a pathological collector that mints a new
-  fingerprint every minute gets one dispatch.
-- Gate 4 caps *attempts per failure identity* at 3 for that identity's entire lifetime, then
-  quarantines it permanently.
-- Gate 3 trips a breaker after 3 consecutive unsuccessful dispatches regardless of
-  fingerprint, and holds it open for 72 hours or until an explicit human reset.
-- Gate 1 drops any incident whose origin path is under `diagnostics/`, whose branch matches
-  `selfheal-*`, or whose signature names a self-heal module — so the loop cannot observe
-  and react to its own exhaust. (The workflow's existing `!startsWith(github.ref_name,
-  'selfheal-')` guard covers the ref; this covers the *content*.)
-
-Fail-closed: an unparseable `config/self_heal.json`, an unreadable ledger, a clock that has
-moved backwards relative to the last ledger entry, or a governor exception all produce
-`dispatch=False` with an explicit reason. There is no code path where an error yields
-permission.
-
-## Component 5 — `scripts/self_heal_spend.py`
-
-Append-only `$DCA_CRON_TRACKING_ROOT/self_heal/spend/YYYY-MM.jsonl`, mirrored sanitized to
-`diagnostics/spend/YYYY-MM.jsonl`, schema `schemas/self_heal_spend.schema.json`. One entry
-per governor evaluation that reached dispatch:
-
-`{run_id, fingerprint, started_utc, ended_utc, wall_clock_seconds, tokens_in, tokens_out,
-usd_estimate, actions_minutes, outcome, reason}`
-
-`usd_estimate` is computed from a `config/self_heal.json` price table so it stays honest
-when rates change; when a dispatch consumed no model call (the deterministic repair path,
-which is the default) the token fields are `0` and the entry still records wall clock and
-Actions minutes. Budget gates read this file; they never trust an in-memory counter.
-
-## Component 6 — `config/self_heal.json` + `schemas/self_heal.schema.json`
-
-Every number in the governor table above lives here; raising the daily cap later is a
-one-line config edit, exactly as the operator asked. Schema validation is added to
-`tests/test_config_invariants.py`, the existing gate. `pyproject.toml` gains the config
-under `[tool.setuptools.data-files]` (hard invariant — a missed entry silently falls back to
-defaults in an installed wheel).
-
-## Component 7 — wiring
-
-- `scripts/self_heal_daily.py`: the local orchestrator. Flags `--dry-run` (print the
-  decision, touch nothing), `--now` (deterministic testing), `--report`.
-- `deploy/launchd/render_self_heal_agent.py`: renders `com.all-stock-dca.self-heal.plist`
-  (label, once-daily `StartCalendarInterval`, `.venv/bin/python`, no secrets embedded),
-  modeled directly on the existing `render_console_agent.py` including its `sys.path.insert(1, …)`
-  precedence comment. The rendered plist is gitignored by the existing `deploy/launchd/*.plist`
-  rule.
-- `.github/workflows/self-heal.yml`: add a `push` trigger on the `self-heal-diagnostics`
-  branch; insert a governor step as the **first** step after checkout, whose refusal exits
-  the job cleanly (not as a failure — a refused run is a correct outcome, and a red X here
-  would itself trigger the reactive path); add an outcome-writeback step. `timeout-minutes`
-  stays and is cross-checked against `max_wall_clock_seconds`.
-  `python scripts/workflow_policy.py` must stay green.
+Fingerprints are HMAC-keyed over fully-sanitized canonical input (finding 11). Round 2's
+follow-ups are adopted: the key has an exact gitignored filename (`.selfheal_fingerprint_key`,
+added to `.gitignore` beside `.lease_fingerprint_key`), domain separation in the HMAC message,
+atomic owner-only (`0600`, `O_EXCL`) creation, and a documented loss policy — a lost key starts
+a new epoch rather than silently reminting identities.
 
 ## Rocks
 
-Seven, at the cap. Each carries a proof command a human runs; per Audit rules every proof
-also re-runs the existing suite so nothing regresses.
+Seven. Every proof ends with **[SUITE]** =
+`ruff check . && .venv/bin/python -m pytest -q && python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo`.
+**[SUITE]** is currently green as of Revision 4 (the two `test_config_invariants.py` failures
+round 2 found were fixed by gitignoring this cycle's Codex transcripts and the
+`analysis/real-octopus-run/` replay output; 205 tests pass).
 
-**Rock 1 — Fingerprint + redaction.** `scripts/incident_fingerprint.py`,
-`scripts/self_heal_redact.py`.
-*Non-goals:* no collection, no I/O, no ledger.
-*Proof:* `.venv/bin/python -m pytest scripts/tests/test_incident_fingerprint.py scripts/tests/test_self_heal_redact.py -q` — including a golden test that the real shard-1 MPS line fingerprints identically when its timestamp, home path and `shard_N` differ, and a test that a planted 9-digit account number never survives redaction — plus `ruff check .`.
+**Rock 1 — `config.py`, `reasons.py`, `config/self_heal.json`, schema.** Strict runtime
+validation: duplicate keys, non-object JSON, bools-as-ints, non-finite, negative, **zero**,
+**unknown keys**, **safe upper bounds**, and **cross-field constraints** (finding 19, widened
+per round 2 — a zero-length epoch must not be able to disable the backstop). No standalone
+6–12 digit literal in any tracked artifact.
+*Proof:* `pytest tests/selfheal/test_config.py tests/test_config_invariants.py -q`, one
+rejection test per malformed case; then **[SUITE]**.
 
-**Rock 2 — Collector.** `scripts/diagnostic_collector.py` with all five sources.
-*Non-goals:* no ledger, no governor, no git operations.
-*Proof:* `.venv/bin/python -m pytest scripts/tests/test_diagnostic_collector.py -q` and `.venv/bin/python -m scripts.diagnostic_collector --dry-run --json` over a fixture tree, plus `ruff check .`.
+**Rock 2 — `redaction.py`, `fingerprint.py`.** Recursive sanitization over the whole object
+graph; HMAC-keyed fingerprints over sanitized input only; keyfile creation `O_EXCL` + `0600`.
+*Proof:* `pytest tests/selfheal/test_redaction.py tests/selfheal/test_fingerprint.py -q` — the
+real shard-1 MPS line fingerprints identically across differing timestamp, home path and
+`shard_N`; a planted account number survives in no nested field; home paths and named env
+secrets are redacted too; a rotated key changes the digest, proving it is not an unkeyed
+oracle; then **[SUITE]**.
 
-**Rock 3 — Ledger + novelty.** `scripts/incident_ledger.py`.
-*Non-goals:* no governor limits, no dispatch.
-*Proof:* `.venv/bin/python -m pytest scripts/tests/test_incident_ledger.py -q` — asserting a re-collected identical incident is not novel, a changed one is, the state machine's terminal `quarantined` is never re-dispatched, and concurrent appends under `cross_process_lock` do not interleave — plus `ruff check .`.
+**Rock 3 — `observe.py` + `sources/`, the ungated half.** Envelope and emergency sink created
+**first**; per-source deadlines, byte caps, process-group kill; CI high-watermark with
+resumable gap policy.
+*Proof:* `pytest tests/selfheal/test_observe.py -q` — **a run with the breaker latched and the
+epoch exhausted still collects, redacts and records every incident** (the new BLOCKER); a
+hanging source is killed and recorded degraded; a collector killed mid-run still leaves a
+readable envelope and emergency-log entry; an unseen CI run beyond page 1 is collected and its
+log archived before the watermark advances; then **[SUITE]**.
 
-**Rock 4 — Governor + config + schema.** `scripts/self_heal_governor.py`,
-`scripts/self_heal_reasons.py`, `config/self_heal.json`, `schemas/self_heal.schema.json`.
-*Non-goals:* no spend ledger yet (gates 5–6 read an injected spend summary), no wiring.
-*Proof:* `.venv/bin/python -m pytest scripts/tests/test_self_heal_governor.py -q` with one test per gate 0–8 in isolation and one fail-closed test per corruption mode, **and** `.venv/bin/python -m pytest tests/test_config_invariants.py -q`, plus `ruff check .`.
+**Rock 4 — `ledger.py` + digest.** One authoritative sequenced store with an anchored head and
+per-record checksums; torn-tail truncation repair; derived mirrors rebuildable from it; the
+corrected attempt boundary (`eligible ⟺ attempts < max`; `quarantined ⟸ attempts ≥ max`); a
+**review lease** distinct from the execution lease, since a PR may sit in human review for days
+(finding 17, per round 2).
+*Proof:* `pytest tests/selfheal/test_ledger.py -q` — valid-prefix truncation is detected via
+the anchored head; a fingerprint at exactly `max` is quarantined, not lost; a crash after
+`gh pr create` but before journaling the PR number is recovered idempotently by the reconciler;
+then **[SUITE]**.
 
-**Rock 5 — Spend ledger.** `scripts/self_heal_spend.py`, `schemas/self_heal_spend.schema.json`.
-*Non-goals:* no live cost API; the price table is config.
-*Proof:* `.venv/bin/python -m pytest scripts/tests/test_self_heal_spend.py -q` including month-rollover reset and a budget-exhausted refusal writing no dispatch, plus `ruff check .`.
+**Rock 5 — `admission.py`.** Latched breaker, cumulative epoch bound, shared-file reservation
+under one lock, clock sanity, all fairness gates.
+*Proof:* `pytest tests/selfheal/test_admission.py -q` — a latch test proving no non-human code
+path clears the breaker; an epoch test proving repair `max+1` is refused however every other
+gate is configured; a test proving **refusals do not consume epoch budget** and abandoned
+repairs do; two concurrent invocations yield exactly one reservation; then **[SUITE]**.
 
-**Rock 6 — Local orchestrator + launchd agent.** `scripts/self_heal_daily.py`,
-`deploy/launchd/render_self_heal_agent.py`.
-*Non-goals:* does not modify the workflow.
-*Proof:* `.venv/bin/python scripts/self_heal_daily.py --dry-run --now 2026-09-14T04:00` prints a deterministic decision and exits 0 having written nothing; `.venv/bin/python deploy/launchd/render_self_heal_agent.py --print` emits a valid plist containing no secret; `.venv/bin/python -m pytest scripts/tests/test_self_heal_daily.py -q`.
+**Rock 6 — `adapters/lint_format.py`, `repair.py`, `publication.py`, `cli.py`, `__main__.py`.**
+The one adapter; branch/commit/push/`gh pr create` as explicit steps; asynchronous Actions
+settlement.
+*Proof:* an **end-to-end test reaching a verified PR from a real detected lint incident** —
+introduce a real ruff violation in a scratch worktree, observe it, repair it, verify *that*
+incident is gone, and assert the PR body is redacted (Codex's stated condition for calling one
+adapter an honest MVP); plus `python -m selfheal --dry-run` writing nothing; then **[SUITE]**.
 
-**Rock 7 — CI wiring, docs, packaging, and two in-scope corrections.**
-`.github/workflows/self-heal.yml`, `docs/self_healing.md`, `pyproject.toml`, `CLAUDE.md`.
-Folds in both defects found during the Clarity Break (operator decision, 2026-09-14), because
-each edits lines this Rock already rewrites:
+**Rock 7 — Deletions, launchd, docs, packaging.** Delete `.github/workflows/self-heal.yml` and
+the dead parts of `scripts/self_heal.py`; `render_self_heal_agent.py` with fully-resolved
+executables (launchd's PATH omits both `/opt/homebrew/bin/gh` and the venv), explicit
+no-`KeepAlive`, overlap prevention, durable stderr; `selfheal/README.md` documenting the two
+halves and why the gate lives outside the governed system; `docs/self_healing.md`;
+`pyproject.toml` (`packages` must include `selfheal` and `selfheal.*`, plus an **installed-wheel
+import proof** — finding 22); **Correction 2**, fixing CLAUDE.md's `scripts/tests` claim.
+*Proof:* an executable scheduler acceptance — `launchctl bootstrap`, `kickstart -p`, poll
+`launchctl print` for a single completed run, assert no restart within N seconds, `bootout` —
+plus `python scripts/workflow_policy.py`, and `pip install . && python -c "import selfheal"`
+from a temp venv; then **[SUITE]**.
 
-  * **Correction 1 — close the `workflow_dispatch` hole.** Delete the `workflow_dispatch:`
-    line from `self-heal.yml`'s trigger block; keep the header comment, which is the correct
-    half. The comment claims parity with `compute-schedule.yml` and `drift-check.yml` and
-    those two carry `schedule:` only, so `self-heal.yml` is the one that drifted. The hole is
-    latent today — the job's `if:` admits only `schedule` and `workflow_run`, so a dispatch
-    skips the job — but that `if:` is exactly the defense the comment argues is not real: a
-    dispatch runs the workflow file as it exists on the *selected ref*, so a branch that
-    deletes the `if:` and dispatches itself gets a job holding `contents: write`,
-    `pull-requests: write` and `issues: write`. Exploiting it requires repo write access.
-    This Rock rewrites the same six-line trigger block to add the `self-heal-diagnostics`
-    push trigger, so the two edits belong together.
-  * **Correction 2 — fix CLAUDE.md's pytest-scope claim.** Rewrite the "Two suites sit outside
-    the root `pytest` sweep" block: `scripts/tests` runs *inside* the sweep and counts toward
-    the coverage gate; only the heavy-dependency sibling subprojects sit outside it. Fix the
-    prose, never `addopts` — adding `scripts/tests` to `--ignore` would drop `run_ledger`,
-    `idempotency`, `scheduler_lease`, `file_lock` and `broker_reconciliation` out of the 90%
-    gate, a real regression.
+## Open questions for round 3
 
-*Non-goals:* no change to `scripts/self_heal.py`'s repair steps themselves; no other CLAUDE.md
-edit beyond the corrected block and the new documentation-index row.
-*Proof:* `.venv/bin/python scripts/workflow_policy.py`; `.venv/bin/python -m pytest scripts/tests/test_self_heal_workflow.py tests/test_config_invariants.py -q`; `ruff check .`; and the full suite `.venv/bin/python -m pytest` plus `python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo` green.
-
-## Known open questions the Integrator should attack
-
-Listed here rather than hidden, so the Same Page Meeting starts from an honest position:
-
-- **Finding A (self-identified, now RESOLVED in plan).** `self-heal.yml`'s header comment
-  argues at length that `workflow_dispatch` is deliberately absent as a trust boundary, and
-  the trigger block three lines below contains `workflow_dispatch:`. Verified: the comment is
-  the correct half and the trigger line is the defect. Resolution folded into Rock 7 as
-  Correction 1. Still worth attacking: whether deleting it is sufficient, or whether the
-  `push`-on-`self-heal-diagnostics` trigger this plan *adds* reopens the same boundary.
-- Whether a `push`-triggered job on a non-default branch can hold `contents: write` without
-  reopening the boundary the header comment defends.
-- Whether the collector's `healthcheck` source double-counts what the `ci_runs` source
-  already reports.
-- Whether committing a ledger mirror to a branch creates a merge/conflict path when two
-  daily runs race, and whether the local push should be `--force-with-lease`.
-- Whether `max_attempts_per_fingerprint = 3` combined with `max_runs_per_day = 1` means a
-  single stubborn failure blocks all other incidents for three days (head-of-line blocking).
+- Does deleting `self-heal.yml` outright leave any capability the operator relied on? My read:
+  no — it could not see `cron_tracking/` or any `*.log`, and its `step_3` never worked.
+- Is `max_repairs_per_epoch = 10` with human `--new-epoch` re-arming a true bound, or merely a
+  slower ratchet?
+- Does the ungated observation half have any path to unbounded work, given its caps are
+  self-enforced rather than externally gated?
+- Is "universal observation + lint/format-only repair" an honest description of what ships?
