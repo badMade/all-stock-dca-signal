@@ -98,3 +98,17 @@ rocket-fuel/**/rounds/*.jsonl
 # 6-12 digit ML counts that match _ACCOUNT_SHAPED, and the .jsonl.gz archives fall through
 # test_every_tracked_file_is_either_scanned_or_a_named_exemption entirely.
 analysis/real-octopus-run/
+
+# rocket-fuel plan-revision snapshots. Kept on disk so the Integrator can diff revisions,
+# but untracked: they are frozen copies of superseded plans and carry whatever literals those
+# plans contained (PLAN-rev2.md.bak still spells a six-digit budget default that trips
+# tests/test_config_invariants.py's _ACCOUNT_SHAPED guard). The durable record is
+# SAME-PAGE-LOG.md, which IS tracked.
+rocket-fuel/**/*.md.bak
+
+# HMAC key for self-heal incident fingerprints (selfheal/fingerprint.py). Committing it would
+# turn every published fingerprint back into an offline verification oracle for a low-entropy
+# account number -- the exact failure Same Page round 1 finding 11 identified. Same rule and
+# rationale as .lease_fingerprint_key above.
+.selfheal_fingerprint_key
+.selfheal_fingerprint_key.*.tmp

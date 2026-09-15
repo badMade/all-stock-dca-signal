@@ -1,102 +1,87 @@
-# VTO — Automated self-healing with a diagnostic memory
+# VTO — Bounded daily diagnostic observation, with lint/format-only automatic repair
 
-Vision/Traction document for the `rocket-fuel/self-heal` cycle (Kickoff, 2026-09-14).
-Namespaced under `rocket-fuel/self-heal/` so the completed `rocket-fuel/hosted-console`
-cycle's root `PLAN.md` / `VTO.md` / `SAME-PAGE-LOG.md` / `DEFERRED.md` stay intact as the
-historical record (operator decision, interview Q1).
+Vision/Traction document for the `rocket-fuel/self-heal` cycle. **Revision 5** (2026-09-14).
+
+Revisions 1-2 described a product this cycle no longer builds. Same Page rounds 1-3 cut it
+twice, and this document has been rewritten to describe only what now ships — round 3's new
+BLOCKER was that the governing documents still mandated the deleted design.
 
 ## What
 
-A closed loop with four parts:
+Two halves with **independent** gating:
 
-1. **Collect.** Every diagnostic this system already emits — Wondrous Octopus shard crash
-   logs, `cron_tracking/` run artifacts, console job output, failed CI runs, and the
-   `scripts/healthcheck.py` gate's own output — swept into one normalized, redacted
-   incident store on a fixed daily cadence.
-2. **Remember.** Each incident is reduced to a stable **fingerprint** and written to an
-   append-only ledger that knows what has been seen before, how many times it has been
-   attacked, and how those attempts ended.
-3. **Heal — narrowly, and honestly labelled.** Only genuinely *new* fingerprints **that have a
-   repair adapter** are dispatched. This cycle ships exactly one adapter (lint/format); every
-   other incident class is report-only by construction. A repair opens a pull request; it
-   never merges itself.
-4. **Govern.** One fail-closed gate stands in front of the *repair* step — and **only** the
-   repair step — enforcing one run per day, a spend ceiling, a per-failure attempt cap, a
-   latched breaker and a cumulative epoch bound.
+1. **Observation — always runs.** On a fixed daily tick, sweep every configured diagnostic
+   source (Wondrous Octopus shard logs, `cron_tracking/` artifacts, console job output, failed
+   CI runs, and `scripts/healthcheck.py`'s own output), archive the complete crash text
+   privately, reduce each incident to a stable keyed fingerprint, record novelty in an
+   append-only ledger, and emit a digest the operator reads. This half is gated by **nothing**
+   except its own bounded resource budget. It can never create a branch, commit or PR.
+2. **Repair — narrow, gated, honestly labelled.** Only new fingerprints **that have a repair
+   adapter** are dispatched. This cycle ships exactly one adapter: lint/format. Every other
+   incident class is report-only *by construction* — no code path dispatches an incident
+   without an adapter. A repair runs in an isolated scratch worktree and opens a pull request;
+   it never merges itself.
 
-**Observation is never gated (Revision 4, 2026-09-14).** Same Page round 2 found that gating
-collection behind the same governor that gates repair creates an observation blackout: the
-system would stop recording crashes at the moment it began failing. Steps 1-2 therefore run on
-every scheduled tick regardless of breaker, budget or epoch state. A latched breaker means
-"stop fixing things", never "stop looking".
+**Accurate one-line description of what ships** (round 3, open question 4): *bounded daily
+observation of persisted diagnostic sources, plus lint/format-only automatic repair.* Not
+"universal observation" — a source that does not persist its crash output cannot be observed,
+and `dca_console_jobs.py` currently does not (see `DEFERRED.md`).
 
 ## Why now
 
-The repair pipeline already exists (`scripts/self_heal.py`, `scripts/healthcheck.py`,
-`.github/workflows/self-heal.yml`) but it is **blind and forgetful**:
+The pre-existing repair path was blind, forgetful and ungoverned, and two of its parts were
+simply broken:
 
-- **Blind.** `.gitignore` excludes `*.log` and `cron_tracking/`, so the two richest crash
-  sources on this machine are invisible to a hosted runner. Today's live example: shard 1's
-  `stdout.log` ends in `RUNTIME FAILURE (NotImplementedError): aten::_nested_tensor_from_mask_left_aligned
-  is not currently implemented for the MPS device`. Nothing in the self-heal path can see
-  that line, so nothing will ever act on it.
-- **Forgetful.** The workflow reacts to a CI conclusion. It has no memory of which failure
-  it already tried to fix, so the same failure can be re-attacked indefinitely and a fixed
-  one leaves no record that it was fixed.
-- **Ungoverned.** There is a weekly cron and a reactive `workflow_run` trigger, and no
-  ceiling of any kind on how often the loop may fire, how much it may spend, or how many
-  times it may retry the same thing.
+- **Blind.** `.gitignore` excludes `*.log` and `cron_tracking/`, so a hosted runner could see
+  neither. Today's live example: shard 1's `stdout.log` ends in `RUNTIME FAILURE
+  (NotImplementedError): aten::_nested_tensor_from_mask_left_aligned … not implemented for the
+  MPS device`. Nothing in the old path could see that line.
+- **Forgetful.** It reacted to a CI conclusion with no memory of what it had already attempted.
+- **Ungoverned.** No ceiling on frequency, spend, or retries.
+- **Broken.** `scripts/self_heal.py`'s `step_3` runs `pytest --snapshot-update`, an
+  unrecognized argument on this checkout with no snapshot plugin installed; `run_cmd` swallows
+  the failure, so it has silently no-opped since it was written. `step_4`'s comment claims
+  pinned installs; they carry no version specifiers.
 
 ## Who
 
-A single operator (the repository owner), on one Mac that holds the artifact tree, with
-GitHub Actions as the repair sandbox.
+A single operator (the repository owner), on one Mac that holds the artifact tree.
 
-## Success criteria for this cycle
+## Success criteria
 
-- A crash written to any configured source is, within one day, present in the incident
-  store with a stable fingerprint and a redacted excerpt — **including when every repair limit
-  is exhausted and the breaker is latched.**
-- Re-running the collector over unchanged sources produces **zero** new incidents.
-- The self-heal dispatch cannot fire twice in one UTC day, and raising that ceiling later
-  is a config edit, not a code change.
-- **Total work is bounded, not merely throttled.** A rolling-window lifetime cap on total
-  dispatches and a breaker that latches until a human clears it together make unbounded
-  repair work impossible, independent of how the per-day and per-fingerprint limits are
-  configured. (Added in Revision 3: Same Page round 1, finding 3, established that a daily
-  bucket, a re-mintable fingerprint and a self-expiring breaker only *delay* a runaway. The
-  earlier claim that any one of four mechanisms alone halted one was false and is withdrawn.)
-- **The pipeline cannot grant itself permission.** No repair code path can widen a budget,
-  clear the breaker, or re-mint its own eligibility; admission is evaluated by a separate
-  component from durable state, before any work — including collection — begins.
-- A single failure fingerprint can consume at most a bounded, configured number of repair
-  attempts in its entire lifetime, after which it is quarantined and surfaced to a human.
-- Every refusal to dispatch names a machine-readable reason code and is written to the
-  ledger.
-- No self-heal artifact committed to this repository ever contains the brokerage account
-  number, an absolute home path, or any value from a `SECRET`/`TOKEN`/`PASSWORD`/`API_KEY`
-  named environment variable.
+- A crash written to any configured **persisted** source is, within one day, present in the
+  incident store with a stable fingerprint, a redacted digest entry, and a complete unredacted
+  private archive — **including when every repair limit is exhausted and the breaker is
+  latched.**
+- Re-running observation over unchanged sources produces zero new incidents.
+- Repair cannot fire twice in one UTC day; raising that ceiling is a config edit.
+- **Total repair work is bounded, not throttled.** A cumulative epoch counter that never resets
+  on its own, plus a breaker that latches until a human clears it, make unbounded repair
+  impossible independent of every other setting. Any condition the pipeline cannot resolve —
+  including loss of the fingerprint key — **fails closed**, refusing repair rather than
+  starting a fresh epoch.
+- Every refusal names a machine-readable reason code and is written to the ledger.
+- No artifact this cycle commits contains the brokerage account number in any documented
+  spelling, an absolute home path, or any named environment-secret value.
 
 ## Non-negotiables
 
-- **Standard library only** in everything that runs at core-DCA runtime. Python ≥3.11.
-- **The account-number invariant holds.** `tests/test_config_invariants.py` greps for
-  account-shaped literals; sanitized digests are committed to a public repository, so
-  redaction is a correctness requirement, not a nicety.
-- **Fail closed.** If the governor cannot prove a limit is satisfied, it refuses to
-  dispatch. An unreadable ledger, an unparseable config, or a clock it cannot trust are all
-  refusals, never permissions.
-- **Nothing merges itself.** Repairs land as labeled pull requests for human review
-  (interview Q4). This repository drives live trading.
-- **Self-heal must never react to its own output.** Incidents originating from self-heal's
-  own artifacts, branches, or pull requests are dropped before the ledger sees them.
-- **The existing trust boundary in `self-heal.yml` is preserved.** No new
-  `workflow_dispatch` path into a job holding `contents: write`.
-- **No new runtime third-party dependency.** `gh` and `git` are the only external binaries,
-  and both are already assumed by the existing workflow.
+- **Standard library only** at runtime; Python ≥3.11. `git` and `gh` are the only external
+  binaries, both already assumed by the repo.
+- **The account-number invariant holds.** Redaction is a correctness requirement: this repo is
+  public and the operator blanket-commits to `main`.
+- **Fail closed, always.** Unparseable config, unreadable ledger, untrustworthy clock, missing
+  key, or any unhandled exception ⇒ refuse repair. Observation degrades to a recorded
+  degraded-source incident rather than silently dropping evidence.
+- **Nothing merges itself.**
+- **The pipeline can never grant itself permission.** No repair code path widens a budget,
+  clears the breaker, starts a new epoch, or re-mints eligibility. Re-arming is a human action.
+- **Observation is never gated by repair state.** A latched breaker means "stop fixing", never
+  "stop looking".
 
-## Out of scope this cycle
+## Deliberate capability losses (round 3, open question 1)
 
-Recorded in `DEFERRED.md`. Headlines: auto-merge of any repair, agent-driven repair of live
-trading logic, repairing the sibling research subprojects' own suites, and multi-machine
-coordination.
+Deleting `.github/workflows/self-heal.yml` removes real behaviour. Recorded as intentional:
+weekly and reactive hosted Ruff repair (replaced by the local adapter), 14-day Actions log
+upload (replaced by the private archive, which is durable rather than expiring), and
+stale-bot-PR cleanup (moves to `DEFERRED.md`).

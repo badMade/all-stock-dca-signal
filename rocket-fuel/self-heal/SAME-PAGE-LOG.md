@@ -222,3 +222,122 @@ honest MVP *only if* the product is described as lint/format self-healing, every
 generic healer is removed, and an end-to-end proof reaches a verified PR from a real detected
 incident. That is a scope decision belonging to the operator, so the meeting pauses here
 rather than spending rounds 3-5 elaborating a plan that may be about to be cut in half.
+
+
+## Round 3 — Revision 4 (operator scope cut)
+
+Usage: 11,634,113 input tokens (11,184,384 cached), 103,459 output, 83,321 reasoning.
+Prompt: `SAME-PAGE-PROMPT-ROUND-3.md`.
+
+### Codex reply
+
+Reviewed PLAN `b10be1ab`, VTO `088ce275`, the backups, deferred list, and cited repository files. There are exactly seven Rocks. The config test file still collects 205 tests, but the account invariant now fails after Revision 2’s backup became tracked.
+
+### Carried findings
+
+[BLOCKER] diagnostics-branch trust paradox — STILL OPEN (FIX): deleting the hosted dispatcher closes the mutable-ref hole, but production still runs guard and repair code from the same mutable checkout with the operator’s `gh` authority, while scratch isolation appears only in Rock 6’s test.
+
+[BLOCKER] admission is neither atomic nor authoritative — STILL OPEN (FIX): `evaluate()`, epoch/daily accounting, reservation, and ledger transition are never defined as one locked durable transaction across the separately “authoritative” ledger and `reservations.json`.
+
+[BLOCKER] loop controls only throttle — STILL OPEN (FIX): the plan contradicts itself between “three consecutive” and “any three” failures, and key loss starts a new epoch without the human-only re-arm required by the termination argument.
+
+[BLOCKER] unbounded work precedes the governor — STILL OPEN (FIX): self-enforced source deadlines do not bound the observer coordinator, config/ledger/digest work, or a collector hung before checking its deadline, and overlap prevention then lets one hung observer suppress later ticks.
+
+[BLOCKER] durable evidence contract is unmet — STILL OPEN (FIX): Revision 4 removed the complete private crash/debug archive and specifies only redacted incidents plus an `O_APPEND` sink without atomic finalization or `fsync`, so it cannot claim requirement #1 is satisfied in full.
+
+[BLOCKER] spend caps are postpaid — STILL OPEN (FIX): pre-reservation is the right structure, but no numeric Actions-minute ceiling, accounting period, or worst-case calculation is defined, and reservation/ledger crash consistency remains unspecified.
+
+[BLOCKER] forward clock jumps bypass limits — STILL OPEN (FIX): “clock sanity” supplies no trusted anchor, live-time override restriction, allowed skew, or reboot rule, so a forward jump can still manufacture a new UTC day or budget period.
+
+[BLOCKER] a refusing step does not stop the job — RESOLVED-BY-SCOPE: the fall-through Actions job is deleted and local repair proceeds only after admission returns an allow decision.
+
+[BLOCKER] the budget default violates the account grep — STILL OPEN (FIX): the now-tracked `PLAN-rev2.md.bak:233` contains standalone `200000`, and I reproduced the exact account-invariant failure against it.
+
+[BLOCKER] public redaction is not closed over the artifact — STILL OPEN (FIX): the two test-gate regexes miss repository-documented forms such as `accountNumber…`, `account_id_…`, and `acctNbr.…` when the corresponding environment value is unavailable.
+
+[BLOCKER] the public fingerprint is secret-derived — STILL OPEN (FIX): sanitize-then-HMAC closes the construction flaw, but `.selfheal_fingerprint_key` is not actually ignored despite the plan’s claim, making blanket commitment of the oracle key possible.
+
+[BLOCKER] the frozen repair baseline is not as claimed — RESOLVED-BY-SCOPE: the broken snapshot, install, and regeneration steps are deleted, leaving only timeout-bounded, error-propagating Ruff behavior.
+
+[BLOCKER] incidents never reach the healer — RESOLVED: the adapter receives the incident, performs incident-specific verification, and the no-input hosted caller is removed.
+
+[BLOCKER] CI collection is lossy and logless — STILL OPEN (FIX): “resumable gap policy” never states that discovery can advance independently of an unavailable older log, and the proof omits the head-of-line interleaving.
+
+[BLOCKER] hard console crashes are invisible — STILL OPEN (FIX): `dca_console_jobs.py` still persists only the initial empty record and terminal state, and the promised incremental-persistence deferral does not exist in `DEFERRED.md`.
+
+[BLOCKER] self-origin filtering is late and heuristic — STILL OPEN (FIX): Revision 4 removes provenance filtering entirely even though VTO still requires pre-ledger exclusion, allowing failures from self-heal PRs or their later main CI runs to re-enter repair.
+
+[BLOCKER] incident states have dead ends — STILL OPEN (FIX): the review lease and PR-create recovery are improvements, but merge, close, cancellation, CI-red, and lease-expiry transitions remain undefined.
+
+[MAJOR] unactionable incidents can monopolize admission — RESOLVED-BY-SCOPE: unsupported incidents are report-only and the legacy generic dispatcher is removed.
+
+[BLOCKER] runtime config is not fail-closed — STILL OPEN (FIX): missing required fields and missing packaged configuration are not covered, and Rock 7’s import-only wheel check never loads `config/self_heal.json`.
+
+[BLOCKER] launchd wiring can fail or relaunch indefinitely — RESOLVED: resolved executables, no `KeepAlive`, overlap prevention, durable stderr, and load/kickstart inspection address the mechanism; its proof defects remain under finding 22.
+
+[BLOCKER] ledger corruption and branch races lack recovery — STILL OPEN (FIX): the anchored head detects more corruption, but no atomic-write/`fsync` protocol or recovery transaction prevents ledger, epoch, and reservation state diverging across a crash.
+
+[BLOCKER] stated proofs cannot establish the plan — STILL OPEN (FIX): `[SUITE]` is presently red, Rock 6 has no executable test command, Rock 7 contains placeholder `N`, and its in-checkout import can shadow the installed wheel and cannot prove subpackages or package data.
+
+[MAJOR] future-model accounting is scope creep — RESOLVED-BY-SCOPE: token/USD pricing is removed, while reservation for presently measurable Actions, time, and attempts is legitimate current-cycle infrastructure.
+
+[BLOCKER] repair admission suppresses failure detection — RESOLVED: observation has its own command and explicit exhausted-breaker/epoch acceptance test, so repair refusal no longer directly suppresses collection.
+
+### New finding
+
+[BLOCKER] governing documents define different products — STILL OPEN (FIX): VTO still mandates a rolling-window bound, pre-collection admission, GitHub Actions repair, and preservation of `self-heal.yml`, while `DEFERRED.md` still describes the deleted legacy design and omits its claimed console deferral.
+
+### Open questions
+
+1. Yes, deletion removes real capability: weekly/reactive hosted Ruff repair, 14-day log upload, and stale-bot-PR cleanup; local repair replaces the core repair path, but these losses must be recorded as intentional scope cuts rather than called nonexistent.
+
+2. As written it is a slower ratchet because fingerprint-key loss starts a new epoch; a cumulative counter becomes a true autonomous bound only when key loss fails closed and every re-arm requires authority unavailable to pipeline code.
+
+3. Yes, observation retains unbounded paths outside its source subprocess caps; it needs an externally enforced whole-tick deadline plus bounded ledger, reconciliation, digest, and emergency-log operations.
+
+4. “Lint/format-only repair” is honest, but “universal observation” is not while hard-console crash output and complete durable archives remain unavailable; “bounded daily observation of persisted sources plus lint/format-only repair” is accurate today.
+
+VERDICT: BLOCKED — 18 open finding(s)
+
+### Visionary's read
+
+`VERDICT: BLOCKED — 18 open finding(s)`. Trajectory 23 -> 22 -> 18; six findings now resolved
+(8, 12, 13, 18, 20, 23) plus round 2's new BLOCKER.
+
+Three of the eighteen were my own regressions, not Codex being pedantic. Cutting Revision 4
+from 374 to 228 lines silently dropped **self-origin provenance filtering** (finding 16) and
+the **complete unredacted private crash archive** (finding 5); neither was a deliberate scope
+cut, and the VTO still required both. A fourth — the new BLOCKER, *governing documents define
+different products* — was straightforward document drift: `VTO.md` still mandated a
+rolling-window bound, pre-collection admission, hosted Actions repair and preservation of
+`self-heal.yml`, all of which Revision 4 had removed. Revision 5 rewrites all three documents
+so the plan, the vision and the backlog describe one product.
+
+Codex also reproduced a **red build** caused by this cycle itself: `PLAN-rev2.md.bak` became
+tracked and carries the six-digit budget literal that finding 9 was about. Confirmed and fixed
+by gitignoring `rocket-fuel/**/*.md.bak` (the snapshots stay on disk for diffing) and
+`.selfheal_fingerprint_key`, which Revision 4 had claimed was ignored without doing it. A
+second instance appeared immediately afterwards when Revision 5's own clock section spelled
+`172800`; also fixed. The lesson is the finding: a plan that *documents* redaction rules is
+itself subject to them.
+
+Substantive corrections adopted from round 3's open-question answers:
+
+- **Q1** — deleting `self-heal.yml` removes real capability (weekly/reactive hosted Ruff
+  repair, 14-day log upload, stale-PR cleanup). Recorded as intentional losses in `VTO.md` and
+  `DEFERRED.md` rather than described as nonexistent.
+- **Q2** — the epoch was still a ratchet, because Revision 4 let fingerprint-key loss start a
+  new epoch, handing the pipeline the human-only re-arm. Corrected to fail closed with
+  `FINGERPRINT_KEY_UNAVAILABLE` and a human `--adopt-new-key` that does not reset the counter.
+- **Q3** — observation had unbounded paths outside its per-source caps. Revision 5 adds one
+  externally enforced whole-tick `setitimer(ITIMER_REAL)` deadline covering the coordinator,
+  config, ledger, reconciliation and digest, plus a TTL on the single-run lock so a hung
+  observer cannot suppress every later tick.
+- **Q4** — "universal observation" was not honest while `dca_console_jobs.py` does not persist
+  incrementally. The product is renamed to *bounded daily observation of persisted diagnostic
+  sources, plus lint/format-only automatic repair*, and the console gap is written into
+  `DEFERRED.md` rather than assumed away.
+
+Round 4 was dispatched against Revision 5 with one added instruction: findings that are
+irreducible for a single-operator local daemon may be marked ACCEPTED-RESIDUAL, because a plan
+cannot stay blocked on a property no implementation of this product could have.
