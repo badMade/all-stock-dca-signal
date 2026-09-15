@@ -36,6 +36,23 @@ BLOCKER: "governing documents define different products").
   `ml-forecaster/`, `wondrous-octopus/`, `ticker-market-breadth/`). Their heavy dependencies
   are not installable in the observation budget.
 
+## Accepted residual risks
+
+These are not deferred work items; they are properties no implementation of *this* product —
+a single-operator daemon on the operator's own Mac — can have, recorded so they stop recurring
+as findings.
+
+- **`gh` runs under the operator's own credential.** A local daemon opening a PR as the
+  operator cannot be separated from the operator's authority at the same UID. Bounded instead:
+  the coordinator runs from an installed wheel rather than the mutable checkout, repair runs in
+  an `origin/main` worktree with a minimal environment, and at most `max_repairs_per_epoch` PRs
+  can ever be opened without a human re-arm.
+- **A same-UID actor can crash, rewrite state, or re-arm the daemon.** Anyone with that access
+  already has the operator's shell. Contributor-controlled CI input, which is *not* same-UID, is
+  excluded separately: non-`main` incidents are report-only.
+- **An environment variable unset at observation time has no known former value**, so redaction
+  can match its shape but not its literal.
+
 ## Deferred hardening
 
 - **Multi-machine coordination.** One operator, one Mac. The single-writer assumption is what

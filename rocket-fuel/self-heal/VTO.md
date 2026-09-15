@@ -66,8 +66,10 @@ A single operator (the repository owner), on one Mac that holds the artifact tre
 
 ## Non-negotiables
 
-- **Standard library only** at runtime; Python ≥3.11. `git` and `gh` are the only external
-  binaries, both already assumed by the repo.
+- **Standard library only** for this cycle's own logic; Python ≥3.11. External binaries it
+  invokes: `git`, `gh`, `ruff` (the lint/format adapter), `launchctl`, `sysctl` (boot time), and
+  whatever `scripts/healthcheck.py` already shells out to. Revision 5 claimed only the first
+  two, which round 4 correctly called false.
 - **The account-number invariant holds.** Redaction is a correctness requirement: this repo is
   public and the operator blanket-commits to `main`.
 - **Fail closed, always.** Unparseable config, unreadable ledger, untrustworthy clock, missing

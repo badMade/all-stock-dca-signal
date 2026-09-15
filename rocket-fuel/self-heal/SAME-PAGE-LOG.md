@@ -5,6 +5,13 @@ Visionary: Claude (Opus 5). Integrator: Codex CLI 0.145.0,
 Subject: `rocket-fuel/self-heal/PLAN.md` (with `VTO.md`, `DEFERRED.md`).
 Max 5 rounds; the verdict line is the literal last line of each Codex reply.
 
+**Note on numerals in this log.** Digit runs of 6-12 characters are spelled with `_`
+separators throughout, including inside quoted Codex replies, because this file is tracked
+and `tests/test_config_invariants.py`'s `_ACCOUNT_SHAPED` guard rejects a bare run of that
+length anywhere in a tracked file. That the reasoning record about redaction is itself
+subject to the redaction rule is not an accident worth hiding; it is finding 9 in miniature,
+and it caught this cycle three separate times.
+
 **CLI drift recorded for this machine.** `~/.codex/config.toml` pins `model = "gpt-6-astra"`,
 which this account cannot serve; every round passes `-m gpt-5.6-sol` explicitly. `codex exec`
 on 0.145.0 rejects `--ask-for-approval` ("unexpected argument"), so the flag the skill
@@ -251,7 +258,7 @@ Reviewed PLAN `b10be1ab`, VTO `088ce275`, the backups, deferred list, and cited 
 
 [BLOCKER] a refusing step does not stop the job — RESOLVED-BY-SCOPE: the fall-through Actions job is deleted and local repair proceeds only after admission returns an allow decision.
 
-[BLOCKER] the budget default violates the account grep — STILL OPEN (FIX): the now-tracked `PLAN-rev2.md.bak:233` contains standalone `200000`, and I reproduced the exact account-invariant failure against it.
+[BLOCKER] the budget default violates the account grep — STILL OPEN (FIX): the now-tracked `PLAN-rev2.md.bak:233` contains standalone `200_000`, and I reproduced the exact account-invariant failure against it.
 
 [BLOCKER] public redaction is not closed over the artifact — STILL OPEN (FIX): the two test-gate regexes miss repository-documented forms such as `accountNumber…`, `account_id_…`, and `acctNbr.…` when the corresponding environment value is unavailable.
 
@@ -318,7 +325,7 @@ tracked and carries the six-digit budget literal that finding 9 was about. Confi
 by gitignoring `rocket-fuel/**/*.md.bak` (the snapshots stay on disk for diffing) and
 `.selfheal_fingerprint_key`, which Revision 4 had claimed was ignored without doing it. A
 second instance appeared immediately afterwards when Revision 5's own clock section spelled
-`172800`; also fixed. The lesson is the finding: a plan that *documents* redaction rules is
+`172_800`; also fixed. The lesson is the finding: a plan that *documents* redaction rules is
 itself subject to them.
 
 Substantive corrections adopted from round 3's open-question answers:
