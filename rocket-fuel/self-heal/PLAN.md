@@ -3,7 +3,8 @@
 Build plan for the `rocket-fuel/self-heal` cycle. Vision and non-negotiables live in
 `rocket-fuel/self-heal/VTO.md`; deferred items in `rocket-fuel/self-heal/DEFERRED.md`.
 This plan is the subject of the Same Page Meeting and is revised on the record until
-`VERDICT: SAME PAGE`. **Revision 1** (as submitted).
+`VERDICT: SAME PAGE`. **Revision 2** — Revision 1 as submitted to Same Page round 1, plus two
+Clarity-Break corrections folded into Rock 7 at the operator's direction (2026-09-14).
 
 ## Starting point (facts, verified 2026-09-14 on this checkout)
 
@@ -58,7 +59,17 @@ This plan is the subject of the Same Page Meeting and is revised on the record u
   `scripts/*.py` ship automatically, but new top-level config needs a `data-files` entry.
 - Test layout: `tests/test_<module>.py` for core modules, `scripts/tests/test_<script>.py`
   for scripts (`test_healthcheck.py` and `test_model_usage_log.py` already exist there).
-  `scripts/tests` is **outside** the root pytest sweep and is run separately.
+  `scripts/tests` is **inside** the root pytest sweep, contrary to CLAUDE.md's "Two suites sit
+  outside the root `pytest` sweep" claim: `testpaths = ["."]`, `addopts` names only the six
+  sibling research trees in its `--ignore` list, and there is no `collect_ignore` or
+  `norecursedirs` anywhere (verified: `pytest --collect-only -q | grep -c scripts/tests` = 38).
+  ci.yml's core job runs bare `pytest --cov=. --cov-fail-under=90` at line 58, so those tests
+  already run in CI and already count toward the coverage gate; the `python -m pytest tests/`
+  calls at lines 183-346 belong to the sibling subproject jobs, not to `scripts/tests`.
+  **Consequence for this plan:** every new `scripts/self_heal_*.py` module falls under
+  `[tool.coverage.run] source = ["."]` and is therefore held to the 90% gate automatically —
+  a constraint, not a courtesy. The per-Rock proof commands below name a targeted
+  `scripts/tests/test_*.py` file only to iterate faster; Rock 7's proof runs the full sweep.
 
 ## Architecture
 
@@ -295,19 +306,43 @@ also re-runs the existing suite so nothing regresses.
 *Non-goals:* does not modify the workflow.
 *Proof:* `.venv/bin/python scripts/self_heal_daily.py --dry-run --now 2026-09-14T04:00` prints a deterministic decision and exits 0 having written nothing; `.venv/bin/python deploy/launchd/render_self_heal_agent.py --print` emits a valid plist containing no secret; `.venv/bin/python -m pytest scripts/tests/test_self_heal_daily.py -q`.
 
-**Rock 7 — CI wiring, docs, packaging.** `.github/workflows/self-heal.yml`,
-`docs/self_healing.md`, `pyproject.toml`, a CLAUDE.md documentation-index row.
-*Non-goals:* no change to `scripts/self_heal.py`'s repair steps themselves.
+**Rock 7 — CI wiring, docs, packaging, and two in-scope corrections.**
+`.github/workflows/self-heal.yml`, `docs/self_healing.md`, `pyproject.toml`, `CLAUDE.md`.
+Folds in both defects found during the Clarity Break (operator decision, 2026-09-14), because
+each edits lines this Rock already rewrites:
+
+  * **Correction 1 — close the `workflow_dispatch` hole.** Delete the `workflow_dispatch:`
+    line from `self-heal.yml`'s trigger block; keep the header comment, which is the correct
+    half. The comment claims parity with `compute-schedule.yml` and `drift-check.yml` and
+    those two carry `schedule:` only, so `self-heal.yml` is the one that drifted. The hole is
+    latent today — the job's `if:` admits only `schedule` and `workflow_run`, so a dispatch
+    skips the job — but that `if:` is exactly the defense the comment argues is not real: a
+    dispatch runs the workflow file as it exists on the *selected ref*, so a branch that
+    deletes the `if:` and dispatches itself gets a job holding `contents: write`,
+    `pull-requests: write` and `issues: write`. Exploiting it requires repo write access.
+    This Rock rewrites the same six-line trigger block to add the `self-heal-diagnostics`
+    push trigger, so the two edits belong together.
+  * **Correction 2 — fix CLAUDE.md's pytest-scope claim.** Rewrite the "Two suites sit outside
+    the root `pytest` sweep" block: `scripts/tests` runs *inside* the sweep and counts toward
+    the coverage gate; only the heavy-dependency sibling subprojects sit outside it. Fix the
+    prose, never `addopts` — adding `scripts/tests` to `--ignore` would drop `run_ledger`,
+    `idempotency`, `scheduler_lease`, `file_lock` and `broker_reconciliation` out of the 90%
+    gate, a real regression.
+
+*Non-goals:* no change to `scripts/self_heal.py`'s repair steps themselves; no other CLAUDE.md
+edit beyond the corrected block and the new documentation-index row.
 *Proof:* `.venv/bin/python scripts/workflow_policy.py`; `.venv/bin/python -m pytest scripts/tests/test_self_heal_workflow.py tests/test_config_invariants.py -q`; `ruff check .`; and the full suite `.venv/bin/python -m pytest` plus `python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo` green.
 
 ## Known open questions the Integrator should attack
 
 Listed here rather than hidden, so the Same Page Meeting starts from an honest position:
 
-- **Finding A (self-identified).** `self-heal.yml`'s header comment argues at length that
-  `workflow_dispatch` is deliberately absent as a trust boundary, and the trigger block
-  three lines below contains `workflow_dispatch:`. One of the two is wrong. This plan does
-  not currently resolve it.
+- **Finding A (self-identified, now RESOLVED in plan).** `self-heal.yml`'s header comment
+  argues at length that `workflow_dispatch` is deliberately absent as a trust boundary, and
+  the trigger block three lines below contains `workflow_dispatch:`. Verified: the comment is
+  the correct half and the trigger line is the defect. Resolution folded into Rock 7 as
+  Correction 1. Still worth attacking: whether deleting it is sufficient, or whether the
+  `push`-on-`self-heal-diagnostics` trigger this plan *adds* reopens the same boundary.
 - Whether a `push`-triggered job on a non-default branch can hold `contents: write` without
   reopening the boundary the header comment defends.
 - Whether the collector's `healthcheck` source double-counts what the `ci_runs` source
