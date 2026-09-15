@@ -168,6 +168,27 @@ Every `Incident` is a frozen dataclass serialized to JSON:
 existing regex, `~` substitution, and the `\b\d{6,12}\b` rule. A unit test asserts a
 synthetic account number planted in a fixture never appears in any emitted artifact.
 
+**Redaction is enforced at write time, not at commit time — this is load-bearing.** The
+operating reality of this checkout is blanket `git add`-style commits straight to `main`:
+during this very cycle, `analysis/real-octopus-run/` went from four untracked directories to
+20 tracked files (including `checkpoint/models/octopus/weights.npz` and the gzipped ledger
+diagnostics) without any action from this plan, and this cycle's own `PLAN.md`, `VTO.md` and
+the 436 KB `rounds/round-1.jsonl` Codex transcript were committed to `main` mid-review. Any
+design that says "the unredacted copy is safe because we won't commit that path" is therefore
+wrong by construction here. The rule the collector enforces instead:
+
+  * unredacted incident text may be written **only** under `$DCA_CRON_TRACKING_ROOT/self_heal/`,
+    which `.gitignore`'s `cron_tracking/` rule covers and which `$DCA_CRON_TRACKING_ROOT` may
+    repoint — so the writer resolves the configured root and **refuses to write** if it is not
+    inside a gitignored path, rather than assuming;
+  * every other sink (`diagnostics/**`, stdout, the daily report, an alert body) receives
+    redacted text only, because redaction happens in the `Incident` constructor, before the
+    value is reachable by any writer.
+
+Rock 1's proof therefore includes a test that walks every path the collector wrote during a
+fixture run, asserts each unredacted-bearing file is inside a `git check-ignore`-confirmed
+path, and greps every non-ignored artifact for the planted account number.
+
 Raw, unredacted incidents are written under `$DCA_CRON_TRACKING_ROOT/self_heal/incidents/`
 — already gitignored — so the operator can still read the full crash locally.
 
