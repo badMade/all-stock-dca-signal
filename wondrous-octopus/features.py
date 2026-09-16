@@ -907,6 +907,7 @@ def build_panel(
     cluster_window: int | None = None,
     cluster_refresh: int = _DEFAULT_CLUSTER_REFRESH,
     extra_features: Sequence[str] = (),
+    external_market_table: pd.DataFrame | None = None,
 ) -> TrainingPanel:
     """Assemble the full in-memory panel from the per-ticker CSV archive.
 

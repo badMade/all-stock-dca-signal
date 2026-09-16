@@ -61,26 +61,80 @@ def split_into_shards(tickers: Sequence[str], n_shards: int) -> list[list[str]]:
     return shards
 
 
-def is_shard_completed(shard_dir: Path) -> bool:
-    """Return True if the shard has already completed and published report.json."""
-    return (shard_dir / "report" / "report.json").is_file()
+def get_shard_last_processed_date(shard_dir: Path) -> str | None:
+    """Return the last processed date recorded in the shard's checkpoint, or None."""
+    import json
+    for name in ("checkpoint", "checkpoint.good", "checkpoint.prev"):
+        state_path = shard_dir / name / "harness_state.json"
+        if state_path.is_file():
+            try:
+                state = json.loads(state_path.read_text())
+                last_date = state.get("last_processed_date")
+                if last_date:
+                    return str(last_date)
+            except Exception:
+                continue
+    return None
+
+
+def get_archive_latest_date(history_dir: Path, sample_tickers: Sequence[str] = ("SPY", "AAPL", "MSFT")) -> str | None:
+    """Infer the latest trading date present in the history directory."""
+    candidates = []
+    for ticker in sample_tickers:
+        p = history_dir / f"{ticker}.csv"
+        if p.is_file():
+            candidates.append(p)
+    if not candidates:
+        candidates = list(history_dir.glob("*.csv"))[:5]
+
+    latest_date = None
+    for path in candidates:
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 512), os.SEEK_SET)
+                lines = f.read().decode("utf-8", errors="ignore").strip().splitlines()
+                if lines:
+                    last_line = lines[-1].strip()
+                    parts = last_line.split(",")
+                    if parts and len(parts[0]) == 10 and parts[0][4] == "-" and parts[0][7] == "-":
+                        d = parts[0]
+                        if latest_date is None or d > latest_date:
+                            latest_date = d
+        except Exception:
+            continue
+    return latest_date
+
+
+def is_shard_completed(shard_dir: Path, target_end: str | None = None) -> bool:
+    """Return True if the shard has already completed and published report.json up to target_end."""
+    report_file = shard_dir / "report" / "report.json"
+    if not report_file.is_file():
+        return False
+    if target_end is not None:
+        last_date = get_shard_last_processed_date(shard_dir)
+        if last_date is not None and last_date < target_end:
+            return False
+    return True
 
 
 def has_checkpoint(shard_dir: Path) -> bool:
     """Return True if a durable checkpoint exists from a previous run."""
-    return (shard_dir / "checkpoint").is_dir() or (shard_dir / "checkpoint.prev").is_dir()
+    return (shard_dir / "checkpoint").is_dir() or (shard_dir / "checkpoint.prev").is_dir() or (shard_dir / "checkpoint.good").is_dir()
 
 
 def build_shard_cmd(
     shard_tickers: Sequence[str],
     shard_dir: Path,
     args: argparse.Namespace,
+    target_end: str | None = None,
 ) -> tuple[list[str] | None, str]:
     """Assemble the CLI command for running run_walkforward.py on one shard.
 
     Returns (command_tokens_or_None, status_mode).
     """
-    if is_shard_completed(shard_dir) and not args.force:
+    if is_shard_completed(shard_dir, target_end) and not args.force:
         return None, "completed"
 
     if has_checkpoint(shard_dir) and not args.force:
@@ -91,6 +145,8 @@ def build_shard_cmd(
             "--resume",
             str(shard_dir),
         ]
+        if args.end:
+            cmd.extend(["--end", args.end])
         if args.device:
             cmd.extend(["--device", args.device])
         if args.dry_run:
@@ -259,14 +315,24 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     shards = split_into_shards(all_tickers, args.shards)
     total_tickers = sum(len(s) for s in shards)
+    archive_latest = get_archive_latest_date(history_dir)
+    target_end = args.end or archive_latest
 
     print(
-        f"Archive: {history_dir} | Total valid tickers: {total_tickers} | "
-        f"Partitioned into {len(shards)} shards"
+        f"Archive: {history_dir} | Latest: {archive_latest or 'unknown'} | "
+        f"Total valid tickers: {total_tickers} | Partitioned into {len(shards)} shards"
     )
     for i, s in enumerate(shards, start=1):
         s_dir = args.run_dir_base / f"shard_{i}"
-        status = " [DONE]" if is_shard_completed(s_dir) else (" [CHECKPOINT]" if has_checkpoint(s_dir) else "")
+        if is_shard_completed(s_dir, target_end):
+            status = " [DONE]"
+        elif (s_dir / "report" / "report.json").is_file():
+            last_p = get_shard_last_processed_date(s_dir)
+            status = f" [STALE: {last_p} < {target_end}]"
+        elif has_checkpoint(s_dir):
+            status = " [CHECKPOINT]"
+        else:
+            status = ""
         print(f"  Shard {i}/{len(shards)}: {len(s)} tickers ({s[0]} ... {s[-1]}){status}")
 
     # 1. Single shard mode
@@ -276,13 +342,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         target_shard = shards[args.shard - 1]
         shard_dir = args.run_dir_base / f"shard_{args.shard}"
-        cmd, mode = build_shard_cmd(target_shard, shard_dir, args)
+        cmd, mode = build_shard_cmd(target_shard, shard_dir, args, target_end=target_end)
         if mode == "completed":
             print(f"\nShard {args.shard} is already completed ({shard_dir}/report/report.json exists).")
             print("Use --force to re-run from scratch.")
             return 0
         if mode == "resume":
-            print(f"\nFound existing save point! Resuming Shard {args.shard} from {shard_dir}/checkpoint ...")
+            last_p = get_shard_last_processed_date(shard_dir)
+            stale_info = f" (stale: processed through {last_p}, target is {target_end})" if last_p and target_end and last_p < target_end else ""
+            print(f"\nFound existing save point! Resuming Shard {args.shard} from {shard_dir}/checkpoint{stale_info} ...")
         else:
             print(f"\nLaunching Shard {args.shard} ({len(target_shard)} tickers) -> {shard_dir} ...")
             print(f"Save points: writing checkpoints every {args.checkpoint_every} steps.")
@@ -296,16 +364,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("\n[Dry Run Preview]")
         for i, s in enumerate(shards, start=1):
             shard_dir = args.run_dir_base / f"shard_{i}"
-            cmd, mode = build_shard_cmd(s, shard_dir, args)
-            action = (
-                f"RESUME from {shard_dir}/checkpoint"
-                if mode == "resume"
-                else (
-                    "ALREADY COMPLETED"
-                    if mode == "completed"
-                    else f"FRESH START (checkpoints every {args.checkpoint_every} steps)"
-                )
-            )
+            cmd, mode = build_shard_cmd(s, shard_dir, args, target_end=target_end)
+            if mode == "resume":
+                last_p = get_shard_last_processed_date(shard_dir)
+                stale_tag = f" (stale: processed through {last_p}, target is {target_end})" if (shard_dir / "report" / "report.json").is_file() else ""
+                action = f"RESUME from {shard_dir}/checkpoint{stale_tag}"
+            elif mode == "completed":
+                action = "ALREADY COMPLETED"
+            else:
+                action = f"FRESH START (checkpoints every {args.checkpoint_every} steps)"
             print(f"  Shard {i}: {len(s)} tickers -> {action}")
         print("\nDry run finished. Pass without --dry-run to execute.")
         return 0
@@ -316,7 +383,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         processes: list[tuple[int, subprocess.Popen, Path]] = []
         for i, s in enumerate(shards, start=1):
             shard_dir = args.run_dir_base / f"shard_{i}"
-            cmd, mode = build_shard_cmd(s, shard_dir, args)
+            cmd, mode = build_shard_cmd(s, shard_dir, args, target_end=target_end)
             if mode == "completed":
                 print(f"  [Shard {i}] Already completed. Skipping.")
                 continue
@@ -356,7 +423,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"\nRunning shards sequentially (save points every {args.checkpoint_every} steps)...")
     for i, s in enumerate(shards, start=1):
         shard_dir = args.run_dir_base / f"shard_{i}"
-        cmd, mode = build_shard_cmd(s, shard_dir, args)
+        cmd, mode = build_shard_cmd(s, shard_dir, args, target_end=target_end)
         if mode == "completed":
             print(f"\nShard {i}/{len(shards)} is already completed. Skipping.")
             continue
