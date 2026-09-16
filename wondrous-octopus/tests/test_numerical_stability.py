@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import math
-from pathlib import Path
-from typing import Any
 
 import features
 import numpy as np
 import pandas as pd
 import pytest
 import torch
-from data import COMPONENTS, TrainingPanel
+from data import COMPONENTS
 from harness import HarnessConfig, WalkForwardHarness, _checkpoint_has_nan
 from metrics import score_forecast
 from octopus_model import OctopusModel
@@ -75,7 +73,6 @@ class TestNumericalDefense:
         fitted._optimizer.step()
         state = next(iter(fitted._optimizer.state.values()))
         assert "exp_avg" in state
-        orig_buf = state["exp_avg"].clone()
         state["exp_avg"][0] = float("nan")
 
         is_finite, err = fitted.verify_finiteness()
@@ -234,3 +231,42 @@ class TestMetricsAndCircuitBreaker:
             ref_close=100.0,
         )
         assert scored_finite["non_finite"] is False
+
+
+class TestUnifiedMarketRepresentation:
+    def test_external_market_table_unifies_representations_across_shards(self, synthetic_history_dir):
+        """Disjoint shards share identical macro market representations when provided a unified market table."""
+        all_tickers = features.discover_available_tickers(synthetic_history_dir)
+        assert len(all_tickers) >= 2
+        mid = len(all_tickers) // 2
+        shard1_tickers = all_tickers[:mid]
+        shard2_tickers = all_tickers[mid:]
+
+        # Without unified market table: each shard computes market averages from its own siloed tickers
+        panel1_isolated = features.build_panel(synthetic_history_dir, tickers=shard1_tickers, min_history=60)
+        panel2_isolated = features.build_panel(synthetic_history_dir, tickers=shard2_tickers, min_history=60)
+
+        # Market summaries will differ because the universes are disjoint
+        assert not np.allclose(panel1_isolated.market_summary, panel2_isolated.market_summary)
+
+        # Compute full-universe market table
+        unified_market = features.compute_market_table(synthetic_history_dir, min_history=60)
+        assert not unified_market.empty
+
+        # Build both shards with the shared market table
+        panel1_unified = features.build_panel(
+            synthetic_history_dir,
+            tickers=shard1_tickers,
+            min_history=60,
+            external_market_table=unified_market,
+        )
+        panel2_unified = features.build_panel(
+            synthetic_history_dir,
+            tickers=shard2_tickers,
+            min_history=60,
+            external_market_table=unified_market,
+        )
+
+        # Now, both shards share the EXACT SAME macro market targets!
+        assert np.array_equal(panel1_unified.market_summary, panel2_unified.market_summary)
+

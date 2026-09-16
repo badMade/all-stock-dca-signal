@@ -698,6 +698,47 @@ def _market_table(long_frame: pd.DataFrame) -> pd.DataFrame:
     return table
 
 
+def compute_market_table(
+    history_dir: Path,
+    tickers: Sequence[str] | None = None,
+    *,
+    end: pd.Timestamp | None = None,
+    as_of: pd.Timestamp | None = None,
+    min_history: int = 60,
+) -> pd.DataFrame:
+    """Precompute the macro market aggregates across the given universe.
+
+    Allows partitioned training shards to share an identical, full-market macro
+    representation instead of calculating siloed, disjoint market averages.
+    """
+    discovered = discover_available_tickers(history_dir, tickers)
+    chunks: list[pd.DataFrame] = []
+    for ticker in discovered:
+        path = history_dir / f"{ticker}.csv"
+        try:
+            frame = load_history_csv(path)
+        except (OSError, ValueError):
+            continue
+        frame = truncate_as_of(frame, as_of)
+        if end is not None:
+            end_day = pd.Timestamp(end).normalize()
+            date_s: Any = pd.to_datetime(frame["Date"])
+            frame = frame.loc[date_s.dt.normalize() <= end_day].reset_index(drop=True)
+        if "Adj Close" not in frame.columns:
+            continue
+        frame, _ = adjusted_ohlc(frame)
+        if len(frame) < min_history + 1:
+            continue
+        computed = compute_ticker_features(frame)
+        chunks.append(pd.DataFrame({"Date": computed["Date"], "ret_close": computed["ret_close"]}).dropna())
+
+    if not chunks:
+        raise ValueError(f"REFUSED: no usable tickers found in {history_dir} to compute market table")
+    pooled = pd.concat(chunks, ignore_index=True)
+    return _market_table(pooled)
+
+
+
 def _cross_sectional_rank(frame: pd.DataFrame, column: str) -> pd.Series:
     """Per-day rank of ``column`` across the universe, in [0, 1].
 
@@ -1030,14 +1071,17 @@ def build_panel(
         ],
         ignore_index=True,
     ).dropna(subset=["ret_close"])
-    market = _market_table(long_frame)
+    if external_market_table is not None:
+        market = external_market_table
+    else:
+        market = _market_table(long_frame)
     long_frame["cs_return_rank"] = _cross_sectional_rank(long_frame, "ret_close")
     long_frame["cs_momentum_rank"] = _cross_sectional_rank(long_frame, "trailing_ret_20")
     long_frame["cs_vol_rank"] = _cross_sectional_rank(long_frame, "realized_vol_20")
 
     # --- Style clustering: a fundamentals-free sector proxy. ---
     returns_wide = long_frame.pivot_table(index="Date", columns="ticker", values="ret_close")
-    calendar_index = np.array(sorted(market.index.to_numpy()), dtype="datetime64[ns]")
+    calendar_index = np.array(sorted(set(long_frame["Date"])), dtype="datetime64[ns]")
     returns_wide = returns_wide.reindex(pd.DatetimeIndex(calendar_index))
     # Derived from min_history rather than fixed, so --min-history stays the
     # one knob that decides how much warm-up a ticker needs; a hard-coded
