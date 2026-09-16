@@ -1198,6 +1198,13 @@ def _run(harness: WalkForwardHarness, run_dir: Path, *, interrupt_flag: _Interru
     # write_report() for a completed run.
     status = harness.run(release_lock=False)
     try:
+        if status == "systemic_model_failure":
+            print(
+                f"systemic_model_failure: halted run due to non-finite model predictions under {run_dir}. "
+                "The last healthy checkpoint is preserved.",
+                file=sys.stderr,
+            )
+            return 2
         if status in {"interrupted", "budget_tripped"}:
             # Both are CLEAN bounded stops with a valid checkpoint -- the
             # circuit-breaker trip already printed its banner.

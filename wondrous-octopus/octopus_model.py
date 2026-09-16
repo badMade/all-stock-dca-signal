@@ -60,7 +60,9 @@ package stays importable without torch.
 from __future__ import annotations
 
 import hashlib
+import math
 import sys
+import warnings
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -449,6 +451,7 @@ class OctopusModel:
         rng = np.random.default_rng(_derive(self._seed, f"update:{step_index}"))
         recent_pool = [ref for day_list in self._recent for ref in day_list]
         losses: list[float] = []
+        skipped_batches = 0
         for _step in range(self.hyper["online_steps"]):
             half = self.hyper["batch_size"] // 2
             batch_refs: list[tuple[str, str]] = []
@@ -459,11 +462,15 @@ class OctopusModel:
             resolved = self._resolve_refs(batch_refs)
             if not resolved:
                 break
-            losses.append(self._train_batch(resolved, lr=self.hyper["lr_online"]))
+            loss = self._train_batch(resolved, lr=self.hyper["lr_online"])
+            if math.isnan(loss) or math.isinf(loss):
+                skipped_batches += 1
+            else:
+                losses.append(loss)
         # Weights moved: every cached market embedding is stale.
         self._market_cache = {}
         self._update_rounds += 1
-        return {"steps": len(losses), "loss": losses[-1] if losses else None}
+        return {"steps": len(losses), "skipped": skipped_batches, "loss": losses[-1] if losses else None}
 
     def reconstruction_diagnostic(self, requests: Sequence[ForecastRequest]) -> dict[str, np.ndarray] | None:
         assert self._net is not None
@@ -490,13 +497,35 @@ class OctopusModel:
                 output[label] = recon * std + mean  # back to raw bar log-return units
         return output
 
+    def verify_finiteness(self) -> tuple[bool, str]:
+        """Verify that all network parameters and optimizer momentum/variance buffers are finite.
+
+        Returns (True, "") if healthy, or (False, error_description) if any NaN or Inf is found.
+        """
+        if self._net is not None:
+            for name, param in self._net.named_parameters():
+                if not torch.isfinite(param).all():
+                    return False, f"non-finite parameter in {name}"
+        if self._optimizer is not None:
+            for param_id, state in self._optimizer.state.items():
+                for buf_name in ("exp_avg", "exp_avg_sq"):
+                    buf = state.get(buf_name)
+                    if isinstance(buf, torch.Tensor) and not torch.isfinite(buf).all():
+                        return False, f"non-finite optimizer buffer {buf_name} for param_id {param_id}"
+        return True, ""
+
+    def is_healthy(self) -> bool:
+        """Return True if model parameters and optimizer buffers are completely finite."""
+        is_finite, _ = self.verify_finiteness()
+        return is_finite
+
     def bind_panel(self, panel: TrainingPanel) -> None:
         """Swap panels (live cycle); expand the vocabulary for new tickers.
 
         New embedding rows initialize from the unknown-ticker row (index 0):
         the new ticker starts exactly where it stood while unknown and then
-        differentiates. Expansion rebuilds the optimizer (Adam moments
-        reset) -- a rare, checkpoint-boundary event, accepted and logged.
+        differentiates. Expansion rebuilds the optimizer, preserving
+        existing trunk and layer Adam moments while adding slots for new tickers.
         """
         self._panel = panel
         self._market_cache = {}
@@ -518,10 +547,18 @@ class OctopusModel:
         for ticker in new_tickers:
             self._vocab.append(ticker)
             self._vocab_index[ticker] = len(self._vocab)
+        old_state_by_param = dict(self._optimizer.state) if self._optimizer is not None else {}
         self._optimizer = torch.optim.AdamW(self._net.parameters(), lr=self.hyper["lr_online"])
+        if old_state_by_param:
+            for p in self._net.parameters():
+                if p in old_state_by_param:
+                    self._optimizer.state[p] = old_state_by_param[p]
 
     def save(self, directory: Path) -> None:
         assert self._net is not None and self._optimizer is not None and self._replay is not None
+        is_finite, err = self.verify_finiteness()
+        if not is_finite:
+            raise ValueError(f"REFUSED to save non-finite OctopusModel: {err}")
         arrays: dict[str, np.ndarray] = {}
         for key, tensor in self._net.state_dict().items():
             arrays[f"net.{key}"] = tensor.detach().cpu().numpy()
@@ -905,19 +942,21 @@ class OctopusModel:
         market_loss = torch.zeros((), device=self.device)
         if valid.any():
             positions = tensors["cal_pos"][:, -1].cpu().numpy()
-            unique_positions = sorted({int(value) for value in positions[valid.cpu().numpy()] if value >= 0})
+            # Deduplicate by calendar position: predict each distinct day once against its target,
+            # avoiding redundant backward accumulation across duplicate ticker rows for the same day.
+            unique_targets: dict[int, torch.Tensor] = {}
+            for row in np.flatnonzero(valid.cpu().numpy()):
+                pos = int(positions[row])
+                if pos >= 0 and pos not in unique_targets:
+                    unique_targets[pos] = market_targets[row]
             predictions = []
             targets_rows = []
-            latents_by_day = {
-                position: self._market_latents_for_day(position) for position in unique_positions
-            }
-            for row in np.flatnonzero(valid.cpu().numpy()):
-                position = int(positions[row])
-                latents = latents_by_day.get(position)
+            for position, tgt in sorted(unique_targets.items()):
+                latents = self._market_latents_for_day(position)
                 if latents is None:
                     continue
                 predictions.append(self._net.market_head(latents.mean(dim=0)))
-                targets_rows.append(market_targets[row])
+                targets_rows.append(tgt)
             if predictions:
                 market_loss = nn.functional.smooth_l1_loss(
                     torch.stack(predictions), torch.stack(targets_rows)
@@ -928,10 +967,55 @@ class OctopusModel:
             + self.hyper["beta"] * recon_loss
             + self.hyper["gamma"] * market_loss
         )
+        if not torch.isfinite(total):
+            warnings.warn(
+                f"Non-finite loss in _train_batch (forward={float(forward_loss.detach()):.4f}, "
+                f"recon={float(recon_loss.detach()):.4f}, market={float(market_loss.detach()):.4f}); skipping step.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._optimizer.zero_grad()
+            return float("nan")
+
+        # Snapshot parameters before step for self-healing rollback if needed
+        pre_step_state = {k: v.detach().clone() for k, v in self._net.state_dict().items()}
         self._optimizer.zero_grad()
         total.backward()
+
+        # Check gradient finiteness across all parameters before clipping and optimizer step
+        grads_finite = True
+        non_finite_param = ""
+        for name, param in self._net.named_parameters():
+            if param.grad is not None and not torch.isfinite(param.grad).all():
+                grads_finite = False
+                non_finite_param = name
+                break
+
+        if not grads_finite:
+            warnings.warn(
+                f"Non-finite gradient in parameter {non_finite_param!r}; "
+                "skipping clip_grad_norm_ and optimizer.step() to protect AdamW buffers.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._optimizer.zero_grad()
+            return float("nan")
+
         nn.utils.clip_grad_norm_(self._net.parameters(), 1.0)
         self._optimizer.step()
+
+        # Post-step verification: ensure parameters and optimizer state are completely finite
+        is_finite, err_msg = self.verify_finiteness()
+        if not is_finite:
+            warnings.warn(
+                f"Model or optimizer state became non-finite after step ({err_msg}); "
+                "rolling back weights to pre-step snapshot.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._net.load_state_dict(pre_step_state)
+            self._optimizer.zero_grad()
+            return float("nan")
         # Every cached (detached, in_graph=False) market embedding was
         # computed from the market encoder's weights AS OF THE LAST STEP --
         # this step just moved them, so every entry is now stale. Within a
