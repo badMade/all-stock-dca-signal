@@ -348,3 +348,230 @@ Substantive corrections adopted from round 3's open-question answers:
 Round 4 was dispatched against Revision 5 with one added instruction: findings that are
 irreducible for a single-operator local daemon may be marked ACCEPTED-RESIDUAL, because a plan
 cannot stay blocked on a property no implementation of this product could have.
+
+
+## Round 4 — Revision 5
+
+Usage: 15,060,254 input (14,354,304 cached), 130,256 output, 103,408 reasoning.
+
+### Codex reply
+
+Revision 5 is materially stronger, but 14 carried findings and one new KILL remain open.
+
+[BLOCKER] diagnostics-branch trust paradox — STILL OPEN (FIX): the worktree isolates repair content, but the plan never binds launchd to the installed wheel instead of the mutable checkout; the operator’s same-UID `gh` authority is ACCEPTED-RESIDUAL, but coordinator provenance is fixable.
+
+[BLOCKER] admission is neither atomic nor authoritative — RESOLVED: `state.json` is now the sole admission authority, with reservation and counters changed in one locked, crash-durable transaction.
+
+[BLOCKER] loop controls only throttle — RESOLVED: the cumulative pre-work epoch charge and non-resetting latch give automation a finite lifetime bound; deliberate human re-arming is ACCEPTED-RESIDUAL.
+
+[BLOCKER] unbounded work precedes the governor — STILL OPEN (FIX): `setitimer` is an in-process signal, cannot bound blocking C or kernel calls, and TTL lock theft can admit overlapping wedged processes rather than terminating them; repair-side `git` and `gh` operations also lack an external whole-run watchdog.
+
+[BLOCKER] durable evidence contract is unmet — STILL OPEN (FIX): “complete” conflicts with truncation and same-fingerprint overwrites, missing-key observation cannot form the specified fingerprint filename, and `git check-ignore` rejects supported artifact roots outside the checkout.
+
+[BLOCKER] spend caps are postpaid — STILL OPEN (FIX): the claimed 25-minute CI worst case is actually up to 150 runner-minutes across current PR workflows, reconciliation describes only one run, and every repair PR also invokes the uncapped Gemini-backed reviewer.
+
+[BLOCKER] forward clock jumps bypass limits — STILL OPEN (FIX): successive accepted two-day jumps ratchet the anchor indefinitely and even a small month-end jump manufactures a new budget period; assertion-based `--now` protection also disappears under `python -O`.
+
+[BLOCKER] a refusing step does not stop the job — RESOLVED-BY-SCOPE: the hosted multi-job dispatcher containing that fallthrough is deleted.
+
+[BLOCKER] the budget default violates the account grep — RESOLVED: the offending defaults and tracked snapshots are gone from the tracked scan, the key is genuinely ignored, and the repository invariant currently passes.
+
+[BLOCKER] public redaction is not closed over the artifact — STILL OPEN (FIX): the displayed regex still misses `accountNumber…`, `account_id_…`, and `acctNbr.…`, while an unset variable’s unknown former value cannot be matched and must be documented as ACCEPTED-RESIDUAL rather than claimed covered.
+
+[BLOCKER] the public fingerprint is secret-derived — RESOLVED: sanitized-input HMAC, domain separation, owner-only atomic key creation, ignore coverage, and fail-closed key loss close the oracle.
+
+[BLOCKER] the frozen repair baseline is not as claimed — RESOLVED-BY-SCOPE: the broken and unrelated legacy steps are deleted, leaving only the explicitly specified lint/format adapter.
+
+[BLOCKER] incidents never reach the healer — RESOLVED: the adapter protocol and Rock 6 end-to-end path connect a detected lint incident to source-specific verification and publication.
+
+[BLOCKER] CI collection is lossy and logless — STILL OPEN (FIX): cursoring only by highest run ID loses reruns sharing that ID but having a new `run_attempt`, and a capped newest-first page can advance past older unseen runs.
+
+[BLOCKER] hard console crashes are invisible — RESOLVED-BY-SCOPE: persisted-source observation is now the honest product boundary, with stale records detecting death while missing crash output is explicitly deferred.
+
+[BLOCKER] self-origin filtering is late and heuristic — STILL OPEN (FIX): a workflow ID identifies the shared workflow definition and would suppress unrelated runs, while head-versus-merge-commit language is contradictory and reconciliation can lag collection; provenance needs a composite run-attempt, SHA, and PR identity without discarding private evidence.
+
+[BLOCKER] incident states have dead ends — RESOLVED: the execution/review lease split and merge, close, CI-red, expiry, refusal, abandonment, and quarantine transitions close the original dead ends.
+
+[MAJOR] unactionable incidents can monopolize admission — STILL OPEN (FIX): contributor-PR lint failures have an adapter but are absent from the `origin/main` repair target, so untrusted CI input can consume attempts, epoch capacity, and breaker failures unless it is report-only.
+
+[BLOCKER] runtime config is not fail-closed — STILL OPEN (FIX): Revision 5 restores missing-file and missing-field checks but silently drops Revision 4’s safe upper bounds, allowing configured deadlines, archive limits, and epoch bounds to defeat practical boundedness.
+
+[BLOCKER] launchd wiring can fail or relaunch indefinitely — STILL OPEN (FIX): no exact plist contract states the program, installed-code location, schedule, working directory, logs, sequencing, or `KeepAlive=false`, and the acceptance command still contains `<plist>`.
+
+[BLOCKER] ledger corruption and branch races lack recovery — STILL OPEN (FIX): PR intent lives only in the non-authoritative journal and is written after branch creation and push, leaving crashes before that point with an untracked remote branch and no specified `git ls-remote` recovery.
+
+[BLOCKER] stated proofs cannot establish the plan — STILL OPEN (FIX): Rock 7 contains a placeholder and prose assertions rather than one executable acceptance, Rock 6’s dry-run command does not assert no writes, and existing tests still require the workflow and legacy healer slated for deletion.
+
+[MAJOR] future-model accounting is scope creep — RESOLVED-BY-SCOPE: speculative token/USD infrastructure remains deferred and a reservation mechanism for resources actually consumed by this cycle is justified.
+
+[BLOCKER] repair admission suppresses failure detection — RESOLVED: observation is independently invoked and Rock 4 explicitly exercises it with both breaker and epoch exhausted.
+
+[BLOCKER] governing documents define different products — STILL OPEN (FIX): VTO says only `git` and `gh` are external binaries despite Ruff, healthcheck tooling, and `sysctl`, calls a capped archive complete, and PLAN claims the `gh` residual appears in DEFERRED when it does not.
+
+[MAJOR] orphaned self-heal scheduler survives the deletion — STILL OPEN (KILL): `.github/workflows/compute-schedule.yml`, its metadata, and `scripts/compute_schedule.py` retain a privileged monthly PR writer whose only consumer is the deleted hosted healer.
+
+Open question 1: No. Worktree isolation and the minimal adapter environment adequately protect the repair target, but not the coordinator’s code provenance; bind launchd to a specific installed artifact and absolute entry point. A same-operator compromise or misuse of that operator’s `gh` credential is ACCEPTED-RESIDUAL.
+
+Open question 2: No. `ITIMER_REAL` is not external enforcement and cannot guarantee interruption while Python is blocked in C or the kernel. Use an outer supervisor that starts a process group, kills it at the deadline, waits for its termination, and only then permits another tick.
+
+Open question 3: Charging abandoned work at worst case is correct. A same-UID actor able to crash, rewrite state, or re-arm the daemon is ACCEPTED-RESIDUAL, but contributor-controlled CI is not local-only and must be excluded from repair admission before exhaustion-based denial is considered out of threat model.
+
+VERDICT: BLOCKED — 15 open finding(s)
+
+## Round 5 — Revision 6 (FINAL ROUND)
+
+Usage: 17,902,517 input (17,146,368 cached), 147,911 output, 117,081 reasoning.
+
+### Codex reply
+
+Revision 6 closes most findings, but I would still block the build on 11 defects.
+
+[BLOCKER] diagnostics-branch trust paradox — ACCEPTED-RESIDUAL: installed-wheel execution and the isolated `origin/main` worktree close the fixable trust gap; same-UID `gh` authority is irreducible and now documented.
+
+[BLOCKER] admission is neither atomic nor authoritative — RESOLVED: one locked, crash-durable `state.json` transaction now governs admission, reservations, counters, and remote intent.
+
+[BLOCKER] loop controls only throttle — RESOLVED: the latched breaker and cumulative human-rearmed epoch impose a finite autonomous repair bound.
+
+[BLOCKER] unbounded work precedes the governor — STILL OPEN: collectors need separate groups for per-source `killpg`, but killing and waiting only for the worker group can leave those collectors orphaned while the singleton lock is released.
+
+[BLOCKER] durable evidence contract is unmet — RESOLVED: run-scoped sequence names, `NOKEY` handling, explicit caps, durable writes, and the corrected root-containment rule close the original evidence defect.
+
+[BLOCKER] spend caps are postpaid — STILL OPEN: 150 Actions-minutes is the correct current fan-out ceiling, but self-heal PRs still invoke Gemini without a token, call, or USD limit, and no proof recalculates the timeout sum when workflows change.
+
+[BLOCKER] forward clock jumps bypass limits — STILL OPEN: the budget counter still advances from wall time, `max_cumulative_skew_seconds` has no default or cross-field bound, and no proof covers daily or period-boundary clock jumps.
+
+[BLOCKER] a refusing step does not stop the job — RESOLVED-BY-SCOPE: the hosted workflow containing that fallthrough is deleted.
+
+[BLOCKER] the budget default violates the account grep — RESOLVED: the offending values and tracked snapshots are gone, while the fingerprint key is genuinely ignored.
+
+[BLOCKER] public redaction is not closed over the artifact — STILL OPEN: the specified regex still fails the expressly claimed `account_id_<digits>` and `account_number_<digits>` forms; unknown former values of unset variables are separately ACCEPTED-RESIDUAL.
+
+[BLOCKER] the public fingerprint is secret-derived — RESOLVED: sanitize-first HMAC, domain separation, owner-only key creation, ignore coverage, and fail-closed key loss close the oracle.
+
+[BLOCKER] the frozen repair baseline is not as claimed — RESOLVED-BY-SCOPE: the broken legacy steps are deleted and only lint/format remains.
+
+[BLOCKER] incidents never reach the healer — STILL OPEN: the only production plist invokes `selfheal observe`, which is forbidden from opening PRs, and nothing subsequently invokes the independently gated `repair` command.
+
+[BLOCKER] CI collection is lossy and logless — STILL OPEN: a tuple high-watermark still skips attempt 2 of an older run after the cursor has advanced to a newer run ID, and `gh run list` provides no oldest-first ordering control.
+
+[BLOCKER] hard console crashes are invisible — RESOLVED-BY-SCOPE: the product now explicitly covers persisted sources only and defers incremental console persistence.
+
+[BLOCKER] self-origin filtering is late and heuristic — RESOLVED: composite run-attempt, SHA, and PR provenance, pending classification, and private retention close the actionable loop.
+
+[BLOCKER] incident states have dead ends — RESOLVED: execution and review leases now cover failure, abandonment, PR, CI, close, merge, expiry, and quarantine outcomes.
+
+[MAJOR] unactionable incidents can monopolize admission — RESOLVED: non-`main` incidents are report-only regardless of adapter.
+
+[BLOCKER] runtime config is not fail-closed — STILL OPEN: the newly load-bearing `max_cumulative_skew_seconds` lacks a default, safe ceiling, and required relationship to the shortest reset period, while `max_wall_clock_seconds` is likewise used without a stated ceiling.
+
+[BLOCKER] launchd wiring can fail or relaunch indefinitely — STILL OPEN: the artifact-root working directory supplies no repository path for `git worktree`, and `pip install .` installs neither Ruff nor healthcheck tooling because those are optional extras and the minimal PATH does not recover them.
+
+[BLOCKER] ledger corruption and branch races lack recovery — RESOLVED: authoritative pre-branch intent plus `git ls-remote` and `gh pr list` reconciliation covers the orphaned-branch interval.
+
+[BLOCKER] stated proofs cannot establish the plan — STILL OPEN: Rock 4 still tests the deleted `setitimer` and expired-lock theft mechanisms, while Rock 7 neither exercises the installed toolchain nor explicitly proves the cascaded files absent.
+
+[MAJOR] future-model accounting is scope creep — RESOLVED-BY-SCOPE: speculative LLM-repair pricing remains deferred; the existing reviewer’s real spend belongs to finding 6.
+
+[BLOCKER] repair admission suppresses failure detection — RESOLVED: observation remains independent of every repair gate and preserves excluded incidents privately.
+
+[BLOCKER] governing documents define different products — STILL OPEN: VTO and DEFERRED still identify themselves as Revision 5, VTO still promises a “complete” archive twice, and PLAN defines the budget period both as calendar-month UTC and as a non-calendar monotonic counter.
+
+[MAJOR] orphaned self-heal scheduler survives the deletion — RESOLVED-BY-SCOPE: the complete hosted-scheduler cascade is now explicitly deleted; its missing absence proof is charged to finding 22.
+
+[BLOCKER] daily repair ceiling is unspecified — STILL OPEN: Revision 6 retains only a `daily counters` field and a VTO promise, with no configurable default-one admission rule or proof that a second repair in the same accepted day is refused.
+
+Open question 1: Yes—the remaining finding 1 risk is genuinely ACCEPTED-RESIDUAL; repository discovery and dependency provisioning remain fixable deployment defects under finding 20.
+
+Open question 2: No—the Python timeout is adequate, but the process hierarchy is not. The supervisor must track, terminate, and reap every collector process group on normal exit, worker crash, timeout, and stale-lock recovery before releasing the lock.
+
+Open question 3: No—the counter is durable but its rollover evidence still comes from the mutable wall clock. Use a human-authorized budget epoch or a fully specified trusted transition rule; no independent cross-reboot monotonic clock exists locally.
+
+Open question 4: The remaining items are build blockers, not refinements: the deployed system cannot invoke repair, can leave unbounded child work, can miss rerun failures and account-shaped secrets, and lacks complete frequency and spend enforcement. Same-UID authority, unset former secret values, cryptographic provenance, multi-machine coordination, and console persistence are the accepted residuals or follow-up work.
+
+VERDICT: BLOCKED — 11 open finding(s)
+
+## DEADLOCK — handed to the operator (decision gate 2)
+
+Round 5 is the last round the skill permits, and it ended `VERDICT: BLOCKED — 11 open`.
+No sixth round was sent. Trajectory across the meeting: 23 -> 22 -> 18 -> 15 -> 11 open, with
+16 findings resolved, 6 resolved-by-scope, and 3 accepted as irreducible residual risk.
+
+Total Integrator cost: roughly 61M input tokens (58M cached), 525k output, 421k reasoning,
+across five rounds against one resumed session.
+
+### Visionary's read on the 11 still-open findings
+
+I agree with Codex on all eleven. None is a matter of taste; each names a concrete defect.
+Two of them are fatal to the operator's own stated requirements and neither was caught by me:
+
+1. **Nothing invokes `repair`.** The Revision 4 split put observation and repair behind
+   independent gates and wired launchd to `observe`. No plist, cron entry, or code path ever
+   calls `repair`. As specified, the system collects forever and never fixes anything —
+   operator requirement #2 unmet. I carried this defect through Revisions 4, 5 and 6 without
+   noticing.
+2. **The once-per-day repair ceiling is not specified.** Only a `daily counters` field and a
+   VTO sentence survive; there is no `max_repairs_per_day` default, no admission rule, and no
+   proof that a second same-day repair is refused — operator requirement #3 unmet.
+
+The other nine are precise and individually cheap, and several are my own carelessness rather
+than genuine design difficulty:
+
+3. Collector process groups can be orphaned when the supervisor kills and reaps only the worker
+   group before releasing the singleton lock.
+4. The Gemini-backed reviewer invoked by every self-heal PR has no token/call/USD ceiling, and
+   no proof recomputes the timeout sum when workflows change.
+5. The budget period counter is durable but its rollover evidence still comes from the mutable
+   wall clock.
+6. The redaction regex still fails `account_id_<digits>` and `account_number_<digits>` — the
+   optional `(?:nbr|number|no|id)?` group sits before the separator class, so a separator
+   *preceding* the qualifier is unmatched. A one-character fix to a pattern I claimed covered
+   exactly these forms.
+7. The composite CI cursor still skips attempt 2 of an older run once the cursor passes to a
+   newer run id, and `gh run list` offers no oldest-first ordering.
+8. `max_cumulative_skew_seconds` became load-bearing in Revision 6 with no default, no ceiling,
+   and no stated relationship to the shortest reset period.
+9. The launchd working directory is the artifact root, which gives `git worktree` no repository
+   path; and `pip install .` installs neither Ruff nor the healthcheck tooling, since both are
+   optional extras the minimal PATH cannot recover.
+10. Rock 4 still tests `setitimer` and expired-lock theft — mechanisms Revision 6 deleted. Rock
+    7 never proves the cascaded files absent.
+11. `VTO.md` and `DEFERRED.md` still identify as Revision 5, the VTO still promises a
+    "complete" archive twice, and PLAN defines the budget period both as calendar-month UTC and
+    as a non-calendar monotonic counter.
+
+### The tradeoff, stated plainly
+
+Every one of the eleven is a *specification* defect. Nine are one-to-three-line edits; the two
+fatal ones are each a config key plus an invocation plus a test. None requires rethinking the
+architecture, which has now survived five adversarial rounds and is materially better for them.
+
+The genuine question is whether the twelfth, thirteenth and fourteenth defects are best found
+by a sixth round of prose review or by writing the code, where a claim like "a second same-day
+repair is refused" becomes a test that either passes or fails. My recommendation is the latter:
+review has reached the point of diminishing returns against prose, and Codex reviewing a real
+diff is a stronger gate than Codex reviewing a plan. The decision is the operator's.
+
+### Operator tie-break (2026-09-15)
+
+**Decision: start building; fix all 11 open findings in code.** Review has reached diminishing
+returns against prose, and a claim like "a second same-day repair is refused" is better proven
+by a test than by a paragraph. Codex moves from reviewing plans to reviewing real diffs, one
+Rock at a time, under the skill's build contract: `--sandbox workspace-write`, the Visionary
+reads the full diff and re-runs the proof command personally, and at most two fix rounds per
+Rock before the Visionary takes the wheel.
+
+Each of the 11 still-open findings is assigned to the Rock that must close it:
+
+| # | Finding | Closed by |
+|---|---|---|
+| 1 | nothing invokes `repair` | Rock 6 (CLI) + Rock 7 (plist) |
+| 2 | no `max_repairs_per_day` rule or proof | **Rock 1** (config) + Rock 5 (admission) |
+| 3 | orphaned collector process groups | Rock 4 (supervisor) |
+| 4 | Gemini reviewer spend uncapped | Rock 5 (budget) |
+| 5 | budget rollover reads the mutable wall clock | Rock 5 |
+| 6 | regex misses `account_id_<digits>` | Rock 2 (redaction) |
+| 7 | CI cursor skips attempt 2 of an older run | Rock 4 (sources) |
+| 8 | `max_cumulative_skew_seconds` has no default or ceiling | **Rock 1** |
+| 9 | launchd cwd gives `git worktree` no repo; ruff not installed | Rock 7 |
+| 10 | Rock 4 tests deleted mechanisms; Rock 7 lacks an absence proof | Rocks 4, 7 |
+| 11 | VTO/DEFERRED still say Revision 5; contradictory budget period | Rock 7 (docs) |
