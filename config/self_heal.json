@@ -1,0 +1,19 @@
+{
+  "$schema": "../schemas/self_heal.schema.json",
+  "enabled": false,
+  "max_repairs_per_day": 1,
+  "max_repairs_per_epoch": 10,
+  "breaker_failure_threshold": 3,
+  "max_attempts_per_fingerprint": 3,
+  "max_tick_seconds": 600,
+  "max_wall_clock_seconds": 1800,
+  "monthly_actions_minutes": 300,
+  "ci_worst_case_minutes": 150,
+  "max_forward_skew_minutes": 2880,
+  "max_cumulative_skew_minutes": 10080,
+  "max_archive_kib_per_incident": 1024,
+  "max_archive_64kib_blocks_per_run": 1024,
+  "budget_period_hours": 720,
+  "review_lease_days": 14,
+  "execution_lease_seconds": 3600
+}
