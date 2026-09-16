@@ -167,6 +167,7 @@ class TestSelfHealingCheckpoint:
 
         run_dir = tmp_path / "test_run"
         run_dir.mkdir()
+        (run_dir / "ledger").mkdir()
         checkpoint_dir = run_dir / "checkpoint"
         good_dir = run_dir / "checkpoint.good"
 
