@@ -180,10 +180,8 @@ class TestSelfHealingCheckpoint:
 
         # Copy to checkpoint_dir, then corrupt checkpoint_dir with NaN
         shutil.copytree(good_dir, checkpoint_dir)
-        np.savez(
-            checkpoint_dir / "models" / "octopus" / "weights.npz",
-            weight=np.array([1.0, float("nan")], dtype=np.float32),
-        )
+        nan_weight = np.array([1.0, float("nan")], dtype=np.float32)
+        np.savez(checkpoint_dir / "models" / "octopus" / "weights.npz", weight=nan_weight)
 
         assert _checkpoint_has_nan(checkpoint_dir)
         assert not _checkpoint_has_nan(good_dir)

@@ -414,6 +414,14 @@ size a run unless all of these hold:
 | `afternoon_states_undated` | `== 0` |
 | `afternoon_states_invalid_notional` | `== 0` |
 
+When `run_states_unclassifiable` is nonzero, `evidence.unclassifiable_reasons`
+(keyed by the same paths as `unclassifiable_paths`) names why each one failed:
+either it has no `run_classification` key at all (its top-level keys are
+listed, as a hint that the field was renamed or the file predates it) or the
+key is present but not an object. This is diagnostic only — it does not change
+what the gate requires, and a plausible-looking reason is not grounds to trust
+the file. Route the fix at whatever wrote the file, then re-run this check.
+
 `afternoon_states_seen` is keyed on `is_afternoon_scheduled_evidence` — the same
 predicate `deployed_by_day` applies — rather than on `classify_stream`, so the
 two cannot disagree about what counts. The roster's own 10:30/12:30 artifacts are

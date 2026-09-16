@@ -158,6 +158,63 @@ def test_evidence_separates_a_parsed_but_uninformative_state(tmp_path):
     assert evidence["run_states_unreadable"] == 0
     assert evidence["run_states_unclassifiable"] == 1
     assert evidence["afternoon_states_seen"] == 0
+    assert evidence["unclassifiable_reasons"] == {
+        str(day / "run_state.json"): "no run_classification key (top-level keys: none)"
+    }
+
+
+def test_evidence_unclassifiable_reason_names_a_missing_key(tmp_path):
+    """Regression for the dca_risk run-state schema investigation: an operator
+    staring at "N files unclassifiable" needs to know WHY without opening each
+    one by hand -- whether the file never had a run_classification block at all
+    (an old/foreign writer) or carries one of the wrong shape (real
+    corruption). The reason lists the file's actual top-level keys so a
+    renamed/flattened field (e.g. a stray ``classification`` key) is
+    immediately visible rather than looking identical to a plain omission.
+    """
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "scheduled_runs"
+    day = root / "20260707_1520ET"
+    day.mkdir(parents=True)
+    state_path = day / "run_state.json"
+    state_path.write_text(
+        _json.dumps({"trading_day": "2026-07-07", "classification": {"stream": "scheduled"}}),
+        encoding="utf-8",
+    )
+
+    _states, evidence = _load_states_with_evidence(root)
+
+    assert evidence["run_states_unclassifiable"] == 1
+    assert evidence["unclassifiable_paths"] == [str(state_path)]
+    assert evidence["unclassifiable_reasons"] == {
+        str(state_path): "no run_classification key (top-level keys: classification, trading_day)"
+    }
+
+
+def test_evidence_unclassifiable_reason_names_a_wrong_type(tmp_path):
+    """The other unclassifiable shape: the key exists but is not an object."""
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "scheduled_runs"
+    day = root / "20260707_1520ET"
+    day.mkdir(parents=True)
+    state_path = day / "run_state.json"
+    state_path.write_text(
+        _json.dumps({"trading_day": "2026-07-07", "run_classification": "scheduled"}),
+        encoding="utf-8",
+    )
+
+    _states, evidence = _load_states_with_evidence(root)
+
+    assert evidence["run_states_unclassifiable"] == 1
+    assert evidence["unclassifiable_reasons"] == {
+        str(state_path): "run_classification is str, not an object"
+    }
 
 
 def test_evidence_counts_a_manual_only_tree_as_no_afternoon_history(tmp_path):
@@ -1314,6 +1371,32 @@ def test_unusable_states_outside_the_window_do_not_block(tmp_path):
     # should be able to see that.
     assert evidence["unusable_states_outside_window"] == 1
     assert len(evidence["outside_window_paths"]) == 1
+
+
+def test_unclassifiable_reasons_omit_a_deferred_out_of_window_path(tmp_path):
+    """A stale unclassifiable file deferred out of the window must not appear
+    in unclassifiable_reasons either -- that dict mirrors unclassifiable_paths
+    exactly, or it would misleadingly imply the file counted against the gate
+    when it did not.
+    """
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    as_of = date(2026, 8, 26)
+    root = tmp_path / "scheduled_runs"
+    day = root / "20260101_1530ET"  # ~8 months stale, same as the unreadable case above
+    day.mkdir(parents=True)
+    (day / "run_state.json").write_text(
+        _json.dumps({"trading_day": "2026-01-01"}), encoding="utf-8"
+    )
+
+    _states, evidence = _load_states_with_evidence(root, as_of=as_of)
+
+    assert evidence["run_states_unclassifiable"] == 0
+    assert evidence["unclassifiable_paths"] == []
+    assert evidence["unclassifiable_reasons"] == {}
+    assert evidence["unusable_states_outside_window"] == 1
 
 
 def test_unusable_states_inside_the_window_still_block(tmp_path):

@@ -353,14 +353,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if mode == "resume":
             last_p = get_shard_last_processed_date(shard_dir)
-            stale_info = (
-                f" (stale: processed through {last_p}, target is {target_end})"
-                if last_p and target_end and last_p < target_end
-                else ""
-            )
+            is_stale = last_p and target_end and last_p < target_end
+            stale_info = f" (stale: processed through {last_p}, target is {target_end})" if is_stale else ""
             print(
-                f"\nFound existing save point! Resuming Shard {args.shard} from "
-                f"{shard_dir}/checkpoint{stale_info} ..."
+                f"\nFound existing save point! Resuming Shard {args.shard} "
+                f"from {shard_dir}/checkpoint{stale_info} ..."
             )
         else:
             print(f"\nLaunching Shard {args.shard} ({len(target_shard)} tickers) -> {shard_dir} ...")
@@ -378,10 +375,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             cmd, mode = build_shard_cmd(s, shard_dir, args, target_end=target_end)
             if mode == "resume":
                 last_p = get_shard_last_processed_date(shard_dir)
+                has_report = (shard_dir / "report" / "report.json").is_file()
                 stale_tag = (
-                    f" (stale: processed through {last_p}, target is {target_end})"
-                    if (shard_dir / "report" / "report.json").is_file()
-                    else ""
+                    f" (stale: processed through {last_p}, target is {target_end})" if has_report else ""
                 )
                 action = f"RESUME from {shard_dir}/checkpoint{stale_tag}"
             elif mode == "completed":
