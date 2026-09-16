@@ -121,7 +121,11 @@ def is_shard_completed(shard_dir: Path, target_end: str | None = None) -> bool:
 
 def has_checkpoint(shard_dir: Path) -> bool:
     """Return True if a durable checkpoint exists from a previous run."""
-    return (shard_dir / "checkpoint").is_dir() or (shard_dir / "checkpoint.prev").is_dir() or (shard_dir / "checkpoint.good").is_dir()
+    return (
+        (shard_dir / "checkpoint").is_dir()
+        or (shard_dir / "checkpoint.prev").is_dir()
+        or (shard_dir / "checkpoint.good").is_dir()
+    )
 
 
 def build_shard_cmd(
@@ -349,8 +353,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if mode == "resume":
             last_p = get_shard_last_processed_date(shard_dir)
-            stale_info = f" (stale: processed through {last_p}, target is {target_end})" if last_p and target_end and last_p < target_end else ""
-            print(f"\nFound existing save point! Resuming Shard {args.shard} from {shard_dir}/checkpoint{stale_info} ...")
+            stale_info = (
+                f" (stale: processed through {last_p}, target is {target_end})"
+                if last_p and target_end and last_p < target_end
+                else ""
+            )
+            print(
+                f"\nFound existing save point! Resuming Shard {args.shard} from "
+                f"{shard_dir}/checkpoint{stale_info} ..."
+            )
         else:
             print(f"\nLaunching Shard {args.shard} ({len(target_shard)} tickers) -> {shard_dir} ...")
             print(f"Save points: writing checkpoints every {args.checkpoint_every} steps.")
@@ -367,7 +378,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             cmd, mode = build_shard_cmd(s, shard_dir, args, target_end=target_end)
             if mode == "resume":
                 last_p = get_shard_last_processed_date(shard_dir)
-                stale_tag = f" (stale: processed through {last_p}, target is {target_end})" if (shard_dir / "report" / "report.json").is_file() else ""
+                stale_tag = (
+                    f" (stale: processed through {last_p}, target is {target_end})"
+                    if (shard_dir / "report" / "report.json").is_file()
+                    else ""
+                )
                 action = f"RESUME from {shard_dir}/checkpoint{stale_tag}"
             elif mode == "completed":
                 action = "ALREADY COMPLETED"

@@ -1297,7 +1297,8 @@ class WalkForwardHarness:
                 )
                 if n_non_finite > 0:
                     self.log(
-                        f"CRITICAL: Model {name!r} emitted {n_non_finite}/{len(forecasts)} non-finite forecasts on {context_date_iso}!"
+                        f"CRITICAL: Model {name!r} emitted {n_non_finite}/{len(forecasts)} non-finite "
+                        f"forecasts on {context_date_iso}!"
                     )
                     self._model_failure = True
             repairs = getattr(model, "last_repairs", None)
