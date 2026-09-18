@@ -85,7 +85,6 @@ import pandas as pd  # noqa: E402
 import torch  # noqa: E402
 from data import discover_available_tickers  # noqa: E402
 from octopus_model import _BAR_SLICE, OctopusModel  # noqa: E402
-from run_sharded import split_into_shards  # noqa: E402
 
 from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
 
@@ -423,7 +422,20 @@ def peak_rss_mb() -> float:
 # Panel + model construction
 # ----------------------------------------------------------------------------
 def resolve_shard_tickers(history_dir: Path, shard: int, shards: int) -> list[str]:
-    """The 1-indexed shard's ticker list, from the same split run_sharded uses."""
+    """The 1-indexed shard's ticker list, from the same split run_sharded uses.
+
+    ``run_sharded`` is imported HERE, not at module scope, and deliberately so:
+    its module body runs ``os.environ.setdefault("DCA_LEDGER_MAX_LINKS", "2")``
+    on darwin, which raises the link count ledger.py tolerates before it
+    refuses an aliased shard file. Importing it at module scope leaked that
+    setting into every process that so much as imported this module -- including
+    pytest collecting tests/test_train_foundation.py, which silently disarmed
+    five hardlink-alias refusals in tests/test_ledger_security.py that only fail
+    when the whole suite is collected together. This module never touches the
+    ledger, so it has no business setting that variable at all.
+    """
+    from run_sharded import split_into_shards
+
     available = discover_available_tickers(history_dir)
     groups = split_into_shards(sorted(available), shards)
     if not 1 <= shard <= len(groups):

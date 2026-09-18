@@ -206,3 +206,16 @@ class TestMetricsArtifact:
         payload = json.loads(path.read_text())
         assert set(payload["stages"]) == {"1", "2"}
         assert payload["shard"] == 1
+
+
+def test_importing_this_module_does_not_arm_the_ledger_link_allowance():
+    # Regression: train_foundation used to `from run_sharded import
+    # split_into_shards` at module scope, and run_sharded's module body sets
+    # DCA_LEDGER_MAX_LINKS=2 on darwin. Merely collecting THIS test file then
+    # raised the link count ledger.py tolerates, and five hardlink-alias
+    # refusals in tests/test_ledger_security.py stopped raising -- but only
+    # when the full suite was collected, so the file passed in isolation.
+    import os
+
+    assert "DCA_LEDGER_MAX_LINKS" not in os.environ
+    assert not hasattr(tf, "split_into_shards")
