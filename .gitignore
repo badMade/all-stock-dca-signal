@@ -98,6 +98,11 @@ rocket-fuel/**/rounds/*.jsonl
 # 6-12 digit ML counts that match _ACCOUNT_SHAPED, and the .jsonl.gz archives fall through
 # test_every_tracked_file_is_either_scanned_or_a_named_exemption entirely.
 analysis/real-octopus-run/
+# train_foundation.py's curriculum pre-training output, ignored for exactly the same
+# reasons: shard_N_stage1.pt / shard_N_final.pt are ~10 MB of binary weights apiece, and
+# shard_N_metrics.json carries ordinary 6-9 digit window/step/parameter counts that match
+# test_config_invariants.py's _ACCOUNT_SHAPED grep.
+analysis/foundation-octopus-run/
 
 # rocket-fuel plan-revision snapshots. Kept on disk so the Integrator can diff revisions,
 # but untracked: they are frozen copies of superseded plans and carry whatever literals those

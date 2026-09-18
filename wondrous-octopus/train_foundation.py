@@ -507,6 +507,7 @@ def run_stage(
 
     for epoch in range(config.epochs):
         started = time.monotonic()
+        epoch_skipped = 0
         totals: list[float] = []
         forwards: list[float] = []
         recons: list[float] = []
@@ -531,6 +532,7 @@ def run_stage(
                 # so the metrics artifact shows instability instead of hiding it
                 # in an average that silently skipped the bad batches.
                 skipped_steps += 1
+                epoch_skipped += 1
                 continue
             totals.append(total)
             forwards.append(components.get("forward", float("nan")))
@@ -547,7 +549,8 @@ def run_stage(
             {
                 "epoch": epoch + 1,
                 "seconds": round(elapsed, 2),
-                "steps": len(totals) + skipped_steps,
+                "steps": len(totals) + epoch_skipped,
+                "skipped_nonfinite_steps": epoch_skipped,
                 "lr_first": epoch_lr_first,
                 "lr_last": epoch_lr_last,
                 "loss_total_mean": _mean(totals),
@@ -692,6 +695,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "feature_count": len(panel.feature_names),
         "window_len": args.window_len,
         "seed": args.seed,
+        # Recorded so the artifact is self-describing: a benchmark capped at N
+        # steps per epoch must not be mistaken for a completed production run
+        # when someone reads the epoch timings months later.
+        "limit_steps": args.limit_steps,
+        "is_capped_run": args.limit_steps is not None,
     }
 
     model = initialize_model(

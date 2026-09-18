@@ -58,6 +58,11 @@ _BAR_CONSISTENCY_RTOL = 1e-4
 #: array, forecast dict, and metrics table uses.
 COMPONENTS = ("open", "high", "low", "close")
 
+#: Inclusive bounds of what datetime64[ns] can represent. Dates outside this
+#: window are unusable downstream (and crash the cast -- see load_history_csv).
+_NS_EPOCH_MIN = pd.Timestamp("1677-09-22")
+_NS_EPOCH_MAX = pd.Timestamp("2262-04-10")
+
 
 def discover_available_tickers(history_dir: Path, tickers: list[str] | None = None) -> list[str]:
     """Tickers with a present ``<ticker>.csv`` under ``history_dir``.
@@ -147,7 +152,22 @@ def load_history_csv(path: Path) -> pd.DataFrame:
     # system -- closes the whole bug class instead of teaching each
     # comparison site to tolerate a raw timestamp. No downstream code reads
     # sub-day precision (nothing in this tree touches .dt.hour/.dt.time).
-    frame["Date"] = parsed_date.dt.normalize()
+    # errors="coerce" does NOT catch every malformed date: dateutil happily
+    # reads a truncated "04-27" (year missing -- real corruption present in
+    # the archive, e.g. CBU.csv's first data row) as 0001-04-27, which is a
+    # perfectly valid Timestamp and survives the dropna below. It is NOT
+    # representable in datetime64[ns] (range 1677-09-21 .. 2262-04-11), and
+    # features.build_panel()'s `to_numpy(dtype="datetime64[ns]")` SEGFAULTS
+    # on the out-of-range cast under pandas 3.0.5 / numpy 2.5.1 rather than
+    # raising -- taking down a multi-hour full-archive run with no traceback
+    # and no indication of which ticker was at fault. Forced to NaT here, at
+    # the one place every row enters the system, so the existing dropna
+    # treats it like any other unusable row: logged as a dropped row, never
+    # a blocker (docs/wondrous_octopus.md's "missing/corrupt tickers are
+    # never blockers" contract, which a segfault plainly violated).
+    normalized = parsed_date.dt.normalize()
+    out_of_ns_range = (normalized < _NS_EPOCH_MIN) | (normalized > _NS_EPOCH_MAX)
+    frame["Date"] = normalized.mask(out_of_ns_range)
     for column in _NUMERIC_RAW_COLUMNS:
         if column in frame.columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")

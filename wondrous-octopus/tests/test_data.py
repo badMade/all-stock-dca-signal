@@ -316,3 +316,33 @@ def test_panel_max_tickers_keeps_longest_histories_deterministically(synthetic_h
     # longest-history-then-alphabetical keeps AAA and BBB.
     assert panel.tickers == ["AAA", "BBB"]
     assert panel.skipped["CCC"] == "over_max_tickers"
+
+
+def test_a_date_outside_the_ns_range_is_dropped_instead_of_crashing_the_panel_build(synthetic_history_dir):
+    # Regression: ticker_data/CBU.csv's first data row carries "04-27" -- a
+    # truncated date with no year. pd.to_datetime(errors="coerce") does NOT
+    # coerce it; dateutil reads it as 0001-04-27, a valid Timestamp that
+    # survives dropna but is outside datetime64[ns]'s representable range
+    # (1677-09-21 .. 2262-04-11). features.build_panel()'s
+    # to_numpy(dtype="datetime64[ns]") then SEGFAULTED on that cast (pandas
+    # 3.0.5 / numpy 2.5.1) instead of raising, killing a full-archive run
+    # with no traceback naming the ticker. Asserted on the invariant rather
+    # than on "04-27" itself, because which out-of-range date dateutil
+    # invents for a yearless string depends on the rest of the column.
+    import features
+
+    frame = make_synthetic_ohlcv(seed=11).reset_index(drop=True)
+    frame["Date"] = frame["Date"].astype(str)
+    frame.loc[0, "Date"] = "0001-04-27"
+    frame.loc[1, "Date"] = "9999-12-31"
+    write_ticker_csv(synthetic_history_dir, "GGG", frame)
+
+    loaded = data.load_history_csv(synthetic_history_dir / "GGG.csv")
+    assert len(loaded) == len(frame) - 2  # only the two unusable rows are lost
+    assert loaded["Date"].min() >= pd.Timestamp("1677-09-22")
+    assert loaded["Date"].max() <= pd.Timestamp("2262-04-10")
+
+    # Non-blocking, and the cast that used to segfault now completes.
+    panel = features.build_panel(synthetic_history_dir, min_history=60)
+    assert "GGG" in panel.series
+    assert panel.series["GGG"].dates.dtype == np.dtype("datetime64[ns]")
