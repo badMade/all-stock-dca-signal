@@ -296,6 +296,13 @@ class OctopusModel:
         self._seed = 0
         self._market_cache: dict[int, torch.Tensor] = {}
         self._update_rounds = 0
+        #: Per-task breakdown of the MOST RECENT _train_batch() call, or None
+        #: before the first one. Purely additive instrumentation: nothing in
+        #: this module reads it, and no training behavior depends on it. It
+        #: exists so an external curriculum runner (train_foundation.py) can
+        #: report forward/recon/market convergence separately without
+        #: forking the loss definition out of _train_batch().
+        self._last_loss_components: dict[str, float] | None = None
 
     # ------------------------------------------------------------------
     # Protocol: fit / predict / update / diagnostic / save / load
@@ -884,6 +891,19 @@ class OctopusModel:
         error = target - predicted
         return torch.maximum(quantile * error, (quantile - 1.0) * error).mean()
 
+    def train_step(self, refs: Sequence[tuple[str, int]], *, lr: float) -> tuple[float, dict[str, float]]:
+        """Run one multi-task gradient step and return ``(total, components)``.
+
+        The public face of :meth:`_train_batch` for external training loops
+        (train_foundation.py's curriculum pre-training) that need their own
+        batch ordering and learning-rate schedule but must NOT fork the loss
+        definition. ``total`` is NaN when the step was skipped by the
+        non-finite loss/gradient guards; ``components`` still carries the
+        per-task breakdown that produced it.
+        """
+        total = self._train_batch(list(refs), lr=lr)
+        return total, dict(self._last_loss_components or {})
+
     def _train_batch(self, refs: list[tuple[str, int]], *, lr: float) -> float:
         assert self._net is not None and self._optimizer is not None
         self._net.train()
@@ -967,6 +987,20 @@ class OctopusModel:
             + self.hyper["beta"] * recon_loss
             + self.hyper["gamma"] * market_loss
         )
+        # Recorded BEFORE the finiteness guard below, so a skipped step still
+        # leaves an honest record of WHICH term blew up instead of an empty
+        # dict. Stacked into one tensor for a SINGLE device->host sync: four
+        # separate float(...cpu()) calls would add three extra MPS/CUDA
+        # stalls to every step of a multi-hour pre-training run.
+        _components = torch.stack(
+            (forward_loss.detach(), recon_loss.detach(), market_loss.detach(), total.detach())
+        ).cpu()
+        self._last_loss_components = {
+            "forward": float(_components[0]),
+            "recon": float(_components[1]),
+            "market": float(_components[2]),
+            "total": float(_components[3]),
+        }
         if not torch.isfinite(total):
             warnings.warn(
                 f"Non-finite loss in _train_batch (forward={float(forward_loss.detach()):.4f}, "
@@ -1031,4 +1065,8 @@ class OctopusModel:
         # once every step already clears, but are left in place as
         # explicit, harmless defense-in-depth.
         self._market_cache = {}
-        return float(total.detach().cpu())
+        # The already-synced value from the component snapshot above, not a
+        # second total.detach().cpu(): recording the breakdown costs this
+        # method's existing callers (the online-update path) zero extra
+        # device->host stalls that way.
+        return self._last_loss_components["total"]
