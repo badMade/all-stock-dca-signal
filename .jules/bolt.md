@@ -135,3 +135,7 @@ Added `get_order_fills` to `BrokerAdapter` protocol and Robinhood live adapter, 
 ## 2026-10-15 - Optimize csv.DictReader loops
 **Learning:** `csv.DictReader` allocates a new Python dictionary for every parsed row, which causes massive overhead in hot loops or large CSVs. However, replacing it with `csv.reader` and manually building a dict via `dict(zip(fieldnames, row))` merely relocates the allocation and yields zero performance benefit.
 **Action:** When refactoring `csv.DictReader` for performance where specific fields are extracted, switch to `csv.reader`, retrieve the index of the required columns once per file (`fieldnames.index(col)`), and extract elements using list indexing directly inside the loop `row[idx]`.
+
+## 2026-09-17 - Avoid Unrelated Import Reordering
+**Learning:** When using auto-formatters or linters with a `--fix` flag (like `ruff check --fix`), they may silently sort or reorder existing imports that were not part of the intended optimization. This can break import side effects or introduce unnecessary risk, leading to code review rejections for out-of-scope changes.
+**Action:** When implementing targeted optimizations, avoid running global auto-fixes on files or carefully revert unrelated import sorting to ensure the PR strictly contains the intentional performance changes.

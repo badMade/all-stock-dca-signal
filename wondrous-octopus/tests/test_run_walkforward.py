@@ -9,11 +9,12 @@ from pathlib import Path
 from typing import Any
 
 import daily_update
-import dca_paths
 import features as _features
 import numpy as np
 import pytest
 import run_walkforward
+
+import dca_paths
 
 features: Any = _features
 
