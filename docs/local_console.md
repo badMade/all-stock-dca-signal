@@ -38,6 +38,13 @@ dependencies, or both.
 
 ## Everyday interface
 
+The console is one hash-routed page with eleven sections in the sidebar (Today,
+Runs, Schedule, State & ledgers, Alerts & health, Config, Reports, Research,
+Workflows & jobs, Environment, Docs). The hash names the section and nothing
+else; an unknown hash shows Today. Sections still being built say so and show
+which observed roots they will read. Every root is shown as a label (basename
+plus a short digest), never as an absolute path.
+
 - Daily summaries: select a date, inspect observed runs, statuses, candidate
   counts and submitted-order counts, and download the summary as JSON.
 - Confirmed spend: comes from the existing purchase-history reader. Requested
@@ -56,6 +63,9 @@ dependencies, or both.
   results; the synthetic demo does not cover all historical crises.
 - Jobs: real command output, start and finish times, failures and retained
   history. One job runs at a time, with bounded logs and execution deadlines.
+  A running job can be cancelled from its row (its process group is
+  terminated and the job ends `cancelled`), and its log is polled as a delta
+  every 1.5 seconds while it runs.
 - Program directory: the repository's canonical entry-point catalog plus the
   adjacent research projects. Commands requiring market-data exports, an archive,
   broker adapters, or optional services retain those setup requirements.
@@ -73,7 +83,16 @@ launcher stops refreshes; it does not install an OS or Codex scheduled task.
 ```bash
 python3 from.py --local
 python3 from.py --local --root /path/to/cron_tracking --octopus-run /path/to/octopus/run
+python3 from.py --local --secondary-root /path/to/checkout/artifacts
 ```
+
+`--secondary-root DIR` (repeatable, implies `--local`) adds another existing
+artifact tree to observe read-only beside the primary root, for example the
+gitignored repo-root `artifacts/` directory that holds run states and alert
+files the `dca_paths`-managed tree never received. A missing directory is
+refused at startup rather than observed as empty history. Readers label
+secondary roots as at risk (gitignored, not managed by `dca_paths`); demo mode
+never observes one.
 
 The default artifact root follows `dca_paths.cron_tracking_root()` and
 `DCA_CRON_TRACKING_ROOT`. Console output normally uses
@@ -169,7 +188,10 @@ Each demo invocation gets a new directory; previous runs are preserved.
 | GET | `/api/snapshot?date=YYYY-MM-DD&ticker=AAPL&period=all` | Basic-authenticated daily, schedule, forecast, job and module views |
 | GET | `/api/export?date=YYYY-MM-DD` | Basic-authenticated daily/forecast JSON download |
 | GET | `/api/docs?path=docs/live_wiring.md` | Basic-authenticated allowlisted local documentation |
+| GET | `/api/jobs/log?job=<id>&offset=<n>` | Basic-authenticated log delta for one job: the text appended after `offset` characters, the new offset, and whether the bounded log window dropped anything |
 | POST | `/api/jobs` | Start a fixed action with `{"action":"demo-dca"}`, Basic auth and `X-Console-Token` |
+| POST | `/api/jobs/cancel` | Cancel the active job with `{"job":"<id>"}`, Basic auth and `X-Console-Token`; `404` when that job is not queued or running |
+| GET | `/`, `/app.js`, `/pages.js`, `/styles.css` | The browser bundle, served from an exact-match map derived from `dca_console.CONSOLE_FILES` |
 | Any | Any route except `/api/health` | Missing or incorrect Basic auth returns JSON `401` and `WWW-Authenticate: Basic realm="DCA console", charset="UTF-8"` |
 | Any | Any route | A rejected Host, Origin or Fetch Metadata check returns JSON `403` with bounded `received_host` and `forwarded_host`; a bad job token also returns `403` before the job is accepted |
 
@@ -447,7 +469,14 @@ Phase A value crossed the LAN in plaintext).
 
 Implementation: `from.py` → `dca_console.py`, with separate daily-data,
 Octopus-artifact, and job modules plus browser assets under `console/` and the
-checkout-only launchd renderer under `deploy/launchd/`.
+checkout-only launchd renderer under `deploy/launchd/`. Since the GUI
+expansion's Phase 0, `dca_console_routes.py` holds the read-only `GET_ROUTES`
+table (dispatched after the unchanged trust → Basic → token gate order, with
+every JSON body passed through `walk_redact`) and `dca_console_reader.py`
+holds the shared confined reader (`BoundedReader`, `RootSpec`) every page
+reader builds on. Every JSON string leaving the server is scrubbed of
+registered secrets, sensitive environment values and account-shaped literals;
+absolute paths are never emitted.
 
 ## Verification for Rock 5
 

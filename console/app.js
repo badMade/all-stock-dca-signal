@@ -2,7 +2,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = { snapshot: null, token: null, loading: false, queued: false, timer: null, dateInitialized: false, docsRequest: 0, launching: new Set() };
+const state = { snapshot: null, token: null, loading: false, queued: false, timer: null, logTimer: null, dateInitialized: false, docsRequest: 0, launching: new Set() };
 const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
 const number = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
 const etTime = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
@@ -279,7 +279,15 @@ function renderJobs(jobs) {
     head.append(title, el("span", "job-time", timing));
     summary.append(head);
     const log = Array.isArray(job.log) ? job.log.join("\n") : job.log;
-    detail.append(summary, el("pre", "", log || "Waiting for process output…"));
+    const output = el("pre", "", log || "Waiting for process output…");
+    output.dataset.offset = String(job.log_total ?? (log ? log.length : 0));
+    if (["running", "queued"].includes(job.status)) {
+      const cancel = el("button", "button secondary small job-cancel", "Cancel job");
+      cancel.type = "button";
+      cancel.addEventListener("click", () => cancelJob(job.id));
+      head.append(cancel);
+    }
+    detail.append(summary, output);
     return detail;
   }) : [el("p", "empty-state", "No jobs started in this console session. Run the full demo to test the complete path.")]));
 }
@@ -375,6 +383,7 @@ function renderSnapshot(snapshot) {
   renderDaily(snapshot.daily);
   renderResearch(snapshot.octopus);
   renderJobs(snapshot.jobs);
+  pollRunningLog();
   renderActions(snapshot.actions);
   renderModules(snapshot.modules);
   $("updated-at").textContent = `Snapshot refreshed ${etTime.format(new Date())} ET`;
@@ -435,17 +444,7 @@ async function startJob(action) {
   state.launching.add(action);
   renderActions(state.snapshot?.actions);
   try {
-    const submit = () => fetch("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json", "X-Console-Token": state.token }, body: JSON.stringify({ action }), signal: AbortSignal.timeout(15000) });
-    let response = await submit();
-    if (response.status === 403) {
-      // A launchd restart rotates the token, and do_POST rejects before submit(), so a 403 proves the job was never
-      // accepted and exactly one retry is safe (Same Page round 1).
-      state.token = null;
-      const bootstrap = await readJson(await fetch("/api/bootstrap", { cache: "no-store", signal: AbortSignal.timeout(15000) }));
-      state.token = bootstrap.token;
-      response = await submit();
-    }
-    await readJson(response);
+    await postWithToken("/api/jobs", { action });
     await refresh();
     // Job output lives on the Workflows page; a launch from Today must land there.
     if (currentPage() !== "workflows") location.hash = "workflows";
@@ -456,6 +455,54 @@ async function startJob(action) {
     state.launching.delete(action);
     renderActions(state.snapshot?.actions);
   }
+}
+
+async function postWithToken(path, body) {
+  const submit = () => fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Console-Token": state.token }, body: JSON.stringify(body), signal: AbortSignal.timeout(15000) });
+  let response = await submit();
+  if (response.status === 403) {
+    // A launchd restart rotates the token; a 403 proves nothing was accepted, so one retry is safe (Same Page round 1).
+    state.token = null;
+    const bootstrap = await readJson(await fetch("/api/bootstrap", { cache: "no-store", signal: AbortSignal.timeout(15000) }));
+    state.token = bootstrap.token;
+    response = await submit();
+  }
+  return readJson(response);
+}
+
+async function cancelJob(id) {
+  if (!state.token) return;
+  try {
+    await postWithToken("/api/jobs/cancel", { job: id });
+    await refresh();
+  } catch (error) {
+    showError(`Could not cancel the job: ${error.message}`);
+  }
+}
+
+/* While a job runs, poll only its log delta every 1.5 s instead of the whole
+   snapshot: the server hands back the text appended after the offset the page
+   already holds (GUI expansion Phase 5). */
+async function pollRunningLog() {
+  clearTimeout(state.logTimer);
+  const running = arr(state.snapshot?.jobs).find((job) => ["running", "queued"].includes(job.status));
+  if (!running) return;
+  const output = $("jobs-list").querySelector(`details[data-job-id="${CSS.escape(String(running.id))}"] pre`);
+  if (output) {
+    try {
+      const query = new URLSearchParams({ job: running.id, offset: output.dataset.offset || "0" });
+      const delta = await readJson(await fetch(`/api/jobs/log?${query}`, { cache: "no-store", signal: AbortSignal.timeout(10000) }));
+      if (delta.text) {
+        if (output.textContent === "Waiting for process output…") output.textContent = "";
+        output.textContent += delta.text;
+        output.dataset.offset = String(delta.offset);
+      }
+      if (!["running", "queued"].includes(delta.status)) { refresh(); return; }
+    } catch (error) {
+      // The next full snapshot repairs any missed delta; nothing to surface here.
+    }
+  }
+  state.logTimer = setTimeout(pollRunningLog, 1500);
 }
 
 function updateClock() {

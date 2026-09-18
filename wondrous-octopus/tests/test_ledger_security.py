@@ -12,6 +12,29 @@ import pytest
 from ledger import Ledger, LedgerError
 
 
+@pytest.fixture(autouse=True)
+def pinned_link_allowance(monkeypatch):
+    """Pin DCA_LEDGER_MAX_LINKS=1 for every test in this file.
+
+    ledger.py reads that variable at call time to decide how many hard links a
+    shard may carry before it is treated as aliased. Production sets it to 2 on
+    darwin (run_walkforward.py / run_sharded.py, at import time) because Google
+    Drive transiently hard-links files written under the mirrored checkout --
+    nlink briefly reads 2 for a file nobody aliased, and a run would refuse
+    itself. Those modules are imported by OTHER test files in this suite
+    (tests/test_run_walkforward.py, and tests/test_daily_update.py even calls
+    run_walkforward.main()), so the setting leaked into this process and
+    silently disarmed every hardlink case below: the file passed in isolation
+    and failed five ways as soon as the suite was collected together, on macOS
+    only -- on Linux the same setdefault writes "1", which is already the
+    default, so CI never saw it.
+
+    A security test must not depend on ambient environment. tmp_path is under
+    /private/var, never Drive-mirrored, so 1 is the honest value here.
+    """
+    monkeypatch.setenv("DCA_LEDGER_MAX_LINKS", "1")
+
+
 def _record(model="persistence"):
     return {"record_type": "forecast", "model": model, "origin_date": "2021-06-01"}
 

@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from dca_console_reader import MAX_BYTES, MAX_FILES, BoundedReader, iso_date, root_label
+from dca_console_reader import MAX_BYTES, MAX_FILES, BoundedReader, RootSpec, iso_date, root_label, roots_from_settings
 
 
 def test_root_label_hides_the_absolute_path_and_is_stable(tmp_path):
@@ -78,3 +78,17 @@ def test_entries_and_latest_in_are_bounded_and_relative(tmp_path):
     assert all(not path.is_absolute() for path in listed)
     assert full.entries("missing") == []
     assert len(full.entries("daily", limit=1)) == 1
+
+
+def test_root_spec_carries_a_label_and_the_console_settings_order(tmp_path):
+    from types import SimpleNamespace
+
+    primary = tmp_path / "cron_tracking"
+    extra = tmp_path / "artifacts"
+    spec = RootSpec.of(primary)
+    assert spec.label == root_label(primary) and spec.kind == "primary" and spec.path == primary
+    assert spec.reader([]).root == primary
+    roots = roots_from_settings(SimpleNamespace(root=primary, secondary_roots=(extra,)))
+    assert [root.kind for root in roots] == ["primary", "secondary"]
+    assert roots[1].label == root_label(extra)
+    assert str(tmp_path) not in "".join(root.label for root in roots)

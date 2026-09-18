@@ -1482,6 +1482,11 @@ def _load_states_with_evidence(
     }
 
 
+# Public entry for the console's risk panel so the evidence block main()
+# attaches is reachable in-process (GUI expansion Phase 3).
+load_states_with_evidence = _load_states_with_evidence
+
+
 def _load_states(root: str | Path) -> List[Dict[str, Any]]:
     """The states alone, for callers that do not need the evidence counts."""
     states, _evidence = _load_states_with_evidence(root)

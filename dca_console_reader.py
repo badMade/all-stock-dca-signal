@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -48,6 +49,36 @@ def root_label(path: object) -> str:
     digest = hashlib.sha256(text.encode("utf-8", "surrogateescape")).hexdigest()[:8]
     name = Path(text).name or text
     return f"{name} ({digest})"
+
+
+@dataclass(frozen=True)
+class RootSpec:
+    """One observed artifact tree: the label the browser sees, the path readers use.
+
+    ``kind`` is ``primary`` for the dca_paths-managed tree the console was
+    started on and ``secondary`` for every ``--secondary-root`` (for example the
+    gitignored repo-root ``artifacts/`` directory, whose contents are at risk
+    of being lost and are flagged as such by the readers). Readers receive a
+    sequence of these and never a bare path, so every row they emit can carry
+    the label instead of the location (GUI expansion Phase 1 contract).
+    """
+
+    label: str
+    path: Path
+    kind: str = "primary"
+
+    @classmethod
+    def of(cls, path: Path, kind: str = "primary") -> "RootSpec":
+        return cls(root_label(path), Path(path), kind)
+
+    def reader(self, warnings: list[str]) -> "BoundedReader":
+        return BoundedReader(self.path, warnings)
+
+
+def roots_from_settings(settings) -> tuple[RootSpec, ...]:
+    """Build the reader contract from console Settings: primary first, then secondaries."""
+    return (RootSpec.of(settings.root, "primary"),
+            *(RootSpec.of(extra, "secondary") for extra in settings.secondary_roots))
 
 
 class BoundedReader:

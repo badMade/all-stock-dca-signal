@@ -678,6 +678,11 @@ class ConsoleApp:
         env = dict(os.environ)
         env["DCA_CRON_TRACKING_ROOT"] = str(self.settings.output / "demo" / "dca" if demo else self.settings.root)
         env["PYTHONUNBUFFERED"] = "1"
+        # Job logs are read in a <pre>, not a terminal: ask pytest, ruff and
+        # friends for plain text so ANSI colour codes never reach the page.
+        env["NO_COLOR"] = "1"
+        env["PY_COLORS"] = "0"
+        env.pop("FORCE_COLOR", None)
         # No allowlisted job needs the brokerage account, a webhook, or any
         # token: purchase_history, the generators and the research CLIs read
         # none of them. Dropping every sensitive variable from EVERY child, not
@@ -1034,7 +1039,7 @@ def make_server(
             if not secrets.compare_digest(self.headers.get("X-Console-Token", ""), app.token):
                 self._forbidden("Missing or invalid console token.")
                 return
-            if self.path != "/api/jobs":
+            if self.path not in {"/api/jobs", "/api/jobs/cancel"}:
                 self._json(404, {"error": "Not found"})
                 return
             try:
@@ -1043,6 +1048,16 @@ def make_server(
                     raise ValueError("Request body must be between 1 and 1024 bytes")
                 self.connection.settimeout(5)
                 payload = json.loads(self.rfile.read(length))
+                if self.path == "/api/jobs/cancel":
+                    # The cancel body is as closed as the start body: one string
+                    # naming the job the page is looking at (GUI expansion Phase 5).
+                    if not isinstance(payload, dict) or set(payload) != {"job"} or not isinstance(payload["job"], str):
+                        raise ValueError("Supply only a string job id")
+                    if app.jobs.cancel(payload["job"]):
+                        self._json(202, {"cancelled": payload["job"]})
+                    else:
+                        self._json(404, {"error": "No active job with that id"})
+                    return
                 if not isinstance(payload, dict) or set(payload) != {"action"} or not isinstance(payload["action"], str):
                     raise ValueError("Supply only a string action")
                 self._json(202, {"job": app.submit(payload["action"])})

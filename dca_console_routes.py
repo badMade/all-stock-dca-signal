@@ -20,12 +20,15 @@ prefix without restating it. Three rules apply to every entry:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Callable
 from urllib.parse import SplitResult, parse_qs
 
 from dca_console_jobs import redact_value
+
+JOB_ID = re.compile(r"[a-zA-Z0-9-]{1,100}")
 
 DEFAULT_CSP = "default-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'"
 # Generated research pages (the 3D market graph, the Octopus inspector) are
@@ -127,16 +130,48 @@ def _route_health(app, request: RouteRequest) -> Response:
     return Response.json(200, {"status": "ok", "mode": app.settings.mode, **request.authority})
 
 
+def _catalog_refs(app) -> set[str]:
+    from dca_console import module_catalog
+
+    return {row["docs"] for row in module_catalog(app.settings.python) if isinstance(row.get("docs"), str)}
+
+
 def _route_docs(app, request: RouteRequest) -> Response:
-    from dca_console import REPO, module_catalog
+    from dca_console import REPO
+    from dca_console_docs import read_doc
 
     fields = query(request.url.query, ("path",), max_fields=1, strict=False)
     name = fields.get("path", "")
-    allowed = {row["docs"] for row in module_catalog(app.settings.python)}
-    path = (REPO / name).resolve()
-    if name not in allowed or not path.is_relative_to(REPO) or not path.is_file():
+    # Two allowlists, both closed: the catalog's own doc_refs (kept so every
+    # program-directory link still resolves) and the docs catalog's bounded
+    # listings. read_doc re-checks membership and confinement itself.
+    data = read_doc(REPO, name) if name in _catalog_refs(app) or name else None
+    if data is None:
         return Response.json(404, {"error": "Documentation not found"})
-    return Response(200, path.read_bytes(), "text/plain")
+    return Response(200, data, "text/plain")
+
+
+def _route_docs_index(app, request: RouteRequest) -> Response:
+    from dca_console import REPO
+    from dca_console_docs import docs_index
+
+    query(request.url.query, (), max_fields=1)
+    return Response.json(200, docs_index(REPO, _catalog_refs(app)))
+
+
+def _route_jobs_log(app, request: RouteRequest) -> Response:
+    """Delta log polling for one job: strict query, opaque id, integer offset."""
+    fields = query(request.url.query, ("job", "offset"), max_fields=2)
+    job = fields.get("job", "")
+    if JOB_ID.fullmatch(job) is None:
+        raise ValueError("job must be a console job id")
+    offset = int(fields.get("offset", "0"))
+    if offset < 0:
+        raise ValueError("offset must not be negative")
+    delta = app.jobs.log_since(job, offset)
+    if delta is None:
+        return Response.json(404, {"error": "Not found"})
+    return Response.json(200, delta)
 
 
 GET_ROUTES: dict[str, Callable[[Any, RouteRequest], Response]] = {
@@ -145,4 +180,6 @@ GET_ROUTES: dict[str, Callable[[Any, RouteRequest], Response]] = {
     "/api/export": _route_export,
     "/api/health": _route_health,
     "/api/docs": _route_docs,
+    "/api/docs/index": _route_docs_index,
+    "/api/jobs/log": _route_jobs_log,
 }

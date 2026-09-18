@@ -96,7 +96,9 @@ def test_every_get_route_sits_behind_trust_then_basic(app, route):
             assert status == 401, route
             assert headers["WWW-Authenticate"].startswith('Basic realm="DCA console"')
         status, headers, _ = request(server, route, headers=auth_headers())
-        assert status in {200, 404}, route
+        # A route that requires parameters answers 400 to a bare request; it
+        # still sits behind the same two gates and carries the same headers.
+        assert status in {200, 400, 404}, route
         assert headers["Content-Security-Policy"] == DEFAULT_CSP, route
         assert headers["Cache-Control"] == "no-store"
 
@@ -128,3 +130,59 @@ def test_snapshot_roots_are_labels_and_secondary_roots_are_reported(tmp_path, mo
         assert data["paths"]["artifacts"] == data["roots"][0]["label"]
     finally:
         application.jobs.close()
+
+
+def test_jobs_log_route_validates_its_closed_query_and_reports_deltas(app):
+    with running_server(app, ConsoleAccess(), AuthFailureLog(interval=0, stream=io.StringIO())) as server:
+        for bad in ("/api/jobs/log", "/api/jobs/log?job=bad%20id", "/api/jobs/log?job=x&offset=-1",
+                    "/api/jobs/log?job=x&offset=abc", "/api/jobs/log?job=x&extra=1"):
+            assert request(server, bad)[0] == 400, bad
+        assert request(server, "/api/jobs/log?job=unknown-job")[0] == 404
+        submitted = app.jobs.submit("demo-dca", "Test", lambda job_id, log: log("hello world\n") or 0)
+        app.jobs.worker.join(timeout=5)
+        status, _, body = request(server, f"/api/jobs/log?job={submitted['id']}&offset=0")
+        assert status == 200
+        delta = json.loads(body)
+        assert "hello world" in delta["text"] and delta["offset"] > 0 and delta["status"] == "completed"
+        status, _, body = request(server, f"/api/jobs/log?job={submitted['id']}&offset={delta['offset']}")
+        assert status == 200 and json.loads(body)["text"] == ""
+
+
+def test_jobs_cancel_route_requires_the_token_and_a_closed_body(app):
+    import os
+    import subprocess
+    import sys as _sys
+    import threading
+
+    from dca_console_jobs import Command
+
+    def post_cancel(server, token, body):
+        return request(server, "/api/jobs/cancel", method="POST", body=body,
+                       headers={"X-Console-Token": token, "Content-Type": "application/json"})
+
+    with running_server(app, ConsoleAccess(), AuthFailureLog(interval=0, stream=io.StringIO())) as server:
+        assert post_cancel(server, "wrong-token", json.dumps({"job": "x"}))[0] == 403
+        assert post_cancel(server, app.token, json.dumps({"job": "x", "extra": 1}))[0] == 400
+        assert post_cancel(server, app.token, json.dumps({"job": 1}))[0] == 400
+        assert post_cancel(server, app.token, json.dumps({"job": "nothing-running"}))[0] == 404
+        launched = threading.Event()
+        original_popen = subprocess.Popen
+
+        def capture_process(*args, **kwargs):
+            process = original_popen(*args, **kwargs)
+            launched.set()
+            return process
+
+        import dca_console_jobs
+        previous = dca_console_jobs.subprocess.Popen
+        dca_console_jobs.subprocess.Popen = capture_process
+        try:
+            command = Command((_sys.executable, "-c", "import time; time.sleep(30)"), app.settings.output, dict(os.environ))
+            submitted = app.jobs.submit("demo-dca", "Cancellable", lambda job_id, log: app.jobs.run_command(command, log))
+            assert launched.wait(2)
+            status, _, body = post_cancel(server, app.token, json.dumps({"job": submitted["id"]}))
+            assert status == 202 and json.loads(body) == {"cancelled": submitted["id"]}
+            app.jobs.worker.join(timeout=10)
+            assert app.jobs.snapshot()[0]["status"] == "cancelled"
+        finally:
+            dca_console_jobs.subprocess.Popen = previous

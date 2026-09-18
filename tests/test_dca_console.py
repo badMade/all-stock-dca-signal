@@ -341,6 +341,7 @@ def test_dca_demo_command_removes_live_artifact_and_account_overrides(app, monke
     assert "DCA_MARKET_OPEN_LIVE_STATE_ROOT" not in command.env
     assert "DCA_INTRADAY_LIVE_STATE_ROOT" not in command.env
     assert "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER" not in command.env
+    assert command.env["NO_COLOR"] == "1" and command.env["PY_COLORS"] == "0"
     assert not app.settings.root.exists()
 
 
