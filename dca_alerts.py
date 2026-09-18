@@ -260,11 +260,25 @@ def write_alert_file(
     2026-09-07 diagnostic (T:F08) this channel had no in-code writer at all:
     every executor prompt hand-rolled the path. ``body`` is redacted. Never
     raises; returns the path written, or ``None`` on failure (logged).
+
+    The filename key is ``(day, slot, gate)`` only -- there is no executor or
+    session identity in it. A second call for the same tuple (a retry, or two
+    executors alerting the same slot/gate the same day, e.g. the 9/15 11:30
+    incident) would otherwise silently overwrite the first file's content. On
+    a collision this probes ``<day>-<slot>-<gate>.2.txt``, ``.3.txt``, etc.,
+    reusing ``scripts/alert_digest.py``'s already-supported optional ``.N``
+    suffix on the gate token so no downstream parser needs to change.
     """
     day = trading_day.isoformat() if trading_day is not None else _trading_day_et()
-    path = Path(stream_root(stream_artifact_dir(stream), "alerts", f"{day}-{slot}-{gate}.txt"))
+    directory = Path(stream_root(stream_artifact_dir(stream), "alerts"))
+    path = directory / f"{day}-{slot}-{gate}.txt"
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            n = 2
+            while (directory / f"{day}-{slot}-{gate}.{n}.txt").exists():
+                n += 1
+            path = directory / f"{day}-{slot}-{gate}.{n}.txt"
         atomic_write_text(path, _redacted(body).rstrip("\n") + "\n")
     except Exception as exc:  # noqa: BLE001 - an alert-file failure must not mask the run failure
         logger.warning("alert file for %s could not be written (%s): %s", stream, path, _sanitize_exception(exc))

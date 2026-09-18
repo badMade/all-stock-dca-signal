@@ -64,17 +64,17 @@ spread, whitelist, or circuit-breaker requirements.
 
 ## Active ticker universe
 
-65 active symbols (see [`config/tickers.json`](../config/tickers.json)):
+64 active symbols (see [`config/tickers.json`](../config/tickers.json)):
 
 ```
 DFTX TRIN AAAU SPCX EVR LUNR IRDM DXYZ LITE ASML DRAM STX
 MSFT AAPL AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR
 INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN RKLB
-GE VRT CAT QQQ QCOM ABBV JPM VT QBUT RVI VCX TRLV LLY TSLA
+GE VRT CAT QQQ QCOM ABBV JPM VT RVI VCX TRLV LLY TSLA
 VIAV CIEN ANET CSCO FFIV COHR
 ```
 
-- **Excluded:** none today.
+- **Excluded:** `QBUT` -- added 2026-08-16 without an in-repo Robinhood instrument search; Robinhood returned not-found for it on every live run since, so it was excluded 2026-09-18 (no confirmed buying mechanism at all -- see `exclusion_reasons.QBUT` in `config/tickers.json`).
 - **Whole-share tickers:** `BYDDY` and `RVII` -- not tradable for fractional/notional buys on Robinhood, so they are evaluated by the same ladder but bought via whole-share accumulation instead (see [whole_share_accumulation.md](whole_share_accumulation.md)). `RVII` moved here from the active list on 2026-08-24.
 - **Symbol corrections applied:** `IRDMI -> IRDM`, `GLWR -> GLW`
 - **`GFUZ` (General Fusion Group Ltd.)** added 2026-07-15 (user-approved). Uses
@@ -209,11 +209,11 @@ Elevated/High-volatility/Stress is less frequent for the same market conditions.
 
 > **This table is the fallback, not the live curve.** As of 2026-09-11
 > [`config/per_ticker_sizing.json`](../config/per_ticker_sizing.json) is
-> `status: active` and carries an entry for all 65 active symbols (plus the two
+> `status: active` and carries an entry for all 64 active symbols (plus the two
 > whole-share symbols, which the ladder evaluates identically). 47 are
 > **per-ticker, volatility-calibrated** (percentile-derived,
-> 1x/1.5x/2.5x/4x/5x, $1.00 base); the 20 in `fallback_tickers` (SPCX, DRAM,
-> CBRS, SATA, GFUZ, VT, QBUT, RVII, RVI, VCX, TRLV, BYDDY, LLY, TSLA, VIAV,
+> 1x/1.5x/2.5x/4x/5x, $1.00 base); the 19 in `fallback_tickers` (SPCX, DRAM,
+> CBRS, SATA, GFUZ, VT, RVII, RVI, VCX, TRLV, BYDDY, LLY, TSLA, VIAV,
 > CIEN, ANET, CSCO, FFIV, COHR) lack the 252 sessions of history the
 > calibration requires and carry a copy of the global fallback ladder instead.
 > `graded_buy_multiplier` reads a ticker's calibrated tiers first and falls back

@@ -233,6 +233,26 @@ trigger condition must be *"aborted before producing a buy list"* and NOT
 buy would otherwise hand off to a runner that buys anyway, inverting the
 strategy on exactly the days it said stay out.
 
+**Reviewed 2026-09-18 (resolution: scope-narrowing, not a sharper trigger).**
+This gap was reviewed against a concrete incident (9/16: a flat $1 duplicate
+top-up on IBM already filled correctly at $4 ladder size). No sharper trigger
+condition is constructible today: Perplexity has no filesystem access to this
+repo, so it cannot read `run_state.json`'s `is_trading_failure` /
+`run_classification_outcome` / `completion_reason` fields, which are exactly
+the fields that already distinguish a genuine failure from a deliberate
+no-signal decline in this repo's own schema (`schemas/run_state.schema.json`)
+— and no broker-visible signal (order tag, note field, watchlist flag) stands
+in for them. The resolution chosen instead, recorded in
+`config/scheduled_tasks.json`'s `standing_perplexity_backup_policy.mechanism`:
+Perplexity's backup role only ever authorizes it to run its **own** independent
+signal/ladder/safety evaluation for the slot (already true per §2/§4's
+top-up sizing steps above), never to treat Claude's absence as license to
+buy purely on Perplexity's own discretion beyond that. This is a documented,
+accepted residual risk, not a solved problem — matching the pattern this
+section already uses for the "simultaneous start" gap above. Item 2 below
+("confirm which medium, if any, both executors can read and write") remains
+the actual precondition for ever building a real distinguishing trigger.
+
 ## 5. Open items for a human
 
 1. **Paste §2 into all five Perplexity task prompts.** Confirmed live by Geoff

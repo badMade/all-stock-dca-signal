@@ -49,6 +49,11 @@ ALREADY_FILLED = "ALREADY_FILLED"
 MISSING_PRIOR_PRICE = "MISSING_PRIOR_PRICE"
 #: No current decision price available -> cannot evaluate the top-up invariant.
 MISSING_CURRENT_PRICE = "MISSING_CURRENT_PRICE"
+#: A prior fill exists and would authorize a top-up, but the reference price
+#: is the unproven average FILL price (never a caller-bound logged target/
+#: decision price) -> conservatively buy $0 and flag for manual review rather
+#: than risk over-authorizing off a fill-price-inflated reference.
+UNLOGGED_REFERENCE_PRICE = "UNLOGGED_REFERENCE_PRICE"
 
 # --- Safety / fail-closed blocks ---------------------------------------------
 
@@ -87,6 +92,7 @@ ALL_REASONS: FrozenSet[str] = frozenset(
         ALREADY_FILLED,
         MISSING_PRIOR_PRICE,
         MISSING_CURRENT_PRICE,
+        UNLOGGED_REFERENCE_PRICE,
         BROKER_HISTORY_INCOMPLETE,
         STALE_POINTER,
         SAFETY_CAP,
@@ -110,6 +116,7 @@ NO_BUY_REASONS: FrozenSet[str] = frozenset(
         ALREADY_FILLED,
         MISSING_PRIOR_PRICE,
         MISSING_CURRENT_PRICE,
+        UNLOGGED_REFERENCE_PRICE,
         BROKER_HISTORY_INCOMPLETE,
         STALE_POINTER,
         SAFETY_CAP,
@@ -181,6 +188,7 @@ __all__ = [
     "ALREADY_FILLED",
     "MISSING_PRIOR_PRICE",
     "MISSING_CURRENT_PRICE",
+    "UNLOGGED_REFERENCE_PRICE",
     "BROKER_HISTORY_INCOMPLETE",
     "STALE_POINTER",
     "SAFETY_CAP",

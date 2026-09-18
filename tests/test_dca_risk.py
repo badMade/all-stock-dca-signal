@@ -217,6 +217,40 @@ def test_evidence_unclassifiable_reason_names_a_wrong_type(tmp_path):
     }
 
 
+def test_midday_run_classification_bare_string_shorthand_is_unclassifiable(tmp_path):
+    """Regression for the 2026-09-15 through 2026-09-17 midday (12:30) abort
+    investigation: config/scheduled_tasks.json's own scheduled_run_outcomes
+    ledger uses "run_classification": "failed_start_no_evidence" as a bare
+    string shorthand for an OUTCOME LABEL, a different, incompatible use of
+    the same key name from the run_state.json contract's nested object. An
+    LLM free-handing the midday write, with that shorthand sitting in the
+    very config file it consults, can reproduce exactly this malformed shape
+    -- which is precisely what made dca_risk report
+    run_states_unclassifiable > 0 and the 7-day kill-switch spend figure
+    read as an unreliable 0. This pins that exact incident shape as a named
+    regression case (see config/scheduled_tasks.json's a6239dae.artifact_contract
+    and the 1230ET live-mirror prompt's Gate 9 template, added to fix it)."""
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "midday_dca"
+    day = root / "20260915_1230ET"
+    day.mkdir(parents=True)
+    state_path = day / "run_state.json"
+    state_path.write_text(
+        _json.dumps({"trading_day": "2026-09-15", "run_classification": "failed_start_no_evidence"}),
+        encoding="utf-8",
+    )
+
+    _states, evidence = _load_states_with_evidence(root)
+
+    assert evidence["run_states_unclassifiable"] == 1
+    assert evidence["unclassifiable_reasons"] == {
+        str(state_path): "run_classification is str, not an object"
+    }
+
+
 def test_evidence_counts_a_manual_only_tree_as_no_afternoon_history(tmp_path):
     """A tree of perfectly valid manual runs loads cleanly and proves nothing
     about afternoon deployment -- the only gate that funds the kill switch."""

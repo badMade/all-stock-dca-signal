@@ -270,8 +270,9 @@ ACTIVE_TICKERS = [
     # notes for the full history. RVII has since moved to WHOLE_SHARE_TICKERS
     # (AUG 24 2026, user-requested): it is not purchasable fractionally, so it
     # is still bought by the same ladder, just through the whole-share
-    # mechanism -- see that constant below.
-    "QBUT",
+    # mechanism -- see that constant below. QBUT itself was excluded again on
+    # SEP 18 2026 (see EXCLUDED_TICKERS below): Robinhood returned not-found
+    # for it on every live run -- no confirmed buying mechanism at all.
     "RVI",
     "VCX",
     # AUG 16 2026 (user-requested, later same day): TRLV. Reverses the
@@ -308,7 +309,11 @@ ACTIVE_TICKERS = [
     "COHR",
 ]
 
-# No ticker is categorically excluded (no mechanism to buy it at all) today.
+# QBUT is the one categorically excluded ticker today (no mechanism to buy it
+# at all). It was added 2026-08-16 without an in-repo Robinhood instrument
+# search -- tradability was unverified from the start -- and Robinhood has
+# returned not-found for it on every live run since, confirmed 2026-09-18. See
+# config/tickers.json's exclusion_reasons.QBUT for the full history.
 # BYDDY previously sat here: Robinhood resolves it as not tradable for
 # fractional/notional buys (fractional_tradability != 'tradable'), so the
 # normal $1-$10 graded-ladder buy would always be blocked at the
@@ -316,11 +321,11 @@ ACTIVE_TICKERS = [
 # excluding it (never bought at all), BYDDY moved to WHOLE_SHARE_TICKERS
 # below, a distinct category with its own buying mechanism -- see
 # dca_whole_share_accumulator.py and docs/whole_share_accumulation.md.
-# EXCLUDED_TICKERS is kept (rather than removed) as the affirmative "this
-# ticker has NO buying mechanism at all" category for any future symbol that
-# genuinely needs it (e.g. a delisting/wind-down), distinct from
-# WHOLE_SHARE_TICKERS' "different mechanism, still actively bought" category.
-EXCLUDED_TICKERS: frozenset[str] = frozenset()
+# EXCLUDED_TICKERS is the affirmative "this ticker has NO buying mechanism at
+# all" category -- e.g. a delisting/wind-down, or QBUT's not-found status --
+# distinct from WHOLE_SHARE_TICKERS' "different mechanism, still actively
+# bought" category.
+EXCLUDED_TICKERS: frozenset[str] = frozenset({"QBUT"})
 
 # Tickers not tradable for fractional/notional buys on Robinhood. Evaluated
 # by the SAME graded ladder as ACTIVE_TICKERS (so they appear in signals.csv

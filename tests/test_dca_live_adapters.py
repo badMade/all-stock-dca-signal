@@ -179,6 +179,71 @@ def test_provider_drops_bars_with_invalid_close():
     assert bars[0].close == pytest.approx(301.0)
 
 
+def test_get_batch_intraday_bars_chunks_the_ticker_list():
+    """A single get_batch_intraday_bars call passes the FULL ticker list to
+    historicals_fn in one call. The 65-ticker live universe has hit a broker
+    tool output-size cap on batch fetches (76KB), and that cap is enforced by
+    the external agent session's MCP transport -- this repo never makes the
+    real network call -- so the only in-repo mitigation is giving the adapter
+    the ABILITY to split a large ticker list into smaller historicals calls
+    and merge the results, mirroring scripts/broker_reconciliation.py's own
+    page-then-merge pagination pattern. This must not change the merged
+    result for any caller (dca_market_graph.py's ProviderLoader.load() reads
+    the return value the same way either way)."""
+    tickers = ["A", "B", "C", "D", "E"]
+    calls: list[list[str]] = []
+
+    def fake_historicals_fn(*, symbols, **_kwargs):
+        calls.append(list(symbols))
+        return {
+            "data": {
+                "results": [
+                    {
+                        "symbol": symbol,
+                        "bars": [
+                            {
+                                "begins_at": "2026-07-02T13:30:00Z",
+                                "open_price": "10",
+                                "close_price": "11",
+                                "high_price": "12",
+                                "low_price": "9",
+                                "volume": 100,
+                            }
+                        ],
+                    }
+                    for symbol in symbols
+                ]
+            }
+        }
+
+    prov = RobinhoodDataProvider(historicals_fn=fake_historicals_fn, batch_chunk_size=2)
+    start = datetime.combine(datetime(2026, 7, 2).date(), time(9, 30), tzinfo=EASTERN)
+    grouped = prov.get_batch_intraday_bars(tickers, start, _decision_dt(), 30)
+
+    # 5 tickers chunked by 2 -> three calls of sizes 2, 2, 1.
+    assert [len(chunk) for chunk in calls] == [2, 2, 1]
+    assert sorted(sum(calls, [])) == sorted(tickers)
+    assert sorted(grouped.keys()) == sorted(tickers)
+    for symbol in tickers:
+        assert grouped[symbol][0].close == pytest.approx(11.0)
+
+
+def test_get_batch_intraday_bars_default_chunk_size_makes_a_single_call_for_a_small_list():
+    """Without an explicit batch_chunk_size, a small ticker list still makes
+    exactly one historicals_fn call -- the default is not so small that it
+    changes behavior for ordinary (non-universe-wide) callers."""
+    calls: list[list[str]] = []
+
+    def fake_historicals_fn(*, symbols, **_kwargs):
+        calls.append(list(symbols))
+        return HISTORICALS
+
+    prov = RobinhoodDataProvider(historicals_fn=fake_historicals_fn)
+    start = datetime.combine(datetime(2026, 7, 2).date(), time(9, 30), tzinfo=EASTERN)
+    prov.get_batch_intraday_bars(["AAPL"], start, _decision_dt(), 30)
+    assert len(calls) == 1
+
+
 def test_provider_previous_close_from_quote():
     prov = RobinhoodDataProvider(historicals_fn=lambda **k: HISTORICALS, quotes_fn=lambda **k: QUOTES)
     bar = prov.get_previous_close_bar("AAPL", _decision_dt())
