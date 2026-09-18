@@ -286,7 +286,8 @@ def attempt_log_view(roots: Sequence[RootSpec], *, days: int = 30, now: datetime
     warnings: list[str] = []
     override = os.environ.get(ATTEMPT_LOG_ROOT_ENV)
     if override:
-        log_root = RootSpec.of(Path(override), "attempt_log")
+        # Resolved so a symlinked operator path still confines under itself.
+        log_root = RootSpec.of(Path(override).resolve(), "attempt_log")
     elif roots:
         log_root = RootSpec(roots[0].label, roots[0].path / "attempt_log", roots[0].kind)
     else:

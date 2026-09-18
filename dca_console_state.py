@@ -274,20 +274,21 @@ def _subdirs(reader: BoundedReader, directory: str, accept) -> list[str]:
     return names
 
 
-def _events(state: dict[str, Any], keys: Sequence[str], keep) -> tuple[list[dict[str, Any]], int | None]:
+def _events(state: dict[str, Any], keys: Sequence[str], keep, extra=None) -> tuple[list[dict[str, Any]], int | None]:
     """Newest-first, bounded, allowlisted events; count None when the list is malformed."""
     raw = state.get("events")
     if not isinstance(raw, list):
         return [], None
     rows = [event for event in raw if isinstance(event, dict) and keep(event)]
-    return [_pick(event, keys) for event in reversed(rows[-MAX_ROWS:])], len(rows)
+    return [{**_pick(event, keys), **(extra(event) if extra else {})} for event in reversed(rows[-MAX_ROWS:])], len(rows)
 
 
 def _entry(root: RootSpec, reader: BoundedReader, relative: Path, filename: str) -> tuple[dict[str, Any], dict | None]:
     status, state = _read_object(reader, relative / filename)
+    # ledger.json sits beside ledger.lock, tracker.json beside tracker.lock:
+    # the lock is reported by existence only and never opened.
     entry = {"id": _identity(root, relative), "root_label": root.label, "at_risk": root.kind != "primary",
-             "status": status, "lock_file_present": _lock_present(reader, relative / "ledger.lock")
-             if filename == "ledger.json" else _lock_present(reader, relative / "tracker.lock")}
+             "status": status, "lock_file_present": _lock_present(reader, relative / (Path(filename).stem + ".lock"))}
     if status == "corrupt":
         reader.warn(f"A {root.label} ledger file is corrupt; its balances are unavailable.")
     return entry, state

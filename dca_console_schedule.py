@@ -1,20 +1,18 @@
 """Read-only Schedule page reader: configured vs deployable vs observed timing.
 
-The Schedule page (GUI expansion, Phase 2) shows three layers that must never
-be confused: **configured** (``config/scheduled_tasks.json``, read through
-``dca_console_data.build_schedule_rows`` so the page keeps the daily snapshot's
+Three layers that must never be confused (GUI expansion, Phase 2):
+**configured** (``config/scheduled_tasks.json`` through
+``dca_console_data.build_schedule_rows``, keeping the daily snapshot's
 ``timing_unverified`` vocabulary), **deployable** (the checked-in ``deploy/``
-cron and systemd examples, the GitHub workflows and the launchd agent -- files
-in the checkout, not a running scheduler) and **observed** (what the runs
-module found on disk, handed to :func:`build_schedule_layers` by the caller).
+cron/systemd examples, GitHub workflows and launchd agent -- files in the
+checkout, not a running scheduler) and **observed** (what the runs module found
+on disk, handed to :func:`build_schedule_layers` by the caller).
 
 Nothing here asserts that a scheduler fired. Every builder is read-only and
 lock-free: no ledger or ``strategy_state.json`` is opened, no executor, broker
-or runner is constructed, and the executor modules are imported only for their
-``*_PROFILES`` constants. File access goes through ``BoundedReader`` or one
-explicitly bounded seek-and-read, and no field carries an absolute path (the
-``*_PROFILES`` dicts embed one under ``state_root``; only the stream name is
-copied out, and log tails are path-scrubbed before redaction).
+or runner is constructed (executor modules are imported only for their
+``*_PROFILES`` constants), file access goes through ``BoundedReader`` or one
+explicitly bounded seek-and-read, and no field carries an absolute path.
 """
 
 from __future__ import annotations
@@ -50,7 +48,10 @@ LAUNCHD_LOGS = ("launchd.out.log", "launchd.err.log")
 _CRON_LINE = re.compile(r"^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+)$")
 _CRON_ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 _SLOT_TOKEN = re.compile(r"^\d{4}ET$")
-_ABSOLUTE_PATH = re.compile(r"(?<![\w:])/(?:[^\s/'\"]+/)+([^\s/'\"]*)")
+# Two or more directory components and not preceded by a word character, a
+# colon or another slash: that scrubs /Users/... and /private/var/... but
+# leaves ``http://host/x`` and API routes such as ``/api/bootstrap`` readable.
+_ABSOLUTE_PATH = re.compile(r"(?<![\w:/])/(?:[^\s/'\"]+/){2,}([^\s/'\"]*)")
 _STREAM_SUBPATHS = {
     "market_open_dca": "market-open", "morning_dca": "morning", "intraday_dca": "intraday",
     "midday_dca": "midday", "ce16ba6b/scheduled_runs": "afternoon", "scheduled_runs": "afternoon",
@@ -90,9 +91,6 @@ def _dedupe(warnings: list[str]) -> list[str]:
 def _scrub_paths(line: str) -> str:
     """Replace every absolute path in a log line by ``<path>/<basename>``."""
     return _ABSOLUTE_PATH.sub(lambda match: f"<path>/{match.group(1)}", line)
-
-
-# -- manifest (configured layer) ---------------------------------------------
 
 
 def _policy_keys(manifest: dict[str, Any]) -> list[str]:
@@ -209,9 +207,6 @@ def policy_block(config_dir: Path, key: str) -> dict[str, Any]:
     return {"key": key, "found": True, "value": value, "notes": _dedupe(notes), "warnings": []}
 
 
-# -- deploy/ (cron + systemd) ------------------------------------------------
-
-
 def _command_shape(command: str) -> dict[str, Any]:
     """Describe a scheduled command by script basename, arguments, slots and streams.
 
@@ -310,9 +305,6 @@ def deploy_layer(repo: Path) -> dict[str, Any]:
             "env_files": env_files, "warnings": _dedupe(warnings)}
 
 
-# -- GitHub workflows --------------------------------------------------------
-
-
 def _workflow_triggers(lines: list[str]) -> list[str]:
     """Find the ``on:`` block by indentation and list its events and cron strings.
 
@@ -371,9 +363,6 @@ def workflows_layer(repo: Path) -> dict[str, Any]:
     return {"workflows": rows, "warnings": _dedupe(warnings)}
 
 
-# -- launchd (console agent) -------------------------------------------------
-
-
 def _log_tail(reader: BoundedReader, relative: Path, warnings: list[str]) -> dict[str, Any] | None:
     """Return size and the last 40 lines of one log, reading at most 8 KB from its end."""
     path = reader.confined(relative)
@@ -417,9 +406,6 @@ def launchd_status(roots: Sequence[RootSpec], home: Path | None = None) -> dict[
     return {"plist_present": modified is not None,
             "plist_modified": datetime.fromtimestamp(modified, ET).isoformat() if modified is not None else None,
             "log_root": primary.label if primary else None, "logs": logs, "warnings": _dedupe(warnings)}
-
-
-# -- roster identity (who owns each slot) ------------------------------------
 
 
 def _profile_rows() -> dict[str, dict[str, Any]]:
@@ -485,9 +471,6 @@ def roster_identity(config_dir: Path) -> dict[str, Any]:
             "config_file": config_file,
         })
     return {"slots": slots, "warnings": _dedupe(warnings)}
-
-
-# -- join matrix ---------------------------------------------------------------
 
 
 def _observed_for(observed: dict[str, Any] | None, stream: str) -> dict[str, Any] | None:
