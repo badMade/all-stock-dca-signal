@@ -10,15 +10,14 @@ from __future__ import annotations
 
 import csv
 import io
-import json
 import math
 import re
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-_MAX_BYTES = 32 * 1024 * 1024
-_MAX_FILES = 20_000
+from dca_console_reader import BoundedReader, iso_date, root_label
+
 _MAX_ROWS = 50_000
 _MAX_RESULTS = 2_000
 _COMPONENTS = ("open", "high", "low", "close")
@@ -48,87 +47,20 @@ def _number(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
-def _date(value: Any) -> str | None:
-    if not isinstance(value, str) or len(value) != 10:
-        return None
-    try:
-        return date.fromisoformat(value).isoformat()
-    except ValueError:
-        return None
+_date = iso_date
 
 
-class _Reader:
-    def __init__(self, root: Path, warnings: list[str]) -> None:
-        self.root = root
-        self.warnings = warnings
+class _Reader(BoundedReader):
+    """The Octopus run reader: the shared bounded reader plus the ``daily/`` lookup.
 
-    def warn(self, message: str) -> None:
-        if message not in self.warnings:
-            self.warnings.append(message)
-
-    def modified_at(self, relative: Path | str) -> float | None:
-        """Read bounded artifact metadata without following an external symlink."""
-        try:
-            path = (self.root / relative).resolve()
-            if path.is_relative_to(self.root) and path.is_file():
-                return path.stat().st_mtime
-        except (OSError, RuntimeError):
-            pass
-        return None
-
-    def text(self, relative: Path | str) -> str | None:
-        path = self.root / relative
-        try:
-            resolved = path.resolve()
-            if not resolved.is_relative_to(self.root):
-                self.warn("An artifact outside the selected run directory was ignored.")
-                return None
-            if not resolved.is_file():
-                return None
-            with resolved.open("rb") as handle:
-                data = handle.read(_MAX_BYTES + 1)
-            if len(data) > _MAX_BYTES:
-                self.warn("An artifact exceeds the 32 MiB read limit and was skipped.")
-                return None
-            return data.decode("utf-8-sig")
-        except (OSError, UnicodeError, RuntimeError):
-            self.warn("An artifact could not be read; its data is unavailable.")
-            return None
-
-    def json(self, relative: Path | str) -> dict:
-        source = self.text(relative)
-        if source is None:
-            return {}
-        try:
-            result = json.loads(source)
-        except (ValueError, RecursionError):
-            self.warn("A JSON artifact is corrupt; its data is unavailable.")
-            return {}
-        if not isinstance(result, dict):
-            self.warn("A JSON artifact has an unsupported shape and was ignored.")
-            return {}
-        return result
+    The confinement, size and scan limits moved to ``dca_console_reader`` in
+    GUI expansion Phase 0 so every later reader shares them; this subclass
+    keeps the one Octopus-specific helper and the private name the module's
+    own functions and tests already use.
+    """
 
     def latest_daily(self, suffix: str) -> Path | None:
-        directory = self.root / "daily"
-        try:
-            if not directory.resolve().is_relative_to(self.root):
-                self.warn("An artifact outside the selected run directory was ignored.")
-                return None
-            if not directory.is_dir():
-                return None
-            latest = None
-            for index, candidate in enumerate(directory.iterdir()):
-                if index >= _MAX_FILES:
-                    self.warn("The daily directory exceeds the file scan limit; the latest file may be unavailable.")
-                    break
-                if candidate.name.endswith(suffix) and _date(candidate.name[:10]):
-                    if latest is None or candidate.name > latest.name:
-                        latest = candidate
-            return latest.relative_to(self.root) if latest is not None else None
-        except (OSError, RuntimeError):
-            self.warn("The daily artifact directory could not be read.")
-            return None
+        return self.latest_in("daily", suffix)
 
 
 def _summary_fields(raw: dict) -> dict:
@@ -314,7 +246,9 @@ def build_octopus_snapshot(
     except (OSError, RuntimeError):
         is_directory = False
         root = Path(run_dir)
-    snapshot["run_dir"] = str(root)
+    # A label, never the absolute run directory: the snapshot is a browser
+    # response and a saved summary (GUI expansion Phase 0 leak fix).
+    snapshot["run_label"] = root_label(root)
     if not is_directory:
         snapshot["status"] = "missing"
         snapshot["summary"] = ["The selected Wondrous Octopus run directory does not exist."]

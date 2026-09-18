@@ -28,17 +28,28 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from zoneinfo import ZoneInfo
 
-from dca_console_jobs import Command, JobBusy, JobManager, redact, register_secret
+from dca_console_jobs import Command, JobBusy, JobManager, is_sensitive_variable, redact, register_secret
+from dca_console_reader import root_label
+from dca_console_routes import CREDENTIAL_FREE_ROUTES, DEFAULT_CSP, GET_ROUTES, RouteRequest
 from dca_fileio import atomic_write_text
 from dca_paths import cron_tracking_root, stream_root
 
 REPO = Path(__file__).resolve().parent
 ET = ZoneInfo("America/New_York")
-ASSETS = {"/": ("index.html", "text/html"), "/app.js": ("app.js", "text/javascript"),
-          "/styles.css": ("styles.css", "text/css")}
+# The complete browser bundle, as (route, file under console/, content type).
+# ASSETS stays an exact-match dict derived from this literal tuple: there is no
+# directory walk, so no other repository file can ever be served (pinned by
+# tests/test_dca_console.py and tests/test_console_assets.py).
+CONSOLE_FILES = (
+    ("/", "index.html", "text/html"),
+    ("/app.js", "app.js", "text/javascript"),
+    ("/pages.js", "pages.js", "text/javascript"),
+    ("/styles.css", "styles.css", "text/css"),
+)
+ASSETS = {route: (name, kind) for route, name, kind in CONSOLE_FILES}
 MAX_AUTH_FILE_BYTES = 4096
 MIN_AUTH_PASSWORD_CHARACTERS = 12
 HANDLER_TIMEOUT_SECONDS = 30
@@ -124,6 +135,11 @@ class Settings:
     research_python: str
     octopus_run: Path | None = None
     config_dir: Path = REPO / "config"
+    # Extra artifact trees to observe read-only beside ``root``: the gitignored
+    # repo-root artifacts/ directory holds more run states and alert files than
+    # the dca_paths-managed tree on this machine (GUI expansion Phase 0). Demo
+    # mode never sets it; readers label every root and never echo its path.
+    secondary_roots: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -446,14 +462,34 @@ def _sigterm_as_keyboard_interrupt():
         signal.signal(signal.SIGTERM, previous_handler)
 
 
+def display_python(python: str) -> str:
+    """Spell the console's interpreter for a copyable command without its absolute path.
+
+    The catalog used to interpolate ``shlex.quote(python)``, which put the
+    operator's home directory into every snapshot and saved summary. A path
+    inside the checkout is shown relative to it (``.venv/bin/python`` still
+    runs from the repository root); anything else is reduced to its basename
+    (GUI expansion Phase 0 leak fix).
+    """
+    try:
+        path = Path(python)
+        if path.is_absolute() and path.resolve().is_relative_to(REPO):
+            return shlex.quote(str(path.resolve().relative_to(REPO)))
+        return shlex.quote(path.name or python)
+    except (OSError, RuntimeError, ValueError):
+        return "python3"
+
+
 def module_catalog(python: str) -> list[dict]:
     """Expose the repository's canonical entry points without executing them."""
     from scripts.agent_entry_points import ENTRY_POINTS
 
+    interpreter = display_python(python)
+
     def runnable(command: str) -> str:
         for prefix in ("python3 ", "python "):
             if command.startswith(prefix):
-                return shlex.quote(python) + " " + command[len(prefix):]
+                return interpreter + " " + command[len(prefix):]
         return command
 
     rows = [{"id": f"entry-{i}", "name": e.need, "description": e.notes,
@@ -480,7 +516,7 @@ def module_catalog(python: str) -> list[dict]:
          "", "dca-sizing-signals/README.md"),
     ]
     rows.extend({"id": f"extra-{i}", "name": name, "description": description,
-                 "command": f"{shlex.quote(python)} {command}" if command else "Library API; see documentation",
+                 "command": f"{interpreter} {command}" if command else "Library API; see documentation",
                  "docs": docs, "status": "Optional research / manual inputs"}
                 for i, (name, description, command, docs) in enumerate(extras))
     return rows
@@ -578,7 +614,12 @@ class ConsoleApp:
                     "mode": self.settings.mode, "now": now.isoformat(), "default_date": request_default_day.isoformat(),
                     "daily": daily, "octopus": octopus, "warnings": [],
                     "modules": module_catalog(self.settings.python),
-                    "paths": {"artifacts": str(self.settings.root), "summaries": str(self.settings.output / "summaries")},
+                    # Labels, never absolute paths: this document is a browser
+                    # response and a saved summary (GUI expansion Phase 0).
+                    "paths": {"artifacts": root_label(self.settings.root),
+                              "summaries": root_label(self.settings.output / "summaries")},
+                    "roots": [{"label": root_label(self.settings.root), "kind": "primary"}]
+                    + [{"label": root_label(extra), "kind": "secondary"} for extra in self.settings.secondary_roots],
                 }
                 try:
                     overview = build_octopus_snapshot(self.octopus_run) if ticker or period != "all" else octopus
@@ -637,12 +678,19 @@ class ConsoleApp:
         env = dict(os.environ)
         env["DCA_CRON_TRACKING_ROOT"] = str(self.settings.output / "demo" / "dca" if demo else self.settings.root)
         env["PYTHONUNBUFFERED"] = "1"
+        # No allowlisted job needs the brokerage account, a webhook, or any
+        # token: purchase_history, the generators and the research CLIs read
+        # none of them. Dropping every sensitive variable from EVERY child, not
+        # only demo ones, makes that a property of the runner rather than of
+        # each action's argv review (GUI expansion Phase 0).
+        for key in list(env):
+            if is_sensitive_variable(key):
+                del env[key]
         if demo:
             # External artifact overrides would defeat the isolated demo root.
             for key in list(env):
                 if key.startswith("DCA_") and key not in {"DCA_CRON_TRACKING_ROOT", "DCA_TICKER_HISTORY_DIR"}:
                     del env[key]
-            env.pop("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", None)
         executable = self.settings.research_python if research else self.settings.python
         return self.jobs.run_command(Command(tuple([executable, *argv]), REPO, env, timeout), log)
 
@@ -852,6 +900,7 @@ def make_server(
             *,
             download: str = "",
             extra_headers: tuple[tuple[str, str], ...] = (),
+            csp: str = DEFAULT_CSP,
         ) -> None:
             self.send_response(code)
             self.send_header("Content-Type", kind + "; charset=utf-8")
@@ -859,7 +908,9 @@ def make_server(
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("Content-Security-Policy", "default-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+            # Only a generated research page served from its own route may
+            # relax this, and then only into an opaque sandbox (dca_console_routes).
+            self.send_header("Content-Security-Policy", csp)
             if download:
                 self.send_header("Content-Disposition", f'attachment; filename="{download}"')
             for name, value in extra_headers:
@@ -946,7 +997,7 @@ def make_server(
             # Health stays credential-free for local probes.  The trust check
             # remains first, so this exception never becomes a cross-origin
             # reachability oracle (Same Page round 1).
-            if route != "/api/health" and not access.authorized(self.headers):
+            if route not in CREDENTIAL_FREE_ROUTES and not access.authorized(self.headers):
                 self._unauthorized()
                 return
             try:
@@ -955,42 +1006,16 @@ def make_server(
                 if url.path in ASSETS:
                     name, kind = ASSETS[url.path]
                     self._reply(200, (REPO / "console" / name).read_bytes(), kind)
-                elif url.path == "/api/bootstrap":
-                    self._json(200, {"token": app.token, "default_date": app.default_day().isoformat()})
-                elif url.path in {"/api/snapshot", "/api/export"}:
-                    query = parse_qs(url.query, max_num_fields=8)
-                    raw_day = query.get("date", [None])[0]
-                    # Let snapshot() resolve an absent date once for both its
-                    # evidence day and default_date. Besides keeping the rolling
-                    # rule in one place, this avoids a midnight split inside one
-                    # response (Same Page round 2).
-                    day = date.fromisoformat(raw_day) if raw_day is not None else None
-                    ticker = query.get("ticker", [""])[0][:32]
-                    period = query.get("period", ["all"])[0][:80]
-                    data = app.snapshot(day, ticker, period)
-                    if url.path == "/api/export":
-                        export = {key: data[key] for key in ("mode", "now", "daily", "octopus", "warnings")}
-                        self._reply(200, json.dumps(export, indent=2, allow_nan=False).encode(),
-                                    download=f"dca-summary-{data['daily']['date']}.json")
-                    else:
-                        self._json(200, data)
-                elif url.path == "/api/health":
-                    self._json(200, {
-                        "status": "ok",
-                        "mode": app.settings.mode,
-                        **self._authority_diagnostics(),
-                    })
-                elif url.path == "/api/docs":
-                    query = parse_qs(url.query, max_num_fields=1)
-                    name = query.get("path", [""])[0]
-                    allowed = {row["docs"] for row in module_catalog(app.settings.python)}
-                    path = (REPO / name).resolve()
-                    if name not in allowed or not path.is_relative_to(REPO) or not path.is_file():
-                        self._json(404, {"error": "Documentation not found"})
-                    else:
-                        self._reply(200, path.read_bytes(), "text/plain")
-                else:
+                    return
+                # Every API read lives in the route table; the gate order above
+                # is the only thing this handler still owns (GUI expansion Phase 0).
+                handler = GET_ROUTES.get(url.path)
+                if handler is None:
                     self._json(404, {"error": "Not found"})
+                    return
+                response = handler(app, RouteRequest(url, self._authority_diagnostics()))
+                self._reply(response.code, response.body, response.kind,
+                            download=response.download, csp=response.csp)
             except ValueError:
                 self._json(400, {"error": "Invalid date or query. Use date=YYYY-MM-DD."})
             except Exception as error:
@@ -1062,6 +1087,8 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--demo", action="store_true", help="Use isolated synthetic demo artifacts (default)")
     mode.add_argument("--local", action="store_true", help="Observe existing artifacts; no automatic demo or broker calls")
     parser.add_argument("--root", type=Path, help="Existing DCA artifact root (implies --local)")
+    parser.add_argument("--secondary-root", type=Path, action="append", default=[], metavar="DIR",
+                        help="Additional existing artifact tree to observe read-only (repeatable; implies --local)")
     parser.add_argument("--output-dir", type=Path, help="Console artifacts; default dca_paths.stream_root('console')")
     parser.add_argument("--octopus-run", type=Path, help="Existing Octopus run directory (use with --local)")
     parser.add_argument("--research-python", help="Python with Octopus dependencies; auto-detect repository .venv")
@@ -1078,8 +1105,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run", metavar="ACTION", help="Run one allowlisted action, print its result and exit")
     parser.add_argument("--check", action="store_true", help="Show runtime and action readiness without starting jobs")
     args = parser.parse_args(argv)
-    if args.demo and (args.root or args.octopus_run):
-        parser.error("Use --local with existing --root/--octopus-run; --demo keeps synthetic data isolated.")
+    if args.demo and (args.root or args.octopus_run or args.secondary_root):
+        parser.error("Use --local with existing --root/--octopus-run/--secondary-root; --demo keeps synthetic data isolated.")
+    secondary_roots = []
+    for extra in args.secondary_root:
+        resolved = extra.expanduser().resolve()
+        if not resolved.is_dir():
+            # A missing secondary tree is a typo, not an empty history: refuse
+            # rather than silently observe nothing (GUI expansion Phase 0).
+            parser.error(f"--secondary-root must name an existing directory: {extra}")
+        if resolved not in secondary_roots:
+            secondary_roots.append(resolved)
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
     try:
@@ -1099,7 +1135,7 @@ def main(argv: list[str] | None = None) -> int:
         # parser.error provides the CLI's established exit-2 contract without
         # ever printing file contents (Same Page round 1).
         parser.error(str(error))
-    local = bool(args.local or args.root or args.octopus_run)
+    local = bool(args.local or args.root or args.octopus_run or secondary_roots)
     root = (args.root or Path(cron_tracking_root())).expanduser().resolve()
     output = (args.output_dir or Path(stream_root("console"))).expanduser().resolve()
     venv_python = REPO / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -1119,7 +1155,8 @@ def main(argv: list[str] | None = None) -> int:
     settings = Settings("local" if local else "demo", root if local else output / "demo" / "dca",
                         output, selected_day,
                         python, args.research_python or python,
-                        args.octopus_run.expanduser().resolve() if args.octopus_run else None)
+                        args.octopus_run.expanduser().resolve() if args.octopus_run else None,
+                        secondary_roots=tuple(secondary_roots))
     app = ConsoleApp(settings)
     if args.check:
         print(json.dumps({"mode": settings.mode, "python": python, "research_python": settings.research_python,

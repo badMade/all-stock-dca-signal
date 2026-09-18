@@ -62,6 +62,41 @@ def redact(text: str) -> str:
     return text
 
 
+_SENSITIVE_VARIABLE_MARKERS = ("SECRET", "TOKEN", "PASSWORD", "API_KEY", "ACCOUNT_NUMBER", "WEBHOOK")
+
+
+def is_sensitive_variable(name: str) -> bool:
+    """Return whether an environment variable name marks its value as secret."""
+    upper = name.upper()
+    return any(marker in upper for marker in _SENSITIVE_VARIABLE_MARKERS)
+
+
+def redact_value(text: str) -> str:
+    """Remove secret VALUES from one string inside a structured response.
+
+    :func:`redact` is the boundary for free text (job logs, error bodies,
+    request headers) and therefore also erases every bare 6-12 digit number and
+    every ``label=value`` pair. That is right for a log line and wrong for a
+    JSON field: a job id carries an 8-digit date stamp, a catalog command shows
+    the literal placeholder ``--account <acct>``, and a documentation note may
+    legitimately say "password". This variant keeps those and removes only what
+    is actually secret: every registered console secret, every environment
+    value whose variable name marks it sensitive, and the credential/account
+    shapes the shared strategy sanitizer recognises (GUI expansion, Phase 0).
+    """
+    from near_close_dca import _redacted_diagnostic_text
+
+    with _REGISTERED_SECRETS_LOCK:
+        registered = _REGISTERED_SECRETS
+    for secret in registered:
+        text = text.replace(secret, "[redacted]")
+    text = _redacted_diagnostic_text(text).replace("[REDACTED]", "[redacted]")
+    for name, value in os.environ.items():
+        if value and len(value) >= 6 and is_sensitive_variable(name):
+            text = text.replace(value, "[redacted]")
+    return text
+
+
 @dataclass(frozen=True)
 class Command:
     """An explicit executable argument vector; shell evaluation is never used."""
