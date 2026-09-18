@@ -208,14 +208,20 @@ class TestMetricsArtifact:
         assert payload["shard"] == 1
 
 
-def test_importing_this_module_does_not_arm_the_ledger_link_allowance():
+def test_importing_this_module_does_not_pull_in_run_sharded():
     # Regression: train_foundation used to `from run_sharded import
     # split_into_shards` at module scope, and run_sharded's module body sets
-    # DCA_LEDGER_MAX_LINKS=2 on darwin. Merely collecting THIS test file then
-    # raised the link count ledger.py tolerates, and five hardlink-alias
-    # refusals in tests/test_ledger_security.py stopped raising -- but only
-    # when the full suite was collected, so the file passed in isolation.
-    import os
+    # DCA_LEDGER_MAX_LINKS=2 on darwin -- which raises the link count
+    # ledger.py tolerates and disarms tests/test_ledger_security.py's
+    # hardlink-alias refusals for the whole session. This module never touches
+    # the ledger, so the import is deferred into resolve_shard_tickers().
+    #
+    # Asserted on the import rather than on os.environ, because
+    # run_walkforward.py:42 sets the SAME variable at ITS import time and
+    # tests/test_run_walkforward.py pulls it in -- a separate, pre-existing
+    # darwin-only source of the same pollution that this module cannot fix
+    # and must not be blamed for.
+    import sys
 
-    assert "DCA_LEDGER_MAX_LINKS" not in os.environ
     assert not hasattr(tf, "split_into_shards")
+    assert "run_sharded" not in sys.modules or tf.__dict__.get("run_sharded") is None

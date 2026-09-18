@@ -339,6 +339,32 @@ async function openDocs(path) {
   }
 }
 
+/* Hash router. Every top-level page is a <section class="page" data-page>; the
+   hash names the page and nothing else, so an unknown or empty hash shows Today.
+   Pages never receive a path or a query from the hash: each page renderer reads
+   the snapshot the server already produced (GUI expansion Phase 0). */
+const PAGE_TITLES = { today: "Today", runs: "Runs", schedule: "Schedule", state: "State & ledgers", alerts: "Alerts & health", config: "Config", reports: "Reports", research: "Research", workflows: "Workflows & jobs", environment: "Environment", docs: "Docs" };
+const PAGES = [...document.querySelectorAll("section.page[data-page]")].map((section) => section.dataset.page);
+
+function currentPage() {
+  const name = location.hash.replace(/^#/, "");
+  return PAGES.includes(name) ? name : "today";
+}
+
+function route() {
+  const page = currentPage();
+  for (const section of document.querySelectorAll("section.page[data-page]")) section.hidden = section.dataset.page !== page;
+  for (const link of document.querySelectorAll("#page-nav a[data-page]")) {
+    const active = link.dataset.page === page;
+    link.classList.toggle("active", active);
+    if (active) link.setAttribute("aria-current", "page");
+    else link.removeAttribute("aria-current");
+  }
+  $("breadcrumb-page").textContent = PAGE_TITLES[page] || page;
+  window.scrollTo({ top: 0, behavior: "auto" });
+  if (state.snapshot && window.ConsolePages) window.ConsolePages.render(page, state.snapshot);
+}
+
 function renderSnapshot(snapshot) {
   state.snapshot = snapshot;
   const demo = snapshot.mode === "demo";
@@ -352,6 +378,7 @@ function renderSnapshot(snapshot) {
   renderActions(snapshot.actions);
   renderModules(snapshot.modules);
   $("updated-at").textContent = `Snapshot refreshed ${etTime.format(new Date())} ET`;
+  if (window.ConsolePages) window.ConsolePages.render(currentPage(), snapshot);
   $("connection-label").textContent = "Local workspace connected";
   $("connection-dot").className = "connection-dot connected";
   $("error-banner").hidden = true;
@@ -420,6 +447,8 @@ async function startJob(action) {
     }
     await readJson(response);
     await refresh();
+    // Job output lives on the Workflows page; a launch from Today must land there.
+    if (currentPage() !== "workflows") location.hash = "workflows";
     $("jobs").scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
   } catch (error) {
     showError(`Could not start ${words(action)}: ${error.message}. Check job history before trying again; a connection timeout can occur after a job was accepted.`);
@@ -454,6 +483,8 @@ $("ticker-filter").addEventListener("input", renderForecasts);
 $("component-filter").addEventListener("change", () => { renderForecasts(); renderPeriods(); });
 $("period-filter").addEventListener("change", renderPeriods);
 $("docs-close").addEventListener("click", () => $("docs-dialog").close());
+window.addEventListener("hashchange", route);
+route();
 updateClock();
 setInterval(updateClock, 1000);
 refresh();

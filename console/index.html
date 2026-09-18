@@ -6,62 +6,116 @@
   <meta name="color-scheme" content="light">
   <title>DCA · Operations console</title>
   <link rel="stylesheet" href="/styles.css">
+  <script src="/pages.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
-  <a class="skip-link" href="#overview">Skip to dashboard</a>
+  <a class="skip-link" href="#main-content">Skip to content</a>
   <aside class="sidebar" aria-label="Console navigation">
-    <a class="brand" href="#overview"><span class="brand-icon" aria-hidden="true">↗</span><span>DCA<span class="brand-subtitle">OPERATIONS CONSOLE</span></span></a>
-    <div class="sidebar-label">WORKSPACE</div>
-    <nav>
-      <a href="#overview"><span aria-hidden="true">◫</span> Daily overview</a>
-      <a href="#timing"><span aria-hidden="true">◷</span> Timing & activity</a>
-      <a href="#research"><span aria-hidden="true">⌁</span> Wondrous Octopus</a>
-      <a href="#workflows"><span aria-hidden="true">⊞</span> Workflows</a>
-      <a href="#jobs"><span aria-hidden="true">≡</span> Job history</a>
+    <a class="brand" href="#today"><span class="brand-icon" aria-hidden="true">↗</span><span>DCA<span class="brand-subtitle">OPERATIONS CONSOLE</span></span></a>
+    <div class="sidebar-label">PAGES</div>
+    <nav id="page-nav">
+      <a href="#today" data-page="today"><span aria-hidden="true">◫</span> Today</a>
+      <a href="#runs" data-page="runs"><span aria-hidden="true">☰</span> Runs</a>
+      <a href="#schedule" data-page="schedule"><span aria-hidden="true">◷</span> Schedule</a>
+      <a href="#state" data-page="state"><span aria-hidden="true">◈</span> State &amp; ledgers</a>
+      <a href="#alerts" data-page="alerts"><span aria-hidden="true">△</span> Alerts &amp; health</a>
+      <a href="#config" data-page="config"><span aria-hidden="true">⚙</span> Config</a>
+      <a href="#reports" data-page="reports"><span aria-hidden="true">≣</span> Reports</a>
+      <a href="#research" data-page="research"><span aria-hidden="true">⌁</span> Research</a>
+      <a href="#workflows" data-page="workflows"><span aria-hidden="true">⊞</span> Workflows &amp; jobs</a>
+      <a href="#environment" data-page="environment"><span aria-hidden="true">◎</span> Environment</a>
+      <a href="#docs" data-page="docs"><span aria-hidden="true">¶</span> Docs</a>
     </nav>
     <div class="sidebar-bottom"><span class="connection-dot" id="connection-dot"></span><span id="connection-label">Connecting locally</span><p>One workspace.<br>A clear view of every run.</p></div>
   </aside>
 
   <main id="main-content">
-    <header class="topbar"><div class="breadcrumb">Workspace <span>/</span> Operations</div><div class="clock"><span id="clock">—</span><span class="tag">ET</span></div></header>
+    <header class="topbar"><div class="breadcrumb">Workspace <span>/</span> <span id="breadcrumb-page">Today</span></div><div class="clock"><span id="clock">—</span><span class="tag">ET</span></div></header>
     <div class="page-content">
-      <section class="page-heading" id="overview">
-        <div><div class="eyebrow">YOUR DAILY OPERATING PICTURE</div><h1>Know what happened.<br><span>See what comes next.</span></h1><p class="lead">DCA activity, scheduled windows, and walk-forward research in one place.</p></div>
-        <div class="heading-actions"><button class="button primary" id="run-demo" disabled><span aria-hidden="true">▶</span> Run full demo</button><p>Tests the DCA and research pipelines.</p></div>
-      </section>
-
       <div class="mode-banner" id="mode-banner" role="status"><span class="mode-marker" id="mode-marker">LOCAL</span><span id="mode-message">Connecting to your local workspace…</span></div>
       <div class="error-banner" id="error-banner" role="alert" hidden></div>
       <div class="notice-list" id="global-warnings"></div>
 
-      <div class="toolbar"><div class="date-control"><label for="report-date">Daily view</label><input type="date" id="report-date"></div><div class="toolbar-right"><span id="updated-at" class="muted">Waiting for first snapshot</span><button class="button secondary small" id="refresh" type="button">↻ Refresh</button><a class="button secondary small" id="export" href="/api/export" download>Export JSON</a></div></div>
-      <div class="recent-days" id="recent-days" aria-label="Recent days with run artifacts"></div>
+      <section class="page" data-page="today" id="page-today">
+        <section class="page-heading" id="overview">
+          <div><div class="eyebrow">YOUR DAILY OPERATING PICTURE</div><h1>Know what happened.<br><span>See what comes next.</span></h1><p class="lead">DCA activity, scheduled windows, and walk-forward research in one place.</p></div>
+          <div class="heading-actions"><button class="button primary" id="run-demo" disabled><span aria-hidden="true">▶</span> Run full demo</button><p>Tests the DCA and research pipelines.</p></div>
+        </section>
 
-      <section class="metrics-grid" aria-label="Daily run metrics">
-        <article class="metric"><div class="metric-label">Observed runs <span aria-hidden="true">◫</span></div><div class="metric-value" id="metric-runs">—</div><p>Artifacts for the selected day</p></article>
-        <article class="metric"><div class="metric-label">Completed <span class="green" aria-hidden="true">✓</span></div><div class="metric-value" id="metric-completed">—</div><p>Reported complete by the runner</p></article>
-        <article class="metric"><div class="metric-label">Blocked / held <span class="amber" aria-hidden="true">⊘</span></div><div class="metric-value" id="metric-blocked">—</div><p>Conditions that need review</p></article>
-        <article class="metric"><div class="metric-label">Confirmed spend <span aria-hidden="true">$</span></div><div class="metric-value" id="metric-spend">—</div><p id="spend-caption">Confirmed fills from run artifacts</p></article>
+        <div class="toolbar"><div class="date-control"><label for="report-date">Daily view</label><input type="date" id="report-date"></div><div class="toolbar-right"><span id="updated-at" class="muted">Waiting for first snapshot</span><button class="button secondary small" id="refresh" type="button">↻ Refresh</button><a class="button secondary small" id="export" href="/api/export" download>Export JSON</a></div></div>
+        <div class="recent-days" id="recent-days" aria-label="Recent days with run artifacts"></div>
+
+        <section class="metrics-grid" aria-label="Daily run metrics">
+          <article class="metric"><div class="metric-label">Observed runs <span aria-hidden="true">◫</span></div><div class="metric-value" id="metric-runs">—</div><p>Artifacts for the selected day</p></article>
+          <article class="metric"><div class="metric-label">Completed <span class="green" aria-hidden="true">✓</span></div><div class="metric-value" id="metric-completed">—</div><p>Reported complete by the runner</p></article>
+          <article class="metric"><div class="metric-label">Blocked / held <span class="amber" aria-hidden="true">⊘</span></div><div class="metric-value" id="metric-blocked">—</div><p>Conditions that need review</p></article>
+          <article class="metric"><div class="metric-label">Confirmed spend <span aria-hidden="true">$</span></div><div class="metric-value" id="metric-spend">—</div><p id="spend-caption">Confirmed fills from run artifacts</p></article>
+        </section>
+
+        <div class="daily-grid">
+          <section class="panel daily-brief"><div class="section-top"><div><div class="eyebrow">THE DAILY BRIEF</div><h2>Your day, explained</h2></div><span class="tag" id="brief-date">—</span></div><div id="daily-summary" class="summary-list"><p class="empty-state">Your daily summary will appear here.</p></div><details class="cost-details"><summary>Automation workload <span id="cost-total">No activity counters</span></summary><p class="panel-footnote">Unitless workload proxies estimate relative processing activity. These are not billed dollars, tokens, or credits.</p><div id="cost-details"></div></details><div class="notice-list" id="daily-warnings"></div></section>
+          <section class="panel" id="timing"><div class="section-top"><div><div class="eyebrow">RUN WINDOWS</div><h2>Timing &amp; next steps</h2></div><span class="tag">Eastern time</span></div><div id="schedule" class="schedule-list"><p class="empty-state">No schedule loaded yet.</p></div><p class="panel-footnote">Configured schedule, not proof of scheduler execution. Actual runs appear below.</p></section>
+        </div>
+
+        <section class="panel section-space"><div class="section-top"><div><div class="eyebrow">OBSERVED ACTIVITY</div><h2>Run ledger</h2></div><span class="tag" id="run-count">0 runs</span></div><div class="table-scroll"><table><caption class="sr-only">Observed DCA runs for the selected day</caption><thead><tr><th>Stream / run</th><th>Time (ET)</th><th>Status</th><th class="numeric">Candidates</th><th class="numeric">Submitted</th><th class="numeric">Confirmed spend</th></tr></thead><tbody id="runs-body"><tr><td colspan="6" class="empty-cell">Waiting for run artifacts.</td></tr></tbody></table></div></section>
       </section>
 
-      <div class="daily-grid">
-        <section class="panel daily-brief"><div class="section-top"><div><div class="eyebrow">THE DAILY BRIEF</div><h2>Your day, explained</h2></div><span class="tag" id="brief-date">—</span></div><div id="daily-summary" class="summary-list"><p class="empty-state">Your daily summary will appear here.</p></div><details class="cost-details"><summary>Automation workload <span id="cost-total">No activity counters</span></summary><p class="panel-footnote">Unitless workload proxies estimate relative processing activity. These are not billed dollars, tokens, or credits.</p><div id="cost-details"></div></details><div class="notice-list" id="daily-warnings"></div></section>
-        <section class="panel" id="timing"><div class="section-top"><div><div class="eyebrow">RUN WINDOWS</div><h2>Timing & next steps</h2></div><span class="tag">Eastern time</span></div><div id="schedule" class="schedule-list"><p class="empty-state">No schedule loaded yet.</p></div><p class="panel-footnote">Configured schedule, not proof of scheduler execution. Actual runs appear below.</p></section>
-      </div>
-
-      <section class="panel section-space"><div class="section-top"><div><div class="eyebrow">OBSERVED ACTIVITY</div><h2>Run ledger</h2></div><span class="tag" id="run-count">0 runs</span></div><div class="table-scroll"><table><caption class="sr-only">Observed DCA runs for the selected day</caption><thead><tr><th>Stream / run</th><th>Time (ET)</th><th>Status</th><th class="numeric">Candidates</th><th class="numeric">Submitted</th><th class="numeric">Confirmed spend</th></tr></thead><tbody id="runs-body"><tr><td colspan="6" class="empty-cell">Waiting for run artifacts.</td></tr></tbody></table></div></section>
-
-      <section class="research-section" id="research"><div class="section-heading"><div><div class="eyebrow">WONDROUS OCTOPUS</div><h2>Research with a view of uncertainty.</h2><p class="muted" id="research-freshness">Latest Octopus run · independent of the daily DCA date selector.</p></div><span class="status-pill neutral" id="research-status">Not loaded</span></div><div class="research-boundary"><span aria-hidden="true">⌁</span> Research outputs stay separate from live DCA sizing and trading.</div><div id="research-summary" class="research-summary"></div><div id="research-warnings" class="notice-list"></div>
-        <div class="panel"><div class="section-top forecast-header"><div><h3>Next-day forecast ranges</h3><p class="muted compact">Split / dividend adjusted dollars. P10–P90 bands express estimated uncertainty.</p></div><div class="filter-group"><div><label for="ticker-filter">Ticker</label><input id="ticker-filter" type="search" list="ticker-options" placeholder="All tickers" autocomplete="off" maxlength="30"><datalist id="ticker-options"></datalist></div><div><label for="component-filter">Price</label><select id="component-filter"><option value="close">Close</option><option value="open">Open</option><option value="high">High</option><option value="low">Low</option></select></div></div></div>
-          <div class="forecast-context"><span id="forecast-count">No forecasts loaded</span><span class="legend"><i class="legend-band"></i> P10–P90 <i class="legend-point"></i> Point forecast</span></div><div id="forecast-chart" class="forecast-chart" aria-label="Forecast uncertainty ranges"></div><div class="table-scroll"><table><caption class="sr-only">Next-day forecasts in dollars, with predictive quantiles</caption><thead><tr><th>Ticker</th><th>Model</th><th>Origin → target</th><th class="numeric">Point</th><th class="numeric">P10</th><th class="numeric">P50</th><th class="numeric">P90</th></tr></thead><tbody id="forecasts-body"><tr><td colspan="7" class="empty-cell">Run a demo or connect a research run to see forecasts.</td></tr></tbody></table></div><p class="panel-footnote" id="forecast-footnote">Forecasts retain their source dates. Older artifacts are not current predictions.</p></div>
-
-        <div class="panel section-space"><div class="section-top"><div><h3>Historical period comparison</h3><p class="muted compact">Measured walk-forward performance, compared with persistence where available.</p></div><div class="filter-group"><div><label for="period-filter">Market period</label><select id="period-filter"><option value="all">All periods</option></select></div></div></div><div class="table-scroll"><table><caption class="sr-only">Historical forecast accuracy by model and market period</caption><thead><tr><th>Period</th><th>Model</th><th>Price</th><th class="numeric">Samples</th><th class="numeric">MAE ($)</th><th class="numeric">Band coverage</th><th class="numeric">Skill vs baseline</th></tr></thead><tbody id="periods-body"><tr><td colspan="7" class="empty-cell">No historical evaluations loaded.</td></tr></tbody></table></div><p class="panel-footnote">MAE is mean absolute error. Band coverage is the share of realized values within P10–P90; its target is 80%. Positive skill means lower error than persistence.</p></div>
+      <section class="page" data-page="runs" id="page-runs" data-placeholder hidden>
+        <div class="section-heading"><div><div class="eyebrow">RUNS</div><h2>Every run on this machine.</h2><p class="muted">Both artifact trees, by day and by stream, with each run's contract, drift and post-trade evidence.</p></div></div>
+        <div class="panel page-placeholder"><p class="empty-state">This page arrives in the next phase of the console expansion. It will read the observed roots below and never a browser-supplied path.</p><div class="root-list" data-roots></div></div>
       </section>
 
-      <section class="section-space" id="workflows"><div class="section-heading"><div><div class="eyebrow">WORKFLOW LAUNCHPAD</div><h2>One place to run the program.</h2><p class="muted">Available entry points, with their purpose and readiness visible before launch.</p></div></div><div id="actions" class="actions-grid"><div class="panel empty-state">Loading available workflows…</div></div><details class="panel section-space module-directory"><summary>Program directory <span class="muted">All components & command-line entry points</span></summary><div id="modules" class="modules-list"><p class="empty-state">No additional program modules loaded.</p></div></details></section>
+      <section class="page" data-page="schedule" id="page-schedule" data-placeholder hidden>
+        <div class="section-heading"><div><div class="eyebrow">SCHEDULE</div><h2>Configured, deployable, observed.</h2><p class="muted">The manifest, the deploy/ cron and systemd layer, the GitHub workflows, the launchd service, and what actually ran.</p></div></div>
+        <div class="panel page-placeholder"><p class="empty-state">This page arrives in a later phase. Timing for today stays on the Today page until then.</p><div class="root-list" data-roots></div></div>
+      </section>
 
-      <section class="panel section-space" id="jobs"><div class="section-top"><div><div class="eyebrow">EXECUTION HISTORY</div><h2>Jobs & output</h2></div><span class="tag" id="job-count">0 jobs</span></div><div id="jobs-list"><p class="empty-state">No jobs started in this console session. Run the full demo to test the complete path.</p></div></section>
+      <section class="page" data-page="state" id="page-state" data-placeholder hidden>
+        <div class="section-heading"><div><div class="eyebrow">STATE &amp; LEDGERS</div><h2>Durable state, read without locks.</h2><p class="muted">Strategy state, the three accumulation ledgers, confirmed purchases, the risk report and calibration events.</p></div></div>
+        <div class="panel page-placeholder"><p class="empty-state">This page arrives in a later phase. Nothing here will ever write a ledger or take the live state lock.</p><div class="root-list" data-roots></div></div>
+      </section>
+
+      <section class="page" data-page="alerts" id="page-alerts" data-placeholder hidden>
+        <div class="section-heading"><div><div class="eyebrow">ALERTS &amp; HEALTH</div><h2>What Gate 9 left behind.</h2><p class="muted">Alert files from both trees, the digest, failed-start markers, model usage and delivery channels.</p></div></div>
+        <div class="panel page-placeholder"><p class="empty-state">This page arrives in a later phase.</p><div class="root-list" data-roots></div></div>
+      </section>
+
+      <section class="page" data-page="config" id="page-config" data-placeholder hidden>
+        <div class="section-heading"><div><div class="eyebrow">CONFIG</div><h2>Every config, read-only, with parity.</h2><p class="muted">Each config file against its schema, the effective strategy configuration, the ladder, and the per-stream authorization flags.</p></div></div>
+        <div class="panel page-placeholder"><p class="empty-state">This page arrives in a later phase. Configuration changes stay in git; the console never edits a config file.</p><div class="root-list" data-roots></div></div>
+      </section>
+
+      <section class="page" data-page="reports" id="page-reports" data-placeholder hidden>
+        <div class="section-heading"><div><div class="eyebrow">REPORTS</div><h2>Rendered from the artifacts.</h2><p class="muted">Weekly dashboard, monthly cost tracker, latest run summary, daily digests and purchase-history exports.</p></div></div>
+        <div class="panel page-placeholder"><p class="empty-state">This page arrives in a later phase.</p><div class="root-list" data-roots></div></div>
+      </section>
+
+      <section class="page" data-page="research" id="page-research" hidden>
+        <section class="research-section" id="research"><div class="section-heading"><div><div class="eyebrow">WONDROUS OCTOPUS</div><h2>Research with a view of uncertainty.</h2><p class="muted" id="research-freshness">Latest Octopus run · independent of the daily DCA date selector.</p></div><span class="status-pill neutral" id="research-status">Not loaded</span></div><div class="research-boundary"><span aria-hidden="true">⌁</span> Research outputs stay separate from live DCA sizing and trading.</div><div id="research-summary" class="research-summary"></div><div id="research-warnings" class="notice-list"></div>
+          <div class="panel"><div class="section-top forecast-header"><div><h3>Next-day forecast ranges</h3><p class="muted compact">Split / dividend adjusted dollars. P10–P90 bands express estimated uncertainty.</p></div><div class="filter-group"><div><label for="ticker-filter">Ticker</label><input id="ticker-filter" type="search" list="ticker-options" placeholder="All tickers" autocomplete="off" maxlength="30"><datalist id="ticker-options"></datalist></div><div><label for="component-filter">Price</label><select id="component-filter"><option value="close">Close</option><option value="open">Open</option><option value="high">High</option><option value="low">Low</option></select></div></div></div>
+            <div class="forecast-context"><span id="forecast-count">No forecasts loaded</span><span class="legend"><i class="legend-band"></i> P10–P90 <i class="legend-point"></i> Point forecast</span></div><div id="forecast-chart" class="forecast-chart" aria-label="Forecast uncertainty ranges"></div><div class="table-scroll"><table><caption class="sr-only">Next-day forecasts in dollars, with predictive quantiles</caption><thead><tr><th>Ticker</th><th>Model</th><th>Origin → target</th><th class="numeric">Point</th><th class="numeric">P10</th><th class="numeric">P50</th><th class="numeric">P90</th></tr></thead><tbody id="forecasts-body"><tr><td colspan="7" class="empty-cell">Run a demo or connect a research run to see forecasts.</td></tr></tbody></table></div><p class="panel-footnote" id="forecast-footnote">Forecasts retain their source dates. Older artifacts are not current predictions.</p></div>
+
+          <div class="panel section-space"><div class="section-top"><div><h3>Historical period comparison</h3><p class="muted compact">Measured walk-forward performance, compared with persistence where available.</p></div><div class="filter-group"><div><label for="period-filter">Market period</label><select id="period-filter"><option value="all">All periods</option></select></div></div></div><div class="table-scroll"><table><caption class="sr-only">Historical forecast accuracy by model and market period</caption><thead><tr><th>Period</th><th>Model</th><th>Price</th><th class="numeric">Samples</th><th class="numeric">MAE ($)</th><th class="numeric">Band coverage</th><th class="numeric">Skill vs baseline</th></tr></thead><tbody id="periods-body"><tr><td colspan="7" class="empty-cell">No historical evaluations loaded.</td></tr></tbody></table></div><p class="panel-footnote">MAE is mean absolute error. Band coverage is the share of realized values within P10–P90; its target is 80%. Positive skill means lower error than persistence.</p></div>
+        </section>
+      </section>
+
+      <section class="page" data-page="workflows" id="page-workflows" hidden>
+        <section id="workflows"><div class="section-heading"><div><div class="eyebrow">WORKFLOW LAUNCHPAD</div><h2>One place to run the program.</h2><p class="muted">Available entry points, with their purpose and readiness visible before launch. Nothing here places, reviews or cancels a brokerage order.</p></div></div><div id="actions" class="actions-grid"><div class="panel empty-state">Loading available workflows…</div></div><details class="panel section-space module-directory"><summary>Program directory <span class="muted">All components &amp; command-line entry points</span></summary><div id="modules" class="modules-list"><p class="empty-state">No additional program modules loaded.</p></div></details></section>
+
+        <section class="panel section-space" id="jobs"><div class="section-top"><div><div class="eyebrow">EXECUTION HISTORY</div><h2>Jobs &amp; output</h2></div><span class="tag" id="job-count">0 jobs</span></div><div id="jobs-list"><p class="empty-state">No jobs started in this console session. Run the full demo to test the complete path.</p></div></section>
+      </section>
+
+      <section class="page" data-page="environment" id="page-environment" data-placeholder hidden>
+        <div class="section-heading"><div><div class="eyebrow">ENVIRONMENT</div><h2>Readiness and provenance.</h2><p class="muted">Interpreters, packages, environment variable names, roots and mounts, the listener's access policy and the repository gates.</p></div></div>
+        <div class="panel page-placeholder"><p class="empty-state">This page arrives in a later phase. Until then, run <code>python3 from.py --check</code> from the checkout.</p><div class="root-list" data-roots></div></div>
+      </section>
+
+      <section class="page" data-page="docs" id="page-docs" data-placeholder hidden>
+        <div class="section-heading"><div><div class="eyebrow">DOCS</div><h2>The documentation corpus, in-app.</h2><p class="muted">Every registered page, its registration status, and a text-only reader.</p></div></div>
+        <div class="panel page-placeholder"><p class="empty-state">This page arrives in a later phase. Documentation links in the program directory already open in the reader.</p><div class="root-list" data-roots></div></div>
+      </section>
+
       <footer class="page-footer"><span>DCA Operations · Local workspace</span><span>Auto-refreshes every 15 seconds <span aria-hidden="true">↻</span></span></footer>
     </div>
   </main>

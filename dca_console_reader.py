@@ -53,9 +53,14 @@ def root_label(path: object) -> str:
 class BoundedReader:
     """Read artifacts below one root with fixed size and count limits."""
 
-    def __init__(self, root: Path, warnings: list[str]) -> None:
+    def __init__(self, root: Path, warnings: list[str], *, max_bytes: int = MAX_BYTES,
+                 max_files: int = MAX_FILES) -> None:
         self.root = root
         self.warnings = warnings
+        # Instance limits so a caller (or a test) can tighten one reader
+        # without touching the module constants every other reader shares.
+        self.max_bytes = max_bytes
+        self.max_files = max_files
 
     def warn(self, message: str) -> None:
         if message not in self.warnings:
@@ -92,8 +97,8 @@ class BoundedReader:
             if not resolved.is_file():
                 return None
             with resolved.open("rb") as handle:
-                data = handle.read(MAX_BYTES + 1)
-            if len(data) > MAX_BYTES:
+                data = handle.read(self.max_bytes + 1)
+            if len(data) > self.max_bytes:
                 self.warn("An artifact exceeds the 32 MiB read limit and was skipped.")
                 return None
             return data.decode("utf-8-sig")
@@ -115,15 +120,16 @@ class BoundedReader:
             return {}
         return result
 
-    def entries(self, relative: Path | str = "", *, limit: int = MAX_FILES) -> list[Path]:
+    def entries(self, relative: Path | str = "", *, limit: int | None = None) -> list[Path]:
         """List one confined directory, relative to the root, stopping at ``limit``."""
         directory = self.confined(relative)
         if directory is None or not directory.is_dir():
             return []
+        bound = self.max_files if limit is None else limit
         found: list[Path] = []
         try:
             for index, candidate in enumerate(directory.iterdir()):
-                if index >= limit:
+                if index >= bound:
                     self.warn("A directory exceeds the file scan limit; later entries were not read.")
                     break
                 found.append(candidate.relative_to(self.root))
@@ -141,7 +147,7 @@ class BoundedReader:
         latest = None
         try:
             for index, candidate in enumerate(folder.iterdir()):
-                if index >= MAX_FILES:
+                if index >= self.max_files:
                     self.warn("The daily directory exceeds the file scan limit; the latest file may be unavailable.")
                     break
                 if candidate.name.endswith(suffix) and iso_date(candidate.name[:10]):

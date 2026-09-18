@@ -16,8 +16,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from dca_console_reader import BoundedReader, iso_date, root_label
+from dca_console_reader import MAX_BYTES, MAX_FILES, BoundedReader, iso_date, root_label
 
+# Module-level copies of the shared limits: tests tighten them per module, and
+# _Reader reads them at construction so the override applies to the next read.
+_MAX_BYTES = MAX_BYTES
+_MAX_FILES = MAX_FILES
 _MAX_ROWS = 50_000
 _MAX_RESULTS = 2_000
 _COMPONENTS = ("open", "high", "low", "close")
@@ -58,6 +62,9 @@ class _Reader(BoundedReader):
     keeps the one Octopus-specific helper and the private name the module's
     own functions and tests already use.
     """
+
+    def __init__(self, root: Path, warnings: list[str]) -> None:
+        super().__init__(root, warnings, max_bytes=_MAX_BYTES, max_files=_MAX_FILES)
 
     def latest_daily(self, suffix: str) -> Path | None:
         return self.latest_in("daily", suffix)

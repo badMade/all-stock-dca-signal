@@ -84,13 +84,21 @@ def redact_value(text: str) -> str:
     value whose variable name marks it sensitive, and the credential/account
     shapes the shared strategy sanitizer recognises (GUI expansion, Phase 0).
     """
-    from near_close_dca import _redacted_diagnostic_text
+    from near_close_dca import _ACCOUNT_LABELED_DIGITS, _ACCOUNT_SHAPED_LITERAL, _URL_EMBEDDED_CREDENTIALS
 
     with _REGISTERED_SECRETS_LOCK:
         registered = _REGISTERED_SECRETS
     for secret in registered:
         text = text.replace(secret, "[redacted]")
-    text = _redacted_diagnostic_text(text).replace("[REDACTED]", "[redacted]")
+    # The strategy sanitizer's labelled-secret scan is deliberately NOT applied:
+    # it rewrites "password must have 12 characters" to "password=[redacted]",
+    # which is right for an exception message and wrong for documentation
+    # prose. Its account-number and URL-credential shapes are exact enough to
+    # keep; a bare digit run glued to a word character (a job id's date stamp,
+    # a run directory name) never matches them.
+    text = _URL_EMBEDDED_CREDENTIALS.sub("://[redacted]@", text)
+    text = _ACCOUNT_LABELED_DIGITS.sub(lambda match: f"{match.group(1)}[redacted]", text)
+    text = _ACCOUNT_SHAPED_LITERAL.sub("[redacted]", text)
     for name, value in os.environ.items():
         if value and len(value) >= 6 and is_sensitive_variable(name):
             text = text.replace(value, "[redacted]")
