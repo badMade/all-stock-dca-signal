@@ -250,7 +250,7 @@ pythonpath = [".", "tests", "dca-sizing-signals"]
 # cd <dir> && python -m pytest tests/), so keep both out of the core
 # "pytest" sweep the same way ruff already excludes them below.
 # wondrous-octopus/ (pandas/numpy/scikit-learn/torch) follows the same rule.
-addopts = "-q --ignore=production-safe-agent-loop --ignore=ticker-advisor --ignore=ml-forecaster --ignore=wondrous-octopus --ignore=dca-sizing-signals --ignore=ticker-market-breadth"
+addopts = "-q --ignore=production-safe-agent-loop --ignore=ticker-advisor --ignore=ml-forecaster --ignore=wondrous-octopus --ignore=dca-sizing-signals --ignore=ticker-market-breadth --ignore=llm-providers"
 
 [tool.coverage.run]
 # Measure the code that runs in production, not the suite that exercises it.
@@ -281,6 +281,8 @@ omit = [
     "dca-sizing-signals/*",
     # Own pytest run, own yfinance/pandas dep -- see ticker-market-breadth/README.md.
     "ticker-market-breadth/*",
+    # Own pytest run, own openai/anthropic/google-genai deps -- see llm-providers/README.md.
+    "llm-providers/*",
 ]
 
 [tool.coverage.report]
@@ -316,6 +318,7 @@ extend-exclude = [
     "wondrous-octopus",
     "dca-sizing-signals",
     "ticker-market-breadth",
+    "llm-providers",
 ]
 
 [tool.ruff.lint]
