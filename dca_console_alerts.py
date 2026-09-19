@@ -7,9 +7,11 @@ the ``model_usage/YYYYMM/model_usage.jsonl`` audit log, the delivery channels
 the executors *could* use (env var names, never values) and the reliability
 engines that are library-only on most machines. Every builder takes explicit
 ``RootSpec`` roots and returns a JSON-safe dict in which ``None`` means
-"unavailable", never zero; every free-text field is bounded and passed through
-``redact_value``; nothing here takes a cross-process lock, constructs an
-executor or broker, or posts to Slack.
+"unavailable", never zero; every free-text field is bounded, has absolute
+paths and broker order ids scrubbed (the same "never emit an absolute path,
+order id or account number" invariant the other console readers assert) and
+is passed through ``redact_value``; nothing here takes a cross-process lock,
+constructs an executor or broker, or posts to Slack.
 
 Three rules from the plan's adversarial pass shape the details below:
 
@@ -25,6 +27,7 @@ Three rules from the plan's adversarial pass shape the details below:
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
@@ -37,8 +40,15 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+# The runs module owns two contracts this page must agree with byte for byte:
+# the absolute-path scrubber (adversarial review of this module: a private
+# lookbehind variant here let ``path:/Users/...`` through untouched, so the
+# one pattern and the one ``<path>`` placeholder are shared, not copied) and
+# ``run_identity``, the preimage every ``run-`` id is minted from, so a
+# model-usage row can be joined to the runs index and GET /api/alerts/drift.
 from dca_console_jobs import redact_value
 from dca_console_reader import MAX_FILES, BoundedReader, RootSpec, iso_date
+from dca_console_runs import _ABSOLUTE_PATH_RE, run_identity
 from dca_paths import STREAM_ARTIFACT_DIRS
 
 ET = ZoneInfo("America/New_York")
@@ -57,10 +67,15 @@ DAY_DIR = re.compile(r"^\d{8}$")
 # ``<gate>.N.txt`` on a same-day collision); the same shape alert_digest parses.
 ALERT_NAME = re.compile(r"^(?P<day>\d{4}-\d{2}-\d{2})-(?P<slot>[A-Za-z0-9]+)-(?P<gate>[A-Za-z0-9_]+(?:\.\d+)?)\.txt$")
 CRON_LINE = re.compile(r"^\s*-\s*cron:\s*['\"]([^'\"]{1,60})['\"]")
-# An absolute POSIX path (two or more segments) quoted inside artifact text: an
-# alert body routinely names the run directory it was written beside, and the
-# console must not echo an operator's home directory back to the browser.
-ABSOLUTE_PATH = re.compile(r"(?<![\w:])/(?:[\w.@+-]+/)+[\w.@+-]*")
+# Broker order ids. A Gate 9 body routinely quotes the order it is complaining
+# about, and ``redact_value`` has no order-id rule of its own, so the same
+# "no order id reaches the browser" invariant the other console readers
+# assert is enforced here before an excerpt is cut. Two shapes: a bare UUID
+# (Robinhood's order and instrument ids) anywhere, and a token holding a
+# digit right after an ``order`` / ``order id`` / ``order ref`` label, which
+# is how prose names a non-UUID reference ("by order abc-123").
+UUID_TOKEN = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
+ORDER_REF = re.compile(r"(?i)(\border(?:[ _-]?(?:id|uuid|ref))?\s*[:=#]?\s*)(?=[\w-]*\d)[\w-]{4,}")
 # No NOTION_TOKEN or SMTP_* reader exists in this repository (dca_notion_sync
 # is offline by design), so the env channel list is exactly the names
 # dca_alerts reads; the page must not suggest a channel the code cannot use.
@@ -70,17 +85,46 @@ MARKER_FIELDS = ("triggered_at_utc", "error_class", "correlation_id")
 _STREAM_OF_DIR = {folder: stream for stream, folder in STREAM_ARTIFACT_DIRS.items()}
 
 
-def _hashed(label: str, relative: str) -> str:
-    # Same shape as dca_console_data._run_row: the browser sees an opaque id,
-    # never the artifact path it was minted from.
-    return "run-" + hashlib.sha256(f"{label}:{relative}".encode()).hexdigest()[:12]
+def _alert_id(label: str, relative: str) -> str:
+    # Same hashing as dca_console_data._run_row (the browser sees an opaque id,
+    # never the file it was minted from) but under an ``alert-`` prefix: a
+    # ``run-`` id promises the runs index can resolve it, and an alert file is
+    # not a run (adversarial review of this module, id-shape collision).
+    return "alert-" + hashlib.sha256(f"{label}:{relative}".encode()).hexdigest()[:12]
+
+
+def _run_id_for(root: RootSpec, artifact: Any) -> str | None:
+    """The runs-index id of ``artifact`` (an absolute run directory), or None when it is not under ``root``."""
+    if not isinstance(artifact, str) or not artifact:
+        return None
+    try:
+        # Resolve both sides exactly as dca_console_runs._index_root does, so
+        # the preimage (label + run dir relative to the resolved root) is the
+        # one the runs module hashed and GET /api/alerts/drift can look up.
+        base, target = root.path.resolve(), Path(artifact).resolve()
+    except (OSError, RuntimeError):
+        return None
+    return run_identity(root.label, str(target.relative_to(base))) if target != base and target.is_relative_to(base) else None
 
 
 def _text(value: Any, limit: int = TEXT_CHARS) -> str | None:
-    """Bound, path-scrub and redact one free-text field copied from an artifact."""
+    """Bound, path-scrub, order-id-scrub and redact one free-text field copied from an artifact.
+
+    The scrubs run before the final cut, on whole tokens: a raw cut at
+    ``limit`` used to leave an excerpt of a few dozen characters once two
+    home-directory paths had eaten the budget, and a cut inside a UUID or a
+    path would hand the scrubbers a fragment they cannot recognise. So the
+    body is pre-cut generously (paths and ids never contain whitespace, so
+    dropping the one partial trailing token keeps every token whole), scrubbed,
+    redacted, and only then bounded to ``limit``.
+    """
     if not isinstance(value, str):
         return None
-    return redact_value(ABSOLUTE_PATH.sub("[path]", " ".join(value[:limit].split())))
+    raw = " ".join(value[: limit * 4].split())
+    if len(value) > limit * 4:
+        raw = raw.rsplit(" ", 1)[0] if " " in raw else ""
+    text = _ABSOLUTE_PATH_RE.sub("<path>", raw)
+    return redact_value(ORDER_REF.sub(r"\1[order-id]", UUID_TOKEN.sub("[order-id]", text)))[:limit]
 
 
 def _window(start: date, end: date) -> None:
@@ -96,10 +140,13 @@ def _finish(result: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
 # --- Gate 9 alert files ------------------------------------------------------
 
 
+ALERT_FOLDERS = (*(f"{name}/alerts" for name in STREAM_ARTIFACT_DIRS.values()), "alerts")
+
+
 def _alert_files(reader: BoundedReader) -> list[Path]:
     """Every ``.txt`` in a known alerts directory, one day-folder deep, capped at MAX_FILES."""
     found: list[Path] = []
-    for folder in [*(f"{name}/alerts" for name in STREAM_ARTIFACT_DIRS.values()), "alerts"]:
+    for folder in ALERT_FOLDERS:
         for entry in reader.entries(folder):
             full = reader.root / entry
             # Offline exports partition alerts by day beneath alerts/, exactly one
@@ -147,12 +194,29 @@ def _alert_record(reader: BoundedReader, relative: Path, digest: Any) -> Any:
     )
 
 
+def _alert_tree_present(root: RootSpec, warnings: list[str]) -> bool:
+    """Whether any known alerts directory exists under ``root``; warns when none does.
+
+    ``BoundedReader.entries`` returns [] silently for an absent directory, which
+    would let a mis-pointed root render as a clean, empty inbox. A missing tree
+    is absence of evidence, not a quiet window (adversarial review of this
+    module; the same rule attempt_log_view's ``root_present`` follows).
+    """
+    present = any((root.path / folder).is_dir() for folder in ALERT_FOLDERS)
+    if not present:
+        warnings.append(f"No alerts directory exists under {root.label}; an empty inbox there is not evidence "
+                        "of a quiet window.")
+    return present
+
+
 def _collect(roots: Sequence[RootSpec], warnings: list[str]) -> list[tuple[RootSpec, Path, Any]]:
     from scripts import alert_digest
 
     found = []
     for root in roots:
         reader = root.reader(warnings)
+        if not _alert_tree_present(root, warnings):
+            continue
         for relative in _alert_files(reader):
             record = _alert_record(reader, relative, alert_digest)
             if record is not None:
@@ -163,7 +227,7 @@ def _collect(roots: Sequence[RootSpec], warnings: list[str]) -> list[tuple[RootS
 def _inbox_row(root: RootSpec, relative: Path, record: Any) -> dict[str, Any]:
     codes = sorted({code for code, _ in record.warnings})
     return {
-        "id": _hashed(root.label, relative.as_posix()), "root_label": root.label,
+        "id": _alert_id(root.label, relative.as_posix()), "root_label": root.label,
         # Only the primary tree is dca_paths-managed and version-safe; a
         # secondary root is the gitignored tree that has already lost alerts.
         "at_risk": root.kind != "primary",
@@ -182,10 +246,15 @@ def alert_inbox(roots: Sequence[RootSpec], start: date, end: date, *, config_dir
 
     Reads ``<root>/<stream dir>/alerts/*.txt`` (one day-folder deep) and
     ``<root>/alerts/*.txt``. Rows are newest first and capped at MAX_ALERTS;
+    ``id`` is ``alert-`` + a hash (never ``run-``: an alert file is not a run),
     ``at_risk`` marks a secondary (gitignored) root, ``delivered`` is False when
     the digest found a delivery contradiction and None when nothing proves
-    delivery either way. Raises ValueError for a window longer than 120 days.
-    ``config_dir`` is accepted for signature parity with the digest view.
+    delivery either way, and ``excerpt`` has paths and order ids scrubbed.
+    ``roots_present`` maps each root label to whether any alerts directory
+    exists there; a False entry (also a warning) means the count for that root
+    is absence of evidence, not a quiet window. Raises ValueError for a window
+    longer than 120 days. ``config_dir`` is accepted for signature parity with
+    the digest view.
     """
     _window(start, end)
     warnings: list[str] = []
@@ -197,6 +266,9 @@ def alert_inbox(roots: Sequence[RootSpec], start: date, end: date, *, config_dir
     rows = rows[:MAX_ALERTS]
     return _finish({
         "alerts": rows, "count": len(rows),
+        # Re-checked here (not taken from _collect) so the map is complete even
+        # when a root was skipped; the is_dir probes are cheap and lock-free.
+        "roots_present": {root.label: any((root.path / folder).is_dir() for folder in ALERT_FOLDERS) for root in roots},
         "by_gate": dict(Counter(row["gate"] or "unclassified" for row in rows)),
         "by_slot": dict(Counter(row["slot"] or "unclassified" for row in rows)),
         "at_risk_count": sum(row["at_risk"] for row in rows),
@@ -323,9 +395,13 @@ def _usage_entry(root: RootSpec, value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
     entry = {key: _text(value.get(key)) for key in USAGE_FIELDS}
-    run_id = value.get("run_id")
-    entry["run_id"] = _hashed(root.label, run_id) if isinstance(run_id, str) else None
     artifact = value.get("artifact_path")
+    # The writer's own ``run_id`` string is never forwarded, hashed or not: a
+    # hash of it could not join the runs index (different preimage) while
+    # looking exactly like an id that can. The run directory the writer
+    # recorded IS the runs module's preimage, so that is what is hashed; None
+    # means the directory lies outside every observed root (or was not logged).
+    entry["run_id"] = _run_id_for(root, artifact)
     # The writer records an absolute artifact directory; the basename is the
     # run's own slot-stamped name and is all the page needs.
     entry["artifact"] = _text(Path(artifact).name, 120) if isinstance(artifact, str) and artifact else None
@@ -336,9 +412,12 @@ def _usage_entry(root: RootSpec, value: Any) -> dict[str, Any] | None:
 def model_usage_view(roots: Sequence[RootSpec], month: str) -> dict[str, Any]:
     """Read ``<root>/model_usage/YYYYMM/model_usage.jsonl`` for one ``YYYY-MM`` month.
 
-    Entries carry the schema's routing fields with ``run_id`` hashed and
-    ``artifact_path`` reduced to a basename; the list is capped at 1,000 across
-    roots. Raises ValueError for a month outside ``^\\d{4}-\\d{2}$``.
+    Entries carry the schema's routing fields; ``run_id`` is the runs-index id
+    of the logged ``artifact_path`` (``dca_console_runs.run_identity`` over the
+    directory relative to its root, so it resolves on the runs page and
+    GET /api/alerts/drift) or None when that directory is outside every root;
+    ``artifact_path`` itself is reduced to a basename. The list is capped at
+    1,000 across roots. Raises ValueError for a month outside ``^\\d{4}-\\d{2}$``.
     """
     if not MONTH.match(month):
         raise ValueError("month must be YYYY-MM")
@@ -418,7 +497,12 @@ def drift_summary(run_dirs: Sequence[tuple[str, Path]]) -> dict[str, Any]:
                                "recommended_action": None}
         try:
             report = detect_drift(Path(run_dir)) if Path(run_dir).is_dir() else None
-        except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
+        # csv.Error is its own Exception subclass, not a ValueError: the
+        # detector's load_run_artifacts reads submitted_orders / buy_candidates
+        # unguarded, and one field over csv's 128 KiB field limit must
+        # degrade that one run to ``drifted: None``, not fail the whole batch
+        # (adversarial review of this module).
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError, csv.Error):
             report = None
             warnings.append("The drift detector could not read a run; its drift status is unavailable.")
         if report is not None:

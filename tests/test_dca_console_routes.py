@@ -69,6 +69,17 @@ def test_walk_redact_removes_secret_values_but_keeps_ids_and_prose(monkeypatch):
     assert "hook-value-123456" not in serialized
     assert "999000111" not in serialized
     assert redacted["nested"][0] == 1 and redacted["nested"][1] is None
+    # An eight-character scheduler task id that happens to be all digits is an
+    # identifier, not an account number, and survives structured redaction.
+    assert walk_redact({"cron_id": "42173154", "note": "task 42173154 fired"}) == {"cron_id": "42173154", "note": "task 42173154 fired"}
+    # Checkout and home locations become placeholders wherever a string carries them.
+    from pathlib import Path
+
+    from dca_console import REPO
+
+    scrubbed = walk_redact({"log": f"Running: {REPO}/.venv/bin/python x.py under {Path.home()}/tmp"})["log"]
+    assert str(REPO) not in scrubbed and str(Path.home()) not in scrubbed
+    assert scrubbed == "Running: <checkout>/.venv/bin/python x.py under ~/tmp"
 
 
 def test_response_json_defaults_to_the_strict_csp_and_redacts_unless_told_not_to():

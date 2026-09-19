@@ -107,11 +107,25 @@ def _scrub_paths(text: str) -> str:
     return _PATH_TOKEN.sub(lambda match: "[path]/" + match.group(0).rsplit("/", 1)[1], text)
 
 
+# How much of an unbounded source string is scanned before it is bounded.
+# Redaction needs the whole token (an account-shaped digit run, an exported
+# secret value, a path) so it must run BEFORE the length cut; the pre-slice
+# only caps the regex cost on a pathological multi-megabyte field.
+_SCAN_LIMIT_FACTOR = 64
+
+
 def _text(value: Any, limit: int = MAX_TEXT) -> str | None:
-    """Bound one free-text field and strip any secret value or path before it leaves."""
+    """Bound one free-text field and strip any secret value or path before it leaves.
+
+    Redact and scrub first, bound last (adversarial review, config area): a cut
+    made before ``redact_value`` splits a 12-digit account literal into a
+    9-digit tail that its regex no longer recognises, and splits a documented
+    "/home/user/..." path so the scrubber never sees the second segment.
+    """
     if value is None:
         return None
-    return redact_value(_scrub_paths(str(value)[:limit].replace("\n", " ")))
+    scanned = str(value)[:limit * _SCAN_LIMIT_FACTOR].replace("\n", " ")
+    return redact_value(_scrub_paths(scanned))[:limit]
 
 
 def _finite(value: Any) -> float | None:
@@ -434,7 +448,10 @@ def ladder_preview(config_dir: Path) -> dict[str, Any]:
     per_ticker = []
     try:
         loaded = dca_config.load_per_ticker_sizing(Path(config_dir)).get("per_ticker_sizing", {})
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
+        # TypeError too: the loader does float(tier["min_drop_pct"]) (dca_config.py
+        # 672) and a publisher that emits null or an object there raises TypeError,
+        # not ValueError. A bad publish must degrade the page, never 500 it.
         _warn_loader(warnings, config_dir, "per_ticker_sizing.json", exc)
         loaded = {}
     for ticker, model in sorted(loaded.items())[:MAX_ROWS]:
@@ -449,7 +466,7 @@ def ladder_point(config_dir: Path, drop_pct: Any, ticker: Any) -> dict[str, Any]
     symbol = str(ticker).strip().upper() if isinstance(ticker, str) else ""
     try:
         universe = dca_config.load_tickers(Path(config_dir)).get("tickers", ())
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         _warn_loader(warnings, config_dir, "tickers.json", exc)
         universe = ()
     if drop is None or not 0 <= drop <= 50 or symbol not in universe:
@@ -529,7 +546,8 @@ def sizing_sources(config_dir: Path, now: datetime) -> dict[str, Any]:
     entries, fallback = pt_raw.get("tickers"), pt_raw.get("fallback_tickers")
     try:
         loaded_count = len(dca_config.load_per_ticker_sizing(Path(config_dir)).get("per_ticker_sizing", {}))
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
+        # Same TypeError shape as ladder_preview: float(None) inside the loader.
         _warn_loader(warnings, config_dir, "per_ticker_sizing.json", exc)
         loaded_count = None
     per_ticker = {"status": _text(pt_raw.get("status"), 40), "version": _text(pt_raw.get("version"), 40),
@@ -558,9 +576,18 @@ def live_gate_summary(config_dir: Path, day: date) -> dict[str, Any]:
              _gate("broker_enable_live_orders", "unknown", "RobinhoodBroker.enable_live_orders is not observable from a checkout.")]
     flags = stream_flags(config_dir)
     warnings.extend(w for w in flags["warnings"] if w not in warnings)
-    enabled = [row["stream"] for row in flags["streams"] if row["live_execution_enabled"] is True]
-    gates.append(_gate("stream_live_execution_enabled", "configured" if enabled else "unconfigured",
-                       f"enabled for: {', '.join(enabled) or 'no stream'}"))
+    # Only a stream file that was actually read is evidence. Zero readable files
+    # is "unknown", never "unconfigured": a banner that said "blocks live money"
+    # from no observations is the None-vs-false confusion the brief forbids
+    # (adversarial review, config area).
+    observed = [row for row in flags["streams"] if row["found"]]
+    enabled = [row["stream"] for row in observed if row["live_execution_enabled"] is True]
+    if not observed:
+        gates.append(_gate("stream_live_execution_enabled", "unknown", "no stream policy file could be read."))
+    else:
+        gates.append(_gate("stream_live_execution_enabled", "configured" if enabled else "unconfigured",
+                           f"enabled for: {', '.join(enabled) or 'no stream'} "
+                           f"({len(observed)} of {len(STREAMS)} stream files read)."))
     present = bool(os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"))
     gates.append(_gate("account_number_env", "configured" if present else "unconfigured",
                        f"ROBINHOOD_AGENTIC_ACCOUNT_NUMBER is {'present' if present else 'absent'} in this process."))

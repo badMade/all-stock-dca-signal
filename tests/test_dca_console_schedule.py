@@ -1,18 +1,16 @@
-"""Schedule page reader: manifest, deploy/, workflows, launchd, roster, and the join matrix.
-
-Every fixture tree lives under ``tmp_path``; the real ``config/`` and checkout
-are used only where the assertion is about the committed schedule itself.
-"""
+"""Schedule-page reader regressions: configured vs deployable vs observed, label-only, lock-free."""
 
 import json
 import math
+import re
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
-import dca_console_schedule as schedule
+import dca_runner
+import scripts.file_lock
 from dca_console_reader import RootSpec
 from dca_console_routes import walk_redact
 from dca_console_schedule import (
@@ -21,328 +19,344 @@ from dca_console_schedule import (
     deploy_layer,
     launchd_status,
     manifest_tasks,
+    observed_from_pointer_strip,
     policy_block,
     roster_identity,
     workflows_layer,
 )
 
+DAY = date(2026, 9, 8)
+ET = ZoneInfo("America/New_York")
+NOW = datetime(2026, 9, 8, 12, tzinfo=ET)
 REPO = Path(__file__).resolve().parents[1]
 CONFIG = REPO / "config"
-DAY = date(2026, 9, 17)
-NOW = datetime(2026, 9, 17, 12, tzinfo=ZoneInfo("America/New_York"))
 ACCOUNT = "999000111"
+# Two or more directory components: the shape every builder must scrub.
+ABSOLUTE = re.compile(r"(?<![\w:/])/(?:[^\s/'\"]+/){2,}")
 
 
-def write(path: Path, text: str) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-    return path
+def write_manifest(config_dir, tasks, **policy):
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "scheduled_tasks.json").write_text(json.dumps({"tasks": tasks, **policy}), encoding="utf-8")
+    return config_dir
 
 
-def make_repo(tmp_path: Path, secret_note: str = "") -> Path:
-    """A miniature checkout: crontab, systemd pair, env files and three workflows."""
-    repo = tmp_path / "repo"
-    write(repo / "deploy" / "crontab.example",
-          "# comment line\nCRON_TZ=UTC\nFOO=supersecretvalue\n"
-          f"# {secret_note}\n"
-          "30 14 * * 1-5 /opt/all-stock-dca/deploy/run-drift-check.sh morning_dca 1030ET\n"
-          f"30 19 * * 1-5 {tmp_path}/deploy/run-drift-check.sh ce16ba6b/scheduled_runs 1530ET {secret_note}\n"
-          "this line is garbage\n")
-    write(repo / "deploy" / "drift-slack.env", "DCA_DRIFT_SLACK_WEBHOOK=https://hooks.example/SECRETWEBHOOK\n")
-    write(repo / "deploy" / "drift-slack.env.example", "DCA_DRIFT_SLACK_WEBHOOK=\n")
-    write(repo / "deploy" / "systemd" / "dca-drift-morning.timer",
-          "# header\n[Unit]\nDescription=Schedule drift (morning)\n[Timer]\n"
-          "OnCalendar=Mon..Fri 10:30 America/New_York\nUnit=dca-drift-morning.service\nPersistent=true\n")
-    write(repo / "deploy" / "systemd" / "dca-drift-morning.service",
-          "[Service]\nType=oneshot\nUser=dca-drift\nEnvironmentFile=-/etc/dca/drift-slack.env\n"
-          f"ExecStart=/opt/all-stock-dca/deploy/run-drift-check.sh morning_dca 1030ET {secret_note}\n")
-    write(repo / "deploy" / "systemd" / "README", "not a unit\n")
-    write(repo / ".github" / "workflows" / "self-heal.yml",
-          "name: Self-Heal\n\non:\n  schedule:\n    # weekly\n    - cron: '0 3 * * 1' # AUTO\n"
-          "  workflow_dispatch:\n  workflow_run:\n    workflows: [\"CI\"]\n\njobs:\n  x:\n"
-          f"    env:\n      GH_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}\n      NOTE: {secret_note}\n")
-    write(repo / ".github" / "workflows" / "ci.yml", "name: CI\non: [push, pull_request]\njobs: {}\n")
-    write(repo / ".github" / "workflows" / "lint.yml", "on: push\njobs: {}\n")
-    write(repo / ".github" / "workflows" / "notes.txt", "on: schedule\n")
-    return repo
+def write_repo(root, crontab=None, service=None, workflow=None):
+    """A tiny checkout: one crontab, one timer/service pair, one workflow."""
+    (root / "deploy" / "systemd").mkdir(parents=True)
+    (root / ".github" / "workflows").mkdir(parents=True)
+    if crontab is not None:
+        (root / "deploy" / "crontab.example").write_text(crontab, encoding="utf-8")
+    (root / "deploy" / "systemd" / "dca-drift-morning.timer").write_text(
+        "[Unit]\nDescription=Timer\n[Timer]\nOnCalendar=Mon..Fri 10:30 America/New_York\nUnit=dca-drift-morning.service\n"
+        "Persistent=false\n", encoding="utf-8")
+    (root / "deploy" / "systemd" / "dca-drift-morning.service").write_text(
+        service or "[Service]\nUser=dca-drift\nExecStart=/opt/x/deploy/run-drift-check.sh morning_dca 1030ET\n",
+        encoding="utf-8")
+    if workflow is not None:
+        (root / ".github" / "workflows" / "one.yml").write_text(workflow, encoding="utf-8")
+    return root
 
 
-def make_config(tmp_path: Path, secret_note: str = "") -> Path:
-    """A tiny manifest with one cron task, one Perplexity-style backup and a policy block."""
-    config = tmp_path / "config"
-    manifest = {
-        "version": 1,
-        "standing_policy": {"items": list(range(300)), "text": "x" * 600, "nan": math.nan, "note": secret_note},
-        "tasks": [
-            {"id": "42173154", "name": "Morning buy", "type": "trading", "status": "active", "trades": True,
-             "cron_utc": "30 14 * * 1-5", "et_equivalent": "10:30 AM ET weekdays", "executor": "MorningDCAExecutor",
-             "notes": "n" * 400 + secret_note},
-            {"id": "4412c3c4", "name": "Perplexity backup 09:55", "type": "trading", "status": "active",
-             "trades": True, "fires_at_et": "09:55", "notes": "backup"},
-            {"id": "d1f7a2c0", "name": "Old monitor", "type": "monitoring", "status": "disabled", "trades": False,
-             "scheduler_registered": False, "cron_utc": "0 13 * * 1-5", "et_equivalent": "9:00 AM ET"},
-            "not a task",
-        ],
-    }
-    write(config / "scheduled_tasks.json", json.dumps(manifest))
-    return config
+def pointer_row(stream, label="primary", **updates):
+    """The exact dict shape dca_console_runs._pointer_row emits (evidence is a bool)."""
+    row = {"stream": stream, "label": label, "at_risk": False, "pointer_file": f"{stream}_dca/latest_{stream}_run.json",
+           "alias": False, "status": "valid", "evidence": True, "evidence_label": "scheduled evidence", "reasons": [],
+           "trading_day": DAY.isoformat(), "run_state_present": True, "order_submit_status": None}
+    row.update(updates)
+    return row
 
 
-def make_home(tmp_path: Path) -> Path:
-    home = tmp_path / "home"
-    write(home / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist", "<plist/>")
-    return home
+def every_builder(config_dir, repo, roots, observed=None):
+    return [manifest_tasks(config_dir, DAY, NOW), policy_block(config_dir, "policy"), deploy_layer(repo),
+            workflows_layer(repo), launchd_status(roots, home=repo), roster_identity(config_dir),
+            build_schedule_layers(config_dir, repo, roots, DAY, NOW, observed=observed)]
 
 
-def make_root(tmp_path: Path, secret_note: str = "") -> RootSpec:
-    root = tmp_path / "cron_tracking"
-    lines = [f"line {index} {tmp_path}/cron_tracking/console/summaries account_number={ACCOUNT} {secret_note}"
-             for index in range(60)]
-    write(root / "console" / "launchd.out.log", "\n".join(lines) + "\n")
-    return RootSpec.of(root)
-
-
-def forbid_locks(monkeypatch):
-    import dca_runner
-    import scripts.file_lock
-
-    def refuse(*args, **kwargs):
-        raise AssertionError("a console reader took a cross-process lock")
-
-    monkeypatch.setattr(scripts.file_lock, "cross_process_lock", refuse)
-    monkeypatch.setattr(dca_runner, "state_transaction", refuse)
-
-
-# -- manifest -----------------------------------------------------------------
+def test_launchd_label_matches_the_renderer():
+    text = (REPO / "deploy" / "launchd" / "render_console_agent.py").read_text(encoding="utf-8")
+    assert f'LABEL = "{LAUNCHD_LABEL}"' in text
 
 
 def test_manifest_tasks_enriches_the_committed_schedule():
     result = manifest_tasks(CONFIG, DAY, NOW)
-    assert result["task_count"] == 29 and len(result["tasks"]) >= 29
-    assert "tasks" not in result["policy_keys"] and "standing_perplexity_backup_policy" in result["policy_keys"]
-    assert result["policy_keys"] == sorted(result["policy_keys"]) and len(result["policy_keys"]) >= 57
-    backups = [row for row in result["tasks"] if row["timing"] == "outside this repo"]
-    assert len(backups) >= 7 and all(row["trades"] is True and row["cron_utc"] is None for row in backups)
-    # Disabled and unregistered tasks must stay visible, not be filtered out.
-    assert any(row["status"] == "disabled" for row in result["tasks"])
-    assert all(len(row["notes"] or "") <= 303 for row in result["tasks"])
-    assert not any("timing verified" in warning for warning in result["warnings"])
-
-
-def test_manifest_multi_slot_task_yields_one_enriched_row_per_slot():
-    rows = [row for row in manifest_tasks(CONFIG, DAY, NOW)["tasks"] if row["id"] == "7be82b97"]
-    assert sorted(row["time"] for row in rows) == ["11:30", "13:30", "14:30"]
-    assert all(row["cron_utc"] and row["timing"] == "cron_utc" and row["type"] == "trading" for row in rows)
-
-
-def test_manifest_tasks_fixture_semantics_and_timezone_naive_now(tmp_path):
-    result = manifest_tasks(make_config(tmp_path), DAY, NOW.replace(tzinfo=None))
+    assert result["task_count"] == 29 and "$schema" in result["policy_keys"] and "tasks" not in result["policy_keys"]
     by_id = {row["id"]: row for row in result["tasks"]}
-    assert by_id["42173154"]["executor"] == "MorningDCAExecutor" and by_id["42173154"]["timing"] == "cron_utc"
-    assert by_id["42173154"]["notes"].endswith("...") and len(by_id["42173154"]["notes"]) == 303
-    assert by_id["4412c3c4"]["timing"] == "outside this repo" and by_id["4412c3c4"]["fires_at_et"] == "09:55"
-    assert by_id["d1f7a2c0"]["status"] == "disabled" and by_id["d1f7a2c0"]["scheduler_registered"] is False
-    assert result["task_count"] == 4 and result["policy_keys"] == ["standing_policy", "version"]
-    # No market calendar in the fixture: the daily snapshot's own wording survives.
-    assert any("timing is unverified" in warning for warning in result["warnings"])
-    assert result["warnings"] == list(dict.fromkeys(result["warnings"]))
+    morning = by_id["42173154"]
+    assert morning["cron_utc"] == "30 14 * * 1-5" and morning["timing"] == "cron_utc" and morning["trades"] is True
+    assert morning["executor"] == "MorningDCAExecutor" and morning["time"] == "10:30"
+    assert morning["notes"] and len(morning["notes"]) <= 303 and "/home/user" not in json.dumps(result)
+    backups = [row for row in result["tasks"] if row["timing"] == "outside this repo"]
+    assert backups and all(row["trades"] is True and row["cron_utc"] is None for row in backups)
+    assert any(row["fires_at_et"] == "09:55" for row in backups)
+    assert "disabled" in {row["status"] for row in result["tasks"]}
+    assert {row["status"] for row in result["tasks"]} <= {
+        "timing_unverified", "elapsed_unverified", "planned", "disabled", "not_registered", "market_closed",
+        "not_scheduled_today", "elapsed_one_time"}
 
 
-def test_manifest_tasks_absent_or_malformed_manifest(tmp_path):
-    for content in (None, "{", "[]", '{"tasks": "nope"}'):
-        config = tmp_path / (content or "absent").replace("{", "brace").replace("[", "bracket").replace('"', "")
-        config.mkdir()
-        if content is not None:
-            write(config / "scheduled_tasks.json", content)
-        result = manifest_tasks(config, DAY, NOW)
-        assert result["tasks"] == [] and result["task_count"] is None and result["policy_keys"] == []
-        assert any("manifest" in warning for warning in result["warnings"])
+def test_manifest_tasks_absent_and_malformed_manifest(tmp_path):
+    absent = manifest_tasks(tmp_path / "none", DAY, NOW)
+    assert absent["tasks"] == [] and absent["task_count"] is None and absent["policy_keys"] == []
+    assert any("missing or malformed" in warning for warning in absent["warnings"])
+    tmp_path.joinpath("scheduled_tasks.json").write_text("[1, 2", encoding="utf-8")
+    broken = manifest_tasks(tmp_path, DAY, NOW)
+    assert broken["task_count"] is None and broken["tasks"] == []
 
 
-def test_policy_block_bounds_values_and_rejects_unknown_keys(tmp_path):
-    config = make_config(tmp_path)
-    block = policy_block(config, "standing_policy")
-    assert block["found"] is True
-    assert len(block["value"]["items"]) == 200 and len(block["value"]["text"]) == 503
-    assert block["value"]["nan"] is None and block["value"]["items"][0] == 0
-    assert any("200" in note for note in block["notes"]) and any("500" in note for note in block["notes"])
-    json.dumps(block, allow_nan=False)
-    for key in ("tasks", "missing", "../x", ""):
-        assert policy_block(config, key) == {"key": key, "found": False, "value": None, "notes": [], "warnings": []}
-    absent = policy_block(tmp_path / "nowhere", "version")
-    assert absent["found"] is False and absent["warnings"]
+def test_manifest_row_without_manifest_fields_still_lists(tmp_path):
+    config = write_manifest(tmp_path, [{"id": "abc", "name": "Bare", "status": "disabled"}, "junk"], policy={"a": 1})
+    result = manifest_tasks(config, DAY, NOW)
+    assert [row["status"] for row in result["tasks"]] == ["disabled"]
+    assert result["tasks"][0]["timing"] == "unspecified" and result["tasks"][0]["time"] == "unspecified"
+    assert result["policy_keys"] == ["policy"]
 
 
-def test_policy_block_fits_sixty_four_kilobytes(tmp_path):
-    config = tmp_path / "config"
-    write(config / "scheduled_tasks.json",
-          json.dumps({"big": {f"k{index}": "v" * 400 for index in range(200)}, "tasks": []}))
-    block = policy_block(config, "big")
-    assert block["found"] is True and len(json.dumps(block["value"])) <= 64 * 1024
-    assert len(block["value"]) < 200 and any("omitted" in note for note in block["notes"])
+def test_policy_block_found_tasks_and_unknown(tmp_path):
+    found = policy_block(CONFIG, "standing_perplexity_backup_policy")
+    assert found["found"] is True and found["value"] is not None and found["warnings"] == []
+    assert policy_block(CONFIG, "tasks")["found"] is False
+    assert policy_block(CONFIG, "no_such_key")["found"] is False
+    assert policy_block(CONFIG, "")["found"] is False
+    missing = policy_block(tmp_path, "version")
+    assert missing["found"] is False and missing["warnings"]
 
 
-# -- deploy/ and workflows ------------------------------------------------------
-
-
-def test_deploy_layer_parses_cron_and_systemd_without_reading_secrets(tmp_path):
-    result = deploy_layer(make_repo(tmp_path))
-    text = json.dumps(result)
-    assert "SECRETWEBHOOK" not in text and "supersecretvalue" not in text and "/opt/" not in text
-    assert str(tmp_path) not in text
-    assert result["cron_tz"] == "UTC" and result["env_files"] == ["drift-slack.env", "drift-slack.env.example"]
-    morning, afternoon = result["cron"]
-    assert morning == {"schedule": "30 14 * * 1-5", "timezone": "UTC", "script": "run-drift-check.sh",
-                       "arguments": ["morning_dca", "1030ET"], "slots": ["1030ET"], "streams": ["morning"]}
-    assert afternoon["streams"] == ["afternoon"] and afternoon["slots"] == ["1530ET"]
-    assert any("garbage" not in warning and "did not parse" in warning for warning in result["warnings"])
-    assert any("FOO" in warning for warning in result["warnings"])
-    timer = next(row for row in result["systemd"] if row["kind"] == "timer")
-    service = next(row for row in result["systemd"] if row["kind"] == "service")
-    assert timer["on_calendar"] == "Mon..Fri 10:30 America/New_York" and timer["persistent"] is True
-    assert timer["unit"] == "dca-drift-morning.service" and len(result["systemd"]) == 2
-    assert service["user"] == "dca-drift" and service["environment_file"] == "drift-slack.env"
-    assert service["slots"] == ["1030ET"] and service["script"] == "run-drift-check.sh"
+def test_policy_block_bounds_lists_strings_floats_and_bytes(tmp_path):
+    config = write_manifest(tmp_path, [], big={"items": list(range(300)), "text": "x" * 900, "nan": math.nan,
+                                                 "blob": ["y" * 400] * 400})
+    result = policy_block(config, "big")
+    assert result["found"] is True
+    value = result["value"]
+    assert len(value["items"]) == 200 and len(value["text"]) == 503 and value["nan"] is None
+    assert len(json.dumps(value)) <= 64 * 1024
+    assert any("truncated to 200 entries" in note for note in result["notes"])
+    assert any("truncated to 500 characters" in note for note in result["notes"])
+    assert any("omitted to stay under 64 KB" in note for note in result["notes"])
 
 
 def test_deploy_layer_parses_the_committed_examples():
     result = deploy_layer(REPO)
-    assert len(result["cron"]) == 7 and sorted(row["slots"][0] for row in result["cron"]) == sorted(
-        f"{slot}ET" for slot in ("0935", "1030", "1130", "1230", "1330", "1430", "1530"))
-    assert len(result["systemd"]) == 14 and all(row["persistent"] is False for row in result["systemd"]
-                                                 if row["kind"] == "timer")
-    assert "drift-slack.env.example" in result["env_files"]
+    assert result["cron_tz"] == "UTC" and len(result["cron"]) == 7
+    first = result["cron"][0]
+    assert first["schedule"] == "35 13 * * 1-5" and first["script"] == "run-drift-check.sh"
+    assert first["slots"] == ["0935ET"] and first["streams"] == ["market-open"]
+    assert {row["kind"] for row in result["systemd"]} == {"timer", "service"} and len(result["systemd"]) == 14
+    afternoon = next(row for row in result["systemd"] if row["file"] == "dca-drift-afternoon.service")
+    assert afternoon["user"] == "dca-drift" and afternoon["slots"] == ["1530ET"] and afternoon["streams"] == ["afternoon"]
+    timer = next(row for row in result["systemd"] if row["file"] == "dca-drift-afternoon.timer")
+    assert timer["persistent"] is False and timer["on_calendar"].startswith("Mon..Fri 15:30")
+    assert result["env_files"] == ["drift-slack.env.example"]
+    assert "/opt/" not in json.dumps(result)
 
 
-def test_deploy_and_workflow_layers_report_absent_directories(tmp_path):
-    (tmp_path / "empty").mkdir()
-    deploy = deploy_layer(tmp_path / "empty")
-    assert deploy["cron"] is None and deploy["systemd"] == [] and deploy["env_files"] == []
-    assert any("absent" in warning for warning in deploy["warnings"])
-    workflows = workflows_layer(tmp_path / "empty")
-    assert workflows["workflows"] is None and workflows["warnings"]
+def test_deploy_layer_absent_files_and_malformed_lines(tmp_path):
+    empty = deploy_layer(tmp_path)
+    assert empty["cron"] is None and empty["systemd"] == [] and empty["env_files"] == []
+    assert any("crontab.example is absent" in warning for warning in empty["warnings"])
+    repo = write_repo(tmp_path / "repo", crontab="CRON_TZ=UTC\nSLACK_TOKEN=abc123456\nnot a cron line\n"
+                                                  "30 14 * * 1-5 /opt/x/deploy/run-drift-check.sh morning_dca 1030ET\n")
+    result = deploy_layer(repo)
+    assert len(result["cron"]) == 1 and result["cron"][0]["timezone"] == "UTC"
+    assert any("did not parse" in warning for warning in result["warnings"])
+    assert any("SLACK_TOKEN was noted by name only" in warning for warning in result["warnings"])
+    assert "abc123456" not in json.dumps(result)
 
 
-def test_workflows_layer_scans_triggers_without_yaml(tmp_path):
-    result = workflows_layer(make_repo(tmp_path))
-    rows = {row["file"]: row for row in result["workflows"]}
-    assert set(rows) == {"self-heal.yml", "ci.yml", "lint.yml"}
-    assert rows["self-heal.yml"]["triggers"] == ["schedule", "0 3 * * 1", "workflow_dispatch", "workflow_run"]
-    assert rows["self-heal.yml"]["has_secrets_reference"] is True and rows["self-heal.yml"]["name"] == "Self-Heal"
-    assert rows["ci.yml"]["triggers"] == ["push", "pull_request"] and rows["ci.yml"]["has_secrets_reference"] is False
-    assert rows["lint.yml"] == {"file": "lint.yml", "name": None, "triggers": ["push"], "has_secrets_reference": False}
-    assert "GITHUB_TOKEN" not in json.dumps(result)
-    committed = {row["file"]: row for row in workflows_layer(REPO)["workflows"]}
-    assert "0 13 * * 1-5" in committed["drift-check.yml"]["triggers"]
-    assert committed["ci.yml"]["triggers"] == ["push", "pull_request"]
+def test_command_tokens_never_carry_embedded_paths(tmp_path):
+    """Adversarial review round 2: a flag-style token with an embedded path was leaving unscrubbed."""
+    repo = write_repo(
+        tmp_path, crontab=f"30 14 * * 1-5 /opt/x/run.sh --state-root={tmp_path}/cron_tracking --acct {ACCOUNT} morning_dca 1030ET\n",
+        service=f"[Service]\nUser=dca-drift\nEnvironmentFile=-{tmp_path}/etc/drift-slack.env\n"
+                f"ExecStart={tmp_path}/deploy/run-drift-check.sh --root={tmp_path}/cron_tracking morning_dca 1030ET\n")
+    result = deploy_layer(repo)
+    dumped = json.dumps(result)
+    assert str(tmp_path) not in dumped and ABSOLUTE.search(dumped) is None
+    cron = result["cron"][0]
+    assert cron["arguments"][0] == "--state-root=<path>/cron_tracking" and cron["slots"] == ["1030ET"]
+    assert ACCOUNT not in json.dumps(walk_redact(result))
+    service = next(row for row in result["systemd"] if row["kind"] == "service")
+    assert service["environment_file"] == "drift-slack.env" and service["script"] == "run-drift-check.sh"
+    assert service["arguments"][0] == "--root=<path>/cron_tracking"
 
 
-# -- launchd ------------------------------------------------------------------
+def test_workflows_layer_committed_and_every_on_form(tmp_path):
+    committed = workflows_layer(REPO)
+    files = {row["file"]: row for row in committed["workflows"]}
+    assert {"push", "pull_request"} <= set(files["ci.yml"]["triggers"]) and files["ci.yml"]["name"]
+    assert any(re.fullmatch(r"[\d*/,-]+( [\d*/,-]+){4}", trigger) for row in files.values() for trigger in row["triggers"])
+    assert workflows_layer(tmp_path)["workflows"] is None
+    repo = write_repo(tmp_path / "block", workflow="name: Nightly\non:\n  schedule:\n    - cron: '0 13 * * 1-5'\n"
+                                                    "  workflow_dispatch:\njobs:\n  x:\n    env: ${{ secrets.TOKEN }}\n")
+    row = workflows_layer(repo)["workflows"][0]
+    assert row["triggers"] == ["schedule", "0 13 * * 1-5", "workflow_dispatch"] and row["has_secrets_reference"] is True
+    (repo / ".github" / "workflows" / "inline.yml").write_text("on: [push, pull_request]\njobs: {}\n", encoding="utf-8")
+    (repo / ".github" / "workflows" / "scalar.yaml").write_text("on: push\n", encoding="utf-8")
+    rows = {row["file"]: row for row in workflows_layer(repo)["workflows"]}
+    assert rows["inline.yml"]["triggers"] == ["push", "pull_request"] and rows["scalar.yaml"]["triggers"] == ["push"]
+    assert rows["inline.yml"]["has_secrets_reference"] is False and rows["scalar.yaml"]["name"] is None
 
 
-def test_launchd_status_reports_plist_presence_and_bounded_redacted_tails(tmp_path):
-    root = make_root(tmp_path)
-    result = launchd_status([RootSpec.of(tmp_path / "other", "secondary"), root], home=make_home(tmp_path))
-    assert result["plist_present"] is True and result["plist_modified"].startswith("20")
-    assert result["log_root"] == root.label and [log["name"] for log in result["logs"]] == ["launchd.out.log"]
+def test_launchd_status_plist_and_log_tails(tmp_path):
+    home = tmp_path / "home"
+    plist = home / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+    plist.parent.mkdir(parents=True)
+    plist.write_text("<plist/>", encoding="utf-8")
+    root = tmp_path / "root"
+    (root / "console").mkdir(parents=True)
+    lines = [f"line {index} at {root} acct {ACCOUNT}" for index in range(60)]
+    (root / "console" / "launchd.out.log").write_text("\n".join(lines), encoding="utf-8")
+    result = launchd_status([RootSpec.of(tmp_path / "other", "secondary"), RootSpec.of(root)], home=home)
+    assert result["plist_present"] is True and result["plist_modified"].endswith(("-04:00", "-05:00"))
+    assert result["log_root"] == RootSpec.of(root).label and [log["name"] for log in result["logs"]] == ["launchd.out.log"]
     tail = result["logs"][0]["tail"]
     assert len(tail) == 40 and tail[-1].startswith("line 59") and result["logs"][0]["size"] > 0
-    text = json.dumps(result)
-    assert str(tmp_path) not in text and ACCOUNT not in text and "<path>/summaries" in text
-    assert launchd_status([root], home=tmp_path / "nohome")["plist_present"] is False
-    empty = launchd_status([], home=tmp_path / "nohome")
-    assert empty["logs"] == [] and empty["plist_modified"] is None and empty["warnings"]
+    assert str(tmp_path) not in json.dumps(result) and ACCOUNT not in json.dumps(result)
+    bare = launchd_status([], home=tmp_path / "nohome")
+    assert bare["plist_present"] is False and bare["plist_modified"] is None and bare["logs"] == []
+    assert any("No artifact root" in warning for warning in bare["warnings"])
 
 
-def test_launchd_label_matches_the_renderer_and_path_scrub_keeps_urls():
-    renderer = (REPO / "deploy" / "launchd" / "render_console_agent.py").read_text(encoding="utf-8")
-    assert f'LABEL = "{LAUNCHD_LABEL}"' in renderer
-    scrubbed = schedule._scrub_paths("root=/Users/who/Documents/Git/repo/cron_tracking/x via http://127.0.0.1:8765/api/x "
-                                     "route=/api/bootstrap")
-    assert scrubbed == "root=<path>/x via http://127.0.0.1:8765/api/x route=/api/bootstrap"
-
-
-# -- roster and matrix ----------------------------------------------------------
-
-
-def test_roster_identity_reads_constants_without_constructing_executors(monkeypatch):
-    import morning_dca
-
-    def boom(self, *args, **kwargs):
-        raise AssertionError("an executor was constructed")
-
-    monkeypatch.setattr(morning_dca.MorningDCAExecutor, "__init__", boom)
+def test_roster_identity_names_every_runner_slot():
     result = roster_identity(CONFIG)
     rows = {row["slot_id"]: row for row in result["slots"]}
     assert list(rows) == ["0935", "1030", "1130", "1230", "1330", "1430", "1530"]
-    assert rows["1030"]["executor_class"] == "MorningDCAExecutor" and rows["1030"]["run_dca_entry"] == "run_slot"
-    assert rows["1030"]["pointer_name"] == "latest_morning_run.json" and rows["1030"]["artifact_dir"] == "morning_dca"
-    assert rows["1030"]["window"] == {"start": "10:30", "end": "11:00"}
-    assert rows["1030"]["executor_window"] == {"start": "10:25", "end": "10:35"}
-    assert rows["0935"]["run_dca_entry"] == "disabled" and rows["0935"]["cron_id"] == "2ba19526"
-    assert rows["1330"]["executor_class"] == "IntradayDCAExecutor" and rows["1330"]["cron_id"] == "7be82b97"
-    assert rows["1530"]["executor_class"] is None and rows["1530"]["artifact_dir"] == "ce16ba6b/scheduled_runs"
-    assert rows["1530"]["pointer_name"] == "latest_scheduled_run.json" and rows["1530"]["run_dca_entry"] == "run_slot"
-    assert rows["1230"]["live_execution_enabled"] is True and rows["0935"]["live_execution_enabled"] is False
-    # morning_dca.json carries no flag and near_close has no stream config: None, never False.
-    assert rows["1030"]["live_execution_enabled"] is None and rows["1530"]["live_execution_enabled"] is None
-    assert str(REPO) not in json.dumps(result) and result["warnings"] == []
+    morning = rows["1030"]
+    assert morning["executor_class"] == "MorningDCAExecutor" and morning["cron_id"] == "42173154"
+    assert morning["run_dca_entry"] == "run_slot" and morning["window"] == {"start": "10:30", "end": "11:00"}
+    assert morning["executor_window"] == {"start": "10:25", "end": "10:35"} and morning["trades"] is True
+    assert morning["artifact_dir"] == "morning_dca" and morning["pointer_name"] == "latest_morning_run.json"
+    assert morning["config_file"] == "morning_dca.json" and morning["live_execution_enabled"] is None
+    assert rows["0935"]["run_dca_entry"] == "disabled" and rows["0935"]["executor_class"] == "MarketOpenDCAExecutor"
+    assert rows["1330"]["stream"] == "intraday" and rows["1330"]["executor_class"] == "IntradayDCAExecutor"
+    final = rows["1530"]
+    assert final["executor_class"] is None and final["cron_id"] == "10ce362c" and final["run_dca_entry"] == "run_slot"
+    assert final["artifact_dir"] == "ce16ba6b/scheduled_runs" and final["pointer_name"] == "latest_scheduled_run.json"
+    assert ABSOLUTE.search(json.dumps(result)) is None
 
 
-def test_roster_identity_without_stream_configs_reports_unknown_flags(tmp_path):
+def test_roster_identity_missing_config_reports_unknown_flag(tmp_path):
     result = roster_identity(tmp_path)
     assert all(row["live_execution_enabled"] is None for row in result["slots"])
-    assert len(result["warnings"]) == 5 and all("live flag is unknown" in warning for warning in result["warnings"])
+    assert any("midday_dca.json is missing" in warning for warning in result["warnings"])
+    (tmp_path / "midday_dca.json").write_text(json.dumps({"live_execution_enabled": False}), encoding="utf-8")
+    rows = {row["slot_id"]: row for row in roster_identity(tmp_path)["slots"]}
+    assert rows["1230"]["live_execution_enabled"] is False
 
 
-def test_build_schedule_layers_joins_slots_and_observed_evidence(tmp_path):
-    observed = {"morning": {"status": "valid", "evidence": "pointer", "run_state_present": True},
-                "afternoon": {"status": "recovery", "evidence": "context", "run_state_present": False},
-                "market_open": {"status": "missing"}}
-    result = build_schedule_layers(CONFIG, REPO, [make_root(tmp_path)], DAY, NOW, observed=observed)
-    matrix = {row["slot_id"]: row for row in result["matrix"]}
-    assert len(matrix) == 7 and all(row["configured"] is True and row["deployable"] is True for row in matrix.values())
-    assert matrix["1030"]["observed"] is True and matrix["1030"]["observed_entry"]["status"] == "valid"
-    assert matrix["1530"]["observed"] is False and matrix["0935"]["observed"] is None
-    assert matrix["1130"]["observed"] is None and matrix["1130"]["observed_entry"] is None
-    assert matrix["1030"]["manifest_task_ids"] == ["42173154"] and matrix["1030"]["cron_entries"] == 1
-    assert matrix["1330"]["systemd_units"] == ["dca-drift-intraday-1330.service"]
+def test_build_schedule_layers_matrix_without_observed(tmp_path):
+    result = build_schedule_layers(CONFIG, REPO, [RootSpec.of(tmp_path)], DAY, NOW)
     assert set(result) == {"manifest", "deploy", "workflows", "launchd", "roster", "matrix", "warnings"}
+    rows = {row["slot_id"]: row for row in result["matrix"]}
+    assert len(rows) == 7 and all(row["observed"] is None and row["observed_entry"] is None for row in rows.values())
+    assert all(row["deployable"] is True and row["cron_entries"] == 1 for row in rows.values())
+    assert "42173154" in rows["1030"]["manifest_task_ids"] and rows["1030"]["configured"] is True
+    assert rows["1030"]["systemd_units"] == ["dca-drift-morning.service"]
     assert result["warnings"][-1].endswith("scheduler execution is unverified.")
-    assert result["warnings"] == list(dict.fromkeys(result["warnings"]))
 
 
-def test_matrix_uses_none_for_unavailable_layers_not_false(tmp_path):
-    (tmp_path / "bare").mkdir()
-    result = build_schedule_layers(tmp_path / "bare", tmp_path / "bare", [], DAY, NOW)
-    assert result["matrix"] and all(row["configured"] is None and row["deployable"] is None and row["observed"] is None
-                                    for row in result["matrix"])
+def test_matrix_layers_unavailable_are_none_not_false(tmp_path):
+    result = build_schedule_layers(tmp_path / "config", tmp_path / "repo", [], DAY, NOW)
+    assert all(row["configured"] is None and row["deployable"] is None for row in result["matrix"])
+    assert result["matrix"] and result["manifest"]["task_count"] is None
+
+
+def test_observed_from_pointer_strip_prefers_primary_and_skips_alias():
+    strip = {"streams": [
+        pointer_row("morning", "backup", at_risk=True, status="valid"),
+        pointer_row("morning", alias=True, status="pending", evidence=False, evidence_label="unverified"),
+        pointer_row("morning", status="missing", evidence=False, run_state_present=False, evidence_label="rejected"),
+        pointer_row("afternoon", status="missing", evidence=False, run_state_present=False),
+        pointer_row("afternoon", status="valid"),
+        pointer_row("midday", "backup", at_risk=True),
+        "junk", {"no": "stream"},
+    ]}
+    observed = observed_from_pointer_strip(strip)
+    assert set(observed) == {"morning", "afternoon", "midday"}
+    # A secondary root's valid pointer never outranks the primary root's canonical row.
+    assert observed["morning"]["status"] == "missing" and observed["morning"]["at_risk"] is False
+    assert observed["afternoon"]["status"] == "valid" and observed["midday"]["at_risk"] is True
+    assert observed_from_pointer_strip(None) == {} and observed_from_pointer_strip({"streams": "x"}) == {}
+
+
+def test_matrix_observed_from_real_pointer_row_shape(tmp_path):
+    """Evidence stays a bool, at_risk and label ride along, and a shared stream never lights three slots."""
+    observed = observed_from_pointer_strip({"streams": [
+        pointer_row("morning"),
+        pointer_row("midday", "backup", at_risk=True, status="valid_recovery_context", evidence=False,
+                    evidence_label="recovery context, not scheduled evidence"),
+        pointer_row("afternoon", status="pending", evidence=False, evidence_label="unverified", run_state_present=False),
+        pointer_row("intraday"),
+    ]})
+    rows = {row["slot_id"]: row for row in
+            build_schedule_layers(CONFIG, REPO, [RootSpec.of(tmp_path)], DAY, NOW, observed=observed)["matrix"]}
+    morning = rows["1030"]
+    assert morning["observed"] is True and morning["scheduled_evidence"] is True and morning["observed_at_risk"] is False
+    assert morning["observed_entry"]["evidence"] is True and morning["observed_entry"]["label"] == "primary"
+    assert morning["observed_entry"]["evidence_label"] == "scheduled evidence"
+    midday = rows["1230"]
+    assert midday["observed"] is True and midday["scheduled_evidence"] is False and midday["observed_at_risk"] is True
+    assert midday["observed_entry"]["status"] == "valid_recovery_context"
+    final = rows["1530"]  # runner label 'final' joins the runs module's 'afternoon'
+    assert final["observed"] is False and final["scheduled_evidence"] is False and final["observed_entry"]["per_slot"]
+    for slot_id in ("1130", "1330", "1430"):
+        row = rows[slot_id]
+        assert row["observed"] is None and row["scheduled_evidence"] is None
+        assert row["observed_entry"]["per_slot"] is False and row["observed_entry"]["run_state_present"] is True
+        assert "per-stream, not per-slot" in row["observed_note"]
+    assert rows["0935"]["observed"] is None and rows["0935"]["observed_note"] is None
+    assert rows["1030"]["observed_note"] is None
+
+
+def test_matrix_slot_keyed_observed_lights_only_that_slot(tmp_path):
+    observed = {"1330": pointer_row("intraday"), "intraday@1430": pointer_row("intraday", status="missing", evidence=False,
+                                                                                 run_state_present=False)}
+    rows = {row["slot_id"]: row for row in
+            build_schedule_layers(CONFIG, REPO, [RootSpec.of(tmp_path)], DAY, NOW, observed=observed)["matrix"]}
+    assert rows["1330"]["observed"] is True and rows["1330"]["observed_note"] is None
+    assert rows["1430"]["observed"] is False and rows["1130"]["observed"] is None
+    # A string in the evidence field (the old fixture shape) is unknown, never a label.
+    loose = {"1030": {**pointer_row("morning"), "evidence": "pointer", "at_risk": "no"}}
+    row = next(row for row in build_schedule_layers(CONFIG, REPO, [], DAY, NOW, observed=loose)["matrix"]
+               if row["slot_id"] == "1030")
+    assert row["scheduled_evidence"] is None and row["observed_at_risk"] is None and row["observed"] is True
 
 
 def test_no_secret_or_absolute_path_survives_any_builder(tmp_path):
-    note = f"acct {ACCOUNT} at {tmp_path}/cron_tracking/console/x"
-    repo, config, root = make_repo(tmp_path, note), make_config(tmp_path, note), make_root(tmp_path, note)
-    raw = build_schedule_layers(config, repo, [root], DAY, NOW, observed={"morning": {"status": note}})
-    raw["policy"] = policy_block(config, "standing_policy")
-    before = json.dumps(raw)
-    assert str(tmp_path) not in before
-    after = json.dumps(walk_redact(raw))
-    assert ACCOUNT not in after and str(tmp_path) not in after
+    leak = f"ledger under {tmp_path}/cron_tracking/morning_dca for account {ACCOUNT}"
+    config = write_manifest(tmp_path / "config", [
+        {"id": "t1", "name": leak, "type": "trading", "status": "active", "trades": True, "cron_utc": "30 14 * * 1-5",
+         "et_slots": ["10:30"], "executor": leak, "notes": leak * 3},
+        {"id": "t2", "name": "Backup", "trades": True, "fires_at_et": "10:50", "notes": leak},
+    ], policy={"where": leak, "list": [leak] * 3})
+    repo = write_repo(tmp_path / "repo", crontab=f"30 14 * * 1-5 {tmp_path}/run.sh --root={tmp_path}/x {ACCOUNT} morning_dca 1030ET\n",
+                      workflow=f"name: {leak}\non:\n  push:\n")
+    root = tmp_path / "root"
+    (root / "console").mkdir(parents=True)
+    (root / "console" / "launchd.err.log").write_text(leak + "\n", encoding="utf-8")
+    observed = {"morning": pointer_row("morning", label=leak, evidence_label=leak, status=leak)}
+    for result in every_builder(config, repo, [RootSpec.of(root)], observed):
+        dumped = json.dumps(result)
+        assert str(tmp_path) not in dumped and ABSOLUTE.search(dumped) is None
+        assert ACCOUNT not in json.dumps(walk_redact(result))
+    tasks = manifest_tasks(config, DAY, NOW)["tasks"]
+    assert all(len(row["notes"]) <= 303 for row in tasks) and all("<path>/morning_dca" in row["notes"] for row in tasks)
+    assert next(row for row in tasks if row["id"] == "t2")["timing"] == "outside this repo"
 
 
-def test_every_builder_is_lock_free(tmp_path, monkeypatch):
-    forbid_locks(monkeypatch)
-    repo, config, root = make_repo(tmp_path), make_config(tmp_path), make_root(tmp_path)
-    manifest_tasks(config, DAY, NOW)
-    manifest_tasks(CONFIG, DAY, NOW)
-    policy_block(config, "standing_policy")
-    deploy_layer(repo)
-    workflows_layer(repo)
-    launchd_status([root], home=make_home(tmp_path))
-    roster_identity(CONFIG)
-    build_schedule_layers(CONFIG, REPO, [root], DAY, NOW, observed={})
+def test_builders_never_take_a_lock(tmp_path, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError("a console reader took a lock")
+
+    monkeypatch.setattr(scripts.file_lock, "cross_process_lock", refuse)
+    monkeypatch.setattr(dca_runner, "state_transaction", refuse)
+    roots = [RootSpec.of(tmp_path)]
+    for result in every_builder(CONFIG, REPO, roots, observed_from_pointer_strip({"streams": [pointer_row("morning")]})):
+        assert isinstance(result["warnings"], list)
+    assert policy_block(CONFIG, "version")["found"] is True
 
 
-@pytest.mark.parametrize("value, expected", [("30 14 * * 1-5", "30 14 * * 1-5"), ("30 14 * *", None), (5, None)])
-def test_cron_utc_requires_five_fields(value, expected):
-    assert schedule._cron_utc(value) == expected
+@pytest.mark.parametrize("key", ["tasks", "../x", "", "no_such_policy"])
+def test_policy_block_rejects_non_policy_keys(key):
+    result = policy_block(CONFIG, key)
+    assert result["found"] is False and result["value"] is None

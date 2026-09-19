@@ -63,6 +63,16 @@ def redact(text: str) -> str:
 
 
 _SENSITIVE_VARIABLE_MARKERS = ("SECRET", "TOKEN", "PASSWORD", "API_KEY", "ACCOUNT_NUMBER", "WEBHOOK")
+_REPO_LOCATION = str(Path(__file__).resolve().parent)
+_HOME_LOCATION = str(Path.home())
+# Longest first, so the checkout (which usually sits under the home directory)
+# is rewritten before the home prefix could split it.
+_LOCATION_PLACEHOLDERS = tuple(sorted(
+    ((_REPO_LOCATION, "<checkout>"), (_HOME_LOCATION, "~")), key=lambda pair: len(pair[0]), reverse=True,
+))
+# Same shape as near_close_dca._ACCOUNT_SHAPED_LITERAL with the lower bound
+# raised to nine digits; see redact_value for why eight-digit ids must survive.
+_STRUCTURED_ACCOUNT_LITERAL = re.compile(r"(?<![.\w])\d{9,12}(?!\w|\.\d)")
 
 
 def is_sensitive_variable(name: str) -> bool:
@@ -84,7 +94,7 @@ def redact_value(text: str) -> str:
     value whose variable name marks it sensitive, and the credential/account
     shapes the shared strategy sanitizer recognises (GUI expansion, Phase 0).
     """
-    from near_close_dca import _ACCOUNT_LABELED_DIGITS, _ACCOUNT_SHAPED_LITERAL, _URL_EMBEDDED_CREDENTIALS
+    from near_close_dca import _ACCOUNT_LABELED_DIGITS, _URL_EMBEDDED_CREDENTIALS
 
     with _REGISTERED_SECRETS_LOCK:
         registered = _REGISTERED_SECRETS
@@ -98,10 +108,23 @@ def redact_value(text: str) -> str:
     # a run directory name) never matches them.
     text = _URL_EMBEDDED_CREDENTIALS.sub("://[redacted]@", text)
     text = _ACCOUNT_LABELED_DIGITS.sub(lambda match: f"{match.group(1)}[redacted]", text)
-    text = _ACCOUNT_SHAPED_LITERAL.sub("[redacted]", text)
+    # The shared literal rule covers 6-12 bare digits, which also swallows the
+    # scheduler's 8-hex-character task ids whenever one happens to be all
+    # digits (42173154 is the 10:30 morning cron). A brokerage account number
+    # is nine digits or longer, so structured responses use the 9-12 span and
+    # keep the free-text sanitizer's wider net for logs and error bodies.
+    text = _STRUCTURED_ACCOUNT_LITERAL.sub("[redacted]", text)
     for name, value in os.environ.items():
         if value and len(value) >= 6 and is_sensitive_variable(name):
             text = text.replace(value, "[redacted]")
+    # Locations are not secrets, but an operator's home directory and the
+    # checkout path are still never echoed to a browser: job logs persisted
+    # before argv was spelled checkout-relative, and any artifact string that
+    # embeds one, are rewritten to a placeholder (GUI expansion Phase 0 leak
+    # fix, applied at the redaction chokepoint so every route inherits it).
+    for location, placeholder in _LOCATION_PLACEHOLDERS:
+        if location and location in text:
+            text = text.replace(location, placeholder)
     return text
 
 

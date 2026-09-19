@@ -151,9 +151,10 @@ py-modules = [
     # shipped in no wheel (2026-09-07 diagnostic P:PACKAGING-02).
     "sizing_adjustment_reader",
     # Deliberately NOT listed: dca_console, dca_console_data, dca_console_jobs,
-    # dca_console_octopus, dca_console_reader, dca_console_routes (and the
-    # from.py launcher) are the local developer console and only ever run from
-    # a source checkout.
+    # dca_console_octopus, dca_console_reader, dca_console_routes, and the
+    # page readers dca_console_{runs,schedule,state,config,alerts,reports,
+    # research,env,docs,launch} (and the from.py launcher) are the local
+    # developer console and only ever run from a source checkout.
 ]
 # scripts/run_classification.py is the run-classification contract used by both
 # the live artifact writer (near_close_dca.build_run_artifacts) and readers

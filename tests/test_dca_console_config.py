@@ -266,18 +266,18 @@ def test_live_gate_summary_reports_names_never_values(cfg, monkeypatch):
     armed = {gate["name"]: gate for gate in reader.live_gate_summary(cfg, DAY)["gates"]}
     assert armed["account_number_env"]["state"] == "configured" and SYNTHETIC_ACCOUNT not in json.dumps(armed)
     assert "not empty" in armed["strategy_dry_run"]["detail"] and armed["strategy_dry_run"]["state"] == "unconfigured"
-    assert reader.live_gate_summary(cfg, date(2026, 12, 1))["gates"][4]["state"] == "unconfigured"
+    assert reader.live_gate_summary(cfg, date(2027, 3, 15))["gates"][4]["state"] == "unconfigured"
 
 
 def test_window_countdown_covers_expiry_and_calendar(cfg):
     inside = reader.window_countdown(cfg, DAY)
-    assert inside["start"] == "2026-07-02" and inside["end"] == "2026-10-30"
+    assert inside["start"] == "2026-07-02" and inside["end"] == "2027-03-12"
     assert inside["in_window"] is True and inside["expired"] is False and inside["expiring_warning"] is False
     assert inside["days_remaining"] > reader.near_close_dca.APPROVED_WINDOW_EXPIRY_WARN_DAYS
     assert inside["calendar_years"] == [2026, 2027, 2028] and inside["calendar_covers_day"] is True
-    near_end = reader.window_countdown(cfg, date(2026, 10, 26))
+    near_end = reader.window_countdown(cfg, date(2027, 3, 8))
     assert near_end["in_window"] is True and near_end["expiring_warning"] is True and near_end["days_remaining"] == 5
-    after = reader.window_countdown(cfg, date(2026, 11, 2))
+    after = reader.window_countdown(cfg, date(2027, 3, 15))
     assert after["in_window"] is False and after["expired"] is True and after["expiring_warning"] is True
     assert after["days_remaining"] == 0
     assert reader.window_countdown(cfg, date(2030, 1, 3))["calendar_covers_day"] is False
@@ -299,6 +299,8 @@ def test_absent_config_dir_is_unavailable_not_zero(tmp_path):
     assert reader.ladder_preview(absent)["per_ticker"] == [] and len(reader.ladder_preview(absent)["grid"]) == 49
     snapshot = reader.build_config_snapshot(absent, REPO, NOW, DAY)
     assert snapshot["gates"]["gates"][4]["state"] == "unknown"
+    # Zero readable stream files is no evidence either way, never "blocks live money".
+    assert snapshot["gates"]["gates"][2]["state"] == "unknown"
     json.dumps(snapshot, allow_nan=False)
 
 
@@ -336,3 +338,66 @@ def test_builders_never_take_a_cross_process_lock(cfg, monkeypatch):
     monkeypatch.setattr(dca_runner, "state_transaction", refuse)
     results = every_builder(cfg)
     assert len(results) == 11 and all("warnings" in result for result in results)
+
+
+def test_text_redacts_and_scrubs_before_bounding():
+    # Adversarial review: a cut before redaction split a 12-digit account literal
+    # into a 9-digit tail the account regex no longer matched, and split a
+    # documented path so its second segment was never scrubbed.
+    # Whitespace before the digits: redact_value's account regex refuses a run
+    # glued to a word (a job id's date stamp) by design, and the conftest export
+    # of the synthetic account must not be what makes this pass.
+    account = "x" * 495 + " 999000111"
+    bounded = reader._text(account)
+    assert len(bounded) <= reader.MAX_TEXT and "9990" not in bounded and bounded.endswith(" [red")
+    assert "999000111" not in bounded
+    # Prose separates a path with whitespace (a token glued to a word, like a
+    # run-dir name "abc/def", is deliberately not a path); the cut lands inside
+    # the path so only the redact-first ordering keeps "/home/" out.
+    path = "y" * 493 + " /home/user/workspace/secretdir/f.json"
+    scrubbed = reader._text(path)
+    assert "/home/" not in scrubbed and len(scrubbed) <= reader.MAX_TEXT and scrubbed.endswith(" [path]")
+    assert reader._text("short " + SYNTHETIC_ACCOUNT) == "short [redacted]"
+    assert reader._text("see /home/user/workspace/run_state.json") == "see [path]/run_state.json"
+    # A shorter limit still bounds the redacted text, and None stays None.
+    assert len(reader._text("z" * 5000, 40)) == 40 and reader._text(None) is None
+    # A pathological field is scanned only up to the pre-slice, never in full.
+    huge = "w" * (reader.MAX_TEXT * reader._SCAN_LIMIT_FACTOR + 10) + SYNTHETIC_ACCOUNT
+    assert len(reader._text(huge)) == reader.MAX_TEXT
+
+
+def test_per_ticker_sizing_type_error_degrades_instead_of_raising(cfg):
+    # dca_config.load_per_ticker_sizing does float(tier["min_drop_pct"]) (line 672):
+    # null there is a TypeError, the failure a bad publish actually produces.
+    write(cfg, "per_ticker_sizing", {"status": "active", "version": "v9",
+                                     "tickers": {"AAPL": {"tiers": [{"min_drop_pct": None, "multiplier": 1.0}]}}})
+    with pytest.raises(TypeError):
+        dca_config.load_per_ticker_sizing(cfg)
+    preview = reader.ladder_preview(cfg)
+    assert preview["per_ticker"] == [] and len(preview["grid"]) == 49
+    assert any(w.startswith("per_ticker_sizing.json:") for w in preview["warnings"])
+    sizing = reader.sizing_sources(cfg, NOW)
+    assert sizing["per_ticker"]["loaded_count"] is None and sizing["per_ticker"]["entry_count"] == 1
+    assert any(w.startswith("per_ticker_sizing.json:") for w in sizing["warnings"])
+    snapshot = reader.build_config_snapshot(cfg, REPO, NOW, DAY)
+    assert any(w.startswith("per_ticker_sizing.json:") for w in snapshot["warnings"])
+    json.dumps(snapshot, allow_nan=False)
+
+
+def test_stream_gate_distinguishes_unread_from_disabled(cfg):
+    # Every stream file unreadable: no observation, so the gate is unknown.
+    for stream in reader.STREAMS:
+        write(cfg, f"{stream}_dca", "{broken")
+    gates = {gate["name"]: gate for gate in reader.live_gate_summary(cfg, DAY)["gates"]}
+    assert gates["stream_live_execution_enabled"]["state"] == "unknown"
+    assert "no stream policy file could be read" in gates["stream_live_execution_enabled"]["detail"]
+    # One file read and it disables live execution: that is evidence of "blocks".
+    write(cfg, "market_open_dca", {"live_execution_enabled": False})
+    gates = {gate["name"]: gate for gate in reader.live_gate_summary(cfg, DAY)["gates"]}
+    assert gates["stream_live_execution_enabled"]["state"] == "unconfigured"
+    assert "1 of 4 stream files read" in gates["stream_live_execution_enabled"]["detail"]
+    # One file read and it enables live execution: permits live money.
+    write(cfg, "market_open_dca", {"live_execution_enabled": True})
+    gates = {gate["name"]: gate for gate in reader.live_gate_summary(cfg, DAY)["gates"]}
+    assert gates["stream_live_execution_enabled"]["state"] == "configured"
+    assert "market_open" in gates["stream_live_execution_enabled"]["detail"]

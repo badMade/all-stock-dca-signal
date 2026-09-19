@@ -1,6 +1,7 @@
 """Runs-page reader regressions: bounded, label-only, lock-free, and honest about gaps."""
 
 import json
+import os
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -8,7 +9,7 @@ import pytest
 
 import dca_runner
 import scripts.file_lock
-from dca_console_reader import RootSpec
+from dca_console_reader import MAX_BYTES, RootSpec
 from dca_console_routes import walk_redact
 from dca_console_runs import (
     artifact_tree_map,
@@ -17,6 +18,7 @@ from dca_console_runs import (
     pointer_strip,
     run_identity,
 )
+from scripts.run_classification import build_scheduled_classification
 
 DAY = date(2026, 9, 8)
 CONFIG = Path(__file__).resolve().parents[1] / "config"
@@ -38,10 +40,18 @@ def write_state(root, relative="morning_dca/20260908_1030ET", name="run_state.js
 
 
 def afternoon_run(root, relative="ce16ba6b/scheduled_runs/20260908_1530ET", **updates):
-    """A 3:30 PM run with every artifact the detail builder knows how to read."""
+    """A 3:30 PM run with every artifact the detail builder knows how to read.
+
+    The classification block is the canonical one the live writer emits, so
+    ``dca_risk.classify_stream`` (which insists on ``validate_classification``
+    passing) counts the run as scheduled afternoon evidence; a hand-rolled
+    three-key block is STREAM_OTHER and the evidence-gap diagnostic would
+    report it as excluded by stream.
+    """
     state = {
         "account_number": ACCOUNT, "order_submit_status": "submitted", "run_id": "scheduled_20260908_1530ET",
-        "run_classification": {"stream": "afternoon", "run_origin": "scheduled", "manual_run": False},
+        "generated_at": DAY.isoformat() + "T15:30:00-04:00",
+        "run_classification": build_scheduled_classification(DAY.isoformat(), "2026-09-08T19:30:00Z"),
         "buy_candidates": [{"ticker": "ABC", "planned_amount_usd": 20.0, "target_price": 10.0,
                             "buy_multiplier": 2.0, "order_id": "ORDER-SECRET-1"}],
         "top_up_note": f"seen under {root} for {ACCOUNT}",
@@ -170,9 +180,11 @@ def test_index_collapses_variants_filters_and_excludes(tmp_path):
     assert result["runs"][0]["status"] == "failed" and result["runs"][0]["time"].startswith("2026-09-08T10:31")
     assert result["recent_days"] == ["2026-09-08", "2026-08-10"]
     assert [row["day"] for row in build_run_index([root], day=date(2026, 8, 10))["runs"]] == ["2026-08-10"]
-    monthly = build_run_index([root], month="2026-09", excluded_roots=[tmp_path / "console"])
-    assert [row["day"] for row in monthly["runs"]] == ["2026-09-08"]
+    # The demo archive is only hidden when the caller excludes it; the day
+    # filter is the state's trading_day, so the demo run is a September row.
     assert [row["day"] for row in build_run_index([root], month="2026-09")["runs"]] == ["2026-09-08", "2026-09-01"]
+    excluded = build_run_index([root], month="2026-09", excluded_roots=[tmp_path / "console"])
+    assert [row["day"] for row in excluded["runs"]] == ["2026-09-08"]
     assert build_run_index([root], day=date(2026, 1, 1))["runs"] == []
 
 
@@ -199,7 +211,13 @@ def test_detail_sections_from_a_full_afternoon_run(tmp_path):
     assert detail["found"] is True and detail["run"]["stream"] == "afternoon"
     identity = detail["identity"]
     assert identity["order_submit_status"] == "submitted" and identity["risk_guard"]["deployed_last_7d_usd"] == 40.0
-    assert identity["run_classification"] == {"stream": "afternoon", "run_origin": "scheduled", "manual_run": False}
+    classification = identity["run_classification"]
+    assert classification["stream"] == "afternoon" and classification["run_origin"] == "scheduled"
+    assert classification["manual_run"] is False and classification["cron_id"] == "10ce362c"
+    # Only the allowlisted sub-keys survive: the run_id, trigger time and
+    # window fields the live writer stamps are dropped with everything else.
+    assert set(classification) <= {"stream", "run_origin", "manual_run", "run_type", "cron_id", "schema",
+                                   "state_schema_version"}
     assert "account_number" not in identity and "buy_candidates" not in identity and "run_id" not in identity
     assert "top_up_note" in identity
     assert detail["contract"]["ok"] is True and detail["contract"]["errors"] == []
@@ -241,14 +259,118 @@ def test_detail_explains_afternoon_evidence_gap_with_labels_only(tmp_path):
     root = RootSpec.of(tmp_path)
     detail = build_run_detail([root], only_run(root)["id"], config_dir=CONFIG)
     explanation = detail["abort_explanation"]
-    # The fixture's classification lacks the scheduled contract's required
-    # fields, so the diagnostic honestly reports the tree as populated with
-    # non-evidence rather than healthy.
-    assert explanation["likely_cause"] == "afternoon_evidence_excluded_by_stream"
-    assert explanation["qualifying_in_window_total"] == 0
+    # afternoon_run() emits the canonical classification block (see its
+    # docstring), so classify_stream counts the run as real scheduled afternoon
+    # evidence and the diagnostic reports the tree as healthy -- the gap this
+    # run aborted on is elsewhere. The "excluded_by_stream" reading belongs to
+    # the older fixture that hand-rolled a three-key classification.
+    assert explanation["likely_cause"] == "afternoon_evidence_healthy"
     assert explanation["as_of"] == "2026-09-08" and "cron_tracking_root" not in explanation
     assert all(entry["root"].startswith(f"<{root.label}>") for entry in explanation["roots"])
     assert str(tmp_path) not in json.dumps(detail)
+
+
+def test_detail_opens_runs_the_capped_index_cannot_list(tmp_path):
+    """The 500-row cap is presentation only; a clicked id must resolve past it (review: detail 404)."""
+    for offset in range(501):
+        (tmp_path / (date(2020, 1, 1) + timedelta(days=offset)).isoformat()).mkdir()
+    root = RootSpec.of(tmp_path)
+    oldest = run_identity(root.label, "2020-01-01")
+    assert oldest not in {row["id"] for row in build_run_index([root])["runs"]}
+    detail = build_run_detail([root], oldest, config_dir=CONFIG)
+    assert detail["found"] is True and detail["run"]["day"] == "2020-01-01"
+    assert not any("newest 500" in warning for warning in detail["warnings"])
+
+
+def test_detail_honours_the_same_exclusions_as_the_index(tmp_path):
+    write_state(tmp_path, "console/demo/20260901_1030ET", trading_day="2026-09-01")
+    root = RootSpec.of(tmp_path)
+    demo = run_identity(root.label, "console/demo/20260901_1030ET")
+    assert build_run_detail([root], demo, config_dir=CONFIG)["found"] is True
+    hidden = build_run_detail([root], demo, config_dir=CONFIG, excluded_roots=[tmp_path / "console"])
+    assert hidden["found"] is False and any("No run" in warning for warning in hidden["warnings"])
+
+
+def test_symlinked_root_scans_and_reads_the_same_tree(tmp_path):
+    """A root reached through a symlink must index, open and validate like a plain one (review: resolved base)."""
+    real = tmp_path / "real"
+    folder = afternoon_run(real)
+    link = tmp_path / "link"
+    os.symlink(real, link, target_is_directory=True)
+    # The documented afternoon pointer lives at the ce16ba6b root itself
+    # (scripts.run_classification.latest_scheduled_run_path), and here it
+    # spells the target through the symlink, as a pointer written by a
+    # process that was itself started on the symlinked path would.
+    (real / "ce16ba6b" / "latest_scheduled_run.json").write_text(json.dumps({
+        "run_id": "scheduled_20260908_1530ET", "run_state_path": str(link / folder.relative_to(real) / "run_state.json"),
+        "trading_day": DAY.isoformat(), "stream": "afternoon", "pointer_status": "valid"}), encoding="utf-8")
+    root = RootSpec.of(link)
+    index = build_run_index([root])
+    assert [row["relative_dir"] for row in index["runs"]] == ["ce16ba6b/scheduled_runs/20260908_1530ET"]
+    assert index["runs"][0]["id"] == run_identity(root.label, "ce16ba6b/scheduled_runs/20260908_1530ET")
+    assert not any("malformed" in warning for warning in index["warnings"])
+    detail = build_run_detail([root], index["runs"][0]["id"], config_dir=CONFIG)
+    assert detail["found"] is True and detail["contract"]["ok"] is True and detail["drift"] is not None
+    assert set(detail["tables"]) == {"signals.csv", "buy_candidates.csv", "submitted_orders.csv"}
+    assert detail["post_trade"]["available"] is True and detail["close_window"]["raw_quote_files"] == 1
+    tree = artifact_tree_map([root])["roots"][0]
+    assert next(entry for entry in tree["directories"] if entry["name"] == "ce16ba6b/scheduled_runs")["entries"] == 1
+    pointer = next(row for row in pointer_strip([root], DAY, config_dir=CONFIG)["streams"]
+                   if row["stream"] == "afternoon" and row["status"] != "missing")
+    assert pointer["status"] == "valid" and pointer["run_state_present"] is True
+    assert pointer["order_submit_status"] == "submitted"
+    for payload in (index, detail, tree, pointer):
+        assert str(link) not in json.dumps(payload) and str(real) not in json.dumps(payload)
+
+
+def test_detail_skips_outside_helpers_for_oversized_artifacts(tmp_path):
+    """Contract and drift open files themselves; an artifact over the ceiling vetoes them (review: unbounded reads)."""
+    folder = afternoon_run(tmp_path)
+    # A sparse file reports the logical size without writing 32 MiB to disk;
+    # errors.csv is one of the names the drift loader would otherwise open.
+    with (folder / "errors.csv").open("wb") as handle:
+        handle.truncate(MAX_BYTES + 1)
+    root = RootSpec.of(tmp_path)
+    detail = build_run_detail([root], only_run(root)["id"], config_dir=CONFIG)
+    assert detail["found"] is True and detail["contract"] is None and detail["drift"] is None
+    assert any("exceeds the 32 MiB read limit" in warning for warning in detail["warnings"])
+    # The reader-backed sections are unaffected: the tables and post-trade
+    # summary still come from their own bounded reads.
+    assert detail["tables"]["signals.csv"]["rows"] and detail["post_trade"]["available"] is True
+
+
+def test_detail_never_follows_artifacts_that_escape_the_root(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "quotes.json").write_text(json.dumps({"results": [{"symbol": "ABC"}]}), encoding="utf-8")
+    (outside / "errors.csv").write_text("ticker,error\nABC,boom\n", encoding="utf-8")
+    root_dir = tmp_path / "root"
+    folder = afternoon_run(root_dir)
+    os.symlink(outside / "quotes.json", folder / "raw" / "quotes_escape.json")
+    root = RootSpec.of(root_dir)
+    detail = build_run_detail([root], only_run(root)["id"], config_dir=CONFIG)
+    # The escaping quote file is not counted; the run directory itself is
+    # still clean so the contract and drift helpers run.
+    assert detail["close_window"]["raw_quote_files"] == 1 and detail["contract"]["ok"] is True
+    os.symlink(outside / "errors.csv", folder / "errors.csv")
+    detail = build_run_detail([root], only_run(root)["id"], config_dir=CONFIG)
+    assert detail["contract"] is None and detail["drift"] is None
+    assert any("resolves outside the root" in warning for warning in detail["warnings"])
+    assert str(outside) not in json.dumps(detail)
+
+
+def test_evidence_gap_diagnostic_is_vetoed_by_an_oversized_run_state(tmp_path):
+    afternoon_run(tmp_path, order_submit_status="blocked_kill_switch_evidence_gap",
+                  risk_guard={"kill_switch_engaged": True})
+    other = tmp_path / "intraday_dca" / "20260908_1430ET"
+    other.mkdir(parents=True)
+    with (other / "run_state.json").open("wb") as handle:
+        handle.truncate(MAX_BYTES + 1)
+    root = RootSpec.of(tmp_path)
+    afternoon = next(row for row in build_run_index([root])["runs"] if row["stream"] == "afternoon")
+    detail = build_run_detail([root], afternoon["id"], config_dir=CONFIG)
+    assert detail["abort_explanation"] is None
+    assert any("evidence-gap diagnostic was skipped" in warning for warning in detail["warnings"])
 
 
 def test_pointer_strip_statuses_evidence_and_alias(tmp_path):

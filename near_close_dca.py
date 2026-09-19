@@ -369,11 +369,17 @@ def _weekday_range(start: date, end: date) -> set:
 MARKET_HOLIDAYS = frozenset({date(2026, 7, 3)})
 
 # Approved live-test window. The original pilot dates (Jun 29 - Jul 1 2026) plus
-# the canonical live window of weekdays 2026-07-02 through 2026-10-30 inclusive
+# the canonical live window of weekdays 2026-07-02 through 2027-03-12 inclusive
 # (minus market holidays), matching config/trading_window.json's start_date/
 # end_date (the authoritative window, extended from 2026-08-28 to 2026-10-30 on
-# 2026-07-26; see that file's own description for the DST reason it stops
-# there). Without this, run_once()'s date gate would mark every scheduled run
+# 2026-07-26 and again to 2027-03-12 on 2026-09-18). The 2026-07-26 extension
+# deliberately stopped the Friday before the EDT->EST change because the
+# external trigger gates were fixed-UTC/EDT-only; the 2026-09-18 extension
+# records those gates as now DST-aware (dual-hour UTC crons covering both the
+# EDT-hour and EST-hour local fires), which is what unblocked spanning the
+# standard-time season. 2027-03-12 (a Friday) is the last trading day before the
+# 2027-03-14 EST->EDT transition, which falls on a Sunday; see that file's
+# own description. Without this, run_once()'s date gate would mark every scheduled run
 # in the live window blocked/no-trade. Callers normally override this default
 # via ``config/trading_window.json`` (``dca_config.load_approved_dates``), but
 # a bare ``StrategyConfig()`` and ``load_strategy_config`` with an absent
@@ -387,7 +393,7 @@ MARKET_HOLIDAYS = frozenset({date(2026, 7, 3)})
 # hand-maintained MARKET_HOLIDAYS above.
 APPROVED_TEST_DATES = (
     {date(2026, 6, 29), date(2026, 6, 30), date(2026, 7, 1)}
-    | _weekday_range(date(2026, 7, 2), date(2026, 10, 30))
+    | _weekday_range(date(2026, 7, 2), date(2027, 3, 12))
 ) - MARKET_HOLIDAYS
 
 

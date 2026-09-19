@@ -11,7 +11,11 @@ always means *unavailable*, never zero.
 Everything here is lock-free by construction: it reads ``run_state.json`` and
 the CSV/JSON artifacts beside it through :class:`BoundedReader`, and reuses
 the analysis helpers (drift, artifact contract, slippage, close-window grading,
-evidence-gap diagnosis) that operate on plain dicts and directories. It never
+evidence-gap diagnosis) that operate on plain dicts and directories. The three
+helpers that open files themselves (contract, drift, evidence-gap) run only
+after a pre-flight proves every file they would open is confined to the root
+and under the reader's byte ceiling. Every root is resolved once, up front,
+so the scan and every read agree on one path spelling. It never
 instantiates a ledger class, never opens ``strategy_state.json`` through
 ``dca_runner.state_transaction``, and never constructs an executor or broker;
 a test pins that no cross-process lock is taken by any builder.
@@ -33,7 +37,7 @@ from zoneinfo import ZoneInfo
 
 from dca_console_data import _day_of, _run_row
 from dca_console_jobs import redact_value
-from dca_console_reader import MAX_FILES, BoundedReader, RootSpec, iso_date
+from dca_console_reader import MAX_BYTES, MAX_FILES, BoundedReader, RootSpec, iso_date
 from dca_paths import STREAM_ARTIFACT_DIRS
 from dca_risk import find_run_state_files, run_timestamp_et
 from scripts.run_classification import is_manual_state
@@ -85,6 +89,10 @@ TABLE_COLUMNS = frozenset({
 })
 INPUT_PREFIXES = ("market_data_", "orders_pages_", "cands_", "candidates_")
 MULTIPLIER_LABEL = "reporting cap 3x"
+# The three trees the afternoon evidence-gap diagnostic re-scans (per
+# docs/midday_signal_entry.md: both afternoon roots and the 2:30 PM intraday
+# root), relative to whichever observed root the run was found under.
+_EVIDENCE_DIRS = ("ce16ba6b/scheduled_runs", "scheduled_runs", "intraday_dca")
 
 
 # --- shared bounding ---------------------------------------------------------
@@ -92,6 +100,68 @@ MULTIPLIER_LABEL = "reporting cap 3x"
 def run_identity(label: str, relative: str) -> str:
     """Opaque, stable id for one run directory: ``run-`` + sha256(label:relative)[:12]."""
     return "run-" + hashlib.sha256(f"{label}:{relative}".encode()).hexdigest()[:12]
+
+
+def _resolve_roots(roots: Sequence[RootSpec]) -> tuple[RootSpec, ...]:
+    """The same roots with their paths resolved, labels and kinds untouched.
+
+    ``find_run_state_files`` hands back paths under the *resolved* root, while
+    ``BoundedReader`` confines every read to the path it was built on. When a
+    configured root passes through a symlink (a Drive- or home-mounted
+    cron_tracking tree) those two spellings differ, every confinement check
+    fails, and the whole tree reads as malformed or empty (adversarial review,
+    "reader root is the unresolved path"). Resolving once, up front, gives the
+    scan and every read the same path object; the label stays the browser's
+    name for the root, so run ids do not change.
+    """
+    resolved = []
+    for root in roots:
+        try:
+            path = root.path.resolve()
+        except (OSError, RuntimeError):
+            path = root.path
+        resolved.append(RootSpec(root.label, path, root.kind))
+    return tuple(resolved)
+
+
+def _reader(root: RootSpec, warnings: list[str]) -> BoundedReader:
+    # The byte ceiling is read from this module's namespace at call time so a
+    # test can lower it without writing a 32 MiB fixture.
+    return BoundedReader(root.path, warnings, max_bytes=MAX_BYTES)
+
+
+def _hazard(reader: BoundedReader, path: Path) -> str | None:
+    """Why a file that an *outside* helper would open must not be handed to it.
+
+    The contract, drift and evidence-gap helpers open files themselves with
+    plain ``read_bytes``/``csv.DictReader`` and follow symlinks, so they get
+    neither the reader's 32 MiB ceiling nor its confinement. This is the
+    pre-flight that stands in for both: ``"escapes"`` when the entry resolves
+    outside the root, ``"oversized"`` when the target exceeds the ceiling,
+    else None (adversarial review, "four detail sections read outside
+    BoundedReader").
+    """
+    try:
+        resolved = path.resolve()
+        if not resolved.is_relative_to(reader.root):
+            return "escapes"
+        if resolved.is_file() and resolved.stat().st_size > reader.max_bytes:
+            return "oversized"
+    except (OSError, RuntimeError):
+        return "escapes"
+    return None
+
+
+_HAZARD_TEXT = {"escapes": "resolves outside the root", "oversized": "exceeds the 32 MiB read limit"}
+
+
+def _run_dir_hazard(reader: BoundedReader, relative_dir: str) -> str | None:
+    """First hazard among a run directory's own entries (the files the helpers open), else None."""
+    for entry in reader.entries(relative_dir):
+        hazard = _hazard(reader, reader.root / entry)
+        if hazard:
+            return hazard
+    return None
 
 
 def _text(value: Any, roots: Sequence[RootSpec] = ()) -> str:
@@ -150,8 +220,8 @@ def artifact_tree_map(roots: Sequence[RootSpec]) -> dict[str, Any]:
     """
     warnings: list[str] = []
     result = []
-    for root in roots:
-        reader = root.reader(warnings)
+    for root in _resolve_roots(roots):
+        reader = _reader(root, warnings)
         directories = []
         for name in TREE_DIRECTORIES:
             folder = reader.confined(name)
@@ -225,8 +295,9 @@ def _excluded(path: Path, exclusions: Sequence[Path]) -> bool:
 
 
 def _index_root(root: RootSpec, exclusions: Sequence[Path], warnings: list[str]) -> list[dict[str, Any]]:
-    reader = root.reader(warnings)
-    base = root.path.resolve()
+    """Every row under one already-resolved root; ``base`` and the reader share the same path."""
+    reader = _reader(root, warnings)
+    base = root.path
     if not base.is_dir():
         _warn(warnings, f"Root {root.label} does not exist; its runs are unavailable.")
         return []
@@ -281,6 +352,22 @@ def _index_root(root: RootSpec, exclusions: Sequence[Path], warnings: list[str])
     return rows
 
 
+def _all_rows(roots: Sequence[RootSpec], excluded_roots: Sequence[Path], warnings: list[str]) -> list[dict[str, Any]]:
+    """Every row under every root, newest first and *uncapped*.
+
+    The 500-row cap belongs to the index page's presentation only. The detail
+    builder looks a clicked id up here, so a run older than the newest 500
+    (listed fine on a filtered day page) can still be opened (adversarial
+    review, "detail 404s a run the user just clicked").
+    """
+    exclusions = tuple(Path(item).resolve() for item in excluded_roots)
+    rows: list[dict[str, Any]] = []
+    for root in _resolve_roots(roots):
+        rows.extend(_index_root(root, exclusions, warnings))
+    rows.sort(key=lambda row: (row["time"] or row["day"] or "", row["relative_dir"]), reverse=True)
+    return rows
+
+
 def build_run_index(roots: Sequence[RootSpec], *, day: date | None = None, month: str | None = None,
                     excluded_roots: Sequence[Path] = ()) -> dict[str, Any]:
     """Every run under every root, newest first: ``{"runs", "recent_days", "warnings"}``.
@@ -295,16 +382,12 @@ def build_run_index(roots: Sequence[RootSpec], *, day: date | None = None, month
     warning. ``recent_days`` lists every day with a row, newest first.
     """
     warnings: list[str] = []
-    exclusions = tuple(Path(item).resolve() for item in excluded_roots)
-    rows: list[dict[str, Any]] = []
-    for root in roots:
-        rows.extend(_index_root(root, exclusions, warnings))
+    rows = _all_rows(roots, excluded_roots, warnings)
     recent = sorted({row["day"] for row in rows if row["day"]}, reverse=True)[:90]
     if day is not None:
         rows = [row for row in rows if row["day"] == day.isoformat()]
     elif month is not None:
         rows = [row for row in rows if row["day"] and row["day"].startswith(month)]
-    rows.sort(key=lambda row: (row["time"] or row["day"] or "", row["relative_dir"]), reverse=True)
     if len(rows) > MAX_RUNS:
         _warn(warnings, f"Only the newest {MAX_RUNS} of {len(rows)} runs are listed; narrow by day or month.")
         rows = rows[:MAX_RUNS]
@@ -415,7 +498,6 @@ def _close_window(reader: BoundedReader, relative_dir: str, state: dict[str, Any
     3x reporting cap and are labelled as such.
     """
     from dca_config import load_per_ticker_sizing, load_sizing_tiers
-    from run_dca import _parse_raw_json
     from scripts.close_window_signal import build_close_window_summary
 
     rows = tables.get("signals.csv", {}).get("rows", [])
@@ -435,17 +517,31 @@ def _close_window(reader: BoundedReader, relative_dir: str, state: dict[str, Any
         tiers, per_ticker = None, {}
     if not tiers:
         return {"available": False, "reason": "config/sizing_ladder.json tiers are unavailable"}
+    # Raw quote files are counted through the reader (confined, 32 MiB
+    # ceiling) rather than run_dca._parse_raw_json's bare read_bytes, which
+    # would follow a symlink out of the root and load any size whole.
     raw_quotes = 0
     for entry in reader.entries(Path(relative_dir) / "raw", limit=MAX_ROWS):
         if entry.name.startswith("quotes") and entry.name.endswith(".json"):
-            _, payload, error = _parse_raw_json(reader.root / entry)
-            raw_quotes += error is None and payload is not None
+            raw_quotes += _parsable_json(reader, entry)
     trading_day = _day_label(state, relative_dir) or "unknown"
     summary = build_close_window_summary(quotes, tiers=tiers, trading_day=trading_day, per_ticker_tiers=per_ticker)
     safe = _json_safe(summary)
     safe.update({"available": True, "multiplier_label": MULTIPLIER_LABEL, "raw_quote_files": raw_quotes,
                  "source": "signals.csv"})
     return safe
+
+
+def _parsable_json(reader: BoundedReader, relative: Path) -> bool:
+    """True when the confined, size-bounded file parses as JSON (the payload itself is discarded)."""
+    source = reader.text(relative)
+    if source is None:
+        return False
+    try:
+        json.loads(source)
+    except (ValueError, RecursionError):
+        return False
+    return True
 
 
 def _inputs(reader: BoundedReader, relative_dir: str) -> list[dict[str, Any]]:
@@ -468,6 +564,27 @@ def _evidence_gap(state: dict[str, Any]) -> bool:
     return guard.get("kill_switch_engaged") is True or "evidence" in markers or "kill_switch" in markers
 
 
+def _evidence_dirs_safe(reader: BoundedReader) -> bool:
+    """Pre-flight for the evidence-gap diagnostic, which rglobs and ``read_bytes`` every run state itself.
+
+    The same ``find_run_state_files`` scan the diagnostic will run is done
+    here first, capped at the reader's file limit, and every hit is checked
+    for confinement and size. Any hazard vetoes the call rather than letting
+    the diagnostic load an oversized or out-of-root file whole.
+    """
+    for name in _EVIDENCE_DIRS:
+        folder = reader.confined(name)
+        if folder is None or not folder.is_dir():
+            continue
+        try:
+            paths = find_run_state_files(folder)
+        except OSError:
+            return False
+        if len(paths) > reader.max_files or any(_hazard(reader, path) for path in paths):
+            return False
+    return True
+
+
 def _abort_explanation(root: RootSpec, row: dict[str, Any], state: dict[str, Any], roots: Sequence[RootSpec],
                        warnings: list[str]) -> dict[str, Any] | None:
     if row["stream"] != "afternoon" or not state or not _evidence_gap(state):
@@ -478,7 +595,10 @@ def _abort_explanation(root: RootSpec, row: dict[str, Any], state: dict[str, Any
     if as_of is None:
         _warn(warnings, "The abort could not be explained: the run carries no trading day.")
         return None
-    scanned = [root.path / "ce16ba6b" / "scheduled_runs", root.path / "scheduled_runs", root.path / "intraday_dca"]
+    if not _evidence_dirs_safe(_reader(root, warnings)):
+        _warn(warnings, "The evidence-gap diagnostic was skipped: an evidence tree is too large or escapes its root.")
+        return None
+    scanned = [root.path / name for name in _EVIDENCE_DIRS]
     try:
         report = diagnose_afternoon_evidence_gap([str(item) for item in scanned], as_of=date.fromisoformat(as_of))
     except (OSError, ValueError, TypeError, KeyError):
@@ -492,39 +612,51 @@ def _abort_explanation(root: RootSpec, row: dict[str, Any], state: dict[str, Any
     return _json_safe(report, roots)
 
 
-def build_run_detail(roots: Sequence[RootSpec], run_id: str, *, config_dir: Path) -> dict[str, Any]:
+def build_run_detail(roots: Sequence[RootSpec], run_id: str, *, config_dir: Path,
+                     excluded_roots: Sequence[Path] = ()) -> dict[str, Any]:
     """Everything the console can say about one run named by an index id.
 
-    ``{"found": False, "warnings"}`` for a malformed or unknown id. Otherwise
-    ``found=True`` with the index ``run`` row, ``identity`` (allowlisted
-    ``run_state.json`` keys), ``contract``, ``drift``, ``tables`` (allowlisted
-    CSV columns, 200 rows each), ``post_trade`` (slippage/coverage from
-    ``raw/orders_after_place.json``), ``close_window`` (``multiplier_label`` =
-    reporting cap 3x), ``inputs`` (saved Gate 5 input file names) and
-    ``abort_explanation`` (afternoon evidence-gap diagnosis, else None). A
-    section is None or ``available=False`` when its inputs are missing; an
-    incomplete run has an empty identity.
+    Returns ``{"found": False, "warnings"}`` for a malformed or unknown id.
+    Otherwise ``found=True`` with the index ``run`` row, ``identity``
+    (allowlisted ``run_state.json`` keys), ``contract`` (artifact contract
+    result), ``drift`` (drift report), ``tables`` (allowlisted CSV columns,
+    200 rows each), ``post_trade`` (slippage/coverage when
+    ``raw/orders_after_place.json`` exists), ``close_window`` (what would have
+    fired, ``multiplier_label`` = reporting cap 3x), ``inputs`` (saved Gate 5
+    input file names) and ``abort_explanation`` (afternoon evidence-gap
+    diagnosis, else None). A section is None or ``available=False`` when its
+    inputs are missing; an incomplete run has an empty identity. The lookup
+    is uncapped, so any run the index can list can be opened;
+    ``excluded_roots`` must be the same tuple the index route passes, or a
+    run the index hides (the console's synthetic demo archive) would still
+    be readable here.
     """
     if not RUN_ID_RE.match(run_id or ""):
         return {"found": False, "warnings": ["The run id is not a console run id."]}
-    index = build_run_index(roots)
-    warnings = list(index["warnings"])
-    row = next((item for item in index["runs"] if item["id"] == run_id), None)
+    warnings: list[str] = []
+    roots = _resolve_roots(roots)
+    row = next((item for item in _all_rows(roots, excluded_roots, warnings) if item["id"] == run_id), None)
     root = next((item for item in roots if row and item.label == row["root_label"]), None)
     if row is None or root is None:
         _warn(warnings, "No run with that id exists under the observed roots.")
         return {"found": False, "warnings": warnings}
-    reader = root.reader(warnings)
+    reader = _reader(root, warnings)
     relative_dir = row["relative_dir"]
     run_dir = reader.confined(relative_dir)
     state = reader.json(Path(relative_dir) / "run_state.json") if not row["incomplete"] else {}
     if row["incomplete"]:
         _warn(warnings, "This directory never wrote run_state.json; it is incomplete, not failed.")
+    # The contract and drift helpers open the run directory's files themselves;
+    # they only run when every entry is confined and under the byte ceiling.
+    hazard = _run_dir_hazard(reader, relative_dir) if run_dir else "escapes"
+    if hazard:
+        _warn(warnings, "The contract and drift checks were skipped: a file in this run directory "
+                        + _HAZARD_TEXT[hazard] + ".")
     tables = _tables(reader, relative_dir, roots)
     return {
         "found": True, "run": row, "identity": _identity(state, roots),
-        "contract": _contract(run_dir, roots, warnings) if run_dir else None,
-        "drift": _drift(run_dir, roots, warnings) if run_dir else None,
+        "contract": _contract(run_dir, roots, warnings) if not hazard else None,
+        "drift": _drift(run_dir, roots, warnings) if not hazard else None,
         "tables": tables,
         "post_trade": _post_trade(reader, relative_dir, state, roots),
         "close_window": _close_window(reader, relative_dir, state, Path(config_dir), tables),
@@ -536,17 +668,31 @@ def build_run_detail(roots: Sequence[RootSpec], run_id: str, *, config_dir: Path
 
 # --- 4. pointer strip --------------------------------------------------------
 
+def _pointer_target(reader: BoundedReader, run_state_path: str | None) -> Path | None:
+    """The pointer's ``run_state_path`` as a confined absolute path, or None when it is absent or escapes."""
+    if not run_state_path:
+        return None
+    try:
+        target = Path(run_state_path).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if not target.is_relative_to(reader.root):
+        return None
+    return reader.confined(target.relative_to(reader.root))
+
+
 def _pointer_row(root: RootSpec, stream: str, pointer: Path, expected_root: Path, day: date,
                  roots: Sequence[RootSpec], warnings: list[str], *, alias: bool = False) -> dict[str, Any]:
     from scripts.same_day_pointer import STATUS_PENDING, STATUS_VALID, STATUS_VALID_RECOVERY_CONTEXT, validate_pointer
 
-    reader = root.reader(warnings)
+    reader = _reader(root, warnings)
     relative = pointer.relative_to(root.path)
     outcome = validate_pointer(pointer, expected_stream=stream, expected_root=expected_root, today=day.isoformat())
-    target = Path(outcome.run_state_path) if outcome.run_state_path else None
-    # The target is only followed when it sits inside the root the pointer was
-    # found under; a pointer naming a path elsewhere is reported, never read.
-    confined = reader.confined(target.relative_to(root.path)) if target and target.is_relative_to(root.path) else None
+    # The target is only followed when it sits inside the (resolved) root the
+    # pointer was found under; a pointer naming a path elsewhere is reported,
+    # never read. The pointer may spell the path through a symlink, so it is
+    # resolved before the containment check, exactly as the reader will.
+    confined = _pointer_target(reader, outcome.run_state_path)
     present = confined is not None and confined.is_file()
     state = reader.json(confined.relative_to(root.path)) if present else {}
     evidence = outcome.status == STATUS_VALID and outcome.valid_scheduled_evidence
@@ -555,8 +701,10 @@ def _pointer_row(root: RootSpec, stream: str, pointer: Path, expected_root: Path
     elif outcome.status == STATUS_VALID_RECOVERY_CONTEXT:
         label = "recovery context, not scheduled evidence"
     elif outcome.status == STATUS_PENDING:
-        # Every structural check passed but the run directory holds no
-        # run_state.json yet: the pointer is unverified, not rejected.
+        # The validator accepted the pointer but its run directory has not
+        # (yet) written run_state.json: nothing to verify, not a rejection.
+        # A stale, outside-root or wrong-stream pointer with an equally absent
+        # target is still a rejection -- the status, not the file, decides.
         label = "unverified"
     else:
         label = "rejected"
@@ -586,6 +734,7 @@ def pointer_strip(roots: Sequence[RootSpec], day: date, *, config_dir: Path) -> 
 
     warnings: list[str] = []
     rows = []
+    roots = _resolve_roots(roots)
     for root in roots:
         if not root.path.is_dir():
             _warn(warnings, f"Root {root.label} does not exist; its pointers are unavailable.")

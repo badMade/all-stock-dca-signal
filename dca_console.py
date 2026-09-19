@@ -47,6 +47,7 @@ CONSOLE_FILES = (
     ("/", "index.html", "text/html"),
     ("/app.js", "app.js", "text/javascript"),
     ("/pages.js", "pages.js", "text/javascript"),
+    ("/markdown.js", "markdown.js", "text/javascript"),
     ("/styles.css", "styles.css", "text/css"),
 )
 ASSETS = {route: (name, kind) for route, name, kind in CONSOLE_FILES}
@@ -588,9 +589,15 @@ class ConsoleApp:
              research, research_reason),
         ]
         # Demo actions always write under output/demo, never into the observed local root.
-        return [{"id": action, "label": label, "description": description,
+        from dca_console_launch import launch_actions
+
+        rows = [{"id": action, "label": label, "description": description,
                  "available": bool(available), "reason": "" if available else reason}
                 for action, label, description, available, reason in definitions]
+        # The Phase 4 launchers join the same closed list; their inputs are
+        # resolved server-side, never posted (dca_console_launch).
+        rows.extend(launch_actions(self, REPO))
+        return rows
 
     def snapshot(self, day: date | None = None, ticker: str = "", period: str = "all") -> dict:
         """Read current evidence, cache briefly, and save a sanitized daily digest."""
@@ -675,7 +682,8 @@ class ConsoleApp:
             raise ValueError(match["reason"])
         return self.jobs.submit(action, match["label"], lambda job_id, log: self._run(action, job_id, log))
 
-    def _command(self, argv: list[str], log, *, demo: bool = False, research: bool = False, timeout: float = 600) -> int:
+    def _command(self, argv: list[str], log, *, demo: bool = False, research: bool = False, timeout: float = 600,
+                 capture_to: Path | None = None) -> int:
         env = dict(os.environ)
         env["DCA_CRON_TRACKING_ROOT"] = str(self.settings.output / "demo" / "dca" if demo else self.settings.root)
         env["PYTHONUNBUFFERED"] = "1"
@@ -698,9 +706,14 @@ class ConsoleApp:
                 if key.startswith("DCA_") and key not in {"DCA_CRON_TRACKING_ROOT", "DCA_TICKER_HISTORY_DIR"}:
                     del env[key]
         executable = self.settings.research_python if research else self.settings.python
-        return self.jobs.run_command(Command(tuple([executable, *argv]), REPO, env, timeout), log)
+        return self.jobs.run_command(Command(tuple([executable, *argv]), REPO, env, timeout, capture_to=capture_to), log)
 
     def _run(self, action: str, job_id: str, log) -> int:
+        from dca_console_launch import LAUNCH_SPECS, run_launch
+
+        if action in LAUNCH_SPECS:
+            today = self.settings.day or datetime.now(ET).date()
+            return run_launch(self, action, job_id, log, repo=REPO, run_command=self._command, today=today)
         results = []
         if action in {"demo-all", "demo-dca"}:
             day = self.settings.day if self.settings.mode == "demo" else default_demo_day()

@@ -68,17 +68,17 @@ _AFTERNOON_OWNER = {"executor_class": None, "config_stem": "near_close_dca", "po
 
 
 def _text(value: Any, limit: int = TEXT_LIMIT) -> str | None:
-    """Scrub, redact and bound one free-text field copied from a repo file; None when absent.
+    """Bound, redact and path-scrub one free-text field copied from a repo file; None when absent.
 
-    Paths are scrubbed here as well as in log tails because manifest notes and
-    policy prose quote install locations, and ``walk_redact`` (the route-level
-    pass) only knows secrets and account shapes, not paths. Clipping happens
-    after redaction so a ``[redacted]`` substitution cannot push the field past
-    ``limit``.
+    Order matters (adversarial review, round 2): the WHOLE value is redacted and
+    path-scrubbed first and clipped last, so a secret straddling the limit cannot
+    survive as a prefix and a ``[redacted]`` substitution cannot push a note
+    past its cap. Manifest prose cites ``/home/user/workspace/...`` freely, so
+    the scrub is not optional for notes either.
     """
     if not isinstance(value, str) or not value:
         return None
-    cleaned = redact_value(_scrub_paths(value.replace("\n", " ")))
+    cleaned = _scrub_paths(redact_value(value.replace("\n", " ")))
     return cleaned[:limit] + ("..." if len(cleaned) > limit else "")
 
 
@@ -155,6 +155,9 @@ def manifest_tasks(config_dir: Path, day: date, now: datetime) -> dict[str, Any]
     for row in rows:
         task = by_id.get(row["id"])
         row.update(_task_details(task) if task else {"timing": "unspecified"})
+        # The shared rows bound ``name`` but never path-scrub it (that helper is
+        # dca_console_data's and off-limits here); task names cite state dirs.
+        row["name"] = _text(row["name"]) or "Unnamed task"
         if task is None:
             warnings.append("A schedule row could not be matched back to a manifest task id.")
     return {"tasks": rows, "task_count": len(tasks) if isinstance(tasks, list) else None,
@@ -168,7 +171,7 @@ def _bounded_copy(value: Any, notes: list[str]) -> Any:
         if len(entries) > LIST_LIMIT:
             notes.append(f"A {'object' if isinstance(value, dict) else 'list'} was truncated to {LIST_LIMIT} entries.")
         if isinstance(value, dict):
-            return {str(key)[:120]: _bounded_copy(item, notes) for key, item in entries[:LIST_LIMIT]}
+            return {_text(str(key), 120) or "": _bounded_copy(item, notes) for key, item in entries[:LIST_LIMIT]}
         return [_bounded_copy(item, notes) for item in entries[:LIST_LIMIT]]
     if isinstance(value, str):
         if len(value) > TEXT_LIMIT:
@@ -217,12 +220,15 @@ def _command_shape(command: str) -> dict[str, Any]:
     """Describe a scheduled command by script basename, arguments, slots and streams.
 
     Absolute tokens (the ``/opt/all-stock-dca`` placeholder in the examples, or
-    a real install path on a host) are reduced to their basename so no path
-    leaves the process; the slot and stream tokens feed the join matrix.
+    a real install path on a host) are reduced to their basename, and EVERY
+    emitted token then goes through :func:`_text` so a flag-style token such as
+    ``--state-root=/Users/me/cron_tracking`` is path-scrubbed too (adversarial
+    review, round 2: basename-only left embedded paths intact). The slot and
+    stream tokens feed the join matrix.
     """
     tokens = command.split()
-    shown = [Path(token).name if token.startswith("/") else token[:80] for token in tokens[:20]]
-    return {"script": shown[0] if shown else None, "arguments": [redact_value(item) for item in shown[1:]],
+    shown = [_text(Path(token).name if token.startswith("/") else token, 80) for token in tokens[:20]]
+    return {"script": shown[0] if shown else None, "arguments": [item for item in shown[1:] if item is not None],
             "slots": [token for token in tokens if _SLOT_TOKEN.fullmatch(token)][:LIST_LIMIT],
             "streams": sorted({_STREAM_SUBPATHS[token] for token in tokens if token in _STREAM_SUBPATHS})}
 
@@ -251,7 +257,8 @@ def _parse_crontab(text: str, warnings: list[str]) -> tuple[list[dict[str, Any]]
         if len(rows) >= LIST_LIMIT:
             warnings.append("The crontab has more entries than the page shows.")
             break
-        rows.append({"schedule": " ".join(match.groups()[:5]), "timezone": cron_tz, **_command_shape(match.group(6))})
+        rows.append({"schedule": _text(" ".join(match.groups()[:5]), 120), "timezone": cron_tz,
+                     **_command_shape(match.group(6))})
     return rows, cron_tz
 
 
@@ -284,7 +291,7 @@ def _systemd_rows(reader: BoundedReader, warnings: list[str]) -> list[dict[str, 
             # contents are never opened by any console reader.
             env_file = unit.get("EnvironmentFile")
             row.update({"user": _text(unit.get("User"), 40),
-                        "environment_file": Path(env_file.lstrip("-")).name if env_file else None,
+                        "environment_file": _text(Path(env_file.lstrip("-")).name, 120) if env_file else None,
                         **_command_shape(unit.get("ExecStart", ""))})
         rows.append(row)
     return rows
@@ -479,26 +486,83 @@ def roster_identity(config_dir: Path) -> dict[str, Any]:
     return {"slots": slots, "warnings": _dedupe(warnings)}
 
 
-def _observed_for(observed: dict[str, Any] | None, stream: str) -> dict[str, Any] | None:
-    """Look up the runs module's pointer-strip entry under either stream spelling."""
+def _observed_rank(row: dict[str, Any]) -> tuple[bool, bool, bool]:
+    """Primary root beats secondary; then scheduled evidence; then a present run_state."""
+    return (row.get("at_risk") is not True, row.get("evidence") is True, row.get("run_state_present") is True)
+
+
+def observed_from_pointer_strip(strip: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """Collapse ``dca_console_runs.pointer_strip`` into the stream-keyed ``observed`` dict.
+
+    ``pointer_strip`` returns ``{"streams": [row, ...]}``: one row per root per
+    stream (two probes for ``afternoon``) plus ``alias=True`` rows, each shaped
+    by ``_pointer_row`` (``stream``, ``label``, ``at_risk``, ``status``,
+    ``evidence`` bool, ``evidence_label``, ``run_state_present``). The matrix
+    wants one entry per stream, so the primary root's canonical row wins, a
+    secondary root's row is used only when no primary row exists and keeps
+    ``at_risk=True`` so the cell says so, and an alias pointer never stands in
+    for the canonical one (adversarial review, round 2). Keys are the runs
+    module's stream names (``market_open``, ``afternoon`` ...);
+    :func:`build_schedule_layers` maps the runner labels onto them. A caller
+    with per-slot evidence may add ``"<slot_id>"`` keys (see ``_observed_for``).
+    """
+    rows = strip.get("streams") if isinstance(strip, dict) else None
+    observed: dict[str, dict[str, Any]] = {}
+    for row in rows[:LIST_LIMIT] if isinstance(rows, list) else []:
+        stream = row.get("stream") if isinstance(row, dict) else None
+        if not isinstance(stream, str) or row.get("alias") is True:
+            continue
+        if stream not in observed or _observed_rank(row) > _observed_rank(observed[stream]):
+            observed[stream] = row
+    return observed
+
+
+def _observed_entry(entry: dict[str, Any], *, per_slot: bool) -> dict[str, Any]:
+    # ``evidence`` is the producer's bool (True only for STATUS_VALID with
+    # scheduled evidence), never coerced through _text: it is the one flag that
+    # separates a scheduled fire from a manual or recovery-context run.
+    return {"status": _text(entry.get("status"), 80), "evidence": _flag(entry.get("evidence")),
+            "evidence_label": _text(entry.get("evidence_label"), 80),
+            "run_state_present": _flag(entry.get("run_state_present")), "at_risk": _flag(entry.get("at_risk")),
+            "label": _text(entry.get("label"), 80), "per_slot": per_slot}
+
+
+def _observed_for(observed: dict[str, Any] | None, slot: dict[str, Any],
+                  shared: set[str]) -> tuple[dict[str, Any] | None, str | None]:
+    """Resolve one roster slot's observed entry; second item is a note when the match is only per-stream.
+
+    A slot-qualified key (``"1330"`` or ``"intraday@1330"``) is tried first.
+    A stream key is accepted for a stream that owns one slot, but ``intraday``
+    covers 1130/1330/1430 with a single pointer, so a stream-level match there
+    is returned with ``per_slot=False`` and the cell stays None: one 11:30
+    ``run_state.json`` must not light up the 13:30 and 14:30 rows (adversarial
+    review, round 2).
+    """
     if not isinstance(observed, dict):
-        return None
+        return None, None
+    stream, slot_id = slot["stream"], slot["slot_id"]
     alias = {"final": "afternoon"}.get(stream, stream)
-    for candidate in (stream, alias, alias.replace("-", "_")):
-        entry = observed.get(candidate)
-        if isinstance(entry, dict):
-            return {"status": _text(entry.get("status"), 80), "evidence": _text(entry.get("evidence"), 200),
-                    "run_state_present": _flag(entry.get("run_state_present"))}
-    return None
+    for key in (slot_id, f"{stream}@{slot_id}", f"{alias}@{slot_id}"):
+        if isinstance(observed.get(key), dict):
+            return _observed_entry(observed[key], per_slot=True), None
+    entry = next((observed[key] for key in (stream, alias, alias.replace("-", "_"))
+                  if isinstance(observed.get(key), dict)), None)
+    if entry is None:
+        return None, None
+    if stream in shared:
+        return _observed_entry(entry, per_slot=False), \
+            f"Evidence for '{stream}' is per-stream, not per-slot; its single pointer cannot say which slot wrote it."
+    return _observed_entry(entry, per_slot=True), None
 
 
 def _matrix_row(slot: dict[str, Any], manifest: dict[str, Any], deploy: dict[str, Any],
-                observed: dict[str, Any] | None) -> dict[str, Any]:
+                observed: dict[str, Any] | None, shared: set[str]) -> dict[str, Any]:
     tasks = [row for row in manifest["tasks"] if row["time"] == slot["time_et"]]
     key = f"{slot['slot_id']}ET"
     cron = [row for row in deploy["cron"] or [] if key in row["slots"]]
     systemd = [row["file"] for row in deploy["systemd"] if key in row.get("slots", ())]
-    entry = _observed_for(observed, slot["stream"])
+    entry, note = _observed_for(observed, slot, shared)
+    settled = entry is not None and entry["per_slot"]
     live = [row for row in tasks if row["status"] not in {"disabled", "not_registered"}]
     return {
         "slot_id": slot["slot_id"], "time_et": slot["time_et"], "stream": slot["stream"],
@@ -506,7 +570,13 @@ def _matrix_row(slot: dict[str, Any], manifest: dict[str, Any], deploy: dict[str
         # None = that layer itself was unavailable, never "unknown whether it fired".
         "configured": None if manifest["task_count"] is None else bool(live),
         "deployable": None if deploy["cron"] is None and not deploy["systemd"] else bool(cron or systemd),
-        "observed": None if entry is None else entry["run_state_present"], "observed_entry": entry,
+        # ``observed`` is run_state presence (manual and recovery runs count);
+        # ``scheduled_evidence`` is the stricter producer flag; ``observed_at_risk``
+        # says the evidence sits under a secondary (at-risk) root only.
+        "observed": entry["run_state_present"] if settled else None,
+        "scheduled_evidence": entry["evidence"] if settled else None,
+        "observed_at_risk": entry["at_risk"] if entry else None,
+        "observed_entry": entry, "observed_note": note,
     }
 
 
@@ -514,15 +584,19 @@ def build_schedule_layers(config_dir: Path, repo: Path, roots: Sequence[RootSpec
                           observed: dict[str, Any] | None = None) -> dict[str, Any]:
     """Assemble every layer and join them per runner slot into ``matrix``.
 
-    ``observed`` is the runs module's pointer strip keyed by stream (``status``,
-    ``evidence``, ``run_state_present``); when omitted every ``observed`` cell
-    is None. True in ``configured``/``deployable`` means a file in the checkout
-    mentions the slot; only ``observed`` reflects artifacts on disk, and even
-    that never asserts the scheduler fired.
+    ``observed`` is a dict of ``_pointer_row``-shaped entries keyed by slot id
+    (``"1330"``, preferred) or by the runs module's stream name, as
+    :func:`observed_from_pointer_strip` produces; when omitted every
+    ``observed`` cell is None. True in ``configured``/``deployable`` means a
+    file in the checkout mentions the slot; only ``observed`` reflects
+    artifacts on disk, and even that never asserts the scheduler fired.
     """
     layers = {"manifest": manifest_tasks(config_dir, day, now), "deploy": deploy_layer(repo),
               "workflows": workflows_layer(repo), "launchd": launchd_status(roots), "roster": roster_identity(config_dir)}
-    matrix = [_matrix_row(slot, layers["manifest"], layers["deploy"], observed) for slot in layers["roster"]["slots"]]
+    slots = layers["roster"]["slots"]
+    shared = {slot["stream"] for slot in slots if sum(other["stream"] == slot["stream"] for other in slots) > 1}
+    matrix = [_matrix_row(slot, layers["manifest"], layers["deploy"], observed, shared) for slot in slots]
     warnings = [warning for layer in layers.values() for warning in layer["warnings"]]
+    warnings.extend(row["observed_note"] for row in matrix if row["observed_note"])
     warnings.append("Every row is configuration or on-disk evidence; scheduler execution is unverified.")
     return {**layers, "matrix": matrix, "warnings": _dedupe(warnings)}

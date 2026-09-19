@@ -1,4 +1,4 @@
-"""State & ledgers page reader regressions: lock-free reads, corrupt != absent, no leaks."""
+"""State & ledgers readers: lock-free, absent/corrupt/available kept apart, nothing path-shaped leaks."""
 
 import json
 from datetime import date
@@ -6,11 +6,12 @@ from pathlib import Path
 
 import pytest
 
-import dca_console_state as state_module
+import dca_console_state as state_mod
 from dca_console_reader import RootSpec
 from dca_console_routes import walk_redact
 from dca_console_state import (
     build_state_snapshot,
+    default_state_path,
     ledger_view,
     maintenance_events,
     purchases_view,
@@ -20,468 +21,606 @@ from dca_console_state import (
 
 DAY = date(2026, 9, 8)
 CONFIG = Path(__file__).resolve().parents[1] / "config"
-ACCOUNT = "999000111"
-# A synthetic broker ORDER id, reused by the fixture that plants it and the
-# assertion that proves it is redacted, so the two cannot drift apart. Taken
-# from the set test_config_invariants.py already recognises as synthetic order
-# ids: the nine-digit shape this previously used is exactly the shape a real
-# Robinhood account has, and the account-literal guard rightly refuses to
-# allowlist any nine-digit value.
-SETTLEMENT_REF = "order-4184502"
+ACCOUNT = "999000111"  # the conftest synthetic account; never a real one
+STATE = Path("dca_runner") / "strategy_state.json"
 
 
 @pytest.fixture(autouse=True)
 def no_torn_write_pause(monkeypatch):
-    # The torn-write retry sleeps 250 ms in production; every corrupt-state
-    # test would otherwise pay it twice.
-    monkeypatch.setattr(state_module, "TORN_WRITE_RETRY_SECONDS", 0)
+    # The retry pause is real in production; a test suite should not sleep for it.
+    monkeypatch.setattr(state_mod, "TORN_WRITE_RETRY_SECONDS", 0)
 
 
-def write_json(path: Path, payload) -> Path:
+@pytest.fixture
+def roots(tmp_path):
+    primary = tmp_path / "cron_tracking"
+    primary.mkdir()
+    extra = tmp_path / "artifacts"
+    extra.mkdir()
+    return (RootSpec.of(primary, "primary"), RootSpec.of(extra, "secondary"))
+
+
+def write(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.write_text(payload if isinstance(payload, str) else json.dumps(payload), encoding="utf-8")
     return path
 
 
-def roots(tmp_path) -> tuple[RootSpec, RootSpec]:
-    return RootSpec.of(tmp_path / "cron", "primary"), RootSpec.of(tmp_path / "artifacts", "secondary")
-
-
-def cumulative_ledger(root: Path, day: str, **overrides):
-    payload = {
-        "version": 1, "trading_day": day,
-        "pending_usd_by_ticker": {"AAPL": 1.25, "MSFT": 0.5},
-        "events": [
-            {"ticker": "AAPL", "stream": "morning", "recorded_at": f"{day}T10:30:00-04:00", "final_session": False,
-             "pending_before_usd": 0.0, "incremental_credit_usd": 1.25, "order_amount_usd": 0.0,
-             "pending_after_usd": 1.25, "decision": "pending"},
-            {"ticker": "MSFT", "stream": "afternoon", "recorded_at": f"{day}T15:30:00-04:00", "final_session": True,
-             "pending_before_usd": 3.0, "incremental_credit_usd": 2.0, "order_amount_usd": 5.0,
-             "pending_after_usd": 0.0, "decision": "order"},
-        ],
-        "settled_order_ids": {"order-123456789": {"order_amount_usd": 5.0}},
-    }
-    payload.update(overrides)
-    return write_json(root / "cumulative_dca_credits" / day / "ledger.json", payload)
-
-
-def whole_share_ledger(root: Path, symbol: str, **overrides):
-    payload = {
-        "version": 1, "ticker": symbol, "pending_usd": 12.5, "shares_purchased_total": 2,
-        "events": [
-            {"trading_day": "2026-09-07", "stream": "afternoon", "recorded_at": "2026-09-07T15:30:00-04:00",
-             "pending_before_usd": 60.0, "contribution_usd": 8.0, "current_share_price_usd": 55.5, "shares_to_buy": 1,
-             "order_notional_usd": 55.5, "pending_after_usd": 12.5, "decision": "fire"},
-            {"trading_day": "2026-09-08", "stream": "afternoon", "recorded_at": "2026-09-08T15:30:00-04:00",
-             "shares_purchased": 1, "submitted_notional_usd": 55.5, "restored_shortfall_usd": 0.0,
-             "shares_purchased_total": 2, "decision": "settled"},
-        ],
-        "recorded_idempotency_keys": {
-            "scheduled_20260907_1530ET": {"resolved": False, "claimed_at": "2026-09-07T15:30:00-04:00",
-                                          "claim_token": "deadbeefcafe", "shares_credited": False},
-            "scheduled_20260908_1530ET": {"resolved": True, "claimed_at": "2026-09-08T15:30:00-04:00",
-                                          "claim_token": "feedface0000", "shares_credited": True},
-        },
-    }
-    payload.update(overrides)
-    return write_json(root / "whole_share_accumulation" / symbol / "ledger.json", payload)
-
-
-def tracker(root: Path, symbol: str, **overrides):
-    payload = {
-        "version": 1, "ticker": symbol, "status": "dipping", "accumulated_usd": 40.0,
-        "cycle_start_trading_day": "2026-09-01", "cycle_reference_close": 100.0, "lowest_drop_seen": -0.06,
-        "crossed_tier_thresholds": [0.03, 0.05], "trading_days_active": 5, "fire_attempts": 0,
-        "settlement_pending": False, "settlement_ref_id": SETTLEMENT_REF, "settlement_account": ACCOUNT,
-        "events": [
-            {"status_before": "none", "status_after": "dipping", "accumulated_usd_before": 0.0,
-             "accumulated_usd_after": 20.0, "newly_crossed_tiers": [0.03], "fired": False, "fire_amount_usd": 0.0,
-             "reason": "tier_crossed"},
-            {"status_before": "dipping", "status_after": "dipping", "accumulated_usd_before": 20.0,
-             "accumulated_usd_after": 40.0, "newly_crossed_tiers": [0.05], "fired": False, "fire_amount_usd": 0.0,
-             "reason": "tier_crossed", "recovery_metadata": {"claim_run_id": "scheduled_20260905_1530ET"}},
-        ],
-    }
-    payload.update(overrides)
-    return write_json(root / "inverse_martingale_dca" / symbol / "tracker.json", payload)
-
-
-def strategy_state(path: Path, **overrides):
+def strategy_state_payload(**over):
     payload = {
         "schema_version": 3,
-        "buys_by_ticker_by_day": {"AAPL": {"2026-09-08": 2}, "bad symbol": {"2026-09-08": 1}},
-        "submitted_notional_by_day": {"2026-09-08": 25.0, "2026-09-05": 10.0},
-        "submitted_notional_by_week": {"2026-W37": 35.0},
-        "submitted_order_count_by_day": {"2026-09-08": 2},
-        "recorded_attempt_order_ids": {"AAPL": ["order-abc123"]},
-        "notional_applied_order_ids": {"AAPL": ["order-abc123"]},
-        "weekly_rollover_reserve_usd": 4.5, "reserve_week_key": "2026-W37",
-        "finalized_budget_days": ["2026-09-05", "2026-09-04"], "selected_tier": {"name": "T2"},
+        "buys_by_ticker_by_day": {"NVDA": {"2026-09-04": 2, "2026-09-08": 1}},
+        "submitted_notional_by_day": {"2026-09-04": 12.5, "2026-09-08": 7.25},
+        "submitted_notional_by_week": {"2026-W37": 19.75},
+        "submitted_order_count_by_day": {"2026-09-08": 1},
+        "weekly_rollover_reserve_usd": 3.5,
+        "reserve_week_key": "2026-W37",
+        "finalized_budget_days": ["2026-09-03", "2026-09-04"],
+        "recorded_attempt_order_ids": {"2026-09-08": ["order-abc"]},
+        "selected_tier": {"name": "deep", "multiplier": 2.0},
     }
-    payload.update(overrides)
-    return write_json(path, payload)
+    payload.update(over)
+    return payload
 
 
-def run_state(root: Path, relative: str, **updates) -> Path:
-    from scripts.run_classification import build_scheduled_classification
-
-    state = {
-        "trading_day": DAY.isoformat(), "generated_at": DAY.isoformat() + "T15:35:00-04:00",
-        "status": "completed", "dry_run": False,
-        "run_classification": build_scheduled_classification(DAY.isoformat()),
-        "buy_candidates": [{"ticker": "AAPL", "planned_amount_usd": 40.0, "status": "submitted"}],
+def cumulative_payload(day, **over):
+    payload = {
+        "trading_day": day,
+        "pending_usd_by_ticker": {"NVDA": 0.6, "AAPL": 0.25},
+        "settled_order_ids": {"order-1": {"ticker": "AAPL"}},
+        "events": [
+            {"ticker": "NVDA", "stream": "morning", "recorded_at": f"{day}T10:31:00-04:00", "final_session": False,
+             "pending_before_usd": 0.0, "incremental_credit_usd": 0.6, "order_amount_usd": 0.0,
+             "pending_after_usd": 0.6, "decision": "pending", "order_id": "order-0"},
+            {"ticker": "AAPL", "stream": "afternoon", "recorded_at": f"{day}T15:31:00-04:00", "final_session": True,
+             "pending_before_usd": 1.25, "incremental_credit_usd": 0.0, "order_amount_usd": 1.0,
+             "pending_after_usd": 0.25, "decision": "order", "order_id": "order-1"},
+        ],
     }
-    state.update(updates)
-    folder = write_json(root / relative / "run_state.json", state).parent
-    # The purchase reader deduplicates by order id across roots, so each run
-    # directory gets its own.
+    payload.update(over)
+    return payload
+
+
+def whole_share_payload(**over):
+    payload = {
+        "ticker": "BYDDY", "pending_usd": 42.1, "shares_purchased_total": 3,
+        "recorded_idempotency_keys": {
+            "20260908_1530ET:BYDDY:tok-secret": {"resolved": False, "claimed_at": "2026-09-08T15:31:00-04:00",
+                                                 "shares_credited": False, "claim_token": "tok-secret"},
+            "20260904_1530ET:BYDDY:tok-older": {"resolved": True, "claimed_at": "2026-09-04T15:31:00-04:00",
+                                                "shares_credited": True, "claim_token": "tok-older"},
+        },
+        "events": [
+            {"trading_day": "2026-09-04", "stream": "afternoon", "recorded_at": "2026-09-04T15:31:00-04:00",
+             "pending_before_usd": 10.0, "contribution_usd": 5.0, "pending_after_usd": 15.0, "decision": "pending",
+             "order_id": "order-4"},
+            {"trading_day": "2026-09-08", "stream": "afternoon", "recorded_at": "2026-09-08T15:31:00-04:00",
+             "pending_before_usd": 60.0, "contribution_usd": 5.0, "current_share_price_usd": 22.9, "shares_to_buy": 1,
+             "order_notional_usd": 22.9, "pending_after_usd": 42.1, "decision": "fire", "order_id": "order-8"},
+        ],
+    }
+    payload.update(over)
+    return payload
+
+
+def tracker_payload(**over):
+    payload = {
+        "version": 1, "ticker": "NVDA", "status": "dipping", "accumulated_usd": 18.0,
+        "cycle_start_trading_day": "2026-09-02", "settlement_pending": True,
+        "settlement_ref_id": "order-secret", "settlement_account": ACCOUNT,
+        "events": [
+            {"status_before": "none", "status_after": "dipping", "accumulated_usd_before": 0.0,
+             "accumulated_usd_after": 9.0, "newly_crossed_tiers": [1], "fired": False, "fire_amount_usd": 0.0,
+             "reason": "crossed tier 1"},
+            {"status_before": "dipping", "status_after": "dipping", "accumulated_usd_before": 9.0,
+             "accumulated_usd_after": 18.0, "newly_crossed_tiers": [2], "fired": False, "fire_amount_usd": 0.0,
+             "reason": "recovered claim", "recovery_metadata": {"order_id": "order-secret"}},
+        ],
+    }
+    payload.update(over)
+    return payload
+
+
+def seed_maintenance(root, day, tmp_path, status="completed"):
+    write(root / "ticker_history_update" / day / "ticker_update_event.json", {
+        "event_type": "ticker_history_update", "status": status, "completed_at": f"{day}T06:05:00-04:00",
+        "invocations": 2, "updated_total": 480, "remaining": 0, "errors": [str(tmp_path)],
+        "changed_tickers": ["NVDA", "AAPL"], "changed_active_tickers": ["NVDA"], "execution_owner": "cron",
+        "perplexity_involved": False, "breadth_fetch": {"status": "completed"}, "history_dir": str(tmp_path),
+    })
+    write(root / "per_ticker_calibration" / day / "calibration_run.json", {
+        "calibrated_tickers": 12, "execution_owner": "cron", "fallback_tickers": [], "history_dir": str(tmp_path),
+        "output": str(tmp_path / "out.json"), "run_at": f"{day}T06:20:00-04:00", "status": status,
+        "trigger_source": "ticker_history_update", "triggering_tickers": ["NVDA"], "upstream_status": "partial",
+        "upstream_ticker_update_event": str(tmp_path / "event.json"),
+    })
+
+
+def seed_purchase_run(root, *, name="morning_dca/20260908_1030ET", day="2026-09-08", order_id="order-example"):
+    folder = root / name
+    write(folder / "run_state.json", {
+        "trading_day": day, "generated_at": f"{day}T10:30:00-04:00", "status": "completed", "dry_run": False,
+        "counts": {"buy_candidates": 1, "submitted": 1},
+        "run_classification": {"stream": "morning", "run_origin": "scheduled", "manual_run": False},
+    })
     (folder / "filled_orders.csv").write_text(
         "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
-        f"AAPL,order-example-{relative[-13:-6]},40,filled,10,4\n", encoding="utf-8")
+        f"NVDA,{order_id},40,filled,10,2\n", encoding="utf-8")
     return folder
 
 
-def maintenance(root: Path, day: str, tmp_path: Path):
-    write_json(root / "ticker_history_update" / day / "ticker_update_event.json", {
-        "event_type": "ticker_history_update", "status": "partial", "completed_at": f"{day}T17:45:01-04:00",
-        "invocations": 40, "updated_total": 4074, "remaining": 1395, "errors": [], "changed_tickers": ["AAPL", "MSFT"],
-        "changed_active_tickers": ["AAPL"], "execution_owner": "claude_only",
-        "breadth_fetch": {"status": "failed", "detail": f"exited 1 under {tmp_path}"},
-    })
-    write_json(root / "per_ticker_calibration" / day / "calibration_run.json", {
-        "calibrated_tickers": 67, "fallback_tickers": ["XYZ"], "history_dir": str(tmp_path / "ticker_data"),
-        "output": "config/per_ticker_sizing.json", "run_at": f"{day}T19:40:49-04:00", "status": "completed",
-        "trigger_source": "standalone", "triggering_tickers": [], "upstream_status": "partial",
-        "upstream_ticker_update_event": str(tmp_path / "cron" / "ticker_history_update" / day / "x.json"),
-        "account": ACCOUNT,
+def seed_afternoon_state(root, day="2026-09-08", deployed=25.0):
+    from scripts.run_classification import build_scheduled_classification
+
+    write(root / "scheduled_runs" / f"{day.replace('-', '')}_1530ET" / "run_state.json", {
+        "trading_day": day, "generated_at": f"{day}T15:20:00-04:00",
+        "run_classification": build_scheduled_classification(day),
+        "buy_candidates": [{"ticker": "AAA", "planned_amount_usd": deployed, "status": "submitted"}],
     })
 
 
-# --- strategy_state_view ----------------------------------------------------
-
-def test_strategy_state_absent_is_distinct_from_corrupt(tmp_path):
-    result = strategy_state_view(tmp_path / "strategy_state.json")
-    assert result["status"] == "absent"
-    assert result["fields"] == {}
-    assert result["modified"] is None
-    assert result["lock_file_present"] is False
-    assert str(tmp_path) not in json.dumps(result)
-
-
-@pytest.mark.parametrize("payload", [
-    "{", '{"a": 1, "a": 2}', "[1, 2]", '"text"',
-])
-def test_strategy_state_corrupt_variants_raise_the_alarm(tmp_path, payload):
-    path = tmp_path / "strategy_state.json"
-    path.write_text(payload, encoding="utf-8")
-    result = strategy_state_view(path)
-    assert result["status"] == "corrupt"
-    assert result["fields"] == {}
-    assert any("corrupt" in warning for warning in result["warnings"])
+def seed_everything(roots, tmp_path):
+    primary, extra = roots[0].path, roots[1].path
+    write(primary / STATE, strategy_state_payload())
+    (primary / STATE).with_name("strategy_state.json.lock").write_text("")
+    write(primary / "cumulative_dca_credits" / "2026-09-04" / "ledger.json", cumulative_payload("2026-09-04"))
+    write(primary / "cumulative_dca_credits" / "2026-09-08" / "ledger.json", cumulative_payload("2026-09-08"))
+    write(primary / "whole_share_accumulation" / "BYDDY" / "ledger.json", whole_share_payload())
+    write(primary / "inverse_martingale_dca" / "NVDA" / "tracker.json", tracker_payload())
+    write(extra / "inverse_martingale_dca" / "AAPL" / "tracker.json", tracker_payload(ticker="AAPL"))
+    seed_maintenance(primary, "2026-09-07", tmp_path)
+    seed_purchase_run(primary)
+    seed_afternoon_state(primary)
 
 
-def test_strategy_state_available_fields_are_allowlisted(tmp_path):
-    path = strategy_state(tmp_path / "strategy_state.json", weekly_rollover_reserve_usd=float("nan"))
-    path.with_name("strategy_state.json.lock").write_text("", encoding="utf-8")
-    result = strategy_state_view(path)
-    fields = result["fields"]
-    assert result["status"] == "available"
-    assert result["lock_file_present"] is True
-    assert result["modified"] is not None
-    assert fields["submitted_notional_by_day"] == {"2026-09-08": 25.0, "2026-09-05": 10.0}
-    assert list(fields["submitted_notional_by_day"]) == ["2026-09-08", "2026-09-05"]
-    assert fields["buys_by_ticker_by_day"] == {"AAPL": {"2026-09-08": 2.0}}
-    assert fields["weekly_rollover_reserve_usd"] is None
-    assert fields["finalized_budget_days"] == ["2026-09-05", "2026-09-04"]
-    assert fields["selected_tier"] == {"name": "T2"}
-    assert "recorded_attempt_order_ids" in fields["omitted_keys"]
-    assert "order-abc123" not in json.dumps(result)
-    assert str(tmp_path) not in json.dumps(result)
-
-
-def test_strategy_state_retries_once_after_a_torn_write(tmp_path, monkeypatch):
-    path = strategy_state(tmp_path / "strategy_state.json")
-    reads = [b'{"schema_version": 3, "submitted_notional_by_da', path.read_bytes()]
-    monkeypatch.setattr(state_module, "_raw_bytes", lambda _path: reads.pop(0))
-    result = strategy_state_view(path)
-    assert result["status"] == "available"
-    assert reads == []
-
-
-def test_strategy_state_default_path_resolves_env_at_call_time(tmp_path, monkeypatch):
-    root = tmp_path / "relocated"
-    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(root))
-    strategy_state(root / "dca_runner" / "strategy_state.json")
-    result = strategy_state_view()
-    assert result["status"] == "available"
-    assert result["path_label"].startswith("strategy_state.json (")
-    assert str(root) not in json.dumps(result)
-
-
-# --- ledger_view ------------------------------------------------------------
-
-def test_ledger_view_cumulative_reads_newest_day_and_filters_ticker(tmp_path):
-    primary, secondary = roots(tmp_path)
-    cumulative_ledger(primary.path, "2026-09-07")
-    cumulative_ledger(primary.path, "2026-09-08")
-    (primary.path / "cumulative_dca_credits" / "2026-09-08" / "ledger.lock").write_text("", encoding="utf-8")
-    (primary.path / "cumulative_dca_credits" / "not-a-date").mkdir()
-    result = ledger_view([primary, secondary], "cumulative")
-    assert result["days"] == ["2026-09-08", "2026-09-07"]
-    entry = result["entries"][0]
-    assert entry["day"] == "2026-09-08" and entry["status"] == "available"
-    assert entry["lock_file_present"] is True
-    assert entry["pending_total_usd"] == 1.75
-    assert [event["decision"] for event in entry["events"]] == ["order", "pending"]
-    assert entry["settled_order_count"] == 1
-    assert "order-123456789" not in json.dumps(result)
-    filtered = ledger_view([primary], "cumulative", ticker="MSFT", day="2026-09-07")
-    assert filtered["entries"][0]["pending_usd_by_ticker"] == {"MSFT": 0.5}
-    assert [event["ticker"] for event in filtered["entries"][0]["events"]] == ["MSFT"]
-
-
-def test_ledger_view_cumulative_absent_corrupt_and_mismatched_days(tmp_path):
-    primary, _ = roots(tmp_path)
-    folder = primary.path / "cumulative_dca_credits"
-    write_json(folder / "2026-09-06" / "ledger.json", {"version": 1, "trading_day": "2026-09-05",
-                                                        "pending_usd_by_ticker": {}, "events": []})
-    (folder / "2026-09-07").mkdir(parents=True)
-    (folder / "2026-09-07" / "ledger.json").write_text("{not json", encoding="utf-8")
-    statuses = {day: ledger_view([primary], "cumulative", day=day)["entries"][0]["status"]
-                for day in ("2026-09-05", "2026-09-06", "2026-09-07")}
-    assert statuses == {"2026-09-05": "absent", "2026-09-06": "mismatched", "2026-09-07": "corrupt"}
-    corrupt = ledger_view([primary], "cumulative", day="2026-09-07")
-    assert corrupt["entries"][0]["pending_total_usd"] is None
-    assert any("corrupt" in warning for warning in corrupt["warnings"])
-
-
-def test_ledger_view_whole_share_claims_and_day_filter(tmp_path):
-    primary, _ = roots(tmp_path)
-    whole_share_ledger(primary.path, "BYDDY")
-    whole_share_ledger(primary.path, "MISMA", ticker="OTHER")
-    (primary.path / "whole_share_accumulation" / "lower").mkdir()
-    result = ledger_view([primary], "whole_share")
-    assert result["tickers"] == ["BYDDY", "MISMA"]
-    by_ticker = {entry["ticker"]: entry for entry in result["entries"]}
-    assert by_ticker["BYDDY"]["pending_usd"] == 12.5
-    assert [event["decision"] for event in by_ticker["BYDDY"]["events"]] == ["settled", "fire"]
-    assert by_ticker["BYDDY"]["unresolved_claim_count"] == 1
-    assert by_ticker["MISMA"]["status"] == "mismatched"
-    assert "deadbeefcafe" not in json.dumps(result)
-    assert "scheduled_20260907_1530ET" not in json.dumps(result)
-    one_day = ledger_view([primary], "whole_share", ticker="BYDDY", day="2026-09-08")
-    assert [event["decision"] for event in one_day["entries"][0]["events"]] == ["settled"]
-    assert one_day["entries"][0]["event_count"] == 1
-
-
-def test_ledger_view_inverse_martingale_tracker_allowlist(tmp_path):
-    primary, _ = roots(tmp_path)
-    tracker(primary.path, "NVDA")
-    (primary.path / "inverse_martingale_dca" / "AMD").mkdir(parents=True)
-    result = ledger_view([primary], "inverse_martingale")
-    assert result["tickers"] == ["AMD", "NVDA"]
-    by_ticker = {entry["ticker"]: entry for entry in result["entries"]}
-    assert by_ticker["AMD"]["status"] == "absent" and by_ticker["AMD"]["tracker"] is None
-    nvda = by_ticker["NVDA"]
-    assert nvda["tracker"]["status"] == "dipping"
-    assert nvda["tracker"]["accumulated_usd"] == 40.0
-    assert "settlement_ref_id" not in nvda["tracker"] and "settlement_account" not in nvda["tracker"]
-    assert [event["has_recovery_metadata"] for event in nvda["events"]] == [True, False]
-    assert "scheduled_20260905_1530ET" not in json.dumps(result)
-    assert SETTLEMENT_REF not in json.dumps(result)
-
-
-@pytest.mark.parametrize("kwargs", [
-    {"kind": "orders"}, {"kind": "whole_share", "ticker": "../x"}, {"kind": "whole_share", "ticker": "aapl"},
-    {"kind": "cumulative", "day": "2026/09/08"},
-])
-def test_ledger_view_rejects_invalid_inputs(tmp_path, kwargs):
-    primary, _ = roots(tmp_path)
-    with pytest.raises(ValueError):
-        ledger_view([primary], **kwargs)
-
-
-def test_ledger_view_empty_roots_and_secondary_at_risk(tmp_path):
-    primary, secondary = roots(tmp_path)
-    for kind in ("cumulative", "whole_share", "inverse_martingale"):
-        result = ledger_view([primary], kind)
-        assert result["entries"] == [] and result["warnings"] == []
-    assert any("No artifact root" in warning for warning in ledger_view([], "cumulative")["warnings"])
-    whole_share_ledger(secondary.path, "BYDDY")
-    result = ledger_view([primary, secondary], "whole_share")
-    assert [(entry["root_label"], entry["at_risk"]) for entry in result["entries"]] == [(secondary.label, True)]
-    assert result["entries"][0]["id"].startswith("run-") and len(result["entries"][0]["id"]) == 16
-
-
-# --- purchases_view ---------------------------------------------------------
-
-def test_purchases_view_records_rollup_and_day_filter(tmp_path):
-    primary, secondary = roots(tmp_path)
-    run_state(primary.path, "scheduled_runs/20260908_1530ET")
-    run_state(secondary.path, "20260907_1530ET", trading_day="2026-09-07",
-              generated_at="2026-09-07T15:35:00-04:00",
-              run_classification={"run_origin": "manual", "manual_run": True})
-    result = purchases_view([primary, secondary])
-    assert result["summary"] == {"record_count": 2, "total_usd": 80.0, "last_trading_day": "2026-09-08"}
-    assert [row["trading_day"] for row in result["records"]] == ["2026-09-08", "2026-09-07"]
-    assert result["records"][0]["root_label"] == primary.label and result["records"][0]["at_risk"] is False
-    assert result["records"][1]["at_risk"] is True
-    assert result["records"][0]["price"] == 10 and result["records"][0]["quantity"] == 4
-    assert result["rollup"]["AAPL"]["buy_count"] == 2
-    assert result["rollup"]["AAPL"]["average_cost_basis_usd"] == 10
-    dumped = json.dumps(result)
-    assert "order-example" not in dumped and "order_id" not in dumped and "source_run_dir" not in dumped
-    assert str(tmp_path) not in dumped
-    one_day = purchases_view([primary, secondary], day="2026-09-07")
-    assert one_day["summary"]["record_count"] == 1
-    assert purchases_view([primary], day="2026-01-01")["summary"]["total_usd"] is None
-    assert any("No artifact root" in warning for warning in purchases_view([])["warnings"])
-
-
-# --- risk_view --------------------------------------------------------------
-
-def test_risk_view_is_unusable_without_evidence(tmp_path):
-    primary, secondary = roots(tmp_path)
-    result = risk_view([primary, secondary], DAY, config_dir=CONFIG)
-    assert result["usable"] is False
-    assert result["evidence"]["state_root_exists"] is False
-    assert result["evidence"]["afternoon_states_seen"] == 0
-    assert result["report"]["scheduled_live"]["deployed_last_7d_usd"] == 0.0
-    assert result["scope"] == {"root_label": primary.label, "ignored_roots": [secondary.label],
-                               "note": result["scope"]["note"]}
-    failed = [warning for warning in result["warnings"] if warning.startswith("Risk evidence check failed")]
-    assert any("state_root_exists" in warning for warning in failed)
-    assert any("afternoon_states_seen" in warning for warning in failed)
-    assert not any("run_states_unreadable" in warning for warning in failed)
-    assert str(tmp_path) not in json.dumps(result)
-
-
-def test_risk_view_usable_with_afternoon_evidence(tmp_path):
-    primary, _ = roots(tmp_path)
-    run_state(primary.path, "scheduled_runs/20260908_1530ET")
-    result = risk_view([primary], DAY, config_dir=CONFIG)
-    assert result["usable"] is True, result["warnings"]
-    assert result["evidence"]["afternoon_states_seen"] == 1
-    assert result["evidence"]["run_states_loaded"] == 1
-    assert result["report"]["scheduled_live"]["deployed_last_7d_usd"] == 40.0
-    assert result["report"]["scheduled_live"]["kill_switch_engaged"] is False
-    assert result["report"]["scheduled_deployed_by_day"] == {"2026-09-08": 40.0}
-    assert result["report"]["window_days"] == {"burn": 30, "kill_switch": 7, "evidence": 30}
-    assert result["report"]["kill_switch_7d_threshold_usd"] > 0
-    (primary.path / "scheduled_runs" / "20260908_1530ET" / "run_state.json").write_text("{", encoding="utf-8")
-    broken = risk_view([primary], DAY, config_dir=CONFIG)
-    assert broken["usable"] is False
-    assert broken["evidence"]["run_states_unreadable"] == 1
-    assert any("run_states_unreadable" in warning for warning in broken["warnings"])
-    assert "unreadable_paths" not in broken["evidence"]
-
-
-# --- maintenance_events -----------------------------------------------------
-
-def test_maintenance_events_forwards_only_allowlisted_keys(tmp_path):
-    primary, _ = roots(tmp_path)
-    for day in ("2026-09-06", "2026-09-07", "2026-09-08"):
-        maintenance(primary.path, day, tmp_path)
-    (primary.path / "ticker_history_update" / "2026-09-05").mkdir()
-    (primary.path / "ticker_history_update" / "2026-09-04" / "ticker_update_event.json").parent.mkdir()
-    (primary.path / "ticker_history_update" / "2026-09-04" / "ticker_update_event.json").write_text("{", "utf-8")
-    result = maintenance_events([primary], days=2)
-    assert [row["day"] for row in result["ticker_history"]] == ["2026-09-08", "2026-09-07"]
-    history = result["ticker_history"][0]
-    assert history["status"] == "partial" and history["invocations"] == 40 and history["remaining"] == 1395
-    assert history["changed_active_tickers_count"] == 1 and history["errors_count"] == 0
-    assert history["breadth_status"] == "failed"
-    calibration = result["calibration"][0]
-    assert calibration["upstream_status"] == "partial" and calibration["calibrated_tickers"] == 67
-    assert calibration["fallback_tickers_count"] == 1 and calibration["file"] == "calibration_run.json"
-    assert "history_dir" not in calibration and "output" not in calibration
-    everything = maintenance_events([primary], days=30)
-    assert [row["file_status"] for row in everything["ticker_history"]][-1] == "corrupt"
-    dumped = json.dumps(everything)
-    assert str(tmp_path) not in dumped and ACCOUNT not in dumped
-    assert maintenance_events([], days=30)["ticker_history"] == []
-
-
-# --- build_state_snapshot ---------------------------------------------------
-
-def test_build_state_snapshot_composes_summaries_without_events(tmp_path):
-    primary, secondary = roots(tmp_path)
-    cumulative_ledger(primary.path, "2026-09-08")
-    whole_share_ledger(secondary.path, "BYDDY")
-    tracker(primary.path, "NVDA")
-    run_state(primary.path, "scheduled_runs/20260908_1530ET")
-    maintenance(primary.path, "2026-09-08", tmp_path)
-    state_path = strategy_state(tmp_path / "strategy_state.json")
-    result = build_state_snapshot([primary, secondary], DAY, config_dir=CONFIG, state_path=state_path)
-    assert result["strategy_state"]["status"] == "available"
-    assert result["ledgers"]["cumulative"] == {"entries": 1, "listed": 1, "corrupt": 0, "lock_files_present": 0,
-                                               "pending_total_usd": 1.75}
-    assert result["ledgers"]["whole_share"]["pending_total_usd"] == 12.5
-    assert result["ledgers"]["inverse_martingale"]["pending_total_usd"] == 40.0
-    assert result["purchases"] == {"record_count": 1, "total_usd": 40.0, "last_trading_day": "2026-09-08"}
-    assert result["risk"]["usable"] is True
-    assert result["maintenance"] == {"ticker_history": {"day": "2026-09-08", "status": "partial"},
-                                     "calibration": {"day": "2026-09-08", "status": "completed"}}
-    dumped = json.dumps(result)
-    assert "events" not in dumped and "records" not in dumped
-    assert result["warnings"] == list(dict.fromkeys(result["warnings"]))
-    empty = build_state_snapshot([], DAY, config_dir=CONFIG, state_path=tmp_path / "missing.json")
-    assert empty["strategy_state"]["status"] == "absent" and empty["risk"]["usable"] is False
-    assert empty["maintenance"] == {"ticker_history": None, "calibration": None}
-
-
-# --- cross-cutting guarantees -----------------------------------------------
-
-def test_no_account_number_or_absolute_path_leaks(tmp_path):
-    primary, _ = roots(tmp_path)
-    cumulative_ledger(primary.path, "2026-09-08", pending_usd_by_ticker={"AAPL": 1.0},
-                      events=[{"ticker": "AAPL", "stream": f"acct {ACCOUNT}", "decision": "pending",
-                               "recorded_at": str(tmp_path)}])
-    tracker(primary.path, "NVDA", basis=f"account_{ACCOUNT}")
-    maintenance(primary.path, "2026-09-08", tmp_path)
-    run_state(primary.path, "scheduled_runs/20260908_1530ET", account_number=ACCOUNT)
-    state_path = strategy_state(tmp_path / "strategy_state.json", selected_tier=f"tier {ACCOUNT}",
-                                state_root=str(tmp_path))
-    views = [
-        strategy_state_view(state_path),
-        *(ledger_view([primary], kind) for kind in ("cumulative", "whole_share", "inverse_martingale")),
-        purchases_view([primary]), risk_view([primary], DAY, config_dir=CONFIG),
-        maintenance_events([primary]),
-        build_state_snapshot([primary], DAY, config_dir=CONFIG, state_path=state_path),
+def every_builder(roots):
+    return [
+        strategy_state_view(roots=roots),
+        ledger_view(roots, "cumulative"),
+        ledger_view(roots, "whole_share"),
+        ledger_view(roots, "inverse_martingale"),
+        purchases_view(roots),
+        risk_view(roots, DAY, config_dir=CONFIG),
+        maintenance_events(roots),
+        build_state_snapshot(roots, DAY, config_dir=CONFIG),
     ]
-    for view in views:
-        # Paths never enter the structures at all; the account shape is gone
-        # once the route-level redaction has run (and, via _text, before it).
-        assert str(tmp_path) not in json.dumps(view)
-        assert ACCOUNT not in json.dumps(walk_redact(view))
 
 
-def test_no_lock_is_ever_taken(tmp_path, monkeypatch):
+# --- strategy_state_view ------------------------------------------------------
+
+def test_strategy_state_absent_is_a_fresh_state_not_an_alarm(roots):
+    view = strategy_state_view(roots=roots)
+    assert view["status"] == "absent" and view["fields"] == {} and view["modified"] is None
+    assert view["lock_file_present"] is False
+    assert view["path_label"].startswith("strategy_state.json (")
+    assert any("fresh state" in warning for warning in view["warnings"])
+
+
+def test_strategy_state_forwards_only_the_allowlist_newest_first(roots):
+    path = write(roots[0].path / STATE, strategy_state_payload())
+    path.with_name("strategy_state.json.lock").write_text("")
+    view = strategy_state_view(path)
+    assert view["status"] == "available" and view["lock_file_present"] is True and view["warnings"] == []
+    assert view["modified"] is not None and view["modified"].endswith(("-04:00", "-05:00"))
+    fields = view["fields"]
+    assert list(fields["submitted_notional_by_day"]) == ["2026-09-08", "2026-09-04"]
+    assert fields["submitted_notional_by_day"]["2026-09-08"] == 7.25
+    assert fields["submitted_order_count_by_day"] == {"2026-09-08": 1.0}
+    assert fields["submitted_notional_by_week"] == {"2026-W37": 19.75}
+    assert fields["finalized_budget_days"] == ["2026-09-04", "2026-09-03"]
+    assert fields["buys_by_ticker_by_day"] == {"NVDA": {"2026-09-08": 1.0, "2026-09-04": 2.0}}
+    assert fields["weekly_rollover_reserve_usd"] == 3.5 and fields["reserve_week_key"] == "2026-W37"
+    assert fields["selected_tier"] == {"name": "deep", "multiplier": 2.0}
+    # The order-id map is hidden by the allowlist and named as such.
+    assert fields["omitted_keys"] == ["recorded_attempt_order_ids"]
+    assert "order-abc" not in json.dumps(view)
+
+
+@pytest.mark.parametrize("payload", ['{"schema_version": 3, "schema_version": 4}', "[1, 2]", "{not json", ""])
+def test_strategy_state_corrupt_is_an_alarm_distinct_from_absent(roots, payload):
+    view = strategy_state_view(write(roots[0].path / STATE, payload))
+    assert view["status"] == "corrupt" and view["fields"] == {}
+    assert view["modified"] is not None  # the file exists; absent would be None
+    assert any("refuse to run" in warning for warning in view["warnings"])
+
+
+def test_strategy_state_oversized_file_is_corrupt_not_partially_read(roots, monkeypatch):
+    monkeypatch.setattr(state_mod, "MAX_BYTES", 16)
+    view = strategy_state_view(write(roots[0].path / STATE, strategy_state_payload()))
+    assert view["status"] == "corrupt"
+
+
+def test_strategy_state_retries_once_after_a_torn_write(roots, monkeypatch):
+    path = write(roots[0].path / STATE, '{"schema_version": 3, "weekly_')
+    pauses = []
+
+    def heal(seconds):
+        pauses.append(seconds)
+        path.write_text(json.dumps(strategy_state_payload()), encoding="utf-8")
+    monkeypatch.setattr(state_mod.time, "sleep", heal)
+    view = strategy_state_view(path)
+    assert view["status"] == "available" and pauses == [0]
+    # A second failure after the pause is real corruption: exactly one retry.
+    path.write_text("{torn", encoding="utf-8")
+    monkeypatch.setattr(state_mod.time, "sleep", lambda seconds: pauses.append(seconds))
+    assert strategy_state_view(path)["status"] == "corrupt" and len(pauses) == 2
+
+
+def test_strategy_state_reads_the_primary_root_not_the_runner_default(roots, tmp_path, monkeypatch):
+    # Adversarial review round 2: a demo/--root console showed production's
+    # budget figures because the default came from $DCA_CRON_TRACKING_ROOT.
     import dca_runner
-    import scripts.file_lock as file_lock
+
+    other = tmp_path / "production" / "dca_runner" / "strategy_state.json"
+    write(other, strategy_state_payload(weekly_rollover_reserve_usd=99.0))
+    write(roots[0].path / STATE, strategy_state_payload(weekly_rollover_reserve_usd=1.0))
+    monkeypatch.setattr(dca_runner, "_default_state_path", lambda: other)
+    assert default_state_path(roots) == roots[0].path / STATE
+    assert strategy_state_view(roots=roots)["fields"]["weekly_rollover_reserve_usd"] == 1.0
+    snapshot = build_state_snapshot(roots, DAY, config_dir=CONFIG)
+    assert snapshot["strategy_state"]["fields"]["weekly_rollover_reserve_usd"] == 1.0
+    # Only with no root at all does dca_runner's default (resolved at call time) apply.
+    assert default_state_path(()) == other
+    assert strategy_state_view()["fields"]["weekly_rollover_reserve_usd"] == 99.0
+
+
+def test_strategy_state_hidden_ticker_keys_are_counted_not_silently_dropped(roots, monkeypatch):
+    buys = {"BRK-B": {"2026-09-08": 1}, "NVDA": {"2026-09-08": 2}, "AAPL": {"2026-09-08": 3}}
+    view = strategy_state_view(write(roots[0].path / STATE, strategy_state_payload(buys_by_ticker_by_day=buys)))
+    assert set(view["fields"]["buys_by_ticker_by_day"]) == {"NVDA", "AAPL"}
+    assert any("1 ticker key(s) in buys_by_ticker_by_day were hidden" in warning for warning in view["warnings"])
+    assert "BRK-B" not in json.dumps(view["warnings"])
+    monkeypatch.setattr(state_mod, "MAX_ROWS", 1)
+    view = strategy_state_view(roots[0].path / STATE)
+    assert view["fields"]["buys_by_ticker_by_day"] == {"AAPL": {"2026-09-08": 3.0}}
+    assert any("2 ticker key(s)" in warning for warning in view["warnings"])
+
+
+# --- ledger_view --------------------------------------------------------------
+
+def test_cumulative_ledger_lists_days_newest_first_and_reads_the_file_directly(roots):
+    primary = roots[0].path
+    write(primary / "cumulative_dca_credits" / "2026-09-04" / "ledger.json", cumulative_payload("2026-09-04"))
+    write(primary / "cumulative_dca_credits" / "2026-09-08" / "ledger.json", cumulative_payload("2026-09-08"))
+    (primary / "cumulative_dca_credits" / "2026-09-08" / "ledger.lock").write_text("")
+    (primary / "cumulative_dca_credits" / "not-a-day").mkdir()
+    view = ledger_view(roots, "cumulative")
+    assert view["kind"] == "cumulative" and view["directory"] == "cumulative_dca_credits"
+    assert view["days"] == ["2026-09-08", "2026-09-04"] and view["roots"] == [root.label for root in roots]
+    # Without a day each root reads its own newest ledger; a root that lists
+    # none contributes no entry at all rather than an invented absent one.
+    assert len(view["entries"]) == 1
+    primary_entry = view["entries"][0]
+    assert primary_entry["day"] == "2026-09-08" and primary_entry["status"] == "available"
+    assert primary_entry["id"].startswith("run-") and len(primary_entry["id"]) == 16
+    assert primary_entry["lock_file_present"] is True and primary_entry["at_risk"] is False
+    assert primary_entry["pending_usd_by_ticker"] == {"AAPL": 0.25, "NVDA": 0.6}
+    assert primary_entry["pending_total_usd"] == 0.85 and primary_entry["settled_order_count"] == 1
+    assert [event["decision"] for event in primary_entry["events"]] == ["order", "pending"]
+    assert primary_entry["event_count"] == 2 and "order_id" not in primary_entry["events"][0]
+    assert primary_entry["events"][0]["recorded_at"] == "2026-09-08T15:31:00-04:00"
+    # An explicit day asks every root: the secondary has no ledger for it --
+    # absent, at risk, never zero.
+    explicit = ledger_view(roots, "cumulative", day="2026-09-08")
+    assert [entry["root_label"] for entry in explicit["entries"]] == [root.label for root in roots]
+    secondary_entry = explicit["entries"][1]
+    assert secondary_entry["status"] == "absent" and secondary_entry["at_risk"] is True
+    assert secondary_entry["pending_total_usd"] is None and secondary_entry["events"] == []
+    # An explicit day and a ticker filter narrow the map and the events without a warning.
+    narrowed = ledger_view(roots, "cumulative", day="2026-09-04", ticker="NVDA")
+    entry = narrowed["entries"][0]
+    assert entry["day"] == "2026-09-04" and entry["pending_usd_by_ticker"] == {"NVDA": 0.6}
+    assert entry["pending_total_usd"] == 0.6 and [event["ticker"] for event in entry["events"]] == ["NVDA"]
+    assert narrowed["warnings"] == []
+    assert "order-1" not in json.dumps(view)
+
+
+def test_cumulative_ledger_corrupt_and_mismatched_are_kept_apart(roots):
+    primary = roots[0].path
+    write(primary / "cumulative_dca_credits" / "2026-09-08" / "ledger.json", "{broken")
+    write(primary / "cumulative_dca_credits" / "2026-09-04" / "ledger.json", cumulative_payload("2026-09-03"))
+    corrupt = ledger_view(roots, "cumulative", day="2026-09-08")
+    assert corrupt["entries"][0]["status"] == "corrupt" and corrupt["entries"][0]["pending_total_usd"] is None
+    assert any("ledger file is corrupt" in warning for warning in corrupt["warnings"])
+    mismatched = ledger_view(roots, "cumulative", day="2026-09-04")
+    assert mismatched["entries"][0]["status"] == "mismatched"
+    assert mismatched["entries"][0]["pending_total_usd"] == 0.85  # the figures are still shown, flagged
+    assert any("different trading day" in warning for warning in mismatched["warnings"])
+
+
+def test_cumulative_pending_total_is_unavailable_when_a_key_is_hidden(roots, monkeypatch):
+    # Adversarial review round 2: dca_cumulative applies no symbol pattern on
+    # write, so a hidden key made a partial sum (or 0.0) pose as the balance.
+    ledger = roots[0].path / "cumulative_dca_credits" / "2026-09-08" / "ledger.json"
+    write(ledger, cumulative_payload("2026-09-08", pending_usd_by_ticker={"BRK-B": 0.4, "NVDA": 0.6}))
+    view = ledger_view(roots, "cumulative", day="2026-09-08")
+    entry = view["entries"][0]
+    assert entry["status"] == "available" and entry["pending_usd_by_ticker"] == {"NVDA": 0.6}
+    assert entry["pending_total_usd"] is None
+    assert any("1 pending-credit key(s)" in warning for warning in view["warnings"])
+    assert "BRK-B" not in json.dumps(view["warnings"])
+    write(ledger, cumulative_payload("2026-09-08", pending_usd_by_ticker={"BRK-B": 0.4}))
+    entry = ledger_view(roots, "cumulative", day="2026-09-08")["entries"][0]
+    assert entry["pending_usd_by_ticker"] == {} and entry["pending_total_usd"] is None
+    snapshot = build_state_snapshot(roots, DAY, config_dir=CONFIG)
+    assert snapshot["ledgers"]["cumulative"]["pending_total_usd"] is None
+    assert any("pending-credit key" in warning for warning in snapshot["warnings"])
+    # Truncation past the row limit is a hidden key too.
+    write(ledger, cumulative_payload("2026-09-08"))
+    monkeypatch.setattr(state_mod, "MAX_ROWS", 1)
+    entry = ledger_view(roots, "cumulative", day="2026-09-08")["entries"][0]
+    assert entry["pending_usd_by_ticker"] == {"AAPL": 0.25} and entry["pending_total_usd"] is None
+
+
+def test_whole_share_ledger_forwards_claims_without_tokens(roots):
+    primary = roots[0].path
+    write(primary / "whole_share_accumulation" / "BYDDY" / "ledger.json", whole_share_payload())
+    (primary / "whole_share_accumulation" / "brk-b").mkdir()
+    view = ledger_view(roots, "whole_share")
+    assert view["tickers"] == ["BYDDY"] and len(view["entries"]) == 1
+    entry = view["entries"][0]
+    assert entry["ticker"] == "BYDDY" and entry["status"] == "available" and entry["lock_file_present"] is False
+    assert entry["pending_usd"] == 42.1 and entry["shares_purchased_total"] == 3.0
+    assert [event["decision"] for event in entry["events"]] == ["fire", "pending"] and entry["event_count"] == 2
+    assert entry["claims"] == [
+        {"resolved": False, "claimed_at": "2026-09-08T15:31:00-04:00", "shares_credited": False},
+        {"resolved": True, "claimed_at": "2026-09-04T15:31:00-04:00", "shares_credited": True},
+    ]
+    assert entry["unresolved_claim_count"] == 1
+    dumped = json.dumps(view)
+    assert "tok-secret" not in dumped and "order-8" not in dumped and "20260908_1530ET" not in dumped
+    filtered = ledger_view(roots, "whole_share", ticker="BYDDY", day="2026-09-04")["entries"][0]
+    assert [event["trading_day"] for event in filtered["events"]] == ["2026-09-04"]
+    write(primary / "whole_share_accumulation" / "BYDDY" / "ledger.json", whole_share_payload(ticker="OTHER"))
+    mismatched = ledger_view(roots, "whole_share", ticker="BYDDY")
+    assert mismatched["entries"][0]["status"] == "mismatched"
+    assert any("different ticker" in warning for warning in mismatched["warnings"])
+
+
+def test_inverse_martingale_tracker_allowlist_and_recovery_flag(roots):
+    write(roots[0].path / "inverse_martingale_dca" / "NVDA" / "tracker.json", tracker_payload())
+    (roots[0].path / "inverse_martingale_dca" / "NVDA" / "tracker.lock").write_text("")
+    # A symbol directory whose tracker.json was unlinked is a resolved cycle.
+    (roots[0].path / "inverse_martingale_dca" / "AMD").mkdir()
+    view = ledger_view(roots, "inverse_martingale")
+    assert view["tickers"] == ["AMD", "NVDA"]
+    by_ticker = {(entry["ticker"], entry["root_label"]): entry for entry in view["entries"]}
+    resolved = by_ticker[("AMD", roots[0].label)]
+    assert resolved["status"] == "absent" and resolved["tracker"] is None and view["warnings"] == []
+    entry = by_ticker[("NVDA", roots[0].label)]
+    assert entry["status"] == "available" and entry["lock_file_present"] is True
+    assert entry["tracker"]["status"] == "dipping" and entry["tracker"]["accumulated_usd"] == 18.0
+    assert entry["tracker"]["settlement_pending"] is True
+    assert "settlement_ref_id" not in entry["tracker"] and "settlement_account" not in entry["tracker"]
+    assert [event["reason"] for event in entry["events"]] == ["recovered claim", "crossed tier 1"]
+    assert [event["has_recovery_metadata"] for event in entry["events"]] == [True, False]
+    assert entry["event_count"] == 2 and "recovery_metadata" not in entry["events"][0]
+    assert "order-secret" not in json.dumps(view)
+
+
+@pytest.mark.parametrize("payload", [{}, {"ticker": "NVDA"}, {"ticker": "NVDA", "events": "nope"},
+                                     {"ticker": "NVDA", "events": [{"reason": "ok"}, "junk"]}])
+def test_tracker_without_an_events_list_is_available_not_an_error(roots, payload):
+    # Adversarial review round 2: state["events"] raised KeyError/TypeError
+    # for a truncated-but-valid tracker and escaped as a 500.
+    write(roots[0].path / "inverse_martingale_dca" / "NVDA" / "tracker.json", payload)
+    entry = ledger_view(roots, "inverse_martingale", ticker="NVDA")["entries"][0]
+    assert entry["status"] == "available" and entry["tracker"] is not None
+    if isinstance(payload.get("events"), list):
+        assert entry["events"] == [{"reason": "ok", "has_recovery_metadata": False}] and entry["event_count"] == 1
+    else:
+        assert entry["events"] == [] and entry["event_count"] is None
+    snapshot = build_state_snapshot(roots, DAY, config_dir=CONFIG)
+    assert snapshot["ledgers"]["inverse_martingale"] == {"entries": 1, "listed": 1, "corrupt": 0,
+                                                         "lock_files_present": 0, "pending_total_usd": None}
+
+
+@pytest.mark.parametrize("kwargs", [{"kind": "credits"}, {"kind": "cumulative", "ticker": "nvda"},
+                                    {"kind": "whole_share", "ticker": "../x"}, {"kind": "whole_share", "ticker": "NVDA1"},
+                                    {"kind": "cumulative", "day": "20260908"}, {"kind": "cumulative", "day": "../x"}])
+def test_ledger_view_rejects_bad_inputs_before_any_path_is_built(roots, kwargs):
+    with pytest.raises(ValueError):
+        ledger_view(roots, **kwargs)
+
+
+def test_ledgers_and_maintenance_without_roots_warn_instead_of_guessing():
+    for kind in state_mod.LEDGER_KINDS:
+        view = ledger_view((), kind)
+        assert view["entries"] == [] and any("No artifact root" in warning for warning in view["warnings"])
+    assert any("No artifact root" in warning for warning in maintenance_events(())["warnings"])
+    assert any("No artifact root" in warning for warning in risk_view((), DAY, config_dir=CONFIG)["warnings"])
+
+
+# --- purchases_view -----------------------------------------------------------
+
+def test_purchases_view_carries_no_order_ids_and_counts_reader_evidence(roots):
+    seed_purchase_run(roots[0].path)
+    seed_purchase_run(roots[1].path, name="artifacts_run/20260904_1030ET", day="2026-09-04", order_id="order-two")
+    write(roots[0].path / "midday_dca" / "broken" / "run_state.json", "{broken")
+    view = purchases_view(roots)
+    assert [record["trading_day"] for record in view["records"]] == ["2026-09-08", "2026-09-04"]
+    record = view["records"][0]
+    assert set(record) == {"trading_day", "ticker", "amount_usd", "price", "quantity", "stream", "origin",
+                           "root_label", "at_risk"}
+    assert record["ticker"] == "NVDA" and record["price"] == 10.0 and record["quantity"] == 2.0
+    assert record["origin"] == "scheduled" and record["root_label"] == roots[0].label and record["at_risk"] is False
+    assert view["records"][1]["root_label"] == roots[1].label and view["records"][1]["at_risk"] is True
+    assert view["rollup"]["NVDA"]["buy_count"] == 2 and view["rollup"]["NVDA"]["total_quantity"] == 4.0
+    assert view["summary"]["record_count"] == 2 and view["summary"]["last_trading_day"] == "2026-09-08"
+    assert view["summary"]["total_usd"] == round(sum(record["amount_usd"] for record in view["records"]), 2)
+    assert any("evidence warning(s)" in warning for warning in view["warnings"])
+    dumped = json.dumps(view)
+    assert "order-example" not in dumped and "order-two" not in dumped and "broken" not in dumped
+
+
+def test_purchases_view_day_filter_and_empty_roots(roots):
+    seed_purchase_run(roots[0].path)
+    seed_purchase_run(roots[0].path, name="morning_dca/20260904_1030ET", day="2026-09-04", order_id="order-two")
+    view = purchases_view(roots, day="2026-09-04")
+    assert [record["trading_day"] for record in view["records"]] == ["2026-09-04"]
+    assert view["summary"] == {"record_count": 1, "total_usd": view["records"][0]["amount_usd"],
+                               "last_trading_day": "2026-09-04"}
+    with pytest.raises(ValueError):
+        purchases_view(roots, day="Sept 4")
+    empty = purchases_view(())
+    assert empty["records"] == [] and empty["rollup"] == {}
+    assert empty["summary"] == {"record_count": 0, "total_usd": None, "last_trading_day": None}
+    assert any("No artifact root" in warning for warning in empty["warnings"])
+
+
+# --- risk_view ----------------------------------------------------------------
+
+def test_risk_view_unusable_when_evidence_is_missing(roots, tmp_path):
+    view = risk_view(roots, DAY, config_dir=CONFIG)
+    assert view["usable"] is False
+    assert view["evidence"]["state_root_exists"] is True and view["evidence"]["run_states_loaded"] == 0
+    assert set(view["evidence"]) == set(state_mod.EVIDENCE_KEYS)
+    failing = [warning for warning in view["warnings"] if warning.startswith("Risk evidence check failed")]
+    assert any("run_states_loaded > 0" in warning for warning in failing)
+    assert any("afternoon_states_seen > 0" in warning for warning in failing)
+    assert view["report"]["scheduled_live"]["kill_switch_engaged"] is False
+    assert view["report"]["scheduled_deployed_by_day"] == {}
+    assert view["scope"]["root_label"] == roots[0].label and view["scope"]["ignored_roots"] == [roots[1].label]
+    missing = risk_view((RootSpec.of(tmp_path / "missing"),), DAY, config_dir=CONFIG)
+    assert missing["evidence"]["state_root_exists"] is False
+    assert any("state_root_exists is true" in warning for warning in missing["warnings"])
+
+
+def test_risk_view_usable_over_the_primary_root_only(roots, monkeypatch):
+    seed_afternoon_state(roots[1].path)  # a secondary root never feeds the kill switch
+    view = risk_view(roots, DAY, config_dir=CONFIG)
+    assert view["usable"] is False and view["report"]["scheduled_live"]["deployed_last_7d_usd"] == 0.0
+    seed_afternoon_state(roots[0].path)
+    view = risk_view(roots, DAY, config_dir=CONFIG)
+    assert view["usable"] is True and view["warnings"] == []
+    assert view["evidence"]["afternoon_states_seen"] == 1 and view["evidence"]["run_states_loaded"] == 1
+    report = view["report"]
+    assert report["as_of"] == "2026-09-08" and report["scheduled_live"]["deployed_last_7d_usd"] == 25.0
+    assert report["scheduled_deployed_by_day"] == {"2026-09-08": 25.0}
+    assert report["window_days"] == {"burn": 30, "kill_switch": 7, "evidence": 30}
+    assert report["kill_switch_7d_threshold_usd"] > 0 and "scheduled" in report["deployed_last_7d_usd_by_stream"]
+    assert report["scheduled_live"]["rolling_cash_burn"]["total_deployed_usd"] == 25.0
+    import dca_config
+
+    monkeypatch.setattr(dca_config, "load_strategy_config", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("x")))
+    fallback = risk_view(roots, DAY, config_dir=CONFIG)
+    assert fallback["usable"] is True and fallback["report"]["scheduled_live"]["deployed_last_7d_usd"] == 25.0
+    assert any("built-in defaults" in warning for warning in fallback["warnings"])
+
+
+# --- maintenance_events -------------------------------------------------------
+
+def test_maintenance_events_summarise_allowlisted_keys_without_paths(roots, tmp_path):
+    seed_maintenance(roots[0].path, "2026-09-07", tmp_path)
+    seed_maintenance(roots[0].path, "2026-09-08", tmp_path, status="partial")
+    seed_maintenance(roots[1].path, "2026-09-06", tmp_path)
+    events = maintenance_events(roots)
+    assert [row["day"] for row in events["ticker_history"]] == ["2026-09-08", "2026-09-07", "2026-09-06"]
+    row = events["ticker_history"][0]
+    assert row["file"] == "ticker_update_event.json" and row["file_status"] == "available"
+    assert row["status"] == "partial" and row["invocations"] == 2 and row["updated_total"] == 480
+    assert row["remaining"] == 0 and row["completed_at"] == "2026-09-08T06:05:00-04:00"
+    assert row["errors_count"] == 1 and row["changed_tickers_count"] == 2 and row["changed_active_tickers_count"] == 1
+    assert row["breadth_status"] == "completed" and "history_dir" not in row and "errors" not in row
+    calibration = events["calibration"][0]
+    assert calibration["upstream_status"] == "partial" and calibration["calibrated_tickers"] == 12
+    assert calibration["triggering_tickers_count"] == 1 and calibration["fallback_tickers_count"] == 0
+    assert "output" not in calibration and "upstream_ticker_update_event" not in calibration
+    assert events["ticker_history"][2]["at_risk"] is True and events["ticker_history"][0]["at_risk"] is False
+    assert str(tmp_path) not in json.dumps(events) and events["warnings"] == []
+    # days is clamped to at least one newest directory per root.
+    clamped = maintenance_events(roots, days=0)
+    assert [row["day"] for row in clamped["ticker_history"]] == ["2026-09-08", "2026-09-06"]
+
+
+def test_corrupt_maintenance_event_warns_and_reaches_the_snapshot(roots, tmp_path):
+    # Adversarial review round 2: a corrupt newest event rendered as status
+    # None ("unavailable") with no warning and no file_status on the card.
+    seed_maintenance(roots[0].path, "2026-09-07", tmp_path)
+    write(roots[0].path / "ticker_history_update" / "2026-09-08" / "ticker_update_event.json", "{not json")
+    events = maintenance_events(roots)
+    row = events["ticker_history"][0]
+    assert row["day"] == "2026-09-08" and row["file_status"] == "corrupt" and "status" not in row
+    assert any("maintenance event file is corrupt" in warning for warning in events["warnings"])
+    snapshot = build_state_snapshot(roots, DAY, config_dir=CONFIG)
+    assert snapshot["maintenance"]["ticker_history"] == {"day": "2026-09-08", "status": None, "file_status": "corrupt"}
+    assert snapshot["maintenance"]["calibration"] == {"day": "2026-09-07", "status": "completed",
+                                                      "file_status": "available"}
+    assert any("maintenance event file is corrupt" in warning for warning in snapshot["warnings"])
+
+
+# --- build_state_snapshot -----------------------------------------------------
+
+def test_build_state_snapshot_has_counts_but_no_lists(roots, tmp_path):
+    seed_everything(roots, tmp_path)
+    snapshot = build_state_snapshot(roots, DAY, config_dir=CONFIG)
+    assert snapshot["date"] == "2026-09-08"
+    assert snapshot["strategy_state"]["status"] == "available" and snapshot["strategy_state"]["lock_file_present"]
+    assert set(snapshot["ledgers"]) == set(state_mod.LEDGER_KINDS)
+    # cumulative: the primary's newest day only (the secondary lists none);
+    # inverse_martingale: NVDA under the primary plus AAPL under the secondary.
+    assert snapshot["ledgers"]["cumulative"] == {"entries": 1, "listed": 2, "corrupt": 0, "lock_files_present": 0,
+                                                 "pending_total_usd": 0.85}
+    assert snapshot["ledgers"]["whole_share"]["pending_total_usd"] == 42.1
+    assert snapshot["ledgers"]["inverse_martingale"] == {"entries": 2, "listed": 2, "corrupt": 0,
+                                                         "lock_files_present": 0, "pending_total_usd": 36.0}
+    assert set(snapshot["purchases"]) == {"record_count", "total_usd", "last_trading_day"}
+    assert snapshot["purchases"]["record_count"] == 1
+    assert snapshot["risk"]["usable"] is True
+    assert snapshot["maintenance"]["ticker_history"]["file_status"] == "available"
+    assert snapshot["warnings"] == list(dict.fromkeys(snapshot["warnings"]))
+
+    def lists_of_dicts(value):
+        if isinstance(value, dict):
+            return any(lists_of_dicts(item) for item in value.values())
+        return isinstance(value, list) and any(isinstance(item, dict) for item in value)
+    assert not lists_of_dicts(snapshot)
+
+
+def test_empty_snapshot_is_all_unavailable_never_zero(roots):
+    snapshot = build_state_snapshot(roots, DAY, config_dir=CONFIG)
+    assert snapshot["strategy_state"]["status"] == "absent"
+    assert all(summary["pending_total_usd"] is None for summary in snapshot["ledgers"].values())
+    assert snapshot["purchases"]["total_usd"] is None and snapshot["risk"]["usable"] is False
+    assert snapshot["maintenance"] == {"ticker_history": None, "calibration": None}
+
+
+# --- cross-cutting guarantees -------------------------------------------------
+
+def test_no_account_number_or_absolute_path_reaches_the_payload(roots, tmp_path):
+    seed_everything(roots, tmp_path)
+    primary = roots[0].path
+    leak = str(tmp_path)
+    write(primary / STATE, strategy_state_payload(
+        reserve_week_key=f"week {ACCOUNT}", recorded_attempt_order_ids={ACCOUNT: [leak]},
+        buys_by_ticker_by_day={"NVDA": {"2026-09-08": 1}}))
+    write(primary / "cumulative_dca_credits" / "2026-09-08" / "ledger.json", cumulative_payload(
+        "2026-09-08", settled_order_ids={ACCOUNT: leak},
+        events=[{"ticker": "NVDA", "stream": f"acct {ACCOUNT}", "recorded_at": leak, "decision": "order",
+                 "order_id": leak}]))
+    write(primary / "whole_share_accumulation" / "BYDDY" / "ledger.json", whole_share_payload(
+        recorded_idempotency_keys={leak: {"resolved": False, "claimed_at": leak, "claim_token": ACCOUNT}}))
+    write(primary / "inverse_martingale_dca" / "NVDA" / "tracker.json", tracker_payload(
+        settlement_ref_id=leak, settlement_account=ACCOUNT, reason=leak,
+        events=[{"reason": f"account {ACCOUNT}", "recovery_metadata": {"path": leak}}]))
+    seed_purchase_run(primary, name="midday_dca/20260908_1230ET", order_id=ACCOUNT)
+    for result in every_builder(roots):
+        before = json.dumps(result)
+        assert leak not in before
+        after = json.dumps(walk_redact(result))
+        assert ACCOUNT not in after and leak not in after
+
+
+def test_builders_never_take_a_cross_process_lock_or_a_state_transaction(roots, tmp_path, monkeypatch):
+    import dca_runner
+    import scripts.file_lock
 
     def refuse(*args, **kwargs):
-        raise AssertionError("a console reader tried to take a lock")
-
-    monkeypatch.setattr(file_lock, "cross_process_lock", refuse)
+        raise AssertionError("a console reader took a lock")
+    seed_everything(roots, tmp_path)
+    monkeypatch.setattr(scripts.file_lock, "cross_process_lock", refuse)
     monkeypatch.setattr(dca_runner, "state_transaction", refuse)
     monkeypatch.setattr(dca_runner, "load_strategy_state", refuse)
-    monkeypatch.setattr(dca_runner, "_acquire_exclusive_lock", refuse)
-    primary, secondary = roots(tmp_path)
-    cumulative_ledger(primary.path, "2026-09-08")
-    whole_share_ledger(primary.path, "BYDDY")
-    tracker(secondary.path, "NVDA")
-    run_state(primary.path, "scheduled_runs/20260908_1530ET")
-    maintenance(primary.path, "2026-09-08", tmp_path)
-    state_path = strategy_state(tmp_path / "strategy_state.json")
-    state_path.with_name("strategy_state.json.lock").write_text("", encoding="utf-8")
-    (primary.path / "cumulative_dca_credits" / "2026-09-08" / "ledger.lock").write_text("", encoding="utf-8")
-    all_roots = [primary, secondary]
-    assert strategy_state_view(state_path)["lock_file_present"] is True
-    for kind in ("cumulative", "whole_share", "inverse_martingale"):
-        assert ledger_view(all_roots, kind)["entries"]
-    assert purchases_view(all_roots)["summary"]["record_count"] == 1
-    assert risk_view(all_roots, DAY, config_dir=CONFIG)["usable"] is True
-    assert maintenance_events(all_roots)["calibration"]
-    snapshot = build_state_snapshot(all_roots, DAY, config_dir=CONFIG, state_path=state_path)
-    assert snapshot["ledgers"]["cumulative"]["lock_files_present"] == 1
+    results = every_builder(roots)
+    assert len(results) == 8 and all("warnings" in result for result in results)
+    assert results[0]["status"] == "available" and results[0]["lock_file_present"] is True

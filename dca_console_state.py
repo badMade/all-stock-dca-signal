@@ -74,6 +74,8 @@ TRACKER_EVENT_KEYS = ("status_before", "status_after", "accumulated_usd_before",
 # order-id, placement-ref and recovered-run-id maps are never forwarded; their
 # names show up under "omitted_keys" so the operator knows the allowlist hid them.
 STATE_SCALAR_KEYS = ("schema_version", "weekly_rollover_reserve_usd", "reserve_week_key", "selected_tier")
+# dca_runner._default_state_path() is stream_root("dca_runner") / "strategy_state.json".
+STATE_DIR, STATE_FILE = "dca_runner", "strategy_state.json"
 STATE_DATED_KEYS = ("submitted_notional_by_day", "submitted_order_count_by_day")
 # Evidence counts the live kill switch requires before it trusts a zero
 # (dca_risk._load_states_with_evidence; plan "Server contract" correction 2).
@@ -93,9 +95,11 @@ MAINTENANCE = {
                                                "trigger_source", "upstream_status", "execution_owner", "version")),
 }
 COUNTED_LIST_KEYS = ("errors", "changed_tickers", "changed_active_tickers", "fallback_tickers", "triggering_tickers")
-# Fields that are timestamps by contract: forwarded only when they parse as
-# one, so an artifact cannot smuggle free text (or a path) through them.
-TIMESTAMP_KEYS = frozenset({"recorded_at", "claimed_at", "completed_at", "run_at"})
+# Fields that must be timestamps: forwarded only when they parse as one, else
+# None. Stricter than the bounded-text rule on purpose -- a stamp is the one
+# free-text slot every ledger and event log shares, so it is where a path or
+# an order reference seeded by a foreign writer would otherwise ride through.
+TIMESTAMP_KEYS = ("recorded_at", "claimed_at", "completed_at", "run_at")
 
 
 def _text(value: Any, limit: int = MAX_TEXT) -> str:
@@ -129,7 +133,7 @@ def _jsonable(value: Any, depth: int = 0) -> Any:
 
 
 def _stamp(value: Any) -> str | None:
-    """An ISO timestamp verbatim, or None: a stamp field is never free text."""
+    """An ISO-8601 timestamp string as written, or None for anything that is not one."""
     if not isinstance(value, str) or len(value) > 40:
         return None
     try:
@@ -140,8 +144,7 @@ def _stamp(value: Any) -> str | None:
 
 
 def _pick(obj: dict[str, Any], keys: Sequence[str]) -> dict[str, Any]:
-    return {key: _stamp(obj.get(key)) if key in TIMESTAMP_KEYS else _jsonable(obj.get(key))
-            for key in keys if key in obj}
+    return {key: (_stamp(obj[key]) if key in TIMESTAMP_KEYS else _jsonable(obj[key])) for key in keys if key in obj}
 
 
 def _identity(root: RootSpec, relative: Path | str) -> str:
@@ -194,8 +197,33 @@ def _dated_numbers(mapping: Any) -> dict[str, float | None] | None:
     return {key: value for key, value in rows[:MAX_ROWS]}
 
 
-def _state_fields(raw: dict[str, Any]) -> dict[str, Any]:
-    fields: dict[str, Any] = {key: _jsonable(raw.get(key)) for key in STATE_SCALAR_KEYS}
+def _symbol_rows(mapping: dict[str, Any], value_of, ticker: str | None = None) -> tuple[dict[str, Any], int]:
+    """Allowlisted, bounded symbol->value rows plus the number of keys DROPPED.
+
+    dca_cumulative and dca_runner apply no symbol pattern on write (every site
+    is ``ticker.strip().upper()``), so a stored key like ``BRK-B`` or a
+    seven-character symbol is legal on disk yet unsafe as a path component
+    here. Such a key is left out of the rows, but the caller must know it was
+    -- a sum over the survivors is not the balance the file records
+    (adversarial review round 2: silent drops turned real credit into $0.00).
+    A ``ticker`` filter is not a drop: the operator asked for that subset.
+    """
+    rows: dict[str, Any] = {}
+    dropped = 0
+    for symbol, value in sorted(mapping.items(), key=lambda item: str(item[0])):
+        if not isinstance(symbol, str) or not SYMBOL.match(symbol):
+            dropped += 1
+        elif ticker not in (None, symbol):
+            continue
+        elif len(rows) >= MAX_ROWS:
+            dropped += 1
+        else:
+            rows[symbol] = value_of(value)
+    return rows, dropped
+
+
+def _state_fields(raw: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
+    fields: dict[str, Any] = _pick(raw, STATE_SCALAR_KEYS)
     for key in STATE_DATED_KEYS:
         fields[key] = _dated_numbers(raw.get(key))
     weeks = raw.get("submitted_notional_by_week")
@@ -207,17 +235,38 @@ def _state_fields(raw: dict[str, Any]) -> dict[str, Any]:
         sorted({iso_date(day) for day in days if iso_date(day)}, reverse=True)[:MAX_ROWS]
         if isinstance(days, list) else None)
     buys = raw.get("buys_by_ticker_by_day")
-    fields["buys_by_ticker_by_day"] = (
-        {symbol: _dated_numbers(buys[symbol])
-         for symbol in sorted(key for key in buys if isinstance(key, str) and SYMBOL.match(key))[:MAX_ROWS]}
-        if isinstance(buys, dict) else None)
+    fields["buys_by_ticker_by_day"] = None
+    if isinstance(buys, dict):
+        fields["buys_by_ticker_by_day"], dropped = _symbol_rows(buys, _dated_numbers)
+        if dropped:
+            warnings.append(f"{dropped} ticker key(s) in buys_by_ticker_by_day were hidden "
+                            "(not a displayable symbol, or past the row limit); the grid is incomplete.")
     shown = set(STATE_SCALAR_KEYS) | set(STATE_DATED_KEYS) | {
         "submitted_notional_by_week", "finalized_budget_days", "buys_by_ticker_by_day"}
     fields["omitted_keys"] = sorted(_text(key, 80) for key in raw if key not in shown)[:MAX_ROWS]
     return fields
 
 
-def strategy_state_view(state_path: Path | None = None) -> dict[str, Any]:
+def default_state_path(roots: Sequence[RootSpec]) -> Path:
+    """Where ``strategy_state.json`` lives for these roots, without reading the environment.
+
+    ``dca_runner.save_strategy_state`` writes ``stream_root("dca_runner") /
+    strategy_state.json``, and the primary RootSpec IS that cron-tracking
+    root, so the same file sits at ``<primary>/dca_runner/strategy_state.json``.
+    Resolving it from the root rather than from ``$DCA_CRON_TRACKING_ROOT``
+    keeps the state card on the same tree as every other panel: a demo or
+    ``--root`` console used to show production's budget figures beside demo
+    ledgers (adversarial review round 2). ``dca_runner._default_state_path``
+    remains the fallback only when no root is configured at all.
+    """
+    if roots:
+        return Path(roots[0].path) / STATE_DIR / STATE_FILE
+    from dca_runner import _default_state_path  # call-time: reads the env through dca_paths
+
+    return _default_state_path()
+
+
+def strategy_state_view(state_path: Path | None = None, *, roots: Sequence[RootSpec] = ()) -> dict[str, Any]:
     """Read ``strategy_state.json`` raw: no lock, no ``load_strategy_state``.
 
     ``status`` is ``absent`` (no file: a fresh state), ``corrupt`` (unreadable,
@@ -225,16 +274,13 @@ def strategy_state_view(state_path: Path | None = None) -> dict[str, Any]:
     because the live loader refuses to run on it) or ``available``. ``fields``
     holds the allowlisted budget/buy-count keys with ``None`` for any value that
     is missing or non-finite; ``lock_file_present`` reports the sibling
-    ``.lock`` without ever opening it. The default location is resolved at call
-    time through ``dca_runner._default_state_path`` (honours
-    ``$DCA_CRON_TRACKING_ROOT``); ``path_label`` names it without the path.
+    ``.lock`` without ever opening it. Without ``state_path`` the file is
+    ``default_state_path(roots)``: under the primary root when one is given,
+    else ``dca_runner._default_state_path()`` resolved at call time.
+    ``path_label`` names the file without its path.
     """
     warnings: list[str] = []
-    if state_path is None:
-        from dca_runner import _default_state_path  # call-time: reads the env through dca_paths
-
-        state_path = _default_state_path()
-    path = Path(state_path)
+    path = Path(state_path) if state_path is not None else default_state_path(roots)
     status, raw = _parse_state(path)
     if status == "corrupt":
         # A torn write is indistinguishable from corruption on the first read;
@@ -254,7 +300,7 @@ def strategy_state_view(state_path: Path | None = None) -> dict[str, Any]:
     except OSError:
         lock_present = False
     return {"status": status, "path_label": root_label(path), "modified": modified,
-            "lock_file_present": lock_present, "fields": _state_fields(raw) if raw is not None else {},
+            "lock_file_present": lock_present, "fields": _state_fields(raw, warnings) if raw is not None else {},
             "warnings": _dedup(warnings)}
 
 
@@ -321,10 +367,15 @@ def _cumulative_entry(root: RootSpec, reader: BoundedReader, day: str, ticker: s
         reader.warn("A cumulative ledger records a different trading day than its directory.")
     pending = state.get("pending_usd_by_ticker")
     if isinstance(pending, dict):
-        rows = {symbol: _finite(value) for symbol, value in islice(sorted(pending.items()), MAX_ROWS)
-                if isinstance(symbol, str) and SYMBOL.match(symbol) and ticker in (None, symbol)}
+        rows, dropped = _symbol_rows(pending, _finite, ticker)
         entry["pending_usd_by_ticker"] = rows
-        entry["pending_total_usd"] = round(sum(rows.values()), 2) if None not in rows.values() else None
+        if dropped:
+            # A total over a thinned map is not the day's pending balance;
+            # None says "unavailable" where a partial sum would read as $0.00.
+            reader.warn(f"{dropped} pending-credit key(s) in a cumulative ledger were hidden "
+                        "(not a displayable symbol, or past the row limit); its pending total is unavailable.")
+        elif None not in rows.values():
+            entry["pending_total_usd"] = round(sum(rows.values()), 2)
     entry["events"], entry["event_count"] = _events(
         state, CUMULATIVE_EVENT_KEYS, lambda event: ticker in (None, event.get("ticker")))
     settled = state.get("settled_order_ids")
@@ -369,8 +420,9 @@ def _tracker_entry(root: RootSpec, reader: BoundedReader, symbol: str) -> dict[s
         entry["status"] = "mismatched"
         reader.warn("An inverse-martingale tracker records a different ticker than its directory.")
     entry["tracker"] = _pick(state, TRACKER_KEYS)
-    # A crash-lease recovery's attribution block is flagged, not forwarded: it
-    # names the claim (a run id) the recovery took over.
+    # recovery_metadata is a nested blob (order refs inside); only its presence
+    # is forwarded, and through _events' hook so a tracker without an "events"
+    # list is still "available", not a KeyError (adversarial review round 2).
     entry["events"], entry["event_count"] = _events(
         state, TRACKER_EVENT_KEYS, lambda event: True,
         extra=lambda event: {"has_recovery_metadata": "recovery_metadata" in event})
@@ -502,7 +554,14 @@ def risk_view(roots: Sequence[RootSpec], day: date, *, config_dir: Path) -> dict
     the evidence window. Secondary roots are ignored on purpose: the live kill
     switch reads the cron-tracking tree alone.
     """
-    import dca_risk as risk  # call-time: dca_risk imports near_close_dca, which is heavy
+    from dca_risk import (
+        BURN_WINDOW_DAYS,
+        EVIDENCE_WINDOW_DAYS,
+        KILL_SWITCH_WINDOW_DAYS,
+        STREAM_SCHEDULED,
+        build_risk_report,
+        deployed_by_day,
+    )
 
     warnings: list[str] = []
     result: dict[str, Any] = {"usable": False, "evidence": None, "report": None, "scope": {
@@ -510,11 +569,12 @@ def risk_view(roots: Sequence[RootSpec], day: date, *, config_dir: Path) -> dict
         "note": "Computed over the primary root only: that is the tree the live kill switch reads."}}
     if not roots:
         return {**result, "warnings": ["No artifact root is configured; the risk report is unavailable."]}
-    loader = getattr(risk, "load_states_with_evidence", None)
-    if loader is None:
+    try:
+        from dca_risk import load_states_with_evidence
+    except ImportError:
         return {**result, "warnings": ["The risk evidence loader is not available in this checkout."]}
     try:
-        states, evidence = loader(roots[0].path, as_of=day)
+        states, evidence = load_states_with_evidence(roots[0].path, as_of=day)
     except (OSError, ValueError, TypeError, KeyError, RecursionError):
         return {**result, "warnings": ["Run states could not be read; the risk report is unavailable."]}
     result["evidence"] = {key: _jsonable(evidence.get(key)) for key in EVIDENCE_KEYS}
@@ -527,13 +587,13 @@ def risk_view(roots: Sequence[RootSpec], day: date, *, config_dir: Path) -> dict
         config = None
         warnings.append("The strategy config could not be loaded; thresholds use built-in defaults.")
     try:
-        report = _jsonable(risk.build_risk_report(states, day, config))
-        by_day = risk.deployed_by_day(states, stream=risk.STREAM_SCHEDULED)
+        report = _jsonable(build_risk_report(states, day, config))
+        by_day = deployed_by_day(states, stream=STREAM_SCHEDULED)
     except (ValueError, TypeError, KeyError, OverflowError):
         return {**result, "warnings": _dedup(warnings + ["The risk report could not be computed."])}
-    start = day.toordinal() - (risk.EVIDENCE_WINDOW_DAYS - 1)
-    report["window_days"] = {"burn": risk.BURN_WINDOW_DAYS, "kill_switch": risk.KILL_SWITCH_WINDOW_DAYS,
-                             "evidence": risk.EVIDENCE_WINDOW_DAYS}
+    start = day.toordinal() - (EVIDENCE_WINDOW_DAYS - 1)
+    report["window_days"] = {"burn": BURN_WINDOW_DAYS, "kill_switch": KILL_SWITCH_WINDOW_DAYS,
+                             "evidence": EVIDENCE_WINDOW_DAYS}
     report["scheduled_deployed_by_day"] = {
         when.isoformat(): _finite(amount) for when, amount in sorted(by_day.items(), reverse=True)
         if start <= when.toordinal() <= day.toordinal()}
@@ -545,6 +605,10 @@ def _maintenance_row(root: RootSpec, reader: BoundedReader, relative: Path, scal
     status, event = _read_object(reader, relative)
     row = {"id": _identity(root, relative), "root_label": root.label, "at_risk": root.kind != "primary",
            "day": relative.parent.name, "file": relative.name, "file_status": status}
+    if status == "corrupt":
+        # _read_object is silent by design (absent is common); a maintenance
+        # event that exists but cannot be parsed is not, so name it here.
+        reader.warn(f"A {root.label} maintenance event file is corrupt; its status is unavailable.")
     if event is None:
         return row
     row.update(_pick(event, scalars))
@@ -589,10 +653,11 @@ def build_state_snapshot(roots: Sequence[RootSpec], day: date, *, config_dir: Pa
     ``ledgers`` holds counts per kind (entries, corrupt, lock files, pending
     total or None); ``purchases`` the record count, total and last day;
     ``strategy_state`` and ``risk`` their full views (neither carries events);
-    ``maintenance`` the newest event's day and status per log. Every
-    sub-view's warnings are merged and deduplicated.
+    ``maintenance`` the newest event's day, status and ``file_status`` per
+    log, so a corrupt newest event is an alarm on the card rather than an
+    unavailable status. Every sub-view's warnings are merged and deduplicated.
     """
-    state = strategy_state_view(state_path)
+    state = strategy_state_view(state_path, roots=roots)
     purchases = purchases_view(roots)
     risk = risk_view(roots, day, config_dir=config_dir)
     maintenance = maintenance_events(roots, days=7)
@@ -608,7 +673,8 @@ def build_state_snapshot(roots: Sequence[RootSpec], day: date, *, config_dir: Pa
                          "corrupt": sum(entry["status"] in {"corrupt", "mismatched"} for entry in view["entries"]),
                          "lock_files_present": sum(entry["lock_file_present"] for entry in view["entries"]),
                          "pending_total_usd": round(sum(pending), 2) if pending and None not in pending else None}
-    latest = {key: ({"day": rows[0]["day"], "status": rows[0].get("status")} if rows else None)
+    latest = {key: ({"day": rows[0]["day"], "status": rows[0].get("status"), "file_status": rows[0]["file_status"]}
+                    if rows else None)
               for key, rows in maintenance.items() if key != "warnings"}
     return {"date": day.isoformat(), "strategy_state": state, "ledgers": ledgers, "purchases": purchases["summary"],
             "risk": risk, "maintenance": latest, "warnings": _dedup(warnings)}
