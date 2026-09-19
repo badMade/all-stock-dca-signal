@@ -255,7 +255,7 @@ def test_capture_to_keeps_stdout_as_a_redacted_document_and_streams_stderr(tmp_p
     manager = JobManager(tmp_path / "jobs")
     target = tmp_path / "out" / "document.json"
     code = ("import json, sys; sys.stderr.write('progress line\\n'); "
-            "print(json.dumps({'volume': 12345678, 'note': 'account 999000111 seen', 'ok': True}))")
+            "print(json.dumps({'volume': 1234567.5, 'note': 'account 999000111 seen', 'ok': True}))")
     command = Command((sys.executable, "-c", code), tmp_path, dict(os.environ), capture_to=target)
     try:
         manager.submit("gate5-replay", "Capture", lambda job_id, log: manager.run_command(command, log))
@@ -267,7 +267,7 @@ def test_capture_to_keeps_stdout_as_a_redacted_document_and_streams_stderr(tmp_p
         assert '{"volume"' not in result["log"]
         assert "document.json" in result["log"]
         document = json.loads(target.read_text())
-        assert document["volume"] == 12345678 and document["ok"] is True
+        assert document["volume"] == 1234567.5 and document["ok"] is True
         assert "999000111" not in document["note"]
     finally:
         manager.close()

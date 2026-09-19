@@ -38,6 +38,9 @@ def load(cfg, stem):
 
 
 def every_builder(cfg):
+    # Builders take the RootSpec's path: the label is for the browser, the
+    # path for the reader, exactly as the other console readers split them.
+    cfg = RootSpec.of(cfg, "config").path
     return [
         reader.config_catalog(cfg, REPO), reader.config_file_view(cfg, "tickers"), reader.parity_checks(cfg),
         reader.effective_config(cfg, NOW), reader.ladder_preview(cfg), reader.ladder_point(cfg, 2.0, "AAPL"),
@@ -317,7 +320,10 @@ def test_snapshot_never_leaks_paths_or_the_account(cfg, tmp_path, monkeypatch):
     assert str(tmp_path) not in raw
     redacted = json.dumps(walk_redact(everything), allow_nan=False)
     assert SYNTHETIC_ACCOUNT not in redacted and str(tmp_path) not in redacted
-    assert RootSpec.of(cfg).label not in redacted or str(cfg) not in redacted
+    # A documented artifact path keeps its file name and loses its location.
+    view = reader.config_file_view(cfg, "midday_dca")["text"]
+    assert "[path]/run_state.json" in view and "/home/user" not in view
+    assert "../schemas/tickers.schema.json" in reader.config_file_view(cfg, "tickers")["text"]
 
 
 def test_builders_never_take_a_cross_process_lock(cfg, monkeypatch):

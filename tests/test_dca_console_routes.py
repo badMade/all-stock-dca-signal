@@ -57,13 +57,13 @@ def test_walk_redact_removes_secret_values_but_keeps_ids_and_prose(monkeypatch):
         "command": "python3 -m scripts.same_day_top_up_gate --account <acct> --trading-day <YYYY-MM-DD>",
         "leak": "see console-private-value-xyz and hook-value-123456",
         "nested": [1, None, {"account": "account number 999000111 seen"}],
-        "number": 20260917,
+        "number": 2026.0917,
     }
     redacted = walk_redact(value)
     assert redacted["id"] == value["id"]
     assert redacted["note"] == value["note"]
     assert redacted["command"] == value["command"]
-    assert redacted["number"] == 20260917
+    assert redacted["number"] == 2026.0917
     serialized = json.dumps(redacted)
     assert "console-private-value-xyz" not in serialized
     assert "hook-value-123456" not in serialized

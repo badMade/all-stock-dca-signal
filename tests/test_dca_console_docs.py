@@ -72,8 +72,9 @@ def test_docs_index_reports_titles_groups_and_registration(tmp_path):
     assert rows["docs/orphan.md"]["in_readme"] is False and rows["docs/orphan.md"]["in_catalog"] is False
     assert rows["README.md"]["in_readme"] is None and rows["README.md"]["group"] == "root"
     assert rows["claude/dca-executor-prompts/live-mirror/1030ET-run.txt"]["mirror"] is True
-    assert index["unregistered"] == ["docs/README.md", "docs/orphan.md"]
-    assert index["warnings"] == ["2 docs page(s) are missing from docs/README.md or CLAUDE.md's index."]
+    assert index["unregistered"] == ["docs/orphan.md"]
+    assert index["warnings"] == ["1 docs page(s) are missing from the docs/README.md index."]
+    assert rows["docs/README.md"]["in_readme"] is True
     assert str(tmp_path) not in json.dumps(index)
 
 
@@ -81,6 +82,9 @@ def test_real_repository_catalog_covers_the_docs_corpus_and_every_catalog_ref():
     from dca_console import module_catalog
 
     catalog = allowed_docs(REPO)
+    # The registration triangle is closed for the real corpus: every docs/
+    # page is linked from the docs index (GUI expansion Phase 5).
+    assert docs_index(REPO, set())["unregistered"] == []
     assert {name for name in catalog if name.startswith("docs/")} == {
         f"docs/{path.name}" for path in (REPO / "docs").glob("*.md")
     }

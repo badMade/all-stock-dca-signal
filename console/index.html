@@ -106,14 +106,14 @@
         <section class="panel section-space" id="jobs"><div class="section-top"><div><div class="eyebrow">EXECUTION HISTORY</div><h2>Jobs &amp; output</h2></div><span class="tag" id="job-count">0 jobs</span></div><div id="jobs-list"><p class="empty-state">No jobs started in this console session. Run the full demo to test the complete path.</p></div></section>
       </section>
 
-      <section class="page" data-page="environment" id="page-environment" data-placeholder hidden>
-        <div class="section-heading"><div><div class="eyebrow">ENVIRONMENT</div><h2>Readiness and provenance.</h2><p class="muted">Interpreters, packages, environment variable names, roots and mounts, the listener's access policy and the repository gates.</p></div></div>
-        <div class="panel page-placeholder"><p class="empty-state">This page arrives in a later phase. Until then, run <code>python3 from.py --check</code> from the checkout.</p><div class="root-list" data-roots></div></div>
+      <section class="page" data-page="environment" id="page-environment" hidden>
+        <div class="section-heading"><div><div class="eyebrow">ENVIRONMENT</div><h2>Readiness and provenance.</h2><p class="muted">Interpreters, packages, environment variable names (never values), roots and mounts as labels, the listener's access policy and the repository gates as copyable commands.</p></div></div>
+        <div data-page-body><div class="panel empty-state">Loading the environment…</div></div>
       </section>
 
-      <section class="page" data-page="docs" id="page-docs" data-placeholder hidden>
-        <div class="section-heading"><div><div class="eyebrow">DOCS</div><h2>The documentation corpus, in-app.</h2><p class="muted">Every registered page, its registration status, and a text-only reader.</p></div></div>
-        <div class="panel page-placeholder"><p class="empty-state">This page arrives in a later phase. Documentation links in the program directory already open in the reader.</p><div class="root-list" data-roots></div></div>
+      <section class="page" data-page="docs" id="page-docs" hidden>
+        <div class="section-heading"><div><div class="eyebrow">DOCS</div><h2>The documentation corpus, in-app.</h2><p class="muted">Every servable page with its index registration status. Select a row to read it as plain text; live-mirror prompts are copies whose source of truth lives outside this repository.</p></div></div>
+        <div class="docs-grid"><div class="panel" data-doc-list><p class="empty-state">Loading the documentation index…</p></div><div class="panel docs-reader" data-doc-reader><h3>Reader</h3><pre class="doc-body">Select a page on the left.</pre></div></div>
       </section>
 
       <footer class="page-footer"><span>DCA Operations · Local workspace</span><span>Auto-refreshes every 15 seconds <span aria-hidden="true">↻</span></span></footer>

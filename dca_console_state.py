@@ -54,7 +54,6 @@ LEDGER_KINDS = ("cumulative", "whole_share", "inverse_martingale")
 # the primary RootSpec IS the cron-tracking root, so they are relative to it.
 LEDGER_DIRS = {"cumulative": "cumulative_dca_credits", "whole_share": "whole_share_accumulation",
                "inverse_martingale": "inverse_martingale_dca"}
-LEDGER_FILES = {"cumulative": "ledger.json", "whole_share": "ledger.json", "inverse_martingale": "tracker.json"}
 CUMULATIVE_EVENT_KEYS = ("ticker", "stream", "recorded_at", "final_session", "pending_before_usd",
                          "incremental_credit_usd", "order_amount_usd", "pending_after_usd", "decision")
 WHOLE_SHARE_EVENT_KEYS = ("trading_day", "stream", "recorded_at", "pending_before_usd", "contribution_usd",
@@ -94,6 +93,9 @@ MAINTENANCE = {
                                                "trigger_source", "upstream_status", "execution_owner", "version")),
 }
 COUNTED_LIST_KEYS = ("errors", "changed_tickers", "changed_active_tickers", "fallback_tickers", "triggering_tickers")
+# Fields that are timestamps by contract: forwarded only when they parse as
+# one, so an artifact cannot smuggle free text (or a path) through them.
+TIMESTAMP_KEYS = frozenset({"recorded_at", "claimed_at", "completed_at", "run_at"})
 
 
 def _text(value: Any, limit: int = MAX_TEXT) -> str:
@@ -126,8 +128,20 @@ def _jsonable(value: Any, depth: int = 0) -> Any:
     return None
 
 
+def _stamp(value: Any) -> str | None:
+    """An ISO timestamp verbatim, or None: a stamp field is never free text."""
+    if not isinstance(value, str) or len(value) > 40:
+        return None
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value
+
+
 def _pick(obj: dict[str, Any], keys: Sequence[str]) -> dict[str, Any]:
-    return {key: _jsonable(obj.get(key)) for key in keys if key in obj}
+    return {key: _stamp(obj.get(key)) if key in TIMESTAMP_KEYS else _jsonable(obj.get(key))
+            for key in keys if key in obj}
 
 
 def _identity(root: RootSpec, relative: Path | str) -> str:
@@ -181,7 +195,7 @@ def _dated_numbers(mapping: Any) -> dict[str, float | None] | None:
 
 
 def _state_fields(raw: dict[str, Any]) -> dict[str, Any]:
-    fields: dict[str, Any] = _pick(raw, STATE_SCALAR_KEYS)
+    fields: dict[str, Any] = {key: _jsonable(raw.get(key)) for key in STATE_SCALAR_KEYS}
     for key in STATE_DATED_KEYS:
         fields[key] = _dated_numbers(raw.get(key))
     weeks = raw.get("submitted_notional_by_week")
@@ -194,8 +208,9 @@ def _state_fields(raw: dict[str, Any]) -> dict[str, Any]:
         if isinstance(days, list) else None)
     buys = raw.get("buys_by_ticker_by_day")
     fields["buys_by_ticker_by_day"] = (
-        {symbol: _dated_numbers(per_day) for symbol, per_day in islice(sorted(buys.items()), MAX_ROWS)
-         if isinstance(symbol, str) and SYMBOL.match(symbol)} if isinstance(buys, dict) else None)
+        {symbol: _dated_numbers(buys[symbol])
+         for symbol in sorted(key for key in buys if isinstance(key, str) and SYMBOL.match(key))[:MAX_ROWS]}
+        if isinstance(buys, dict) else None)
     shown = set(STATE_SCALAR_KEYS) | set(STATE_DATED_KEYS) | {
         "submitted_notional_by_week", "finalized_budget_days", "buys_by_ticker_by_day"}
     fields["omitted_keys"] = sorted(_text(key, 80) for key in raw if key not in shown)[:MAX_ROWS]
@@ -334,7 +349,7 @@ def _whole_share_entry(root: RootSpec, reader: BoundedReader, symbol: str, day: 
     claims = state.get("recorded_idempotency_keys")
     if isinstance(claims, dict):
         # Claim tokens and the slot keys are never forwarded; resolution state is.
-        rows = [{"resolved": claim.get("resolved") is True, "claimed_at": _jsonable(claim.get("claimed_at")),
+        rows = [{"resolved": claim.get("resolved") is True, "claimed_at": _stamp(claim.get("claimed_at")),
                  "shares_credited": claim.get("shares_credited") is True}
                 for claim in islice(claims.values(), MAX_ROWS) if isinstance(claim, dict)]
         entry["claims"] = rows
@@ -354,9 +369,11 @@ def _tracker_entry(root: RootSpec, reader: BoundedReader, symbol: str) -> dict[s
         entry["status"] = "mismatched"
         reader.warn("An inverse-martingale tracker records a different ticker than its directory.")
     entry["tracker"] = _pick(state, TRACKER_KEYS)
-    entry["events"], entry["event_count"] = _events(state, TRACKER_EVENT_KEYS, lambda event: True)
-    for event, raw in zip(entry["events"], reversed([e for e in state["events"] if isinstance(e, dict)][-MAX_ROWS:])):
-        event["has_recovery_metadata"] = "recovery_metadata" in raw
+    # A crash-lease recovery's attribution block is flagged, not forwarded: it
+    # names the claim (a run id) the recovery took over.
+    entry["events"], entry["event_count"] = _events(
+        state, TRACKER_EVENT_KEYS, lambda event: True,
+        extra=lambda event: {"has_recovery_metadata": "recovery_metadata" in event})
     return entry
 
 
@@ -485,8 +502,7 @@ def risk_view(roots: Sequence[RootSpec], day: date, *, config_dir: Path) -> dict
     the evidence window. Secondary roots are ignored on purpose: the live kill
     switch reads the cron-tracking tree alone.
     """
-    from dca_risk import (BURN_WINDOW_DAYS, EVIDENCE_WINDOW_DAYS, KILL_SWITCH_WINDOW_DAYS, STREAM_SCHEDULED,
-                          build_risk_report, deployed_by_day)
+    import dca_risk as risk  # call-time: dca_risk imports near_close_dca, which is heavy
 
     warnings: list[str] = []
     result: dict[str, Any] = {"usable": False, "evidence": None, "report": None, "scope": {
@@ -494,12 +510,11 @@ def risk_view(roots: Sequence[RootSpec], day: date, *, config_dir: Path) -> dict
         "note": "Computed over the primary root only: that is the tree the live kill switch reads."}}
     if not roots:
         return {**result, "warnings": ["No artifact root is configured; the risk report is unavailable."]}
-    try:
-        from dca_risk import load_states_with_evidence
-    except ImportError:
+    loader = getattr(risk, "load_states_with_evidence", None)
+    if loader is None:
         return {**result, "warnings": ["The risk evidence loader is not available in this checkout."]}
     try:
-        states, evidence = load_states_with_evidence(roots[0].path, as_of=day)
+        states, evidence = loader(roots[0].path, as_of=day)
     except (OSError, ValueError, TypeError, KeyError, RecursionError):
         return {**result, "warnings": ["Run states could not be read; the risk report is unavailable."]}
     result["evidence"] = {key: _jsonable(evidence.get(key)) for key in EVIDENCE_KEYS}
@@ -512,13 +527,13 @@ def risk_view(roots: Sequence[RootSpec], day: date, *, config_dir: Path) -> dict
         config = None
         warnings.append("The strategy config could not be loaded; thresholds use built-in defaults.")
     try:
-        report = _jsonable(build_risk_report(states, day, config))
-        by_day = deployed_by_day(states, stream=STREAM_SCHEDULED)
+        report = _jsonable(risk.build_risk_report(states, day, config))
+        by_day = risk.deployed_by_day(states, stream=risk.STREAM_SCHEDULED)
     except (ValueError, TypeError, KeyError, OverflowError):
         return {**result, "warnings": _dedup(warnings + ["The risk report could not be computed."])}
-    start = day.toordinal() - (EVIDENCE_WINDOW_DAYS - 1)
-    report["window_days"] = {"burn": BURN_WINDOW_DAYS, "kill_switch": KILL_SWITCH_WINDOW_DAYS,
-                             "evidence": EVIDENCE_WINDOW_DAYS}
+    start = day.toordinal() - (risk.EVIDENCE_WINDOW_DAYS - 1)
+    report["window_days"] = {"burn": risk.BURN_WINDOW_DAYS, "kill_switch": risk.KILL_SWITCH_WINDOW_DAYS,
+                             "evidence": risk.EVIDENCE_WINDOW_DAYS}
     report["scheduled_deployed_by_day"] = {
         when.isoformat(): _finite(amount) for when, amount in sorted(by_day.items(), reverse=True)
         if start <= when.toordinal() <= day.toordinal()}

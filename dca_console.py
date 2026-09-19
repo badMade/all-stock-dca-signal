@@ -410,7 +410,7 @@ def dependency_reason(packages: dict, names: tuple[str, ...]) -> str:
 
 def python_packages(executable: str) -> dict:
     """Probe optional package availability without importing research modules."""
-    names = ("numpy", "pandas", "sklearn", "torch", "pytest", "ruff")
+    names = ("numpy", "pandas", "sklearn", "torch", "pytest", "ruff", "jsonschema", "yaml", "yfinance", "tkinter")
     code = (
         "import importlib.util,json; "
         f"print(json.dumps({{n: importlib.util.find_spec(n) is not None for n in {names!r}}}))"
@@ -527,6 +527,7 @@ class ConsoleApp:
 
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.access: ConsoleAccess | None = None
         self.jobs = JobManager(settings.output / "jobs")
         self.token = secrets.token_urlsafe(32)
         self.packages = python_packages(settings.research_python)
@@ -865,6 +866,9 @@ def make_server(
     access = ConsoleAccess() if access is None else access
     if not isinstance(access, ConsoleAccess):
         raise ValueError("access must be a validated ConsoleAccess policy")
+    # The Environment page reports the listener's non-secret policy (bind,
+    # trusted hosts, auth mode); the credential bytes never leave ConsoleAccess.
+    app.access = access
     # This limiter belongs to one server, rather than the module, so separate
     # consoles and tests cannot suppress each other's diagnostics (panel,
     # round 3).
@@ -1018,7 +1022,7 @@ def make_server(
                 if handler is None:
                     self._json(404, {"error": "Not found"})
                     return
-                response = handler(app, RouteRequest(url, self._authority_diagnostics()))
+                response = handler(app, RouteRequest(url, self._authority_diagnostics(), self.server.server_address[1]))
                 self._reply(response.code, response.body, response.kind,
                             download=response.download, csp=response.csp)
             except ValueError:

@@ -68,11 +68,18 @@ _AFTERNOON_OWNER = {"executor_class": None, "config_stem": "near_close_dca", "po
 
 
 def _text(value: Any, limit: int = TEXT_LIMIT) -> str | None:
-    """Bound and redact one free-text field copied from a repo file; None when absent."""
+    """Scrub, redact and bound one free-text field copied from a repo file; None when absent.
+
+    Paths are scrubbed here as well as in log tails because manifest notes and
+    policy prose quote install locations, and ``walk_redact`` (the route-level
+    pass) only knows secrets and account shapes, not paths. Clipping happens
+    after redaction so a ``[redacted]`` substitution cannot push the field past
+    ``limit``.
+    """
     if not isinstance(value, str) or not value:
         return None
-    clipped = value[:limit] + ("..." if len(value) > limit else "")
-    return redact_value(clipped.replace("\n", " "))
+    cleaned = redact_value(_scrub_paths(value.replace("\n", " ")))
+    return cleaned[:limit] + ("..." if len(cleaned) > limit else "")
 
 
 def _flag(value: Any) -> bool | None:
@@ -129,15 +136,14 @@ def _task_details(task: dict[str, Any]) -> dict[str, Any]:
 def manifest_tasks(config_dir: Path, day: date, now: datetime) -> dict[str, Any]:
     """Read ``config/scheduled_tasks.json`` once and enrich the daily schedule rows.
 
-    ``tasks`` holds one row per ``build_schedule_rows`` entry (a multi-slot task
-    yields one row per ET slot) joined by task id to the manifest fields the
-    daily snapshot omits: type, trades, enabled/status, scheduler registration,
-    ``cron_utc``, the executor label, a 300-char note and ``timing`` (``cron_utc``
-    / ``outside this repo`` / ``one-time`` / ``unspecified``). Every row is
-    configuration; ``status`` keeps the daily snapshot's ``timing_unverified``
-    wording and disabled or unregistered tasks stay listed. ``task_count`` is
-    the manifest's own total (None when unreadable); ``policy_keys`` are the
-    non-task top-level keys :func:`policy_block` accepts.
+    ``tasks``: one row per ``build_schedule_rows`` entry (a multi-slot task
+    yields one per ET slot) joined by task id to the manifest fields the daily
+    snapshot omits: type, trades, enabled/status, scheduler registration,
+    ``cron_utc``, executor label, a 300-char note and ``timing`` (``cron_utc`` /
+    ``outside this repo`` / ``one-time`` / ``unspecified``). ``status`` keeps the
+    snapshot's ``timing_unverified`` wording; disabled and unregistered tasks
+    stay listed. ``task_count`` is the manifest's own total (None when
+    unreadable); ``policy_keys`` are the keys :func:`policy_block` accepts.
     """
     warnings: list[str] = []
     manifest = _load_object(Path(config_dir) / MANIFEST_NAME)

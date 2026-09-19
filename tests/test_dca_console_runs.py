@@ -170,7 +170,9 @@ def test_index_collapses_variants_filters_and_excludes(tmp_path):
     assert result["runs"][0]["status"] == "failed" and result["runs"][0]["time"].startswith("2026-09-08T10:31")
     assert result["recent_days"] == ["2026-09-08", "2026-08-10"]
     assert [row["day"] for row in build_run_index([root], day=date(2026, 8, 10))["runs"]] == ["2026-08-10"]
-    assert [row["day"] for row in build_run_index([root], month="2026-09")["runs"]] == ["2026-09-08"]
+    monthly = build_run_index([root], month="2026-09", excluded_roots=[tmp_path / "console"])
+    assert [row["day"] for row in monthly["runs"]] == ["2026-09-08"]
+    assert [row["day"] for row in build_run_index([root], month="2026-09")["runs"]] == ["2026-09-08", "2026-09-01"]
     assert build_run_index([root], day=date(2026, 1, 1))["runs"] == []
 
 
@@ -239,7 +241,11 @@ def test_detail_explains_afternoon_evidence_gap_with_labels_only(tmp_path):
     root = RootSpec.of(tmp_path)
     detail = build_run_detail([root], only_run(root)["id"], config_dir=CONFIG)
     explanation = detail["abort_explanation"]
-    assert explanation["likely_cause"] == "afternoon_evidence_healthy"
+    # The fixture's classification lacks the scheduled contract's required
+    # fields, so the diagnostic honestly reports the tree as populated with
+    # non-evidence rather than healthy.
+    assert explanation["likely_cause"] == "afternoon_evidence_excluded_by_stream"
+    assert explanation["qualifying_in_window_total"] == 0
     assert explanation["as_of"] == "2026-09-08" and "cron_tracking_root" not in explanation
     assert all(entry["root"].startswith(f"<{root.label}>") for entry in explanation["roots"])
     assert str(tmp_path) not in json.dumps(detail)

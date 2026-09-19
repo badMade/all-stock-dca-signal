@@ -225,6 +225,10 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `docs/whole_share_accumulation.md` | Whole-share accumulation for tickers not tradable for fractional buys (built for BYDDY): tracks would-be graded-ladder buys, fires one whole-share purchase once they sum to a share's price. Wired into the 3:30 PM canonical stream only |
 | `docs/market_graph.md` | The 3D market graph: axis mapping, Pulse/Wave modes, the four data-source loaders, and the two tiers of behavioural ticker grouping |
 | `docs/wondrous_octopus.md` | The `wondrous-octopus/` tool: walk-forward, online-updated next-day OHLC forecasting across the whole archive; research artifacts only, never wired into live sizing |
+| `docs/morning_dca.md`, `docs/midday_dca.md` | The two executor-class stream references: modes, task/ET/artifact-root tables, the Jul 10 2026 ladder unification |
+| `docs/market_open_signal_entry.md`, `docs/morning_signal_entry.md`, `docs/midday_signal_entry.md`, `docs/intraday_signal_entry.md` | The per-slot Gate 5 signal-generation contracts behind the seven candidate generators (payload shape, flags, output document) |
+| `docs/risk_management.md` | The rolling cash-burn report and the 7-day deployment kill switch (`dca_risk.py`) |
+| `docs/dca_operational_todos.md` | Operational notes, including the standing Perplexity backup-pass policy behind the seven Claude slots |
 | `docs/alert_digest.md` | Why executor gate alerts piled up undelivered in Gmail drafts, and `scripts/alert_digest.py` — the digest that counts them by gate/slot/streak and flags alerts whose delivery channel was off or gitignored |
 | `docs/drift_detection.md`, `docs/reporting_workflow.md`, `docs/cost_tracking.md` | Post-run detection, reporting, and cost policy |
 | `docs/pr_review_workflow.md` | The two-workflow PR review split and its trust boundary |

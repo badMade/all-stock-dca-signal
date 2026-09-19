@@ -52,6 +52,8 @@ class RouteRequest:
     # Already redacted and bounded by the handler; reported back on /api/health
     # and 403 bodies so an operator can decide --behind-proxy from evidence.
     authority: dict[str, str | None]
+    # The listening port, for the Environment page's access-policy panel.
+    port: int | None = None
 
 
 @dataclass(frozen=True)
@@ -142,10 +144,10 @@ def _route_docs(app, request: RouteRequest) -> Response:
 
     fields = query(request.url.query, ("path",), max_fields=1, strict=False)
     name = fields.get("path", "")
-    # Two allowlists, both closed: the catalog's own doc_refs (kept so every
-    # program-directory link still resolves) and the docs catalog's bounded
-    # listings. read_doc re-checks membership and confinement itself.
-    data = read_doc(REPO, name) if name in _catalog_refs(app) or name else None
+    # One closed allowlist: the docs catalog's bounded listings, which a test
+    # proves cover every program-directory doc_ref. read_doc re-checks
+    # membership and confinement itself.
+    data = read_doc(REPO, name) if name else None
     if data is None:
         return Response.json(404, {"error": "Documentation not found"})
     return Response(200, data, "text/plain")
@@ -174,6 +176,14 @@ def _route_jobs_log(app, request: RouteRequest) -> Response:
     return Response.json(200, delta)
 
 
+def _route_env(app, request: RouteRequest) -> Response:
+    from dca_console import REPO
+    from dca_console_env import build_env_snapshot
+
+    query(request.url.query, (), max_fields=1)
+    return Response.json(200, build_env_snapshot(app, REPO, port=request.port))
+
+
 GET_ROUTES: dict[str, Callable[[Any, RouteRequest], Response]] = {
     "/api/bootstrap": _route_bootstrap,
     "/api/snapshot": _route_snapshot,
@@ -182,4 +192,5 @@ GET_ROUTES: dict[str, Callable[[Any, RouteRequest], Response]] = {
     "/api/docs": _route_docs,
     "/api/docs/index": _route_docs_index,
     "/api/jobs/log": _route_jobs_log,
+    "/api/env": _route_env,
 }

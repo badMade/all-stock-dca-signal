@@ -42,7 +42,13 @@ def write_alert(root, stream_dir="morning_dca", name=ALERT_FILE, body=BODY, day_
     return folder / name
 
 
-def write_marker(root, day="20260908", stream="morning", **extra):
+#: The YYYYMMDD every marker fixture in this file is written under.
+MARKER_DAY = "20260908"
+#: The YYYYMM every model-usage fixture in this file is written under.
+USAGE_MONTH = "202609"
+
+
+def write_marker(root, day=MARKER_DAY, stream="morning", **extra):
     folder = root / "attempt_log" / day
     folder.mkdir(parents=True, exist_ok=True)
     marker = {"stream": stream, "error_class": "RuntimeError", "error_message": "boom", "traceback": "…",
@@ -53,7 +59,7 @@ def write_marker(root, day="20260908", stream="morning", **extra):
     return folder
 
 
-def write_usage(root, month="202609", *entries):
+def write_usage(root, month=USAGE_MONTH, *entries):
     folder = root / "model_usage" / month
     folder.mkdir(parents=True, exist_ok=True)
     lines = [entry if isinstance(entry, str) else json.dumps(entry) for entry in entries]
@@ -138,7 +144,7 @@ def test_alert_digest_view_keeps_the_digest_vocabulary_and_never_calls_silence_h
 def test_attempt_log_view_reads_markers_from_the_primary_root_by_default(tmp_path, monkeypatch):
     monkeypatch.delenv("DCA_ATTEMPT_LOG_ROOT", raising=False)
     primary, secondary = roots_for(tmp_path)
-    folder = write_marker(primary.path, correlation_id="dca-20260908-morning-1030")
+    folder = write_marker(primary.path, correlation_id=f"dca-{MARKER_DAY}-morning-1030")
     (folder / "morning.attempts.jsonl").write_text("{not json}\n" + json.dumps({"triggered_at_utc": "x"}) + "\n")
     write_marker(primary.path, day="20260701")  # older than the 30-day window
     result = attempt_log_view((primary, secondary), days=30, now=NOW)
@@ -171,7 +177,7 @@ def test_attempt_log_view_honours_the_env_override_at_call_time_and_reports_abse
 
 def test_model_usage_view_hashes_run_ids_and_reduces_artifact_paths_to_basenames(tmp_path):
     primary, _ = roots_for(tmp_path)
-    write_usage(primary.path, "202609", usage_entry(primary.path), "{broken", "[1, 2]", usage_entry(primary.path, run_id=7))
+    write_usage(primary.path, USAGE_MONTH, usage_entry(primary.path), "{broken", "[1, 2]", usage_entry(primary.path, run_id=7))
     result = model_usage_view((primary,), "2026-09")
     assert len(result["entries"]) == 2 and result["month"] == "2026-09"
     first = result["entries"][0]
@@ -182,7 +188,7 @@ def test_model_usage_view_hashes_run_ids_and_reduces_artifact_paths_to_basenames
     assert any("unsupported shape" in warning for warning in result["warnings"])
     assert model_usage_view((primary,), "2026-08") == {"entries": [], "month": "2026-08", "warnings": []}
     with pytest.raises(ValueError):
-        model_usage_view((primary,), "202609")
+        model_usage_view((primary,), USAGE_MONTH)
 
 
 def test_delivery_channels_reports_names_and_flags_but_never_values(tmp_path, monkeypatch):
@@ -262,7 +268,7 @@ def test_reliability_engines_distinguish_library_only_from_observed_data(tmp_pat
     run.mkdir(parents=True)
     (run / "run_state.json").write_text(json.dumps({"correlation_id": "dca-x"}), encoding="utf-8")
     (run / "run_state.corrupt.json").write_text("{", encoding="utf-8")
-    write_usage(primary.path, "202609", usage_entry(primary.path))  # a model_usage.jsonl is not a run ledger
+    write_usage(primary.path, USAGE_MONTH, usage_entry(primary.path))  # a model_usage.jsonl is not a run ledger
     engines = {row["name"]: row for row in reliability_engines((primary, secondary))["engines"]}
     assert engines["run_ledger"]["count"] == 1 and engines["scheduler_lease"]["count"] == 1
     assert engines["correlation"] == {"name": "correlation", "has_data": True, "count": 1,
@@ -292,7 +298,7 @@ def test_no_absolute_path_or_account_number_reaches_the_response(tmp_path, monke
     write_alert(primary.path, body=BODY + poison + "\n")
     write_alert(secondary.path, "ce16ba6b", f"{DAY.isoformat()}-1530-gate9.txt", body=BODY + poison + "\n")
     write_marker(primary.path, error_class=poison, triggered_at_utc=poison, correlation_id=poison)
-    write_usage(primary.path, "202609", usage_entry(primary.path, notes=poison, task_name=poison))
+    write_usage(primary.path, USAGE_MONTH, usage_entry(primary.path, notes=poison, task_name=poison))
     run = primary.path / "run"
     run.mkdir()
     snapshot = build_alerts_snapshot((primary, secondary), DAY, DAY, config_dir=CONFIG, repo=REPO, now=NOW)
@@ -317,7 +323,7 @@ def test_builders_never_take_a_cross_process_lock_or_a_state_transaction(tmp_pat
     primary, secondary = roots_for(tmp_path)
     write_alert(primary.path)
     write_marker(primary.path)
-    write_usage(primary.path, "202609", usage_entry(primary.path))
+    write_usage(primary.path, USAGE_MONTH, usage_entry(primary.path))
     run = primary.path / "run"
     run.mkdir()
     alert_inbox((primary, secondary), DAY, DAY, config_dir=CONFIG)

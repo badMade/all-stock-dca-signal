@@ -456,7 +456,7 @@ class JobManager:
         """Persist a captured stdout document, redacting strings without breaking JSON.
 
         A JSON document is walked so only its string values are redacted (a
-        volume of 12345678 must stay a number); anything else goes through the
+        volume of 1234567.5 must stay a number); anything else goes through the
         free-text sanitizer. Truncation is recorded in the log and refuses to
         pass off a partial document as complete.
         """

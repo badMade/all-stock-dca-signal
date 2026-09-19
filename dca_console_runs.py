@@ -126,15 +126,15 @@ def _warn(warnings: list[str], message: str) -> None:
         warnings.append(message)
 
 
-def _stat_time(path: Path) -> float | None:
-    try:
-        return path.lstat().st_mtime
-    except OSError:
-        return None
-
-
-def _iso(stamp: float | None) -> str | None:
-    return datetime.fromtimestamp(stamp, ET).isoformat() if stamp is not None else None
+def _newest(root: Path, entries: Sequence[Path]) -> str | None:
+    """ISO mtime (ET) of the newest entry, without following symlinks; None when empty."""
+    stamps = []
+    for entry in entries:
+        try:
+            stamps.append((root / entry).lstat().st_mtime)
+        except OSError:
+            continue
+    return datetime.fromtimestamp(max(stamps), ET).isoformat() if stamps else None
 
 
 # --- 1. artifact tree map ----------------------------------------------------
@@ -143,11 +143,10 @@ def artifact_tree_map(roots: Sequence[RootSpec]) -> dict[str, Any]:
     """Probe every expected artifact directory under each root.
 
     Returns ``{"roots": [{label, kind, exists, at_risk, directories: [{name,
-    entries, newest, present}]}], "warnings"}``. ``present=False`` means the
-    directory does not exist (never "empty history"); ``entries`` is a bounded
-    count; ``newest`` is the ISO mtime of the newest entry or None when the
-    directory is absent or empty. Secondary roots are ``at_risk`` because the
-    repo-root ``artifacts/`` tree is gitignored and unmanaged.
+    present, entries, newest}]}], "warnings"}``. ``present=False`` is an absent
+    directory, never "empty history"; ``entries`` is a bounded count; ``newest``
+    is None when absent or empty. Secondary roots are ``at_risk`` (the repo-root
+    ``artifacts/`` tree is gitignored and unmanaged).
     """
     warnings: list[str] = []
     result = []
@@ -158,9 +157,8 @@ def artifact_tree_map(roots: Sequence[RootSpec]) -> dict[str, Any]:
             folder = reader.confined(name)
             present = folder is not None and folder.is_dir()
             entries = reader.entries(name) if present else []
-            newest = max((_stat_time(root.path / entry) or 0.0 for entry in entries), default=None)
             directories.append({"name": name, "present": present, "entries": len(entries),
-                                "newest": _iso(newest) if newest else None})
+                                "newest": _newest(root.path, entries)})
         result.append({"label": root.label, "kind": root.kind, "exists": root.path.is_dir(),
                        "at_risk": root.kind == "secondary", "directories": directories})
     return {"roots": result, "warnings": warnings}
@@ -410,12 +408,11 @@ def _close_window(reader: BoundedReader, relative_dir: str, state: dict[str, Any
                   tables: dict[str, Any]) -> dict[str, Any]:
     """Grade "what would have fired" from the persisted afternoon signal prices.
 
-    The live path persists each ticker's decision bar close, prior close and
-    60-minute lookback price in ``signals.csv``, which is exactly the quote
-    contract ``build_close_window_summary`` asks for; the raw ``quotes_batch*``
-    files hold broker quotes without the lookback bar, so they only count as
-    corroborating inputs here. Multipliers carry the summary's own 3x
-    reporting cap and are labelled as such.
+    ``signals.csv`` persists each ticker's decision bar close, prior close and
+    60-minute lookback price -- exactly ``build_close_window_summary``'s quote
+    contract. The raw ``quotes_batch*`` files lack the lookback bar, so they are
+    only counted as corroborating inputs. Multipliers carry the summary's own
+    3x reporting cap and are labelled as such.
     """
     from dca_config import load_per_ticker_sizing, load_sizing_tiers
     from run_dca import _parse_raw_json
@@ -498,16 +495,15 @@ def _abort_explanation(root: RootSpec, row: dict[str, Any], state: dict[str, Any
 def build_run_detail(roots: Sequence[RootSpec], run_id: str, *, config_dir: Path) -> dict[str, Any]:
     """Everything the console can say about one run named by an index id.
 
-    Returns ``{"found": False, "warnings"}`` for a malformed or unknown id.
-    Otherwise ``found=True`` with the index ``run`` row, ``identity``
-    (allowlisted ``run_state.json`` keys), ``contract`` (artifact contract
-    result), ``drift`` (drift report), ``tables`` (allowlisted CSV columns,
-    200 rows each), ``post_trade`` (slippage/coverage when
-    ``raw/orders_after_place.json`` exists), ``close_window`` (what would have
-    fired, ``multiplier_label`` = reporting cap 3x), ``inputs`` (saved Gate 5
-    input file names) and ``abort_explanation`` (afternoon evidence-gap
-    diagnosis, else None). A section is None or ``available=False`` when its
-    inputs are missing; an incomplete run has an empty identity.
+    ``{"found": False, "warnings"}`` for a malformed or unknown id. Otherwise
+    ``found=True`` with the index ``run`` row, ``identity`` (allowlisted
+    ``run_state.json`` keys), ``contract``, ``drift``, ``tables`` (allowlisted
+    CSV columns, 200 rows each), ``post_trade`` (slippage/coverage from
+    ``raw/orders_after_place.json``), ``close_window`` (``multiplier_label`` =
+    reporting cap 3x), ``inputs`` (saved Gate 5 input file names) and
+    ``abort_explanation`` (afternoon evidence-gap diagnosis, else None). A
+    section is None or ``available=False`` when its inputs are missing; an
+    incomplete run has an empty identity.
     """
     if not RUN_ID_RE.match(run_id or ""):
         return {"found": False, "warnings": ["The run id is not a console run id."]}
@@ -542,7 +538,7 @@ def build_run_detail(roots: Sequence[RootSpec], run_id: str, *, config_dir: Path
 
 def _pointer_row(root: RootSpec, stream: str, pointer: Path, expected_root: Path, day: date,
                  roots: Sequence[RootSpec], warnings: list[str], *, alias: bool = False) -> dict[str, Any]:
-    from scripts.same_day_pointer import STATUS_VALID, STATUS_VALID_RECOVERY_CONTEXT, validate_pointer
+    from scripts.same_day_pointer import STATUS_PENDING, STATUS_VALID, STATUS_VALID_RECOVERY_CONTEXT, validate_pointer
 
     reader = root.reader(warnings)
     relative = pointer.relative_to(root.path)
@@ -558,7 +554,9 @@ def _pointer_row(root: RootSpec, stream: str, pointer: Path, expected_root: Path
         label = "scheduled evidence"
     elif outcome.status == STATUS_VALID_RECOVERY_CONTEXT:
         label = "recovery context, not scheduled evidence"
-    elif pointer.is_file() and not present:
+    elif outcome.status == STATUS_PENDING:
+        # Every structural check passed but the run directory holds no
+        # run_state.json yet: the pointer is unverified, not rejected.
         label = "unverified"
     else:
         label = "rejected"
@@ -574,17 +572,15 @@ def _pointer_row(root: RootSpec, stream: str, pointer: Path, expected_root: Path
 def pointer_strip(roots: Sequence[RootSpec], day: date, *, config_dir: Path) -> dict[str, Any]:
     """Validate every stream's ``latest_<stream>_run.json`` under each root for ``day``.
 
-    Returns ``{"streams": [...], "warnings"}``; each row carries the literal
-    ``same_day_pointer.STATUS_*`` value, ``evidence`` (True only for
-    ``STATUS_VALID`` with ``valid_scheduled_evidence``), an ``evidence_label``
-    ("scheduled evidence", "recovery context, not scheduled evidence",
-    "unverified" for a pointer whose run directory lacks ``run_state.json``,
-    else "rejected"), the validator's reasons, ``run_state_present`` and the
+    Each row carries the literal ``same_day_pointer.STATUS_*`` value,
+    ``evidence`` (True only for ``STATUS_VALID`` with scheduled evidence), an
+    ``evidence_label`` ("scheduled evidence" / "recovery context, not scheduled
+    evidence" / "unverified" when the run directory lacks ``run_state.json`` /
+    "rejected"), the validator's reasons, ``run_state_present`` and the
     target's ``order_submit_status``. The afternoon pointer is probed under
     ``ce16ba6b/scheduled_runs`` and the local ``scheduled_runs``; the
-    ``morning_dca/latest_morning_live.json`` alias is reported with
-    ``alias=True`` when present. ``config_dir`` is accepted for parity with the
-    other builders; pointer validation needs no configuration.
+    ``morning_dca/latest_morning_live.json`` alias is reported ``alias=True``.
+    ``config_dir`` is accepted for parity; pointer validation needs no config.
     """
     from scripts.run_classification import latest_scheduled_run_path
 

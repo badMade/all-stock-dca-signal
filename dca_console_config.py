@@ -18,6 +18,7 @@ import enum
 import json
 import math
 import os
+import re
 from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any
@@ -93,11 +94,24 @@ FAIL_MODES: dict[str, str] = {
 }
 
 
+# An absolute-path-shaped token: two or more "/segment" runs not glued to a
+# word, a URL scheme's "//", or a relative "../" prefix. The committed stream
+# policies document artifact roots as prose ("/home/user/workspace/..."), and
+# a fixture can seed this machine's own tmp path; either way the location is
+# dropped and only the final segment survives, so a documented file name
+# stays readable while no directory ever reaches the browser.
+_PATH_TOKEN = re.compile(r"(?<![\w:/.])(?:/[\w.@+~-]+){2,}")
+
+
+def _scrub_paths(text: str) -> str:
+    return _PATH_TOKEN.sub(lambda match: "[path]/" + match.group(0).rsplit("/", 1)[1], text)
+
+
 def _text(value: Any, limit: int = MAX_TEXT) -> str | None:
-    """Bound one free-text field and strip any secret value before it leaves."""
+    """Bound one free-text field and strip any secret value or path before it leaves."""
     if value is None:
         return None
-    return redact_value(str(value)[:limit].replace("\n", " "))
+    return redact_value(_scrub_paths(str(value)[:limit].replace("\n", " ")))
 
 
 def _finite(value: Any) -> float | None:
@@ -139,6 +153,13 @@ def _parse(config_dir: Path, stem: str, warnings: list[str]) -> tuple[dict[str, 
         return None, _loader_error(exc, path, Path(reader.root))
 
 
+def _warn_loader(warnings: list[str], config_dir: Path, label: str, exc: BaseException) -> None:
+    """Record a loader rejection under a file name or label, never under a path."""
+    message = f"{label}: {_loader_error(exc, Path(config_dir).resolve())}"
+    if message not in warnings:
+        warnings.append(message)
+
+
 def _raw(config_dir: Path, stem: str, warnings: list[str]) -> dict[str, Any] | None:
     data, error = _parse(config_dir, stem, warnings)
     if error is not None and f"{stem}.json: {error}" not in warnings:
@@ -152,10 +173,12 @@ def _json_safe(value: Any, depth: int = 0) -> Any:
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else None
-    if isinstance(value, str):
-        return _text(value)
+    # Before the str branch: BrokerName is a str-mixin Enum whose str() is the
+    # member name, and the page wants the wire value ("robinhood").
     if isinstance(value, enum.Enum):
         return _json_safe(value.value, depth)
+    if isinstance(value, str):
+        return _text(value)
     if isinstance(value, (datetime, date, time)):
         return value.isoformat()
     if depth >= 8:
@@ -181,7 +204,7 @@ def _env_reference(text: str) -> str:
 
 def _view_safe(value: Any, depth: int = 0) -> Any:
     if isinstance(value, str):
-        return redact_value(_env_reference(value))
+        return redact_value(_scrub_paths(_env_reference(value)))
     if isinstance(value, float) and not math.isfinite(value):
         return None
     if depth >= 32:
@@ -270,13 +293,21 @@ def _universe_check(name: str, documented: list[str] | None, constant: Any, orde
 
 
 def _schema_exists(config_dir: Path, ref: str) -> bool | None:
-    """Resolve a relative ``$schema`` against the config dir, refusing to leave its parent."""
-    try:
-        base = Path(config_dir).resolve()
-        target = (base / ref).resolve()
-    except (OSError, RuntimeError):
-        return None
-    return target.is_file() if target.is_relative_to(base.parent) else False
+    """Resolve a relative ``$schema`` beside the config dir, then beside this checkout.
+
+    A ``$DCA_CONFIG_DIR`` override (or a test's tmp copy) carries no schemas/
+    of its own; the invariants job validates such a directory against the
+    checkout's schemas, so the fallback mirrors it. Neither lookup may leave
+    its base directory.
+    """
+    for base in (Path(config_dir).resolve(), Path(__file__).resolve().parent / "config"):
+        try:
+            target = (base / ref).resolve()
+        except (OSError, RuntimeError):
+            return None
+        if target.is_relative_to(base.parent) and target.is_file():
+            return True
+    return False
 
 
 def parity_checks(config_dir: Path) -> dict[str, Any]:
@@ -337,7 +368,7 @@ def _load_config(config_dir: Path, now: datetime, warnings: list[str]) -> tuple[
         warnings.append("The strategy config references an unset environment variable.")
         return None, names
     except (ValueError, TypeError, OSError) as exc:
-        warnings.append(f"The strategy config could not be loaded: {_loader_error(exc, Path(config_dir).resolve())}")
+        _warn_loader(warnings, config_dir, "The strategy config could not be loaded", exc)
         return None, []
 
 
@@ -404,7 +435,7 @@ def ladder_preview(config_dir: Path) -> dict[str, Any]:
     try:
         loaded = dca_config.load_per_ticker_sizing(Path(config_dir)).get("per_ticker_sizing", {})
     except ValueError as exc:
-        warnings.append(f"per_ticker_sizing.json: {_loader_error(exc, Path(config_dir).resolve())}")
+        _warn_loader(warnings, config_dir, "per_ticker_sizing.json", exc)
         loaded = {}
     for ticker, model in sorted(loaded.items())[:MAX_ROWS]:
         per_ticker.append({"ticker": _text(ticker, 16), "entries": len(model.get("tiers", ())), "version": version})
@@ -419,7 +450,7 @@ def ladder_point(config_dir: Path, drop_pct: Any, ticker: Any) -> dict[str, Any]
     try:
         universe = dca_config.load_tickers(Path(config_dir)).get("tickers", ())
     except ValueError as exc:
-        warnings.append(f"tickers.json: {_loader_error(exc, Path(config_dir).resolve())}")
+        _warn_loader(warnings, config_dir, "tickers.json", exc)
         universe = ()
     if drop is None or not 0 <= drop <= 50 or symbol not in universe:
         return {"found": False, "warnings": warnings}
@@ -499,7 +530,7 @@ def sizing_sources(config_dir: Path, now: datetime) -> dict[str, Any]:
     try:
         loaded_count = len(dca_config.load_per_ticker_sizing(Path(config_dir)).get("per_ticker_sizing", {}))
     except ValueError as exc:
-        warnings.append(f"per_ticker_sizing.json: {_loader_error(exc, Path(config_dir).resolve())}")
+        _warn_loader(warnings, config_dir, "per_ticker_sizing.json", exc)
         loaded_count = None
     per_ticker = {"status": _text(pt_raw.get("status"), 40), "version": _text(pt_raw.get("version"), 40),
                   "entry_count": len(entries) if isinstance(entries, dict) else None,
@@ -560,7 +591,7 @@ def window_countdown(config_dir: Path, day: date) -> dict[str, Any]:
     try:
         approved = dca_config.load_approved_dates(Path(config_dir)).get("approved_test_dates")
     except (ValueError, TypeError) as exc:
-        warnings.append(f"trading_window.json: {_loader_error(exc, Path(config_dir).resolve())}")
+        _warn_loader(warnings, config_dir, "trading_window.json", exc)
         approved = None
     if approved:
         in_window, end, remaining = near_close_dca.approved_window_status(approved, day)

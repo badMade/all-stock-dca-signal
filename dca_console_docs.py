@@ -28,6 +28,13 @@ ROOT_DOCS = (
     "README.md", "CLAUDE.md", "AGENTS.md", "DEFERRED.md", "PRODUCTION_READINESS.md",
     "HANDOFF.md", "SELF_HEAL_SETUP.md", "scripts/README.md",
 )
+# The sibling subprojects' front pages, which the program directory already
+# links to; listed by name so no subproject tree is ever walked.
+SUBPROJECT_DOCS = (
+    "ml-forecaster/README.md", "wondrous-octopus/README.md", "ticker-advisor/README.md",
+    "dca-sizing-signals/README.md", "production-safe-agent-loop/README.md",
+    "ticker-market-breadth/README.md", "trading-strategies/README.md",
+)
 DOCS_DIR = "docs"
 GOVERNANCE_DIR = "claude"
 MIRROR_DIR = "claude/dca-executor-prompts/live-mirror"
@@ -55,6 +62,9 @@ def allowed_docs(repo: Path) -> dict[str, DocEntry]:
     for name in ROOT_DOCS:
         if (repo / name).is_file():
             entries[name] = DocEntry(name, "root")
+    for name in SUBPROJECT_DOCS:
+        if (repo / name).is_file():
+            entries[name] = DocEntry(name, "subproject")
     for path in _listing(reader, DOCS_DIR, ".md"):
         entries[path.as_posix()] = DocEntry(path.as_posix(), "docs")
     for path in _listing(reader, GOVERNANCE_DIR, ".md"):
@@ -112,13 +122,17 @@ def docs_index(repo: Path, catalog_refs: set[str]) -> dict:
             "title": _title(repo, name),
             "group": entry.group,
             "mirror": entry.mirror,
-            "in_readme": f"({basename})" in readme or f"/{basename}" in readme if entry.group == "docs" else None,
+            "in_readme": (name == "docs/README.md" or f"({basename})" in readme or f"/{basename}" in readme)
+            if entry.group == "docs" else None,
             "in_claude_md": f"`{name}`" in claude_md if entry.group == "docs" else None,
             "in_catalog": name in catalog_refs,
         })
-    unregistered = [row["path"] for row in rows if row["group"] == "docs" and not (row["in_readme"] and row["in_claude_md"])]
+    # docs/README.md is the documentation index proper; CLAUDE.md's table is a
+    # curated subset, so absence there is reported per row but is not a gap.
+    unregistered = [row["path"] for row in rows
+                    if row["group"] == "docs" and row["in_readme"] is False and row["path"] != "docs/README.md"]
     if unregistered:
-        warnings.append(f"{len(unregistered)} docs page(s) are missing from docs/README.md or CLAUDE.md's index.")
+        warnings.append(f"{len(unregistered)} docs page(s) are missing from the docs/README.md index.")
     return {"docs": rows, "count": len(rows), "unregistered": unregistered, "warnings": warnings}
 
 
