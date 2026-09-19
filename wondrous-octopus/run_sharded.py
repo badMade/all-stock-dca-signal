@@ -150,6 +150,8 @@ def build_shard_cmd(
             "--resume",
             str(shard_dir),
         ]
+        if getattr(args, "retrain", False):
+            cmd.append("--retrain")
         if args.end:
             cmd.extend(["--end", args.end])
         if args.device:
@@ -303,6 +305,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--force",
         action="store_true",
         help="Force re-run from scratch, ignoring existing checkpoints or reports",
+    )
+    parser.add_argument(
+        "--retrain",
+        action="store_true",
+        help="Pass --retrain to run_walkforward.py for a sanctioned recovery refit if archive changed",
     )
     parser.add_argument(
         "--dry-run",
