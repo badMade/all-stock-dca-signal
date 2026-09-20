@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 
-import anthropic
+import anthropic  # type: ignore
 import pytest
 from llm_providers import (
     AnthropicClient,

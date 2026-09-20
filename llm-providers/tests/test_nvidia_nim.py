@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import openai
+import openai  # type: ignore
 import pytest
 from llm_providers import (
     LLMAuthError,
@@ -102,4 +102,5 @@ def test_real_sdk_client_built_from_env(monkeypatch):
     monkeypatch.setenv("NVIDIA_API_KEY", "unit-test-key")
     client = NvidiaNimClient(timeout=5)
     assert isinstance(client._client, openai.OpenAI)
+    assert client._client is not None
     assert str(client._client.base_url).rstrip("/") == "https://integrate.api.nvidia.com/v1"

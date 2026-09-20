@@ -352,6 +352,7 @@ extraPaths = [
     "dca-sizing-signals",
     "ticker-market-breadth",
     "trading-strategies",
+    "llm-providers",
 ]
 typeCheckingMode = "basic"
 reportGeneralTypeIssues = false
@@ -367,6 +368,7 @@ executionEnvironments = [
     { root = "dca-sizing-signals", extraPaths = ["dca-sizing-signals", "."] },
     { root = "ticker-market-breadth", extraPaths = ["ticker-market-breadth", "."] },
     { root = "trading-strategies", extraPaths = ["trading-strategies", "."] },
+    { root = "llm-providers", extraPaths = ["llm-providers", "."] },
     { root = ".", extraPaths = [".", "tests", "scripts"] },
 ]
 

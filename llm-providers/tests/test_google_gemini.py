@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import pytest
-from google import genai
-from google.genai import errors
+from google import genai  # type: ignore
+from google.genai import errors  # type: ignore
 from llm_providers import (
     GeminiClient,
     LLMAuthError,
