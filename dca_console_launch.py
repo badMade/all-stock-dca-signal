@@ -492,13 +492,13 @@ def junit_summary(path: Path) -> dict[str, Any]:
     except (OSError, ElementTree.ParseError):
         return summary
     for case in tree.iter("testcase"):
-        name = str(case.get("name") or "")[:200]
+        name = (case.get("name") or "")[:200]
         outcome = "passed"
         message = ""
         for child in case:
             if child.tag in {"failure", "error", "skipped"}:
                 outcome = {"failure": "failed", "error": "error", "skipped": "skipped"}[child.tag]
-                message = str(child.get("message") or "")[:300]
+                message = (child.get("message") or "")[:300]
                 break
         summary[{"passed": "passed", "failed": "failed", "error": "errors", "skipped": "skipped"}[outcome]] += 1
         if len(summary["cases"]) < 500:

@@ -173,12 +173,18 @@ def _alert_record(reader: BoundedReader, relative: Path, digest: Any) -> Any:
     if body is None or modified is None:
         return None
     match = ALERT_NAME.match(relative.name)
-    named_day = date.fromisoformat(match["day"]) if match and iso_date(match["day"]) else None
-    slot = _slot_from_token(match["slot"], digest.SLOTS) if named_day else None
+    named_day = None
+    slot_token = ""
+    gate_token = ""
+    if match and iso_date(match["day"]):
+        named_day = date.fromisoformat(match["day"])
+        slot_token = match["slot"]
+        gate_token = match["gate"]
+    slot = _slot_from_token(slot_token, digest.SLOTS) if named_day else None
     slot_evidence = "filename" if slot else ""
     if slot is None:
-        slot, slot_evidence = digest.detect_slot_evidence(f"{relative.name}\n{match['slot'] if named_day else ''}\n{body}")
-    gate, gate_evidence = digest.detect_gate_evidence(match["gate"] if named_day else "", body)
+        slot, slot_evidence = digest.detect_slot_evidence(f"{relative.name}\n{slot_token}\n{body}")
+    gate, gate_evidence = digest.detect_gate_evidence(gate_token, body)
     # A contract filename is filed at ET noon, the one hour that cannot cross a
     # date boundary in UTC; an off-contract file falls back to its mtime.
     stamp = (datetime.combine(named_day, datetime.min.time(), ET).replace(hour=12).astimezone(timezone.utc)
@@ -456,17 +462,24 @@ def delivery_channels(config_dir: Path) -> dict[str, Any]:
 
     warnings: list[str] = []
     names = (FAILURE_WEBHOOK_ENV, FALLBACK_WEBHOOK_ENV, HEARTBEAT_URL_ENV_PREFIX)
-    channels = [{"name": name, "configured": bool(os.environ.get(name)), "source": "env"} for name in names]
+    channels: list[dict[str, Any]] = [{"name": name, "configured": bool(os.environ.get(name)), "source": "env"} for name in names]
     channels.extend({"name": f"heartbeat:{stream}", "source": "env", "configured": bool(
         os.environ.get(f"{HEARTBEAT_URL_ENV_PREFIX}_{stream.upper()}") or os.environ.get(HEARTBEAT_URL_ENV_PREFIX))}
         for stream in STREAM_ARTIFACT_DIRS)
     document = BoundedReader(Path(config_dir).resolve(), warnings).json("notifications.json")
     if not document:
         warnings.append("config/notifications.json is missing or malformed; configured channels are unknown.")
-    configured = document.get("channels") if isinstance(document.get("channels"), dict) else {}
+    configured: dict[str, Any] = {}
+    routing: dict[str, Any] = {}
+    if isinstance(document, dict):
+        raw_channels = document.get("channels")
+        if isinstance(raw_channels, dict):
+            configured = raw_channels
+        raw_routing = document.get("routing")
+        if isinstance(raw_routing, dict):
+            routing = raw_routing
     channels.extend({"name": _text(name, 60), "configured": isinstance(value, dict) and value.get("enabled") is True,
                      "source": "config"} for name, value in list(configured.items())[:MAX_ROWS])
-    routing = document.get("routing") if isinstance(document.get("routing"), dict) else {}
     for row in channels:
         row["status"] = "configured" if row["configured"] else "silent_no_op"
     return _finish({
@@ -507,8 +520,8 @@ def drift_summary(run_dirs: Sequence[tuple[str, Path]]) -> dict[str, Any]:
             warnings.append("The drift detector could not read a run; its drift status is unavailable.")
         if report is not None:
             causes = {report.run_suspected_cause, *(item.suspected_cause for item in report.affected_symbols)}
-            row.update(drifted=bool(report.drift_detected), symbols_affected=len(report.affected_symbols),
-                       causes=sorted(_text(cause, 80) for cause in causes if isinstance(cause, str) and cause),
+            row.update(drifted=report.drift_detected, symbols_affected=len(report.affected_symbols),
+                       causes=sorted(c for cause in causes if isinstance(cause, str) and cause for c in (_text(cause, 80),) if c is not None),
                        recommended_action=_text(report.recommended_action))
         rows.append(row)
     return _finish({"runs": rows}, warnings)

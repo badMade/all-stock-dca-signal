@@ -83,7 +83,8 @@ def _single_header(headers, name: str) -> tuple[bool, str | None]:
     try:
         get_all = getattr(headers, "get_all", None)
         if callable(get_all):
-            values = get_all(name, [])
+            raw_values = get_all(name, [])
+            values = list(raw_values) if isinstance(raw_values, (list, tuple)) else []
             if not values:
                 return False, None
             if len(values) != 1 or not isinstance(values[0], str):
@@ -281,7 +282,8 @@ class ConsoleAccess:
             return True
         get_all = getattr(headers, "get_all", None)
         if callable(get_all):
-            values = get_all("Authorization", [])
+            raw_values = get_all("Authorization", [])
+            values = list(raw_values) if isinstance(raw_values, (list, tuple)) else []
         else:
             value = headers.get("Authorization")
             values = [] if value is None else [value]
@@ -886,12 +888,19 @@ def make_server(
     # consoles and tests cannot suppress each other's diagnostics (panel,
     # round 3).
     failure_log = AuthFailureLog() if failure_log is None else failure_log
+    active_failure_log: AuthFailureLog = failure_log
 
     class Handler(BaseHTTPRequestHandler):
         # StreamRequestHandler applies this while setting up every accepted
         # socket. An idle LAN/proxy peer therefore cannot retain a worker thread
         # forever without sending even a request line (Rock 2 handler finding).
         timeout = HANDLER_TIMEOUT_SECONDS
+
+        def _server_port(self) -> int:
+            addr = getattr(self.server, "server_address", None)
+            if isinstance(addr, tuple) and len(addr) > 1 and isinstance(addr[1], int):
+                return addr[1]
+            return 0
 
         def log_message(self, format: str, *args) -> None:
             return
@@ -944,7 +953,7 @@ def make_server(
             self._reply(code, json.dumps(value, allow_nan=False).encode())
 
         def _trusted(self) -> bool:
-            port_number = self.server.server_address[1]
+            port_number = self._server_port()
             if not access.trusted(self.headers, port_number):
                 return False
             site_present, site = _lower_ascii_header(self.headers, "Sec-Fetch-Site")
@@ -985,7 +994,7 @@ def make_server(
 
         def _log_auth_failure(self) -> None:
             try:
-                failure_log.record(self.client_address, self.command, self.path)
+                active_failure_log.record(self.client_address, self.command, self.path)
             except Exception:
                 # Test doubles get the same fail-safe boundary as the concrete
                 # logger; an observability failure cannot become an auth bypass.
@@ -1035,7 +1044,7 @@ def make_server(
                 if handler is None:
                     self._json(404, {"error": "Not found"})
                     return
-                response = handler(app, RouteRequest(url, self._authority_diagnostics(), self.server.server_address[1]))
+                response = handler(app, RouteRequest(url, self._authority_diagnostics(), self._server_port()))
                 self._reply(response.code, response.body, response.kind,
                             download=response.download, csp=response.csp)
             except ValueError:

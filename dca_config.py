@@ -328,7 +328,9 @@ def _config_float(raw: object, *, field: str) -> float:
     """
     if isinstance(raw, bool):
         raise ValueError(f"{field} must be a number, got boolean {raw!r}")
-    return float(raw)
+    if isinstance(raw, (int, float, str)):
+        return float(raw)
+    raise ValueError(f"{field} must be a number, got {type(raw).__name__} {raw!r}")
 
 
 #: The limits a live run uses when there is no ``budgets.json`` at all.
@@ -543,6 +545,7 @@ def load_budgets(config_dir: Path) -> Dict[str, Any]:
     # mapping to index at all, and the absent-file fallback leaves the breaker
     # exactly where it was before this loader learned to read the key.
     if budgets_present:
+        assert isinstance(circuit_breakers, dict)
         max_streak = circuit_breakers["max_consecutive_placement_failures"]
         if isinstance(max_streak, bool) or not isinstance(max_streak, int) or max_streak < 1:
             raise ValueError(

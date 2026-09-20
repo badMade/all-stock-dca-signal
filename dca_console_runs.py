@@ -417,7 +417,7 @@ def _contract(run_dir: Path, roots: Sequence[RootSpec], warnings: list[str]) -> 
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         _warn(warnings, "The artifact contract could not be evaluated for this run.")
         return None
-    return {"ok": bool(result.ok), "errors": [_text(error, roots) for error in result.errors[:MAX_ROWS]]}
+    return {"ok": result.ok, "errors": [_text(error, roots) for error in result.errors[:MAX_ROWS]]}
 
 
 def _drift(run_dir: Path, roots: Sequence[RootSpec], warnings: list[str]) -> dict[str, Any] | None:
@@ -570,7 +570,8 @@ def _inputs(reader: BoundedReader, relative_dir: str) -> list[dict[str, Any]]:
 
 
 def _evidence_gap(state: dict[str, Any]) -> bool:
-    guard = state.get("risk_guard") if isinstance(state.get("risk_guard"), dict) else {}
+    raw_guard = state.get("risk_guard")
+    guard = raw_guard if isinstance(raw_guard, dict) else {}
     markers = " ".join(str(state.get(key) or "") for key in ("status", "order_submit_status", "error_class",
                                                                "completion_reason")).lower()
     return guard.get("kill_switch_engaged") is True or "evidence" in markers or "kill_switch" in markers
@@ -667,8 +668,8 @@ def build_run_detail(roots: Sequence[RootSpec], run_id: str, *, config_dir: Path
     tables = _tables(reader, relative_dir, roots)
     return {
         "found": True, "run": row, "identity": _identity(state, roots),
-        "contract": _contract(run_dir, roots, warnings) if not hazard else None,
-        "drift": _drift(run_dir, roots, warnings) if not hazard else None,
+        "contract": _contract(run_dir, roots, warnings) if (run_dir is not None and not hazard) else None,
+        "drift": _drift(run_dir, roots, warnings) if (run_dir is not None and not hazard) else None,
         "tables": tables,
         "post_trade": _post_trade(reader, relative_dir, state, roots),
         "close_window": _close_window(reader, relative_dir, state, Path(config_dir), tables),
@@ -706,7 +707,7 @@ def _pointer_row(root: RootSpec, stream: str, pointer: Path, expected_root: Path
     # resolved before the containment check, exactly as the reader will.
     confined = _pointer_target(reader, outcome.run_state_path)
     present = confined is not None and confined.is_file()
-    state = reader.json(confined.relative_to(root.path)) if present else {}
+    state = reader.json(confined.relative_to(root.path)) if (confined is not None and present) else {}
     evidence = outcome.status == STATUS_VALID and outcome.valid_scheduled_evidence
     if evidence:
         label = "scheduled evidence"

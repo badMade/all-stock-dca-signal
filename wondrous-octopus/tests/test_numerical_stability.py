@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
+from typing import Any, cast
 
-import features
+import features as _features
 import numpy as np
 import pandas as pd
 import pytest
@@ -14,9 +15,11 @@ from harness import HarnessConfig, WalkForwardHarness, _checkpoint_has_nan
 from metrics import score_forecast
 from octopus_model import OctopusModel
 
+features: Any = _features
+
 pytestmark = pytest.mark.filterwarnings("ignore::RuntimeWarning")
 
-TINY = dict(
+TINY: dict[str, Any] = dict(
     window_len=16,
     d_model=16,
     n_heads=2,
@@ -199,7 +202,7 @@ class TestSelfHealingCheckpoint:
         (good_dir / "harness_state.json").write_text(json.dumps(state))
 
         # verify_checkpoint_integrity should detect NaN and heal from checkpoint.good
-        WalkForwardHarness.verify_checkpoint_integrity(None, run_dir, cfg, mutate_ledger=True)
+        WalkForwardHarness.verify_checkpoint_integrity(cast(Any, None), run_dir, cfg, mutate_ledger=True)
 
         # After healing, checkpoint_dir must now be free of NaNs!
         assert not _checkpoint_has_nan(checkpoint_dir)

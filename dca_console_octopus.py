@@ -218,7 +218,7 @@ def _periods(report: dict, selected: str) -> list[dict]:
                 stats = _mapping(_mapping(block.get(model)).get(component))
                 if not stats:
                     continue
-                row = {"id": regime, "name": label, "model": model, "component": component}
+                row: dict[str, Any] = {"id": regime, "name": label, "model": model, "component": component}
                 row.update({key: _number(stats.get(key)) for key in ("n", "mae", "mae_price", "coverage")})
                 # The report's published skill metric applies only to the full
                 # intersection. Do not mislabel it as a crisis-specific score.
@@ -277,7 +277,7 @@ def build_octopus_snapshot(
         state = reader.json(checkpoint_path)
     report_modified = reader.modified_at("report/report.json") if report else None
     checkpoint_modified = reader.modified_at(checkpoint_path) if state else None
-    snapshot["report_may_be_stale"] = bool(
+    snapshot["report_may_be_stale"] = (
         report_modified is not None and checkpoint_modified is not None and report_modified < checkpoint_modified
     )
     if report_modified is not None:

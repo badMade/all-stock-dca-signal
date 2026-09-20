@@ -140,7 +140,7 @@ What the root sweep genuinely does not cover is the seven directories named in
 that ignore list, each excluded because it carries its own heavy dependencies:
 
 | Subproject | Own CI job |
-|---|---|
+| --- | --- |
 | `production-safe-agent-loop/`, `ticker-advisor/`, `ml-forecaster/`, `wondrous-octopus/`, `ticker-market-breadth/`, `llm-providers/` | yes |
 | `dca-sizing-signals/` | **no** |
 
@@ -178,7 +178,7 @@ Each of these passes locally until one specific test, or an installed wheel,
 disagrees. Make the companion edit in the same commit.
 
 | If you add | Also update |
-|---|---|
+| --- | --- |
 | A `config/*.json` file | `dca_console_config.CONFIG_FILES` and its consumer map, plus the two count assertions in `tests/test_dca_console_config.py` |
 | A top-level module, or a config read at runtime | `pyproject.toml`: `[tool.setuptools] packages`/`py-modules`, and `[tool.setuptools.data-files]` for the config |
 

@@ -29,12 +29,16 @@ tests/test_kalman.py:
 from __future__ import annotations
 
 import math
+from typing import Any
 
+import features as _features
 import numpy as np
 import pandas as pd
 import pytest
 from data import COMPONENTS
-from features import build_panel
+
+_features_module: Any = _features
+build_panel: Any = _features_module.build_panel
 
 volatility = pytest.importorskip("volatility", reason="optional volatility component is not present in this checkout")
 

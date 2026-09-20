@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from dca_console_jobs import is_sensitive_variable
 from dca_console_reader import BoundedReader, root_label, roots_from_settings
@@ -98,11 +99,11 @@ def environment_variables() -> list[dict]:
     return rows
 
 
-def _probe_root(name: str, path: Path | None, *, follow: bool, note: str = "") -> dict:
+def _probe_root(name: str, path: Path | None, *, follow: bool, note: str = "") -> dict[str, Any]:
     """Describe one root by label; ``follow=False`` uses lstat only (Google Drive mounts)."""
     if path is None:
         return {"name": name, "label": None, "present": None, "symlink": None, "note": note or "not configured"}
-    row = {"name": name, "label": root_label(path), "present": None, "symlink": None, "note": note}
+    row: dict[str, Any] = {"name": name, "label": root_label(path), "present": None, "symlink": None, "note": note}
     try:
         info = os.lstat(path)
         row["symlink"] = os.path.islink(path)
@@ -152,7 +153,8 @@ def stray_root_files(repo: Path) -> list[dict]:
     for name, note in STRAY_ROOT_FILES:
         path = reader.confined(name)
         present = path is not None and path.is_file()
-        rows.append({"name": name, "present": present, "size": path.stat().st_size if present else None, "note": note})
+        size = path.stat().st_size if (path is not None and present) else None
+        rows.append({"name": name, "present": present, "size": size, "note": note})
     for entry in reader.entries("", limit=500):
         if entry.suffix == ".log" and entry.name not in {name for name, _ in STRAY_ROOT_FILES}:
             rows.append({"name": entry.name, "present": True, "size": (repo / entry).stat().st_size,

@@ -32,8 +32,14 @@ def _octopus_run(reader: BoundedReader, relative: Path, label: str, *, demo: boo
     meta = reader.json(relative / "run_meta.json")
     state = reader.json(relative / "checkpoint" / "harness_state.json") or reader.json(relative / "checkpoint.prev" / "harness_state.json")
     report_path = reader.confined(relative / "report" / "report.json")
-    universe = meta.get("universe") if isinstance(meta.get("universe"), dict) else {}
+    universe: dict[str, Any] = {}
+    if isinstance(meta, dict):
+        u = meta.get("universe")
+        if isinstance(u, dict):
+            universe = u
     tickers = universe.get("tickers") if isinstance(universe.get("tickers"), list) else None
+    model_selection = str(meta.get("model_selection") or "")[:40] if isinstance(meta, dict) else ""
+    last_processed = iso_date(state.get("last_processed_date")) if isinstance(state, dict) else None
     return {
         "name": relative.name,
         "location": label,
@@ -41,9 +47,9 @@ def _octopus_run(reader: BoundedReader, relative: Path, label: str, *, demo: boo
         "run_meta_present": bool(meta),
         # daily_update.py refuses a run without run_meta.json: say so up front.
         "updatable": bool(meta),
-        "model_selection": str(meta.get("model_selection") or "")[:40] or None,
+        "model_selection": model_selection or None,
         "ticker_count": len(tickers) if tickers is not None else None,
-        "last_processed_date": iso_date(state.get("last_processed_date")),
+        "last_processed_date": last_processed,
         "report_present": bool(report_path and report_path.is_file()),
         "modified": _modified(reader.root / relative),
     }

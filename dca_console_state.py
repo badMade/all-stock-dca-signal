@@ -193,7 +193,12 @@ def _parse_state(path: Path) -> tuple[str, dict[str, Any] | None]:
 def _dated_numbers(mapping: Any) -> dict[str, float | None] | None:
     if not isinstance(mapping, dict):
         return None
-    rows = sorted(((iso_date(key), _finite(value)) for key, value in mapping.items() if iso_date(key)), reverse=True)
+    rows: list[tuple[str, float | None]] = []
+    for raw_key, raw_val in mapping.items():
+        date_key = iso_date(raw_key)
+        if date_key is not None:
+            rows.append((date_key, _finite(raw_val)))
+    rows.sort(key=lambda r: r[0], reverse=True)
     return {key: value for key, value in rows[:MAX_ROWS]}
 
 
@@ -210,7 +215,7 @@ def _symbol_rows(mapping: dict[str, Any], value_of, ticker: str | None = None) -
     """
     rows: dict[str, Any] = {}
     dropped = 0
-    for symbol, value in sorted(mapping.items(), key=lambda item: str(item[0])):
+    for symbol, value in sorted(mapping.items(), key=lambda item: item[0]):
         if not isinstance(symbol, str) or not SYMBOL.match(symbol):
             dropped += 1
         elif ticker not in (None, symbol):
@@ -232,7 +237,7 @@ def _state_fields(raw: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
         if isinstance(weeks, dict) else None)
     days = raw.get("finalized_budget_days")
     fields["finalized_budget_days"] = (
-        sorted({iso_date(day) for day in days if iso_date(day)}, reverse=True)[:MAX_ROWS]
+        sorted({d for day in days for d in (iso_date(day),) if d is not None}, reverse=True)[:MAX_ROWS]
         if isinstance(days, list) else None)
     buys = raw.get("buys_by_ticker_by_day")
     fields["buys_by_ticker_by_day"] = None
@@ -509,7 +514,7 @@ def purchases_view(roots: Sequence[RootSpec], *, day: str | None = None) -> dict
                         "confirmed-fill coverage may be incomplete. Run the purchase-history CLI for details.")
     if day is not None:
         records = [record for record in records if record.trading_day == day]
-    records.sort(key=lambda record: str(record.trading_day or ""), reverse=True)
+    records.sort(key=lambda record: record.trading_day or "", reverse=True)
     resolved = [(root, root.path.resolve()) for root in roots]
     rows = []
     for record in records[:MAX_PURCHASES]:
@@ -521,8 +526,8 @@ def purchases_view(roots: Sequence[RootSpec], *, day: str | None = None) -> dict
                      "at_risk": owner.kind != "primary" if owner else None})
     if len(records) > MAX_PURCHASES:
         warnings.append(f"Only the newest {MAX_PURCHASES} of {len(records)} purchase records are shown.")
-    amounts = [_finite(record.amount_usd) for record in records]
-    total = round(sum(amounts), 2) if amounts and None not in amounts else None
+    valid_amounts = [a for record in records if (a := _finite(record.amount_usd)) is not None]
+    total = round(sum(valid_amounts), 2) if (len(valid_amounts) == len(records) and records) else None
     return {"records": rows, "rollup": _jsonable(build_ticker_rollup(records)),
             "summary": {"record_count": len(records), "total_usd": total,
                         "last_trading_day": iso_date(records[0].trading_day) if records else None},
@@ -603,7 +608,7 @@ def risk_view(roots: Sequence[RootSpec], day: date, *, config_dir: Path) -> dict
 
 def _maintenance_row(root: RootSpec, reader: BoundedReader, relative: Path, scalars: Sequence[str]) -> dict[str, Any]:
     status, event = _read_object(reader, relative)
-    row = {"id": _identity(root, relative), "root_label": root.label, "at_risk": root.kind != "primary",
+    row: dict[str, Any] = {"id": _identity(root, relative), "root_label": root.label, "at_risk": root.kind != "primary",
            "day": relative.parent.name, "file": relative.name, "file_status": status}
     if status == "corrupt":
         # _read_object is silent by design (absent is common); a maintenance
@@ -631,7 +636,7 @@ def maintenance_events(roots: Sequence[RootSpec], *, days: int = 30) -> dict[str
     ``file_status`` is ``corrupt`` for an unreadable event.
     """
     warnings: list[str] = []
-    limit = max(1, min(int(days), 366))
+    limit = max(1, min(days, 366))
     result: dict[str, Any] = {key: [] for key in MAINTENANCE}
     for root in roots:
         reader = root.reader(warnings)
@@ -669,10 +674,12 @@ def build_state_snapshot(roots: Sequence[RootSpec], day: date, *, config_dir: Pa
         pending = [entry.get("pending_total_usd" if kind == "cumulative" else "pending_usd")
                    if kind != "inverse_martingale" else (entry["tracker"] or {}).get("accumulated_usd")
                    for entry in view["entries"] if entry["status"] == "available"]
+        valid_pending: list[float] = [float(v) for v in pending if isinstance(v, (int, float)) and math.isfinite(v)]
+        pending_total = round(sum(valid_pending), 2) if (len(valid_pending) == len(pending) and pending) else None
         ledgers[kind] = {"entries": len(view["entries"]), "listed": len(view.get("days") or view.get("tickers") or []),
                          "corrupt": sum(entry["status"] in {"corrupt", "mismatched"} for entry in view["entries"]),
                          "lock_files_present": sum(entry["lock_file_present"] for entry in view["entries"]),
-                         "pending_total_usd": round(sum(pending), 2) if pending and None not in pending else None}
+                         "pending_total_usd": pending_total}
     latest = {key: ({"day": rows[0]["day"], "status": rows[0].get("status"), "file_status": rows[0]["file_status"]}
                     if rows else None)
               for key, rows in maintenance.items() if key != "warnings"}

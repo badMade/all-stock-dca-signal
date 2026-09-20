@@ -48,6 +48,7 @@ dev = [
     "types-requests==2.33.0.20260906",
     "types-PyYAML==6.0.12.20260906",
     "types-beautifulsoup4==4.12.0.20250516",
+    "scipy-stubs==1.18.1.0",
     "pip-audit==2.10.1",
     "pyright==1.1.414",
     "uv==0.12.13",
@@ -337,7 +338,10 @@ select = ["E", "F", "I", "B"]
 ignore = ["E501"]
 
 [tool.pyright]
+venvPath = "."
+venv = ".venv"
 extraPaths = [
+    ".",
     "tests",
     "scripts",
     "ml-forecaster",
@@ -358,7 +362,7 @@ executionEnvironments = [
     { root = "dca-sizing-signals", extraPaths = ["dca-sizing-signals", "."] },
     { root = "ticker-market-breadth", extraPaths = ["ticker-market-breadth", "."] },
     { root = "trading-strategies", extraPaths = ["trading-strategies", "."] },
-    { root = ".", extraPaths = ["tests", "scripts"] },
+    { root = ".", extraPaths = [".", "tests", "scripts"] },
 ]
 
 

@@ -615,6 +615,7 @@ class GbmQuantileModel:
         # Lazy import inside fit: the house pattern for heavy deps (see
         # ml-forecaster/model.py's identically-motivated lazy sklearn import).
         import sys
+
         from sklearn.ensemble import HistGradientBoostingRegressor
 
         total_estimators = len(COMPONENTS) * 4
@@ -626,7 +627,7 @@ class GbmQuantileModel:
                 return
             pct = (completed / total_estimators) * 100
             bar_len = 24
-            filled = int(bar_len * completed // total_estimators)
+            filled = bar_len * completed // total_estimators
             bar = (
                 "=" * filled
                 + (">" if filled < bar_len else "")

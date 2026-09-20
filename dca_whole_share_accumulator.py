@@ -1426,7 +1426,7 @@ class WholeShareAccumulationLedger:
         # at wherever the batch currently stands.
         recorded_keys = state.setdefault("recorded_idempotency_keys", {})
         prior_remainder_as_of = _finite_non_negative(cached.get(_CLAIM_REMAINDER_AS_OF_FIELD))
-        if prior_remainder_as_of == float(state[_WITHDRAWN_TOTAL_FIELD]):
+        if prior_remainder_as_of is not None and prior_remainder_as_of == float(state[_WITHDRAWN_TOTAL_FIELD]):
             prior_remainder_registered = _finite_non_negative(cached.get(_CLAIM_REMAINDER_FIELD)) or 0.0
             prior_remainder_offset = _finite_non_negative(cached.get(_CLAIM_REMAINDER_TIE_OFFSET_FIELD)) or 0.0
             _retire_credit_tie_interval(
@@ -1943,7 +1943,7 @@ class WholeShareAccumulationLedger:
             withdrawn_total = float(state.get(_WITHDRAWN_TOTAL_FIELD, 0.0))
             pending_after = round(pending_before + restored_amount, 2)
             state["pending_usd"] = pending_after
-            if cached is not None:
+            if cached is not None and dedup_key is not None:
                 cached["resolved"] = True
                 # The claim's entitlement in the pool is what this restoration
                 # puts back PLUS whatever of its own credit the failed order
@@ -1989,7 +1989,7 @@ class WholeShareAccumulationLedger:
                 # instead, so it stays valid (Codex review: "Keep later tie
                 # offsets valid when moving a remainder").
                 prior_remainder_as_of = _finite_non_negative(cached.get(_CLAIM_REMAINDER_AS_OF_FIELD))
-                if prior_remainder_as_of == withdrawn_total:
+                if prior_remainder_as_of is not None and prior_remainder_as_of == withdrawn_total:
                     prior_remainder_registered = _finite_non_negative(cached.get(_CLAIM_REMAINDER_FIELD)) or 0.0
                     prior_remainder_offset = _finite_non_negative(cached.get(_CLAIM_REMAINDER_TIE_OFFSET_FIELD)) or 0.0
                     _retire_credit_tie_interval(
@@ -2196,8 +2196,11 @@ class WholeShareAccumulationLedger:
             if dedup_key is not None:
                 recorded_keys = state.setdefault("recorded_idempotency_keys", {})
                 cached = recorded_keys.get(dedup_key)
-            if cached is None or cached.get("resolved") or not self._claim_matches(
-                cached, claim_token=claim_token, recorded_at=recorded_at
+            if (
+                dedup_key is None
+                or cached is None
+                or cached.get("resolved")
+                or not self._claim_matches(cached, claim_token=claim_token, recorded_at=recorded_at)
             ):
                 # No cached entry at all, already resolved by someone else,
                 # or this caller no longer holds the claim -- nothing to
@@ -2264,7 +2267,7 @@ class WholeShareAccumulationLedger:
             # (Codex review: "Keep later tie offsets valid when moving a
             # remainder").
             prior_remainder_as_of = _finite_non_negative(cached.get(_CLAIM_REMAINDER_AS_OF_FIELD))
-            if prior_remainder_as_of == withdrawn_total:
+            if prior_remainder_as_of is not None and prior_remainder_as_of == withdrawn_total:
                 prior_remainder_registered = _finite_non_negative(cached.get(_CLAIM_REMAINDER_FIELD)) or 0.0
                 prior_remainder_offset = _finite_non_negative(cached.get(_CLAIM_REMAINDER_TIE_OFFSET_FIELD)) or 0.0
                 _retire_credit_tie_interval(
@@ -2662,7 +2665,7 @@ class WholeShareAccumulationLedger:
                     self.root / symbol / "ledger.json", json.dumps(state, indent=2, sort_keys=True) + "\n"
                 )
             result = operation()
-            if dedup_key is not None:
+            if dedup_key is not None and cached is not None and state is not None:
                 cached["placing"] = False
                 cached["placed"] = True
                 try:
@@ -3787,8 +3790,7 @@ class WholeShareAccumulationLedger:
                 # records"). Only a genuinely missing key gets the trust
                 # exemption; a present-and-unreadable one fails closed like
                 # a mismatch.
-                _audit_key_present = isinstance(_audit, dict) and _audit_key in _audit
-                if not _audit_key_present:
+                if not (isinstance(_audit, dict) and _audit_key in _audit):
                     continue
                 _audited_offset = _finite_non_negative(_audit.get(_audit_key))
                 if _audited_offset is None or round(_offset, 2) != round(_audited_offset, 2):

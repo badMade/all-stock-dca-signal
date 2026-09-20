@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from uuid import uuid4
 
 from dca_fileio import atomic_write_text
@@ -222,7 +222,7 @@ class JobManager:
                     continue
                 if code is not None and (type(code) is not int or not -255 <= code <= 255):
                     continue
-                clean = {"id": item["id"], "status": status, "returncode": code}
+                clean: dict[str, Any] = {"id": item["id"], "status": status, "returncode": code}
                 for key in ("action", "label", "log"):
                     value = item.get(key)
                     if isinstance(value, str):
@@ -237,11 +237,12 @@ class JobManager:
                     # no longer parse (GUI expansion Phase 5 history fix).
                     clean[key] = _iso_timestamp_or_none(item.get(key))
                 total = item.get("log_total")
-                clean["log_total"] = total if type(total) is int and 0 <= total <= 10**12 else len(clean["log"] or "")
+                log_text = clean["log"] if isinstance(clean.get("log"), str) else ""
+                clean["log_total"] = total if type(total) is int and 0 <= total <= 10**12 else len(log_text)
                 item = clean
                 if status in {"queued", "running"}:
                     item["status"] = "interrupted"
-                    item["log"] = (item.get("log") or "") + "\nConsole stopped before this job completed."
+                    item["log"] = log_text + "\nConsole stopped before this job completed."
                 self.jobs.append(item)
             except (OSError, ValueError, RecursionError):
                 continue
@@ -470,7 +471,7 @@ class JobManager:
             # behind a reader's buffered-I/O lock on the other platforms.
             stop_reading.set()
             reader.join(timeout=0.2)
-            if capturing and not interrupted:
+            if command.capture_to is not None and not interrupted:
                 self._write_capture(command.capture_to, bytes(captured), capture_truncated[0], log)
             return CANCELLED_RETURNCODE if was_cancelled else 3 if interrupted else code
 

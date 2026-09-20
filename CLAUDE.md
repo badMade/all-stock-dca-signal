@@ -91,7 +91,7 @@ research-only failures stay outside self-heal's documented core-only scope.
 ## Architecture
 
 | Layer | Modules |
-|---|---|
+| --- | --- |
 | Strategy core | `near_close_dca.py` (~40k lines: signals, graded ladder, budgets, safeguards, run artifacts, `build_broker`, `StrategyConfig`/`StrategyState`) |
 | Stream executors | `morning_dca.py` defines `MorningDCAExecutor`; `market_open_dca.py` (9:35, cron `2ba19526`), `midday_dca.py` (12:30, `a6239dae`), `intraday_dca.py` (11:30 / 1:30 / 2:30, `7be82b97`) are thin subclasses that override identity constants and a few flags only |
 | Orchestration | `run_dca.py` — `run_pipeline()`, `run_slot()`, `main()` (CLI); `dca_runner.py` — the gate-sequence live runner (Gate 0 market day → Gate 1 time sanity → Gate 3 window → Gate 4 sole-executor → Gate 6 budget → Gate 7 placement → Gate 9 evidence) |
@@ -110,7 +110,7 @@ research-only failures stay outside self-heal's documented core-only scope.
 A fix applied to one does **not** propagate to the others. Full detail in `docs/live_wiring.md`.
 
 | Entry point | Shape | Driven by |
-|---|---|---|
+| --- | --- | --- |
 | `run_dca.run_slot()` | Function pipeline over `near_close_dca` primitives | `run_dca.py` itself; the 3:30 PM live path. The only path with a real `__main__`. |
 | `MorningDCAExecutor` + 3 subclasses | Class hierarchy, one per stream | An external agent constructing the class and calling `.run(now, data, broker=…)`. **No in-repo caller, no CLI.** |
 | `dca_runner.py` | Gate sequence + injected callables | An external agent session holding MCP runtime access. |
@@ -163,7 +163,7 @@ These are enforced by tests or by fail-closed runtime code. Violating one fails 
 ### Environment variables
 
 | Variable | Default | Effect |
-|---|---|---|
+| --- | --- | --- |
 | `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` | — | Required for live runs; not needed for `--demo` or tests |
 | `DCA_CRON_TRACKING_ROOT` | `<checkout>/cron_tracking` (production exports the shared tree explicitly) | Root of the whole per-stream artifact tree. Read at import time |
 | `DCA_CONFIG_DIR` | `config/` beside the modules | Where `config/*.json` is loaded from |
@@ -212,7 +212,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 ## Documentation index
 
 | File | Contents |
-|---|---|
+| --- | --- |
 | `AGENTS.md` | The repo-wide agent operating contract (secrets policy, PR expectations) |
 | `docs/repo_map.md` | **Read this before opening a core module.** Structural map of every runner, report producer, and prediction tool: slot-to-entry-point ownership, which reporting modules have a CLI and which are library-only, and which tools can reach live sizing. Complements `scripts/agent_entry_points.py` (that one is task-oriented: "what command do I run") |
 | `docs/README.md` | Doc index + quick-reference facts (universe, ladder, budgets, test window) |

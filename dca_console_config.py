@@ -247,7 +247,7 @@ def config_catalog(config_dir: Path, repo: Path) -> dict[str, Any]:
         path = reader.confined(name)
         exists = path is not None and path.is_file()
         size = modified = None
-        if exists:
+        if path is not None and exists:
             try:
                 stat = path.stat()
                 size, modified = stat.st_size, datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
@@ -465,7 +465,7 @@ def ladder_point(config_dir: Path, drop_pct: Any, ticker: Any) -> dict[str, Any]
     """One ladder row for a validated drop (0-50) and a ticker in tickers.json's active list."""
     warnings: list[str] = []
     drop = _finite(drop_pct)
-    symbol = str(ticker).strip().upper() if isinstance(ticker, str) else ""
+    symbol = ticker.strip().upper() if isinstance(ticker, str) else ""
     try:
         universe = dca_config.load_tickers(Path(config_dir)).get("tickers", ())
     except (ValueError, TypeError) as exc:

@@ -218,17 +218,24 @@ def average_cost(roots: Sequence[RootSpec]) -> dict[str, Any]:
     snapshot = root.reader(warnings).json(relative)
     if not snapshot:
         return {"found": False, "warnings": warnings + ["The newest average-cost snapshot could not be parsed."]}
-    combined = snapshot.get("combined") if isinstance(snapshot.get("combined"), dict) else {}
+    combined: dict[str, Any] = {}
+    accounts: dict[str, Any] = {}
+    if isinstance(snapshot, dict):
+        raw_combined = snapshot.get("combined")
+        if isinstance(raw_combined, dict):
+            combined = raw_combined
+        raw_accounts = snapshot.get("accounts")
+        if isinstance(raw_accounts, dict):
+            accounts = raw_accounts
     rows = []
     for ticker, block in list(combined.items())[:500]:
         if not isinstance(block, dict) or not re.fullmatch(r"[A-Z][A-Z.]{0,5}", str(ticker)):
             continue
         rows.append({"ticker": ticker, "average_cost_usd": _finite(block.get("average_cost_usd")),
                      "total_quantity": _finite(block.get("total_quantity"))})
-    accounts = snapshot.get("accounts") if isinstance(snapshot.get("accounts"), dict) else {}
     return {
         "found": True, "root_label": root.label, "relative_path": relative.as_posix(),
-        "generated_at": str(snapshot.get("generated_at") or "")[:40] or None,
+        "generated_at": str(snapshot.get("generated_at") or "")[:40] if isinstance(snapshot, dict) else None,
         "account_count": len(accounts),
         # Account numbers are keys in the artifact; the page only ever sees a digest of each.
         "accounts": [hashlib.sha256(str(key).encode()).hexdigest()[:12] for key in list(accounts)[:50]],

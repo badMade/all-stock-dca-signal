@@ -540,8 +540,9 @@ def _observed_for(observed: dict[str, Any] | None, slot: dict[str, Any],
     """
     if not isinstance(observed, dict):
         return None, None
-    stream, slot_id = slot["stream"], slot["slot_id"]
-    alias = {"final": "afternoon"}.get(stream, stream)
+    stream = str(slot.get("stream") or "")
+    slot_id = str(slot.get("slot_id") or "")
+    alias: str = {"final": "afternoon"}.get(stream, stream)
     for key in (slot_id, f"{stream}@{slot_id}", f"{alias}@{slot_id}"):
         if isinstance(observed.get(key), dict):
             return _observed_entry(observed[key], per_slot=True), None
@@ -573,8 +574,8 @@ def _matrix_row(slot: dict[str, Any], manifest: dict[str, Any], deploy: dict[str
         # ``observed`` is run_state presence (manual and recovery runs count);
         # ``scheduled_evidence`` is the stricter producer flag; ``observed_at_risk``
         # says the evidence sits under a secondary (at-risk) root only.
-        "observed": entry["run_state_present"] if settled else None,
-        "scheduled_evidence": entry["evidence"] if settled else None,
+        "observed": entry["run_state_present"] if (entry is not None and settled) else None,
+        "scheduled_evidence": entry["evidence"] if (entry is not None and settled) else None,
         "observed_at_risk": entry["at_risk"] if entry else None,
         "observed_entry": entry, "observed_note": note,
     }

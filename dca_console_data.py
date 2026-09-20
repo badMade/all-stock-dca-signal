@@ -249,7 +249,7 @@ def _schedule(day: date, now: datetime, config_dir: Path, warnings: list[str]) -
     except (OSError, ValueError, TypeError, KeyError, RuntimeError):
         calendar = None
         warnings.append("The market calendar is unavailable or does not cover the selected year; timing is unverified.")
-    rows = []
+    rows: list[dict[str, Any]] = []
     for index, task in enumerate(manifest["tasks"]):
         if not isinstance(task, dict):
             warnings.append("An invalid schedule entry was skipped.")
@@ -260,7 +260,7 @@ def _schedule(day: date, now: datetime, config_dir: Path, warnings: list[str]) -
             if one_time:
                 clocks = [one_time.timetz().replace(tzinfo=None)]
             for clock in clocks or [None]:
-                row = {
+                row: dict[str, Any] = {
                     "id": _safe_label(task.get("id"), f"task-{index}"),
                     "name": _safe_label(task.get("name"), "Unnamed task"),
                     "time": clock.strftime("%H:%M") if clock else "unspecified",

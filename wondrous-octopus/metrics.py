@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 from data import COMPONENTS
@@ -227,7 +227,7 @@ class MetricsAccumulator:
         )
         self._close_err_all: dict[str, _Welford] = defaultdict(_Welford)
 
-    def add_score(self, record: dict[str, Any]) -> None:
+    def add_score(self, record: Mapping[str, Any]) -> None:
         model = record["model"]
         regime = bucket_regime(record["target_date"])
         score = record["score"]
@@ -358,7 +358,7 @@ class MetricsAccumulator:
 
 
 def build_report(
-    records_by_model: dict[str, Callable[[], Iterable[dict[str, Any]]]],
+    records_by_model: Mapping[str, Callable[[], Iterable[Mapping[str, Any]]]],
     *,
     intersect: bool = True,
     universe: dict[str, Any] | None = None,

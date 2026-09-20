@@ -630,7 +630,7 @@ class WalkForwardHarness:
     @classmethod
     def verify_checkpoint_integrity(
         cls,
-        panel: TrainingPanel,
+        panel: TrainingPanel | None,
         run_dir: Path,
         requested_config: HarnessConfig,
         *,
@@ -763,6 +763,8 @@ class WalkForwardHarness:
         # "Verify archive contents before restoring model state").
         recorded_panel_fingerprint = state.get("panel_fingerprint")
         if strict_model_data and recorded_panel_fingerprint is not None:
+            if panel is None:
+                raise HarnessError(f"REFUSED: panel is required to verify panel fingerprint under {run_dir}")
             actual_panel_fingerprint = _fingerprint_panel_history(panel, state.get("last_processed_date"))
             if actual_panel_fingerprint != recorded_panel_fingerprint:
                 raise HarnessError(

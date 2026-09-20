@@ -80,9 +80,11 @@ ensure_venv(
 )
 
 import features as _features  # noqa: E402
+
+features: Any = _features
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
-import torch  # noqa: E402
+import torch  # noqa: E402  # pyright: ignore[reportMissingImports]
 from data import discover_available_tickers  # noqa: E402
 from octopus_model import _BAR_SLICE, OctopusModel  # noqa: E402
 
@@ -172,7 +174,7 @@ class WindowIndex:
         self._dates = dates
 
     def __len__(self) -> int:
-        return int(self._ticker_ids.size)
+        return self._ticker_ids.size
 
     @property
     def date_range(self) -> tuple[str | None, str | None]:
@@ -457,11 +459,16 @@ def build_shard_panel(
     normalization vector over every row rather than a leading window -- see this
     module's docstring for why that is acceptable here and not elsewhere.
     """
-    return _features.build_panel(
+    end_ts = pd.Timestamp(end) if end else None
+    if end_ts is not None and pd.isna(end_ts):
+        end_ts = None
+    elif end_ts is not None:
+        assert isinstance(end_ts, pd.Timestamp)
+    return features.build_panel(
         history_dir,
         tickers=list(tickers),
         max_tickers=max_tickers,
-        end=pd.Timestamp(end) if end else None,
+        end=end_ts,
         min_history=min_history,
     )
 
@@ -718,6 +725,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         panel, seed=args.seed, window_len=args.window_len, batch_size=args.batch_size, device=args.device
     )
     shared["device"] = model.device
+    assert model._net is not None
     shared["parameters"] = sum(parameter.numel() for parameter in model._net.parameters())
     print(f"[model] {shared['parameters']:,} parameters on {model.device}", flush=True)
 

@@ -33,7 +33,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -64,7 +64,7 @@ _NS_EPOCH_MIN = pd.Timestamp("1677-09-22")
 _NS_EPOCH_MAX = pd.Timestamp("2262-04-10")
 
 
-def discover_available_tickers(history_dir: Path, tickers: list[str] | None = None) -> list[str]:
+def discover_available_tickers(history_dir: Path, tickers: Sequence[str] | None = None) -> list[str]:
     """Tickers with a present ``<ticker>.csv`` under ``history_dir``.
 
     Adapted from ml-forecaster/features.py:discover_available_tickers,
@@ -274,6 +274,7 @@ def truncate_as_of(frame: pd.DataFrame, as_of: Any) -> pd.DataFrame:
         # "pd.NaT truncation risk"). NaT = no cutoff, same as None.
         return frame
     day_start = pd.Timestamp(as_of)
+    assert isinstance(day_start, pd.Timestamp)
     if day_start.tzinfo is not None:
         # Archive dates are tz-naive UTC (load_history_csv normalizes them);
         # a tz-aware cutoff like "...T18:00:00Z" would raise on comparison
@@ -282,7 +283,7 @@ def truncate_as_of(frame: pd.DataFrame, as_of: Any) -> pd.DataFrame:
         # the UTC one the archive speaks.
         day_start = day_start.tz_convert("UTC").tz_localize(None)
     day_start = day_start.normalize()
-    return cast(pd.DataFrame, frame.loc[frame["Date"] < day_start].reset_index(drop=True))
+    return frame.loc[frame["Date"] < day_start].reset_index(drop=True)
 
 
 @dataclass
@@ -301,9 +302,9 @@ class TickerSeries:
 
     ticker: str
     ticker_id: int
-    dates: np.ndarray  # datetime64[ns], sorted ascending, unique
-    features: np.ndarray  # (n, F) float32
-    day_of_week: np.ndarray  # (n,) int8, Monday=0 -- embedded/encoded per model
+    dates: np.ndarray[Any, Any]  # datetime64[ns], sorted ascending, unique
+    features: np.ndarray[Any, Any]  # (n, F) float32
+    day_of_week: np.ndarray[Any, Any]  # (n,) int8, Monday=0 -- embedded/encoded per model
     #: (n,) int8 style-cluster label, 0 = not assigned yet (the correlation
     #: window has not filled). Kept OUT of ``features`` for the same reason
     #: day_of_week is: it is a categorical, and a float column where 3 sits
@@ -311,11 +312,11 @@ class TickerSeries:
     #: models consume it as a category -- embedded by the octopus, appended
     #: as a column the GBM can split on -- so it travels with every request
     #: window rather than living only on the panel.
-    cluster_id: np.ndarray
-    targets: np.ndarray  # (n, 4) float32 -- next-row log-returns vs this row's close
-    label_end_dates: np.ndarray  # (n,) datetime64[ns], NaT on the last row
-    ref_close: np.ndarray  # (n,) float64, ADJUSTED close (log-return <-> price pivot)
-    adj_ratio: np.ndarray  # (n,) float64, Adj Close / Close actually applied
+    cluster_id: np.ndarray[Any, Any]
+    targets: np.ndarray[Any, Any]  # (n, 4) float32 -- next-row log-returns vs this row's close
+    label_end_dates: np.ndarray[Any, Any]  # (n,) datetime64[ns], NaT on the last row
+    ref_close: np.ndarray[Any, Any]  # (n,) float64, ADJUSTED close (log-return <-> price pivot)
+    adj_ratio: np.ndarray[Any, Any]  # (n,) float64, Adj Close / Close actually applied
 
     def __len__(self) -> int:
         return len(self.dates)
@@ -338,7 +339,7 @@ class TrainingPanel:
 
     series: dict[str, TickerSeries]
     tickers: list[str]
-    calendar: np.ndarray  # datetime64[ns], sorted union of all series' dates
+    calendar: np.ndarray[Any, Any]  # datetime64[ns], sorted union of all series' dates
     date_index: dict[pd.Timestamp, list[tuple[str, int]]]
     feature_names: tuple[str, ...]
     normalization: dict[str, list[float]]  # {"mean": [...], "std": [...]} over the fit window
@@ -346,7 +347,7 @@ class TrainingPanel:
     #: Per-calendar-day market summary (median return, fraction down >=2%,
     #: return dispersion IQR) aligned to ``calendar`` -- the octopus model's
     #: market-auxiliary-head target looks up day t+1's row here.
-    market_summary: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=np.float32))
+    market_summary: np.ndarray[Any, Any] = field(default_factory=lambda: np.zeros((0, 3), dtype=np.float32))
     calendar_pos: dict[pd.Timestamp, int] = field(default_factory=dict)
     skipped: dict[str, str] = field(default_factory=dict)
     dropped_bar_rows: dict[str, int] = field(default_factory=dict)
