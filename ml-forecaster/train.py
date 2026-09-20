@@ -787,7 +787,7 @@ def main(argv: list[str] | None = None) -> int:
         "dataset": {
             "n_rows_all": len(dataset),
             "n_rows_dip_days": len(dip_dataset),
-            "n_tickers": int(dataset["ticker"].nunique()) if not dataset.empty else 0,
+            "n_tickers": dataset["ticker"].nunique() if not dataset.empty else 0,
         },
         "evaluation": evaluation,
         "adjustments": adjustments,
