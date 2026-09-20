@@ -555,7 +555,6 @@ def risk_view(roots: Sequence[RootSpec], day: date, *, config_dir: Path) -> dict
     switch reads the cron-tracking tree alone.
     """
     from dca_risk import (
-        BURN_WINDOW_DAYS,
         EVIDENCE_WINDOW_DAYS,
         KILL_SWITCH_WINDOW_DAYS,
         STREAM_SCHEDULED,
