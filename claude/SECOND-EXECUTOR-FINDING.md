@@ -91,7 +91,7 @@ Claude's scheduler applies a deterministic per-task delay. Observed values from
 `list_scheduled_tasks`:
 
 | Slot | Nominal | Jitter | Actual fire |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 0935 | 09:35 | 494 s | 09:43:14 |
 | 1030 | 10:30 | 594 s | 10:39:54 |
 | 1130 | 11:30 | 413 s | 11:36:53 |
@@ -103,7 +103,7 @@ Claude's scheduler applies a deterministic per-task delay. Observed values from
 Against the backup's actual bursts:
 
 | Burst (ET) | Claude slot fired | Who was first |
-|---|---|---|
+| --- | --- | --- |
 | 09:36:36 | 09:43:14 | **backup, by 6m38s** |
 | 10:13:35 | 10:39:54 | **backup, by 26m19s** |
 | 11:40:31 | 11:36:53 | Claude, by 3m38s |

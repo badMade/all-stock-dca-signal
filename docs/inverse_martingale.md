@@ -289,7 +289,7 @@ The claim now writes a **recoverable lease** instead: the untouched *pre-fire* s
 metadata needed to reconcile it later.
 
 | Field | Purpose |
-|---|---|
+| --- | --- |
 | `settlement_pending` | The lease flag itself (unchanged semantics) |
 | `settlement_ref_id` | The deterministic broker ref the fire is about to be submitted under |
 | `settlement_trading_day` | The claiming trading day — a lease may only be released *after* it |

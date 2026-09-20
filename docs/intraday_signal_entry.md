@@ -33,7 +33,7 @@ Gate 4 already writes `orders_week.json` under. `stream_root()` joins the text i
 Because the repo already models them as one thing. The three fires share:
 
 | | |
-|---|---|
+| --- | --- |
 | Cron | `7be82b97` (one scheduled task, three fires) |
 | Executor | `IntradayDCAExecutor` — **one class**, with `slot=` as a constructor argument |
 | Config | `config/intraday_dca.json` |
@@ -84,7 +84,7 @@ flagged `manual_review_candidate`: it stays in `candidates` and
 its own anchor:**
 
 | `--slot` | Decision anchor | Fetch bars from |
-|---|---|---|
+| --- | --- | --- |
 | `1130` | 11:30 ET | 10:30 ET |
 | `1330` | 13:30 ET | 12:30 ET |
 | `1430` | 14:30 ET | 13:30 ET |

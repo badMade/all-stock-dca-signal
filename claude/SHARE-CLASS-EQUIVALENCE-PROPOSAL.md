@@ -11,9 +11,9 @@ that change. This is a portfolio-construction decision, not a bug.
 On 2026-07-30 the 09:35 slot bought both halves of Alphabet in one batch:
 
 | Time (ET) | Ticker | Amount | Fill price |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 09:58:27 | GOOGL | $1.50 | 332.0699 |
-| 09:58:37 | GOOG  | $1.50 | 331.5199 |
+| 09:58:37 | GOOG | $1.50 | 331.5199 |
 
 Ten seconds apart, $3.00 total, same company. The 11:30 slot then came back for
 GOOGL again at 331.7699.

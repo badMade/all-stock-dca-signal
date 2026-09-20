@@ -74,6 +74,7 @@ is stale.
 > unambiguously `sell`.
 >
 > Each remaining order's contribution depends on its state:
+>
 > - **Filled** → counts its *executed* dollar amount (filled quantity × average
 >   fill price), and that average fill price is a candidate reference price.
 > - **Pending / still working** → counts its full submitted dollar amount,
@@ -98,6 +99,7 @@ is stale.
 >   the silent gap Step 5 exists to close.
 >
 > From those contributions, per ticker:
+>
 > - `prior_usd[ticker]` = sum of every contribution above.
 > - `prior_price[ticker]` — a zero-fill terminal order (it counts $0 above and
 >   carries no price) does not affect `prior_price` at all; skip it here
@@ -123,6 +125,7 @@ is stale.
 > since risen above its qualifying reference must never receive a buy
 > authorized on a stale, earlier quote. For each ticker you intend to buy,
 > with `desired_usd` from the ladder and this fresh `current_price`:
+>
 > - If `current_price` is missing, non-numeric, or not strictly positive → buy
 >   **$0.00** and flag the ticker for manual review, EVEN IF this would
 >   otherwise be a first allocation. A missing price never authorizes a buy,
@@ -171,7 +174,7 @@ way to close this gap, so it inherits the limitation rather than hiding it.
 DXYZ, as it actually happened versus as the guard would have sized it.
 
 | Time (ET) | Event | Actual | Guarded |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 09:36:46 | first buy, filled @ $23.2499 | $1.00 | $1.00 (first allocation) |
 | 10:13:35 | second buy, filled @ $22.3507 | $2.00 | **$1.00** |
 
@@ -182,7 +185,7 @@ bought equals $1.00, not another full $2.00.
 Contrast AAAU, which should not have repeated at all:
 
 | Time (ET) | Event | Actual | Guarded |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 11:40:32 | first buy, filled @ $39.8599 | $1.50 | $1.50 (first allocation) |
 | 11:41:42 | second buy, filled @ $39.8381 | $1.50 | **$0.00** |
 
@@ -213,6 +216,7 @@ yet exist.
 
 Genuine first-come-first-serve would need one medium both sides can write and
 read. Candidates worth checking, in rough order of likelihood:
+
 - Slack. Claude can post (verified 2026-07-28, channel `C0BKS1ZL5UY`). Whether
   Perplexity can post and read there is unconfirmed — though worth noting: the
   2026-07-31 `#dca-alerts`/DM history shows posts attributed to a sender named

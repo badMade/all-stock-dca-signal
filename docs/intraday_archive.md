@@ -22,7 +22,7 @@ read-only 9:45 pre-flight and watchlist scans included. A price observed by a
 scan is no less real for having been observed by a run that places no orders.
 
 | Slot (ET) | Stream | Cron |
-|---|---|---|
+| --- | --- | --- |
 | 9:35 | `market_open` | `2ba19526` |
 | 9:45 | `morning` (watchlist / pre-flight) | `bb4f6ef1` |
 | 10:30 | `morning` (live) | `42173154` |

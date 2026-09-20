@@ -42,7 +42,7 @@ changes.
 Optional flags:
 
 | Flag | Meaning |
-|---|---|
+| --- | --- |
 | `--config-dir DIR` | Defaults to the resolved `config/`. A directory that is missing or incomplete aborts rather than silently falling back to hardcoded defaults. |
 | `--already-covered-tickers T1 T2` | Gate 4's compatible-stand-down case: tickers a compatible executor already placed an order for in this same window. They are never scored and never published. |
 
@@ -157,7 +157,7 @@ not a validation/context acceptance.
 Mapping for the payload:
 
 | Field here | Robinhood source |
-|---|---|
+| --- | --- |
 | `previous_close_bar` | `get_equity_historicals` (`interval=day`), the last **completed prior session** bar: `begins_at`→`timestamp`, `open_price`/`high_price`/`low_price`/`close_price`→`open`/`high`/`low`/`close` |
 | `intraday_bars` | `get_equity_historicals` (`interval=5minute`, `span=day`), 09:30 ET through the 09:35 decision anchor, same field mapping |
 | `quote` | `get_equity_quotes`: `last_trade_price`→`price`, the quote's own as-of timestamp→`as_of` |
@@ -378,7 +378,7 @@ This covers **0935ET only**.
 All **seven** roster slots now have a Gate 5 entry point:
 
 | Slot | Command | Page |
-|---|---|---|
+| --- | --- | --- |
 | 0935ET | `scripts/generate_market_open_candidates.py` | `docs/market_open_signal_entry.md` |
 | 1030ET | `scripts/generate_morning_candidates.py` | `docs/morning_signal_entry.md` |
 | 1130/1330/1430ET | `scripts/generate_intraday_candidates.py --slot …` | `docs/intraday_signal_entry.md` |
@@ -389,4 +389,3 @@ The first four run on the shared core in `scripts/stream_candidates.py`; 1530ET
 predates it and calls `near_close_dca.evaluate_source_signal`, that stream's own
 engine. Each command is scoped to its own slot: pointing one at another slot
 scores against the wrong logic.
-

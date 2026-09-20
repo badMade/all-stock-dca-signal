@@ -9,7 +9,7 @@ Machine-readable source:
 `onetime-1630-credit-usage-proxy-2026-07-27`.
 
 | Field | Value |
-|---|---|
+| --- | --- |
 | Name | One-time 4:30 PM DCA credit-usage proxy report with recovery runs |
 | Fires | 2026-07-27 4:30 PM America/New_York |
 | Cadence | One-time |
@@ -91,7 +91,7 @@ matches the existing rule for the monthly cost review `bec4a6ee` in
 One row per scheduled run of the active daily chain, **per ET slot**:
 
 | ET | Task | ID |
-|---|---|---|
+| --- | --- | --- |
 | 9:35 AM | Market-open DCA live Robinhood execution | `2ba19526` |
 | 9:45 AM | Morning DCA pre-flight validation (writes the artifact 42173154's gate requires) | `bb4f6ef1` (preflight) |
 | 9:45 AM | Morning DCA watchlist early-warning scan | `bb4f6ef1` (watchlist) |
@@ -132,7 +132,7 @@ the following artifact types is searched for explicitly on the current trading
 day:
 
 | Type | |
-|---|---|
+| --- | --- |
 | `same_day_recovery_run` | `parent_recovery_run` |
 | `manual_recovery_artifact` | `subagent_escalation` |
 | `manual_rerun` | `failed_scheduled_start` |
@@ -349,7 +349,7 @@ limitation explicitly in `caveats` for any of those five classified
 ### Per-run fields (both sections)
 
 | Field | Rule |
-|---|---|
+| --- | --- |
 | `run_id` | Exact id as written in the artifact. If the run failed before writing anything, record `no_run_id_written` plus the id it would have used. |
 | `stream` | One of `market_open`, `watchlist`, `preflight`, `morning`, `intraday`, `midday`, `afternoon`, `slippage`, `watchdog`, `recovery`. `slippage` (not `post_trade`) matches the value the 3:35 PM `67aa802b` task's own model-usage directory entry and pointer-validation policy already persist. `preflight` matches `bb4f6ef1`'s separately-logged pre-flight sub-invocation. |
 | `triggering_issue` | `scheduled` for scheduled runs. For everything in the recovery section, the concrete failure or gap that caused the run, not a generic label. |
@@ -513,7 +513,7 @@ mutually exclusive by construction, so a measurement never matches more than
 one.
 
 | Dimension | Proxy | low | moderate | high |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `run_volume` | scheduled plus recovery runs, combined total | total at or below 11 runs (the 11-execution scheduled baseline: eight active ids, `bb4f6ef1` firing twice -- preflight and watchlist -- `7be82b97` x3 slots, `e3e6f09e` paused/no slot; any mix of scheduled and recovery runs at or below 11 total is low) | total 12 to 17 | total 18 or more |
 | `recovery_load` | `recovery_and_escalation_count` | 0 | 1 to 2 | 3 or more |
 | `connector_load` | `connector_pull_count_where_logged` | at or below 50 (routine per-run pulls across the 10-run baseline) | 51 to 90 | 91 or more |

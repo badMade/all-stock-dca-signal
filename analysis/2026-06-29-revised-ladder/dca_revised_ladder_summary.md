@@ -17,7 +17,7 @@ This analysis uses completed daily bars for the 30 completed trading days before
 ## Top tickers by graded capital deployed
 
 | Ticker | Graded capital | Graded avg entry | Graded shares | Flat capital | Flat avg entry | Flat shares | 1x | 1.5x | 2x | 3x |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | VCX | $46.50 | $139.42 | 0.333525 | $30.00 | $141.42 | 0.212129 | 3 | 5 | 0 | 12 |
 | RVI | $40.00 | $42.85 | 0.933492 | $30.00 | $43.29 | 0.692945 | 3 | 6 | 5 | 6 |
 | LUNR | $39.00 | $27.35 | 1.425930 | $30.00 | $28.78 | 1.042284 | 2 | 8 | 2 | 7 |

@@ -52,7 +52,7 @@ near-close signal schemas all work without configuration.
 The detector picks the most likely run-level cause, in priority order:
 
 | Cause | Trigger |
-|---|---|
+| --- | --- |
 | `raw_data_persistence_failure` | `raw/` directory missing |
 | `submitted_orders_missing` | no order-record CSV written at all |
 | `submitted_orders_empty` | `submitted_orders.csv` present but has zero rows |
@@ -116,7 +116,7 @@ Each live trading task carries a `post_artifact_drift_check` block in
 the detector **immediately after writing artifacts**:
 
 | Task | ET | Run directory |
-|---|---|---|
+| --- | --- | --- |
 | `2ba19526` market-open live | 9:35 AM | `cron_tracking/market_open_dca/YYYYMMDD_0935ET/` |
 | `42173154` morning live | 10:30 AM | `cron_tracking/morning_dca/YYYYMMDD_1030ET/` |
 | `7be82b97` intraday live | 11:30 AM, 1:30 PM, 2:30 PM | `cron_tracking/intraday_dca/YYYYMMDD_<HHMM>ET/` |

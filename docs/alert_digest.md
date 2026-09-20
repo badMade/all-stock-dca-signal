@@ -17,7 +17,7 @@ Between 2026-08-06 and 2026-08-26 all three degraded at once, and the degradatio
 invisible precisely because alerting was the thing that broke:
 
 | Channel | What actually happened |
-|---|---|
+| --- | --- |
 | Message center | Per-session. Nothing to go back and read after the session ends. |
 | Repo alert file | 23 of 49 alerts reported writing to a bare repo-relative `artifacts/alerts/` — which `.gitignore` discards. Only 6 named the `stream_root(...)` path the prompt requires. |
 | Email | Prompt said *"the email connector has no send capability, so a draft is NOT delivery"* and told the executor to create a draft. So every alert became a draft, and none were delivered. |
@@ -162,7 +162,7 @@ the early-close exception above for the three afternoon slots.
 ### Sources, after the prompt fix lands
 
 | Source | Flag | Carries `EMAIL_DRAFT_NOT_DELIVERED`? |
-|---|---|---|
+| --- | --- | --- |
 | Gmail drafts | `--drafts` / `--stdin` | Always — a draft is not delivery, by definition |
 | Sent alert emails | `--messages` | Only if the body says delivery failed |
 | Gate 9 repo alert files | `--alerts-dir` | Only if the body says delivery failed |

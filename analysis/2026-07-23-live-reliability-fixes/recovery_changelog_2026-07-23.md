@@ -15,7 +15,7 @@ this version-controlled report; they live only in the local gitignored
 ### 12:30 midday live (`a6239dae`) — TXN filled
 
 | Field | Value |
-|---|---|
+| --- | --- |
 | Symbol | TXN |
 | Amount | $1.00 |
 | Average fill price | recorded in the local gitignored artifact |
@@ -86,7 +86,7 @@ not count as scheduled evidence.
 ### Completed recovery fill
 
 | Field | Value |
-|---|---|
+| --- | --- |
 | Symbol | BTX |
 | Amount | $1.00 |
 | Order type | market (dollar notional) |

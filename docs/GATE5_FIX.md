@@ -1,6 +1,7 @@
 # GATE 5 Failure Fix: Signal Generation Pipeline
 
 ## Problem Summary
+
 **Date:** 2026-07-31
 **Executor:** 10:30 AM Morning DCA Live (Task 42173154)
 **Failure:** GATE 5 - Buy List Generation
@@ -17,6 +18,7 @@ Preflight Watchlist          Morning Live Executor
 ```
 
 ### Current State
+
 - **9:45 AM preflight** is configured but has NO in-repo executor
 - Expected behavior: External scheduler runs `MorningDCAExecutor` in preflight mode
 - Expected output: `cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/signals.csv`
@@ -25,14 +27,17 @@ Preflight Watchlist          Morning Live Executor
 ## Real Fix Options
 
 ### Option A: Ensure Preflight Task Actually Executes ✅ (RECOMMENDED)
+
 **Why:** Preserves the intended separation of concerns
 **Action:** Verify that the external scheduler/agent is:
+
 1. Running task `bb4f6ef1` at 9:45 AM ET
 2. Calling `MorningDCAExecutor` in **preflight mode** with config/morning_dca.json
 3. Injecting Finance/Robinhood/Alpaca MCP providers
 4. Writing signals to `cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/signals.csv`
 
 **Scheduler Requirement:**
+
 ```yaml
 task_id: bb4f6ef1
 timing: 09:45 AM ET (cron: 45 13 * * 1-5 UTC)
@@ -45,8 +50,10 @@ output: morning_dca_preflight/YYYYMMDD_0945ET/signals.csv
 ```
 
 ### Option B: Make 10:30 AM Executor Self-Sufficient
+
 **Why:** Removes dependency on preflight task
 **Action:** Modify `morning_dca.py` live mode to:
+
 1. Check for preflight signals first (existing behavior)
 2. If preflight missing/failed: generate own signals using fresh market data
 3. Requires market data provider access (same as preflight)
@@ -56,8 +63,10 @@ output: morning_dca_preflight/YYYYMMDD_0945ET/signals.csv
 **Risk:** Adds latency; reduces time for signal validation before 10:30 open
 
 ### Option C: Add Earlier Preflight Signal Generation
+
 **Why:** Creates redundancy; multiple signal sources
 **Action:** Add a pre-9:45 AM task that generates signals:
+
 - 9:35 AM market-open task (2ba19526) currently only places orders
 - Could be enhanced to also generate morning signals as a byproduct
 - 9:45 AM preflight then becomes a cross-check/validation
@@ -65,8 +74,10 @@ output: morning_dca_preflight/YYYYMMDD_0945ET/signals.csv
 **Complexity:** High; touches 2ba19526 and signal persistence logic
 
 ### Option D: Use Perplexity Runner BEFORE 10:30 AM
+
 **Why:** Different execution engine might succeed where Claude fails
 **Action:** Schedule Perplexity runner at 10:20 AM (10 min before 10:30 executor)
+
 - Generates signals using Perplexity's market data access
 - Writes to `cron_tracking/morning_dca/YYYYMMDD_1030ET/signals.csv`
 - 10:30 executor reads Perplexity-generated signals instead of preflight
@@ -79,9 +90,11 @@ output: morning_dca_preflight/YYYYMMDD_0945ET/signals.csv
 ## Recommended Fix Implementation
 
 ### Short Term (Immediate)
+
 Implement **Option A**: Ensure the external scheduler properly invokes the 9:45 AM preflight task.
 
 **Verification:**
+
 ```bash
 # These files should exist by 9:50 AM every weekday:
 cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/run_state.json
@@ -93,20 +106,24 @@ cron_tracking/morning_dca_preflight/latest_preflight.json
 If files don't exist by 9:55 AM ET, page the scheduler maintainer before 10:30 AM firing.
 
 ### Long Term (Robustness)
+
 Implement **Option B**: Make 10:30 AM executor self-sufficient.
 
 **Benefits:**
+
 - Removes external scheduler dependency
 - Executor becomes more resilient
 - Clear error path: if 10:30 executor can't generate signals → clear failure vs. hidden upstream issue
 
 **Implementation:**
+
 1. Modify `morning_dca.py` to support optional preflight bypass
 2. Add flag: `--generate-own-signals-if-preflight-missing`
 3. Update config/morning_dca.json with fallback parameters
 4. Adjust GATE 5 logic in executor to call signal generation on-demand
 
 ### Prevent Future Occurrences
+
 1. Add health check: "Preflight task fired and wrote signals" → daily monitoring
 2. Add GATE 5 enhancement: "If preflight signals don't exist, attempt generation with available providers"
 3. Document external scheduler requirements in `docs/scheduler_requirements.md`
@@ -114,12 +131,14 @@ Implement **Option B**: Make 10:30 AM executor self-sufficient.
 ---
 
 ## Files Modified
+
 - `cron_tracking/morning_dca_preflight/20260731_0945ET/run_state.json` (created)
 - `cron_tracking/morning_dca_preflight/20260731_0945ET/signals.csv` (created, empty)
 - `cron_tracking/morning_dca_preflight/latest_preflight.json` (created)
 - `artifacts/alerts/2026-07-31-1030-gate5.txt` (executor alert)
 
 ## Related Issues
+
 - Task 42173154 (10:30 AM) assumes preflight output exists
 - Task bb4f6ef1 (9:45 AM) has no in-repo executor, depends on scheduler
 - Similar dependency for 12:30 PM midday (a6239dae) on separate midday preflight
@@ -128,6 +147,7 @@ Implement **Option B**: Make 10:30 AM executor self-sufficient.
 ---
 
 ## Success Criteria
+
 ✅ Signals generated and available before 10:30 AM executor runs
 ✅ GATE 5 passes (output file exists)
 ✅ 10:30 AM executor can proceed through remaining gates

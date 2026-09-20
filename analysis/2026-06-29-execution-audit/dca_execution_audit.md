@@ -16,7 +16,7 @@ This audit reviewed the 3:45 PM ET graded DCA live strategy task `ce16ba6b` over
 ## Day-by-day findings
 
 | Date | Evidence found | Execution assessment | Failure mode |
-|---|---:|---|---|
+| --- | ---: | --- | --- |
 | 2026-06-16 | 0 artifacts | No evidence of run | No run artifacts; likely before task was active or not scheduled in this thread |
 | 2026-06-17 | 0 artifacts | No evidence of run | No run artifacts; likely before task was active or not scheduled in this thread |
 | 2026-06-18 | 0 artifacts | No evidence of run | No run artifacts; likely before task was active or not scheduled in this thread |

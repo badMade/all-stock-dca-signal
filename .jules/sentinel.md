@@ -1,3 +1,5 @@
+# Sentinel's Journal
+
 ## 2024-05-18 - Unsanitized HTTP Error Response Logging
 **Vulnerability:** HTTP response errors from Pipedream containing `PIPEDREAM_TOKEN` (or generic `Bearer` tokens) were directly logged to the application console without being sanitized.
 **Learning:** Raw responses from failed external API integrations often echo authentication parameters. Blindly logging these error responses can lead to credential exposure within error tracking logs.
@@ -42,7 +44,7 @@
 **Vulnerability:** `urllib.request.urlopen` is used in `trading-strategies/strategy_monitor.py`; if the target URL ever becomes configurable/untrusted, it could enable SSRF (including `file://` reads).
 **Learning:** Static analyzers (Ruff `S310`) flag `urlopen` based on syntax, so add explicit allowlisting (and/or an explicit suppression) when the URL is trusted.
 **Prevention:** Keep the endpoint hardcoded to `https://api.pipedream.com/...` (or validate scheme + host allowlist) before calling `urlopen`, and keep `# noqa: S310` on the call site. `urlopen` also follows redirects (preserving `Authorization`) by default, so build the opener with a custom `HTTPRedirectHandler` that refuses to follow them rather than trusting the initial-URL check alone.
-## 2026-08-10 - SSRF in strategy_monitor.py
+## 2026-08-10 - SSRF in strategy_monitor.py (build_opener Handlers)
 **Vulnerability:** `urllib.request.urlopen` is used in `trading-strategies/strategy_monitor.py`; if the target URL ever becomes configurable/untrusted, it could enable SSRF (including `file://` reads).
 **Learning:** Adding validation before the call mitigates the threat. However, security linters (like Ruff enforcing `S310`) analyze the syntax, not the surrounding control flow validation. When mitigating SSRF/LFI by globally subclassing and blocking `urllib.request.FileHandler` and `urllib.request.FTPHandler`, these protections can be accidentally bypassed if a specific module later uses `urllib.request.build_opener()` to create a local opener (e.g. to disable redirects). `build_opener()` always adds default handlers (including the unsafe `FileHandler` and `FTPHandler`) unless they are explicitly overridden in its arguments.
 **Prevention:** Keep the endpoint hardcoded to `https://api.pipedream.com/...` (or validate scheme + host allowlist) before calling `urlopen`, and keep `# noqa: S310` on the call site. `urlopen` also follows redirects (preserving `Authorization`) by default, so build the opener with a custom `HTTPRedirectHandler` that refuses to follow them rather than trusting the initial-URL check alone. Always import and explicitly pass the globally-defined blocking handlers (e.g., `BlockedFileHandler`, `BlockedFTPHandler`) when invoking `urllib.request.build_opener()`.
