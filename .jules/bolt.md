@@ -139,3 +139,6 @@ Added `get_order_fills` to `BrokerAdapter` protocol and Robinhood live adapter, 
 ## 2026-09-17 - Avoid Unrelated Import Reordering
 **Learning:** When using auto-formatters or linters with a `--fix` flag (like `ruff check --fix`), they may silently sort or reorder existing imports that were not part of the intended optimization. This can break import side effects or introduce unnecessary risk, leading to code review rejections for out-of-scope changes.
 **Action:** When implementing targeted optimizations, avoid running global auto-fixes on files or carefully revert unrelated import sorting to ensure the PR strictly contains the intentional performance changes.
+## 2026-09-20 - [Fixing Code Health Issue with Unused Import Side Effects]
+**Learning:** Sometimes an import is intentionally marked as unused by the linter, but it exists solely to execute important side effects (like patching network libraries during testing). Deleting it blindly based on linter warnings can compromise security or test validity.
+**Action:** Always check the surrounding comments and context. If an unused import is necessary for its side effects, use a linter suppression directive (e.g., `# noqa: F401`) instead of removing it to preserve the necessary behavior while clearing the code health warning.

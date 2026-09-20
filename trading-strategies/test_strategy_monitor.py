@@ -171,7 +171,7 @@ def test_write_rows_rejects_untrusted_host(monkeypatch):
     mock_urlopen.assert_not_called()
 
 def test_write_rows_rejects_disallowed_ip(monkeypatch):
-    import dca_net_utils
+    import dca_net_utils  # noqa: F401
 
     monkeypatch.setattr(
         strategy_monitor.SheetsWriter,
