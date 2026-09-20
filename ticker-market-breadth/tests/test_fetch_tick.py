@@ -365,7 +365,12 @@ def test_write_tick_csv_merges_a_download_missing_older_history(tmp_path):
 
     merged = pd.read_csv(_archive_path(history_dir), index_col="Date", parse_dates=True)
     assert len(merged) == 4
-    assert pd.to_datetime(merged.index).strftime("%Y-%m-%d").tolist() == ["2020-01-02", "2020-01-03", "2020-06-01", "2020-06-02"]
+    assert pd.to_datetime(merged.index).strftime("%Y-%m-%d").tolist() == [
+        "2020-01-02",
+        "2020-01-03",
+        "2020-06-01",
+        "2020-06-02",
+    ]
 
 
 def test_write_tick_csv_merges_a_download_missing_recent_history(tmp_path):
