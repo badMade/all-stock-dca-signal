@@ -1218,8 +1218,9 @@ def _fills_from_orders_csv(orders_csv: Path) -> List[Dict[str, Any]]:
         except ValueError:
             return fills
 
+        max_idx = max(idx_status, idx_avg_fill_price, idx_quantity_filled, idx_ticker, idx_order_id)
         for row in reader:
-            if len(row) <= max(idx_status, idx_avg_fill_price, idx_quantity_filled, idx_ticker, idx_order_id):
+            if len(row) <= max_idx:
                 continue
 
             if (row[idx_status] or "").lower() != "filled":
@@ -1259,8 +1260,9 @@ def _execution_targets_from_orders_csv(orders_csv: Path) -> Dict[str, Optional[f
         except (StopIteration, ValueError):
             return targets
 
+        max_idx = max(idx_ticker, idx_target_price)
         for row in reader:
-            if len(row) <= max(idx_ticker, idx_target_price):
+            if len(row) <= max_idx:
                 continue
 
             ticker = row[idx_ticker]
@@ -1295,8 +1297,9 @@ def _execution_targets_by_order_id_from_orders_csv(orders_csv: Path) -> Dict[str
         except (StopIteration, ValueError):
             return targets
 
+        max_idx = max(idx_order_id, idx_target_price)
         for row in reader:
-            if len(row) <= max(idx_order_id, idx_target_price):
+            if len(row) <= max_idx:
                 continue
 
             order_id = row[idx_order_id]
@@ -1397,8 +1400,9 @@ def _refresh_fills_from_broker(
         except ValueError:
             idx_action_reason = -1
 
+        max_idx = max(idx_order_id, idx_status, idx_ticker)
         for row in reader:
-            if len(row) <= max(idx_order_id, idx_status, idx_ticker):
+            if len(row) <= max_idx:
                 continue
 
             order_id = row[idx_order_id]
@@ -2077,15 +2081,18 @@ def _prior_submitted_order_rows(run_dir: Path) -> List[Dict[str, Any]]:
                     })
                 return rows
 
+            _max_idx = max(_status_idx, _oid_idx, _amount_idx, _ticker_idx)
             for _row in _reader:
+                if len(_row) <= _max_idx:
+                    continue
                 # Same bar submitted_order_rows() applies: a concrete order_id, or
                 # a placed/in-flight status. Accepting only submitted/filled would
                 # drop a pending or unconfirmed order the broker may well have
                 # taken, letting a later run allocate it again (Codex review).
-                status = _row[_status_idx].strip() if len(_row) > _status_idx else ""
+                status = _row[_status_idx].strip()
                 # Stripped BEFORE the gate, so a whitespace-only id cannot pass as
                 # a concrete order id and then be normalized away to None below.
-                order_id = _row[_oid_idx].strip() or None if len(_row) > _oid_idx else None
+                order_id = _row[_oid_idx].strip() or None
                 if not order_id and status not in ORDER_ATTEMPT_STATUSES:
                     continue
                 # These dicts are assigned straight to run_state["buy_candidates"],
@@ -2097,14 +2104,14 @@ def _prior_submitted_order_rows(run_dir: Path) -> List[Dict[str, Any]]:
                 # reject while the lightweight validator still passed (Codex
                 # review).
                 try:
-                    amount = float(_row[_amount_idx].strip() or 0.0) if len(_row) > _amount_idx else 0.0
+                    amount = float(_row[_amount_idx].strip() or 0.0)
                 except (TypeError, ValueError):
                     amount = 0.0
                 # A blank ticker would produce a schema-valid but meaningless
                 # candidate row in the canonical state, and the same-day guards
                 # key on the ticker (Copilot review). Whitespace is stripped for
                 # the same reason: " AAA" is not the ticker any consumer matches.
-                ticker = _row[_ticker_idx].strip() if len(_row) > _ticker_idx else ""
+                ticker = _row[_ticker_idx].strip()
                 if not ticker:
                     continue
                 rows.append(
