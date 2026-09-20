@@ -218,10 +218,16 @@ def test_write_rows_uses_redirect_blocking_opener_on_trusted_url():
     mock_opener = MagicMock()
     mock_opener.open.return_value = _mock_success_response()
 
-    with patch("urllib.request.build_opener", return_value=mock_opener) as mock_build_opener:
+    with (
+        patch("urllib.request.build_opener", return_value=mock_opener) as mock_build_opener,
+        patch("dca_net_utils.assert_safe_destination") as mock_assert_safe_destination,
+    ):
         result = writer.write_rows({"StratA": {"sharpe": 1.0}}, {}, "2026-08-10")
 
     assert result is True
+    mock_assert_safe_destination.assert_called_once_with(
+        "https://api.pipedream.com/v1/accounts/google_sheets__pipedream/actions/add-rows"
+    )
     assert mock_build_opener.call_count >= 1
     mock_opener.open.assert_called_once()
     req = mock_opener.open.call_args.args[0]
@@ -242,9 +248,15 @@ def test_no_redirect_handler_blocks_redirects_instead_of_following_them():
     mock_opener = MagicMock()
     mock_opener.open.return_value = _mock_success_response()
 
-    with patch("urllib.request.build_opener", return_value=mock_opener) as mock_build_opener:
+    with (
+        patch("urllib.request.build_opener", return_value=mock_opener) as mock_build_opener,
+        patch("dca_net_utils.assert_safe_destination") as mock_assert_safe_destination,
+    ):
         writer.write_rows({}, {}, "2026-08-10")
 
+    mock_assert_safe_destination.assert_called_once_with(
+        "https://api.pipedream.com/v1/accounts/google_sheets__pipedream/actions/add-rows"
+    )
     call_args = None
     for call in mock_build_opener.call_args_list:
         if call.args and issubclass(call.args[0], urllib.request.HTTPRedirectHandler):
