@@ -285,7 +285,16 @@ def read_ticker_observations(
     if not path.exists():
         return []
     with path.open("r", encoding="utf-8", newline="") as handle:
-        return [dict(row) for row in csv.DictReader(handle)]
+        _reader = csv.reader(handle)
+        try:
+            _header = next(_reader)
+        except StopIteration:
+            return []
+
+        _rows = []
+        for _row in _reader:
+            _rows.append(dict(zip(_header, _row)))  # noqa: B905
+        return _rows
 
 
 def _sort_key(row: Mapping[str, Any]) -> Tuple[str, ...]:

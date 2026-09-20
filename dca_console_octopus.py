@@ -183,15 +183,22 @@ def _csv_forecasts(path: Path, reader: _Reader) -> list[dict]:
         return []
     rows = []
     try:
-        records = csv.DictReader(io.StringIO(source), strict=True)
-        if not {"ticker", "model", "origin_date", "pred_close"}.issubset(records.fieldnames or []):
+        records = csv.reader(io.StringIO(source), strict=True)
+        try:
+            fieldnames = next(records)
+        except StopIteration:
+            fieldnames = []
+
+        if not {"ticker", "model", "origin_date", "pred_close"}.issubset(fieldnames):
             reader.warn("The forecast CSV has unsupported columns and was ignored.")
             return []
+
         for index, raw in enumerate(records):
             if index >= _MAX_ROWS:
                 reader.warn("Forecast scanning was capped at 50,000 rows.")
                 break
-            if row := _forecast(raw):
+            raw_dict = dict(zip(fieldnames, raw))  # noqa: B905
+            if row := _forecast(raw_dict):
                 rows.append(row)
     except (csv.Error, ValueError):
         reader.warn("The forecast CSV is corrupt; checkpoint forecasts are used when available.")

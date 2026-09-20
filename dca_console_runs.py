@@ -440,15 +440,27 @@ def _tables(reader: BoundedReader, relative_dir: str, roots: Sequence[RootSpec])
         if source is None:
             continue
         try:
-            parsed = csv.DictReader(io.StringIO(source))
+            parsed = csv.reader(io.StringIO(source))
+            try:
+                fieldnames = next(parsed)
+            except StopIteration:
+                fieldnames = []
+            columns = [column for column in fieldnames if column in TABLE_COLUMNS]
+
+            # Map column index to column name for TABLE_COLUMNS only
+            col_indices = {i: name for i, name in enumerate(fieldnames) if name in TABLE_COLUMNS}
+
             rows = []
             for row in parsed:
                 if len(rows) >= MAX_ROWS:
                     reader.warn(f"{name} shows only its first {MAX_ROWS} rows.")
                     break
-                rows.append({key: _text(value, roots) for key, value in row.items()
-                             if key in TABLE_COLUMNS and value not in (None, "")})
-            columns = [column for column in (parsed.fieldnames or []) if column in TABLE_COLUMNS]
+
+                row_dict = {}
+                for i, value in enumerate(row):
+                    if i in col_indices and value not in (None, ""):
+                        row_dict[col_indices[i]] = _text(value, roots)
+                rows.append(row_dict)
         except (csv.Error, UnicodeError):
             reader.warn(f"{name} is not a readable CSV; its rows are unavailable.")
             continue

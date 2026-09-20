@@ -10732,36 +10732,99 @@ def _orders_csv_terminal_non_fills(
         return order_ids, tickers
     try:
         with open(orders_csv, newline="", encoding="utf-8") as handle:
-            for row in csv.DictReader(handle):
-                # csv.DictReader fills omitted TRAILING cells with None rather
-                # than raising, so a row observed mid-write can look like a
-                # zero-execution terminal outcome purely because its
-                # cumulative_quantity has not been flushed yet -- and this
-                # helper would then delete a candidate whose order really did
-                # partially fill, letting the later run buy its full amount.
-                # _orders_csv_fills drops such a tail row; here ANY row with a
-                # missing field is refused, not just the last one, because this
-                # collector only ever REMOVES prior allocation and so must be
-                # strictly more conservative (Codex review: "Reject truncated
-                # terminal rows before excluding candidates").
-                if any(value is None for value in row.values()):
+            reader = csv.reader(handle)
+            try:
+                fieldnames = next(reader)
+            except StopIteration:
+                return set(), set()
+
+            try:
+                _state_idx = fieldnames.index("state")
+                _oid_idx = fieldnames.index("order_id")
+                _ticker_idx = fieldnames.index("ticker")
+
+                _qty_indices = []
+                for col in _EXECUTED_QUANTITY_COLS:
+                    if col in fieldnames:
+                        _qty_indices.append(fieldnames.index(col))
+                _min_len = len(fieldnames)
+            except ValueError:
+                # Fallback to DictReader for missing expected columns
+                handle.seek(0)
+                for row in csv.DictReader(handle):
+                    if any(value is None for value in row.values()):
+                        continue
+                    state = (row.get("state") or "").strip().lower()
+                    if state not in _TERMINAL_NON_FILL_STATES:
+                        continue
+                    if not _executed_quantity_is_explicit_zero(row):
+                        continue
+                    oid = (row.get("order_id") or "").strip()
+                    if oid and oid != "-":
+                        order_ids.add(oid)
+                    else:
+                        ticker = (row.get("ticker") or "").strip().upper()
+                        if ticker:
+                            tickers.add(ticker)
+                return order_ids, tickers
+
+            for _row in reader:
+                # csv.reader produces a list. We pair it with fieldnames to detect None values
+                # based on mismatched lengths or explicit empty/missing fields.
+                if len(_row) < _min_len:
+                    # A row shorter than headers implies trailing missing cells (mid-write)
                     continue
-                state = (row.get("state") or "").strip().lower()
+
+                state = (_row[_state_idx] or "").strip().lower()
                 if state not in _TERMINAL_NON_FILL_STATES:
                     continue
-                # An EXPLICIT numeric zero is required, not merely the absence
-                # of a positive quantity. A malformed or missing cell means the
-                # artifact does not establish whether the order executed, and
-                # this collector only ever REMOVES prior allocation -- so an
-                # unresolved row must stay unresolved rather than be read as a
-                # definitive zero fill.
-                if not _executed_quantity_is_explicit_zero(row):
+
+                _explicit_zero = False
+                _handled = False
+                for idx in _qty_indices:
+                    val = _row[idx]
+                    if val in (None, "", "-"):
+                        continue
+                    try:
+                        f_val = float(val)
+                        if math.isfinite(f_val) and f_val == 0.0:
+                            _explicit_zero = True
+                            _handled = True
+                            break
+                        else:
+                            _handled = True
+                            break
+                    except (TypeError, ValueError):
+                        _handled = True
+                        break
+
+                # Replicate fallback in _executed_quantity_is_explicit_zero exactly
+                if not _handled:
+                    _raw = None
+                    for col in _FILL_QUANTITY_COLS:
+                        if col in fieldnames:
+                            _idx = fieldnames.index(col)
+                            _val = _row[_idx]
+                            if _val is not None:
+                                _raw = _val
+                                break
+
+                    if _raw not in (None, "", "-"):
+                        try:
+                            f_qty = float(_raw)
+                            if math.isfinite(f_qty) and f_qty == 0.0:
+                                _explicit_zero = True
+                        except (TypeError, ValueError):
+                            pass
+
+                if not _explicit_zero:
                     continue
-                oid = (row.get("order_id") or "").strip()
+
+                oid = (_row[_oid_idx] or "").strip()
                 if oid and oid != "-":
                     order_ids.add(oid)
                 else:
-                    ticker = (row.get("ticker") or "").strip().upper()
+                    ticker = (_row[_ticker_idx] or "").strip().upper()
                     if ticker:
                         tickers.add(ticker)
     except (OSError, csv.Error, UnicodeDecodeError):
