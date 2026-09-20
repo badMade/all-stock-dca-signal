@@ -10,7 +10,8 @@
 ## Why It Wouldn't Work (as originally asked)
 
 **Timing Problem:**
-```
+
+```text
 9:45 AM          10:30 AM            10:35 AM
 Preflight        Claude Executor     Perplexity Runner
 (read-only)      (live trading)
@@ -21,6 +22,7 @@ Preflight        Claude Executor     Perplexity Runner
 ```
 
 The Claude executor runs at 10:30 AM and immediately checks for signals. By 10:35 AM when Perplexity runs, Claude has already:
+
 - Hit GATE 5 (Buy List Generation)
 - Found no signals
 - Aborted and sent alerts
@@ -32,7 +34,7 @@ Perplexity can't help because the decision is already made.
 
 ## What WOULD Work: Pre-10:30 AM Perplexity Run
 
-```
+```text
 9:45 AM          9:50 AM            10:30 AM
 Preflight        Perplexity Runner  Claude Executor
 (reads available)→(generates signals)→(uses signals)
@@ -58,6 +60,7 @@ Preflight        Perplexity Runner  Claude Executor
 Rather than adding a Perplexity runner at all, the REAL solution is to make Claude's 10:30 AM executor **self-sufficient**.
 
 ### The Problem with Adding a New Task
+
 - ❌ Adds complexity: now THREE signal generators (preflight, Perplexity, Claude)
 - ❌ Three different failure modes to monitor
 - ❌ Harder to debug when signals don't match expected values
@@ -65,9 +68,10 @@ Rather than adding a Perplexity runner at all, the REAL solution is to make Clau
 - ❌ More cost (extra Claude/Perplexity API calls)
 
 ### The Better Approach (Already Implemented)
+
 Make Claude's 10:30 AM executor generate its OWN signals if preflight is missing:
 
-```
+```text
 9:45 AM              10:30 AM
 Preflight            Claude Executor
 (missing/fails)      ├─ Check for preflight signals
@@ -77,6 +81,7 @@ Preflight            Claude Executor
 ```
 
 **Advantages:**
+
 - ✅ Single, unified signal generation logic
 - ✅ Predictable failure modes (one executor to monitor)
 - ✅ Immediate signals (no waiting for Perplexity)
@@ -97,6 +102,7 @@ I've added a **fallback policy** to Claude's 10:30 AM executor:
 ```
 
 **Result:**
+
 - If 9:45 AM preflight generates signals → use them (existing behavior)
 - **If 9:45 AM preflight missing → generate own signals (new fallback)**
 - Executor proceeds with GATE 5 ✅ → places orders ✅
@@ -106,7 +112,7 @@ I've added a **fallback policy** to Claude's 10:30 AM executor:
 ## Comparison: Three Approaches
 
 | Approach | Setup Time | Reliability | Cost | Complexity |
-|----------|-----------|-------------|------|-----------|
+| ---------- | ----------- | ------------- | ------ | ----------- |
 | **Add Perplexity Runner** (your question) | ⏱️ Medium | 🟡 Moderate | 💰💰 Higher | 🔴 High |
 | **Add Perplexity Pre-10:30** (modified timing) | ⏱️ Medium | 🟡 Moderate | 💰💰 Higher | 🔴 High |
 | **Make Claude Self-Sufficient** (what I did) | ⚡ Fast | 🟢 High | 💰 Lower | 🟢 Simple |

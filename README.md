@@ -32,7 +32,7 @@ synthetic value in `conftest.py`.
 ### Optional environment
 
 | Variable | Default | Effect |
-|---|---|---|
+| --- | --- | --- |
 | `DCA_CRON_TRACKING_ROOT` | `<checkout>/cron_tracking` (production exports the shared tree explicitly) | Root of the per-stream run-artifact tree. Every stream root (`morning_dca`, `midday_dca`, `intraday_dca`, `market_open_dca`, `ce16ba6b`, `attempt_log`, `model_usage`, …) derives from it via `dca_paths`, so one variable relocates the whole tree. Read at import time — export it before invoking the task. |
 | `DCA_CONFIG_DIR` | `config/` beside the modules | Directory holding `config/*.json`. |
 | `DCA_ATTEMPT_LOG_ROOT` | `<cron root>/attempt_log` | Overrides just the failed-start marker tree. Read at call time. |

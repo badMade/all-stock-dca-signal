@@ -1,4 +1,5 @@
 # Historical Stock Data Fetch System
+
 ## Complete Automation for 5,502+ US Stock Tickers
 
 ---
@@ -6,7 +7,9 @@
 ## Quick Start
 
 ### Current Status
+
 ✅ **System initialized and tested**
+
 - 5,502 tickers extracted from source CSV
 - Polygon.io API verified and working
 - CSV output file created with correct schema
@@ -14,7 +17,9 @@
 - Sample data fetched for verification
 
 ### To Continue Fetching
+
 Run the main fetch script to process remaining tickers:
+
 ```bash
 python3 /sessions/relaxed-gallant-cerf/run_fetch.py
 ```
@@ -26,7 +31,8 @@ Then execute API calls for each ticker in the batch and feed results to the CSV 
 ## System Overview
 
 ### Architecture
-```
+
+```text
 Stock Ticker CSV (5,502)
         ↓
    Extract Tickers
@@ -45,7 +51,7 @@ Historical Data CSV (26+ years)
 ### Key Files
 
 | File | Purpose | Status |
-|------|---------|--------|
+| ------ | --------- | -------- |
 | `Stock ticker all - Sheet1.csv` | Source data with 5,502 tickers | Source file |
 | `historical_stock_data.csv` | Output: daily OHLCV for all tickers | Being built |
 | `stock_fetch_progress.json` | Tracks which tickers have been processed | Active tracking |
@@ -58,6 +64,7 @@ Historical Data CSV (26+ years)
 ## Data Schema
 
 ### Input: Stock Ticker CSV
+
 ```csv
 Ticker,Company Name,Industry,Market Cap
 A,"Agilent Technologies, Inc.",Diagnostics & Research,33.56B
@@ -66,6 +73,7 @@ AA,Alcoa Corporation,Aluminum,7.67B
 ```
 
 ### Output: Historical Data CSV
+
 ```csv
 ticker,date,open,high,low,close,volume,vwap,n
 A,2024-03-29,198.50,199.25,198.25,199.10,2150000,198.87,45000
@@ -75,6 +83,7 @@ AAPL,2024-04-03,172.50,173.80,172.10,173.45,85700000,173.12,450000
 ```
 
 ### Field Descriptions
+
 - **ticker**: Stock symbol (e.g., "AAPL")
 - **date**: Trading date in YYYY-MM-DD format
 - **open**: Opening price (adjusted)
@@ -94,6 +103,7 @@ AAPL,2024-04-03,172.50,173.80,172.10,173.45,85700000,173.12,450000
 Fetches historical daily bars for a ticker.
 
 **Parameters**:
+
 ```python
 ticker = "AAPL"           # Stock symbol
 multiplier = 1             # 1 day per bar
@@ -104,6 +114,7 @@ limit = 50000              # Max results per request
 ```
 
 **Response Format**:
+
 ```json
 {
   "result": {
@@ -133,20 +144,25 @@ limit = 50000              # Max results per request
 ## Execution Strategy
 
 ### Batch Processing
+
 The system uses **batches of 25-50 tickers per checkpoint** to:
+
 - Allow resuming if interrupted
 - Manage memory efficiently
 - Provide feedback on progress
 - Distribute processing over time
 
 ### Rate Limiting
+
 - **Delay between requests**: 0.4 seconds
 - **Requests per second**: ~2.5 (conservative)
 - **Total tickers**: 5,502
 - **Estimated runtime**: 1-2 hours
 
 ### Progress Tracking
+
 Progress is saved in JSON format:
+
 ```json
 {
   "fetched": ["A", "AA", "AACB", ...],
@@ -162,6 +178,7 @@ The system is **fully resumable**: Stop at any time, and restart to continue fro
 ## Implementation Details
 
 ### Step 1: Prepare Tickers
+
 ```python
 import json
 with open('/sessions/relaxed-gallant-cerf/tickers.txt') as f:
@@ -170,6 +187,7 @@ with open('/sessions/relaxed-gallant-cerf/tickers.txt') as f:
 ```
 
 ### Step 2: Load Progress
+
 ```python
 import json
 from pathlib import Path
@@ -186,6 +204,7 @@ failed = set(progress['failed'])
 ```
 
 ### Step 3: Fetch Data for Remaining Tickers
+
 ```python
 import time
 import json
@@ -218,6 +237,7 @@ for ticker in remaining_tickers:
 ```
 
 ### Step 4: Save Results to CSV
+
 ```python
 import csv
 
@@ -245,6 +265,7 @@ def append_to_csv(ticker, bars):
 ```
 
 ### Step 5: Update Progress Checkpoint
+
 ```python
 def checkpoint_progress(progress):
     """Save progress to allow resuming later."""
@@ -258,6 +279,7 @@ def checkpoint_progress(progress):
 ## Monitoring & Validation
 
 ### Monitor Progress
+
 ```bash
 # Check latest progress
 cat /sessions/relaxed-gallant-cerf/stock_fetch_progress.json
@@ -270,6 +292,7 @@ tail -10 /sessions/relaxed-gallant-cerf/mnt/All Stock/historical_stock_data.csv
 ```
 
 ### Validate Data
+
 ```python
 import pandas as pd
 
@@ -288,13 +311,14 @@ print(f"\nSample data:\n{df.head()}")
 ### Common Issues
 
 | Error | Cause | Solution |
-|-------|-------|----------|
+| ------- | ------- | ---------- |
 | "ticker not found" | Delisted or invalid ticker | Log to failed list, continue |
 | Rate limit (429) | Too many requests | Increase delay, exponential backoff |
 | Network timeout | Connection issue | Retry with longer timeout |
 | CSV write error | File locked | Wait and retry, check permissions |
 
 ### Resilience Features
+
 - ✅ **Checkpointing**: Save progress every 25-50 tickers
 - ✅ **Failed ticker logging**: Track failures separately
 - ✅ **Resumable**: Run same script again to continue
@@ -305,7 +329,8 @@ print(f"\nSample data:\n{df.head()}")
 ## Performance Metrics
 
 ### Sample Run (2 tickers tested)
-```
+
+```text
 Ticker A:
   - Records: 500 bars (2024-2026)
   - Size: ~45 KB
@@ -318,7 +343,8 @@ Ticker AA:
 ```
 
 ### Projected Full Run (5,502 tickers)
-```
+
+```text
 Average records/ticker:  6,000 bars (26 years)
 Average size/ticker:     ~480 KB
 Total data:              ~2.3 GB
@@ -332,14 +358,18 @@ Rate:                    ~40-50 tickers/minute
 ## Troubleshooting
 
 ### Issue: Script stops unexpectedly
+
 **Solution**: Check progress file
+
 ```bash
 cat /sessions/relaxed-gallant-cerf/stock_fetch_progress.json
 # Note the last_update timestamp and count of fetched/failed
 ```
 
 ### Issue: CSV file is corrupted
+
 **Solution**: Verify and restore
+
 ```bash
 # Check row count
 wc -l /sessions/relaxed-gallant-cerf/mnt/All Stock/historical_stock_data.csv
@@ -352,7 +382,9 @@ sort -u historical_stock_data.csv > historical_stock_data.csv.dedupe
 ```
 
 ### Issue: API rate limiting
+
 **Solution**: Adjust rate limit
+
 ```python
 # In run_fetch.py, change:
 RATE_LIMIT_DELAY = 0.4  # to:
@@ -364,18 +396,21 @@ RATE_LIMIT_DELAY = 1.0  # Slower, more conservative
 ## Next Steps
 
 ### Immediate
+
 1. ✅ Review this README
 2. ✅ Check progress file
 3. ⏳ **Run the fetch loop** for remaining tickers
 4. ⏳ Monitor progress and handle any errors
 
 ### Expected Timeline
+
 - **Current**: 2026-03-30 22:25 UTC (setup complete)
 - **Fetch starts**: Immediately with API calls
 - **Fetch ends**: 2026-03-31 00:25 to 02:25 UTC (1-2 hours)
 - **Verification**: Upon completion
 
 ### Final Steps
+
 1. Verify data integrity
 2. Generate summary statistics
 3. Create analysis-ready CSV
@@ -386,14 +421,18 @@ RATE_LIMIT_DELAY = 1.0  # Slower, more conservative
 ## Support & Maintenance
 
 ### Questions?
+
 Refer to:
+
 - `FETCH_STATUS_REPORT.md` - Technical details
 - `stock_fetch_progress.json` - Current status
 - `run_fetch.py` - Implementation code
 - Polygon.io documentation - API details
 
 ### Future Updates
+
 To update this system:
+
 1. Modify ticker source: Update CSV file
 2. Change date range: Edit `from_` and `to_` parameters
 3. Adjust batch size: Modify `CHECKPOINT_INTERVAL`

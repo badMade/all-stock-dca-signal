@@ -2082,10 +2082,10 @@ def _prior_submitted_order_rows(run_dir: Path) -> List[Dict[str, Any]]:
                 # a placed/in-flight status. Accepting only submitted/filled would
                 # drop a pending or unconfirmed order the broker may well have
                 # taken, letting a later run allocate it again (Codex review).
-                status = str(_row[_status_idx]).strip() if len(_row) > _status_idx else ""
+                status = _row[_status_idx].strip() if len(_row) > _status_idx else ""
                 # Stripped BEFORE the gate, so a whitespace-only id cannot pass as
                 # a concrete order id and then be normalized away to None below.
-                order_id = str(_row[_oid_idx] or "").strip() or None if len(_row) > _oid_idx else None
+                order_id = _row[_oid_idx].strip() or None if len(_row) > _oid_idx else None
                 if not order_id and status not in ORDER_ATTEMPT_STATUSES:
                     continue
                 # These dicts are assigned straight to run_state["buy_candidates"],
@@ -2097,14 +2097,14 @@ def _prior_submitted_order_rows(run_dir: Path) -> List[Dict[str, Any]]:
                 # reject while the lightweight validator still passed (Codex
                 # review).
                 try:
-                    amount = float(str(_row[_amount_idx] or "").strip() or 0.0) if len(_row) > _amount_idx else 0.0
+                    amount = float(_row[_amount_idx].strip() or 0.0) if len(_row) > _amount_idx else 0.0
                 except (TypeError, ValueError):
                     amount = 0.0
                 # A blank ticker would produce a schema-valid but meaningless
                 # candidate row in the canonical state, and the same-day guards
                 # key on the ticker (Copilot review). Whitespace is stripped for
                 # the same reason: " AAA" is not the ticker any consumer matches.
-                ticker = str(_row[_ticker_idx] or "").strip() if len(_row) > _ticker_idx else ""
+                ticker = _row[_ticker_idx].strip() if len(_row) > _ticker_idx else ""
                 if not ticker:
                     continue
                 rows.append(

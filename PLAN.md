@@ -65,8 +65,8 @@ listed at the end).
 ## Design decisions
 
 | Topic | Decision | Why |
-|---|---|---|
-| Secret source | `--auth-file PATH`: one line `user:password`; POSIX only (`os.name == "posix"`, otherwise `ValueError` — fail closed, no Windows tolerance for this feature); opened with `os.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)` (a symlink fails with `ELOOP`; `O_NONBLOCK` makes a FIFO open return at once instead of waiting for a writer, and has no effect on a regular-file read), validated with `os.fstat` **on that descriptor** (`S_ISREG`; `st_uid == os.getuid()`; `st_mode & 0o077 == 0`; `st_size ≤ 4096`) and read through the same descriptor with a bounded `os.read`, so the bytes provably come from the checked inode; username printable ASCII without `:`; password ≥ 12 chars. Errors name the rule, never the contents | An env var would be copied into every job child by `env = dict(os.environ)` (`dca_console.py:237`), show in `launchctl print` / `ps -E`, and sit inside the plist. A path in argv leaks nothing. Ownership and regular-file checks are what make "0600" mean something, and checking a path then reading it separately is a check/use race a writable parent directory could exploit (Same Page round 2). Without `O_NONBLOCK` a FIFO at `--auth-file` would hang the console and the renderer before `fstat` could reject it, instead of exiting 2 (Same Page round 3) |
+| --- | --- | --- |
+| Secret source | `--auth-file PATH`: one line `user:password`; POSIX only (`os.name == "posix"`, otherwise `ValueError` — fail closed, no Windows tolerance for this feature); opened with `os.open(path, O_RDONLY \| O_NOFOLLOW \| O_CLOEXEC \| O_NONBLOCK)` (a symlink fails with `ELOOP`;`O_NONBLOCK` makes a FIFO open return at once instead of waiting for a writer, and has no effect on a regular-file read), validated with `os.fstat`**on that descriptor** (`S_ISREG`;`st_uid == os.getuid()`;`st_mode & 0o077 == 0`;`st_size ≤ 4096`) and read through the same descriptor with a bounded`os.read`, so the bytes provably come from the checked inode; username printable ASCII without`:`; password ≥ 12 chars. Errors name the rule, never the contents | An env var would be copied into every job child by `env = dict(os.environ)` (`dca_console.py:237`), show in `launchctl print` / `ps -E`, and sit inside the plist. A path in argv leaks nothing. Ownership and regular-file checks are what make "0600" mean something, and checking a path then reading it separately is a check/use race a writable parent directory could exploit (Same Page round 2). Without `O_NONBLOCK` a FIFO at `--auth-file` would hang the console and the renderer before `fstat` could reject it, instead of exiting 2 (Same Page round 3) |
 | Fail-closed construction | All access rules are enforced in `ConsoleAccess.__post_init__`, so an invalid combination cannot be constructed anywhere — not in `main()`, not by a future caller of `make_server()`. `main()` maps `ValueError` → `parser.error` (exit 2) | A CLI-only check would let another entry point open a reachable socket without a credential |
 | Auth scheme | HTTP Basic on every route except `/api/health`, only when a credential is configured; `secrets.compare_digest` on `b"user:password"`; failure → `401` + `WWW-Authenticate: Basic realm="DCA console", charset="UTF-8"` + JSON error | Native browser prompt on a phone; zero frontend change for auth because same-origin `fetch` (`console/app.js:381,384,411`) and the `<a download>` export (`console/index.html:38`) attach credentials automatically |
 | `/api/health` unauthenticated and diagnostic | Still behind the Host/Origin check; body is `{"status","mode","received_host","forwarded_host"}` — the two host values are what the client itself sent (≤ 253 chars each, or null) | Lets probes and the launchd runbook work without embedding the password anywhere, and makes the runbook probe diagnostic on a 200 as well as on a 403: a front that rewrites `Host` to the loopback authority and carries the public name only in `X-Forwarded-Host` would otherwise return a bare 200 and the checklist could not tell that `--behind-proxy` is needed (Same Page round 3). This is the cycle's one edit to an existing test: the exact-equality assertion at `tests/test_dca_console.py:88` becomes a check of `status` and `mode` |
@@ -85,7 +85,7 @@ listed at the end).
 | SIGTERM | Context manager installs a handler that raises `KeyboardInterrupt`, reusing the Ctrl+C teardown (`dca_console.py:492-497`); restores the previous handler; entered **before** the readiness banner is printed and covering server creation through `serve_forever` (the serving branch only, not `--once`/`--run`/`--check`) | `server.shutdown()` from the handler would deadlock (same thread as `serve_forever`). A handler installed after the banner would let a SIGTERM sent on seeing the banner hit the default action and exit `-15` (Same Page round 2). Worst-case teardown ≈ 11 s (`dca_console_jobs.py:210-226`), inside the plist's `ExitTimeOut = 30` |
 | Handler hygiene | `Handler.timeout = HANDLER_TIMEOUT_SECONDS` (30; today `None`, only POST bodies get `settimeout(5)` at line 400); `version_string()` override | An idle LAN/proxy connection must not pin a thread; `Server:` should not advertise the Python version |
 | Long uptime | Cap `ConsoleApp.signatures` to the last 32 days | Everything else is already bounded |
-| launchd | `deploy/launchd/render_console_agent.py` renders the plist with `plistlib` (`--print` / `--install`), validates the auth file via `load_auth_file`, takes `--python PATH` (default `<checkout>/.venv/bin/python`; refuses when the chosen interpreter does not exist), resolves **one** artifact root with precedence `--cron-tracking-root` > `$DCA_CRON_TRACKING_ROOT` > `dca_paths` default, always writes it into the plist environment and derives the log paths from that same value, creates the log directory, prints the `launchctl` commands including the apply pair (`bootout … 2>/dev/null || true`, then `bootstrap`). Fixed label `com.all-stock-dca.console`. Optional `--octopus-run DIR` passthrough. No `--bind`. No placeholder template | Same "logic in a script, not the unit" rationale as `deploy/run-drift-check.sh:6-17`; `plistlib` cannot mis-escape; one resolved root means logs and console artifacts can never land in different trees; a fixed label removes an unvalidated path/shell fragment |
+| launchd | `deploy/launchd/render_console_agent.py` renders the plist with `plistlib` (`--print` / `--install`), validates the auth file via `load_auth_file`, takes `--python PATH` (default `<checkout>/.venv/bin/python`; refuses when the chosen interpreter does not exist), resolves **one** artifact root with precedence `--cron-tracking-root` > `$DCA_CRON_TRACKING_ROOT` > `dca_paths` default, always writes it into the plist environment and derives the log paths from that same value, creates the log directory, prints the `launchctl` commands including the apply pair (`bootout … 2>/dev/null \|\| true`, then `bootstrap`). Fixed label`com.all-stock-dca.console`. Optional`--octopus-run DIR` passthrough. No `--bind`. No placeholder template | Same "logic in a script, not the unit" rationale as `deploy/run-drift-check.sh:6-17`; `plistlib` cannot mis-escape; one resolved root means logs and console artifacts can never land in different trees; a fixed label removes an unvalidated path/shell fragment |
 | pyproject | No change | Console is checkout-only; `deploy/` is not shipped |
 | Proxy `Host` semantics (read from source at HEAD, not a live install — uncertainty acknowledged) | Tailscale Serve preserves `Host` and adds `X-Forwarded-Host/-Proto/-For` + `Tailscale-User-*`; cloudflared preserves `Host` unless `httpHostHeader` is set | Accept the configured name in `Host` or (with `--behind-proxy`) `X-Forwarded-Host`; every runbook starts with a `curl -si …/api/health` whose 403 body prints what arrived |
 | Credentials in proofs | `curl -K <(printf 'user = "%s"\n' "$(<"$AUTH")")` | The curl config arrives through a `/dev/fd` path; argv never holds the secret |
@@ -164,6 +164,7 @@ no sub-case depends on wall-clock spacing. `test_auth_failure_limiter_is_thread_
 and a consistent suppressed count).
 
 **Proof.**
+
 ```bash
 CONSOLE_TESTS=(tests/test_dca_console.py tests/test_dca_console_jobs.py tests/test_dca_console_data.py tests/test_dca_console_octopus.py tests/test_console_security_logging.py); AUTH=~/.config/all-stock-dca/console-auth
 .venv/bin/python -m ruff check . && .venv/bin/python -m pytest "${CONSOLE_TESTS[@]}" tests/test_config_invariants.py -q
@@ -175,6 +176,7 @@ curl -s -o /dev/null -w '%{http_code} ' http://127.0.0.1:8765/api/bootstrap
 curl -s -o /dev/null -w '%{http_code}\n' -K <(printf 'user = "%s"\n' "$(<"$AUTH")") http://127.0.0.1:8765/api/bootstrap
 kill -TERM "$pid"; wait "$pid"; echo "exit=$?"
 ```
+
 Expected: ruff clean; 87 console passes (78 + 9) and the invariants file green; curl
 prints `200 401 200`; the stop step exits 143 (SIGTERM is unhandled until Rock 3, which changes this to `Stopping local console.` and `exit=0`).
 
@@ -207,8 +209,8 @@ address.
 `--bind 192.0.2.10` without `--auth-file`, `--trusted-host x` without `--auth-file`,
 `--behind-proxy` without `--trusted-host`, `--behind-proxy --bind 192.0.2.10 …`,
 `--bind 0.0.0.0 --auth-file …` without `--trusted-host`);
-`test_trusted_hosts_accept_configured_names_and_https_origin` (`Host: mac.tailnet.ts.net`
-+ `Origin: https://mac.tailnet.ts.net` + credentials → 200; upper-case Host → 200;
+`test_trusted_hosts_accept_configured_names_and_https_origin` (`Host: mac.tailnet.ts.net` +
+`Origin: https://mac.tailnet.ts.net` + credentials → 200; upper-case Host → 200;
 `Host: other.ts.net` → 403 with `received_host == "other.ts.net"`; loopback Host still 200);
 `test_origin_must_match_effective_authority` (loopback `Host` + `Origin:
 https://mac.tailnet.ts.net` → 403; tailnet `Host` + `Origin: http://127.0.0.1:<port>` → 403;
@@ -235,6 +237,7 @@ cors` on `/` → 403; POST → 403);
 socket that sends nothing gets EOF within 2 s); `test_server_header_does_not_leak_python_version`.
 
 **Proof.**
+
 ```bash
 CONSOLE_TESTS=(tests/test_dca_console.py tests/test_dca_console_jobs.py tests/test_dca_console_data.py tests/test_dca_console_octopus.py tests/test_console_security_logging.py); AUTH=~/.config/all-stock-dca/console-auth
 .venv/bin/python -m ruff check . && .venv/bin/python -m pytest "${CONSOLE_TESTS[@]}" tests/test_config_invariants.py -q
@@ -249,6 +252,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: evil.example' "http://$LAN:87
 kill -TERM "$pid"; wait "$pid"; echo "exit=$?"
 .venv/bin/python from.py --local --no-browser --bind 0.0.0.0; echo "exit=$?"
 ```
+
 Expected: ruff clean; 100 console passes (87 + 13); the banner shows the plaintext
 warning; curl prints `200 401 200 403`; the stop step exits 143 (SIGTERM is unhandled until Rock 3); the last
 command prints the fail-closed message and `exit=2`. Then a phone on the same wifi:
@@ -288,6 +292,7 @@ previous full session's date to `--now`, captured from a monkeypatched `_command
 `test_summary_signature_cache_is_bounded` (100 distinct days → `len(app.signatures) <= 32`).
 
 **Proof.**
+
 ```bash
 CONSOLE_TESTS=(tests/test_dca_console.py tests/test_dca_console_jobs.py tests/test_dca_console_data.py tests/test_dca_console_octopus.py tests/test_console_security_logging.py); AUTH=~/.config/all-stock-dca/console-auth
 .venv/bin/python -m ruff check . && .venv/bin/python -m pytest "${CONSOLE_TESTS[@]}" -q
@@ -297,6 +302,7 @@ for _ in $(seq 1 40); do curl -sf -o /dev/null http://127.0.0.1:8765/api/health 
 kill -TERM "$pid"; wait "$pid"; echo "exit=$?"
 ! lsof -nP -iTCP:8765 -sTCP:LISTEN && echo "port released"
 ```
+
 Expected: 106 passes; `Stopping local console.` then `exit=0` within seconds, then
 `port released`. Manual (after Rock 4): with a tab open, `launchctl kickstart -k
 gui/$(id -u)/com.all-stock-dca.console`, then click "Test DCA pipeline" in the same tab
@@ -317,7 +323,7 @@ no `--label`. The renderer resolves `ROOT` once with precedence `--cron-tracking
 the plist environment and the log paths, so the plist is self-consistent whatever the
 invoking shell exported. Rendered dict:
 
-```
+```text
 Label                = com.all-stock-dca.console
 ProgramArguments     = [<python>, <checkout>/from.py, --local, --no-browser,
                         --port, 8765, --auth-file, <abs path>, (--trusted-host, H)*, (--behind-proxy),
@@ -337,7 +343,7 @@ No secret anywhere in the plist. `--install` writes
 `~/Library/LaunchAgents/com.all-stock-dca.console.plist` (0644), creates
 `<ROOT>/console/` (launchd creates log files but not their parent), and prints:
 
-```
+```bash
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.console.plist   # load + start
 launchctl print gui/$(id -u)/com.all-stock-dca.console | grep -E 'state|pid'             # status
 launchctl kickstart -k gui/$(id -u)/com.all-stock-dca.console                            # restart an UNCHANGED definition (e.g. after rotating the auth file)
@@ -378,6 +384,7 @@ exist); `test_default_python_is_used_when_flag_absent` (`DEFAULT_PYTHON` monkeyp
 `launchctl bootout` before `launchctl bootstrap`).
 
 **Proof.**
+
 ```bash
 CONSOLE_TESTS=(tests/test_dca_console.py tests/test_dca_console_jobs.py tests/test_dca_console_data.py tests/test_dca_console_octopus.py tests/test_console_security_logging.py); AUTH=~/.config/all-stock-dca/console-auth
 git add -N deploy/launchd tests/test_console_launchd.py \
@@ -390,6 +397,7 @@ git add -N deploy/launchd tests/test_console_launchd.py \
 && curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8765/api/health \
 && launchctl print gui/$(id -u)/com.all-stock-dca.console | grep -E 'state = |pid = '
 ```
+
 Expected: tests green (106 console + 8 launchd); `plutil` reports OK and exits 0; `200` (a cold launchd start takes up to ~30 s: the console probes optional packages in subprocesses before it listens); `state = running`
 with a pid. Afterwards `launchctl bootout gui/$(id -u)/com.all-stock-dca.console` and
 `tail -2 cron_tracking/console/launchd.out.log` shows `Stopping local console.`
@@ -402,6 +410,7 @@ the precise rule (loopback needs nothing; any non-loopback bind or external name
 `--auth-file`; forwarded headers only with `--behind-proxy` on a loopback bind; never
 `tailscale funnel`, never a bare port-forward; the launchd service is always loopback).
 Sub-sections:
+
 - **Phase A: home LAN (foreground, plaintext).** First sentence: this is plain HTTP on the
   home wifi and the credential crosses it on every 15-second refresh; use a disposable
   credential and rotate it before Phase B; never install it as the service. Note that
@@ -452,6 +461,7 @@ block gains `python3 from.py --local --no-browser`. `docs/repo_map.md` §1.7 row
 `MEMORY.md`, `DEFERRED.md`.
 
 **Proof.**
+
 ```bash
 CONSOLE_TESTS=(tests/test_dca_console.py tests/test_dca_console_jobs.py tests/test_dca_console_data.py tests/test_dca_console_octopus.py tests/test_console_security_logging.py)
 git add -N deploy/launchd tests/test_console_launchd.py DEFERRED.md \
@@ -488,7 +498,8 @@ Rock 4's launchd bootstrap / health / bootout cycle; Rock 3's open-tab job butto
 Common first step: rotate the credential file (regenerate it with the one-liner above; the
 Phase A value crossed the LAN in plaintext).
 
-**Tailscale Serve**
+### Tailscale Serve
+
 1. Install Tailscale on this Mac and the phone; log in (operator step). `tailscale serve
    --bg http://127.0.0.1:8765`; `tailscale serve status` shows the tailnet URL and no Funnel.
 2. Probe from a tailnet device (laptop on the tailnet, or the phone):
@@ -503,7 +514,8 @@ Phase A value crossed the LAN in plaintext).
    `https://<mac>.<tailnet>.ts.net/` prompts once, shows `LOCAL` mode with the latest
    scheduled runs, "Export JSON" downloads, a job button starts a job.
 
-**Cloudflare Tunnel + Access**
+### Cloudflare Tunnel + Access
+
 1. Install cloudflared on this Mac; log in (operator step). Local pre-check of the Host
    semantics: `curl -si -H 'Host: console.<domain>' http://127.0.0.1:8765/api/health` →
    403 with `received_host: console.<domain>`.
