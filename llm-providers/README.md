@@ -43,7 +43,7 @@ for chunk in client.stream(messages):
 ## Configuration (all via environment; nothing is hard-coded)
 
 | Variable | Read by | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `LLM_PROVIDER` | `get_client()` when called without an argument | `nvidia` (default), `anthropic`, `gemini` (aliases: `nim`, `nemotron`, `claude`, `google`) |
 | `NVIDIA_API_KEY` | `NvidiaNimClient` | NIM bearer key for `https://integrate.api.nvidia.com/v1` |
 | `ANTHROPIC_API_KEY` | `AnthropicClient` | |
@@ -61,7 +61,7 @@ Default models: `nvidia/nemotron-3-ultra-550b-a55b`, `claude-sonnet-5`, `gemini-
 Every adapter maps its SDK's exceptions onto one family, each carrying `.provider`:
 
 | Normalised | NVIDIA / Anthropic (`openai` / `anthropic`) | Gemini (`google.genai.errors`) |
-|---|---|---|
+| --- | --- | --- |
 | `LLMAuthError` | `AuthenticationError`, `PermissionDeniedError`, missing env var | `APIError` with code 401/403, missing env var |
 | `LLMRateLimitError` | `RateLimitError` | code 429 |
 | `LLMTimeoutError` | `APITimeoutError` | code 408/504, `TimeoutError`, httpx `*Timeout*` |
