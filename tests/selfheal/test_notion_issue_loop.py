@@ -54,6 +54,7 @@ _VALID_ROW: dict[str, object] = {
     "PR": None,
     "Last attempt": None,
     "Fixed on": None,
+    "Quiet since": None,
 }
 
 # One aggregated Run Log row, in the shape the documented GROUP BY produces.
@@ -93,8 +94,16 @@ def config() -> "loop.LoopConfig":
 
 @pytest.fixture()
 def enabled(config) -> "loop.LoopConfig":
-    """The shipped policy with the operator gate opened, for tick tests."""
-    return loop.replace_config(config, enabled=True)
+    """The shipped policy with the gate opened and the spend ceilings raised.
+
+    The shipped daily bound is one pull request, which is correct in production
+    but means the per-tick cap can never bind. Raising the two spend ceilings
+    here lets each of the three ceilings be exercised in isolation; the tests
+    that care about the shipped values use the ``config`` fixture instead.
+    """
+    return loop.replace_config(
+        config, enabled=True, max_prs_per_day=10, max_prs_per_month=50
+    )
 
 
 # --- parse_row: identity and required fields --------------------------------
@@ -115,6 +124,7 @@ def test_parse_row_returns_every_field_of_a_valid_row() -> None:
     assert row.pr_url is None
     assert row.last_attempt is None
     assert row.fixed_on is None
+    assert row.quiet_since is None
 
 
 def test_parse_row_is_frozen_so_a_decision_cannot_mutate_its_input() -> None:
@@ -242,7 +252,10 @@ def test_parse_row_reads_a_date_or_datetime_last_attempt(raw: object, expected: 
     assert loop.parse_row(_mapping(**{"Last attempt": raw})).last_attempt == expected
 
 
-@pytest.mark.parametrize("field,attribute", [("Last attempt", "last_attempt"), ("Fixed on", "fixed_on")])
+@pytest.mark.parametrize(
+    "field,attribute",
+    [("Last attempt", "last_attempt"), ("Fixed on", "fixed_on"), ("Quiet since", "quiet_since")],
+)
 def test_parse_row_also_accepts_the_expanded_date_column_spelling(field: str, attribute: str) -> None:
     # SQL mode exposes a date property only as "date:<name>:start"; accepting
     # both spellings keeps the Routine from reshaping rows before calling in.
@@ -252,7 +265,7 @@ def test_parse_row_also_accepts_the_expanded_date_column_spelling(field: str, at
     assert getattr(loop.parse_row(mapping), attribute) == date(2026, 9, 5)
 
 
-@pytest.mark.parametrize("field", ["Last attempt", "Fixed on"])
+@pytest.mark.parametrize("field", ["Last attempt", "Fixed on", "Quiet since"])
 @pytest.mark.parametrize("raw", ["05/09/2026", "2026-13-01", "yesterday"])
 def test_parse_row_rejects_an_unparseable_date(field: str, raw: str) -> None:
     with pytest.raises(loop.RowError) as excinfo:
@@ -520,7 +533,7 @@ def test_plan_tick_selects_the_top_rows_up_to_the_cap(enabled) -> None:
     facts = _facts(
         *[(f"blocks_{index}", index, "2026-09-16") for index in range(len(rows))]
     )
-    plan = loop.plan_tick(rows, config=enabled, facts=facts)
+    plan = loop.plan_tick(rows, config=enabled, facts=facts, calendar=(), prs_opened_this_month=0, prs_opened_today=0)
     assert len(plan.selected) == enabled.max_repairs_per_tick
     # Highest occurrence count first, so the cap sheds the least frequent rows.
     assert plan.selected[0].key == f"blocks_{len(rows) - 1}"
@@ -534,13 +547,13 @@ def test_plan_tick_reports_capped_rows_distinctly_from_ineligible_ones(enabled) 
     facts = _facts(
         *[(f"blocks_{index}", index + 1, "2026-09-16") for index in range(len(rows) - 1)]
     )
-    plan = loop.plan_tick(rows, config=enabled, facts=facts)
+    plan = loop.plan_tick(rows, config=enabled, facts=facts, calendar=(), prs_opened_this_month=0, prs_opened_today=0)
     assert plan.refusals["blocks_0"] == loop.TICK_CAP_REACHED
     assert plan.refusals["env_row"] == loop.CLASS_NOT_REPAIRABLE
 
 
 def test_plan_tick_selects_nothing_when_the_loop_is_disabled(config) -> None:
-    plan = loop.plan_tick([_row()], config=config, facts={})
+    plan = loop.plan_tick([_row()], config=config, facts={}, calendar=(), prs_opened_this_month=0, prs_opened_today=0)
     assert config.enabled is False
     assert plan.selected == ()
     assert plan.refusals[str(_VALID_ROW["Key"])] == loop.DISABLED
@@ -551,7 +564,7 @@ def test_plan_tick_selects_nothing_while_the_breaker_is_latched(enabled) -> None
         _row(Key=f"refused_{index}", **{"Fix state": "Refused"})
         for index in range(enabled.breaker_refused_threshold)
     ] + [_row(Key="fresh_row")]
-    plan = loop.plan_tick(rows, config=enabled, facts={})
+    plan = loop.plan_tick(rows, config=enabled, facts={}, calendar=(), prs_opened_this_month=0, prs_opened_today=0)
     assert plan.breaker_latched is True
     assert plan.selected == ()
     assert plan.refusals["fresh_row"] == loop.BREAKER_LATCHED
@@ -563,7 +576,7 @@ def test_plan_tick_gives_every_row_exactly_one_outcome(enabled) -> None:
         _row(Key="env_row", Class="Environmental"),
         _row(Key="done_row", **{"Fix state": "Repaired"}),
     ]
-    plan = loop.plan_tick(rows, config=enabled, facts={})
+    plan = loop.plan_tick(rows, config=enabled, facts={}, calendar=(), prs_opened_this_month=0, prs_opened_today=0)
     selected_keys = {row.key for row in plan.selected}
     assert selected_keys | set(plan.refusals) == {"admitted_row", "env_row", "done_row"}
     assert not (selected_keys & set(plan.refusals))
@@ -828,6 +841,413 @@ def test_a_repaired_row_with_no_fix_date_is_escalated_not_reopened(config) -> No
     assert update.needs_human is True
 
 
+# --- parse_run_calendar: which days the Run Log actually covers -------------
+
+
+def _calendar(*days: str) -> tuple:
+    """Build a logged-day calendar from the documented DISTINCT query shape."""
+    result = loop.parse_run_calendar([{"day": day} for day in days])
+    assert result.errors == ()
+    return result.days
+
+
+def test_parse_run_calendar_returns_sorted_distinct_days() -> None:
+    days = _calendar("2026-09-16", "2026-09-14", "2026-09-16", "2026-09-15")
+    assert days == (date(2026, 9, 14), date(2026, 9, 15), date(2026, 9, 16))
+
+
+@pytest.mark.parametrize("blank", [None, "", "   "])
+def test_parse_run_calendar_skips_an_undated_record(blank: object) -> None:
+    result = loop.parse_run_calendar([{"day": blank}, {"day": "2026-09-16"}])
+    assert result.days == (date(2026, 9, 16),)
+    assert result.errors == ()
+
+
+def test_parse_run_calendar_reports_an_unparseable_day() -> None:
+    result = loop.parse_run_calendar([{"day": "last Tuesday"}])
+    assert result.days == ()
+    assert any("day" in message for message in result.errors)
+
+
+def test_logged_days_since_counts_only_days_strictly_after() -> None:
+    # Weekend and holiday gaps must not read as health, which is the whole
+    # reason this counts logged days rather than calendar days.
+    days = _calendar("2026-09-14", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18")
+    assert loop.logged_days_since(date(2026, 9, 16), calendar=days) == 2
+    assert loop.logged_days_since(date(2026, 9, 18), calendar=days) == 0
+    assert loop.logged_days_since(date(2026, 9, 13), calendar=days) == 5
+
+
+# --- plan_quiet_check: an issue someone fixed by hand ------------------------
+
+
+def _quiet_calendar() -> tuple:
+    """Five logged days, the last three of them after 2026-09-15."""
+    return _calendar("2026-09-14", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18")
+
+
+def test_an_open_row_gone_quiet_is_proposed_as_handled(config) -> None:
+    # Three logged days with no recurrence is the configured threshold, so the
+    # loop proposes the row as handled rather than dispatching a repair for
+    # something that has stopped happening.
+    facts = _facts(("market_data_unavailable", 4, "2026-09-15"))
+    update = loop.plan_quiet_check(_row(), facts=facts, calendar=_quiet_calendar(), config=config)
+    assert update is not None
+    assert update.status == "Monitoring"
+    # Fix state is untouched: the loop is guessing, not claiming a repair.
+    assert update.fix_state == loop.STATE_NEW
+    assert update.needs_human is True
+    assert "2026-09-15" in update.note
+
+
+def test_a_row_one_logged_day_short_of_the_threshold_is_left_alone(config) -> None:
+    facts = _facts(("market_data_unavailable", 4, "2026-09-16"))
+    assert loop.plan_quiet_check(
+        _row(), facts=facts, calendar=_quiet_calendar(), config=config
+    ) is None
+
+
+def test_a_quiet_row_already_marked_monitoring_is_not_reproposed(config) -> None:
+    # Idempotence: without this the loop would comment on the same row every
+    # tick for as long as it stayed quiet.
+    facts = _facts(("market_data_unavailable", 4, "2026-09-15"))
+    row = _row(Status="Monitoring", **{"Quiet since": "2026-09-15"})
+    assert loop.plan_quiet_check(
+        row, facts=facts, calendar=_quiet_calendar(), config=config
+    ) is None
+
+
+def test_a_monitoring_row_whose_code_fires_after_the_baseline_is_reopened(config) -> None:
+    # The self-correcting half: a wrong guess must not bury a live issue. The
+    # baseline is what makes this a recurrence rather than an inference: the
+    # code was recorded again strictly after the loop stopped watching.
+    facts = _facts(("market_data_unavailable", 9, "2026-09-18"))
+    row = _row(Status="Monitoring", **{"Quiet since": "2026-09-16"})
+    update = loop.plan_quiet_check(row, facts=facts, calendar=_quiet_calendar(), config=config)
+    assert update is not None
+    assert update.status == "Open"
+    assert update.quiet_since is None
+    assert update.needs_human is False
+    assert "2026-09-18" in update.note
+
+
+def test_a_quiet_transition_records_the_baseline_it_will_be_judged_against(config) -> None:
+    facts = _facts(("market_data_unavailable", 4, "2026-09-15"))
+    update = loop.plan_quiet_check(_row(), facts=facts, calendar=_quiet_calendar(), config=config)
+    assert update is not None
+    assert update.quiet_since == date(2026, 9, 15)
+
+
+def test_a_monitoring_row_the_loop_did_not_mark_is_never_touched(config) -> None:
+    # Without a baseline the loop did not put this row in Monitoring, so an
+    # operator did. Reopening it would override a human decision on nothing
+    # more than an inference (Copilot review, PR #1494).
+    facts = _facts(("market_data_unavailable", 9, "2026-09-18"))
+    row = _row(Status="Monitoring", **{"Quiet since": None})
+    assert loop.plan_quiet_check(
+        row, facts=facts, calendar=_quiet_calendar(), config=config
+    ) is None
+
+
+def test_a_monitoring_row_with_no_occurrence_after_its_baseline_stays_put(config) -> None:
+    # Same-day is not evidence, matching the regression check's rule.
+    facts = _facts(("market_data_unavailable", 4, "2026-09-16"))
+    row = _row(Status="Monitoring", **{"Quiet since": "2026-09-16"})
+    assert loop.plan_quiet_check(
+        row, facts=facts, calendar=_quiet_calendar(), config=config
+    ) is None
+
+
+def test_quiet_check_declines_to_judge_without_a_calendar(config) -> None:
+    # Absence of a code is only evidence if runs actually happened. With no
+    # logged days the check must fail open, because failing closed here would
+    # stall every dispatch whenever the Run Log is stale.
+    facts = _facts(("market_data_unavailable", 4, "2026-09-15"))
+    assert loop.plan_quiet_check(_row(), facts=facts, calendar=(), config=config) is None
+
+
+def test_quiet_check_declines_to_judge_a_code_never_logged(config) -> None:
+    assert loop.plan_quiet_check(
+        _row(), facts={}, calendar=_quiet_calendar(), config=config
+    ) is None
+
+
+@pytest.mark.parametrize("state", ["In review", "Repaired", "Quarantined"])
+def test_quiet_check_ignores_rows_it_does_not_own(config, state: str) -> None:
+    # In review belongs to plan_outcome and Repaired to plan_regression_check;
+    # a quarantined row is terminal. Acting here would fight those.
+    facts = _facts(("market_data_unavailable", 4, "2026-09-15"))
+    row = _row(**{"Fix state": state})
+    assert loop.plan_quiet_check(
+        row, facts=facts, calendar=_quiet_calendar(), config=config
+    ) is None
+
+
+def test_plan_tick_refuses_a_quiet_row_independently_of_the_quiet_check(enabled) -> None:
+    # Belt and braces: the quiet check proposes a Status flip, but a tick that
+    # ran before that flip was applied would otherwise still dispatch. The tick
+    # refuses quiet rows on its own so ordering cannot waste a pull request.
+    facts = _facts(("market_data_unavailable", 4, "2026-09-15"))
+    plan = loop.plan_tick(
+        [_row()],
+        config=enabled,
+        facts=facts,
+        calendar=_quiet_calendar(),
+        prs_opened_this_month=0, prs_opened_today=0,
+    )
+    assert plan.selected == ()
+    assert plan.refusals[str(_VALID_ROW["Key"])] == loop.APPARENTLY_RESOLVED
+
+
+# --- the daily spend bound ---------------------------------------------------
+
+
+def test_plan_tick_selects_nothing_once_the_daily_pr_budget_is_spent(enabled) -> None:
+    # A per-tick cap is not a per-day cap: it only coincides while the schedule
+    # fires exactly once a day. A manual re-fire or a retry would otherwise buy
+    # a whole fresh tick's worth of pull requests.
+    plan = loop.plan_tick(
+        [_row()],
+        config=enabled,
+        facts={},
+        calendar=(),
+        prs_opened_this_month=0,
+        prs_opened_today=enabled.max_prs_per_day,
+    )
+    assert plan.selected == ()
+    assert plan.refusals[str(_VALID_ROW["Key"])] == loop.DAILY_SPEND_EXHAUSTED
+
+
+def test_the_daily_remainder_caps_the_tick_below_its_own_limit(enabled) -> None:
+    rows = [
+        _row(Key=f"blocks_{index}", Severity="Blocks slot")
+        for index in range(enabled.max_repairs_per_tick + 1)
+    ]
+    facts = _facts(*[(f"blocks_{index}", index + 1, "2026-09-16") for index in range(len(rows))])
+    plan = loop.plan_tick(
+        rows,
+        config=enabled,
+        facts=facts,
+        calendar=(),
+        prs_opened_this_month=0,
+        prs_opened_today=enabled.max_prs_per_day - 1,
+    )
+    assert len(plan.selected) == 1
+    assert set(plan.refusals.values()) == {loop.DAILY_SPEND_EXHAUSTED}
+
+
+def test_the_shipped_daily_bound_is_one_pull_request(config) -> None:
+    # Mirrors config/self_heal.json's max_repairs_per_day, which is the
+    # operator's stated once-per-day rule for the sibling policy.
+    assert config.max_prs_per_day == 1
+
+
+def test_the_tightest_of_the_three_ceilings_wins(enabled) -> None:
+    # Daily, monthly and per-tick are independent. Whichever binds first is the
+    # one reported, so the refusal names the limit that actually stopped work.
+    rows = [_row(Key=f"blocks_{index}") for index in range(3)]
+    facts = _facts(*[(f"blocks_{index}", 1, "2026-09-16") for index in range(3)])
+    monthly_bound = loop.plan_tick(
+        rows, config=enabled, facts=facts, calendar=(),
+        prs_opened_this_month=enabled.max_prs_per_month, prs_opened_today=0,
+    )
+    daily_bound = loop.plan_tick(
+        rows, config=enabled, facts=facts, calendar=(),
+        prs_opened_this_month=0, prs_opened_today=enabled.max_prs_per_day,
+    )
+    assert set(monthly_bound.refusals.values()) == {loop.MONTHLY_SPEND_EXHAUSTED}
+    assert set(daily_bound.refusals.values()) == {loop.DAILY_SPEND_EXHAUSTED}
+
+
+@pytest.mark.parametrize("spent", [-1, 1.5, "1", True, None])
+def test_plan_tick_rejects_an_unusable_daily_count(enabled, spent: object) -> None:
+    with pytest.raises(loop.LoopStateError):
+        loop.plan_tick(
+            [_row()], config=enabled, facts={}, calendar=(),
+            prs_opened_this_month=0, prs_opened_today=spent,
+        )
+
+
+# --- the monthly spend bound -------------------------------------------------
+
+
+def test_plan_tick_selects_nothing_once_the_monthly_pr_budget_is_spent(enabled) -> None:
+    # Every dispatched pull request costs a full CI fan-out, so an unbounded
+    # loop is an unbounded spend. This is the ceiling that makes it bounded.
+    plan = loop.plan_tick(
+        [_row()],
+        config=enabled,
+        facts={},
+        calendar=(),
+        prs_opened_this_month=enabled.max_prs_per_month, prs_opened_today=0,
+    )
+    assert plan.selected == ()
+    assert plan.refusals[str(_VALID_ROW["Key"])] == loop.MONTHLY_SPEND_EXHAUSTED
+
+
+def test_the_monthly_remainder_caps_the_tick_below_its_own_limit(enabled) -> None:
+    rows = [
+        _row(Key=f"blocks_{index}", Severity="Blocks slot")
+        for index in range(enabled.max_repairs_per_tick + 1)
+    ]
+    facts = _facts(*[(f"blocks_{index}", index + 1, "2026-09-16") for index in range(len(rows))])
+    # One pull request left in the month, so the tick cap is not the binding
+    # constraint and the rows it sheds are shed for the budget reason.
+    plan = loop.plan_tick(
+        rows,
+        config=enabled,
+        facts=facts,
+        calendar=(),
+        prs_opened_this_month=enabled.max_prs_per_month - 1, prs_opened_today=0,
+    )
+    assert len(plan.selected) == 1
+    assert set(plan.refusals.values()) == {loop.MONTHLY_SPEND_EXHAUSTED}
+
+
+def test_the_tick_cap_still_binds_when_the_monthly_remainder_is_larger(enabled) -> None:
+    rows = [
+        _row(Key=f"blocks_{index}", Severity="Blocks slot")
+        for index in range(enabled.max_repairs_per_tick + 1)
+    ]
+    facts = _facts(*[(f"blocks_{index}", index + 1, "2026-09-16") for index in range(len(rows))])
+    plan = loop.plan_tick(
+        rows, config=enabled, facts=facts, calendar=(), prs_opened_this_month=0, prs_opened_today=0
+    )
+    assert len(plan.selected) == enabled.max_repairs_per_tick
+    assert set(plan.refusals.values()) == {loop.TICK_CAP_REACHED}
+
+
+@pytest.mark.parametrize("spent", [-1, 1.5, "3", True, None])
+def test_plan_tick_rejects_an_unusable_monthly_count(enabled, spent: object) -> None:
+    # Fail closed: a caller that cannot count what it has already spent must
+    # not be allowed to spend more by passing something meaningless.
+    with pytest.raises(loop.LoopStateError):
+        loop.plan_tick(
+            [_row()], config=enabled, facts={}, calendar=(), prs_opened_this_month=spent, prs_opened_today=0
+        )
+
+
+def test_the_breaker_takes_precedence_over_the_spend_bound(enabled) -> None:
+    # Both are stop conditions, and the breaker wins: it is a safety latch that
+    # a human must clear, so a spend ceiling must never mask it in the report.
+    # An earlier version of this test was named the other way round and only
+    # checked key accounting, so it passed while asserting nothing about
+    # precedence at all (Copilot review, PR #1494).
+    rows = [
+        _row(Key=f"refused_{index}", **{"Fix state": "Refused"})
+        for index in range(enabled.breaker_refused_threshold)
+    ] + [_row(Key="fresh_row")]
+    plan = loop.plan_tick(
+        rows,
+        config=enabled,
+        facts={},
+        calendar=(),
+        prs_opened_this_month=enabled.max_prs_per_month, prs_opened_today=0,
+    )
+    assert plan.selected == ()
+    assert set(plan.refusals) == {row.key for row in rows}
+    assert plan.refusals["fresh_row"] == loop.BREAKER_LATCHED
+    assert plan.breaker_latched is True
+
+
+# --- dispatch claims: making the spend bound atomic -------------------------
+
+
+def test_a_claim_ref_names_its_day_and_slot() -> None:
+    assert loop.claim_ref_for(date(2026, 9, 20), 1) == "selfheal-claim/2026-09-20/1"
+
+
+def test_a_claim_ref_round_trips() -> None:
+    result = loop.parse_claim_refs(["selfheal-claim/2026-09-20/2"])
+    assert result.claims == ((date(2026, 9, 20), 2),)
+    assert result.errors == ()
+
+
+def test_parse_claim_refs_ignores_unrelated_refs() -> None:
+    # The caller lists every remote ref; branches and tags are not claims.
+    result = loop.parse_claim_refs(
+        ["main", "notion-fix/cap_breach", "selfheal-claim/2026-09-20/1", "v1.2.3"]
+    )
+    assert result.claims == ((date(2026, 9, 20), 1),)
+    assert result.errors == ()
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "selfheal-claim/not-a-date/1",
+        "selfheal-claim/2026-09-20/zero",
+        "selfheal-claim/2026-09-20/0",
+        "selfheal-claim/2026-09-20/-1",
+        "selfheal-claim/2026-09-20",
+    ],
+)
+def test_parse_claim_refs_reports_a_malformed_claim(ref: str) -> None:
+    # A ref that looks like a claim but cannot be read is reported, never
+    # silently dropped: dropping one would under-count the spend.
+    result = loop.parse_claim_refs([ref])
+    assert result.claims == ()
+    assert any(ref in message for message in result.errors)
+
+
+def test_the_next_claim_takes_the_lowest_unused_slot_for_the_day(config) -> None:
+    claims = ((date(2026, 9, 20), 1), (date(2026, 9, 20), 3))
+    plan = loop.next_claim(
+        claims,
+        day=date(2026, 9, 20),
+        config=loop.replace_config(config, max_prs_per_day=5, max_prs_per_month=50),
+    )
+    assert plan.ref == "selfheal-claim/2026-09-20/2"
+    assert plan.reason == loop.ADMITTED
+
+
+def test_the_next_claim_is_refused_once_the_day_is_spent(config) -> None:
+    # The shipped daily bound is one, so a single existing claim spends it.
+    claims = ((date(2026, 9, 20), 1),)
+    plan = loop.next_claim(claims, day=date(2026, 9, 20), config=config)
+    assert plan.ref is None
+    assert plan.reason == loop.DAILY_SPEND_EXHAUSTED
+
+
+def test_the_next_claim_is_refused_once_the_month_is_spent(config) -> None:
+    spent = loop.replace_config(config, max_prs_per_day=5, max_prs_per_month=3)
+    claims = tuple((date(2026, 9, day), 1) for day in (1, 2, 3))
+    plan = loop.next_claim(claims, day=date(2026, 9, 20), config=spent)
+    assert plan.ref is None
+    assert plan.reason == loop.MONTHLY_SPEND_EXHAUSTED
+
+
+def test_the_monthly_ceiling_is_checked_before_the_daily_one(config) -> None:
+    spent = loop.replace_config(config, max_prs_per_day=1, max_prs_per_month=2)
+    claims = ((date(2026, 9, 1), 1), (date(2026, 9, 2), 1), (date(2026, 9, 20), 1))
+    plan = loop.next_claim(claims, day=date(2026, 9, 20), config=spent)
+    assert plan.reason == loop.MONTHLY_SPEND_EXHAUSTED
+
+
+def test_claims_from_another_month_do_not_count(config) -> None:
+    spent = loop.replace_config(config, max_prs_per_day=5, max_prs_per_month=2)
+    claims = ((date(2026, 8, 30), 1), (date(2026, 8, 31), 1))
+    plan = loop.next_claim(claims, day=date(2026, 9, 20), config=spent)
+    assert plan.ref == "selfheal-claim/2026-09-20/1"
+
+
+def test_an_abandoned_claim_still_counts_as_spent(config) -> None:
+    # Fail-closed settlement: a claim whose dispatch died before the pull
+    # request opened is indistinguishable from one that succeeded, and the
+    # safe reading is that the slot is gone (Copilot review, PR #1494).
+    claims = ((date(2026, 9, 20), 1),)
+    plan = loop.next_claim(claims, day=date(2026, 9, 20), config=config)
+    assert plan.ref is None
+
+
+def test_spend_counts_derived_from_claims_feed_plan_tick(config) -> None:
+    # The counts plan_tick takes come from the claim refs, which are an atomic
+    # source, rather than from a caller tallying pull requests by hand.
+    claims = ((date(2026, 9, 1), 1), (date(2026, 9, 20), 1))
+    assert loop.claims_on(claims, day=date(2026, 9, 20)) == 1
+    assert loop.claims_in_month(claims, day=date(2026, 9, 20)) == 2
+
+
 # --- config -----------------------------------------------------------------
 
 
@@ -837,6 +1257,12 @@ def test_load_config_reads_the_shipped_document() -> None:
     assert config.breaker_refused_threshold >= 1
     assert config.review_lease_days >= 1
     assert config.max_repairs_per_tick >= 1
+    assert config.max_prs_per_month >= 1
+    assert config.max_prs_per_day >= 1
+    assert config.quiet_logged_days >= 1
+    # The monthly ceiling must be able to bind before the per-tick one does,
+    # or the spend bound is decorative.
+    assert config.max_prs_per_month >= config.max_prs_per_day
 
 
 def test_the_shipped_config_ships_disabled() -> None:
@@ -859,6 +1285,9 @@ def _valid_document() -> dict[str, object]:
         "max_attempts_per_issue": 3,
         "breaker_refused_threshold": 3,
         "review_lease_days": 14,
+        "max_prs_per_month": 20,
+        "max_prs_per_day": 1,
+        "quiet_logged_days": 3,
     }
 
 
@@ -884,7 +1313,7 @@ def test_load_config_rejects_duplicate_keys(tmp_path) -> None:
     path.write_text(
         '{"$schema": "../schemas/notion_issue_loop.schema.json", "enabled": false,'
         ' "max_repairs_per_tick": 1, "max_repairs_per_tick": 9,'
-        ' "max_attempts_per_issue": 3, "breaker_refused_threshold": 3, "review_lease_days": 14}',
+        ' "max_attempts_per_issue": 3, "breaker_refused_threshold": 3, "review_lease_days": 14, "max_prs_per_month": 20, "max_prs_per_day": 1, "quiet_logged_days": 3}',
         encoding="utf-8",
     )
     with pytest.raises(loop.LoopConfigError):
@@ -899,6 +1328,9 @@ def test_load_config_rejects_duplicate_keys(tmp_path) -> None:
         "max_attempts_per_issue",
         "breaker_refused_threshold",
         "review_lease_days",
+        "max_prs_per_month",
+        "max_prs_per_day",
+        "quiet_logged_days",
     ],
 )
 def test_load_config_rejects_a_missing_required_key(tmp_path, key: str) -> None:
@@ -933,6 +1365,9 @@ def test_load_config_rejects_a_malformed_integer(tmp_path, value: object) -> Non
         ("max_attempts_per_issue", 99),
         ("breaker_refused_threshold", 999),
         ("review_lease_days", 999),
+        ("max_prs_per_month", 9999),
+        ("max_prs_per_day", 999),
+        ("quiet_logged_days", 999),
     ],
 )
 def test_load_config_enforces_an_upper_bound_on_every_integer(tmp_path, key, value) -> None:

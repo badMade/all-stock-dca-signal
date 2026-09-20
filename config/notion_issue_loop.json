@@ -2,7 +2,10 @@
   "$schema": "../schemas/notion_issue_loop.schema.json",
   "enabled": false,
   "max_repairs_per_tick": 3,
+  "max_prs_per_month": 20,
+  "max_prs_per_day": 1,
   "max_attempts_per_issue": 3,
   "breaker_refused_threshold": 3,
-  "review_lease_days": 14
+  "review_lease_days": 14,
+  "quiet_logged_days": 3
 }
