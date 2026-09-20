@@ -160,7 +160,11 @@ py-modules = [
 # the live artifact writer (near_close_dca.build_run_artifacts) and readers
 # (dca_risk, dca_reporting) -- it must ship with the installed package, not just
 # exist in a checkout, or those imports fail at runtime (see scripts/__init__.py).
-packages = ["scripts"]
+# selfheal/ holds the bounded self-heal foundations and the Notion-backed issue
+# loop. Both resolve their own config through sys.prefix, so the package must be
+# installed rather than merely present in a checkout, or load() raises on a wheel
+# (CLAUDE.md: "New top-level module or config file => update pyproject.toml").
+packages = ["scripts", "selfheal"]
 
 # Ship the version-controlled config so an installed `run-dca` (outside a checkout) finds
 # the live trading window instead of falling back to the hardcoded defaults. dca_config
@@ -201,6 +205,13 @@ packages = ["scripts"]
     # this list from dca_config's own _read_json call sites (2026-09-07
     # diagnostic, P:PACKAGING-01).
     "config/near_close_dca.json",
+    # Read by selfheal.config.load and selfheal.notion_issue_loop.load_config,
+    # both of which check sys.prefix/share/all-stock-dca/config after the
+    # checkout path. Without these the strict loaders raise on an installed
+    # wheel instead of finding the policy they are meant to enforce. The rest of
+    # the self-heal packaging acceptance remains Rock 7's.
+    "config/self_heal.json",
+    "config/notion_issue_loop.json",
 ]
 
 # Browser assets for the 3D market graph, resolved at runtime by

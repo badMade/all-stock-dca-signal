@@ -10,4 +10,4 @@ from pathlib import Path
 # repository's real package directory.
 __path__.append(str(Path(__file__).resolve().parents[2] / "selfheal"))
 
-__all__ = ["config", "reasons"]
+__all__ = ["config", "notion_issue_loop", "reasons"]

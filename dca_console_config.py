@@ -54,6 +54,7 @@ CONFIG_FILES: tuple[tuple[str, str | None, bool], ...] = (
     ("morning_dca", None, False),
     ("near_close_dca", None, False),
     ("notifications", "notifications", False),
+    ("notion_issue_loop", "notion_issue_loop", False),
     ("per_ticker_sizing", None, True),
     ("reporting", "reporting", False),
     ("run_classification", "run_classification_policy", False),
@@ -79,6 +80,7 @@ LOADERS: dict[str, str] = {
     "midday_dca": "midday_dca.load_midday_config", "intraday_dca": "intraday_dca.load_intraday_config",
     "scheduled_tasks": "dca_console_data (schedule) / scripts", "run_classification": "scripts.run_classification",
     "notifications": "dca_alerts", "reporting": "dca_reporting", "self_heal": "self-heal workflow",
+    "notion_issue_loop": "selfheal.notion_issue_loop.load_config",
     "backtest_intraday_cap_curve": "analytics only; never loaded live",
 }
 # What a malformed file does to a live start. Line references are dca_config.py:
