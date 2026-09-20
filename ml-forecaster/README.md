@@ -76,7 +76,7 @@ gitignored the same way the root `CLAUDE.md` gives `cron_tracking/`/`artifacts/`
 ## The pipeline
 
 | Module | Role |
-|---|---|
+| --- | --- |
 | `features.py` | OHLCV archive CSV -> per-day, per-ticker feature rows. Own small loader -- does NOT cross-import `ticker-advisor/pricing.py`, keeping the two sibling tools independently deployable. Reads the archive location via `dca_ticker_paths.configured_ticker_history_dir()` through a `sys.path` splice to the repo root, the same pattern `ticker-advisor/pricing.py`/`advise_tickers.py` already use for that import. |
 | `model.py` | The pooled Ridge model: `fit()` (needs scikit-learn), `TrainedModel.predict_return_pct()`/`predict_multipliers()` (plain numpy, no scikit-learn needed), JSON `to_dict()`/`from_dict()`/`save()`/`load()`, and `rescale_return_to_multiplier()`. |
 | `evaluate.py` | Chronological expanding-window walk-forward backtest: MAE/RMSE/directional hit-rate for the model and two naive baselines (predict-zero, predict-trailing-mean), per fold and averaged overall. |
