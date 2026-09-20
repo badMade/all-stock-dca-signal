@@ -66,7 +66,7 @@ spread, whitelist, or circuit-breaker requirements.
 
 64 active symbols (see [`config/tickers.json`](../config/tickers.json)):
 
-```
+```text
 DFTX TRIN AAAU SPCX EVR LUNR IRDM DXYZ LITE ASML DRAM STX
 MSFT AAPL AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR
 INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN RKLB
@@ -90,7 +90,7 @@ VIAV CIEN ANET CSCO FFIV COHR
 > Existing exclusions remain BYDDY, VCX, TRLV, and RVI; corrected symbols IRDM
 > and GLW remain; IBM and GFUZ remain included (GFUZ with Robinhood primary if
 > finance is unresolved).
-
+>
 > **TICKER UNIVERSE UPDATE JUL 27 2026:** RKLB (Rocket Lab Corporation) is
 > added to the active DCA universe. Robinhood resolved RKLB as Rocket Lab
 > Corporation Common Stock, state active, tradeable true, fractional
@@ -98,7 +98,7 @@ VIAV CIEN ANET CSCO FFIV COHR
 > available ($63.91 as of 2026-07-24). Existing exclusions remain BYDDY, VCX,
 > TRLV, and RVI; corrected symbols IRDM and GLW remain; IBM, GFUZ, and TXN
 > remain included.
-
+>
 > **TICKER UNIVERSE UPDATE AUG 2 2026:** `GE`, `VRT`, `CAT`, `QQQ`, `QCOM`,
 > `ABBV`, and `JPM` are added to the active DCA universe. The active universe
 > is now **52 symbols**. `DJX` ("Dow Jones Industrial Average Mini Index") was
@@ -109,7 +109,7 @@ VIAV CIEN ANET CSCO FFIV COHR
 > remain included. This adds whitelisted symbols only; it preserves all
 > existing trading safety, pre-authorization, top-up, run-classification,
 > budget, cost-conscious, manual-exclusion, and recovery text.
-
+>
 > **TICKER UNIVERSE UPDATE AUG 4 2026:** `VT` (Vanguard Total World Stock ETF)
 > is added to the active DCA universe, taking it to **53 symbols**. Read this
 > one differently from the additions above: every earlier symbol was confirmed
@@ -128,7 +128,7 @@ VIAV CIEN ANET CSCO FFIV COHR
 > This adds a whitelisted symbol only; it preserves all existing trading
 > safety, pre-authorization, top-up, run-classification, budget,
 > cost-conscious, manual-exclusion, and recovery text.
-
+>
 > **TICKER UNIVERSE UPDATE AUG 16 2026 (user-requested):** `QBUT` and `RVII`
 > are added to the active DCA universe as new symbols. `RVI` and `VCX` are
 > also added, **reversing the AUG 5 2026 exclusion decision** above at the
@@ -145,7 +145,7 @@ VIAV CIEN ANET CSCO FFIV COHR
 > `scripts/generate_per_ticker_sizing.py` is re-run. `TRLV` remains
 > excluded; `BYDDY` remains excluded separately for its ADR wind-down
 > status.
-
+>
 > **TICKER UNIVERSE UPDATE AUG 16 2026, SECOND UPDATE (user-requested):**
 > `TRLV` is added to the active DCA universe, reversing the last piece of
 > the AUG 5 2026 exclusion decision above and leaving `BYDDY` as the
@@ -164,7 +164,7 @@ VIAV CIEN ANET CSCO FFIV COHR
 > and [whole_share_accumulation.md](whole_share_accumulation.md) for the
 > opt-in path built to track `BYDDY`'s would-be buys and fire a single
 > whole-share purchase instead.
-
+>
 > **TICKER UNIVERSE UPDATE AUG 24 2026 (user-requested):** `RVII` moves out of
 > the active DCA universe into the **whole-share** category, taking the active
 > universe back to **57 symbols** and making `BYDDY` and `RVII` the two
@@ -187,17 +187,17 @@ Boundaries are min-inclusive, max-exclusive. There is **no upper cutoff**: any
 drop of 8% or more is 5x. See [`config/sizing_ladder.json`](../config/sizing_ladder.json).
 
 | Drop vs. prior close | Multiplier | Dollars ($2 base) | Dollars ($1 base) |
-|---|---|---|---|
-| < 0.1%            | 0x (no buy) | $0.00 | $0.00 |
-| 0.1% to < 2%      | 1x   | $2.00 | $1.00 |
-| 2% to < 4%        | 1.5x | $3.00 | $1.50 |
-| 4% to < 5%        | 2x   | $4.00 | $2.00 |
-| 5% to < 6%        | 2.5x | $5.00 | $2.50 |
-| 6% to < 6.5%      | 3x   | $6.00 | $3.00 |
-| 6.5% to < 7%      | 3.5x | $7.00 | $3.50 |
-| 7% to < 7.5%      | 4x   | $8.00 | $4.00 |
-| 7.5% to < 8%      | 4.5x | $9.00 | $4.50 |
-| >= 8%             | 5x   | $10.00 | $5.00 |
+| --- | --- | --- | --- |
+| < 0.1% | 0x (no buy) | $0.00 | $0.00 |
+| 0.1% to < 2% | 1x | $2.00 | $1.00 |
+| 2% to < 4% | 1.5x | $3.00 | $1.50 |
+| 4% to < 5% | 2x | $4.00 | $2.00 |
+| 5% to < 6% | 2.5x | $5.00 | $2.50 |
+| 6% to < 6.5% | 3x | $6.00 | $3.00 |
+| 6.5% to < 7% | 3.5x | $7.00 | $3.50 |
+| 7% to < 7.5% | 4x | $8.00 | $4.00 |
+| 7.5% to < 8% | 4.5x | $9.00 | $4.50 |
+| >= 8% | 5x | $10.00 | $5.00 |
 
 **Rescaled 2026-08-02.** The prior curve stepped uniformly every 1% from 0.1% to
 8%. This one is flatter on shallow dips — 1x now runs to 2% and 1.5x to 4% — and
@@ -248,7 +248,7 @@ close only) as hardcoded, user-confirmed fallbacks.
 > (5x x $2); the $1 scale tops out at $5. Ladder multipliers, the ticker
 > universe, exclusions, budget caps, the top-up guard, pre-authorization,
 > confidence, recovery, and all other safety rules are unchanged.
-
+>
 > **Base-amount change (Jul 19 2026):** the user changed all future DCA
 > scheduled runs from a $3 base amount to a $2 base amount. Superseded by the
 > dynamic first-allocation base above; retained for history.
@@ -260,7 +260,7 @@ before sizing runs, not an output of the sizing decision. Tier selection never
 keys on planned spend.
 
 | Tier | Select when | Daily cap | Weekly cap |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Normal | 3x+ signals <= 5 | $180 | $900 |
 | Elevated | 3x+ signals 6-10 | $240 | $1,200 |
 | High-volatility | 3x+ signals 11-17 | $300 | $1,500 |

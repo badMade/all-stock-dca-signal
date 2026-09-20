@@ -3615,7 +3615,7 @@ redispatch sizing to the claim's restored credit"). Tracking that entitlement in
 fungible pool takes several scalar fields plus a ledger counter and per-field snapshots:
 
 | Field | Written by | Read by |
-|---|---|---|
+| --- | --- | --- |
 | `restored_credit_usd` | both preserve paths, and a zero-share reprice | `_redispatchable_credit_usd()` |
 | `restored_credit_as_of_withdrawn_usd` | alongside the restored credit | `_redispatchable_credit_usd()`'s aging |
 | `claim_credit_remainder_usd` | every path that sizes a fire | the preserve fold |
@@ -3704,7 +3704,7 @@ and the review history is evidence that it is hard to hold correct by hand.
 [Issue #868](https://github.com/badMade/all-stock-dca/issues/868) proposes collapsing the
 pairs into one aged entitlement:
 
-```
+```text
 claim_entitlement_usd            # what this claim owns of the pool
 entitlement_as_of_withdrawn_usd  # withdrawn_usd_total when that was last written
 ```
