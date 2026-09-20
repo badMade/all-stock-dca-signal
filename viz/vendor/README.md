@@ -23,7 +23,7 @@ maintain in a repository whose competence is trading logic, not graphics.
 ## three.js
 
 | | |
-|---|---|
+| --- | --- |
 | Version | **0.149.0** (r149) |
 | File | `build/three.min.js` (UMD) |
 | License | MIT (see `three.LICENSE`) |

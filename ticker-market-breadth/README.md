@@ -25,24 +25,24 @@ a separate, deliberate change -- not something this script does on its own.
 `<history_dir>/_breadth/TICK.csv` instead of a top-level `TICK.csv`, for two
 reasons found in review:
 
-  * The documented daily archive-refresh flow enumerates every `{TICKER}.csv`
-    DIRECTLY under the archive root and re-fetches each stem AS A YAHOO
-    SYMBOL. That updater is external to this repo (not part of this
-    checkout), so its exact filtering logic can't be verified from here --
-    an earlier cut of this module relied on an underscore-prefixed top-level
-    filename (`"_TICK.csv"`) on the unverifiable assumption that updater
-    also skips underscore stems. A subdirectory is a structural guarantee
-    instead: a top-level `*.csv` glob never descends into it, matching the
-    archive's existing `_intraday/` subtree.
-  * `ml-forecaster/features.py`'s and `wondrous-octopus/data.py`'s training
-    pipelines assume every archived series is a positive asset price -- NYSE
-    TICK is a signed breadth count that regularly goes negative, and pooling
-    it in as an ordinary "ticker" would feed meaningless features into the
-    pooled Ridge model behind live sizing adjustments. Their own
-    `discover_available_tickers()` helpers glob only `*.csv` directly under
-    the archive root too, so the subdirectory keeps this out of their
-    default `--all-tickers-in-archive` discovery for the same structural
-    reason.
+* The documented daily archive-refresh flow enumerates every `{TICKER}.csv`
+  DIRECTLY under the archive root and re-fetches each stem AS A YAHOO
+  SYMBOL. That updater is external to this repo (not part of this
+  checkout), so its exact filtering logic can't be verified from here --
+  an earlier cut of this module relied on an underscore-prefixed top-level
+  filename (`"_TICK.csv"`) on the unverifiable assumption that updater
+  also skips underscore stems. A subdirectory is a structural guarantee
+  instead: a top-level `*.csv` glob never descends into it, matching the
+  archive's existing `_intraday/` subtree.
+* `ml-forecaster/features.py`'s and `wondrous-octopus/data.py`'s training
+  pipelines assume every archived series is a positive asset price -- NYSE
+  TICK is a signed breadth count that regularly goes negative, and pooling
+  it in as an ordinary "ticker" would feed meaningless features into the
+  pooled Ridge model behind live sizing adjustments. Their own
+  `discover_available_tickers()` helpers glob only `*.csv` directly under
+  the archive root too, so the subdirectory keeps this out of their
+  default `--all-tickers-in-archive` discovery for the same structural
+  reason.
 
 See `tests/test_fetch_tick.py::test_archive_path_is_a_subdirectory_not_a_top_level_file`
 for the regression test that pins this down.

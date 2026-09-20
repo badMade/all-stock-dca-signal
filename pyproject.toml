@@ -345,6 +345,8 @@ extraPaths = [
     "production-safe-agent-loop",
     "wondrous-octopus",
     "dca-sizing-signals",
+    "ticker-market-breadth",
+    "trading-strategies",
 ]
 typeCheckingMode = "basic"
 reportGeneralTypeIssues = false
@@ -354,6 +356,8 @@ executionEnvironments = [
     { root = "ticker-advisor", extraPaths = ["ticker-advisor", "."] },
     { root = "production-safe-agent-loop", extraPaths = ["production-safe-agent-loop", "."] },
     { root = "dca-sizing-signals", extraPaths = ["dca-sizing-signals", "."] },
+    { root = "ticker-market-breadth", extraPaths = ["ticker-market-breadth", "."] },
+    { root = "trading-strategies", extraPaths = ["trading-strategies", "."] },
     { root = ".", extraPaths = ["tests", "scripts"] },
 ]
 

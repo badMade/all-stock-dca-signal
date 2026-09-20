@@ -365,7 +365,7 @@ def test_write_tick_csv_merges_a_download_missing_older_history(tmp_path):
 
     merged = pd.read_csv(_archive_path(history_dir), index_col="Date", parse_dates=True)
     assert len(merged) == 4
-    assert list(merged.index.date.astype(str)) == ["2020-01-02", "2020-01-03", "2020-06-01", "2020-06-02"]
+    assert pd.to_datetime(merged.index).strftime("%Y-%m-%d").tolist() == ["2020-01-02", "2020-01-03", "2020-06-01", "2020-06-02"]
 
 
 def test_write_tick_csv_merges_a_download_missing_recent_history(tmp_path):
@@ -418,7 +418,7 @@ def test_write_tick_csv_merges_an_interior_gap_download(tmp_path):
     write_tick_csv(interior_gap, history_dir)
 
     merged = pd.read_csv(_archive_path(history_dir), index_col="Date", parse_dates=True)
-    assert list(merged.index.date.astype(str)) == [
+    assert pd.to_datetime(merged.index).strftime("%Y-%m-%d").tolist() == [
         "2020-01-02",
         "2020-01-03",
         "2020-01-06",
@@ -458,8 +458,8 @@ def test_fetch_tick_history_normalizes_a_tz_aware_dst_spanning_index(monkeypatch
 
     normalized = fetch_tick_history()
 
-    assert normalized.index.tz is None
-    assert list(normalized.index.date.astype(str)) == ["2024-01-02", "2024-06-03"]
+    assert getattr(normalized.index, "tz", None) is None
+    assert pd.to_datetime(normalized.index).strftime("%Y-%m-%d").tolist() == ["2024-01-02", "2024-06-03"]
 
 
 def test_fetch_tick_history_keeps_the_exchange_local_date_for_a_late_ny_bar(monkeypatch):
@@ -483,7 +483,7 @@ def test_fetch_tick_history_keeps_the_exchange_local_date_for_a_late_ny_bar(monk
 
     normalized = fetch_tick_history()
 
-    assert list(normalized.index.date.astype(str)) == ["2024-01-02"]
+    assert pd.to_datetime(normalized.index).strftime("%Y-%m-%d").tolist() == ["2024-01-02"]
 
 
 def test_write_tick_csv_merges_a_dst_spanning_download_against_the_archive(tmp_path, monkeypatch):

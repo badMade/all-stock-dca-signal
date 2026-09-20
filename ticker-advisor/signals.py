@@ -126,7 +126,7 @@ def _calmar(cagr: float, max_drawdown: float) -> float:
 
 
 def _beta_alpha(returns: pd.Series, benchmark: pd.Series, rf_daily: float) -> tuple[float, float]:
-    from scipy import stats
+    from scipy import stats  # pyright: ignore[reportMissingTypeStubs]
 
     aligned = pd.concat([returns, benchmark], axis=1, join="inner").dropna()
     if len(aligned) < MIN_OBSERVATIONS:
@@ -545,7 +545,7 @@ def _reject_filing_redirect(response, **_kwargs) -> None:
         raise ValueError("SEC filing document redirect refused")
 
 
-def _extract_filing_snippet(raw_document: str) -> str | None:
+def _extract_filing_snippet(raw_document: object) -> str | None:
     """Reduce a fetched filing document to a bounded, sentiment-scorable text snippet.
 
     Filing documents are HTML (occasionally plain text) and can run to
@@ -595,7 +595,7 @@ def fetch_sec_filings(
     limit: int = 3,
     days: int | None = None,
     timeout: float = 10.0,
-    fetcher: Callable[[], dict] | None = None,
+    fetcher: Callable[[], Any] | None = None,
     document_fetcher: Callable[[str], str] | None = None,
     errors: list[str] | None = None,
     as_of: "date | None" = None,
@@ -879,7 +879,7 @@ def fetch_news_headlines(
     days: int = 7,
     page_size: int = 20,
     timeout: float = 10.0,
-    fetcher: Callable[[], dict] | None = None,
+    fetcher: Callable[[], Any] | None = None,
     errors: list[str] | None = None,
     as_of: "datetime | None" = None,
 ) -> list[dict[str, str]]:
@@ -1103,13 +1103,12 @@ def _resolve_finbert_revision(
 
 
 class FinbertSentimentAnalyzer:
-    """Loads FinBERT once; reuse a single instance across every candidate.
+    """Pipelines ProsusAI/finbert sequence-classification over news and SEC filings."""
 
-    Model loading (the expensive part) happens in ``__init__``, not per
-    call, so a caller scoring N candidates should build one analyzer and
-    pass it to every ``sentiment_score`` call rather than let each call
-    construct its own.
-    """
+    _tokenizer: Any = None
+    _model: Any = None
+    _labels: list[str] = []
+    _inference_lock: threading.Lock | None = None
 
     # Class-level guard for ``_get_inference_lock``'s lazy creation of the
     # per-instance ``_inference_lock``. Lives on the class (not in
@@ -1198,7 +1197,7 @@ class FinbertSentimentAnalyzer:
                     self._inference_lock = lock
         return lock
 
-    def score_texts(self, texts: list[str], *, batch_size: int = 16) -> list[dict[str, object]]:
+    def score_texts(self, texts: list[str], *, batch_size: int = 16) -> list[dict[str, Any]]:
         """Run FinBERT over ``texts``, chunked by ``batch_size`` to bound peak memory.
 
         Returns one dict per input text (same order), each with:
@@ -1215,7 +1214,7 @@ class FinbertSentimentAnalyzer:
             return []
         import torch
 
-        results: list[dict[str, object]] = []
+        results: list[dict[str, Any]] = []
         # A candidate's news + SEC items are scored in one call; chunking
         # bounds peak memory for an unusually large batch rather than
         # tokenizing/running the whole list through the model in one forward
@@ -1252,11 +1251,11 @@ def sentiment_score(
     ticker: str,
     *,
     news_api_key: str | None = None,
-    analyzer: "FinbertSentimentAnalyzer | None" = None,
+    analyzer: Any = None,
     days: int = 7,
     sec_limit: int = 3,
     as_of: "datetime | None" = None,
-) -> dict[str, object] | None:
+) -> dict[str, Any] | None:
     """News + SEC-filing sentiment for ``ticker``, or ``None`` if no text was found.
 
     Bypasses ``sentiment_monitor.py``'s ``run_pipeline``/``EmailBriefing``

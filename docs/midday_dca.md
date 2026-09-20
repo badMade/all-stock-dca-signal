@@ -8,9 +8,9 @@ this one ladder; the former morning-only 0x-to-3x ladder is historical/supersede
 It is implemented by [`midday_dca.MiddayDCAExecutor`](../midday_dca.py) and
 governed by [`config/midday_dca.json`](../config/midday_dca.json).
 
-| Mode | Task | ET | Trades | run_type | schema | Artifact root |
-|---|---|---|---|---|---|---|
-| `live` | `a6239dae` | 12:30 PM | **yes** | `midday_dca_live` | `midday-live-v1` | `.../cron_tracking/midday_dca/` |
+| Mode   | Task         | ET         | Trades    | run_type           | schema            | Artifact root                     |
+| ------ | ------------ | ---------- | --------- | ------------------ | ----------------- | --------------------------------- |
+| `live` | `a6239dae`   | 12:30 PM   | **yes**   | `midday_dca_live`  | `midday-live-v1`  | `.../cron_tracking/midday_dca/`   |
 
 `MiddayDCAExecutor` subclasses `MorningDCAExecutor` and reuses the entire
 evaluate/build/write pipeline, overriding only the stream-identity attributes and

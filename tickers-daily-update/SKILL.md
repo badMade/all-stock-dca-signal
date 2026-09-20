@@ -33,7 +33,7 @@ the original, superseded text.
 
 ---
 
-You maintain a large local archive of Yahoo Finance daily price history: one CSV per ticker (~6,058 tickers) saved in the user's Google Drive at "/Users/geoffplymale/My Drive/Tickers" (in the sandbox this same folder is reachable via the workspace bash tool at "/sessions/<session>/mnt/My Drive/Tickers" — use whichever path form your Read/Write/Bash tools expect; if "My Drive" is not already connected/mounted, request access to it first via the Cowork directory-access tool before proceeding).
+You maintain a large local archive of Yahoo Finance daily price history: one CSV per ticker (~6,058 tickers) saved in the user's Google Drive at "/Users/geoffplymale/My Drive/Tickers" (in the sandbox this same folder is reachable via the workspace bash tool at `/sessions/<session>/mnt/My Drive/Tickers` — use whichever path form your Read/Write/Bash tools expect; if "My Drive" is not already connected/mounted, request access to it first via the Cowork directory-access tool before proceeding).
 
 There is already a maintenance script for this at:
 /Users/geoffplymale/Documents/Claude/Projects/Code/stock-history-downloader-updates/incremental_update.py
@@ -41,6 +41,7 @@ There is already a maintenance script for this at:
 What this script does (don't rewrite it, just run it): it lists every {TICKER}.csv already saved in the Tickers folder (that file listing IS the ticker universe — no need to re-fetch any master list), fetches a small recent window (period="10d") per ticker from Yahoo via yfinance in batches, and merges fresh rows into each existing CSV — replacing any rows for dates that already exist (self-healing, in case an earlier run got truncated/corrupted data) and appending new trailing trading days. It never touches the older full-history rows outside that 10-day window. It is time-budgeted (~30s per invocation) and resumable via a `_update_progress.json` progress file that resets each new calendar day, so you MUST invoke it repeatedly in a loop until it prints "ALL_DONE" — a single invocation only processes part of the list.
 
 Steps:
+
 1. Ensure dependencies are present (idempotent, fast if already installed):
    pip3 install --break-system-packages --quiet yfinance pandas
 2. Loop: run `cd "/path/to/Code/stock-history-downloader-updates" && python3 incremental_update.py` repeatedly (each call has its own ~30-45s internal time budget and will print a line like "DONE_THIS_RUN updated=N remaining=M"). Keep calling it until it prints "ALL_DONE" (all tickers refreshed for today) OR until remaining stops decreasing across 3-4 consecutive calls (this means Yahoo is throttling this session hard for the day — see the note on persistent stragglers below). Cap yourself at roughly 40 invocations total to avoid an unbounded loop; if still not done after that, stop and report partial progress honestly.

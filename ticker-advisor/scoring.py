@@ -11,7 +11,7 @@ import math
 import re
 import statistics
 from dataclasses import dataclass, field
-from typing import TypeGuard
+from typing import Any, Mapping, TypeGuard
 
 # Exactly config/tickers.json's `active`/`excluded` schema pattern
 # (schemas/tickers.schema.json). Shared between advise_tickers.py (filters
@@ -58,7 +58,7 @@ class TickerScore:
     """
 
     ticker: str
-    raw: dict[str, object]
+    raw: Mapping[str, Any]
     sub_scores: dict[str, float | None]
     composite: float | None
     classification: str
@@ -155,9 +155,9 @@ def classify(composite: float | None) -> str:
 
 
 def combine_scores(
-    per_ticker_raw_scores: dict[str, dict[str, object]],
+    per_ticker_raw_scores: Mapping[str, Mapping[str, Any]],
     *,
-    weights: dict[str, float] | None = None,
+    weights: Mapping[str, float] | None = None,
 ) -> dict[str, TickerScore]:
     """Combine each candidate's raw ``health``/``backtest``/``sentiment`` signals.
 
@@ -291,7 +291,7 @@ def combine_scores(
     return results
 
 
-def rank(scores: dict[str, TickerScore]) -> list[TickerScore]:
+def rank(scores: Mapping[str, TickerScore]) -> list[TickerScore]:
     """Highest composite first; candidates with no composite sort last."""
     return sorted(scores.values(), key=lambda s: (s.composite is None, -(s.composite or 0.0)))
 

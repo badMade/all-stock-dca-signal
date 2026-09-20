@@ -7,7 +7,7 @@ under `cron_tracking/`.
 
 It **supplements** the daily OHLCV archive; it does not replace or modify it.
 
-```
+```text
 ticker_data/AMD.csv            <- daily OHLCV, one row per trading day (unchanged)
 ticker_data/_intraday/AMD.csv  <- this archive, one row per poll per trading day
 ```

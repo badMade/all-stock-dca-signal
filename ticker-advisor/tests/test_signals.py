@@ -189,12 +189,13 @@ def test_generate_rsi_reversion_signals_enters_on_recovery_not_the_dip():
     rsi = _wilder_rsi(close, period=14)
     entries, _exits = generate_rsi_reversion_signals(close, rsi_period=14, rsi_low=30.0, rsi_high=70.0)
 
-    entry_days = entries[entries].index
+    entry_days = entries.loc[entries].index
     assert len(entry_days) >= 1
     for day in entry_days:
         # On an entry day, RSI must be AT/ABOVE rsi_low with the PRIOR day
         # below it -- i.e. crossing up out of oversold, not down into it.
         position = close.index.get_loc(day)
+        assert isinstance(position, int)
         assert position > 0
         assert rsi.iloc[position] >= 30.0
         assert rsi.iloc[position - 1] < 30.0
@@ -777,6 +778,7 @@ def test_extract_filing_snippet_strips_tags_collapses_whitespace_and_caps_length
 
     snippet = _extract_filing_snippet(raw)
 
+    assert snippet is not None
     assert snippet.startswith("Hello World")
     assert "<p>" not in snippet
     assert len(snippet) <= 4000

@@ -259,7 +259,7 @@ def adjusted_ohlc(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     return frame, dropped
 
 
-def truncate_as_of(frame: pd.DataFrame, as_of: pd.Timestamp | None) -> pd.DataFrame:
+def truncate_as_of(frame: pd.DataFrame, as_of: Any) -> pd.DataFrame:
     """Drop rows dated on or after ``as_of``'s own calendar day.
 
     The calendar-day-EXCLUSIVE rule from ml-forecaster/features.py's
