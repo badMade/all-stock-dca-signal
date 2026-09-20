@@ -186,7 +186,7 @@ def test_jobs_cancel_route_requires_the_token_and_a_closed_body(app):
 
         import dca_console_jobs
         previous = dca_console_jobs.subprocess.Popen
-        dca_console_jobs.subprocess.Popen = capture_process
+        dca_console_jobs.subprocess.Popen = capture_process  # type: ignore
         try:
             command = Command((_sys.executable, "-c", "import time; time.sleep(30)"), app.settings.output, dict(os.environ))
             submitted = app.jobs.submit("demo-dca", "Cancellable", lambda job_id, log: app.jobs.run_command(command, log))

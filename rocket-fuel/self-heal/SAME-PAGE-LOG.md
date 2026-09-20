@@ -87,7 +87,6 @@ stated proofs cannot establish the plan: FIX — Replace isolated proofs with ex
 future-model accounting is scope creep: KILL — Retain enforceable Actions, wall-clock, and attempt limits now and move model-token and pricing accounting to the deferred LLM cycle.
 VERDICT: BLOCKED — 23 open finding(s)
 
-
 ### Visionary's read (pending adjudication)
 
 Round 1 returned `VERDICT: BLOCKED — 23 open finding(s)`: 20 BLOCKER, 2 MAJOR, 3 KILL
@@ -114,7 +113,7 @@ premise would corrupt the revision:
   proposed to build on is already broken.
 
 | # | Finding | Severity | Verdict | Visionary's position |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | 1 | diagnostics-branch trust paradox | BLOCKER | **KILL, accepted** | Agreed without reservation. Revision 3 deletes the orphan branch and the new privileged trigger entirely. The local daemon becomes the sole dispatcher and opens an ordinary PR via `gh`; the existing `CI` workflow validates it. "CI healer" becomes "CI verifier" — the hosted sandbox still validates every repair, which is what actually mattered in interview Q2, with no mutable ref able to control a privileged job. |
 | 2 | admission is neither atomic nor authoritative | BLOCKER | FIX, accepted | Agreed. Finding 1's topology change makes this tractable: one writer, so one authoritative reservation under `O_EXCL`, keyed `(run_id, fingerprint)`, taken before any repair work. |
 | 3 | loop controls only throttle | BLOCKER | FIX, accepted | Agreed, and this is the finding that most damages Revision 2. The VTO claimed "any one mechanism alone halts a runaway"; that was false. Daily buckets reset, fingerprints re-mint on any edit above the crash site, and a 72h auto-reopening breaker is a delay, not a stop. Revision 3 adds a **latched** breaker with no automatic cooldown (human reset only) and a finite **lifetime** work bound over a rolling window. The VTO sentence is corrected on the record rather than quietly dropped. |
@@ -141,14 +140,13 @@ premise would corrupt the revision:
 
 **Net:** 23 of 23 accepted. Revision 2 is not patchable into shape — findings 1, 3, 13 and 18 each invalidate a load-bearing structural choice — so Revision 3 is a restructure, not a diff.
 
-
 ## Round 2 — Revision 3 (restructure)
 
 Invocation: `codex exec resume <session> -m gpt-5.6-sol -c 'sandbox_mode="read-only"' --json`
 Usage: 9,430,874 input tokens (9,095,808 cached), 84,077 output, 69,664 reasoning.
 Prompt: `SAME-PAGE-PROMPT-ROUND-2.md` (tracked).
 
-### Codex reply
+### Codex reply (Round 2)
 
 Revision 3 cleanly resolves two original findings; twenty-one remain open, plus one new blocker.
 
@@ -230,13 +228,12 @@ generic healer is removed, and an end-to-end proof reaches a verified PR from a 
 incident. That is a scope decision belonging to the operator, so the meeting pauses here
 rather than spending rounds 3-5 elaborating a plan that may be about to be cut in half.
 
-
 ## Round 3 — Revision 4 (operator scope cut)
 
 Usage: 11,634,113 input tokens (11,184,384 cached), 103,459 output, 83,321 reasoning.
 Prompt: `SAME-PAGE-PROMPT-ROUND-3.md`.
 
-### Codex reply
+### Codex reply (Round 3)
 
 Reviewed PLAN `b10be1ab`, VTO `088ce275`, the backups, deferred list, and cited repository files. There are exactly seven Rocks. The config test file still collects 205 tests, but the account invariant now fails after Revision 2’s backup became tracked.
 
@@ -306,7 +303,7 @@ Reviewed PLAN `b10be1ab`, VTO `088ce275`, the backups, deferred list, and cited 
 
 VERDICT: BLOCKED — 18 open finding(s)
 
-### Visionary's read
+### Visionary's read (Round 3)
 
 `VERDICT: BLOCKED — 18 open finding(s)`. Trajectory 23 -> 22 -> 18; six findings now resolved
 (8, 12, 13, 18, 20, 23) plus round 2's new BLOCKER.
@@ -349,12 +346,11 @@ Round 4 was dispatched against Revision 5 with one added instruction: findings t
 irreducible for a single-operator local daemon may be marked ACCEPTED-RESIDUAL, because a plan
 cannot stay blocked on a property no implementation of this product could have.
 
-
 ## Round 4 — Revision 5
 
 Usage: 15,060,254 input (14,354,304 cached), 130,256 output, 103,408 reasoning.
 
-### Codex reply
+### Codex reply (Round 4)
 
 Revision 5 is materially stronger, but 14 carried findings and one new KILL remain open.
 
@@ -422,7 +418,7 @@ VERDICT: BLOCKED — 15 open finding(s)
 
 Usage: 17,902,517 input (17,146,368 cached), 147,911 output, 117,081 reasoning.
 
-### Codex reply
+### Codex reply (Round 5)
 
 Revision 6 closes most findings, but I would still block the build on 11 defects.
 
@@ -516,28 +512,28 @@ Two of them are fatal to the operator's own stated requirements and neither was 
 The other nine are precise and individually cheap, and several are my own carelessness rather
 than genuine design difficulty:
 
-3. Collector process groups can be orphaned when the supervisor kills and reaps only the worker
+1. Collector process groups can be orphaned when the supervisor kills and reaps only the worker
    group before releasing the singleton lock.
-4. The Gemini-backed reviewer invoked by every self-heal PR has no token/call/USD ceiling, and
+2. The Gemini-backed reviewer invoked by every self-heal PR has no token/call/USD ceiling, and
    no proof recomputes the timeout sum when workflows change.
-5. The budget period counter is durable but its rollover evidence still comes from the mutable
+3. The budget period counter is durable but its rollover evidence still comes from the mutable
    wall clock.
-6. The redaction regex still fails `account_id_<digits>` and `account_number_<digits>` — the
+4. The redaction regex still fails `account_id_<digits>` and `account_number_<digits>` — the
    optional `(?:nbr|number|no|id)?` group sits before the separator class, so a separator
    *preceding* the qualifier is unmatched. A one-character fix to a pattern I claimed covered
    exactly these forms.
-7. The composite CI cursor still skips attempt 2 of an older run once the cursor passes to a
+5. The composite CI cursor still skips attempt 2 of an older run once the cursor passes to a
    newer run id, and `gh run list` offers no oldest-first ordering.
-8. `max_cumulative_skew_seconds` became load-bearing in Revision 6 with no default, no ceiling,
+6. `max_cumulative_skew_seconds` became load-bearing in Revision 6 with no default, no ceiling,
    and no stated relationship to the shortest reset period.
-9. The launchd working directory is the artifact root, which gives `git worktree` no repository
+7. The launchd working directory is the artifact root, which gives `git worktree` no repository
    path; and `pip install .` installs neither Ruff nor the healthcheck tooling, since both are
    optional extras the minimal PATH cannot recover.
-10. Rock 4 still tests `setitimer` and expired-lock theft — mechanisms Revision 6 deleted. Rock
-    7 never proves the cascaded files absent.
-11. `VTO.md` and `DEFERRED.md` still identify as Revision 5, the VTO still promises a
-    "complete" archive twice, and PLAN defines the budget period both as calendar-month UTC and
-    as a non-calendar monotonic counter.
+8. Rock 4 still tests `setitimer` and expired-lock theft — mechanisms Revision 6 deleted. Rock
+   7 never proves the cascaded files absent.
+9. `VTO.md` and `DEFERRED.md` still identify as Revision 5, the VTO still promises a
+   "complete" archive twice, and PLAN defines the budget period both as calendar-month UTC and
+   as a non-calendar monotonic counter.
 
 ### The tradeoff, stated plainly
 
@@ -563,7 +559,7 @@ Rock before the Visionary takes the wheel.
 Each of the 11 still-open findings is assigned to the Rock that must close it:
 
 | # | Finding | Closed by |
-|---|---|---|
+| --- | --- | --- |
 | 1 | nothing invokes `repair` | Rock 6 (CLI) + Rock 7 (plist) |
 | 2 | no `max_repairs_per_day` rule or proof | **Rock 1** (config) + Rock 5 (admission) |
 | 3 | orphaned collector process groups | Rock 4 (supervisor) |

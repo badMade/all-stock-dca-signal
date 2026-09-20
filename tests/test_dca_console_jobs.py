@@ -340,12 +340,16 @@ def test_log_since_returns_only_unseen_text_and_reports_window_truncation(tmp_pa
         join_job(manager)
         assert manager.log_since("missing-job", 0) is None
         first = manager.log_since(submitted["id"], 0)
+        assert first is not None
         assert first["offset"] == 30_100 and first["truncated"] is True
         assert first["text"] == "b" * 24_000 and first["status"] == "completed"
         tail = manager.log_since(submitted["id"], 30_090)
+        assert tail is not None
         assert tail["text"] == "b" * 10 and tail["truncated"] is False
-        assert manager.log_since(submitted["id"], 30_100)["text"] == ""
-        assert manager.log_since(submitted["id"], 99_999)["text"] == ""
+        at_end = manager.log_since(submitted["id"], 30_100)
+        assert at_end is not None and at_end["text"] == ""
+        past_end = manager.log_since(submitted["id"], 99_999)
+        assert past_end is not None and past_end["text"] == ""
     finally:
         manager.close()
 

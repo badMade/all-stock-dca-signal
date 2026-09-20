@@ -139,7 +139,7 @@ def _scan_root(root: str, *, as_of: date, window_days: int) -> Dict[str, Any]:
         else:
             reason_counts[reason] += 1
     return {
-        "root": str(root),
+        "root": root,
         "exists": exists,
         "run_state_files_found": len(files),
         "files_unreadable": files_unreadable,

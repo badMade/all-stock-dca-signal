@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from datetime import date
+from typing import Any, cast
 
 import pytest
 from test_dca_console import request, running_server
@@ -59,7 +60,7 @@ def seed_payloads(root, extra):
 def test_payload_discovery_picks_the_newest_per_slot_without_paths(app, tmp_path):
     seed_payloads(app.settings.root, tmp_path / "artifacts")
     roots = (RootSpec.of(app.settings.root, "primary"), RootSpec.of(tmp_path / "artifacts", "secondary"))
-    payloads = latest_gate5_payloads(roots)
+    payloads = cast(dict[str, dict[str, Any]], latest_gate5_payloads(roots))
     assert set(payloads) == set(GATE5_SLOTS)
     assert payloads["1330"]["trading_day"] == "2026-09-16" and payloads["1330"]["day_source"] == "filename"
     assert payloads["1030"]["trading_day"] == "2026-09-14" and payloads["1030"]["day_source"] == "run directory"
@@ -114,6 +115,7 @@ def test_gate5_replay_refuses_without_usable_risk_evidence(app, tmp_path):
     assert code == 1 and calls == []
     assert any("Refusing the replay" in line for line in lines)
     manifest = read_manifest(app, "job-a")
+    assert manifest is not None
     assert manifest["action"] == "gate5-replay-1230" and manifest["artifacts"] == []
     assert "payload" in manifest["inputs"] and str(tmp_path) not in json.dumps(manifest)
 
@@ -131,6 +133,7 @@ def test_run_launch_captures_documents_and_lists_them_in_the_manifest(app, tmp_p
     code = run_launch(app, "gate5-replay-1330", "job-b", lines.append, repo=REPO, run_command=fake_command, today=date(2026, 9, 8))
     assert code == 0
     manifest = read_manifest(app, "job-b")
+    assert manifest is not None
     assert [item["name"] for item in manifest["artifacts"]] == ["document.json"]
     assert manifest["inputs"]["payload"]["trading_day"] == "2026-09-16"
     assert any("Replay of saved inputs" in line for line in lines)
@@ -214,7 +217,9 @@ def test_drift_check_targets_the_newest_run_directory(app):
     assert run_launch(app, "drift-check", "job-d", lambda _: None, repo=REPO, run_command=fake_command, today=date(2026, 9, 8)) == 0
     argv = seen[0]
     assert argv[argv.index("--run-dir") + 1].endswith("20260908_1530ET")
-    assert read_manifest(app, "job-d")["inputs"]["run_dir"] == "scheduled_runs/20260908_1530ET"
+    manifest = read_manifest(app, "job-d")
+    assert manifest is not None
+    assert manifest["inputs"]["run_dir"] == "scheduled_runs/20260908_1530ET"
 
 
 def test_payload_discovery_is_cached_briefly_per_root_set(app, tmp_path, monkeypatch):
@@ -226,7 +231,11 @@ def test_payload_discovery_is_cached_briefly_per_root_set(app, tmp_path, monkeyp
     # Within the window the cached listing is returned unchanged...
     assert latest_gate5_payloads(roots, now=110.0)["1130"] == first["1130"]
     # ...and a fresh scan follows once it expires.
-    assert latest_gate5_payloads(roots, now=100.0 + launch.PAYLOAD_CACHE_SECONDS + 1)["1130"]["trading_day"] == "2026-09-20"
+    refreshed = latest_gate5_payloads(roots, now=100.0 + launch.PAYLOAD_CACHE_SECONDS + 1)
+    assert refreshed["1130"] is not None
+    assert refreshed["1130"]["trading_day"] == "2026-09-20"
     # A launch never trusts the cache: it re-discovers the newest payload itself.
-    assert launch._payload_path(roots, "1130")[0]["trading_day"] == "2026-09-20"
+    resolved_payload, _ = launch._payload_path(roots, "1130")
+    assert resolved_payload is not None
+    assert resolved_payload["trading_day"] == "2026-09-20"
     launch._PAYLOAD_CACHE.clear()

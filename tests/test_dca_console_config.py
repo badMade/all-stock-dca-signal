@@ -349,6 +349,7 @@ def test_text_redacts_and_scrubs_before_bounding():
     # of the synthetic account must not be what makes this pass.
     account = "x" * 495 + " 999000111"
     bounded = reader._text(account)
+    assert bounded is not None
     assert len(bounded) <= reader.MAX_TEXT and "9990" not in bounded and bounded.endswith(" [red")
     assert "999000111" not in bounded
     # Prose separates a path with whitespace (a token glued to a word, like a
@@ -356,6 +357,7 @@ def test_text_redacts_and_scrubs_before_bounding():
     # the path so only the redact-first ordering keeps "/home/" out.
     path = "y" * 493 + " /home/user/workspace/secretdir/f.json"
     scrubbed = reader._text(path)
+    assert scrubbed is not None
     assert "/home/" not in scrubbed and len(scrubbed) <= reader.MAX_TEXT and scrubbed.endswith(" [path]")
     assert reader._text("short " + SYNTHETIC_ACCOUNT) == "short [redacted]"
     assert reader._text("see /home/user/workspace/run_state.json") == "see [path]/run_state.json"
