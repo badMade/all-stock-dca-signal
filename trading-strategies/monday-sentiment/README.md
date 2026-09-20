@@ -11,8 +11,8 @@ z-scores against a 30-day rolling baseline, and sends an HTML email alert
 ## How It Differs from Generic Sentiment Scripts
 
 | Feature | Generic scripts | This script |
-|---|---|---|
-| Alert trigger | Always sends email | **Only sends if |z| ≥ 2.0** |
+| --- | --- | --- |
+| Alert trigger | Always sends email | **Only sends if \|z\| ≥ 2.0** |
 | Z-score threshold | Often 1.5 (noisy) | **2.0 (stricter, fewer false positives)** |
 | Data sources | News only | **NewsAPI + SEC EDGAR 8-K/10-K/10-Q** |
 | NLP model | VADER or TextBlob | **ProsusAI/finbert (finance-domain BERT)** |
@@ -42,7 +42,7 @@ from HuggingFace on first run and cached in `~/.cache/huggingface/`.
 ## Environment Variables
 
 | Variable | Required | Default | Description |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `NEWS_API_KEY` | Optional | — | NewsAPI.org API key. Without it, the script runs on SEC filings only. Get a free key at [newsapi.org](https://newsapi.org/register). |
 | `SMTP_USER` | Required for email | — | SMTP login username, e.g. `you@gmail.com` |
 | `SMTP_PASSWORD` | Required for email | — | SMTP password or app-specific password |
@@ -113,7 +113,7 @@ crontab -e        # edit crontab
 
 ## CLI Usage
 
-```
+```text
 python sentiment_cron.py [options]
 
 Options:
@@ -147,7 +147,7 @@ python sentiment_cron.py --days 14
 
 ## How It Works (Pipeline Summary)
 
-```
+```text
 1. Load FinBERT (ProsusAI/finbert) via HuggingFace pipeline
 2. Load rolling 30-day history from sentiment_history.json
    └── Prune entries older than 30 days
@@ -180,7 +180,7 @@ If zero tickers flagged:
 
 When one or more tickers are flagged, the email looks like this:
 
-```
+```text
 Subject: 🔔 Pre-Market Sentiment Alert — 2026-06-29 | 2 stocks flagged
 
 Header
@@ -230,7 +230,7 @@ Full Watchlist Summary
 
 When no tickers are flagged, **no email is sent** and the log records:
 
-```
+```text
 2026-06-29 07:02:14 [INFO] No significant sentiment shifts detected (threshold |z| >= 2.0) — skipping email.
 ```
 
@@ -262,6 +262,7 @@ scores to 2.5–3.5+, so this threshold does a good job separating signal
 from noise.
 
 Best for:
+
 - Blue-chip / large-cap watchlists (NVDA, AAPL, MSFT, TSLA, META)
 - Anyone who wants a tight inbox — only genuine regime shifts
 
@@ -273,6 +274,7 @@ shocks. With a 5-ticker watchlist and 2.5 threshold, you might see an alert
 only once every 2–3 months.
 
 Good for:
+
 - Busy executives who want zero noise
 - Supplementary alert layer on top of a 2.0-threshold script
 - Long-duration holds where weekly noise is irrelevant
@@ -366,7 +368,7 @@ maps directly to a simple two-column table.
 
 ## File Structure
 
-```
+```text
 monday-sentiment/
 ├── sentiment_cron.py        # Main script — everything in one file
 ├── README.md                # This file
@@ -383,7 +385,7 @@ this directory in version control.
 ## Error Handling Summary
 
 | Scenario | Behavior |
-|---|---|
+| --- | --- |
 | `NEWS_API_KEY` missing | Logs warning; continues with SEC filings only |
 | NewsAPI rate limit / network error | Logs warning; that ticker scored from SEC only |
 | SEC EDGAR request fails | Logs warning; that ticker scored from news only |

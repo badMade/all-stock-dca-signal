@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import csv
 import os
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Any, Dict, Iterator, NamedTuple, Sequence
+from typing import IO, Any, Dict, NamedTuple, Sequence
 from uuid import uuid4
 
 
@@ -43,7 +44,7 @@ def atomic_open_w(
     *,
     encoding: str = "utf-8",
     newline: str | None = None,
-) -> Iterator[IO[str]]:
+) -> Generator[IO[str]]:
     """Context manager yielding a text handle whose contents replace ``path`` atomically.
 
     Drop-in for ``path.open("w", ...)`` in artifact writers (including
@@ -383,7 +384,7 @@ def order_csv_covers(path: Path, expected_rows: Sequence[Dict[str, Any]]) -> boo
                     for row in reader:
                         order_id = row[id_idx] if id_idx != -1 and len(row) > id_idx else None
                         ticker = row[t_idx] if t_idx != -1 and len(row) > t_idx else None
-                        present.add(str(order_id or f"ticker:{ticker}"))
+                        present.add(order_id or f"ticker:{ticker}")
                 except ValueError:
                     pass
     except (OSError, UnicodeDecodeError, csv.Error):

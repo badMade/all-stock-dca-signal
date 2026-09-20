@@ -187,8 +187,8 @@ losses_a, losses_b = rng.uniform(0.001, 0.02, 40), rng.uniform(0.001, 0.02, 40)
 for la, lb in zip(losses_a, losses_b, strict=True):
     tracker.observe_day({"a": {c: la for c in ("open", "high", "low", "close")},
                          "b": {c: lb for c in ("open", "high", "low", "close")}})
-pandas_a = pd.Series(losses_a, dtype=np.float64).ewm(halflife=half_life, adjust=False).mean().iloc[-1]
-pandas_b = pd.Series(losses_b, dtype=np.float64).ewm(halflife=half_life, adjust=False).mean().iloc[-1]
+pandas_a = pd.Series(losses_a.tolist()).ewm(halflife=half_life, adjust=False).mean().iloc[-1]
+pandas_b = pd.Series(losses_b.tolist()).ewm(halflife=half_life, adjust=False).mean().iloc[-1]
 check("EWMA loss (model a) vs pandas ewm(adjust=False)",
       [tracker.mean_loss("a")["close"]], [pandas_a], tol=1e-12)
 # NOTE: the implementation guards division with + _LOSS_EPS. Omitting it here

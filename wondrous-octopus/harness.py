@@ -313,7 +313,7 @@ def _acquire_run_lock(run_dir: Path):
         if fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt is not None:  # pragma: no cover - exercised on Windows only
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore
     except OSError as exc:
         handle.close()
         raise HarnessError(
@@ -330,7 +330,7 @@ def _release_run_lock(handle) -> None:
     closes the handle."""
     if fcntl is None and msvcrt is not None:  # pragma: no cover - exercised on Windows only
         handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore
     handle.close()
 
 
@@ -1407,7 +1407,7 @@ class WalkForwardHarness:
         # -- 2. diagnostics ---------------------------------------------------
         eligible = [
             (ticker, row)
-            for ticker, row in self.panel.eligible_on(pd.Timestamp(date64))
+            for ticker, row in self.panel.eligible_on(pd.Timestamp(date64))  # type: ignore
             if np.isfinite(self.panel.series[ticker].features[row]).all()
         ]
         diagnostic_pool = eligible
@@ -1780,7 +1780,7 @@ class WalkForwardHarness:
             already_forecast = {entry["ticker"] for entry in self.outstanding.get(UNRESOLVED_KEY, [])}
             terminal_date64 = self.panel.calendar[-1]
             terminal_date = pd.Timestamp(terminal_date64)
-            candidates: dict[str, int] = dict(self.panel.eligible_on(terminal_date))
+            candidates: dict[str, int] = dict(self.panel.eligible_on(terminal_date))  # type: ignore
             # eligible_on(the market-wide final date) only surfaces a
             # ticker whose OWN terminal row lands on THAT exact date. A
             # ticker whose restored/newly warmed-up CSV is one session

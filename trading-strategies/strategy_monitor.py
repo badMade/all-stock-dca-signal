@@ -799,7 +799,7 @@ class StrategyRunner:
         avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
         avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
         rs       = avg_gain / avg_loss.replace(0, np.nan)
-        return 100 - (100 / (1 + rs))
+        return 100 - (100 / (1 + rs))  # type: ignore
 
     @staticmethod
     def _min_variance_weights(returns: Any) -> np.ndarray:

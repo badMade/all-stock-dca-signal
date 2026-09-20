@@ -470,7 +470,7 @@ def _estimate_cost(
     matrix = np.random.default_rng(0).normal(size=(size, size)).astype(np.float32)
     began = time.perf_counter()
     for _ in range(10):
-        matrix @ matrix
+        _ = matrix @ matrix
     gemm_seconds = (time.perf_counter() - began) / 10
     per_ticker_step = 2e-6 + gemm_seconds / 5e3  # empirical fudge: features + model math
     per_step = avg_daily * per_ticker_step * len(names)

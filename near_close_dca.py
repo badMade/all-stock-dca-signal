@@ -39526,7 +39526,7 @@ def run_daily_compact(
                 # write, and no archive is created for a canonical file that
                 # was never actually replaced.
                 _mode_switch_archive_state_text = _serialize_run_state(
-                    cast(Dict[str, Any], _prior_state_payload)
+                    _prior_state_payload
                 )
                 _mode_switch_archive_path = (
                     Path(options.artifacts_dir)

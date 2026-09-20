@@ -153,6 +153,8 @@ def fetch_data(
         )
 
         data: Dict[str, pd.DataFrame] = {}
+        if raw is None or raw.empty:
+            return data
 
         if isinstance(raw.columns, pd.MultiIndex):
             # Multiple tickers: columns are (field, ticker)

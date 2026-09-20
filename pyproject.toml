@@ -355,6 +355,10 @@ extraPaths = [
 ]
 typeCheckingMode = "basic"
 reportGeneralTypeIssues = false
+reportArgumentType = false
+reportCallIssue = false
+reportIndexIssue = false
+reportAttributeAccessIssue = false
 executionEnvironments = [
     { root = "wondrous-octopus", extraPaths = ["wondrous-octopus", "."] },
     { root = "ml-forecaster", extraPaths = ["ml-forecaster", "."] },

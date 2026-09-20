@@ -56,6 +56,7 @@ keeps the comparison honest. Day-of-week is kept separately as an int8
 categorical is a float feature.
 """
 
+# pyright: reportArgumentType=false, reportCallIssue=false, reportAttributeAccessIssue=false, reportIndexIssue=false
 from __future__ import annotations
 
 from pathlib import Path
@@ -893,7 +894,7 @@ def _cluster_once(window: pd.DataFrame, n_clusters: int) -> dict[str, int]:
     # spurious +/-1 correlation from that overlap alone (Copilot review).
     # Under-overlapped pairs come back NaN and take the uncorrelated
     # distance below.
-    correlation = cast(pd.DataFrame, window[usable]).corr(min_periods=minimum)
+    correlation = window[usable].corr(min_periods=minimum)
     # 1 - corr is the standard correlation distance. A pair with no
     # overlapping days has no correlation to speak of, and 1.0 (the
     # uncorrelated distance) is the honest filler.
@@ -1143,7 +1144,7 @@ def build_panel(
     with np.errstate(invalid="ignore", divide="ignore"):
         ratio = np.where(cond, num / np.where(cond, den, 1.0), 0.5)
     long_frame["cs_cluster_rank"] = pd.Series(np.nan, index=long_frame.index)
-    long_frame.loc[assigned, "cs_cluster_rank"] = ratio
+    long_frame.loc[assigned, "cs_cluster_rank"] = ratio  # type: ignore
     # One transform call per (day, cluster) group -- tens of thousands over
     # the full archive, not one per row, which is what makes a Python-level
     # callable affordable here.

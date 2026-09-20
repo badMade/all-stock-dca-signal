@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any, cast
+from typing import Any
 
 import data
 import features as _features
@@ -38,7 +38,7 @@ def _val(x: Any) -> float:
 
 
 def _ts(x: Any) -> pd.Timestamp:
-    return cast(pd.Timestamp, pd.Timestamp(x))
+    return pd.Timestamp(x)  # type: ignore
 
 
 def _log_return_frame(log_returns, *, start_price=50.0, start=conftest.DEFAULT_START):

@@ -238,7 +238,7 @@ def average_cost(roots: Sequence[RootSpec]) -> dict[str, Any]:
         "generated_at": str(snapshot.get("generated_at") or "")[:40] if isinstance(snapshot, dict) else None,
         "account_count": len(accounts),
         # Account numbers are keys in the artifact; the page only ever sees a digest of each.
-        "accounts": [hashlib.sha256(str(key).encode()).hexdigest()[:12] for key in list(accounts)[:50]],
+        "accounts": [hashlib.sha256(key.encode()).hexdigest()[:12] for key in list(accounts)[:50]],
         "combined": rows, "warnings": warnings,
     }
 
