@@ -1,3 +1,5 @@
+# Rock 1 Contract — Configuration and Reason Codes
+
 You are the Integrator. Build Rock 1 of the plan in rocket-fuel/self-heal/PLAN.md (Revision 6).
 Read PLAN.md and VTO.md first. You have workspace-write. Build ONLY what this contract says.
 
@@ -27,12 +29,12 @@ Create the configuration and reason-code foundation of the `selfheal` package:
 
 These two exist specifically to close Same Page findings and MUST be present:
 
-  * `max_repairs_per_day`: default 1, minimum 1, maximum 24. This is the operator's explicit
-    once-per-day requirement. Round 5 found it was never actually specified.
-  * `max_cumulative_skew_seconds`: default 604_800, minimum 60, maximum 2_592_000. Round 5 found
-    it became load-bearing in Revision 6 with no default and no ceiling. It MUST ALSO be
-    cross-field validated: it must be strictly less than the shortest reset period, i.e. less
-    than `budget_period_seconds`.
+* `max_repairs_per_day`: default 1, minimum 1, maximum 24. This is the operator's explicit
+  once-per-day requirement. Round 5 found it was never actually specified.
+* `max_cumulative_skew_seconds`: default 604_800, minimum 60, maximum 2_592_000. Round 5 found
+  it became load-bearing in Revision 6 with no default and no ceiling. It MUST ALSO be
+  cross-field validated: it must be strictly less than the shortest reset period, i.e. less
+  than `budget_period_seconds`.
 
 Also required, each with an explicit min and max in the schema and a documented rationale:
 `enabled` (bool), `max_repairs_per_epoch` (10, 1..50), `breaker_failure_threshold` (3, 1..20),
@@ -56,23 +58,23 @@ usable object.
 
 ## Hard constraints
 
-  * Standard library ONLY. Python >= 3.11. No third-party imports in `selfheal/`.
-  * Type hints on every function; Google-style docstrings (Args/Returns/Raises) on every
-    public function and class.
-  * Match this repository's house comment style: heavy inline commentary explaining WHY a line
-    exists. Read `scripts/reason_codes.py` and `dca_config.py` and imitate them.
-  * **No standalone 6-12 digit literal may appear in any tracked file you create.** This repo's
-    `tests/test_config_invariants.py` greps for account-shaped numbers and WILL fail your
-    build. Several of the defaults above are 6-12 digits: write every one of them with Python
-    underscore separators in .py files (e.g. `604_800`, `2_592_000`, `1_048_576`,
-    `67_108_864`, `536_870_912`, `172_800`). JSON has no underscore syntax, so in
-    config/self_heal.json and schemas/self_heal.schema.json express those particular values as
-    a documented smaller unit that avoids the pattern (for example seconds-based keys in whole
-    minutes or hours, byte-based keys in KiB) and convert in `config.py`, OR choose defaults
-    that are not 6-12 digits. State plainly in your final message which approach you took and
-    why. Verify with: `.venv/bin/python -m pytest tests/test_config_invariants.py -q`
-  * Do not modify any existing file except to add nothing. Create new files only.
-  * Do not add the config to pyproject.toml — that is Rock 7's job.
+* Standard library ONLY. Python >= 3.11. No third-party imports in `selfheal/`.
+* Type hints on every function; Google-style docstrings (Args/Returns/Raises) on every
+  public function and class.
+* Match this repository's house comment style: heavy inline commentary explaining WHY a line
+  exists. Read `scripts/reason_codes.py` and `dca_config.py` and imitate them.
+* **No standalone 6-12 digit literal may appear in any tracked file you create.** This repo's
+  `tests/test_config_invariants.py` greps for account-shaped numbers and WILL fail your
+  build. Several of the defaults above are 6-12 digits: write every one of them with Python
+  underscore separators in .py files (e.g. `604_800`, `2_592_000`, `1_048_576`,
+  `67_108_864`, `536_870_912`, `172_800`). JSON has no underscore syntax, so in
+  config/self_heal.json and schemas/self_heal.schema.json express those particular values as
+  a documented smaller unit that avoids the pattern (for example seconds-based keys in whole
+  minutes or hours, byte-based keys in KiB) and convert in `config.py`, OR choose defaults
+  that are not 6-12 digits. State plainly in your final message which approach you took and
+  why. Verify with: `.venv/bin/python -m pytest tests/test_config_invariants.py -q`
+* Do not modify any existing file except to add nothing. Create new files only.
+* Do not add the config to pyproject.toml — that is Rock 7's job.
 
 ## Proof command (run it yourself and report the output verbatim)
 
