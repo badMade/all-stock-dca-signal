@@ -49,10 +49,10 @@ class AnthropicClient(LLMClient):
         self.model = model
         self.default_max_tokens = default_max_tokens
         if client is None:
-            from anthropic import Anthropic
+            from anthropic import Anthropic  # type: ignore
 
             client = Anthropic(api_key=read_api_key(API_KEY_ENV, provider=self.provider), timeout=timeout)
-        self._client = client
+        self._client: Any = client
 
     def _request_kwargs(
         self,
@@ -72,7 +72,7 @@ class AnthropicClient(LLMClient):
         }
 
     def _translate(self, exc: BaseException) -> LLMError | None:
-        import anthropic
+        import anthropic  # type: ignore
 
         if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):
             return LLMAuthError(str(exc), provider=self.provider)

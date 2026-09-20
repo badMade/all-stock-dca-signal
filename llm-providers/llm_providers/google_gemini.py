@@ -48,12 +48,12 @@ class GeminiClient(LLMClient):
         """Build the adapter; ``client`` injects a ``google.genai.Client``-compatible object for tests."""
         self.model = model
         if client is None:
-            from google import genai
+            from google import genai  # type: ignore
 
             http_options = {"timeout": int(timeout * 1000)} if timeout is not None else None  # SDK wants ms
             api_key = read_api_key(*API_KEY_ENVS, provider=self.provider)
             client = genai.Client(api_key=api_key, http_options=http_options)
-        self._client = client
+        self._client: Any = client
 
     def _request_kwargs(
         self,
@@ -80,7 +80,7 @@ class GeminiClient(LLMClient):
         return kwargs
 
     def _translate(self, exc: BaseException) -> LLMError | None:
-        from google.genai import errors
+        from google.genai import errors  # type: ignore
 
         if isinstance(exc, errors.APIError):
             code = getattr(exc, "code", None)

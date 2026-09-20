@@ -56,11 +56,11 @@ class NvidiaNimClient(LLMClient):
         if client is None:
             # Imported lazily so the package imports cleanly when only another
             # provider's SDK is installed.
-            from openai import OpenAI
+            from openai import OpenAI  # type: ignore
 
             api_key = read_api_key(API_KEY_ENV, provider=self.provider)
             client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
-        self._client = client
+        self._client: Any = client
 
     # -- request shaping ---------------------------------------------------
 
@@ -86,7 +86,7 @@ class NvidiaNimClient(LLMClient):
 
     def _translate(self, exc: BaseException) -> LLMError | None:
         """Map ``openai`` exceptions onto the shared family; ``None`` means "not ours, re-raise"."""
-        import openai
+        import openai  # type: ignore
 
         if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
             return LLMAuthError(str(exc), provider=self.provider)
