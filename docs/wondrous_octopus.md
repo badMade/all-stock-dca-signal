@@ -13,7 +13,7 @@ and does not share code with it — sibling trees deliberately do not import eac
 ## Learning in "all directions" without leakage
 
 | Direction | Mechanism | Used live? |
-|---|---|---|
+| --- | --- | --- |
 | Backward in time | Causal attention over each ticker's trailing window → forward head (point + p10/p50/p90 per component) | **Yes — the only path forecasts use** |
 | Both directions in time | Training-only masked-day reconstruction (BERT-style): reconstruct a day's bar from context on both sides | Training + diagnostics only |
 | Sideways across the market | A Perceiver-style per-day market encoder: learned latent tokens cross-attend to every ticker's day-*t* features; every window position consumes its day's market embedding | Yes — leakage-free by construction (all inputs are day ≤ *t*) |
@@ -72,7 +72,7 @@ matrix was built against. `features.build_panel(..., extra_features=("calculus",
 opt-in **calculus block** of 5 more per-ticker columns:
 
 | Column | What it adds | Warm-up |
-|---|---|---|
+| --- | --- | --- |
 | `ret_accel` | The literal discrete second derivative of log price (`ret_close.diff()`). The base set carries level and velocity but no curvature | 2 rows |
 | `vol20_roc` | Which way `realized_vol_20` is *moving*, not just where it sits: a log-ratio against its own reading 5 rows back, neutral-and-finite when either endpoint is zero, clipped at ±3.0 | 25 rows |
 | `sg_slope`, `sg_curvature` | Savitzky-Golay local derivatives: a degree-2 polynomial fitted to the trailing 11 log prices, differentiated at the window's right edge. Noise-robust without a moving average's lag | 10 rows |
@@ -117,7 +117,7 @@ python run_walkforward.py --preset quick --run-dir ~/octopus/quick
 Presets bundle the scale knobs (explicit flags always win):
 
 | Preset | Universe | Window | Online update | GBM refit | Intent |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | `quick` | 500 longest histories | 64 | every 5 days | quarterly | prove the pipeline in ~an hour |
 | `overnight` | 2,000 | 128 | every 2 days | monthly | one night on MPS/CUDA |
 | `full` | whole archive | 128 | daily | monthly | several nights via `--resume` |
@@ -233,7 +233,7 @@ The five production-safe-loop primitives (spec → circuit breaker → ledger �
 review surface), mapped onto this system:
 
 | Primitive | Where it lives here |
-|---|---|
+| --- | --- |
 | **Spec — define done first, no mid-run revisions** | `HarnessConfig` is the frozen spec: what runs (models/universe/window), what "done" is (`--start`→`--end`/archive end). Its hash is sealed into every checkpoint; a resume with changed non-resume-safe flags — or a silently different ticker universe — is REFUSED. |
 | **Circuit breaker — hard ceilings, pre-flight, loud** | `--max-steps` / `--max-hours`: per-invocation ceilings checked **before** each step's work (never after the spend). A trip prints an unmissable `=== CIRCUIT BREAKER CHECKPOINT ===` banner even if the caller ignores the status, checkpoints cleanly, and exits 3; `--resume` continues later. `steps == limit` is allowed; the next step trips — no grace period. |
 | **Ledger — append-only audit trail** | The gzip-member JSONL ledger: no updates, no deletes, every record stamped with schema version + seed. SHA-256 shard fingerprints ride in the checkpoint; editing the ledger makes the next resume REFUSE. |
