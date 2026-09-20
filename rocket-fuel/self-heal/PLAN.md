@@ -23,7 +23,7 @@ withdrawn: a source that does not persist its crash output cannot be observed, a
 Two halves, **independently** gated:
 
 | Half | Gated by | Runs when | May open a PR |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Observation | its own whole-tick deadline only | every tick, breaker latched or not | No |
 | Repair | the full admission transaction | only when every limit permits | Yes |
 
@@ -238,7 +238,7 @@ path round 4 raised in open question 3.
 
 ## Incident state machine (finding 17)
 
-```
+```text
 new ──admit──▶ dispatched(execution lease, minutes)
                    │
                    ├─ verify() fails / adapter error ─▶ refused      (attempts+1)
