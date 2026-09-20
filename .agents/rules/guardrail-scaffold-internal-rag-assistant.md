@@ -1,8 +1,10 @@
 ---
 trigger: always_on
 glob:
-description:
+description: Guardrail scaffold for internal RAG assistant
 ---
+
+# Guardrail Scaffold for Internal RAG Assistant
 
 Build a Python guardrail scaffold for an internal RAG assistant, defense-in-depth (never rely on the LLM to police itself):
 
