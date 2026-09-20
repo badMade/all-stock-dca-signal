@@ -55,7 +55,7 @@ import stat
 import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Generator, Iterator
 
 _LEDGER_DIRNAME = "ledger"
 
@@ -100,7 +100,7 @@ def _require_secure_filesystem() -> None:
 
 
 @contextmanager
-def _directory(parent_fd: int | None, name: str, *, create: bool = False) -> Iterator[int]:
+def _directory(parent_fd: int | None, name: str, *, create: bool = False) -> Generator[int, None, None]:
     """Pin a directory without following an alias in its final component."""
     if create:
         try:
@@ -329,7 +329,7 @@ class Ledger:
 
     # -- lifecycle ---------------------------------------------------------
     @contextmanager
-    def _root_handle(self, *, create: bool = False) -> Iterator[int]:
+    def _root_handle(self, *, create: bool = False) -> Generator[int, None, None]:
         _require_secure_filesystem()
         try:
             # The caller selects the run directory (which may itself be an

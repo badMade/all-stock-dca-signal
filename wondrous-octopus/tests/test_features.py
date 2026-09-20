@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import inspect
+from typing import Any, cast
 
 import data
-import features
+import features as _features
 import numpy as np
 import pandas as pd
 import pytest
 
-import conftest
+import conftest as _conftest
+
+conftest: Any = _conftest
+features: Any = _features
 
 make_market_returns = conftest.make_market_returns
 make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
@@ -27,6 +31,14 @@ MARKET_SUMMARY_NAMES = features.MARKET_SUMMARY_NAMES
 def _adjusted(frame):
     adjusted, _ = data.adjusted_ohlc(frame)
     return adjusted
+
+
+def _val(x: Any) -> float:
+    return float(x)
+
+
+def _ts(x: Any) -> pd.Timestamp:
+    return cast(pd.Timestamp, pd.Timestamp(x))
 
 
 def _log_return_frame(log_returns, *, start_price=50.0, start=conftest.DEFAULT_START):
@@ -69,9 +81,9 @@ class TestComputeTickerFeatures:
         frame = _adjusted(make_synthetic_ohlcv(n=40, seed=11))
         computed = compute_ticker_features(frame)
         t = 20
-        expected = np.log(frame.loc[t + 1, "Close"] / frame.loc[t, "Close"])
+        expected = np.log(_val(frame.loc[t + 1, "Close"]) / _val(frame.loc[t, "Close"]))
         assert computed.loc[t, "target_close"] == pytest.approx(expected, rel=1e-12)
-        expected_high = np.log(frame.loc[t + 1, "High"] / frame.loc[t, "Close"])
+        expected_high = np.log(_val(frame.loc[t + 1, "High"]) / _val(frame.loc[t, "Close"]))
         assert computed.loc[t, "target_high"] == pytest.approx(expected_high, rel=1e-12)
         # Final row: nothing to predict, NaN target, NaT label end.
         assert np.isnan(computed["target_close"].iloc[-1])
@@ -83,7 +95,7 @@ class TestComputeTickerFeatures:
         # Row 29 is the last row before the gap; its label end is the first
         # row AFTER the gap -- a ticker's t+1 is its own next trading row.
         assert computed.loc[29, "label_end_date"] == frame.loc[30, "Date"]
-        assert (frame.loc[30, "Date"] - frame.loc[29, "Date"]).days > 10
+        assert (_ts(frame.loc[30, "Date"]) - _ts(frame.loc[29, "Date"])).days > 10
 
     def test_doji_bar_close_position_is_neutral(self):
         frame = _adjusted(make_synthetic_ohlcv(n=30, seed=13))
@@ -566,11 +578,11 @@ class TestMarketFeatures:
         returns = []
         for ticker in panel.tickers:
             series = panel.series[ticker]
-            row = int(np.where(series.dates == np.datetime64(date))[0][0])
+            row = int(np.where(series.dates == date.to_datetime64())[0][0])
             returns.append(series.features[row, FEATURE_NAMES.index("ret_close")])
         median_column = FEATURE_NAMES.index("mkt_median_ret")
         series = panel.series["AAA"]
-        row = int(np.where(series.dates == np.datetime64(date))[0][0])
+        row = int(np.where(series.dates == date.to_datetime64())[0][0])
         assert series.features[row, median_column] == pytest.approx(float(np.median(returns)), rel=1e-5)
 
     def test_cross_sectional_rank_spans_zero_to_one(self, synthetic_history_dir):
@@ -937,10 +949,10 @@ class TestContinuousMomentumOscillators:
         # Guard the guard: a simple rolling mean must NOT satisfy the above,
         # or this test would pass against the implementation it exists to
         # rule out.
-        returns = pd.Series(np.concatenate([[np.nan], np.diff(closes)]))
+        returns = pd.Series(np.concatenate([[np.nan], np.diff(closes)]).tolist())
         simple_gain = returns.clip(lower=0).rolling(14).mean()
         simple_loss = (-returns.clip(upper=0)).rolling(14).mean()
-        simple = (1.0 - 1.0 / (1.0 + simple_gain / simple_loss)).to_numpy()
+        simple = np.asarray(1.0 - 1.0 / (1.0 + simple_gain / simple_loss))
         assert not np.isclose(simple[40], expected[40], rtol=1e-6)
 
     def test_adx_matches_wilder_smoothing_on_a_non_degenerate_path(self):
@@ -1182,7 +1194,7 @@ class TestBarDecomposition:
         closes = 100.0 * np.cumprod(1.0 + rng.normal(0.0003, 0.02, size=40))
         frame = _adjusted(_frame_from_closes(closes))
         computed = compute_ticker_features(frame)
-        expected = np.log(frame.loc[25, "Close"] / frame.loc[25, "Open"])
+        expected = np.log(_val(frame.loc[25, "Close"]) / _val(frame.loc[25, "Open"]))
         assert computed.loc[25, "intraday_ret"] == pytest.approx(expected, rel=1e-12)
 
     def test_intraday_and_overnight_legs_sum_back_to_the_daily_return(self):
@@ -1267,7 +1279,7 @@ class TestReturnDistributionShape:
         rng = np.random.default_rng(56)
         closes = 100.0 * np.cumprod(1.0 + rng.normal(0.0, 0.02, size=60))
         computed = compute_ticker_features(_adjusted(_frame_from_closes(closes)))
-        returns = pd.Series(np.concatenate([[np.nan], np.log(closes[1:] / closes[:-1])]))
+        returns = pd.Series(np.concatenate([[np.nan], np.log(closes[1:] / closes[:-1])]).tolist())
         assert computed.loc[40, "ret_skew_20"] == pytest.approx(
             returns.rolling(20).skew().iloc[40], rel=1e-9
         )
