@@ -142,6 +142,7 @@ jobs:
             wondrous-octopus/requirements.txt \
             ticker-market-breadth/requirements.txt \
             llm-providers/requirements.txt \
+            yfinance-prefetch/requirements.txt \
             trading-strategies/requirements.txt \
             analysis/market-graph-3d/requirements.txt; do
             scope="${manifest%/requirements.txt}"
@@ -373,4 +374,33 @@ jobs:
 
       - name: Run tests
         working-directory: llm-providers
+        run: python -m pytest tests/
+
+  yfinance-prefetch:
+    name: Lint & test (yfinance-prefetch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            yfinance-prefetch/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt -r yfinance-prefetch/requirements.txt
+
+      - name: Ruff lint
+        run: ruff check --isolated --select=E,F,B --line-length=120 yfinance-prefetch
+
+      - name: Run tests
+        working-directory: yfinance-prefetch
         run: python -m pytest tests/

@@ -252,6 +252,31 @@ independent cross-check). This protects a caller whose fetch failed and who
 never built the object at all, not just one who remembered to also populate
 ``source_errors`` (Codex review: "Fail closed when a source is absent").
 
+``yahoo_finance_yfinance`` is an OPTIONAL third key under ``sources``, in the
+identical per-ticker shape as ``finance``/``robinhood`` -- the repo-wide
+market-data source policy's fallback (``config/scheduled_tasks.json``'s
+``market_data_source_policy``: "yfinance is a fallback used ONLY if Finance
+connector data is unavailable, stale, incomplete, or unresolved"). Unlike
+``finance``/``robinhood`` its absence is never itself an error; it is simply
+unavailable to substitute for a failed Finance fetch. When Finance is judged
+unusable for the run -- listed in ``source_errors``, entirely absent from
+``sources``, carrying a ``ticker_errors`` entry for any attempted ticker, or
+incomplete (missing a fresh decision/lookback bar or ``previous_close_bar``)
+for any attempted ticker -- and a usable ``yahoo_finance_yfinance`` payload is
+present, this module scores the ENTIRE universe's finance-side signal from
+the fallback instead, exactly the whole-universe switch the same policy
+already requires of the other six roster slots
+(``scripts/stream_candidates.py``'s ``use_fallback``). Real Finance evidence
+for an individual ticker is never mixed with fallback evidence for another
+ticker in the same run, and a healthy, complete Finance payload is never
+overridden by a disagreeing fallback payload. When Finance needs the
+fallback but none was supplied (or it was itself listed in
+``source_errors``/incomplete), this module does **not** abort -- it falls
+back to exactly today's behavior, scoring Finance ``NO_DATA``/
+``provider_error=True`` and letting ``reconcile_signals`` reconcile off
+Robinhood alone, as it already does for a Finance outage with no fallback
+evidence.
+
 USAGE (from an executor prompt)
 --------------------------------
     python3 -m scripts.generate_buy_candidates \\
@@ -1186,6 +1211,17 @@ def generate_candidates(
     # it (Codex review: "Fail closed when a source is absent").
     finance_unavailable = "finance" in source_errors or "finance" not in market_data_by_source
     robinhood_unavailable = "robinhood" in source_errors or "robinhood" not in market_data_by_source
+    # The yfinance fallback is genuinely optional -- unlike finance/robinhood,
+    # its absence is never itself a failure this module reports, only a
+    # signal that the fallback substitution below cannot happen. See
+    # `use_yfinance_fallback` for the policy this backs (market_data_source_
+    # policy in config/scheduled_tasks.json: "yfinance is a fallback used
+    # ONLY if Finance connector data is unavailable, stale, incomplete, or
+    # unresolved").
+    yfinance_unavailable = (
+        SourceName.YFINANCE_FALLBACK.value in source_errors
+        or SourceName.YFINANCE_FALLBACK.value not in market_data_by_source
+    )
     # A ticker absent from an otherwise-working source's per-ticker map is
     # ambiguous: near_close_dca._safe_signal distinguishes a permanent "this
     # source doesn't cover this ticker" (provider_error=False, single-source
@@ -1197,6 +1233,7 @@ def generate_candidates(
     # per-ticker provider errors").
     finance_ticker_errors = set(ticker_errors.get("finance", ()))
     robinhood_ticker_errors = set(ticker_errors.get("robinhood", ()))
+    yfinance_ticker_errors = set(ticker_errors.get(SourceName.YFINANCE_FALLBACK.value, ()))
     # A ticker/source already marked errored above, excluded from trading
     # entirely, or already covered by a compatible executor in this same
     # window (Gate 4's stand-down case) is never scored via a real
@@ -1260,6 +1297,22 @@ def generate_candidates(
             and ticker not in already_covered_tickers_set
         }
     )
+    # Filtered identically to finance_inputs -- the fallback stands in for
+    # Finance evidence, so it is held to the same excluded/whole-share/
+    # already-covered/ticker-error filtering before ever reaching
+    # _StaticMarketData's eager parse.
+    yfinance_inputs = (
+        {}
+        if yfinance_unavailable
+        else {
+            ticker: payload
+            for ticker, payload in market_data_by_source.get(SourceName.YFINANCE_FALLBACK.value, {}).items()
+            if ticker not in yfinance_ticker_errors
+            and ticker not in config.excluded_tickers
+            and ticker not in config.whole_share_tickers
+            and ticker not in already_covered_tickers_set
+        }
+    )
     finance_data = _StaticMarketData(
         SourceName.FINANCE,
         finance_inputs,
@@ -1270,6 +1323,17 @@ def generate_candidates(
         SourceName.ROBINHOOD,
         robinhood_inputs,
         quote_staleness_minutes=config.robinhood_interval_minutes,
+        trading_day=trading_day,
+    )
+    # yfinance stands in for Finance, never for Robinhood (Robinhood is
+    # execution-broker validation/context, not a policy primary with a
+    # configured fallback) -- so it shares Finance's staleness window
+    # (config.finance_interval_minutes), the same interval the executor
+    # prompts require the fallback fetch to match.
+    yfinance_data = _StaticMarketData(
+        SourceName.YFINANCE_FALLBACK,
+        yfinance_inputs,
+        quote_staleness_minutes=config.finance_interval_minutes,
         trading_day=trading_day,
     )
     # The same decision/lookback anchors evaluate_source_signal computes
@@ -1283,6 +1347,33 @@ def generate_candidates(
     robinhood_decision_anchor = completed_bar_anchor(decision_dt, config.robinhood_interval_minutes, config)
     finance_lookback_anchor = finance_decision_anchor - timedelta(minutes=config.trend_lookback_minutes)
     robinhood_lookback_anchor = robinhood_decision_anchor - timedelta(minutes=config.trend_lookback_minutes)
+    # Whole-universe switch, matching the checked-in market-data source
+    # policy ("the generator switches the entire ordinary universe to the
+    # configured fallback when even one Finance row is unresolved" --
+    # claude/dca-executor-prompts/live-mirror/1230ET-*.txt's Gate 5 step,
+    # applied here to the 1530ET dual-source engine): Finance is judged
+    # unusable for the WHOLE run, not per-ticker, so a partial fallback
+    # payload for only the tickers Finance happened to miss is never
+    # sufficient and never silently mixed with real Finance evidence for
+    # other tickers in the same run.
+    finance_needs_fallback = (
+        finance_unavailable
+        or bool(finance_ticker_errors)
+        or any(
+            _attempted_source_incomplete(
+                finance_data, ticker, finance_decision_anchor, finance_lookback_anchor, config.finance_interval_minutes
+            )
+            for ticker in finance_inputs
+        )
+    )
+    # When Finance needs the fallback but no usable fallback evidence was
+    # supplied, this stays False rather than raising: the 1530ET engine
+    # already tolerates a down Finance source today by reconciling on
+    # Robinhood alone (reconcile_signals' "Robinhood-only BUY because
+    # finance source is unavailable" path) -- requiring yfinance-or-abort
+    # here would regress that existing, already-live degraded-mode
+    # behavior instead of only adding a new one.
+    use_yfinance_fallback = finance_needs_fallback and not yfinance_unavailable
 
     candidates: List[Dict[str, Any]] = []
     for ticker in config.tickers:
@@ -1302,9 +1393,6 @@ def generate_candidates(
         # intraday bars"). Checked only when the ticker was actually
         # attempted on this source (ticker in *_inputs) -- a ticker never
         # attempted is the existing, separate "not covered" case above.
-        finance_incomplete = ticker in finance_inputs and _attempted_source_incomplete(
-            finance_data, ticker, finance_decision_anchor, finance_lookback_anchor, config.finance_interval_minutes
-        )
         robinhood_incomplete = ticker in robinhood_inputs and _attempted_source_incomplete(
             robinhood_data,
             ticker,
@@ -1312,14 +1400,38 @@ def generate_candidates(
             robinhood_lookback_anchor,
             config.robinhood_interval_minutes,
         )
-        if finance_unavailable or ticker in finance_ticker_errors or finance_incomplete:
-            finance_signal: Optional[SourceSignal] = _unavailable_signal(ticker, SourceName.FINANCE)
-        elif ticker in finance_inputs:
-            finance_signal = evaluate_source_signal(
-                ticker, now, config, finance_data, config.finance_interval_minutes
+        # use_yfinance_fallback is a whole-run decision (see its definition
+        # above): when set, EVERY ticker's finance-side signal is built from
+        # yfinance_data instead of finance_data, never a per-ticker mix of
+        # the two. Robinhood is entirely unaffected either way.
+        if use_yfinance_fallback:
+            yfinance_incomplete = ticker in yfinance_inputs and _attempted_source_incomplete(
+                yfinance_data,
+                ticker,
+                finance_decision_anchor,
+                finance_lookback_anchor,
+                config.finance_interval_minutes,
             )
+            if ticker in yfinance_ticker_errors or yfinance_incomplete:
+                finance_signal: Optional[SourceSignal] = _unavailable_signal(ticker, SourceName.YFINANCE_FALLBACK)
+            elif ticker in yfinance_inputs:
+                finance_signal = evaluate_source_signal(
+                    ticker, now, config, yfinance_data, config.finance_interval_minutes
+                )
+            else:
+                finance_signal = None
         else:
-            finance_signal = None
+            finance_incomplete = ticker in finance_inputs and _attempted_source_incomplete(
+                finance_data, ticker, finance_decision_anchor, finance_lookback_anchor, config.finance_interval_minutes
+            )
+            if finance_unavailable or ticker in finance_ticker_errors or finance_incomplete:
+                finance_signal = _unavailable_signal(ticker, SourceName.FINANCE)
+            elif ticker in finance_inputs:
+                finance_signal = evaluate_source_signal(
+                    ticker, now, config, finance_data, config.finance_interval_minutes
+                )
+            else:
+                finance_signal = None
         if robinhood_unavailable or ticker in robinhood_ticker_errors or robinhood_incomplete:
             robinhood_signal: Optional[SourceSignal] = _unavailable_signal(ticker, SourceName.ROBINHOOD)
         elif ticker in robinhood_inputs:

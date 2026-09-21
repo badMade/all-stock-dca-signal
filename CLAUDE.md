@@ -68,6 +68,8 @@ ruff check --isolated --select=E,F,B --line-length=120 wondrous-octopus
 ruff check --isolated --select=E,F,B --line-length=120 ticker-market-breadth
 (cd llm-providers && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt (openai, anthropic, google-genai)
 ruff check --isolated --select=E,F,B --line-length=120 llm-providers
+(cd yfinance-prefetch && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt
+ruff check --isolated --select=E,F,B --line-length=120 yfinance-prefetch
 ```
 
 CI (`.github/workflows/ci.yml`) runs lint + coverage-gated tests on Python 3.11 and 3.12, the
@@ -77,9 +79,12 @@ from `uv.lock` plus each independent research manifest, and the `production-safe
 `docs/ticker_advisory.md`'s "Implemented: the ml-forecaster sibling tool" section),
 `wondrous-octopus` (walk-forward OHLC forecasting, see `docs/wondrous_octopus.md`), and
 `ticker-market-breadth` (yfinance `^TICK` NYSE breadth-index archive fetch, data only --
-see `ticker-market-breadth/README.md`), and `llm-providers` (one provider-agnostic chat
+see `ticker-market-breadth/README.md`), `llm-providers` (one provider-agnostic chat
 interface over the `openai`/`anthropic`/`google-genai` SDKs, not wired into any live
-path -- see `llm-providers/README.md`) suites each in their own job. Dev tool versions are
+path -- see `llm-providers/README.md`), and `yfinance-prefetch` (pre-fetches a labeled
+yfinance fallback payload for the market-data source policy's fallback ahead of a live
+slot; not itself wired into any scheduled task -- see `yfinance-prefetch/README.md`)
+suites each in their own job. Dev tool versions are
 **pinned** in `requirements-dev.txt` on purpose — bump deliberately.
 The `dev` extra uses the same exact pins. It also installs `pip-audit`, `uv`, and
 Pyright; Pyright uses the existing `[tool.pyright]` configuration but is not a CI
@@ -198,11 +203,13 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 - Tests live under `tests/`, one `test_<module>.py` per core module (moved out of the repo root
   2026-08-23, where each used to sit flat beside its module); `scripts/` tests live in
   `scripts/tests/`, and each heavy-dependency sibling subproject (`ticker-advisor/`,
-  `ml-forecaster/`, `wondrous-octopus/`, `dca-sizing-signals/`, `ticker-market-breadth/`, `llm-providers/`) keeps
+  `ml-forecaster/`, `wondrous-octopus/`, `dca-sizing-signals/`, `ticker-market-breadth/`, `llm-providers/`,
+  `yfinance-prefetch/`) keeps
   its own `tests/`. Add or update tests for every behavior change, and a regression test for
   every bug fix.
 - `trading-strategies/`, `analysis/`, `.github/`, `production-safe-agent-loop/`,
-  `ticker-advisor/`, `ml-forecaster/`, `wondrous-octopus/`, `ticker-market-breadth/`, and `llm-providers/` are
+  `ticker-advisor/`, `ml-forecaster/`, `wondrous-octopus/`, `ticker-market-breadth/`, `llm-providers/`, and
+  `yfinance-prefetch/` are
   excluded from the core ruff gate and the coverage source — they carry their own deps and
   conventions.
 - Check `git status --short` before editing and preserve existing user changes. Keep patches
