@@ -199,7 +199,7 @@ placeholder, not a shipped constant. Whoever confirms it should record the
 real value (and how it was confirmed -- which order IDs, which timestamps)
 directly in this section.
 
-```
+```python
 PERPLEXITY_PLACED_AGENT_VALUE = "agentic"  # ACCEPTED 2026-08-07 by Geoff's direction,
                                             # NOT independently confirmed against a known
                                             # Perplexity order/timestamp -- see the
