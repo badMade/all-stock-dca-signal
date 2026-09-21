@@ -227,7 +227,23 @@ def test_payload_discovery_is_cached_briefly_per_root_set(app, tmp_path, monkeyp
     seed_payloads(app.settings.root, tmp_path / "artifacts")
     roots = (RootSpec.of(app.settings.root, "primary"), RootSpec.of(tmp_path / "artifacts", "secondary"))
     first = latest_gate5_payloads(roots, now=100.0)
-    (tmp_path / "artifacts" / "market_data_2026-09-20_1130.json").write_text("{}")
+    import os
+    from datetime import datetime, timezone
+
+    # Touch a new payload with a specific timestamp to ensure the test does not depend on host machine time
+    new_file = tmp_path / "artifacts" / "market_data_2026-09-20_1130.json"
+    new_file.write_text("{}")
+
+    # The existing files from `seed_payloads` might be evaluated as "newer" depending on the host time
+    # and fallback logic because they don't have explicit timestamps or specific names matching the regex exactly to the day.
+    # We utime everything in artifacts back into the past so this test doesn't randomly fail across days.
+    old_ts = datetime(2020, 1, 1, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    for child in (tmp_path / "artifacts").iterdir():
+        os.utime(child, (old_ts, old_ts))
+
+    target_ts = datetime(2026, 9, 20, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    os.utime(new_file, (target_ts, target_ts))
+
     # Within the window the cached listing is returned unchanged...
     assert latest_gate5_payloads(roots, now=110.0)["1130"] == first["1130"]
     # ...and a fresh scan follows once it expires.
