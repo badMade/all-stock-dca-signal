@@ -2042,7 +2042,12 @@ def _prior_submitted_order_rows(run_dir: Path) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     try:
         with path.open(newline="", encoding="utf-8") as handle:
-            for row in csv.DictReader(handle):
+            iter_csv = csv.reader(handle)
+            header = next(iter_csv, None)
+            if header is None:
+                return []
+            for _raw_row in iter_csv:
+                row = dict(zip(header, _raw_row + [None] * max(0, len(header) - len(_raw_row))))  # noqa: B905
                 # Same bar submitted_order_rows() applies: a concrete order_id, or
                 # a placed/in-flight status. Accepting only submitted/filled would
                 # drop a pending or unconfirmed order the broker may well have
@@ -4542,7 +4547,12 @@ def _run_pipeline_impl(
         order_id_to_ticker: Dict[str, str] = {}
         if orders_csv.exists():
             with orders_csv.open(newline="", encoding="utf-8") as _fh:
-                for _row in csv.DictReader(_fh):
+                iter_csv = csv.reader(_fh)
+                header = next(iter_csv, None)
+                if header is None:
+                    return []
+                for _raw_row in iter_csv:
+                    _row = dict(zip(header, _raw_row + [None] * max(0, len(header) - len(_raw_row))))  # noqa: B905
                     _oid = _row.get("order_id")
                     _tkr = _row.get("ticker")
                     if _oid and _tkr:

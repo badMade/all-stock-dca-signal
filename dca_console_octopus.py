@@ -244,8 +244,10 @@ def _csv_forecasts(path: Path, reader: _Reader) -> list[dict]:
         return []
     rows = []
     try:
-        records = csv.DictReader(io.StringIO(source), strict=True)
-        if not {"ticker", "model", "origin_date", "pred_close"}.issubset(records.fieldnames or []):
+        iter_csv = csv.reader(io.StringIO(source), strict=True)
+        h = next(iter_csv, None)
+        records = (dict(zip(h, r + [None] * max(0, len(h) - len(r)))) for r in iter_csv) if h else []  # noqa: B905
+        if not {"ticker", "model", "origin_date", "pred_close"}.issubset(h or []):
             reader.warn("The forecast CSV has unsupported columns and was ignored.")
             return []
         for index, raw in enumerate(records):

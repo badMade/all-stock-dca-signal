@@ -1402,6 +1402,7 @@ _NON_ACCOUNT_LITERALS = frozenset(
         "110000",
         "154500",
         "152000",
+        "100000",
         "120000",
         "1730000000",
         # Masking illustrations ("123456789012 becomes ********9012").

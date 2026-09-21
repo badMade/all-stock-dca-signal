@@ -3427,9 +3427,9 @@ def _read_csv_rows(
     """
     try:
         with csv_path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            raw_rows = list(reader)
-            fieldnames = reader.fieldnames
+            iter_csv = csv.reader(handle)
+            fieldnames = next(iter_csv, None)
+            raw_rows = [dict(zip(fieldnames, r + [None] * max(0, len(fieldnames) - len(r)))) for r in iter_csv] if fieldnames else []  # noqa: B905
     except (OSError, csv.Error, UnicodeDecodeError):
         if skip_sink is not None:
             skip_sink.append(csv_path)

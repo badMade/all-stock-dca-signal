@@ -10721,7 +10721,12 @@ def _orders_csv_terminal_non_fills(
         return order_ids, tickers
     try:
         with open(orders_csv, newline="", encoding="utf-8") as handle:
-            for row in csv.DictReader(handle):
+            iter_csv = csv.reader(handle)
+            header = next(iter_csv, None)
+            if header is None:
+                return []
+            for _raw_row in iter_csv:
+                row = dict(zip(header, _raw_row + [None] * max(0, len(header) - len(_raw_row))))  # noqa: B905
                 # csv.DictReader fills omitted TRAILING cells with None rather
                 # than raising, so a row observed mid-write can look like a
                 # zero-execution terminal outcome purely because its
@@ -13614,7 +13619,12 @@ def _merge_execution_csv(
     if not replace_existing and path.exists():
         try:
             with path.open(newline="", encoding="utf-8") as handle:
-                for row in csv.DictReader(handle):
+                iter_csv = csv.reader(handle)
+                header = next(iter_csv, None)
+                if header is None:
+                    return []
+                for _raw_row in iter_csv:
+                    row = dict(zip(header, _raw_row + [None] * max(0, len(header) - len(_raw_row))))  # noqa: B905
                     order_id = row.get("order_id")
                     if order_id:
                         existing_rows_by_order_id[order_id] = len(existing_rows)
