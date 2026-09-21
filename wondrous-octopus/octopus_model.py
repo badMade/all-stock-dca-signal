@@ -380,11 +380,16 @@ class OctopusModel:
                         f"[{batch_idx}/{total_batches} ({pct:3.0f}%)] loss: {loss:.4f}  "
                     )
                     sys.stdout.flush()
-        if is_tty and total_epochs > 0 and losses:
-            sys.stdout.write(
-                f"\r[fit] octopus: {total_epochs} epochs complete! "
-                f"final loss: {losses[-1]:.4f}             \n"
-            )
+                elif not is_tty and (batch_idx % 50 == 0 or batch_idx == total_batches):
+                    pct = (batch_idx / total_batches) * 100
+                    sys.stdout.write(
+                        f"[fit] octopus: epoch {epoch + 1}/{total_epochs} "
+                        f"[{batch_idx}/{total_batches} ({pct:3.0f}%)] loss: {loss:.4f}\n"
+                    )
+                    sys.stdout.flush()
+        if total_epochs > 0 and losses:
+            msg = f"[fit] octopus: {total_epochs} epochs complete! final loss: {losses[-1]:.4f}\n"
+            sys.stdout.write(f"\r{msg}" if is_tty else msg)
             sys.stdout.flush()
         self._market_cache = {}
         return {
