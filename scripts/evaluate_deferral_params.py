@@ -170,17 +170,29 @@ class DeferralEvaluator:
             ticker = csv_file.stem.upper()
             try:
                 with open(csv_file) as f:
-                    reader = csv.DictReader(f)
+                    reader = csv.reader(f)
+                    try:
+                        header = next(reader)
+                        idx_date = header.index("Date")
+                        idx_close = header.index("Close")
+                        idx_low = header.index("Low")
+                        max_idx = max(idx_date, idx_close, idx_low)
+                    except (StopIteration, ValueError):
+                        continue
+
                     prices = []
                     for row in reader:
-                        try:
-                            row_date = date.fromisoformat(row["Date"])
-                            if self.start_date <= row_date <= self.end_date:
-                                close = float(row["Close"])
-                                low = float(row["Low"])
-                                prices.append((row_date, close, low))
-                        except (ValueError, KeyError):
-                            continue
+                        # ⚡ Bolt Optimization: Use index-based access on csv.reader instead of csv.DictReader
+                        # to avoid dictionary allocation overhead per row. Bound check avoids IndexError on short rows.
+                        if len(row) > max_idx:
+                            try:
+                                row_date = date.fromisoformat(row[idx_date])
+                                if self.start_date <= row_date <= self.end_date:
+                                    close = float(row[idx_close])
+                                    low = float(row[idx_low])
+                                    prices.append((row_date, close, low))
+                            except ValueError:
+                                continue
                     if prices:
                         self.price_history[ticker] = sorted(prices)
                         logger.info(f"Loaded {len(prices)} rows for {ticker}")
