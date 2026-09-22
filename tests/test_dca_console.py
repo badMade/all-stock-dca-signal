@@ -295,7 +295,7 @@ def test_local_once_reads_existing_artifacts_without_running_commands(tmp_path, 
     assert (output / "summaries/local/2026-09-08.json").is_file()
 
 
-def test_default_once_selects_isolated_demo_and_explicit_root_selects_local(tmp_path, monkeypatch, capsys):
+def test_default_once_selects_local_and_explicit_demo_selects_isolated_demo(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(dca_console, "python_packages", lambda _: {})
     calls = []
 
@@ -304,9 +304,17 @@ def test_default_once_selects_isolated_demo_and_explicit_root_selects_local(tmp_
         return 0
 
     monkeypatch.setattr(ConsoleApp, "_run", fake_work)
-    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "user-live-root"))
+    live_root = tmp_path / "user-live-root"
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(live_root))
     output = tmp_path / "output"
+    # No mode flag: the console must default to observing real local artifacts,
+    # never a synthetic demo, and must not auto-submit any job on its own.
     assert main(["--once", "--output-dir", str(output), "--date", "2026-09-08"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["mode"] == "local"
+    assert calls == []
+    # --demo remains an explicit, isolated opt-in sandbox.
+    assert main(["--demo", "--once", "--output-dir", str(output), "--date", "2026-09-08"]) == 0
     result = json.loads(capsys.readouterr().out)
     assert result["mode"] == "demo"
     assert calls == [("demo", output / "demo/dca", "demo-all")]
