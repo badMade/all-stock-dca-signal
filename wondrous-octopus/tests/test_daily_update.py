@@ -25,6 +25,14 @@ make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
 write_ticker_csv = conftest.write_ticker_csv
 
 
+def _dict_rows(reader: csv.reader) -> list[dict[str, Any]]:
+    """Read a csv.reader's header + rows into dicts, padding short rows with None."""
+    header = next(reader, None)
+    if header is None:
+        return []
+    return [dict(zip(header, row + [None] * max(0, len(header) - len(row)))) for row in reader]  # noqa: B905
+
+
 def test_dollar_clamps_non_finite_log_returns_instead_of_raising():
     # Regression (Antigravity review: "Uncaught OverflowError risk in
     # _dollar()"): a divergent model could emit a non-finite or extreme
@@ -76,7 +84,7 @@ def test_write_next_day_forecasts_includes_an_older_origin_date(tmp_path):
     path = daily_update._write_next_day_forecasts(tmp_path / "run", fake_harness, "2021-06-01")
     assert path is not None
     with path.open(newline="", encoding="utf-8") as handle:
-        rows = (lambda r, h=None: [dict(zip(h, row + [None] * max(0, len(h) - len(row)))) for row in r] if (h := next(r, None)) else [])(csv.reader(handle))  # noqa: B905
+        rows = _dict_rows(csv.reader(handle))
     assert {row["ticker"] for row in rows} == {"LAGGY"}
 
 
@@ -113,7 +121,7 @@ def test_write_next_day_forecasts_excludes_a_ticker_dropped_from_a_capped_univer
     path = daily_update._write_next_day_forecasts(tmp_path / "run", fake_harness, "2021-06-01")
     assert path is not None
     with path.open(newline="", encoding="utf-8") as handle:
-        rows = (lambda r, h=None: [dict(zip(h, row + [None] * max(0, len(h) - len(row)))) for row in r] if (h := next(r, None)) else [])(csv.reader(handle))  # noqa: B905
+        rows = _dict_rows(csv.reader(handle))
     assert {row["ticker"] for row in rows} == {"KEPT"}
 
 
@@ -145,7 +153,7 @@ def test_write_next_day_forecasts_marks_a_nan_component_invalid_instead_of_a_fab
     path = daily_update._write_next_day_forecasts(tmp_path / "run", fake_harness, "2021-06-01")
     assert path is not None
     with path.open(newline="", encoding="utf-8") as handle:
-        rows = (lambda r, h=None: [dict(zip(h, row + [None] * max(0, len(h) - len(row)))) for row in r] if (h := next(r, None)) else [])(csv.reader(handle))  # noqa: B905
+        rows = _dict_rows(csv.reader(handle))
     row = rows[0]
     assert row["pred_close"] == "N/A"
     assert row["pred_close"] != f"{50.0:.4f}"  # not fabricated as ref_close's flat price

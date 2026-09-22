@@ -227,6 +227,14 @@ def test_stream_flags_come_from_raw_json(cfg, tmp_path):
 
 
 def test_sizing_sources_report_staleness_and_publisher_only(cfg):
+    # Reset to the safe inactive template regardless of whatever is
+    # currently published live in config/ml_sizing_adjustment.json: this
+    # test exercises reader.sizing_sources()'s staleness/publisher-only
+    # logic, not the live-published state, which changes independently
+    # whenever scripts/publish_octopus_sizing.py is next run.
+    ml = load(cfg, "ml_sizing_adjustment")
+    ml.update({"status": "inactive", "generated_at": None, "adjustments": {}})
+    write(cfg, "ml_sizing_adjustment", ml)
     committed = reader.sizing_sources(cfg, NOW)
     assert committed["publisher_only"] is True and committed["ml"]["status"] == "inactive"
     assert committed["ml"]["stale"] is None and committed["ml"]["applied_count"] == 0

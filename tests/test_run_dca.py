@@ -8349,11 +8349,17 @@ def test_run_slot_allows_a_guarded_top_up_the_old_forced_flag_used_to_block(tmp_
     this test targets, so the status itself is not asserted here.
     """
     import json
+    from dataclasses import replace
 
     from near_close_dca import PriorSameDayAllocation
     from run_dca import run_slot
 
-    config = _demo_config()
+    # Neutralize whatever Wondrous Octopus Tier C multiplier is currently
+    # live-published in config/ml_sizing_adjustment.json (it is not always
+    # inactive -- see scripts/publish_octopus_sizing.py): this test targets
+    # the top-up guard's own $3.00 - $1.00 = $2.00 incremental arithmetic,
+    # not sizing adjustments layered on top of it.
+    config = replace(_demo_config(), ml_sizing_adjustment={})
 
     class _RecordingBroker(DryRunBroker):
         def same_day_strategy_order_exists(self, ticker, trading_day):

@@ -523,13 +523,17 @@ def test_ml_sizing_adjustment_schema_rejects_active_status_with_null_generated_a
 
 
 def test_ml_sizing_adjustment_schema_still_allows_null_generated_at_when_inactive():
-    """The inactive template (the shipped default) must remain valid with a
-    null generated_at -- the new constraint only applies when active."""
+    """The inactive template shape (status "inactive", generated_at null) must
+    remain valid -- the new constraint only applies when active. Built as its
+    own synthetic document (mirroring the active-status test right below)
+    rather than asserting on config/ml_sizing_adjustment.json's live content,
+    whose status reflects whatever scripts/publish_octopus_sizing.py last
+    published and is not always "inactive"."""
     jsonschema = pytest.importorskip("jsonschema")
     schema = json.loads((SCHEMAS_DIR / "ml_sizing_adjustment.schema.json").read_bytes())
     document = json.loads(json.dumps(_load("ml_sizing_adjustment.json")))  # deep copy
-    assert document["status"] == "inactive"
-    assert document["generated_at"] is None
+    document["status"] = "inactive"
+    document["generated_at"] = None
     jsonschema.validate(document, schema)  # must not raise
 
 
