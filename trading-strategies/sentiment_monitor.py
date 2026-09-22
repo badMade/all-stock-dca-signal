@@ -968,6 +968,17 @@ def _log_fatal_exception(exc: BaseException) -> None:
     # format_exc()/format_exception() append str(exc), which may contain a
     # credential-bearing URL.  format_tb() emits stack frames only.
     safe_traceback = "".join(traceback.format_tb(exc.__traceback__))
+
+    smtp_pass = os.environ.get("SMTP_PASSWORD")
+    news_key = os.environ.get("NEWSAPI_KEY")
+
+    if smtp_pass:
+        safe_exc = safe_exc.replace(smtp_pass, "***")
+        safe_traceback = safe_traceback.replace(smtp_pass, "***")
+    if news_key:
+        safe_exc = safe_exc.replace(news_key, "***")
+        safe_traceback = safe_traceback.replace(news_key, "***")
+
     logger.error("Fatal error in pipeline: %s", safe_exc)
     logger.error("Exception details (stack only):\n%s", safe_traceback)
 def _direction(score: float, zscore: Optional[float]) -> str:
