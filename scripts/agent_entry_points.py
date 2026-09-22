@@ -176,6 +176,17 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
+        need="Publish Wondrous Octopus Tier C sizing adjustments to ml_sizing_adjustment.json",
+        command="python3 scripts/publish_octopus_sizing.py [--status active|inactive] [--dry-run]",
+        exists_path="scripts/publish_octopus_sizing.py",
+        doc_ref="docs/README.md",
+        symbols=("main", "publish_octopus_sizing"),
+        notes=(
+            "Translates next-day Octopus multi-quantile forecasts into bounded Tier C recovery "
+            "sizing adjustments in config/ml_sizing_adjustment.json."
+        ),
+    ),
+    EntryPoint(
         need="Recalibrate per-ticker signal parameters for the day",
         command="python -m scripts.run_ticker_maintenance calibrate",
         exists_path="scripts/run_ticker_maintenance.py",
