@@ -270,8 +270,9 @@ ACTIVE_TICKERS = [
     # notes for the full history. RVII has since moved to WHOLE_SHARE_TICKERS
     # (AUG 24 2026, user-requested): it is not purchasable fractionally, so it
     # is still bought by the same ladder, just through the whole-share
-    # mechanism -- see that constant below.
-    "QBUT",
+    # mechanism -- see that constant below. QBUT itself was excluded again on
+    # SEP 18 2026 (see EXCLUDED_TICKERS below): Robinhood returned not-found
+    # for it on every live run -- no confirmed buying mechanism at all.
     "RVI",
     "VCX",
     # AUG 16 2026 (user-requested, later same day): TRLV. Reverses the
@@ -308,7 +309,11 @@ ACTIVE_TICKERS = [
     "COHR",
 ]
 
-# No ticker is categorically excluded (no mechanism to buy it at all) today.
+# QBUT is the one categorically excluded ticker today (no mechanism to buy it
+# at all). It was added 2026-08-16 without an in-repo Robinhood instrument
+# search -- tradability was unverified from the start -- and Robinhood has
+# returned not-found for it on every live run since, confirmed 2026-09-18. See
+# config/tickers.json's exclusion_reasons.QBUT for the full history.
 # BYDDY previously sat here: Robinhood resolves it as not tradable for
 # fractional/notional buys (fractional_tradability != 'tradable'), so the
 # normal $1-$10 graded-ladder buy would always be blocked at the
@@ -316,11 +321,11 @@ ACTIVE_TICKERS = [
 # excluding it (never bought at all), BYDDY moved to WHOLE_SHARE_TICKERS
 # below, a distinct category with its own buying mechanism -- see
 # dca_whole_share_accumulator.py and docs/whole_share_accumulation.md.
-# EXCLUDED_TICKERS is kept (rather than removed) as the affirmative "this
-# ticker has NO buying mechanism at all" category for any future symbol that
-# genuinely needs it (e.g. a delisting/wind-down), distinct from
-# WHOLE_SHARE_TICKERS' "different mechanism, still actively bought" category.
-EXCLUDED_TICKERS: frozenset[str] = frozenset()
+# EXCLUDED_TICKERS is the affirmative "this ticker has NO buying mechanism at
+# all" category -- e.g. a delisting/wind-down, or QBUT's not-found status --
+# distinct from WHOLE_SHARE_TICKERS' "different mechanism, still actively
+# bought" category.
+EXCLUDED_TICKERS: frozenset[str] = frozenset({"QBUT"})
 
 # Tickers not tradable for fractional/notional buys on Robinhood. Evaluated
 # by the SAME graded ladder as ACTIVE_TICKERS (so they appear in signals.csv
@@ -364,11 +369,17 @@ def _weekday_range(start: date, end: date) -> set:
 MARKET_HOLIDAYS = frozenset({date(2026, 7, 3)})
 
 # Approved live-test window. The original pilot dates (Jun 29 - Jul 1 2026) plus
-# the canonical live window of weekdays 2026-07-02 through 2026-10-30 inclusive
+# the canonical live window of weekdays 2026-07-02 through 2027-03-12 inclusive
 # (minus market holidays), matching config/trading_window.json's start_date/
 # end_date (the authoritative window, extended from 2026-08-28 to 2026-10-30 on
-# 2026-07-26; see that file's own description for the DST reason it stops
-# there). Without this, run_once()'s date gate would mark every scheduled run
+# 2026-07-26 and again to 2027-03-12 on 2026-09-18). The 2026-07-26 extension
+# deliberately stopped the Friday before the EDT->EST change because the
+# external trigger gates were fixed-UTC/EDT-only; the 2026-09-18 extension
+# records those gates as now DST-aware (dual-hour UTC crons covering both the
+# EDT-hour and EST-hour local fires), which is what unblocked spanning the
+# standard-time season. 2027-03-12 (a Friday) is the last trading day before the
+# 2027-03-14 EST->EDT transition, which falls on a Sunday; see that file's
+# own description. Without this, run_once()'s date gate would mark every scheduled run
 # in the live window blocked/no-trade. Callers normally override this default
 # via ``config/trading_window.json`` (``dca_config.load_approved_dates``), but
 # a bare ``StrategyConfig()`` and ``load_strategy_config`` with an absent
@@ -382,7 +393,7 @@ MARKET_HOLIDAYS = frozenset({date(2026, 7, 3)})
 # hand-maintained MARKET_HOLIDAYS above.
 APPROVED_TEST_DATES = (
     {date(2026, 6, 29), date(2026, 6, 30), date(2026, 7, 1)}
-    | _weekday_range(date(2026, 7, 2), date(2026, 10, 30))
+    | _weekday_range(date(2026, 7, 2), date(2027, 3, 12))
 ) - MARKET_HOLIDAYS
 
 
@@ -10721,41 +10732,99 @@ def _orders_csv_terminal_non_fills(
         return order_ids, tickers
     try:
         with open(orders_csv, newline="", encoding="utf-8") as handle:
-            iter_csv = csv.reader(handle)
-            header = next(iter_csv, None)
-            if header is None:
-                return []
-            for _raw_row in iter_csv:
-                row = dict(zip(header, _raw_row + [None] * max(0, len(header) - len(_raw_row))))  # noqa: B905
-                # csv.DictReader fills omitted TRAILING cells with None rather
-                # than raising, so a row observed mid-write can look like a
-                # zero-execution terminal outcome purely because its
-                # cumulative_quantity has not been flushed yet -- and this
-                # helper would then delete a candidate whose order really did
-                # partially fill, letting the later run buy its full amount.
-                # _orders_csv_fills drops such a tail row; here ANY row with a
-                # missing field is refused, not just the last one, because this
-                # collector only ever REMOVES prior allocation and so must be
-                # strictly more conservative (Codex review: "Reject truncated
-                # terminal rows before excluding candidates").
-                if any(value is None for value in row.values()):
+            reader = csv.reader(handle)
+            try:
+                fieldnames = next(reader)
+            except StopIteration:
+                return set(), set()
+
+            try:
+                _state_idx = fieldnames.index("state")
+                _oid_idx = fieldnames.index("order_id")
+                _ticker_idx = fieldnames.index("ticker")
+
+                _qty_indices = []
+                for col in _EXECUTED_QUANTITY_COLS:
+                    if col in fieldnames:
+                        _qty_indices.append(fieldnames.index(col))
+                _min_len = len(fieldnames)
+            except ValueError:
+                # Fallback to DictReader for missing expected columns
+                handle.seek(0)
+                for row in csv.DictReader(handle):
+                    if any(value is None for value in row.values()):
+                        continue
+                    state = (row.get("state") or "").strip().lower()
+                    if state not in _TERMINAL_NON_FILL_STATES:
+                        continue
+                    if not _executed_quantity_is_explicit_zero(row):
+                        continue
+                    oid = (row.get("order_id") or "").strip()
+                    if oid and oid != "-":
+                        order_ids.add(oid)
+                    else:
+                        ticker = (row.get("ticker") or "").strip().upper()
+                        if ticker:
+                            tickers.add(ticker)
+                return order_ids, tickers
+
+            for _row in reader:
+                # csv.reader produces a list. We pair it with fieldnames to detect None values
+                # based on mismatched lengths or explicit empty/missing fields.
+                if len(_row) < _min_len:
+                    # A row shorter than headers implies trailing missing cells (mid-write)
                     continue
-                state = (row.get("state") or "").strip().lower()
+
+                state = (_row[_state_idx] or "").strip().lower()
                 if state not in _TERMINAL_NON_FILL_STATES:
                     continue
-                # An EXPLICIT numeric zero is required, not merely the absence
-                # of a positive quantity. A malformed or missing cell means the
-                # artifact does not establish whether the order executed, and
-                # this collector only ever REMOVES prior allocation -- so an
-                # unresolved row must stay unresolved rather than be read as a
-                # definitive zero fill.
-                if not _executed_quantity_is_explicit_zero(row):
+
+                _explicit_zero = False
+                _handled = False
+                for idx in _qty_indices:
+                    val = _row[idx]
+                    if val in (None, "", "-"):
+                        continue
+                    try:
+                        f_val = float(val)
+                        if math.isfinite(f_val) and f_val == 0.0:
+                            _explicit_zero = True
+                            _handled = True
+                            break
+                        else:
+                            _handled = True
+                            break
+                    except (TypeError, ValueError):
+                        _handled = True
+                        break
+
+                # Replicate fallback in _executed_quantity_is_explicit_zero exactly
+                if not _handled:
+                    _raw = None
+                    for col in _FILL_QUANTITY_COLS:
+                        if col in fieldnames:
+                            _idx = fieldnames.index(col)
+                            _val = _row[_idx]
+                            if _val is not None:
+                                _raw = _val
+                                break
+
+                    if _raw not in (None, "", "-"):
+                        try:
+                            f_qty = float(_raw)
+                            if math.isfinite(f_qty) and f_qty == 0.0:
+                                _explicit_zero = True
+                        except (TypeError, ValueError):
+                            pass
+
+                if not _explicit_zero:
                     continue
-                oid = (row.get("order_id") or "").strip()
+
+                oid = (_row[_oid_idx] or "").strip()
                 if oid and oid != "-":
                     order_ids.add(oid)
                 else:
-                    ticker = (row.get("ticker") or "").strip().upper()
+                    ticker = (_row[_ticker_idx] or "").strip().upper()
                     if ticker:
                         tickers.add(ticker)
     except (OSError, csv.Error, UnicodeDecodeError):
@@ -39462,7 +39531,7 @@ def run_daily_compact(
                 # write, and no archive is created for a canonical file that
                 # was never actually replaced.
                 _mode_switch_archive_state_text = _serialize_run_state(
-                    cast(Dict[str, Any], _prior_state_payload)
+                    _prior_state_payload
                 )
                 _mode_switch_archive_path = (
                     Path(options.artifacts_dir)

@@ -249,7 +249,7 @@ def _schedule(day: date, now: datetime, config_dir: Path, warnings: list[str]) -
     except (OSError, ValueError, TypeError, KeyError, RuntimeError):
         calendar = None
         warnings.append("The market calendar is unavailable or does not cover the selected year; timing is unverified.")
-    rows = []
+    rows: list[dict[str, Any]] = []
     for index, task in enumerate(manifest["tasks"]):
         if not isinstance(task, dict):
             warnings.append("An invalid schedule entry was skipped.")
@@ -260,7 +260,7 @@ def _schedule(day: date, now: datetime, config_dir: Path, warnings: list[str]) -
             if one_time:
                 clocks = [one_time.timetz().replace(tzinfo=None)]
             for clock in clocks or [None]:
-                row = {
+                row: dict[str, Any] = {
                     "id": _safe_label(task.get("id"), f"task-{index}"),
                     "name": _safe_label(task.get("name"), "Unnamed task"),
                     "time": clock.strftime("%H:%M") if clock else "unspecified",
@@ -301,6 +301,18 @@ def _schedule(day: date, now: datetime, config_dir: Path, warnings: list[str]) -
             })
             warnings.append("A task has timing information that could not be verified.")
     return sorted(rows, key=lambda row: (row["time"], row["name"]))
+
+
+def build_schedule_rows(day: date, now: datetime, config_dir: Path, warnings: list[str]) -> list[dict[str, Any]]:
+    """Public entry for the Schedule page (GUI expansion, Phase 2).
+
+    Returns :func:`_schedule` unchanged: one row per manifest task (or per ET
+    slot of a multi-slot task) with the same ``timing_unverified`` /
+    ``not_scheduled_today`` / ``elapsed_unverified`` vocabulary the daily
+    snapshot shows, so the two pages can never disagree about a task's timing.
+    ``warnings`` is appended to in place, exactly as the private function does.
+    """
+    return _schedule(day, now, config_dir, warnings)
 
 
 def build_daily_snapshot(

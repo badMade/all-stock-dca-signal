@@ -52,6 +52,7 @@ def test_combine_scores_ranks_higher_metrics_higher():
 
     scores = combine_scores(raw)
 
+    assert scores["STRONG"].composite is not None and scores["WEAK"].composite is not None
     assert scores["STRONG"].composite > scores["WEAK"].composite
     assert scores["STRONG"].classification == "ADD"
     assert scores["WEAK"].classification == "REJECT"
@@ -327,7 +328,10 @@ def test_scale_dominant_metric_does_not_drown_out_the_other():
 
     scores = combine_scores(raw)
 
-    assert scores["BEST_SHARPE"].sub_scores["health"] > scores["WORST_SHARPE"].sub_scores["health"]
+    best_health = scores["BEST_SHARPE"].sub_scores["health"]
+    worst_health = scores["WORST_SHARPE"].sub_scores["health"]
+    assert best_health is not None and worst_health is not None
+    assert best_health > worst_health
 
 
 def test_raw_errors_surface_in_rationale():

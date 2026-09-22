@@ -1223,6 +1223,33 @@ def test_write_alert_file_lands_where_the_alert_digest_reads(monkeypatch, tmp_pa
     assert afternoon == tmp_path / "ce16ba6b" / "alerts" / "2026-09-08-1530-gate7.txt"
 
 
+def test_write_alert_file_does_not_clobber_a_same_slot_same_gate_collision(monkeypatch, tmp_path):
+    """Regression for the 9/15 11:30 incident: the filename key is
+    (day, slot, gate) only, with no executor/session identity, so a second
+    firing for the same tuple (e.g. a retry, or a primary executor and its
+    Perplexity backup both alerting the same slot/gate the same day)
+    silently overwrote the first file's content -- evidence lost exactly
+    when most needed (docs/alert_digest.md's own AlertRecord.key docstring
+    already documents this as a known, tolerated gap). A second call with
+    the same (stream, slot, gate, trading_day) must land at a distinct path
+    that preserves the first file's content, using the digest's own already-
+    supported optional ".N" gate suffix so no downstream parser changes."""
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path))
+    first = dca_alerts.write_alert_file(
+        "morning", slot="1030", gate="gate5", body="first alert", trading_day=date(2026, 9, 8)
+    )
+    second = dca_alerts.write_alert_file(
+        "morning", slot="1030", gate="gate5", body="second alert", trading_day=date(2026, 9, 8)
+    )
+    assert first != second
+    assert first.read_text(encoding="utf-8").strip() == "first alert"
+    assert second.read_text(encoding="utf-8").strip() == "second alert"
+    from scripts.alert_digest import _ALERT_FILENAME
+
+    assert _ALERT_FILENAME.match(first.name)
+    assert _ALERT_FILENAME.match(second.name)
+
+
 def test_write_alert_file_never_raises(monkeypatch, tmp_path):
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "file-not-dir"))
     (tmp_path / "file-not-dir").write_text("occupied", encoding="utf-8")

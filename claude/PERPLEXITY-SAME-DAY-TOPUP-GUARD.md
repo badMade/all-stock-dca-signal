@@ -74,6 +74,7 @@ is stale.
 > unambiguously `sell`.
 >
 > Each remaining order's contribution depends on its state:
+>
 > - **Filled** → counts its *executed* dollar amount (filled quantity × average
 >   fill price), and that average fill price is a candidate reference price.
 > - **Pending / still working** → counts its full submitted dollar amount,
@@ -98,6 +99,7 @@ is stale.
 >   the silent gap Step 5 exists to close.
 >
 > From those contributions, per ticker:
+>
 > - `prior_usd[ticker]` = sum of every contribution above.
 > - `prior_price[ticker]` — a zero-fill terminal order (it counts $0 above and
 >   carries no price) does not affect `prior_price` at all; skip it here
@@ -123,6 +125,7 @@ is stale.
 > since risen above its qualifying reference must never receive a buy
 > authorized on a stale, earlier quote. For each ticker you intend to buy,
 > with `desired_usd` from the ladder and this fresh `current_price`:
+>
 > - If `current_price` is missing, non-numeric, or not strictly positive → buy
 >   **$0.00** and flag the ticker for manual review, EVEN IF this would
 >   otherwise be a first allocation. A missing price never authorizes a buy,
@@ -171,7 +174,7 @@ way to close this gap, so it inherits the limitation rather than hiding it.
 DXYZ, as it actually happened versus as the guard would have sized it.
 
 | Time (ET) | Event | Actual | Guarded |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 09:36:46 | first buy, filled @ $23.2499 | $1.00 | $1.00 (first allocation) |
 | 10:13:35 | second buy, filled @ $22.3507 | $2.00 | **$1.00** |
 
@@ -182,7 +185,7 @@ bought equals $1.00, not another full $2.00.
 Contrast AAAU, which should not have repeated at all:
 
 | Time (ET) | Event | Actual | Guarded |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 11:40:32 | first buy, filled @ $39.8599 | $1.50 | $1.50 (first allocation) |
 | 11:41:42 | second buy, filled @ $39.8381 | $1.50 | **$0.00** |
 
@@ -213,6 +216,7 @@ yet exist.
 
 Genuine first-come-first-serve would need one medium both sides can write and
 read. Candidates worth checking, in rough order of likelihood:
+
 - Slack. Claude can post (verified 2026-07-28, channel `C0BKS1ZL5UY`). Whether
   Perplexity can post and read there is unconfirmed — though worth noting: the
   2026-07-31 `#dca-alerts`/DM history shows posts attributed to a sender named
@@ -232,6 +236,26 @@ trigger condition must be *"aborted before producing a buy list"* and NOT
 *"placed zero orders."* A quiet tape where the strategy correctly declines to
 buy would otherwise hand off to a runner that buys anyway, inverting the
 strategy on exactly the days it said stay out.
+
+**Reviewed 2026-09-18 (resolution: scope-narrowing, not a sharper trigger).**
+This gap was reviewed against a concrete incident (9/16: a flat $1 duplicate
+top-up on IBM already filled correctly at $4 ladder size). No sharper trigger
+condition is constructible today: Perplexity has no filesystem access to this
+repo, so it cannot read `run_state.json`'s `is_trading_failure` /
+`run_classification_outcome` / `completion_reason` fields, which are exactly
+the fields that already distinguish a genuine failure from a deliberate
+no-signal decline in this repo's own schema (`schemas/run_state.schema.json`)
+— and no broker-visible signal (order tag, note field, watchlist flag) stands
+in for them. The resolution chosen instead, recorded in
+`config/scheduled_tasks.json`'s `standing_perplexity_backup_policy.mechanism`:
+Perplexity's backup role only ever authorizes it to run its **own** independent
+signal/ladder/safety evaluation for the slot (already true per §2/§4's
+top-up sizing steps above), never to treat Claude's absence as license to
+buy purely on Perplexity's own discretion beyond that. This is a documented,
+accepted residual risk, not a solved problem — matching the pattern this
+section already uses for the "simultaneous start" gap above. Item 2 below
+("confirm which medium, if any, both executors can read and write") remains
+the actual precondition for ever building a real distinguishing trigger.
 
 ## 5. Open items for a human
 

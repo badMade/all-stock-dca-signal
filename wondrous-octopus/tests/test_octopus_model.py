@@ -19,12 +19,16 @@ from market_encoder import MarketDayEncoder  # noqa: E402
 from octopus_model import OctopusModel as _OctopusModel  # noqa: E402
 from octopus_model import _OctopusNet  # noqa: E402
 
-from conftest import make_synthetic_ohlcv, write_ticker_csv  # noqa: E402 # type: ignore[import-not-found]
+import conftest as _conftest  # noqa: E402
 
+conftest: Any = _conftest
 features: Any = _features
 OctopusModel: Any = _OctopusModel
 
-TINY = dict(
+make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
+write_ticker_csv = conftest.write_ticker_csv
+
+TINY: dict[str, Any] = dict(
     window_len=16,
     d_model=16,
     n_heads=2,
@@ -425,7 +429,7 @@ class TestSaveLoadAndResume:
         start = str(np.datetime_as_string(panel.calendar[151], unit="D"))
         end_full = str(np.datetime_as_string(panel.calendar[158], unit="D"))
         end_half = str(np.datetime_as_string(panel.calendar[154], unit="D"))
-        base = dict(
+        base: dict[str, Any] = dict(
             start=start,
             initial_train_end=str(np.datetime_as_string(panel.calendar[150], unit="D")),
             models=("octopus",),

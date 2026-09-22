@@ -1680,14 +1680,15 @@ def evaluate_inverse_martingale_step(
             # -- see the same-day re-arm guard below for why a later same-
             # day evaluation from a DIFFERENT stream must not treat a price
             # still within that already-paid-for range as a fresh dip.
+            lowest_drop = tracker_state.get("lowest_drop_seen")
             new_state = resolved_marker(
                 trading_day,
                 stream,
-                fired_floor_drop_metric=tracker_state.get("lowest_drop_seen"),
+                fired_floor_drop_metric=lowest_drop,
                 fired_floor_price=_drop_metric_to_price(
-                    reference_close, tracker_state.get("lowest_drop_seen"), basis, tracker_state.get("stddev_reference")
+                    reference_close, float(lowest_drop), basis, tracker_state.get("stddev_reference")
                 )
-                if tracker_state.get("lowest_drop_seen") is not None
+                if lowest_drop is not None
                 else None,
                 rearm_reference_close=tracker_state.get("cycle_reference_close"),
                 # cycle_reference_close is frozen from cycle_start_trading_day

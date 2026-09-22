@@ -267,8 +267,8 @@ class TestVerifyShardsIsReadOnly:
 
         original_relative_to = pathlib.Path.relative_to
 
-        def _fake_relative_to(self, *args, **kwargs):
-            real = original_relative_to(self, *args, **kwargs)
+        def _fake_relative_to(self, other):
+            real = original_relative_to(self, other)
             if str(real).endswith(".jsonl.gz"):
                 return _FakeWindowsRelPath(real.as_posix())
             return real

@@ -38,6 +38,18 @@ dependencies, or both.
 
 ## Everyday interface
 
+The console is one hash-routed page with eleven sections in the sidebar (Today,
+Runs, Schedule, State & ledgers, Alerts & health, Config, Reports, Research,
+Workflows & jobs, Environment, Docs). The hash names the section and nothing
+else; an unknown hash shows Today. Each section reads one or more `/api/*`
+routes below; the reader modules behind them (`dca_console_runs.py`,
+`dca_console_schedule.py`, `dca_console_state.py`, `dca_console_config.py`,
+`dca_console_alerts.py`, `dca_console_env.py`, `dca_console_docs.py`,
+`dca_console_launch.py`) take explicit roots and never write, never take a
+lock, and never touch the Google Drive ticker archive on a page view. Every root
+is shown as a label (basename plus a short digest), never as an absolute path.
+Every section is backed by a reader today.
+
 - Daily summaries: select a date, inspect observed runs, statuses, candidate
   counts and submitted-order counts, and download the summary as JSON.
 - Confirmed spend: comes from the existing purchase-history reader. Requested
@@ -56,9 +68,32 @@ dependencies, or both.
   results; the synthetic demo does not cover all historical crises.
 - Jobs: real command output, start and finish times, failures and retained
   history. One job runs at a time, with bounded logs and execution deadlines.
+  A running job can be cancelled from its row (its process group is
+  terminated and the job ends `cancelled`), and its log is polled as a delta
+  every 1.5 seconds while it runs.
 - Program directory: the repository's canonical entry-point catalog plus the
   adjacent research projects. Commands requiring market-data exports, an archive,
   broker adapters, or optional services retain those setup requirements.
+
+### Launchers
+
+Beyond the original eight demo/test/report actions, the Workflows page offers
+launchers whose inputs are resolved on the server (the browser still posts only
+an action id): `config-invariants` (pytest over `tests/test_config_invariants.py`,
+junit kept), `risk-report` (`dca_risk` over the primary root), `alert-digest`
+(`scripts/alert_digest.py --json` over the primary root), `drift-check` (the
+newest run directory, never `--slack`), `market-graph-archive` (last 365 days,
+bounded server-side) and `market-graph-csv`, `octopus-inspect-html`,
+`ml-train-dry-run` (`--dry-run`, `--output` pinned to the job directory), and
+seven `gate5-replay-<slot>` actions that re-run a candidate generator on the
+newest saved `market_data_*.json` payload found under the observed roots. The
+two slots whose generator needs the 7-day deployment figure (`1230`, `1530`)
+refuse to run unless the primary root's risk evidence is complete. Every
+launcher writes only under `<console-output>/launches/<job>/`, lists what it
+produced in a manifest, and a test asserts no template ever carries
+`--slack`, `--slack-webhook`, `--ledger`, `--write`, `--force`, `--account`,
+`--all-tickers-in-archive`, `--archive-dir`, `--install` or `--publish`.
+Nothing places, reviews or cancels an order, and no config file is written.
 
 The browser refreshes about every 15 seconds. While the launcher is running,
 its background reader also saves the current day's digest without requiring an
@@ -73,7 +108,16 @@ launcher stops refreshes; it does not install an OS or Codex scheduled task.
 ```bash
 python3 from.py --local
 python3 from.py --local --root /path/to/cron_tracking --octopus-run /path/to/octopus/run
+python3 from.py --local --secondary-root /path/to/checkout/artifacts
 ```
+
+`--secondary-root DIR` (repeatable, implies `--local`) adds another existing
+artifact tree to observe read-only beside the primary root, for example the
+gitignored repo-root `artifacts/` directory that holds run states and alert
+files the `dca_paths`-managed tree never received. A missing directory is
+refused at startup rather than observed as empty history. Readers label
+secondary roots as at risk (gitignored, not managed by `dca_paths`); demo mode
+never observes one.
 
 The default artifact root follows `dca_paths.cron_tracking_root()` and
 `DCA_CRON_TRACKING_ROOT`. Console output normally uses
@@ -169,7 +213,22 @@ Each demo invocation gets a new directory; previous runs are preserved.
 | GET | `/api/snapshot?date=YYYY-MM-DD&ticker=AAPL&period=all` | Basic-authenticated daily, schedule, forecast, job and module views |
 | GET | `/api/export?date=YYYY-MM-DD` | Basic-authenticated daily/forecast JSON download |
 | GET | `/api/docs?path=docs/live_wiring.md` | Basic-authenticated allowlisted local documentation |
+| GET | `/api/jobs/log?job=<id>&offset=<n>` | Basic-authenticated log delta for one job: the text appended after `offset` characters, the new offset, and whether the bounded log window dropped anything |
 | POST | `/api/jobs` | Start a fixed action with `{"action":"demo-dca"}`, Basic auth and `X-Console-Token` |
+| POST | `/api/jobs/cancel` | Cancel the active job with `{"job":"<id>"}`, Basic auth and `X-Console-Token`; `404` when that job is not queued or running |
+| GET | `/api/docs/index` | Basic-authenticated catalog of every servable page (docs/, root pages, subproject READMEs, `claude/` governance notes, the live-mirror prompts) with its docs-index and CLAUDE.md registration status |
+| GET | `/api/env` | Basic-authenticated Environment page: interpreters and probed packages, environment variable names with set/unset flags (never values), labelled roots and mounts, the listener's access policy, copyable repository gates |
+| GET | `/api/launch` | Basic-authenticated launch bench: the newest saved Gate 5 payload per slot, launcher readiness, and the manifests of recent launcher jobs |
+| GET | `/api/artifact?job=<id>&name=<file>` | Basic-authenticated launcher artifact named in that job's manifest; HTML pages (market graph, Octopus inspector) are served under a sandboxed CSP, JSON is redacted structurally, text is redacted as free text |
+| GET | `/api/today?date=` | The Today page's truth strip: the six live-money gates as configured/unconfigured/unknown, the approved-window countdown, and the same-day pointer validation per stream |
+| GET | `/api/runs?date=` \| `?month=YYYY-MM`, `/api/runs/tree`, `/api/runs/detail?run=run-<12hex>`, `/api/runs/pointers?date=` | The Runs page: the run index across every observed root (incomplete directories flagged, manual runs never counted as scheduled), the artifact tree map, one run's allowlisted identity/contract/drift/tables/post-trade/close-window sections, and the same-day pointer strip |
+| GET | `/api/schedule?date=`, `/api/schedule/tasks?date=`, `/api/schedule/policy?key=` | The Schedule page: manifest tasks, the deploy/ cron and systemd layer, GitHub workflows, the launchd service, the roster identity, the configured/deployable/observed matrix, and one manifest policy block |
+| GET | `/api/state?date=`, `/api/state/strategy`, `/api/state/ledger?kind=&ticker=&date=`, `/api/state/purchases?date=`, `/api/state/risk?date=`, `/api/state/maintenance?days=` | The State & ledgers page: `strategy_state.json` read without its lock (corrupt is an alarm, absent is absent), the three accumulation ledgers read from their files, confirmed purchases, the risk report with its evidence gate, maintenance events |
+| GET | `/api/config?date=`, `/api/config/file?stem=`, `/api/config/effective`, `/api/config/ladder`, `/api/config/ladder/point?drop=&ticker=` | The Config page (read-only): the catalog with schema/loader/fail-mode, parity checks mirroring the invariants test, executor stream flags, publisher-only sizing sources, a bounded file view with `${VAR}` shown as set/unset, the effective `StrategyConfig`, and the ladder |
+| GET | `/api/reports?date=`, `/api/reports/weekly?date=`, `/api/reports/cost?month=`, `/api/reports/latest`, `/api/reports/summary?date=` | The Reports page: the weekly dashboard markdown for the ISO week (scheduled runs under `scheduled_runs/` and the date-named directories of a secondary root), the monthly cost tracker in proxy units, the newest `latest_run_summary.json` with its Notion preview (`page_id` null), and the console's own saved digests; nothing is written |
+| GET | `/api/research` | The Research page's catalog: Octopus run directories with `run_meta.json`/checkpoint metadata, research launcher artifacts, and the `analysis/` archive listing |
+| GET | `/api/alerts?from=&to=`, `/api/alerts/inbox`, `/api/alerts/usage?month=`, `/api/alerts/drift?date=` | The Alerts & health page: alert files from both trees (secondary flagged at risk), the digest, failed-start markers, model usage, delivery channel names, self-heal configuration, reliability-engine presence, and per-run drift for one day |
+| GET | `/`, `/app.js`, `/pages.js`, `/styles.css` | The browser bundle, served from an exact-match map derived from `dca_console.CONSOLE_FILES` |
 | Any | Any route except `/api/health` | Missing or incorrect Basic auth returns JSON `401` and `WWW-Authenticate: Basic realm="DCA console", charset="UTF-8"` |
 | Any | Any route | A rejected Host, Origin or Fetch Metadata check returns JSON `403` with bounded `received_host` and `forwarded_host`; a bad job token also returns `403` before the job is accepted |
 
@@ -447,7 +506,14 @@ Phase A value crossed the LAN in plaintext).
 
 Implementation: `from.py` → `dca_console.py`, with separate daily-data,
 Octopus-artifact, and job modules plus browser assets under `console/` and the
-checkout-only launchd renderer under `deploy/launchd/`.
+checkout-only launchd renderer under `deploy/launchd/`. Since the GUI
+expansion's Phase 0, `dca_console_routes.py` holds the read-only `GET_ROUTES`
+table (dispatched after the unchanged trust → Basic → token gate order, with
+every JSON body passed through `walk_redact`) and `dca_console_reader.py`
+holds the shared confined reader (`BoundedReader`, `RootSpec`) every page
+reader builds on. Every JSON string leaving the server is scrubbed of
+registered secrets, sensitive environment values and account-shaped literals;
+absolute paths are never emitted.
 
 ## Verification for Rock 5
 

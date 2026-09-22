@@ -55,7 +55,7 @@ import stat
 import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Generator, Iterator
 
 _LEDGER_DIRNAME = "ledger"
 
@@ -100,7 +100,7 @@ def _require_secure_filesystem() -> None:
 
 
 @contextmanager
-def _directory(parent_fd: int | None, name: str, *, create: bool = False) -> Iterator[int]:
+def _directory(parent_fd: int | None, name: str, *, create: bool = False) -> Generator[int, None, None]:
     """Pin a directory without following an alias in its final component."""
     if create:
         try:
@@ -147,12 +147,13 @@ def _settled_shard(relpath: str, look: Callable[[], tuple[os.stat_result, os.sta
     """
     if deadline is None:
         deadline = time.monotonic() + _ALIAS_SETTLE_SECONDS
+    max_links = int(os.environ.get("DCA_LEDGER_MAX_LINKS", "1"))
     while True:
         info, named = look()
         _regular_file(info, relpath)
         if named is not None and (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
             raise LedgerError(f"REFUSED: ledger shard {relpath} was replaced while it was being checked")
-        if info.st_nlink == 1:
+        if info.st_nlink <= max_links:
             return info
         if info.st_nlink == 0:
             # Every name for this inode is gone, so waiting cannot bring the
@@ -328,7 +329,7 @@ class Ledger:
 
     # -- lifecycle ---------------------------------------------------------
     @contextmanager
-    def _root_handle(self, *, create: bool = False) -> Iterator[int]:
+    def _root_handle(self, *, create: bool = False) -> Generator[int, None, None]:
         _require_secure_filesystem()
         try:
             # The caller selects the run directory (which may itself be an

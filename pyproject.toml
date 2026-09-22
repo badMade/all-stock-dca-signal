@@ -16,13 +16,13 @@ dependencies = []
 [project.optional-dependencies]
 selfheal = [
     "pytest==9.1.1",
-    "ruff==0.16.2",
-    "pyright==1.1.411",
+    "ruff==0.16.7",
+    "pyright==1.1.414",
     "pytest-cov==7.1.0",
     "pip-audit==2.10.1",
     "pip-tools",
-    "types-requests==2.33.0.20260712",
-    "types-PyYAML==6.0.12.20240917",
+    "types-requests==2.33.0.20260906",
+    "types-PyYAML==6.0.12.20260906",
     "types-beautifulsoup4==4.12.0.20250516",
     "types-Pillow"
 ]
@@ -35,7 +35,7 @@ selfheal = [
 # at all (Codex review, PR #219).
 dev = [
     "pytest==9.1.1",
-    "ruff==0.16.2",
+    "ruff==0.16.7",
     "jsonschema==4.26.0",
     "referencing==0.37.0",
     "pytest-cov==7.1.0",
@@ -45,12 +45,14 @@ dev = [
     # else, since it isn't a documented dependency of either (Codex review,
     # PR #219: "Include PyYAML in the dev extra").
     "pyyaml==6.0.3",
-    "types-requests==2.33.0.20260712",
-    "types-PyYAML==6.0.12.20240917",
+    "types-requests==2.33.0.20260906",
+    "types-PyYAML==6.0.12.20260906",
     "types-beautifulsoup4==4.12.0.20250516",
+    "scipy-stubs==1.17.1.5; python_version < '3.12'",
+    "scipy-stubs==1.18.1.0; python_version >= '3.12'",
     "pip-audit==2.10.1",
-    "pyright==1.1.411",
-    "uv==0.12.10",
+    "pyright==1.1.414",
+    "uv==0.12.13",
 ]
 # Heavy, undeclared-elsewhere deps used only by the trading-strategies/ research
 # tools (backtester, sentiment monitor). Not needed to run the DCA strategy.
@@ -151,14 +153,20 @@ py-modules = [
     # shipped in no wheel (2026-09-07 diagnostic P:PACKAGING-02).
     "sizing_adjustment_reader",
     # Deliberately NOT listed: dca_console, dca_console_data, dca_console_jobs,
-    # dca_console_octopus (and the from.py launcher) are the local developer
-    # console and only ever run from a source checkout.
+    # dca_console_octopus, dca_console_reader, dca_console_routes, and the
+    # page readers dca_console_{runs,schedule,state,config,alerts,reports,
+    # research,env,docs,launch} (and the from.py launcher) are the local
+    # developer console and only ever run from a source checkout.
 ]
 # scripts/run_classification.py is the run-classification contract used by both
 # the live artifact writer (near_close_dca.build_run_artifacts) and readers
 # (dca_risk, dca_reporting) -- it must ship with the installed package, not just
 # exist in a checkout, or those imports fail at runtime (see scripts/__init__.py).
-packages = ["scripts"]
+# selfheal/ holds the bounded self-heal foundations and the Notion-backed issue
+# loop. Both resolve their own config through sys.prefix, so the package must be
+# installed rather than merely present in a checkout, or load() raises on a wheel
+# (CLAUDE.md: "New top-level module or config file => update pyproject.toml").
+packages = ["scripts", "selfheal"]
 
 # Ship the version-controlled config so an installed `run-dca` (outside a checkout) finds
 # the live trading window instead of falling back to the hardcoded defaults. dca_config
@@ -199,6 +207,13 @@ packages = ["scripts"]
     # this list from dca_config's own _read_json call sites (2026-09-07
     # diagnostic, P:PACKAGING-01).
     "config/near_close_dca.json",
+    # Read by selfheal.config.load and selfheal.notion_issue_loop.load_config,
+    # both of which check sys.prefix/share/all-stock-dca/config after the
+    # checkout path. Without these the strict loaders raise on an installed
+    # wheel instead of finding the policy they are meant to enforce. The rest of
+    # the self-heal packaging acceptance remains Rock 7's.
+    "config/self_heal.json",
+    "config/notion_issue_loop.json",
 ]
 
 # Browser assets for the 3D market graph, resolved at runtime by
@@ -248,7 +263,7 @@ pythonpath = [".", "tests", "dca-sizing-signals"]
 # cd <dir> && python -m pytest tests/), so keep both out of the core
 # "pytest" sweep the same way ruff already excludes them below.
 # wondrous-octopus/ (pandas/numpy/scikit-learn/torch) follows the same rule.
-addopts = "-q --ignore=production-safe-agent-loop --ignore=ticker-advisor --ignore=ml-forecaster --ignore=wondrous-octopus --ignore=dca-sizing-signals --ignore=ticker-market-breadth"
+addopts = "-q --ignore=production-safe-agent-loop --ignore=ticker-advisor --ignore=ml-forecaster --ignore=wondrous-octopus --ignore=dca-sizing-signals --ignore=ticker-market-breadth --ignore=llm-providers --ignore=yfinance-prefetch"
 
 [tool.coverage.run]
 # Measure the code that runs in production, not the suite that exercises it.
@@ -279,6 +294,10 @@ omit = [
     "dca-sizing-signals/*",
     # Own pytest run, own yfinance/pandas dep -- see ticker-market-breadth/README.md.
     "ticker-market-breadth/*",
+    # Own pytest run, own openai/anthropic/google-genai deps -- see llm-providers/README.md.
+    "llm-providers/*",
+    # Own pytest run, own yfinance/pandas dep -- see yfinance-prefetch/README.md.
+    "yfinance-prefetch/*",
 ]
 
 [tool.coverage.report]
@@ -314,6 +333,8 @@ extend-exclude = [
     "wondrous-octopus",
     "dca-sizing-signals",
     "ticker-market-breadth",
+    "llm-providers",
+    "yfinance-prefetch",
 ]
 
 [tool.ruff.lint]
@@ -321,7 +342,10 @@ select = ["E", "F", "I", "B"]
 ignore = ["E501"]
 
 [tool.pyright]
+venvPath = "."
+venv = ".venv"
 extraPaths = [
+    ".",
     "tests",
     "scripts",
     "ml-forecaster",
@@ -329,16 +353,28 @@ extraPaths = [
     "production-safe-agent-loop",
     "wondrous-octopus",
     "dca-sizing-signals",
+    "ticker-market-breadth",
+    "trading-strategies",
+    "llm-providers",
+    "yfinance-prefetch",
 ]
 typeCheckingMode = "basic"
 reportGeneralTypeIssues = false
+reportArgumentType = false
+reportCallIssue = false
+reportIndexIssue = false
+reportAttributeAccessIssue = false
 executionEnvironments = [
     { root = "wondrous-octopus", extraPaths = ["wondrous-octopus", "."] },
     { root = "ml-forecaster", extraPaths = ["ml-forecaster", "."] },
     { root = "ticker-advisor", extraPaths = ["ticker-advisor", "."] },
     { root = "production-safe-agent-loop", extraPaths = ["production-safe-agent-loop", "."] },
     { root = "dca-sizing-signals", extraPaths = ["dca-sizing-signals", "."] },
-    { root = ".", extraPaths = ["tests", "scripts"] },
+    { root = "ticker-market-breadth", extraPaths = ["ticker-market-breadth", "."] },
+    { root = "trading-strategies", extraPaths = ["trading-strategies", "."] },
+    { root = "llm-providers", extraPaths = ["llm-providers", "."] },
+    { root = "yfinance-prefetch", extraPaths = ["yfinance-prefetch", "."] },
+    { root = ".", extraPaths = [".", "tests", "scripts"] },
 ]
 
 

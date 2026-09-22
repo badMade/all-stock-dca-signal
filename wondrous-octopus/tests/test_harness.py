@@ -9,7 +9,7 @@ from collections import Counter
 from typing import Any, Sequence
 
 import baseline_model
-import features
+import features as _features
 import harness as harness_module
 import numpy as np
 import pandas as pd
@@ -17,6 +17,8 @@ import pytest
 from harness import HarnessConfig, HarnessError, WalkForwardHarness
 from ledger import Ledger
 from model_interface import ForecastRequest, RepairCounts
+
+features: Any = _features
 
 
 def _quiet(_message: str) -> None:
@@ -35,7 +37,7 @@ def _config(panel, *, n_steps=None, models=("persistence",), **overrides):
     end = None
     if n_steps is not None:
         end = np.datetime_as_string(panel.calendar[151 + n_steps - 1], unit="D")
-    defaults = dict(
+    defaults: dict[str, Any] = dict(
         start=start,
         end=end,
         initial_train_end=np.datetime_as_string(panel.calendar[150], unit="D"),

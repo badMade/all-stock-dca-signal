@@ -9,11 +9,12 @@ from pathlib import Path
 from typing import Any
 
 import daily_update
-import dca_paths
 import features as _features
 import numpy as np
 import pytest
 import run_walkforward
+
+import dca_paths
 
 features: Any = _features
 
@@ -1006,7 +1007,7 @@ class TestDefaultRunRootIsolation:
         # directory and run_meta.json, THEN the fit refuses. A code of 1
         # proves we got past directory creation rather than failing early
         # on argument validation, which would make the assertion vacuous.
-        probe = _features.build_panel(synthetic_history_dir, min_history=60)
+        probe = features.build_panel(synthetic_history_dir, min_history=60)
         impossible_cutoff = str(np.datetime_as_string(probe.calendar[0], unit="D"))
         code = run_walkforward.main(
             [

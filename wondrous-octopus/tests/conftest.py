@@ -112,12 +112,12 @@ def make_synthetic_ohlcv(
         }
     )
     if with_volume:
-        frame["Volume"] = rng.integers(500_000, 5_000_000, size=n)
+        frame["Volume"] = rng.integers(500_000, 5_000_000, size=n).tolist()
     if gap is not None:
         gap_start, gap_len = gap
         keep = np.ones(n, dtype=bool)
         keep[gap_start : gap_start + gap_len] = False
-        frame = frame.loc[keep].reset_index(drop=True)
+        frame = frame.loc[list(keep)].reset_index(drop=True)
     return frame
 
 
@@ -187,7 +187,7 @@ def synthetic_history_dir(tmp_path: Path, market_factor: np.ndarray) -> Path:
         "BBB",
         make_synthetic_ohlcv(seed=2, drift=-0.0002, market_returns=market_factor, market_beta=1.0, split_at=130),
     )
-    late_start = str(pd.bdate_range(start=DEFAULT_START, periods=DEFAULT_ROWS)[104].date())
+    late_start = str(pd.bdate_range(start=DEFAULT_START, periods=DEFAULT_ROWS).strftime("%Y-%m-%d")[104])
     write_ticker_csv(
         history_dir,
         "CCC",

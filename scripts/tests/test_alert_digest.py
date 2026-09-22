@@ -1635,13 +1635,13 @@ def test_lowercase_reason_code_negation_is_still_honoured():
 
 
 def test_expected_days_stop_at_the_approved_trading_window():
-    # config/trading_window.json ends 2026-10-30; the weekdays after it are days
+    # config/trading_window.json ends 2027-03-12; the weekdays after it are days
     # the scheduler's trigger window had already closed on, not days it died.
-    days = expected_roster_days(date(2026, 10, 28), date(2026, 11, 6))
-    assert max(days) == date(2026, 10, 30)
-    assert date(2026, 11, 2) not in days
+    days = expected_roster_days(date(2027, 3, 10), date(2027, 3, 19))
+    assert max(days) == date(2027, 3, 12)
+    assert date(2027, 3, 15) not in days
     # The raw NYSE calendar still has them; only the *expected* view is clamped.
-    assert date(2026, 11, 2) in trading_days_between(date(2026, 10, 28), date(2026, 11, 6))
+    assert date(2027, 3, 15) in trading_days_between(date(2027, 3, 10), date(2027, 3, 19))
 
 
 def test_expected_days_stop_before_the_approved_window_start():
@@ -1652,13 +1652,13 @@ def test_expected_days_stop_before_the_approved_window_start():
 def test_days_after_the_window_are_not_reported_as_roster_silent(tmp_path, capsys):
     path = tmp_path / "drafts.json"
     path.write_text(
-        json.dumps({"drafts": [_draft("r1", "2026-10-30T19:34:00Z", "ABORT 3:30 PM ET slot Gate 4", "x")]}),
+        json.dumps({"drafts": [_draft("r1", "2027-03-12T19:34:00Z", "ABORT 3:30 PM ET slot Gate 4", "x")]}),
         encoding="utf-8",
     )
-    main(["--drafts", str(path), "--since", "2026-10-28", "--as-of", "2026-11-06", "--json"])
+    main(["--drafts", str(path), "--since", "2027-03-10", "--as-of", "2027-03-19", "--json"])
     payload = json.loads(capsys.readouterr().out)
-    assert "2026-11-02" not in payload["roster_silent_days"]
-    assert payload["roster_silent_days"] == ["2026-10-28", "2026-10-29"]
+    assert "2027-03-15" not in payload["roster_silent_days"]
+    assert payload["roster_silent_days"] == ["2027-03-10", "2027-03-11"]
 
 
 def test_unclamped_when_the_window_config_is_unreadable(tmp_path, monkeypatch):
@@ -1669,10 +1669,11 @@ def test_unclamped_when_the_window_config_is_unreadable(tmp_path, monkeypatch):
 
 
 # The early-close calendar is exercised against _compute_streaks directly rather
-# than through build_digest: every configured early close falls after
-# config/trading_window.json's 2026-10-30 end, so the approved-window clamp above
-# would (correctly) leave build_digest with an empty calendar and no streak to
-# measure. The two guards are independent, and this is the one under test.
+# than through build_digest: the two guards are independent and this is the one
+# under test. (Until the 2026-09-18 window extension the stronger claim held --
+# every configured early close fell after the then-2026-10-30 end, so the clamp
+# left build_digest with an empty calendar. The 2026-11-27 early close is inside
+# the window now, so only the independence argument still applies.)
 def test_late_slot_streak_bridges_an_early_close_day():
     # 2026-11-27 is an early close at 1:00 PM ET, so the 1530 slot was not
     # scheduled that day. Failures either side of it are one repeat, not two.
@@ -1854,16 +1855,16 @@ def test_slot_filter_still_renders_another_slots_off_calendar_firing(tmp_path, c
 
 
 def test_an_out_of_window_weekday_is_not_called_a_non_trading_day(tmp_path, capsys):
-    # 2026-11-02 is an ordinary NYSE Monday; it is past the approved window, so
+    # 2027-03-15 is an ordinary NYSE Monday; it is past the approved window, so
     # the fault is an off-schedule firing, not an off-market one.
     path = tmp_path / "drafts.json"
     path.write_text(
-        json.dumps({"drafts": [_draft("r1", "2026-11-02T20:34:00Z", "ABORT 3:30 PM ET slot Gate 4", "x")]}),
+        json.dumps({"drafts": [_draft("r1", "2027-03-15T20:34:00Z", "ABORT 3:30 PM ET slot Gate 4", "x")]}),
         encoding="utf-8",
     )
-    main(["--drafts", str(path), "--as-of", "2026-11-02"])
+    main(["--drafts", str(path), "--as-of", "2027-03-15"])
     out = capsys.readouterr().out
-    assert "2026-11-02" in out
+    assert "2027-03-15" in out
     assert "outside the approved trading window" in out
     assert "NOT a trading day" not in out
 
@@ -2284,12 +2285,12 @@ def test_json_coverage_classifies_a_weekend_firing(tmp_path, capsys):
 def test_json_coverage_classifies_a_day_outside_the_approved_window(tmp_path, capsys):
     path = tmp_path / "drafts.json"
     path.write_text(
-        json.dumps({"drafts": [_draft("r1", "2026-11-02T20:34:00Z", "ABORT 3:30 PM ET slot Gate 4", "x")]}),
+        json.dumps({"drafts": [_draft("r1", "2027-03-15T20:34:00Z", "ABORT 3:30 PM ET slot Gate 4", "x")]}),
         encoding="utf-8",
     )
-    main(["--drafts", str(path), "--as-of", "2026-11-02", "--json"])
+    main(["--drafts", str(path), "--as-of", "2027-03-15", "--json"])
     payload = json.loads(capsys.readouterr().out)
-    assert payload["day_classification"]["2026-11-02"] == "outside_approved_trading_window"
+    assert payload["day_classification"]["2027-03-15"] == "outside_approved_trading_window"
 
 
 def test_json_and_text_classification_agree_on_every_day(tmp_path, capsys):

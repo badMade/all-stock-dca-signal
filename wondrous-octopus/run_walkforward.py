@@ -20,11 +20,26 @@ driven directly by this process); `--device auto` prefers cuda, then Apple
 MPS, then CPU.
 """
 
+# ruff: noqa: E402
 from __future__ import annotations
 
+import argparse
+import contextlib
+import hashlib
+import json
 import os
+import signal
 import sys
+import threading
+import time
+import traceback
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
+
+# Enable PyTorch CPU fallback for ops not yet implemented in Apple Silicon MPS backend
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+os.environ.setdefault("DCA_LEDGER_MAX_LINKS", "2" if sys.platform == "darwin" else "1")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # Index 1, not 0 -- index 0 is this subproject's own directory; see
@@ -42,19 +57,8 @@ ensure_venv(
     ),
 )
 
-import argparse
-import contextlib
-import hashlib
-import json
-import signal
-import threading
-import time
-from datetime import datetime, timedelta
-from typing import Any
-
-import numpy as np
-
 import features as _features  # noqa: E402
+import numpy as np  # noqa: E402
 
 from dca_paths import stream_root  # noqa: E402
 from dca_ticker_paths import configured_ticker_history_dir  # noqa: E402
@@ -466,7 +470,7 @@ def _estimate_cost(
     matrix = np.random.default_rng(0).normal(size=(size, size)).astype(np.float32)
     began = time.perf_counter()
     for _ in range(10):
-        matrix @ matrix
+        _ = matrix @ matrix
     gemm_seconds = (time.perf_counter() - began) / 10
     per_ticker_step = 2e-6 + gemm_seconds / 5e3  # empirical fudge: features + model math
     per_step = avg_daily * per_ticker_step * len(names)
@@ -635,12 +639,14 @@ def main(argv: list[str] | None = None) -> int:
         message = str(error)
         if isinstance(error, ValueError) and not message.startswith("REFUSED"):
             print(f"RUNTIME FAILURE ({error.__class__.__name__}): {error}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
             print("The last checkpoint (if any) is retained; --resume can continue the run.", file=sys.stderr)
             return 2
         print(message if message.startswith("REFUSED") else f"REFUSED: {message}", file=sys.stderr)
         return 1
     except Exception as error:  # noqa: BLE001 -- CLI boundary: report, keep checkpoint, exit 2
         print(f"RUNTIME FAILURE ({error.__class__.__name__}): {error}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         print("The last checkpoint (if any) is retained; --resume can continue the run.", file=sys.stderr)
         return 2
     finally:
@@ -1192,6 +1198,13 @@ def _run(harness: WalkForwardHarness, run_dir: Path, *, interrupt_flag: _Interru
     # write_report() for a completed run.
     status = harness.run(release_lock=False)
     try:
+        if status == "systemic_model_failure":
+            print(
+                f"systemic_model_failure: halted run due to non-finite model predictions under {run_dir}. "
+                "The last healthy checkpoint is preserved.",
+                file=sys.stderr,
+            )
+            return 2
         if status in {"interrupted", "budget_tripped"}:
             # Both are CLEAN bounded stops with a valid checkpoint -- the
             # circuit-breaker trip already printed its banner.

@@ -433,8 +433,6 @@ def build_missing_fills(
     orders"). Falls back to plain ticker matching, exactly as before, when
     neither side has an order_id to disambiguate with.
     """
-    filled_tickers = {f.get("ticker") or f.get("symbol") for f in fills}
-
     # ⚡ Bolt Optimization: pre-compute, once per call, the only two facts the
     # candidate loop needs about a ticker's fills -- the set of normalized
     # order ids its fills carry, and whether any of its fills carries NO id --
@@ -450,8 +448,10 @@ def build_missing_fills(
     # exactly the "at least one same-ticker fill carries an order_id" test.
     fill_order_ids_by_ticker: Dict[Any, set[str]] = {}
     tickers_with_unidentified_fill: set[Any] = set()
+    filled_tickers: set[Any] = set()
     for f in fills:
         ticker = f.get("ticker") or f.get("symbol")
+        filled_tickers.add(ticker)
         nid = _normalize_order_id(f.get("order_id"))
         if nid:
             fill_order_ids_by_ticker.setdefault(ticker, set()).add(nid)
@@ -466,22 +466,8 @@ def build_missing_fills(
         candidate_order_ids = _candidate_order_ids(candidate)
         ticker_fill_order_ids = fill_order_ids_by_ticker.get(ticker)
         if candidate_order_ids and ticker_fill_order_ids:
-            # Exact-id mode: covered iff any of the candidate's ids (scalar
-            # order_id plus aggregated whole_share_order_ids) is among this
-            # ticker's fill ids. A no-id same-ticker fill deliberately does
-            # NOT rescue an id-bearing candidate here -- once both sides can
-            # disambiguate, only an exact match counts.
             covered = not ticker_fill_order_ids.isdisjoint(candidate_order_ids)
         elif not candidate_order_ids and ticker_fill_order_ids:
-            # This candidate has no order_id of its own (e.g. failed or
-            # blocked before placement ever assigned one), but at least one
-            # same-ticker fill carries one -- an ID-bearing fill belongs to a
-            # DIFFERENT, identifiable order (a recovery, in particular), so
-            # it must not cover a distinct no-ID candidate just because the
-            # ticker matches (Codex review: "Keep no-ID current candidates
-            # missing beside recoveries"). Only a fill that ALSO carries no
-            # order_id -- genuinely undisambiguated on both sides -- can
-            # still satisfy the ticker fallback.
             covered = ticker in tickers_with_unidentified_fill
         else:
             covered = ticker in filled_tickers

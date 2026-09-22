@@ -53,7 +53,7 @@ it whenever the strategy changes so the backup stays current.
 ## What it extracts
 
 | Section | Output file (with `--write`) | Notes |
-|---|---|---|
+| --- | --- | --- |
 | Ticker universe | `config/tickers.json` | active, excluded, `X -> Y` corrections |
 | Sizing ladder | `config/sizing_ladder.json` | drop-% tiers → multiplier; keeps the latest ladder |
 | Budget rules | `config/budgets.json` | base amount, tiered daily/weekly caps, weekly rollover reserve cap |

@@ -154,7 +154,7 @@ streams — see the "pick ONE" note in the Overview above. The canonical live
 invocation is recorded in
 [`config/scheduled_tasks.json`](../config/scheduled_tasks.json):
 
-```
+```bash
 python scripts/drift_detection.py --run-dir <run_dir> \
   --json-out <run_dir>/drift_report.json --md-out <run_dir>/drift_report.md \
   --slack --fail-on-drift

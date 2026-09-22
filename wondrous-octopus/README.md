@@ -35,7 +35,7 @@ python inspect_run.py --run-dir /tmp/octopus-demo --summary    # the short whole
 ## Modules
 
 | Module | Responsibility |
-|---|---|
+| --- | --- |
 | `data.py` | Archive discovery/loading, full-bar split/dividend adjustment, as-of truncation, panel containers |
 | `features.py` | Causal per-ticker features, next-day OHLC log-return targets, cross-sectional market features, correlation-based style clustering, panel assembly, the opt-in `calculus` feature block |
 | `model_interface.py` | The `OHLCForecaster` protocol, shared quantile/bar repairs, adaptive conformal calibration, no-pickle artifact helpers |

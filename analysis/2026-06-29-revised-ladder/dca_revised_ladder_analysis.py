@@ -79,7 +79,7 @@ def apply_budget(decisions: pd.DataFrame) -> pd.DataFrame:
     week_spend: dict[tuple[int, int], float] = {}
     idx_name = decisions.index.name if decisions.index.name else 'index'
     for date, group in decisions.sort_values(["date", "multiplier", "drop_pct"], ascending=[True, False, False]).groupby("date"):
-        iso = pd.Timestamp(date).isocalendar()
+        iso = pd.Timestamp(cast(Any, date)).isocalendar()
         week_key = (iso.year, iso.week)
         remaining_daily = DAILY_CAP
         remaining_weekly = WEEKLY_CAP - week_spend.get(week_key, 0.0)
@@ -97,8 +97,9 @@ def apply_budget(decisions: pd.DataFrame) -> pd.DataFrame:
             remaining_daily -= allowed
             remaining_weekly -= allowed
             week_spend[week_key] = week_spend.get(week_key, 0.0) + allowed
-            rows.append(row)
-    return pd.DataFrame(rows).set_index(idx_name).rename_axis(decisions.index.name)
+    res = pd.DataFrame(rows).set_index(idx_name)
+    res.index.name = decisions.index.name
+    return res
 
 
 def build_backtest(hist_30: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:

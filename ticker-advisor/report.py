@@ -9,6 +9,7 @@ directly into ``config/tickers.json`` or ``near_close_dca.py``.
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from typing import Any, Mapping
 
 from scoring import TICKER_SYMBOL_PATTERN, TickerScore, rank
 
@@ -37,7 +38,7 @@ def render_markdown(
     scores: dict[str, TickerScore],
     *,
     generated_at: datetime | None = None,
-    run_metadata: dict[str, object] | None = None,
+    run_metadata: Mapping[str, Any] | None = None,
 ) -> str:
     """Render a ranked Markdown table of every candidate's score.
 
@@ -115,7 +116,7 @@ def render_proposed_diff(
     as_of: date | None = None,
     active_tickers: frozenset[str] = frozenset(),
     excluded_tickers: frozenset[str] = frozenset(),
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """Build the literal edit a human/agent would apply to add ADD-classified candidates.
 
     Mirrors the existing manual workflow documented in docs/strategy.md:

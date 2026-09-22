@@ -750,10 +750,10 @@ class StrategyRunner:
         for idx in range(cov_window, len(daily_ret)):
             # Rebalance on schedule
             if (idx - cov_window) % rebalance_freq == 0:
-                window_rets = daily_ret.iloc[idx - cov_window : idx].values
+                window_rets = np.asarray(daily_ret.iloc[idx - cov_window : idx], dtype=float)
                 weights     = self._min_variance_weights(window_rets)
 
-            daily_pnl = float(np.dot(weights, daily_ret.iloc[idx].values))
+            daily_pnl = float(np.dot(weights, np.asarray(daily_ret.iloc[idx], dtype=float)))
             port_rets.append((daily_ret.index[idx], daily_pnl))
 
         result = pd.Series(
@@ -799,10 +799,10 @@ class StrategyRunner:
         avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
         avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
         rs       = avg_gain / avg_loss.replace(0, np.nan)
-        return 100 - (100 / (1 + rs))
+        return 100 - (100 / (1 + rs))  # type: ignore
 
     @staticmethod
-    def _min_variance_weights(returns: np.ndarray) -> np.ndarray:
+    def _min_variance_weights(returns: Any) -> np.ndarray:
         """
         Analytic minimum-variance weights.
         Falls back to equal weighting if the covariance matrix is singular.

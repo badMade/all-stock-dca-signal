@@ -1,13 +1,17 @@
 """Tests for data.py: discovery, loading, adjustment, as-of truncation."""
 
-from __future__ import annotations
+from typing import Any
 
 import data
+import features as _features
 import numpy as np
 import pandas as pd
 import pytest
 
-import conftest
+import conftest as _conftest
+
+conftest: Any = _conftest
+features: Any = _features
 
 make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
 write_ticker_csv = conftest.write_ticker_csv
@@ -142,7 +146,7 @@ class TestAdjustedOhlc:
 
     def test_impossible_bars_are_dropped_and_counted(self):
         frame = make_synthetic_ohlcv(n=30, seed=7)
-        frame.loc[10, "High"] = frame.loc[10, "Low"] * 0.5  # high far below the body
+        frame.loc[10, "High"] = float(frame.loc[10, "Low"]) * 0.5  # high far below the body
         frame.loc[20, "Close"] = -1.0  # negative price
         adjusted, dropped = data.adjusted_ohlc(frame)
         assert dropped == 2
@@ -220,8 +224,6 @@ class TestTruncateAsOf:
 
 
 def test_panel_eligibility_requires_min_history(synthetic_history_dir):
-    import features
-
     panel = features.build_panel(synthetic_history_dir, min_history=60)
     aaa = panel.series["AAA"]
     early_day = pd.Timestamp(aaa.dates[10])
@@ -235,8 +237,6 @@ def test_panel_eligibility_requires_min_history(synthetic_history_dir):
 
 
 def test_panel_skips_broken_and_short_tickers_without_blocking(synthetic_history_dir):
-    import features
-
     (synthetic_history_dir / "EEE.csv").write_text("garbage that is not a csv at all\x00\n")
     write_ticker_csv(synthetic_history_dir, "FFF", make_synthetic_ohlcv(n=20, seed=9))  # far too short
     panel = features.build_panel(synthetic_history_dir, min_history=60)
@@ -252,8 +252,6 @@ def test_panel_skips_a_ticker_whose_csv_lacks_the_adj_close_column_entirely(synt
     # its ENTIRE history -- silently treating every split/dividend
     # discontinuity as a real price move (Codex review regression: "Require
     # adjusted close before accepting a ticker").
-    import features
-
     frame = make_synthetic_ohlcv(seed=7).drop(columns=["Adj Close"])
     write_ticker_csv(synthetic_history_dir, "HHH", frame)
     panel = features.build_panel(synthetic_history_dir, min_history=60)
@@ -269,8 +267,6 @@ def test_panel_admits_a_ticker_with_exactly_min_history_plus_one_rows(synthetic_
     # forecast by a full trading day, contradicting the documented "joins
     # once it has min_history prior rows" contract (Codex review
     # regression: "Admit tickers as soon as the warm-up is complete").
-    import features
-
     write_ticker_csv(synthetic_history_dir, "GGG", make_synthetic_ohlcv(n=61, seed=11))
     panel = features.build_panel(synthetic_history_dir, min_history=60)
     assert "GGG" not in panel.skipped
@@ -285,8 +281,6 @@ def test_panel_admits_a_ticker_with_exactly_min_history_plus_one_rows(synthetic_
 
 
 def test_panel_refuses_archive_with_zero_usable_tickers(tmp_path):
-    import features
-
     empty = tmp_path / "ticker_data"
     empty.mkdir()
     (empty / "AAA.csv").write_text("Date,Open,High,Low,Close\n")  # header only
@@ -295,8 +289,6 @@ def test_panel_refuses_archive_with_zero_usable_tickers(tmp_path):
 
 
 def test_panel_lowercase_ticker_request_is_loaded_not_marked_skipped(synthetic_history_dir):
-    import features
-
     # discover_available_tickers() case-normalizes an explicit --tickers
     # list ("aapl" -> "AAPL") before matching it against the archive; a
     # successfully-loaded ticker must not ALSO show up in panel.skipped
@@ -309,10 +301,36 @@ def test_panel_lowercase_ticker_request_is_loaded_not_marked_skipped(synthetic_h
 
 
 def test_panel_max_tickers_keeps_longest_histories_deterministically(synthetic_history_dir):
-    import features
-
     panel = features.build_panel(synthetic_history_dir, max_tickers=2, min_history=60)
     # AAA (260 rows) and ZZZ (260 rows) tie with BBB (260) and DDD (250);
     # longest-history-then-alphabetical keeps AAA and BBB.
     assert panel.tickers == ["AAA", "BBB"]
     assert panel.skipped["CCC"] == "over_max_tickers"
+
+
+def test_a_date_outside_the_ns_range_is_dropped_instead_of_crashing_the_panel_build(synthetic_history_dir):
+    # Regression: ticker_data/CBU.csv's first data row carries "04-27" -- a
+    # truncated date with no year. pd.to_datetime(errors="coerce") does NOT
+    # coerce it; dateutil reads it as 0001-04-27, a valid Timestamp that
+    # survives dropna but is outside datetime64[ns]'s representable range
+    # (1677-09-21 .. 2262-04-11). features.build_panel()'s
+    # to_numpy(dtype="datetime64[ns]") then SEGFAULTED on that cast (pandas
+    # 3.0.5 / numpy 2.5.1) instead of raising, killing a full-archive run
+    # with no traceback naming the ticker. Asserted on the invariant rather
+    # than on "04-27" itself, because which out-of-range date dateutil
+    # invents for a yearless string depends on the rest of the column.
+    frame = make_synthetic_ohlcv(seed=11).reset_index(drop=True)
+    frame["Date"] = frame["Date"].astype(str)
+    frame.loc[0, "Date"] = "0001-04-27"
+    frame.loc[1, "Date"] = "9999-12-31"
+    write_ticker_csv(synthetic_history_dir, "GGG", frame)
+
+    loaded = data.load_history_csv(synthetic_history_dir / "GGG.csv")
+    assert len(loaded) == len(frame) - 2  # only the two unusable rows are lost
+    assert loaded["Date"].min() >= pd.Timestamp("1677-09-22")
+    assert loaded["Date"].max() <= pd.Timestamp("2262-04-10")
+
+    # Non-blocking, and the cast that used to segfault now completes.
+    panel = features.build_panel(synthetic_history_dir, min_history=60)
+    assert "GGG" in panel.series
+    assert panel.series["GGG"].dates.dtype == np.dtype("datetime64[ns]")

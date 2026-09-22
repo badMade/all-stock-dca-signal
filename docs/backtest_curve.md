@@ -44,7 +44,7 @@ by 10:30, up to 65% by 12:30, and up to 100% by the 3:30 final slot.
 ## Results (60 trading day window)
 
 | Curve | Total deployed | Fills | Cap skips | Final spend share | Ending rollover | Discount vs prior close |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | 65 / 90 / 100 | $3,546.50 | 2,733 | 6 | 10.45% | $353.50 | 3.44% |
 | 50 / 85 / 100 | $3,544.50 | 2,721 | 32 | 10.51% | $355.50 | 3.45% |
 | 40 / 75 / 100 | $3,541.50 | 2,704 | 64 | 10.70% | $358.50 | 3.46% |

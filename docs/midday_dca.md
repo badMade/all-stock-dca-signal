@@ -8,9 +8,9 @@ this one ladder; the former morning-only 0x-to-3x ladder is historical/supersede
 It is implemented by [`midday_dca.MiddayDCAExecutor`](../midday_dca.py) and
 governed by [`config/midday_dca.json`](../config/midday_dca.json).
 
-| Mode | Task | ET | Trades | run_type | schema | Artifact root |
-|---|---|---|---|---|---|---|
-| `live` | `a6239dae` | 12:30 PM | **yes** | `midday_dca_live` | `midday-live-v1` | `.../cron_tracking/midday_dca/` |
+| Mode   | Task         | ET         | Trades    | run_type           | schema            | Artifact root                     |
+| ------ | ------------ | ---------- | --------- | ------------------ | ----------------- | --------------------------------- |
+| `live` | `a6239dae`   | 12:30 PM   | **yes**   | `midday_dca_live`  | `midday-live-v1`  | `.../cron_tracking/midday_dca/`   |
 
 `MiddayDCAExecutor` subclasses `MorningDCAExecutor` and reuses the entire
 evaluate/build/write pipeline, overriding only the stream-identity attributes and
@@ -88,7 +88,7 @@ The midday stream is **independent** of the afternoon 3:30 PM live task
 (`10ce362c`, which supersedes the deleted `ce16ba6b`) and of the morning stream:
 
 | Axis | Afternoon live (`10ce362c`) | Morning stream | Midday stream |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | Ladder | 0x → **5x** | 0x → **5x** | 0x → **5x** |
 | Budget ledger | `StrategyState` / `BUDGET_TIERS` | namespace `morning` | namespace `midday` |
 | Artifact root | `.../ce16ba6b/` | `.../morning_dca[_watchlist]/` | `.../midday_dca/` |
@@ -131,7 +131,7 @@ Example — 2026-07-09 manual override fills (excluded from scheduled evidence,
 affecting afternoon top-up eligibility only):
 
 | Ticker | Amount | Avg fill price |
-|---|---|---|
+| --- | --- | --- |
 | `AMZN` | $3.00 | 242.1099 |
 | `GOOG` | $4.50 | 352.1778 |
 | `GOOGL` | $4.50 | 354.9800 |
@@ -149,7 +149,7 @@ midday buys by hand under a dedicated path:
 Fills in that recovery:
 
 | Ticker | Amount | Avg fill price |
-|---|---|---|
+| --- | --- | --- |
 | `AAPL` | $1.00 | 324.389900 |
 | `TRIN` | $2.00 | 17.399900 |
 | `ASML` | $2.00 | 1739.506300 |
@@ -177,7 +177,7 @@ used by the later same-day **3:30** top-up logic as prior-allocation context onl
 Filled orders (total **$9.00**):
 
 | Ticker | Amount | Order id | Avg price | Quantity |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `MSFT` | $2.00 | `6a5fb151-043b-4063-b317-40b666bb4bb7` | 399.136400 | 0.005010 |
 | `GOOGL` | $2.00 | `6a5fb151-de49-4f8d-bd0e-2e98aeece284` | 349.168900 | 0.005727 |
 | `GOOG` | $2.00 | `6a5fb151-330b-4d78-9fcc-3da0151ab289` | 348.485500 | 0.005739 |
@@ -193,7 +193,7 @@ Drop is measured as a fraction below yesterday's regular-session close. The
 largest tier threshold ≤ the actual drop wins.
 
 | Drop vs. prior close | Multiplier |
-|---|---|
+| --- | --- |
 | < 0.1% | 0x (no buy) |
 | 0.1% – < 2% | 1x |
 | 2% – < 4% | 1.5x |
@@ -405,7 +405,7 @@ The report's `evidence` block exists to tell the two apart. Abort rather than
 size a run unless all of these hold:
 
 | Field | Required |
-|---|---|
+| --- | --- |
 | `state_root_exists` | `true` |
 | `run_states_loaded` | `> 0` |
 | `run_states_unreadable` | `== 0` |
@@ -413,6 +413,14 @@ size a run unless all of these hold:
 | `afternoon_states_seen` | `> 0` |
 | `afternoon_states_undated` | `== 0` |
 | `afternoon_states_invalid_notional` | `== 0` |
+
+When `run_states_unclassifiable` is nonzero, `evidence.unclassifiable_reasons`
+(keyed by the same paths as `unclassifiable_paths`) names why each one failed:
+either it has no `run_classification` key at all (its top-level keys are
+listed, as a hint that the field was renamed or the file predates it) or the
+key is present but not an object. This is diagnostic only — it does not change
+what the gate requires, and a plausible-looking reason is not grounds to trust
+the file. Route the fix at whatever wrote the file, then re-run this check.
 
 `afternoon_states_seen` is keyed on `is_afternoon_scheduled_evidence` — the same
 predicate `deployed_by_day` applies — rather than on `classify_stream`, so the

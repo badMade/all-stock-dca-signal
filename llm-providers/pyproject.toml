@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+# Self-contained pytest config for llm-providers. Without this file pytest
+# walks up to the repo-root pyproject.toml, whose addopts/testpaths are scoped
+# to the core DCA suite (and --ignore this directory).
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+pythonpath = ["."]

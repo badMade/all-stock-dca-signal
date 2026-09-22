@@ -1110,6 +1110,28 @@ def _latest_attributed_date(state: Dict[str, Any]) -> Optional[date]:
     return max(days) if days else None
 
 
+def _unclassifiable_reason(data: Dict[str, Any]) -> str:
+    """One-line diagnostic for why ``data`` failed the ``run_classification``
+    dict check below.
+
+    Distinguishes the two shapes an unclassifiable state can take, which need
+    different follow-up: a file with no ``run_classification`` key at all
+    likely came from a writer that predates the field, or from a different
+    schema entirely (its top-level keys are listed here as a hint -- a stray
+    ``classification`` or ``run_type`` key at this level, for example, points
+    at a renamed/flattened field rather than a missing one); a file that HAS
+    the key but not as an object is more likely genuine corruption or a
+    truncated write. Purely descriptive -- the gate this feeds stays a bare
+    ``run_states_unclassifiable == 0`` count regardless of the reason, so a
+    convincing-looking reason here is never itself grounds to trust the file.
+    """
+    if "run_classification" not in data:
+        keys = sorted(data.keys())
+        return "no run_classification key (top-level keys: " + (", ".join(keys) if keys else "none") + ")"
+    value = data["run_classification"]
+    return f"run_classification is {type(value).__name__}, not an object"
+
+
 def _load_states_with_evidence(
     root: str | Path, as_of: Optional[date] = None
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -1161,6 +1183,15 @@ def _load_states_with_evidence(
     state_paths: List[Path] = []
     unreadable: List[str] = []
     unclassifiable: List[str] = []
+    # Per-path diagnostic for EVERY entry that lands in `unclassifiable` below --
+    # never consulted by the gate itself (that stays a bare `== 0` count, on
+    # purpose: a human still has to look before trusting a schema variant). It
+    # exists because "3 files unclassifiable" alone forces whoever is chasing an
+    # abort to go open each one by hand to learn whether the file is missing the
+    # key entirely (an old/foreign writer that never adopted run_classification)
+    # or carries one of the wrong JSON type (a real corruption). See
+    # ``_unclassifiable_reason``.
+    unclassifiable_reasons: Dict[str, str] = {}
     # Files parked as out-of-window, held as (path, origin bucket) until the
     # whole tree has been read -- see path_dates_contradicted below.
     deferred: List[Tuple[str, str]] = []
@@ -1269,6 +1300,7 @@ def _load_states_with_evidence(
             # that was read, and hiding it would make the found/loaded counts
             # disagree for no visible reason.
             if not isinstance(data.get("run_classification"), dict):
+                unclassifiable_reasons[str(path)] = _unclassifiable_reason(data)
                 if _relevant(path):
                     unclassifiable.append(str(path))
                 else:
@@ -1415,6 +1447,11 @@ def _load_states_with_evidence(
         "unreadable_paths": sorted(unreadable),
         "run_states_unclassifiable": len(unclassifiable),
         "unclassifiable_paths": sorted(unclassifiable),
+        # Keyed only on paths that actually landed in unclassifiable above --
+        # not on every path unclassifiable_reasons ever saw -- so a deferred
+        # entry that turned out to be outside the window (and so never counted
+        # against the gate) does not appear here as if it had.
+        "unclassifiable_reasons": {p: unclassifiable_reasons[p] for p in sorted(unclassifiable)},
         "afternoon_states_seen": afternoon_seen,
         # Broken out rather than folded into run_states_unclassifiable: these
         # states ARE classifiable (that is how they reached the afternoon
@@ -1443,6 +1480,11 @@ def _load_states_with_evidence(
         "unusable_states_outside_window": len(outside_window),
         "outside_window_paths": sorted(outside_window),
     }
+
+
+# Public entry for the console's risk panel so the evidence block main()
+# attaches is reachable in-process (GUI expansion Phase 3).
+load_states_with_evidence = _load_states_with_evidence
 
 
 def _load_states(root: str | Path) -> List[Dict[str, Any]]:

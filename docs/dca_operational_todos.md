@@ -65,11 +65,10 @@ This file tracks follow-up work from live DCA incidents so the same failure mode
   - Confirm whether the Aug 17-21 disabled gates should be extended, removed, or replaced before the next trading week.
   - Keep the Aug 18 manual override artifacts excluded from scheduled-live metrics via the existing manual override classification rules.
 
-
 ## 2026-08-03 follow-ups
 
 | Priority | Area | Problem observed | Follow-up fix |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | High | 11:30 intraday scheduling | The active schedule did not contain the 11:30 Perplexity-primary buying slot when checked at 11:35 AM ET. | Add a pre-market schedule integrity check that verifies every primary buying slot for the current trading day: 9:35, 10:30, 11:30, 12:30, 1:30, 2:30, and 3:30. If a slot is missing, create or repair it before market open and write a compact schedule readiness artifact. |
 | High | Latest pointer publishing | The 9:35 Perplexity-primary run wrote complete root artifacts and 25 filled orders, but the expected latest pointer was missing, which made pointer-based checks report no record. | Require each Perplexity-primary buying run to publish both its canonical stream pointer and the Perplexity-primary same-day alias pointer after root artifacts are written. Add a post-write assertion that fails the run artifact contract if the pointer is missing. |
 | High | Direct path fallback | The 12:30 task needed to use 9:35 fills as top-up context even when the 9:35 latest pointer was missing. | Keep the direct date/window artifact fallback for same-day top-up context. Pointer absence should be recorded as `latest_pointer_missing_artifact_contract_failure`, but direct path discovery should still load completed same-day root artifacts. |

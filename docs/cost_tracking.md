@@ -23,7 +23,7 @@ safety rule (see [safeguards.md](safeguards.md)).
 ### Daily compact weekday chain
 
 | ET | Task | Role |
-|---|---|---|
+| --- | --- | --- |
 | 9:35 AM | `2ba19526` | market-open live execution (first buy of the day) |
 | 9:45 AM | `bb4f6ef1` | watchlist early-warning scan (read-only) |
 | 10:30 AM | `42173154` | morning live execution |
@@ -113,7 +113,7 @@ behavior **only** — it does **not** relax any trading safety rule (see
 ### Applies to these daily tasks
 
 | ET | Task | Role |
-|---|---|---|
+| --- | --- | --- |
 | 9:35 AM | `2ba19526` | market-open live execution (first buy of the day) |
 | 9:45 AM | `bb4f6ef1` | watchlist early-warning scan (read-only); also runs the required pre-flight writer absorbed from `morning-dca-0945` |
 | 10:30 AM | `42173154` | morning live execution |
@@ -177,7 +177,7 @@ one **compact JSONL** entry recording which model / routing mode it used.
 Covered daily tasks (same set as the routing policy):
 
 | ET | Task | Stream |
-|---|---|---|
+| --- | --- | --- |
 | 9:35 AM | `2ba19526` | market_open |
 | 9:45 AM | `bb4f6ef1` | watchlist |
 | 10:30 AM | `42173154` | morning |
@@ -204,6 +204,7 @@ keeps exactly one row per `task_id` because `_load_task_directory` keys on it.
 appends the entry; every append is best-effort (never raises into or blocks
 the run it reports on) and opt-in via a `model_usage_log_root` parameter that
 defaults to `None`, so ad-hoc/test construction never touches the real path.
+
 - **Enabled by default for the two executor-based tasks' normal
   configuration path:** `load_morning_config()`/`load_midday_config()`
   (`42173154`/`a6239dae`) resolve `model_usage_log_root`
@@ -255,7 +256,7 @@ top-up guards, and safety rules unchanged.
 ## Proxy metrics
 
 | Proxy | Meaning |
-|---|---|
+| --- | --- |
 | `task_runs` | Total scheduled task executions in the period |
 | `heavy_analysis_runs` | Weekly/monthly full refreshes |
 | `manual_runs` | Ad-hoc manual runs (should trend to zero) |

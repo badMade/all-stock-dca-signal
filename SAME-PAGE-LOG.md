@@ -8,14 +8,14 @@ Subject: PLAN.md (with VTO.md, DEFERRED.md). Max 5 rounds; verdict line is the l
 Timestamp: 2026-09-13T04:32:08Z
 PLAN.md sha256: 315868e14c3b4eb9…  VTO.md sha256: f876df743cc468ea…
 
-### Prompt sent
+### Prompt sent (Round 1)
 
 > You are the Integrator reviewing a plan written by the Visionary. Read PLAN.md and VTO.md
 > end to end (DEFERRED.md lists what is intentionally out of scope). You are read-only — do
 > not propose file edits, propose plan changes instead.
-> 
+>
 > Ground your findings in the actual code: read dca_console.py (especially make_server,
-> _trusted, do_GET, do_POST, main), dca_console_jobs.py (redact, JobManager, _command
+> _trusted, do_GET, do_POST, main), dca_console_jobs.py (redact, JobManager,_command
 > env handling), tests/test_dca_console.py (fixtures and the existing Host/Origin/token
 > tests), docs/local_console.md, deploy/run-drift-check.sh, pyproject.toml (the
 > [tool.ruff] / [tool.coverage] / [tool.setuptools] stanzas), and CLAUDE.md's "Hard
@@ -23,13 +23,13 @@ PLAN.md sha256: 315868e14c3b4eb9…  VTO.md sha256: f876df743cc468ea…
 > the console never places brokerage orders; no 6-12 digit literal in any tracked file
 > (tests/test_config_invariants.py scans every git ls-files entry); no hard-coded absolute
 > paths; heavy "why" comments.
-> 
+>
 > Attack the plan for gaps, contradictions, scope creep, blind spots, and anything that
 > would fail CI or violate a repo invariant. For every real problem you find, emit exactly
 > one line in this format:
-> 
+>
 > [SEVERITY] short-title — one sentence on why it matters
-> 
+>
 > Severity is one of BLOCKER, MAJOR, MINOR, NIT. After the findings, for each one state a
 > verdict: FIX (plan must change before anyone builds), DEFER (valid, but out of scope for
 > this cycle), KILL (this scope should be cut entirely), or ACCEPT (flagged, but on
@@ -385,7 +385,7 @@ Timestamp: 2026-09-13T05:10:20Z
 > [MAJOR] cloudflared-ingress-is-incomplete — Rock 5 does not require the mandatory terminal catch-all ingress rule, so its documented Cloudflare configuration can fail validation ([Cloudflare configuration docs](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/local-management/configuration-file/)).
 > [MINOR] renderer-cannot-produce-phase-a — Rock 4 claims Phase A and Phase B forms, but the renderer has no `--bind` argument and cannot emit the LAN-bound Phase A shape.
 > [MAJOR] hosted-success-is-not-gated — VTO requires phone access over HTTPS, but whole-cycle verification postpones both proxy executions, allowing completion without demonstrating the cycle’s primary outcome.
-> 
+>
 > credential-in-curl-argv — FIX — Replace authenticated curl proofs with a stdin, protected-config, or interactive mechanism that never materializes the secret in argv.
 > fail-closed-only-at-cli — FIX — Require shared validation at `ConsoleAccess` construction or `make_server()` and directly test that invalid access never invokes the server constructor.
 > plaintext-lan-basic-auth — FIX — Restrict direct HTTP to temporary synthetic testing with disposable credentials and require HTTPS before exposing real local data.
@@ -409,7 +409,7 @@ Timestamp: 2026-09-13T05:10:20Z
 ### Round 1 — Discuss (Visionary responses, on the record)
 
 | # | Finding | Codex | Visionary response |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1 | credential-in-curl-argv | FIX | **Agree.** Proofs now use `curl -K <(printf 'user = "%s"\n' "$(<"$AUTH")")`: the config arrives through a `/dev/fd` path, argv holds only the path. |
 | 2 | fail-closed-only-at-cli | FIX | **Agree.** Validation moves into `ConsoleAccess.__post_init__` (credential shape in Rock 1; the bind/host matrix in Rock 2 once those fields exist). `main()` maps `ValueError` → `parser.error`. New test: `make_server` with an invalid access raises before `ThreadingHTTPServer` is constructed (constructor monkeypatched to fail the test if called). |
 | 3 | plaintext-lan-basic-auth | FIX | **Agree on the risk; bounded rather than eliminated.** The operator explicitly chose LAN-first for build/test (interview gate 1). Bounds: Phase A is a foreground run and never the launchd service (the renderer cannot emit `--bind`, see #17); Phase A uses a disposable credential that the runbook rotates before Phase B; the runbook's first sentence says LAN HTTP is plaintext on the home wifi; in-process TLS stays in `DEFERRED.md` as the proper fix. Not adopting "synthetic data only": the operator's stated purpose for Phase A is testing against real runs. |
@@ -439,7 +439,7 @@ Timestamp: 2026-09-13T05:15:27Z. Claude workflow `plan-pressure-test`: four lens
 survived only with ≥ 2 of 3 upholding it. 11 survived, 4 were refuted. Responses:
 
 | # | Finding (lens, votes) | Overlaps Codex | Visionary response |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | C1 | Phase A cleartext credential every 15 s, carried unrotated into Phase B, proofs put it in argv (security, 2/3) | #1, #3 | **Already in rev 2** (foreground-only Phase A, disposable credential + rotation, plaintext stated, `curl -K <(…)`). **Added:** a startup banner line when the bind is non-loopback ("plain HTTP: the Basic credential and console token are visible to anyone on this network") via a pure `startup_banner()` with a test; runbook note that Phase A may bind the Tailscale interface IP instead (WireGuard-encrypted). |
 | C2 | Navigation exemption covers side-effecting `/api/*` GETs (security, 3/3) | #4 | **Already in rev 2** (exemption only for `GET /`). **Added:** the test also asserts `app.snapshot` is not invoked for a cross-site navigational GET to `/api/snapshot`. |
 | C3 | Auth-failure stderr line is an unauthenticated, unbounded, unredacted write path (security, 3/3) | — | **Agree, FIX (Rock 1).** Fixed shape: `redact()` of client address, method and `urlsplit(path).path[:128]` (route only, no query); rate-limited to one line per 5 s per process with a suppressed count. Test: 60 KB path and a path containing the fixture password → one short masked line; a burst of 50 failures → ≤ 2 lines. |
@@ -462,15 +462,15 @@ Timestamp: 2026-09-13T05:17:24Z
 PLAN.md sha256: f70c8137468d7a81…  VTO.md sha256: 80b5d096df300f6a…  DEFERRED.md sha256: 4047692bd9fa01a8…
 Invocation: `codex exec resume <session> -m gpt-5.6-sol --sandbox read-only --json`
 
-### Prompt sent
+### Prompt sent (Round 2)
 
 > Round 2. PLAN.md, VTO.md and DEFERRED.md have been revised (PLAN.md is now "Revision 3")
 > to address every finding from your round-1 review. Re-read all three files end to end;
 > the "Changes since round 1" section at the end of PLAN.md is the index. You remain
 > read-only — propose plan changes, not file edits.
-> 
+>
 > Per-finding resolutions:
-> 
+>
 > 1. credential-in-curl-argv — every proof now passes credentials with
 >    `curl -K <(printf 'user = "%s"\n' "$(<"$AUTH")")`; argv holds only a /dev/fd path.
 > 2. fail-closed-only-at-cli — the whole matrix is enforced in `ConsoleAccess.__post_init__`;
@@ -509,7 +509,7 @@ Invocation: `codex exec resume <session> -m gpt-5.6-sol --sandbox read-only --js
 > 18. hosted-success-is-not-gated — VTO redefined: code-complete (in-cycle, gated by commit
 >     approval) vs deployed (operator completes the acceptance checklist after installing and
 >     logging in to a front, which the Visionary cannot do); checklist added to PLAN.md.
-> 
+>
 > Additional changes from the Visionary's independent adversarial review (see the end of
 > PLAN.md): bounded/redacted/rate-limited auth-failure log line; plaintext warning in a pure
 > `startup_banner()`; renderer `--python PATH` so tests never assume `.venv` exists (CI has
@@ -518,7 +518,7 @@ Invocation: `codex exec resume <session> -m gpt-5.6-sol --sandbox read-only --js
 > then through `cloudflared access curl` (a plain curl is answered at the edge);
 > `--behind-proxy` is added only when the probe shows the name under `forwarded_host`; a TCC
 > troubleshooting note for checkouts under `~/Documents`.
-> 
+>
 > For each finding from the previous round, confirm whether it is resolved or still open,
 > using the same [SEVERITY] short-title label you used before. New findings are allowed but
 > should be rare this late — flag anything major. End with the same single verdict line as
@@ -1117,91 +1117,91 @@ Timestamp: 2026-09-13T05:40:22Z
 > The revised plan closes most of the original design gaps. I’m now checking whether its acceptance commands actually run under the shell it explicitly targets, and whether “rolling today” reaches job submission—not just the displayed snapshot.
 > A substantive regression surfaced in the rolling-date fix: as written, every local-mode `snapshot()` ignores `Settings.day`, so explicit `--local --date …` stops working and existing tests that pin a local day fail. The plan needs to distinguish an unpinned hosted service from an explicitly pinned date.
 > Revision 3 closes 14 round-1 findings; four remain open, plus three new material findings.
-> 
+>
 > [BLOCKER] credential-in-curl-argv — RESOLVED: authenticated proofs now pass curl a `/dev/fd` config path without placing the credential in argv.
-> 
+>
 > [BLOCKER] fail-closed-only-at-cli — RESOLVED: `ConsoleAccess.__post_init__` owns the complete exposure matrix before any server can be constructed.
-> 
+>
 > [MAJOR] plaintext-lan-basic-auth — RESOLVED AS AN EXPLICIT DEFER: Phase A is foreground-only, plainly warned, disposable, and followed by mandatory rotation, while TLS is recorded in DEFERRED.md.
-> 
+>
 > [MAJOR] cross-site-get-exception-writes — RESOLVED: only the side-effect-free document route receives navigation tolerance, with API non-invocation and no-write assertions.
-> 
+>
 > [MINOR] origin-not-bound-to-host — RESOLVED: Origin must match the selected effective authority, including proxy and alias-mismatch tests.
-> 
+>
 > [MAJOR] auth-file-confidentiality-unproved — STILL OPEN: pathname `lstat` followed by an unspecified read does not prove the bytes came from the checked inode, allowing a swap in a writable parent to bypass the checks.
-> 
+>
 > [MAJOR] hosted-default-date-freezes — STILL OPEN: making every local `default_day()` use wall-clock today discards explicit `--local --date`, breaking the existing pinned-date test and direct local `snapshot()` semantics.
-> 
+>
 > [MAJOR] restart-breaks-job-buttons — RESOLVED: one 403-specific re-bootstrap and retry is safe because the current POST path rejects before `submit()`.
-> 
+>
 > [MAJOR] launchd-drops-octopus-input — RESOLVED: the renderer passes and tests `--octopus-run`, while VTO conditions the forecast promise on its configuration.
-> 
+>
 > [MAJOR] kickstart-does-not-reload-plist — RESOLVED: changed definitions now use `bootout` followed by `bootstrap`, reserving `kickstart` for unchanged plists.
-> 
+>
 > [MAJOR] custom-root-splits-service-output — RESOLVED: one precedence-resolved root supplies both the service environment and log paths.
-> 
+>
 > [MINOR] custom-label-is-an-unsafe-target — RESOLVED BY REMOVAL: the option is gone and the launchd label is fixed.
-> 
+>
 > [MAJOR] verification-omits-coverage-gate — RESOLVED: whole-cycle verification includes CI’s full `--cov-fail-under=90` command.
-> 
+>
 > [MINOR] focused-tests-variable-is-never-set — STILL OPEN: it is now set as a scalar, but zsh does not word-split `$CONSOLE_TESTS`, so every focused pytest proof receives one invalid space-containing path.
-> 
+>
 > [MINOR] new-files-escape-local-literal-scan — RESOLVED: intent-to-add occurs before invariant scans once the new files exist.
-> 
+>
 > [MAJOR] cloudflared-ingress-is-incomplete — RESOLVED: the terminal `http_status:404` rule and ingress validation are both required.
-> 
+>
 > [MINOR] renderer-cannot-produce-phase-a — RESOLVED: the renderer intentionally has no `--bind` and claims only the loopback Phase B form.
-> 
+>
 > [MAJOR] hosted-success-is-not-gated — STILL OPEN: the generic checklist uses plain curl where Cloudflare Access intercepts it, cannot reliably expose `forwarded_host` on a successful loopback-Host probe, and unconditionally enables `--behind-proxy` contrary to both conditional runbooks.
-> 
+>
 > [MAJOR] auth-failure-logger-is-not-fail-closed — OPEN: truncating before redaction can expose credential fragments, malformed targets can escape into unrate-limited tracebacks, and no synchronized limiter or concurrency regression is required for the threaded server.
-> 
+>
 > [MAJOR] sigterm-handler-installed-after-readiness — OPEN: scoping the handler around `serve_forever` leaves the flushed startup banner before protection, so the planned immediate post-banner SIGTERM can still terminate with `-15`.
-> 
+>
 > [MAJOR] cloudflared-access-curl-url-order — OPEN: PLAN.md places `-si` before the URL, but [cloudflared’s current command definition](https://github.com/cloudflare/cloudflared/blob/master/cmd/cloudflared/access/cmd.go) parses the first argument as the application URL.
-> 
+>
 > credential-in-curl-argv — ACCEPT: no further plan change is needed.
-> 
+>
 > fail-closed-only-at-cli — ACCEPT: construction-time enforcement is the correct boundary.
-> 
+>
 > plaintext-lan-basic-auth — DEFER: retain the stated safeguards and the explicit TLS backlog item.
-> 
+>
 > cross-site-get-exception-writes — ACCEPT: the revised route boundary and regressions are sufficient.
-> 
+>
 > origin-not-bound-to-host — ACCEPT: the effective-authority rule closes the mismatch.
-> 
+>
 > auth-file-confidentiality-unproved — FIX: require `O_NOFOLLOW` opening, `fstat` validation, bounded reading through that same descriptor, and a swap regression.
-> 
+>
 > hosted-default-date-freezes — FIX: distinguish an unpinned hosted service from an explicit or fixture-pinned date and test both behaviors.
-> 
+>
 > restart-breaks-job-buttons — ACCEPT: the bounded retry and manual restart proof are appropriate.
-> 
+>
 > launchd-drops-octopus-input — ACCEPT: passthrough and narrowed success language align.
-> 
+>
 > kickstart-does-not-reload-plist — ACCEPT: the apply sequence is now correct.
-> 
+>
 > custom-root-splits-service-output — ACCEPT: root resolution and tests cover both override sources.
-> 
+>
 > custom-label-is-an-unsafe-target — ACCEPT: the prior KILL has already been applied.
-> 
+>
 > verification-omits-coverage-gate — ACCEPT: the exact gate is present.
-> 
+>
 > focused-tests-variable-is-never-set — FIX: make `CONSOLE_TESTS` a zsh array and invoke pytest with `"${CONSOLE_TESTS[@]}"`.
-> 
+>
 > new-files-escape-local-literal-scan — ACCEPT: the new-file visibility gap is closed.
-> 
+>
 > cloudflared-ingress-is-incomplete — ACCEPT: the required terminal rule and validation are covered.
-> 
+>
 > renderer-cannot-produce-phase-a — ACCEPT: foreground Phase A and rendered Phase B are now honestly separated.
-> 
+>
 > hosted-success-is-not-gated — FIX: make acceptance front-specific, use Access-aware probing, select `--behind-proxy` only from reliable diagnostics, and explicitly perform the second-device acceptance.
-> 
+>
 > auth-failure-logger-is-not-fail-closed — FIX: require exception-safe extraction, redact-before-truncate, control-character normalization, locked limiter state, and cutoff/malformed/concurrent regressions.
-> 
+>
 > sigterm-handler-installed-after-readiness — FIX: require the SIGTERM context to be active before emitting any readiness banner.
-> 
+>
 > cloudflared-access-curl-url-order — FIX: specify `cloudflared access curl https://… -si`.
-> 
+>
 > VERDICT: BLOCKED — 7 open finding(s)
 
 ### Round 2 — Discuss (Visionary responses, on the record)
@@ -1210,7 +1210,7 @@ Timestamp: 2026-09-13T05:40:22Z
 Open items:
 
 | # | Finding | Codex | Visionary response |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 6 | auth-file-confidentiality-unproved | FIX | **Agree.** `lstat`-then-read is a check/use race. `load_auth_file` now opens with `os.open(path, O_RDONLY \| O_NOFOLLOW \| O_CLOEXEC)` (a symlink fails with `ELOOP`), validates with `os.fstat` on that descriptor (regular file, owner, mode, size ≤ 4096) and reads through the same descriptor, so the bytes provably come from the checked inode. Test asserts `fstat`/`read` use the fd returned by `open` and that no path-based read happens; symlink and oversized-file cases added. |
 | 7 | hosted-default-date-freezes | FIX | **Agree.** `Settings.day` becomes `date \| None`: `None` = unpinned (local mode without `--date`) → `default_day()` is today (ET) at request time; an explicit `--date` or a fixture-provided day pins it → `default_day()` returns it. Demo mode always has a concrete day. Both behaviours tested; existing pinned-day tests keep their semantics. |
 | 14 | focused-tests-variable-is-never-set | FIX | **Agree.** zsh does not word-split `$CONSOLE_TESTS`. Every proof now uses a zsh/bash array: `CONSOLE_TESTS=(…)` and `pytest "${CONSOLE_TESTS[@]}"`. |
@@ -1227,14 +1227,14 @@ Timestamp: 2026-09-13T05:43:28Z
 PLAN.md sha256: 720f5babdb0dd9c2…  (VTO.md, DEFERRED.md unchanged since round 2)
 Invocation: `codex exec resume <session> -m gpt-5.6-sol -c 'sandbox_mode="read-only"' --json`
 
-### Prompt sent
+### Prompt sent (Round 3)
 
 > Round 3. PLAN.md is revised to "Revision 4" addressing the seven items you left open in
 > round 2; VTO.md and DEFERRED.md are unchanged since round 2. Re-read PLAN.md end to end;
 > the "Changes since round 2" section at the end is the index. You remain read-only.
-> 
+>
 > Resolutions for the seven open findings:
-> 
+>
 > - auth-file-confidentiality-unproved — `load_auth_file` opens with
 >   `os.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)`, validates with `os.fstat` on that
 >   descriptor (regular file, owner, mode, size ≤ 4096) and reads through the same descriptor
@@ -1258,7 +1258,7 @@ Invocation: `codex exec resume <session> -m gpt-5.6-sol -c 'sandbox_mode="read-o
 > - sigterm-handler-installed-after-readiness — the SIGTERM context is entered before the
 >   readiness banner and covers server creation through `serve_forever`.
 > - cloudflared-access-curl-url-order — `cloudflared access curl https://… -si`.
-> 
+>
 > For each of those seven, confirm resolved or still open using the same [SEVERITY]
 > short-title label. New findings are allowed but should be rare this late — flag anything
 > major. End with the same single verdict line as before, as the literal last line:
@@ -1462,25 +1462,25 @@ Timestamp: 2026-09-13T07:23:03Z
 > The same-fd credential design is now sound against path swaps, but one fail-closed edge remains under scrutiny: opening a FIFO with blocking `O_RDONLY` happens before `fstat`, so the stated FIFO rejection test may hang unless the open itself is nonblocking.
 > Six prior items look closed. I’m doing one final consistency pass on the proxy probe and the two newly surfaced edge cases before fixing the verdict count.
 > [MAJOR] auth-file-confidentiality-unproved — RESOLVED: `O_NOFOLLOW`, same-descriptor `fstat`, and bounded descriptor reads close the pathname substitution race, with tests enforcing descriptor identity.
-> 
+>
 > [MAJOR] hosted-default-date-freezes — RESOLVED: unpinned local settings now compute the ET day per request while explicit dates and demo mode remain pinned.
-> 
+>
 > [MINOR] focused-tests-variable-is-never-set — RESOLVED: every proof defines `CONSOLE_TESTS` as an array and expands it with `"${CONSOLE_TESTS[@]}"`.
-> 
+>
 > [MAJOR] hosted-success-is-not-gated — STILL OPEN: if a front rewrites `Host` to an accepted loopback authority and places the public name only in `X-Forwarded-Host`, the initial health probe returns 200 without diagnostic fields, leaving the checklist unable to select `--behind-proxy`, whose forwarded-host precedence is also unspecified and untested for this fallback shape.
-> 
+>
 > [MAJOR] auth-failure-logger-is-not-fail-closed — RESOLVED: extraction is exception-safe, control bytes are removed, redaction precedes truncation, and locked rate limiting has adversarial regressions.
-> 
+>
 > [MAJOR] sigterm-handler-installed-after-readiness — RESOLVED: the handler now covers server construction, readiness publication, and `serve_forever`.
-> 
+>
 > [MAJOR] cloudflared-access-curl-url-order — RESOLVED: both occurrences place the URL before forwarded curl flags.
-> 
+>
 > [MAJOR] fifo-auth-file-blocks-before-validation — `os.open` with blocking `O_RDONLY` waits for a FIFO writer before `fstat` can reject it, so startup and the required FIFO regression can hang indefinitely.
-> 
+>
 > [MAJOR] rolling-default-breaks-demo-pipeline — applying the unpinned calendar-day `default_day()` to `_run` replaces the existing recent-full-session selection, causing “Test DCA pipeline” to produce no `run_state.json` on weekends, holidays, and early-close days.
-> 
+>
 > Verdicts:
-> 
+>
 > - auth-file-confidentiality-unproved — ACCEPT: the original confidentiality race is closed.
 > - hosted-default-date-freezes — ACCEPT: rollover and pinning semantics are now explicit and tested.
 > - focused-tests-variable-is-never-set — ACCEPT: the proof commands now expand correctly.
@@ -1490,7 +1490,7 @@ Timestamp: 2026-09-13T07:23:03Z
 > - cloudflared-access-curl-url-order — ACCEPT: the invocation order is corrected.
 > - fifo-auth-file-blocks-before-validation — FIX: add `O_NONBLOCK` and make the FIFO regression timeout-bounded.
 > - rolling-default-breaks-demo-pipeline — FIX: use an explicit pinned date when supplied, otherwise retain `default_demo_day()` for `_run`, with a closed-market-day regression.
-> 
+>
 > VERDICT: BLOCKED — 3 open finding(s)
 
 ### Round 3 (addendum) — Visionary's second adversarial panel on revision 4
@@ -1500,7 +1500,7 @@ skeptics each (three verifier agents were lost to the operator's session limit; 
 findings they touched are marked under-verified). 7 survived, 2 did not:
 
 | # | Finding (lens, votes) | Response |
-|---|---|---|
+| --- | --- | --- |
 | P1/P3/P6 | FIFO auth file hangs the `O_RDONLY` open before `fstat` runs (security + correctness + operability, 3/3 each, reproduced on this Mac) | **Agree, FIX.** Same as Codex's `fifo-auth-file-blocks-before-validation`. `O_NONBLOCK` added; FIFO test via `os.mkfifo` with a bounded-time assertion; descriptor test asserts `O_NONBLOCK` is among the recorded flags. |
 | P2/P5/P7 | Rock 4's "default interpreter missing → exit 2" case cannot pass on the Mac where `.venv` exists (3/3, 2/3) | **Agree, FIX.** Renderer exposes module-level `DEFAULT_PYTHON` read at call time; the test monkeypatches it to a missing path; positive counterpart patched to `sys.executable`. |
 | P4 | A process-wide 5-second limiter makes the Rock 1 log tests order-dependent and unpassable as written (correctness, 3/3) | **Agree, FIX.** `AuthFailureLog(interval, clock, stream)` is created per `make_server` call (injectable via `failure_log=`), never module-global; per-line tests use `interval=0` or a fake clock; burst/thread tests use a fresh instance with the real interval; no test relies on wall-clock spacing. |
@@ -1510,7 +1510,7 @@ findings they touched are marked under-verified). 7 survived, 2 did not:
 ### Round 3 — Discuss (Visionary responses, on the record)
 
 | # | Finding | Codex | Visionary response |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 18 | hosted-success-is-not-gated | FIX | **Agree.** Rather than forcing a 403, `/api/health` now always reports `received_host` and `forwarded_host` (values the client itself sent; nothing sensitive), so the probe is diagnostic on 200 and 403 alike. This is the one existing-test edit of the cycle: the equality assertion at `tests/test_dca_console.py:88` becomes a two-key check. Forwarded-host precedence is now specified: under `--behind-proxy`, a present `X-Forwarded-Host` must be a configured name and becomes the effective authority (Host must still be in `hosts(port)`); present-but-unconfigured → 403; absent → Host rules. Test: loopback `Host` + `X-Forwarded-Host: mac.tailnet.ts.net` + `Origin: https://mac.tailnet.ts.net` → 200 under `--behind-proxy`, 403 without it. Checklist rule: add `--behind-proxy` when the public name appears under `forwarded_host` and not `received_host`. |
 | 22 | fifo-auth-file-blocks-before-validation (new) | FIX | **Agree.** `O_NONBLOCK` added to the open flags (no effect on regular-file reads; a FIFO open returns at once and `S_ISREG` rejects it). FIFO regression: `os.mkfifo`, no writer, `load_auth_file` must raise within a 5-second thread join. |
 | 23 | rolling-default-breaks-demo-pipeline (new) | FIX | **Agree; my error in revision 4.** `_run` keeps its current selection (`settings.day` in demo mode, `default_demo_day()` in local mode); `default_day()` feeds only `/api/bootstrap`, `snapshot()` and `default_date`. Regression: unpinned local `Settings` with the clock on a Saturday → `demo-dca` still targets the previous full session. |
@@ -1522,15 +1522,15 @@ Solve: PLAN.md revised to revision 5 (see "Changes since round 3" at its end).
 Timestamp: 2026-09-13T07:25:21Z
 PLAN.md sha256: 3ecb5f9372047f19…  (VTO.md, DEFERRED.md unchanged since round 2)
 
-### Prompt sent
+### Prompt sent (Round 4)
 
 > Round 4. PLAN.md is revised to "Revision 5" addressing the three items you left open in
 > round 3 plus two findings from an independent review; VTO.md and DEFERRED.md are unchanged.
 > Re-read PLAN.md end to end; "Changes since round 3" at the end is the index. You remain
 > read-only.
-> 
+>
 > Resolutions:
-> 
+>
 > - hosted-success-is-not-gated — `/api/health` now always reports `received_host` and
 >   `forwarded_host` (what the client sent), so the probe is diagnostic on 200 and 403 alike;
 >   this is the cycle's one existing-test edit (the equality at tests/test_dca_console.py:88
@@ -1538,7 +1538,7 @@ PLAN.md sha256: 3ecb5f9372047f19…  (VTO.md, DEFERRED.md unchanged since round 
 >   a present `X-Forwarded-Host` must be a configured name and becomes the effective
 >   authority while `Host` must still be in `hosts(port)`; present-but-unconfigured → 403;
 >   absent → plain Host rules. New test: loopback Host + `X-Forwarded-Host: mac.tailnet.ts.net`
->   + `Origin: https://mac.tailnet.ts.net` → 200 with `--behind-proxy`, 403 without. Both
+>   - `Origin: https://mac.tailnet.ts.net` → 200 with `--behind-proxy`, 403 without. Both
 >   checklists read the body on 200 or 403 and add `--behind-proxy` only when the public name
 >   is under `forwarded_host` and not `received_host`.
 > - fifo-auth-file-blocks-before-validation — `O_NONBLOCK` added to the open flags; the FIFO
@@ -1557,7 +1557,7 @@ PLAN.md sha256: 3ecb5f9372047f19…  (VTO.md, DEFERRED.md unchanged since round 
 >   `DEFAULT_PYTHON` read at call time; the missing-default test monkeypatches it to a
 >   missing path and a positive counterpart patches it to `sys.executable`, so both pass on
 >   the Mac (where `.venv` exists) and in CI (where it does not).
-> 
+>
 > For each of the three round-3 open items, confirm resolved or still open using the same
 > [SEVERITY] short-title label. New findings are allowed but should be rare this late — flag
 > anything major. End with the same single verdict line as before, as the literal last line:
@@ -1938,19 +1938,19 @@ Timestamp: 2026-09-13T07:30:11Z
 > I’ll re-audit Revision 5 against the current implementation and tests, concentrating on the three reopened boundaries and whether the two independent-review additions introduce portability or CI gaps.
 > The runtime fixes themselves are coherent. One test-harness detail remains under scrutiny: a timed join only prevents a FIFO regression from hanging CI if the still-blocked worker is daemonized or explicitly released during cleanup.
 > [MAJOR] hosted-success-is-not-gated — RESOLVED: health diagnostics now cover both statuses, forwarded-host precedence is fail-closed and Origin-bound, the loopback-host fallback is tested, and both checklists require successful reprobe and phone acceptance.
-> 
+>
 > [MAJOR] fifo-auth-file-blocks-before-validation — RESOLVED: `O_NONBLOCK` lets a writerless FIFO reach same-descriptor `fstat` rejection immediately, with flag and bounded-completion regressions planned.
-> 
+>
 > [MAJOR] rolling-default-breaks-demo-pipeline — RESOLVED: `_run` retains its recent-full-session selection independently of the rolling hosted date, with a Saturday regression checking `--now`.
-> 
+>
 > The per-server `AuthFailureLog` and call-time `DEFAULT_PYTHON` designs introduce no new major issue.
-> 
+>
 > Verdicts:
-> 
+>
 > - hosted-success-is-not-gated — ACCEPT: the complete detection-to-acceptance path is now specified and tested.
 > - fifo-auth-file-blocks-before-validation — ACCEPT: the runtime hang is closed.
 > - rolling-default-breaks-demo-pipeline — ACCEPT: existing demo behavior is preserved.
-> 
+>
 > VERDICT: SAME PAGE
 
 ### Round 4 — Discuss and close
@@ -1978,7 +1978,7 @@ Timestamp: 2026-09-13T08:47:04Z. Codex built Rock 1 (`dca_console.py`, `dca_cons
 adversarial diff review (three lenses, three skeptics per finding) confirmed 3 of 8 findings:
 
 | # | Finding | Response |
-|---|---|---|
+| --- | --- | --- |
 | 1 | [MAJOR] Non-ASCII password leaks its printable projection into the auth-failure log — `http.server` decodes the request line as ISO-8859-1, so the UTF-8 `str` registration never matches the wire spelling (reproduced independently by the Visionary: `route=/x/psswrd-abcdefg`) | **FIX round 1.** Register the ISO-8859-1 and percent-encoded spellings; redact the unquoted target too; raw-socket regression test. |
 | 2 | [MINOR] No "why" comment on the `O_NOFOLLOW \| O_NONBLOCK` flags line | **FIX round 1.** House-voice comment citing rounds 2 and 3. |
 | 3 | [MINOR] `urlsplit` moved inside the `try` without a comment | **FIX round 1.** One-line comment. |
@@ -2014,7 +2014,7 @@ exercise a half-built console). Adversarial diff review confirmed 3 of 7 finding
 defect:
 
 | # | Finding | Response |
-|---|---|---|
+| --- | --- | --- |
 | 1-3 | [MAJOR] The artifact root is the one path input never absolutized: a relative `--cron-tracking-root` or `$DCA_CRON_TRACKING_ROOT` renders relative log paths and env root, and `--install` mkdirs under the invoking cwd while the console resolves against the checkout; an empty flag becomes `Path('.')` and overrides the env | **FIX round 1.** Parse the flag as text, empty means unset, absolutize lexically through the existing helper; regression test with a relative flag, a relative env value, and an empty flag. |
 | R1-R3 | `--port 0` accepted for a persistent agent | Refuted: mirrors the console's own documented guard; no change. |
 | R4 | `test_renderer_fails_closed` asserts only exit 2 | Refuted: the positive-path tests would catch a wrong rule firing; no change. |

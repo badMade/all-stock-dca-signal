@@ -2486,7 +2486,7 @@ class _RawInputRecorder:
                 highest = max(highest, int(suffix))
         return highest
 
-    def record_error(self, kind: str, key: str, exc: Exception) -> None:
+    def record_connector_error(self, kind: str, key: str, exc: Exception) -> None:
         """Record a connector/normalization failure.
 
         ``fetch_or_normalize_error`` keeps this failure's own message
@@ -2515,8 +2515,6 @@ class _RawInputRecorder:
             self.fetch_or_normalize_error = f"failed to fetch or normalize {kind} for {key}: {exc}"
         if self.error is None:
             self.error = self.fetch_or_normalize_error
-
-    record_connector_error = record_error
 
     def persist(self, kind: str, key: str, payload: Any) -> Any:
         """Persist *payload* and return the representation read back from disk."""
@@ -3934,7 +3932,7 @@ class MorningDCAExecutor(DCAExecutor):
             # cached final decision here (Codex review: "Recognize
             # preserved credits before recomputing the slot").
             existing_pending_credit_usd = max(0.0, raw_pending_credit_usd - preserved_credit_for_slot_usd)
-            evaluate_kwargs = {"existing_pending_credit_usd": existing_pending_credit_usd}
+            evaluate_kwargs: dict[str, Any] = {"existing_pending_credit_usd": existing_pending_credit_usd}
             # Root containment alone does not prove the settling order is
             # actually reflected in THIS ticker's loaded prior: a crash
             # after settle(order_id=...) succeeded but before the original

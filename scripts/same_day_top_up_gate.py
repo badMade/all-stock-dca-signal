@@ -60,13 +60,27 @@ supply ``prior_logged_reference_price`` to override the fill-price fallback
 with the true logged reference WHEN THE CALLER ALREADY HAS IT (e.g. from its
 own or an earlier slot's orders.csv/run_state.json), without this gate ever
 reading an artifact itself or treating one's absence as "no prior exists";
-see ``evaluate_slot``'s docstring. Omitted, the gate still falls back to the
-broker-observed fill price, matching the documented preference's own
-last-resort tier. The override is honored ONLY when the candidate also
-supplies ``prior_logged_reference_order_id`` matching the broker's own latest
-qualifying order_id for that ticker -- an unbound override could describe a
-stale, older buy rather than the latest one, over-crediting prior exposure
-(Codex review: "Bind logged references to the latest broker order").
+see ``evaluate_slot``'s docstring. The override is honored ONLY when the
+candidate also supplies ``prior_logged_reference_order_id`` matching the
+broker's own latest qualifying order_id for that ticker -- an unbound
+override could describe a stale, older buy rather than the latest one,
+over-crediting prior exposure (Codex review: "Bind logged references to the
+latest broker order").
+
+FIXED (2026-09-18): a prior fill with no bound logged reference used to fall
+back silently to the broker-observed fill price and auto-authorize a top-up
+off it -- a documented known limitation, since a market order commonly fills
+above its own decision price and that inflated reference could wrongly
+authorize a top-up a true target/decision-price comparison would have
+blocked. It no longer auto-authorizes: when the fill-price fallback would
+authorize a nonzero top-up (``EFFECTIVE_TOP_UP``) and no bound logged
+reference was supplied, the outcome is ``UNLOGGED_REFERENCE_PRICE`` -- $0,
+flagged ``manual_review``. Every other outcome (a legitimate $0 from
+``NO_LOWER_PRICE``/``ALREADY_MET_OR_OVERFILLED``/etc., or any bound-reference
+decision) is unaffected. Only the 3:30 PM live-mirror prompt currently
+threads the override through (via ``scripts/prior_reference_bindings.py``);
+until the other six do too, a real same-day top-up in those slots holds for
+manual review rather than auto-firing off an unproven reference.
 
 It also does not decide share-class equivalence. ``GOOG`` and ``GOOGL`` are
 scored as independent tickers here, exactly as ``config/tickers.json`` lists
@@ -124,13 +138,21 @@ from scripts.broker_reconciliation import (
     reconcile_effective_prior,
     same_day_order_snapshot,
 )
-from scripts.reason_codes import BROKER_HISTORY_INCOMPLETE, MISSING_CURRENT_PRICE, MISSING_PRIOR_PRICE
+from scripts.reason_codes import (
+    BROKER_HISTORY_INCOMPLETE,
+    EFFECTIVE_TOP_UP,
+    MISSING_CURRENT_PRICE,
+    MISSING_PRIOR_PRICE,
+    UNLOGGED_REFERENCE_PRICE,
+)
 
 __all__ = ["evaluate_slot", "main"]
 
 #: Reasons that mean "$0 and a human should look at this", as distinct from
 #: "$0 because the policy's arithmetic legitimately landed on zero".
-_MANUAL_REVIEW_REASONS = frozenset({MISSING_PRIOR_PRICE, MISSING_CURRENT_PRICE, BROKER_HISTORY_INCOMPLETE})
+_MANUAL_REVIEW_REASONS = frozenset(
+    {MISSING_PRIOR_PRICE, MISSING_CURRENT_PRICE, BROKER_HISTORY_INCOMPLETE, UNLOGGED_REFERENCE_PRICE}
+)
 
 
 def _resolve_minimum_order_usd(
@@ -371,8 +393,13 @@ def evaluate_slot(
     review: "Bind logged references to the latest broker order" -- an
     unbound override could belong to an earlier, stale fill and over-credit
     prior exposure). When omitted, or unbound, this falls back to the
-    broker-observed fill price, matching the documented preference's own
-    last-resort tier.
+    broker-observed fill price for COMPARISON purposes, but no longer
+    auto-authorizes off it: if that fallback reference would authorize a
+    nonzero top-up, the decision is ``UNLOGGED_REFERENCE_PRICE`` -- $0,
+    ``manual_review=True`` -- instead of firing on an unproven, possibly
+    fill-price-inflated reference. A legitimate $0 outcome the fallback would
+    have produced anyway (``NO_LOWER_PRICE``, ``ALREADY_MET_OR_OVERFILLED``,
+    etc.) is unaffected.
 
     Raises ``ValueError`` if ``account_number`` is empty: an order snapshot that
     is not pinned to the account being traded proves nothing about it.
@@ -532,6 +559,20 @@ def evaluate_slot(
         buy_usd = float(
             Decimal(str(decision.incremental_usd)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
         )
+        reason = decision.reason
+        # A prior fill exists (broker_reference_price is not None) and the
+        # policy's own arithmetic would authorize a nonzero top-up off it --
+        # but the reference behind that arithmetic is the unproven, possibly
+        # fill-price-inflated broker reference, never a caller-bound logged
+        # target/decision price (see this function's docstring). Authorizing
+        # the buy anyway risks exactly the over-purchase this gate's own
+        # module docstring names as a known limitation. Redirect to manual
+        # review instead of auto-firing; every OTHER outcome (a legitimate
+        # $0 from NO_LOWER_PRICE/ALREADY_MET_OR_OVERFILLED/etc., or any
+        # bound-reference decision) is unaffected.
+        if reason == EFFECTIVE_TOP_UP and broker_reference_price is not None and not logged_reference_bound:
+            reason = UNLOGGED_REFERENCE_PRICE
+            buy_usd = 0.0
         decisions.append(
             {
                 "ticker": ticker,
@@ -543,8 +584,8 @@ def evaluate_slot(
                 "reference_source": _reference_source(logged_reference_bound, prior.reference_price),
                 "logged_reference_bound": logged_reference_bound,
                 "buy_usd": buy_usd,
-                "reason": decision.reason,
-                "manual_review": decision.reason in _MANUAL_REVIEW_REASONS,
+                "reason": reason,
+                "manual_review": reason in _MANUAL_REVIEW_REASONS,
             }
         )
 

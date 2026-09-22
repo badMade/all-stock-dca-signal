@@ -9,7 +9,7 @@ Robinhood-only scheduled live streams plus a read-only monitor.
 ## Scheduled stream manifest
 
 | Stream | ET fire time | Cron id | Role | Stream root (artifacts) |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | Preflight | 9:45 AM | `morning-dca-0945` | Read-only same-day validation, no orders | `cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/` |
 | Morning live | 10:30 AM | `42173154` | Live buy execution | `cron_tracking/morning_dca/YYYYMMDD_1030ET/` |
 | Midday live | 12:30 PM | `a6239dae` | Live buy execution | `cron_tracking/midday_dca/YYYYMMDD_1230ET/` |
@@ -136,7 +136,7 @@ must always write `signals.csv` and `submitted_orders.csv` with header rows
 CSV is an artifact-contract failure, not a soft warning. `run_classification`
 must be an **object** (not a string), and `trading_day` must be non-null; a run
 whose local artifact violated this was repaired in place (see the
-[midday result](#midday-live-1230) below).
+[midday result](#midday-live-1230-a6239dae--filled) below).
 
 Standing exceptions (valid states, NOT contract failures):
 
@@ -234,7 +234,6 @@ land in the tracked adapter.
 
 ## Scheduled evidence results — 2026-07-23
 
-<a name="midday-live-1230"></a>
 ### Midday live (12:30, `a6239dae`) — filled
 
 TXN `$1.00` placed and filled in the configured Robinhood account

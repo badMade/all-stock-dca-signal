@@ -6,15 +6,20 @@ import csv
 import json
 import math
 from types import SimpleNamespace
+from typing import Any
 
 import daily_update
+import features as _features
 import harness as harness_module
 import pytest
 import run_walkforward
 from harness import UNRESOLVED_KEY
 from ledger import Ledger
 
-import conftest
+import conftest as _conftest
+
+conftest: Any = _conftest
+features: Any = _features
 
 make_synthetic_ohlcv = conftest.make_synthetic_ohlcv
 write_ticker_csv = conftest.write_ticker_csv
@@ -685,7 +690,6 @@ class TestDailyCycle:
         # day").
         import dataclasses
 
-        import features
         import numpy as np
 
         history, run_dir, all_dates = live_setup
@@ -717,8 +721,6 @@ class TestDailyCycle:
         # same way or the NOOP short-circuit disagrees with what a real
         # invocation actually does (Codex review: "Process restored
         # dated forecasts before NOOP").
-        import features
-
         history, run_dir, all_dates = live_setup
         panel = features.build_panel(history, min_history=60)
         # See the intraday-stamp test above for why this is suppressed.
@@ -739,8 +741,6 @@ class TestDailyCycle:
         # checkpointed forever and the corrected ticker without its
         # replacement (Codex review: "Count deleted-origin forecasts as
         # pending work").
-        import features
-
         history, run_dir, all_dates = live_setup
         panel = features.build_panel(history, min_history=60)
         # Isolates this test to the specific loop under fix -- see the
@@ -752,8 +752,6 @@ class TestDailyCycle:
         assert daily_update._count_pending_rebinds(state, panel) == 1
 
     def test_count_pending_rebinds_skips_dated_entries_for_a_still_missing_ticker(self, live_setup, monkeypatch):
-        import features
-
         history, run_dir, all_dates = live_setup
         panel = features.build_panel(history, min_history=60)
         # See the intraday-stamp test above for why this is suppressed.
@@ -771,7 +769,6 @@ class TestDailyCycle:
         # rebind_unresolved() ever ran, permanently skipping its only
         # chance at a forecast for that terminal row (Codex review: "Treat
         # newly admitted terminal rows as pending work").
-        import features
         import pandas as pd
 
         history, run_dir, all_dates = live_setup

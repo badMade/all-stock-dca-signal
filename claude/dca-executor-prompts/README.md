@@ -4,7 +4,7 @@ There are **two generations** of executor prompt text committed here, and they
 disagree with each other. This file says which one is live, so a reader does not
 patch the wrong one.
 
-## `live-mirror/` — CANONICAL. Mirrors what actually runs.
+## `live-mirror/` — CANONICAL. Mirrors what actually runs
 
 Seven read-only copies of the live scheduled tasks, captured 2026-07-31 after
 the same-day top-up guard fix. Source of truth is
@@ -146,7 +146,7 @@ Characteristics of this generation:
 * `GATE 6.5 - SAME-DAY TOP-UP GUARD` (step 4.5 in the 1230 slot) invokes
   `scripts/same_day_top_up_gate.py`.
 
-## `1-executor-*.txt` … `7-executor-*.txt` — SUPERSEDED. Do not patch these.
+## `1-executor-*.txt` … `7-executor-*.txt` — SUPERSEDED. Do not patch these
 
 An earlier generation, last touched 2026-07-29, kept for history. It is **not**
 what runs today and has NOT been updated with the same-day top-up guard,

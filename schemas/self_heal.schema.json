@@ -1,0 +1,147 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "self_heal.schema.json",
+  "title": "Bounded self-heal policy",
+  "description": "Strict policy for independently gated observation and repair. Large canonical second and byte counts use documented smaller units so repository text cannot resemble a brokerage account identifier.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "enabled",
+    "max_repairs_per_day",
+    "max_repairs_per_epoch",
+    "breaker_failure_threshold",
+    "max_attempts_per_fingerprint",
+    "max_tick_seconds",
+    "max_wall_clock_seconds",
+    "monthly_actions_minutes",
+    "ci_worst_case_minutes",
+    "max_forward_skew_minutes",
+    "max_cumulative_skew_minutes",
+    "max_archive_kib_per_incident",
+    "max_archive_64kib_blocks_per_run",
+    "budget_period_hours",
+    "review_lease_days",
+    "execution_lease_seconds"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "const": "../schemas/self_heal.schema.json",
+      "minLength": 32,
+      "maxLength": 32,
+      "description": "Pins this document to the strict local draft-07 schema instead of relying on an editor-selected policy."
+    },
+    "enabled": {
+      "type": "boolean",
+      "enum": [false, true],
+      "default": false,
+      "description": "Operator kill switch for repair only; observation remains ungated. The shipped false default requires an explicit operator edit before the new PR-writing path can run."
+    },
+    "max_repairs_per_day": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 24,
+      "default": 1,
+      "description": "Explicit UTC-day admission ceiling. The shipped value implements the operator's once-per-day requirement independently of every other gate."
+    },
+    "max_repairs_per_epoch": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 50,
+      "default": 10,
+      "description": "Cumulative admitted-or-abandoned repair ceiling. It never resets automatically, so only a human new-epoch action can restore lifetime capacity."
+    },
+    "breaker_failure_threshold": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 20,
+      "default": 3,
+      "description": "Any this-many unsuccessful repairs in the current epoch latch the breaker. Failures need not be consecutive, preventing alternating outcomes from dodging the stop."
+    },
+    "max_attempts_per_fingerprint": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10,
+      "default": 3,
+      "description": "Per-fingerprint attempt ceiling. Reaching it quarantines the incident so a recurrence cannot consume repair capacity forever."
+    },
+    "max_tick_seconds": {
+      "type": "integer",
+      "minimum": 30,
+      "maximum": 3600,
+      "default": 600,
+      "description": "Whole-tick deadline enforced by the out-of-process supervisor, including configuration, state, collection, reconciliation, and repair work."
+    },
+    "max_wall_clock_seconds": {
+      "type": "integer",
+      "minimum": 60,
+      "maximum": 7200,
+      "default": 1800,
+      "description": "Local elapsed-time allowance reserved for one repair. It bounds execution and contributes to the repair's worst-case minute charge."
+    },
+    "monthly_actions_minutes": {
+      "type": "integer",
+      "minimum": 10,
+      "maximum": 2000,
+      "default": 300,
+      "description": "Actions-minute allowance for one monotonic budget period. Admission reserves before dispatch so unsettled work cannot overspend silently."
+    },
+    "ci_worst_case_minutes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 600,
+      "default": 150,
+      "description": "Worst-case CI reservation for every workflow run on a repair PR's head SHA; an unsettled review lease is charged at this amount."
+    },
+    "max_forward_skew_minutes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10080,
+      "default": 2880,
+      "description": "Largest accepted single forward wall-clock jump, in whole minutes. The loader converts it to max_forward_skew_seconds so jumps cannot manufacture a fresh period."
+    },
+    "max_cumulative_skew_minutes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 43200,
+      "default": 10080,
+      "description": "Cumulative accepted forward skew per epoch, in whole minutes. The loader converts it to seconds and additionally requires it to be strictly shorter than budget_period_hours."
+    },
+    "max_archive_kib_per_incident": {
+      "type": "integer",
+      "minimum": 4,
+      "maximum": 65536,
+      "default": 1024,
+      "description": "Per-incident as-captured private archive cap in KiB. The loader converts it to max_archive_bytes_per_incident; any truncation must be recorded."
+    },
+    "max_archive_64kib_blocks_per_run": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 8192,
+      "default": 1024,
+      "description": "Aggregate private archive cap in 64-KiB blocks. Integer blocks preserve the exact lower bound; the loader converts them to max_archive_bytes_per_run."
+    },
+    "budget_period_hours": {
+      "type": "integer",
+      "minimum": 24,
+      "maximum": 2160,
+      "default": 720,
+      "description": "Duration of the durable monotonic budget period in whole hours, converted by the loader to budget_period_seconds instead of deriving resets directly from wall-calendar boundaries."
+    },
+    "review_lease_days": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 90,
+      "default": 14,
+      "description": "Maximum time a repair may remain in review before it is refused and its unsettled CI reservation is charged at worst case."
+    },
+    "execution_lease_seconds": {
+      "type": "integer",
+      "minimum": 60,
+      "maximum": 21600,
+      "default": 3600,
+      "description": "Dispatch lease before a crashed or wedged repair becomes an abandonment that consumes an attempt and worst-case reservation."
+    }
+  }
+}

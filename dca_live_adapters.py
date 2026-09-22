@@ -4857,6 +4857,15 @@ class RobinhoodDataProvider:
 
     source = SourceName.ROBINHOOD
 
+    #: Default ticker-list chunk size for get_batch_intraday_bars. This repo
+    #: never makes the real network call -- an external agent session does,
+    #: via the injected historicals_fn -- so the true output-size limit that
+    #: triggered the 76KB incidents is outside this repo's control. 25 is a
+    #: conservative starting point (roughly a third of the current 65-ticker
+    #: live universe); revisit once a real output-size incident is observed
+    #: with chunking already in place.
+    DEFAULT_BATCH_CHUNK_SIZE = 25
+
     def __init__(
         self,
         historicals_fn: HistoricalsFn,
@@ -4864,11 +4873,13 @@ class RobinhoodDataProvider:
         *,
         bounds: str = "regular",
         adjustment_type: str = "none",
+        batch_chunk_size: int = DEFAULT_BATCH_CHUNK_SIZE,
     ) -> None:
         self._historicals_fn = historicals_fn
         self._quotes_fn = quotes_fn
         self._bounds = bounds
         self._adjustment_type = adjustment_type
+        self._batch_chunk_size = batch_chunk_size
         # ⚡ Bolt: signal-time quote memo, scoped to a single decision moment. Both
         # get_previous_close_bar (via _previous_close_from_quote) and get_quote are
         # invoked from near_close_dca.evaluate_source_signal for the SAME ticker at the
@@ -4932,18 +4943,28 @@ class RobinhoodDataProvider:
         A symbol whose every bar was dropped is omitted from the result rather
         than mapped to ``[]`` so callers treat it exactly like a symbol the
         broker returned nothing for (2026-09-07 diagnostic P:COMMENT-03).
+
+        ``tickers`` is split into ``self._batch_chunk_size``-sized chunks,
+        each fetched with its own ``historicals_fn`` call and merged before
+        parsing -- a single unbounded batch call hit a broker tool
+        output-size cap (76KB) as the live ticker universe grew (59->65),
+        and this repo cannot control that limit itself since the real
+        network call happens in an external agent session, not here.
         """
         interval = _rh_interval(interval_minutes)
-        response = self._historicals_fn(
-            symbols=tickers,
-            start_time=_to_utc_iso(start),
-            end_time=_to_utc_iso(end),
-            interval=interval,
-            bounds=self._bounds,
-            adjustment_type=self._adjustment_type,
-        )
-        data = _unwrap(response)
-        results = data.get("results") or []
+        results: List[Dict[str, Any]] = []
+        for start_index in range(0, len(tickers), self._batch_chunk_size):
+            chunk = tickers[start_index : start_index + self._batch_chunk_size]
+            response = self._historicals_fn(
+                symbols=chunk,
+                start_time=_to_utc_iso(start),
+                end_time=_to_utc_iso(end),
+                interval=interval,
+                bounds=self._bounds,
+                adjustment_type=self._adjustment_type,
+            )
+            data = _unwrap(response)
+            results.extend(data.get("results") or [])
         grouped = {}
         for result in results:
             symbol = result.get("symbol")

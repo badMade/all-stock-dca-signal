@@ -28,17 +28,29 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 from zoneinfo import ZoneInfo
 
-from dca_console_jobs import Command, JobBusy, JobManager, redact, register_secret
+from dca_console_jobs import Command, JobBusy, JobManager, is_sensitive_variable, redact, register_secret
+from dca_console_reader import root_label
+from dca_console_routes import CREDENTIAL_FREE_ROUTES, DEFAULT_CSP, GET_ROUTES, RouteRequest
 from dca_fileio import atomic_write_text
 from dca_paths import cron_tracking_root, stream_root
 
 REPO = Path(__file__).resolve().parent
 ET = ZoneInfo("America/New_York")
-ASSETS = {"/": ("index.html", "text/html"), "/app.js": ("app.js", "text/javascript"),
-          "/styles.css": ("styles.css", "text/css")}
+# The complete browser bundle, as (route, file under console/, content type).
+# ASSETS stays an exact-match dict derived from this literal tuple: there is no
+# directory walk, so no other repository file can ever be served (pinned by
+# tests/test_dca_console.py and tests/test_console_assets.py).
+CONSOLE_FILES = (
+    ("/", "index.html", "text/html"),
+    ("/app.js", "app.js", "text/javascript"),
+    ("/pages.js", "pages.js", "text/javascript"),
+    ("/markdown.js", "markdown.js", "text/javascript"),
+    ("/styles.css", "styles.css", "text/css"),
+)
+ASSETS = {route: (name, kind) for route, name, kind in CONSOLE_FILES}
 MAX_AUTH_FILE_BYTES = 4096
 MIN_AUTH_PASSWORD_CHARACTERS = 12
 HANDLER_TIMEOUT_SECONDS = 30
@@ -71,7 +83,8 @@ def _single_header(headers, name: str) -> tuple[bool, str | None]:
     try:
         get_all = getattr(headers, "get_all", None)
         if callable(get_all):
-            values = get_all(name, [])
+            raw_values = get_all(name, [])
+            values = list(raw_values) if isinstance(raw_values, (list, tuple)) else []
             if not values:
                 return False, None
             if len(values) != 1 or not isinstance(values[0], str):
@@ -124,6 +137,11 @@ class Settings:
     research_python: str
     octopus_run: Path | None = None
     config_dir: Path = REPO / "config"
+    # Extra artifact trees to observe read-only beside ``root``: the gitignored
+    # repo-root artifacts/ directory holds more run states and alert files than
+    # the dca_paths-managed tree on this machine (GUI expansion Phase 0). Demo
+    # mode never sets it; readers label every root and never echo its path.
+    secondary_roots: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -264,7 +282,8 @@ class ConsoleAccess:
             return True
         get_all = getattr(headers, "get_all", None)
         if callable(get_all):
-            values = get_all("Authorization", [])
+            raw_values = get_all("Authorization", [])
+            values = list(raw_values) if isinstance(raw_values, (list, tuple)) else []
         else:
             value = headers.get("Authorization")
             values = [] if value is None else [value]
@@ -394,7 +413,7 @@ def dependency_reason(packages: dict, names: tuple[str, ...]) -> str:
 
 def python_packages(executable: str) -> dict:
     """Probe optional package availability without importing research modules."""
-    names = ("numpy", "pandas", "sklearn", "torch", "pytest", "ruff")
+    names = ("numpy", "pandas", "sklearn", "torch", "pytest", "ruff", "jsonschema", "yaml", "yfinance", "tkinter")
     code = (
         "import importlib.util,json; "
         f"print(json.dumps({{n: importlib.util.find_spec(n) is not None for n in {names!r}}}))"
@@ -446,14 +465,34 @@ def _sigterm_as_keyboard_interrupt():
         signal.signal(signal.SIGTERM, previous_handler)
 
 
+def display_python(python: str) -> str:
+    """Spell the console's interpreter for a copyable command without its absolute path.
+
+    The catalog used to interpolate ``shlex.quote(python)``, which put the
+    operator's home directory into every snapshot and saved summary. A path
+    inside the checkout is shown relative to it (``.venv/bin/python`` still
+    runs from the repository root); anything else is reduced to its basename
+    (GUI expansion Phase 0 leak fix).
+    """
+    try:
+        path = Path(python)
+        if path.is_absolute() and path.resolve().is_relative_to(REPO):
+            return shlex.quote(str(path.resolve().relative_to(REPO)))
+        return shlex.quote(path.name or python)
+    except (OSError, RuntimeError, ValueError):
+        return "python3"
+
+
 def module_catalog(python: str) -> list[dict]:
     """Expose the repository's canonical entry points without executing them."""
     from scripts.agent_entry_points import ENTRY_POINTS
 
+    interpreter = display_python(python)
+
     def runnable(command: str) -> str:
         for prefix in ("python3 ", "python "):
             if command.startswith(prefix):
-                return shlex.quote(python) + " " + command[len(prefix):]
+                return interpreter + " " + command[len(prefix):]
         return command
 
     rows = [{"id": f"entry-{i}", "name": e.need, "description": e.notes,
@@ -480,7 +519,7 @@ def module_catalog(python: str) -> list[dict]:
          "", "dca-sizing-signals/README.md"),
     ]
     rows.extend({"id": f"extra-{i}", "name": name, "description": description,
-                 "command": f"{shlex.quote(python)} {command}" if command else "Library API; see documentation",
+                 "command": f"{interpreter} {command}" if command else "Library API; see documentation",
                  "docs": docs, "status": "Optional research / manual inputs"}
                 for i, (name, description, command, docs) in enumerate(extras))
     return rows
@@ -491,6 +530,7 @@ class ConsoleApp:
 
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.access: ConsoleAccess | None = None
         self.jobs = JobManager(settings.output / "jobs")
         self.token = secrets.token_urlsafe(32)
         self.packages = python_packages(settings.research_python)
@@ -551,9 +591,15 @@ class ConsoleApp:
              research, research_reason),
         ]
         # Demo actions always write under output/demo, never into the observed local root.
-        return [{"id": action, "label": label, "description": description,
+        from dca_console_launch import launch_actions
+
+        rows = [{"id": action, "label": label, "description": description,
                  "available": bool(available), "reason": "" if available else reason}
                 for action, label, description, available, reason in definitions]
+        # The Phase 4 launchers join the same closed list; their inputs are
+        # resolved server-side, never posted (dca_console_launch).
+        rows.extend(launch_actions(self, REPO))
+        return rows
 
     def snapshot(self, day: date | None = None, ticker: str = "", period: str = "all") -> dict:
         """Read current evidence, cache briefly, and save a sanitized daily digest."""
@@ -578,7 +624,12 @@ class ConsoleApp:
                     "mode": self.settings.mode, "now": now.isoformat(), "default_date": request_default_day.isoformat(),
                     "daily": daily, "octopus": octopus, "warnings": [],
                     "modules": module_catalog(self.settings.python),
-                    "paths": {"artifacts": str(self.settings.root), "summaries": str(self.settings.output / "summaries")},
+                    # Labels, never absolute paths: this document is a browser
+                    # response and a saved summary (GUI expansion Phase 0).
+                    "paths": {"artifacts": root_label(self.settings.root),
+                              "summaries": root_label(self.settings.output / "summaries")},
+                    "roots": [{"label": root_label(self.settings.root), "kind": "primary"}]
+                    + [{"label": root_label(extra), "kind": "secondary"} for extra in self.settings.secondary_roots],
                 }
                 try:
                     overview = build_octopus_snapshot(self.octopus_run) if ticker or period != "all" else octopus
@@ -633,20 +684,38 @@ class ConsoleApp:
             raise ValueError(match["reason"])
         return self.jobs.submit(action, match["label"], lambda job_id, log: self._run(action, job_id, log))
 
-    def _command(self, argv: list[str], log, *, demo: bool = False, research: bool = False, timeout: float = 600) -> int:
+    def _command(self, argv: list[str], log, *, demo: bool = False, research: bool = False, timeout: float = 600,
+                 capture_to: Path | None = None) -> int:
         env = dict(os.environ)
         env["DCA_CRON_TRACKING_ROOT"] = str(self.settings.output / "demo" / "dca" if demo else self.settings.root)
         env["PYTHONUNBUFFERED"] = "1"
+        # Job logs are read in a <pre>, not a terminal: ask pytest, ruff and
+        # friends for plain text so ANSI colour codes never reach the page.
+        env["NO_COLOR"] = "1"
+        env["PY_COLORS"] = "0"
+        env.pop("FORCE_COLOR", None)
+        # No allowlisted job needs the brokerage account, a webhook, or any
+        # token: purchase_history, the generators and the research CLIs read
+        # none of them. Dropping every sensitive variable from EVERY child, not
+        # only demo ones, makes that a property of the runner rather than of
+        # each action's argv review (GUI expansion Phase 0).
+        for key in list(env):
+            if is_sensitive_variable(key):
+                del env[key]
         if demo:
             # External artifact overrides would defeat the isolated demo root.
             for key in list(env):
                 if key.startswith("DCA_") and key not in {"DCA_CRON_TRACKING_ROOT", "DCA_TICKER_HISTORY_DIR"}:
                     del env[key]
-            env.pop("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", None)
         executable = self.settings.research_python if research else self.settings.python
-        return self.jobs.run_command(Command(tuple([executable, *argv]), REPO, env, timeout), log)
+        return self.jobs.run_command(Command(tuple([executable, *argv]), REPO, env, timeout, capture_to=capture_to), log)
 
     def _run(self, action: str, job_id: str, log) -> int:
+        from dca_console_launch import LAUNCH_SPECS, run_launch
+
+        if action in LAUNCH_SPECS:
+            today = self.settings.day or datetime.now(ET).date()
+            return run_launch(self, action, job_id, log, repo=REPO, run_command=self._command, today=today)
         results = []
         if action in {"demo-all", "demo-dca"}:
             day = self.settings.day if self.settings.mode == "demo" else default_demo_day()
@@ -812,16 +881,26 @@ def make_server(
     access = ConsoleAccess() if access is None else access
     if not isinstance(access, ConsoleAccess):
         raise ValueError("access must be a validated ConsoleAccess policy")
+    # The Environment page reports the listener's non-secret policy (bind,
+    # trusted hosts, auth mode); the credential bytes never leave ConsoleAccess.
+    app.access = access
     # This limiter belongs to one server, rather than the module, so separate
     # consoles and tests cannot suppress each other's diagnostics (panel,
     # round 3).
     failure_log = AuthFailureLog() if failure_log is None else failure_log
+    active_failure_log: AuthFailureLog = failure_log
 
     class Handler(BaseHTTPRequestHandler):
         # StreamRequestHandler applies this while setting up every accepted
         # socket. An idle LAN/proxy peer therefore cannot retain a worker thread
         # forever without sending even a request line (Rock 2 handler finding).
         timeout = HANDLER_TIMEOUT_SECONDS
+
+        def _server_port(self) -> int:
+            addr = getattr(self.server, "server_address", None)
+            if isinstance(addr, tuple) and len(addr) > 1 and isinstance(addr[1], int):
+                return addr[1]
+            return 0
 
         def log_message(self, format: str, *args) -> None:
             return
@@ -852,6 +931,7 @@ def make_server(
             *,
             download: str = "",
             extra_headers: tuple[tuple[str, str], ...] = (),
+            csp: str = DEFAULT_CSP,
         ) -> None:
             self.send_response(code)
             self.send_header("Content-Type", kind + "; charset=utf-8")
@@ -859,7 +939,9 @@ def make_server(
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("Content-Security-Policy", "default-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+            # Only a generated research page served from its own route may
+            # relax this, and then only into an opaque sandbox (dca_console_routes).
+            self.send_header("Content-Security-Policy", csp)
             if download:
                 self.send_header("Content-Disposition", f'attachment; filename="{download}"')
             for name, value in extra_headers:
@@ -871,7 +953,7 @@ def make_server(
             self._reply(code, json.dumps(value, allow_nan=False).encode())
 
         def _trusted(self) -> bool:
-            port_number = self.server.server_address[1]
+            port_number = self._server_port()
             if not access.trusted(self.headers, port_number):
                 return False
             site_present, site = _lower_ascii_header(self.headers, "Sec-Fetch-Site")
@@ -912,7 +994,7 @@ def make_server(
 
         def _log_auth_failure(self) -> None:
             try:
-                failure_log.record(self.client_address, self.command, self.path)
+                active_failure_log.record(self.client_address, self.command, self.path)
             except Exception:
                 # Test doubles get the same fail-safe boundary as the concrete
                 # logger; an observability failure cannot become an auth bypass.
@@ -946,7 +1028,7 @@ def make_server(
             # Health stays credential-free for local probes.  The trust check
             # remains first, so this exception never becomes a cross-origin
             # reachability oracle (Same Page round 1).
-            if route != "/api/health" and not access.authorized(self.headers):
+            if route not in CREDENTIAL_FREE_ROUTES and not access.authorized(self.headers):
                 self._unauthorized()
                 return
             try:
@@ -955,42 +1037,16 @@ def make_server(
                 if url.path in ASSETS:
                     name, kind = ASSETS[url.path]
                     self._reply(200, (REPO / "console" / name).read_bytes(), kind)
-                elif url.path == "/api/bootstrap":
-                    self._json(200, {"token": app.token, "default_date": app.default_day().isoformat()})
-                elif url.path in {"/api/snapshot", "/api/export"}:
-                    query = parse_qs(url.query, max_num_fields=8)
-                    raw_day = query.get("date", [None])[0]
-                    # Let snapshot() resolve an absent date once for both its
-                    # evidence day and default_date. Besides keeping the rolling
-                    # rule in one place, this avoids a midnight split inside one
-                    # response (Same Page round 2).
-                    day = date.fromisoformat(raw_day) if raw_day is not None else None
-                    ticker = query.get("ticker", [""])[0][:32]
-                    period = query.get("period", ["all"])[0][:80]
-                    data = app.snapshot(day, ticker, period)
-                    if url.path == "/api/export":
-                        export = {key: data[key] for key in ("mode", "now", "daily", "octopus", "warnings")}
-                        self._reply(200, json.dumps(export, indent=2, allow_nan=False).encode(),
-                                    download=f"dca-summary-{data['daily']['date']}.json")
-                    else:
-                        self._json(200, data)
-                elif url.path == "/api/health":
-                    self._json(200, {
-                        "status": "ok",
-                        "mode": app.settings.mode,
-                        **self._authority_diagnostics(),
-                    })
-                elif url.path == "/api/docs":
-                    query = parse_qs(url.query, max_num_fields=1)
-                    name = query.get("path", [""])[0]
-                    allowed = {row["docs"] for row in module_catalog(app.settings.python)}
-                    path = (REPO / name).resolve()
-                    if name not in allowed or not path.is_relative_to(REPO) or not path.is_file():
-                        self._json(404, {"error": "Documentation not found"})
-                    else:
-                        self._reply(200, path.read_bytes(), "text/plain")
-                else:
+                    return
+                # Every API read lives in the route table; the gate order above
+                # is the only thing this handler still owns (GUI expansion Phase 0).
+                handler = GET_ROUTES.get(url.path)
+                if handler is None:
                     self._json(404, {"error": "Not found"})
+                    return
+                response = handler(app, RouteRequest(url, self._authority_diagnostics(), self._server_port()))
+                self._reply(response.code, response.body, response.kind,
+                            download=response.download, csp=response.csp)
             except ValueError:
                 self._json(400, {"error": "Invalid date or query. Use date=YYYY-MM-DD."})
             except Exception as error:
@@ -1009,7 +1065,7 @@ def make_server(
             if not secrets.compare_digest(self.headers.get("X-Console-Token", ""), app.token):
                 self._forbidden("Missing or invalid console token.")
                 return
-            if self.path != "/api/jobs":
+            if self.path not in {"/api/jobs", "/api/jobs/cancel"}:
                 self._json(404, {"error": "Not found"})
                 return
             try:
@@ -1018,6 +1074,16 @@ def make_server(
                     raise ValueError("Request body must be between 1 and 1024 bytes")
                 self.connection.settimeout(5)
                 payload = json.loads(self.rfile.read(length))
+                if self.path == "/api/jobs/cancel":
+                    # The cancel body is as closed as the start body: one string
+                    # naming the job the page is looking at (GUI expansion Phase 5).
+                    if not isinstance(payload, dict) or set(payload) != {"job"} or not isinstance(payload["job"], str):
+                        raise ValueError("Supply only a string job id")
+                    if app.jobs.cancel(payload["job"]):
+                        self._json(202, {"cancelled": payload["job"]})
+                    else:
+                        self._json(404, {"error": "No active job with that id"})
+                    return
                 if not isinstance(payload, dict) or set(payload) != {"action"} or not isinstance(payload["action"], str):
                     raise ValueError("Supply only a string action")
                 self._json(202, {"job": app.submit(payload["action"])})
@@ -1062,6 +1128,8 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--demo", action="store_true", help="Use isolated synthetic demo artifacts (default)")
     mode.add_argument("--local", action="store_true", help="Observe existing artifacts; no automatic demo or broker calls")
     parser.add_argument("--root", type=Path, help="Existing DCA artifact root (implies --local)")
+    parser.add_argument("--secondary-root", type=Path, action="append", default=[], metavar="DIR",
+                        help="Additional existing artifact tree to observe read-only (repeatable; implies --local)")
     parser.add_argument("--output-dir", type=Path, help="Console artifacts; default dca_paths.stream_root('console')")
     parser.add_argument("--octopus-run", type=Path, help="Existing Octopus run directory (use with --local)")
     parser.add_argument("--research-python", help="Python with Octopus dependencies; auto-detect repository .venv")
@@ -1078,8 +1146,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run", metavar="ACTION", help="Run one allowlisted action, print its result and exit")
     parser.add_argument("--check", action="store_true", help="Show runtime and action readiness without starting jobs")
     args = parser.parse_args(argv)
-    if args.demo and (args.root or args.octopus_run):
-        parser.error("Use --local with existing --root/--octopus-run; --demo keeps synthetic data isolated.")
+    if args.demo and (args.root or args.octopus_run or args.secondary_root):
+        parser.error("Use --local with existing --root/--octopus-run/--secondary-root; --demo keeps synthetic data isolated.")
+    secondary_roots = []
+    for extra in args.secondary_root:
+        resolved = extra.expanduser().resolve()
+        if not resolved.is_dir():
+            # A missing secondary tree is a typo, not an empty history: refuse
+            # rather than silently observe nothing (GUI expansion Phase 0).
+            parser.error(f"--secondary-root must name an existing directory: {extra}")
+        if resolved not in secondary_roots:
+            secondary_roots.append(resolved)
     if not 0 <= args.port <= 65535:
         parser.error("--port must be between 0 and 65535")
     try:
@@ -1099,7 +1176,7 @@ def main(argv: list[str] | None = None) -> int:
         # parser.error provides the CLI's established exit-2 contract without
         # ever printing file contents (Same Page round 1).
         parser.error(str(error))
-    local = bool(args.local or args.root or args.octopus_run)
+    local = bool(args.local or args.root or args.octopus_run or secondary_roots)
     root = (args.root or Path(cron_tracking_root())).expanduser().resolve()
     output = (args.output_dir or Path(stream_root("console"))).expanduser().resolve()
     venv_python = REPO / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -1119,7 +1196,8 @@ def main(argv: list[str] | None = None) -> int:
     settings = Settings("local" if local else "demo", root if local else output / "demo" / "dca",
                         output, selected_day,
                         python, args.research_python or python,
-                        args.octopus_run.expanduser().resolve() if args.octopus_run else None)
+                        args.octopus_run.expanduser().resolve() if args.octopus_run else None,
+                        secondary_roots=tuple(secondary_roots))
     app = ConsoleApp(settings)
     if args.check:
         print(json.dumps({"mode": settings.mode, "python": python, "research_python": settings.research_python,

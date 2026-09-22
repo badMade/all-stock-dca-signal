@@ -15,9 +15,9 @@ Views (composable with --run-dir):
 Exit codes: 0 ok, 1 REFUSED (no run/ledger/checkpoint where required).
 """
 
+# ruff: noqa: E402
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -50,7 +50,7 @@ from data import COMPONENTS  # noqa: E402
 from ledger import Ledger, LedgerError  # noqa: E402
 from run_walkforward import Refused, _checkpoint_state_path, write_report  # noqa: E402
 
-from analysis import render_analysis  # noqa: E402
+from analysis import render_analysis  # type: ignore  # noqa: E402
 
 _MODEL_PREFERENCE = ("octopus", "gbm_quantile", "persistence")
 

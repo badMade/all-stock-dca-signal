@@ -5,7 +5,7 @@ How the strategy library becomes a running system, and where the safety gates ar
 ## Modules
 
 | Module | Role |
-|---|---|
+| --- | --- |
 | `near_close_dca.py` | Pure strategy library: signals, budgets, safeguards, artifacts. Standard library only. |
 | `dca_config.py` | Loads `config/*.json` onto `StrategyConfig` defaults (tickers, budgets, sizing ladder, approved trading window). |
 | `dca_live_adapters.py` | `RobinhoodDataProvider`, `FinanceDataProvider`, `RobinhoodBroker` — conform to the `MarketDataProvider` / `BrokerAdapter` protocols via **injected callables**. No credentials, no network in-module. |
@@ -21,7 +21,7 @@ None is dead, but they are not interchangeable, and a fix applied to one does
 **not** propagate to the others. Verified 2026-08-03:
 
 | Entry point | Shape | Invoked by | Notes |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `run_dca.run_slot()` | Function pipeline over `near_close_dca` primitives | `run_dca.py` itself; the 3:30 PM live path | The only path with a real `__main__` (via `near_close_dca.py`). Re-implements the morning preflight gate rather than calling `MorningDCAExecutor`'s. |
 | `MorningDCAExecutor` + 3 subclasses | Class hierarchy, one class per stream | **External agent/prompt** constructing the class and calling `.run(now, data, broker=…)` | **No in-repo caller and no CLI.** Nothing in this repository runs them; `grep` for `MiddayDCAExecutor(` etc. hits only their own modules and tests. |
 | `dca_runner.py` | Gate sequence + injected callables | **External agent session** holding MCP runtime access | Deliberate design, not abandoned: it exists so guardrails live in diffable code instead of truncatable prompt text. Covered by `test_live_reliability_contract.py` and pinned by `test_config_invariants.py`. |
@@ -322,9 +322,9 @@ refused outright: every cap/buying-power check uses the raw float, but placement
 cent-rounded string the broker actually receives, so an unrounded amount could pass every
 check here while exceeding a confirmed ceiling by the rounding delta once submitted. The
 placement response itself is checked for identity too, not just order id and state: when
-the broker's response carries a `symbol`/`instrument_symbol`/`side`, a mismatch against the
+the broker's response carries a`symbol`/`instrument_symbol`/`side`, a mismatch against the
 order actually requested (e.g. an MSFT sell confirmation while AAPL was requested) halts the
-batch rather than being recorded as a successful submission. `orders` is materialized to a
+batch rather than being recorded as a successful submission.`orders` is materialized to a
 list internally before either traversal that consumes it (the bought-today check and the
 recomputed snapshot), so a single-pass iterable (e.g. a generator) is not silently exhausted
 by the first use, leaving the second with nothing. `tier` is validated against a configured
@@ -332,7 +332,7 @@ by the first use, leaving the second with nothing. `tier` is validated against a
 public and constructible independently of `select_budget_tier`, so a caller-built tier
 naming a real tier but carrying inflated caps must not be trusted at face value. That check
 proves the tier's DEFINITION is legitimate, never that it was the correct SELECTION for
-today's actual candidates, though. A bare `planned_spend_usd`/`high_multiplier_signal_count`
+today's actual candidates, though. A bare`planned_spend_usd`/`high_multiplier_signal_count`
 scalar pair is not enough either: neither is tied to any actual candidate set, so a caller
 could just as easily claim a large `planned_spend_usd` for a small real plan. `candidates` --
 the SAME raw rows the caller used to select `tier` via `select_budget_tier()` in the first
@@ -349,7 +349,7 @@ selection (e.g. many small candidates whose aggregate spend crosses an escalatio
 while submitting only a hand-picked subset of them, riding on the richer tier's daily/weekly
 caps for spend a real, full `plan_orders()` run on those same candidates would never have
 authorized in isolation. `execute_plan` closes this by rebuilding, from the same deduped and
-validated candidate winners, snapshot, tier, `weekly_cap_usd`, and `buying_power_usd` this call
+validated candidate winners, snapshot, tier, `weekly_cap_usd`, and`buying_power_usd` this call
 has already verified, the exact `Plan` that `plan_orders()` itself would produce, and requiring
 `plan.to_place` to match it exactly -- every submitted order must appear in that rebuilt plan
 (checked once each order has already cleared every other per-order validation: ticker shape,
@@ -365,7 +365,7 @@ callable
 returning a fresh timezone-aware datetime, is sampled immediately before every single
 placement and reruns the market-day/time-window/trading-window gates against it: a batch with
 more than one ticker, or a slow placement call, can otherwise straddle the slot's acceptance
-window, since the single pre-loop `now` check only proves the window was open when the batch
+window, since the single pre-loop`now` check only proves the window was open when the batch
 started -- making it required rather than merely accepted closes this for every live placement
 rather than leaving it an opt-in a caller could forget. The window closing mid-batch halts the
 remainder -- `result.submitted` still reports every order already placed -- rather than

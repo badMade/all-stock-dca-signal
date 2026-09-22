@@ -82,6 +82,114 @@ The core application has no runtime third-party dependencies. Optional research 
 - `tickers.txt`, `historical_stock_data.csv`, `stock_fetch_progress.json` — operational data files used by fetch/analysis scripts; do not delete.
 - `FETCH_*.md`, `FILE_MANIFEST.txt`, `FINAL_EXECUTION_REPORT.md`, `TASK_SUMMARY.txt`, `README_*.md` — generated operational reports from fetch runs; treat as read-only artifacts.
 
+## What review catches here
+
+Derived from the 298 distinct review findings recorded in source comments (the
+`(Codex review: "...")` trail). These are not general good practice; they are the
+mistakes this repository actually rejects, in descending order of frequency.
+
+**1. Malformed persisted input reaches logic that trusted it (81 of 298).**
+Artifacts, state files and injected payloads are the largest single source of
+findings. Four traps recur:
+
+- **Booleans where a number is expected (8 findings).** `bool` subclasses `int`,
+  so `isinstance(value, int)` accepts `True` and it silently becomes `1`. Guard
+  `isinstance(value, bool)` *before* the integer check, every time.
+- **Non-finite floats (10 findings).** Python's JSON decoder accepts `NaN` and
+  `Infinity` even though the format does not. Reject them explicitly; a `NaN`
+  price or multiplier propagates silently through arithmetic.
+- **Duplicate JSON keys (6 findings).** `json.loads` keeps the last value, so
+  file order silently decides which limit applies. Use an `object_pairs_hook`
+  that refuses duplicates for anything that carries a safety bound.
+- **Blank, empty and absent values (8 findings).** Decide explicitly whether the
+  field is required. Never substitute a default that is indistinguishable from
+  real data.
+
+**2. A decision bound to stale evidence (10 findings).** Cap checks must read a
+fresh history snapshot, live placement a fresh clock, scoring a non-stale bar.
+When adding a cache or reusing a snapshot, first check whether a
+freshness-critical caller (a breaker, a last-moment guard) routes through the
+same helper: `.jules/bolt.md`'s first entry documents exactly that trap, where
+memoizing a shared quote helper would have stale-served the spread breaker.
+
+**3. Failing open when a source is absent.** Fail closed instead: refuse, and say
+why. Treat a non-object payload as unavailable rather than empty, and a dropped
+tail as non-authoritative rather than complete.
+
+**4. Claims that are not atomic or idempotent (9 findings).** Release, settlement
+and ownership transitions are repeatedly found to be re-entrant. Assume any step
+can be retried or interrupted.
+
+**5. Outbound requests without SSRF protection.** `.jules/sentinel.md` records
+this across five entries, one of them logged twice. Route every operator-supplied URL through
+`dca_net_utils.assert_safe_destination`, and leave existing `# noqa: S310`
+suppressions in place when editing around them. Note that they are security
+context, not a live gate: `[tool.ruff.lint] select` is `["E", "F", "I", "B"]`,
+so `S310` is not enforced here and removing a suppression would not fail CI.
+That is a reason to be more careful with them, not less. Never log a raw
+external error response: they echo credentials.
+
+## Checks beyond the standard three
+
+`## Agent workflow` step 5 covers `ruff check .`, `pytest` and the demo smoke
+test. `scripts/tests/` needs no separate command: `testpaths = ["."]` and the
+`addopts` ignore list does not exclude `scripts/`, so a bare `pytest` already
+collects it (39 cases at the time of writing).
+
+What the root sweep genuinely does not cover is the seven directories named in
+that ignore list, each excluded because it carries its own heavy dependencies:
+
+| Subproject | Own CI job |
+| --- | --- |
+| `production-safe-agent-loop/`, `ticker-advisor/`, `ml-forecaster/`, `wondrous-octopus/`, `ticker-market-breadth/`, `llm-providers/` | yes |
+| `dca-sizing-signals/` | **no** |
+
+Install that subproject's `requirements.txt` and run its `tests/` from inside
+it, and only for the one your diff touches. A CI failure isolated to a sibling
+suite your diff does not touch is very likely not yours; say so rather than
+widening the change.
+
+`dca-sizing-signals/` is the exception worth knowing: it is excluded from the
+root pytest sweep *and* from root `ruff` (`extend-exclude`), and `ci.yml`
+contains no job for it, so nothing validates it automatically. If you touch it,
+you are its only gate. Run its suite yourself and say so in the pull request.
+
+**Root-only tests CI cannot see.**
+`tests/test_dca_fileio.py::test_the_destination_owner_is_preserved` and
+`::test_the_write_aborts_when_ownership_cannot_be_reproduced` call
+`pytest.skip()` unless `os.getuid() == 0`. CI runs unprivileged, so it **skips
+them every time**: a green CI proves nothing about these two, and cannot catch
+a root-only regression in `atomic_write_text`.
+
+Run as root, which is the case in most containers, they currently fail on the
+mode assertion (`0o600` where `0o620` is expected). That reproduces on an
+unchanged base, so it predates any given change.
+
+Do not call that environmental and move on. Pre-existing is all a clean-base
+reproduction establishes, and the only conditions under which these tests
+execute at all are the conditions under which they fail. If you hit them:
+reproduce on an unchanged base to show your diff did not cause it, say so
+explicitly rather than calling it noise, and never weaken or skip them to quiet
+a local run.
+
+## Companion edits CI catches late
+
+Each of these passes locally until one specific test, or an installed wheel,
+disagrees. Make the companion edit in the same commit.
+
+| If you add | Also update |
+| --- | --- |
+| A `config/*.json` file | `dca_console_config.CONFIG_FILES` and its consumer map, plus the two count assertions in `tests/test_dca_console_config.py` |
+| A top-level module, or a config read at runtime | `pyproject.toml`: `[tool.setuptools] packages`/`py-modules`, and `[tool.setuptools.data-files]` for the config |
+
+Packaging is worth proving rather than assuming, because a checkout hides the
+failure completely:
+
+```bash
+python -m venv /tmp/wheelcheck && /tmp/wheelcheck/bin/pip install .
+cd /tmp && /tmp/wheelcheck/bin/python -c "import <your_module>"
+```
+
 ## Pull request expectations
 
 Include:
@@ -90,3 +198,12 @@ Include:
 - Tests or checks run, with exact commands.
 - Any known limitations or follow-up work.
 - Confirmation that no secrets were added.
+- **Which of the three entry points the change covers.** `run_dca.run_slot()`,
+  the `MorningDCAExecutor` hierarchy and `dca_runner.py` coexist, and a fix to
+  one does not propagate to the others. A reviewer cannot infer the coverage
+  from the diff, so state it.
+
+Never edit `.github/workflows/` in a pull request an agent drives. Those jobs
+hold `contents: write` and `pull-requests: write`, and the trust-boundary
+reasoning is written in the workflow headers themselves. Propose the change
+instead. Approving and merging are the operator's, never an agent's.

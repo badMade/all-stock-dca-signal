@@ -22,6 +22,7 @@ import pytest
 import dca_console
 from dca_console import AuthFailureLog, ConsoleAccess, ConsoleApp, Settings, load_auth_file, main, make_server
 from dca_console_jobs import JobManager, redact
+from dca_console_reader import root_label
 
 AUTH_CREDENTIAL = b"dca:s3cret-pw-abcdefg"
 AUTH_PASSWORD = AUTH_CREDENTIAL.partition(b":")[2].decode()
@@ -283,7 +284,12 @@ def test_local_once_reads_existing_artifacts_without_running_commands(tmp_path, 
     assert main(["--local", "--once", "--root", str(root), "--output-dir", str(output), "--date", "2026-09-08"]) == 0
     result = json.loads(capsys.readouterr().out)
     assert result["mode"] == "local" and result["jobs"] == []
-    assert result["paths"]["artifacts"] == str(root)
+    # Roots are labelled, never echoed: the snapshot is a browser response and
+    # a saved summary (GUI expansion Phase 0 leak fix).
+    assert result["paths"]["artifacts"] == root_label(root)
+    assert result["roots"] == [{"label": root_label(root), "kind": "primary"}]
+    assert str(root) not in json.dumps(result)
+    assert str(tmp_path) not in json.dumps(result)
     assert sentinel.read_text() == "keep this data"
     assert list(root.iterdir()) == [sentinel]
     assert (output / "summaries/local/2026-09-08.json").is_file()
@@ -335,6 +341,7 @@ def test_dca_demo_command_removes_live_artifact_and_account_overrides(app, monke
     assert "DCA_MARKET_OPEN_LIVE_STATE_ROOT" not in command.env
     assert "DCA_INTRADAY_LIVE_STATE_ROOT" not in command.env
     assert "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER" not in command.env
+    assert command.env["NO_COLOR"] == "1" and command.env["PY_COLORS"] == "0"
     assert not app.settings.root.exists()
 
 

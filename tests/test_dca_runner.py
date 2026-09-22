@@ -2977,8 +2977,8 @@ def test_gate3_inside_approved_window_passes():
 
 
 def test_gate3_past_end_date_fails():
-    """config/trading_window.json end_date is 2026-10-30."""
-    assert not dca_runner.gate_trading_window(date(2026, 10, 31))
+    """config/trading_window.json end_date is 2027-03-12."""
+    assert not dca_runner.gate_trading_window(date(2027, 3, 15))
 
 
 def test_gate3_before_start_date_fails():
@@ -11307,7 +11307,9 @@ def test_assess_off_schedule_firing_aborts_rather_than_running_late():
 
 
 def test_assess_past_trading_window_end_date_aborts():
-    r = dca_runner.assess(**_clean_kwargs(now=datetime(2026, 11, 2, 9, 43, tzinfo=ET)))
+    # First weekday past config/trading_window.json's end_date (2027-03-12, a
+    # Friday); the 13th/14th are the weekend and the 14th is the EST->EDT change.
+    r = dca_runner.assess(**_clean_kwargs(now=datetime(2027, 3, 15, 9, 43, tzinfo=ET)))
     assert r["verdict"] == "ABORT"
 
 

@@ -1149,10 +1149,11 @@ def test_a_market_holiday_ends_silently():
 
 
 def test_a_fire_past_the_approved_test_window_aborts():
-    """config/trading_window.json stops before the 2026-11-01 EDT->EST change,
-    because the live tasks' cron schedules are fixed-UTC. Trading past it
-    would fire at the wrong ET time."""
-    result = _assess(now=datetime(2026, 11, 2, 9, 43, tzinfo=ET))
+    """config/trading_window.json now stops at 2027-03-12, the Friday before the
+    2027-03-14 EST->EDT change (the 2026-11-01 EDT->EST stop was lifted on
+    2026-09-18 once the external trigger gates became DST-aware). Trading past
+    the end_date is refused whatever the reason for the end_date."""
+    result = _assess(now=datetime(2027, 3, 15, 9, 43, tzinfo=ET))
     assert result["verdict"] == "ABORT"
 
 

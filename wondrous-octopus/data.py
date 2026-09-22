@@ -33,7 +33,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -58,8 +58,13 @@ _BAR_CONSISTENCY_RTOL = 1e-4
 #: array, forecast dict, and metrics table uses.
 COMPONENTS = ("open", "high", "low", "close")
 
+#: Inclusive bounds of what datetime64[ns] can represent. Dates outside this
+#: window are unusable downstream (and crash the cast -- see load_history_csv).
+_NS_EPOCH_MIN = pd.Timestamp("1677-09-22")
+_NS_EPOCH_MAX = pd.Timestamp("2262-04-10")
 
-def discover_available_tickers(history_dir: Path, tickers: list[str] | None = None) -> list[str]:
+
+def discover_available_tickers(history_dir: Path, tickers: Sequence[str] | None = None) -> list[str]:
     """Tickers with a present ``<ticker>.csv`` under ``history_dir``.
 
     Adapted from ml-forecaster/features.py:discover_available_tickers,
@@ -131,7 +136,7 @@ def load_history_csv(path: Path) -> pd.DataFrame:
     # Naive (no-offset) Date columns are unaffected: utc=True localizes
     # them as UTC directly, and the tz-aware branch just below converts
     # right back to naive -- the same end result as before this change.
-    parsed_date: Any = pd.to_datetime(frame["Date"], errors="coerce", utc=True)
+    parsed_date: Any = pd.to_datetime(frame["Date"], errors="coerce", utc=True, format="mixed")
     if getattr(getattr(parsed_date, "dtype", None), "tz", None) is not None:
         parsed_date = parsed_date.dt.tz_convert("UTC").dt.tz_localize(None)
     # Calendar-day precision, not a raw timestamp: every downstream consumer
@@ -147,7 +152,22 @@ def load_history_csv(path: Path) -> pd.DataFrame:
     # system -- closes the whole bug class instead of teaching each
     # comparison site to tolerate a raw timestamp. No downstream code reads
     # sub-day precision (nothing in this tree touches .dt.hour/.dt.time).
-    frame["Date"] = parsed_date.dt.normalize()
+    # errors="coerce" does NOT catch every malformed date: dateutil happily
+    # reads a truncated "04-27" (year missing -- real corruption present in
+    # the archive, e.g. CBU.csv's first data row) as 0001-04-27, which is a
+    # perfectly valid Timestamp and survives the dropna below. It is NOT
+    # representable in datetime64[ns] (range 1677-09-21 .. 2262-04-11), and
+    # features.build_panel()'s `to_numpy(dtype="datetime64[ns]")` SEGFAULTS
+    # on the out-of-range cast under pandas 3.0.5 / numpy 2.5.1 rather than
+    # raising -- taking down a multi-hour full-archive run with no traceback
+    # and no indication of which ticker was at fault. Forced to NaT here, at
+    # the one place every row enters the system, so the existing dropna
+    # treats it like any other unusable row: logged as a dropped row, never
+    # a blocker (docs/wondrous_octopus.md's "missing/corrupt tickers are
+    # never blockers" contract, which a segfault plainly violated).
+    normalized = parsed_date.dt.normalize()
+    out_of_ns_range = (normalized < _NS_EPOCH_MIN) | (normalized > _NS_EPOCH_MAX)
+    frame["Date"] = normalized.mask(out_of_ns_range)
     for column in _NUMERIC_RAW_COLUMNS:
         if column in frame.columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
@@ -239,7 +259,7 @@ def adjusted_ohlc(frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     return frame, dropped
 
 
-def truncate_as_of(frame: pd.DataFrame, as_of: pd.Timestamp | None) -> pd.DataFrame:
+def truncate_as_of(frame: pd.DataFrame, as_of: Any) -> pd.DataFrame:
     """Drop rows dated on or after ``as_of``'s own calendar day.
 
     The calendar-day-EXCLUSIVE rule from ml-forecaster/features.py's
@@ -254,6 +274,7 @@ def truncate_as_of(frame: pd.DataFrame, as_of: pd.Timestamp | None) -> pd.DataFr
         # "pd.NaT truncation risk"). NaT = no cutoff, same as None.
         return frame
     day_start = pd.Timestamp(as_of)
+    assert isinstance(day_start, pd.Timestamp)
     if day_start.tzinfo is not None:
         # Archive dates are tz-naive UTC (load_history_csv normalizes them);
         # a tz-aware cutoff like "...T18:00:00Z" would raise on comparison
@@ -262,7 +283,7 @@ def truncate_as_of(frame: pd.DataFrame, as_of: pd.Timestamp | None) -> pd.DataFr
         # the UTC one the archive speaks.
         day_start = day_start.tz_convert("UTC").tz_localize(None)
     day_start = day_start.normalize()
-    return cast(pd.DataFrame, frame.loc[frame["Date"] < day_start].reset_index(drop=True))
+    return frame.loc[frame["Date"] < day_start].reset_index(drop=True)
 
 
 @dataclass
@@ -281,9 +302,9 @@ class TickerSeries:
 
     ticker: str
     ticker_id: int
-    dates: np.ndarray  # datetime64[ns], sorted ascending, unique
-    features: np.ndarray  # (n, F) float32
-    day_of_week: np.ndarray  # (n,) int8, Monday=0 -- embedded/encoded per model
+    dates: np.ndarray[Any, Any]  # datetime64[ns], sorted ascending, unique
+    features: np.ndarray[Any, Any]  # (n, F) float32
+    day_of_week: np.ndarray[Any, Any]  # (n,) int8, Monday=0 -- embedded/encoded per model
     #: (n,) int8 style-cluster label, 0 = not assigned yet (the correlation
     #: window has not filled). Kept OUT of ``features`` for the same reason
     #: day_of_week is: it is a categorical, and a float column where 3 sits
@@ -291,11 +312,11 @@ class TickerSeries:
     #: models consume it as a category -- embedded by the octopus, appended
     #: as a column the GBM can split on -- so it travels with every request
     #: window rather than living only on the panel.
-    cluster_id: np.ndarray
-    targets: np.ndarray  # (n, 4) float32 -- next-row log-returns vs this row's close
-    label_end_dates: np.ndarray  # (n,) datetime64[ns], NaT on the last row
-    ref_close: np.ndarray  # (n,) float64, ADJUSTED close (log-return <-> price pivot)
-    adj_ratio: np.ndarray  # (n,) float64, Adj Close / Close actually applied
+    cluster_id: np.ndarray[Any, Any]
+    targets: np.ndarray[Any, Any]  # (n, 4) float32 -- next-row log-returns vs this row's close
+    label_end_dates: np.ndarray[Any, Any]  # (n,) datetime64[ns], NaT on the last row
+    ref_close: np.ndarray[Any, Any]  # (n,) float64, ADJUSTED close (log-return <-> price pivot)
+    adj_ratio: np.ndarray[Any, Any]  # (n,) float64, Adj Close / Close actually applied
 
     def __len__(self) -> int:
         return len(self.dates)
@@ -318,7 +339,7 @@ class TrainingPanel:
 
     series: dict[str, TickerSeries]
     tickers: list[str]
-    calendar: np.ndarray  # datetime64[ns], sorted union of all series' dates
+    calendar: np.ndarray[Any, Any]  # datetime64[ns], sorted union of all series' dates
     date_index: dict[pd.Timestamp, list[tuple[str, int]]]
     feature_names: tuple[str, ...]
     normalization: dict[str, list[float]]  # {"mean": [...], "std": [...]} over the fit window
@@ -326,7 +347,7 @@ class TrainingPanel:
     #: Per-calendar-day market summary (median return, fraction down >=2%,
     #: return dispersion IQR) aligned to ``calendar`` -- the octopus model's
     #: market-auxiliary-head target looks up day t+1's row here.
-    market_summary: np.ndarray = field(default_factory=lambda: np.zeros((0, 3), dtype=np.float32))
+    market_summary: np.ndarray[Any, Any] = field(default_factory=lambda: np.zeros((0, 3), dtype=np.float32))
     calendar_pos: dict[pd.Timestamp, int] = field(default_factory=dict)
     skipped: dict[str, str] = field(default_factory=dict)
     dropped_bar_rows: dict[str, int] = field(default_factory=dict)

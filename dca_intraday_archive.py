@@ -263,7 +263,7 @@ def _safe_ticker_filename(ticker: str) -> str:
     Tickers reach this module from config and from parsed artifacts, so a
     malformed or hostile symbol must not be able to write outside the archive.
     """
-    cleaned = _TICKER_FILENAME_PATTERN.sub(_replace_non_filename_char, str(ticker).strip())
+    cleaned = _TICKER_FILENAME_PATTERN.sub(_replace_non_filename_char, ticker.strip())
     cleaned = cleaned.strip(".")
     if not cleaned:
         raise ValueError(f"ticker {ticker!r} has no filename-safe characters")
@@ -285,7 +285,16 @@ def read_ticker_observations(
     if not path.exists():
         return []
     with path.open("r", encoding="utf-8", newline="") as handle:
-        return (lambda r, h=None: [dict(zip(h, row + [None] * max(0, len(h) - len(row)))) for row in r] if (h := next(r, None)) else [])(csv.reader(handle))  # noqa: B905
+        _reader = csv.reader(handle)
+        try:
+            _header = next(_reader)
+        except StopIteration:
+            return []
+
+        _rows = []
+        for _row in _reader:
+            _rows.append(dict(zip(_header, _row)))  # noqa: B905
+        return _rows
 
 
 def _sort_key(row: Mapping[str, Any]) -> Tuple[str, ...]:
@@ -348,7 +357,7 @@ def append_observations(
     for observation in observations:
         if not observation.ticker:
             continue
-        by_ticker.setdefault(str(observation.ticker).upper(), []).append(observation)
+        by_ticker.setdefault(observation.ticker.upper(), []).append(observation)
     if not by_ticker:
         return {
             "archive_dir": str(directory),

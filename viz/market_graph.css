@@ -40,6 +40,7 @@ html, body {
   padding: 16px;
   overflow-y: auto;
   background: var(--panel);
+  -webkit-backdrop-filter: blur(12px);
   backdrop-filter: blur(12px);
   border-right: 1px solid var(--border);
   display: flex;

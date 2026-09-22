@@ -34,12 +34,17 @@ import dataclasses
 import json
 import math
 from statistics import NormalDist
+from typing import Any
+
+import features as _features
 import model_interface
 import numpy as np
 import pandas as pd
 import pytest
 from data import COMPONENTS
-from features import build_panel
+
+_features_module: Any = _features
+build_panel: Any = _features_module.build_panel
 
 kalman = pytest.importorskip("kalman", reason="optional kalman component is not present in this checkout")
 

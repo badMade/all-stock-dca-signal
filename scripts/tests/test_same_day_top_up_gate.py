@@ -49,6 +49,7 @@ from scripts.reason_codes import (  # noqa: E402
     MISSING_CURRENT_PRICE,
     MISSING_PRIOR_PRICE,
     NO_LOWER_PRICE,
+    UNLOGGED_REFERENCE_PRICE,
 )
 
 ACCOUNT = "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}"
@@ -118,23 +119,25 @@ def test_no_prior_same_day_buy_authorizes_the_full_desired_amount():
     assert d["reference_source"] is None
 
 
-def test_a_lower_price_and_a_larger_desired_amount_buys_only_the_difference():
-    """The policy's core arithmetic: buy max(0, desired - prior), nothing more.
-
-    A ticker with $1.00 already bought today at 17.56, now wanted at $4.00 with
-    the price down to 17.32, must buy $3.00 -- not $4.00 (which would ignore the
-    prior fill) and not $0.00 (which would forbid a legitimate top-up).
+def test_a_lower_price_and_a_larger_desired_amount_without_a_logged_reference_needs_manual_review():
+    """The policy's core arithmetic is buy max(0, desired - prior), nothing
+    more -- but without a caller-supplied, order-id-bound logged reference,
+    this gate's only reference price is the average FILL price, which a
+    market order commonly fills above its own decision price. Authorizing a
+    top-up off that unproven, possibly-inflated reference risks over-buying
+    (Codex review: "Compare top-ups against the configured reference price"),
+    so a would-be top-up with no bound reference goes to manual review at $0
+    instead of auto-firing. See test_a_logged_reference_price_still_permits_a_genuine_topup
+    for the same arithmetic WITH a bound reference, which still auto-fires.
     """
     pages = [_page([_fill("o1", "TRIN", 1.00, 17.5599, "2026-07-30T13:58:14Z")])]
     r = _run(pages, [{"ticker": "TRIN", "desired_usd": 4.00, "current_price": 17.3199}])
     assert r["verdict"] == "PROCEED"
     d = _by_ticker(r)["TRIN"]
-    # Cent tolerance throughout: prior exposure is the dollars that actually
-    # executed (cumulative_quantity * average_price), which on a dollar-based
-    # fractional order lands a fraction of a cent off the requested notional.
-    assert d["buy_usd"] == pytest.approx(3.00, abs=0.01)
+    assert d["buy_usd"] == pytest.approx(0.0)
     assert d["effective_prior_usd"] == pytest.approx(1.00, abs=0.01)
-    assert d["reason"] == EFFECTIVE_TOP_UP
+    assert d["reason"] == UNLOGGED_REFERENCE_PRICE
+    assert d["manual_review"] is True
 
 
 def test_a_price_equal_to_the_reference_is_not_strictly_below_and_buys_zero():
@@ -179,8 +182,24 @@ def test_top_up_difference_below_broker_minimum_is_skipped_and_recorded():
     assert d["buy_usd"] == pytest.approx(0.0)
     assert d["reason"] == BELOW_BROKER_MINIMUM_ORDER_SIZE
 
-    # Under a smaller minimum (e.g. $0.25), the same $0.50 delta is authorized.
-    r_small = _run(pages, [{"ticker": "TRIN", "desired_usd": 2.50, "current_price": 17.3199}], minimum_order_usd=0.25)
+    # Under a smaller minimum (e.g. $0.25), the same $0.50 delta is
+    # authorized. Bound to the broker's own latest fill (o1, unchanged
+    # reference value) so this exercises the minimum-boundary arithmetic
+    # itself rather than the separate unbound-reference manual-review path
+    # (see test_a_lower_price_and_a_larger_desired_amount_without_a_logged_reference_needs_manual_review).
+    r_small = _run(
+        pages,
+        [
+            {
+                "ticker": "TRIN",
+                "desired_usd": 2.50,
+                "current_price": 17.3199,
+                "prior_logged_reference_price": 17.5599,
+                "prior_logged_reference_order_id": "o1",
+            }
+        ],
+        minimum_order_usd=0.25,
+    )
     assert r_small["verdict"] == "PROCEED"
     d_small = _by_ticker(r_small)["TRIN"]
     assert d_small["buy_usd"] == pytest.approx(0.50, abs=0.01)
@@ -190,11 +209,27 @@ def test_top_up_difference_below_broker_minimum_is_skipped_and_recorded():
 def test_top_up_with_float_subtraction_at_exact_minimum_boundary():
     """Cent-quantization prevents float subtraction from skipping an exact minimum buy.
 
-    desired ($2.30) - prior ($1.30) produces 0.9999999999999998 in raw float arithmetic.
-    Cent-quantized comparison must treat this delta as exactly $1.00 and authorize it.
+    desired ($2.30) - prior ($1.30) produces 0.9999999999999998 in raw float
+    arithmetic. Cent-quantized comparison must treat this delta as exactly
+    $1.00 and authorize it. Bound to the broker's own latest fill (o1,
+    unchanged reference value) so this exercises the cent-quantization
+    boundary itself rather than the separate unbound-reference manual-review
+    path (see test_a_lower_price_and_a_larger_desired_amount_without_a_logged_reference_needs_manual_review).
     """
     pages = [_page([_fill("o1", "TRIN", 1.30, 17.5599, "2026-07-30T13:58:14Z")])]
-    r = _run(pages, [{"ticker": "TRIN", "desired_usd": 2.30, "current_price": 17.3199}], minimum_order_usd=1.0)
+    r = _run(
+        pages,
+        [
+            {
+                "ticker": "TRIN",
+                "desired_usd": 2.30,
+                "current_price": 17.3199,
+                "prior_logged_reference_price": 17.5599,
+                "prior_logged_reference_order_id": "o1",
+            }
+        ],
+        minimum_order_usd=1.0,
+    )
     assert r["verdict"] == "PROCEED"
     d = _by_ticker(r)["TRIN"]
     assert d["buy_usd"] == pytest.approx(1.00, abs=0.01)
@@ -265,7 +300,23 @@ def test_prior_exposure_accumulates_across_every_slot_not_just_the_last_one():
             ]
         )
     ]
-    r = _run(pages, [{"ticker": "TRIN", "desired_usd": 5.00, "current_price": 17.10}])
+    # Bound to the broker's own latest fill (o3, unchanged reference value) so
+    # this exercises the cent-accumulation arithmetic itself rather than the
+    # separate unbound-reference manual-review path (see
+    # test_a_lower_price_and_a_larger_desired_amount_without_a_logged_reference_needs_manual_review
+    # for that case).
+    r = _run(
+        pages,
+        [
+            {
+                "ticker": "TRIN",
+                "desired_usd": 5.00,
+                "current_price": 17.10,
+                "prior_logged_reference_price": 17.3199,
+                "prior_logged_reference_order_id": "o3",
+            }
+        ],
+    )
     d = _by_ticker(r)["TRIN"]
     # Exact, not approximate: effective_prior_usd is normalized to cents before
     # the subtraction below, so three genuine $1.00 fills must present as
@@ -275,6 +326,7 @@ def test_prior_exposure_accumulates_across_every_slot_not_just_the_last_one():
     # delta").
     assert d["effective_prior_usd"] == 3.00
     assert d["buy_usd"] == 2.00
+    assert d["reason"] == EFFECTIVE_TOP_UP
 
 
 def test_the_reference_price_is_the_lowest_same_day_fill_not_the_most_recent():
@@ -311,20 +363,22 @@ def test_the_reference_price_is_the_lowest_same_day_fill_not_the_most_recent():
 # review: "Compare top-ups against the configured reference price").
 
 
-def test_without_a_logged_reference_positive_slippage_wrongly_permits_a_topup():
-    """Pins the KNOWN LIMITATION this gate has without the override below: a
-    prior decision at $100 that filled at $101 leaves this gate no way to
-    tell that a new $100.50 decision is actually above the true $100
-    reference, so it authorizes a top-up a target/decision-price comparison
-    would have blocked. This is exactly why a caller that has the logged
-    reference should supply prior_logged_reference_price (see the next
-    test) -- this test is not an endorsement of the fallback's precision."""
+def test_without_a_logged_reference_a_would_be_topup_goes_to_manual_review():
+    """Fixed KNOWN LIMITATION: a prior decision at $100 that filled at $101
+    leaves this gate no way to tell that a new $100.50 decision is actually
+    above the true $100 reference. Without a bound logged reference, this
+    used to authorize a top-up a target/decision-price comparison would have
+    blocked; it now goes to manual review at $0 instead of auto-firing off
+    the unproven, possibly-inflated fill-price reference. A caller that has
+    the logged reference should supply prior_logged_reference_price to
+    auto-fire correctly (see the next test)."""
     pages = [_page([_fill("o1", "TRIN", 1.00, 101.00, "2026-07-30T13:58:14Z")])]
     r = _run(pages, [{"ticker": "TRIN", "desired_usd": 4.00, "current_price": 100.50}])
     d = _by_ticker(r)["TRIN"]
     assert d["reference_price"] == pytest.approx(101.00)
-    assert d["reason"] == EFFECTIVE_TOP_UP
-    assert d["buy_usd"] > 0
+    assert d["reason"] == UNLOGGED_REFERENCE_PRICE
+    assert d["buy_usd"] == 0.0
+    assert d["manual_review"] is True
 
 
 def test_a_logged_reference_price_blocks_a_topup_the_fill_price_would_permit():
@@ -439,7 +493,9 @@ def test_a_logged_reference_price_unbound_to_the_latest_order_is_ignored():
 def test_an_invalid_logged_reference_price_falls_back_to_the_fill_price(bad_value):
     """A non-positive, non-numeric, or non-finite override must not silently
     poison or corrupt the comparison -- it is simply ignored, falling back
-    to this gate's own broker-fill-price reference."""
+    to this gate's own broker-fill-price reference. That fallback reference
+    is unproven (never the true logged decision price), so the resulting
+    would-be top-up goes to manual review rather than auto-firing."""
     pages = [_page([_fill("o1", "TRIN", 1.00, 17.5599, "2026-07-30T13:58:14Z")])]
     r = _run(
         pages,
@@ -454,7 +510,9 @@ def test_an_invalid_logged_reference_price_falls_back_to_the_fill_price(bad_valu
     )
     d = _by_ticker(r)["TRIN"]
     assert d["reference_price"] == pytest.approx(17.5599)
-    assert d["buy_usd"] == pytest.approx(3.00, abs=0.01)
+    assert d["buy_usd"] == 0.0
+    assert d["reason"] == UNLOGGED_REFERENCE_PRICE
+    assert d["manual_review"] is True
 
 
 def test_goog_and_googl_are_scored_as_independent_tickers():
@@ -737,13 +795,26 @@ def test_a_non_finite_or_nonnumeric_current_price_is_treated_as_missing(bad_pric
 def test_the_same_order_repeated_across_a_page_boundary_is_not_double_counted():
     """Pagination can repeat an order at a page boundary; a saved response
     array can also contain a duplicated page. Either way, the SAME order id
-    must count once, not once per appearance."""
+    must count once, not once per appearance. Bound to that same order
+    (unchanged reference value) so this exercises the dedup itself rather
+    than the separate unbound-reference manual-review path."""
     fill = _fill("o1", "TRIN", 1.00, 17.5599, "2026-07-30T13:58:14Z")
     pages = [
         {"data": {"orders": [fill], "next_cursor": "page-2"}},
         {"data": {"orders": [fill]}},
     ]
-    r = _run(pages, [{"ticker": "TRIN", "desired_usd": 4.00, "current_price": 17.0}])
+    r = _run(
+        pages,
+        [
+            {
+                "ticker": "TRIN",
+                "desired_usd": 4.00,
+                "current_price": 17.0,
+                "prior_logged_reference_price": 17.5599,
+                "prior_logged_reference_order_id": "o1",
+            }
+        ],
+    )
     assert r["verdict"] == "PROCEED"
     assert r["orders_in_snapshot"] == 1
     d = _by_ticker(r)["TRIN"]
@@ -798,7 +869,9 @@ def test_reference_price_is_the_most_recent_fill_not_the_minimum():
     minimum of the two -- is also below $95. Comparing against the minimum
     would incorrectly block this and change the documented experiment
     strategy (Codex review: "Compare against the most recent valid reference
-    price")."""
+    price"). Bound to the broker's own latest fill (o2, unchanged reference
+    value) so this exercises the most-recent-vs-minimum selection itself
+    rather than the separate unbound-reference manual-review path."""
     pages = [
         _page(
             [
@@ -807,7 +880,19 @@ def test_reference_price_is_the_most_recent_fill_not_the_minimum():
             ]
         )
     ]
-    r = _run(pages, [{"ticker": "TRIN", "desired_usd": 5.00, "current_price": 95.00}], day="2026-07-31")
+    r = _run(
+        pages,
+        [
+            {
+                "ticker": "TRIN",
+                "desired_usd": 5.00,
+                "current_price": 95.00,
+                "prior_logged_reference_price": 100.00,
+                "prior_logged_reference_order_id": "o2",
+            }
+        ],
+        day="2026-07-31",
+    )
     d = _by_ticker(r)["TRIN"]
     assert d["reference_price"] == pytest.approx(100.00)
     assert d["reason"] == EFFECTIVE_TOP_UP

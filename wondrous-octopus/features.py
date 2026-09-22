@@ -56,10 +56,11 @@ keeps the comparison honest. Day-of-week is kept separately as an int8
 categorical is a float feature.
 """
 
+# pyright: reportArgumentType=false, reportCallIssue=false, reportAttributeAccessIssue=false, reportIndexIssue=false
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Sequence, cast
 
 import numpy as np
 import pandas as pd
@@ -315,7 +316,9 @@ def resolve_feature_names(extra_features: Sequence[str] | None = ()) -> tuple[st
     return names
 
 
-def _trailing_kernel(values: np.ndarray, kernel: np.ndarray, *, anchored: bool = False) -> np.ndarray:
+def _trailing_kernel(
+    values: np.ndarray[Any, Any], kernel: np.ndarray[Any, Any], *, anchored: bool = False
+) -> np.ndarray[Any, Any]:
     """Apply a fixed FIR ``kernel`` to each row's TRAILING window.
 
     ``out[t] = kernel @ [values[t], values[t-1], ...]``, NaN until the
@@ -370,7 +373,10 @@ def _add_calculus_features(out: pd.DataFrame, close: pd.Series) -> None:
     warmed = np.isfinite(now) & np.isfinite(lagged)
     with np.errstate(invalid="ignore", divide="ignore"):
         ratio = np.where(usable, np.log(np.where(usable, now, 1.0) / np.where(usable, lagged, 1.0)), 0.0)
-    out["vol20_roc"] = np.where(warmed, np.clip(ratio, -VOL_ROC_CLIP, VOL_ROC_CLIP), np.nan)
+    out["vol20_roc"] = pd.Series(
+        np.where(warmed, np.clip(ratio, -VOL_ROC_CLIP, VOL_ROC_CLIP), np.nan),
+        index=out.index,
+    )
 
     # errstate: a corrupt non-positive close makes np.log emit a
     # RuntimeWarning per bad row. The value it produces is already handled
@@ -383,9 +389,11 @@ def _add_calculus_features(out: pd.DataFrame, close: pd.Series) -> None:
     # non-positive prices").
     with np.errstate(invalid="ignore", divide="ignore"):
         log_price = np.log(close.to_numpy(dtype=np.float64))
-    out["sg_slope"] = _trailing_kernel(log_price, SG_SLOPE_KERNEL)
-    out["sg_curvature"] = _trailing_kernel(log_price, SG_CURVATURE_KERNEL)
-    out["frac_diff_close"] = _trailing_kernel(log_price, FRAC_DIFF_WEIGHTS, anchored=True)
+    out["sg_slope"] = pd.Series(_trailing_kernel(log_price, SG_SLOPE_KERNEL), index=out.index)
+    out["sg_curvature"] = pd.Series(_trailing_kernel(log_price, SG_CURVATURE_KERNEL), index=out.index)
+    out["frac_diff_close"] = pd.Series(
+        _trailing_kernel(log_price, FRAC_DIFF_WEIGHTS, anchored=True), index=out.index
+    )
 
 
 #: Which function computes each optional block. Kept beside FEATURE_BLOCKS
@@ -402,7 +410,7 @@ if set(_BLOCK_BUILDERS) != set(FEATURE_BLOCKS):
     )
 
 
-def _wilder_smooth(values: np.ndarray, period: int, *, start: int = 0) -> np.ndarray:
+def _wilder_smooth(values: np.ndarray[Any, Any], period: int, *, start: int = 0) -> np.ndarray[Any, Any]:
     """Wilder's smoothed average, seeded by a simple mean.
 
     The seed is the plain mean of ``values[start : start + period]``, placed
@@ -418,19 +426,19 @@ def _wilder_smooth(values: np.ndarray, period: int, *, start: int = 0) -> np.nda
     Rows before the seed are NaN: a smoothed average of fewer than `period`
     observations is not defined, and 0.0 there would read as a real reading.
     """
-    out = np.full(len(values), np.nan)
+    out = np.full(len(values), np.nan, dtype=np.float64)
     end = start + period
     if end > len(values):
         return out
-    seeded = np.full(len(values), np.nan)
+    seeded = np.full(len(values), np.nan, dtype=np.float64)
     seeded[end - 1] = values[start:end].mean()
     seeded[end:] = values[end:]
-    smoothed = pd.Series(seeded).ewm(alpha=1.0 / period, adjust=False).mean().to_numpy()
+    smoothed = pd.Series(seeded, dtype=np.float64).ewm(alpha=1.0 / period, adjust=False).mean().to_numpy()
     out[end - 1 :] = smoothed[end - 1 :]
     return out
 
 
-def _wilder_rsi(close: pd.Series, period: int) -> np.ndarray:
+def _wilder_rsi(close: pd.Series, period: int) -> np.ndarray[Any, Any]:
     """Wilder RSI rescaled to [0, 1]; 0.5 when there is no movement at all."""
     delta = close.diff()
     gains = delta.clip(lower=0.0).to_numpy()
@@ -452,7 +460,7 @@ def _wilder_rsi(close: pd.Series, period: int) -> np.ndarray:
     return np.where(np.isnan(average_gain) | np.isnan(average_loss), np.nan, rsi)
 
 
-def _wilder_adx(frame: pd.DataFrame, period: int) -> np.ndarray:
+def _wilder_adx(frame: pd.DataFrame, period: int) -> np.ndarray[Any, Any]:
     """Wilder ADX rescaled to [0, 1] -- trend STRENGTH, direction-free.
 
     Being direction-free is what keeps it from restating rsi_14 or
@@ -461,7 +469,7 @@ def _wilder_adx(frame: pd.DataFrame, period: int) -> np.ndarray:
     high = frame["High"].to_numpy(dtype=float)
     low = frame["Low"].to_numpy(dtype=float)
     close = frame["Close"].to_numpy(dtype=float)
-    out = np.full(len(close), np.nan)
+    out = np.full(len(close), np.nan, dtype=np.float64)
     if len(close) < 2:
         return out
     # Directional movement: only the side that expanded further counts, and
@@ -497,7 +505,7 @@ def _wilder_adx(frame: pd.DataFrame, period: int) -> np.ndarray:
     return out
 
 
-def _signed_streak(close: pd.Series) -> np.ndarray:
+def _signed_streak(close: pd.Series) -> np.ndarray[Any, Any]:
     """Signed count of consecutive same-direction closes, clipped.
 
     +3 is a third straight up day, -2 a second straight down day, and an
@@ -506,7 +514,7 @@ def _signed_streak(close: pd.Series) -> np.ndarray:
     cannot -- they measure how far price moved, not how many sessions in a
     row it moved the same way.
     """
-    direction = pd.Series(np.sign(close.diff().to_numpy()), index=close.index)
+    direction = pd.Series(np.sign(close.diff().to_numpy(dtype=np.float64)), index=close.index, dtype=np.float64)
     # Vectorized run lengths: a new group starts wherever the sign changes
     # (row 0's NaN differs from its own shifted NaN, so it opens its own
     # group and stays NaN through the multiplication below).
@@ -531,7 +539,9 @@ def compute_ticker_features(frame: pd.DataFrame, *, extra_features: Sequence[str
     trading history for eligibility counting.
     """
     out = pd.DataFrame({"Date": frame["Date"].to_numpy()})
-    close = frame["Close"].astype(float)
+    close_raw = frame["Close"].astype(float)
+    assert isinstance(close_raw, pd.Series)
+    close: pd.Series = close_raw
     prev_close = close.shift(1)
     out["ret_open"] = np.log(frame["Open"] / prev_close)
     out["ret_high"] = np.log(frame["High"] / prev_close)
@@ -539,10 +549,17 @@ def compute_ticker_features(frame: pd.DataFrame, *, extra_features: Sequence[str
     out["ret_close"] = np.log(close / prev_close)
     out["intraday_range"] = np.log(frame["High"] / frame["Low"])
     bar_span = frame["High"] - frame["Low"]
+    bar_span_s = pd.Series(bar_span)
+    low_s = pd.Series(frame["Low"])
     # A doji day (High == Low) has no meaningful position-in-range; 0.5 is
     # the neutral "middle of the bar" placeholder, same graceful-degradation
     # spirit as ml-forecaster's neutral volume ratio.
-    out["close_position"] = np.where(bar_span > 0, (close - frame["Low"]) / bar_span, 0.5)
+    cond = (bar_span_s > 0).to_numpy()
+    num = (close - low_s).to_numpy()
+    den = bar_span_s.to_numpy()
+    with np.errstate(invalid="ignore", divide="ignore"):
+        pos = np.where(cond, num / np.where(cond, den, 1.0), 0.5)
+    out["close_position"] = pd.Series(pos, index=out.index)
     out["trailing_ret_5"] = np.log(close / close.shift(_TRAIL_SHORT))
     out["trailing_ret_20"] = np.log(close / close.shift(_TRAIL_LONG))
     out["realized_vol_20"] = out["ret_close"].rolling(_VOL_WINDOW).std()
@@ -577,8 +594,9 @@ def compute_ticker_features(frame: pd.DataFrame, *, extra_features: Sequence[str
         vol_mean = log_volume_clean.rolling(_VOLUME_WINDOW, min_periods=1).mean()
         vol_std = log_volume_clean.rolling(_VOLUME_WINDOW, min_periods=1).std()
         with np.errstate(invalid="ignore"):
-            out["volume_z"] = np.where(
-                (~missing) & (vol_std > 0), (log_volume - vol_mean) / vol_std, 0.0
+            out["volume_z"] = pd.Series(
+                np.where((~missing) & (vol_std > 0), (log_volume - vol_mean) / vol_std, 0.0),
+                index=out.index,
             )
         out["volume_missing"] = missing.astype(float)
         # Share volume ignores price level: a $5 name and a $500 name that
@@ -592,8 +610,9 @@ def compute_ticker_features(frame: pd.DataFrame, *, extra_features: Sequence[str
         dollar_mean = log_dollar_clean.rolling(_VOLUME_WINDOW, min_periods=1).mean()
         dollar_std = log_dollar_clean.rolling(_VOLUME_WINDOW, min_periods=1).std()
         with np.errstate(invalid="ignore"):
-            out["dollar_volume_z"] = np.where(
-                (~missing) & (dollar_std > 0), (log_dollar - dollar_mean) / dollar_std, 0.0
+            out["dollar_volume_z"] = pd.Series(
+                np.where((~missing) & (dollar_std > 0), (log_dollar - dollar_mean) / dollar_std, 0.0),
+                index=out.index,
             )
         # Amihud price impact: how far the price moved per dollar traded.
         # Same data as dollar_volume_z, opposite lens -- that one asks how
@@ -627,9 +646,9 @@ def compute_ticker_features(frame: pd.DataFrame, *, extra_features: Sequence[str
     # Intraday leg of the bar; ret_open is already the overnight one, and
     # the two sum back to ret_close exactly.
     out["intraday_ret"] = np.log(close / frame["Open"])
-    out["updown_streak"] = _signed_streak(close)
-    out["rsi_14"] = _wilder_rsi(close, _RSI_PERIOD)
-    out["adx_14"] = _wilder_adx(frame, _ADX_PERIOD)
+    out["updown_streak"] = pd.Series(_signed_streak(close), index=out.index)
+    out["rsi_14"] = pd.Series(_wilder_rsi(close, _RSI_PERIOD), index=out.index)
+    out["adx_14"] = pd.Series(_wilder_adx(frame, _ADX_PERIOD), index=out.index)
     # Tail-risk regime, read straight by the p10/p90 heads: a window that
     # has been throwing fat left tails is one where the band should already
     # be wider before the next one lands.
@@ -698,6 +717,49 @@ def _market_table(long_frame: pd.DataFrame) -> pd.DataFrame:
     return table
 
 
+def compute_market_table(
+    history_dir: Path,
+    tickers: Sequence[str] | None = None,
+    *,
+    end: pd.Timestamp | None = None,
+    as_of: pd.Timestamp | None = None,
+    min_history: int = 60,
+) -> pd.DataFrame:
+    """Precompute the macro market aggregates across the given universe.
+
+    Allows partitioned training shards to share an identical, full-market macro
+    representation instead of calculating siloed, disjoint market averages.
+    """
+    discovered = discover_available_tickers(history_dir, tickers)
+    chunks: list[pd.DataFrame] = []
+    for ticker in discovered:
+        path = history_dir / f"{ticker}.csv"
+        try:
+            frame = load_history_csv(path)
+        except (OSError, ValueError):
+            continue
+        frame = truncate_as_of(frame, as_of)
+        if end is not None:
+            ts = pd.Timestamp(end)
+            assert isinstance(ts, pd.Timestamp)
+            end_day = ts.normalize()
+            date_s: Any = pd.to_datetime(frame["Date"])
+            frame = frame.loc[date_s.dt.normalize() <= end_day].reset_index(drop=True)
+        if "Adj Close" not in frame.columns:
+            continue
+        frame, _ = adjusted_ohlc(frame)
+        if len(frame) < min_history + 1:
+            continue
+        computed = compute_ticker_features(frame)
+        chunks.append(pd.DataFrame({"Date": computed["Date"], "ret_close": computed["ret_close"]}).dropna())
+
+    if not chunks:
+        raise ValueError(f"REFUSED: no usable tickers found in {history_dir} to compute market table")
+    pooled = pd.concat(chunks, ignore_index=True)
+    return _market_table(pooled)
+
+
+
 def _cross_sectional_rank(frame: pd.DataFrame, column: str) -> pd.Series:
     """Per-day rank of ``column`` across the universe, in [0, 1].
 
@@ -710,17 +772,20 @@ def _cross_sectional_rank(frame: pd.DataFrame, column: str) -> pd.Series:
     """
     values = frame[column]
     grouped = values.groupby(frame["Date"])
-    rank = grouped.rank(method="average")
+    rank_s = pd.Series(grouped.rank(method="average"))
     # transform("count") counts non-NaN, so a day's peer group is the
     # tickers that actually have the quantity, not everything that traded.
-    count = grouped.transform("count")
-    ranked = pd.Series(
-        np.where(count > 1, (rank - 1.0) / (count - 1.0), 0.5), index=frame.index
-    )
+    count_s = pd.Series(grouped.transform("count"))
+    cond = (count_s > 1).to_numpy()
+    num = (rank_s - 1.0).to_numpy()
+    den = (count_s - 1.0).to_numpy()
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ratio = np.where(cond, num / np.where(cond, den, 1.0), 0.5)
+    ranked = pd.Series(ratio, index=frame.index)
     return ranked.where(values.notna())
 
 
-def _peer_median(values: np.ndarray) -> np.ndarray:
+def _peer_median(values: np.ndarray[Any, Any]) -> np.ndarray[Any, Any]:
     """Leave-one-out median: for each element, the median of the OTHERS.
 
     Excluding self is what makes the result peer information rather than a
@@ -839,7 +904,7 @@ def _cluster_once(window: pd.DataFrame, n_clusters: int) -> dict[str, int]:
     distance[~np.isfinite(distance)] = 1.0
     np.fill_diagonal(distance, 0.0)
     distance = np.clip((distance + distance.T) / 2.0, 0.0, 2.0)
-    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.cluster import AgglomerativeClustering  # pyright: ignore[reportMissingImports]
 
     model = AgglomerativeClustering(
         n_clusters=effective, metric="precomputed", linkage="average"
@@ -850,7 +915,7 @@ def _cluster_once(window: pd.DataFrame, n_clusters: int) -> dict[str, int]:
 
 def _assign_clusters(
     returns_wide: pd.DataFrame,
-    calendar: np.ndarray,
+    calendar: np.ndarray[Any, Any],
     *,
     n_clusters: int,
     cluster_window: int,
@@ -864,7 +929,7 @@ def _assign_clusters(
     perturbation tests cover this the same way they cover every other
     feature.
     """
-    index = pd.DatetimeIndex(calendar)
+    index = pd.to_datetime(calendar)
     labels = pd.DataFrame(np.nan, index=index, columns=returns_wide.columns, dtype=float)
     previous: dict[str, int] = {}
     effective_cap = max(1, min(n_clusters, len(returns_wide.columns) // 2 or 1))
@@ -907,6 +972,7 @@ def build_panel(
     cluster_window: int | None = None,
     cluster_refresh: int = _DEFAULT_CLUSTER_REFRESH,
     extra_features: Sequence[str] = (),
+    external_market_table: pd.DataFrame | None = None,
 ) -> TrainingPanel:
     """Assemble the full in-memory panel from the per-ticker CSV archive.
 
@@ -964,7 +1030,9 @@ def build_panel(
             # later than midnight on --end's own day, silently ending the
             # replay one trading day early (Codex review: "Treat --end as
             # an inclusive calendar day").
-            end_day = pd.Timestamp(end).normalize()
+            ts = pd.Timestamp(end)
+            assert isinstance(ts, pd.Timestamp)
+            end_day = ts.normalize()
             date_s: Any = pd.to_datetime(frame["Date"])
             frame = frame.loc[date_s.dt.normalize() <= end_day].reset_index(drop=True)
         if "Adj Close" not in frame.columns:
@@ -1029,15 +1097,18 @@ def build_panel(
         ],
         ignore_index=True,
     ).dropna(subset=["ret_close"])
-    market = _market_table(long_frame)
+    if external_market_table is not None:
+        market = external_market_table
+    else:
+        market = _market_table(long_frame)
     long_frame["cs_return_rank"] = _cross_sectional_rank(long_frame, "ret_close")
     long_frame["cs_momentum_rank"] = _cross_sectional_rank(long_frame, "trailing_ret_20")
     long_frame["cs_vol_rank"] = _cross_sectional_rank(long_frame, "realized_vol_20")
 
     # --- Style clustering: a fundamentals-free sector proxy. ---
     returns_wide = long_frame.pivot_table(index="Date", columns="ticker", values="ret_close")
-    calendar_index = np.array(sorted(market.index.to_numpy()), dtype="datetime64[ns]")
-    returns_wide = returns_wide.reindex(pd.DatetimeIndex(calendar_index))
+    calendar_index = np.array(sorted(set(long_frame["Date"])), dtype="datetime64[ns]")
+    returns_wide = returns_wide.reindex(pd.to_datetime(calendar_index))
     # Derived from min_history rather than fixed, so --min-history stays the
     # one knob that decides how much warm-up a ticker needs; a hard-coded
     # window silently overrode it (Copilot review).
@@ -1055,7 +1126,7 @@ def build_panel(
     stacked.index = stacked.index.set_names(["Date", "ticker"])
     long_frame["cluster_id"] = (
         pd.MultiIndex.from_arrays([long_frame["Date"], long_frame["ticker"]])
-        .map(stacked)
+        .map(cast(Any, stacked))
         .to_numpy()
     )
     long_frame["cluster_id"] = long_frame["cluster_id"].fillna(0).astype(int)
@@ -1065,12 +1136,15 @@ def build_panel(
     assigned = long_frame["cluster_id"] > 0
     peers = long_frame.loc[assigned]
     within = peers.groupby(["Date", "cluster_id"])["ret_close"]
-    peer_count = within.transform("count")
-    peer_rank = within.rank(method="average")
+    peer_count_s = pd.Series(within.transform("count"))
+    peer_rank_s = pd.Series(within.rank(method="average"))
+    cond = (peer_count_s > 1).to_numpy()
+    num = (peer_rank_s - 1.0).to_numpy()
+    den = (peer_count_s - 1.0).to_numpy()
+    with np.errstate(invalid="ignore", divide="ignore"):
+        ratio = np.where(cond, num / np.where(cond, den, 1.0), 0.5)
     long_frame["cs_cluster_rank"] = pd.Series(np.nan, index=long_frame.index)
-    long_frame.loc[assigned, "cs_cluster_rank"] = np.where(
-        peer_count > 1, (peer_rank - 1.0) / (peer_count - 1.0), 0.5
-    )
+    long_frame.loc[assigned, "cs_cluster_rank"] = ratio  # type: ignore
     # One transform call per (day, cluster) group -- tens of thousands over
     # the full archive, not one per row, which is what makes a Python-level
     # callable affordable here.
@@ -1089,8 +1163,12 @@ def build_panel(
     rank_lookup = long_frame.set_index(["ticker", "Date"])[lookup_columns]
 
     calendar = calendar_index
-    calendar_pos = {pd.Timestamp(date): position for position, date in enumerate(calendar)}
-    market_aligned = market.reindex(pd.DatetimeIndex(calendar))
+    calendar_pos: dict[pd.Timestamp, int] = {}
+    for position, date in enumerate(calendar):
+        ts = pd.Timestamp(date)
+        assert isinstance(ts, pd.Timestamp)
+        calendar_pos[ts] = position
+    market_aligned = market.reindex(pd.to_datetime(calendar))
     market_summary = market_aligned[list(MARKET_SUMMARY_NAMES)].to_numpy(dtype=np.float32)
 
     tickers_sorted = sorted(frames)
@@ -1117,7 +1195,9 @@ def build_panel(
         # A flat market has no variance to regress against; 0.0 ("no
         # measurable loading") keeps the row finite, while a window that
         # simply has not filled yet stays NaN.
-        joined["mkt_beta_20"] = beta.where(market_variance > 0, 0.0).where(market_variance.notna())
+        var_s = pd.Series(market_variance)
+        beta_s = pd.Series(beta)
+        joined["mkt_beta_20"] = beta_s.where(var_s > 0, 0.0).where(var_s.notna())
         # fillna before the int cast: a ticker can trade on a day that never
         # entered the calendar (its own first row, whose ret_close is NaN and
         # so never reached the pooled frame). Reindexing yields NaN there,
@@ -1143,7 +1223,9 @@ def build_panel(
             adj_ratio=computed["adj_ratio"].to_numpy(dtype=np.float64),
         )
         for row_index, date in enumerate(dates):
-            date_index.setdefault(pd.Timestamp(date), []).append((ticker, row_index))
+            ts = pd.Timestamp(date)
+            assert isinstance(ts, pd.Timestamp)
+            date_index.setdefault(ts, []).append((ticker, row_index))
 
     normalization = _fit_normalization(series, initial_train_end, feature_names)
     return TrainingPanel(
@@ -1195,7 +1277,10 @@ def _fit_normalization(
     if initial_train_end is None or pd.isna(initial_train_end):
         cutoff = None
     else:
-        cutoff = pd.Timestamp(initial_train_end)
+        cutoff_ts = pd.Timestamp(initial_train_end)
+        cutoff = None if pd.isna(cutoff_ts) else cutoff_ts
+        if cutoff is not None:
+            assert isinstance(cutoff, pd.Timestamp)
 
     def moments(limit: pd.Timestamp | None, *, require_all_finite: bool) -> tuple[np.ndarray, np.ndarray, int]:
         """Per-column (mean, std) via one streaming pass over each ticker's

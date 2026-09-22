@@ -66,6 +66,10 @@ ruff check --isolated --select=E,F,B --line-length=120 ml-forecaster
 ruff check --isolated --select=E,F,B --line-length=120 wondrous-octopus
 (cd ticker-market-breadth && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt
 ruff check --isolated --select=E,F,B --line-length=120 ticker-market-breadth
+(cd llm-providers && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt (openai, anthropic, google-genai)
+ruff check --isolated --select=E,F,B --line-length=120 llm-providers
+(cd yfinance-prefetch && pip install -r requirements.txt && python -m pytest tests/)   # own requirements.txt
+ruff check --isolated --select=E,F,B --line-length=120 yfinance-prefetch
 ```
 
 CI (`.github/workflows/ci.yml`) runs lint + coverage-gated tests on Python 3.11 and 3.12, the
@@ -75,7 +79,12 @@ from `uv.lock` plus each independent research manifest, and the `production-safe
 `docs/ticker_advisory.md`'s "Implemented: the ml-forecaster sibling tool" section),
 `wondrous-octopus` (walk-forward OHLC forecasting, see `docs/wondrous_octopus.md`), and
 `ticker-market-breadth` (yfinance `^TICK` NYSE breadth-index archive fetch, data only --
-see `ticker-market-breadth/README.md`) suites each in their own job. Dev tool versions are
+see `ticker-market-breadth/README.md`), `llm-providers` (one provider-agnostic chat
+interface over the `openai`/`anthropic`/`google-genai` SDKs, not wired into any live
+path -- see `llm-providers/README.md`), and `yfinance-prefetch` (pre-fetches a labeled
+yfinance fallback payload for the market-data source policy's fallback ahead of a live
+slot; not itself wired into any scheduled task -- see `yfinance-prefetch/README.md`)
+suites each in their own job. Dev tool versions are
 **pinned** in `requirements-dev.txt` on purpose — bump deliberately.
 The `dev` extra uses the same exact pins. It also installs `pip-audit`, `uv`, and
 Pyright; Pyright uses the existing `[tool.pyright]` configuration but is not a CI
@@ -87,7 +96,7 @@ research-only failures stay outside self-heal's documented core-only scope.
 ## Architecture
 
 | Layer | Modules |
-|---|---|
+| --- | --- |
 | Strategy core | `near_close_dca.py` (~40k lines: signals, graded ladder, budgets, safeguards, run artifacts, `build_broker`, `StrategyConfig`/`StrategyState`) |
 | Stream executors | `morning_dca.py` defines `MorningDCAExecutor`; `market_open_dca.py` (9:35, cron `2ba19526`), `midday_dca.py` (12:30, `a6239dae`), `intraday_dca.py` (11:30 / 1:30 / 2:30, `7be82b97`) are thin subclasses that override identity constants and a few flags only |
 | Orchestration | `run_dca.py` — `run_pipeline()`, `run_slot()`, `main()` (CLI); `dca_runner.py` — the gate-sequence live runner (Gate 0 market day → Gate 1 time sanity → Gate 3 window → Gate 4 sole-executor → Gate 6 budget → Gate 7 placement → Gate 9 evidence) |
@@ -95,7 +104,7 @@ research-only failures stay outside self-heal's documented core-only scope.
 | Broker/data | `dca_live_adapters.py` — `RobinhoodDataProvider`, `FinanceDataProvider`, `RobinhoodBroker`, all built from **injected callables** that map 1:1 to Robinhood MCP tools |
 | Money & risk | `dca_risk.py`, `dca_cumulative.py` (cumulative sub-dollar credit ledger), `dca_cost_tracker.py`, `dca_inverse_martingale.py` (opt-in deferred-accumulation sizing mode, off by default — see `docs/inverse_martingale.md`), `dca_whole_share_accumulator.py` (whole-share accumulation for tickers not tradable for fractional buys, e.g. BYDDY; wired into `near_close_dca._run_once_impl` — the 3:30 PM canonical stream only — see `docs/whole_share_accumulation.md`) |
 | Output | `dca_reporting.py`, `dca_alerts.py`, `dca_fileio.py`, `dca_notion_sync.py`, `dca_weekly_dashboard.py` |
-| Local console | `from.py` → `dca_console.py`, `dca_console_{data,jobs,octopus}.py`, `console/`, `deploy/launchd/` — checkout-only; reads artifacts and runs fixed dry-run/test actions, never places brokerage orders |
+| Local console | `from.py` → `dca_console.py`, `dca_console_{data,jobs,octopus,reader,routes}.py` plus one reader per page (`dca_console_{runs,schedule,state,config,alerts,reports,research,env,docs,launch}.py`), `console/`, `deploy/launchd/` — checkout-only; reads artifacts and runs allowlisted dry-run/test/report actions, never places brokerage orders and never writes state or config. `dca_console_routes.GET_ROUTES` is the read-only route table, `dca_console_reader.BoundedReader` the shared confined reader; see `docs/local_console.md` |
 | Visualization | `dca_market_graph.py` + `viz/` (the 3D market graph, "The Ocean" — the only pixel output here; `viz/vendor/three.min.js` is the repo's only vendored third-party asset, browser-side only, never imported by Python — see `docs/market_graph.md`) |
 | Reliability engines | `scripts/broker_reconciliation.py`, `run_state_machine.py`, `run_ledger.py`, `idempotency.py`, `scheduler_lease.py`, `reason_codes.py`, `correlation.py`, `same_day_pointer.py`, `same_day_top_up_gate.py`, `file_lock.py` |
 | Ops utilities | `scripts/run_classification.py`, `drift_detection.py`, `backup_strategy.py`, `run_ticker_maintenance.py`, `daily_per_ticker_calibration.py`, `generate_per_ticker_sizing.py`, `workflow_policy.py` |
@@ -106,7 +115,7 @@ research-only failures stay outside self-heal's documented core-only scope.
 A fix applied to one does **not** propagate to the others. Full detail in `docs/live_wiring.md`.
 
 | Entry point | Shape | Driven by |
-|---|---|---|
+| --- | --- | --- |
 | `run_dca.run_slot()` | Function pipeline over `near_close_dca` primitives | `run_dca.py` itself; the 3:30 PM live path. The only path with a real `__main__`. |
 | `MorningDCAExecutor` + 3 subclasses | Class hierarchy, one per stream | An external agent constructing the class and calling `.run(now, data, broker=…)`. **No in-repo caller, no CLI.** |
 | `dca_runner.py` | Gate sequence + injected callables | An external agent session holding MCP runtime access. |
@@ -159,7 +168,7 @@ These are enforced by tests or by fail-closed runtime code. Violating one fails 
 ### Environment variables
 
 | Variable | Default | Effect |
-|---|---|---|
+| --- | --- | --- |
 | `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` | — | Required for live runs; not needed for `--demo` or tests |
 | `DCA_CRON_TRACKING_ROOT` | `<checkout>/cron_tracking` (production exports the shared tree explicitly) | Root of the whole per-stream artifact tree. Read at import time |
 | `DCA_CONFIG_DIR` | `config/` beside the modules | Where `config/*.json` is loaded from |
@@ -194,11 +203,13 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 - Tests live under `tests/`, one `test_<module>.py` per core module (moved out of the repo root
   2026-08-23, where each used to sit flat beside its module); `scripts/` tests live in
   `scripts/tests/`, and each heavy-dependency sibling subproject (`ticker-advisor/`,
-  `ml-forecaster/`, `wondrous-octopus/`, `dca-sizing-signals/`, `ticker-market-breadth/`) keeps
+  `ml-forecaster/`, `wondrous-octopus/`, `dca-sizing-signals/`, `ticker-market-breadth/`, `llm-providers/`,
+  `yfinance-prefetch/`) keeps
   its own `tests/`. Add or update tests for every behavior change, and a regression test for
   every bug fix.
 - `trading-strategies/`, `analysis/`, `.github/`, `production-safe-agent-loop/`,
-  `ticker-advisor/`, `ml-forecaster/`, `wondrous-octopus/`, and `ticker-market-breadth/` are
+  `ticker-advisor/`, `ml-forecaster/`, `wondrous-octopus/`, `ticker-market-breadth/`, `llm-providers/`, and
+  `yfinance-prefetch/` are
   excluded from the core ruff gate and the coverage source — they carry their own deps and
   conventions.
 - Check `git status --short` before editing and preserve existing user changes. Keep patches
@@ -208,7 +219,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 ## Documentation index
 
 | File | Contents |
-|---|---|
+| --- | --- |
 | `AGENTS.md` | The repo-wide agent operating contract (secrets policy, PR expectations) |
 | `docs/repo_map.md` | **Read this before opening a core module.** Structural map of every runner, report producer, and prediction tool: slot-to-entry-point ownership, which reporting modules have a CLI and which are library-only, and which tools can reach live sizing. Complements `scripts/agent_entry_points.py` (that one is task-oriented: "what command do I run") |
 | `docs/README.md` | Doc index + quick-reference facts (universe, ladder, budgets, test window) |
@@ -225,6 +236,10 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `docs/whole_share_accumulation.md` | Whole-share accumulation for tickers not tradable for fractional buys (built for BYDDY): tracks would-be graded-ladder buys, fires one whole-share purchase once they sum to a share's price. Wired into the 3:30 PM canonical stream only |
 | `docs/market_graph.md` | The 3D market graph: axis mapping, Pulse/Wave modes, the four data-source loaders, and the two tiers of behavioural ticker grouping |
 | `docs/wondrous_octopus.md` | The `wondrous-octopus/` tool: walk-forward, online-updated next-day OHLC forecasting across the whole archive; research artifacts only, never wired into live sizing |
+| `docs/morning_dca.md`, `docs/midday_dca.md` | The two executor-class stream references: modes, task/ET/artifact-root tables, the Jul 10 2026 ladder unification |
+| `docs/market_open_signal_entry.md`, `docs/morning_signal_entry.md`, `docs/midday_signal_entry.md`, `docs/intraday_signal_entry.md` | The per-slot Gate 5 signal-generation contracts behind the seven candidate generators (payload shape, flags, output document) |
+| `docs/risk_management.md` | The rolling cash-burn report and the 7-day deployment kill switch (`dca_risk.py`) |
+| `docs/dca_operational_todos.md` | Operational notes, including the standing Perplexity backup-pass policy behind the seven Claude slots |
 | `docs/alert_digest.md` | Why executor gate alerts piled up undelivered in Gmail drafts, and `scripts/alert_digest.py` — the digest that counts them by gate/slot/streak and flags alerts whose delivery channel was off or gitignored |
 | `docs/drift_detection.md`, `docs/reporting_workflow.md`, `docs/cost_tracking.md` | Post-run detection, reporting, and cost policy |
 | `docs/pr_review_workflow.md` | The two-workflow PR review split and its trust boundary |

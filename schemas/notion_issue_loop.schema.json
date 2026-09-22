@@ -1,0 +1,86 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "notion_issue_loop.schema.json",
+  "title": "Notion-backed self-healing loop policy",
+  "description": "Bounds for the loop that selects issues from the operator's DCA Issues database, dispatches one repair branch each, reads the outcome back, and reopens a repaired issue whose error code recurs. Kept separate from self_heal.json so the bounded self-heal policy is not widened by this loop's own caps.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "enabled",
+    "max_repairs_per_tick",
+    "max_prs_per_month",
+    "max_prs_per_day",
+    "max_attempts_per_issue",
+    "breaker_refused_threshold",
+    "review_lease_days",
+    "quiet_logged_days"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "const": "../schemas/notion_issue_loop.schema.json",
+      "minLength": 40,
+      "maxLength": 40,
+      "description": "Pins this document to the strict local draft-07 schema instead of relying on an editor-selected policy."
+    },
+    "enabled": {
+      "type": "boolean",
+      "enum": [
+        false,
+        true
+      ],
+      "default": false,
+      "description": "Operator kill switch for the repair half. The shipped false default requires an explicit operator edit before the loop can open anything against a repository that drives live trading."
+    },
+    "max_repairs_per_tick": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10,
+      "default": 3,
+      "description": "Most dispatches one tick may plan. The ceiling bounds how many unreviewed changes a single unattended run can put in front of a reviewer."
+    },
+    "max_attempts_per_issue": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10,
+      "default": 3,
+      "description": "Attempts charged at dispatch before an issue quarantines. Reaching it is terminal, so a recurring defect cannot consume repair capacity forever."
+    },
+    "breaker_refused_threshold": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 20,
+      "default": 3,
+      "description": "Rows sitting in the Refused state that latch the breaker. The refused queue is the latch, so only a human triaging those rows clears it."
+    },
+    "review_lease_days": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 90,
+      "default": 14,
+      "description": "Days a dispatched attempt may remain unsettled before it is refused, so an ignored proposal cannot hold an issue's only slot indefinitely."
+    },
+    "max_prs_per_month": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 500,
+      "default": 20,
+      "description": "Pull requests the loop may open in a calendar month. Each dispatch costs a full CI fan-out, measured at roughly 34 job-minutes across the twelve jobs, so this is the ceiling that makes the loop's spend bounded rather than open-ended."
+    },
+    "max_prs_per_day": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 50,
+      "default": 1,
+      "description": "Pull requests the loop may open in one day, mirroring config/self_heal.json's max_repairs_per_day. Separate from the per-tick cap because a per-tick cap only equals a per-day cap while the schedule fires exactly once a day; a manual re-fire or a retry breaks that equivalence."
+    },
+    "quiet_logged_days": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 90,
+      "default": 3,
+      "description": "Logged Run Log days without a recurrence before an open issue is treated as handled outside the loop. Counted in logged days rather than calendar days, so the Run Log's weekend gaps cannot read as health."
+    }
+  }
+}

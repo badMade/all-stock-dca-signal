@@ -40,12 +40,14 @@ is stale.
 > **Step 2 — Build the prior picture, per ticker.** From those orders, counting
 > only buys, and counting an order whether it filled, is pending, was cancelled,
 > or was rejected:
+>
 > - `prior_usd[ticker]` = sum of the dollar amounts already submitted today.
 > - `prior_price[ticker]` = the price of the most recent of those buys, using
 >   `average_price` when the order filled, otherwise its submitted `price`.
 >
 > **Step 3 — Size each candidate.** For each ticker you intend to buy, with
 > `desired_usd` from the ladder and `current_price` your decision price now:
+>
 > - If `prior_usd` is 0 → this is the first allocation. Buy the full
 >   `desired_usd`.
 > - Else if `current_price` is NOT strictly less than `prior_price` → buy
@@ -78,7 +80,7 @@ is stale.
 DXYZ, as it actually happened versus as the guard would have sized it.
 
 | Time (ET) | Event | Actual | Guarded |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 09:36:46 | first buy, filled @ $23.2499 | $1.00 | $1.00 (first allocation) |
 | 10:13:35 | second buy, filled @ $22.3507 | $2.00 | **$1.00** |
 
@@ -89,7 +91,7 @@ bought equals $1.00, not another full $2.00.
 Contrast AAAU, which should not have repeated at all:
 
 | Time (ET) | Event | Actual | Guarded |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 11:40:32 | first buy, filled @ $39.8599 | $1.50 | $1.50 (first allocation) |
 | 11:41:42 | second buy, filled @ $39.8381 | $1.50 | **$0.00** |
 
@@ -112,6 +114,7 @@ one sizes against what the first already bought.
 
 Genuine first-come-first-serve would need one medium both sides can write and
 read. Candidates worth checking, in rough order of likelihood:
+
 - Slack. Claude can post (verified 2026-07-28, channel `C0BKS1ZL5UY`). Whether
   Perplexity can post and read there is unconfirmed.
 - Notion. Both may have connectors; unconfirmed on the Perplexity side.

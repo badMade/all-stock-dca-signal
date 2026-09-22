@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import math
 import sys
+from typing import Any
 
 import data
-import features
+import features as _features
 import numpy as np
 import pandas as pd
 import stacking
+
+features: Any = _features
 
 FAILURES: list[str] = []
 
@@ -29,7 +32,7 @@ def check(label, got, expected, *, tol, note=""):
         print(f"  FAIL  {label:52s} shape {got_a.shape} vs {exp_a.shape}")
         return
     dev = float(np.max(np.abs(got_a[both] - exp_a[both]))) if both.any() else 0.0
-    nan_match = bool(np.array_equal(np.isfinite(got_a), np.isfinite(exp_a)))
+    nan_match = np.array_equal(np.isfinite(got_a), np.isfinite(exp_a))
     ok = dev <= tol and nan_match
     if not ok:
         FAILURES.append(label)
@@ -45,7 +48,7 @@ def synthetic_frame(n=400, seed=7):
     frame = pd.DataFrame({
         "Date": pd.bdate_range("2020-01-01", periods=n),
         "Open": close, "High": high, "Low": low, "Close": close, "Adj Close": close,
-        "Dividends": 0.0, "Stock Splits": 0.0, "Volume": rng.integers(1e5, 5e6, n),
+        "Dividends": 0.0, "Stock Splits": 0.0, "Volume": rng.integers(100_000, 5_000_000, n),
     })
     adjusted, _ = data.adjusted_ohlc(frame)
     return adjusted
@@ -184,8 +187,8 @@ losses_a, losses_b = rng.uniform(0.001, 0.02, 40), rng.uniform(0.001, 0.02, 40)
 for la, lb in zip(losses_a, losses_b, strict=True):
     tracker.observe_day({"a": {c: la for c in ("open", "high", "low", "close")},
                          "b": {c: lb for c in ("open", "high", "low", "close")}})
-pandas_a = pd.Series(losses_a).ewm(halflife=half_life, adjust=False).mean().iloc[-1]
-pandas_b = pd.Series(losses_b).ewm(halflife=half_life, adjust=False).mean().iloc[-1]
+pandas_a = pd.Series(losses_a.tolist()).ewm(halflife=half_life, adjust=False).mean().iloc[-1]
+pandas_b = pd.Series(losses_b.tolist()).ewm(halflife=half_life, adjust=False).mean().iloc[-1]
 check("EWMA loss (model a) vs pandas ewm(adjust=False)",
       [tracker.mean_loss("a")["close"]], [pandas_a], tol=1e-12)
 # NOTE: the implementation guards division with + _LOSS_EPS. Omitting it here

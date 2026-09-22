@@ -92,7 +92,7 @@ def test_scheduled_slot_end_between_candidates_preserves_first_submission(tmp_pa
     )
     assert len(placed) == 1
     assert executor.ledger.day_attempts(now.date()) == 1
-    artifact = json.loads(Path(result["paths"]["run_state"]).read_text())
+    artifact = json.loads(Path(result["paths"]["run_state"]).read_bytes())
     rows = {row["ticker"]: row for row in artifact["buy_candidates"]}
     assert rows["AAPL"]["order_id"] == "fixture-order-1"
     assert rows["MSFT"]["status"] == "blocked"
@@ -139,7 +139,7 @@ def _manual_morning(tmp_path, now, broker, tickers=("NVDA",)):
         now, DecliningBarsProvider(SourceName.ROBINHOOD, 100, dict.fromkeys(tickers, 0.10)),
         broker=broker, data_source="fixture", manual=True,
     )
-    return json.loads(Path(result["paths"]["run_state"]).read_text()), executor
+    return json.loads(Path(result["paths"]["run_state"]).read_bytes()), executor
 
 
 @pytest.mark.parametrize("now", [

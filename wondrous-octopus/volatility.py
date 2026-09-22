@@ -123,7 +123,7 @@ class GarchVolatility:
     """Fit one close-to-close GARCH path per ticker and rescale emitted bands."""
 
     def __init__(self, *, min_observations: int = 60, min_scale: float = 0.5, max_scale: float = 2.5) -> None:
-        self.min_observations = int(min_observations)
+        self.min_observations = min_observations
         self.min_scale = float(min_scale)
         self.max_scale = float(max_scale)
         self._params: dict[str, GarchParams] = {}
@@ -143,7 +143,7 @@ class GarchVolatility:
             if cutoff_value is not None:
                 usable &= series.label_end_dates <= cutoff_value
             rows = np.flatnonzero(usable)
-            observations[ticker] = int(len(rows))
+            observations[ticker] = len(rows)
             if len(rows) < self.min_observations:
                 skipped_short_history += 1
                 continue

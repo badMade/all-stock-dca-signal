@@ -209,7 +209,9 @@ class PersistenceModel:
                     self._pool[replace_at] = residual
         return {"absorbed": len(revealed)}
 
-    def reconstruction_diagnostic(self, requests: Sequence[ForecastRequest]) -> None:
+    def reconstruction_diagnostic(
+        self, requests: Sequence[ForecastRequest]
+    ) -> dict[str, np.ndarray] | None:
         return None  # no encoder to health-check
 
     def save(self, directory: Path) -> None:
@@ -404,7 +406,9 @@ class GbmQuantileModel:
             return {"refit": True, "training_rows": rows, "cutoff": self._last_refit_date}
         return {"refit": False}
 
-    def reconstruction_diagnostic(self, requests: Sequence[ForecastRequest]) -> None:
+    def reconstruction_diagnostic(
+        self, requests: Sequence[ForecastRequest]
+    ) -> dict[str, np.ndarray] | None:
         return None  # no encoder to health-check
 
     def save(self, directory: Path) -> None:
@@ -611,6 +615,7 @@ class GbmQuantileModel:
         # Lazy import inside fit: the house pattern for heavy deps (see
         # ml-forecaster/model.py's identically-motivated lazy sklearn import).
         import sys
+
         from sklearn.ensemble import HistGradientBoostingRegressor
 
         total_estimators = len(COMPONENTS) * 4
@@ -622,7 +627,7 @@ class GbmQuantileModel:
                 return
             pct = (completed / total_estimators) * 100
             bar_len = 24
-            filled = int(bar_len * completed // total_estimators)
+            filled = bar_len * completed // total_estimators
             bar = (
                 "=" * filled
                 + (">" if filled < bar_len else "")
@@ -639,7 +644,7 @@ class GbmQuantileModel:
         for position, component in enumerate(COMPONENTS):
             y = targets[:, position].astype(np.float64)
             fits: dict[str, Any] = {}
-            categorical = self._categorical_mask(design.shape[1])
+            categorical: Any = self._categorical_mask(design.shape[1])
             _update_progress(component, "point")
             fits["point"] = HistGradientBoostingRegressor(
                 loss="absolute_error",
@@ -683,7 +688,7 @@ def attach_target_dates(forecasts: list[OHLCForecast], panel: TrainingPanel) -> 
             if len(positions):
                 label_end = series.label_end_dates[positions[0]]
                 if not np.isnat(label_end):
-                    target_date = np.datetime_as_string(label_end, unit="D")
+                    target_date = str(np.datetime_as_string(label_end, unit="D"))
         filled.append(
             OHLCForecast(
                 ticker=forecast.ticker,

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import time
@@ -172,6 +173,25 @@ def _fingerprint_directory(directory: Path) -> dict[str, dict[str, Any]]:
     return fingerprints
 
 
+def _checkpoint_has_nan(checkpoint_dir: Path) -> bool:
+    """Check if any model artifact under checkpoint_dir contains non-finite values (NaN or Inf)."""
+    models_dir = checkpoint_dir / "models"
+    if not models_dir.is_dir():
+        return False
+    for model_path in models_dir.iterdir():
+        weights_path = model_path / "weights.npz"
+        if weights_path.is_file():
+            try:
+                with np.load(weights_path) as data:
+                    for key in data.files:
+                        arr = data[key]
+                        if np.issubdtype(arr.dtype, np.floating) and (np.isnan(arr).any() or np.isinf(arr).any()):
+                            return True
+            except Exception:
+                return True
+    return False
+
+
 def _fingerprint_panel_history(panel: TrainingPanel, as_of_date: str | None) -> str:
     """Hash of every ticker's ALREADY-PROCESSED rows (dates <= ``as_of_date``),
     per ticker.
@@ -293,7 +313,7 @@ def _acquire_run_lock(run_dir: Path):
         if fcntl is not None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt is not None:  # pragma: no cover - exercised on Windows only
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore
     except OSError as exc:
         handle.close()
         raise HarnessError(
@@ -310,7 +330,7 @@ def _release_run_lock(handle) -> None:
     closes the handle."""
     if fcntl is None and msvcrt is not None:  # pragma: no cover - exercised on Windows only
         handle.seek(0)
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore
     handle.close()
 
 
@@ -450,7 +470,11 @@ class WalkForwardHarness:
             # already knows how to recover (Codex review: "Refuse fresh
             # runs when checkpoint.prev is recoverable"). Either directory
             # existing means this run_dir needs resume, not fresh.
-            if (run_dir / "checkpoint").exists() or (run_dir / "checkpoint.prev").exists():
+            if (
+                (run_dir / "checkpoint").exists()
+                or (run_dir / "checkpoint.prev").exists()
+                or (run_dir / "checkpoint.good").exists()
+            ):
                 raise HarnessError(f"REFUSED: {run_dir} already holds a checkpoint; use resume")
             # Tracked so the cleanup below never touches a directory the
             # operator already owned -- only what THIS call itself created.
@@ -606,7 +630,7 @@ class WalkForwardHarness:
     @classmethod
     def verify_checkpoint_integrity(
         cls,
-        panel: TrainingPanel,
+        panel: TrainingPanel | None,
         run_dir: Path,
         requested_config: HarnessConfig,
         *,
@@ -643,18 +667,46 @@ class WalkForwardHarness:
         run_dir = Path(run_dir)
         checkpoint_dir = run_dir / "checkpoint"
         previous_dir = run_dir / "checkpoint.prev"
-        if not checkpoint_dir.exists() and previous_dir.exists():
-            # A crash between the two renames of the checkpoint swap: the
-            # previous checkpoint is complete and authoritative.
-            if mutate_ledger:
-                previous_dir.rename(checkpoint_dir)
+        good_dir = run_dir / "checkpoint.good"
+        if not checkpoint_dir.exists():
+            if previous_dir.exists():
+                # A crash between the two renames of the checkpoint swap: the
+                # previous checkpoint is complete and authoritative.
+                if mutate_ledger:
+                    previous_dir.rename(checkpoint_dir)
+                else:
+                    # mutate_ledger=False's caller (daily_update.py's --dry-run
+                    # preview) must perform NO mutation, including this
+                    # crash-recovery rename -- read straight from
+                    # checkpoint.prev/ in place instead (Codex review: "Keep
+                    # checkpoint fallback recovery read-only in dry runs").
+                    checkpoint_dir = previous_dir
+            elif good_dir.exists():
+                if mutate_ledger:
+                    shutil.copytree(good_dir, checkpoint_dir)
+                else:
+                    checkpoint_dir = good_dir
+
+        if checkpoint_dir.exists() and _checkpoint_has_nan(checkpoint_dir):
+            # Autonomous self-healing: current checkpoint contains non-finite weights (NaN/Inf).
+            # Look for healthy fallback in checkpoint.good or checkpoint.prev.
+            fallback_dir = None
+            if good_dir.is_dir() and not _checkpoint_has_nan(good_dir):
+                fallback_dir = good_dir
+            elif previous_dir.is_dir() and not _checkpoint_has_nan(previous_dir):
+                fallback_dir = previous_dir
+
+            if fallback_dir is not None:
+                if mutate_ledger:
+                    shutil.rmtree(checkpoint_dir)
+                    shutil.copytree(fallback_dir, checkpoint_dir)
+                else:
+                    checkpoint_dir = fallback_dir
             else:
-                # mutate_ledger=False's caller (daily_update.py's --dry-run
-                # preview) must perform NO mutation, including this
-                # crash-recovery rename -- read straight from
-                # checkpoint.prev/ in place instead (Codex review: "Keep
-                # checkpoint fallback recovery read-only in dry runs").
-                checkpoint_dir = previous_dir
+                raise HarnessError(
+                    f"REFUSED: checkpoint under {run_dir} contains non-finite weights and no healthy fallback exists"
+                )
+
         if not checkpoint_dir.exists():
             raise HarnessError(f"REFUSED: no checkpoint under {run_dir}")
         state = json.loads((checkpoint_dir / _STATE_FILENAME).read_bytes())
@@ -711,6 +763,8 @@ class WalkForwardHarness:
         # "Verify archive contents before restoring model state").
         recorded_panel_fingerprint = state.get("panel_fingerprint")
         if strict_model_data and recorded_panel_fingerprint is not None:
+            if panel is None:
+                raise HarnessError(f"REFUSED: panel is required to verify panel fingerprint under {run_dir}")
             actual_panel_fingerprint = _fingerprint_panel_history(panel, state.get("last_processed_date"))
             if actual_panel_fingerprint != recorded_panel_fingerprint:
                 raise HarnessError(
@@ -893,6 +947,8 @@ class WalkForwardHarness:
         """
         import time
 
+        if getattr(self, "_model_failure", False):
+            return "systemic_model_failure"
         if self.config.max_steps_per_run is not None and steps_taken >= self.config.max_steps_per_run:
             return "step_ceiling"
         if self.config.max_hours_per_run is not None:
@@ -911,7 +967,10 @@ class WalkForwardHarness:
         self.log(f"reason        : {reason}")
         self.log(f"steps this run: {steps_taken} / limit {self.config.max_steps_per_run}")
         self.log(f"hours this run: {elapsed_hours:.2f} / limit {self.config.max_hours_per_run}")
-        self.log("action        : checkpoint saved; resume with --resume when ready")
+        if reason == "systemic_model_failure":
+            self.log("action        : execution HALTED; last healthy checkpoint preserved; corrupt state NOT written")
+        else:
+            self.log("action        : checkpoint saved; resume with --resume when ready")
         self.log("==================================")
 
     def run(self, *, release_lock: bool = True) -> str:
@@ -975,6 +1034,8 @@ class WalkForwardHarness:
             tripped = self._breaker_tripped(steps_taken, started_monotonic)
             if tripped is not None:
                 self._trip_banner(tripped, steps_taken, started_monotonic)
+                if tripped == "systemic_model_failure":
+                    return "systemic_model_failure"
                 self.checkpoint()
                 return "budget_tripped"
             if self._interrupted:
@@ -990,6 +1051,9 @@ class WalkForwardHarness:
             self._steps_taken_in_run += 1
             self.step(date64)
             steps_taken += 1
+            if getattr(self, "_model_failure", False):
+                self._trip_banner("systemic_model_failure", steps_taken, started_monotonic)
+                return "systemic_model_failure"
             if self.step_index % self.config.checkpoint_every == 0:
                 self.checkpoint()
             if self._interrupted:
@@ -1228,6 +1292,17 @@ class WalkForwardHarness:
         n_predicted = 0
         for name, model in self.models.items():
             forecasts = model.predict(requests)
+            if requests and forecasts:
+                n_non_finite = sum(
+                    1 for f in forecasts
+                    if any(not math.isfinite(v) for v in f.point.values())
+                )
+                if n_non_finite > 0:
+                    self.log(
+                        f"CRITICAL: Model {name!r} emitted {n_non_finite}/{len(forecasts)} "
+                        f"non-finite forecasts on {context_date_iso}!"
+                    )
+                    self._model_failure = True
             repairs = getattr(model, "last_repairs", None)
             if repairs is not None and (repairs.quantile_crossings or repairs.bar_repairs):
                 records.append(
@@ -1332,7 +1407,7 @@ class WalkForwardHarness:
         # -- 2. diagnostics ---------------------------------------------------
         eligible = [
             (ticker, row)
-            for ticker, row in self.panel.eligible_on(pd.Timestamp(date64))
+            for ticker, row in self.panel.eligible_on(pd.Timestamp(date64))  # type: ignore
             if np.isfinite(self.panel.series[ticker].features[row]).all()
         ]
         diagnostic_pool = eligible
@@ -1705,7 +1780,7 @@ class WalkForwardHarness:
             already_forecast = {entry["ticker"] for entry in self.outstanding.get(UNRESOLVED_KEY, [])}
             terminal_date64 = self.panel.calendar[-1]
             terminal_date = pd.Timestamp(terminal_date64)
-            candidates: dict[str, int] = dict(self.panel.eligible_on(terminal_date))
+            candidates: dict[str, int] = dict(self.panel.eligible_on(terminal_date))  # type: ignore
             # eligible_on(the market-wide final date) only surfaces a
             # ticker whose OWN terminal row lands on THAT exact date. A
             # ticker whose restored/newly warmed-up CSV is one session
@@ -1927,6 +2002,13 @@ class WalkForwardHarness:
         models_dir.mkdir(parents=True)
         model_fingerprints: dict[str, dict[str, dict[str, Any]]] = {}
         for name, model in self.models.items():
+            verify_fn = getattr(model, "verify_finiteness", None)
+            if verify_fn is not None:
+                is_finite, err_msg = verify_fn()
+                if not is_finite:
+                    raise HarnessError(
+                        f"REFUSED to write checkpoint: model {name!r} has non-finite state ({err_msg})"
+                    )
             model_dir = tmp_dir / "models" / name
             model.save(model_dir)
             # model.save()'s own close()/flush() only reaches the OS page
@@ -1990,24 +2072,17 @@ class WalkForwardHarness:
         _fsync_dir(tmp_dir)
         checkpoint_dir = self.run_dir / "checkpoint"
         previous_dir = self.run_dir / "checkpoint.prev"
+        good_dir = self.run_dir / "checkpoint.good"
         if previous_dir.exists():
             shutil.rmtree(previous_dir)
         if checkpoint_dir.exists():
             checkpoint_dir.rename(previous_dir)
         tmp_dir.rename(checkpoint_dir)
-        # The two renames above only mutate run_dir's own directory entries
-        # (checkpoint/checkpoint.prev/checkpoint.tmp) -- a file's presence
-        # under a directory is metadata the OS can buffer and reorder
-        # separately from file contents, so without fsyncing run_dir
-        # itself here, a crash could commit the fallback's removal below
-        # before these renames are durable, leaving recovery with NEITHER
-        # a complete new checkpoint/ NOR the checkpoint.prev/ fallback it
-        # was supposed to still have (Codex review: "Fsync the checkpoint
-        # swap before removing the fallback"). Fsynced before the removal,
-        # not after: a crash before this point still leaves checkpoint.prev/
-        # (or, worst case, an unrenamed checkpoint.tmp/) as a valid
-        # fallback; a crash after only ever loses the now-redundant
-        # fallback, never the just-published checkpoint.
+        # Autonomous self-healing: maintain durable checkpoint.good with verified healthy state
+        if not _checkpoint_has_nan(checkpoint_dir):
+            if good_dir.exists():
+                shutil.rmtree(good_dir)
+            shutil.copytree(checkpoint_dir, good_dir)
         _fsync_dir(self.run_dir)
         if previous_dir.exists():
             shutil.rmtree(previous_dir)

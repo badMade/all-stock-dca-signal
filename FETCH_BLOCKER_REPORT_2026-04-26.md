@@ -32,7 +32,7 @@ The scheduled fetch did **not** download new ticker data this run. Existing CSV 
 ## Tickers covered vs. remaining
 
 | Bucket | Count | Notes |
-|---|---|---|
+| --- | --- | --- |
 | Fully fetched (≥100 rows) | 5 | A, AAPL, AMZN, GOOGL, MSFT |
 | Stub rows (1 row each) | 5 | AA, AACB, AACG, AACI, AACT — should be re-fetched for full history |
 | Not yet attempted | 5,492 | Bulk of the remaining 5,497 unfetched tickers |

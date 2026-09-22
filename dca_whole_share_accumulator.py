@@ -1426,7 +1426,7 @@ class WholeShareAccumulationLedger:
         # at wherever the batch currently stands.
         recorded_keys = state.setdefault("recorded_idempotency_keys", {})
         prior_remainder_as_of = _finite_non_negative(cached.get(_CLAIM_REMAINDER_AS_OF_FIELD))
-        if prior_remainder_as_of == float(state[_WITHDRAWN_TOTAL_FIELD]):
+        if prior_remainder_as_of is not None and prior_remainder_as_of == float(state[_WITHDRAWN_TOTAL_FIELD]):
             prior_remainder_registered = _finite_non_negative(cached.get(_CLAIM_REMAINDER_FIELD)) or 0.0
             prior_remainder_offset = _finite_non_negative(cached.get(_CLAIM_REMAINDER_TIE_OFFSET_FIELD)) or 0.0
             _retire_credit_tie_interval(
@@ -1689,7 +1689,7 @@ class WholeShareAccumulationLedger:
                 "claim_token": claim_token,
             }
             if claim_token is not None:
-                decision = WholeShareAccumulationDecision(**{**decision.__dict__, "claim_token": claim_token})
+                decision = replace(decision, claim_token=claim_token)
         state["events"].append(
             {
                 "trading_day": trading_day,
@@ -1881,69 +1881,67 @@ class WholeShareAccumulationLedger:
         dedup_key = f"{trading_day}:{idempotency_key}" if idempotency_key else None
         with cross_process_lock(lock_path):
             state = self._read_state(state_path, symbol)
-            cached = None
-            if dedup_key is not None:
-                recorded_keys = state.setdefault("recorded_idempotency_keys", {})
-                cached = recorded_keys.get(dedup_key)
-                if cached is not None and (
-                    cached.get("resolved")
-                    or cached.get("placed")
-                    or not self._claim_matches(cached, claim_token=claim_token, recorded_at=recorded_at)
-                ):
-                    # Already resolved by someone else, this caller no longer
-                    # holds the claim, or -- the case this ``placed`` check
-                    # closes -- a genuine order was accepted by
-                    # execute_claimed() for THIS SAME claim_token/claimed_at
-                    # after the caller's own broker-history evidence was
-                    # gathered but before this call acquired the lock. The
-                    # stale-claim recovery path
-                    # (near_close_dca._reconcile_unresolved_whole_share_claim)
-                    # decides "no live order found, safe to restore" from a
-                    # broker lookup that ran BEFORE this call, not under this
-                    # lock; execute_claimed() shares this exact per-ticker
-                    # lock and can complete a real placement -- including its
-                    # own durable ``placed`` write -- entirely in the gap
-                    # between that lookup and this call acquiring the lock.
-                    # Re-reading ``cached`` here (this method already reads
-                    # ``state`` fresh under the lock every call) catches that:
-                    # a caller whose claim_token/claimed_at still match can
-                    # nonetheless have had its claim resolved out from under
-                    # it by a placement that landed in that gap. Restoring
-                    # the deduction and clearing ``placed`` here (the prior
-                    # round's zero-fill fix) would erase the now-durable
-                    # marker for a real order and let a same-day retry
-                    # redispatch the same money a second time (Codex review
-                    # discussion_r3821705222, "Preserve a placement that
-                    # races stale-claim restoration"). Deliberately does NOT
-                    # also check ``placing``: an in-line caller reacting to
-                    # its OWN execute_claimed() call raising (e.g.
-                    # OrderConfirmationRequiredError, or any other placement
-                    # exception) reaches this method with ``placing`` still
-                    # ``True`` ON DISK -- execute_claimed() sets it durably
-                    # BEFORE calling the broker and only clears it after a
-                    # confirmed outcome, so a raised exception leaves it set
-                    # -- and that caller is the correct, sole owner clearing
-                    # a known-failed attempt, not a racing observer; gating on
-                    # ``placing`` here would wrongly refuse that legitimate
-                    # restoration. ``placed`` alone is sufficient: because
-                    # this call and execute_claimed() share the SAME
-                    # cross_process_lock spanning the whole broker call
-                    # (Codex review discussion_r3821705226 confirms this),
-                    # the two can never interleave mid-flight -- by the time
-                    # this call acquires the lock, any execute_claimed() that
-                    # started is either fully done (``placed`` durably True)
-                    # or crashed with ``placing`` still True and the lock
-                    # released, and that crash case is exactly what the
-                    # broker-history lookup and staleness wait upstream in
-                    # ``_reconcile_unresolved_whole_share_claim`` already
-                    # exist to resolve safely.
-                    return state["pending_usd"]
+            recorded_keys = state.setdefault("recorded_idempotency_keys", {})
+            cached = recorded_keys.get(dedup_key) if dedup_key is not None else None
+            if cached is not None and (
+                cached.get("resolved")
+                or cached.get("placed")
+                or not self._claim_matches(cached, claim_token=claim_token, recorded_at=recorded_at)
+            ):
+                # Already resolved by someone else, this caller no longer
+                # holds the claim, or -- the case this ``placed`` check
+                # closes -- a genuine order was accepted by
+                # execute_claimed() for THIS SAME claim_token/claimed_at
+                # after the caller's own broker-history evidence was
+                # gathered but before this call acquired the lock. The
+                # stale-claim recovery path
+                # (near_close_dca._reconcile_unresolved_whole_share_claim)
+                # decides "no live order found, safe to restore" from a
+                # broker lookup that ran BEFORE this call, not under this
+                # lock; execute_claimed() shares this exact per-ticker
+                # lock and can complete a real placement -- including its
+                # own durable ``placed`` write -- entirely in the gap
+                # between that lookup and this call acquiring the lock.
+                # Re-reading ``cached`` here (this method already reads
+                # ``state`` fresh under the lock every call) catches that:
+                # a caller whose claim_token/claimed_at still match can
+                # nonetheless have had its claim resolved out from under
+                # it by a placement that landed in that gap. Restoring
+                # the deduction and clearing ``placed`` here (the prior
+                # round's zero-fill fix) would erase the now-durable
+                # marker for a real order and let a same-day retry
+                # redispatch the same money a second time (Codex review
+                # discussion_r3821705222, "Preserve a placement that
+                # races stale-claim restoration"). Deliberately does NOT
+                # also check ``placing``: an in-line caller reacting to
+                # its OWN execute_claimed() call raising (e.g.
+                # OrderConfirmationRequiredError, or any other placement
+                # exception) reaches this method with ``placing`` still
+                # ``True`` ON DISK -- execute_claimed() sets it durably
+                # BEFORE calling the broker and only clears it after a
+                # confirmed outcome, so a raised exception leaves it set
+                # -- and that caller is the correct, sole owner clearing
+                # a known-failed attempt, not a racing observer; gating on
+                # ``placing`` here would wrongly refuse that legitimate
+                # restoration. ``placed`` alone is sufficient: because
+                # this call and execute_claimed() share the SAME
+                # cross_process_lock spanning the whole broker call
+                # (Codex review discussion_r3821705226 confirms this),
+                # the two can never interleave mid-flight -- by the time
+                # this call acquires the lock, any execute_claimed() that
+                # started is either fully done (``placed`` durably True)
+                # or crashed with ``placing`` still True and the lock
+                # released, and that crash case is exactly what the
+                # broker-history lookup and staleness wait upstream in
+                # ``_reconcile_unresolved_whole_share_claim`` already
+                # exist to resolve safely.
+                return state["pending_usd"]
             restored_amount = float(_money(deducted_usd, field="deducted_usd"))
             pending_before = state["pending_usd"]
             withdrawn_total = float(state.get(_WITHDRAWN_TOTAL_FIELD, 0.0))
             pending_after = round(pending_before + restored_amount, 2)
             state["pending_usd"] = pending_after
-            if cached is not None:
+            if cached is not None and dedup_key is not None:
                 cached["resolved"] = True
                 # The claim's entitlement in the pool is what this restoration
                 # puts back PLUS whatever of its own credit the failed order
@@ -1989,7 +1987,7 @@ class WholeShareAccumulationLedger:
                 # instead, so it stays valid (Codex review: "Keep later tie
                 # offsets valid when moving a remainder").
                 prior_remainder_as_of = _finite_non_negative(cached.get(_CLAIM_REMAINDER_AS_OF_FIELD))
-                if prior_remainder_as_of == withdrawn_total:
+                if prior_remainder_as_of is not None and prior_remainder_as_of == withdrawn_total:
                     prior_remainder_registered = _finite_non_negative(cached.get(_CLAIM_REMAINDER_FIELD)) or 0.0
                     prior_remainder_offset = _finite_non_negative(cached.get(_CLAIM_REMAINDER_TIE_OFFSET_FIELD)) or 0.0
                     _retire_credit_tie_interval(
@@ -2192,12 +2190,13 @@ class WholeShareAccumulationLedger:
         dedup_key = f"{trading_day}:{idempotency_key}" if idempotency_key else None
         with cross_process_lock(lock_path):
             state = self._read_state(state_path, symbol)
-            cached = None
-            if dedup_key is not None:
-                recorded_keys = state.setdefault("recorded_idempotency_keys", {})
-                cached = recorded_keys.get(dedup_key)
-            if cached is None or cached.get("resolved") or not self._claim_matches(
-                cached, claim_token=claim_token, recorded_at=recorded_at
+            recorded_keys = state.setdefault("recorded_idempotency_keys", {})
+            cached = recorded_keys.get(dedup_key) if dedup_key is not None else None
+            if (
+                dedup_key is None
+                or cached is None
+                or cached.get("resolved")
+                or not self._claim_matches(cached, claim_token=claim_token, recorded_at=recorded_at)
             ):
                 # No cached entry at all, already resolved by someone else,
                 # or this caller no longer holds the claim -- nothing to
@@ -2264,7 +2263,7 @@ class WholeShareAccumulationLedger:
             # (Codex review: "Keep later tie offsets valid when moving a
             # remainder").
             prior_remainder_as_of = _finite_non_negative(cached.get(_CLAIM_REMAINDER_AS_OF_FIELD))
-            if prior_remainder_as_of == withdrawn_total:
+            if prior_remainder_as_of is not None and prior_remainder_as_of == withdrawn_total:
                 prior_remainder_registered = _finite_non_negative(cached.get(_CLAIM_REMAINDER_FIELD)) or 0.0
                 prior_remainder_offset = _finite_non_negative(cached.get(_CLAIM_REMAINDER_TIE_OFFSET_FIELD)) or 0.0
                 _retire_credit_tie_interval(
@@ -2662,7 +2661,7 @@ class WholeShareAccumulationLedger:
                     self.root / symbol / "ledger.json", json.dumps(state, indent=2, sort_keys=True) + "\n"
                 )
             result = operation()
-            if dedup_key is not None:
+            if dedup_key is not None and cached is not None and state is not None:
                 cached["placing"] = False
                 cached["placed"] = True
                 try:
@@ -3787,8 +3786,7 @@ class WholeShareAccumulationLedger:
                 # records"). Only a genuinely missing key gets the trust
                 # exemption; a present-and-unreadable one fails closed like
                 # a mismatch.
-                _audit_key_present = isinstance(_audit, dict) and _audit_key in _audit
-                if not _audit_key_present:
+                if not (isinstance(_audit, dict) and _audit_key in _audit):
                     continue
                 _audited_offset = _finite_non_negative(_audit.get(_audit_key))
                 if _audited_offset is None or round(_offset, 2) != round(_audited_offset, 2):

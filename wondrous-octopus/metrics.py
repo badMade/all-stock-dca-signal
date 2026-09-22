@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 from data import COMPONENTS
@@ -123,6 +123,13 @@ def score_forecast(
     # through ANY field of this record, since MetricsAccumulator sums
     # several of them (abs_err, sq_err, pred_close, ...) into running
     # per-bucket/per-day totals that a single NaN poisons permanently.
+    has_non_finite = any(
+        not math.isfinite(val) for val in point.values()
+    ) or any(
+        not math.isfinite(val)
+        for comp in quantiles.values()
+        for val in comp.values()
+    )
     point = {component: _bounded_log_return(point[component]) for component in COMPONENTS}
     quantiles = {
         component: {key: _bounded_log_return(quantiles[component][key]) for key in QUANTILE_KEYS}
@@ -161,6 +168,7 @@ def score_forecast(
         "in_band": in_band,
         "in_band_raw": in_band_raw,
         "band_width": band_width,
+        "non_finite": has_non_finite,
         # "Inside the realized values": did the point land within the day's
         # actual traded range? Scored for close and open, the two components
         # a user most naturally reads as "the price tomorrow".
@@ -219,7 +227,7 @@ class MetricsAccumulator:
         )
         self._close_err_all: dict[str, _Welford] = defaultdict(_Welford)
 
-    def add_score(self, record: dict[str, Any]) -> None:
+    def add_score(self, record: Mapping[str, Any]) -> None:
         model = record["model"]
         regime = bucket_regime(record["target_date"])
         score = record["score"]
@@ -350,7 +358,7 @@ class MetricsAccumulator:
 
 
 def build_report(
-    records_by_model: dict[str, Callable[[], Iterable[dict[str, Any]]]],
+    records_by_model: Mapping[str, Callable[[], Iterable[Mapping[str, Any]]]],
     *,
     intersect: bool = True,
     universe: dict[str, Any] | None = None,

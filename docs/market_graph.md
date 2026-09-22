@@ -15,7 +15,7 @@ the code remains greppable for "market graph".
 ## The axes
 
 | Axis | Channel |
-|---|---|
+| --- | --- |
 | **X** | volume |
 | **Y** | the high/low range |
 | **Z** | the open→close body |
@@ -58,7 +58,7 @@ similar-behaving names sit adjacent, and banded into labelled, colour-coded grou
 There are two tiers, and **both work**:
 
 | Tier | How to get it | Needs | What it captures |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `returns` (default) | nothing — it is the default | nothing at all | "moves together": close-to-close return correlation |
 | `file` | `ml-forecaster/cluster_tickers.py` | the ML venv + the ticker archive | "moves together" **and** "behaves like": volatility regime, drawdown character, volume profile |
 
@@ -148,7 +148,7 @@ misrepresent the market.
 One loader interface, four implementations, covering every OHLCV store here:
 
 | `--source` | Reads | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `csv` | `historical_stock_data.csv` | The only OHLCV file committed to git, hence the default. **Thin** — a handful of real tickers plus single-row stubs, which are dropped for having no prior close. |
 | `archive` | `dca_ticker_paths.configured_ticker_history_dir()` | The primary store, thousands of symbols. Gitignored; set `$DCA_TICKER_HISTORY_DIR` outside a populated checkout. Defaults to the **active universe**, not the whole archive — pass `--all-tickers-in-archive` to override. |
 | `intraday` | `<history_dir>/_intraday/` | Per-poll bars via `dca_intraday_archive.read_ticker_observations` — resolution the daily archive cannot show. |
@@ -333,7 +333,7 @@ never imported by Python — so the stdlib-only runtime invariant is untouched.
 ## Files
 
 | Path | Role |
-|---|---|
+| --- | --- |
 | `dca_market_graph.py` | stdlib-only: loaders, normalization, seriation, payload, HTML emission |
 | `viz/market_graph.{html.tmpl,css,js}` | the browser viewer |
 | `viz/vendor/` | vendored three.js + licence + provenance |

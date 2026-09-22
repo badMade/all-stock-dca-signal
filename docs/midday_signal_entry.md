@@ -239,7 +239,7 @@ This covers **1230ET only**.
 All **seven** roster slots now have a Gate 5 entry point:
 
 | Slot | Command | Page |
-|---|---|---|
+| --- | --- | --- |
 | 0935ET | `scripts/generate_market_open_candidates.py` | `docs/market_open_signal_entry.md` |
 | 1030ET | `scripts/generate_morning_candidates.py` | `docs/morning_signal_entry.md` |
 | 1130/1330/1430ET | `scripts/generate_intraday_candidates.py --slot …` | `docs/intraday_signal_entry.md` |
@@ -250,4 +250,3 @@ The first four run on the shared core in `scripts/stream_candidates.py`; 1530ET
 predates it and calls `near_close_dca.evaluate_source_signal`, that stream's own
 engine. Each command is scoped to its own slot: pointing one at another slot
 scores against the wrong logic.
-

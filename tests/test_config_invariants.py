@@ -1473,7 +1473,7 @@ _NON_ACCOUNT_LITERALS = frozenset(
 # was one of the places the real account number had to be removed from, and a
 # future fixture that pasted it back would have sailed past this check
 # (Codex review, PR #219: "Scan test files for account literals").
-_SYNTHETIC_ACCOUNT_VALUES = frozenset({FIXTURE_ACCOUNT_NUMBER, "123456789"})
+_SYNTHETIC_ACCOUNT_VALUES = frozenset({FIXTURE_ACCOUNT_NUMBER, "123456789", "100000"})
 
 # Files exempt from scanning entirely. The first two are market-data tables whose
 # volume columns are full of nine-digit share counts -- genuine data, not identifiers.
@@ -4474,3 +4474,69 @@ def test_mirror_constants_are_sourced_from_their_canonical_definitions():
     assert near_close_dca._WORKING_BROKER_ORDER_STATES == _LIVE_ORDER_STATES
     assert near_close_dca._EXECUTED_QUANTITY_COLS is EXECUTED_QUANTITY_COLS
     assert near_close_dca._ACCOUNT_NUMBER_SHAPE.pattern == dca_config.ACCOUNT_NUMBER_SHAPE.pattern
+
+
+def _task_by_id(task_id: str) -> dict:
+    tasks = _load("scheduled_tasks.json")["tasks"]
+    for task in tasks:
+        if task.get("id") == task_id:
+            return task
+    raise AssertionError(f"no scheduled task with id {task_id!r}")
+
+
+def test_midday_task_has_a_run_classification_artifact_contract():
+    """The 12:30 midday task (a6239dae) aborted daily since 2026-09-15 with
+    run_states_unclassifiable > 0 -- dca_risk could not parse the
+    run_classification block some days produced. Every other trading task
+    with a state_file_guarantee (see intraday_task_patch_2026_07_27) spells
+    out that run_classification must be a non-null object, never a bare
+    string, and that state_schema_version is required; midday's own
+    state_file_guarantee never said so. An LLM free-handing the write has
+    config/scheduled_tasks.json's own scheduled_run_outcomes ledger sitting
+    nearby using "run_classification": "failed_start_no_evidence" as a bare
+    string for an unrelated purpose -- exactly the malformed shape
+    dca_risk._unclassifiable_reason() flags as "wrong JSON type". This test
+    pins the fix: midday's task entry must carry the same explicit warning
+    intraday's does."""
+    task = _task_by_id("a6239dae")
+    contract = task.get("artifact_contract")
+    assert contract is not None, "a6239dae is missing an artifact_contract block"
+    field_rules = contract.get("field_rules", {})
+    run_classification_rule = str(field_rules.get("run_classification", ""))
+    assert "never a bare string" in run_classification_rule.lower()
+    required_fields = contract.get("required_top_level_run_state_fields", [])
+    assert any("state_schema_version" in str(f) for f in required_fields)
+    assert any("run_classification" in str(f) for f in required_fields)
+
+
+def test_every_trading_task_with_a_state_file_guarantee_warns_against_a_bare_string():
+    """Generalizes the midday-specific fix above: any current or future
+    trading task that promises to always write run_state.json must also warn
+    that run_classification is never a bare string, so this exact gap cannot
+    silently reappear for a different task."""
+    tasks = _load("scheduled_tasks.json")["tasks"]
+    for task in tasks:
+        if not task.get("trades") or "state_file_guarantee" not in task:
+            continue
+        contract = task.get("artifact_contract")
+        assert contract is not None, (
+            f"{task.get('id')} has a state_file_guarantee but no artifact_contract "
+            "warning that run_classification must never be a bare string"
+        )
+        run_classification_rule = str(contract.get("field_rules", {}).get("run_classification", ""))
+        assert "never a bare string" in run_classification_rule.lower(), task.get("id")
+
+
+def test_midday_live_mirror_documents_the_run_classification_template():
+    """The live 12:30 Cowork task runs on this prompt text, not on
+    MiddayDCAExecutor (docs/safeguards.md notes the deployed task is still a
+    stale pre-executor version) -- so the tested Python schema never actually
+    reaches production. This prompt's own Gate 9 must spell out the literal
+    run_classification fields (mirroring docs/midday_dca.md's already-correct
+    documentation), or an LLM free-handing the write has no template to
+    follow and can reproduce the exact unclassifiable-artifact incident."""
+    text = _midday_live_mirror_text()
+    assert 'state_schema_version' in text
+    assert 'midday-live-v1' in text
+    assert 'midday_dca_live' in text
+    assert 'never a bare string' in text

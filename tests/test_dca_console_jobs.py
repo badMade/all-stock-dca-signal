@@ -249,3 +249,139 @@ def test_submit_startup_failure_preserves_history_and_allows_retry(tmp_path, mon
         if manager.worker is not None and manager.worker.ident is None:
             manager.worker = None
         manager.close()
+
+
+def test_capture_to_keeps_stdout_as_a_redacted_document_and_streams_stderr(tmp_path):
+    manager = JobManager(tmp_path / "jobs")
+    target = tmp_path / "out" / "document.json"
+    code = ("import json, sys; sys.stderr.write('progress line\\n'); "
+            "print(json.dumps({'volume': 1234567.5, 'note': 'account 999000111 seen', 'ok': True}))")
+    command = Command((sys.executable, "-c", code), tmp_path, dict(os.environ), capture_to=target)
+    try:
+        manager.submit("gate5-replay", "Capture", lambda job_id, log: manager.run_command(command, log))
+        result = join_job(manager)
+        assert result["status"] == "completed" and result["returncode"] == 0
+        assert "progress line" in result["log"]
+        # stdout went to the document, not the log; numbers survive because the
+        # document is walked as JSON rather than scrubbed as text.
+        assert '{"volume"' not in result["log"]
+        assert "document.json" in result["log"]
+        document = json.loads(target.read_text())
+        assert document["volume"] == 1234567.5 and document["ok"] is True
+        assert "999000111" not in document["note"]
+    finally:
+        manager.close()
+
+
+def test_capture_limit_refuses_to_save_a_partial_document(tmp_path, monkeypatch):
+    monkeypatch.setattr(dca_console_jobs, "CAPTURE_LIMIT_BYTES", 16)
+    manager = JobManager(tmp_path / "jobs")
+    target = tmp_path / "out" / "document.json"
+    command = Command((sys.executable, "-c", "print('x' * 200)"), tmp_path, dict(os.environ), capture_to=target)
+    try:
+        manager.submit("gate5-replay", "Capture", lambda job_id, log: manager.run_command(command, log))
+        result = join_job(manager)
+        assert result["status"] == "completed"
+        assert not target.exists()
+        assert "was not saved" in result["log"]
+    finally:
+        manager.close()
+
+
+def test_cancel_terminates_the_child_and_marks_the_job_cancelled(tmp_path, monkeypatch):
+    original_popen = subprocess.Popen
+    processes = []
+    launched = threading.Event()
+
+    def capture_process(*args, **kwargs):
+        process = original_popen(*args, **kwargs)
+        processes.append(process)
+        launched.set()
+        return process
+
+    monkeypatch.setattr(dca_console_jobs.subprocess, "Popen", capture_process)
+    manager = JobManager(tmp_path / "jobs")
+    command = Command((sys.executable, "-c", "import time; time.sleep(30)"), tmp_path, dict(os.environ), timeout=30)
+    try:
+        assert manager.cancel("nothing-running") is False
+        submitted = manager.submit("demo-dca", "Cancellable", lambda job_id, log: manager.run_command(command, log))
+        assert launched.wait(2)
+        assert manager.cancel("another-id") is False
+        assert manager.cancel(submitted["id"]) is True
+        result = join_job(manager)
+        assert result["status"] == "cancelled"
+        assert result["returncode"] == dca_console_jobs.CANCELLED_RETURNCODE
+        assert "cancelled by the operator" in result["log"]
+        assert processes and all(process.poll() is not None for process in processes)
+        # A finished job can no longer be cancelled, and its file says cancelled.
+        assert manager.cancel(submitted["id"]) is False
+        assert json.loads((manager.root / f"{submitted['id']}.json").read_text())["status"] == "cancelled"
+        restored = JobManager(manager.root)
+        assert restored.snapshot()[0]["status"] == "cancelled"
+        restored.close()
+    finally:
+        manager.close()
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+
+
+def test_log_since_returns_only_unseen_text_and_reports_window_truncation(tmp_path):
+    manager = JobManager(tmp_path / "jobs")
+
+    def work(job_id, log):
+        log("a" * 100)
+        log("b" * 30_000)
+        return 0
+
+    try:
+        submitted = manager.submit("demo-dca", "Chatty", work)
+        join_job(manager)
+        assert manager.log_since("missing-job", 0) is None
+        first = manager.log_since(submitted["id"], 0)
+        assert first is not None
+        assert first["offset"] == 30_100 and first["truncated"] is True
+        assert first["text"] == "b" * 24_000 and first["status"] == "completed"
+        tail = manager.log_since(submitted["id"], 30_090)
+        assert tail is not None
+        assert tail["text"] == "b" * 10 and tail["truncated"] is False
+        at_end = manager.log_since(submitted["id"], 30_100)
+        assert at_end is not None and at_end["text"] == ""
+        past_end = manager.log_since(submitted["id"], 99_999)
+        assert past_end is not None and past_end["text"] == ""
+    finally:
+        manager.close()
+
+
+def test_job_log_shows_checkout_relative_argv_not_absolute_paths(tmp_path):
+    manager = JobManager(tmp_path / "jobs")
+    target = tmp_path / "out" / "document.json"
+    command = Command((sys.executable, "-c", "print('ok')", "--artifacts-dir", str(tmp_path / "out")),
+                      tmp_path, dict(os.environ), capture_to=target)
+    try:
+        manager.submit("demo-dca", "Relative argv", lambda job_id, log: manager.run_command(command, log))
+        result = join_job(manager)
+        assert result["status"] == "completed"
+        assert str(tmp_path) not in result["log"]
+        assert "--artifacts-dir out" in result["log"]
+        assert os.path.basename(sys.executable) in result["log"]
+    finally:
+        manager.close()
+
+
+def test_restored_timestamps_are_validated_not_redacted(tmp_path):
+    root = tmp_path / "jobs"
+    saved_job(root, "stamped", started_at="2026-09-17T23:36:05.123456+00:00", finished_at="not a timestamp",
+              log_total=12)
+    saved_job(root, "unstamped", started_at=None, log_total="many")
+    manager = JobManager(root)
+    try:
+        by_id = {item["id"]: item for item in manager.snapshot()}
+        assert by_id["stamped"]["started_at"] == "2026-09-17T23:36:05.123456+00:00"
+        assert by_id["stamped"]["finished_at"] is None
+        assert by_id["stamped"]["log_total"] == 12
+        assert by_id["unstamped"]["started_at"] is None
+        assert by_id["unstamped"]["log_total"] == len("Completed normally.")
+    finally:
+        manager.close()

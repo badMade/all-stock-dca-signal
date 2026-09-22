@@ -7,7 +7,7 @@ happened). New analysis gets its own `YYYY-MM-DD-short-name/` folder rather than
 one, so the history stays intact.
 
 | Folder | What it covers |
-|---|---|
+| --- | --- |
 | `2026-06-29-execution-audit/` | 10-weekday execution audit of the legacy single-task 3:45 PM ET live strategy (`ce16ba6b`): scheduler state, order history, and a file inventory. |
 | `2026-06-29-revised-ladder/` | Backtest of a revised graded-buy ladder against 30 trading days of daily bars, plus a same-day intraday tier preview. |
 | `2026-07-17-live-reliability/` | Reliability fixes applied 2026-07-17 to align the version-controlled schedule manifest with live scheduler state for the three pre-authorized live tasks. |
