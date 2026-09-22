@@ -1,2 +1,2 @@
 # Shared by the trusted reviewer install and the complete transitive CI audit.
-google-antigravity==0.1.16
+google-antigravity==0.1.17
