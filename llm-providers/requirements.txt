@@ -1,6 +1,6 @@
 # Independent LLM-provider tooling; never imported by the stdlib-only core.
 # Exactly the three vendors' own clients -- no shared HTTP layer, no extras.
-openai>=1.50
+openai>=3.16.2
 anthropic>=0.40
 google-genai>=1.0
 pytest>=8.0.0
