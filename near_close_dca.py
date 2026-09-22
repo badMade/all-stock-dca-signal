@@ -13690,14 +13690,13 @@ def _merge_execution_csv(
             with path.open(newline="", encoding="utf-8") as handle:
                 iter_csv = csv.reader(handle)
                 header = next(iter_csv, None)
-                if header is None:
-                    return []
-                for _raw_row in iter_csv:
-                    row = dict(zip(header, _raw_row + [None] * max(0, len(header) - len(_raw_row))))  # noqa: B905
-                    order_id = row.get("order_id")
-                    if order_id:
-                        existing_rows_by_order_id[order_id] = len(existing_rows)
-                    existing_rows.append(row)
+                if header is not None:
+                    for _raw_row in iter_csv:
+                        row = dict(zip(header, _raw_row + [None] * max(0, len(header) - len(_raw_row))))  # noqa: B905
+                        order_id = row.get("order_id")
+                        if order_id:
+                            existing_rows_by_order_id[order_id] = len(existing_rows)
+                        existing_rows.append(row)
         except (OSError, csv.Error, UnicodeDecodeError):
             # Quarantine, don't discard THIS invocation's own records: a
             # corrupt/unreadable existing file is not evidence about
