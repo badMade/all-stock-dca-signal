@@ -51,6 +51,40 @@ def _missing_packages(packages: Sequence[str]) -> list[str]:
     return missing
 
 
+# PyPI's default `torch` wheel bundles the full CUDA runtime (multi-GB, e.g.
+# nvidia-cudnn/cuda-toolkit); every caller that requests "torch" here only
+# needs CPU (wondrous-octopus's model is ~1-2M parameters -- see its
+# requirements.txt and .github/workflows/ci.yml's identical CPU-first-install
+# comment). Installing this wheel before the requirements-file install
+# satisfies the unpinned `torch` line so pip never reaches for the default
+# CUDA bundle, mirroring CI's own install order.
+_TORCH_CPU_INDEX_URL = "https://download.pytorch.org/whl/cpu"
+
+
+def _install_dependencies(
+    venv_python: Path,
+    to_install: Sequence[str],
+    requirements_files: Sequence[Path | str],
+) -> None:
+    """Install ``to_install`` (or ``requirements_files``) into ``venv_python``."""
+    if "torch" in to_install:
+        subprocess.run(
+            [str(venv_python), "-m", "pip", "install", "torch", "--index-url", _TORCH_CPU_INDEX_URL],
+            check=True,
+        )
+
+    install_cmd = [str(venv_python), "-m", "pip", "install"]
+    has_file = False
+    for req in requirements_files:
+        req_path = Path(req)
+        if req_path.is_file():
+            install_cmd.extend(["-r", str(req_path)])
+            has_file = True
+    if not has_file:
+        install_cmd.extend(to_install)
+    subprocess.run(install_cmd, check=True)
+
+
 def ensure_venv(
     *,
     packages: Sequence[str] = (),
@@ -93,16 +127,7 @@ def ensure_venv(
             return
 
         print(f"Installing missing dependencies ({', '.join(missing)}) into {venv_dir.name}...", flush=True)
-        install_cmd = [str(venv_python), "-m", "pip", "install"]
-        has_file = False
-        for req in requirements_files:
-            req_path = Path(req)
-            if req_path.is_file():
-                install_cmd.extend(["-r", str(req_path)])
-                has_file = True
-        if not has_file:
-            install_cmd.extend(missing)
-        subprocess.run(install_cmd, check=True)
+        _install_dependencies(venv_python, missing, requirements_files)
         return
 
     # 2. Executing outside the target venv: create if missing
@@ -114,16 +139,7 @@ def ensure_venv(
     # Install requirements if packages are missing
     if packages and not _check_packages_installed(venv_python, packages):
         print(f"Installing required dependencies into {venv_dir.name} (first-time setup)...", flush=True)
-        install_cmd = [str(venv_python), "-m", "pip", "install"]
-        has_file = False
-        for req in requirements_files:
-            req_path = Path(req)
-            if req_path.is_file():
-                install_cmd.extend(["-r", str(req_path)])
-                has_file = True
-        if not has_file:
-            install_cmd.extend(packages)
-        subprocess.run(install_cmd, check=True)
+        _install_dependencies(venv_python, packages, requirements_files)
 
     # 3. Seamlessly re-execute this process using venv_python
     try:

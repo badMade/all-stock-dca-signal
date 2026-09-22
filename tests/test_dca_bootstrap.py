@@ -120,3 +120,72 @@ def test_ensure_venv_ignores_ambient_packages_when_none_requested(tmp_path, monk
     assert venv_python.is_file()
     assert execv_calls
     assert execv_calls
+
+
+def test_ensure_venv_installs_torch_cpu_wheel_before_requirements_when_in_venv(tmp_path, monkeypatch) -> None:
+    # Regression: PyPI's default `torch` wheel bundles the full CUDA runtime
+    # (multi-GB -- nvidia-cudnn, cuda-toolkit, etc). wondrous-octopus's own
+    # requirements.txt and .github/workflows/ci.yml both install the CPU-only
+    # wheel from pytorch.org's cpu index FIRST, so the later requirements-file
+    # install finds torch already satisfied and never reaches for the CUDA
+    # default. ensure_venv's own install path used to skip that and pip
+    # straight from requirements.txt, so running e.g.
+    # `python wondrous-octopus/run_walkforward.py --help` on a fresh checkout
+    # pulled the multi-GB CUDA bundle instead.
+    venv_dir = tmp_path / "venv"
+    req_file = tmp_path / "requirements.txt"
+    req_file.write_text("torch\n")
+
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    monkeypatch.setattr("dca_bootstrap._is_running_in_venv", lambda venv_python: True)
+    monkeypatch.setattr("dca_bootstrap._missing_packages", lambda packages: ["torch"])
+
+    ensure_venv(packages=("torch",), requirements_files=(req_file,), venv_dir=venv_dir)
+
+    torch_cpu_calls = [c for c in calls if "torch" in c and "--index-url" in c]
+    assert torch_cpu_calls, calls
+    assert "https://download.pytorch.org/whl/cpu" in torch_cpu_calls[0]
+
+    requirements_calls = [c for c in calls if "-r" in c]
+    assert requirements_calls, calls
+    assert calls.index(torch_cpu_calls[0]) < calls.index(requirements_calls[0])
+
+
+def test_ensure_venv_installs_torch_cpu_wheel_before_requirements_on_first_setup(tmp_path, monkeypatch) -> None:
+    # Same regression as above, for the OTHER install path: a fresh venv
+    # that doesn't exist yet (first-time setup before the re-exec).
+    venv_dir = tmp_path / "venv"
+    venv_python = get_venv_python(venv_dir)
+    req_file = tmp_path / "requirements.txt"
+    req_file.write_text("torch\n")
+
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        if "-m" in cmd and "venv" in cmd:
+            venv_python.parent.mkdir(parents=True, exist_ok=True)
+            venv_python.touch()
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    monkeypatch.setattr(subprocess, "call", lambda *a, **k: 0)
+    monkeypatch.setattr(os, "execv", lambda *a: None)
+    monkeypatch.setattr("dca_bootstrap._missing_packages", lambda packages: ["torch"])
+    monkeypatch.setattr("dca_bootstrap._check_packages_installed", lambda python_bin, packages: False)
+
+    ensure_venv(packages=("torch",), requirements_files=(req_file,), venv_dir=venv_dir)
+
+    torch_cpu_calls = [c for c in calls if "torch" in c and "--index-url" in c]
+    assert torch_cpu_calls, calls
+    assert "https://download.pytorch.org/whl/cpu" in torch_cpu_calls[0]
+
+    requirements_calls = [c for c in calls if "-r" in c]
+    assert requirements_calls, calls
+    assert calls.index(torch_cpu_calls[0]) < calls.index(requirements_calls[0])
