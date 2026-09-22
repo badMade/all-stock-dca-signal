@@ -136,7 +136,7 @@ def load_history_csv(path: Path) -> pd.DataFrame:
     # Naive (no-offset) Date columns are unaffected: utc=True localizes
     # them as UTC directly, and the tz-aware branch just below converts
     # right back to naive -- the same end result as before this change.
-    parsed_date: Any = pd.to_datetime(frame["Date"], errors="coerce", utc=True)
+    parsed_date: Any = pd.to_datetime(frame["Date"], errors="coerce", utc=True, format="mixed")
     if getattr(getattr(parsed_date, "dtype", None), "tz", None) is not None:
         parsed_date = parsed_date.dt.tz_convert("UTC").dt.tz_localize(None)
     # Calendar-day precision, not a raw timestamp: every downstream consumer
