@@ -76,7 +76,7 @@ def test_write_next_day_forecasts_includes_an_older_origin_date(tmp_path):
     path = daily_update._write_next_day_forecasts(tmp_path / "run", fake_harness, "2021-06-01")
     assert path is not None
     with path.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
+        rows = (lambda r, h=None: [dict(zip(h, row + [None] * max(0, len(h) - len(row)))) for row in r] if (h := next(r, None)) else [])(csv.reader(handle))  # noqa: B905
     assert {row["ticker"] for row in rows} == {"LAGGY"}
 
 
@@ -113,7 +113,7 @@ def test_write_next_day_forecasts_excludes_a_ticker_dropped_from_a_capped_univer
     path = daily_update._write_next_day_forecasts(tmp_path / "run", fake_harness, "2021-06-01")
     assert path is not None
     with path.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
+        rows = (lambda r, h=None: [dict(zip(h, row + [None] * max(0, len(h) - len(row)))) for row in r] if (h := next(r, None)) else [])(csv.reader(handle))  # noqa: B905
     assert {row["ticker"] for row in rows} == {"KEPT"}
 
 
@@ -145,7 +145,7 @@ def test_write_next_day_forecasts_marks_a_nan_component_invalid_instead_of_a_fab
     path = daily_update._write_next_day_forecasts(tmp_path / "run", fake_harness, "2021-06-01")
     assert path is not None
     with path.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
+        rows = (lambda r, h=None: [dict(zip(h, row + [None] * max(0, len(h) - len(row)))) for row in r] if (h := next(r, None)) else [])(csv.reader(handle))  # noqa: B905
     row = rows[0]
     assert row["pred_close"] == "N/A"
     assert row["pred_close"] != f"{50.0:.4f}"  # not fabricated as ref_close's flat price

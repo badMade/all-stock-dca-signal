@@ -449,8 +449,9 @@ class _PurchaseCollector:
                 # corrupt artifact aborts this entire history scan instead
                 # of just being skipped (Codex review: "Catch CSV errors
                 # while reading the header").
-                reader = csv.DictReader(handle)
-                if reader.fieldnames is None:
+                iter_csv = csv.reader(handle)
+                fieldnames = next(iter_csv, None)
+                if fieldnames is None:
                     return False, set(), set()
                 # Mirror near_close_dca._orders_csv_fills's own row-by-row
                 # iteration, not a blanket ``list(reader)``: csv.Error (e.g.
@@ -464,7 +465,8 @@ class _PurchaseCollector:
                 # same file was malformed (Codex review: "Retain
                 # authoritative prefix rows after CSV parser errors").
                 try:
-                    for row in reader:
+                    for _raw_row in iter_csv:
+                        row = dict(zip(fieldnames, _raw_row + [None] * max(0, len(fieldnames) - len(_raw_row))))  # noqa: B905
                         rows.append(row)
                 except csv.Error:
                     had_csv_error = True

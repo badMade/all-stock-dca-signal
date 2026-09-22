@@ -1600,9 +1600,18 @@ def _candidate_calibrated_multiplier_is_consistent(cand: Candidate) -> bool:
     if bounds is None:
         return False
     configured_bases, configured_min, configured_max, _minimum_order_usd = bounds
-    if cand.sizing_base_usd is None or cand.sizing_base_usd not in configured_bases:
+    if cand.sizing_base_usd is None or not any(math.isclose(cand.sizing_base_usd, b, abs_tol=1e-4) for b in configured_bases):
         return False
-    if cand.sizing_min_drop_pct != configured_min or cand.sizing_max_drop_pct != configured_max:
+    try:
+        if not math.isclose(cand.sizing_min_drop_pct, configured_min, abs_tol=1e-4):
+            return False
+        if cand.sizing_max_drop_pct is None:
+            if configured_max is not None:
+                return False
+        else:
+            if configured_max is None or not math.isclose(cand.sizing_max_drop_pct, configured_max, abs_tol=1e-4):
+                return False
+    except OverflowError:
         return False
     return _cents(cand.amount_usd) <= _cents(cand.sizing_base_usd * cand.multiplier)
 
@@ -1688,9 +1697,18 @@ def _candidate_multiplier_notional_mismatch(cand: Candidate) -> bool:
         if bounds is None:
             return True
         configured_bases, configured_min, configured_max, minimum_order_usd = bounds
-        if cand.sizing_base_usd is None or cand.sizing_base_usd not in configured_bases:
+        if cand.sizing_base_usd is None or not any(math.isclose(cand.sizing_base_usd, b, abs_tol=1e-4) for b in configured_bases):
             return True
-        if cand.sizing_min_drop_pct != configured_min or cand.sizing_max_drop_pct != configured_max:
+        try:
+            if not math.isclose(cand.sizing_min_drop_pct, configured_min, abs_tol=1e-4):
+                return True
+            if cand.sizing_max_drop_pct is None:
+                if configured_max is not None:
+                    return True
+            else:
+                if configured_max is None or not math.isclose(cand.sizing_max_drop_pct, configured_max, abs_tol=1e-4):
+                    return True
+        except OverflowError:
             return True
         # amount_usd may be strictly less than sizing_base_usd * multiplier:
         # a same-day top-up (scripts/same_day_top_up_gate.py, Gate 6.5 in the

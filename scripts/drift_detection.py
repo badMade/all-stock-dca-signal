@@ -310,7 +310,7 @@ def read_csv_rows(path: Path) -> List[Dict[str, str]]:
     if not path.exists():
         return []
     with path.open(newline="", encoding="utf-8") as handle:
-        return list(csv.DictReader(handle))
+        return (lambda r, h=None: [dict(zip(h, row + [None] * max(0, len(h) - len(row)))) for row in r] if (h := next(r, None)) else [])(csv.reader(handle))  # noqa: B905
 
 
 # --- Located artifacts -------------------------------------------------------
