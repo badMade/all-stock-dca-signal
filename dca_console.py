@@ -894,7 +894,7 @@ def make_server(
         # StreamRequestHandler applies this while setting up every accepted
         # socket. An idle LAN/proxy peer therefore cannot retain a worker thread
         # forever without sending even a request line (Rock 2 handler finding).
-        timeout = HANDLER_TIMEOUT_SECONDS
+        timeout = 5
 
         def _server_port(self) -> int:
             addr = getattr(self.server, "server_address", None)

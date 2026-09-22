@@ -58,6 +58,7 @@ ARTIFACT_KINDS = {".html": "html", ".json": "json", ".md": "markdown", ".txt": "
 MAX_ARTIFACT_BYTES = 32 * 1024 * 1024
 _PAYLOAD_NAME = re.compile(r"market_data_(?P<a>[0-9_-]*?)(?P<slot>0935|1030|1130|1230|1330|1430|1530)(?:ET)?(?P<b>[0-9_A-Za-z-]*)\.json")
 _RUN_DIR = re.compile(r"(\d{8})_(\d{4})ET")
+_PAYLOAD_DAY_SOURCE_RANK = {"unknown": -1, "file modification time": 0, "run directory": 1, "filename": 2}
 
 
 @dataclass(frozen=True)
@@ -163,6 +164,17 @@ def _candidate_dirs(reader: BoundedReader) -> list[str]:
     return found
 
 
+def _payload_sort_key(day: str | None, source: str, modified: float) -> tuple[int, str, float]:
+    """Prefer payloads whose trading day is encoded more explicitly.
+
+    A bare ``market_data_1130ET.json`` can only fall back to its mtime, which is
+    the weakest hint and drifts every time the file is recopied. A payload whose
+    filename or parent run directory states the trading day is safer to replay,
+    even if an undated sibling happened to be touched more recently.
+    """
+    return (_PAYLOAD_DAY_SOURCE_RANK.get(source, -1), day or "", modified)
+
+
 def _discover(roots: Sequence[RootSpec]) -> list[dict[str, Any]]:
     rows = []
     for root in roots:
@@ -187,7 +199,7 @@ def _discover(roots: Sequence[RootSpec]) -> list[dict[str, Any]]:
                     "slot": match.group("slot"), "root_label": root.label, "at_risk": root.kind != "primary",
                     "relative_path": entry.as_posix(), "trading_day": day, "day_source": source,
                     "modified": datetime.fromtimestamp(modified, timezone.utc).isoformat(), "_path": path,
-                    "_sort": (day or "", modified),
+                    "_sort": _payload_sort_key(day, source, modified),
                 })
     return rows
 

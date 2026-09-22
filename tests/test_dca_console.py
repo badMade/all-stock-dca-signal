@@ -1069,7 +1069,12 @@ def test_cross_site_navigation_allowed_only_for_document_route(app, monkeypatch)
 
 
 def test_idle_connection_is_closed_by_handler_timeout(app, monkeypatch):
-    monkeypatch.setattr(dca_console, "HANDLER_TIMEOUT_SECONDS", 0.2)
+    original_server = dca_console.ThreadingHTTPServer
+    def mock_server(addr, handler_cls):
+        handler_cls.timeout = 0.2
+        return original_server(addr, handler_cls)
+    monkeypatch.setattr(dca_console, "ThreadingHTTPServer", mock_server)
+
     with running_server(
         app,
         ConsoleAccess(),
