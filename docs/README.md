@@ -13,7 +13,7 @@ environment (see the repository README).
 |---|---|
 | [newcomer_guide.md](newcomer_guide.md) | First-read architecture guide: core components, execution flow, safety boundaries, and a recommended learning path |
 | [repo_map.md](repo_map.md) | Structural map of every runner, report producer, and prediction tool: slot-to-entry-point ownership, which reporting modules are library-only, and which tools can reach live sizing. Read before opening a core module |
-| [local_console.md](local_console.md) | `python3 from.py`: checkout-only local interface, demo launcher, daily summaries, timing and Octopus predictions; authenticated LAN/proxy access and launchd runbooks; never places brokerage orders |
+| [local_console.md](local_console.md) | `python3 from.py`: checkout-only local interface, real-data by default with an opt-in demo sandbox, daily summaries, timing and Octopus predictions; authenticated LAN/proxy access and launchd runbooks; never places brokerage orders |
 | [reliability_spec.md](reliability_spec.md) | Formal run-state, reconciliation, and artifact-contract spec + honest implementation-status matrix |
 | [strategy.md](strategy.md) | Strategy overview, ticker universe, latest sizing ladder, budgets |
 | [ticker_advisory.md](ticker_advisory.md) | The `ticker-advisor/` tool: scores candidate tickers, proposes universe additions for manual review |

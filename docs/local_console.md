@@ -6,11 +6,23 @@ Launch from the repository with Python 3.11 or later:
 python3 from.py
 ```
 
-This opens `http://127.0.0.1:8765`, starts an isolated DCA demo and an Octopus
-baseline replay, and displays progress while they run. The DCA test uses the
-existing `run_dca.py --demo --report` entry point. The Octopus test uses its
-existing synthetic 2019–2020 archive, followed by the daily-update entry point.
-Forecasts on this first screen are synthetic research examples, with their real
+This opens `http://127.0.0.1:8765` in **local mode** by default: it observes
+your real existing artifact tree read-only (the `DCA_CRON_TRACKING_ROOT` /
+`dca_paths.cron_tracking_root()` root, or `--root`), starts no job on its own,
+and never places a brokerage order. This is a reporting tool, never the part
+of the program that buys anything — that boundary holds regardless of mode.
+
+For an isolated synthetic sandbox instead of real data, opt in explicitly:
+
+```bash
+python3 from.py --demo
+```
+
+`--demo` starts an isolated DCA demo and an Octopus baseline replay, and
+displays progress while they run. The DCA test uses the existing
+`run_dca.py --demo --report` entry point. The Octopus test uses its existing
+synthetic 2019–2020 archive, followed by the daily-update entry point.
+Forecasts on that screen are synthetic research examples, with their real
 artifact dates shown. They are not current market predictions.
 
 The core interface has no third-party runtime dependencies. If the repository
@@ -155,11 +167,11 @@ remain research artifacts and never automatically change live sizing.
 ## Simple entry points for testing
 
 ```bash
-# Browser demo; choose an available port automatically.
+# Browser console on your real local artifacts; choose an available port automatically.
 python3 from.py --port 0
 
 # Full DCA + Octopus demo, summaries and JSON result, then exit.
-python3 from.py --once --output-dir /tmp/dca-console-demo
+python3 from.py --demo --once --output-dir /tmp/dca-console-demo
 
 # Just the DCA demo (works with Python's standard library).
 python3 from.py --run demo-dca --output-dir /tmp/dca-console-demo

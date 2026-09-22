@@ -77,10 +77,11 @@ python3 from.py
 ```
 
 Opens a local control panel with daily summaries, the ET schedule, job progress,
-and Wondrous Octopus forecasts and historical-period comparisons. Startup runs
-an isolated synthetic demo. Use `python3 from.py --local` to inspect existing output, or
-`python3 from.py --once` for a headless test. Research dependencies and all
-launcher options are documented in [the local console guide](docs/local_console.md).
+and Wondrous Octopus forecasts and historical-period comparisons. Startup observes
+your real existing artifacts read-only by default; no order is ever placed from
+here. Use `python3 from.py --demo` for an isolated synthetic sandbox instead, or
+`python3 from.py --once` for a headless snapshot of real data. Research dependencies
+and all launcher options are documented in [the local console guide](docs/local_console.md).
 
 ### CLI dry run
 

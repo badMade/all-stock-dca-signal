@@ -1123,17 +1123,23 @@ def startup_banner(access: ConsoleAccess, port: int) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     """Launch the browser UI, run a single action, or produce one daily snapshot."""
-    parser = argparse.ArgumentParser(description="Local DCA console. Default: launch a synthetic demo and open the browser.")
+    parser = argparse.ArgumentParser(
+        description="Local DCA console. Default: observe real local artifacts read-only and open the browser; "
+                     "use --demo for an isolated synthetic sandbox."
+    )
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--demo", action="store_true", help="Use isolated synthetic demo artifacts (default)")
-    mode.add_argument("--local", action="store_true", help="Observe existing artifacts; no automatic demo or broker calls")
+    mode.add_argument("--demo", action="store_true", help="Use isolated synthetic demo artifacts (opt-in, not the default)")
+    mode.add_argument("--local", action="store_true",
+                       help="Observe existing artifacts; no automatic demo or broker calls (default when no mode flag is given)")
     parser.add_argument("--root", type=Path, help="Existing DCA artifact root (implies --local)")
     parser.add_argument("--secondary-root", type=Path, action="append", default=[], metavar="DIR",
                         help="Additional existing artifact tree to observe read-only (repeatable; implies --local)")
     parser.add_argument("--output-dir", type=Path, help="Console artifacts; default dca_paths.stream_root('console')")
     parser.add_argument("--octopus-run", type=Path, help="Existing Octopus run directory (use with --local)")
     parser.add_argument("--research-python", help="Python with Octopus dependencies; auto-detect repository .venv")
-    parser.add_argument("--date", type=date.fromisoformat, help="Day to inspect; demo defaults to previous market session")
+    parser.add_argument("--date", type=date.fromisoformat,
+                        help="Day to inspect; local mode resolves the date per request unless pinned, --demo defaults to "
+                             "the previous market session")
     parser.add_argument("--port", type=int, default=8765, help="HTTP port; use 0 for an available port")
     parser.add_argument("--bind", default="127.0.0.1", help="IPv4 address to listen on (default: 127.0.0.1)")
     parser.add_argument("--trusted-host", action="append", default=[], metavar="HOST[:PORT]",
@@ -1142,7 +1148,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Honor a configured X-Forwarded-Host on a loopback listener")
     parser.add_argument("--auth-file", type=Path, help="POSIX owner-only file containing one user:password line")
     parser.add_argument("--no-browser", action="store_true")
-    parser.add_argument("--once", action="store_true", help="Run demo (unless local), save summaries, print JSON and exit")
+    parser.add_argument("--once", action="store_true",
+                        help="Save summaries and print JSON once, then exit (runs demo-all first only with --demo)")
     parser.add_argument("--run", metavar="ACTION", help="Run one allowlisted action, print its result and exit")
     parser.add_argument("--check", action="store_true", help="Show runtime and action readiness without starting jobs")
     args = parser.parse_args(argv)
@@ -1176,7 +1183,12 @@ def main(argv: list[str] | None = None) -> int:
         # parser.error provides the CLI's established exit-2 contract without
         # ever printing file contents (Same Page round 1).
         parser.error(str(error))
-    local = bool(args.local or args.root or args.octopus_run or secondary_roots)
+    # Real local artifacts are the default (--demo is already mutually exclusive
+    # with --local/--root/--octopus-run/--secondary-root, enforced above), so
+    # observing them is simply "not an explicit demo" (Sep 2026 default flip:
+    # the reporting console must show real data unless a synthetic sandbox is
+    # explicitly requested).
+    local = not args.demo
     root = (args.root or Path(cron_tracking_root())).expanduser().resolve()
     output = (args.output_dir or Path(stream_root("console"))).expanduser().resolve()
     venv_python = REPO / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")

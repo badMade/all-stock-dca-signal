@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the local DCA console: python3 from.py (demo by default)."""
+"""Launch the local DCA console: python3 from.py (observes real local artifacts by default; --demo for a synthetic sandbox)."""
 
 from pathlib import Path
 
