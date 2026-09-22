@@ -10,6 +10,7 @@ from pathlib import Path
 from dca_bootstrap import (
     DEFAULT_VENV_DIR,
     _check_packages_installed,
+    _cuda_gpu_available,
     _is_running_in_venv,
     _missing_packages,
     ensure_venv,
@@ -145,6 +146,7 @@ def test_ensure_venv_installs_torch_cpu_wheel_before_requirements_when_in_venv(t
     monkeypatch.setattr(subprocess, "run", _fake_run)
     monkeypatch.setattr("dca_bootstrap._is_running_in_venv", lambda venv_python: True)
     monkeypatch.setattr("dca_bootstrap._missing_packages", lambda packages: ["torch"])
+    monkeypatch.setattr("dca_bootstrap._cuda_gpu_available", lambda: False)
 
     ensure_venv(packages=("torch",), requirements_files=(req_file,), venv_dir=venv_dir)
 
@@ -155,6 +157,62 @@ def test_ensure_venv_installs_torch_cpu_wheel_before_requirements_when_in_venv(t
     requirements_calls = [c for c in calls if "-r" in c]
     assert requirements_calls, calls
     assert calls.index(torch_cpu_calls[0]) < calls.index(requirements_calls[0])
+
+
+def test_ensure_venv_skips_torch_cpu_pin_when_cuda_gpu_detected(tmp_path, monkeypatch) -> None:
+    # Regression (Copilot review on #1505: "Unconditional CPU install breaks
+    # CUDA device selection"): wondrous-octopus's CLIs document and accept
+    # `--device cuda`/`auto`, which prefers CUDA when available. Forcing the
+    # CPU-only wheel regardless of the host would silently make CUDA
+    # unreachable even when a GPU is present and requested.
+    venv_dir = tmp_path / "venv"
+    req_file = tmp_path / "requirements.txt"
+    req_file.write_text("torch\n")
+
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    monkeypatch.setattr("dca_bootstrap._is_running_in_venv", lambda venv_python: True)
+    monkeypatch.setattr("dca_bootstrap._missing_packages", lambda packages: ["torch"])
+    monkeypatch.setattr("dca_bootstrap._cuda_gpu_available", lambda: True)
+
+    ensure_venv(packages=("torch",), requirements_files=(req_file,), venv_dir=venv_dir)
+
+    torch_cpu_calls = [c for c in calls if "torch" in c and "--index-url" in c]
+    assert not torch_cpu_calls, calls
+
+    requirements_calls = [c for c in calls if "-r" in c]
+    assert requirements_calls, calls
+
+
+def test_cuda_gpu_available_true_when_nvidia_smi_succeeds(monkeypatch) -> None:
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 0))
+    assert _cuda_gpu_available() is True
+
+
+def test_cuda_gpu_available_false_when_nvidia_smi_missing(monkeypatch) -> None:
+    def _raise(*args, **kwargs):
+        raise FileNotFoundError("no such file: nvidia-smi")
+
+    monkeypatch.setattr(subprocess, "run", _raise)
+    assert _cuda_gpu_available() is False
+
+
+def test_cuda_gpu_available_false_when_nvidia_smi_exits_nonzero(monkeypatch) -> None:
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 1))
+    assert _cuda_gpu_available() is False
+
+
+def test_cuda_gpu_available_false_on_timeout(monkeypatch) -> None:
+    def _raise(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="nvidia-smi", timeout=10)
+
+    monkeypatch.setattr(subprocess, "run", _raise)
+    assert _cuda_gpu_available() is False
 
 
 def test_ensure_venv_installs_torch_cpu_wheel_before_requirements_on_first_setup(tmp_path, monkeypatch) -> None:
@@ -179,6 +237,7 @@ def test_ensure_venv_installs_torch_cpu_wheel_before_requirements_on_first_setup
     monkeypatch.setattr(os, "execv", lambda *a: None)
     monkeypatch.setattr("dca_bootstrap._missing_packages", lambda packages: ["torch"])
     monkeypatch.setattr("dca_bootstrap._check_packages_installed", lambda python_bin, packages: False)
+    monkeypatch.setattr("dca_bootstrap._cuda_gpu_available", lambda: False)
 
     ensure_venv(packages=("torch",), requirements_files=(req_file,), venv_dir=venv_dir)
 

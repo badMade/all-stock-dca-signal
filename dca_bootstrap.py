@@ -52,13 +52,36 @@ def _missing_packages(packages: Sequence[str]) -> list[str]:
 
 
 # PyPI's default `torch` wheel bundles the full CUDA runtime (multi-GB, e.g.
-# nvidia-cudnn/cuda-toolkit); every caller that requests "torch" here only
-# needs CPU (wondrous-octopus's model is ~1-2M parameters -- see its
-# requirements.txt and .github/workflows/ci.yml's identical CPU-first-install
-# comment). Installing this wheel before the requirements-file install
-# satisfies the unpinned `torch` line so pip never reaches for the default
-# CUDA bundle, mirroring CI's own install order.
+# nvidia-cudnn/cuda-toolkit); on a host with no CUDA-capable GPU, that bundle
+# can never be used anyway (wondrous-octopus's model is ~1-2M parameters and
+# runs fine on CPU -- see its requirements.txt and .github/workflows/ci.yml's
+# identical CPU-first-install comment), so installing the CPU-only wheel
+# first satisfies the unpinned `torch` line and pip never reaches for the
+# CUDA default. But wondrous-octopus's CLIs document and accept
+# `--device cuda`/`auto` (README: "`--device auto` prefers CUDA, then
+# Apple-Silicon MPS, then CPU"), so forcing CPU-only unconditionally would
+# silently break CUDA acceleration on a host that actually has a GPU
+# (Copilot review on #1505: "Unconditional CPU install breaks CUDA device
+# selection"). Skip the CPU pin when a CUDA GPU is detected, letting the
+# later plain `pip install` resolve torch normally.
 _TORCH_CPU_INDEX_URL = "https://download.pytorch.org/whl/cpu"
+
+
+def _cuda_gpu_available() -> bool:
+    """Best-effort NVIDIA GPU detection, without importing torch (which isn't
+    installed yet at this point). ``nvidia-smi`` succeeding on PATH is the
+    same signal the CUDA runtime itself depends on -- absent it, a CUDA
+    wheel couldn't use a GPU here anyway, so the CPU-only wheel is strictly
+    better. Never raises: any lookup failure (no such command, PATH issue,
+    a hung driver) means "assume no GPU" rather than aborting bootstrap.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def _install_dependencies(
@@ -67,7 +90,7 @@ def _install_dependencies(
     requirements_files: Sequence[Path | str],
 ) -> None:
     """Install ``to_install`` (or ``requirements_files``) into ``venv_python``."""
-    if "torch" in to_install:
+    if "torch" in to_install and not _cuda_gpu_available():
         subprocess.run(
             [str(venv_python), "-m", "pip", "install", "torch", "--index-url", _TORCH_CPU_INDEX_URL],
             check=True,
