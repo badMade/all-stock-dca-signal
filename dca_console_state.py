@@ -81,7 +81,8 @@ STATE_DATED_KEYS = ("submitted_notional_by_day", "submitted_order_count_by_day")
 # (dca_risk._load_states_with_evidence; plan "Server contract" correction 2).
 EVIDENCE_KEYS = ("state_root_exists", "run_state_files_found", "run_states_loaded", "run_states_unreadable",
                  "run_states_unclassifiable", "afternoon_states_seen", "afternoon_states_undated",
-                 "afternoon_states_invalid_notional", "unusable_states_outside_window")
+                 "afternoon_states_invalid_notional", "unusable_states_outside_window",
+                 "unclassifiable_states_without_deployment")
 EVIDENCE_CHECKS = (("state_root_exists", "is true"), ("run_states_loaded", "> 0"), ("run_states_unreadable", "== 0"),
                    ("run_states_unclassifiable", "== 0"), ("afternoon_states_seen", "> 0"),
                    ("afternoon_states_undated", "== 0"), ("afternoon_states_invalid_notional", "== 0"))

@@ -16,6 +16,16 @@ should skip rather than trade. Machine-readable copies live in
 
 ## Live execution roster
 
+> **Note (2026-09-22): this section mixes eras.** The paragraphs below call the
+> Claude roster an "intended eventual replacement". That is the July/August
+> framing. The later record is `claude/dca-executor-prompts/README.md`, which
+> logs Geoff's 2026-09-02 direction that placement be on for all seven slots,
+> and the standing Perplexity *backup* policy of 2026-09-08. Scheduled
+> sessions reading the two as conflicting declined to place and then asked an
+> absent user to choose (2026-09-14, 09-15, 09-17, 09-22 x2). Whatever a
+> session concludes, a decline in a scheduled run is an abort that must alert
+> on all three channels. It must never end on a question.
+
 **The prior three-stream Perplexity-era roster is still the account's ONLY
 currently-functioning live execution.** `config/scheduled_tasks.json` lists
 five live-execution tasks (`2ba19526` 9:35 market-open, `42173154` 10:30

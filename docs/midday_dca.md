@@ -422,6 +422,23 @@ key is present but not an object. This is diagnostic only — it does not change
 what the gate requires, and a plausible-looking reason is not grounds to trust
 the file. Route the fix at whatever wrote the file, then re-run this check.
 
+An unclassifiable file that provably carries no capital does not count toward
+`run_states_unclassifiable`. It is listed separately under
+`unclassifiable_states_without_deployment` /
+`unclassifiable_without_deployment_paths` / `..._reasons`, which are reported
+but not gated. "Provably" is strict, and the file's classification is never
+consulted: `deployed_usd` is 0, no candidate has a deployed status or an
+ambiguous-placement flag (even one with an unusable notional),
+`deployed_usd_by_claim_date` attributes nothing, `orders_submitted_count` is
+absent or exactly the integer `0`, and `order_submit_status` is absent or a
+known not-submitted value. Any other signal keeps the file gated. The reason
+is the same one that exempts out-of-window files: a file like this contributes
+$0 whichever stream it is routed to. Gating on it kept the 12:30 slot aborting
+on 2026-09-22 with `run_states_unclassifiable: 3`, four days after the
+2026-09-18 Gate 9 template fix. The three malformed 9/15 to 9/17 stubs sit
+inside the 30-day window until mid-October. A nonzero count here still means
+some writer is emitting the wrong shape and should be fixed.
+
 `afternoon_states_seen` is keyed on `is_afternoon_scheduled_evidence` — the same
 predicate `deployed_by_day` applies — rather than on `classify_stream`, so the
 two cannot disagree about what counts. The roster's own 10:30/12:30 artifacts are

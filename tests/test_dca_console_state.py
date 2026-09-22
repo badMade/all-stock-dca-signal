@@ -475,6 +475,9 @@ def test_risk_view_unusable_when_evidence_is_missing(roots, tmp_path):
     assert view["usable"] is False
     assert view["evidence"]["state_root_exists"] is True and view["evidence"]["run_states_loaded"] == 0
     assert set(view["evidence"]) == set(state_mod.EVIDENCE_KEYS)
+    # Non-gating like unusable_states_outside_window, but must still reach the
+    # console so an operator can see files that left run_states_unclassifiable.
+    assert view["evidence"]["unclassifiable_states_without_deployment"] == 0
     failing = [warning for warning in view["warnings"] if warning.startswith("Risk evidence check failed")]
     assert any("run_states_loaded > 0" in warning for warning in failing)
     assert any("afternoon_states_seen > 0" in warning for warning in failing)

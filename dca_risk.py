@@ -1132,6 +1132,81 @@ def _unclassifiable_reason(data: Dict[str, Any]) -> str:
     return f"run_classification is {type(value).__name__}, not an object"
 
 
+# order_submit_status values that positively say nothing reached the broker.
+# An allowlist, not a denylist: the vocabulary is open-ended (hand-written
+# stubs invent new values), and an unrecognized value must keep an
+# unclassifiable file gating rather than exempt it -- see
+# _unclassifiable_state_deployed_nothing.
+_NOT_SUBMITTED_ORDER_STATUSES = frozenset(
+    {
+        "blocked_kill_switch_evidence_gap",
+        "blocked_placement_phase_unreachable",
+        "completed_no_orders",
+        "dry_run",
+        "escalated_before_order_placement",
+        "failed_start_no_evidence",
+        "no_orders_submitted",
+        "not_submitted",
+        "not_submitted_confirmation_required",
+        "not_submitted_error",
+        "not_submitted_no_candidates",
+    }
+)
+
+
+def _unclassifiable_state_deployed_nothing(data: Dict[str, Any]) -> bool:
+    """True only when ``data`` provably moves no figure under ANY classification.
+
+    An unclassifiable state is gated because its broken ``run_classification``
+    stops ``classify_stream`` routing its capital: a real afternoon run with a
+    mangled block would silently drop out of the kill-switch total. That risk
+    exists only if the file carries capital. A stub that records none
+    contributes exactly $0 whichever stream it is routed to, so counting it
+    proves nothing -- and it wedged the 12:30 slot for the whole 30-day
+    evidence window after its writer was fixed (the three 2026-09-15..17
+    midday stubs were still aborting the slot on 2026-09-22, four days after
+    the 2026-09-18 Gate 9 template fix stopped new ones).
+
+    This is proof of irrelevance, the same argument ``_relevant`` makes for an
+    out-of-window file, NOT trust in a schema variant: the file's classification
+    is never read. Every signal that the file could carry capital keeps it
+    gated, fail closed:
+
+    * ``deployed_usd`` is nonzero (candidate notional, or the budget fallback);
+    * any candidate carries a deployed status or an ambiguous-placement flag,
+      even with an unusable notional that ``deployed_usd`` sums as $0;
+    * ``deployed_usd_by_claim_date`` attributes anything to any day;
+    * ``orders_submitted_count`` is present and not exactly the integer 0;
+    * ``order_submit_status`` is present and not a known not-submitted value;
+    * ``has_unusable_deployed_notional`` flags it -- a ``buy_candidates``
+      present as an object/scalar/null, or an unusable
+      ``budget.day_notional_usd``, makes ``deployed_usd`` return 0 while
+      being corrupt evidence, not proof of nothing (Copilot review: "Fail
+      closed on unusable deployed-notional evidence").
+    """
+    if has_unusable_deployed_notional(data):
+        return False
+    if deployed_usd(data) != 0:
+        return False
+    candidates = data.get("buy_candidates")
+    if isinstance(candidates, list) and any(
+        isinstance(c, dict)
+        and (_is_deployed_status(c.get("status")) or c.get("ambiguous_placement_exception") is True)
+        for c in candidates
+    ):
+        return False
+    if any(amount for amount in deployed_usd_by_claim_date(data).values()):
+        return False
+    if "orders_submitted_count" in data:
+        count = data["orders_submitted_count"]
+        # bool is an int subclass: True must not pass as a count of 1 or 0.
+        if isinstance(count, bool) or not isinstance(count, int) or count != 0:
+            return False
+    if "order_submit_status" in data and data["order_submit_status"] not in _NOT_SUBMITTED_ORDER_STATUSES:
+        return False
+    return True
+
+
 def _load_states_with_evidence(
     root: str | Path, as_of: Optional[date] = None
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -1192,6 +1267,12 @@ def _load_states_with_evidence(
     # or carries one of the wrong JSON type (a real corruption). See
     # ``_unclassifiable_reason``.
     unclassifiable_reasons: Dict[str, str] = {}
+    # Unclassifiable files that provably carry no capital under any
+    # classification (``_unclassifiable_state_deployed_nothing``). Reported,
+    # never gated -- the same treatment unusable_states_outside_window gets,
+    # for the same reason: they cannot move any figure this report publishes,
+    # and gating on them wedged the 12:30 slot on long-fixed legacy stubs.
+    unclassifiable_without_deployment: List[str] = []
     # Files parked as out-of-window, held as (path, origin bucket) until the
     # whole tree has been read -- see path_dates_contradicted below.
     deferred: List[Tuple[str, str]] = []
@@ -1301,16 +1382,33 @@ def _load_states_with_evidence(
             # disagree for no visible reason.
             if not isinstance(data.get("run_classification"), dict):
                 unclassifiable_reasons[str(path)] = _unclassifiable_reason(data)
-                if _relevant(path):
+                # A file that deployed nothing is irrelevant whatever its
+                # date says, so it is tagged here and path_dates_contradicted
+                # below must not pull it back into the gate either. Out-of-
+                # window files still defer first, so they keep reporting
+                # under unusable_states_outside_window exactly as before.
+                bucket = (
+                    "unclassifiable_without_deployment"
+                    if _unclassifiable_state_deployed_nothing(data)
+                    else "unclassifiable"
+                )
+                if not _relevant(path):
+                    deferred.append((str(path), bucket))
+                elif bucket == "unclassifiable":
                     unclassifiable.append(str(path))
                 else:
-                    deferred.append((str(path), "unclassifiable"))
+                    unclassifiable_without_deployment.append(str(path))
     if path_dates_contradicted:
         # Fail closed: this tree's directory names do not track its states'
         # dates, so nothing was proven irrelevant. Every deferred file goes
         # back to the bucket it came from.
+        restore_to = {
+            "unreadable": unreadable,
+            "unclassifiable": unclassifiable,
+            "unclassifiable_without_deployment": unclassifiable_without_deployment,
+        }
         for deferred_path, bucket in deferred:
-            (unreadable if bucket == "unreadable" else unclassifiable).append(deferred_path)
+            restore_to[bucket].append(deferred_path)
         outside_window: List[str] = []
     else:
         outside_window = [deferred_path for deferred_path, _bucket in deferred]
@@ -1452,6 +1550,15 @@ def _load_states_with_evidence(
         # entry that turned out to be outside the window (and so never counted
         # against the gate) does not appear here as if it had.
         "unclassifiable_reasons": {p: unclassifiable_reasons[p] for p in sorted(unclassifiable)},
+        # Visibility only, never gated: see _unclassifiable_state_deployed_nothing.
+        # Still listed with reasons so the writer that produced them can be
+        # chased -- a nonzero count here means some writer is still emitting
+        # the wrong shape, even though it no longer blocks sizing.
+        "unclassifiable_states_without_deployment": len(unclassifiable_without_deployment),
+        "unclassifiable_without_deployment_paths": sorted(unclassifiable_without_deployment),
+        "unclassifiable_without_deployment_reasons": {
+            p: unclassifiable_reasons[p] for p in sorted(unclassifiable_without_deployment)
+        },
         "afternoon_states_seen": afternoon_seen,
         # Broken out rather than folded into run_states_unclassifiable: these
         # states ARE classifiable (that is how they reached the afternoon

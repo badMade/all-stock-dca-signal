@@ -201,6 +201,63 @@ class BrokerOrder:
     has_unvalued_fill: bool = False  # terminal order shows a fill we could not value
 
 
+def _executions_vwap(raw: Mapping[str, Any], *, filled_qty: Optional[float]) -> Optional[float]:
+    """Volume-weighted fill price from a row's ``executions`` list, or None.
+
+    All-or-nothing: one unreadable execution (non-dict, missing or non-positive
+    price/quantity) makes the average unknown, so this returns None rather than
+    averaging over whichever subset happened to parse. When the row also
+    reports its executed quantity, the executions must add up to it -- a
+    partial list would weight the average toward the fills it happens to show.
+    """
+    executions = raw.get("executions")
+    if not isinstance(executions, list) or not executions:
+        return None
+    total_qty = 0.0
+    total_value = 0.0
+    for execution in executions:
+        if not isinstance(execution, Mapping):
+            return None
+        price = _money(execution.get("price"))
+        qty = _to_float(execution.get("quantity"))
+        if not price or not qty or price <= 0 or qty <= 0:
+            return None
+        total_qty += qty
+        total_value += price * qty
+    if filled_qty is not None and abs(total_qty - filled_qty) > 1e-6:
+        return None
+    return total_value / total_qty
+
+
+def _fill_price(raw: Mapping[str, Any], *, filled_qty: Optional[float]) -> Optional[float]:
+    """The order's executed (average FILL) price, from whichever field reports it.
+
+    2026-09-22 2:30 PM: MA's earlier same-day fill was in the saved history,
+    yet the top-up gate reported MISSING_PRIOR_PRICE. Reading only a scalar
+    ``average_price`` let a real fill count as exposure (``executed_notional``
+    is parsed as a money object) while its price came back None -- and one
+    priceless qualifying order poisons the whole ticker's reference. In order:
+
+    1. ``average_price``, as a scalar OR a ``{"amount": ...}`` money object,
+       the same shape ``executed_notional`` is already accepted in;
+    2. the VWAP of a fully readable ``executions`` list;
+    3. ``executed_notional / cumulative_quantity``, both broker-reported.
+
+    Never the ``price`` field: on a limit order that is the LIMIT, not a fill
+    (see test_normalize_ignores_limit_price_as_fill_price).
+    """
+    avg_price = _money(raw.get("average_price"))
+    if avg_price and avg_price > 0:
+        return avg_price
+    vwap = _executions_vwap(raw, filled_qty=filled_qty)
+    if vwap is not None:
+        return vwap
+    executed_notional = _money(raw.get("executed_notional"))
+    if executed_notional and executed_notional > 0 and filled_qty and filled_qty > 0:
+        return executed_notional / filled_qty
+    return None
+
+
 def _executed_dollars(raw: Mapping[str, Any], *, filled_qty: Optional[float], avg_price: Optional[float]) -> float:
     """Dollars this order actually executed (settled), or 0 if nothing filled.
 
@@ -292,8 +349,10 @@ def normalize_order(raw: Mapping[str, Any]) -> Optional[BrokerOrder]:
     filled_qty = cumulative_qty if cumulative_qty is not None else _to_float(raw.get("quantity"))
     # ``average_price`` is the executed fill price. The ``price`` field is the
     # LIMIT price on a limit order, not the achieved fill, so it must not be used
-    # as the fill price for notional/reference computations.
-    avg_price = _to_float(raw.get("average_price"))
+    # as the fill price for notional/reference computations. _fill_price also
+    # recovers it from a money-object average_price, the executions list, or
+    # executed_notional / cumulative_quantity -- see its docstring.
+    avg_price = _fill_price(raw, filled_qty=filled_qty)
     is_filled = state == "filled"
     is_live = state in _LIVE_ORDER_STATES
     # A state that is neither known-live nor a known terminal (including a missing
@@ -301,7 +360,9 @@ def normalize_order(raw: Mapping[str, Any]) -> Optional[BrokerOrder]:
     # state, so it must not be assumed terminal/zero-exposure.
     unknown_state = (not is_live) and (state not in _TERMINAL_ORDER_STATES)
     # A reference price is trusted only from a confirmed full fill; a live but
-    # unfilled order's logged price may still be rejected/repriced.
+    # unfilled order's logged price may still be rejected/repriced. A terminal
+    # order's partial fill stays unreferenced on purpose (manual review) -- see
+    # test_a_cancelled_order_that_partially_filled_counts_and_blocks_pending_review.
     reference_price = avg_price if (is_filled and avg_price and avg_price > 0) else None
     executed = _executed_dollars(raw, filled_qty=filled_qty, avg_price=avg_price)
     if is_live:

@@ -1028,3 +1028,73 @@ def test_to_float_and_order_id_cleaning_survive_hostile_json_shapes():
     assert _to_float(True) is None
     assert _to_float("12.5") == 12.5
     assert _clean_order_ids([123, " a ", None, "-", "", "a", True]) == ["123", "a"]
+
+
+# --- 2026-09-22 2:30 PM: MA same-day fill surfaced as MISSING_PRIOR_PRICE ------
+#
+# The 2:30 run zeroed MA with MISSING_PRIOR_PRICE although MA's earlier fill,
+# and its price, sat in the saved order history. normalize_order counted each
+# of these shapes as exposure (notional_usd > 0) while leaving
+# reference_price None, and one priceless qualifying order poisons the whole
+# ticker's reference (_most_recent_reference) -- so every later slot that day
+# failed closed on a fill whose price was plainly available. Each test below
+# pins one such shape. None of them may ever read the LIMIT ``price`` field
+# (see test_normalize_ignores_limit_price_as_fill_price, which still holds).
+
+
+def test_money_object_average_price_is_a_reference_price():
+    # executed_notional is already parsed as a money object; average_price in
+    # the same {"amount": ...} shape must parse the same way, not as None.
+    raw = {"id": "m1", "symbol": "MA", "state": "filled", "side": "buy",
+           "cumulative_quantity": "0.007", "average_price": {"amount": "571.43", "currency_code": "USD"},
+           "executed_notional": {"amount": "4.00", "currency_code": "USD"}}
+    order = normalize_order(raw)
+    assert order is not None
+    assert order.notional_usd == pytest.approx(4.0)
+    assert order.reference_price == pytest.approx(571.43)
+
+
+def test_filled_order_without_average_price_derives_it_from_executed_notional():
+    raw = {"id": "m2", "symbol": "MA", "state": "filled", "side": "buy",
+           "cumulative_quantity": "0.008", "executed_notional": {"amount": "4.00"}}
+    order = normalize_order(raw)
+    assert order is not None
+    assert order.notional_usd == pytest.approx(4.0)
+    assert order.reference_price == pytest.approx(500.0)
+
+
+def test_filled_order_without_average_price_derives_it_from_executions():
+    raw = {"id": "m3", "symbol": "MA", "state": "filled", "side": "buy",
+           "cumulative_quantity": "0.008",
+           "executions": [{"price": "499.00", "quantity": "0.004"}, {"price": "501.00", "quantity": "0.004"}]}
+    order = normalize_order(raw)
+    assert order is not None
+    assert order.reference_price == pytest.approx(500.0)
+    assert order.notional_usd == pytest.approx(4.0)
+
+
+@pytest.mark.parametrize(
+    "executions",
+    [
+        [{"price": "499.00", "quantity": "0.004"}, {"price": "n/a", "quantity": "0.004"}],
+        [{"price": "499.00"}],
+        [{"price": "499.00", "quantity": "0"}],
+        "not-a-list",
+    ],
+)
+def test_malformed_executions_never_produce_a_reference(executions):
+    # Any unreadable execution means the VWAP is unknown: fail closed to None
+    # rather than averaging over the subset that happened to parse.
+    raw = {"id": "m4", "symbol": "MA", "state": "filled", "side": "buy",
+           "cumulative_quantity": "0.008", "executions": executions}
+    order = normalize_order(raw)
+    assert order is not None
+    assert order.reference_price is None
+
+
+def test_live_partially_filled_order_still_has_no_reference():
+    # Still working on the book: its average can move, so it must keep
+    # poisoning the reference exactly as before.
+    order = normalize_order(_raw("m6", "MA", "partially_filled", qty="0.004", price="500.00", notional="4.00"))
+    assert order is not None
+    assert order.reference_price is None

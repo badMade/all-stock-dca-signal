@@ -1186,3 +1186,29 @@ def test_main_rejects_the_pre_pinning_bare_array_shape(tmp_path, capsys):
     )
     assert exit_code == 2
     assert json.loads(capsys.readouterr().out)["verdict"] == "ABORT"
+
+
+def test_a_visible_prior_fill_without_average_price_is_not_missing_prior_price():
+    """2026-09-22 2:30 PM: MA was bought earlier that day and the fill was in
+    the saved history, yet the gate reported MISSING_PRIOR_PRICE. A fill whose
+    price is derivable (here: executed_notional / cumulative_quantity, with no
+    average_price field) must yield a reference, so the decision is the
+    policy's own answer -- here NO_LOWER_PRICE, since the current price is
+    above the $500 fill -- not a fail-closed "unknown"."""
+    fill = {
+        "id": "ma-935",
+        "symbol": "MA",
+        "side": "buy",
+        "state": "filled",
+        "cumulative_quantity": "0.008000",
+        "executed_notional": {"amount": "4.00", "currency_code": "USD"},
+        "dollar_based_amount": {"amount": "4.00", "currency_code": "USD"},
+        "created_at": "2026-07-30T13:35:10Z",
+    }
+    r = _run([_page([fill])], [{"ticker": "MA", "desired_usd": 4.00, "current_price": 505.00}])
+    assert r["verdict"] == "PROCEED"
+    d = _by_ticker(r)["MA"]
+    assert d["reason"] != MISSING_PRIOR_PRICE
+    assert d["reason"] in (ALREADY_MET_OR_OVERFILLED, NO_LOWER_PRICE)
+    assert d["reference_price"] == pytest.approx(500.0)
+    assert d["buy_usd"] == pytest.approx(0.0)

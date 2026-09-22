@@ -14,6 +14,17 @@ the same-day top-up guard fix. Source of truth is
 through `update_scheduled_task`'s full-body replacement, then the mirror is
 re-captured.
 
+**Check for drift before trusting a mirror.** On the machine that runs the
+Cowork tasks, `python3 -m scripts.check_live_prompt_drift` compares every
+live `SKILL.md` with its mirror and names three known failures:
+`missing_top_up_gate` (the live body never runs the same-day top-up guard),
+`bare_array_order_pages` (it saves order history in the shape the guard
+rejects), and `stale_window_end_date` (it hardcodes a window end that
+`config/trading_window.json` no longer says). Add `--diff` for masked diffs.
+It exits 1 when any slot needs a repaste. On 2026-09-22 the 2:30 PM run found
+its live body instructing the bare-array shape and a stale end date, while
+these mirrors were already correct.
+
 **These mirrors are not byte-identical to the live prompts.** The live prompts
 carry the Robinhood account number as a literal; every occurrence is replaced
 with `${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}` before committing, because this repo

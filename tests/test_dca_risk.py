@@ -156,9 +156,16 @@ def test_evidence_separates_a_parsed_but_uninformative_state(tmp_path):
     assert states == [{}]
     assert evidence["run_states_loaded"] == 1
     assert evidence["run_states_unreadable"] == 0
-    assert evidence["run_states_unclassifiable"] == 1
+    # `{}` carries no deployment under ANY classification, so since the
+    # 2026-09-22 dispatch investigation it is reported in its own non-gating
+    # bucket rather than counted against run_states_unclassifiable. The
+    # original concern this test pins -- a consumer reading "1 loaded" as proof
+    # of afternoon history -- is still caught: afternoon_states_seen stays 0,
+    # and that gate is asserted > 0 in its own right.
+    assert evidence["run_states_unclassifiable"] == 0
+    assert evidence["unclassifiable_states_without_deployment"] == 1
     assert evidence["afternoon_states_seen"] == 0
-    assert evidence["unclassifiable_reasons"] == {
+    assert evidence["unclassifiable_without_deployment_reasons"] == {
         str(day / "run_state.json"): "no run_classification key (top-level keys: none)"
     }
 
@@ -180,8 +187,15 @@ def test_evidence_unclassifiable_reason_names_a_missing_key(tmp_path):
     day = root / "20260707_1520ET"
     day.mkdir(parents=True)
     state_path = day / "run_state.json"
+    # Carries a placed order so it stays on the GATED path: a file that
+    # deployed nothing is reported under unclassifiable_states_without_
+    # deployment instead (see the 2026-09-22 regression tests below).
     state_path.write_text(
-        _json.dumps({"trading_day": "2026-07-07", "classification": {"stream": "scheduled"}}),
+        _json.dumps({
+            "trading_day": "2026-07-07",
+            "classification": {"stream": "scheduled"},
+            "buy_candidates": [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 2.0}],
+        }),
         encoding="utf-8",
     )
 
@@ -190,7 +204,7 @@ def test_evidence_unclassifiable_reason_names_a_missing_key(tmp_path):
     assert evidence["run_states_unclassifiable"] == 1
     assert evidence["unclassifiable_paths"] == [str(state_path)]
     assert evidence["unclassifiable_reasons"] == {
-        str(state_path): "no run_classification key (top-level keys: classification, trading_day)"
+        str(state_path): "no run_classification key (top-level keys: buy_candidates, classification, trading_day)"
     }
 
 
@@ -205,7 +219,11 @@ def test_evidence_unclassifiable_reason_names_a_wrong_type(tmp_path):
     day.mkdir(parents=True)
     state_path = day / "run_state.json"
     state_path.write_text(
-        _json.dumps({"trading_day": "2026-07-07", "run_classification": "scheduled"}),
+        _json.dumps({
+            "trading_day": "2026-07-07",
+            "run_classification": "scheduled",
+            "buy_candidates": [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 2.0}],
+        }),
         encoding="utf-8",
     )
 
@@ -245,10 +263,132 @@ def test_midday_run_classification_bare_string_shorthand_is_unclassifiable(tmp_p
 
     _states, evidence = _load_states_with_evidence(root)
 
-    assert evidence["run_states_unclassifiable"] == 1
-    assert evidence["unclassifiable_reasons"] == {
+    # Still named, with its reason, so the writer can be chased -- but no
+    # longer gating: this stub records no deployment, so no classification
+    # could route capital from it into any figure. Counting it wedged the
+    # 12:30 slot for the whole 30-day evidence window AFTER the writer was
+    # fixed on 2026-09-18 (still aborting on 2026-09-22 with
+    # run_states_unclassifiable: 3 -- the 9/15, 9/16 and 9/17 stubs).
+    assert evidence["run_states_unclassifiable"] == 0
+    assert evidence["unclassifiable_states_without_deployment"] == 1
+    assert evidence["unclassifiable_without_deployment_paths"] == [str(state_path)]
+    assert evidence["unclassifiable_without_deployment_reasons"] == {
         str(state_path): "run_classification is str, not an object"
     }
+
+
+def _write_unclassifiable(root, name, payload):
+    """Write one in-window midday stub whose run_classification is a bare string."""
+    import json as _json
+
+    day = root / name
+    day.mkdir(parents=True)
+    path = day / "run_state.json"
+    body = {"trading_day": "2026-09-16", "run_classification": "failed_start_no_evidence"}
+    body.update(payload)
+    path.write_text(_json.dumps(body), encoding="utf-8")
+    return path
+
+
+def test_three_legacy_non_deploying_stubs_no_longer_wedge_the_evidence_gate(tmp_path):
+    """Regression for the 2026-09-22 12:30 abort: dca_risk reported
+    run_states_unclassifiable: 3 four days after the 2026-09-18 writer fix,
+    because the three malformed 9/15-9/17 stubs stay inside the 30-day
+    EVIDENCE_WINDOW_DAYS until mid-October. None of them recorded an order, so
+    the gate must pass on them while still listing them for cleanup."""
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "midday_dca"
+    paths = [
+        _write_unclassifiable(root, run_dir, {
+            "trading_day": trading_day,
+            "order_submit_status": "not_submitted_error",
+            "orders_submitted_count": 0,
+            "buy_candidates": [{"ticker": "AAPL", "status": "skipped", "planned_amount_usd": 2.0}],
+        })
+        for run_dir, trading_day in (
+            ("20260915_1230ET", "2026-09-15"),
+            ("20260916_1230ET", "2026-09-16"),
+            ("20260917_1230ET", "2026-09-17"),
+        )
+    ]
+
+    _states, evidence = _load_states_with_evidence(root, as_of=date(2026, 9, 22))
+
+    assert evidence["run_states_unclassifiable"] == 0
+    assert evidence["unclassifiable_states_without_deployment"] == 3
+    assert evidence["unclassifiable_without_deployment_paths"] == sorted(str(p) for p in paths)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # A real placed order: routing this file is exactly what the gate protects.
+        {"buy_candidates": [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 2.0}]},
+        # Deployed status with an unusable notional: deployed_usd() sums $0, but
+        # the row is still order evidence -- a $0 sum must not read as "nothing".
+        {"buy_candidates": [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": "n/a"}]},
+        # Ambiguous placement exception: possibly placed.
+        {"buy_candidates": [{"ticker": "AAPL", "status": "error", "ambiguous_placement_exception": True}]},
+        # No candidate detail, but the budget fallback carries notional.
+        {"budget": {"day_notional_usd": 4.0}},
+        # The file itself says orders went out.
+        {"orders_submitted_count": 2},
+        # Garbage count: not provably zero, so fail closed.
+        {"orders_submitted_count": "0"},
+        {"orders_submitted_count": True},
+        # A submit status outside the known not-submitted vocabulary.
+        {"order_submit_status": "submitted"},
+        {"order_submit_status": "some_new_status"},
+        # Corrupt deployment evidence: deployed_usd() reads each as $0, but
+        # has_unusable_deployed_notional() treats them as unusable, not empty.
+        {"buy_candidates": {"ticker": "AAPL", "status": "filled"}},
+        {"buy_candidates": None},
+        {"budget": {"day_notional_usd": "n/a"}},
+    ],
+)
+def test_unclassifiable_state_with_any_deployment_signal_still_gates(tmp_path, payload):
+    """The exemption is proof-of-irrelevance, not trust in a schema variant:
+    ANY sign this file could carry capital keeps it counted, fail closed."""
+    from dca_risk import _load_states_with_evidence
+
+    path = _write_unclassifiable(tmp_path / "midday_dca", "20260916_1230ET", payload)
+
+    _states, evidence = _load_states_with_evidence(tmp_path / "midday_dca", as_of=date(2026, 9, 22))
+
+    assert evidence["run_states_unclassifiable"] == 1
+    assert evidence["unclassifiable_paths"] == [str(path)]
+    assert evidence["unclassifiable_states_without_deployment"] == 0
+
+
+def test_non_deploying_exemption_survives_a_contradicted_path_date_tree(tmp_path):
+    """path_dates_contradicted re-counts DEFERRED (out-of-window) files because
+    their dates can no longer be trusted. A file that deployed nothing does not
+    depend on its date to be irrelevant, so it stays exempt there too -- while
+    a deploying one still comes back into the gate."""
+    import json as _json
+
+    from dca_risk import _load_states_with_evidence
+
+    root = tmp_path / "scheduled_runs"
+    stale_quiet = _write_unclassifiable(root, "20260101_1530ET", {"trading_day": "2026-01-01"})
+    stale_deploying = _write_unclassifiable(root, "20260102_1530ET", {
+        "trading_day": "2026-01-02",
+        "buy_candidates": [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 2.0}],
+    })
+    # A readable state attributing capital to a day AFTER its directory date
+    # contradicts the tree's naming convention (see path_dates_contradicted).
+    misfiled = root / "20260103_1530ET"
+    misfiled.mkdir(parents=True)
+    (misfiled / "run_state.json").write_text(
+        _json.dumps({"trading_day": "2026-09-20", "run_classification": {}}), encoding="utf-8"
+    )
+
+    _states, evidence = _load_states_with_evidence(root, as_of=date(2026, 9, 22))
+
+    assert evidence["unclassifiable_paths"] == [str(stale_deploying)]
+    assert evidence["unclassifiable_without_deployment_paths"] == [str(stale_quiet)]
+    assert evidence["unusable_states_outside_window"] == 0
 
 
 def test_evidence_counts_a_manual_only_tree_as_no_afternoon_history(tmp_path):
