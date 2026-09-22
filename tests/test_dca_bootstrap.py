@@ -189,6 +189,41 @@ def test_ensure_venv_skips_torch_cpu_pin_when_cuda_gpu_detected(tmp_path, monkey
     assert requirements_calls, calls
 
 
+def test_ensure_venv_skips_torch_cpu_pin_on_macos(tmp_path, monkeypatch) -> None:
+    # Apple wheels have no separate CUDA bundle to avoid -- the default PyPI
+    # wheel already includes the CPU/MPS support `--device auto` picks up
+    # (wondrous-octopus/requirements.txt's own comment) -- and pytorch.org's
+    # CPU-only index is not guaranteed to carry macOS wheels the way it does
+    # Linux/Windows, so pinning to it there risks breaking the install
+    # rather than shrinking it. Pin CANNOT apply here even with no GPU
+    # detected: _cuda_gpu_available() is left at its real (non-macOS)
+    # default of False to prove the platform check, not the GPU check, is
+    # what's gating this.
+    venv_dir = tmp_path / "venv"
+    req_file = tmp_path / "requirements.txt"
+    req_file.write_text("torch\n")
+
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr("dca_bootstrap._is_running_in_venv", lambda venv_python: True)
+    monkeypatch.setattr("dca_bootstrap._missing_packages", lambda packages: ["torch"])
+    monkeypatch.setattr("dca_bootstrap._cuda_gpu_available", lambda: False)
+
+    ensure_venv(packages=("torch",), requirements_files=(req_file,), venv_dir=venv_dir)
+
+    torch_cpu_calls = [c for c in calls if "torch" in c and "--index-url" in c]
+    assert not torch_cpu_calls, calls
+
+    requirements_calls = [c for c in calls if "-r" in c]
+    assert requirements_calls, calls
+
+
 def test_cuda_gpu_available_true_when_nvidia_smi_succeeds(monkeypatch) -> None:
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a[0], 0))
     assert _cuda_gpu_available() is True

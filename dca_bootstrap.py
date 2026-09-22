@@ -63,7 +63,13 @@ def _missing_packages(packages: Sequence[str]) -> list[str]:
 # silently break CUDA acceleration on a host that actually has a GPU
 # (Copilot review on #1505: "Unconditional CPU install breaks CUDA device
 # selection"). Skip the CPU pin when a CUDA GPU is detected, letting the
-# later plain `pip install` resolve torch normally.
+# later plain `pip install` resolve torch normally. Also skip it on macOS
+# entirely: Apple wheels have no separate CUDA bundle to avoid in the first
+# place (the default PyPI wheel already includes the CPU/MPS support
+# `--device auto` picks up -- see wondrous-octopus/requirements.txt's own
+# comment), and pytorch.org's CPU-only index is not guaranteed to carry
+# macOS wheels the way it does Linux/Windows, so pinning to it there risks
+# breaking the install rather than shrinking it.
 _TORCH_CPU_INDEX_URL = "https://download.pytorch.org/whl/cpu"
 
 
@@ -90,7 +96,7 @@ def _install_dependencies(
     requirements_files: Sequence[Path | str],
 ) -> None:
     """Install ``to_install`` (or ``requirements_files``) into ``venv_python``."""
-    if "torch" in to_install and not _cuda_gpu_available():
+    if "torch" in to_install and sys.platform != "darwin" and not _cuda_gpu_available():
         subprocess.run(
             [str(venv_python), "-m", "pip", "install", "torch", "--index-url", _TORCH_CPU_INDEX_URL],
             check=True,
