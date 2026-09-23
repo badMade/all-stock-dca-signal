@@ -39,7 +39,11 @@
       }
     },
     "in_app_message_center": { "enabled": true, "note": "Primary notification channel." },
-    "email": { "enabled": true, "scope": "Only where a task explicitly says to email; no routine dashboard emails." }
+    "email": {
+      "enabled": true,
+      "address": "${DCA_ALERT_EMAIL_ADDRESS}",
+      "scope": "Only where a task explicitly says to email; no routine dashboard emails."
+    }
   },
   "routing": {
     "live_run_alerts": ["in_app_message_center"],

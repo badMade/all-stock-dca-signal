@@ -622,6 +622,36 @@ def test_notifications_schema_rejects_a_non_boolean_channel_enabled_flag():
         jsonschema.validate(document, schema)
 
 
+def test_email_channel_declares_operator_address_via_env_placeholder():
+    """Every executor prompt (claude/dca-executor-prompts/*.txt and
+    live-mirror/*.txt) tells the agent to send alerts "to the operator email
+    configured for alerts (do not hardcode a personal address)" -- but
+    nothing in config/notifications.json ever named that address, so a
+    compliant executor has nowhere to send to and falls back to a draft
+    (see docs/alert_digest.md's EMAIL_DRAFT_NOT_DELIVERED case). The address
+    must be the expandable placeholder, resolved the same way
+    dca_config.expand_config_env resolves ${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER},
+    never a literal address committed to git."""
+    document = _load("notifications.json")
+    assert document["channels"]["email"]["address"] == "${DCA_ALERT_EMAIL_ADDRESS}", (
+        "config/notifications.json's channels.email must declare 'address': "
+        '"${DCA_ALERT_EMAIL_ADDRESS}" so a live executor has a destination to send to'
+    )
+
+
+def test_notifications_schema_rejects_a_hardcoded_email_address():
+    """The schema must enforce the same "never hardcode a personal address"
+    rule the executor prompts state in prose -- a manual edit that pastes a
+    literal address into channels.email.address should fail validation, not
+    silently reach an executor as config it can send to verbatim."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "notifications.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("notifications.json")))  # deep copy
+    document["channels"]["email"]["address"] = "geoffplymale@gmail.com"
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
 def test_reporting_schema_rejects_a_non_object_notion_block():
     """`notion` is declared as an object (the notion sync's config surface);
     a scalar left over from a botched manual edit must be rejected rather
