@@ -39,14 +39,16 @@ import itertools
 import re
 import socket
 import urllib.request
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
+import dca_config
 import dca_runner
 from conftest import FIXTURE_ACCOUNT_NUMBER
-from near_close_dca import BudgetTier, DryRunBroker, iso_week_key
+from near_close_dca import BudgetTier, DryRunBroker, iso_week_key, nyse_holidays
 from scripts import reason_codes as rc
 from scripts.broker_reconciliation import (
     EffectivePrior,
@@ -71,6 +73,15 @@ from scripts.run_state_machine import (
 from scripts.scheduler_lease import SchedulerLease, window_key
 
 ET = ZoneInfo("America/New_York")
+REPO = Path(__file__).resolve().parents[1]
+
+
+def _first_trading_day_after_window() -> date:
+    approved = dca_config.load_approved_dates(REPO / "config")["approved_test_dates"]
+    day = max(approved) + timedelta(days=1)
+    while day.weekday() >= 5 or day in nyse_holidays(day.year):
+        day += timedelta(days=1)
+    return day
 
 # The synthetic account conftest.py pins before any module import. execute_plan
 # requires broker.account_number to equal exactly this (Codex review: "Verify
@@ -1149,11 +1160,9 @@ def test_a_market_holiday_ends_silently():
 
 
 def test_a_fire_past_the_approved_test_window_aborts():
-    """config/trading_window.json now stops at 2027-03-12, the Friday before the
-    2027-03-14 EST->EDT change (the 2026-11-01 EDT->EST stop was lifted on
-    2026-09-18 once the external trigger gates became DST-aware). Trading past
-    the end_date is refused whatever the reason for the end_date."""
-    result = _assess(now=datetime(2027, 3, 15, 9, 43, tzinfo=ET))
+    """Trading past the configured approved window is refused whatever its end date."""
+    after_window = _first_trading_day_after_window()
+    result = _assess(now=datetime(after_window.year, after_window.month, after_window.day, 9, 43, tzinfo=ET))
     assert result["verdict"] == "ABORT"
 
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import replace
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path, PureWindowsPath
 
 import pytest
@@ -83,6 +83,19 @@ def _record(alert_id, when, slot, gate, verdict="ABORT", warnings=()):
         verdict=verdict,
         warnings=tuple(warnings),
     )
+
+
+def _approved_window_last_trading_day_and_next():
+    window = approved_trading_window()
+    assert window is not None
+    start, end = window
+    window_days = expected_roster_days(start, end)
+    assert window_days
+    last_window_day = window_days[-1]
+    next_trading_day = last_window_day + timedelta(days=1)
+    while not is_trading_day(next_trading_day):
+        next_trading_day += timedelta(days=1)
+    return last_window_day, next_trading_day
 
 
 # --- timestamps --------------------------------------------------------------
@@ -1635,13 +1648,14 @@ def test_lowercase_reason_code_negation_is_still_honoured():
 
 
 def test_expected_days_stop_at_the_approved_trading_window():
-    # config/trading_window.json ends 2027-03-12; the weekdays after it are days
-    # the scheduler's trigger window had already closed on, not days it died.
-    days = expected_roster_days(date(2027, 3, 10), date(2027, 3, 19))
-    assert max(days) == date(2027, 3, 12)
-    assert date(2027, 3, 15) not in days
+    # The weekdays after the last approved in-window trading day are days the
+    # scheduler's trigger window had already closed on, not days it died.
+    last_window_day, next_trading_day = _approved_window_last_trading_day_and_next()
+    days = expected_roster_days(last_window_day - timedelta(days=3), next_trading_day + timedelta(days=4))
+    assert max(days) == last_window_day
+    assert next_trading_day not in days
     # The raw NYSE calendar still has them; only the *expected* view is clamped.
-    assert date(2027, 3, 15) in trading_days_between(date(2027, 3, 10), date(2027, 3, 19))
+    assert next_trading_day in trading_days_between(last_window_day - timedelta(days=3), next_trading_day + timedelta(days=4))
 
 
 def test_expected_days_stop_before_the_approved_window_start():
@@ -1650,15 +1664,20 @@ def test_expected_days_stop_before_the_approved_window_start():
 
 
 def test_days_after_the_window_are_not_reported_as_roster_silent(tmp_path, capsys):
+    last_window_day, next_trading_day = _approved_window_last_trading_day_and_next()
     path = tmp_path / "drafts.json"
     path.write_text(
-        json.dumps({"drafts": [_draft("r1", "2027-03-12T19:34:00Z", "ABORT 3:30 PM ET slot Gate 4", "x")]}),
+        json.dumps({"drafts": [_draft("r1", f"{last_window_day.isoformat()}T19:34:00Z", "ABORT 3:30 PM ET slot Gate 4", "x")]}),
         encoding="utf-8",
     )
-    main(["--drafts", str(path), "--since", "2027-03-10", "--as-of", "2027-03-19", "--json"])
+    window_start = last_window_day - timedelta(days=3)
+    as_of = next_trading_day + timedelta(days=4)
+    main(["--drafts", str(path), "--since", window_start.isoformat(), "--as-of", as_of.isoformat(), "--json"])
     payload = json.loads(capsys.readouterr().out)
-    assert "2027-03-15" not in payload["roster_silent_days"]
-    assert payload["roster_silent_days"] == ["2027-03-10", "2027-03-11"]
+    assert next_trading_day.isoformat() not in payload["roster_silent_days"]
+    assert payload["roster_silent_days"] == [
+        day.isoformat() for day in expected_roster_days(window_start, last_window_day) if day < last_window_day
+    ]
 
 
 def test_unclamped_when_the_window_config_is_unreadable(tmp_path, monkeypatch):
@@ -1855,16 +1874,17 @@ def test_slot_filter_still_renders_another_slots_off_calendar_firing(tmp_path, c
 
 
 def test_an_out_of_window_weekday_is_not_called_a_non_trading_day(tmp_path, capsys):
-    # 2027-03-15 is an ordinary NYSE Monday; it is past the approved window, so
-    # the fault is an off-schedule firing, not an off-market one.
+    # The first ordinary trading day after the approved window is an off-schedule
+    # firing, not an off-market one.
+    _, next_trading_day = _approved_window_last_trading_day_and_next()
     path = tmp_path / "drafts.json"
     path.write_text(
-        json.dumps({"drafts": [_draft("r1", "2027-03-15T20:34:00Z", "ABORT 3:30 PM ET slot Gate 4", "x")]}),
+        json.dumps({"drafts": [_draft("r1", f"{next_trading_day.isoformat()}T20:34:00Z", "ABORT 3:30 PM ET slot Gate 4", "x")]}),
         encoding="utf-8",
     )
-    main(["--drafts", str(path), "--as-of", "2027-03-15"])
+    main(["--drafts", str(path), "--as-of", next_trading_day.isoformat()])
     out = capsys.readouterr().out
-    assert "2027-03-15" in out
+    assert next_trading_day.isoformat() in out
     assert "outside the approved trading window" in out
     assert "NOT a trading day" not in out
 
@@ -1880,7 +1900,7 @@ def test_a_weekend_firing_is_still_called_a_non_trading_day(tmp_path, capsys):
 
 
 def test_is_trading_day_separates_holidays_from_the_approved_window():
-    assert is_trading_day(date(2026, 11, 2))          # past the window, still open
+    assert is_trading_day(date(2026, 11, 2))          # inside or outside the window, still open
     assert not is_trading_day(date(2026, 8, 22))      # Saturday
     assert not is_trading_day(date(2026, 11, 26))     # Thanksgiving
 
@@ -2283,14 +2303,15 @@ def test_json_coverage_classifies_a_weekend_firing(tmp_path, capsys):
 
 
 def test_json_coverage_classifies_a_day_outside_the_approved_window(tmp_path, capsys):
+    _, next_trading_day = _approved_window_last_trading_day_and_next()
     path = tmp_path / "drafts.json"
     path.write_text(
-        json.dumps({"drafts": [_draft("r1", "2027-03-15T20:34:00Z", "ABORT 3:30 PM ET slot Gate 4", "x")]}),
+        json.dumps({"drafts": [_draft("r1", f"{next_trading_day.isoformat()}T20:34:00Z", "ABORT 3:30 PM ET slot Gate 4", "x")]}),
         encoding="utf-8",
     )
-    main(["--drafts", str(path), "--as-of", "2027-03-15", "--json"])
+    main(["--drafts", str(path), "--as-of", next_trading_day.isoformat(), "--json"])
     payload = json.loads(capsys.readouterr().out)
-    assert payload["day_classification"]["2027-03-15"] == "outside_approved_trading_window"
+    assert payload["day_classification"][next_trading_day.isoformat()] == "outside_approved_trading_window"
 
 
 def test_json_and_text_classification_agree_on_every_day(tmp_path, capsys):

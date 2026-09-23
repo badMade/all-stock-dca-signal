@@ -369,31 +369,31 @@ def _weekday_range(start: date, end: date) -> set:
 MARKET_HOLIDAYS = frozenset({date(2026, 7, 3)})
 
 # Approved live-test window. The original pilot dates (Jun 29 - Jul 1 2026) plus
-# the canonical live window of weekdays 2026-07-02 through 2027-03-12 inclusive
+# the canonical live window of weekdays 2026-07-02 through 2027-11-06 inclusive
 # (minus market holidays), matching config/trading_window.json's start_date/
 # end_date (the authoritative window, extended from 2026-08-28 to 2026-10-30 on
-# 2026-07-26 and again to 2027-03-12 on 2026-09-18). The 2026-07-26 extension
-# deliberately stopped the Friday before the EDT->EST change because the
-# external trigger gates were fixed-UTC/EDT-only; the 2026-09-18 extension
-# records those gates as now DST-aware (dual-hour UTC crons covering both the
-# EDT-hour and EST-hour local fires), which is what unblocked spanning the
-# standard-time season. 2027-03-12 (a Friday) is the last trading day before the
-# 2027-03-14 EST->EDT transition, which falls on a Sunday; see that file's
-# own description. Without this, run_once()'s date gate would mark every scheduled run
-# in the live window blocked/no-trade. Callers normally override this default
-# via ``config/trading_window.json`` (``dca_config.load_approved_dates``), but
-# a bare ``StrategyConfig()`` and ``load_strategy_config`` with an absent
-# config dir both fall back to THIS set, so it must track the JSON: the
-# 2026-09-07 diagnostic (T:F02) found it still ending on 2026-08-28, i.e.
-# every JSON-blind path blocked with a no-trade date gate from 2026-08-31 on
-# while the JSON-driven paths kept trading.
+# 2026-07-26, to 2027-03-12 on 2026-09-18, and through the 2027 DST season on
+# 2026-09-22). The 2026-07-26 extension deliberately stopped the Friday before
+# the EDT->EST change because the external trigger gates were fixed-UTC/EDT-only;
+# the later extensions record those gates as now DST-aware (dual-hour UTC crons
+# covering both the EDT-hour and EST-hour local fires), which is what unblocked
+# spanning the 2026-27 standard-time season and the following daylight-time
+# season. 2027-11-06 is a Saturday, so the last approved trading day remains
+# 2027-11-05; see trading_window.json's description. Without this, run_once()'s
+# date gate would mark every scheduled run in the live window blocked/no-trade.
+# Callers normally override this default via ``config/trading_window.json``
+# (``dca_config.load_approved_dates``), but a bare ``StrategyConfig()`` and
+# ``load_strategy_config`` with an absent config dir both fall back to THIS set,
+# so it must track the JSON: the 2026-09-07 diagnostic (T:F02) found it still
+# ending on 2026-08-28, i.e. every JSON-blind path blocked with a no-trade date
+# gate from 2026-08-31 on while the JSON-driven paths kept trading.
 # tests/test_config_invariants.py pins the two to each other.
 # ``nyse_holidays()`` still applies on top of whichever set is active, which
 # is why the Labor Day inside the extended range is not listed in the
 # hand-maintained MARKET_HOLIDAYS above.
 APPROVED_TEST_DATES = (
     {date(2026, 6, 29), date(2026, 6, 30), date(2026, 7, 1)}
-    | _weekday_range(date(2026, 7, 2), date(2027, 3, 12))
+    | _weekday_range(date(2026, 7, 2), date(2027, 11, 6))
 ) - MARKET_HOLIDAYS
 
 

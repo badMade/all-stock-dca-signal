@@ -38,13 +38,15 @@ import threading
 import time as time_module
 import types
 from datetime import date, datetime, time, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
 
+import dca_config
 from conftest import FIXTURE_ACCOUNT_NUMBER
-from near_close_dca import WHOLE_SHARE_TICKERS, BudgetTier, StrategyState, iso_week_key
+from near_close_dca import WHOLE_SHARE_TICKERS, BudgetTier, StrategyState, iso_week_key, nyse_holidays
 
 dca_runner = pytest.importorskip(
     "dca_runner",
@@ -52,6 +54,15 @@ dca_runner = pytest.importorskip(
 )
 
 ET = ZoneInfo("America/New_York")
+REPO = Path(__file__).resolve().parents[1]
+
+def _first_trading_day_after_window() -> date:
+    approved = dca_config.load_approved_dates(REPO / "config")["approved_test_dates"]
+    day = max(approved) + timedelta(days=1)
+    while day.weekday() >= 5 or day in nyse_holidays(day.year):
+        day += timedelta(days=1)
+    return day
+
 
 # conftest.py sets $ROBINHOOD_AGENTIC_ACCOUNT_NUMBER to this synthetic value
 # before any module import, so it is also what dca_runner.execute_plan's
@@ -2977,8 +2988,7 @@ def test_gate3_inside_approved_window_passes():
 
 
 def test_gate3_past_end_date_fails():
-    """config/trading_window.json end_date is 2027-03-12."""
-    assert not dca_runner.gate_trading_window(date(2027, 3, 15))
+    assert not dca_runner.gate_trading_window(_first_trading_day_after_window())
 
 
 def test_gate3_before_start_date_fails():
@@ -11307,9 +11317,8 @@ def test_assess_off_schedule_firing_aborts_rather_than_running_late():
 
 
 def test_assess_past_trading_window_end_date_aborts():
-    # First weekday past config/trading_window.json's end_date (2027-03-12, a
-    # Friday); the 13th/14th are the weekend and the 14th is the EST->EDT change.
-    r = dca_runner.assess(**_clean_kwargs(now=datetime(2027, 3, 15, 9, 43, tzinfo=ET)))
+    after_window = _first_trading_day_after_window()
+    r = dca_runner.assess(**_clean_kwargs(now=datetime(after_window.year, after_window.month, after_window.day, 9, 43, tzinfo=ET)))
     assert r["verdict"] == "ABORT"
 
 

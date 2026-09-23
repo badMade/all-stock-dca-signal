@@ -37,6 +37,19 @@ def load(cfg, stem):
     return json.loads((cfg / f"{stem}.json").read_text(encoding="utf-8"))
 
 
+def approved_window_days(cfg):
+    approved = sorted(dca_config.load_approved_dates(Path(cfg))["approved_test_dates"])
+    assert approved
+    return approved
+
+
+def first_trading_day_after_window(cfg):
+    day = approved_window_days(cfg)[-1] + timedelta(days=1)
+    while day.weekday() >= 5 or day in reader.near_close_dca.nyse_holidays(day.year):
+        day += timedelta(days=1)
+    return day
+
+
 def every_builder(cfg):
     # Builders take the RootSpec's path: the label is for the browser, the
     # path for the reader, exactly as the other console readers split them.
@@ -274,18 +287,21 @@ def test_live_gate_summary_reports_names_never_values(cfg, monkeypatch):
     armed = {gate["name"]: gate for gate in reader.live_gate_summary(cfg, DAY)["gates"]}
     assert armed["account_number_env"]["state"] == "configured" and SYNTHETIC_ACCOUNT not in json.dumps(armed)
     assert "not empty" in armed["strategy_dry_run"]["detail"] and armed["strategy_dry_run"]["state"] == "unconfigured"
-    assert reader.live_gate_summary(cfg, date(2027, 3, 15))["gates"][4]["state"] == "unconfigured"
+    assert reader.live_gate_summary(cfg, first_trading_day_after_window(cfg))["gates"][4]["state"] == "unconfigured"
 
 
 def test_window_countdown_covers_expiry_and_calendar(cfg):
+    approved = approved_window_days(cfg)
+    window_end = approved[-1]
+    expected_years = list(range(approved[0].year, window_end.year + 2))
     inside = reader.window_countdown(cfg, DAY)
-    assert inside["start"] == "2026-07-02" and inside["end"] == "2027-03-12"
+    assert inside["start"] == approved[0].isoformat() and inside["end"] == window_end.isoformat()
     assert inside["in_window"] is True and inside["expired"] is False and inside["expiring_warning"] is False
     assert inside["days_remaining"] > reader.near_close_dca.APPROVED_WINDOW_EXPIRY_WARN_DAYS
-    assert inside["calendar_years"] == [2026, 2027, 2028] and inside["calendar_covers_day"] is True
-    near_end = reader.window_countdown(cfg, date(2027, 3, 8))
+    assert inside["calendar_years"] == expected_years and inside["calendar_covers_day"] is True
+    near_end = reader.window_countdown(cfg, approved[-5])
     assert near_end["in_window"] is True and near_end["expiring_warning"] is True and near_end["days_remaining"] == 5
-    after = reader.window_countdown(cfg, date(2027, 3, 15))
+    after = reader.window_countdown(cfg, first_trading_day_after_window(cfg))
     assert after["in_window"] is False and after["expired"] is True and after["expiring_warning"] is True
     assert after["days_remaining"] == 0
     assert reader.window_countdown(cfg, date(2030, 1, 3))["calendar_covers_day"] is False

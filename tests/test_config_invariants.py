@@ -4393,14 +4393,16 @@ def test_every_placing_prompt_refreshes_buying_power_at_final_reapply():
 
 
 def test_in_code_approved_dates_cover_the_configured_trading_window():
+    import dca_config
     from near_close_dca import APPROVED_TEST_DATES, MARKET_HOLIDAYS
 
     window = _load("trading_window.json")
     start = date.fromisoformat(window["start_date"])
     end = date.fromisoformat(window["end_date"])
-    assert max(APPROVED_TEST_DATES) == end, (
+    configured = dca_config.load_approved_dates(REPO_ROOT / "config")["approved_test_dates"]
+    assert max(APPROVED_TEST_DATES) == max(configured), (
         f"near_close_dca.APPROVED_TEST_DATES ends {max(APPROVED_TEST_DATES)} but "
-        f"config/trading_window.json ends {end}; extend the in-code fallback with the JSON"
+        f"config/trading_window.json approves through {max(configured)}; extend the in-code fallback with the JSON"
     )
     cursor = start
     while cursor <= end:
