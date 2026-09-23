@@ -246,13 +246,13 @@ def test_roster_identity_missing_config_reports_unknown_flag(tmp_path):
 
 def test_build_schedule_layers_matrix_without_observed(tmp_path):
     result = build_schedule_layers(CONFIG, REPO, [RootSpec.of(tmp_path)], DAY, NOW)
-    assert set(result) == {"manifest", "deploy", "workflows", "launchd", "roster", "matrix", "warnings"}
+    assert set(result) == {"manifest", "deploy", "workflows", "launchd", "roster", "matrix", "evidence", "warnings"}
     rows = {row["slot_id"]: row for row in result["matrix"]}
     assert len(rows) == 7 and all(row["observed"] is None and row["observed_entry"] is None for row in rows.values())
     assert all(row["deployable"] is True and row["cron_entries"] == 1 for row in rows.values())
     assert "42173154" in rows["1030"]["manifest_task_ids"] and rows["1030"]["configured"] is True
     assert rows["1030"]["systemd_units"] == ["dca-drift-morning.service"]
-    assert result["warnings"][-1].endswith("scheduler execution is unverified.")
+    assert result["warnings"][-1].endswith("not that any order filled.")
 
 
 def test_matrix_layers_unavailable_are_none_not_false(tmp_path):
@@ -360,3 +360,38 @@ def test_builders_never_take_a_lock(tmp_path, monkeypatch):
 def test_policy_block_rejects_non_policy_keys(key):
     result = policy_block(CONFIG, key)
     assert result["found"] is False and result["value"] is None
+
+
+def test_elapsed_live_rows_take_their_own_slots_evidence_verdict(tmp_path, monkeypatch):
+    """2026-09-22 schedule audit: an elapsed live row must say verified or missing, never stay 'elapsed_unverified'."""
+    from scripts.finalize_run_evidence import finalize
+
+    monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", ACCOUNT)
+    after_close = datetime(2026, 9, 8, 17, 0, tzinfo=ET)
+    root = tmp_path / "cron"
+    assert finalize("1030", datetime(2026, 9, 8, 10, 31, tzinfo=ET), outcome="NO_ORDERS",
+                    order_submit_status="no_orders_submitted", root=root, now=after_close)["verified"]
+    (root / "intraday_dca" / "20260908_1130ET").mkdir(parents=True)  # fired, never finalized
+
+    result = build_schedule_layers(CONFIG, REPO, [RootSpec.of(root)], DAY, after_close)
+    manifest = {(row["time"], row["id"]): row for row in result["manifest"]["tasks"]}
+    assert manifest[("10:30", "42173154")]["status"] == "verified"
+    assert manifest[("11:30", "7be82b97")]["status"] == "evidence_incomplete"
+    # The 13:30 row of the same multi-slot task gets ITS slot's verdict, not 11:30's.
+    assert manifest[("13:30", "7be82b97")]["status"] == "no_evidence"
+    assert manifest[("09:35", "2ba19526")]["evidence"]["run_dir"] == "market_open_dca/20260908_0935ET"
+    # Non-live rows keep their calendar/manifest status.
+    assert "elapsed_unverified" not in {row["status"] for (time, _), row in manifest.items()
+                                         if time in {"09:35", "10:30", "11:30", "12:30", "13:30", "14:30", "15:30"}
+                                         and row["id"] in {"2ba19526", "42173154", "7be82b97", "a6239dae", "10ce362c"}}
+    matrix = {row["slot_id"]: row for row in result["matrix"]}
+    assert matrix["1030"]["slot_evidence"] == "verified" and matrix["1130"]["slot_evidence"] == "evidence_incomplete"
+    assert any("have no finalized scheduled run_state" in warning for warning in result["warnings"])
+    assert not ABSOLUTE.search(json.dumps(result["evidence"]))
+
+
+def test_slot_evidence_before_the_slot_is_not_due(tmp_path):
+    from dca_console_schedule import slot_evidence
+
+    evidence = slot_evidence([RootSpec.of(tmp_path)], DAY, datetime(2026, 9, 8, 9, 0, tzinfo=ET))
+    assert {row["status"] for row in evidence.values()} == {"not_due"}

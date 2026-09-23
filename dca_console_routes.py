@@ -319,10 +319,16 @@ def _route_schedule_policy(app, request: RouteRequest) -> Response:
 
 
 def _route_schedule_tasks(app, request: RouteRequest) -> Response:
-    from dca_console_schedule import manifest_tasks
+    from dca_console_schedule import manifest_tasks, roster_identity, slot_evidence
 
     fields = query(request.url.query, ("date",), max_fields=1)
-    return Response.json(200, manifest_tasks(app.settings.config_dir, _day_field(app, fields), _now(app)))
+    day, now = _day_field(app, fields), _now(app)
+    # Same per-slot evidence join as /api/schedule, so the two never disagree
+    # about whether an elapsed live row is verified.
+    owners = {slot["slot_id"]: slot["cron_id"] for slot in roster_identity(app.settings.config_dir)["slots"]
+              if isinstance(slot.get("cron_id"), str)}
+    return Response.json(200, manifest_tasks(app.settings.config_dir, day, now,
+                                             evidence=slot_evidence(_roots(app), day, now), slot_owners=owners))
 
 
 def _route_state(app, request: RouteRequest) -> Response:

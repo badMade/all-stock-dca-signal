@@ -229,6 +229,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `docs/reliability_spec.md` | Run-state lifecycle, broker snapshot contract, honest implementation-status matrix |
 | `docs/safeguards.md` | Binding broker/account rules, budget caps, live execution roster |
 | `docs/run_classification.md` | Scheduled-vs-manual contract: paths, required fields, exclusions |
+| `docs/schedule_verification.md` | Daily per-slot evidence audit (`scripts/verify_schedule.py`) and the Gate 9 finalizer every live prompt runs (`scripts/finalize_run_evidence.py`); why every slot read "elapsed unverified" on 2026-09-22 |
 | `docs/schedule_manifest.md` | The canonical recurring schedule |
 | `docs/strategy.md` | Strategy overview, ticker universe, sizing ladder, budgets |
 | `docs/ticker_advisory.md` | The `ticker-advisor/` tool: scores candidate tickers, proposes universe additions for manual review |

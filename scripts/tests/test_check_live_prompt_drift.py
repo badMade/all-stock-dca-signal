@@ -31,6 +31,8 @@ GOOD_BODY = (
     "GATE 6.5 - SAME-DAY TOP-UP GUARD\n"
     'Save {"account_number": "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", "trading_day": "<YYYY-MM-DD>", '
     '"pages": [...]} then run python3 -m scripts.same_day_top_up_gate --orders-pages ...\n'
+    "GATE 9 - REPORT\n"
+    "Run python3 -m scripts.finalize_run_evidence --slot 1030 --started-at ... on every outcome.\n"
 )
 
 
@@ -105,6 +107,23 @@ def test_a_live_task_without_the_top_up_gate_is_flagged(tmp_path):
     mirror_dir = _mirror(tmp_path, "1030-test")
     report = _check(tmp_path, mirror_dir, _live(tmp_path, "1030-test", "GATE 7 - PLACE THE ORDERS\nPlace them.\n"))
     assert "missing_top_up_gate" in _findings(report)
+
+
+def test_a_live_task_without_the_evidence_finalizer_is_flagged(tmp_path):
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    stale = GOOD_BODY.split("GATE 9 - REPORT")[0] + "GATE 9 - REPORT\nWrite run_state.json and refresh the pointer.\n"
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1430-test", stale))
+    assert "missing_finalize_evidence" in _findings(report)
+
+
+def test_every_committed_mirror_runs_the_evidence_finalizer_for_its_own_slot():
+    from scripts.check_live_prompt_drift import DEFAULT_MIRROR_DIR
+
+    mirrors = sorted(DEFAULT_MIRROR_DIR.glob("[0-9]*ET-*.txt"))
+    assert len(mirrors) == 7
+    for mirror in mirrors:
+        text = mirror.read_text(encoding="utf-8")
+        assert f"python3 -m scripts.finalize_run_evidence --slot {mirror.name[:4]} " in text, mirror.name
 
 
 def test_a_hardcoded_window_end_date_that_disagrees_with_config_is_flagged(tmp_path):

@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""Gate 9 finalizer: write a live slot's scheduled evidence and refresh its pointer, in one command.
+
+Why this exists (2026-09-22): every live-mirror prompt told the agent to
+"write run_state.json ... and refresh <stream>/latest_<stream>_run.json" but
+never named the code that does either, so each session improvised. That day's
+run directories held Gate 5 documents and a free-form ``gate9_report_*.json``
+but no ``run_state.json``, and the pointers were hand-written in a private
+``{slot, trading_day, run_dir, outcome}`` shape that
+``same_day_pointer.validate_pointer`` rejects as malformed. Every slot fired;
+none of them could be verified (see ``scripts/verify_schedule.py``).
+
+This command is the one Gate 9 step the prompts now call, on EVERY outcome
+(orders placed, zero orders, blocked, END_SILENTLY, abort after the run
+directory exists). It:
+
+  1. refuses a ``--started-at`` outside the slot's ``dca_runner.SLOTS``
+     acceptance window -- that run was not a scheduled fire and belongs under
+     ``manual_runs/``, which never updates a pointer;
+  2. stamps the run_classification the stream's OWN writer would
+     (``<Executor>(mode="live").run_classification()`` for 09:35-14:30,
+     ``scheduled_artifacts.build_afternoon_live_run_classification`` for
+     15:30), so the identity -- cron id, run_type, schema version, account
+     pinning -- cannot drift from the executors;
+  3. writes ``run_state.json``/``run_summary.json`` plus header-only CSVs when
+     none exist, and validates the directory with
+     ``scheduled_artifacts.validate_run_artifacts``;
+  4. refreshes the pointer through ``same_day_pointer.refresh_latest_pointer``
+     (or ``run_classification.update_latest_scheduled_run_pointer`` for 15:30);
+  5. re-reads both through ``validate_pointer`` and
+     ``verify_schedule.classify_slot_evidence`` and exits non-zero unless the
+     slot now verifies.
+
+An existing ``run_state.json`` in the slot directory (e.g. one an executor's
+own ``run()`` wrote) is never overwritten: step 3 is skipped and only the
+pointer is refreshed from it.
+
+Writes only under the cron-tracking root. No broker, no network, no orders.
+
+Usage (from the prompts; run from the repo root)::
+
+    python -m scripts.finalize_run_evidence --slot 1430 \\
+        --started-at 2026-09-22T14:30:41-04:00 \\
+        --outcome NO_ORDERS_GATE6_5_ZEROED --order-submit-status no_orders_submitted \\
+        --orders-json <run_dir>/orders.json --report-json <run_dir>/gate9_report.json
+
+Exit codes: 0 verified; 1 written but not verifiable (message says why);
+2 refused before writing anything (bad arguments or off-window start).
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import sys
+from datetime import date, datetime, time, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
+
+from dca_fileio import atomic_open_w
+from dca_paths import cron_tracking_root
+from scripts.file_lock import cross_process_lock
+from scripts.run_classification import (
+    ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED,
+    ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
+    ORDER_SUBMIT_STATUS_ERROR,
+    ORDER_SUBMIT_STATUS_NO_CANDIDATES,
+    ORDER_SUBMIT_STATUS_NO_ORDERS,
+    ORDER_SUBMIT_STATUS_SUBMITTED,
+    scheduled_run_id,
+    update_latest_scheduled_run_pointer,
+    validate_classification,
+)
+from scripts.same_day_pointer import (
+    derive_valid_scheduled_evidence,
+    refresh_latest_pointer,
+    validate_pointer,
+)
+from scripts.scheduled_artifacts import (
+    ORDER_ATTEMPT_STATUSES,
+    ORDER_SUBMIT_STATUS_PLACEMENT_UNREACHABLE,
+    SIGNAL_CSV_NAMES,
+    SUBMITTED_ORDERS_CSV_FILENAME,
+    build_afternoon_live_run_classification,
+    build_run_summary,
+    validate_run_artifacts,
+    write_signals_csv,
+    write_submitted_orders_csv,
+)
+from scripts.verify_schedule import (
+    ET,
+    SLOT_EVIDENCE_LAYOUT,
+    STATUS_VERIFIED,
+    classify_slot_evidence,
+    slot_run_dir_relative,
+)
+
+# The live-run vocabulary only: dry_run is deliberately absent, since a dry run
+# is never scheduled evidence and must not be finalized as one.
+ORDER_SUBMIT_STATUSES = (
+    ORDER_SUBMIT_STATUS_SUBMITTED,
+    ORDER_SUBMIT_STATUS_NO_ORDERS,
+    ORDER_SUBMIT_STATUS_NO_CANDIDATES,
+    ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED,
+    ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED,
+    ORDER_SUBMIT_STATUS_ERROR,
+    ORDER_SUBMIT_STATUS_PLACEMENT_UNREACHABLE,
+)
+
+# Pointer file per stream, beside the stream's run directories. Each name is
+# the executor class's own latest_pointer_name (pinned by a test); the 3:30
+# pointer goes through run_classification's own helper instead.
+POINTER_NAMES = {
+    "market_open": "latest_market_open_run.json",
+    "morning": "latest_morning_run.json",
+    "midday": "latest_midday_run.json",
+    "intraday": "latest_intraday_run.json",
+}
+# The stream-specific signals filename each writer emits; any SIGNAL_CSV_NAMES
+# entry satisfies the contract, so this only picks the header-only file's name.
+SIGNALS_FILENAMES = {
+    "market_open": "market_open_signals.csv",
+    "morning": "morning_signals.csv",
+    "midday": "midday_signals.csv",
+    "intraday": "intraday_signals.csv",
+    "afternoon": "signals.csv",
+}
+
+
+class FinalizeRefused(ValueError):
+    """Raised before anything is written; maps to exit code 2."""
+
+
+def _utc_iso(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def normalize_slot(value: str) -> str:
+    slot = value.strip().upper().removesuffix("ET")
+    if slot not in SLOT_EVIDENCE_LAYOUT:
+        raise FinalizeRefused(f"unknown slot {value!r}; expected one of {sorted(SLOT_EVIDENCE_LAYOUT)}")
+    return slot
+
+
+def parse_started_at(value: str) -> datetime:
+    """Parse the run's start instant; a naive value is ET, like every other clock in this repo."""
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise FinalizeRefused(f"--started-at {value!r} is not ISO-8601") from exc
+    return (parsed.replace(tzinfo=ET) if parsed.tzinfo is None else parsed).astimezone(ET)
+
+
+# The live prompts' own Gate 1 opens EARLY_START_MINUTES before the nominal
+# time (e.g. 2:25-2:55 PM for the 2:30 slot, 12:25 PM-1:00 PM for 12:30),
+# while dca_runner.SLOTS opens AT nominal for every slot but 09:35. A fire
+# that passed the prompt's Gate 1 at 14:26 is a real scheduled fire, so this
+# accepts the union of the two: never refuse evidence Gate 1 already accepted.
+EARLY_START_MINUTES = 5
+
+
+def acceptance_window(slot: str, day: date) -> tuple[datetime, datetime]:
+    """The union of the slot's dca_runner window and its live prompt's Gate 1 window, in ET."""
+    from datetime import timedelta
+
+    from dca_runner import SLOTS
+
+    spec = SLOTS[slot]
+    nominal = datetime.combine(day, time(*spec.nominal_et), tzinfo=ET)
+    start = min(datetime.combine(day, time(*spec.window_start_et), tzinfo=ET),
+                nominal - timedelta(minutes=EARLY_START_MINUTES))
+    return start, datetime.combine(day, time(*spec.window_end_et), tzinfo=ET)
+
+
+def check_window(slot: str, started: datetime) -> None:
+    """Refuse a start outside every window Gate 1 could have accepted for this slot."""
+    start, end = acceptance_window(slot, started.date())
+    # End EXCLUSIVE, exactly as dca_runner.gate_time_sanity checks it
+    # (start <= local < end): a fire at 11:00:00 for the 10:30 slot was
+    # rejected by Gate 1, so it must not be finalized as scheduled evidence
+    # (Copilot review, PR #1514).
+    if not start <= started < end:
+        raise FinalizeRefused(
+            f"--started-at {started.isoformat()} is outside slot {slot}'s acceptance window "
+            f"{start.strftime('%H:%M')}-{end.strftime('%H:%M')} ET; an off-window run is not a scheduled "
+            "fire and must be written under the stream's manual_runs/ instead"
+        )
+
+
+def build_classification(slot: str, started: datetime) -> Dict[str, Any]:
+    """The run_classification the stream's own writer stamps for a scheduled live run at ``started``."""
+    stream, _ = SLOT_EVIDENCE_LAYOUT[slot]
+    if stream == "afternoon":
+        day = started.date().isoformat()
+        # valid_scheduled_evidence is finalized from the completed state below.
+        return build_afternoon_live_run_classification(
+            trading_day=day, run_id=scheduled_run_id(day), valid_scheduled_evidence=False,
+            triggered_at_utc=_utc_iso(started),
+        )
+    import intraday_dca
+    import market_open_dca
+    import midday_dca
+    import morning_dca
+
+    executor = {
+        "market_open": lambda: market_open_dca.MarketOpenDCAExecutor(mode="live"),
+        "morning": lambda: morning_dca.MorningDCAExecutor(mode="live"),
+        "midday": lambda: midday_dca.MiddayDCAExecutor(mode="live"),
+        "intraday": lambda: intraday_dca.IntradayDCAExecutor(mode="live", slot=slot),
+    }[stream]()
+    # Constructing an executor reads config only; it writes nothing and opens
+    # no ledger file, so this is identity lookup, not a run.
+    return executor.run_classification(started)
+
+
+def _load_json(path: Optional[str], kind: type, label: str) -> Any:
+    if path is None:
+        return None
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise FinalizeRefused(f"{label} {path!r} is not readable JSON: {exc}") from exc
+    if not isinstance(value, kind) or (kind is list and not all(isinstance(row, dict) for row in value)):
+        raise FinalizeRefused(f"{label} must be a JSON {'array of objects' if kind is list else 'object'}")
+    return value
+
+
+BUDGET_TIERS = ("normal", "elevated", "high_volatility", "stress")
+
+
+def validate_orders(orders: Optional[List[Dict[str, Any]]]) -> None:
+    """Refuse order rows that cannot be submitted-order evidence (Copilot review, PR #1514).
+
+    Every row must name a ticker and a broker order_id, carry a positive
+    finite submitted_amount_usd, and a status the drift detector counts as a
+    placed or in-flight order (scheduled_artifacts.ORDER_ATTEMPT_STATUSES).
+    A rejected or dry-run row is not an order and would otherwise inflate
+    orders_submitted_count and mark the pointer valid on nothing. Duplicate
+    order_ids are refused rather than silently collapsed.
+    """
+    if orders is None:
+        return
+    seen: set = set()
+    for index, row in enumerate(orders):
+        ticker, order_id, status = row.get("ticker"), row.get("order_id"), row.get("status")
+        amount = row.get("submitted_amount_usd")
+        if not isinstance(ticker, str) or not ticker.strip():
+            raise FinalizeRefused(f"order row {index} has no ticker")
+        if not isinstance(order_id, str) or not order_id.strip():
+            raise FinalizeRefused(f"order row {index} ({ticker}) has no broker order_id")
+        if status not in ORDER_ATTEMPT_STATUSES:
+            raise FinalizeRefused(f"order row {index} ({ticker}) status {status!r} is not a placed or in-flight "
+                                  f"order; expected one of {sorted(ORDER_ATTEMPT_STATUSES)}")
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)) or not math.isfinite(amount) \
+                or amount <= 0:
+            raise FinalizeRefused(f"order row {index} ({ticker}) submitted_amount_usd {amount!r} is not a positive number")
+        if order_id in seen:
+            raise FinalizeRefused(f"order_id {order_id!r} appears more than once")
+        seen.add(order_id)
+
+
+def validate_budget(budget: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Normalize a supplied Gate 6 budget block to schemas/run_state.schema.json's ``budget`` shape.
+
+    ``{"budget_evaluated": false}`` is the schema's own form for a fire that
+    exited before Gate 6. Anything else must carry the tier and both caps Gate
+    6 selected; the tier is lower-cased because the Gate 9 reports spell it
+    "Normal" while the schema enum is lower-case.
+    """
+    if budget is None or budget.get("budget_evaluated") is False:
+        return None if budget is None else dict(budget)
+    tier = budget.get("budget_tier")
+    normalized = {**budget, "budget_tier": tier.strip().lower() if isinstance(tier, str) else tier}
+    if normalized["budget_tier"] not in BUDGET_TIERS:
+        raise FinalizeRefused(f"--budget-json budget_tier {tier!r} is not one of {list(BUDGET_TIERS)}")
+    for key in ("daily_cap_usd", "weekly_cap_usd"):
+        value = budget.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise FinalizeRefused(f"--budget-json {key} {value!r} is not a non-negative number")
+    return normalized
+
+
+def _csv_rows(path: Path) -> List[Dict[str, str]]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        return [row for row in csv.DictReader(handle)]
+
+
+def build_run_state(
+    slot: str,
+    started: datetime,
+    *,
+    outcome: str,
+    order_submit_status: str,
+    orders_submitted_count: int,
+    error_class: Optional[str] = None,
+    error_detail: Optional[str] = None,
+    report: Optional[Dict[str, Any]] = None,
+    budget: Optional[Dict[str, Any]] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    stream, _ = SLOT_EVIDENCE_LAYOUT[slot]
+    classification = build_classification(slot, started)
+    # The executors stamp the pinned account number into their classification;
+    # the live prompts' secret rule says it never goes into an artifact, and
+    # this command's artifacts are read by the console and copied into reports
+    # (Copilot review, PR #1514). Keep only the fact that it was pinned.
+    if classification.pop("account_number", None) is not None:
+        classification["account_number_redacted"] = True
+    state: Dict[str, Any] = {
+        "run_id": classification["run_id"],
+        "trading_day": started.date().isoformat(),
+        "generated_at": _utc_iso(now or datetime.now(timezone.utc)),
+        "broker": "robinhood",
+        "dry_run": False,
+        "stream": stream,
+        "slot": f"{slot}ET",
+        "runner_slot_id": slot,
+        "cron_id": classification.get("cron_id"),
+        "status": outcome,
+        "order_submit_status": order_submit_status,
+        "orders_submitted_count": orders_submitted_count,
+        # schemas/run_state.schema.json requires both (Copilot review, PR #1514).
+        # A missing budget means Gate 6 never ran on this fire -- the schema's
+        # own budget_evaluated=false form; finalize() refuses that claim for a
+        # run that placed orders.
+        "budget": budget if budget is not None else {"budget_evaluated": False},
+        "counts": {"submitted": orders_submitted_count},
+        "run_classification": classification,
+        # Names the writer so a reader can tell this state from one an
+        # executor's own run() produced (which carries candidates, ledger
+        # seeding and the rest of the executor-specific payload).
+        "finalized_by": "scripts.finalize_run_evidence",
+    }
+    if error_class:
+        state["error_class"] = error_class
+    if error_detail:
+        state["error_detail"] = error_detail
+    if report is not None:
+        state["gate9_report"] = report
+    # Finalize the placeholder from the completed state, exactly as the
+    # executors' build_artifacts() does -- never asserted by the caller.
+    evidence = derive_valid_scheduled_evidence(state)
+    classification["valid_scheduled_evidence"] = evidence
+    if stream == "afternoon":
+        classification["valid_afternoon_scheduled_evidence"] = evidence
+    return state
+
+
+def finalize(
+    slot: str,
+    started: datetime,
+    *,
+    outcome: str,
+    order_submit_status: str,
+    root: Optional[Path] = None,
+    orders: Optional[List[Dict[str, Any]]] = None,
+    signals: Optional[List[Dict[str, Any]]] = None,
+    report: Optional[Dict[str, Any]] = None,
+    budget: Optional[Dict[str, Any]] = None,
+    error_class: Optional[str] = None,
+    error_detail: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Write (or reuse) the slot's run_state, refresh its pointer, and report whether it verifies.
+
+    Every argument check that needs no disk state runs first, so a bad call
+    refuses before anything -- even the lock file -- is created. The rest runs
+    under one per-run ``cross_process_lock``: two overlapping Gate 9 retries of
+    the same fire would otherwise both read the prior submitted_orders.csv,
+    merge different order sets, and let the last writer silently drop the
+    other's orders (Copilot review, PR #1514).
+    """
+    slot = normalize_slot(slot)
+    started = started.astimezone(ET)
+    check_window(slot, started)
+    if order_submit_status not in ORDER_SUBMIT_STATUSES:
+        raise FinalizeRefused(f"--order-submit-status {order_submit_status!r} is not one of {list(ORDER_SUBMIT_STATUSES)}")
+    if not outcome.strip():
+        raise FinalizeRefused("--outcome must name the Gate 9 outcome")
+    validate_orders(orders)
+    budget = validate_budget(budget)
+    base = Path(root) if root is not None else cron_tracking_root()
+    run_dir = base / slot_run_dir_relative(slot, started.date())
+    # Beside the run directory, not inside it: the lock must not be mistaken
+    # for evidence that the slot started.
+    with cross_process_lock(run_dir.parent / f".{run_dir.name}.finalize.lock"):
+        return _finalize_locked(slot, started, base, run_dir, outcome=outcome,
+                                order_submit_status=order_submit_status, orders=orders, signals=signals,
+                                report=report, budget=budget, error_class=error_class,
+                                error_detail=error_detail, now=now)
+
+
+def _repair_companions(run_dir: Path, state: Dict[str, Any], stream: str) -> List[str]:
+    """Write only the MISSING companion files of an executor-written state; never touch one that exists.
+
+    An executor interrupted between run_state.json and its summary/CSVs leaves
+    a state that classifies as scheduled evidence beside an incomplete
+    artifact set (Copilot review, PR #1514). A header-only CSV and a summary
+    mirrored from the state are exactly what the contract requires for "no
+    rows known", so filling the gap is safe; anything already on disk is the
+    executor's and is left alone.
+    """
+    repaired: List[str] = []
+    if not (run_dir / SUBMITTED_ORDERS_CSV_FILENAME).is_file():
+        write_submitted_orders_csv(run_dir, [])
+        repaired.append(SUBMITTED_ORDERS_CSV_FILENAME)
+    if not any((run_dir / name).is_file() for name in SIGNAL_CSV_NAMES):
+        write_signals_csv(run_dir, [], fieldnames=["ticker"], filename=SIGNALS_FILENAMES[stream])
+        repaired.append(SIGNALS_FILENAMES[stream])
+    if not (run_dir / "run_summary.json").is_file():
+        with atomic_open_w(run_dir / "run_summary.json") as handle:
+            json.dump(build_run_summary(state), handle, indent=2, sort_keys=True, default=str)
+        repaired.append("run_summary.json")
+    return repaired
+
+
+def _finalize_locked(
+    slot: str,
+    started: datetime,
+    base: Path,
+    run_dir: Path,
+    *,
+    outcome: str,
+    order_submit_status: str,
+    orders: Optional[List[Dict[str, Any]]],
+    signals: Optional[List[Dict[str, Any]]],
+    report: Optional[Dict[str, Any]],
+    budget: Optional[Dict[str, Any]],
+    error_class: Optional[str],
+    error_detail: Optional[str],
+    now: Optional[datetime],
+) -> Dict[str, Any]:
+    stream, _ = SLOT_EVIDENCE_LAYOUT[slot]
+    day = started.date()
+    state_path = run_dir / "run_state.json"
+    orders_path = run_dir / SUBMITTED_ORDERS_CSV_FILENAME
+
+    existing = None
+    if state_path.is_file():
+        try:
+            loaded = json.loads(state_path.read_bytes())
+            existing = loaded if isinstance(loaded, dict) else None
+        except (OSError, ValueError):
+            existing = None
+        if existing is None:
+            raise FinalizeRefused(f"{state_path.relative_to(base)} exists but is not a JSON object; "
+                                  "refusing to overwrite it -- inspect it by hand")
+
+    warnings: List[str] = []
+    # A state an executor's own run() wrote is authoritative and carries far
+    # more than this command knows; only a state THIS command wrote may be
+    # rebuilt, which is what a scheduler retry of the same firing needs (the
+    # retry may place orders the first attempt did not).
+    ours = existing is not None and existing.get("finalized_by") == "scripts.finalize_run_evidence"
+    if existing is not None and not ours:
+        state = existing
+        wrote = False
+        if orders is not None or signals is not None or report is not None or budget is not None:
+            warnings.append("run_state.json was written by the executor, not this command; it was kept "
+                            "unchanged and the supplied orders/signals/report/budget were NOT recorded")
+        repaired = _repair_companions(run_dir, state, stream)
+        if repaired:
+            warnings.append(f"wrote missing companion file(s) beside the executor's run_state: {', '.join(repaired)}")
+    else:
+        prior_rows = _csv_rows(orders_path) if orders_path.is_file() else []
+        if orders is None:
+            order_rows = prior_rows
+        else:
+            # Union by order_id so a retry that re-supplies the first attempt's
+            # orders does not double them, and one that supplies only its own
+            # new orders does not drop the first attempt's.
+            supplied_ids = {str(row.get("order_id")) for row in orders if row.get("order_id")}
+            order_rows = [row for row in prior_rows
+                          if not row.get("order_id") or str(row.get("order_id")) not in supplied_ids] + orders
+        count = len(order_rows)
+        # The status and the order rows must tell the same story, or the drift
+        # detector and the evidence disagree about whether money moved.
+        if order_submit_status == ORDER_SUBMIT_STATUS_SUBMITTED and count == 0:
+            raise FinalizeRefused("order_submit_status 'submitted' needs at least one order row "
+                                  "(--orders-json or an existing submitted_orders.csv)")
+        if order_submit_status != ORDER_SUBMIT_STATUS_SUBMITTED and orders:
+            raise FinalizeRefused(f"{len(orders)} order row(s) supplied with order_submit_status "
+                                  f"{order_submit_status!r}; use 'submitted'")
+        if order_submit_status != ORDER_SUBMIT_STATUS_SUBMITTED and count:
+            # An earlier attempt of this firing already placed orders; a retry
+            # that placed nothing more must not relabel the slot as order-free.
+            order_submit_status = ORDER_SUBMIT_STATUS_SUBMITTED
+            warnings.append(f"{count} order row(s) already recorded for this slot; "
+                            "order_submit_status kept as 'submitted'")
+        if budget is None and ours and isinstance(existing.get("budget"), dict):
+            budget = existing["budget"]  # a retry keeps the first attempt's Gate 6 budget
+        if order_submit_status == ORDER_SUBMIT_STATUS_SUBMITTED and (budget is None or budget.get("budget_evaluated") is False):
+            # Placing an order means Gate 6 ran and selected a tier; writing
+            # budget_evaluated=false for it would be false evidence.
+            raise FinalizeRefused("orders were placed, so Gate 6 ran: pass --budget-json with budget_tier, "
+                                  "daily_cap_usd and weekly_cap_usd")
+        state = build_run_state(slot, started, outcome=outcome, order_submit_status=order_submit_status,
+                                orders_submitted_count=count, error_class=error_class,
+                                error_detail=error_detail, report=report, budget=budget, now=now)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        # CSVs first, run_state last among the evidence files: a crash between
+        # them leaves a directory verify_schedule reports as incomplete, never
+        # a run_state that claims files which are not there.
+        if orders is not None or not orders_path.is_file():
+            write_submitted_orders_csv(run_dir, [dict(row) for row in order_rows])
+        if signals is not None:
+            write_signals_csv(run_dir, signals, filename=SIGNALS_FILENAMES[stream])
+        elif not any((run_dir / name).is_file() for name in SIGNAL_CSV_NAMES):
+            write_signals_csv(run_dir, [], fieldnames=["ticker"], filename=SIGNALS_FILENAMES[stream])
+        with atomic_open_w(run_dir / "run_summary.json") as handle:
+            json.dump(build_run_summary(state), handle, indent=2, sort_keys=True, default=str)
+        with atomic_open_w(state_path) as handle:
+            json.dump(state, handle, indent=2, sort_keys=True, default=str)
+        wrote = True
+
+    errors: List[str] = []
+    contract = validate_run_artifacts(run_dir, require_summary=True)
+    errors.extend(contract.errors)
+
+    pointer: Optional[Path] = None
+    if stream == "afternoon":
+        pointer_root = base / "ce16ba6b"
+        check = validate_classification(state.get("run_classification"))
+        if not check.ok:
+            errors.extend(f"run_classification: {error}" for error in check.errors)
+        elif contract.ok:
+            pointer = update_latest_scheduled_run_pointer(state, state_path, base=pointer_root)
+    else:
+        pointer_root = run_dir.parent
+        if contract.ok:
+            rc = state.get("run_classification") or {}
+            pointer = refresh_latest_pointer(
+                pointer_root / POINTER_NAMES[stream], run_id=rc.get("run_id") or state.get("run_id"),
+                run_state_path=state_path, stream=stream, trading_day=day.isoformat(), run_state=state,
+                extra={"slot": f"{slot}ET", "runner_slot_id": slot},
+            )
+
+    pointer_status = None
+    if pointer is not None:
+        validation = validate_pointer(pointer, expected_stream=stream, expected_root=pointer_root,
+                                      today=day.isoformat())
+        pointer_status = validation.status
+        if not validation.is_valid:
+            errors.extend(f"pointer: {reason}" for reason in validation.reasons)
+    slot_row = classify_slot_evidence(slot, day, now or datetime.now(ET), run_dir_present=True,
+                                      run_state=state, run_state_present=True, market_closed=None,
+                                      artifact_errors=contract.errors)
+    errors.extend(f"slot: {reason}" for reason in slot_row["reasons"])
+    verified = slot_row["status"] == STATUS_VERIFIED and pointer_status == "valid" and contract.ok
+    return {
+        "slot": f"{slot}ET", "stream": stream, "trading_day": day.isoformat(),
+        "run_dir": slot_run_dir_relative(slot, day).as_posix(), "run_state_written": wrote,
+        "pointer": pointer.relative_to(base).as_posix() if pointer is not None else None,
+        "pointer_status": pointer_status, "slot_status": slot_row["status"], "verified": verified,
+        "errors": list(dict.fromkeys(errors)), "warnings": warnings,
+    }
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument("--slot", required=True, help="roster slot: 0935 1030 1130 1230 1330 1430 1530 (ET suffix ok)")
+    parser.add_argument("--started-at", required=True,
+                        help="ISO-8601 instant this run started (Gate 1's clock); naive values are ET")
+    parser.add_argument("--outcome", required=True, help="Gate 9 outcome label, e.g. ORDERS_PLACED, END_SILENTLY")
+    parser.add_argument("--order-submit-status", required=True, choices=ORDER_SUBMIT_STATUSES)
+    parser.add_argument("--orders-json", help="JSON array of {ticker, order_id, submitted_amount_usd, status}")
+    parser.add_argument("--signals-json", help="JSON array of signal rows for the stream's signals CSV")
+    parser.add_argument("--report-json", help="JSON object embedded in run_state as gate9_report")
+    parser.add_argument("--budget-json",
+                        help='Gate 6 budget object {"budget_tier","daily_cap_usd","weekly_cap_usd",...}; '
+                        'required when orders were placed; omit only when Gate 6 never ran')
+    parser.add_argument("--error-class", help="concrete error class for a blocked/failed run")
+    parser.add_argument("--error-detail", help="one-line detail for a blocked/failed run")
+    parser.add_argument("--root", help="cron-tracking root (default: $DCA_CRON_TRACKING_ROOT or <checkout>/cron_tracking)")
+    args = parser.parse_args(argv)
+    try:
+        result = finalize(
+            args.slot, parse_started_at(args.started_at), outcome=args.outcome,
+            order_submit_status=args.order_submit_status, root=Path(args.root) if args.root else None,
+            orders=_load_json(args.orders_json, list, "--orders-json"),
+            signals=_load_json(args.signals_json, list, "--signals-json"),
+            report=_load_json(args.report_json, dict, "--report-json"),
+            budget=_load_json(args.budget_json, dict, "--budget-json"),
+            error_class=args.error_class, error_detail=args.error_detail,
+        )
+    except FinalizeRefused as exc:
+        print(json.dumps({"verified": False, "refused": str(exc)}, indent=2))
+        return 2
+    print(json.dumps(result, indent=2))
+    return 0 if result["verified"] else 1
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())

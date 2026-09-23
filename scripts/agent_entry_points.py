@@ -137,6 +137,34 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
+        need="Check whether every live slot left verifiable scheduled evidence today",
+        command="python -m scripts.verify_schedule [--date YYYY-MM-DD] [--root <cron-tracking root>] [--json]",
+        exists_path="scripts/verify_schedule.py",
+        doc_ref="docs/schedule_verification.md",
+        symbols=("main", "verify_day", "classify_slot_evidence", "SLOT_EVIDENCE_LAYOUT"),
+        notes=(
+            "Read-only. Reads each slot's OWN dated run_state.json, not the stream pointer "
+            "(intraday's one pointer covers three slots). Exits 1 when any due slot is "
+            "evidence_incomplete or no_evidence; the console Schedule page shows the same verdict."
+        ),
+    ),
+    EntryPoint(
+        need="Write a live slot's Gate 9 run_state and refresh its latest pointer",
+        command=(
+            "python -m scripts.finalize_run_evidence --slot HHMM --started-at <ISO-8601> "
+            "--outcome <label> --order-submit-status <status> [--orders-json <file>] "
+            "[--signals-json <file>] [--report-json <file>]"
+        ),
+        exists_path="scripts/finalize_run_evidence.py",
+        doc_ref="docs/schedule_verification.md",
+        symbols=("main", "finalize", "build_run_state", "acceptance_window"),
+        notes=(
+            "The one Gate 9 command every live-mirror prompt runs, on every outcome. Stamps the "
+            "executor's own run_classification, never overwrites an executor-written run_state, "
+            "and refuses an off-window --started-at. Exit 0 only when the slot verifies."
+        ),
+    ),
+    EntryPoint(
         need="Back up the live strategy config from a pasted thread/notes dump",
         command="python scripts/backup_strategy.py --transcript <file> --write",
         exists_path="scripts/backup_strategy.py",

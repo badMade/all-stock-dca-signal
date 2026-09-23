@@ -39,10 +39,10 @@ window.ConsolePages = (() => {
   function badge(value) {
     const normalized = String(value ?? "unknown").toLowerCase();
     let tone = "neutral";
-    if (/failed|error|corrupt|refused|abort|blocked|at.risk|missing/.test(normalized)) tone = "bad";
+    if (/failed|error|corrupt|refused|abort|blocked|at.risk|missing|no.evidence/.test(normalized)) tone = "bad";
     else if (/warn|stale|unverified|recovery|incomplete|skip|partial|unregistered|disabled|not_registered|unknown/.test(normalized)) tone = "warning";
     else if (/running|queued|pending|loading/.test(normalized)) tone = "running";
-    else if (/valid|complete|success|ready|healthy|ok|available|configured|present|yes|true|registered|enabled|installed|set$|indexed/.test(normalized)) tone = "good";
+    else if (/valid|complete|success|ready|healthy|ok|available|configured|present|yes|true|registered|enabled|installed|set$|indexed|^verified$/.test(normalized)) tone = "good";
     return text("span", `status-pill ${tone}`, String(value ?? "unknown").replaceAll("_", " "));
   }
 
@@ -558,13 +558,15 @@ window.ConsolePages = (() => {
         if (fingerprint === lastSchedule) return;
         lastSchedule = fingerprint;
         const matrix = panel("Configured vs deployable vs observed", [
-          text("p", "muted", "Configured: the manifest names this slot. Deployable: deploy/ cron or systemd mentions it. Observed: a run_state.json exists for the day. Scheduled evidence: the same-day pointer is valid. None of these proves the scheduler fired."),
+          text("p", "muted", "Configured: the manifest names this slot. Deployable: deploy/ cron or systemd mentions it. Observed: a run_state.json exists for the day. Scheduled evidence: the same-day pointer is valid. Slot verified: the slot's own dated run_state.json was finalized as scheduled evidence (python -m scripts.verify_schedule), which proves it fired, not that any order filled."),
           table([
             { label: "Time", key: "time_et" }, { label: "Stream", key: "stream" },
             { label: "Configured", get: (row) => dot(row.configured, "manifest task present") },
             { label: "Deployable", get: (row) => dot(row.deployable, "cron/systemd entry present") },
             { label: "Observed", get: (row) => dot(row.observed, row.observed_note || "run_state.json present today") },
             { label: "Scheduled evidence", get: (row) => dot(row.scheduled_evidence, "same-day pointer valid") },
+            { label: "Slot verified", key: "slot_evidence", badge: true },
+            { label: "Why", get: (row) => arr(row.slot_evidence_reasons).join("; ") },
             { label: "Manifest tasks", get: (row) => arr(row.manifest_task_ids).join(", ") }, { label: "Note", key: "observed_note" },
           ], arr(data.matrix), "No roster slots."),
         ], "per roster slot");

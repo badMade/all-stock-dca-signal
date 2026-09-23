@@ -23,7 +23,10 @@ for all seven slots and names the specific failures that have cost real runs:
 * ``bare_array_order_pages`` -- it runs the gate but never wraps the saved
   pages as ``{"account_number", "trading_day", "pages"}``;
 * ``stale_window_end_date`` -- it hardcodes a window end date that disagrees
-  with ``config/trading_window.json``.
+  with ``config/trading_window.json``;
+* ``missing_finalize_evidence`` -- Gate 9 never runs
+  ``scripts.finalize_run_evidence``, so the slot leaves no verifiable
+  run_state or pointer (2026-09-22: all seven slots fired, none verified).
 
 Read-only. It never edits a live task (that stays a human's
 ``update_scheduled_task`` full-body replacement) and never prints an
@@ -58,6 +61,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MIRROR_DIR = REPO_ROOT / "claude" / "dca-executor-prompts" / "live-mirror"
 ACCOUNT_PLACEHOLDER = "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}"
 TOP_UP_GATE_MODULE = "scripts.same_day_top_up_gate"
+# The one Gate 9 command that writes verifiable evidence (2026-09-22 schedule
+# audit: every slot fired, none left a run_state.json or a valid pointer).
+FINALIZE_EVIDENCE_MODULE = "scripts.finalize_run_evidence"
 # The seven roster slots, as each mirror's filename prefix (<HHMM>ET-<task>.txt).
 EXPECTED_SLOTS = ("0935ET", "1030ET", "1130ET", "1230ET", "1330ET", "1430ET", "1530ET")
 # Every key same_day_top_up_gate requires on its --orders-pages envelope.
@@ -147,6 +153,12 @@ def findings_for(live_text: str, window_end_date: Optional[str]) -> List[Dict[st
             "code": "bare_array_order_pages",
             "detail": 'runs the gate but never wraps saved pages as {"account_number", "trading_day", "pages"}; '
             "the gate rejects a bare array",
+        })
+    if FINALIZE_EVIDENCE_MODULE not in live_text:
+        findings.append({
+            "code": "missing_finalize_evidence",
+            "detail": f"never runs {FINALIZE_EVIDENCE_MODULE}: the slot fires but leaves no verifiable run_state "
+            "or pointer, so scripts.verify_schedule reports it evidence_incomplete",
         })
     if window_end_date:
         stale = _stale_window_dates(live_text, window_end_date)

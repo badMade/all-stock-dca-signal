@@ -133,7 +133,92 @@ def _task_details(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def manifest_tasks(config_dir: Path, day: date, now: datetime) -> dict[str, Any]:
+_EVIDENCE_RANK = {"verified": 3, "evidence_incomplete": 2, "awaiting_evidence": 1}
+
+
+def slot_evidence(roots: Sequence[RootSpec], day: date, now: datetime) -> dict[str, dict[str, Any]]:
+    """Per-slot evidence for ``day``, keyed by slot id, via ``verify_schedule.classify_slot_evidence``.
+
+    The same verdict ``python -m scripts.verify_schedule`` prints, but every
+    read goes through a ``BoundedReader`` on the resolved root (a Drive- or
+    symlink-mounted tree would otherwise fail confinement, see
+    ``dca_console_runs._resolve_roots``). Each slot is probed under every root;
+    the primary root's row wins unless a secondary root holds strictly better
+    evidence, in which case that row is used and flagged ``at_risk``. Only the
+    root label is returned, never its path.
+    """
+    from scripts.scheduled_artifacts import SIGNAL_CSV_NAMES
+    from scripts.verify_schedule import (
+        SLOT_EVIDENCE_LAYOUT,
+        classify_slot_evidence,
+        market_closed_for_slot,
+        slot_run_dir_relative,
+    )
+
+    warnings: list[str] = []
+    result: dict[str, dict[str, Any]] = {}
+    for slot_id in SLOT_EVIDENCE_LAYOUT:
+        closed = market_closed_for_slot(day, slot_id)
+        best: dict[str, Any] | None = None
+        for root in roots:
+            try:
+                base = Path(root.path).resolve()
+            except (OSError, RuntimeError):
+                continue
+            reader = BoundedReader(base, warnings)
+            relative = slot_run_dir_relative(slot_id, day)
+            run_dir = reader.confined(relative)
+            state_file = reader.confined(relative / "run_state.json")
+            present = state_file is not None and state_file.is_file()
+            state = reader.json(relative / "run_state.json") if present else {}
+            # Bounded presence check of the artifact contract's companion files
+            # (the full validate_run_artifacts opens files outside BoundedReader).
+            missing = [] if not state else [
+                name for name, found in (
+                    ("run_summary.json", _present(reader, relative / "run_summary.json")),
+                    ("submitted_orders.csv", _present(reader, relative / "submitted_orders.csv")),
+                    ("a signals CSV", any(_present(reader, relative / name) for name in SIGNAL_CSV_NAMES)),
+                ) if not found]
+            row = classify_slot_evidence(slot_id, day, now, run_dir_present=run_dir is not None and run_dir.is_dir(),
+                                         run_state=state or None, run_state_present=present, market_closed=closed,
+                                         artifact_errors=[f"{name} is missing" for name in missing])
+            row.update(root_label=root.label, at_risk=root.kind == "secondary",
+                       reasons=[_text(reason, 200) for reason in row["reasons"][:10]])
+            if best is None or _EVIDENCE_RANK.get(row["status"], 0) > _EVIDENCE_RANK.get(best["status"], 0):
+                best = row
+        if best is not None:
+            result[slot_id] = best
+    return result
+
+
+def _present(reader: BoundedReader, relative: Path) -> bool:
+    path = reader.confined(relative)
+    return path is not None and path.is_file()
+
+
+def _apply_evidence(rows: list[dict[str, Any]], evidence: dict[str, dict[str, Any]],
+                    slot_owners: dict[str, str]) -> None:
+    """Replace ``elapsed_unverified`` on a live slot's manifest row with that slot's evidence verdict.
+
+    A row matches a slot only when BOTH its time and its task id (the cron id)
+    agree with the roster, so the 13:30 row of the multi-slot intraday task
+    takes the 13:30 verdict, never the 11:30 one. Every other status
+    (planned, not scheduled today, disabled, not registered) is a calendar or
+    manifest fact and is left alone.
+    """
+    for row in rows:
+        slot_id = row.get("time", "").replace(":", "")
+        verdict = evidence.get(slot_id)
+        if verdict is None or slot_owners.get(slot_id) != row.get("id") or row.get("status") != "elapsed_unverified":
+            continue
+        row["status"] = verdict["status"]
+        row["evidence"] = {key: verdict.get(key) for key in ("run_dir", "reasons", "order_submit_status",
+                                                              "orders_submitted_count", "root_label", "at_risk")}
+
+
+def manifest_tasks(config_dir: Path, day: date, now: datetime, *,
+                   evidence: dict[str, dict[str, Any]] | None = None,
+                   slot_owners: dict[str, str] | None = None) -> dict[str, Any]:
     """Read ``config/scheduled_tasks.json`` once and enrich the daily schedule rows.
 
     ``tasks``: one row per ``build_schedule_rows`` entry (a multi-slot task
@@ -160,6 +245,8 @@ def manifest_tasks(config_dir: Path, day: date, now: datetime) -> dict[str, Any]
         row["name"] = _text(row["name"]) or "Unnamed task"
         if task is None:
             warnings.append("A schedule row could not be matched back to a manifest task id.")
+    if evidence:
+        _apply_evidence(rows, evidence, slot_owners or {})
     return {"tasks": rows, "task_count": len(tasks) if isinstance(tasks, list) else None,
             "policy_keys": _policy_keys(manifest) if manifest else [], "warnings": _dedupe(warnings)}
 
@@ -592,12 +679,30 @@ def build_schedule_layers(config_dir: Path, repo: Path, roots: Sequence[RootSpec
     file in the checkout mentions the slot; only ``observed`` reflects
     artifacts on disk, and even that never asserts the scheduler fired.
     """
-    layers = {"manifest": manifest_tasks(config_dir, day, now), "deploy": deploy_layer(repo),
-              "workflows": workflows_layer(repo), "launchd": launchd_status(roots), "roster": roster_identity(config_dir)}
-    slots = layers["roster"]["slots"]
+    now = now.replace(tzinfo=ET) if now.tzinfo is None else now.astimezone(ET)
+    roster = roster_identity(config_dir)
+    slots = roster["slots"]
+    # Per-slot run_state evidence (scripts/verify_schedule.py's verdict) is what
+    # turns an elapsed live row from "elapsed_unverified" into verified or
+    # missing; the per-stream pointer ``observed`` above cannot, because one
+    # intraday pointer covers three slots (2026-09-22 schedule audit).
+    evidence = slot_evidence(roots, day, now)
+    owners = {slot["slot_id"]: slot["cron_id"] for slot in slots if isinstance(slot.get("cron_id"), str)}
+    layers = {"manifest": manifest_tasks(config_dir, day, now, evidence=evidence, slot_owners=owners),
+              "deploy": deploy_layer(repo), "workflows": workflows_layer(repo), "launchd": launchd_status(roots),
+              "roster": roster}
     shared = {slot["stream"] for slot in slots if sum(other["stream"] == slot["stream"] for other in slots) > 1}
     matrix = [_matrix_row(slot, layers["manifest"], layers["deploy"], observed, shared) for slot in slots]
+    for row in matrix:
+        verdict = evidence.get(row["slot_id"])
+        row["slot_evidence"] = verdict["status"] if verdict else None
+        row["slot_evidence_reasons"] = verdict["reasons"] if verdict else []
     warnings = [warning for layer in layers.values() for warning in layer["warnings"]]
     warnings.extend(row["observed_note"] for row in matrix if row["observed_note"])
-    warnings.append("Every row is configuration or on-disk evidence; scheduler execution is unverified.")
-    return {**layers, "matrix": matrix, "warnings": _dedupe(warnings)}
+    failing = [row["slot_id"] for row in matrix if row["slot_evidence"] in {"evidence_incomplete", "no_evidence"}]
+    if failing:
+        warnings.append(f"Live slot(s) {', '.join(failing)} have no finalized scheduled run_state for {day.isoformat()}; "
+                        "run `python -m scripts.verify_schedule` for reasons.")
+    warnings.append("Every row is configuration or on-disk evidence; 'verified' means a scheduled run_state was "
+                    "finalized for that slot, not that any order filled.")
+    return {**layers, "matrix": matrix, "evidence": evidence, "warnings": _dedupe(warnings)}
