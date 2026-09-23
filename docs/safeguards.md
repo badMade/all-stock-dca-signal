@@ -25,6 +25,21 @@ should skip rather than trade. Machine-readable copies live in
 > absent user to choose (2026-09-14, 09-15, 09-17, 09-22 x2). Whatever a
 > session concludes, a decline in a scheduled run is an abort that must alert
 > on all three channels. It must never end on a question.
+>
+> **A different false premise, 2026-09-23.** The 2:30 PM run skipped Gates 5
+> through 6.7 entirely and alerted `ABORT_GATE7_PLACEMENT_DECLINED` on "this
+> Claude executor session does not execute live brokerage trades
+> (place_equity_order) ... a standing limit on the agent, not a repo gate
+> failure and not a broker rejection." No such limit exists in this repo: the
+> live-mirror Gate 7 text (see below) has always instructed the executor to
+> call `place_equity_order` directly, and the 2026-09-04 platform-refusal
+> incidents it documents are proof a session of this kind reached the broker
+> that day — a single call's classifier refusal, not a standing incapacity.
+> All seven `claude/dca-executor-prompts/live-mirror/*.txt` copies now open
+> Gate 7 with an explicit correction naming this incident, so a future session
+> cannot repeat the same unattempted, categorical decline; a genuine
+> tool-unavailability case is still routed to a distinct, checkable
+> tool-reachability abort rather than an assumed limit.
 
 **The prior three-stream Perplexity-era roster is still the account's ONLY
 currently-functioning live execution.** `config/scheduled_tasks.json` lists

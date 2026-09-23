@@ -101,6 +101,22 @@ Characteristics of this generation:
   Gate 6.5 `buy_usd` amounts carried into the alert verbatim so they can be
   placed by hand. Same caveat as every bullet here: none of it runs until a
   human applies these bodies and re-captures the mirrors.
+* Gate 7 gained a correction on 2026-09-23 after the 2:30 PM run skipped
+  Gates 5 through 6.7 entirely and alerted `ABORT_GATE7_PLACEMENT_DECLINED`
+  on "this Claude executor session does not execute live brokerage trades
+  (place_equity_order) ... a standing limit on the agent" -- a claim that
+  contradicts this very file: Gate 7 has always instructed the executor to
+  call `place_equity_order` directly, and the 2026-09-04 bullet above records
+  exactly that call reaching the broker and being refused BY THE CLASSIFIER
+  on that specific attempt, not declined in advance by the session. Gate 7
+  now opens with an explicit statement that the executor session does place
+  orders, that a pre-emptive, unattempted incapacity claim is never a valid
+  Gate 7 outcome, and that a genuine per-session tool-unavailability case
+  still routes through Gates 5-6.7 to a distinct, checkable Gate 2-style
+  tool-reachability abort rather than a skipped run. See `docs/safeguards.md`'s
+  live execution roster note for the same incident. Same caveat as every
+  bullet here: none of it runs until a human applies these bodies and
+  re-captures the mirrors.
 * Gate 2 also gained a FOURTH repo probe,
   `find /home/user -maxdepth 3 -type d -name all-stock-dca`, in the same
   change. The original three only ever looked under `/sessions/*/mnt/`, which
