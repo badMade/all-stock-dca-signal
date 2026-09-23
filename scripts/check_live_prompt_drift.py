@@ -78,6 +78,8 @@ _DATE_RE = re.compile(r"\b(20\d\d-\d\d-\d\d)\b")
 _END_DATE_CONTEXT_CHARS = 80
 _END_DATE_PHRASE_RE = re.compile(r"end[_ ]date|window end|trading window ends?", re.IGNORECASE)
 _LONG_DIGITS_RE = re.compile(r"\d{6,}")
+# A whole 6+ digit run (not a slice of a longer one) -- an account candidate.
+_ACCOUNT_CANDIDATE_RE = re.compile(r"(?<!\d)\d{6,}(?!\d)")
 
 
 def default_scheduled_dir() -> Path:
@@ -237,6 +239,30 @@ def check(
             "drifted_slots": drifted, "slots": slots}
 
 
+def shared_live_account(mirror_dir: Path, scheduled_dir: Path) -> Optional[str]:
+    """The one account-shaped value every live slot carries, when the env var is unset.
+
+    Without ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` the literal-vs-placeholder
+    lines were never normalized, so the plain command reported every slot as
+    ``differs`` right after a faithful repaste (2026-09-22: 13 false changed
+    lines per slot). The live bodies already hold the account, so use it --
+    but only when exactly ONE 6+ digit value is common to every live slot.
+    Anything else (a slot missing, two candidates, a slot on a different
+    account) returns None and the comparison stays strict, so a live task
+    pointed at the wrong account still reads as drift. Never printed.
+    """
+    common: Optional[set] = None
+    for mirror in sorted(Path(mirror_dir).glob("*.txt")):
+        if mirror.name.startswith("."):
+            continue
+        live = Path(scheduled_dir) / str(task_id_for(mirror)) / "SKILL.md"
+        if not live.is_file():
+            return None
+        values = set(_ACCOUNT_CANDIDATE_RE.findall(live.read_text(encoding="utf-8")))
+        common = values if common is None else common & values
+    return next(iter(common)) if common and len(common) == 1 else None
+
+
 def mirror_set_problem(mirror_dir: Path) -> Optional[str]:
     """Why ``mirror_dir`` cannot anchor a check, or None when it holds one mirror per slot.
 
@@ -312,7 +338,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         mirror_dir=args.mirror_dir,
         scheduled_dir=scheduled_dir,
         window_end_date=window_end_date,
-        account_number=os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER") or None,
+        account_number=(os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER")
+                        or shared_live_account(args.mirror_dir, scheduled_dir)),
         with_diff=args.diff,
     )
     if args.json:

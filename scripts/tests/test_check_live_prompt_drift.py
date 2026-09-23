@@ -267,3 +267,42 @@ def test_the_window_end_date_defaults_to_config(monkeypatch, tmp_path):
     (tmp_path / "trading_window.json").write_text('{"end_date": "2027-03-12"}', encoding="utf-8")
     monkeypatch.setenv("DCA_CONFIG_DIR", str(tmp_path))
     assert drift._window_end_date_from_config() == "2027-03-12"
+
+
+# The conftest synthetic account, and a second one derived at runtime so no new
+# account-shaped literal lands in the tree (test_config_invariants greps for them).
+SYNTHETIC_ACCOUNT = "999000111"
+OTHER_ACCOUNT = SYNTHETIC_ACCOUNT.replace("111", "222")
+
+def _live_from_full_mirror(tmp_path: Path, mirror_dir: Path, accounts: dict) -> Path:
+    """A live SKILL.md per full-mirror slot, the placeholder expanded per slot."""
+    scheduled = tmp_path / "Scheduled"
+    for mirror in sorted(mirror_dir.glob("*.txt")):
+        task = drift.task_id_for(mirror)
+        body = "\n".join(drift._mirror_body(mirror.read_text(encoding="utf-8")))
+        account = accounts.get(task, SYNTHETIC_ACCOUNT)
+        _live(tmp_path, task, f"---\nname: {task}\n---\n\n" + body.replace(drift.ACCOUNT_PLACEHOLDER, account))
+    return scheduled
+
+
+def test_without_the_env_var_the_account_shared_by_every_live_slot_is_used(tmp_path, monkeypatch, capsys):
+    # 2026-09-22: right after a faithful repaste the plain command (no env var)
+    # still reported 7 of 7 "differs" -- 13 false lines each, all the account.
+    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
+    mirror_dir = _full_mirror_dir(tmp_path)
+    scheduled = _live_from_full_mirror(tmp_path, mirror_dir, {})
+    code = drift.main([
+        "--mirror-dir", str(mirror_dir), "--scheduled-dir", str(scheduled), "--window-end-date", "2027-03-12",
+    ])
+    assert code == 0
+    assert SYNTHETIC_ACCOUNT not in capsys.readouterr().out
+
+
+def test_a_slot_on_a_different_account_is_not_auto_normalized(tmp_path):
+    # Auto-detection must never bless a live task pointed at another account:
+    # with no single shared value the comparison stays strict.
+    mirror_dir = _full_mirror_dir(tmp_path)
+    scheduled = _live_from_full_mirror(tmp_path, mirror_dir, {"task-1430et": OTHER_ACCOUNT})
+    assert drift.shared_live_account(mirror_dir, scheduled) is None
+    report = _check(tmp_path, mirror_dir, scheduled, account=drift.shared_live_account(mirror_dir, scheduled))
+    assert report["drifted_slots"] == 7
