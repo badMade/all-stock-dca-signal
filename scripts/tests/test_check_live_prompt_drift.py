@@ -82,6 +82,27 @@ def test_a_live_task_matching_its_mirror_is_clean(tmp_path):
     assert report["slots"][0]["status"] == "match"
 
 
+def test_the_live_skill_frontmatter_is_not_reported_as_drift(tmp_path):
+    # Every real ~/Claude/Scheduled/<task>/SKILL.md opens with name/description
+    # frontmatter the mirror never carries; before this was stripped a faithful
+    # repaste still read as "differs" (2026-09-22).
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    live = "---\nname: 1430-test\ndescription: 2:30pm ET DCA buy\n---\n\n" + GOOD_BODY
+    scheduled = _live(tmp_path, "1430-test", live)
+    report = _check(tmp_path, mirror_dir, scheduled)
+    assert report["slots"][0]["status"] == "match"
+    assert report["drifted_slots"] == 0
+
+
+def test_an_unclosed_frontmatter_opener_is_still_compared(tmp_path):
+    # A lone leading "---" with no closer is not frontmatter; stripping to EOF
+    # would hide the whole body, so it must stay in the comparison.
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    scheduled = _live(tmp_path, "1430-test", "---\n" + GOOD_BODY)
+    report = _check(tmp_path, mirror_dir, scheduled)
+    assert report["slots"][0]["status"] == "differs"
+
+
 def test_the_account_literal_in_live_text_is_not_reported_as_drift(tmp_path):
     # The README's one permitted divergence: live text carries the literal
     # account where the mirror carries the placeholder.

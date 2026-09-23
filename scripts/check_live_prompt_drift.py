@@ -117,10 +117,28 @@ def _mirror_body(text: str) -> List[str]:
     return lines[start:]
 
 
+def _live_body(lines: List[str]) -> List[str]:
+    """Live lines minus the leading ``---`` YAML frontmatter Cowork keeps on every SKILL.md.
+
+    The frontmatter (``name``/``description``) is task metadata the mirror
+    never copies, so leaving it in made every slot read as ``differs`` even
+    after a faithful repaste (2026-09-22: "7 of 7 slots need a repaste" could
+    never reach 0). Only a block opened on line 1 AND closed by a later ``---``
+    is stripped; an unclosed opener is left as prompt content so it is still
+    compared rather than silently swallowing the whole body.
+    """
+    if not lines or lines[0].strip() != "---":
+        return lines
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            return lines[index + 1:]
+    return lines
+
+
 def _normalize_live(text: str, account_number: Optional[str]) -> List[str]:
     if account_number:
         text = text.replace(account_number, ACCOUNT_PLACEHOLDER)
-    return text.splitlines()
+    return _live_body(text.splitlines())
 
 
 def mask(line: str, account_number: Optional[str] = None) -> str:
