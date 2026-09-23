@@ -124,6 +124,7 @@ implementation-status matrix.
 | `scripts/idempotency.py` | Order idempotency keys |
 | `scripts/scheduler_lease.py` | File-based leases (the sole-executor guarantee) |
 | `scripts/same_day_pointer.py` | Latest-pointer validation and refresh |
+| `scripts/assemble_order_pages.py` | Turns saved `get_equity_orders` page files (an oversized page the session could not show in full) into the `orders_pages_<day>_<slot>.json` envelope, after proving the pagination chain complete with the top-up gate's own replay. **CLI**; every live prompt calls it instead of transcribing rows by hand (DCA Issues `output_cap_exceeded`). |
 | `scripts/same_day_top_up_gate.py` | Broker-sourced enforcement of `same_day_top_up_policy`. **CLI**; its printed `buy_usd` is authoritative. |
 | `scripts/reason_codes.py` | Unified structured decision/reason codes |
 | `scripts/correlation.py` | Incident correlation IDs across scheduler/runner/broker/recovery |

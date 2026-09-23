@@ -4546,3 +4546,35 @@ def test_midday_live_mirror_documents_the_run_classification_template():
     assert 'midday-live-v1' in text
     assert 'midday_dca_live' in text
     assert 'never a bare string' in text
+
+
+def test_every_live_mirror_routes_oversized_order_pages_through_the_assembler():
+    """All seven live mirrors must carry the OVERSIZED ORDER PAGES rule, ahead
+    of their first ``get_equity_orders`` call, invoking the assembler as a
+    module and aborting as ``output_cap_exceeded`` on refusal.
+
+    DCA Issues ``output_cap_exceeded``: the 2026-09-09 12:30 run transcribed
+    an oversized page by hand and Gate 6 aborted on two disagreeing row counts.
+    The rule was pasted into seven independent prompts, so one slot losing it
+    (or regressing to ``python3 scripts/assemble_order_pages.py``, which fails
+    with ModuleNotFoundError) would otherwise pass every other check (Copilot
+    review, PR #1520: "Add regression coverage for all live prompt mirrors").
+    """
+    texts = _live_mirror_placing_prompt_texts()
+    assert len(texts) == 7, sorted(texts)
+    offenders = []
+    for name, text in texts.items():
+        rule = text.find("OVERSIZED ORDER PAGES")
+        first_fetch = text.find("call get_equity_orders")
+        if rule == -1:
+            offenders.append(f"{name}: rule missing")
+            continue
+        if first_fetch != -1 and rule > first_fetch:
+            offenders.append(f"{name}: rule appears after the first get_equity_orders call")
+        paragraph = text[rule : text.find("\n", rule)]
+        for required in ("python3 -m scripts.assemble_order_pages", "--error-class output_cap_exceeded"):
+            if required not in paragraph:
+                offenders.append(f"{name}: rule lacks {required!r}")
+        if "python3 scripts/assemble_order_pages.py" in text:
+            offenders.append(f"{name}: path-style invocation cannot import dca_config")
+    assert not offenders, offenders

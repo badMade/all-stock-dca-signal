@@ -85,6 +85,20 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         notes="The printed JSON's buy_usd per ticker is authoritative. Never recompute it by hand.",
     ),
     EntryPoint(
+        need="Assemble saved oversized get_equity_orders pages into an orders_pages envelope",
+        command=(
+            "python3 -m scripts.assemble_order_pages --account <acct> --trading-day <YYYY-MM-DD> "
+            "--out <orders_pages file> [--snapshot-at <ISO>] <page file> [<page file> ...]"
+        ),
+        exists_path="scripts/assemble_order_pages.py",
+        doc_ref="docs/repo_map.md",
+        symbols=("assemble", "main"),
+        notes=(
+            "Use when a page's tool output was too large to show and was saved to a file. "
+            "Never transcribe rows by hand; any non-zero exit is incomplete history."
+        ),
+    ),
+    EntryPoint(
         need="Load validated logged-reference/order bindings from prior-allocation artifacts",
         command=(
             "python3 -m scripts.prior_reference_bindings --trading-day <YYYY-MM-DD> "
