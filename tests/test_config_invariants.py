@@ -622,6 +622,36 @@ def test_notifications_schema_rejects_a_non_boolean_channel_enabled_flag():
         jsonschema.validate(document, schema)
 
 
+def test_email_channel_declares_operator_address_via_env_placeholder():
+    """Every executor prompt (claude/dca-executor-prompts/*.txt and
+    live-mirror/*.txt) tells the agent to send alerts "to the operator email
+    configured for alerts (do not hardcode a personal address)" -- but
+    nothing in config/notifications.json ever named that address, so a
+    compliant executor has nowhere to send to and falls back to a draft
+    (see docs/alert_digest.md's EMAIL_DRAFT_NOT_DELIVERED case). The address
+    must be the expandable placeholder, resolved the same way
+    dca_config.expand_config_env resolves ${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER},
+    never a literal address committed to git."""
+    document = _load("notifications.json")
+    assert document["channels"]["email"]["address"] == "${DCA_ALERT_EMAIL_ADDRESS}", (
+        "config/notifications.json's channels.email must declare 'address': "
+        '"${DCA_ALERT_EMAIL_ADDRESS}" so a live executor has a destination to send to'
+    )
+
+
+def test_notifications_schema_rejects_a_hardcoded_email_address():
+    """The schema must enforce the same "never hardcode a personal address"
+    rule the executor prompts state in prose -- a manual edit that pastes a
+    literal address into channels.email.address should fail validation, not
+    silently reach an executor as config it can send to verbatim."""
+    jsonschema = pytest.importorskip("jsonschema")
+    schema = json.loads((SCHEMAS_DIR / "notifications.schema.json").read_bytes())
+    document = json.loads(json.dumps(_load("notifications.json")))  # deep copy
+    document["channels"]["email"]["address"] = "geoffplymale@gmail.com"
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(document, schema)
+
+
 def test_reporting_schema_rejects_a_non_object_notion_block():
     """`notion` is declared as an object (the notion sync's config surface);
     a scalar left over from a botched manual edit must be rejected rather
@@ -4565,3 +4595,35 @@ def test_every_live_slot_gate_5_merges_its_prefetched_yfinance_fallback():
         assert "sources.yahoo_finance_yfinance" in gate_5, mirror.name
         # The prefetch tree is deliberately not the run directory.
         assert "$ROOT/yfinance_fallback_" not in gate_5, mirror.name
+
+
+def test_every_live_mirror_routes_oversized_order_pages_through_the_assembler():
+    """All seven live mirrors must carry the OVERSIZED ORDER PAGES rule, ahead
+    of their first ``get_equity_orders`` call, invoking the assembler as a
+    module and aborting as ``output_cap_exceeded`` on refusal.
+
+    DCA Issues ``output_cap_exceeded``: the 2026-09-09 12:30 run transcribed
+    an oversized page by hand and Gate 6 aborted on two disagreeing row counts.
+    The rule was pasted into seven independent prompts, so one slot losing it
+    (or regressing to ``python3 scripts/assemble_order_pages.py``, which fails
+    with ModuleNotFoundError) would otherwise pass every other check (Copilot
+    review, PR #1520: "Add regression coverage for all live prompt mirrors").
+    """
+    texts = _live_mirror_placing_prompt_texts()
+    assert len(texts) == 7, sorted(texts)
+    offenders = []
+    for name, text in texts.items():
+        rule = text.find("OVERSIZED ORDER PAGES")
+        first_fetch = text.find("call get_equity_orders")
+        if rule == -1:
+            offenders.append(f"{name}: rule missing")
+            continue
+        if first_fetch != -1 and rule > first_fetch:
+            offenders.append(f"{name}: rule appears after the first get_equity_orders call")
+        paragraph = text[rule : text.find("\n", rule)]
+        for required in ("python3 -m scripts.assemble_order_pages", "--error-class output_cap_exceeded"):
+            if required not in paragraph:
+                offenders.append(f"{name}: rule lacks {required!r}")
+        if "python3 scripts/assemble_order_pages.py" in text:
+            offenders.append(f"{name}: path-style invocation cannot import dca_config")
+    assert not offenders, offenders

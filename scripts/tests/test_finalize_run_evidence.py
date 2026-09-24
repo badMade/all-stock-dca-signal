@@ -262,3 +262,176 @@ def test_cli_exit_codes(tmp_path, capsys):
     assert fre.main(["--slot", "0900", "--started-at", "2026-09-22T09:00:00", *base]) == 2
     missing = tmp_path / "nope.json"
     assert fre.main(["--slot", "1230", "--started-at", "2026-09-22T12:31:00", "--orders-json", str(missing), *base]) == 2
+
+
+# --- zero-order finalizes must show Gate 5 actually evaluated data -----------
+# 2026-09-18: the 12:30 and 3:30 sessions lost market data, hand-wrote an empty
+# candidates file and ended silently as a "quiet tape" (Notion DCA Issues:
+# fabricated_empty_candidates, logged_as_quiet_tape).
+
+
+def rows_for(evaluated, provider_error, no_data):
+    """Candidate rows the way the generators emit them: a provider-error ticker is
+    itself a NO_DATA row, then plain NO_DATA rows, then evaluated-and-quiet rows."""
+    rows = [{"ticker": f"T{i}", "action": "NO_DATA", "provider_error": i < provider_error}
+            for i in range(max(provider_error, no_data))]
+    rows += [{"ticker": f"T{i}", "action": "NO_ACTION", "provider_error": False}
+             for i in range(len(rows), evaluated)]
+    return rows
+
+
+def gate5_doc(slot_id="1430", **overrides):
+    counts = {"evaluated_count": 64, "provider_error_count": 1, "no_data_count": 1}
+    counts.update({k: overrides.pop(k) for k in list(overrides) if k in counts})
+    doc = {"slot": f"{slot_id}ET", "runner_slot_id": slot_id, "trading_day": DAY.isoformat(),
+           "buy_count": 0, "already_covered_tickers": [], **counts,
+           "candidates": rows_for(counts["evaluated_count"], counts["provider_error_count"], counts["no_data_count"])}
+    doc.update(overrides)
+    return doc
+
+
+def put(tmp_path, slot_id, name, payload):
+    run_dir = tmp_path / slot_run_dir_relative(slot_id, DAY)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / name).write_text(json.dumps(payload))
+    return run_dir
+
+
+@pytest.mark.parametrize("payload", [[], {"candidates": []}, {"candidates": [], "buy_count": 0}])
+def test_hand_written_empty_candidates_file_is_refused(tmp_path, payload):
+    run_dir = put(tmp_path, "1230", "candidates_2026-09-22_1230.json", payload)
+    with pytest.raises(fre.FinalizeRefused, match="none is a Gate 5 generator document.*market_data_unavailable"):
+        run(tmp_path, "1230", outcome="END_SILENTLY")
+    assert not (run_dir / "run_state.json").exists()
+
+
+def test_no_candidates_status_needs_the_generator_document(tmp_path):
+    with pytest.raises(fre.FinalizeRefused, match="needs this slot's Gate 5 generator document"):
+        run(tmp_path, "1430", status="not_submitted_no_candidates")
+
+
+@pytest.mark.parametrize("counts", [
+    {"evaluated_count": 0},
+    {"evaluated_count": 64, "provider_error_count": 64},
+    {"evaluated_count": 64, "provider_error_count": 4, "no_data_count": 64},
+])
+def test_zero_candidates_from_zero_usable_tickers_is_an_outage(tmp_path, counts):
+    put(tmp_path, "1430", "gate5_document.json", gate5_doc(**counts))
+    with pytest.raises(fre.FinalizeRefused, match="data outage, not a quiet tape"):
+        run(tmp_path, "1430", status="not_submitted_no_candidates")
+
+
+def test_genuinely_quiet_tape_verifies_and_records_its_evidence(tmp_path):
+    # One provider error is routine in real documents; it must not block.
+    run_dir = put(tmp_path, "1430", "gate5_document.json", gate5_doc(no_data_count=40))
+    result = run(tmp_path, "1430", status="not_submitted_no_candidates")
+    assert result["verified"] is True, result["errors"]
+    evidence = json.loads((run_dir / "run_state.json").read_text())["gate5_evidence"]
+    # The provider-error ticker is one of the 40 NO_DATA rows, not subtracted twice.
+    assert evidence == {"document": "gate5_document.json", "evaluated_count": 64, "usable_count": 24,
+                        "buy_count": 0, "provider_error_count": 1, "no_data_count": 40}
+
+
+def test_fully_covered_universe_is_served_not_an_outage(tmp_path):
+    put(tmp_path, "1430", "gate5_document.json", gate5_doc(evaluated_count=0, already_covered_tickers=["MA"]))
+    assert run(tmp_path, "1430", status="not_submitted_no_candidates")["verified"] is True
+
+
+def test_gate6_5_zeroing_real_buys_passes(tmp_path):
+    put(tmp_path, "1430", "gate5_document.json", gate5_doc(buy_count=3, provider_error_count=64))
+    assert run(tmp_path, "1430", outcome="NO_ORDERS_GATE6_5_ZEROED")["verified"] is True
+
+
+def test_cands_extract_beside_a_real_document_is_not_a_stray(tmp_path):
+    put(tmp_path, "1030", "cands.json", [])
+    put(tmp_path, "1030", "cands_output.json", gate5_doc("1030"))
+    assert run(tmp_path, "1030", outcome="END_SILENTLY")["verified"] is True
+
+
+def test_a_document_for_another_slot_or_day_is_not_this_runs_evidence(tmp_path):
+    put(tmp_path, "1430", "candidates.json", gate5_doc("1330"))
+    put(tmp_path, "1430", "candidates_old.json", gate5_doc(trading_day="2026-09-21"))
+    with pytest.raises(fre.FinalizeRefused, match="look like candidate files"):
+        run(tmp_path, "1430", outcome="END_SILENTLY")
+
+
+def test_declared_failure_is_not_second_guessed(tmp_path):
+    put(tmp_path, "1230", "candidates.json", [])
+    result = run(tmp_path, "1230", status="not_submitted_error", error_class="market_data_unavailable",
+                 error_detail="provider returned nothing")
+    assert result["run_state_written"] is True
+
+
+def test_cli_maps_an_outage_dressed_as_quiet_tape_to_exit_2(tmp_path, capsys):
+    put(tmp_path, "1530", "candidates.json", {"candidates": []})
+    argv = ["--slot", "1530", "--started-at", "2026-09-22T15:31:00-04:00", "--root", str(tmp_path),
+            "--outcome", "END_SILENTLY", "--order-submit-status", "no_orders_submitted"]
+    assert fre.main(argv) == 2
+    assert "market_data_unavailable" in json.loads(capsys.readouterr().out)["refused"]
+
+
+# --- Copilot review, PR #1519 ------------------------------------------------
+
+
+def test_all_no_data_1530_document_without_no_data_count_is_an_outage(tmp_path):
+    """generate_buy_candidates' 15:30 document publishes no no_data_count; its rows say it all."""
+    doc = gate5_doc("1530", provider_error_count=0, no_data_count=64)
+    del doc["no_data_count"]
+    put(tmp_path, "1530", "candidates_2026-09-22_1530.json", doc)
+    with pytest.raises(fre.FinalizeRefused, match="no data 64.*data outage"):
+        run(tmp_path, "1530", status="not_submitted_no_candidates")
+
+
+def test_document_without_rows_or_no_data_count_is_not_evidence(tmp_path):
+    doc = gate5_doc()
+    del doc["no_data_count"], doc["candidates"]
+    put(tmp_path, "1430", "gate5_document.json", doc)
+    with pytest.raises(fre.FinalizeRefused, match="needs this slot's Gate 5 generator document"):
+        run(tmp_path, "1430", status="not_submitted_no_candidates")
+
+
+def test_counts_only_document_falls_back_to_its_counts(tmp_path):
+    doc = gate5_doc(no_data_count=10)
+    del doc["candidates"]
+    put(tmp_path, "1430", "gate5_document.json", doc)
+    assert run(tmp_path, "1430", status="not_submitted_no_candidates")["verified"] is True
+
+
+def test_duplicate_json_keys_make_a_file_invalid_evidence(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1430", DAY)
+    run_dir.mkdir(parents=True)
+    body = json.dumps(gate5_doc())[:-1] + ', "evaluated_count": 0}'
+    (run_dir / "gate5_document.json").write_text(body)
+    with pytest.raises(fre.FinalizeRefused, match="gate5_document.json look like candidate files.*duplicate JSON keys"):
+        run(tmp_path, "1430", outcome="END_SILENTLY")
+
+
+def executor_state(run_dir, **fields):
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state = {"trading_day": DAY.isoformat(), "stream": "intraday", "order_submit_status": "no_orders_submitted",
+             **fields}
+    (run_dir / "run_state.json").write_text(json.dumps(state))
+    return state
+
+
+def test_executor_state_recording_an_outage_is_refused_and_left_untouched(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1430", DAY)
+    executor_state(run_dir, counts={"evaluated": 64, "no_data": 64, "buy_candidates": 0})
+    before = sorted(p.name for p in run_dir.iterdir())
+    with pytest.raises(fre.FinalizeRefused, match="not written by this command.*data outage"):
+        run(tmp_path, "1430", outcome="END_SILENTLY")
+    assert sorted(p.name for p in run_dir.iterdir()) == before
+
+
+def test_hand_written_state_beside_a_fabricated_candidates_file_is_refused(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1230", DAY)
+    executor_state(run_dir, stream="midday")
+    (run_dir / "candidates.json").write_text("[]")
+    with pytest.raises(fre.FinalizeRefused, match="candidates.json look like candidate files"):
+        run(tmp_path, "1230", outcome="END_SILENTLY")
+
+
+def test_executor_state_with_usable_data_is_not_second_guessed(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1430", DAY)
+    executor_state(run_dir, counts={"evaluated": 64, "no_data": 1, "buy_candidates": 0})
+    fre.check_existing_state_gate5_evidence(run_dir, "1430", DAY, json.loads((run_dir / "run_state.json").read_text()))

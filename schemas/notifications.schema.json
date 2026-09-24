@@ -9,6 +9,20 @@
     "version": { "type": "string" },
     "channels": {
       "type": "object",
+      "required": ["email"],
+      "properties": {
+        "email": {
+          "type": "object",
+          "required": ["enabled", "address"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "scope": { "type": "string" },
+            "note": { "type": "string" },
+            "address": { "const": "${DCA_ALERT_EMAIL_ADDRESS}" }
+          },
+          "additionalProperties": true
+        }
+      },
       "additionalProperties": {
         "type": "object",
         "properties": {

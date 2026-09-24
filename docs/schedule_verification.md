@@ -89,6 +89,35 @@ python3 -m scripts.finalize_run_evidence --slot 1430 \
   overwritten; the command only refreshes the pointer from it. If the summary
   or a CSV is missing beside it (the executor was interrupted), it writes just
   that missing file.
+- It refuses a zero-order finalize (`no_orders_submitted` or
+  `not_submitted_no_candidates`, without `--error-class`) that can't show
+  Gate 5 actually evaluated data. On 2026-09-18 the 12:30 and 3:30 sessions
+  lost market data, hand-wrote an empty candidates file and ended silently as
+  a "quiet tape" (Notion keys `fabricated_empty_candidates`,
+  `logged_as_quiet_tape`). The command finds this slot's generator document
+  in the run directory by content (the count fields plus a matching
+  `runner_slot_id` and `trading_day`), not by filename. It then requires:
+  - `not_submitted_no_candidates`: the document must exist.
+  - `no_orders_submitted`: a missing document is fine, because a Gate 4
+    stand-down ends before Gate 5. A `*cand*.json` that isn't a document is
+    refused, since that is the fabrication signature.
+  - Zero buys: at least one usable ticker, counted from the document's
+    `candidates` rows (not `NO_DATA`, not a provider error). The 15:30
+    document has no `no_data_count`, and a provider-error ticker is itself a
+    `NO_DATA` row. One provider error is routine and doesn't block.
+    `evaluated_count: 0` with `already_covered_tickers` is Gate 4's served
+    case.
+  - A file with duplicate JSON keys is invalid evidence, whatever its name.
+  - A `run_state.json` this command didn't write gets the same check before
+    the pointer is refreshed. For an executor's own state, the check uses its
+    `counts.evaluated` and `counts.no_data`; a state without them (hand-written)
+    falls back to the directory's generator document.
+
+  The refusal tells the session to finalize an outage honestly, as
+  `not_submitted_error --error-class market_data_unavailable`, which then
+  alerts. A passing check is recorded as `gate5_evidence` in `run_state.json`.
+  A fully forged generator document still gets through; this catches the
+  shortcut that actually happened.
 - Everything after argument checks runs under a per-run `cross_process_lock`
   (`.<run dir>.finalize.lock` beside the run directory), so overlapping
   retries can't drop each other's orders. A state this

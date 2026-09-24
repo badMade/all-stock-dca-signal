@@ -282,6 +282,218 @@ def validate_budget(budget: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
     return normalized
 
 
+# The zero-order statuses a session could use to dress a data outage up as a
+# quiet tape. On 2026-09-18 the 12:30 and 3:30 sessions both lost market data,
+# wrote an empty candidates file by hand, and ended silently as though the
+# universe had simply not qualified -- no alert, and a Run Log that read "no-op"
+# for what was an outage (Notion DCA Issues: fabricated_empty_candidates,
+# logged_as_quiet_tape). Every prompt already states the quiet-tape test in
+# prose; nothing enforced it, so this command -- the one step every slot runs
+# -- now does.
+ZERO_ORDER_STATUSES = (ORDER_SUBMIT_STATUS_NO_ORDERS, ORDER_SUBMIT_STATUS_NO_CANDIDATES)
+# Count fields both Gate 5 generators publish (scripts/stream_candidates.py's
+# build_document for 09:35-14:30, scripts/generate_buy_candidates.py for
+# 15:30). A file lacking any of these was not written by a generator -- which
+# is exactly what a hand-typed ``[]`` or ``{"candidates": []}`` looks like.
+GATE5_COUNT_KEYS = ("evaluated_count", "buy_count", "provider_error_count")
+NO_DATA_ACTION = "NO_DATA"
+
+
+def _is_count(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _reject_duplicate_keys(pairs: List[Any]) -> Dict[str, Any]:
+    """``object_pairs_hook`` that raises on a duplicate key, like ``dca_config``'s.
+
+    ``json.loads`` silently keeps the LAST of two same-named keys, so a
+    hand-edited evidence file could carry two conflicting ``evaluated_count``
+    (or ``trading_day``) values and be judged on whichever came last --
+    ambiguous precisely on the fabrication path this check exists for
+    (Copilot review, PR #1519). Such a file is invalid evidence, not a document.
+    """
+    result: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate key {key!r} in JSON document")
+        result[key] = value
+    return result
+
+
+def _candidate_rows(doc: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    rows = doc.get("candidates")
+    if isinstance(rows, list) and all(isinstance(row, dict) and "action" in row for row in rows):
+        return rows
+    return None
+
+
+def gate5_usable_counts(doc: Dict[str, Any]) -> tuple[int, int]:
+    """``(usable, no_data)`` for a generator document.
+
+    Counted from the per-ticker ``candidates`` rows whenever the document
+    carries them: a row is usable when its action is not ``NO_DATA`` and it is
+    not a provider error. Both generators publish those rows, but only
+    stream_candidates publishes ``no_data_count`` -- the 15:30 document does
+    not, so reading that field with a 0 default made an all-``NO_DATA`` 15:30
+    document look fully usable, the very outage this guard exists to catch
+    (Copilot review, PR #1519). Counting rows also stops a provider-error
+    ticker, which the executor scores as ``NO_DATA``, from being subtracted
+    twice. Only a document without rows falls back to its counts.
+    """
+    rows = _candidate_rows(doc)
+    if rows is not None:
+        no_data = sum(1 for row in rows if row["action"] == NO_DATA_ACTION)
+        usable = sum(1 for row in rows if row["action"] != NO_DATA_ACTION and not row.get("provider_error"))
+        return usable, no_data
+    no_data = doc["no_data_count"]
+    return doc["evaluated_count"] - doc["provider_error_count"] - no_data, no_data
+
+
+def find_gate5_documents(run_dir: Path, slot: str, day: date) -> tuple[List[tuple[Path, Dict[str, Any]]], List[str]]:
+    """This slot's Gate 5 generator documents in ``run_dir`` (newest first), plus the names of
+    candidate-looking JSON files that are NOT one.
+
+    Matched by content, never by filename: the live sessions have saved the
+    generator's stdout as ``candidates_<day>_<slot>.json``, ``gate5_document.json``,
+    ``cands_output.json`` and more. A document for another slot or day (a
+    copied-in file) does not count as this run's evidence, and neither does
+    one that says nothing about missing data (no ``candidates`` rows and no
+    ``no_data_count``). The second list is filenames containing "cand" that
+    fail that test, plus ANY file with duplicate JSON keys; beside a real
+    document a "cand" file is a harmless extract (the ``cands`` array saved on
+    its own), but on its own it is the 2026-09-18 fabrication signature.
+    """
+    documents: List[tuple[float, Path, Dict[str, Any]]] = []
+    strays: List[str] = []
+    if not run_dir.is_dir():
+        return [], []
+    for path in sorted(run_dir.glob("*.json")):
+        if path.name in ("run_state.json", "run_summary.json"):
+            continue
+        try:
+            loaded = json.loads(path.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
+        except ValueError as exc:
+            if "duplicate key" in str(exc):
+                strays.append(path.name)
+                continue
+            loaded = None
+        except OSError:
+            loaded = None
+        is_document = (
+            isinstance(loaded, dict)
+            and all(_is_count(loaded.get(key)) for key in GATE5_COUNT_KEYS)
+            and (_candidate_rows(loaded) is not None or _is_count(loaded.get("no_data_count")))
+            and str(loaded.get("runner_slot_id")) == slot
+            and loaded.get("trading_day") == day.isoformat()
+        )
+        if is_document:
+            documents.append((path.stat().st_mtime, path, loaded))
+        elif "cand" in path.name.lower():
+            strays.append(path.name)
+    documents.sort(key=lambda item: item[0], reverse=True)
+    return [(path, doc) for _, path, doc in documents], strays
+
+
+RELABEL_HINT = ("if market data failed, finalize as --order-submit-status not_submitted_error "
+                "--error-class market_data_unavailable --error-detail \"<what failed>\" and alert per Gate 9")
+
+
+def check_zero_order_gate5_evidence(
+    run_dir: Path, slot: str, day: date, *, order_submit_status: str, error_class: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Refuse a zero-order finalize whose Gate 5 evidence cannot tell a quiet tape from a data outage.
+
+    Returns the ``gate5_evidence`` block recorded in run_state.json, or None
+    when the check does not apply. It applies only to a zero-order status
+    WITHOUT ``--error-class``: a declared failure is already an alert, and
+    ``submitted`` has orders to show for itself.
+
+    * ``not_submitted_no_candidates`` claims Gate 5 ran and produced nothing,
+      so it needs this slot's generator document.
+    * ``no_orders_submitted`` also covers endings before Gate 5 (a Gate 4
+      stand-down), so a missing document is accepted -- unless a hand-made
+      candidates file sits in the directory instead, which is the
+      2026-09-18 signature.
+    * With a document and ``buy_count == 0``, at least one evaluated ticker
+      must have had usable data (see ``gate5_usable_counts``). One provider
+      error is routine (it is in most real documents), so the test is
+      "anything usable", not "no errors". ``evaluated_count == 0`` with
+      ``already_covered_tickers`` is Gate 4's served case, not an outage.
+      A document with ``buy_count > 0`` (Gate 6.5 zeroed every buy) passes.
+
+    A session that forges a whole generator document with invented counts
+    gets through; this catches the shortcut that actually happened, not
+    deliberate forgery.
+    """
+    if order_submit_status not in ZERO_ORDER_STATUSES or error_class:
+        return None
+    documents, strays = find_gate5_documents(run_dir, slot, day)
+    if not documents:
+        if order_submit_status == ORDER_SUBMIT_STATUS_NO_CANDIDATES:
+            raise FinalizeRefused(
+                "not_submitted_no_candidates needs this slot's Gate 5 generator document in the run "
+                f"directory (none for runner_slot_id {slot} / {day.isoformat()}); save the generator's "
+                f"output there, or {RELABEL_HINT}")
+        if strays:
+            raise FinalizeRefused(
+                f"{', '.join(strays)} look like candidate files but none is a Gate 5 generator document "
+                f"for runner_slot_id {slot} / {day.isoformat()}; a hand-written candidates file (or the "
+                f"cands array saved without its document, or a file with duplicate JSON keys) is not "
+                f"evidence of a quiet tape -- save the generator's full output document in the run "
+                f"directory, or {RELABEL_HINT}")
+        return None
+    path, doc = documents[0]
+    evaluated = doc["evaluated_count"]
+    usable, no_data = gate5_usable_counts(doc)
+    evidence = {
+        "document": path.name,
+        "evaluated_count": evaluated,
+        "usable_count": max(usable, 0),
+        "buy_count": doc["buy_count"],
+        "provider_error_count": doc["provider_error_count"],
+        "no_data_count": no_data,
+    }
+    if doc["buy_count"] > 0:
+        return evidence
+    if evaluated == 0 and doc.get("already_covered_tickers"):
+        return {**evidence, "served_by_compatible_executor": True}
+    if usable <= 0:
+        raise FinalizeRefused(
+            f"{path.name} shows zero candidates from zero usable tickers (evaluated {evaluated}, "
+            f"provider errors {doc['provider_error_count']}, no data {no_data}): "
+            f"that is a data outage, not a quiet tape -- {RELABEL_HINT}")
+    return evidence
+
+
+def check_existing_state_gate5_evidence(run_dir: Path, slot: str, day: date, state: Dict[str, Any]) -> None:
+    """The same outage check for a run_state.json this command did not write.
+
+    Without it, an executor-owned (or hand-written) zero-order state beside a
+    hand-made candidates file verified untouched: that path only refreshed the
+    pointer (Copilot review, PR #1519). An executor's own ``run()`` records its
+    evaluation in ``counts`` -- ``evaluated`` and ``no_data``, where a provider
+    error is already a ``NO_DATA`` signal -- so that is the evidence when
+    present; a state without it (hand-written) must pass the run directory's
+    generator-document check instead.
+    """
+    status = state.get("order_submit_status")
+    if status not in ZERO_ORDER_STATUSES or state.get("error_class"):
+        return
+    counts = state.get("counts") if isinstance(state.get("counts"), dict) else {}
+    evaluated, no_data = counts.get("evaluated"), counts.get("no_data")
+    if not (_is_count(evaluated) and _is_count(no_data)):
+        check_zero_order_gate5_evidence(run_dir, slot, day, order_submit_status=status, error_class=None)
+        return
+    buys = counts.get("buy_candidates")
+    if _is_count(buys) and buys > 0:
+        return
+    if evaluated - no_data <= 0:
+        raise FinalizeRefused(
+            f"run_state.json (not written by this command) records zero candidates from zero usable "
+            f"tickers (evaluated {evaluated}, no data {no_data}): that is a data outage, not a quiet "
+            f"tape -- {RELABEL_HINT}")
+
+
 def _csv_rows(path: Path) -> List[Dict[str, str]]:
     with path.open(newline="", encoding="utf-8") as handle:
         return [row for row in csv.DictReader(handle)]
@@ -455,6 +667,9 @@ def _finalize_locked(
     # retry may place orders the first attempt did not).
     ours = existing is not None and existing.get("finalized_by") == "scripts.finalize_run_evidence"
     if existing is not None and not ours:
+        # Before anything below writes a companion file or the pointer, so a
+        # refusal leaves the directory exactly as it was.
+        check_existing_state_gate5_evidence(run_dir, slot, day, existing)
         state = existing
         wrote = False
         if orders is not None or signals is not None or report is not None or budget is not None:
@@ -496,9 +711,16 @@ def _finalize_locked(
             # budget_evaluated=false for it would be false evidence.
             raise FinalizeRefused("orders were placed, so Gate 6 ran: pass --budget-json with budget_tier, "
                                   "daily_cap_usd and weekly_cap_usd")
+        # After the status is final (a retry above may have promoted it to
+        # 'submitted', which this check never blocks) and before anything is
+        # written, so a refusal leaves the directory as the session left it.
+        gate5_evidence = check_zero_order_gate5_evidence(run_dir, slot, day, order_submit_status=order_submit_status,
+                                                         error_class=error_class)
         state = build_run_state(slot, started, outcome=outcome, order_submit_status=order_submit_status,
                                 orders_submitted_count=count, error_class=error_class,
                                 error_detail=error_detail, report=report, budget=budget, now=now)
+        if gate5_evidence is not None:
+            state["gate5_evidence"] = gate5_evidence
         run_dir.mkdir(parents=True, exist_ok=True)
         # CSVs first, run_state last among the evidence files: a crash between
         # them leaves a directory verify_schedule reports as incomplete, never
