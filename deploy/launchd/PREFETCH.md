@@ -88,6 +88,15 @@ launchctl load ~/Library/LaunchAgents/com.all-stock-dca.prefetch.plist
 - `StartCalendarInterval` is local time and assumes the Mac is on US Eastern.
   `auto` reads the ET clock itself, so a wrong offset makes it skip ("no slot
   is due") rather than fetch for the wrong slot.
+- The agent starts through the checkout's `.venv/bin/python`, not `/bin/bash`.
+  macOS privacy protection (TCC) grants `~/Documents` access per binary: a
+  launchd agent running `/bin/bash` on a script there fails with
+  "Operation not permitted" (exit 126). The venv Python is what the existing
+  ticker-update agent already runs, and its child processes inherit that
+  access. So the checkout's `.venv` must exist.
+- The agent runs whatever `prefetch_slot.sh` the checkout has. If the
+  checkout is switched to a branch without it, runs fail (logged) until it's
+  back.
 - Log: `/tmp/dca-prefetch.log`.
 - If you installed the earlier 3:30-only agent, remove it:
   `launchctl unload ~/Library/LaunchAgents/com.all-stock-dca.prefetch-1530.plist`

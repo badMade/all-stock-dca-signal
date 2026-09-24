@@ -4,11 +4,18 @@
 <dict>
   <key>Label</key><string>com.all-stock-dca.prefetch</string>
   <key>ProgramArguments</key>
+  <!-- Started through the checkout's venv Python, not /bin/bash directly:
+       macOS privacy protection (TCC) grants ~/Documents access per binary, and
+       a launchd agent running /bin/bash on a script under ~/Documents fails
+       with "Operation not permitted" (exit 126). The venv Python is the binary
+       the existing ticker-update agent already runs from this checkout, and a
+       child process inherits its access. auto: fetch for the slot whose
+       decision time passed 1-14 minutes ago. -->
   <array>
-    <string>/bin/bash</string>
+    <string>REPLACE_WITH_REPO_PATH/.venv/bin/python</string>
+    <string>-c</string>
+    <string>import subprocess, sys; sys.exit(subprocess.call(["/bin/bash", sys.argv[1], "auto"]))</string>
     <string>REPLACE_WITH_REPO_PATH/deploy/launchd/prefetch_slot.sh</string>
-    <!-- auto: fetch for the slot whose decision time passed 1-14 minutes ago. -->
-    <string>auto</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

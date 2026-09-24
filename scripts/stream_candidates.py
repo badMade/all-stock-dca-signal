@@ -1830,7 +1830,16 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
             "validation/context evidence and the configured yfinance fallback only"
         )
     finance_primary = spec.source is SourceName.FINANCE
-    if spec.source.value not in sources and not (finance_primary and fallback_source in sources):
+    # Every slot's primary may now fall back to the labeled yfinance payload
+    # (config/scheduled_tasks.json market_data_source_policy, 2026-09-22). The
+    # Robinhood-primary slots used to have no fallback at all: their only data
+    # path was the live session pulling ~64 tickers of 5-minute bars through
+    # MCP tool output, which is what blew the output cap and the session's
+    # token budget on 2026-09-15 and 2026-09-18 (Notion DCA Issues:
+    # output_size_limit, intraday_bars_unavailable, token_limit_exceeded,
+    # market_data_unavailable). deploy/launchd/prefetch_slot.sh now writes that
+    # payload outside any session.
+    if spec.source.value not in sources and fallback_source not in sources:
         raise ValueError(
             f"--market-data's 'sources' is missing the required {spec.source.value!r} object; a "
             "genuinely failed fetch is spelled by listing it in source_errors (which aborts), "
@@ -1917,16 +1926,46 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
         for ticker in primary_scored_tickers
         for item in (primary_payload.get(ticker),)
     )
-    use_fallback = finance_primary and (
-        spec.source.value in source_errors
-        or spec.source.value not in sources
-        or bool(primary_ticker_errors)
-        or primary_incomplete
-    )
+    # Absent or declared failed. An empty-but-present object is NOT counted
+    # here: when Gate 4's compatible executor already covered every ticker
+    # nothing is left to score, and treating {} as an outage would demand a
+    # fallback for a run that needs no data. An empty object with tickers left
+    # to score is still caught -- by primary_incomplete / the all-stale test.
+    primary_unavailable = spec.source.value in source_errors or spec.source.value not in sources
+    if finance_primary:
+        use_fallback = primary_unavailable or bool(primary_ticker_errors) or primary_incomplete
+    else:
+        # Robinhood-primary: fall back only when the source failed AS A WHOLE
+        # -- listed in source_errors, absent/empty, or not one scored ticker
+        # carrying data fresh for this slot. NOT on a single ticker error or a
+        # single stale ticker, as Finance does: Robinhood reports one routine
+        # per-ticker error (QBUT) in most real documents, so Finance's rule
+        # would move these slots onto yfinance nearly every day. A per-ticker
+        # gap stays what it was before this change, that ticker's own
+        # provider error.
+        # Constructed once, not per ticker: each construction re-reads config
+        # (and logs its account-pinning warning) for an identical anchor.
+        decision_time = spec.executor_cls(config=config, mode=spec.live_mode, **spec.executor_kwargs).decision_time
+        use_fallback = primary_unavailable or (
+            bool(primary_scored_tickers)
+            and all(
+                not _primary_payload_is_fresh(
+                    primary_payload.get(ticker),
+                    trading_day=trading_day,
+                    nominal_time=decision_time,
+                    interval_minutes=spec.source_interval_minutes or config.interval_minutes,
+                    evaluation_delay_minutes=spec.evaluation_delay_minutes,
+                )
+                for ticker in primary_scored_tickers
+            )
+        )
     effective_spec = spec
     if use_fallback:
         if fallback_source not in sources or fallback_source in source_errors:
-            raise ValueError("Finance data is unavailable/incomplete and the configured yfinance fallback is unavailable")
+            raise ValueError(
+                f"{spec.source.value} data is unavailable/incomplete and the configured yfinance "
+                "fallback is unavailable"
+            )
         effective_spec = dataclasses.replace(spec, source=SourceName.YFINANCE_FALLBACK)
     # Checked against the source actually being scored, AFTER the fallback
     # decision: on main this check sat before it and read the primary only,

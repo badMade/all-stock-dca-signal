@@ -44,6 +44,14 @@ live slot) merges this script's JSON output into its own `--market-data`
 payload. **This script never calls either candidate generator, never places
 an order, and is read-only against the DCA strategy's own state.**
 
+## Scheduled use
+
+`deploy/launchd/prefetch_slot.sh` runs this script one minute after every
+live slot's decision time and writes the payload to
+`<cron root>/yfinance_prefetch/<YYYY-MM-DD>/yfinance_fallback_<YYYY-MM-DD>_<HHMM>.json`,
+where each slot's Gate 5 merges it. Every slot's generator accepts it as a
+fallback since 2026-09-22 (see `deploy/launchd/PREFETCH.md`).
+
 ## Usage
 
 ```bash

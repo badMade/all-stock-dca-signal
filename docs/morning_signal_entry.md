@@ -27,13 +27,17 @@ Unlike the Finance-primary slots, **Finance and Alpaca are not accepted keys at
 all here** -- `run_cli()`'s `accepted_sources` is built from `spec.source`
 (robinhood) plus the yfinance fallback key only, so a `sources.finance` or
 `sources.alpaca` object in the payload raises `"unsupported key(s)"`, it does
-not get accepted as validation/context. `sources.yahoo_finance_yfinance` is an
-accepted key but is **not a usable fallback for this slot**: the "missing
-primary can be met by yfinance instead" allowance in `run_cli()` is gated on
-`spec.source is SourceName.FINANCE`, so for this Robinhood-primary spec a
-`robinhood` entry in `source_errors` still aborts even when yfinance data is
-present (`test_cli_does_not_substitute_yfinance_for_a_robinhood_primary_spec`).
-A Robinhood outage at 10:30 has no automatic data-source fallback today.
+not get accepted as validation/context. `sources.yahoo_finance_yfinance` is
+the **labeled fallback** (since 2026-09-22; it used to be accepted but never
+substituted). `run_cli()` switches the whole universe to it only when Robinhood
+failed as a whole: `robinhood` listed in `source_errors`, the key absent, or
+no scored ticker carrying data fresh for this slot. A single ticker's gap
+does NOT switch -- Robinhood reports one routine per-ticker error in most real
+documents -- and stays that ticker's provider error
+(`test_one_robinhood_ticker_error_does_not_move_the_universe_to_yfinance`).
+With no yfinance block present, a Robinhood outage still aborts. The payload
+is prefetched outside the session by `deploy/launchd/prefetch_slot.sh`
+(`deploy/launchd/PREFETCH.md`).
 
 This is a deliberate, confirmed exception (2026-09-09) to the repo-wide
 Finance-primary policy in `docs/safeguards.md#market-data-source-policy` and

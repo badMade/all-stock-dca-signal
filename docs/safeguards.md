@@ -222,9 +222,14 @@ here. See that README for the full caveat.
   `42173154`) uses **Robinhood as its PRIMARY** source for this slot only, and
   has **no automatic fallback**: Finance and Alpaca are not accepted
   `--market-data` keys for this slot at all (an unsupported-key error, not
-  validation/context), and a `yfinance` payload present alongside a
-  `robinhood` fetch failure does not get substituted -- a genuine Robinhood
-  outage aborts this slot's Gate 5. Confirmed 2026-09-09 as this slot's
+  validation/context). Since 2026-09-22 a labeled `yfinance` payload IS
+  substituted -- for the whole universe -- when Robinhood failed as a whole
+  (listed in `source_errors`, absent, or no scored ticker fresh for the slot),
+  never over one ticker's gap; with no yfinance block present, a genuine
+  Robinhood outage still aborts this slot's Gate 5. The 11:30, 1:30 and 2:30
+  intraday slots are Robinhood-primary under the same rule. The payload is
+  prefetched outside any session by `deploy/launchd/prefetch_slot.sh`
+  (`deploy/launchd/PREFETCH.md`). Confirmed 2026-09-09 as this slot's
   deliberate policy rather than the Finance-primary default every other slot
   uses -- see
   [morning_signal_entry.md](morning_signal_entry.md#market-data-source-for-this-slot)
@@ -232,8 +237,9 @@ here. See that README for the full caveat.
 - **0935ET slot exception:** the 9:35 AM market-open slot's Gate 5 entry point
   (`scripts/generate_market_open_candidates.py`, `MARKET_OPEN_SPEC.source`,
   cron `2ba19526`) uses **Robinhood as its PRIMARY** source too, for the same
-  reason and with the same no-fallback contract as the 1030ET exception above
-  (Finance/Alpaca rejected outright, `yfinance` accepted but non-substituting).
+  reason and with the same fallback contract as the 1030ET exception above
+  (Finance/Alpaca rejected outright, `yfinance` substituted only when Robinhood
+  failed as a whole).
   GFUZ is no longer a special case on this slot -- every ticker, GFUZ
   included, is scored from Robinhood the same way, so the GFUZ exception
   above no longer applies to this slot's Gate 5 CLI specifically (it still

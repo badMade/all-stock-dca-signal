@@ -145,12 +145,13 @@ executor sessions here have no reliable Finance MCP connector access, and the
 repo's own fail-closed Gate 5 correctly refuses to fabricate `sources.finance`
 from Robinhood data rather than substitute silently. GFUZ is no longer a
 special case: every ticker on this slot, GFUZ included, is scored from
-Robinhood the same way. `sources.yahoo_finance_yfinance` is an accepted key
-but **not a usable fallback** -- as with 1030ET, the "missing primary can be
-met by yfinance instead" allowance in `scripts/stream_candidates.py`'s
-`run_cli()` is gated on `spec.source is SourceName.FINANCE`, which is no
-longer true here, so a `robinhood` entry in `source_errors` still aborts even
-when yfinance data is present. `sources.finance` and `sources.alpaca` are not
+Robinhood the same way. `sources.yahoo_finance_yfinance` is the **labeled
+fallback** (since 2026-09-22), under the same Robinhood-primary rule as 1030ET:
+`scripts/stream_candidates.py`'s `run_cli()` switches the whole universe to it
+only when Robinhood failed as a whole (listed in `source_errors`, absent, or no
+scored ticker fresh for the slot), never over one ticker's gap, and still
+aborts when no yfinance block is present. `deploy/launchd/prefetch_slot.sh`
+writes that block outside the session. `sources.finance` and `sources.alpaca` are not
 accepted keys at all for this slot -- either raises `"unsupported key(s)"`,
 not a validation/context acceptance.
 

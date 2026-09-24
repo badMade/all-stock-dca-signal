@@ -867,30 +867,80 @@ def test_cli_accepts_a_robinhood_only_payload_with_no_finance_data_at_all(tmp_pa
     assert _only(document)["target_price"] == pytest.approx(95.0)
 
 
-def test_cli_does_not_substitute_yfinance_for_a_robinhood_primary_spec(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        gmoc,
-        "MARKET_OPEN_SPEC",
-        dataclasses.replace(gmoc.MARKET_OPEN_SPEC, source=stream_candidates.SourceName.ROBINHOOD),
-    )
-    _patch_config(monkeypatch)
-    payload = {
+def _yfinance_rescue_payload(**robinhood: dict) -> dict:
+    """Robinhood as given, plus a labeled yfinance block carrying TEST and OTHER."""
+    return {
         "sources": {
-            "robinhood": {},
+            "robinhood": dict(robinhood),
             "yahoo_finance_yfinance": {
-                "TEST": _ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0)
+                "TEST": _ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0),
+                "OTHER": _ticker_payload(price=50.0, previous_close=50.5, previous_low=49.0),
             },
         },
-        "source_errors": ["robinhood"],
+        "source_errors": [],
         "ticker_errors": {"robinhood": [], "yahoo_finance_yfinance": []},
     }
+
+
+def _two_ticker_cli(tmp_path, monkeypatch, payload: dict) -> dict:
     path = tmp_path / "market_data_0935ET.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
+    return _cli(
+        ["--trading-day", DAY.isoformat(), "--market-data", str(path), "--config-dir", str(REAL_CONFIG_DIR)],
+        monkeypatch,
+        _config(tickers=("TEST", "OTHER")),
+    )
 
-    with pytest.raises(ValueError, match="robinhood.*source_errors"):
-        gmoc.main(
-            ["--trading-day", DAY.isoformat(), "--market-data", str(path), "--config-dir", str(REAL_CONFIG_DIR)]
-        )
+
+# 2026-09-22 policy change (config/scheduled_tasks.json market_data_source_policy):
+# a Robinhood-primary slot may now fall back to the labeled yfinance payload --
+# but only when Robinhood failed AS A WHOLE, never over one ticker's gap (Notion
+# DCA Issues: output_size_limit, intraday_bars_unavailable, market_data_unavailable).
+
+
+def test_cli_substitutes_yfinance_when_robinhood_is_declared_failed(tmp_path, monkeypatch):
+    payload = _yfinance_rescue_payload()
+    payload["source_errors"] = ["robinhood"]
+    document = _two_ticker_cli(tmp_path, monkeypatch, payload)
+
+    assert document["source"] == "yahoo_finance_yfinance"
+    assert _only(document)["target_price_source"] == "yahoo_finance_yfinance"
+    assert _only(document)["action"] == Action.BUY.value
+
+
+def test_cli_substitutes_yfinance_when_the_robinhood_key_is_absent(tmp_path, monkeypatch):
+    payload = _yfinance_rescue_payload()
+    del payload["sources"]["robinhood"]
+    del payload["ticker_errors"]["robinhood"]
+    assert _two_ticker_cli(tmp_path, monkeypatch, payload)["source"] == "yahoo_finance_yfinance"
+
+
+def test_cli_substitutes_yfinance_when_every_robinhood_ticker_is_empty(tmp_path, monkeypatch):
+    document = _two_ticker_cli(tmp_path, monkeypatch, _yfinance_rescue_payload())
+    assert document["source"] == "yahoo_finance_yfinance"
+
+
+def test_one_robinhood_ticker_error_does_not_move_the_universe_to_yfinance(tmp_path, monkeypatch):
+    """Robinhood reports one routine per-ticker error in most real documents; Finance's
+    any-gap rule would put these slots on yfinance nearly every day."""
+    payload = _yfinance_rescue_payload(
+        TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0)
+    )
+    payload["ticker_errors"]["robinhood"] = ["OTHER"]
+    document = _two_ticker_cli(tmp_path, monkeypatch, payload)
+
+    assert document["source"] == "robinhood"
+    assert document["provider_error_tickers"] == ["OTHER"]
+
+
+def test_robinhood_failure_without_a_fallback_still_aborts(tmp_path, monkeypatch):
+    payload = _market_data()
+    payload["source_errors"] = ["robinhood"]
+    path = tmp_path / "market_data_0935ET.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    _patch_config(monkeypatch)
+    with pytest.raises(ValueError, match="robinhood data is unavailable.*yfinance fallback is unavailable"):
+        gmoc.main(["--trading-day", DAY.isoformat(), "--market-data", str(path), "--config-dir", str(REAL_CONFIG_DIR)])
 
 
 def test_cli_refreshed_decision_time_recomputes_desired_size(tmp_path, monkeypatch):

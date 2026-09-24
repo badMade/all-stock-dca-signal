@@ -4546,3 +4546,22 @@ def test_midday_live_mirror_documents_the_run_classification_template():
     assert 'midday-live-v1' in text
     assert 'midday_dca_live' in text
     assert 'never a bare string' in text
+
+
+def test_every_live_slot_gate_5_merges_its_prefetched_yfinance_fallback():
+    """2026-09-22: every slot's Gate 5 generator accepts the labeled yfinance
+    fallback, and deploy/launchd/prefetch_slot.sh writes it outside the session.
+    A prompt that forgets to merge it sends its session back to pulling every
+    ticker's bars through MCP tool output -- the failure behind Notion DCA
+    Issues output_size_limit, intraday_bars_unavailable and token_limit_exceeded.
+    """
+    mirror_dir = PROMPTS_DIR / "live-mirror"
+    for mirror in sorted(mirror_dir.glob("[0-9][0-9][0-9][0-9]ET-*.txt")):
+        slot = mirror.name[:4]
+        text = mirror.read_text(encoding="utf-8")
+        gate_5 = text[text.index("GATE 5 - BUY LIST") : text.index("GATE 6 - BUDGET")]
+        assert f"stream_root('yfinance_prefetch', '<YYYY-MM-DD>', 'yfinance_fallback_<YYYY-MM-DD>_{slot}.json')" in gate_5, mirror.name
+        assert f'deploy/launchd/prefetch_slot.sh" {slot}' in gate_5, mirror.name
+        assert "sources.yahoo_finance_yfinance" in gate_5, mirror.name
+        # The prefetch tree is deliberately not the run directory.
+        assert "$ROOT/yfinance_fallback_" not in gate_5, mirror.name
