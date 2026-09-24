@@ -307,6 +307,14 @@ ACTIVE_TICKERS = [
     "CSCO",
     "FFIV",
     "COHR",
+    # SEP 24 2026 (user-confirmed symbol correction): QUBT (Quantum Computing
+    # Inc.) is the symbol QBUT was meant to be. Unlike QBUT, it was checked
+    # against Robinhood before being added (instrument search + quote: state
+    # active, prior close available); fractional tradability was NOT checked,
+    # so the is_tradable_for_fractional_buy gate still decides fail-closed.
+    # QBUT stays in EXCLUDED_TICKERS so a stale list carrying the misspelling
+    # is filtered out. See config/tickers.json's notes.
+    "QUBT",
 ]
 
 # QBUT is the one categorically excluded ticker today (no mechanism to buy it

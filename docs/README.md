@@ -66,10 +66,11 @@ environment (see the repository README).
   `RVI`, `VCX`, `TRLV`, the 2026-09-05 additions `LLY`, `TSLA`, and the
   2026-09-11 additions `VIAV`, `CIEN`, `ANET`, `CSCO`, `FFIV`, `COHR` — all
   whitelisted without a broker instrument search, so unverified until their
-  first live run; `near_close_dca.ACTIVE_TICKERS` and `config/tickers.json`
+  first live run — plus `QUBT`, added 2026-09-24 as the corrected spelling of
+  `QBUT` after Robinhood resolved it; `QBUT` itself stays excluded; `near_close_dca.ACTIVE_TICKERS` and `config/tickers.json`
   are the count of record and `tests/test_config_invariants.py` pins them);
   `BYDDY` and `RVII` are whole-share tickers, not excluded (fractional-tradability; `RVII` moved
-  out of the active list 2026-08-24 — see [whole_share_accumulation.md](whole_share_accumulation.md)); `IRDMI→IRDM`, `GLWR→GLW`; `GFUZ` uses
+  out of the active list 2026-08-24 — see [whole_share_accumulation.md](whole_share_accumulation.md)); `IRDMI→IRDM`, `GLWR→GLW`, `QBUT→QUBT`; `GFUZ` uses
   Robinhood primary data (finance `NOT_FOUND`).
 - **Latest ladder:** 0.1%→8%+, base $2, max **5x** (no upper cutoff). Older
   0.1%–12% ladders are **superseded**.

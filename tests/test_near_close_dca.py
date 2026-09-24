@@ -2377,6 +2377,11 @@ def test_ticker_universe():
     # every live run since its unverified 2026-08-16 addition.
     assert "QBUT" not in ACTIVE_TICKERS
     assert "QBUT" in EXCLUDED_TICKERS
+    # QBUT was a misspelling of QUBT (Quantum Computing Inc.), corrected
+    # 2026-09-24: QUBT is active, and QBUT stays excluded so a stale list
+    # still carrying the misspelling is filtered out rather than fetched.
+    assert "QUBT" in ACTIVE_TICKERS
+    assert "QUBT" not in EXCLUDED_TICKERS
 
 
 # --- Target price selection --------------------------------------------------
