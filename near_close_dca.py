@@ -10435,21 +10435,68 @@ def _orders_csv_fills(
     had_csv_error = False
     try:
         with orders_csv.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            fieldnames = reader.fieldnames  # reads the header row
+            reader = csv.reader(handle)
+            try:
+                fieldnames = next(reader)
+            except StopIteration:
+                fieldnames = None
             if fieldnames is not None:
                 try:
-                    for row in reader:
-                        rows.append(row)
-                except csv.Error:
-                    had_csv_error = True
-                    logger.exception(
-                        "failed to parse %s for same-day fill context; prior allocations from "
-                        "this file may be undercounted -- reconcile against broker orders",
-                        orders_csv,
-                    )
-                    if skip_sink is not None:
-                        skip_sink.append(orders_csv)
+                    t_idx = fieldnames.index("ticker")
+                    s_idx = fieldnames.index("status") if "status" in fieldnames else -1
+                    st_idx = fieldnames.index("state") if "state" in fieldnames else -1
+                    o_idx = fieldnames.index("order_id") if "order_id" in fieldnames else -1
+
+                    price_indices = [(col, fieldnames.index(col)) for col in _FILL_PRICE_COLS if col in fieldnames]
+                    qty_indices = [(col, fieldnames.index(col)) for col in _FILL_QUANTITY_COLS if col in fieldnames]
+                    notional_indices = [(col, fieldnames.index(col)) for col in _SUBMITTED_NOTIONAL_COLS if col in fieldnames]
+                    exec_qty_indices = [(col, fieldnames.index(col)) for col in _EXECUTED_QUANTITY_COLS if col in fieldnames]
+
+                    all_indices = [(col, idx) for col, idx in price_indices + qty_indices + notional_indices + exec_qty_indices]
+
+                    try:
+                        for _row in reader:
+                            row_dict = {}
+                            if t_idx != -1 and t_idx < len(_row) and _row[t_idx] is not None:
+                                row_dict["ticker"] = _row[t_idx]
+                            if s_idx != -1 and s_idx < len(_row) and _row[s_idx] is not None:
+                                row_dict["status"] = _row[s_idx]
+                            if st_idx != -1 and st_idx < len(_row) and _row[st_idx] is not None:
+                                row_dict["state"] = _row[st_idx]
+                            if o_idx != -1 and o_idx < len(_row) and _row[o_idx] is not None:
+                                row_dict["order_id"] = _row[o_idx]
+
+                            for col, idx in all_indices:
+                                if idx < len(_row) and _row[idx] is not None:
+                                    row_dict[col] = _row[idx]
+
+                            if len([x for x in _row if x is not None]) < len(fieldnames):
+                                row_dict["_trunc"] = None
+                            rows.append(row_dict)
+                    except csv.Error:
+                        had_csv_error = True
+                        logger.exception(
+                            "failed to parse %s for same-day fill context; prior allocations from "
+                            "this file may be undercounted -- reconcile against broker orders",
+                            orders_csv,
+                        )
+                        if skip_sink is not None:
+                            skip_sink.append(orders_csv)
+                except ValueError:
+                    handle.seek(0)
+                    dict_reader = csv.DictReader(handle)
+                    try:
+                        for row in dict_reader:
+                            rows.append(row)
+                    except csv.Error:
+                        had_csv_error = True
+                        logger.exception(
+                            "failed to parse %s for same-day fill context; prior allocations from "
+                            "this file may be undercounted -- reconcile against broker orders",
+                            orders_csv,
+                        )
+                        if skip_sink is not None:
+                            skip_sink.append(orders_csv)
     except (OSError, UnicodeDecodeError):
         logger.exception(
             "failed to parse %s for same-day fill context; prior allocations from "
@@ -11034,16 +11081,48 @@ def _orders_csv_attempt_counts(
     had_csv_error = False
     try:
         with orders_csv.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            fieldnames = reader.fieldnames
+            reader = csv.reader(handle)
+            try:
+                fieldnames = next(reader)
+            except StopIteration:
+                fieldnames = None
             if fieldnames is not None:
                 try:
-                    for row in reader:
-                        rows.append(row)
-                except csv.Error:
-                    had_csv_error = True
-                    if skip_sink is not None:
-                        skip_sink.append(orders_csv)
+                    t_idx = fieldnames.index("ticker")
+                    o_idx = fieldnames.index("order_id") if "order_id" in fieldnames else -1
+                    s_idx = fieldnames.index("status") if "status" in fieldnames else -1
+                    st_idx = fieldnames.index("state") if "state" in fieldnames else -1
+
+                    try:
+                        for _row in reader:
+                            row_dict = {}
+                            if t_idx != -1 and t_idx < len(_row):
+                                row_dict["ticker"] = _row[t_idx]
+                            if o_idx != -1 and o_idx < len(_row):
+                                row_dict["order_id"] = _row[o_idx]
+                            if s_idx != -1 and s_idx < len(_row):
+                                row_dict["status"] = _row[s_idx]
+                            if st_idx != -1 and st_idx < len(_row):
+                                row_dict["state"] = _row[st_idx]
+
+                            if len([x for x in _row if x is not None]) < len(fieldnames):
+                                row_dict["_trunc"] = None
+
+                            rows.append(row_dict)
+                    except csv.Error:
+                        had_csv_error = True
+                        if skip_sink is not None:
+                            skip_sink.append(orders_csv)
+                except ValueError:
+                    handle.seek(0)
+                    dict_reader = csv.DictReader(handle)
+                    try:
+                        for row in dict_reader:
+                            rows.append(row)
+                    except csv.Error:
+                        had_csv_error = True
+                        if skip_sink is not None:
+                            skip_sink.append(orders_csv)
     except (OSError, UnicodeDecodeError):
         if skip_sink is not None:
             skip_sink.append(orders_csv)

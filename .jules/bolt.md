@@ -207,3 +207,8 @@ Added `get_order_fills` to `BrokerAdapter` protocol and Robinhood live adapter, 
 
 **Learning:** Sometimes an import is intentionally marked as unused by the linter, but it exists solely to execute important side effects (like patching network libraries during testing). Deleting it blindly based on linter warnings can compromise security or test validity.
 **Action:** Always check the surrounding comments and context. If an unused import is necessary for its side effects, use a linter suppression directive (e.g., `# noqa: F401`) instead of removing it to preserve the necessary behavior while clearing the code health warning.
+
+## 2026-10-21 - Maintain DictReader Key Contracts
+
+**Learning:** When refactoring `csv.DictReader` into `csv.reader` loops to eliminate dict allocations, manually constructing smaller dicts using only a subset of keys (to avoid full manual tuple mapping overhead) can break downstream codebase validations. `csv.DictReader` guarantees every header field will exist as a key (resolving truncated trailing fields to `None`). Omitting these keys results in hidden `KeyError`s or schema validation failures later in the pipeline.
+**Action:** When manually reconstructing dictionary mappings from `csv.reader`, ensure you fully mimic the `DictReader` contract for any keys downstream consumers expect, including safely padding missing values with `None`. Do not use `if idx < len(_row): dict[col] = _row[idx]` as it drops the key entirely on short rows. Use `dict[col] = _row[idx] if idx < len(_row) else None` instead.
