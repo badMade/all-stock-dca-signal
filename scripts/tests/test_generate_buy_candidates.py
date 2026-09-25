@@ -17,7 +17,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo
@@ -2289,6 +2289,33 @@ def test_no_already_covered_tickers_is_still_the_default(tmp_path, monkeypatch):
     assert document["buy_count"] == 1
     assert len(document["planner_candidates"]) == 1
     assert document["already_covered_tickers"] == []
+
+
+def test_parse_bar_accepts_robinhood_nanosecond_zulu_timestamp():
+    """Robinhood's MCP historicals return timestamps like
+    "2026-07-06T18:31:29.201412148Z" -- trailing Z, 9 fractional digits.
+    Python 3.11 broadened fromisoformat to accept this directly; this
+    repo's signal scripts are sometimes run from a stricter Python 3.10
+    interpreter that rejects it outright (confirmed: ValueError on 3.10
+    before this fix). _parse_bar must not depend on interpreter version."""
+    bar = gbc._parse_bar(
+        {
+            "timestamp": "2026-07-06T18:31:29.201412148Z",
+            "open": 100.0,
+            "high": 101.0,
+            "low": 99.0,
+            "close": 100.5,
+            "volume": 1000.0,
+        }
+    )
+    assert bar.timestamp == datetime(2026, 7, 6, 18, 31, 29, 201412, tzinfo=timezone.utc)
+
+
+def test_parse_quote_accepts_robinhood_nanosecond_zulu_timestamp():
+    """Same shape, for the quote.as_of field _parse_quote reads."""
+    price, quote_time = gbc._parse_quote({"price": 123.45, "as_of": "2026-07-06T18:31:29.201412148Z"})
+    assert price == pytest.approx(123.45)
+    assert quote_time == datetime(2026, 7, 6, 18, 31, 29, 201412, tzinfo=timezone.utc)
 
 
 def test_malformed_finance_quote_does_not_crash():

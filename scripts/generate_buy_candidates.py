@@ -678,6 +678,32 @@ def _finite_positive_float(raw: Any, *, field: str) -> float:
     return value
 
 
+def _normalize_iso8601_timestamp(text: str) -> str:
+    """Normalize a market-data timestamp so ``datetime.fromisoformat`` accepts
+    it on Python 3.10, not just the broadened 3.11+ parser.
+
+    Robinhood returns timestamps like ``2026-07-06T18:31:29.201412148Z`` (a
+    trailing ``Z``, 9 fractional digits). Trims to microsecond precision and
+    replaces a trailing ``Z`` with an explicit ``+00:00`` offset -- the same
+    normalization ``dca_live_adapters._parse_rfc3339`` already applies for the
+    identical reason -- so parsing this module's own ``timestamp``/``as_of``
+    fields does not depend on which interpreter runs it.
+    """
+    text = text.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    if "." in text:
+        head, _, tail = text.partition(".")
+        frac, offset = tail, ""
+        for sep in ("+", "-"):
+            idx = tail.find(sep)
+            if idx != -1:
+                frac, offset = tail[:idx], tail[idx:]
+                break
+        text = f"{head}.{frac[:6]}{offset}"
+    return text
+
+
 def _parse_bar(raw: Mapping[str, Any], *, allow_unknown_low: bool = False) -> Bar:
     """``allow_unknown_low`` relaxes ``low`` from strictly-positive to merely
     finite, for ``previous_close_bar`` only. The live Robinhood adapter's own
@@ -714,7 +740,7 @@ def _parse_bar(raw: Mapping[str, Any], *, allow_unknown_low: bool = False) -> Ba
     """
     low_parser = _finite_float if allow_unknown_low else _finite_positive_float
     try:
-        timestamp = datetime.fromisoformat(str(raw["timestamp"]))
+        timestamp = datetime.fromisoformat(_normalize_iso8601_timestamp(str(raw["timestamp"])))
         if timestamp.tzinfo is None:
             raise ValueError(f"bar timestamp must be timezone-aware, got {raw['timestamp']!r}")
         open_price = _finite_positive_float(raw["open"], field="open")
@@ -786,7 +812,7 @@ def _parse_quote(raw: Optional[Mapping[str, Any]]) -> Optional[Tuple[float, Opti
         raise ValueError(f"quote must be an object mapping, got {type(raw).__name__}")
     try:
         as_of = raw.get("as_of")
-        quote_time = datetime.fromisoformat(str(as_of)) if as_of else None
+        quote_time = datetime.fromisoformat(_normalize_iso8601_timestamp(str(as_of))) if as_of else None
         if quote_time is not None and quote_time.tzinfo is None:
             raise ValueError(f"quote.as_of must be timezone-aware, got {as_of!r}")
         return (

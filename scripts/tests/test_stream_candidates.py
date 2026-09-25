@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from datetime import date
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any, cast
 
@@ -14,8 +14,10 @@ import pytest
 
 from near_close_dca import SourceName
 from scripts.stream_candidates import (
+    StreamMarketData,
     StreamSpec,
     _allocation_priority_key,
+    _primary_payload_is_fresh,
     _require_config_number,
     _require_parseable_stream_config,
     _run_with_args,
@@ -320,4 +322,36 @@ def test_run_multi_slot_cli_success(tmp_path, monkeypatch):
         description="test",
     )
     assert ret == 42
+
+
+def test_primary_payload_is_fresh_accepts_robinhood_nanosecond_zulu_quote_timestamp():
+    """_primary_payload_is_fresh re-parses quote.as_of independently of
+    _parse_quote -- confirmed it silently returns False (not a crash) under
+    Python 3.10 for this exact Robinhood-shaped timestamp, misclassifying
+    valid signal-time evidence as stale."""
+    payload = {
+        "previous_close_bar": {"close": 100.0},
+        "quote": {"price": 100.0, "as_of": "2026-08-05T13:34:00.201412148Z"},
+    }
+    assert _primary_payload_is_fresh(
+        payload,
+        trading_day=date(2026, 8, 5),
+        nominal_time=time(9, 35),
+        interval_minutes=5,
+        evaluation_delay_minutes=0,
+    )
+
+
+def test_stream_market_data_finance_quote_accepts_robinhood_nanosecond_zulu_timestamp():
+    """StreamMarketData's Finance-quote override re-implements the same
+    fromisoformat call inline rather than reusing _parse_quote -- must
+    accept the same nanosecond+Z shape."""
+    as_of = datetime(2026, 8, 5, 13, 35, 0, 201412, tzinfo=timezone.utc)
+    provider = StreamMarketData(
+        SourceName.FINANCE,
+        {"TEST": {"quote": {"price": 123.45, "as_of": "2026-08-05T13:35:00.201412148Z"}}},
+        quote_staleness_minutes=5,
+        trading_day=date(2026, 8, 5),
+    )
+    assert provider.get_quote("TEST", as_of) == (123.45, as_of)
 

@@ -105,6 +105,7 @@ from scripts.generate_buy_candidates import (  # noqa: E402
     _REQUIRED_CONFIG_FILENAMES as _SHARED_REQUIRED_CONFIG_FILENAMES,
 )
 from scripts.generate_buy_candidates import (  # noqa: E402
+    _normalize_iso8601_timestamp,
     _parse_bar,
     _planner_incompatible,
     _require_populated_config,
@@ -478,7 +479,7 @@ class StreamMarketData(_StaticMarketData):
                     continue
                 try:
                     price = float(raw_quote["price"])
-                    quote_time = datetime.fromisoformat(str(raw_quote["as_of"]))
+                    quote_time = datetime.fromisoformat(_normalize_iso8601_timestamp(str(raw_quote["as_of"])))
                 except (KeyError, TypeError, ValueError):
                     continue
                 if math.isfinite(price) and price > 0 and quote_time.tzinfo is not None:
@@ -636,7 +637,7 @@ def _primary_payload_is_fresh(
     quote = payload.get("quote")
     if isinstance(quote, Mapping):
         try:
-            quote_time = datetime.fromisoformat(str(quote["as_of"]))
+            quote_time = datetime.fromisoformat(_normalize_iso8601_timestamp(str(quote["as_of"])))
             quote_price = float(quote["price"])
         except (KeyError, TypeError, ValueError):
             pass
