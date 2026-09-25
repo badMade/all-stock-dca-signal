@@ -1,0 +1,71 @@
+name: Claude Code Review
+
+# TRUST BOUNDARY -- read this before editing. See also
+# antigravity-pr-review*.yml and docs/pr_review_workflow.md for the sibling
+# automated-review pipeline's threat model.
+#
+# This workflow is triggered by `issue_comment`, not `pull_request`. GitHub
+# always takes an `issue_comment`-triggered workflow's YAML from the
+# repository's DEFAULT branch, never from the commented-on PR's branch -- so,
+# unlike `pull_request`, a PR cannot edit this file and have that edit apply
+# to its own run. That is the specific problem the Antigravity two-workflow
+# split exists to solve for `pull_request`; it does not arise here, so a
+# single workflow file is sufficient.
+#
+# What still has to be defended here is authorization: any GitHub user can
+# comment on a PR, so the job only runs for a comment (a) on a pull request,
+# (b) containing the trigger phrase, and (c) from a commenter GitHub itself
+# reports as OWNER/MEMBER/COLLABORATOR via `author_association` -- a
+# server-computed field the commenter cannot forge. anthropics/claude-code-action
+# separately enforces write-permission authorization internally (its
+# `allowed_non_write_users` input, left unset here, defaults to allowing no
+# non-write users), so this is defense in depth, not the only gate.
+#
+# This is a review-only deployment: no `contents: write` permission, and
+# `claude_args` disallows the Edit/Write/MultiEdit/Bash tools so Claude cannot
+# modify the repo or run commands -- it can only read the code/diff and post
+# a review comment.
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: claude-review-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    name: Respond to @claude review comment
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: >-
+      github.event.issue.pull_request != null &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
+      contains(toLower(github.event.comment.body), '@claude review')
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Run Claude Code Review
+        uses: anthropics/claude-code-action@9171db3e57d6a3140a37ddc2ba92788584e0ead6 # v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          trigger_phrase: "@claude review"
+          prompt: |
+            Review this pull request's changes. Focus on correctness bugs,
+            security issues, and test coverage gaps. Do not modify any files
+            or run commands -- post your findings as a PR comment only.
+          claude_args: |
+            --disallowedTools "Bash,Edit,Write,MultiEdit,NotebookEdit"
