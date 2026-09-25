@@ -104,6 +104,48 @@ def _load_diff() -> "str | None":
         return None
 
 
+async def _generate_review(
+    agent_factory,
+    prompt: str,
+    *,
+    max_attempts: int = 3,
+    base_delay_seconds: float = 2.0,
+    sleep=asyncio.sleep,
+) -> str:
+    """Call the provider for a review, retrying rate-limit-shaped failures.
+
+    `agent_factory()` is called fresh on every attempt -- a session tied to a
+    rate-limited request is discarded, not reused, in case it is itself
+    implicated. Only errors `_is_rate_limit_error` recognizes are retried
+    (a per-minute limit can clear within a job's timeout; a daily quota
+    exhaustion will not, and simply burns through `max_attempts`). Any other
+    exception, and the final attempt's exception once `max_attempts` is
+    exhausted, propagate unchanged -- `review_pr`'s existing broad
+    `except Exception: _emit_skipped_note(exc)` still owns turning that into
+    the advisory, fail-open skip note.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            async with agent_factory() as agent:
+                response = await agent.chat(prompt)
+                review_text = ""
+                async for token in response:
+                    review_text += token
+            return review_text
+        except Exception as exc:
+            if attempt >= max_attempts or not _is_rate_limit_error(exc):
+                raise
+            delay = base_delay_seconds * (2 ** (attempt - 1))
+            print(
+                f"Antigravity PR review: rate-limited (attempt {attempt}/{max_attempts}), "
+                f"retrying in {delay:.0f}s: {type(exc).__name__}: {_redact_secrets(str(exc))}",
+                file=sys.stderr,
+            )
+            await sleep(delay)
+
+
 async def review_pr():
     diff_output = _load_diff()
     if diff_output is None:
@@ -145,13 +187,10 @@ Focus your feedback on:
     # Provider call. Rate limits (HTTP 429 / quota), provider outages, and provider
     # SDK runtime errors are advisory and must not block the PR: fail open with a
     # note. This broad catch is intentional and scoped to the provider call only
-    # (not the import above).
+    # (not the import above). _generate_review retries a bounded number of times
+    # on rate-limit-shaped errors before this catch ever sees them.
     try:
-        async with Agent(config) as agent:
-            response = await agent.chat(prompt)
-            review_text = ""
-            async for token in response:
-                review_text += token
+        review_text = await _generate_review(lambda: Agent(config), prompt)
         print(review_text)
     except Exception as exc:  # noqa: BLE001 - provider errors are advisory; fail open
         _emit_skipped_note(exc)

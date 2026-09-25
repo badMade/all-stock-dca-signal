@@ -12,6 +12,7 @@ inside review_pr), so it is loaded here straight from its path; .github/ is
 not a package and is outside the core ruff/coverage gates on purpose.
 """
 
+import asyncio
 import importlib.util
 import sys
 from pathlib import Path
@@ -67,3 +68,141 @@ def test_rate_limit_skip_note_is_still_recognised_after_redaction(pr_review, mon
     captured = capsys.readouterr()
     assert FAKE_KEY not in captured.err
     assert "rate-limited" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# _generate_review: bounded retry-with-backoff around the provider call.
+#
+# A 429/quota error is sometimes a per-minute limit that has cleared a few
+# seconds later, not just the daily-exhaustion case that no amount of
+# in-job backoff can fix. These tests use a fake async agent (no real SDK,
+# no real network) and a recording fake `sleep` so the suite stays fast and
+# deterministic; they pin the *behavior* (which errors retry, how many
+# times, growing delay, non-rate-limit errors bypass the loop) rather than
+# timing.
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    """Minimal stand-in for the SDK's async-iterable chat response."""
+
+    def __init__(self, tokens):
+        self._tokens = tokens
+
+    def __aiter__(self):
+        return self._aiter()
+
+    async def _aiter(self):
+        for token in self._tokens:
+            yield token
+
+
+class _FakeAgent:
+    """Minimal stand-in for `google.antigravity.Agent`'s async context manager."""
+
+    def __init__(self, chat_outcome):
+        # chat_outcome is either a list of tokens (success) or an exception
+        # instance to raise from chat().
+        self._chat_outcome = chat_outcome
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def chat(self, prompt):
+        if isinstance(self._chat_outcome, BaseException):
+            raise self._chat_outcome
+        return _FakeResponse(self._chat_outcome)
+
+
+def _agent_factory_from_outcomes(outcomes):
+    """Return an agent_factory() that yields one _FakeAgent per call, in order."""
+    outcomes_iter = iter(outcomes)
+
+    def agent_factory():
+        return _FakeAgent(next(outcomes_iter))
+
+    return agent_factory
+
+
+def test_generate_review_retries_rate_limit_errors_then_succeeds(pr_review):
+    delays = []
+
+    async def sleep(seconds):
+        delays.append(seconds)
+
+    agent_factory = _agent_factory_from_outcomes(
+        [
+            RuntimeError("429 RESOURCE_EXHAUSTED"),
+            RuntimeError("429 RESOURCE_EXHAUSTED"),
+            ["Looks", " good."],
+        ]
+    )
+
+    result = asyncio.run(
+        pr_review._generate_review(
+            agent_factory,
+            "prompt",
+            max_attempts=3,
+            base_delay_seconds=2.0,
+            sleep=sleep,
+        )
+    )
+
+    assert result == "Looks good."
+    # Two retries before the third, successful attempt: backoff doubles.
+    assert delays == [2.0, 4.0]
+
+
+def test_generate_review_does_not_retry_non_rate_limit_errors(pr_review):
+    delays = []
+
+    async def sleep(seconds):
+        delays.append(seconds)
+
+    boom = ValueError("malformed response")
+    agent_factory = _agent_factory_from_outcomes([boom, ["unreached"]])
+
+    with pytest.raises(ValueError, match="malformed response"):
+        asyncio.run(
+            pr_review._generate_review(
+                agent_factory,
+                "prompt",
+                max_attempts=3,
+                base_delay_seconds=2.0,
+                sleep=sleep,
+            )
+        )
+
+    assert delays == []
+
+
+def test_generate_review_raises_after_exhausting_max_attempts(pr_review):
+    delays = []
+
+    async def sleep(seconds):
+        delays.append(seconds)
+
+    agent_factory = _agent_factory_from_outcomes(
+        [
+            RuntimeError("429 quota exceeded"),
+            RuntimeError("429 quota exceeded"),
+            RuntimeError("429 quota exceeded"),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="quota exceeded"):
+        asyncio.run(
+            pr_review._generate_review(
+                agent_factory,
+                "prompt",
+                max_attempts=3,
+                base_delay_seconds=1.0,
+                sleep=sleep,
+            )
+        )
+
+    # Only 2 backoff sleeps precede the 3rd (final, non-retried) attempt.
+    assert delays == [1.0, 2.0]
