@@ -32,7 +32,6 @@ import json
 import logging
 import os
 import traceback
-import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
