@@ -39,7 +39,11 @@ class StaticProvider:
         candidates = [b for b in bars if b.timestamp.astimezone(EASTERN).date() < as_of_date]
         if not candidates:
             return None
-        return max(candidates, key=lambda b: b.timestamp)
+        _best = candidates[0]
+        for b in candidates[1:]:
+            if b.timestamp > _best.timestamp:
+                _best = b
+        return _best
 
     def get_intraday_bars(self, ticker, start, end, interval_minutes):
         bars = self.minute_bars.get(ticker, [])

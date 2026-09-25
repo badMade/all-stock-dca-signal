@@ -4096,7 +4096,13 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 # max returns the first of equal-ranked elements) picks the
                 # highest-ranked status, falling back to the first row when
                 # none has a real status at all (every rank is -1).
-                _keeper = max(_dup_rows, key=lambda r: _OUTCOME_STATUS_RANK.get(str(r.get("status") or ""), -1))
+                _keeper = _dup_rows[0]
+                _best_rank = _OUTCOME_STATUS_RANK.get(str(_keeper.get("status") or ""), -1)
+                for _r in _dup_rows[1:]:
+                    _rank = _OUTCOME_STATUS_RANK.get(str(_r.get("status") or ""), -1)
+                    if _rank > _best_rank:
+                        _keeper = _r
+                        _best_rank = _rank
                 for _dup_row in _dup_rows:
                     if _dup_row is _keeper:
                         continue

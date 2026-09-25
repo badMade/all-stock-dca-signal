@@ -5015,7 +5015,11 @@ class RobinhoodDataProvider:
         daily = [bar for bar in self._parse_bars(response, ticker) if bar.timestamp.astimezone(EASTERN).date() < as_of_date]
         if not daily:
             return None
-        return max(daily, key=lambda bar: bar.timestamp)
+        _best = daily[0]
+        for bar in daily[1:]:
+            if bar.timestamp > _best.timestamp:
+                _best = bar
+        return _best
 
     def get_quote(self, ticker: str, as_of: datetime) -> Optional[Tuple[float, Optional[datetime]]]:
         if self._quotes_fn is None:

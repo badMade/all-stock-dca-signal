@@ -1206,7 +1206,10 @@ def _cut_clusters(node: _Node, count: int) -> List[List[int]]:
         splittable = [c for c in clusters if not c.is_leaf]
         if not splittable:
             break
-        target = max(splittable, key=lambda c: c.height)
+        target = splittable[0]
+        for c in splittable[1:]:
+            if c.height > target.height:
+                target = c
         clusters.remove(target)
         clusters.extend([target.left, target.right])  # type: ignore[list-item]
     return [sorted(c.members) for c in clusters]

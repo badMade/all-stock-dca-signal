@@ -91,11 +91,11 @@ SOURCE_KEY = "yahoo_finance_yfinance"
 def _bar_from_row(timestamp: datetime, row: Any) -> Dict[str, Any]:
     return {
         "timestamp": timestamp.isoformat(),
-        "open": float(row["Open"]),
-        "high": float(row["High"]),
-        "low": float(row["Low"]),
-        "close": float(row["Close"]),
-        "volume": float(row["Volume"]),
+        "open": float(row.Open),
+        "high": float(row.High),
+        "low": float(row.Low),
+        "close": float(row.Close),
+        "volume": float(row.Volume),
     }
 
 
@@ -151,7 +151,8 @@ def fetch_intraday_bars(
         return []
     decision_dt = datetime.combine(trading_day, decision_time_et, tzinfo=ET)
     bars: List[Dict[str, Any]] = []
-    for timestamp, row in frame.iterrows():
+    for row in frame.itertuples():
+        timestamp = row.Index
         ts_et = timestamp.tz_convert(ET) if timestamp.tzinfo is not None else timestamp.tz_localize(ET)
         if ts_et > decision_dt:
             continue

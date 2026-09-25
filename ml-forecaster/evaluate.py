@@ -33,10 +33,9 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from typing import Any, cast
 
+import model as model_module
 import numpy as np
 import pandas as pd
-
-import model as model_module
 from features import NUMERIC_FEATURE_COLUMNS, TARGET_COLUMN
 
 DEFAULT_N_SPLITS = 5
@@ -115,8 +114,8 @@ def _row_fingerprint(frame: pd.DataFrame) -> str:
                 *(f"{column}={row[column]!r}" for column in scored_columns),
             )
         )
-        for ticker, date, (_, row) in zip(
-            frame["ticker"].astype(str), frame["date"], frame.iterrows(), strict=True
+        for ticker, date, row in zip(
+            frame["ticker"].astype(str), frame["date"], frame.to_dict('records'), strict=True
         )
     )
     return hashlib.sha256("\u241f".join(identities).encode("utf-8")).hexdigest()
