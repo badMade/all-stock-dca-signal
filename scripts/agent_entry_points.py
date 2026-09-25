@@ -229,6 +229,39 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
+        need="Run 90-trading-day walk-forward prediction and sequestered evaluation experiment",
+        command="python3 scripts/run_90day_prediction_experiment.py [--days 90] [--tickers SPY AAPL ...] [--model persistence|gbm|octopus]",
+        exists_path="scripts/run_90day_prediction_experiment.py",
+        doc_ref="README.md",
+        symbols=("main", "generate_walkforward_baseline_predictions"),
+        notes=(
+            "Runs a strictly zero-lookahead walk-forward replay from 90 trading days ago to today, "
+            "quarantines predictions, and executes the independent sequestered truth comparator."
+        ),
+    ),
+    EntryPoint(
+        need="Evaluate predictions against market actuals with independent sequestered source of truth",
+        command="python3 scripts/sequestered_truth_comparator.py --predictions <csv> [--history-dir <dir>] [--report-md <out>]",
+        exists_path="scripts/sequestered_truth_comparator.py",
+        doc_ref="README.md",
+        symbols=("main", "SequesteredComparator", "DailyRecord", "EvaluationSummary"),
+        notes=(
+            "Standalone, sequestered comparator computing MAE, RMSE, MAPE, directional hit rates, "
+            "and quantile band coverage without lookahead bias or model entanglement."
+        ),
+    ),
+    EntryPoint(
+        need="Export Octopus ledger predictions and scores for the 61 scheduled stocks",
+        command="python3 scripts/export_octopus_ledger.py --run-dir <run_dir> [--all-scheduled] [--csv-out <out.csv>]",
+        exists_path="scripts/export_octopus_ledger.py",
+        doc_ref="README.md",
+        symbols=("main", "export_ledger_records", "load_scheduled_tickers"),
+        notes=(
+            "Streams records from a Wondrous Octopus run ledger, filters to the requested "
+            "tickers (e.g. 61 scheduled stocks), and exports clean tabular CSVs and metrics."
+        ),
+    ),
+    EntryPoint(
         need="Recalibrate per-ticker signal parameters for the day",
         command="python -m scripts.run_ticker_maintenance calibrate",
         exists_path="scripts/run_ticker_maintenance.py",
