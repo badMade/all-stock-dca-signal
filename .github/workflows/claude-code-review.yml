@@ -42,10 +42,14 @@ jobs:
     name: Respond to @claude review comment
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # contains() already does a case-insensitive substring match on strings,
+    # so no toLower() wrapper is needed (toLower isn't a valid GitHub Actions
+    # expression function anyway -- it would fail to evaluate this condition
+    # and the job would never start; Copilot review, PR #1532).
     if: >-
       github.event.issue.pull_request != null &&
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association) &&
-      contains(toLower(github.event.comment.body), '@claude review')
+      contains(github.event.comment.body, '@claude review')
     permissions:
       contents: read
       pull-requests: write
