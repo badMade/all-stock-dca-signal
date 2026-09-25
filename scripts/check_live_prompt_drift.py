@@ -27,6 +27,15 @@ for all seven slots and names the specific failures that have cost real runs:
 * ``missing_finalize_evidence`` -- Gate 9 never runs
   ``scripts.finalize_run_evidence``, so the slot leaves no verifiable
   run_state or pointer (2026-09-22: all seven slots fired, none verified).
+* ``missing_oversized_order_pages_helper`` -- the live body calls
+  ``get_equity_orders`` but never runs ``scripts.assemble_order_pages``, so an
+  oversized page would be hand-transcribed instead of assembled and proven
+  complete (2026-09-09: the 12:30 slot hand-transcribed a page, two passes
+  disagreed on the row count, and Gate 6 aborted -- the incident this helper
+  exists to prevent; see ``scripts/assemble_order_pages.py``). Live drift on
+  this finding is exactly what would let that incident recur even though the
+  repo's own mirror already carries the fix (2026-09-24 audit: all seven live
+  bodies had drifted from the mirror on this exact paragraph).
 
 Read-only. It never edits a live task (that stays a human's
 ``update_scheduled_task`` full-body replacement) and never prints an
@@ -64,6 +73,10 @@ TOP_UP_GATE_MODULE = "scripts.same_day_top_up_gate"
 # The one Gate 9 command that writes verifiable evidence (2026-09-22 schedule
 # audit: every slot fired, none left a run_state.json or a valid pointer).
 FINALIZE_EVIDENCE_MODULE = "scripts.finalize_run_evidence"
+# The helper that replaces hand-transcribing an oversized get_equity_orders
+# page (2026-09-09 incident; see scripts/assemble_order_pages.py).
+ORDER_PAGES_HELPER_MODULE = "scripts.assemble_order_pages"
+GET_EQUITY_ORDERS_CALL = "get_equity_orders"
 # The seven roster slots, as each mirror's filename prefix (<HHMM>ET-<task>.txt).
 EXPECTED_SLOTS = ("0935ET", "1030ET", "1130ET", "1230ET", "1330ET", "1430ET", "1530ET")
 # Every key same_day_top_up_gate requires on its --orders-pages envelope.
@@ -179,6 +192,12 @@ def findings_for(live_text: str, window_end_date: Optional[str]) -> List[Dict[st
             "code": "missing_finalize_evidence",
             "detail": f"never runs {FINALIZE_EVIDENCE_MODULE}: the slot fires but leaves no verifiable run_state "
             "or pointer, so scripts.verify_schedule reports it evidence_incomplete",
+        })
+    if GET_EQUITY_ORDERS_CALL in live_text and ORDER_PAGES_HELPER_MODULE not in live_text:
+        findings.append({
+            "code": "missing_oversized_order_pages_helper",
+            "detail": f"calls {GET_EQUITY_ORDERS_CALL} but never runs {ORDER_PAGES_HELPER_MODULE}: an oversized "
+            "page would be hand-transcribed instead of assembled and proven complete (2026-09-09 incident)",
         })
     if window_end_date:
         stale = _stale_window_dates(live_text, window_end_date)

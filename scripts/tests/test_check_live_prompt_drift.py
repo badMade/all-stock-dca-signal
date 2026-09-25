@@ -124,6 +124,32 @@ def test_bare_array_order_pages_instruction_is_flagged(tmp_path):
     assert report["drifted_slots"] == 1
 
 
+def test_a_live_task_calling_get_equity_orders_without_the_page_helper_is_flagged(tmp_path):
+    # 2026-09-24 audit: all seven live bodies called get_equity_orders but had
+    # drifted from the mirror's OVERSIZED ORDER PAGES paragraph, so an oversized
+    # page would again be hand-transcribed -- the exact 2026-09-09 incident.
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    stale = "GATE 4 - SOLE-EXECUTOR INTERLOCK\nCall get_equity_orders for today's window.\n" + GOOD_BODY
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1430-test", stale))
+    assert "missing_oversized_order_pages_helper" in _findings(report)
+
+
+def test_a_live_task_not_calling_get_equity_orders_at_all_is_not_flagged_for_the_page_helper(tmp_path):
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1430-test", GOOD_BODY))
+    assert "missing_oversized_order_pages_helper" not in _findings(report)
+
+
+def test_a_live_task_with_both_get_equity_orders_and_the_page_helper_is_not_flagged(tmp_path):
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    body = (
+        "GATE 4 - SOLE-EXECUTOR INTERLOCK\nCall get_equity_orders for today's window.\n"
+        "OVERSIZED ORDER PAGES: run python3 -m scripts.assemble_order_pages --account ... --out ...\n"
+    ) + GOOD_BODY
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1430-test", body))
+    assert "missing_oversized_order_pages_helper" not in _findings(report)
+
+
 def test_a_live_task_without_the_top_up_gate_is_flagged(tmp_path):
     mirror_dir = _mirror(tmp_path, "1030-test")
     report = _check(tmp_path, mirror_dir, _live(tmp_path, "1030-test", "GATE 7 - PLACE THE ORDERS\nPlace them.\n"))
