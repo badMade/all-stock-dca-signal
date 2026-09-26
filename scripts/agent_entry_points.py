@@ -262,6 +262,18 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
+        need="Supervise and auto-restart Wondrous Octopus walk-forward runs upon transient crashes or shard shifts",
+        command="python3 scripts/auto_resume_walkforward.py [--run-dir <run_dir>] [--delay <sec>] [--max-retries <n>]",
+        exists_path="scripts/auto_resume_walkforward.py",
+        doc_ref="README.md",
+        symbols=("main", "run_supervisor", "build_walkforward_cmd", "build_export_cmd"),
+        notes=(
+            "Supervises a walk-forward run and automatically resumes with `--resume --retrain` "
+            "if interrupted by transient errors (such as macOS inode shifts or file sync locks). "
+            "Automatically exports predictions to CSV upon successful completion."
+        ),
+    ),
+    EntryPoint(
         need="Recalibrate per-ticker signal parameters for the day",
         command="python -m scripts.run_ticker_maintenance calibrate",
         exists_path="scripts/run_ticker_maintenance.py",
