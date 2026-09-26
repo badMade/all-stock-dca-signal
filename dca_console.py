@@ -1072,6 +1072,7 @@ def make_server(
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 0 < length <= 1024:
                     raise ValueError("Request body must be between 1 and 1024 bytes")
+                # Retain explicit timeout before reading payload to protect against body-trickling DoS attacks.
                 self.connection.settimeout(5)
                 payload = json.loads(self.rfile.read(length))
                 if self.path == "/api/jobs/cancel":
