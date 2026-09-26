@@ -274,6 +274,17 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
+        need="Trigger interactive web browser OAuth login for github-mcp-server",
+        command="python3 scripts/github_mcp_login.py",
+        exists_path="scripts/github_mcp_login.py",
+        doc_ref="README.md",
+        symbols=("main",),
+        notes=(
+            "Initiates an interactive OAuth login session with the local GitHub MCP server, "
+            "launching the default browser for authorization without requiring on-disk tokens."
+        ),
+    ),
+    EntryPoint(
         need="Recalibrate per-ticker signal parameters for the day",
         command="python -m scripts.run_ticker_maintenance calibrate",
         exists_path="scripts/run_ticker_maintenance.py",
