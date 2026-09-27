@@ -2,6 +2,64 @@
 
 This file tracks follow-up work from live DCA incidents so the same failure modes are not lost in chat history.
 
+## Handoff - 2026-09-25 silent-abort incident + independent watchdog
+
+- Status: the 12:30 ET slot halted before Gate 4 and asked the (absent) user for
+  authorization instead of following the standing rule in `docs/safeguards.md`'s
+  live execution roster note ("a decline in a scheduled run is an abort that must
+  alert on all three channels ... it must never end on a question"). The 6th
+  recorded occurrence of this exact pattern since 09-14 (09-14, 09-15, 09-17,
+  09-22 x2, 09-25). Because the session never reached its own Gate 9, nothing
+  alerted on any of the three existing channels (in-app message center, repo
+  alert file, email) and the day would have looked clean to every one of them.
+- Root cause (inference, not directly observable): the only thing that could
+  alert on this failure was the same session whose judgment had already failed
+  -- a single point of failure covering both the decision and its own audit
+  trail. This is model-judgment variance under an unattended prompt, not a
+  connector outage: the same day's 11:30 slot failed for the opposite reason
+  (no broker tools reachable at all), ruling out one shared cause.
+- Remedy implemented: `scripts/schedule_watchdog.py` -- an independent,
+  deterministic wrapper over `scripts.verify_schedule.verify_day` that does not
+  depend on the executor session at all. Writes its own durable, idempotent
+  repo alert file per failing slot (`write_watchdog_alert_files`, under
+  `schedule_watchdog/alerts/`, honoring `--root`) and optionally posts to
+  Slack (`DCA_WATCHDOG_SLACK_WEBHOOK`, falling back to
+  `DCA_ALERT_SLACK_WEBHOOK` then `DCA_DRIFT_SLACK_WEBHOOK`). See
+  `docs/schedule_verification.md`'s watchdog section for the full contract.
+- Recommended cadence once deployed (deployment is outside this repo -- see
+  below): the earliest a fire usefully catches a silent slot is roughly
+  55-60 minutes after that slot's nominal time -- `verify_day` keeps a slot as
+  `awaiting_evidence` (no alert) until its acceptance window ends plus the
+  30-minute grace period, not merely until its nominal time. Run
+  `python -m scripts.schedule_watchdog --slack` with a few extra minutes of
+  margin on top of that (roughly 65-75 minutes after each of the seven slots'
+  nominal times: 09:35, 10:30, 11:30, 12:30, 13:30, 14:30, 15:30 ET), or at
+  minimum once daily well after 16:00 ET to catch the whole day in one pass.
+  Pair with a daily
+  `python -m scripts.alert_digest --drafts <export> --messages <export> --ledger
+  --fail-on-warnings` run (needs a Gmail-connector session to produce the
+  exports) so undelivered-channel drift (drafted-not-sent email, a gitignored
+  alert path) is caught even on days the watchdog itself is clean -- see
+  `docs/alert_digest.md`.
+- Deployment caveat, same as every scheduled-task change in this repo: this
+  file and the scripts it documents live in the repo; registering an actual
+  recurring invocation (a Cowork task, a cron entry, however the operator's
+  scheduler works) happens outside it and is not something a repo commit can
+  do on its own. Nothing above runs on a schedule until that registration
+  happens.
+- Also see the live-mirror prompt-text hardening in
+  `claude/dca-executor-prompts/README.md`'s Gate 4 entry (2026-09-25): the
+  "conflicting directives" ambiguity between the Perplexity-coexistence
+  framing and the never-ask rule was closed across all seven prompts, and the
+  abort branch was restructured so there is no path in the prompt text that
+  reaches an interactive question. That is a mitigation, not a fix -- a
+  prompt cannot force a non-deterministic session to follow it -- which is
+  why the watchdog above is the one remedy that does not depend on the
+  session's cooperation at all. **Editing the repo copy still changes nothing
+  live**: it takes effect only once a human re-pastes it via
+  `update_scheduled_task` and the mirror is re-captured, same as every other
+  correction in that file's own history.
+
 ## Handoff - 2026-09-08 standing Perplexity backup policy
 
 - Status: user direction: "Perplexity shouldn't be disabled anywhere permanently... Perplexity is supposed to back up Claude if it fails, not be disabled." Also: "make sure that if Claude fails on a run that there is a mechanism to run it with perplexity."

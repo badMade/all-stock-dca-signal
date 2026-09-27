@@ -405,11 +405,18 @@ _STREAM_WORD_TO_SLOT: Tuple[Tuple[str, str], ...] = (
     ("midday", "1230"),
 )
 
-# Named reason codes that stand in for a numeric gate. Both are documented in
-# config/notifications.json as *expected* conditions rather than errors, so a
-# digest that folded them into the plain "Gate 4"/"Gate 5" counts would overstate
-# how much is actually going wrong.
-_REASON_CODES: Tuple[str, ...] = ("GATE5_DISABLED", "GATE4_EXPECTED_OVERLAP")
+# Named reason codes that stand in for a numeric gate. GATE5_DISABLED and
+# GATE4_EXPECTED_OVERLAP are documented in config/notifications.json as
+# *expected* conditions rather than errors, so a digest that folded them into
+# the plain "Gate 4"/"Gate 5" counts would overstate how much is actually
+# going wrong. SCHEDULE_WATCHDOG (added 2026-09-26) is the opposite case -- a
+# genuine failure -- but belongs in the same lookup for the same mechanical
+# reason: scripts/schedule_watchdog.py writes this literal token as the gate
+# field of its own alert filenames (<day>-<slot>-SCHEDULE_WATCHDOG.txt), and
+# without an entry here detect_gate_evidence() has no numeric "Gate N" to
+# fall back to, so every one of those files silently loaded with gate=None
+# and the promised per-gate bucket never existed (caught in PR #1535 review).
+_REASON_CODES: Tuple[str, ...] = ("GATE5_DISABLED", "GATE4_EXPECTED_OVERLAP", "SCHEDULE_WATCHDOG")
 
 # A reason code used as a NOUN-PHRASE MODIFIER -- naming a config/routing
 # object, not classifying this run's own outcome. "Unable to load the

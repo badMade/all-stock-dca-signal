@@ -163,6 +163,29 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
+        need="Alert independently of the executor session when a live slot left no scheduled evidence",
+        command=(
+            "python -m scripts.schedule_watchdog [--date YYYY-MM-DD] [--root <cron-tracking root>] "
+            "[--json] [--slack [--slack-webhook-env DCA_WATCHDOG_SLACK_WEBHOOK]]"
+        ),
+        exists_path="scripts/schedule_watchdog.py",
+        doc_ref="docs/schedule_verification.md",
+        symbols=("main", "failing_rows", "write_watchdog_alert_files", "send_slack_alert"),
+        notes=(
+            "Thin wrapper over scripts.verify_schedule -- does not re-derive evidence, only "
+            "alerts on what that module already finds. Exists because every other alert "
+            "channel (in-app message center, the Gate 9 repo alert file, email) is written "
+            "BY the executor session, so a session that ends on a question instead of "
+            "following the abort-and-alert rule (docs/safeguards.md's live execution roster "
+            "note) leaves no trace on any of them. This module depends on none of that: it "
+            "writes its own durable, idempotent alert file per failing slot (honoring --root, "
+            "overwriting rather than numbering on a repeat fire for the same day/slot) and "
+            "optionally posts to Slack. Meant to run on its own external schedule, not "
+            "inside any of the seven executor sessions -- see the module docstring's "
+            "'Deploying this' section."
+        ),
+    ),
+    EntryPoint(
         need="Write a live slot's Gate 9 run_state and refresh its latest pointer",
         command=(
             "python -m scripts.finalize_run_evidence --slot HHMM --started-at <ISO-8601> "

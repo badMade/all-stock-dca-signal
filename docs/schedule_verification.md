@@ -131,6 +131,70 @@ wrote nothing.
 `python3 -m scripts.check_live_prompt_drift` reports a live `SKILL.md` that
 never runs this command as `missing_finalize_evidence`.
 
+## Watchdog: alerting independently of the executor session (2026-09-25)
+
+`scripts/verify_schedule.py` answers "did the slot fire" from durable
+evidence; it does not alert anyone on its own. Every alert channel an
+executor session has (in-app message center, the Gate 9 repo alert file,
+email) is written **by that same session** -- so a session that reads a
+real or perceived conflict in its own instructions and ends by asking an
+absent user to confirm, instead of following the standing rule ("a decline
+in a scheduled run is an abort that must alert on all three channels ... it
+must never end on a question", `docs/safeguards.md`'s live execution roster
+note), never reaches its own alerting step either. That pattern is recorded
+on 2026-09-14, 09-15, 09-17, 09-22 x2, and 2026-09-25 (12:30 ET, before
+Gate 4) -- each one a day that would have looked clean to every existing
+channel.
+
+`scripts/schedule_watchdog.py` closes that single point of failure. It is a
+thin wrapper over `verify_day` -- it adds no new evidence detection, only
+alerting on what that function already finds -- and it does not depend on
+the executor session at all:
+
+```bash
+python -m scripts.schedule_watchdog                       # today, ET; text report
+python -m scripts.schedule_watchdog --date 2026-09-22 --json
+python -m scripts.schedule_watchdog --slack \
+    --slack-webhook-env DCA_WATCHDOG_SLACK_WEBHOOK          # falls back to
+                                                             # DCA_ALERT_SLACK_WEBHOOK,
+                                                             # then DCA_DRIFT_SLACK_WEBHOOK
+```
+
+For every slot whose status is not `verified`/`not_due`/`awaiting_evidence`/
+`market_closed`, it:
+
+* writes its own durable, idempotent alert file (`write_watchdog_alert_files`,
+  not `dca_alerts.write_alert_file` -- that writer resolves its root
+  independently of `--root` and numbers every collision, both wrong for a
+  recurring check reporting the same still-open absence) --
+  `<root>/schedule_watchdog/alerts/<day>-<slot>-SCHEDULE_WATCHDOG.txt`, the
+  same `<day>-<slot>-<gate>.txt` shape `scripts/alert_digest.py` already
+  parses. `SCHEDULE_WATCHDOG` is registered in that module's `_REASON_CODES`
+  so `detect_gate_evidence` recognizes it and buckets it separately from a
+  gate an executor reported on itself, rather than loading as `gate=None`;
+* re-running it for a still-unresolved (day, slot) overwrites that same file
+  rather than creating a numbered duplicate, so `alert_digest`'s per-slot
+  counts and streaks reflect one unresolved incident, not one per invocation;
+* optionally POSTs a Slack summary of every failing slot, opt-in and
+  env-only like every other webhook path in this repo (`--slack`, no secret
+  ever in git);
+* exits 1 when anything is failing, 0 otherwise.
+
+**Deploying this.** Same constraint as the seven executor tasks: registering
+a recurring invocation lives outside this repo (the external scheduler/Cowork
+-- see `docs/live_wiring.md`), so committing this script changes nothing on
+its own. A slot stays `awaiting_evidence` (excluded from an alert) until its
+OWN acceptance window ends plus `GRACE_MINUTES` (30) -- not merely until its
+nominal time -- so on this roster (windows run 25-30 minutes past nominal)
+the earliest a fire usefully catches a silent slot is roughly 55-60 minutes
+after nominal. Run it with a few more minutes of margin on top of that, or
+once daily well after the last slot's deadline.
+If the invocation is itself an agent session rather than a bare cron job,
+give it nothing to decide -- its only job should be running this command and
+relaying the result, since the exit code has already made the ABORT/alert
+call. That is deliberately the opposite of the failure mode this script
+exists to catch.
+
 ## Deploying the prompt change
 
 Editing `claude/dca-executor-prompts/live-mirror/` changes nothing on its
