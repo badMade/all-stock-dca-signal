@@ -55,7 +55,9 @@ def compute_cadence():
 
     # Keep the execution hour pinned to 03:00 UTC. The cadence logic only varies
     # by frequency; CI/tests and self-heal docs rely on this fixed hour.
-    run_hour = 3
+
+    # Keep the execution hour fixed. Cadence changes frequency only.
+    run_hour = "03"
 
     # Adjustment triggers check
     try:
@@ -65,17 +67,51 @@ def compute_cadence():
     except Exception:
         pass
 
+    display_hour = int(run_hour)
     if num_commits > 50:
-        return f"0 {run_hour} * * *", f"High PR velocity (>50 commits/mo); running daily at {run_hour}:00."
+        return f"0 {display_hour} * * *", f"High PR velocity (>50 commits/mo); running daily at {display_hour}:00."
     elif num_commits > 10:
-        return f"0 {run_hour} * * 1,4", f"Active velocity; running twice a week at {run_hour}:00."
+        return f"0 {display_hour} * * 1,4", f"Active velocity; running twice a week at {display_hour}:00."
     else:
-        return f"0 {run_hour} * * 1", f"Standard velocity; running weekly at {run_hour}:00."
+        return f"0 {display_hour} * * 1", f"Standard velocity; running weekly at {display_hour}:00."
+
 
 def update_schedule_file(schedule: str, rationale: str, file_path: str, *, override: bool = False) -> None:
-    # Keep this on a fixed, four-key shape so we stay standard-library-only.
-    _old_update_schedule_file(schedule, rationale, file_path, override=override)
+    import os
+    try:
+        from ruamel.yaml import YAML
+        yaml = YAML()
+        yaml.preserve_quotes = True
 
+        data = {}
+        if os.path.exists(file_path):
+            with open(file_path, "r") as f:
+                data = yaml.load(f) or {}
+
+        data['schedule'] = schedule
+        data['rationale'] = rationale
+        data['override'] = override
+
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as tf:
+            yaml.dump(data, tf)
+            temp_name = tf.name
+
+        # Validate parseability
+        with open(temp_name, "r") as tf:
+            yaml.load(tf)
+
+        import shutil
+        shutil.move(temp_name, file_path)
+
+        # Ensure AUTO-UPDATED marker
+        with open(file_path, "r") as f:
+            file_content = f.read()
+        if "# AUTO-UPDATED" not in file_content:
+            with open(file_path, "a") as f:
+                f.write("\n# AUTO-UPDATED\n")
+    except ImportError:
+        _old_update_schedule_file(schedule, rationale, file_path, override=override)
 
 def _old_update_schedule_file(schedule: str, rationale: str, file_path: str, *, override: bool = False) -> None:
     """(Over)write the schedule file. Plain writes -- no YAML library needed for this

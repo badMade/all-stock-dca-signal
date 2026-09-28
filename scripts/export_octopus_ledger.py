@@ -62,7 +62,8 @@ def export_ledger_records(
     report_md: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Stream records from the ledger, filter to target tickers, and export."""
-    _dollar, _open_ledger = _inspect_run_helpers()
+    from inspect_run import _dollar, _open_ledger  # noqa: E402
+
     ledger = _open_ledger(run_dir)
     available_models = ledger.models()
     if model not in available_models:
