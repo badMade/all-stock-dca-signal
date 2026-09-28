@@ -136,9 +136,7 @@ class EvaluationSummary:
                 else None
             ),
             "overall_band_coverage_pct": (
-                round(self.overall_band_coverage_pct, 4)
-                if self.overall_band_coverage_pct is not None
-                else None
+                round(self.overall_band_coverage_pct, 4) if self.overall_band_coverage_pct is not None else None
             ),
             "ticker_metrics": {k: asdict(v) for k, v in self.ticker_metrics.items()},
         }
@@ -171,21 +169,76 @@ def load_actuals_from_csv(path: Path) -> dict[str, dict[str, float]]:
 
     records: dict[str, dict[str, float]] = {}
     with path.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+
+            # Find indices
+            def _find_all_indices(col_names):
+                return [header.index(name) for name in col_names if name in header]
+
+            date_indices = _find_all_indices(["Date", "date"])
+            adj_close_indices = _find_all_indices(["Adj Close"])
+            close_indices = _find_all_indices(["Close"])
+            open_indices = _find_all_indices(["Open"])
+            high_indices = _find_all_indices(["High"])
+            low_indices = _find_all_indices(["Low"])
+
+            if not date_indices or (not close_indices and not adj_close_indices):
+                return records
+
+            max_idx = max(
+                (date_indices + adj_close_indices + close_indices + open_indices + high_indices + low_indices) or [-1]
+            )
+        except StopIteration:
+            return records
+
         for row in reader:
-            raw_date = row.get("Date") or row.get("date")
+            if len(row) <= max_idx:
+                continue
+
+            raw_date = None
+            for idx in date_indices:
+                raw_date = row[idx]
+                if raw_date:
+                    break
             if not raw_date:
                 continue
             # Normalize to YYYY-MM-DD
             date_str = raw_date.strip().split(" ")[0].split("T")[0]
+
             # Prefer Adj Close if present for split adjustments, else Close
-            close_val = _safe_float(row.get("Adj Close")) or _safe_float(row.get("Close"))
+            close_val = None
+            for idx in adj_close_indices:
+                close_val = _safe_float(row[idx])
+                if close_val is not None:
+                    break
+            if close_val is None:
+                for idx in close_indices:
+                    close_val = _safe_float(row[idx])
+                    if close_val is not None:
+                        break
+
             if close_val is None:
                 continue
 
-            open_val = _safe_float(row.get("Open"))
-            high_val = _safe_float(row.get("High"))
-            low_val = _safe_float(row.get("Low"))
+            open_val = None
+            for idx in open_indices:
+                open_val = _safe_float(row[idx])
+                if open_val is not None:
+                    break
+
+            high_val = None
+            for idx in high_indices:
+                high_val = _safe_float(row[idx])
+                if high_val is not None:
+                    break
+
+            low_val = None
+            for idx in low_indices:
+                low_val = _safe_float(row[idx])
+                if low_val is not None:
+                    break
 
             records[date_str] = {
                 "open": open_val if open_val is not None else close_val,
@@ -216,62 +269,114 @@ def load_predictions_from_csv(path: Path) -> list[dict[str, Any]]:
 
     predictions: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+
+            def _find_all_indices(col_names):
+                return [header.index(name) for name in col_names if name in header]
+
+            date_indices = _find_all_indices(["Date", "date", "target_date"])
+            ticker_indices = _find_all_indices(["Ticker", "ticker", "symbol"])
+            close_indices = _find_all_indices(
+                ["Pred_Close", "pred_close", "predicted_close", "pred_close_p50", "close"]
+            )
+            open_indices = _find_all_indices(["Pred_Open", "pred_open", "predicted_open"])
+            high_indices = _find_all_indices(["Pred_High", "pred_high", "predicted_high"])
+            low_indices = _find_all_indices(["Pred_Low", "pred_low", "predicted_low"])
+            p10_indices = _find_all_indices(["Pred_Close_P10", "pred_close_p10", "p10"])
+            p90_indices = _find_all_indices(["Pred_Close_P90", "pred_close_p90", "p90"])
+
+            if not date_indices or not ticker_indices or not close_indices:
+                return predictions
+
+            all_indices = (
+                date_indices
+                + ticker_indices
+                + close_indices
+                + open_indices
+                + high_indices
+                + low_indices
+                + p10_indices
+                + p90_indices
+            )
+            max_idx = max(all_indices or [-1])
+        except StopIteration:
+            return predictions
+
         for row in reader:
-            raw_date = row.get("Date") or row.get("date") or row.get("target_date")
-            raw_ticker = row.get("Ticker") or row.get("ticker") or row.get("symbol")
+            if len(row) <= max_idx:
+                continue
+
+            raw_date = None
+            for idx in date_indices:
+                raw_date = row[idx]
+                if raw_date:
+                    break
+
+            raw_ticker = None
+            for idx in ticker_indices:
+                raw_ticker = row[idx]
+                if raw_ticker:
+                    break
+
             if not raw_date or not raw_ticker:
                 continue
 
             date_str = raw_date.strip().split(" ")[0].split("T")[0]
             ticker_str = raw_ticker.strip().upper()
 
-            pred_close = (
-                _safe_float(row.get("Pred_Close"))
-                or _safe_float(row.get("pred_close"))
-                or _safe_float(row.get("predicted_close"))
-                or _safe_float(row.get("pred_close_p50"))
-                or _safe_float(row.get("close"))
-            )
+            pred_close = None
+            for idx in close_indices:
+                pred_close = _safe_float(row[idx])
+                if pred_close is not None:
+                    break
+
             if pred_close is None:
                 continue
 
-            pred_open = (
-                _safe_float(row.get("Pred_Open"))
-                or _safe_float(row.get("pred_open"))
-                or _safe_float(row.get("predicted_open"))
-            )
-            pred_high = (
-                _safe_float(row.get("Pred_High"))
-                or _safe_float(row.get("pred_high"))
-                or _safe_float(row.get("predicted_high"))
-            )
-            pred_low = (
-                _safe_float(row.get("Pred_Low"))
-                or _safe_float(row.get("pred_low"))
-                or _safe_float(row.get("predicted_low"))
-            )
-            pred_p10 = (
-                _safe_float(row.get("Pred_Close_P10"))
-                or _safe_float(row.get("pred_close_p10"))
-                or _safe_float(row.get("p10"))
-            )
-            pred_p90 = (
-                _safe_float(row.get("Pred_Close_P90"))
-                or _safe_float(row.get("pred_close_p90"))
-                or _safe_float(row.get("p90"))
-            )
+            pred_open = None
+            for idx in open_indices:
+                pred_open = _safe_float(row[idx])
+                if pred_open is not None:
+                    break
 
-            predictions.append({
-                "date": date_str,
-                "ticker": ticker_str,
-                "pred_close": pred_close,
-                "pred_open": pred_open,
-                "pred_high": pred_high,
-                "pred_low": pred_low,
-                "pred_close_p10": pred_p10,
-                "pred_close_p90": pred_p90,
-            })
+            pred_high = None
+            for idx in high_indices:
+                pred_high = _safe_float(row[idx])
+                if pred_high is not None:
+                    break
+
+            pred_low = None
+            for idx in low_indices:
+                pred_low = _safe_float(row[idx])
+                if pred_low is not None:
+                    break
+
+            pred_p10 = None
+            for idx in p10_indices:
+                pred_p10 = _safe_float(row[idx])
+                if pred_p10 is not None:
+                    break
+
+            pred_p90 = None
+            for idx in p90_indices:
+                pred_p90 = _safe_float(row[idx])
+                if pred_p90 is not None:
+                    break
+
+            predictions.append(
+                {
+                    "date": date_str,
+                    "ticker": ticker_str,
+                    "pred_close": pred_close,
+                    "pred_open": pred_open,
+                    "pred_high": pred_high,
+                    "pred_low": pred_low,
+                    "pred_close_p10": pred_p10,
+                    "pred_close_p90": pred_p90,
+                }
+            )
     return predictions
 
 
@@ -410,7 +515,7 @@ class SequesteredComparator:
             base = r.prev_actual_close or r.actual_close
             if base > 0:
                 daily_pred_ret = (r.pred_close - base) / base
-                cum_pred_mult *= (1.0 + daily_pred_ret)
+                cum_pred_mult *= 1.0 + daily_pred_ret
         cum_pred_ret = (cum_pred_mult - 1.0) * 100.0
         drift = cum_pred_ret - cum_actual_ret
 
@@ -538,21 +643,35 @@ def render_markdown_report(summary: EvaluationSummary, records: Sequence[DailyRe
     ]
 
     if summary.overall_directional_accuracy_pct is not None:
-        lines.append(f"- **Overall Directional Accuracy (Hit Rate)**: `{summary.overall_directional_accuracy_pct:.2f}%`")
+        lines.append(
+            f"- **Overall Directional Accuracy (Hit Rate)**: `{summary.overall_directional_accuracy_pct:.2f}%`"
+        )
     if summary.overall_band_coverage_pct is not None:
-        lines.append(f"- **Overall P10-P90 Band Coverage**: `{summary.overall_band_coverage_pct:.2f}%` (Nominal target: 80%)")
+        lines.append(
+            f"- **Overall P10-P90 Band Coverage**: `{summary.overall_band_coverage_pct:.2f}%` (Nominal target: 80%)"
+        )
 
-    lines.extend([
-        "",
-        "## 2. Per-Ticker Evaluation Breakdown",
-        "",
-        "| Ticker | Days | MAE ($) | RMSE ($) | MAPE (%) | Direction Hit Rate | Band Coverage | Range Capture | Cumul. Actual Ret | Cumul. Pred Ret | Drift |",
-        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
-    ])
+    lines.extend(
+        [
+            "",
+            "## 2. Per-Ticker Evaluation Breakdown",
+            "",
+            "| Ticker | Days | MAE ($) | RMSE ($) | MAPE (%) | Direction Hit Rate | Band Coverage | Range Capture | Cumul. Actual Ret | Cumul. Pred Ret | Drift |",
+            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        ]
+    )
 
     for ticker, m in sorted(summary.ticker_metrics.items()):
-        dir_str = f"{m.directional_accuracy_pct:.1f}% ({m.directional_hits}/{m.directional_opportunities})" if m.directional_accuracy_pct is not None else "N/A"
-        band_str = f"{m.band_coverage_pct:.1f}% ({m.band_hits}/{m.band_opportunities})" if m.band_coverage_pct is not None else "N/A"
+        dir_str = (
+            f"{m.directional_accuracy_pct:.1f}% ({m.directional_hits}/{m.directional_opportunities})"
+            if m.directional_accuracy_pct is not None
+            else "N/A"
+        )
+        band_str = (
+            f"{m.band_coverage_pct:.1f}% ({m.band_hits}/{m.band_opportunities})"
+            if m.band_coverage_pct is not None
+            else "N/A"
+        )
         range_str = f"{m.range_capture_pct:.1f}%" if m.range_capture_pct is not None else "N/A"
         act_ret_str = f"{m.cumulative_actual_return_pct:+.2f}%" if m.cumulative_actual_return_pct is not None else "N/A"
         pred_ret_str = f"{m.cumulative_pred_return_pct:+.2f}%" if m.cumulative_pred_return_pct is not None else "N/A"
@@ -563,13 +682,15 @@ def render_markdown_report(summary: EvaluationSummary, records: Sequence[DailyRe
             f"{dir_str} | {band_str} | {range_str} | {act_ret_str} | {pred_ret_str} | {drift_str} |"
         )
 
-    lines.extend([
-        "",
-        "## 3. Recent 10 Trading Days Comparison Sample",
-        "",
-        "| Date | Ticker | Predicted Close | Actual Close | Abs Error ($) | Error (%) | Direction Match | In Band |",
-        "| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
-    ])
+    lines.extend(
+        [
+            "",
+            "## 3. Recent 10 Trading Days Comparison Sample",
+            "",
+            "| Date | Ticker | Predicted Close | Actual Close | Abs Error ($) | Error (%) | Direction Match | In Band |",
+            "| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        ]
+    )
 
     # Show last 10 records per ticker or last 20 overall
     sorted_recs = sorted(records, key=lambda r: (r.date, r.ticker), reverse=True)
@@ -640,27 +761,29 @@ def export_daily_ledger_csv(records: Sequence[DailyRecord], output_path: Path) -
             if r.pred_close_p10 is not None and r.pred_close_p90 is not None:
                 in_band = bool(r.pred_close_p10 <= r.actual_close <= r.pred_close_p90)
 
-            writer.writerow({
-                "date": r.date,
-                "ticker": r.ticker,
-                "actual_close": round(r.actual_close, 4),
-                "pred_close": round(r.pred_close, 4),
-                "abs_error": round(abs_err, 4),
-                "error_pct": round(err_pct, 4),
-                "prev_actual_close": round(r.prev_actual_close, 4) if r.prev_actual_close else "",
-                "actual_return_pct": round(act_ret, 4) if act_ret is not None else "",
-                "pred_return_pct": round(pred_ret, 4) if pred_ret is not None else "",
-                "directional_hit": dir_hit if dir_hit is not None else "",
-                "actual_open": round(r.actual_open, 4) if r.actual_open else "",
-                "pred_open": round(r.pred_open, 4) if r.pred_open else "",
-                "actual_high": round(r.actual_high, 4) if r.actual_high else "",
-                "pred_high": round(r.pred_high, 4) if r.pred_high else "",
-                "actual_low": round(r.actual_low, 4) if r.actual_low else "",
-                "pred_low": round(r.pred_low, 4) if r.pred_low else "",
-                "pred_close_p10": round(r.pred_close_p10, 4) if r.pred_close_p10 else "",
-                "pred_close_p90": round(r.pred_close_p90, 4) if r.pred_close_p90 else "",
-                "in_band": in_band if in_band is not None else "",
-            })
+            writer.writerow(
+                {
+                    "date": r.date,
+                    "ticker": r.ticker,
+                    "actual_close": round(r.actual_close, 4),
+                    "pred_close": round(r.pred_close, 4),
+                    "abs_error": round(abs_err, 4),
+                    "error_pct": round(err_pct, 4),
+                    "prev_actual_close": round(r.prev_actual_close, 4) if r.prev_actual_close else "",
+                    "actual_return_pct": round(act_ret, 4) if act_ret is not None else "",
+                    "pred_return_pct": round(pred_ret, 4) if pred_ret is not None else "",
+                    "directional_hit": dir_hit if dir_hit is not None else "",
+                    "actual_open": round(r.actual_open, 4) if r.actual_open else "",
+                    "pred_open": round(r.pred_open, 4) if r.pred_open else "",
+                    "actual_high": round(r.actual_high, 4) if r.actual_high else "",
+                    "pred_high": round(r.pred_high, 4) if r.pred_high else "",
+                    "actual_low": round(r.actual_low, 4) if r.actual_low else "",
+                    "pred_low": round(r.pred_low, 4) if r.pred_low else "",
+                    "pred_close_p10": round(r.pred_close_p10, 4) if r.pred_close_p10 else "",
+                    "pred_close_p90": round(r.pred_close_p90, 4) if r.pred_close_p90 else "",
+                    "in_band": in_band if in_band is not None else "",
+                }
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:

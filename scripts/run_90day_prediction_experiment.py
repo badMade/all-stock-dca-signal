@@ -60,11 +60,30 @@ def get_trading_days(ticker_dir: Path, reference_ticker: str = "SPY") -> list[st
 
     dates: list[str] = []
     with ref_path.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+
+            def _find_all_indices(col_names):
+                return [header.index(name) for name in col_names if name in header]
+
+            date_indices = _find_all_indices(["Date", "date"])
+            if not date_indices:
+                return []
+
+            max_idx = max(date_indices or [-1])
+        except StopIteration:
+            return []
+
         for row in reader:
-            d = row.get("Date") or row.get("date")
-            if d:
-                dates.append(d.strip().split(" ")[0].split("T")[0])
+            if len(row) > max_idx:
+                d = None
+                for idx in date_indices:
+                    d = row[idx]
+                    if d:
+                        break
+                if d:
+                    dates.append(d.strip().split(" ")[0].split("T")[0])
     return sorted(list(set(dates)))
 
 
@@ -130,16 +149,18 @@ def generate_walkforward_baseline_predictions(
                 pred_p10 = pred_close * 0.98
                 pred_p90 = pred_close * 1.02
 
-            all_predictions.append({
-                "date": target_date,
-                "ticker": ticker,
-                "pred_close": round(pred_close, 4),
-                "pred_open": round(pred_open, 4),
-                "pred_high": round(pred_high, 4),
-                "pred_low": round(pred_low, 4),
-                "pred_close_p10": round(pred_p10, 4),
-                "pred_close_p90": round(pred_p90, 4),
-            })
+            all_predictions.append(
+                {
+                    "date": target_date,
+                    "ticker": ticker,
+                    "pred_close": round(pred_close, 4),
+                    "pred_open": round(pred_open, 4),
+                    "pred_high": round(pred_high, 4),
+                    "pred_low": round(pred_low, 4),
+                    "pred_close_p10": round(pred_p10, 4),
+                    "pred_close_p90": round(pred_p90, 4),
+                }
+            )
 
     # Write predictions CSV
     fieldnames = [

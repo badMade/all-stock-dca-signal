@@ -85,18 +85,81 @@ def evaluate_tier_c_candidates(
     scanned_active = 0
 
     with open(forecasts_csv_path, "r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+
+            def _find_all_indices(col_names):
+                return [header.index(name) for name in col_names if name in header]
+
+            ticker_indices = _find_all_indices(["ticker"])
+            ref_indices = _find_all_indices(["ref_close"])
+            p90_indices = _find_all_indices(["close_p90"])
+            p10_indices = _find_all_indices(["close_p10"])
+            pred_indices = _find_all_indices(["pred_close"])
+
+            if not ticker_indices or not ref_indices or not p90_indices or not p10_indices or not pred_indices:
+                return {}, {}
+
+            max_idx = max((ticker_indices + ref_indices + p90_indices + p10_indices + pred_indices) or [-1])
+        except StopIteration:
+            return {}, {}
+
         for row in reader:
-            ticker = (row.get("ticker") or "").strip().upper()
+            if len(row) <= max_idx:
+                continue
+
+            ticker = None
+            for idx in ticker_indices:
+                ticker = row[idx]
+                if ticker:
+                    break
+
+            ticker = (ticker or "").strip().upper()
             if ticker not in active_tickers:
                 continue
 
             scanned_active += 1
             try:
-                ref_close = float(row["ref_close"])
-                p90_close = float(row["close_p90"])
-                p10_close = float(row["close_p10"])
-                pred_close = float(row["pred_close"])
+                ref_close = None
+                for idx in ref_indices:
+                    try:
+                        ref_close = float(row[idx])
+                        break
+                    except (ValueError, TypeError):
+                        pass
+                if ref_close is None:
+                    continue
+
+                p90_close = None
+                for idx in p90_indices:
+                    try:
+                        p90_close = float(row[idx])
+                        break
+                    except (ValueError, TypeError):
+                        pass
+                if p90_close is None:
+                    continue
+
+                p10_close = None
+                for idx in p10_indices:
+                    try:
+                        p10_close = float(row[idx])
+                        break
+                    except (ValueError, TypeError):
+                        pass
+                if p10_close is None:
+                    continue
+
+                pred_close = None
+                for idx in pred_indices:
+                    try:
+                        pred_close = float(row[idx])
+                        break
+                    except (ValueError, TypeError):
+                        pass
+                if pred_close is None:
+                    continue
             except (KeyError, ValueError, TypeError):
                 continue
 
