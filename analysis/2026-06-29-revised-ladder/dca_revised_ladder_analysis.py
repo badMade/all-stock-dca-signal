@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, cast
 
+import numpy as np
 import pandas as pd
 
 # Data/output directory. Override with DCA_LADDER_DIR; defaults to this script's own
@@ -12,11 +13,51 @@ import pandas as pd
 BASE = Path(os.environ.get("DCA_LADDER_DIR", Path(__file__).resolve().parent))
 OUT = BASE
 ACTIVE_TICKERS = [
-    "DFTX", "TRIN", "AAAU", "SPCX", "TRLV", "RVI", "VCX", "EVR", "LUNR", "IRDM",
-    "DXYZ", "LITE", "ASML", "DRAM", "STX", "MSFT", "AAPL", "AMAT", "AMD", "CBRS",
-    "MRVL", "BTX", "STM", "SNDK", "WDC", "TSM", "AVGO", "NVDA", "QBTS", "FLKR",
-    "INTC", "GOOGL", "GOOG", "AMZN", "GLW", "MA", "GS", "MU", "NFLX", "XLG",
-    "TOPT", "QTOP", "SATA", "RGTI", "IBM",
+    "DFTX",
+    "TRIN",
+    "AAAU",
+    "SPCX",
+    "TRLV",
+    "RVI",
+    "VCX",
+    "EVR",
+    "LUNR",
+    "IRDM",
+    "DXYZ",
+    "LITE",
+    "ASML",
+    "DRAM",
+    "STX",
+    "MSFT",
+    "AAPL",
+    "AMAT",
+    "AMD",
+    "CBRS",
+    "MRVL",
+    "BTX",
+    "STM",
+    "SNDK",
+    "WDC",
+    "TSM",
+    "AVGO",
+    "NVDA",
+    "QBTS",
+    "FLKR",
+    "INTC",
+    "GOOGL",
+    "GOOG",
+    "AMZN",
+    "GLW",
+    "MA",
+    "GS",
+    "MU",
+    "NFLX",
+    "XLG",
+    "TOPT",
+    "QTOP",
+    "SATA",
+    "RGTI",
+    "IBM",
 ]
 
 BASE_AMOUNT = 1.0
@@ -24,16 +65,12 @@ DAILY_CAP = 120.0
 WEEKLY_CAP = 600.0
 
 
-def tier_for_drop(drop_pct: float) -> tuple[float, str]:
-    if pd.isna(drop_pct) or drop_pct < 0.1:
-        return 0.0, "0x"
-    if drop_pct < 2.0:
-        return 1.0, "1x"
-    if drop_pct < 5.0:
-        return 1.5, "1.5x"
-    if drop_pct < 8.0:
-        return 2.0, "2x"
-    return 3.0, "3x"
+def compute_tiers_and_multipliers(drop_pct: pd.Series | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    drop = np.asarray(drop_pct, dtype=float)
+    conds = [np.isnan(drop) | (drop < 0.1), drop < 2.0, drop < 5.0, drop < 8.0]
+    multipliers = np.select(conds, [0.0, 1.0, 1.5, 2.0], default=3.0)
+    tiers = np.select(conds, ["0x", "1x", "1.5x", "2x"], default="3x")
+    return multipliers, tiers
 
 
 def symbol_from_history_filename(path: Path) -> str:
@@ -60,9 +97,9 @@ def load_history() -> pd.DataFrame:
     hist = pd.concat(frames, ignore_index=True).sort_values(by=["symbol", "date"])
     hist["prev_close"] = hist.groupby("symbol")["close"].shift(1)
     hist["drop_pct"] = (hist["prev_close"] - hist["close"]) / hist["prev_close"] * 100
-    tiers = hist["drop_pct"].apply(tier_for_drop)
-    hist["multiplier"] = pd.Series([x[0] for x in tiers], index=hist.index)
-    hist["tier"] = pd.Series([x[1] for x in tiers], index=hist.index)
+
+    # ⚡ Bolt Optimization: Replace slow .apply(tier_for_drop) with vectorized compute_tiers_and_multipliers
+    hist["multiplier"], hist["tier"] = compute_tiers_and_multipliers(hist["drop_pct"])
     hist["planned_spend"] = hist["multiplier"] * BASE_AMOUNT
     return hist
 
@@ -77,8 +114,10 @@ def completed_last_30(hist: pd.DataFrame) -> pd.DataFrame:
 def apply_budget(decisions: pd.DataFrame) -> pd.DataFrame:
     rows = []
     week_spend: dict[tuple[int, int], float] = {}
-    idx_name = decisions.index.name if decisions.index.name else 'index'
-    for date, group in decisions.sort_values(["date", "multiplier", "drop_pct"], ascending=[True, False, False]).groupby("date"):
+    idx_name = decisions.index.name if decisions.index.name else "index"
+    for date, group in decisions.sort_values(
+        ["date", "multiplier", "drop_pct"], ascending=[True, False, False]
+    ).groupby("date"):
         iso = pd.Timestamp(cast(Any, date)).isocalendar()
         week_key = (iso.year, iso.week)
         remaining_daily = DAILY_CAP
@@ -123,14 +162,29 @@ def build_backtest(hist_30: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         flat_final_shares=("flat_shares", "sum"),
     )
     summary = g.merge(f, on="symbol", how="outer").merge(tier_counts, on="symbol", how="left")
-    summary["graded_avg_entry_price"] = summary["graded_total_capital"] / summary["graded_final_shares"].replace(0, pd.NA)
+    summary["graded_avg_entry_price"] = summary["graded_total_capital"] / summary["graded_final_shares"].replace(
+        0, pd.NA
+    )
     summary["flat_avg_entry_price"] = summary["flat_total_capital"] / summary["flat_final_shares"].replace(0, pd.NA)
     summary["capital_delta_vs_flat"] = summary["graded_total_capital"] - summary["flat_total_capital"]
     summary["share_delta_vs_flat"] = summary["graded_final_shares"] - summary["flat_final_shares"]
     ordered_cols = [
-        "symbol", "graded_total_capital", "graded_avg_entry_price", "graded_final_shares",
-        "flat_total_capital", "flat_avg_entry_price", "flat_final_shares",
-        "capital_delta_vs_flat", "share_delta_vs_flat", "graded_buy_days", "0x", "1x", "1.5x", "2x", "3x", "capped_days",
+        "symbol",
+        "graded_total_capital",
+        "graded_avg_entry_price",
+        "graded_final_shares",
+        "flat_total_capital",
+        "flat_avg_entry_price",
+        "flat_final_shares",
+        "capital_delta_vs_flat",
+        "share_delta_vs_flat",
+        "graded_buy_days",
+        "0x",
+        "1x",
+        "1.5x",
+        "2x",
+        "3x",
+        "capped_days",
     ]
     summary = summary[ordered_cols].sort_values(["graded_total_capital", "symbol"], ascending=[False, True])  # type: ignore
     return summary, budgeted
@@ -145,11 +199,12 @@ def load_quotes() -> pd.DataFrame:
         if col in q.columns:
             q[col] = pd.to_numeric(q[col], errors="coerce")
     q["drop_pct"] = (q["previousClose"] - q["price"]) / q["previousClose"] * 100
-    tiers = q["drop_pct"].apply(tier_for_drop)
-    q["multiplier"] = [x[0] for x in tiers]
-    q["tier"] = [x[1] for x in tiers]
+
+    # ⚡ Bolt Optimization: Replace slow .apply(tier_for_drop) with vectorized compute_tiers_and_multipliers
+    q["multiplier"], q["tier"] = compute_tiers_and_multipliers(q["drop_pct"])
     q["planned_dollars"] = q["multiplier"] * BASE_AMOUNT
-    q["signal_status"] = q["multiplier"].apply(lambda x: "BUY_PREVIEW" if x > 0 else "NO_BUY")
+    # ⚡ Bolt Optimization: Replace .apply() lambda with vectorized np.where
+    q["signal_status"] = np.where(q["multiplier"] > 0, "BUY_PREVIEW", "NO_BUY")
     q = q[q["symbol"].isin(ACTIVE_TICKERS)].copy()
     q = q.sort_values(["multiplier", "drop_pct", "symbol"], ascending=[False, False, True])  # type: ignore
 
@@ -177,12 +232,25 @@ def write_report(summary: pd.DataFrame, decisions: pd.DataFrame, today: pd.DataF
     total_graded_shares = float(summary["graded_final_shares"].sum())
     total_flat_shares = float(summary["flat_final_shares"].sum())
     today_signal = today[today["planned_dollars"] > 0]
-    tier_distribution_today = today["tier"].value_counts().reindex(["0x", "1x", "1.5x", "2x", "3x"], fill_value=0).to_dict()
+    tier_distribution_today = (
+        today["tier"].value_counts().reindex(["0x", "1x", "1.5x", "2x", "3x"], fill_value=0).to_dict()
+    )
 
-    top_lines = summary.head(10)[[
-        "symbol", "graded_total_capital", "graded_avg_entry_price", "graded_final_shares",
-        "flat_total_capital", "flat_avg_entry_price", "flat_final_shares", "1x", "1.5x", "2x", "3x"
-    ]].copy()
+    top_lines = summary.head(10)[
+        [
+            "symbol",
+            "graded_total_capital",
+            "graded_avg_entry_price",
+            "graded_final_shares",
+            "flat_total_capital",
+            "flat_avg_entry_price",
+            "flat_final_shares",
+            "1x",
+            "1.5x",
+            "2x",
+            "3x",
+        ]
+    ].copy()
 
     def fmt_money(x: float) -> str:
         return "" if pd.isna(x) else f"${x:,.2f}"
@@ -193,7 +261,9 @@ def write_report(summary: pd.DataFrame, decisions: pd.DataFrame, today: pd.DataF
     md = []
     md.append("# Revised Graded DCA Ladder Analysis")
     md.append("")
-    md.append("This analysis uses completed daily bars for the 30 completed trading days before 2026-06-29 for the backtest, and the finance quote snapshot fetched on 2026-06-29 at 11:25 AM ET for the intraday tier preview.")
+    md.append(
+        "This analysis uses completed daily bars for the 30 completed trading days before 2026-06-29 for the backtest, and the finance quote snapshot fetched on 2026-06-29 at 11:25 AM ET for the intraday tier preview."
+    )
     md.append("")
     md.append("## Portfolio-level summary")
     md.append("")
@@ -209,7 +279,9 @@ def write_report(summary: pd.DataFrame, decisions: pd.DataFrame, today: pd.DataF
     md.append("")
     md.append("## Top tickers by graded capital deployed")
     md.append("")
-    md.append("| Ticker | Graded capital | Graded avg entry | Graded shares | Flat capital | Flat avg entry | Flat shares | 1x | 1.5x | 2x | 3x |")
+    md.append(
+        "| Ticker | Graded capital | Graded avg entry | Graded shares | Flat capital | Flat avg entry | Flat shares | 1x | 1.5x | 2x | 3x |"
+    )
     md.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     # ⚡ Bolt Optimization: Use to_dict('records') instead of iterrows() for faster iteration.
     # We use to_dict because column names like '1x' are invalid Python identifiers for itertuples.

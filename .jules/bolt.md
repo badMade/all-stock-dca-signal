@@ -212,3 +212,7 @@ Added `get_order_fills` to `BrokerAdapter` protocol and Robinhood live adapter, 
 
 **Learning:** When refactoring `csv.DictReader` into `csv.reader` loops to eliminate dict allocations, manually constructing smaller dicts using only a subset of keys (to avoid full manual tuple mapping overhead) can break downstream codebase validations. `csv.DictReader` guarantees every header field will exist as a key (resolving truncated trailing fields to `None`). Omitting these keys results in hidden `KeyError`s or schema validation failures later in the pipeline.
 **Action:** When manually reconstructing dictionary mappings from `csv.reader`, ensure you fully mimic the `DictReader` contract for any keys downstream consumers expect, including safely padding missing values with `None`. Do not use `if idx < len(_row): dict[col] = _row[idx]` as it drops the key entirely on short rows. Use `dict[col] = _row[idx] if idx < len(_row) else None` instead.
+
+## 2026-07-28 - pandas Series.apply optimization
+**Learning:** `Series.apply()` executes iteratively row-by-row in Python and lacks vectorization, making it significantly slower than native NumPy or Pandas operations.
+**Action:** Replace `Series.apply()` with vectorized alternatives like `np.select()`, `np.where()`, or `pd.cut()` when transforming or mapping values across a column to achieve large performance gains.
