@@ -91,6 +91,9 @@ class OutputGuardrail:
         Returns:
             Tuple of (redacted_text, total_redactions_made).
         """
+        if not isinstance(text, str):
+            raise TypeError(f"Expected string, got {type(text)}")
+
         if not text:
             return text, 0
 
@@ -121,6 +124,9 @@ class OutputGuardrail:
         Returns:
             True if hallucination is detected (untraceable claim), False if grounded.
         """
+        if not isinstance(output_text, str):
+            raise TypeError(f"Expected string for output_text, got {type(output_text)}")
+
         if not output_text.strip():
             return False
 
