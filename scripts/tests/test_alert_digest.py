@@ -2405,9 +2405,8 @@ def test_a_bare_gate_mention_corroborated_by_a_declared_slot_is_still_an_alert()
 
 
 def test_failed_send_corroboration_is_scoped_to_the_clause_not_the_sentence():
-    # Fresh evidence after the sentence-level scoping fix: the other channel's
-    # failure and email's success sharing one sentence still tripped the
-    # generic-failure check.
+    # Verifies that clause-level scoping prevents a failure in one channel (Slack)
+    # from being misattributed to email within the same sentence.
     body = "Slack could not send, but the alert email went out fine"
     assert not states_email_failure(body)
 
