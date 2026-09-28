@@ -172,8 +172,10 @@ def _is_within_repo_checkout(path: Path) -> bool:
 # could never fire and a durable, correctly-external path would be wrongly
 # flagged.
 _BODY_ARTIFACTS_PATH = re.compile(
-    r"(?:^|(?<=[\s([{\"'`]))(?:/\S*|[A-Za-z]:[\\/]\S*|\\\\\S*)"
-    r"(?:artifacts|cron_tracking)[/\\]\S*",
+    r"(?:^|(?<=[\s([{\"'`]))"
+    r"(?:/[^\s]*?|[A-Za-z]:[\\/][^\s]*?|\\\\[^\s]*?)"
+    r"(?:artifacts|cron_tracking)[/\\]"
+    r"[^\s]*[^\s\])\"'`.,:;!]",
     re.IGNORECASE,
 )
 

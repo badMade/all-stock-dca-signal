@@ -3134,6 +3134,45 @@ def test_merge_still_unions_the_draft_warning_when_the_counterpart_is_a_draft():
     assert _DRAFT_WARNING[0] in {code for code, _ in merged[0].warnings}
 
 
+
+def test_gitignored_path_drops_trailing_punctuation_from_sentence(tmp_path):
+    # A path mentioned in prose might end with a period. The regex should strip
+    # it so the file path checks work accurately without looking for a file
+    # ending in `.txt.`
+    external = tmp_path / "mnt" / "external" / "artifacts" / "alerts" / "2026-08-26-1430-gate4.txt"
+    body = f"Error found in {external}."
+    codes = {code for code, _ in detect_channel_warnings(body, source="alert_file")}
+    # The external path should be successfully stripped and therefore exempted.
+    assert "GITIGNORED_ALERT_PATH" not in codes
+
+
+def test_gitignored_path_drops_trailing_brackets_and_quotes(tmp_path):
+    external = tmp_path / "mnt" / "external" / "artifacts" / "alerts" / "data.csv"
+
+    # In brackets
+    body_brackets = f"See attached [{external}]"
+    codes_brackets = {code for code, _ in detect_channel_warnings(body_brackets, source="alert_file")}
+    assert "GITIGNORED_ALERT_PATH" not in codes_brackets
+
+    # In JSON string
+    body_json = f'{{"path": "{external}", "status": "failed"}}'
+    codes_json = {code for code, _ in detect_channel_warnings(body_json, source="alert_file")}
+    assert "GITIGNORED_ALERT_PATH" not in codes_json
+
+def test_relative_paths_bypass_external_exemption(tmp_path):
+    # Purely relative paths have no anchor to resolve and thus are never
+    # considered external; they should still trigger the gitignored path warning.
+
+    # Missing leading slash with a write claim
+    body_missing_slash = "wrote to var/log/artifacts/alerts"
+    codes_slash = {code for code, _ in detect_channel_warnings(body_missing_slash, source="alert_file")}
+    assert "GITIGNORED_ALERT_PATH" in codes_slash
+
+    # Purely relative to current directory with a write claim
+    body_relative = "wrote to artifacts/run.json"
+    codes_relative = {code for code, _ in detect_channel_warnings(body_relative, source="alert_file")}
+    assert "GITIGNORED_ALERT_PATH" in codes_relative
+
 def test_a_body_stated_absolute_path_outside_the_checkout_is_not_flagged(tmp_path):
     # A durable artifact root can live entirely outside this repository and
     # still be named in the alert's OWN body text -- not just at its loaded
@@ -3521,15 +3560,13 @@ def test_a_historical_task_name_does_not_shadow_the_labelled_slot():
     assert detect_slot_evidence(text) == ("1130", "labelled")
 
 
-def test_a_windows_drive_path_is_recognized_as_external():
-    # Path.resolve() on this (POSIX) host treats a Windows drive-qualified
-    # string as an ordinary relative path component -- backslashes are not
-    # separators and "C:" carries no meaning to pathlib.PurePosixPath -- so
-    # it silently resolved as if it sat under this checkout instead of being
-    # recognized as external.
-    body = "Saved to C:\\durable\\artifacts\\alerts\\x.txt"
-    codes = {code for code, _ in detect_channel_warnings(body, source="alert_file")}
-    assert "GITIGNORED_ALERT_PATH" not in codes
+def test_a_windows_drive_path_is_recognized_as_external(monkeypatch):
+    from pathlib import Path, PureWindowsPath
+    from unittest.mock import patch
+    monkeypatch.setattr("scripts.alert_digest._REPO_ROOT", Path("/app/dca"))
+    with patch('scripts.alert_digest.Path', PureWindowsPath):
+        assert _matched_path_is_external(r"C:\logs\artifacts\alerts\x.txt")
+
 
 
 def test_connector_error_fallback_wording_is_recognized_as_a_failure():
@@ -3627,10 +3664,13 @@ def test_a_different_drive_windows_path_is_still_external(monkeypatch):
     assert _matched_path_is_external("D:\\durable\\artifacts\\alerts\\x.txt")
 
 
-def test_a_windows_drive_path_is_still_external_on_a_posix_checkout():
-    # Regression guard for the ordinary (POSIX) case round 26 fixed: no
-    # monkeypatch here, so _REPO_ROOT is this checkout's real, POSIX path.
-    assert _matched_path_is_external("C:\\durable\\artifacts\\alerts\\x.txt")
+def test_a_windows_drive_path_is_still_external_on_a_posix_checkout(monkeypatch):
+    from pathlib import Path, PureWindowsPath
+    from unittest.mock import patch
+    monkeypatch.setattr("scripts.alert_digest._REPO_ROOT", Path("/app/dca"))
+    with patch('scripts.alert_digest.Path', PureWindowsPath):
+        assert _matched_path_is_external(r"C:\durable\artifacts\alerts\x.txt")
+
 
 
 def test_a_streak_includes_todays_own_incomplete_but_observed_alert():
@@ -4640,17 +4680,21 @@ def test_a_unc_network_share_artifact_root_is_not_flagged():
 
 
 def test_a_unc_path_naming_this_checkout_is_still_internal(monkeypatch):
-    # Regression guard, mirroring the existing same-drive Windows test: a
-    # UNC path naming THIS checkout's own root (if it were itself mounted
-    # as a network share) must still be recognized as internal via
-    # PureWindowsPath comparison, not treated as unconditionally external.
+    from pathlib import Path, PureWindowsPath
+    from unittest.mock import patch
     monkeypatch.setattr("scripts.alert_digest._REPO_ROOT", Path(r"\\server\share\all-stock-dca"))
-    assert not _matched_path_is_external(r"\\server\share\all-stock-dca\artifacts\alerts\x.txt")
+    with patch('scripts.alert_digest.Path', PureWindowsPath):
+        assert not _matched_path_is_external(r"\\server\share\all-stock-dca\artifacts\alerts\x.txt")
+
 
 
 def test_a_different_unc_share_is_still_external(monkeypatch):
+    from pathlib import Path, PureWindowsPath
+    from unittest.mock import patch
     monkeypatch.setattr("scripts.alert_digest._REPO_ROOT", Path(r"\\server\share\all-stock-dca"))
-    assert _matched_path_is_external(r"\\otherserver\othershare\artifacts\alerts\x.txt")
+    with patch('scripts.alert_digest.Path', PureWindowsPath):
+        assert _matched_path_is_external(r"\\otherserver\othershare\artifacts\alerts\x.txt")
+
 
 
 def test_a_noun_phrase_no_cap_breach_is_recognized_as_a_denial():
