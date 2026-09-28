@@ -3463,6 +3463,29 @@ def test_a_relative_path_hint_with_an_internal_slash_is_not_misread_as_absolute(
     assert any(code == "GITIGNORED_ALERT_PATH" for code, _ in warnings)
 
 
+def test_body_artifacts_path_anchoring_regression(caplog):
+    # Regression guard for the _BODY_ARTIFACTS_PATH anchoring fix: a
+    # malformed path missing the root anchor should be caught and rejected,
+    # rather than silently misread as a relative path.
+    import logging
+
+    from scripts.alert_digest import _matched_path_is_external
+
+    # Capture logs at the WARNING level or higher
+    caplog.set_level(logging.WARNING)
+
+    # Arrange: A malformed path missing a root anchor (/, C:\)
+    malformed_path = "var/log/artifacts/alerts/x.txt"
+
+    # Act: Bypass the regex gatekeeper and test the boundary function directly
+    result = _matched_path_is_external(malformed_path)
+
+    # Assert: The function must explicitly reject the input
+    assert result is False
+    # Assert: The specific rejection reason must be logged
+    assert "Artifacts path anchored" in caplog.text
+
+
 def test_then_is_recognized_as_a_retry_outcome_boundary():
     # "Email failed to send initially then retry email sent successfully"
     # narrates two sequential outcomes with no comma or coordinating

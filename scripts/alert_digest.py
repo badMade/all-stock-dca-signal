@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
 from collections import Counter, defaultdict, deque
@@ -78,6 +79,9 @@ from dca_paths import stream_root
 from near_close_dca import nyse_holidays
 
 ET = ZoneInfo("America/New_York")
+
+logger = logging.getLogger(__name__)
+
 
 LEDGER_SCHEMA_VERSION = "alert-digest-v1"
 
@@ -196,8 +200,14 @@ _UNC_PATH = re.compile(r"^\\\\\S")
 def _matched_path_is_external(path_text: str) -> bool:
     """Whether the absolute path text ``path_text`` sits OUTSIDE this checkout."""
     # Sentence scanning masks periods, but containment needs the actual path.
-    path_text = path_text.replace(_PATH_EXTENSION_PERIOD_MASK, ".")
-    if _WINDOWS_DRIVE_PATH.match(path_text) or _UNC_PATH.match(path_text):
+    path_text_unmasked = path_text.replace(_PATH_EXTENSION_PERIOD_MASK, ".")
+
+    # Fail fast: Explicitly reject malformed inputs lacking a root anchor
+    if not (Path(path_text_unmasked).is_absolute() or _WINDOWS_DRIVE_PATH.match(path_text_unmasked) or _UNC_PATH.match(path_text_unmasked)):
+        logger.warning("Artifacts path anchored check failed: expected absolute path, got '%s'", path_text_unmasked)
+        return False
+
+    if _WINDOWS_DRIVE_PATH.match(path_text_unmasked) or _UNC_PATH.match(path_text_unmasked):
         # Compared with Windows path semantics, not assumed external
         # outright: if THIS process also happens to run on Windows,
         # `_REPO_ROOT` is itself drive-qualified, and a same-drive,
@@ -209,10 +219,10 @@ def _matched_path_is_external(path_text: str) -> bool:
         # parses a UNC path's "\\server\share" as its own drive, so the
         # same is_relative_to comparison covers both forms.
         try:
-            return not PureWindowsPath(path_text).is_relative_to(PureWindowsPath(str(_REPO_ROOT)))
+            return not PureWindowsPath(path_text_unmasked).is_relative_to(PureWindowsPath(str(_REPO_ROOT)))
         except ValueError:
             return True
-    return not _is_within_repo_checkout(Path(path_text))
+    return not _is_within_repo_checkout(Path(path_text_unmasked))
 
 
 def _gitignored_mention_is_external(text: str, match: "re.Match[str]") -> bool:
