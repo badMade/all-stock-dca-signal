@@ -428,6 +428,11 @@ _STREAM_WORD_TO_SLOT: Tuple[Tuple[str, str], ...] = (
 # and the promised per-gate bucket never existed (caught in PR #1535 review).
 _REASON_CODES: Tuple[str, ...] = ("GATE5_DISABLED", "GATE4_EXPECTED_OVERLAP", "SCHEDULE_WATCHDOG")
 
+_REASON_CODE_PATTERNS = {
+    code: re.compile(r"(?<![A-Za-z0-9_])" + re.escape(code.lower()) + r"(?![A-Za-z0-9_])")
+    for code in _REASON_CODES
+}
+
 # A reason code used as a NOUN-PHRASE MODIFIER -- naming a config/routing
 # object, not classifying this run's own outcome. "Unable to load the
 # GATE5_DISABLED routing configuration" mentions the code the same way an
@@ -2479,7 +2484,7 @@ def detect_gate_evidence(subject: str, body: str) -> Tuple[Optional[str], str]:
         # (letter, digit, or underscore) immediately before or after the
         # match closes both gaps at once (Codex review: "Require token
         # boundaries for named reason codes").
-        code_pattern = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(lowered_code) + r"(?![A-Za-z0-9_])")
+        code_pattern = _REASON_CODE_PATTERNS[code]
         for sentence in sentences:
             lowered = sentence.lower()
             # Every occurrence in the sentence is tried, not just the first:
@@ -2594,7 +2599,7 @@ def detect_verdict(subject: str, body: str) -> Optional[str]:
     sentences = _SENTENCE_SPLIT.split(f"{subject}\n{body}")
     for code in _REASON_CODES:
         lowered_code = code.lower()
-        code_pattern = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(lowered_code) + r"(?![A-Za-z0-9_])")
+        code_pattern = _REASON_CODE_PATTERNS[code]
         for sentence in sentences:
             lowered = sentence.lower()
             for match in code_pattern.finditer(lowered):
