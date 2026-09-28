@@ -6337,17 +6337,14 @@ class MorningDCAExecutor(DCAExecutor):
         has_submitted = any(
             isinstance(row, dict)
             and (
-                (isinstance(row.get("status"), str) and row["status"] in _ORDER_BEARING_CANDIDATE_STATUSES)
+                _is_deployed_candidate_status(row.get("status"))
                 or row.get("ambiguous_placement_exception") is True
             )
             for row in buy_candidates
         ) or any(
             isinstance(outcome, dict)
             and (
-                (
-                    isinstance(outcome.get("status"), str)
-                    and outcome["status"] in _ORDER_BEARING_CANDIDATE_STATUSES
-                )
+                _is_deployed_candidate_status(outcome.get("status"))
                 or outcome.get("ambiguous_placement_exception") is True
             )
             for outcome in broker_outcomes.values()
