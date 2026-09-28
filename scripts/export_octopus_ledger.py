@@ -28,8 +28,6 @@ OCTOPUS_DIR = REPO_ROOT / "wondrous-octopus"
 if str(OCTOPUS_DIR) not in sys.path:
     sys.path.insert(1, str(OCTOPUS_DIR))
 
-from inspect_run import _dollar, _open_ledger  # noqa: E402
-
 from scripts.sequestered_truth_comparator import (  # noqa: E402
     SequesteredComparator,
     render_markdown_report,
@@ -46,6 +44,15 @@ def load_scheduled_tickers() -> list[str]:
     return sorted(list({t.upper() for t in active}))
 
 
+def _inspect_run_helpers() -> tuple[Any, Any]:
+    # inspect_run.py bootstraps the full Wondrous Octopus environment (including
+    # torch) on import. Keep the core-testable config/CLI paths import-safe and
+    # defer that setup until we actually need ledger access.
+    from inspect_run import _dollar, _open_ledger  # noqa: E402
+
+    return _dollar, _open_ledger
+
+
 def export_ledger_records(
     run_dir: Path,
     target_tickers: set[str],
@@ -55,6 +62,7 @@ def export_ledger_records(
     report_md: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Stream records from the ledger, filter to target tickers, and export."""
+    _dollar, _open_ledger = _inspect_run_helpers()
     ledger = _open_ledger(run_dir)
     available_models = ledger.models()
     if model not in available_models:

@@ -36,6 +36,17 @@ for all seven slots and names the specific failures that have cost real runs:
   this finding is exactly what would let that incident recur even though the
   repo's own mirror already carries the fix (2026-09-24 audit: all seven live
   bodies had drifted from the mirror on this exact paragraph).
+* ``missing_shell_unavailable_fallback`` -- the live body runs Gate 2's repo
+  probes but never carries the distinct abort reason "executor shell tool
+  unavailable, repo probes could not run" (2026-09-08: a dead sandboxed shell
+  made Gate 2's probes look identical to an unreachable repo, so three
+  consecutive slots reported "repo access" with the wrong reconnect-the-folder
+  remedy -- one of them burning roughly a third of its window on retries
+  first).
+* ``email_draft_not_send`` -- the live body still tells the operator to
+  DRAFT the Gate 9 alert email rather than send it (2026-08-26:
+  ``docs/alert_digest.md`` counted roughly fifty undelivered draft alerts
+  sitting in Gmail before this was fixed to require EMAIL SENT).
 
 Read-only. It never edits a live task (that stays a human's
 ``update_scheduled_task`` full-body replacement) and never prints an
@@ -77,6 +88,14 @@ FINALIZE_EVIDENCE_MODULE = "scripts.finalize_run_evidence"
 # page (2026-09-09 incident; see scripts/assemble_order_pages.py).
 ORDER_PAGES_HELPER_MODULE = "scripts.assemble_order_pages"
 GET_EQUITY_ORDERS_CALL = "get_equity_orders"
+# A Gate 2 repo-probe command; its presence means the live body actually runs
+# the probes the shell-unavailable fallback below must guard (2026-09-08
+# incident: see check_live_prompt_drift's module docstring).
+GATE_2_PROBE_MARKER = "ls -d /sessions"
+SHELL_UNAVAILABLE_ABORT_REASON = "executor shell tool unavailable, repo probes could not run"
+# The pre-2026-08-26 alert wording this checker flags as a regression back to
+# draft-only delivery (docs/alert_digest.md: ~50 undelivered drafts).
+EMAIL_DRAFT_PHRASE = "EMAIL DRAFT"
 # The seven roster slots, as each mirror's filename prefix (<HHMM>ET-<task>.txt).
 EXPECTED_SLOTS = ("0935ET", "1030ET", "1130ET", "1230ET", "1330ET", "1430ET", "1530ET")
 # Every key same_day_top_up_gate requires on its --orders-pages envelope.
@@ -207,6 +226,18 @@ def findings_for(live_text: str, window_end_date: Optional[str]) -> List[Dict[st
                 "detail": f"hardcodes {', '.join(stale)} as the window end; config/trading_window.json says "
                 f"{window_end_date}",
             })
+    if GATE_2_PROBE_MARKER in live_text and SHELL_UNAVAILABLE_ABORT_REASON not in live_text:
+        findings.append({
+            "code": "missing_shell_unavailable_fallback",
+            "detail": f'runs Gate 2\'s repo probes without the distinct abort reason "{SHELL_UNAVAILABLE_ABORT_REASON}"'
+            ": a dead sandboxed shell can misdiagnose as repo-unreachable (2026-09-08 incident)",
+        })
+    if EMAIL_DRAFT_PHRASE in live_text:
+        findings.append({
+            "code": "email_draft_not_send",
+            "detail": "still tells the operator to DRAFT the Gate 9 alert email instead of sending it "
+            "(2026-08-26 regression: docs/alert_digest.md counted ~50 undelivered drafts)",
+        })
     return findings
 
 

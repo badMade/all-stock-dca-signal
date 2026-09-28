@@ -189,6 +189,73 @@ def test_a_hardcoded_window_date_matching_config_is_not_flagged(tmp_path):
     assert "stale_window_end_date" not in _findings(report)
 
 
+def test_a_live_task_missing_the_shell_unavailable_fallback_is_flagged(tmp_path):
+    # 2026-09-08 incident (claude/dca-executor-prompts/README.md): a dead
+    # sandboxed shell made Gate 2's repo-mount probes look identical to an
+    # unreachable repo, so three consecutive slots reported "repo access" with
+    # the wrong reconnect-the-folder remedy -- one of them (9:35) burning
+    # roughly a third of its window on retries first. The fix adds a bounded
+    # liveness check and this distinct abort reason; a live body still missing
+    # it can reproduce the same misdiagnosis on the next dead shell.
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    stale = (
+        "GATE 2 - REPO REACHABLE\n"
+        "Run `ls -d /sessions/*/mnt/all-stock-dca` and the other repo probes.\n"
+    ) + GOOD_BODY
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1430-test", stale))
+    assert "missing_shell_unavailable_fallback" in _findings(report)
+
+
+def test_a_live_task_with_the_shell_unavailable_fallback_is_not_flagged(tmp_path):
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    body = (
+        "GATE 2 - REPO REACHABLE\n"
+        "Run `ls -d /sessions/*/mnt/all-stock-dca` and the other repo probes.\n"
+        'If the shell will not start, abort with "executor shell tool unavailable, '
+        'repo probes could not run" instead of a repo-access reason.\n'
+    ) + GOOD_BODY
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1430-test", body))
+    assert "missing_shell_unavailable_fallback" not in _findings(report)
+
+
+def test_a_live_task_that_never_runs_gate_2_probes_is_not_flagged_for_the_shell_fallback(tmp_path):
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1430-test", GOOD_BODY))
+    assert "missing_shell_unavailable_fallback" not in _findings(report)
+
+
+def test_a_live_task_still_telling_the_operator_to_draft_the_alert_email_is_flagged(tmp_path):
+    # 2026-08-26 fix (README): the alert contract read "EMAIL DRAFT" as its
+    # third Gate 9 channel until docs/alert_digest.md counted ~50 undelivered
+    # drafts sitting in Gmail. A live body still requiring only a draft
+    # repeats that silent-alert failure.
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    stale = (
+        "GATE 9 - REPORT\n"
+        "Alert on: (1) IN-APP MESSAGE CENTER; (2) REPO ALERT FILE; "
+        "(3) EMAIL DRAFT to the configured operator address.\n"
+    ) + GOOD_BODY
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1430-test", stale))
+    assert "email_draft_not_send" in _findings(report)
+
+
+def test_a_live_task_requiring_the_alert_email_to_be_sent_is_not_flagged(tmp_path):
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    body = (
+        "GATE 9 - REPORT\n"
+        "Alert on: (1) IN-APP MESSAGE CENTER; (2) REPO ALERT FILE; "
+        "(3) EMAIL SENT (not drafted) to the configured operator address.\n"
+    ) + GOOD_BODY
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1430-test", body))
+    assert "email_draft_not_send" not in _findings(report)
+
+
+def test_a_live_task_with_no_email_alerting_at_all_is_not_flagged_for_the_draft_check(tmp_path):
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1430-test", GOOD_BODY))
+    assert "email_draft_not_send" not in _findings(report)
+
+
 def test_a_missing_live_task_file_is_reported_not_skipped(tmp_path):
     mirror_dir = _mirror(tmp_path, "0935-test")
     scheduled = tmp_path / "Scheduled"
