@@ -2450,6 +2450,53 @@ def test_mtime_matches_trading_day_is_on_or_after_not_strict_equality():
         assert _mtime_matches_trading_day(path, "2026-06-29") is False
 
 
+def test_run_classification_missing_target_day():
+    # End-to-end wiring for the >= fix: an earlier-weekday (Jul 21) corrupt
+    # or missing artifact must NOT be read as the Jul 22 state. The direct
+    # caller (select_same_day_run_state) enforces this, but this test verifies
+    # that the top-up context loader's fast path strictly demands the exact
+    # trading day, refusing to add the mismatched corrupt artifact to skip_sink
+    # (where it would trigger a bounded reload / skip).
+
+    jul22 = "2026-07-22"
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d) / "ce16ba6b"
+        base.mkdir()
+        run_dir = base / "final_manual_review" / "20260721_1345ET"
+        run_dir.mkdir(parents=True)
+        run_state_path = run_dir / "run_state.json"
+
+        # 1. Missing artifact
+        skip_sink = []
+        ctx = load_same_day_top_up_context(jul22, base=base, skip_sink=skip_sink)
+        assert ctx == {}
+        assert not skip_sink
+
+        # 2. Corrupt earlier-day artifact, but rewritten/stamped ON the target day.
+        # This simulates Monday's run_state.json rewritten while a Tuesday run scans it.
+        # It's physically broken, but it's from Monday. We are evaluating Tuesday (Jul 22).
+        run_state_path.write_text("{not valid json")
+
+        # Correctly set the file mtime using os.utime to properly simulate the time bomb fix
+        _EASTERN = ZoneInfo("America/New_York")
+        stamp = datetime.combine(
+            datetime.strptime(jul22, "%Y-%m-%d").date(), time(12, 0), tzinfo=_EASTERN
+        ).timestamp()
+        os.utime(run_state_path, (stamp, stamp))
+
+        skip_sink = []
+        ctx = load_same_day_top_up_context(jul22, base=base, skip_sink=skip_sink)
+        assert ctx == {}
+        # Since it does not contain the trading day bytes ("2026-07-22"), the fast path
+        # correctly ignores it without even checking mtime or parsing it, meaning
+        # it is NOT added to skip_sink.
+        assert not skip_sink, (
+            "an earlier-weekday corrupt artifact rewritten on the target day "
+            "must not poison the target day's skip_sink"
+        )
+
+
+
 def test_top_up_context_skip_sink_records_later_day_rewrite_of_earlier_artifact():
     # End-to-end wiring for the >= fix: an earlier-weekday (Jul 21) corrupt
     # run_state that was rewritten/backfilled on a LATER day (mtime Jul 22)
