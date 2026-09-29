@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, cast
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -65,12 +65,29 @@ DAILY_CAP = 120.0
 WEEKLY_CAP = 600.0
 
 
-def compute_tiers_and_multipliers(drop_pct: pd.Series | np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    drop = np.asarray(drop_pct, dtype=float)
-    conds = [np.isnan(drop) | (drop < 0.1), drop < 2.0, drop < 5.0, drop < 8.0]
-    multipliers = np.select(conds, [0.0, 1.0, 1.5, 2.0], default=3.0)
+def compute_tier_and_multiplier(drop_pct: float | pd.Series | np.ndarray) -> tuple[Any, Any]:
+    is_series = isinstance(drop_pct, pd.Series)
+    is_scalar = not isinstance(drop_pct, (pd.Series, np.ndarray))
+
+    arr = np.asarray(drop_pct)
+    conds = [
+        pd.isna(arr) | (arr < 0.1),
+        arr < 2.0,
+        arr < 5.0,
+        arr < 8.0,
+    ]
+    mults = np.select(conds, [0.0, 1.0, 1.5, 2.0], default=3.0)
     tiers = np.select(conds, ["0x", "1x", "1.5x", "2x"], default="3x")
-    return multipliers, tiers
+
+    if is_scalar:
+        return float(mults.item()), str(tiers.item())
+    if is_series:
+        return pd.Series(mults, index=drop_pct.index), pd.Series(tiers, index=drop_pct.index)
+    return mults, tiers
+
+
+def tier_for_drop(drop_pct: float | pd.Series | np.ndarray) -> tuple[Any, Any]:
+    return compute_tier_and_multiplier(drop_pct)
 
 
 def symbol_from_history_filename(path: Path) -> str:
@@ -97,9 +114,7 @@ def load_history() -> pd.DataFrame:
     hist = pd.concat(frames, ignore_index=True).sort_values(by=["symbol", "date"])
     hist["prev_close"] = hist.groupby("symbol")["close"].shift(1)
     hist["drop_pct"] = (hist["prev_close"] - hist["close"]) / hist["prev_close"] * 100
-
-    # ⚡ Bolt Optimization: Replace slow .apply(tier_for_drop) with vectorized compute_tiers_and_multipliers
-    hist["multiplier"], hist["tier"] = compute_tiers_and_multipliers(hist["drop_pct"])
+    hist["multiplier"], hist["tier"] = compute_tier_and_multiplier(hist["drop_pct"])
     hist["planned_spend"] = hist["multiplier"] * BASE_AMOUNT
     return hist
 
@@ -199,11 +214,8 @@ def load_quotes() -> pd.DataFrame:
         if col in q.columns:
             q[col] = pd.to_numeric(q[col], errors="coerce")
     q["drop_pct"] = (q["previousClose"] - q["price"]) / q["previousClose"] * 100
-
-    # ⚡ Bolt Optimization: Replace slow .apply(tier_for_drop) with vectorized compute_tiers_and_multipliers
-    q["multiplier"], q["tier"] = compute_tiers_and_multipliers(q["drop_pct"])
+    q["multiplier"], q["tier"] = compute_tier_and_multiplier(q["drop_pct"])
     q["planned_dollars"] = q["multiplier"] * BASE_AMOUNT
-    # ⚡ Bolt Optimization: Replace .apply() lambda with vectorized np.where
     q["signal_status"] = np.where(q["multiplier"] > 0, "BUY_PREVIEW", "NO_BUY")
     q = q[q["symbol"].isin(ACTIVE_TICKERS)].copy()
     q = q.sort_values(["multiplier", "drop_pct", "symbol"], ascending=[False, False, True])  # type: ignore
