@@ -262,8 +262,8 @@ pythonpath = [".", "tests", "dca-sizing-signals"]
 # its own directory instead (pip install -r <dir>/requirements.txt, then
 # cd <dir> && python -m pytest tests/), so keep both out of the core
 # "pytest" sweep the same way ruff already excludes them below.
-# wondrous-octopus/ (pandas/numpy/scikit-learn/torch) and analysis/ (research
-# tooling with optional dependencies) follow the same rule.
+# wondrous-octopus/ (pandas/numpy/scikit-learn/torch) and analysis/ (pandas/numpy)
+# follow the same rule.
 addopts = "-q --ignore=production-safe-agent-loop --ignore=ticker-advisor --ignore=ml-forecaster --ignore=wondrous-octopus --ignore=dca-sizing-signals --ignore=ticker-market-breadth --ignore=llm-providers --ignore=yfinance-prefetch --ignore=analysis"
 
 [tool.coverage.run]
