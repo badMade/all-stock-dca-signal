@@ -202,6 +202,36 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
+        need="Prove a cloud run's checkout is the pinned release and pull the evidence store (cloud Gate 2)",
+        command=(
+            "python -m scripts.cloud_preflight --repo-root . --evidence-remote <url> "
+            "--evidence-root \"$DCA_CRON_TRACKING_ROOT\" --trading-day YYYY-MM-DD "
+            "[--expect-prior-slots 0935,1030] [--init]"
+        ),
+        exists_path="scripts/cloud_preflight.py",
+        doc_ref="docs/cloud_clone_runs.md",
+        symbols=("main",),
+        notes=(
+            "Refuses (exit 2, 'GATE2_ABORT: <reason>') unless HEAD equals $DCA_PINNED_SHA, is merged to "
+            "origin/main and unmodified, and the evidence store's MANIFEST.json is usable. Never installs anything."
+        ),
+    ),
+    EntryPoint(
+        need="Publish a cloud run's evidence to the private store, or claim a slot before trading",
+        command=(
+            "python -m scripts.evidence_publish publish|claim --evidence-root <root> --remote <url> "
+            "--trading-day YYYY-MM-DD --slot HHMM (--code-sha <40 hex> | --claimant <run id>)"
+        ),
+        exists_path="scripts/evidence_publish.py",
+        doc_ref="docs/cloud_clone_runs.md",
+        symbols=("main", "scan_for_secrets"),
+        notes=(
+            "publish never moves local artifacts, refuses any evidence holding the account number, and on a "
+            "failed push returns an alert text with the run numbers. claim is a compare-and-swap: first run "
+            "per slot and day wins, an unreachable store refuses."
+        ),
+    ),
+    EntryPoint(
         need="Back up the live strategy config from a pasted thread/notes dump",
         command="python scripts/backup_strategy.py --transcript <file> --write",
         exists_path="scripts/backup_strategy.py",

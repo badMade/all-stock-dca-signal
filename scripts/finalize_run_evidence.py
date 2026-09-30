@@ -54,10 +54,12 @@ import argparse
 import csv
 import json
 import math
+import os
+import re
 import sys
 from datetime import date, datetime, time, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from dca_fileio import atomic_open_w
 from dca_paths import cron_tracking_root
@@ -127,6 +129,9 @@ SIGNALS_FILENAMES = {
     "intraday": "intraday_signals.csv",
     "afternoon": "signals.csv",
 }
+
+
+_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
 class FinalizeRefused(ValueError):
@@ -230,6 +235,31 @@ def _load_json(path: Optional[str], kind: type, label: str) -> Any:
     return value
 
 
+def _load_inline_or_file_json(value: Optional[str], label: str) -> Any:
+    """``--code-version-json`` takes the object itself or a path to a file holding it.
+
+    The other ``--*-json`` flags take a path only. A Gate 9 command line already
+    has the pinned SHA in an environment variable, and a ten-line object is
+    easier to pass inline than to write to a scratch file first, so a value that
+    opens with ``{`` is parsed in place; anything else is read as a path exactly
+    like its siblings. Both forms reject a duplicate key: ``json.loads`` keeps
+    the last one silently, which would make the release identity ambiguous
+    (Copilot review, PR #1571: "Reject duplicate git_sha keys").
+    """
+    if value is None:
+        return None
+    inline = value.lstrip().startswith("{")
+    try:
+        text = value if inline else Path(value).read_text(encoding="utf-8")
+        parsed = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except (OSError, ValueError) as exc:
+        where = "is not valid JSON" if inline else f"{value!r} is not readable JSON"
+        raise FinalizeRefused(f"{label} {where}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise FinalizeRefused(f"{label} must be a JSON object")
+    return parsed
+
+
 BUDGET_TIERS = ("normal", "elevated", "high_volatility", "stress")
 
 
@@ -283,6 +313,76 @@ def validate_budget(budget: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise FinalizeRefused(f"--budget-json {key} {value!r} is not a non-negative number")
     return normalized
+
+
+CODE_VERSION_KEYS = ("git_sha", "tag", "pinned_by")
+
+
+def validate_code_version(code_version: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Check the optional ``code_version`` block that names the release which produced this evidence.
+
+    A cloud run trades from a checkout pinned by a full commit SHA
+    (scripts/cloud_preflight.py). The evidence has to say which commit that was,
+    or nobody can tell afterwards what code placed an order. Only a full
+    lower-case 40-character SHA is accepted: an abbreviated one is ambiguous and
+    a mixed-case one never equals what ``git rev-parse`` prints. Unknown keys are
+    refused so the block cannot grow into a free-form note that hides a secret.
+    """
+    if code_version is None:
+        return None
+    if not isinstance(code_version, dict):
+        raise FinalizeRefused("--code-version-json must be a JSON object")
+    unknown = sorted(set(code_version) - set(CODE_VERSION_KEYS))
+    if unknown:
+        raise FinalizeRefused(f"--code-version-json has unknown key(s) {unknown}; allowed: {list(CODE_VERSION_KEYS)}")
+    sha = code_version.get("git_sha")
+    if not isinstance(sha, str) or not _GIT_SHA_RE.fullmatch(sha):
+        raise FinalizeRefused("--code-version-json git_sha must be a full lower-case 40-character commit SHA")
+    for key in ("tag", "pinned_by"):
+        if key in code_version and not (isinstance(code_version[key], str) and code_version[key].strip()):
+            raise FinalizeRefused(f"--code-version-json {key} must be a non-empty string")
+    return dict(code_version)
+
+
+PINNED_SHA_ENV = "DCA_PINNED_SHA"
+
+
+def check_code_version_pin(code_version: Optional[Dict[str, Any]], env: Mapping[str, str]) -> None:
+    """Refuse a ``code_version`` whose SHA is not the release ``$DCA_PINNED_SHA`` names.
+
+    ``validate_code_version`` proves only the SHA's shape, so without this a
+    caller could stamp any valid 40-character SHA on a cloud run and produce
+    authoritative-looking but false provenance. The pin lives in the run
+    environment, outside the repo (scripts/cloud_preflight.py). Where it is
+    unset (a local or non-cloud run) there is nothing to bind to.
+    """
+    pin = env.get(PINNED_SHA_ENV) or ""
+    if code_version is None or not pin or not isinstance(code_version, dict):
+        return
+    if code_version.get("git_sha") != pin:
+        raise FinalizeRefused(f"--code-version-json git_sha is not the pinned release named by {PINNED_SHA_ENV}")
+
+
+def _merge_code_version(run_dir: Path, state: Dict[str, Any], code_version: Dict[str, Any]) -> None:
+    """Add the immutable ``code_version`` to an executor-written state and its summary.
+
+    Summary first, state last: a crash between them leaves a state without the
+    field, which the next call simply adds again, never a state that claims a
+    release its summary does not carry.
+    """
+    summary_path = run_dir / "run_summary.json"
+    if summary_path.is_file():
+        try:
+            summary = json.loads(summary_path.read_bytes())
+        except (OSError, ValueError):
+            summary = None
+        if isinstance(summary, dict):
+            summary["code_version"] = code_version
+            with atomic_open_w(summary_path) as handle:
+                json.dump(summary, handle, indent=2, sort_keys=True, default=str)
+    state["code_version"] = code_version
+    with atomic_open_w(run_dir / "run_state.json") as handle:
+        json.dump(state, handle, indent=2, sort_keys=True, default=str)
 
 
 # The zero-order statuses a session could use to dress a data outage up as a
@@ -513,6 +613,7 @@ def build_run_state(
     error_detail: Optional[str] = None,
     report: Optional[Dict[str, Any]] = None,
     budget: Optional[Dict[str, Any]] = None,
+    code_version: Optional[Dict[str, Any]] = None,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     stream, _ = SLOT_EVIDENCE_LAYOUT[slot]
@@ -554,6 +655,8 @@ def build_run_state(
         state["error_detail"] = error_detail
     if report is not None:
         state["gate9_report"] = report
+    if code_version is not None:
+        state["code_version"] = code_version
     # Finalize the placeholder from the completed state, exactly as the
     # executors' build_artifacts() does -- never asserted by the caller.
     evidence = derive_valid_scheduled_evidence(state)
@@ -576,6 +679,7 @@ def finalize(
     budget: Optional[Dict[str, Any]] = None,
     error_class: Optional[str] = None,
     error_detail: Optional[str] = None,
+    code_version: Optional[Dict[str, Any]] = None,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Write (or reuse) the slot's run_state, refresh its pointer, and report whether it verifies.
@@ -596,6 +700,7 @@ def finalize(
         raise FinalizeRefused("--outcome must name the Gate 9 outcome")
     validate_orders(orders)
     budget = validate_budget(budget)
+    code_version = validate_code_version(code_version)
     base = Path(root) if root is not None else cron_tracking_root()
     run_dir = base / slot_run_dir_relative(slot, started.date())
     # Beside the run directory, not inside it: the lock must not be mistaken
@@ -604,7 +709,7 @@ def finalize(
         return _finalize_locked(slot, started, base, run_dir, outcome=outcome,
                                 order_submit_status=order_submit_status, orders=orders, signals=signals,
                                 report=report, budget=budget, error_class=error_class,
-                                error_detail=error_detail, now=now)
+                                error_detail=error_detail, code_version=code_version, now=now)
 
 
 def _repair_companions(run_dir: Path, state: Dict[str, Any], stream: str) -> List[str]:
@@ -645,6 +750,7 @@ def _finalize_locked(
     budget: Optional[Dict[str, Any]],
     error_class: Optional[str],
     error_detail: Optional[str],
+    code_version: Optional[Dict[str, Any]],
     now: Optional[datetime],
 ) -> Dict[str, Any]:
     stream, _ = SLOT_EVIDENCE_LAYOUT[slot]
@@ -663,6 +769,14 @@ def _finalize_locked(
             raise FinalizeRefused(f"{state_path.relative_to(base)} exists but is not a JSON object; "
                                   "refusing to overwrite it -- inspect it by hand")
 
+    if code_version is not None and existing is not None:
+        recorded = existing.get("code_version")
+        # The release that produced a run cannot change afterwards; refuse before
+        # anything below writes a companion file or the pointer.
+        if recorded is not None and recorded != code_version:
+            raise FinalizeRefused(f"{state_path.relative_to(base)} already records a different code_version; "
+                                  "the release that produced a run is immutable")
+
     warnings: List[str] = []
     # A state an executor's own run() wrote is authoritative and carries far
     # more than this command knows; only a state THIS command wrote may be
@@ -678,6 +792,11 @@ def _finalize_locked(
         if orders is not None or signals is not None or report is not None or budget is not None:
             warnings.append("run_state.json was written by the executor, not this command; it was kept "
                             "unchanged and the supplied orders/signals/report/budget were NOT recorded")
+        if code_version is not None and state.get("code_version") is None:
+            # The one field this command may add: provenance is immutable and the executors
+            # do not know the pin, so leaving it out would record a cloud run with no release.
+            _merge_code_version(run_dir, state, code_version)
+            warnings.append("code_version was added to the executor's run_state.json and run_summary.json")
         repaired = _repair_companions(run_dir, state, stream)
         if repaired:
             warnings.append(f"wrote missing companion file(s) beside the executor's run_state: {', '.join(repaired)}")
@@ -709,6 +828,8 @@ def _finalize_locked(
                             "order_submit_status kept as 'submitted'")
         if budget is None and ours and isinstance(existing.get("budget"), dict):
             budget = existing["budget"]  # a retry keeps the first attempt's Gate 6 budget
+        if code_version is None and ours and isinstance(existing.get("code_version"), dict):
+            code_version = existing["code_version"]  # ...and the release it traded from
         if order_submit_status == ORDER_SUBMIT_STATUS_SUBMITTED and (budget is None or budget.get("budget_evaluated") is False):
             # Placing an order means Gate 6 ran and selected a tier; writing
             # budget_evaluated=false for it would be false evidence.
@@ -721,7 +842,8 @@ def _finalize_locked(
                                                          error_class=error_class)
         state = build_run_state(slot, started, outcome=outcome, order_submit_status=order_submit_status,
                                 orders_submitted_count=count, error_class=error_class,
-                                error_detail=error_detail, report=report, budget=budget, now=now)
+                                error_detail=error_detail, report=report, budget=budget,
+                                code_version=code_version, now=now)
         if gate5_evidence is not None:
             state["gate5_evidence"] = gate5_evidence
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -796,11 +918,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--budget-json",
                         help='Gate 6 budget object {"budget_tier","daily_cap_usd","weekly_cap_usd",...}; '
                         'required when orders were placed; omit only when Gate 6 never ran')
+    parser.add_argument("--code-version-json",
+                        help='{"git_sha": <40 hex>, "tag": ..., "pinned_by": ...} inline, or a path to a file holding it: '
+                        'the pinned release this run traded from')
     parser.add_argument("--error-class", help="concrete error class for a blocked/failed run")
     parser.add_argument("--error-detail", help="one-line detail for a blocked/failed run")
     parser.add_argument("--root", help="cron-tracking root (default: $DCA_CRON_TRACKING_ROOT or <checkout>/cron_tracking)")
     args = parser.parse_args(argv)
     try:
+        code_version = _load_inline_or_file_json(args.code_version_json, "--code-version-json")
+        check_code_version_pin(code_version, os.environ)
         result = finalize(
             args.slot, parse_started_at(args.started_at), outcome=args.outcome,
             order_submit_status=args.order_submit_status, root=Path(args.root) if args.root else None,
@@ -808,6 +935,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             signals=_load_json(args.signals_json, list, "--signals-json"),
             report=_load_json(args.report_json, dict, "--report-json"),
             budget=_load_json(args.budget_json, dict, "--budget-json"),
+            code_version=code_version,
             error_class=args.error_class, error_detail=args.error_detail,
         )
     except FinalizeRefused as exc:

@@ -662,6 +662,7 @@ def build_run_summary(
         "counts",
         "status",
         "block_reason",
+        "code_version",
     ):
         if key in run_state:
             summary[key] = run_state[key]

@@ -126,6 +126,17 @@
       "type": ["string", "null"],
       "description": "Set when raw connector persistence or normalization failed. The scheduled run_state is still written (run_origin='scheduled', manual_run=false, no orders) with order_submit_status='not_submitted_error' rather than escalating without state."
     },
+    "code_version": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["git_sha"],
+      "description": "Optional. The pinned release a cloud run traded from (scripts/cloud_preflight.py checks it against $DCA_PINNED_SHA), written by scripts/finalize_run_evidence.py --code-version-json. Absent on runs that did not go through a pinned cloud checkout.",
+      "properties": {
+        "git_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "tag": {"type": "string", "minLength": 1},
+        "pinned_by": {"type": "string", "minLength": 1}
+      }
+    },
     "budget": {
       "type": "object",
       "additionalProperties": true,

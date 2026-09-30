@@ -438,3 +438,149 @@ def test_executor_state_with_usable_data_is_not_second_guessed(tmp_path):
     run_dir = tmp_path / slot_run_dir_relative("1430", DAY)
     executor_state(run_dir, counts={"evaluated": 64, "no_data": 1, "buy_candidates": 0})
     fre.check_existing_state_gate5_evidence(run_dir, "1430", DAY, json.loads((run_dir / "run_state.json").read_text()))
+
+
+# --- code_version: which release produced this evidence (cloud-clone plan, step 5) ---------------------------
+# A cloud run trades from a pinned checkout. The run's evidence has to say which commit that was, or
+# nobody can tell afterwards what code placed an order. The field is optional so every existing caller
+# (the seven prompts before they are repasted, the executors' own artifacts) is unchanged.
+
+CODE_VERSION = {"git_sha": "a" * 40, "tag": "live-sep30-1", "pinned_by": "DCA_PINNED_SHA"}
+
+
+def test_code_version_is_recorded_in_run_state_and_run_summary(tmp_path):
+    result = run(tmp_path, "1330", code_version=CODE_VERSION)
+
+    assert result["verified"] is True, result["errors"]
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    assert json.loads((run_dir / "run_state.json").read_text())["code_version"] == CODE_VERSION
+    assert json.loads((run_dir / "run_summary.json").read_text())["code_version"] == CODE_VERSION
+
+
+def test_code_version_is_absent_when_the_caller_gives_none(tmp_path):
+    run(tmp_path, "1330")
+
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    assert "code_version" not in json.loads((run_dir / "run_state.json").read_text())
+    assert "code_version" not in json.loads((run_dir / "run_summary.json").read_text())
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"tag": "live-1"},
+        {"git_sha": "abc123"},
+        {"git_sha": "G" * 40},
+        {"git_sha": "a" * 40, "unexpected": 1},
+        "a" * 40,
+    ],
+)
+def test_a_malformed_code_version_is_refused_before_anything_is_written(tmp_path, bad):
+    with pytest.raises(ValueError):
+        run(tmp_path, "1330", code_version=bad)
+
+    assert not (tmp_path / slot_run_dir_relative("1330", DAY)).exists()
+
+
+def test_the_cli_accepts_code_version_json(tmp_path):
+    exit_code = fre.main([
+        "--slot", "1330", "--started-at", "2026-09-22T13:32:00-04:00",
+        "--outcome", "NO_ORDERS", "--order-submit-status", "no_orders_submitted",
+        "--code-version-json", json.dumps(CODE_VERSION), "--root", str(tmp_path),
+    ])
+
+    assert exit_code == 0
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    assert json.loads((run_dir / "run_state.json").read_text())["code_version"] == CODE_VERSION
+
+
+# --- code_version review follow-ups (Copilot review, PR #1571) ------------------------------------------------
+
+
+def as_executor_state(tmp_path, slot="1030", **fields):
+    """Turn a state this command wrote into one an executor's own run() wrote."""
+    run(tmp_path, slot)
+    run_dir = tmp_path / slot_run_dir_relative(slot, DAY)
+    state = json.loads((run_dir / "run_state.json").read_text())
+    state.pop("finalized_by")
+    state.update(fields)
+    (run_dir / "run_state.json").write_text(json.dumps(state))
+    return run_dir
+
+
+def test_code_version_is_merged_into_an_executor_written_run_state_and_summary(tmp_path):
+    run_dir = as_executor_state(tmp_path)
+
+    result = run(tmp_path, "1030", code_version=CODE_VERSION)
+
+    assert result["run_state_written"] is False and result["verified"] is True, result["errors"]
+    assert json.loads((run_dir / "run_state.json").read_text())["code_version"] == CODE_VERSION
+    assert json.loads((run_dir / "run_summary.json").read_text())["code_version"] == CODE_VERSION
+    assert not any("code_version" in warning and "NOT recorded" in warning for warning in result["warnings"])
+
+
+def test_an_executor_state_keeps_its_other_fields_when_code_version_is_merged(tmp_path):
+    run_dir = as_executor_state(tmp_path, executor_payload="kept")
+
+    run(tmp_path, "1030", code_version=CODE_VERSION)
+
+    assert json.loads((run_dir / "run_state.json").read_text())["executor_payload"] == "kept"
+
+
+def test_a_conflicting_code_version_is_refused_and_the_state_is_left_as_it_was(tmp_path):
+    run_dir = as_executor_state(tmp_path, code_version={"git_sha": "b" * 40})
+    before = (run_dir / "run_state.json").read_text()
+
+    with pytest.raises(fre.FinalizeRefused, match="code_version"):
+        run(tmp_path, "1030", code_version=CODE_VERSION)
+
+    assert (run_dir / "run_state.json").read_text() == before
+
+
+def test_a_retry_that_omits_code_version_keeps_the_first_attempts_release(tmp_path):
+    run(tmp_path, "1330", code_version=CODE_VERSION)
+
+    run(tmp_path, "1330")
+
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    assert json.loads((run_dir / "run_state.json").read_text())["code_version"] == CODE_VERSION
+
+
+def cli_args(tmp_path, code_version_json):
+    return ["--slot", "1330", "--started-at", "2026-09-22T13:32:00-04:00",
+            "--outcome", "NO_ORDERS", "--order-submit-status", "no_orders_submitted",
+            "--code-version-json", code_version_json, "--root", str(tmp_path)]
+
+
+DUPLICATE_SHA_JSON = '{"git_sha": "%s", "git_sha": "%s"}' % ("a" * 40, "b" * 40)
+
+
+def test_the_cli_refuses_duplicate_git_sha_keys_given_inline(tmp_path, capsys):
+    assert fre.main(cli_args(tmp_path, DUPLICATE_SHA_JSON)) == 2
+
+    assert "duplicate" in json.loads(capsys.readouterr().out)["refused"]
+    assert not (tmp_path / slot_run_dir_relative("1330", DAY)).exists()
+
+
+def test_the_cli_refuses_duplicate_git_sha_keys_given_as_a_file(tmp_path, capsys):
+    path = tmp_path / "code_version.json"
+    path.write_text(DUPLICATE_SHA_JSON, encoding="utf-8")
+
+    assert fre.main(cli_args(tmp_path / "root", str(path))) == 2
+
+    assert "duplicate" in json.loads(capsys.readouterr().out)["refused"]
+
+
+def test_the_cli_refuses_a_git_sha_that_is_not_the_pinned_release(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("DCA_PINNED_SHA", "b" * 40)
+
+    assert fre.main(cli_args(tmp_path, json.dumps(CODE_VERSION))) == 2
+
+    assert "DCA_PINNED_SHA" in json.loads(capsys.readouterr().out)["refused"]
+    assert not (tmp_path / slot_run_dir_relative("1330", DAY)).exists()
+
+
+def test_the_cli_accepts_a_git_sha_equal_to_the_pinned_release(tmp_path, monkeypatch):
+    monkeypatch.setenv("DCA_PINNED_SHA", CODE_VERSION["git_sha"])
+
+    assert fre.main(cli_args(tmp_path, json.dumps(CODE_VERSION))) == 0
