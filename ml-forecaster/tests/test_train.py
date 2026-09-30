@@ -1553,3 +1553,19 @@ def test_an_external_relative_models_dir_is_refused_rather_than_published(tmp_pa
 
     with pytest.raises(ValueError, match="outside the ML artifact root"):
         train_module._portable_artifact_reference(relative)
+
+def test_main_refuses_duplicate_json_keys(tmp_path):
+    import train as train_module
+    tickers_config = tmp_path / "tickers.json"
+    # Duplicate "active" key
+    tickers_config.write_text('{"active": ["AAPL"], "active": ["MSFT"]}', encoding="utf-8")
+    history_dir = tmp_path / "ticker_data"
+    history_dir.mkdir()
+    exit_code = train_module.main([
+        "--history-dir", str(history_dir),
+        "--tickers-config", str(tickers_config),
+        "--models-dir", str(tmp_path / "models"),
+        "--dry-run",
+        "--now", "2024-06-01T00:00:00+00:00",
+    ])
+    assert exit_code != 0

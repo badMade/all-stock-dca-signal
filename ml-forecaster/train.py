@@ -287,7 +287,8 @@ def _load_active_tickers(config_path: Path) -> list[str]:
     when absent -- schemas/tickers.schema.json does not require it, unlike
     "active".
     """
-    payload = json.loads(config_path.read_bytes())
+    from publish import _reject_duplicate_keys
+    payload = json.loads(config_path.read_bytes(), object_pairs_hook=_reject_duplicate_keys)
     if not isinstance(payload, dict):
         raise ValueError(f"{config_path} must contain a JSON object, got {type(payload).__name__}")
     active = payload["active"]
