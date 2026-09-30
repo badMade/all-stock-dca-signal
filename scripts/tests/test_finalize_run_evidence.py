@@ -101,7 +101,10 @@ def test_live_classification_is_the_executors_own(tmp_path):
 def test_window_accepts_the_prompts_early_gate1_start_but_nothing_earlier(tmp_path):
     # The live 2:30 prompt's Gate 1 accepts 2:25-2:55; dca_runner's window opens at 2:30.
     assert run(tmp_path, "1430", start=datetime(2026, 9, 22, 14, 25, tzinfo=ET))["verified"] is True
-    assert run(tmp_path, "0935", start=datetime(2026, 9, 22, 9, 30, tzinfo=ET))["verified"] is True
+    assert run(tmp_path, "0935", start=datetime(2026, 9, 22, 9, 35, tzinfo=ET))["verified"] is True
+    # 0935 never fires before 9:35: no early-start allowance, unlike the other slots.
+    with pytest.raises(fre.FinalizeRefused, match="acceptance window"):
+        run(tmp_path, "0935", start=datetime(2026, 9, 22, 9, 30, tzinfo=ET))
     with pytest.raises(fre.FinalizeRefused, match="acceptance window"):
         run(tmp_path, "1030", start=datetime(2026, 9, 22, 10, 24, tzinfo=ET))
     assert fre.acceptance_window("1230", DAY)[1].strftime("%H:%M") == "13:00"

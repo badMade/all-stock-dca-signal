@@ -6746,7 +6746,7 @@ def _market_open_run_classification(*, manual: bool):
         "manual_run": False,
         "cron_id": "2ba19526",
         "scheduled_for_et": "09:35",
-        "scheduled_window_start_et": "09:30",
+        "scheduled_window_start_et": "09:35",
         "scheduled_window_end_et": "09:50",
         "run_id": "market_open_live_20260727_0935ET",
         "triggered_at_utc": "2026-07-27T13:35:00Z",

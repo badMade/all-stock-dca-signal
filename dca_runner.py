@@ -711,7 +711,9 @@ class SlotSpec:
 
 # Authoritative roster: docs/safeguards.md "Live execution roster".
 SLOTS: dict[str, SlotSpec] = {
-    "0935": SlotSpec("0935", (9, 35), (9, 30), (10, 0), "market-open"),
+    # The window opens AT nominal (9:35), never before: the 9:35 decision reads the
+    # completed 9:30 bar, so an earlier fire has no decision bar to trade on.
+    "0935": SlotSpec("0935", (9, 35), (9, 35), (10, 0), "market-open"),
     "1030": SlotSpec("1030", (10, 30), (10, 30), (11, 0), "morning"),
     "1130": SlotSpec("1130", (11, 30), (11, 30), (12, 0), "intraday"),
     "1230": SlotSpec("1230", (12, 30), (12, 30), (13, 0), "midday"),

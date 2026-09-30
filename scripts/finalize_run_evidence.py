@@ -155,7 +155,8 @@ def parse_started_at(value: str) -> datetime:
 
 # The live prompts' own Gate 1 opens EARLY_START_MINUTES before the nominal
 # time (e.g. 2:25-2:55 PM for the 2:30 slot, 12:25 PM-1:00 PM for 12:30),
-# while dca_runner.SLOTS opens AT nominal for every slot but 09:35. A fire
+# while dca_runner.SLOTS opens AT nominal for every slot (09:35 included, and
+# it gets no early allowance here). A fire
 # that passed the prompt's Gate 1 at 14:26 is a real scheduled fire, so this
 # accepts the union of the two: never refuse evidence Gate 1 already accepted.
 EARLY_START_MINUTES = 5
@@ -169,8 +170,10 @@ def acceptance_window(slot: str, day: date) -> tuple[datetime, datetime]:
 
     spec = SLOTS[slot]
     nominal = datetime.combine(day, time(*spec.nominal_et), tzinfo=ET)
-    start = min(datetime.combine(day, time(*spec.window_start_et), tzinfo=ET),
-                nominal - timedelta(minutes=EARLY_START_MINUTES))
+    start = datetime.combine(day, time(*spec.window_start_et), tzinfo=ET)
+    # 0935 must never fire before 9:35, so it gets no early-start allowance.
+    if slot != "0935":
+        start = min(start, nominal - timedelta(minutes=EARLY_START_MINUTES))
     return start, datetime.combine(day, time(*spec.window_end_et), tzinfo=ET)
 
 

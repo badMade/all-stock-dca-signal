@@ -108,7 +108,8 @@ MARKET_OPEN_LIVE_MODE = "live"
 MARKET_OPEN_LIVE_CRON_ID = "2ba19526"
 MARKET_OPEN_LIVE_RUN_TYPE = "market_open_dca_live"
 MARKET_OPEN_LIVE_SCHEDULED_FOR_ET = "09:35"
-MARKET_OPEN_LIVE_WINDOW_START_ET = "09:30"
+# Opens AT the 9:35 decision time, never before it (the decision reads the completed 9:30 bar).
+MARKET_OPEN_LIVE_WINDOW_START_ET = "09:35"
 MARKET_OPEN_LIVE_WINDOW_END_ET = "09:50"
 MARKET_OPEN_LIVE_SCHEMA_VERSION = "market-open-live-v1"
 
