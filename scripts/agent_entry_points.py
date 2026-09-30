@@ -202,6 +202,18 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
+        need="Find out whether a scheduled cloud run keeps its cron_tracking files between fires",
+        command="python -m scripts.workspace_probe [--root DIR] [--now YYYY-MM-DDTHH:MM:SSZ]",
+        exists_path="scripts/workspace_probe.py",
+        doc_ref="docs/workspace_probe.md",
+        symbols=("main", "run"),
+        notes=(
+            "Writes one timestamped marker under <root>/workspace_probe/ and lists earlier ones (age from the "
+            "time inside each marker). Run it twice as a scheduled task; if the second run lists the first "
+            "marker the workspace persists. No broker, order, network or account access."
+        ),
+    ),
+    EntryPoint(
         need="Prove a cloud run's checkout is the pinned release and pull the evidence store (cloud Gate 2)",
         command=(
             "python -m scripts.cloud_preflight --repo-root . --evidence-remote <url> "

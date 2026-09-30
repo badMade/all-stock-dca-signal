@@ -24,6 +24,7 @@ environment (see the repository README).
 | [schedule_manifest.md](schedule_manifest.md) | The canonical 15-row recurring schedule (17 rows verified 2026-07-27; 2 removed 2026-08-02), one-time tasks, retired entries, and the expired dated scheduler overrides (kept as historical record, authorizing nothing today) |
 | [run_classification.md](run_classification.md) | Scheduled-vs-manual run contract (paths, required fields, exclusion rules) |
 | [schedule_verification.md](schedule_verification.md) | Daily per-slot evidence audit (`scripts/verify_schedule.py`) and the Gate 9 finalizer every live prompt runs |
+| [workspace_probe.md](workspace_probe.md) | Read-only probe that shows whether a scheduled cloud run keeps its `cron_tracking` files between fires (`scripts/workspace_probe.py`) |
 | [cloud_clone_runs.md](cloud_clone_runs.md) | Running the live slots from a cloud clone: pinned-release preflight, the private evidence store, publish, and the slot claim (`scripts/cloud_preflight.py`, `scripts/evidence_publish.py`) |
 | [drift_detection.md](drift_detection.md) | Post-artifact signals-vs-submitted-orders drift detector + Slack alerting |
 | [alert_digest.md](alert_digest.md) | Why Gate 9 alerts piled up undelivered in Gmail drafts, and the digest that counts them by gate/slot/streak and flags dead delivery channels |
