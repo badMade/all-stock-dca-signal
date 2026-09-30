@@ -43,6 +43,12 @@ for all seven slots and names the specific failures that have cost real runs:
   consecutive slots reported "repo access" with the wrong reconnect-the-folder
   remedy -- one of them burning roughly a third of its window on retries
   first).
+* ``missing_bridge_only_abort`` -- the live body runs Gate 2's repo probes
+  but never carries the distinct abort reason "repo readable via device
+  bridge, not mounted in executor shell" (2026-09-29 2:30 PM: shell alive,
+  all four probes empty, repo readable only through the device file bridge,
+  so the run took the generic repo-access abort and its reconnect-the-folder
+  remedy for a repo that exists).
 * ``email_draft_not_send`` -- the live body still tells the operator to
   DRAFT the Gate 9 alert email rather than send it (2026-08-26:
   ``docs/alert_digest.md`` counted roughly fifty undelivered draft alerts
@@ -93,6 +99,9 @@ GET_EQUITY_ORDERS_CALL = "get_equity_orders"
 # incident: see check_live_prompt_drift's module docstring).
 GATE_2_PROBE_MARKER = "ls -d /sessions"
 SHELL_UNAVAILABLE_ABORT_REASON = "executor shell tool unavailable, repo probes could not run"
+# Same probe marker, different failure: the shell works and finds no checkout,
+# but the repo is readable through a device file bridge (2026-09-29 2:30 PM).
+BRIDGE_ONLY_ABORT_REASON = "repo readable via device bridge, not mounted in executor shell"
 # The pre-2026-08-26 alert wording this checker flags as a regression back to
 # draft-only delivery (docs/alert_digest.md: ~50 undelivered drafts).
 EMAIL_DRAFT_PHRASE = "EMAIL DRAFT"
@@ -231,6 +240,13 @@ def findings_for(live_text: str, window_end_date: Optional[str]) -> List[Dict[st
             "code": "missing_shell_unavailable_fallback",
             "detail": f'runs Gate 2\'s repo probes without the distinct abort reason "{SHELL_UNAVAILABLE_ABORT_REASON}"'
             ": a dead sandboxed shell can misdiagnose as repo-unreachable (2026-09-08 incident)",
+        })
+    if GATE_2_PROBE_MARKER in live_text and BRIDGE_ONLY_ABORT_REASON not in live_text:
+        findings.append({
+            "code": "missing_bridge_only_abort",
+            "detail": f'runs Gate 2\'s repo probes without the distinct abort reason "{BRIDGE_ONLY_ABORT_REASON}"'
+            ": a repo readable only through the device bridge misdiagnoses as a disconnected folder "
+            "(2026-09-29 incident)",
         })
     if EMAIL_DRAFT_PHRASE in live_text:
         findings.append({

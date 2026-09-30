@@ -224,6 +224,40 @@ def test_a_live_task_that_never_runs_gate_2_probes_is_not_flagged_for_the_shell_
     assert "missing_shell_unavailable_fallback" not in _findings(report)
 
 
+def test_a_live_task_missing_the_bridge_only_abort_is_flagged(tmp_path):
+    # 2026-09-29 2:30 PM: shell alive, all four probes empty, repo readable only
+    # through the device file bridge. A live body without this distinct reason
+    # reports the generic repo-access abort and its reconnect-the-folder remedy
+    # for a repo that exists, so the operator fixes the wrong thing.
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    stale = (
+        "GATE 2 - REPO REACHABLE\n"
+        "Run `ls -d /sessions/*/mnt/all-stock-dca` and the other repo probes.\n"
+        'If the shell will not start, abort with "executor shell tool unavailable, '
+        'repo probes could not run".\n'
+    ) + GOOD_BODY
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1430-test", stale))
+    assert "missing_bridge_only_abort" in _findings(report)
+
+
+def test_a_live_task_with_the_bridge_only_abort_is_not_flagged(tmp_path):
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    body = (
+        "GATE 2 - REPO REACHABLE\n"
+        "Run `ls -d /sessions/*/mnt/all-stock-dca` and the other repo probes.\n"
+        'If the probes are empty but a bridge read works, abort with "repo readable via device bridge, '
+        'not mounted in executor shell".\n'
+    ) + GOOD_BODY
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1430-test", body))
+    assert "missing_bridge_only_abort" not in _findings(report)
+
+
+def test_a_live_task_that_never_runs_gate_2_probes_is_not_flagged_for_the_bridge_only_abort(tmp_path):
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1430-test", GOOD_BODY))
+    assert "missing_bridge_only_abort" not in _findings(report)
+
+
 def test_a_live_task_still_telling_the_operator_to_draft_the_alert_email_is_flagged(tmp_path):
     # 2026-08-26 fix (README): the alert contract read "EMAIL DRAFT" as its
     # third Gate 9 channel until docs/alert_digest.md counted ~50 undelivered

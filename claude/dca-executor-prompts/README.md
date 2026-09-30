@@ -129,6 +129,28 @@ Characteristics of this generation:
   probe folds into the same deduplicated union, the same
   exactly-one-surviving-checkout rule, and the same required-config-files
   check, so it is not a back door into an arbitrary tree.
+* Gate 2 gained a BRIDGE-ONLY abort on 2026-09-30 after the 2026-09-29 2:30 PM
+  run: the shell was alive, all four probes came back empty, and the repo was
+  readable through the device file bridge, with `mcp__remote-devices__device_bash`
+  listed even though Gate 2 said that tool family "is not present in this
+  environment" (and this README called its absence "expected"; both were
+  wrong). That is neither the dead-shell case, where a successful read PASSES
+  Gate 2, nor an unmounted folder. Zero checkouts in the shell that would
+  execute the signal entry point still fails the exactly-one-surviving-checkout
+  rule, so the run now aborts as `Failing gate: Gate 2` with the distinct reason
+  "repo readable via device bridge, not mounted in executor shell" and a
+  mount-the-folder-into-the-shell remedy, in Gate 2's body and in the
+  truncation-safe prefix (a 301-character paragraph, sized so the later
+  prefix rules stay inside the 5,850-character boundary). A bridge read never
+  authorizes placement, and the ban on running repo code through any bridge
+  tool is unchanged; tool presence is now reported as diagnostic only. The
+  probes, dedupe and exactly-one rule are untouched. Open question, not
+  decided here: whether a bridge shell that holds the repo should ever be
+  allowed to run the signal entry point (needs the operator's answer on what
+  that device exposes and its own review). Same caveat as every bullet here:
+  none of it runs until a human applies these bodies and re-captures the
+  mirrors; `scripts.check_live_prompt_drift` now reports
+  `missing_bridge_only_abort` for a live body still lacking the reason.
 * Live placement is authorized for all seven slots as of 2026-09-02, per
   Geoff's explicit direction that order placement be on for all scheduled
   buy runs. The 1230 slot was the one exception up to that point, and its

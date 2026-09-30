@@ -3068,6 +3068,63 @@ def test_every_live_mirror_gate2_separates_a_dead_shell_from_a_missing_repo():
         )
 
 
+# 2026-09-29 2:30 PM: the shell was ALIVE, all four probes came back empty, and
+# the repo was readable through the device file bridge -- with
+# mcp__remote-devices__device_bash present although Gate 2 said that tool family
+# "is not present in this environment". That is neither the dead-shell case
+# (where a successful read PASSES Gate 2) nor an unmounted folder, so it got the
+# generic repo-access abort and its reconnect-the-folder remedy. Zero checkouts
+# in the EXECUTING shell still fails the exactly-one rule, so it is a real
+# Gate 2 failure with its own reason; the bridge read authorizes nothing.
+_BRIDGE_ONLY_REASON = "repo readable via device bridge, not mounted in executor shell"
+
+
+def test_every_live_mirror_gate2_has_a_distinct_bridge_only_abort():
+    for filename in _LIVE_MIRROR_FILES:
+        text = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")
+        gate_2 = _gate_section(text, "GATE 2 - REPO REACHABLE")
+        assert _BRIDGE_ONLY_REASON in gate_2, f"{filename}: Gate 2 has no distinct bridge-only reason"
+        # scripts/alert_digest.py buckets on this exact token; unlike a dead
+        # shell with a readable repo, this case genuinely fails Gate 2.
+        assert "Failing gate: Gate 2" in gate_2, f"{filename}: the bridge-only abort must be labelled Gate 2"
+        assert "a bridge read never authorizes placement" in gate_2, (
+            f"{filename}: a repo readable only through the bridge must not count as a located checkout"
+        )
+        # The probes, dedupe and exactly-one rule stay exactly as strict.
+        assert "exactly-one-surviving-checkout" in gate_2, f"{filename}: exactly-one rule weakened"
+        # Case-insensitive: the 1230 mirror words these in lower case.
+        assert "deduplicated union" in gate_2.casefold(), f"{filename}: dedupe rule weakened"
+        assert "four probes" in gate_2.casefold(), f"{filename}: probe set weakened"
+
+
+def test_every_live_mirror_gate2_makes_bridge_tool_presence_diagnostic_only():
+    for filename in _LIVE_MIRROR_FILES:
+        text = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")
+        gate_2 = _gate_section(text, "GATE 2 - REPO REACHABLE")
+        assert "not present in this environment" not in gate_2, (
+            f"{filename}: Gate 2 still states as fact that the bridge tool is absent (false on 2026-09-29)"
+        )
+        # Running repo code through the bridge stays forbidden.
+        assert "Do NOT reach for mcp__remote-devices__device_bash" in gate_2, (
+            f"{filename}: the ban on executing repo code through the bridge must survive"
+        )
+        assert "presence of mcp__remote-devices__" in gate_2 and "diagnostic only" in gate_2, (
+            f"{filename}: tool presence must be reported, never used to satisfy Gate 2"
+        )
+
+
+def test_every_live_mirror_front_loads_the_bridge_only_reason():
+    boundary = 5_850
+    for filename in _LIVE_MIRROR_FILES:
+        prefix = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")[:boundary]
+        assert _BRIDGE_ONLY_REASON in prefix, (
+            f"{filename}: a truncated fire must know the bridge-only reason before the truncation boundary"
+        )
+        assert "Failing gate: Gate 2" in prefix, (
+            f"{filename}: the truncation-safe rule must name the canonical gate token"
+        )
+
+
 def test_midday_live_mirror_normalizes_broker_notionals_before_orders():
     text = _midday_live_mirror_text()
     assert "def _to_notional(v):" in text
