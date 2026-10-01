@@ -630,14 +630,6 @@ def _usable_order_ids(candidate: object) -> List[Any]:
     return found
 
 
-def _placement_response_has_order_id(response: object) -> bool:
-    """Return whether any response envelope carries a usable order id."""
-    return any(
-        bool(_usable_order_ids(envelope))
-        for envelope in _placement_response_dicts(response)
-    )
-
-
 def _placement_response_has_untrackable_positive_order_id(response: object) -> bool:
     """Whether a response names a positive numeric ID too large to track safely."""
     for envelope in _placement_response_dicts(response):

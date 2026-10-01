@@ -571,7 +571,6 @@ class BrokerName(str, Enum):
 ALPACA_SOURCE_ID = "alpaca__pipedream"
 ALPACA_ACCOUNT_INFO_TOOL = "alpaca-get-account-info"
 ALPACA_LIST_ORDERS_TOOL = "alpaca-list-orders"
-ALPACA_LIST_POSITIONS_TOOL = "alpaca-list-positions"
 ALPACA_PLACE_ORDER_TOOL = "alpaca-place-order"
 ALPACA_GET_ORDER_TOOL = "alpaca-get-order"
 
@@ -4237,14 +4236,6 @@ def build_alpaca_list_orders_payload(
         "source_id": ALPACA_SOURCE_ID,
         "tool": ALPACA_LIST_ORDERS_TOOL,
         "input": order_input,
-    }
-
-
-def build_alpaca_list_positions_payload(is_paper_api: bool) -> Dict[str, Any]:
-    return {
-        "source_id": ALPACA_SOURCE_ID,
-        "tool": ALPACA_LIST_POSITIONS_TOOL,
-        "input": {"isPaperAPI": is_paper_api},
     }
 
 
@@ -29395,12 +29386,6 @@ def _attempt_side_days(outcome: Dict[str, Any]) -> Dict[str, int]:
             # naming several days belongs to several claims, so each gets one.
             return {day: 1 for day in days}
     return {_UNDATED_ATTEMPT_DAY: 1}
-
-
-def _attempt_side_count(outcome: Dict[str, Any]) -> int:
-    """How many broker attempts one side of a merge stands for, across all
-    days -- the flat total, kept for the aggregate's own record."""
-    return sum(_attempt_side_days(outcome).values())
 
 
 def _broker_attempts_on_day(outcome: Dict[str, Any], trading_day_iso: str) -> int:

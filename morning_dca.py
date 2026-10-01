@@ -1473,11 +1473,6 @@ def _live_circuit_breaker_overrides(config_dir_path, mode) -> dict:
     return overrides
 
 
-def _first_not_none(value, fallback):
-    """``value`` unless it is ``None``, in which case ``fallback``."""
-    return fallback if value is None else value
-
-
 def resolved_count_breakers(config_dir_path: Path) -> dict:
     """The two COUNT limits from ``budgets.json`` -- the consecutive-failure
     breaker and the daily order cap -- with the SHIPPED values filled in where

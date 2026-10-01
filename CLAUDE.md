@@ -130,7 +130,9 @@ Consequences to internalize before changing anything:
   `morning_preflight_eligible_tickers()`.)
 - **"No in-repo caller" ≠ dead code.** The executor classes, `dca_runner.py`,
   `dca_cost_tracker.py`, `dca_weekly_dashboard.py`, and `scripts/same_day_top_up_gate.py`
-  have zero in-repo callers *by design*. Deleting them breaks live automation this repo
+  have no in-repo caller that *runs a slot* by design (the local console and a few scripts do
+  import helpers from `dca_runner`, `dca_cost_tracker`, and `dca_weekly_dashboard`; see
+  `docs/codebase_roadmap.md`). Deleting them breaks live automation this repo
   cannot see. (`dca_whole_share_accumulator.py` used to be an example here too, until it
   was wired into `near_close_dca._run_once_impl` — see `docs/whole_share_accumulation.md`'s
   "Scope" section for exactly which of the three entry points that covers.)
@@ -222,6 +224,8 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | --- | --- |
 | `AGENTS.md` | The repo-wide agent operating contract (secrets policy, PR expectations) |
 | `docs/repo_map.md` | **Read this before opening a core module.** Structural map of every runner, report producer, and prediction tool: slot-to-entry-point ownership, which reporting modules have a CLI and which are library-only, and which tools can reach live sizing. Complements `scripts/agent_entry_points.py` (that one is task-oriented: "what command do I run") |
+| `docs/codebase_roadmap.md` | Verified end-to-end flow and layer map built from the import graph; lists where older docs overstate (e.g. "zero in-repo callers") |
+| `docs/dead_code_report.md` | Tiered dead/obsolete code candidates with evidence; nothing deleted |
 | `docs/README.md` | Doc index + quick-reference facts (universe, ladder, budgets, test window) |
 | `docs/local_console.md` | Checkout-only console setup, API, authentication, LAN/proxy access and launchd runbooks; never places brokerage orders |
 | `docs/live_wiring.md` | Modules, dependency injection, the three entry points, state persistence, local agent quick reference |

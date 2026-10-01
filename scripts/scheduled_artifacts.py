@@ -732,10 +732,6 @@ class ArtifactContractResult:
         return self.ok
 
 
-def _has_signal_csv(run_dir: Path) -> bool:
-    return any((run_dir / name).exists() for name in SIGNAL_CSV_NAMES)
-
-
 def _signal_csv_paths(run_dir: Path) -> List[Path]:
     """Every recognized signals CSV present at the run root, in preference order.
 

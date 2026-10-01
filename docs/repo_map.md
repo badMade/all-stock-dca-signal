@@ -214,7 +214,7 @@ Everything else in this section is research output. Nothing else here is wired i
 | `dca_inverse_martingale.py` | Opt-in deferred accumulation: tracks dip-tier amounts, fires once on recovery | opt-in, **off by default** (`docs/inverse_martingale.md`) |
 | `dca_whole_share_accumulator.py` | Whole-share accumulation for non-fractional tickers (built for BYDDY) | **yes, 3:30 PM stream only** (`docs/whole_share_accumulation.md`) |
 | `dca_cumulative.py` | Cumulative sub-dollar credit ledger | yes |
-| `claude/_agent_scratch/run_market_open_signals.py`, `build_raw_data.py`, `snap.py` (moved out of the repo root 2026-09-07) | One-off 9:35 signal reproduction from static data | no, harness/scratch |
+| `claude/_agent_scratch/run_market_open_signals.py`, `build_raw_data.py`, `snap.py` | One-off 9:35 signal reproduction from static data | no, harness/scratch. Note: copies of these three (and two JSON files) still sit at the repo root and the root versions are newer, so the 2026-09-07 move is unfinished; see [dead_code_report.md](dead_code_report.md) |
 
 ### 3.3 Sibling subprojects (own `requirements.txt`, own `tests/`, own CI job)
 
@@ -250,6 +250,14 @@ behavioral ticker grouping for the 3D market graph, and has no path to the guard
 | Add a new suggester that influences sizing | Publish your own config file, then teach `sizing_adjustment_reader.py` to combine it. Do not touch `graded_buy_multiplier` directly. |
 | Add a top-level module or config file | Update `pyproject.toml` (`py-modules`, `data-files`) or it breaks only in an installed wheel |
 | Find the tests for something | `tests/test_<module>.py` for core, `scripts/tests/` for `scripts/`, each subproject's own `tests/` |
+
+## 4b. Import-graph cross-check (2026-09-30)
+
+Two claims on this page are narrower than they read. `dca_runner.py`, `dca_cost_tracker.py` and
+`dca_weekly_dashboard.py` have no in-repo caller that *runs a slot*, but the console
+(`dca_console_*`), `near_close_dca` and several `scripts/` import from them. See
+[codebase_roadmap.md](codebase_roadmap.md) section 5 for the table, and
+[dead_code_report.md](dead_code_report.md) for actual unused code.
 
 ## 5. Keeping this honest
 

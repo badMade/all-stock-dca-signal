@@ -44,15 +44,6 @@ def load_scheduled_tickers() -> list[str]:
     return sorted(list({t.upper() for t in active}))
 
 
-def _inspect_run_helpers() -> tuple[Any, Any]:
-    # inspect_run.py bootstraps the full Wondrous Octopus environment (including
-    # torch) on import. Keep the core-testable config/CLI paths import-safe and
-    # defer that setup until we actually need ledger access.
-    from inspect_run import _dollar, _open_ledger  # noqa: E402
-
-    return _dollar, _open_ledger
-
-
 def export_ledger_records(
     run_dir: Path,
     target_tickers: set[str],

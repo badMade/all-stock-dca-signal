@@ -399,15 +399,6 @@ def _finalize(ticker: str, bars: List[Bar], source: str) -> Optional[BarSeries]:
     return BarSeries(ticker=ticker, bars=ordered, source=source)
 
 
-def _within(bar: Bar, start: Optional[date], end: Optional[date]) -> bool:
-    day = bar.timestamp.date()
-    if start is not None and day < start:
-        return False
-    if end is not None and day > end:
-        return False
-    return True
-
-
 def _window(bars: Sequence[Bar], start: Optional[date], end: Optional[date]) -> List[Bar]:
     """Trim to ``[start, end]``, keeping ONE bar before ``start`` as a prior-close baseline.
 
