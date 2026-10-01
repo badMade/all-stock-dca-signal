@@ -202,7 +202,7 @@ def previous_container_publishes(world, slot, tmp_name="first"):
         ["publish", "--evidence-root", str(root), "--remote", str(world.evidence_origin),
          "--trading-day", DAY, "--slot", slot, "--code-sha", world.sha,
          "--max-attempts", "1", "--backoff-seconds", "0"],
-        env=base_env(),
+        env=base_env(DCA_PINNED_SHA=world.sha),
     ) == 0
 
 

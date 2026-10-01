@@ -20,7 +20,7 @@ anything (the live path is standard library only, Python 3.11 or newer).
 |---|---|
 | `DCA_PINNED_SHA` | The full lower-case 40-character commit SHA a human promoted. Held in the run environment, never in the repo: a file in the checkout cannot vouch for itself |
 | `DCA_CRON_TRACKING_ROOT` | Set to the same absolute path in every container (recommended: `/home/user/workspace/cron_tracking`, the bundled root, so `config/*.json` paths need no rebase). Pointers store absolute paths and are rejected as `outside_root` if the root differs between containers. Export it before Python starts; several modules read it at import time |
-| `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` | As before. Also used by `evidence_publish` to refuse any evidence that contains it |
+| `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` | As before. Also used by `evidence_publish` to refuse any evidence that contains it; `publish` refuses (exit 4) when it is unset or shorter than 6 characters, because the exact-match scan cannot run without it |
 | `DCA_ALERT_EMAIL_ADDRESS` | Alert routing; the operator address otherwise lives only in repo config |
 
 ## Preflight
@@ -78,7 +78,7 @@ python3 -m scripts.evidence_publish publish --evidence-root "$DCA_CRON_TRACKING_
 | 0 | `published` | Pushed and manifest updated |
 | 3 | `push_failed` | Local artifacts untouched and committed locally, marker at `evidence_push_failed/<day>_<slot>.json`, `alert_text` carries SHA, slot, orders, tickers, dollars and order IDs. Send it by email. Never re-run Gate 7 |
 | 4 | `refused_secret` | The account number (exact, or an account-shaped literal) was found; only the relative paths are printed, nothing is pushed |
-| 7 | `refused_provenance` | `--code-sha` is not `$DCA_PINNED_SHA` (when set), or the slot's `run_state.json` / `run_summary.json` records a different `code_version.git_sha`; nothing is pushed |
+| 7 | `refused_provenance` | `--code-sha` is not `$DCA_PINNED_SHA`, `$DCA_PINNED_SHA` is unset, or the slot's `run_state.json` / `run_summary.json` records a different `code_version.git_sha`; nothing is pushed |
 
 A competing publish from another container is merged: `MANIFEST.json` is the union
 of both sides and, for `latest_*_run.json`, the more recently written pointer wins.

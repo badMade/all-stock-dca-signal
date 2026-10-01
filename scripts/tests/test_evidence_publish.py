@@ -117,7 +117,7 @@ def publish(world, root=None, slot="1330", *, remote=None, day=DAY_TEXT, env=Non
          "--remote", str(remote if remote is not None else world.origin),
          "--trading-day", day, "--slot", slot, "--code-sha", world.sha,
          "--max-attempts", "2", "--backoff-seconds", "0"],
-        env=env if env is not None else base_env(),
+        env=env if env is not None else base_env(DCA_PINNED_SHA=world.sha),
     )
 
 
@@ -439,3 +439,54 @@ def test_publish_accepts_evidence_whose_code_version_is_the_pinned_release(world
     assert publish(world, env=base_env(DCA_PINNED_SHA=world.sha)) == 0
 
     assert payload(capsys)["status"] == "published"
+
+
+# --- adversarial review follow-ups (findings 1 to 3 on PR #1571's publish path) ---------------------------
+
+
+def test_an_unusable_fetched_manifest_does_not_leave_a_merge_in_progress(world, capsys):
+    """Finding 1: a Failure mid-merge must abort the merge, not leave conflict markers to be committed."""
+    pull(world)
+    finalize(world.root)
+    other = clone(world, "hand_edited_store")
+    (other / "MANIFEST.json").write_text('{"version": 1, "days": {}, "days": {}}\n', encoding="utf-8")
+    git(other, "commit", "-qam", "hand edit")
+    git(other, "push", "origin", "HEAD:main")
+    before = remote_head(world.origin)
+
+    assert publish(world) == 3
+
+    assert payload(capsys)["status"] == "push_failed"
+    assert not (world.root / ".git" / "MERGE_HEAD").exists()
+    assert "UU" not in git(world.root, "status", "--porcelain")
+    assert "<<<<<<<" not in (world.root / "MANIFEST.json").read_text(encoding="utf-8")
+    assert "<<<<<<<" not in git(world.root, "show", "HEAD:MANIFEST.json")
+    assert remote_head(world.origin) == before
+
+
+def test_publish_refuses_when_the_pinned_release_is_not_in_the_environment(world, capsys):
+    """Finding 2: no $DCA_PINNED_SHA means --code-sha is unbound, so nothing is published."""
+    pull(world)
+    finalize(world.root)
+    before = remote_head(world.origin)
+
+    assert publish(world, env=base_env()) == 7
+
+    result = payload(capsys)
+    assert result["status"] == "refused_provenance"
+    assert "DCA_PINNED_SHA" in result["detail"]
+    assert remote_head(world.origin) == before
+
+
+def test_publish_refuses_when_the_account_number_is_not_in_the_environment(world, capsys):
+    """Finding 3: without the exact value the scan cannot clear the evidence, so it must not push."""
+    pull(world)
+    finalize(world.root)
+    before = remote_head(world.origin)
+
+    assert publish(world, env=base_env(DCA_PINNED_SHA=world.sha, ROBINHOOD_AGENTIC_ACCOUNT_NUMBER="")) == 4
+
+    result = payload(capsys)
+    assert result["status"] == "refused_secret"
+    assert result["refused_paths"] == []
+    assert remote_head(world.origin) == before

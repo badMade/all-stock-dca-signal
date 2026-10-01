@@ -198,7 +198,11 @@ def _provenance_mismatch(root: Path, env: Mapping[str, str], day: str, slot: str
     that never passed one) have nothing to contradict and are not refused for that.
     """
     pin = env.get(PINNED_SHA_ENV) or ""
-    if pin and sha != pin:
+    # No pin means --code-sha (caller-supplied) is bound to nothing, so fail closed
+    # (adversarial review of PR #1571); cloud_preflight already requires the pin.
+    if not pin:
+        return f"{PINNED_SHA_ENV} is not set, so --code-sha is not bound to a pinned release"
+    if sha != pin:
         return f"--code-sha is not the pinned release named by {PINNED_SHA_ENV}"
     try:
         run_dir = root / slot_run_dir_relative(slot, date.fromisoformat(day))
@@ -296,24 +300,34 @@ def _resolve_pointer(root: Path, env: Mapping[str, str], relative: str) -> None:
     _require(_git(root, env, "add", relative), "git add")
 
 
+def _resolve_conflicts(root: Path, env: Mapping[str, str], mine: Mapping[str, Any]) -> None:
+    """Finish a conflicted merge when only the manifest and pointers conflict; else raise Failure."""
+    conflicted = _git(root, env, "diff", "--name-only", "--diff-filter=U").stdout.split()
+    for relative in conflicted:
+        if relative == MANIFEST_NAME:
+            continue  # rewritten below from both sides
+        if _POINTER_RE.fullmatch(Path(relative).name):
+            _resolve_pointer(root, env, relative)
+            continue
+        raise Failure(f"merge conflict in {relative}")
+    theirs_text = _git(root, env, "show", f"FETCH_HEAD:{MANIFEST_NAME}").stdout
+    _write_manifest(root / MANIFEST_NAME, _merge_manifests(_manifest_from_text(theirs_text), mine))
+    _require(_git(root, env, "add", MANIFEST_NAME), "git add")
+    _require(_git(root, env, "commit", "-q", "--no-edit"), "git commit")
+
+
 def _integrate(root: Path, remote: str, env: Mapping[str, str], mine: Mapping[str, Any]) -> None:
     """Merge the store's newer main into local main after a non-fast-forward rejection."""
     _require(_git(root, env, "fetch", remote, BRANCH, network=True), "git fetch")
     merged = _git(root, env, "merge", "--no-edit", "FETCH_HEAD")
     if merged.returncode != 0:
-        conflicted = _git(root, env, "diff", "--name-only", "--diff-filter=U").stdout.split()
-        for relative in conflicted:
-            if relative == MANIFEST_NAME:
-                continue  # rewritten below from both sides
-            if _POINTER_RE.fullmatch(Path(relative).name):
-                _resolve_pointer(root, env, relative)
-                continue
+        try:
+            _resolve_conflicts(root, env, mine)
+        except Exception:
+            # A half-finished merge would leave conflict markers for the failure path's
+            # `git add -A` to commit as the manifest (adversarial review of PR #1571).
             _git(root, env, "merge", "--abort")
-            raise Failure(f"merge conflict in {relative}")
-        theirs_text = _git(root, env, "show", f"FETCH_HEAD:{MANIFEST_NAME}").stdout
-        _write_manifest(root / MANIFEST_NAME, _merge_manifests(_manifest_from_text(theirs_text), mine))
-        _require(_git(root, env, "add", MANIFEST_NAME), "git add")
-        _require(_git(root, env, "commit", "-q", "--no-edit"), "git commit")
+            raise
     # Even a clean textual merge of the manifest is re-derived, so it can never end up
     # as a JSON document nobody wrote.
     theirs_text = _git(root, env, "show", f"FETCH_HEAD:{MANIFEST_NAME}").stdout
@@ -369,11 +383,16 @@ def _publish(args: argparse.Namespace, env: Mapping[str, str]) -> Tuple[int, Dic
         if not (root / ".git").is_dir():
             raise Failure("evidence root is not an evidence clone")
         refused = scan_for_secrets(root, env)
-        if refused:
+        # Without the exact value the scan cannot clear the evidence, so a missing
+        # variable refuses too (adversarial review of PR #1571).
+        unscannable = len(env.get(ACCOUNT_ENV) or "") < 6
+        if refused or unscannable:
             return EXIT_REFUSED_SECRET, {
                 "status": "refused_secret",
                 "refused_paths": refused,
                 "alert_text": _alert_text(
+                    f"EVIDENCE PUBLISH REFUSED ({ACCOUNT_ENV} is not set, so the secret scan cannot clear the "
+                    "evidence; nothing was pushed)" if not refused else
                     "EVIDENCE PUBLISH REFUSED (account number in evidence; nothing was pushed)",
                     root, day, slot, sha, "contents were left uncommitted for a human to inspect",
                 ),
