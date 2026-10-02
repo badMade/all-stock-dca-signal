@@ -241,6 +241,8 @@ class PinnedHTTPHandler(urllib.request.HTTPHandler):
     and let the configured proxy resolve and connect instead.
     """
 
+    # Note: These methods are dynamically invoked by urllib.request.OpenerDirector.
+    # Do not remove; they are required to enforce SSRF protection via IP pinning.
     def http_open(self, req):
         if request_is_proxied(req):
             return self.do_open(HTTPConnection, req)
@@ -254,6 +256,8 @@ class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
     still target the real hostname.
     """
 
+    # Note: These methods are dynamically invoked by urllib.request.OpenerDirector.
+    # Do not remove; they are required to enforce SSRF protection via IP pinning.
     def https_open(self, req):
         # Only pass context, not check_hostname: on Python 3.12+,
         # HTTPSHandler.__init__ folds check_hostname into the SSL context
