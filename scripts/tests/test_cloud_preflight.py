@@ -130,6 +130,22 @@ def test_refuses_a_modified_tracked_file(world, capsys):
     assert line.startswith("GATE2_ABORT:") and "modified" in line
 
 
+def test_refuses_an_untracked_file_that_could_shadow_the_pinned_code(world, capsys):
+    (world.checkout / "sitecustomize.py").write_text("raise SystemExit\n", encoding="utf-8")
+
+    assert run_preflight(world) == 2
+    line = last_line(capsys)
+    assert line.startswith("GATE2_ABORT:") and "untracked" in line
+
+
+def test_accepts_an_ignored_file_in_the_checkout(world, capsys):
+    # git's own exclude file stands in for .gitignore without changing the pinned commit.
+    (world.checkout / ".git" / "info" / "exclude").write_text("*.log\n", encoding="utf-8")
+    (world.checkout / "run.log").write_text("noise\n", encoding="utf-8")
+
+    assert run_preflight(world) == 0
+
+
 def test_refuses_when_the_evidence_remote_is_unreachable_and_creates_nothing(world, capsys):
     assert run_preflight(world, remote=world.tmp / "does-not-exist.git") == 2
     line = last_line(capsys)

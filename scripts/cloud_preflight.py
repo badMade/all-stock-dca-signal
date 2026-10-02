@@ -116,8 +116,13 @@ def _verify_checkout(repo_root: Path, env: Mapping[str, str], pin: str) -> None:
     head = _git(repo_root, env, "rev-parse", "HEAD").stdout.strip()
     if head != pin:
         raise Refused(f"checkout HEAD {head[:12]} is not the pinned release {pin[:12]}")
-    if _git(repo_root, env, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+    # Untracked, non-ignored files count too: an untracked sitecustomize.py or .pth would run
+    # code the pinned commit does not contain (adversarial review of PR #1571).
+    changes = _git(repo_root, env, "status", "--porcelain", "--untracked-files=normal").stdout.splitlines()
+    if any(not line.startswith("??") for line in changes):
         raise Refused("checkout has modified tracked files, so it is not the pinned release")
+    if changes:
+        raise Refused("checkout has untracked files, so it is not the pinned release")
     # Reachability from origin/main is what "merged" means: a pin on an
     # unreviewed side branch must not trade even though HEAD equals it.
     fetched = _git(repo_root, env, "fetch", "origin", f"+refs/heads/{EVIDENCE_BRANCH}:refs/remotes/origin/{EVIDENCE_BRANCH}",

@@ -90,6 +90,13 @@ def _scrub(text: str, env: Mapping[str, str]) -> str:
     return text.replace(account, "[REDACTED]") if len(account) >= 6 else text
 
 
+def _git_env(env: Mapping[str, str]) -> Dict[str, str]:
+    """``env`` with git pinned to the C locale: the lost-race and non-fast-forward checks read English stderr."""
+    pinned = {**env, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
+    pinned.pop("LANGUAGE", None)  # LANGUAGE outranks LC_ALL for gettext catalogs
+    return pinned
+
+
 def _git(
     root: Path | str, env: Mapping[str, str], *args: str, network: bool = False
 ) -> subprocess.CompletedProcess:
@@ -97,7 +104,7 @@ def _git(
     command = ["git", "-c", "user.name=dca-evidence", "-c", "user.email=dca-evidence@localhost", *args]
     try:
         return subprocess.run(
-            command, cwd=str(root), env={**env, "GIT_TERMINAL_PROMPT": "0"}, capture_output=True, text=True,
+            command, cwd=str(root), env=_git_env(env), capture_output=True, text=True,
             timeout=NETWORK_TIMEOUT_SECONDS if network else None,
         )
     except subprocess.TimeoutExpired:

@@ -490,3 +490,22 @@ def test_publish_refuses_when_the_account_number_is_not_in_the_environment(world
     assert result["status"] == "refused_secret"
     assert result["refused_paths"] == []
     assert remote_head(world.origin) == before
+
+
+# --- low-severity follow-ups from the same review (git locale) --------------------------
+
+
+def test_git_is_always_run_with_the_c_locale_so_its_error_text_can_be_matched(world, monkeypatch):
+    """The non-fast-forward and lost-race checks read git's English stderr; a localized git would hide them."""
+    seen = {}
+
+    def spy(command, **kwargs):
+        seen.update(kwargs["env"])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(evidence_publish.subprocess, "run", spy)
+
+    evidence_publish._git(world.root, {"LC_ALL": "de_DE.UTF-8", "LANG": "de_DE.UTF-8", "LANGUAGE": "de"}, "status")
+
+    assert seen["LC_ALL"] == "C"
+    assert "LANGUAGE" not in seen

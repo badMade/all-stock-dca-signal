@@ -36,8 +36,9 @@ a Gate 2 abort (keep the literal `Failing gate: Gate 2` in the alert so
 `scripts/alert_digest.py` buckets it correctly). It refuses when:
 
 - `DCA_PINNED_SHA` is missing or is not a full lower-case SHA;
-- HEAD is not the pinned SHA, a tracked file is modified, or the pinned commit is
-  not an ancestor of `origin/main`;
+- HEAD is not the pinned SHA, a tracked file is modified, the checkout holds an
+  untracked file that git does not ignore (it could shadow pinned code), or the pinned
+  commit is not an ancestor of `origin/main`;
 - the evidence store is unreachable, has no `MANIFEST.json` (unless a human passes
   `--init`), or has an unusable one (invalid JSON, a wrong shape, or a duplicate key);
 - `--expect-prior-slots` names a slot the manifest does not list for the day, or a
@@ -91,7 +92,7 @@ python3 -m scripts.evidence_publish claim --evidence-root "$DCA_CRON_TRACKING_RO
     --remote <evidence repo> --trading-day YYYY-MM-DD --slot 1330 --claimant <run id>
 ```
 
-The remote rejecting a non-fast-forward push is the mutex. Exit 0 means this run
+The remote rejecting a non-fast-forward push is the mutex (git runs with `LC_ALL=C`, because the lost-race and non-fast-forward checks read its English error text). Exit 0 means this run
 owns the slot; 5 means another run already does (abort); 6 means the store is
 unreachable or kept changing (abort, fail closed). Any existing claim is refused,
 including the same claimant, so a scheduler retry cannot double-trade. `--slot` must
