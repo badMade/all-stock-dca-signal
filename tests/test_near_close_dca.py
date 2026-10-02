@@ -37,6 +37,8 @@ from dca_cumulative import CumulativeCreditLedger, MinimumOrderDiscard
 from dca_whole_share_accumulator import WholeShareAccumulationLedger
 from near_close_dca import (
     ACTIVE_TICKERS,
+    ALPACA_ACCOUNT_INFO_TOOL,
+    ALPACA_SOURCE_ID,
     BASE_BELOW_CLOSE_AND_LOW,
     BASE_BELOW_CLOSE_ONLY,
     BASE_NOT_BELOW_CLOSE,
@@ -84,6 +86,7 @@ from near_close_dca import (
     _select_reconciled_signal_rows,
     account_pinning_failure,
     allocation_sort_key,
+    build_alpaca_account_info_payload,
     build_broker,
     build_execution_record,
     build_report,
@@ -51083,3 +51086,25 @@ def test_same_stream_order_exists_recognizes_the_other_entry_points_ref_ids_for_
         assert found is not None and found["id"] == "ORDER-FOREIGN", foreign_ref
         # Still scoped to the slot: the midday engine does not claim it.
         assert _same_stream_order_exists(broker, "AAPL", trading_day, "midday") is None
+
+
+def test_build_alpaca_account_info_payload_happy_path() -> None:
+    # Test True
+    payload_true = build_alpaca_account_info_payload(True)
+    assert payload_true["source_id"] == ALPACA_SOURCE_ID
+    assert payload_true["tool"] == ALPACA_ACCOUNT_INFO_TOOL
+    assert payload_true["input"] == {"isPaperAPI": True}
+
+    # Test False
+    payload_false = build_alpaca_account_info_payload(False)
+    assert payload_false["source_id"] == ALPACA_SOURCE_ID
+    assert payload_false["tool"] == ALPACA_ACCOUNT_INFO_TOOL
+    assert payload_false["input"] == {"isPaperAPI": False}
+
+
+def test_build_alpaca_account_info_payload_malformed() -> None:
+    with pytest.raises(TypeError, match="is_paper_api must be a boolean"):
+        build_alpaca_account_info_payload("not a bool")  # type: ignore
+
+    with pytest.raises(TypeError, match="is_paper_api must be a boolean"):
+        build_alpaca_account_info_payload(None)  # type: ignore

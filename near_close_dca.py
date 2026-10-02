@@ -4003,6 +4003,8 @@ class AlpacaConfig:
 
 
 def build_alpaca_account_info_payload(is_paper_api: bool) -> Dict[str, Any]:
+    if not isinstance(is_paper_api, bool):
+        raise TypeError("is_paper_api must be a boolean")
     return {
         "source_id": ALPACA_SOURCE_ID,
         "tool": ALPACA_ACCOUNT_INFO_TOOL,
