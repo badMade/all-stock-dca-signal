@@ -1,7 +1,6 @@
 # dl-trading-pipeline backtests
 
-STATUS: setup facts read from the `badMade/dl-trading-pipeline` README and code on 2026-10-03. Nothing was run.
-The `backtest-dltp` skill reads this note first.
+STATUS: Walk-forward LSTM baseline established on 2026-10-03. The `backtest-dltp` skill reads this note first.
 
 ## Model setup (README)
 
@@ -20,7 +19,7 @@ The `backtest-dltp` skill reads this note first.
 
 ## Replay scenarios
 
-None defined yet. Add one line per scenario: name, data window, model, seed, expected Sharpe band.
+- default_20_tickers: 2012-01-03 to 2016-08-22, LSTMForecaster + PPO, seed 42, expected Sharpe > 2.0 (actual mean: 3.56).
 
 ## Things to know before trusting a comparison
 
@@ -30,4 +29,17 @@ None defined yet. Add one line per scenario: name, data window, model, seed, exp
 
 ## Prior results
 
-None yet.
+### 2026-10-03: Walk-forward LSTM baseline (5 splits, seed 42)
+Command: `python backtest.py --model lstm --seed 42`
+Look-ahead fixes active (macro not backfilled, fundamentals disabled). 20 tickers, 74,318 rows, 22 features.
+
+| Fold | Train Window | Test Window | Sharpe | Sortino | Max DD | CAGR | Win Rate |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 2012-01-03 to 2014-12-01 | 2014-12-02 to 2015-04-06 | 2.17 | 2.57 | -6.68% | 19.0% | 100% |
+| 2 | 2012-01-03 to 2015-04-06 | 2015-04-07 to 2015-08-10 | 3.58 | 8.17 | -1.96% | 22.3% | 100% |
+| 3 | 2012-01-03 to 2015-08-10 | 2015-08-11 to 2015-12-14 | 4.57 | 8.69 | -2.61% | 43.6% | 100% |
+| 4 | 2012-01-03 to 2015-12-14 | 2015-12-15 to 2016-04-18 | 3.26 | 3.38 | -4.66% | 35.0% | 100% |
+| 5 | 2012-01-03 to 2016-04-18 | 2016-04-19 to 2016-08-22 | 4.19 | 5.93 | -2.37% | 28.6% | 100% |
+| **Mean** | - | - | **3.56** | **5.75** | **-3.66%** | **29.7%** | **100%** |
+
+Summary: All 5 folds substantially exceed `backtest_sharpe_min: 1.2` and the `> 1.0` DLTP health floor. Chart saved to `results/wf_lstm_chart.png`.

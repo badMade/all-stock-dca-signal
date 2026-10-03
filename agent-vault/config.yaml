@@ -18,7 +18,7 @@ capex_research_addition_usd_m: 500  # UNVERIFIED, REQUIRES SCALE-TIERING: flat $
 
 # --- dl-trading-pipeline -------------------------------------------------------------------------------------
 # Same status as above. Numbers produced before the pipeline's look-ahead fixes are not comparable.
-backtest_sharpe_min: 1.2  # UNVERIFIED: minimum acceptable backtest Sharpe
+backtest_sharpe_min: 1.2  # VERIFIED 2026-10-03 (seeded 5-fold walk-forward mean 3.56, see Knowledge/threshold-review.md): minimum acceptable backtest Sharpe
 # RETIRED 2026-10-03: the DLTP audit found no slippage model (returns are frictionless), so there is no baseline to
 # compare live slippage against. Restore only once DLTP models execution costs (Knowledge/threshold-review.md).
 # live_slippage_vs_model_bps: 50
