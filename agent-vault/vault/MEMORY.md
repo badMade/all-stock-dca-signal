@@ -10,7 +10,7 @@
 
 ## Active goals
 
-- Automate recurring capex delta scans across the 51 watched operating companies.
+- Automated recurring capex delta scanner implemented (`agent-vault/scripts/scan_capex_deltas.py`).
 - Schedule weekly capex monitoring reports against the two-tier addition rule.
 
 ## Standing lessons

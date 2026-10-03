@@ -383,6 +383,12 @@ def _vault_copy(tmp_path: Path) -> Path:
     # Resolved up front so the path the hook prints (it derives it from $0) compares byte-for-byte on macOS too.
     copy = tmp_path.resolve() / "agent-vault"
     shutil.copytree(VAULT_ROOT, copy, symlinks=True)
+    for folder in ("Daily", "Reflections"):
+        d = copy / "vault" / folder
+        if d.is_dir():
+            for p in d.iterdir():
+                if p.name != ".gitkeep":
+                    p.unlink()
     return copy
 
 
