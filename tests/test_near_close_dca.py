@@ -51325,3 +51325,14 @@ def test_build_alpaca_account_info_payload_malformed() -> None:
 
     with pytest.raises(TypeError, match="is_paper_api must be a boolean"):
         build_alpaca_account_info_payload(None)  # type: ignore
+
+def test_format_notional():
+    from near_close_dca import format_notional
+
+    assert format_notional(10.555) == "10.55"
+    assert format_notional(10.554) == "10.55"
+    assert format_notional(0.0) == "0.00"
+    assert format_notional(100) == "100.00"
+    assert format_notional(100.0) == "100.00"
+    assert format_notional(123456789.12) == "123456789.12" # Avoid scientific notation
+    assert format_notional(-5.5) == "-5.50"
