@@ -14,7 +14,7 @@ budgets_config: config/budgets.json
 # --- capex-monitoring ----------------------------------------------------------------------------------------
 # Carried over from the original brief, not from any repo document. Re-evaluate in Knowledge/threshold-review.md.
 capex_delta_flag_pct: 15  # VERIFIED 2026-10-03 (baseline run, see Knowledge/threshold-review.md): flag a quarter-over-quarter capex change larger than this
-capex_research_addition_usd_m: 500  # UNVERIFIED, REQUIRES SCALE-TIERING: flat $500M is scale-blind (trips every quarter on hyperscalers); flag a research-spend addition larger than this (USD millions)
+capex_research_addition_usd_m: 2000  # SETTLED 2026-10-03 (two-tier rule: $2,000M for hyperscalers [capex > $5B], $250M for suppliers/mid-caps; see Knowledge/threshold-review.md)
 
 # --- dl-trading-pipeline -------------------------------------------------------------------------------------
 # Same status as above. Numbers produced before the pipeline's look-ahead fixes are not comparable.

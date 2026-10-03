@@ -7,7 +7,7 @@ settle it. Values live in `config.yaml` or the repo's own files; this note recor
 | --- | --- | --- | --- | --- |
 | all-stock-dca limits (base amount, per-order cap, caps, breakers) | `config/budgets.json`, `docs/safeguards.md` | This repo | Reconciled 2026-10-03 | safeguards.md updated from Max 8 to Max 120 matching budgets.json |
 | `capex_delta_flag_pct` | `config.yaml` | Original brief | Candidate (Verified 2026-10-03) | Empirically verified against MSFT/GOOGL/AMZN; flags real inflection quarters (+20% to +54%) while passing steady quarters (+3.3%) |
-| `capex_research_addition_usd_m` | `config.yaml` | Original brief | Requires scale-tiering (2026-10-03) | Flat $500M is scale-blind: hyperscalers shift spend by $5B-$10B/qtr, tripping on noise; replace with per-company tiers or a % basis via reflect/improve before relying on it |
+| `capex_research_addition_usd_m` | `config.yaml` | Original brief | Settled (two-tier rule 2026-10-03) | Replaced flat $500M with two-tier rule: $2,000M for hyperscalers (> $5B quarterly spend), $250M for suppliers and mid-caps |
 | `backtest_sharpe_min` | `config.yaml` | Original brief | Verified 2026-10-03 | Seeded 5-fold walk-forward run produced mean Sharpe 3.56 (min fold 2.17); exceeds 1.2 threshold across all folds |
 | `live_slippage_vs_model_bps` | `config.yaml` | Original brief | Retired (2026-10-03, commented out in config.yaml) | Audited dl-trading-pipeline: zero slippage modeling exists (frictionless returns); retire or defer until DLTP adds execution costs |
 

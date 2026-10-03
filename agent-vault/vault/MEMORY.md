@@ -10,8 +10,9 @@
 
 ## Active goals
 
-- Validate the loop on all-stock-dca (dry-run) before relying on the capex and backtest skills.
-- Re-evaluate every task threshold; `Knowledge/threshold-review.md` is the first `improve` target.
+- Automate recurring capex delta scans across the 51 watched operating companies.
+- Settle capex_research_addition_usd_m with scale-relative tiering in threshold-review.md.
+- Evaluate paired TCN vs LSTM walk-forward performance in dl-trading-pipeline.
 
 ## Standing lessons
 
@@ -22,6 +23,6 @@
 <!-- One line per note in Knowledge/, added by the capture skill. -->
 
 - [all-stock-dca rules](Knowledge/all-stock-dca-rules.md) - pointer to the repo's safeguards, ladder and run commands
-- [capex monitoring KPIs](Knowledge/capex-monitoring-kpis.md) - watched companies, baselines (skeleton, untested)
-- [dl-trading backtests](Knowledge/dl-trading-backtests.md) - model setup, validation rules, seed policy (untested)
-- [threshold review](Knowledge/threshold-review.md) - status of every threshold and what would settle it
+- [capex monitoring KPIs](Knowledge/capex-monitoring-kpis.md) - 51 watched companies, 8 verified baselines
+- [dl-trading backtests](Knowledge/dl-trading-backtests.md) - walk-forward backtest baseline established (mean Sharpe 3.56)
+- [threshold review](Knowledge/threshold-review.md) - status of all thresholds; 4 settled, 1 pending tiering
