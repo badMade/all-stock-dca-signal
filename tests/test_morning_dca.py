@@ -155,9 +155,7 @@ class FixedDropProvider:
         self._drops = drops
 
     def get_previous_close_bar(self, ticker: str, as_of: datetime):
-        ts = datetime.combine(
-            as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
-        )
+        ts = datetime.combine(as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN)
         p = self._prev
         return Bar(timestamp=ts, open=p, high=p, low=p, close=p, volume=0.0)
 
@@ -239,6 +237,7 @@ class RisingBarsProvider(FixedDropProvider):
 
 class FakeLiveBroker:
     """Minimal successful broker for scheduled live tests."""
+
     supports_concurrent_fill_lookup: bool = False
 
     def account_number(self) -> str:
@@ -252,7 +251,9 @@ class FakeLiveBroker:
     def same_day_strategy_order_exists(self, ticker, trading_day) -> bool:
         return False
 
-    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes) -> Optional[Dict[str, Any]]:
+    def same_day_strategy_order_exists_with_ref_id_prefix(
+        self, ticker, trading_day, ref_id_prefixes
+    ) -> Optional[Dict[str, Any]]:
         return None
 
     def strategy_order_with_ref_id(self, ticker, trading_day, ref_id) -> Optional[Dict[str, Any]]:
@@ -276,9 +277,7 @@ class FakeLiveBroker:
     def same_day_order_with_ref_id_prefix_any_state(
         self, ticker, trading_day, ref_id_prefixes
     ) -> Optional[Dict[str, Any]]:
-        return self.same_day_strategy_order_exists_with_ref_id_prefix(
-            ticker, trading_day, ref_id_prefixes
-        )
+        return self.same_day_strategy_order_exists_with_ref_id_prefix(ticker, trading_day, ref_id_prefixes)
 
     def is_tradable_for_whole_share_buy(self, ticker) -> bool:
         return True
@@ -339,19 +338,19 @@ def test_ladder_brackets():
     # default base_buy_amount_usd rather than overriding it.
     ex = MorningDCAExecutor(MorningConfig())
     cases = {
-        0.0005: 0.0,   # < 0.1%  -> 0x
-        0.001: 1.0,    # 0.1%    -> 1x
-        0.019: 1.0,    # < 2%    -> 1x
-        0.020: 1.5,    # 2%      -> 1.5x
-        0.039: 1.5,    # < 4%    -> 1.5x
-        0.040: 2.0,    # 4%      -> 2x
-        0.050: 2.5,    # 5%      -> 2.5x
-        0.060: 3.0,    # 6%      -> 3x
-        0.065: 3.5,    # 6.5%    -> 3.5x
-        0.070: 4.0,    # 7%      -> 4x
-        0.075: 4.5,    # 7.5%    -> 4.5x
-        0.080: 5.0,    # 8%      -> 5x
-        0.20: 5.0,     # >= 8%   -> 5x (no upper cutoff)
+        0.0005: 0.0,  # < 0.1%  -> 0x
+        0.001: 1.0,  # 0.1%    -> 1x
+        0.019: 1.0,  # < 2%    -> 1x
+        0.020: 1.5,  # 2%      -> 1.5x
+        0.039: 1.5,  # < 4%    -> 1.5x
+        0.040: 2.0,  # 4%      -> 2x
+        0.050: 2.5,  # 5%      -> 2.5x
+        0.060: 3.0,  # 6%      -> 3x
+        0.065: 3.5,  # 6.5%    -> 3.5x
+        0.070: 4.0,  # 7%      -> 4x
+        0.075: 4.5,  # 7.5%    -> 4.5x
+        0.080: 5.0,  # 8%      -> 5x
+        0.20: 5.0,  # >= 8%   -> 5x (no upper cutoff)
     }
     for drop, expected in cases.items():
         assert ex.multiplier_for_drop(drop) == expected, (drop, expected)
@@ -405,9 +404,7 @@ def test_signal_zero_multiplier_below_configured_minimum_drop_normalizes_to_no_a
     # _buy_candidates() (multiplier > 0) still excludes it, a false
     # execution-gap alert. The signal must be normalized to a genuine
     # no-action/skip result instead.
-    cfg = MorningConfig(
-        tickers=("BELOWTIER",), base_buy_amount_usd=2.0, minimum_drop_vs_previous_close=0.0001
-    )
+    cfg = MorningConfig(tickers=("BELOWTIER",), base_buy_amount_usd=2.0, minimum_drop_vs_previous_close=0.0001)
     ex = MorningDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BELOWTIER": 0.0005})
     sig = {s.ticker: s for s in ex.evaluate(_now(), data)}["BELOWTIER"]
@@ -432,9 +429,7 @@ class FixedDropProviderWithLow(FixedDropProvider):
         self._prev_low = previous_low
 
     def get_previous_close_bar(self, ticker, as_of):
-        ts = datetime.combine(
-            as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
-        )
+        ts = datetime.combine(as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN)
         return Bar(timestamp=ts, open=self._prev, high=self._prev, low=self._prev_low, close=self._prev, volume=0.0)
 
 
@@ -479,8 +474,11 @@ def test_stale_quote_falls_back_to_completed_bar():
     decision_dt = _now()
     stale_quote_time = decision_dt + timedelta(minutes=5)
     data = FixedQuoteProvider(
-        SourceName.ROBINHOOD, 100.0, {"BIG": 0.10},
-        quote_price=50.0, quote_time=stale_quote_time,
+        SourceName.ROBINHOOD,
+        100.0,
+        {"BIG": 0.10},
+        quote_price=50.0,
+        quote_time=stale_quote_time,
     )
     ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
     sig = ex.evaluate(decision_dt, data)[0]
@@ -492,8 +490,11 @@ def test_fresh_quote_at_or_before_decision_is_used():
     decision_dt = _now()
     fresh_quote_time = decision_dt - timedelta(minutes=1)
     data = FixedQuoteProvider(
-        SourceName.ROBINHOOD, 100.0, {"BIG": 0.10},
-        quote_price=91.0, quote_time=fresh_quote_time,
+        SourceName.ROBINHOOD,
+        100.0,
+        {"BIG": 0.10},
+        quote_price=91.0,
+        quote_time=fresh_quote_time,
     )
     ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
     sig = ex.evaluate(decision_dt, data)[0]
@@ -507,8 +508,11 @@ def test_quote_older_than_completed_bar_anchor_falls_back_to_bar():
     decision_dt = _now()
     stale_quote_time = decision_dt - timedelta(minutes=10)  # older than the 5-min bar anchor
     data = FixedQuoteProvider(
-        SourceName.ROBINHOOD, 100.0, {"BIG": 0.10},
-        quote_price=50.0, quote_time=stale_quote_time,
+        SourceName.ROBINHOOD,
+        100.0,
+        {"BIG": 0.10},
+        quote_price=50.0,
+        quote_time=stale_quote_time,
     )
     ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
     sig = ex.evaluate(decision_dt, data)[0]
@@ -542,8 +546,11 @@ def test_non_positive_quote_price_falls_back_to_completed_bar():
     fresh_quote_time = decision_dt - timedelta(minutes=1)
     for bad_price in (0.0, -5.0):
         data = FixedQuoteProvider(
-            SourceName.ROBINHOOD, 100.0, {"BIG": 0.10},
-            quote_price=bad_price, quote_time=fresh_quote_time,
+            SourceName.ROBINHOOD,
+            100.0,
+            {"BIG": 0.10},
+            quote_price=bad_price,
+            quote_time=fresh_quote_time,
         )
         ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
         sig = ex.evaluate(decision_dt, data)[0]
@@ -574,9 +581,7 @@ def test_negative_previous_close_bar_rejected():
 
     class NegativePrevCloseProvider(FixedDropProvider):
         def get_previous_close_bar(self, ticker, as_of):
-            ts = datetime.combine(
-                as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
-            )
+            ts = datetime.combine(as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN)
             return Bar(timestamp=ts, open=-100.0, high=-100.0, low=-100.0, close=-100.0, volume=0.0)
 
     data = NegativePrevCloseProvider(SourceName.ROBINHOOD, 90.0, {"BIG": 0.0})
@@ -592,8 +597,11 @@ def test_untimestamped_quote_falls_back_to_completed_bar():
     # decision anchor, so it must not be trusted for sizing.
     decision_dt = _now()
     data = FixedQuoteProvider(
-        SourceName.ROBINHOOD, 100.0, {"BIG": 0.10},
-        quote_price=50.0, quote_time=None,
+        SourceName.ROBINHOOD,
+        100.0,
+        {"BIG": 0.10},
+        quote_price=50.0,
+        quote_time=None,
     )
     ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
     sig = ex.evaluate(decision_dt, data)[0]
@@ -692,7 +700,9 @@ def test_build_artifacts_does_not_double_count_ledger(tmp_path):
     # inspecting artifacts before writing) must not re-record spend against the
     # ledger. Only run()'s single record_buy_candidates() call should count.
     cfg = MorningConfig(
-        tickers=("BIG",), base_buy_amount_usd=2.0, morning_run_state_root=str(tmp_path),
+        tickers=("BIG",),
+        base_buy_amount_usd=2.0,
+        morning_run_state_root=str(tmp_path),
     )
     ex = MorningDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
@@ -756,8 +766,7 @@ def test_holiday_block_overwrites_stale_minimal_stub(tmp_path):
     state_dir.mkdir(parents=True, exist_ok=True)
     stale_path = state_dir / "run_state.json"
     stale_path.write_text(
-        _json.dumps({"status": "blocked", "block_reason": "market holiday",
-                     "trades": False, "broker_outcomes": {}}),
+        _json.dumps({"status": "blocked", "block_reason": "market holiday", "trades": False, "broker_outcomes": {}}),
         encoding="utf-8",
     )
 
@@ -892,8 +901,16 @@ def test_run_state_path_and_classification(tmp_path):
     assert art["trades"] is False
     for row in art["signal_rows"]:
         assert set(
-            ["ticker", "current_price", "previous_close", "drop_pct", "multiplier",
-             "hypothetical_amount_usd", "source", "warnings"]
+            [
+                "ticker",
+                "current_price",
+                "previous_close",
+                "drop_pct",
+                "multiplier",
+                "hypothetical_amount_usd",
+                "source",
+                "warnings",
+            ]
         ).issubset(row.keys())
     assert art["data_source"] == SourceName.ROBINHOOD.value
 
@@ -1230,8 +1247,14 @@ class FewBarsProvider(FixedDropProvider):
         # interval), so current_price resolves but the trend window is too thin.
         anchor = end - timedelta(minutes=interval_minutes)
         return [
-            Bar(timestamp=anchor - timedelta(minutes=interval_minutes),
-                open=price, high=price, low=price, close=price, volume=100.0),
+            Bar(
+                timestamp=anchor - timedelta(minutes=interval_minutes),
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=100.0,
+            ),
             Bar(timestamp=anchor, open=price, high=price, low=price, close=price, volume=100.0),
         ]
 
@@ -1277,8 +1300,7 @@ def test_live_confidence_rule_rejects_trend_with_stale_latest_bar():
 def test_live_confidence_rule_withholds_when_trend_unvalidated(tmp_path):
     # Price/drop passes, but too few intraday bars means the trend cannot be
     # validated -> the candidate is a manual_review_candidate, NOT auto-bought.
-    cfg = MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0,
-                        morning_run_state_root=str(tmp_path))
+    cfg = MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0, morning_run_state_root=str(tmp_path))
     ex = MorningDCAExecutor(cfg, mode="live")
     data = FewBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
 
@@ -1348,16 +1370,18 @@ def test_load_morning_config_uses_multiplier_not_max_drop(tmp_path):
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir()
     (cfg_dir / "morning_dca.json").write_text(
-        json.dumps({
-            "sizing_ladder": {
-                "base_amount_usd": 3.0,
-                "no_buy_below_pct": 0.1,
-                "tiers": [
-                    {"min_drop_pct": 0.1, "max_drop_pct": 1.0, "multiplier": 1.0},
-                    {"min_drop_pct": 1.0, "max_drop_pct": 2.0, "multiplier": 1.5},
-                ],
+        json.dumps(
+            {
+                "sizing_ladder": {
+                    "base_amount_usd": 3.0,
+                    "no_buy_below_pct": 0.1,
+                    "tiers": [
+                        {"min_drop_pct": 0.1, "max_drop_pct": 1.0, "multiplier": 1.0},
+                        {"min_drop_pct": 1.0, "max_drop_pct": 2.0, "multiplier": 1.5},
+                    ],
+                }
             }
-        }),
+        ),
         encoding="utf-8",
     )
     from morning_dca import load_morning_config
@@ -1410,7 +1434,9 @@ class RecordingLiveBroker(FakeLiveBroker):
     def same_day_strategy_order_exists(self, ticker, trading_day) -> bool:
         return False
 
-    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes) -> Optional[Dict[str, Any]]:
+    def same_day_strategy_order_exists_with_ref_id_prefix(
+        self, ticker, trading_day, ref_id_prefixes
+    ) -> Optional[Dict[str, Any]]:
         return None
 
     def strategy_order_with_ref_id(self, ticker, trading_day, ref_id) -> Optional[Dict[str, Any]]:
@@ -1618,14 +1644,14 @@ def test_morning_live_ledger_seed_naive_manual_timestamp_is_eastern_not_utc(tmp_
     manual_dir = tmp_path / "manual_runs" / "20260708_1429"
     manual_dir.mkdir(parents=True)
     (manual_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": "2026-07-08",
-            "generated_at": "2026-07-08T14:29:00",
-            "run_id": "manual-late-afternoon",
-            "buy_candidates": [
-                {"ticker": "ZZZ", "status": "submitted", "planned_amount_usd": 7.5}
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": "2026-07-08",
+                "generated_at": "2026-07-08T14:29:00",
+                "run_id": "manual-late-afternoon",
+                "buy_candidates": [{"ticker": "ZZZ", "status": "submitted", "planned_amount_usd": 7.5}],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -1661,14 +1687,14 @@ def test_morning_live_ledger_seed_excludes_delayed_scheduled_artifact_on_replay(
     scheduled_dir = tmp_path / "20260708_1030ET"
     scheduled_dir.mkdir(parents=True)
     (scheduled_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": "2026-07-08",
-            "generated_at": "2026-07-08T14:00:00-04:00",
-            "run_id": "scheduled-delayed",
-            "buy_candidates": [
-                {"ticker": "ZZZ", "status": "submitted", "planned_amount_usd": 7.5}
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": "2026-07-08",
+                "generated_at": "2026-07-08T14:00:00-04:00",
+                "run_id": "scheduled-delayed",
+                "buy_candidates": [{"ticker": "ZZZ", "status": "submitted", "planned_amount_usd": 7.5}],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -1708,13 +1734,13 @@ def test_morning_live_ledger_seed_rejects_non_finite_csv_notional(tmp_path):
     monday_dir = tmp_path / "20260706_1030ET"
     monday_dir.mkdir(parents=True)
     (monday_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": "2026-07-06",
-            "run_id": "scheduled-monday",
-            "buy_candidates": [
-                {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 1.0}
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": "2026-07-06",
+                "run_id": "scheduled-monday",
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 1.0}],
+            }
+        ),
         encoding="utf-8",
     )
     with (monday_dir / "filled_orders.csv").open("w", newline="", encoding="utf-8") as handle:
@@ -1755,13 +1781,13 @@ def test_morning_live_ledger_seed_survives_corrupt_filled_orders_csv(tmp_path):
     monday_dir = tmp_path / "20260706_1030ET"
     monday_dir.mkdir(parents=True)
     (monday_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": "2026-07-06",
-            "run_id": "scheduled-monday",
-            "buy_candidates": [
-                {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 1.0}
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": "2026-07-06",
+                "run_id": "scheduled-monday",
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 1.0}],
+            }
+        ),
         encoding="utf-8",
     )
     (monday_dir / "filled_orders.csv").write_bytes(b"order_id,ticker,amount_usd\n\xff\xfe,AAA,3.0\n")
@@ -1794,13 +1820,13 @@ def test_morning_live_ledger_seed_falls_back_to_orders_csv_when_filled_orders_un
     monday_dir = tmp_path / "20260706_1030ET"
     monday_dir.mkdir(parents=True)
     (monday_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": "2026-07-06",
-            "run_id": "scheduled-monday",
-            "buy_candidates": [
-                {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 1.0}
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": "2026-07-06",
+                "run_id": "scheduled-monday",
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 1.0}],
+            }
+        ),
         encoding="utf-8",
     )
     # filled_orders.csv exists but is corrupt (non-UTF-8) -- unusable.
@@ -1841,13 +1867,13 @@ def test_morning_live_ledger_seed_uses_larger_of_partial_filled_orders_and_order
     monday_dir = tmp_path / "20260706_1030ET"
     monday_dir.mkdir(parents=True)
     (monday_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": "2026-07-06",
-            "run_id": "scheduled-monday",
-            "buy_candidates": [
-                {"ticker": "AAA", "status": "submitted", "planned_amount_usd": 1.0}
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": "2026-07-06",
+                "run_id": "scheduled-monday",
+                "buy_candidates": [{"ticker": "AAA", "status": "submitted", "planned_amount_usd": 1.0}],
+            }
+        ),
         encoding="utf-8",
     )
     # filled_orders.csv is valid and has a qualifying row, but under-reports
@@ -1987,8 +2013,8 @@ def test_base_executor_is_abstract():
         raise AssertionError("expected NotImplementedError from abstract base hook")
 
 
-
 # --- Thread fixes (PR #13 review comments) -----------------------------------
+
 
 def test_nyse_holidays_stays_open_dec_31_before_saturday_new_year():
     """NYSE Rule 7.2 carves out a year-end-accounting exception for New Year's
@@ -2024,9 +2050,7 @@ class _NaNCloseProvider:
         self._nan_intraday = nan_intraday
 
     def get_previous_close_bar(self, ticker, as_of):
-        ts = datetime.combine(
-            as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
-        )
+        ts = datetime.combine(as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN)
         close = float("nan") if self._nan_prev else 100.0
         return Bar(timestamp=ts, open=close, high=close, low=close, close=close, volume=0.0)
 
@@ -2095,23 +2119,25 @@ def test_load_morning_config_reads_config_file(tmp_path):
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir()
     (cfg_dir / "morning_dca.json").write_text(
-        json.dumps({
-            "sizing_ladder": {
-                "base_amount_usd": 5.0,
-                "no_buy_below_pct": 0.2,
-                "tiers": [
-                    {"min_drop_pct": 0.2, "max_drop_pct": 3.0, "multiplier": 1.0},
-                    {"min_drop_pct": 3.0, "max_drop_pct": None, "multiplier": 2.0},
-                ],
-            },
-            "budget_ledger": {
-                "morning_daily_cap_usd": 60.0,
-                "morning_weekly_cap_usd": 300.0,
-            },
-            "artifact_paths": {
-                "morning_run_state_root": "/custom/morning/root",
-            },
-        }),
+        json.dumps(
+            {
+                "sizing_ladder": {
+                    "base_amount_usd": 5.0,
+                    "no_buy_below_pct": 0.2,
+                    "tiers": [
+                        {"min_drop_pct": 0.2, "max_drop_pct": 3.0, "multiplier": 1.0},
+                        {"min_drop_pct": 3.0, "max_drop_pct": None, "multiplier": 2.0},
+                    ],
+                },
+                "budget_ledger": {
+                    "morning_daily_cap_usd": 60.0,
+                    "morning_weekly_cap_usd": 300.0,
+                },
+                "artifact_paths": {
+                    "morning_run_state_root": "/custom/morning/root",
+                },
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -2123,9 +2149,7 @@ def test_load_morning_config_reads_config_file(tmp_path):
     assert cfg.morning_run_state_root == "/custom/morning/root"
 
 
-def test_load_morning_config_appends_dated_manual_override_to_configured_cap_seed_roots(
-    tmp_path, monkeypatch
-):
+def test_load_morning_config_appends_dated_manual_override_to_configured_cap_seed_roots(tmp_path, monkeypatch):
     # Codex review, PR #656 follow-up on discussion_r3839652545: "Add
     # override roots to configured cap seeds". default_pooled_cap_seed_
     # roots()'s own perplexity_primary_*/manual_override_* glob fix is
@@ -2176,7 +2200,6 @@ def test_load_morning_config_respects_an_explicitly_empty_cap_seed_roots(tmp_pat
     cfg = load_morning_config(str(cfg_dir))
 
     assert cfg.cap_seed_roots == ()
-
 
 
 def test_load_morning_config_reads_approved_dates_from_trading_window(tmp_path):
@@ -2248,6 +2271,7 @@ def test_maybe_block_for_holiday_preserves_submitted_run_state(tmp_path):
     )
 
     from morning_dca import _APPROVED_DATES_LOAD_FAILED, load_morning_config
+
     cfg = load_morning_config(str(cfg_dir))
     cfg = MorningConfig(
         **cast(
@@ -2446,17 +2470,19 @@ def test_load_morning_config_reads_multipliers_not_max_drop(tmp_path):
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir()
     (cfg_dir / "morning_dca.json").write_text(
-        json.dumps({
-            "sizing_ladder": {
-                "base_amount_usd": 3.0,
-                "no_buy_below_pct": 0.1,
-                "tiers": [
-                    {"min_drop_pct": 0.1, "max_drop_pct": 1.0, "multiplier": 1.0},
-                    {"min_drop_pct": 1.0, "max_drop_pct": 2.0, "multiplier": 1.5},
-                    {"min_drop_pct": 8.0, "max_drop_pct": None, "multiplier": 5.0},
-                ],
-            },
-        }),
+        json.dumps(
+            {
+                "sizing_ladder": {
+                    "base_amount_usd": 3.0,
+                    "no_buy_below_pct": 0.1,
+                    "tiers": [
+                        {"min_drop_pct": 0.1, "max_drop_pct": 1.0, "multiplier": 1.0},
+                        {"min_drop_pct": 1.0, "max_drop_pct": 2.0, "multiplier": 1.5},
+                        {"min_drop_pct": 8.0, "max_drop_pct": None, "multiplier": 5.0},
+                    ],
+                },
+            }
+        ),
         encoding="utf-8",
     )
     cfg = load_morning_config(str(cfg_dir))
@@ -2645,10 +2671,22 @@ def test_preflight_run_writes_validation_and_summary_and_pointer(tmp_path):
 
 # --- Machine-complete pre-flight contract (morning-preflight-v2) ------------
 _MACHINE_TICKER_FIELDS = {
-    "symbol", "active_universe", "quote_available", "prior_close_available",
-    "tradable", "account_ok", "buying_power_ok", "spread_pct", "spread_ok",
-    "trend_status", "data_confidence_status", "early_drop_pct", "early_multiplier",
-    "hypothetical_amount", "eligible_to_execute", "ineligible_reason",
+    "symbol",
+    "active_universe",
+    "quote_available",
+    "prior_close_available",
+    "tradable",
+    "account_ok",
+    "buying_power_ok",
+    "spread_pct",
+    "spread_ok",
+    "trend_status",
+    "data_confidence_status",
+    "early_drop_pct",
+    "early_multiplier",
+    "hypothetical_amount",
+    "eligible_to_execute",
+    "ineligible_reason",
 }
 
 
@@ -2661,9 +2699,7 @@ class _UnresolvedProvider(FixedDropProvider):
 
     def get_previous_close_bar(self, ticker, as_of):
         if ticker in self._unresolved:
-            ts = datetime.combine(
-                as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
-            )
+            ts = datetime.combine(as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN)
             return Bar(timestamp=ts, open=-1.0, high=-1.0, low=-1.0, close=-1.0, volume=0.0)
         return super().get_previous_close_bar(ticker, as_of)
 
@@ -2684,9 +2720,16 @@ def test_preflight_machine_complete_envelope(tmp_path):
     art = ex.run(_now_preflight(), data)["artifacts"]
 
     # Every required top-level machine field is present.
-    for key in ("overall_ok", "eligible_count", "ineligible_count",
-                "unresolved_tickers", "blocking_errors", "warnings",
-                "run_classification", "per_ticker_eligibility"):
+    for key in (
+        "overall_ok",
+        "eligible_count",
+        "ineligible_count",
+        "unresolved_tickers",
+        "blocking_errors",
+        "warnings",
+        "run_classification",
+        "per_ticker_eligibility",
+    ):
         assert key in art, key
 
     # No global failure -> overall_ok true even with an ineligible ticker.
@@ -2727,9 +2770,7 @@ def test_preflight_unresolved_ticker_does_not_invalidate_run(tmp_path):
         MorningConfig(tickers=("BIG", "AAAU"), morning_run_state_root=str(tmp_path)),
         mode=MORNING_PREFLIGHT_MODE,
     )
-    data = _UnresolvedProvider(
-        SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "AAAU": 1.0}, unresolved=("AAAU",)
-    )
+    data = _UnresolvedProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "AAAU": 1.0}, unresolved=("AAAU",))
     art = ex.run(_now_preflight(), data)["artifacts"]
 
     assert art["overall_ok"] is True
@@ -2774,8 +2815,7 @@ def test_preflight_machine_complete_validates_against_json_schema(tmp_path):
     schemas_dir = Path(__file__).resolve().parent.parent / "schemas"
     main = json.loads((schemas_dir / "morning_preflight.schema.json").read_bytes())
     resources = [
-        (name, Resource.from_contents(
-            json.loads((schemas_dir / name).read_bytes())))
+        (name, Resource.from_contents(json.loads((schemas_dir / name).read_bytes())))
         for name in ("morning_preflight.schema.json", "morning_run_classification.schema.json")
     ]
     registry = Registry().with_resources(resources)
@@ -2784,9 +2824,7 @@ def test_preflight_machine_complete_validates_against_json_schema(tmp_path):
         MorningConfig(tickers=("BIG", "AAAU"), morning_run_state_root=str(tmp_path)),
         mode=MORNING_PREFLIGHT_MODE,
     )
-    data = _UnresolvedProvider(
-        SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "AAAU": 1.0}, unresolved=("AAAU",)
-    )
+    data = _UnresolvedProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "AAAU": 1.0}, unresolved=("AAAU",))
     art = ex.run(_now_preflight(), data)["artifacts"]
     jsonschema.Draft7Validator(main, registry=registry).validate(art)
 
@@ -2835,22 +2873,24 @@ def test_load_same_day_preflight_reads_per_ticker_eligibility_v2(tmp_path):
     run_dir = tmp_path / "20260708_0945ET"
     run_dir.mkdir(parents=True)
     (run_dir / "run_state.json").write_text(
-        json.dumps({
-            "run_id": "morning_preflight_20260708",
-            "trading_day": "2026-07-08",
-            "overall_ok": True,
-            "run_classification": {
-                "run_origin": "scheduled",
-                "manual_run": False,
-                "stream": "morning",
-                "run_type": "morning_dca_preflight",
-                "state_schema_version": "morning-preflight-v2-machine-complete",
-            },
-            "per_ticker_eligibility": [
-                {"symbol": "BIG", "eligible_to_execute": True},
-                {"symbol": "FLAT", "eligible_to_execute": False},
-            ],
-        }),
+        json.dumps(
+            {
+                "run_id": "morning_preflight_20260708",
+                "trading_day": "2026-07-08",
+                "overall_ok": True,
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "manual_run": False,
+                    "stream": "morning",
+                    "run_type": "morning_dca_preflight",
+                    "state_schema_version": "morning-preflight-v2-machine-complete",
+                },
+                "per_ticker_eligibility": [
+                    {"symbol": "BIG", "eligible_to_execute": True},
+                    {"symbol": "FLAT", "eligible_to_execute": False},
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -2869,13 +2909,15 @@ def test_load_same_day_preflight_primary_path_manual_state_rejected(tmp_path):
     run_dir = tmp_path / "20260708_0945ET"
     run_dir.mkdir(parents=True)
     (run_dir / "run_state.json").write_text(
-        json.dumps({
-            "run_id": "manual_morning_preflight_20260708",
-            "trading_day": "2026-07-08",
-            "overall_ok": True,
-            "run_classification": {"run_origin": "manual", "manual_run": True, "stream": "morning"},
-            "eligible_to_execute_tickers": ["BIG"],
-        }),
+        json.dumps(
+            {
+                "run_id": "manual_morning_preflight_20260708",
+                "trading_day": "2026-07-08",
+                "overall_ok": True,
+                "run_classification": {"run_origin": "manual", "manual_run": True, "stream": "morning"},
+                "eligible_to_execute_tickers": ["BIG"],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -2890,13 +2932,15 @@ def test_load_same_day_preflight_primary_path_prior_day_state_rejected(tmp_path)
     run_dir = tmp_path / "20260708_0945ET"
     run_dir.mkdir(parents=True)
     (run_dir / "run_state.json").write_text(
-        json.dumps({
-            "run_id": "morning_preflight_20260707",
-            "trading_day": "2026-07-07",
-            "overall_ok": True,
-            "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "morning"},
-            "eligible_to_execute_tickers": ["BIG"],
-        }),
+        json.dumps(
+            {
+                "run_id": "morning_preflight_20260707",
+                "trading_day": "2026-07-07",
+                "overall_ok": True,
+                "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "morning"},
+                "eligible_to_execute_tickers": ["BIG"],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -2911,13 +2955,15 @@ def test_load_same_day_preflight_primary_path_wrong_stream_rejected(tmp_path):
     run_dir = tmp_path / "20260708_0945ET"
     run_dir.mkdir(parents=True)
     (run_dir / "run_state.json").write_text(
-        json.dumps({
-            "run_id": "midday_live_20260708_1230ET",
-            "trading_day": "2026-07-08",
-            "overall_ok": True,
-            "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "midday"},
-            "eligible_to_execute_tickers": ["BIG"],
-        }),
+        json.dumps(
+            {
+                "run_id": "midday_live_20260708_1230ET",
+                "trading_day": "2026-07-08",
+                "overall_ok": True,
+                "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "midday"},
+                "eligible_to_execute_tickers": ["BIG"],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -2933,23 +2979,27 @@ def test_load_same_day_preflight_pointer_wrong_stream_rejected(tmp_path):
     target_dir.mkdir(parents=True)
     target_path = target_dir / "run_state.json"
     target_path.write_text(
-        json.dumps({
-            "run_id": "morning_preflight_20260708",
-            "trading_day": "2026-07-08",
-            "overall_ok": True,
-            "run_classification": {"run_origin": "scheduled", "manual_run": False},
-            "eligible_to_execute_tickers": ["BIG"],
-        }),
+        json.dumps(
+            {
+                "run_id": "morning_preflight_20260708",
+                "trading_day": "2026-07-08",
+                "overall_ok": True,
+                "run_classification": {"run_origin": "scheduled", "manual_run": False},
+                "eligible_to_execute_tickers": ["BIG"],
+            }
+        ),
         encoding="utf-8",
     )
     pointer = tmp_path / "latest_preflight.json"
     pointer.write_text(
-        json.dumps({
-            "run_id": "morning_preflight_20260708",
-            "run_state_path": str(target_path),
-            "trading_day": "2026-07-08",
-            "stream": "midday",
-        }),
+        json.dumps(
+            {
+                "run_id": "morning_preflight_20260708",
+                "run_state_path": str(target_path),
+                "trading_day": "2026-07-08",
+                "stream": "midday",
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -2963,23 +3013,27 @@ def test_load_same_day_preflight_pointer_manual_target_rejected(tmp_path):
     target_dir.mkdir(parents=True)
     target_path = target_dir / "run_state.json"
     target_path.write_text(
-        json.dumps({
-            "run_id": "manual_x",
-            "trading_day": "2026-07-08",
-            "overall_ok": True,
-            "run_classification": {"run_origin": "manual", "manual_run": True},
-            "eligible_to_execute_tickers": ["BIG"],
-        }),
+        json.dumps(
+            {
+                "run_id": "manual_x",
+                "trading_day": "2026-07-08",
+                "overall_ok": True,
+                "run_classification": {"run_origin": "manual", "manual_run": True},
+                "eligible_to_execute_tickers": ["BIG"],
+            }
+        ),
         encoding="utf-8",
     )
     pointer = tmp_path / "latest_preflight.json"
     pointer.write_text(
-        json.dumps({
-            "run_id": "manual_x",
-            "run_state_path": str(target_path),
-            "trading_day": "2026-07-08",
-            "stream": "morning",
-        }),
+        json.dumps(
+            {
+                "run_id": "manual_x",
+                "run_state_path": str(target_path),
+                "trading_day": "2026-07-08",
+                "stream": "morning",
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -2993,29 +3047,33 @@ def test_load_same_day_preflight_pointer_valid_used_as_fallback(tmp_path):
     target_dir.mkdir(parents=True)
     target_path = target_dir / "run_state.json"
     target_path.write_text(
-        json.dumps({
-            "run_id": "morning_preflight_20260708",
-            "trading_day": "2026-07-08",
-            "overall_ok": True,
-            "run_classification": {
-                "run_origin": "scheduled",
-                "manual_run": False,
-                "run_type": "morning_dca_preflight",
-                "state_schema_version": "morning-preflight-v2-machine-complete",
-            },
-            "eligible_to_execute_tickers": ["BIG"],
-        }),
+        json.dumps(
+            {
+                "run_id": "morning_preflight_20260708",
+                "trading_day": "2026-07-08",
+                "overall_ok": True,
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "manual_run": False,
+                    "run_type": "morning_dca_preflight",
+                    "state_schema_version": "morning-preflight-v2-machine-complete",
+                },
+                "eligible_to_execute_tickers": ["BIG"],
+            }
+        ),
         encoding="utf-8",
     )
     pointer = tmp_path / "latest_preflight.json"
     pointer.write_text(
-        json.dumps({
-            "run_id": "morning_preflight_20260708",
-            "run_state_path": str(target_path),
-            "trading_day": "2026-07-08",
-            "stream": "morning",
-            "pointer_status": "valid",
-        }),
+        json.dumps(
+            {
+                "run_id": "morning_preflight_20260708",
+                "run_state_path": str(target_path),
+                "trading_day": "2026-07-08",
+                "stream": "morning",
+                "pointer_status": "valid",
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -3032,14 +3090,16 @@ def test_load_same_day_preflight_fails_closed_when_overall_ok_false(tmp_path):
     run_dir = tmp_path / "20260708_0945ET"
     run_dir.mkdir(parents=True)
     (run_dir / "run_state.json").write_text(
-        json.dumps({
-            "run_id": "morning_preflight_20260708",
-            "trading_day": "2026-07-08",
-            "overall_ok": False,
-            "blocking_errors": ["account lookup failed"],
-            # Even if some eligibility data is present, it must not be trusted.
-            "eligible_to_execute_tickers": ["BIG"],
-        }),
+        json.dumps(
+            {
+                "run_id": "morning_preflight_20260708",
+                "trading_day": "2026-07-08",
+                "overall_ok": False,
+                "blocking_errors": ["account lookup failed"],
+                # Even if some eligibility data is present, it must not be trusted.
+                "eligible_to_execute_tickers": ["BIG"],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -3072,19 +3132,21 @@ def test_load_same_day_preflight_rejects_artifact_symlink_into_forbidden_root(tm
     forbidden_root.mkdir(parents=True)
     forbidden_state = forbidden_root / "run_state.json"
     forbidden_state.write_text(
-        json.dumps({
-            "run_id": "morning_preflight_20260708",
-            "trading_day": "2026-07-08",
-            "overall_ok": True,
-            "eligible_to_execute_tickers": ["SMALL"],
-            "per_ticker_eligibility": [{"symbol": "SMALL", "eligible_to_execute": True}],
-            "run_classification": {
-                "stream": "morning",
-                "run_type": "morning_dca_preflight",
-                "manual_run": False,
-                "state_schema_version": "morning-preflight-v2-machine-complete",
-            },
-        }),
+        json.dumps(
+            {
+                "run_id": "morning_preflight_20260708",
+                "trading_day": "2026-07-08",
+                "overall_ok": True,
+                "eligible_to_execute_tickers": ["SMALL"],
+                "per_ticker_eligibility": [{"symbol": "SMALL", "eligible_to_execute": True}],
+                "run_classification": {
+                    "stream": "morning",
+                    "run_type": "morning_dca_preflight",
+                    "manual_run": False,
+                    "state_schema_version": "morning-preflight-v2-machine-complete",
+                },
+            }
+        ),
         encoding="utf-8",
     )
     (allowed_run_dir / "run_state.json").symlink_to(forbidden_state)
@@ -3117,19 +3179,21 @@ def test_load_same_day_preflight_rejects_artifact_symlink_outside_preflight_root
     external_dir.mkdir(parents=True)
     external_state = external_dir / "run_state.json"
     external_state.write_text(
-        json.dumps({
-            "run_id": "morning_preflight_20260708",
-            "trading_day": "2026-07-08",
-            "overall_ok": True,
-            "eligible_to_execute_tickers": ["SMALL"],
-            "per_ticker_eligibility": [{"symbol": "SMALL", "eligible_to_execute": True}],
-            "run_classification": {
-                "stream": "morning",
-                "run_type": "morning_dca_preflight",
-                "manual_run": False,
-                "state_schema_version": "morning-preflight-v2-machine-complete",
-            },
-        }),
+        json.dumps(
+            {
+                "run_id": "morning_preflight_20260708",
+                "trading_day": "2026-07-08",
+                "overall_ok": True,
+                "eligible_to_execute_tickers": ["SMALL"],
+                "per_ticker_eligibility": [{"symbol": "SMALL", "eligible_to_execute": True}],
+                "run_classification": {
+                    "stream": "morning",
+                    "run_type": "morning_dca_preflight",
+                    "manual_run": False,
+                    "state_schema_version": "morning-preflight-v2-machine-complete",
+                },
+            }
+        ),
         encoding="utf-8",
     )
     (allowed_run_dir / "run_state.json").symlink_to(external_state)
@@ -3263,9 +3327,7 @@ def test_maybe_block_for_holiday_seeds_prior_spend_in_budget_ledger(tmp_path):
     prior_state = {
         "run_id": "morning_live_20260706_1030ET",
         "trading_day": "2026-07-06",
-        "broker_outcomes": {
-            "SMALL": {"status": "submitted", "submitted_amount_usd": 50.0, "order_id": "ord-1"}
-        },
+        "broker_outcomes": {"SMALL": {"status": "submitted", "submitted_amount_usd": 50.0, "order_id": "ord-1"}},
         "buy_candidates": [
             {
                 "symbol": "SMALL",
@@ -3304,9 +3366,7 @@ def test_maybe_block_for_holiday_seeds_same_day_pooled_spend(tmp_path):
         "run_id": "market_open_live_20260708_0935ET",
         "trading_day": "2026-07-08",
         "generated_at": "2026-07-08T09:35:05-04:00",
-        "broker_outcomes": {
-            "SMALL": {"status": "submitted", "submitted_amount_usd": 30.0, "order_id": "ord-mo-1"}
-        },
+        "broker_outcomes": {"SMALL": {"status": "submitted", "submitted_amount_usd": 30.0, "order_id": "ord-mo-1"}},
         "buy_candidates": [
             {
                 "ticker": "SMALL",
@@ -3515,9 +3575,7 @@ def test_preflight_classification_matches_morning_schema():
     schema_path = Path(__file__).resolve().parent.parent / "schemas" / "morning_run_classification.schema.json"
     schema = json.loads(schema_path.read_bytes())
     cfg = MorningConfig(tickers=("BIG",))
-    rc = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE).run_classification(
-        _now_preflight(), manual=False
-    )
+    rc = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE).run_classification(_now_preflight(), manual=False)
     assert rc["run_type"] == "morning_dca_preflight"
     assert rc["cron_id"] == "bb4f6ef1"
     assert rc["state_schema_version"] == "morning-preflight-v2-machine-complete"
@@ -3525,9 +3583,7 @@ def test_preflight_classification_matches_morning_schema():
     assert set(schema["required"]).issubset(rc.keys())
     jsonschema = pytest.importorskip("jsonschema")
     jsonschema.validate(rc, schema)
-    manual_rc = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE).run_classification(
-        _now_preflight(), manual=True
-    )
+    manual_rc = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE).run_classification(_now_preflight(), manual=True)
     jsonschema.validate(manual_rc, schema)
 
 
@@ -3550,17 +3606,19 @@ def _seed_preflight(tmp_path, tickers, trading_date=None):
     pf_dir = tmp_path / folder
     pf_dir.mkdir(parents=True, exist_ok=True)
     (pf_dir / "run_state.json").write_text(
-        json.dumps({
-            "eligible_to_execute_tickers": list(tickers),
-            "trading_day": trading_date.isoformat(),
-            "run_classification": {
-                "run_origin": "scheduled",
-                "manual_run": False,
-                "stream": "morning",
-                "run_type": "morning_dca_preflight",
-                "state_schema_version": "morning-preflight-v2-machine-complete",
-            },
-        }),
+        json.dumps(
+            {
+                "eligible_to_execute_tickers": list(tickers),
+                "trading_day": trading_date.isoformat(),
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "manual_run": False,
+                    "stream": "morning",
+                    "run_type": "morning_dca_preflight",
+                    "state_schema_version": "morning-preflight-v2-machine-complete",
+                },
+            }
+        ),
         encoding="utf-8",
     )
     return tmp_path
@@ -3753,9 +3811,7 @@ def test_scheduled_live_run_writing_run_state_then_failing_is_a_late_error(tmp_p
     assert marker["failure_phase"] == "after_run_artifact"
 
 
-def test_freshness_probe_ignores_a_write_made_while_waiting_for_the_attempt_lock(
-    tmp_path, monkeypatch
-):
+def test_freshness_probe_ignores_a_write_made_while_waiting_for_the_attempt_lock(tmp_path, monkeypatch):
     # Codex review discussion_r3849268549 ("Snapshot artifact freshness after
     # acquiring the attempt lock"): when two scheduled attempts overlap, the
     # waiter used to snapshot run_state.json BEFORE blocking on
@@ -3782,9 +3838,7 @@ def test_freshness_probe_ignores_a_write_made_while_waiting_for_the_attempt_lock
         # Stands in for the wait: by the time this call gets the lock, the
         # attempt that held it has already published this slot's run_state.json.
         run_state_path.parent.mkdir(parents=True, exist_ok=True)
-        run_state_path.write_text(
-            '{"run_id": "morning_live_written_by_the_other_attempt"}', encoding="utf-8"
-        )
+        run_state_path.write_text('{"run_id": "morning_live_written_by_the_other_attempt"}', encoding="utf-8")
         yield
 
     monkeypatch.setattr(morning_dca, "cross_process_lock", _lock_held_by_a_concurrent_attempt)
@@ -3827,9 +3881,7 @@ def test_freshness_probe_is_cleared_when_the_attempt_lock_times_out(tmp_path, mo
         # The holder publishes the slot's run_state.json, then this waiter
         # exhausts its window without ever acquiring the lock.
         run_state_path.parent.mkdir(parents=True, exist_ok=True)
-        run_state_path.write_text(
-            '{"run_id": "morning_live_written_by_the_other_attempt"}', encoding="utf-8"
-        )
+        run_state_path.write_text('{"run_id": "morning_live_written_by_the_other_attempt"}', encoding="utf-8")
         raise TimeoutError("could not acquire flock within 30s")
 
     monkeypatch.setattr(morning_dca, "cross_process_lock", _held_until_timeout)
@@ -4602,9 +4654,7 @@ def test_blocked_retry_synthesizes_a_row_for_outcome_only_evidence(tmp_path):
     artifacts = second["artifacts"]
 
     assert artifacts["status"] == "blocked"
-    synthesized = [
-        row for row in artifacts["buy_candidates"] if row["ticker"] == submitted_ticker
-    ]
+    synthesized = [row for row in artifacts["buy_candidates"] if row["ticker"] == submitted_ticker]
     assert len(synthesized) == 1, "the outcome-only order must be represented by a row"
     row = synthesized[0]
     assert row["status"] == "submitted"
@@ -4627,9 +4677,7 @@ def test_blocked_retry_synthesizes_a_row_for_outcome_only_evidence(tmp_path):
     ],
     ids=("boolean-amount", "ambiguous-missing-status"),
 )
-def test_blocked_retry_validates_outcome_only_order_amount_and_status(
-    tmp_path, outcome, expects_unreconstructable
-):
+def test_blocked_retry_validates_outcome_only_order_amount_and_status(tmp_path, outcome, expects_unreconstructable):
     """Outcome-only carry-forward must not normalize corrupt evidence into a safe order."""
     pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
@@ -4653,8 +4701,7 @@ def test_blocked_retry_validates_outcome_only_order_amount_and_status(
     if expects_unreconstructable:
         assert artifacts["unreconstructable_submitted_tickers"] == [ticker]
         assert not any(
-            row["ticker"] == ticker and row.get("planned_amount_usd") == 1.0
-            for row in artifacts["buy_candidates"]
+            row["ticker"] == ticker and row.get("planned_amount_usd") == 1.0 for row in artifacts["buy_candidates"]
         )
     else:
         row = next(row for row in artifacts["buy_candidates"] if row["ticker"] == ticker)
@@ -4684,9 +4731,7 @@ def test_ambiguous_same_ticker_rows_keep_unknown_notional_marker_across_retries(
             {"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0},
             {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": None},
         ],
-        "broker_outcomes": {
-            "AAPL": {"ticker": "AAPL", "status": "filled", "submitted_amount_usd": 3.0}
-        },
+        "broker_outcomes": {"AAPL": {"ticker": "AAPL", "status": "filled", "submitted_amount_usd": 3.0}},
         "unreconstructable_submitted_tickers": ["AAPL"],
     }
     (run_dir / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
@@ -4767,8 +4812,7 @@ def test_blocked_retry_preserves_pending_and_unconfirmed_orders(tmp_path, pre_te
     on_disk = json.loads(run_state_path.read_bytes())
     assert on_disk["status"] == "blocked"
     assert any(
-        row["ticker"] == pending_ticker and row["status"] == pre_terminal_status
-        for row in on_disk["buy_candidates"]
+        row["ticker"] == pending_ticker and row["status"] == pre_terminal_status for row in on_disk["buy_candidates"]
     ), "the pending/unconfirmed order must not be erased from the persisted artifact"
 
 
@@ -4803,9 +4847,7 @@ def test_blocked_retry_preserves_ambiguous_placement_reservation(tmp_path):
 
 
 @pytest.mark.parametrize("pre_terminal_status", ["pending", "unconfirmed"])
-def test_blocked_retry_carries_candidate_only_pending_orders_into_the_csv(
-    tmp_path, pre_terminal_status
-):
+def test_blocked_retry_carries_candidate_only_pending_orders_into_the_csv(tmp_path, pre_terminal_status):
     # Codex review ("Carry in-flight candidates into submitted_orders.csv"):
     # the prior test covers the shape where broker_outcomes ALSO carries the
     # pending/unconfirmed status -- submitted_order_rows() picks that up on
@@ -4839,18 +4881,15 @@ def test_blocked_retry_carries_candidate_only_pending_orders_into_the_csv(
 
     second = ex.run(_now_live(), data, broker=None)
     assert second["artifacts"]["status"] == "blocked"
-    carried = [
-        row for row in second["artifacts"]["buy_candidates"] if row["ticker"] == pending_ticker
-    ]
+    carried = [row for row in second["artifacts"]["buy_candidates"] if row["ticker"] == pending_ticker]
     assert len(carried) == 1 and carried[0]["status"] == pre_terminal_status
 
     csv_path = run_state_path.parent / "submitted_orders.csv"
     with csv_path.open(newline="", encoding="utf-8") as handle:
         order_rows = list(csv.DictReader(handle))
-    assert any(
-        row["ticker"] == pending_ticker and row["status"] == pre_terminal_status
-        for row in order_rows
-    ), "a candidate-only pending/unconfirmed order must still reach submitted_orders.csv"
+    assert any(row["ticker"] == pending_ticker and row["status"] == pre_terminal_status for row in order_rows), (
+        "a candidate-only pending/unconfirmed order must still reach submitted_orders.csv"
+    )
 
 
 @pytest.mark.parametrize("outcome_status", ["pending", "unconfirmed", "filled"])
@@ -4979,9 +5018,7 @@ def test_blocked_live_retry_does_not_preserve_stale_non_submitted_block(tmp_path
         "broker account mismatch: expected 999000111, got not-the-approved-account"
     )
     on_disk = json.loads(run_state_path.read_bytes())
-    assert on_disk["block_reason"] == (
-        "broker account mismatch: expected 999000111, got not-the-approved-account"
-    )
+    assert on_disk["block_reason"] == ("broker account mismatch: expected 999000111, got not-the-approved-account")
 
 
 def test_blocked_live_retry_recovers_from_corrupted_existing_run_state(tmp_path):
@@ -5200,12 +5237,24 @@ def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
 
     class _FakeLiveBroker(FakeLiveBroker):
         """Returns real-looking order IDs so submitted_today accumulates."""
-        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
-        def available_buying_power(self): return 500.0
-        def same_day_strategy_order_exists(self, ticker, trading_day): return False
-        def is_tradable_for_fractional_buy(self, ticker): return True
-        def review_market_buy(self, ticker, notional_usd): return True, "ok"
-        def place_market_buy(self, ticker, notional_usd, ref_id): return f"ORDER-{ticker}"
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            return f"ORDER-{ticker}"
 
     pf_root = _seed_preflight(tmp_path / "pf", ("BIGDROP", "SMALLDROP"))
     cfg = MorningConfig(
@@ -5222,10 +5271,13 @@ def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
     res = ex.run(_now_live(), data, broker=_FakeLiveBroker())
     broker_outcomes = res["artifacts"].get("broker_outcomes", {})
     assert broker_outcomes.get("BIGDROP", {}).get("status") == "submitted", "BIGDROP (5x) should be placed first"
-    assert broker_outcomes.get("SMALLDROP", {}).get("status") == "cap_exceeded", "SMALLDROP (1.5x) should be cap-gated out"
+    assert broker_outcomes.get("SMALLDROP", {}).get("status") == "cap_exceeded", (
+        "SMALLDROP (1.5x) should be cap-gated out"
+    )
 
 
 # ── Morning top-up guard ─────────────────────────────────────────────────────
+
 
 def _write_prior_run_state(
     root: Path,
@@ -5264,12 +5316,14 @@ def _write_prior_run_state(
     if selected_base_amount_usd is not None:
         candidate["selected_base_amount_usd"] = selected_base_amount_usd
     (run_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": "2026-07-08",
-            "generated_at": "2026-07-08T09:00:00-04:00",
-            "run_classification": {"run_origin": "manual", "manual_run": True},
-            "buy_candidates": [candidate],
-        }),
+        json.dumps(
+            {
+                "trading_day": "2026-07-08",
+                "generated_at": "2026-07-08T09:00:00-04:00",
+                "run_classification": {"run_origin": "manual", "manual_run": True},
+                "buy_candidates": [candidate],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -5507,14 +5561,10 @@ def test_morning_evaluate_top_up_full_dollar_ladder_deducts_settled_slot_credit(
         selected_base_amount_usd=1.0,
     )
 
-    outcome = ex._evaluate_top_up(
-        signal, prior, settled_credit_for_slot_usd=0.80, preserved_credit_for_slot_usd=0.20
-    )
+    outcome = ex._evaluate_top_up(signal, prior, settled_credit_for_slot_usd=0.80, preserved_credit_for_slot_usd=0.20)
 
     unsettled_outcome = ex._evaluate_top_up(signal, prior, preserved_credit_for_slot_usd=0.20)
-    assert outcome.incremental_order_amount == pytest.approx(
-        unsettled_outcome.incremental_order_amount - 0.80
-    )
+    assert outcome.incremental_order_amount == pytest.approx(unsettled_outcome.incremental_order_amount - 0.80)
 
 
 def test_morning_evaluate_top_up_routes_post_settlement_sub_dollar_remainder_to_credit_policy():
@@ -5648,9 +5698,16 @@ def test_morning_retry_keeps_partial_preserve_out_of_minimum_order_pool(tmp_path
     ex.credit_ledger.preserve_pending("AAPL", "2026-07-08", 1.0, idempotency_key=slot_key)
     ex.credit_ledger.settle("AAPL", "2026-07-08", 0.80, stream="midday")
     signal = MorningSignal(
-        ticker="AAPL", source="finance", action=Action.BUY, reason="test",
-        current_price=99.2, previous_close=100.0, drop_pct=0.8, multiplier=1.8,
-        hypothetical_amount_usd=1.8, selected_base_amount_usd=1.0,
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.2,
+        previous_close=100.0,
+        drop_pct=0.8,
+        multiplier=1.8,
+        hypothetical_amount_usd=1.8,
+        selected_base_amount_usd=1.0,
     )
 
     outcome = ex._compute_top_up(now, [signal])["AAPL"]
@@ -5708,10 +5765,12 @@ def test_morning_compute_top_up_persists_pending_credit_and_is_retry_safe(tmp_pa
     run_dir = ex.run_state_dir(now)
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": "2026-07-08",
-            "buy_candidates": [{"ticker": "AAPL", "cumulative_credit_decline_usd": 0.30}],
-        }),
+        json.dumps(
+            {
+                "trading_day": "2026-07-08",
+                "buy_candidates": [{"ticker": "AAPL", "cumulative_credit_decline_usd": 0.30}],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -5863,9 +5922,7 @@ def test_morning_scheduled_duplicate_recovery_settles_preserved_credit(tmp_path)
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return False
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORDER-AAPL", "dollar_amount": 1.0}
 
         def is_tradable_for_fractional_buy(self, ticker):
@@ -5879,9 +5936,7 @@ def test_morning_scheduled_duplicate_recovery_settles_preserved_credit(tmp_path)
     ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
     trading_day = date(2026, 7, 8)
     slot_key = "morning-2026-07-08-1030"
-    ex.credit_ledger.preserve_pending(
-        "AAPL", trading_day.isoformat(), 0.20, idempotency_key=slot_key
-    )
+    ex.credit_ledger.preserve_pending("AAPL", trading_day.isoformat(), 0.20, idempotency_key=slot_key)
     assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.20
 
     signal = MorningSignal(
@@ -5963,8 +6018,12 @@ def test_morning_compute_top_up_skips_settled_deduction_when_prior_already_refle
     # ticker (as if an earlier retry of this same slot already placed a
     # $1.00 order).
     _seed_prior(
-        state_root, "AAPL", 1.0,
-        reference_price=100.0, trading_date=trading_day, selected_base_amount_usd=1.0,
+        state_root,
+        "AAPL",
+        1.0,
+        reference_price=100.0,
+        trading_date=trading_day,
+        selected_base_amount_usd=1.0,
         run_id=ex.run_id(now, manual=False),
     )
     ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
@@ -5974,11 +6033,13 @@ def test_morning_compute_top_up_skips_settled_deduction_when_prior_already_refle
     # leaving settled_credit_for_slot_usd=0.80 and preserved_credit_for_slot_usd=0.20
     # outstanding, matching test_morning_top_up_deducts_partially_settled_
     # slot_credit's own numbers.
-    ex.credit_ledger.preserve_pending(
-        "AAPL", trading_day.isoformat(), 1.0, idempotency_key=slot_key
-    )
+    ex.credit_ledger.preserve_pending("AAPL", trading_day.isoformat(), 1.0, idempotency_key=slot_key)
     ex.credit_ledger.settle(
-        "AAPL", trading_day.isoformat(), 0.80, final_session=False, stream="morning",
+        "AAPL",
+        trading_day.isoformat(),
+        0.80,
+        final_session=False,
+        stream="morning",
     )
     assert ex.credit_ledger.settled_credit_for_slot("AAPL", trading_day.isoformat(), slot_key) == 0.80
     assert ex.credit_ledger.preserved_credit_for_slot("AAPL", trading_day.isoformat(), slot_key) == 0.20
@@ -6025,8 +6086,12 @@ def test_morning_compute_top_up_still_deducts_settled_credit_when_prior_is_from_
     trading_day = date(2026, 7, 8)
     now = datetime(2026, 7, 8, 10, 30, tzinfo=EASTERN)
     _seed_prior(
-        state_root, "AAPL", 2.0,
-        reference_price=100.0, trading_date=trading_day, selected_base_amount_usd=1.0,
+        state_root,
+        "AAPL",
+        2.0,
+        reference_price=100.0,
+        trading_date=trading_day,
+        selected_base_amount_usd=1.0,
         run_id="some_other_run_20260708",
     )
     cfg = MorningConfig(
@@ -6038,11 +6103,13 @@ def test_morning_compute_top_up_still_deducts_settled_credit_when_prior_is_from_
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
     slot_key = ex._credit_idempotency_key(now, manual=False)
-    ex.credit_ledger.preserve_pending(
-        "AAPL", trading_day.isoformat(), 1.0, idempotency_key=slot_key
-    )
+    ex.credit_ledger.preserve_pending("AAPL", trading_day.isoformat(), 1.0, idempotency_key=slot_key)
     ex.credit_ledger.settle(
-        "AAPL", trading_day.isoformat(), 0.80, final_session=False, stream="morning",
+        "AAPL",
+        trading_day.isoformat(),
+        0.80,
+        final_session=False,
+        stream="morning",
     )
 
     signal = MorningSignal(
@@ -6094,33 +6161,43 @@ def test_morning_compute_top_up_skips_settled_deduction_when_this_slot_is_any_co
     own_dir = state_root / f"{trading_day.strftime('%Y%m%d')}_1000ET"
     own_dir.mkdir(parents=True, exist_ok=True)
     (own_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": trading_day.isoformat(),
-            "generated_at": f"{trading_day.isoformat()}T10:00:00-04:00",
-            "run_classification": {"run_id": own_run_id, "run_origin": "scheduled", "stream": "morning"},
-            "buy_candidates": [
-                {
-                    "ticker": "AAPL", "status": "filled", "planned_amount_usd": 0.80,
-                    "target_price": 100.0, "selected_base_amount_usd": 1.0,
-                }
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": trading_day.isoformat(),
+                "generated_at": f"{trading_day.isoformat()}T10:00:00-04:00",
+                "run_classification": {"run_id": own_run_id, "run_origin": "scheduled", "stream": "morning"},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "filled",
+                        "planned_amount_usd": 0.80,
+                        "target_price": 100.0,
+                        "selected_base_amount_usd": 1.0,
+                    }
+                ],
+            }
+        ),
         encoding="utf-8",
     )
     newer_dir = state_root / f"{trading_day.strftime('%Y%m%d')}_1015ET"
     newer_dir.mkdir(parents=True, exist_ok=True)
     (newer_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": trading_day.isoformat(),
-            "generated_at": f"{trading_day.isoformat()}T10:15:00-04:00",
-            "run_classification": {"run_id": "newer_unrelated_run", "run_origin": "manual", "stream": "morning"},
-            "buy_candidates": [
-                {
-                    "ticker": "AAPL", "status": "filled", "planned_amount_usd": 1.20,
-                    "target_price": 99.0, "selected_base_amount_usd": 1.0,
-                }
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": trading_day.isoformat(),
+                "generated_at": f"{trading_day.isoformat()}T10:15:00-04:00",
+                "run_classification": {"run_id": "newer_unrelated_run", "run_origin": "manual", "stream": "morning"},
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "filled",
+                        "planned_amount_usd": 1.20,
+                        "target_price": 99.0,
+                        "selected_base_amount_usd": 1.0,
+                    }
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -6132,11 +6209,13 @@ def test_morning_compute_top_up_skips_settled_deduction_when_this_slot_is_any_co
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
-    ex.credit_ledger.preserve_pending(
-        "AAPL", trading_day.isoformat(), 1.0, idempotency_key=own_run_id
-    )
+    ex.credit_ledger.preserve_pending("AAPL", trading_day.isoformat(), 1.0, idempotency_key=own_run_id)
     ex.credit_ledger.settle(
-        "AAPL", trading_day.isoformat(), 0.80, final_session=False, stream="morning",
+        "AAPL",
+        trading_day.isoformat(),
+        0.80,
+        final_session=False,
+        stream="morning",
     )
 
     signal = MorningSignal(
@@ -6189,17 +6268,23 @@ def test_morning_compute_top_up_skips_settled_deduction_when_prior_root_is_an_an
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     _seed_prior(
-        state_root, "AAPL", 1.0,
-        reference_price=100.0, trading_date=trading_day, selected_base_amount_usd=1.0,
+        state_root,
+        "AAPL",
+        1.0,
+        reference_price=100.0,
+        trading_date=trading_day,
+        selected_base_amount_usd=1.0,
         run_id=ex.run_id(now, manual=False),
     )
     ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
     slot_key = ex._credit_idempotency_key(now, manual=False)
-    ex.credit_ledger.preserve_pending(
-        "AAPL", trading_day.isoformat(), 1.0, idempotency_key=slot_key
-    )
+    ex.credit_ledger.preserve_pending("AAPL", trading_day.isoformat(), 1.0, idempotency_key=slot_key)
     ex.credit_ledger.settle(
-        "AAPL", trading_day.isoformat(), 0.80, final_session=False, stream="morning",
+        "AAPL",
+        trading_day.isoformat(),
+        0.80,
+        final_session=False,
+        stream="morning",
     )
 
     signal = MorningSignal(
@@ -6242,8 +6327,12 @@ def test_morning_compute_top_up_still_deducts_settled_credit_when_prior_understa
     # than the $0.80 this slot's ledger already shows settled, simulating
     # the crash-before-persist window.
     _seed_prior(
-        state_root, "AAPL", 0.20,
-        reference_price=100.0, trading_date=trading_day, selected_base_amount_usd=1.0,
+        state_root,
+        "AAPL",
+        0.20,
+        reference_price=100.0,
+        trading_date=trading_day,
+        selected_base_amount_usd=1.0,
     )
     cfg = MorningConfig(
         tickers=("AAPL",),
@@ -6254,11 +6343,13 @@ def test_morning_compute_top_up_still_deducts_settled_credit_when_prior_understa
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "ledger")
     slot_key = ex._credit_idempotency_key(now, manual=False)
-    ex.credit_ledger.preserve_pending(
-        "AAPL", trading_day.isoformat(), 1.0, idempotency_key=slot_key
-    )
+    ex.credit_ledger.preserve_pending("AAPL", trading_day.isoformat(), 1.0, idempotency_key=slot_key)
     ex.credit_ledger.settle(
-        "AAPL", trading_day.isoformat(), 0.80, final_session=False, stream="morning",
+        "AAPL",
+        trading_day.isoformat(),
+        0.80,
+        final_session=False,
+        stream="morning",
     )
 
     signal = MorningSignal(
@@ -6300,8 +6391,12 @@ def test_morning_compute_top_up_reconciles_a_zeroed_preserve_entry_on_revival(tm
     trading_day = date(2026, 7, 8)
     now = datetime(2026, 7, 8, 10, 30, tzinfo=EASTERN)
     _seed_prior(
-        prior_root, "AAPL", 1.0,
-        reference_price=100.0, trading_date=trading_day, selected_base_amount_usd=1.0,
+        prior_root,
+        "AAPL",
+        1.0,
+        reference_price=100.0,
+        trading_date=trading_day,
+        selected_base_amount_usd=1.0,
     )
     cfg = MorningConfig(
         tickers=("AAPL",),
@@ -6316,14 +6411,24 @@ def test_morning_compute_top_up_reconciles_a_zeroed_preserve_entry_on_revival(tm
     # An earlier attempt of THIS SAME slot preserved a $1.00 threshold-
     # crossing credit that got blocked before placement...
     ex.credit_ledger.preserve_pending(
-        "AAPL", trading_day.isoformat(), 1.00, idempotency_key=slot_key, stream="morning",
+        "AAPL",
+        trading_day.isoformat(),
+        1.00,
+        idempotency_key=slot_key,
+        stream="morning",
     )
     # ...then a later retry (before this one) reconciled it down to $0.00
     # because the price temporarily recovered.
     ex.credit_ledger.reconcile_preserved_credit(
-        "AAPL", trading_day.isoformat(), slot_key, 0.0,
-        expected_settled_credit_usd=0.0, expected_outstanding_credit_usd=1.00,
-        expected_pending_usd=1.00, stream="morning", recorded_at=now.isoformat(),
+        "AAPL",
+        trading_day.isoformat(),
+        slot_key,
+        0.0,
+        expected_settled_credit_usd=0.0,
+        expected_outstanding_credit_usd=1.00,
+        expected_pending_usd=1.00,
+        stream="morning",
+        recorded_at=now.isoformat(),
     )
     assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
     assert ex.credit_ledger.preserved_credit_for_slot("AAPL", trading_day.isoformat(), slot_key) == 0.0
@@ -6382,9 +6487,7 @@ def test_morning_scheduled_duplicate_recovery_settlement_is_idempotent(tmp_path)
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return False
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "ORDER-AAPL", "dollar_amount": 1.0}
 
         def is_tradable_for_fractional_buy(self, ticker):
@@ -6398,9 +6501,7 @@ def test_morning_scheduled_duplicate_recovery_settlement_is_idempotent(tmp_path)
     ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
     trading_day = date(2026, 7, 8)
     slot_key = "morning-2026-07-08-1030"
-    ex.credit_ledger.preserve_pending(
-        "AAPL", trading_day.isoformat(), 0.20, idempotency_key=slot_key
-    )
+    ex.credit_ledger.preserve_pending("AAPL", trading_day.isoformat(), 0.20, idempotency_key=slot_key)
     # Simulate the ORIGINAL attempt's own settle() call already having
     # applied this exact recovered order before the crash.
     ex.credit_ledger.settle(
@@ -6465,25 +6566,36 @@ def test_morning_top_up_guard_buys_incremental_when_prior_fill_exists(tmp_path):
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_INCREMENTAL
 
     class _Broker(FakeLiveBroker):
-        def __init__(self): self.placed = {}
-        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
-        def available_buying_power(self): return 500.0
-        def same_day_strategy_order_exists(self, ticker, trading_day): return False
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             # Guarded top-ups use the narrower same-stream ref-id duplicate check;
             # this fixture never has prior broker orders on file, so it always
             # proceeds as a fresh placement.
             return None
-        def is_tradable_for_fractional_buy(self, ticker): return True
-        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
         def place_market_buy(self, ticker, notional_usd, ref_id):
             self.placed[ticker] = notional_usd
             return f"ORDER-{ticker}"
 
     prior_root = tmp_path / "prior"
-    _write_prior_run_state(
-        prior_root, "TOPUP", amount_usd=4.50, decision_price=99.0, selected_base_amount_usd=3.0
-    )
+    _write_prior_run_state(prior_root, "TOPUP", amount_usd=4.50, decision_price=99.0, selected_base_amount_usd=3.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
@@ -6533,9 +6645,7 @@ def test_morning_duplicate_recovery_settles_the_preserved_credit(tmp_path):
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return False
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             # The first attempt's order is already sitting at the broker.
             return {"id": "ORDER-ALREADY-PLACED", "dollar_amount": 1.0}
 
@@ -6774,23 +6884,40 @@ def test_morning_original_settlement_is_keyed_so_the_first_recovery_is_deduped(t
     ex.credit_ledger.record("AAPL", trading_day.isoformat(), 0.30, stream="morning")
 
     signal = MorningSignal(
-        ticker="AAPL", source="finance", action=Action.BUY, reason="test",
-        current_price=99.0, previous_close=100.0, drop_pct=1.0, multiplier=1.0,
-        hypothetical_amount_usd=1.0, selected_base_amount_usd=1.0,
+        ticker="AAPL",
+        source="finance",
+        action=Action.BUY,
+        reason="test",
+        current_price=99.0,
+        previous_close=100.0,
+        drop_pct=1.0,
+        multiplier=1.0,
+        hypothetical_amount_usd=1.0,
+        selected_base_amount_usd=1.0,
     )
     outcome = TopUpOutcome(
-        ticker="AAPL", desired_amount=1.30, decision_price=99.0,
-        prior_same_day_amount=1.0, prior_same_day_reference_price=100.0,
-        prior_same_day_run_id="morning_am", prior_same_day_source="morning",
-        incremental_order_amount=1.0, top_up_guard_result=TOP_UP_INCREMENTAL,
-        top_up_skipped=False, effective_base_amount_usd=1.0,
+        ticker="AAPL",
+        desired_amount=1.30,
+        decision_price=99.0,
+        prior_same_day_amount=1.0,
+        prior_same_day_reference_price=100.0,
+        prior_same_day_run_id="morning_am",
+        prior_same_day_source="morning",
+        incremental_order_amount=1.0,
+        top_up_guard_result=TOP_UP_INCREMENTAL,
+        top_up_skipped=False,
+        effective_base_amount_usd=1.0,
         cumulative_credit_decline_usd=0.30,
     )
 
     # The ORIGINAL placement settles successfully, keyed on ORDER-AAPL.
     ex._place_broker_orders(
-        [signal], trading_day, _PlacingBroker(), {"AAPL": outcome},
-        remaining_daily=180.0, remaining_weekly=900.0,
+        [signal],
+        trading_day,
+        _PlacingBroker(),
+        {"AAPL": outcome},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
     )
     assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.0
 
@@ -6801,8 +6928,12 @@ def test_morning_original_settlement_is_keyed_so_the_first_recovery_is_deduped(t
 
     # The FIRST recovery of that same order must be deduped, not settle again.
     ex._place_broker_orders(
-        [signal], trading_day, _DuplicateBroker(), {"AAPL": outcome},
-        remaining_daily=180.0, remaining_weekly=900.0,
+        [signal],
+        trading_day,
+        _DuplicateBroker(),
+        {"AAPL": outcome},
+        remaining_daily=180.0,
+        remaining_weekly=900.0,
     )
     assert ex.credit_ledger.pending_usd("AAPL", trading_day.isoformat()) == 0.45
 
@@ -6831,9 +6962,7 @@ def test_morning_place_broker_orders_settles_credit_ledger_after_confirmed_submi
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return False
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None
 
         def is_tradable_for_fractional_buy(self, ticker):
@@ -6905,9 +7034,7 @@ def test_morning_terminal_partial_fill_settles_credit_ledger(tmp_path):
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return False
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None
 
         def is_tradable_for_fractional_buy(self, ticker):
@@ -7236,9 +7363,7 @@ def test_consecutive_placement_failures_halt_the_executor_batch(tmp_path):
             raise OrderConfirmationRequiredError("broker unavailable")
 
     tickers = ("AAPL", "GS", "EVR", "IBM", "MSFT")
-    cfg = MorningConfig(
-        tickers=tickers, base_buy_amount_usd=2.0, max_consecutive_placement_failures=3
-    )
+    cfg = MorningConfig(tickers=tickers, base_buy_amount_usd=2.0, max_consecutive_placement_failures=3)
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
     broker = _DownBroker()
@@ -7253,10 +7378,7 @@ def test_consecutive_placement_failures_halt_the_executor_batch(tmp_path):
     )
 
     assert len(broker.attempted) == 3, "the breaker must stop the batch, not attempt all five"
-    assert all(
-        outcomes[t]["status"] == "not_submitted_confirmation_required"
-        for t in broker.attempted
-    )
+    assert all(outcomes[t]["status"] == "not_submitted_confirmation_required" for t in broker.attempted)
     # The unattempted remainder is RECORDED, not simply absent -- see
     # test_the_breaker_preserves_credits_for_candidates_it_skips for why that
     # matters beyond reporting.
@@ -7296,9 +7418,7 @@ def test_the_breaker_preserves_credits_for_candidates_it_skips(tmp_path):
             raise OrderConfirmationRequiredError("broker unavailable")
 
     tickers = ("AAPL", "GS", "EVR", "IBM", "MSFT")
-    cfg = MorningConfig(
-        tickers=tickers, base_buy_amount_usd=2.0, max_consecutive_placement_failures=3
-    )
+    cfg = MorningConfig(tickers=tickers, base_buy_amount_usd=2.0, max_consecutive_placement_failures=3)
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
     trading_day = date(2026, 7, 8)
@@ -7363,9 +7483,7 @@ def test_a_success_between_failures_resets_the_executor_streak(tmp_path):
             return f"ORDER-{ticker}"
 
     tickers = ("AAPL", "GS", "EVR", "IBM", "MSFT", "NVDA")
-    cfg = MorningConfig(
-        tickers=tickers, base_buy_amount_usd=2.0, max_consecutive_placement_failures=3
-    )
+    cfg = MorningConfig(tickers=tickers, base_buy_amount_usd=2.0, max_consecutive_placement_failures=3)
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
     broker = _AlternatingBroker()
@@ -7403,9 +7521,7 @@ def test_confirmation_required_placements_count_toward_the_executor_streak(tmp_p
             raise OrderConfirmationRequiredError("confirmation required")
 
     tickers = ("AAPL", "GS", "EVR", "IBM", "MSFT")
-    cfg = MorningConfig(
-        tickers=tickers, base_buy_amount_usd=2.0, max_consecutive_placement_failures=3
-    )
+    cfg = MorningConfig(tickers=tickers, base_buy_amount_usd=2.0, max_consecutive_placement_failures=3)
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
     broker = _ConfirmationBroker()
@@ -7420,9 +7536,7 @@ def test_confirmation_required_placements_count_toward_the_executor_streak(tmp_p
     )
 
     assert len(broker.attempted) == 3, "the breaker must stop the batch after three refusals"
-    assert all(
-        outcomes[t]["status"] == "not_submitted_confirmation_required" for t in broker.attempted
-    )
+    assert all(outcomes[t]["status"] == "not_submitted_confirmation_required" for t in broker.attempted)
 
 
 def test_every_live_stream_config_loads_the_streak_breaker():
@@ -7441,10 +7555,7 @@ def test_every_live_stream_config_loads_the_streak_breaker():
     config_dir = get_config_dir()
 
     assert load_strategy_config(config_dir).max_consecutive_placement_failures == expected
-    assert (
-        load_morning_config(config_dir, mode=MORNING_LIVE_MODE).max_consecutive_placement_failures
-        == expected
-    )
+    assert load_morning_config(config_dir, mode=MORNING_LIVE_MODE).max_consecutive_placement_failures == expected
     for loader in (load_market_open_config, load_midday_config, load_intraday_config):
         assert loader(config_dir).max_consecutive_placement_failures == expected, loader.__name__
 
@@ -7468,19 +7579,21 @@ def test_a_live_fallback_still_carries_the_shared_circuit_breakers(tmp_path):
     import json as _json
 
     (tmp_path / "budgets.json").write_text(
-        _json.dumps({"circuit_breakers": {
-            "max_per_order_usd": 4.0,
-            "max_orders_per_day": 6,
-            "max_consecutive_placement_failures": 2,
-        }}),
+        _json.dumps(
+            {
+                "circuit_breakers": {
+                    "max_per_order_usd": 4.0,
+                    "max_orders_per_day": 6,
+                    "max_consecutive_placement_failures": 2,
+                }
+            }
+        ),
         encoding="utf-8",
     )
     cfg_path = tmp_path / "morning_dca.json"
 
     def load(mode=MORNING_LIVE_MODE):
-        return load_morning_config(
-            config_dir=str(tmp_path), mode=mode, allow_unpinned_account=True
-        )
+        return load_morning_config(config_dir=str(tmp_path), mode=mode, allow_unpinned_account=True)
 
     # 1. morning_dca.json missing, 2. unparseable, 3. present and valid.
     cfg_path.write_text(_json.dumps({"live_task": {}}), encoding="utf-8")
@@ -7490,8 +7603,7 @@ def test_a_live_fallback_still_carries_the_shared_circuit_breakers(tmp_path):
     cfg_path.write_text("{ not json", encoding="utf-8")
     unparseable = load()
 
-    for label, cfg in (("missing", missing), ("unparseable", unparseable),
-                       ("valid", valid)):
+    for label, cfg in (("missing", missing), ("unparseable", unparseable), ("valid", valid)):
         assert cfg.max_per_order_usd == 4.0, label
         assert cfg.max_orders_per_day == 6, label
         assert cfg.max_consecutive_placement_failures == 2, label
@@ -7529,10 +7641,7 @@ def test_the_executor_streak_breaker_is_loaded_from_budgets_json(tmp_path):
         encoding="utf-8",
     )
     assert load_max_consecutive_placement_failures(tmp_path) == 4
-    assert (
-        load_max_consecutive_placement_failures(tmp_path / "missing")
-        == DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
-    )
+    assert load_max_consecutive_placement_failures(tmp_path / "missing") == DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
 
     (tmp_path / "budgets.json").write_text(
         _json.dumps({"circuit_breakers": {"max_consecutive_placement_failures": True}}),
@@ -7544,10 +7653,7 @@ def test_the_executor_streak_breaker_is_loaded_from_budgets_json(tmp_path):
     # The shipped config is what both live paths actually run on.
     from dca_config import get_config_dir
 
-    assert (
-        load_max_consecutive_placement_failures(get_config_dir())
-        == dca_runner.MAX_CONSECUTIVE_PLACEMENT_FAILURES
-    )
+    assert load_max_consecutive_placement_failures(get_config_dir()) == dca_runner.MAX_CONSECUTIVE_PLACEMENT_FAILURES
 
 
 def test_a_tradability_refusal_does_not_stop_the_executor_batch(tmp_path):
@@ -7595,20 +7701,30 @@ def test_morning_top_up_guard_skips_when_price_not_below_reference(tmp_path):
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_PRICE_NOT_BELOW
 
     class _Broker(FakeLiveBroker):
-        def __init__(self): self.placed = {}
-        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
-        def available_buying_power(self): return 500.0
-        def same_day_strategy_order_exists(self, ticker, trading_day): return False
-        def is_tradable_for_fractional_buy(self, ticker): return True
-        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
         def place_market_buy(self, ticker, notional_usd, ref_id):
             self.placed[ticker] = notional_usd
             return f"ORDER-{ticker}"
 
     prior_root = tmp_path / "prior"
-    _write_prior_run_state(
-        prior_root, "TOPUP", amount_usd=4.50, decision_price=96.0, selected_base_amount_usd=2.0
-    )
+    _write_prior_run_state(prior_root, "TOPUP", amount_usd=4.50, decision_price=96.0, selected_base_amount_usd=2.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
@@ -7663,12 +7779,24 @@ def test_morning_top_up_guard_seeds_ledger_from_prior_fills(tmp_path):
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
     class _Broker(FakeLiveBroker):
-        def __init__(self): self.placed = {}
-        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
-        def available_buying_power(self): return 500.0
-        def same_day_strategy_order_exists(self, ticker, trading_day): return False
-        def is_tradable_for_fractional_buy(self, ticker): return True
-        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
         def place_market_buy(self, ticker, notional_usd, ref_id):
             self.placed[ticker] = notional_usd
             return f"ORDER-{ticker}"
@@ -7715,43 +7843,47 @@ def test_morning_cap_seeding_counts_every_prior_buy_attempt_not_one_per_ticker(t
     first_dir = prior_root / "20260708_0900ET"
     first_dir.mkdir(parents=True)
     (first_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": "2026-07-08",
-            "generated_at": "2026-07-08T09:00:00-04:00",
-            "run_classification": {"run_origin": "manual", "manual_run": True},
-            "buy_candidates": [
-                {
-                    "ticker": "MULTI",
-                    "status": "filled",
-                    "planned_amount_usd": 1.0,
-                    "decision_price": 50.0,
-                    "selected_base_amount_usd": 1.0,
-                },
-                {
-                    "ticker": "FAILTICK",
-                    "status": "failed",
-                },
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": "2026-07-08",
+                "generated_at": "2026-07-08T09:00:00-04:00",
+                "run_classification": {"run_origin": "manual", "manual_run": True},
+                "buy_candidates": [
+                    {
+                        "ticker": "MULTI",
+                        "status": "filled",
+                        "planned_amount_usd": 1.0,
+                        "decision_price": 50.0,
+                        "selected_base_amount_usd": 1.0,
+                    },
+                    {
+                        "ticker": "FAILTICK",
+                        "status": "failed",
+                    },
+                ],
+            }
+        ),
         encoding="utf-8",
     )
     second_dir = prior_root / "20260708_0930ET"
     second_dir.mkdir(parents=True)
     (second_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": "2026-07-08",
-            "generated_at": "2026-07-08T09:30:00-04:00",
-            "run_classification": {"run_origin": "manual", "manual_run": True},
-            "buy_candidates": [
-                {
-                    "ticker": "MULTI",
-                    "status": "filled",
-                    "planned_amount_usd": 1.0,
-                    "decision_price": 49.0,
-                    "selected_base_amount_usd": 1.0,
-                },
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": "2026-07-08",
+                "generated_at": "2026-07-08T09:30:00-04:00",
+                "run_classification": {"run_origin": "manual", "manual_run": True},
+                "buy_candidates": [
+                    {
+                        "ticker": "MULTI",
+                        "status": "filled",
+                        "planned_amount_usd": 1.0,
+                        "decision_price": 49.0,
+                        "selected_base_amount_usd": 1.0,
+                    },
+                ],
+            }
+        ),
         encoding="utf-8",
     )
     pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
@@ -7780,12 +7912,24 @@ def test_morning_top_up_guard_afternoon_fills_do_not_reduce_morning_cap(tmp_path
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
     class _Broker(FakeLiveBroker):
-        def __init__(self): self.placed = {}
-        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
-        def available_buying_power(self): return 500.0
-        def same_day_strategy_order_exists(self, ticker, trading_day): return False
-        def is_tradable_for_fractional_buy(self, ticker): return True
-        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
         def place_market_buy(self, ticker, notional_usd, ref_id):
             self.placed[ticker] = notional_usd
             return f"ORDER-{ticker}"
@@ -7828,13 +7972,23 @@ def test_morning_top_up_guard_inactive_in_manual_live_run(tmp_path):
         def __init__(self):
             self.placed = {}
             self.dup_checked = {}
-        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
-        def available_buying_power(self): return 500.0
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
         def same_day_strategy_order_exists(self, ticker, trading_day):
             self.dup_checked[ticker] = True
             return True  # simulate: order already placed → should block
-        def is_tradable_for_fractional_buy(self, ticker): return True
-        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
         def place_market_buy(self, ticker, notional_usd, ref_id):
             self.placed[ticker] = notional_usd
             return f"ORDER-{ticker}"
@@ -7878,11 +8032,22 @@ def test_morning_cap_seeding_is_idempotent_across_multiple_runs(tmp_path):
     class _Broker(FakeLiveBroker):
         def __init__(self):
             self.placed = {}
-        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
-        def available_buying_power(self): return 500.0
-        def same_day_strategy_order_exists(self, ticker, trading_day): return False
-        def is_tradable_for_fractional_buy(self, ticker): return True
-        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
         def place_market_buy(self, ticker, notional_usd, ref_id):
             self.placed[ticker] = notional_usd
             return f"ORDER-{ticker}"
@@ -7923,14 +8088,18 @@ def test_morning_cap_seeding_is_idempotent_across_multiple_runs(tmp_path):
     run_dir2 = morning_root / "20260708_0901ET"
     run_dir2.mkdir(parents=True, exist_ok=True)
     import json as _json
+
     (run_dir2 / "run_state.json").write_text(
-        _json.dumps({
-            "trading_day": "2026-07-08",
-            "generated_at": "2026-07-08T09:01:00-04:00",
-            "run_classification": {"run_origin": "manual", "manual_run": True},
-            "buy_candidates": [{"ticker": "OTHER", "status": "submitted",
-                                "planned_amount_usd": 4.0, "decision_price": 55.0}],
-        }),
+        _json.dumps(
+            {
+                "trading_day": "2026-07-08",
+                "generated_at": "2026-07-08T09:01:00-04:00",
+                "run_classification": {"run_origin": "manual", "manual_run": True},
+                "buy_candidates": [
+                    {"ticker": "OTHER", "status": "submitted", "planned_amount_usd": 4.0, "decision_price": 55.0}
+                ],
+            }
+        ),
         encoding="utf-8",
     )
     broker3 = _Broker()
@@ -7952,12 +8121,24 @@ def test_cap_seed_scan_failure_poison_clears_on_a_recovered_rescan(tmp_path, mon
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
     class _Broker(FakeLiveBroker):
-        def __init__(self): self.placed = {}
-        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
-        def available_buying_power(self): return 500.0
-        def same_day_strategy_order_exists(self, ticker, trading_day): return False
-        def is_tradable_for_fractional_buy(self, ticker): return True
-        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
         def place_market_buy(self, ticker, notional_usd, ref_id):
             self.placed[ticker] = notional_usd
             return f"ORDER-{ticker}"
@@ -8081,13 +8262,15 @@ def test_earlier_weekday_pending_with_unusable_notional_fails_closed(tmp_path, n
     monday_dir = state_root / "20260629_1030ET"
     monday_dir.mkdir(parents=True)
     (monday_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": "2026-06-29",
-            "run_id": "pending-with-unknown-notional",
-            "buy_candidates": [
-                {"ticker": "AAPL", "status": "pending", "planned_amount_usd": notional},
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": "2026-06-29",
+                "run_id": "pending-with-unknown-notional",
+                "buy_candidates": [
+                    {"ticker": "AAPL", "status": "pending", "planned_amount_usd": notional},
+                ],
+            }
+        ),
         encoding="utf-8",
     )
     cfg = MorningConfig(
@@ -8242,8 +8425,7 @@ def test_seed_ledger_keeps_unknown_marker_when_same_ticker_rows_are_ambiguous(tm
     assert ex.ledger.remaining_daily(now.date()) == 0.0
     assert ex.ledger.remaining_weekly(now.date()) == 0.0
     assert any(
-        row.get("ticker") == "AAPL"
-        and row.get("synthesized_from_unreconstructable_submission") is True
+        row.get("ticker") == "AAPL" and row.get("synthesized_from_unreconstructable_submission") is True
         for row in ex._prior_same_day_candidate_rows
     ), "the durable unknown-notional marker must survive fixed-slot carry-forward"
 
@@ -8281,9 +8463,7 @@ def test_seed_ledger_keeps_unknown_marker_when_same_ticker_rows_are_ambiguous(tm
     ],
     ids=("single-proven-fill", "ambiguous-price-only-second-row"),
 )
-def test_no_id_marker_reconciliation_counts_all_same_ticker_broker_rows(
-    tmp_path, broker_rows, resolved
-):
+def test_no_id_marker_reconciliation_counts_all_same_ticker_broker_rows(tmp_path, broker_rows, resolved):
     """A no-ID marker resolves only from one total row with a proven notional."""
 
     class Broker(FakeLiveBroker):
@@ -8358,13 +8538,13 @@ def test_cap_seed_scan_finds_sibling_suffix_fills_under_the_current_stream_root(
         run_dir = live_root / f"20260706_{folder_suffix}"
         run_dir.mkdir(parents=True)
         (run_dir / "run_state.json").write_text(
-            json.dumps({
-                "trading_day": "2026-07-06",
-                "run_id": run_id,
-                "buy_candidates": [
-                    {"ticker": "XXX", "status": "submitted", "planned_amount_usd": amount}
-                ],
-            }),
+            json.dumps(
+                {
+                    "trading_day": "2026-07-06",
+                    "run_id": run_id,
+                    "buy_candidates": [{"ticker": "XXX", "status": "submitted", "planned_amount_usd": amount}],
+                }
+            ),
             encoding="utf-8",
         )
 
@@ -8407,13 +8587,13 @@ def test_cap_seed_scan_reads_a_leaf_override_roots_own_run_state(tmp_path):
     override_root = tmp_path / "perplexity_primary_20260706" / "manual_override_1015ET"
     override_root.mkdir(parents=True)
     (override_root / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": "2026-07-06",  # Monday, same ISO week as _now_live()'s Wednesday
-            "run_id": "manual_override_20260706_1015ET",
-            "buy_candidates": [
-                {"ticker": "CCC", "status": "submitted", "planned_amount_usd": 12.0}
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": "2026-07-06",  # Monday, same ISO week as _now_live()'s Wednesday
+                "run_id": "manual_override_20260706_1015ET",
+                "buy_candidates": [{"ticker": "CCC", "status": "submitted", "planned_amount_usd": 12.0}],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -8485,13 +8665,13 @@ def test_cap_seed_scan_ignores_a_same_day_leaf_override_root(tmp_path):
     override_root = tmp_path / "perplexity_primary_20260708" / "manual_override_0900ET"
     override_root.mkdir(parents=True)
     (override_root / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": "2026-07-08",  # same day as _now_live()
-            "run_id": "manual_override_20260708_0900ET",
-            "buy_candidates": [
-                {"ticker": "CCC", "status": "submitted", "planned_amount_usd": 12.0}
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": "2026-07-08",  # same day as _now_live()
+                "run_id": "manual_override_20260708_0900ET",
+                "buy_candidates": [{"ticker": "CCC", "status": "submitted", "planned_amount_usd": 12.0}],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -8558,14 +8738,16 @@ def test_earlier_weekday_cap_seed_poison_clears_on_a_recovered_rescan(tmp_path):
 
     # The artifact becomes readable with a real, modest $10 fill.
     sibling_path.write_text(
-        json.dumps({
-            "trading_day": "2026-06-29",
-            "generated_at": "2026-06-29T09:00:00-04:00",
-            "run_id": "earlier_week_recovered",
-            "buy_candidates": [
-                {"ticker": "OTHER", "status": "filled", "planned_amount_usd": 10.0},
-            ],
-        }),
+        json.dumps(
+            {
+                "trading_day": "2026-06-29",
+                "generated_at": "2026-06-29T09:00:00-04:00",
+                "run_id": "earlier_week_recovered",
+                "buy_candidates": [
+                    {"ticker": "OTHER", "status": "filled", "planned_amount_usd": 10.0},
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -8595,12 +8777,14 @@ def test_earlier_weekday_run_with_a_failed_csv_scan_is_rescanned_once_repaired(t
     sibling_dir = cap_root / "20260629_manualET"
     sibling_dir.mkdir(parents=True)
     (sibling_dir / "run_state.json").write_text(
-        json.dumps({
-            "trading_day": "2026-06-29",
-            "generated_at": "2026-06-29T09:00:00-04:00",
-            "run_id": "earlier_week_csv_run",
-            "buy_candidates": [],
-        }),
+        json.dumps(
+            {
+                "trading_day": "2026-06-29",
+                "generated_at": "2026-06-29T09:00:00-04:00",
+                "run_id": "earlier_week_csv_run",
+                "buy_candidates": [],
+            }
+        ),
         encoding="utf-8",
     )
     csv_path = sibling_dir / "submitted_orders.csv"
@@ -8667,14 +8851,25 @@ def test_morning_cap_seeding_does_not_double_count_own_manual_submission(tmp_pat
 
     class _DupBlockingBroker(FakeLiveBroker):
         """First call places; subsequent calls for same ticker return dup=True."""
+
         def __init__(self):
             self.placed = {}
-        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
-        def available_buying_power(self): return 500.0
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return ticker in self.placed  # block the ticker if already placed
-        def is_tradable_for_fractional_buy(self, ticker): return True
-        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
         def place_market_buy(self, ticker, notional_usd, ref_id):
             self.placed[ticker] = notional_usd
             return f"ORDER-{ticker}"
@@ -8739,12 +8934,22 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
         def __init__(self):
             self.placed = {}
             self._placed_tickers = set()
-        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
-        def available_buying_power(self): return 500.0
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return ticker in self._placed_tickers
-        def is_tradable_for_fractional_buy(self, ticker): return True
-        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
         def place_market_buy(self, ticker, notional_usd, ref_id):
             self.placed[ticker] = notional_usd
             self._placed_tickers.add(ticker)
@@ -8780,12 +8985,16 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     ext_dir1 = manual_root / "20260708_0936ET"
     ext_dir1.mkdir(parents=True, exist_ok=True)
     (ext_dir1 / "run_state.json").write_text(
-        _json.dumps({
-            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:36:00-04:00",
-            "run_classification": {"run_origin": "manual", "manual_run": True},
-            "buy_candidates": [{"ticker": "EXT1", "status": "submitted",
-                                "planned_amount_usd": 4.0, "decision_price": 55.0}],
-        }),
+        _json.dumps(
+            {
+                "trading_day": "2026-07-08",
+                "generated_at": "2026-07-08T09:36:00-04:00",
+                "run_classification": {"run_origin": "manual", "manual_run": True},
+                "buy_candidates": [
+                    {"ticker": "EXT1", "status": "submitted", "planned_amount_usd": 4.0, "decision_price": 55.0}
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -8801,12 +9010,16 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     ext_dir2 = manual_root / "20260708_0937ET"
     ext_dir2.mkdir(parents=True, exist_ok=True)
     (ext_dir2 / "run_state.json").write_text(
-        _json.dumps({
-            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:37:00-04:00",
-            "run_classification": {"run_origin": "manual", "manual_run": True},
-            "buy_candidates": [{"ticker": "EXT2", "status": "submitted",
-                                "planned_amount_usd": 4.0, "decision_price": 55.0}],
-        }),
+        _json.dumps(
+            {
+                "trading_day": "2026-07-08",
+                "generated_at": "2026-07-08T09:37:00-04:00",
+                "run_classification": {"run_origin": "manual", "manual_run": True},
+                "buy_candidates": [
+                    {"ticker": "EXT2", "status": "submitted", "planned_amount_usd": 4.0, "decision_price": 55.0}
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -8814,8 +9027,7 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
     ex.run(_now_live(), data, broker=broker)
     ledger_after_sched2 = ex.ledger.day_planned(date(2026, 7, 8))
     assert ledger_after_sched2 == manual_amount + 8.0, (
-        f"ledger should be manual($4.50) + ext1-seed($4) + ext2-seed($4) = $12.50, "
-        f"got {ledger_after_sched2}"
+        f"ledger should be manual($4.50) + ext1-seed($4) + ext2-seed($4) = $12.50, got {ledger_after_sched2}"
     )
 
 
@@ -8837,14 +9049,25 @@ def test_morning_cap_seeding_does_not_double_count_own_scheduled_submission(tmp_
 
     class _DupBlockingBroker(FakeLiveBroker):
         """First call places; subsequent calls for same ticker return dup=True."""
+
         def __init__(self):
             self.placed = {}
-        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
-        def available_buying_power(self): return 500.0
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return ticker in self.placed
-        def is_tradable_for_fractional_buy(self, ticker): return True
-        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
         def place_market_buy(self, ticker, notional_usd, ref_id):
             self.placed[ticker] = notional_usd
             return f"ORDER-{ticker}"
@@ -8908,12 +9131,22 @@ def test_morning_cap_seeding_picks_up_external_fill_after_own_retry_overwrite(tm
     class _DupBlockingBroker(FakeLiveBroker):
         def __init__(self):
             self.placed = {}
-        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
-        def available_buying_power(self): return 500.0
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return ticker in self.placed
-        def is_tradable_for_fractional_buy(self, ticker): return True
-        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
         def place_market_buy(self, ticker, notional_usd, ref_id):
             self.placed[ticker] = notional_usd
             return f"ORDER-{ticker}"
@@ -8951,12 +9184,16 @@ def test_morning_cap_seeding_picks_up_external_fill_after_own_retry_overwrite(tm
     ext_dir = live_root / "manual_runs" / "20260708_1032ET"
     ext_dir.mkdir(parents=True, exist_ok=True)
     (ext_dir / "run_state.json").write_text(
-        _json.dumps({
-            "trading_day": "2026-07-08", "generated_at": "2026-07-08T10:32:00-04:00",
-            "run_classification": {"run_origin": "manual", "manual_run": True},
-            "buy_candidates": [{"ticker": "EXT", "status": "submitted",
-                                "planned_amount_usd": 4.0, "decision_price": 55.0}],
-        }),
+        _json.dumps(
+            {
+                "trading_day": "2026-07-08",
+                "generated_at": "2026-07-08T10:32:00-04:00",
+                "run_classification": {"run_origin": "manual", "manual_run": True},
+                "buy_candidates": [
+                    {"ticker": "EXT", "status": "submitted", "planned_amount_usd": 4.0, "decision_price": 55.0}
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -9102,14 +9339,27 @@ def test_morning_top_up_guard_no_prior_run_when_default_roots_empty(tmp_path):
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER, TOP_UP_NO_PRIOR_RUN
 
     class _Broker(FakeLiveBroker):
-        def __init__(self): self.placed = {}
-        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
-        def available_buying_power(self): return 500.0
-        def same_day_strategy_order_exists(self, ticker, trading_day): return False
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return None
-        def is_tradable_for_fractional_buy(self, ticker): return True
-        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
         def place_market_buy(self, ticker, notional_usd, ref_id):
             self.placed[ticker] = notional_usd
             return f"ORDER-{ticker}"
@@ -9139,9 +9389,16 @@ def test_morning_top_up_guard_no_prior_run_when_default_roots_empty(tmp_path):
 # Top-up guard regression tests (scheduled-run path)
 # ---------------------------------------------------------------------------
 
+
 def _seed_prior(
-    root, ticker, amount_usd, *,
-    status="filled", reference_price=95.0, trading_date=None, selected_base_amount_usd=None,
+    root,
+    ticker,
+    amount_usd,
+    *,
+    status="filled",
+    reference_price=95.0,
+    trading_date=None,
+    selected_base_amount_usd=None,
     run_id="test_prior",
 ):
     """Write a prior-fill run_state.json for one ticker under root.
@@ -9181,32 +9438,53 @@ def _seed_prior(
 
 class _TopUpBroker(FakeLiveBroker):
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER as _acct
+
     supports_concurrent_fill_lookup: bool = False
 
     def __init__(self):
         self.placed = {}
-    def account_number(self) -> str: return self._acct
-    def available_buying_power(self) -> float: return 1000.0
-    def same_day_strategy_order_exists(self, ticker, trading_day) -> bool: return False
-    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes) -> Optional[Dict[str, Any]]:
+
+    def account_number(self) -> str:
+        return self._acct
+
+    def available_buying_power(self) -> float:
+        return 1000.0
+
+    def same_day_strategy_order_exists(self, ticker, trading_day) -> bool:
+        return False
+
+    def same_day_strategy_order_exists_with_ref_id_prefix(
+        self, ticker, trading_day, ref_id_prefixes
+    ) -> Optional[Dict[str, Any]]:
         return None
-    def strategy_order_with_ref_id(self, ticker, trading_day, ref_id) -> Optional[Dict[str, Any]]: return None
-    def same_day_ticker_notional_usd(self, ticker, trading_day) -> float: return 0.0
-    def is_tradable_for_fractional_buy(self, ticker) -> bool: return True
-    def review_market_buy(self, ticker, notional_usd) -> Tuple[bool, str]: return (True, "ok")
+
+    def strategy_order_with_ref_id(self, ticker, trading_day, ref_id) -> Optional[Dict[str, Any]]:
+        return None
+
+    def same_day_ticker_notional_usd(self, ticker, trading_day) -> float:
+        return 0.0
+
+    def is_tradable_for_fractional_buy(self, ticker) -> bool:
+        return True
+
+    def review_market_buy(self, ticker, notional_usd) -> Tuple[bool, str]:
+        return (True, "ok")
+
     def place_market_buy(self, ticker, notional_usd, ref_id) -> str:
         self.placed[ticker] = notional_usd
         return f"ORDER-{ticker}"
-    def get_order_fill(self, order_id) -> Any: return None
-    def get_raw_placement_responses(self) -> list: return []
+
+    def get_order_fill(self, order_id) -> Any:
+        return None
+
+    def get_raw_placement_responses(self) -> list:
+        return []
 
 
 def test_morning_live_applies_prior_manual_offset_incremental(tmp_path):
     # Prior manual fill: NVDA $3 at $95 reference. Morning price $90 (10% drop, below ref).
     # Desired = 5x * $2 = $10. Incremental = $15 - $3 = $8.
-    prior_root = _seed_prior(
-        tmp_path / "prior", "NVDA", 2.0, reference_price=95.0, selected_base_amount_usd=2.0
-    )
+    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 2.0, reference_price=95.0, selected_base_amount_usd=2.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
@@ -9218,7 +9496,9 @@ def test_morning_live_applies_prior_manual_offset_incremental(tmp_path):
     broker = _TopUpBroker()
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
     res = ex.run(_now_live(), data, broker=broker)
-    assert "NVDA" in broker.placed, f"expected incremental order; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
+    assert "NVDA" in broker.placed, (
+        f"expected incremental order; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
+    )
     assert abs(broker.placed["NVDA"] - 8.0) < 0.01, f"expected $8 incremental; got {broker.placed['NVDA']}"
     rows = {r["ticker"]: r for r in res["artifacts"].get("buy_candidates", [])}
     assert rows["NVDA"]["top_up_guard_result"] == "incremental_top_up"
@@ -9229,21 +9509,19 @@ def test_morning_live_applies_prior_manual_offset_incremental(tmp_path):
     [(2.0, 8.0), (8.0, 2.0)],
     ids=["artifact_matches_broker", "artifact_understates_broker"],
 )
-def test_morning_live_top_up_accounts_for_broker_spend(
-    tmp_path, monkeypatch, broker_prior_usd, expected_increment_usd
-):
+def test_morning_live_top_up_accounts_for_broker_spend(tmp_path, monkeypatch, broker_prior_usd, expected_increment_usd):
     """Missing artifact spending must not be purchased again by a later stream."""
     monkeypatch.setenv("DCA_TICKER_HISTORY_DIR", str(tmp_path / "history"))
     monkeypatch.setenv("DCA_INTRADAY_ARCHIVE_DIR", str(tmp_path / "intraday"))
     for name in (
-        "DCA_HEARTBEAT_URL_MORNING", "DCA_HEARTBEAT_URL",
-        "DCA_ALERT_SLACK_WEBHOOK", "DCA_DRIFT_SLACK_WEBHOOK",
+        "DCA_HEARTBEAT_URL_MORNING",
+        "DCA_HEARTBEAT_URL",
+        "DCA_ALERT_SLACK_WEBHOOK",
+        "DCA_DRIFT_SLACK_WEBHOOK",
     ):
         monkeypatch.delenv(name, raising=False)
     now = _now_live()
-    prior_root = _seed_prior(
-        tmp_path / "prior", "NVDA", 2.0, reference_price=95.0, selected_base_amount_usd=2.0
-    )
+    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 2.0, reference_price=95.0, selected_base_amount_usd=2.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
@@ -9303,6 +9581,7 @@ class _RefIdTrackingBroker(FakeLiveBroker):
     """
 
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER as _acct
+
     supports_concurrent_fill_lookup: bool = False
 
     def __init__(self):
@@ -9318,7 +9597,9 @@ class _RefIdTrackingBroker(FakeLiveBroker):
     def same_day_strategy_order_exists(self, ticker, trading_day) -> bool:
         return any(t == ticker for t, _ in self._ref_ids)
 
-    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes) -> Optional[Dict[str, Any]]:
+    def same_day_strategy_order_exists_with_ref_id_prefix(
+        self, ticker, trading_day, ref_id_prefixes
+    ) -> Optional[Dict[str, Any]]:
         for t, rid in self._ref_ids:
             if t == ticker and any(rid.startswith(p) for p in ref_id_prefixes):
                 return {"id": f"ORDER-{ticker}", "dollar_amount": self.placed.get(ticker, 0.0)}
@@ -9457,9 +9738,7 @@ def test_morning_scheduled_top_up_duplicate_preserves_original_submitted_amount(
     # order placed.
     retry_now = _now_live() + timedelta(minutes=1)
     retry = ex.run(retry_now, data, broker=broker)
-    assert len(broker._ref_ids) == 1, (
-        "a genuine duplicate must not place a second real order"
-    )
+    assert len(broker._ref_ids) == 1, "a genuine duplicate must not place a second real order"
     outcomes = retry["artifacts"].get("broker_outcomes", {})
     nvda_outcome = outcomes.get("NVDA", {})
     assert nvda_outcome.get("status") == "submitted", nvda_outcome
@@ -9470,9 +9749,7 @@ def test_morning_scheduled_top_up_duplicate_preserves_original_submitted_amount(
     # The buy_candidates row copies submitted_amount_usd into
     # planned_amount_usd (see run()'s broker-outcome sync step), not a
     # separate submitted_amount_usd key on the row itself.
-    on_disk_rows = {
-        r["ticker"]: r for r in retry["artifacts"].get("buy_candidates", [])
-    }
+    on_disk_rows = {r["ticker"]: r for r in retry["artifacts"].get("buy_candidates", [])}
     assert on_disk_rows["NVDA"].get("planned_amount_usd") == pytest.approx(15.0)
 
 
@@ -9531,9 +9808,7 @@ def test_morning_scheduled_duplicate_with_pending_prior_preserves_sent_amount(tm
     retry = ex.run(_now_live() + timedelta(minutes=1), data, broker=broker)
     nvda_outcome = retry["artifacts"].get("broker_outcomes", {}).get("NVDA", {})
     assert nvda_outcome.get("status") == "submitted", nvda_outcome
-    retry_row = next(
-        row for row in retry["artifacts"].get("buy_candidates", []) if row["ticker"] == "NVDA"
-    )
+    retry_row = next(row for row in retry["artifacts"].get("buy_candidates", []) if row["ticker"] == "NVDA")
     # The persisted duplicate carries the $8 that was sent, not the $4 the
     # retry recomputed, so the dated-slot artifact never understates spend;
     # the candidate row is rewritten to the same preserved figure.
@@ -9587,9 +9862,7 @@ def test_morning_scheduled_duplicate_with_pending_prior_without_amount_fails_clo
     retry = ex.run(_now_live() + timedelta(minutes=1), data, broker=broker)
     nvda_outcome = retry["artifacts"].get("broker_outcomes", {}).get("NVDA", {})
     assert nvda_outcome.get("status") == "submitted", nvda_outcome
-    retry_row = next(
-        row for row in retry["artifacts"].get("buy_candidates", []) if row["ticker"] == "NVDA"
-    )
+    retry_row = next(row for row in retry["artifacts"].get("buy_candidates", []) if row["ticker"] == "NVDA")
     assert nvda_outcome.get("submitted_amount_usd") == pytest.approx(cfg.max_per_order_usd)
     assert retry_row["planned_amount_usd"] == pytest.approx(cfg.max_per_order_usd)
     assert nvda_outcome.get("submitted_amount_usd") != pytest.approx(12.0)
@@ -9605,9 +9878,7 @@ def test_morning_scheduled_duplicate_check_preserved_when_cap_fully_consumed(tmp
     # ledger already has the first attempt's amount booked), overwriting the
     # dated-slot artifact's "submitted" row with "cap_exceeded" -- erasing
     # evidence a fresh executor's cap-seeding scan depends on.
-    prior_root = _seed_prior(
-        tmp_path / "prior", "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=3.0
-    )
+    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=3.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
@@ -9654,9 +9925,7 @@ def test_morning_scheduled_duplicate_not_rebooked_into_ledger(tmp_path):
     # record_buy_candidates() also books it directly into self.ledger every
     # retry, the ledger balance keeps growing without any new money ever
     # being submitted.
-    prior_root = _seed_prior(
-        tmp_path / "prior", "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=3.0
-    )
+    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=3.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
@@ -9693,9 +9962,7 @@ def test_morning_scheduled_duplicate_not_rebooked_into_ledger(tmp_path):
 def test_morning_live_skips_when_price_not_below_prior_reference(tmp_path):
     # Prior: NVDA $2 at $85 reference. Morning price $90 (10% drop from $100).
     # $90 >= $85 → price_not_below → skip, no order.
-    prior_root = _seed_prior(
-        tmp_path / "prior", "NVDA", 2.0, reference_price=85.0, selected_base_amount_usd=2.0
-    )
+    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 2.0, reference_price=85.0, selected_base_amount_usd=2.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
@@ -9831,9 +10098,7 @@ def test_morning_live_missing_price_triggers_manual_review(tmp_path):
 
 def test_morning_live_no_incremental_when_prior_covers_full_desired(tmp_path):
     # Prior: NVDA $20 at $95 reference. Desired = $10. $10 - $20 = -$10 ≤ 0 → no_incremental.
-    prior_root = _seed_prior(
-        tmp_path / "prior", "NVDA", 20.0, reference_price=95.0, selected_base_amount_usd=2.0
-    )
+    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 20.0, reference_price=95.0, selected_base_amount_usd=2.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
@@ -9872,7 +10137,9 @@ def test_morning_live_prior_from_configured_root_only(tmp_path):
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
     res = ex.run(_now_live(), data, broker=broker)
     # Configured root contributes $3 only → incremental $8, not no_incremental.
-    assert "NVDA" in broker.placed, f"expected incremental order; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
+    assert "NVDA" in broker.placed, (
+        f"expected incremental order; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
+    )
     assert abs(broker.placed["NVDA"] - 8.0) < 0.01, f"expected $8; got {broker.placed['NVDA']}"
 
 
@@ -9890,9 +10157,7 @@ def test_morning_live_default_roots_include_market_open(tmp_path, monkeypatch):
     # review, PR #219), so DEFAULT_AFTERNOON_TASK_ROOT/DEFAULT_MARKET_OPEN_
     # TASK_ROOT no longer affect what _compute_top_up scans; redirect the
     # function itself instead of the now-inert module constants.
-    monkeypatch.setattr(
-        morning_dca, "default_cap_seed_roots", lambda: (str(afternoon_root), str(market_open_root))
-    )
+    monkeypatch.setattr(morning_dca, "default_cap_seed_roots", lambda: (str(afternoon_root), str(market_open_root)))
 
     _seed_prior(market_open_root, "NVDA", 2.0, reference_price=95.0, selected_base_amount_usd=2.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
@@ -9908,7 +10173,9 @@ def test_morning_live_default_roots_include_market_open(tmp_path, monkeypatch):
     broker = _TopUpBroker()
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
     res = ex.run(_now_live(), data, broker=broker)
-    assert "NVDA" in broker.placed, f"expected incremental order; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
+    assert "NVDA" in broker.placed, (
+        f"expected incremental order; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
+    )
     assert abs(broker.placed["NVDA"] - 8.0) < 0.01, f"expected $8 incremental; got {broker.placed['NVDA']}"
 
 
@@ -10020,8 +10287,7 @@ def test_morning_top_up_guard_seeds_daily_cap_with_prior_spend(tmp_path):
     res = ex.run(_now_live(), data, broker=broker, manual=True)
     broker_outcomes = res["artifacts"].get("broker_outcomes", {})
     assert broker_outcomes.get("TOPUP", {}).get("status") == "cap_exceeded", (
-        f"TOPUP must be cap_exceeded: $15 > $5.00 remaining after $85 prior spend; "
-        f"broker_outcomes={broker_outcomes}"
+        f"TOPUP must be cap_exceeded: $15 > $5.00 remaining after $85 prior spend; broker_outcomes={broker_outcomes}"
     )
     assert "TOPUP" not in broker.placed, "broker.place_market_buy must not be called"
     assert ex.ledger.day_planned(date(2026, 7, 8)) == 85.0, (
@@ -10094,12 +10360,24 @@ def test_morning_cap_seeding_runs_even_when_per_ticker_guard_disabled(tmp_path):
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
     class _Broker(FakeLiveBroker):
-        def __init__(self): self.placed = {}
-        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
-        def available_buying_power(self): return 500.0
-        def same_day_strategy_order_exists(self, ticker, trading_day): return False
-        def is_tradable_for_fractional_buy(self, ticker): return True
-        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+        def __init__(self):
+            self.placed = {}
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
         def place_market_buy(self, ticker, notional_usd, ref_id):
             self.placed[ticker] = notional_usd
             return f"ORDER-{ticker}"
@@ -10146,12 +10424,22 @@ def test_morning_cap_seeding_own_amount_scoped_to_cap_roots(tmp_path):
         def __init__(self):
             self.placed = {}
             self._placed_tickers: set = set()
-        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
-        def available_buying_power(self): return 500.0
+
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return ticker in self._placed_tickers
-        def is_tradable_for_fractional_buy(self, ticker): return True
-        def review_market_buy(self, ticker, notional_usd): return True, "ok"
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
         def place_market_buy(self, ticker, notional_usd, ref_id):
             self.placed[ticker] = notional_usd
             self._placed_tickers.add(ticker)
@@ -10187,12 +10475,16 @@ def test_morning_cap_seeding_own_amount_scoped_to_cap_roots(tmp_path):
     ext_dir = external_cap_root / "20260708_0936ET"
     ext_dir.mkdir(parents=True, exist_ok=True)
     (ext_dir / "run_state.json").write_text(
-        _json.dumps({
-            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:36:00-04:00",
-            "run_classification": {"run_origin": "manual", "manual_run": True},
-            "buy_candidates": [{"ticker": "EXT", "status": "submitted",
-                                "planned_amount_usd": 4.0, "decision_price": 55.0}],
-        }),
+        _json.dumps(
+            {
+                "trading_day": "2026-07-08",
+                "generated_at": "2026-07-08T09:36:00-04:00",
+                "run_classification": {"run_origin": "manual", "manual_run": True},
+                "buy_candidates": [
+                    {"ticker": "EXT", "status": "submitted", "planned_amount_usd": 4.0, "decision_price": 55.0}
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -10200,9 +10492,7 @@ def test_morning_cap_seeding_own_amount_scoped_to_cap_roots(tmp_path):
     # external $4 fill even though own_amount=$4.50 is not in external_cap_root.
     ex.run(_now_live(), data, broker=broker)
     ledger_after = ex.ledger.day_planned(date(2026, 7, 8))
-    assert ledger_after == 4.5 + 4.0, (
-        f"ledger should be own($4.50) + external-seed($4) = $8.50, got {ledger_after}"
-    )
+    assert ledger_after == 4.5 + 4.0, f"ledger should be own($4.50) + external-seed($4) = $8.50, got {ledger_after}"
 
 
 def test_morning_cap_seeding_ignores_own_amount_from_no_broker_manual_run(tmp_path):
@@ -10247,12 +10537,16 @@ def test_morning_cap_seeding_ignores_own_amount_from_no_broker_manual_run(tmp_pa
     ext_dir = manual_root / "20260708_0901ET"
     ext_dir.mkdir(parents=True, exist_ok=True)
     (ext_dir / "run_state.json").write_text(
-        _json.dumps({
-            "trading_day": "2026-07-08", "generated_at": "2026-07-08T09:01:00-04:00",
-            "run_classification": {"run_origin": "manual", "manual_run": True},
-            "buy_candidates": [{"ticker": "EXT", "status": "submitted",
-                                "planned_amount_usd": 4.0, "decision_price": 55.0}],
-        }),
+        _json.dumps(
+            {
+                "trading_day": "2026-07-08",
+                "generated_at": "2026-07-08T09:01:00-04:00",
+                "run_classification": {"run_origin": "manual", "manual_run": True},
+                "buy_candidates": [
+                    {"ticker": "EXT", "status": "submitted", "planned_amount_usd": 4.0, "decision_price": 55.0}
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -10261,19 +10555,31 @@ def test_morning_cap_seeding_ignores_own_amount_from_no_broker_manual_run(tmp_pa
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
     class _Broker(FakeLiveBroker):
-        def account_number(self): return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
-        def available_buying_power(self): return 500.0
-        def same_day_strategy_order_exists(self, ticker, trading_day): return False
-        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes): return None
-        def is_tradable_for_fractional_buy(self, ticker): return True
-        def review_market_buy(self, ticker, notional_usd): return True, "ok"
-        def place_market_buy(self, ticker, notional_usd, ref_id): return f"ORDER-{ticker}"
+        def account_number(self):
+            return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
+
+        def available_buying_power(self):
+            return 500.0
+
+        def same_day_strategy_order_exists(self, ticker, trading_day):
+            return False
+
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
+            return None
+
+        def is_tradable_for_fractional_buy(self, ticker):
+            return True
+
+        def review_market_buy(self, ticker, notional_usd):
+            return True, "ok"
+
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            return f"ORDER-{ticker}"
 
     ex.run(_now_live(), data, broker=_Broker())
     ledger_after = ex.ledger.day_planned(date(2026, 7, 8))
     assert ledger_after >= 4.0, (
-        f"external $4 fill must be seeded even after an earlier no-broker manual run; "
-        f"ledger={ledger_after}"
+        f"external $4 fill must be seeded even after an earlier no-broker manual run; ledger={ledger_after}"
     )
 
 
@@ -10292,8 +10598,7 @@ def test_per_order_cap_blocks_without_any_broker_call(tmp_path):
 
         def available_buying_power(self):
             raise AssertionError(
-                "available_buying_power() must not be called when the "
-                "per-order cap alone blocks every candidate"
+                "available_buying_power() must not be called when the per-order cap alone blocks every candidate"
             )
 
         def same_day_strategy_order_exists(self, ticker, trading_day):
@@ -10480,9 +10785,7 @@ def test_morning_live_same_stream_check_ignores_manual_fill_ref_id(tmp_path):
     # segment comes after `-dca-`, diverging from the plain scheduled prefix
     # `-dca-<date>-` at the fourth segment); _same_stream_order_exists checks
     # `morning-dca-topup-*` and `morning-dca-<date>-*`, so they never match it.
-    prior_root = _seed_prior(
-        tmp_path / "prior", "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=3.0
-    )
+    prior_root = _seed_prior(tmp_path / "prior", "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=3.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
 
     class _ManualFillBroker(_TopUpBroker):
@@ -10492,6 +10795,7 @@ def test_morning_live_same_stream_check_ignores_manual_fill_ref_id(tmp_path):
         sitting in broker history.  The scheduled same-stream check must NOT match
         this prefix; it should only look for morning-dca-topup-* and morning-dca-*.
         """
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes) -> Any:
             # Simulate the manual fill's distinct ref ID being present at the broker.
             manual_prefix = f"morning-dca-manual-{trading_day.isoformat()}-{ticker}"
@@ -10515,9 +10819,7 @@ def test_morning_live_same_stream_check_ignores_manual_fill_ref_id(tmp_path):
     assert "NVDA" in broker.placed, (
         f"incremental top-up must be placed; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
     )
-    assert abs(broker.placed["NVDA"] - 12.0) < 0.01, (
-        f"expected $12 incremental; got {broker.placed['NVDA']}"
-    )
+    assert abs(broker.placed["NVDA"] - 12.0) < 0.01, f"expected $12 incremental; got {broker.placed['NVDA']}"
 
 
 def test_morning_live_retry_after_manual_fill_detects_plain_scheduled_order(tmp_path):
@@ -10532,6 +10834,7 @@ def test_morning_live_retry_after_manual_fill_detects_plain_scheduled_order(tmp_
 
     class _RetryBroker(_TopUpBroker):
         """Broker that already has the plain scheduled order (morning-dca-*) on record."""
+
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes) -> Any:
             # Simulate the already-live plain scheduled order sitting in broker history.
             plain_prefix = f"morning-dca-{trading_day.isoformat()}-{ticker}"
@@ -10556,6 +10859,7 @@ def test_morning_live_retry_after_manual_fill_detects_plain_scheduled_order(tmp_
 
 
 # --- Raw-input persistence / failure-state guarantee (live_schedule_hardening_2026_07_20) --
+
 
 def test_raw_input_recorder_persists_and_lists_files(tmp_path):
     recorder = _RawInputRecorder(tmp_path / "raw", "2026-07-08")
@@ -10616,9 +10920,7 @@ def test_persisting_market_data_provider_records_bar_and_quote_responses(tmp_pat
     wrapped = _PersistingMarketDataProvider(data, recorder)
     now = _now_live()
     bar = wrapped.get_previous_close_bar("AAPL", now)
-    bars = wrapped.get_intraday_bars(
-        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=15
-    )
+    bars = wrapped.get_intraday_bars(ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=15)
     assert bar is not None
     assert bars
     assert recorder.error is None
@@ -10653,9 +10955,7 @@ def test_persisting_robinhood_provider_normalizes_pointer_before_parsing(tmp_pat
     wrapped = _PersistingMarketDataProvider(provider, recorder)
     now = _now_live()
 
-    bars = wrapped.get_intraday_bars(
-        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
-    )
+    bars = wrapped.get_intraday_bars(ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10)
 
     assert bars == []
     assert recorder.saved_filenames == []
@@ -10710,9 +11010,7 @@ def test_persisting_finance_provider_archives_connectors_before_parsing(tmp_path
     wrapped = _PersistingMarketDataProvider(provider, recorder)
     now = _now_live()
 
-    bars = wrapped.get_intraday_bars(
-        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
-    )
+    bars = wrapped.get_intraday_bars(ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10)
     previous_close = wrapped.get_previous_close_bar("AAPL", now)
 
     assert len(bars) == 1
@@ -10752,9 +11050,7 @@ def test_persisting_robinhood_provider_parses_intraday_bars_after_raw_round_trip
     wrapped = _PersistingMarketDataProvider(provider, recorder)
     now = _now_live()
 
-    bars = wrapped.get_intraday_bars(
-        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
-    )
+    bars = wrapped.get_intraday_bars(ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10)
 
     assert recorder.error is None
     assert len(bars) == 1
@@ -10771,7 +11067,11 @@ def test_persisting_finance_provider_materializes_generator_bars_payload(tmp_pat
     def _bars_gen(*args):
         yield {
             "timestamp": "2026-07-08T10:20:00-04:00",
-            "open": 99.0, "high": 100.0, "low": 98.0, "close": 99.5, "volume": 10,
+            "open": 99.0,
+            "high": 100.0,
+            "low": 98.0,
+            "close": 99.5,
+            "volume": 10,
         }
 
     provider = FinanceDataProvider(
@@ -10782,9 +11082,7 @@ def test_persisting_finance_provider_materializes_generator_bars_payload(tmp_pat
     wrapped = _PersistingMarketDataProvider(provider, recorder)
     now = _now_live()
 
-    bars = wrapped.get_intraday_bars(
-        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
-    )
+    bars = wrapped.get_intraday_bars(ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10)
 
     assert recorder.error is None
     assert len(bars) == 1
@@ -10809,9 +11107,7 @@ def test_persisting_finance_provider_preserves_bare_date_bar_timestamp(tmp_path)
     wrapped = _PersistingMarketDataProvider(provider, recorder)
     now = _now_live()
 
-    bars = wrapped.get_intraday_bars(
-        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
-    )
+    bars = wrapped.get_intraday_bars(ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10)
 
     assert recorder.error is None
     assert len(bars) == 1
@@ -10864,9 +11160,7 @@ def test_persisting_finance_provider_serializes_vendor_scalar_bar_fields(tmp_pat
     wrapped = _PersistingMarketDataProvider(provider, recorder)
     now = _now_live()
 
-    bars = wrapped.get_intraday_bars(
-        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
-    )
+    bars = wrapped.get_intraday_bars(ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10)
 
     assert recorder.error is None
     assert len(bars) == 1
@@ -10893,9 +11187,7 @@ def test_persisting_market_data_provider_clears_copied_quote_cache_before_wrappi
         call_count["n"] += 1
         return {"results": [{"quote": {"symbol": "AAPL", "last_trade_price": "101.00"}}]}
 
-    provider = RobinhoodDataProvider(
-        historicals_fn=lambda **kwargs: {"results": []}, quotes_fn=_quotes_fn
-    )
+    provider = RobinhoodDataProvider(historicals_fn=lambda **kwargs: {"results": []}, quotes_fn=_quotes_fn)
     now = _now_live()
     # Pre-populate the cache exactly as an earlier caller reusing this same
     # provider instance at this same `as_of` would have.
@@ -11038,9 +11330,7 @@ def test_persisting_broker_adapter_preserves_submitted_order_when_persist_write_
             raise OSError("disk full")
         raise AssertionError("unexpected atomic_write_text call in this test")
 
-    monkeypatch.setattr(
-        _run_classification_module, "atomic_write_text", _failing_atomic_write_text
-    )
+    monkeypatch.setattr(_run_classification_module, "atomic_write_text", _failing_atomic_write_text)
     order_id = wrapped.place_market_buy("AAPL", 10.0, "ref-1")
 
     assert order_id == "order-456"
@@ -11064,9 +11354,7 @@ def test_persisting_provider_archives_the_raw_connector_response_before_parsing(
     wrapped = _PersistingMarketDataProvider(provider, recorder)
     now = _now_live()
     try:
-        wrapped.get_intraday_bars(
-            ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=5
-        )
+        wrapped.get_intraday_bars(ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=5)
     except Exception:  # noqa: BLE001 - whether parsing raises is the adapter's business
         pass
 
@@ -11106,9 +11394,7 @@ def test_each_run_intercepts_its_own_private_view_of_the_provider(tmp_path):
     now = _now_live()
     for run in (run_two, run_one):
         try:
-            run.get_intraday_bars(
-                ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=5
-            )
+            run.get_intraday_bars(ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=5)
         except Exception:  # noqa: BLE001 - only the archiving side matters here
             pass
 
@@ -11146,9 +11432,7 @@ def test_the_callers_provider_is_never_mutated_by_a_run(tmp_path):
 
     now = _now_live()
     try:
-        provider.get_intraday_bars(
-            ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=5
-        )
+        provider.get_intraday_bars(ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=5)
     except Exception:  # noqa: BLE001 - only the archiving side matters here
         pass
 
@@ -11360,10 +11644,7 @@ def test_persisting_broker_adapter_records_buying_power_and_tradability(tmp_path
     assert any(name.startswith("tradability_AAPL_") for name in recorder.saved_filenames)
     # The guarded same-stream duplicate query is also raw input, rather than
     # being forwarded unrecorded through __getattr__.
-    assert (
-        wrapped.same_day_strategy_order_exists_with_ref_id_prefix("AAPL", date(2026, 7, 8), [])
-        is None
-    )
+    assert wrapped.same_day_strategy_order_exists_with_ref_id_prefix("AAPL", date(2026, 7, 8), []) is None
     assert any(name.startswith("orders_since_midnight_AAPL_") for name in recorder.saved_filenames)
 
 
@@ -11901,6 +12182,7 @@ class _BadTradabilityBroker(FakeLiveBroker):
         self.place_calls.append((ticker, notional_usd, ref_id))
         return super().place_market_buy(ticker, notional_usd, ref_id)
 
+
 def test_raw_persistence_failure_during_this_candidate_blocks_this_candidate(tmp_path):
     # Codex review ("Recheck persistence before submitting the current
     # candidate"): _BadTradabilityBroker sets raw_recorder.error from inside
@@ -11978,9 +12260,7 @@ def test_scheduled_live_run_persists_block_when_buying_power_lookup_fails(tmp_pa
 
     artifacts = res["artifacts"]
     assert artifacts["status"] == "blocked"
-    assert artifacts["block_reason"] == (
-        "failed to retrieve broker buying power: broker temporarily unavailable"
-    )
+    assert artifacts["block_reason"] == ("failed to retrieve broker buying power: broker temporarily unavailable")
     assert artifacts["error_class"] == "buying_power_lookup_failed"
     assert artifacts["broker_outcomes"] == {}
     assert heartbeat_results == [False]
@@ -12153,9 +12433,7 @@ def test_placement_stops_after_raw_persistence_fails_mid_batch(tmp_path):
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    data = DecliningBarsProvider(
-        SourceName.ROBINHOOD, 100.0, {"AAA": 0.03, "BBB": 0.03, "CCC": 0.03}
-    )
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03, "BBB": 0.03, "CCC": 0.03})
 
     res = ex.run(_now_live(), data, broker=_FailAfterFirstTradabilityBroker())
     artifacts = res["artifacts"]
@@ -12245,13 +12523,9 @@ def test_raw_persistence_abort_records_an_outcome_for_every_candidate(tmp_path):
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    data = DecliningBarsProvider(
-        SourceName.ROBINHOOD, 100.0, {t: 0.03 for t in tickers}
-    )
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {t: 0.03 for t in tickers})
 
-    artifacts = ex.run(
-        _now_live(), data, broker=_PersistenceFailsAfterFirstTradabilityBroker()
-    )["artifacts"]
+    artifacts = ex.run(_now_live(), data, broker=_PersistenceFailsAfterFirstTradabilityBroker())["artifacts"]
 
     # The premise: persistence failed partway through a multi-candidate batch.
     assert artifacts["raw_persistence_error"]
@@ -12409,7 +12683,14 @@ def test_model_usage_routing_overrides():
     from morning_dca import _model_usage_routing_overrides
 
     # Test all fields set
-    config_all = Mock(spec=["model_usage_model_requested", "model_usage_model_actual", "model_usage_model_routing_mode", "model_usage_reason_for_premium_model"])
+    config_all = Mock(
+        spec=[
+            "model_usage_model_requested",
+            "model_usage_model_actual",
+            "model_usage_model_routing_mode",
+            "model_usage_reason_for_premium_model",
+        ]
+    )
     config_all.model_usage_model_requested = "model_a"
     config_all.model_usage_model_actual = "model_b"
     config_all.model_usage_model_routing_mode = "fast"
@@ -12422,7 +12703,14 @@ def test_model_usage_routing_overrides():
     }
 
     # Test partial fields set
-    config_partial = Mock(spec=["model_usage_model_requested", "model_usage_model_actual", "model_usage_model_routing_mode", "model_usage_reason_for_premium_model"])
+    config_partial = Mock(
+        spec=[
+            "model_usage_model_requested",
+            "model_usage_model_actual",
+            "model_usage_model_routing_mode",
+            "model_usage_reason_for_premium_model",
+        ]
+    )
     config_partial.model_usage_model_requested = "model_a"
     config_partial.model_usage_model_actual = None
     config_partial.model_usage_model_routing_mode = "fast"
@@ -12433,7 +12721,14 @@ def test_model_usage_routing_overrides():
     }
 
     # Test no fields set
-    config_empty = Mock(spec=["model_usage_model_requested", "model_usage_model_actual", "model_usage_model_routing_mode", "model_usage_reason_for_premium_model"])
+    config_empty = Mock(
+        spec=[
+            "model_usage_model_requested",
+            "model_usage_model_actual",
+            "model_usage_model_routing_mode",
+            "model_usage_reason_for_premium_model",
+        ]
+    )
     config_empty.model_usage_model_requested = None
     config_empty.model_usage_model_actual = None
     config_empty.model_usage_model_routing_mode = None
@@ -12455,7 +12750,6 @@ def test_nth_weekday_of_month():
     ]
     for year, month, weekday, n, expected in cases:
         assert _nth_weekday_of_month(year, month, weekday, n) == expected
-
 
 
 # --- Root-level artifact set and the spread gate (Jul 27 2026 12:30 / 1:30) ---
@@ -12611,9 +12905,7 @@ def test_missing_spread_for_one_ticker_does_not_suppress_another(tmp_path):
     """Fail only the unproven rows closed; every other qualifying ticker proceeds."""
     ex = _live_executor(tmp_path, ("NVDA", "AMD"))
     broker = _TopUpBroker()
-    data = _PartialBidAskProvider(
-        SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10, "AMD": 0.10}, with_quote={"AMD"}
-    )
+    data = _PartialBidAskProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10, "AMD": 0.10}, with_quote={"AMD"})
     res = ex.run(_now_live(), data, broker=broker)
 
     assert "AMD" in broker.placed, "a proven-spread ticker must still be submitted"
@@ -13503,9 +13795,7 @@ def test_generic_placement_exception_halt_preserves_credit_for_unreached_candida
     # test_morning_top_up_guard_buys_incremental_when_prior_fill_exists for
     # the identical math worked out in isolation.
     prior_root = tmp_path / "prior"
-    _write_prior_run_state(
-        prior_root, "TOPUP", amount_usd=4.50, decision_price=99.0, selected_base_amount_usd=3.0
-    )
+    _write_prior_run_state(prior_root, "TOPUP", amount_usd=4.50, decision_price=99.0, selected_base_amount_usd=3.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("AAPL", "TOPUP"))
     cfg = MorningConfig(
         tickers=("AAPL", "TOPUP"),
@@ -13660,8 +13950,7 @@ def test_a_partial_artifact_set_is_completed_after_a_mid_write_failure(tmp_path)
         {
             "run_id": "partial",
             "trading_day": "2026-07-08",
-            "run_classification": {"run_origin": "scheduled", "manual_run": False,
-                                   "stream": "morning"},
+            "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "morning"},
         },
         sort_keys=True,
     )
@@ -13725,9 +14014,7 @@ def test_stale_in_flight_outcomes_never_leak_into_a_later_run(tmp_path):
     with pytest.raises(RuntimeError):
         ex.run(later, data, broker=broker)
 
-    later_state = json.loads(
-        (ex.run_state_dir(later) / "run_state.json").read_text(encoding="utf-8")
-    )
+    later_state = json.loads((ex.run_state_dir(later) / "run_state.json").read_bytes())
     assert later_state["orders_submitted_count"] == 0
     assert later_state["broker_outcomes"] == {}
     assert later_state["buy_candidates"] == []
@@ -13747,9 +14034,7 @@ def test_a_failure_after_submission_does_not_contradict_the_order_it_recorded(tm
     with pytest.raises(RuntimeError):
         ex.run(_now_live(), data, broker=broker)
 
-    run_state = json.loads(
-        (ex.run_state_dir(_now_live()) / "run_state.json").read_text(encoding="utf-8")
-    )
+    run_state = json.loads((ex.run_state_dir(_now_live()) / "run_state.json").read_bytes())
     assert run_state["orders_submitted_count"] == 1
     assert run_state["order_submit_status"] == "submitted"
     assert run_state["run_classification_outcome"] == "failed_after_partial_submission"
@@ -13820,9 +14105,7 @@ def test_a_synthesized_failure_state_is_never_valid_scheduled_evidence(tmp_path)
     with pytest.raises(RuntimeError):
         ex.run(_now_live(), data, broker=_TopUpBroker())
 
-    run_state = json.loads(
-        (ex.run_state_dir(_now_live()) / "run_state.json").read_text(encoding="utf-8")
-    )
+    run_state = json.loads((ex.run_state_dir(_now_live()) / "run_state.json").read_bytes())
     assert run_state["scheduled_evidence_denied"] is True
     assert derive_valid_scheduled_evidence(run_state) is False
 
@@ -13873,16 +14156,23 @@ def test_a_stale_companion_blocks_a_valid_pointer_on_the_preserved_path(tmp_path
     run_dir = ex.run_state_dir(_now_live())
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "run_state.json").write_text(
-        json.dumps({"run_id": "fresh", "trading_day": "2026-07-08",
-                    "run_classification": {"run_origin": "scheduled", "manual_run": False,
-                                           "stream": "morning"}}),
+        json.dumps(
+            {
+                "run_id": "fresh",
+                "trading_day": "2026-07-08",
+                "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "morning"},
+            }
+        ),
         encoding="utf-8",
     )
     # A summary left from an earlier attempt whose classification does not mirror.
     (run_dir / "run_summary.json").write_text(
-        json.dumps({"run_id": "stale", "run_classification": {"run_origin": "scheduled",
-                                                              "manual_run": False,
-                                                              "stream": "afternoon"}}),
+        json.dumps(
+            {
+                "run_id": "stale",
+                "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "afternoon"},
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -13893,9 +14183,7 @@ def test_a_stale_companion_blocks_a_valid_pointer_on_the_preserved_path(tmp_path
     with pytest.raises(RuntimeError):
         ex.run(_now_live(), data, broker=_TopUpBroker())
 
-    payload = json.loads(
-        (Path(ex.state_root) / ex.latest_pointer_name).read_text(encoding="utf-8")
-    )
+    payload = json.loads((Path(ex.state_root) / ex.latest_pointer_name).read_bytes())
     # The mismatched summary must not be advertised as valid scheduled evidence.
     assert payload["pointer_status"] == "pending"
     assert payload["valid_scheduled_evidence"] is False
@@ -13912,15 +14200,22 @@ def test_a_broken_companion_set_denies_evidence_in_the_state_itself(tmp_path):
     run_dir = ex.run_state_dir(_now_live())
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "run_state.json").write_text(
-        json.dumps({"run_id": "fresh", "trading_day": "2026-07-08",
-                    "run_classification": {"run_origin": "scheduled", "manual_run": False,
-                                           "stream": "morning"}}),
+        json.dumps(
+            {
+                "run_id": "fresh",
+                "trading_day": "2026-07-08",
+                "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "morning"},
+            }
+        ),
         encoding="utf-8",
     )
     (run_dir / "run_summary.json").write_text(
-        json.dumps({"run_id": "stale", "run_classification": {"run_origin": "scheduled",
-                                                              "manual_run": False,
-                                                              "stream": "afternoon"}}),
+        json.dumps(
+            {
+                "run_id": "stale",
+                "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "afternoon"},
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -13967,10 +14262,8 @@ def test_a_retry_that_raises_merges_its_order_into_the_preserved_state(tmp_path)
         "buy_candidates": [{"ticker": "AAA", "status": "submitted", "order_id": "o-earlier"}],
         "orders_submitted_count": 1,
     }
-    placed = {"BBB": {"status": "submitted", "order_id": "o-retry",
-                      "submitted_amount_usd": 2.0}}
-    rows = [{"ticker": "BBB", "status": "submitted", "order_id": "o-retry",
-             "planned_amount_usd": 2.0}]
+    placed = {"BBB": {"status": "submitted", "order_id": "o-retry", "submitted_amount_usd": 2.0}}
+    rows = [{"ticker": "BBB", "status": "submitted", "order_id": "o-retry", "planned_amount_usd": 2.0}]
 
     merged = _m._merge_placements_into_state(earlier, placed, rows)
 
@@ -14036,17 +14329,13 @@ def test_a_stale_order_csv_does_not_satisfy_companion_validation(tmp_path):
     state = {
         "run_id": "r1",
         "trading_day": "2026-07-08",
-        "run_classification": {"run_origin": "scheduled", "manual_run": False,
-                               "stream": "morning"},
-        "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "o-new",
-                                    "submitted_amount_usd": 2.0}},
+        "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "morning"},
+        "broker_outcomes": {"AAA": {"status": "submitted", "order_id": "o-new", "submitted_amount_usd": 2.0}},
         "buy_candidates": [],
     }
     write_scheduled_run_artifacts(run_dir, state)
     # Replace the order CSV with a header-only file from an "earlier attempt".
-    (run_dir / "submitted_orders.csv").write_text(
-        "ticker,order_id,submitted_amount_usd,status\n", encoding="utf-8"
-    )
+    (run_dir / "submitted_orders.csv").write_text("ticker,order_id,submitted_amount_usd,status\n", encoding="utf-8")
 
     assert _m.MorningDCAExecutor._companions_match_state(run_dir, state) is False
 
@@ -14082,16 +14371,19 @@ def test_a_merged_morning_retry_is_stamped_as_a_failure(tmp_path):
     earlier = {
         "run_id": "earlier",
         "status": "completed",
-        "run_classification": {"run_origin": "scheduled", "manual_run": False,
-                               "stream": "morning", "valid_scheduled_evidence": True},
+        "run_classification": {
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "morning",
+            "valid_scheduled_evidence": True,
+        },
         "run_classification_outcome": "completed_no_orders",
         "order_submit_status": "no_orders_submitted",
         "is_trading_failure": False,
         "broker_outcomes": {},
         "buy_candidates": [],
     }
-    placed = {"NVDA": {"status": "submitted", "order_id": "o-retry",
-                       "submitted_amount_usd": 2.0}}
+    placed = {"NVDA": {"status": "submitted", "order_id": "o-retry", "submitted_amount_usd": 2.0}}
     rows = [{"ticker": "NVDA", "status": "submitted", "order_id": "o-retry"}]
 
     merged = _m._merge_placements_into_state(earlier, placed, rows, error_detail="RuntimeError: x")
@@ -14175,9 +14467,7 @@ def test_a_synthesized_morning_failure_state_carries_the_schema_required_fields(
     run_state = json.loads((run_dir / "run_state.json").read_bytes())
 
     schema = json.loads(
-        (Path(__file__).resolve().parent.parent / "schemas" / "run_state.schema.json").read_text(
-            encoding="utf-8"
-        )
+        (Path(__file__).resolve().parent.parent / "schemas" / "run_state.schema.json").read_text(encoding="utf-8")
     )
     for field in schema["required"]:
         assert field in run_state, field
@@ -14213,9 +14503,7 @@ def test_a_synthesized_morning_failure_replaces_stale_companions(tmp_path):
     # run_state.json.
     (run_dir / "morning_signals.csv").write_text("", encoding="utf-8")
     (run_dir / "submitted_orders.csv").write_text("stale,garbage\n", encoding="utf-8")
-    (run_dir / "run_summary.json").write_text(
-        json.dumps({"run_classification": None, "stale": True}), encoding="utf-8"
-    )
+    (run_dir / "run_summary.json").write_text(json.dumps({"run_classification": None, "stale": True}), encoding="utf-8")
 
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.0})
 
@@ -14338,9 +14626,7 @@ def test_a_breaker_trip_on_the_final_candidate_still_marks_the_run(tmp_path):
     # Exactly four: one submits, then three confirmation-required holds trip
     # the breaker ON THE FINAL CANDIDATE, leaving no remainder to annotate.
     tickers = ("AAPL", "GS", "EVR", "IBM")
-    cfg = MorningConfig(
-        tickers=tickers, base_buy_amount_usd=2.0, max_consecutive_placement_failures=3
-    )
+    cfg = MorningConfig(tickers=tickers, base_buy_amount_usd=2.0, max_consecutive_placement_failures=3)
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     ex.credit_ledger = CumulativeCreditLedger(root=tmp_path)
     broker = _ConfirmationBroker()
@@ -14409,13 +14695,9 @@ def test_a_breaker_halt_with_no_submissions_is_not_a_clean_run(tmp_path):
 
     _apply_no_order_classification(artifacts)
 
-    assert artifacts["orders_submitted_count"] is None or artifacts.get(
-        "orders_submitted_count", 0
-    ) == 0
+    assert artifacts["orders_submitted_count"] is None or artifacts.get("orders_submitted_count", 0) == 0
     assert artifacts["is_trading_failure"] is True
-    assert artifacts["run_classification_outcome"] == (
-        "failed_after_connector_native_recovery_attempt"
-    )
+    assert artifacts["run_classification_outcome"] == ("failed_after_connector_native_recovery_attempt")
     # The concrete submit status still survives the failure classification --
     # is_confirmation_blocked() must keep working.
     assert artifacts["order_submit_status"] == "not_submitted_confirmation_required"
@@ -14447,10 +14729,7 @@ def test_an_existing_budget_without_the_breaker_key_fails_closed(tmp_path):
         encoding="utf-8",
     )
     assert load_max_consecutive_placement_failures(tmp_path) == 4
-    assert (
-        load_max_consecutive_placement_failures(tmp_path / "nope")
-        == DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
-    )
+    assert load_max_consecutive_placement_failures(tmp_path / "nope") == DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
 
 
 def test_duplicate_breaker_keys_in_budgets_are_refused(tmp_path):
@@ -14467,8 +14746,7 @@ def test_duplicate_breaker_keys_in_budgets_are_refused(tmp_path):
     from morning_dca import load_max_consecutive_placement_failures
 
     (tmp_path / "budgets.json").write_text(
-        '{"circuit_breakers": {"max_consecutive_placement_failures": 1, '
-        '"max_consecutive_placement_failures": 999}}',
+        '{"circuit_breakers": {"max_consecutive_placement_failures": 1, "max_consecutive_placement_failures": 999}}',
         encoding="utf-8",
     )
     with _pytest.raises(RuntimeError, match="could not be read or parsed"):
@@ -14529,6 +14807,7 @@ def test_a_mixed_dry_run_batch_keeps_its_dry_run_identity(tmp_path):
 # naming another -- and with the variable unset the artifact carried the
 # "UNSET_..." sentinel, which violates the schema's ^[0-9]{6,12}$ pattern
 # (Codex review, PR #219).
+
 
 def test_live_classification_stamps_the_loaded_account(tmp_path):
     schema_path = Path(__file__).resolve().parent.parent / "schemas" / "morning_run_classification.schema.json"
@@ -14593,8 +14872,7 @@ def test_live_classification_always_carries_an_account(tmp_path):
     conditional = next(
         block
         for block in schema["allOf"]
-        if block.get("if", {}).get("properties", {}).get("run_type", {}).get("const")
-        == "morning_dca_live"
+        if block.get("if", {}).get("properties", {}).get("run_type", {}).get("const") == "morning_dca_live"
         and "account_number" in block.get("then", {}).get("required", [])
     )
     assert "account_number" in conditional["then"]["required"]
@@ -14612,6 +14890,7 @@ def test_live_classification_always_carries_an_account(tmp_path):
 # run, so that evidence had no valid form: stamping a malformed value fails the
 # pattern, omitting it fails the conditional `required`. The schema now admits
 # the blocked state explicitly via account_pinning_failed (Codex review, #219).
+
 
 def _morning_schema():
     path = Path(__file__).resolve().parent.parent / "schemas" / "morning_run_classification.schema.json"
@@ -14643,9 +14922,7 @@ def test_a_pinning_failed_document_asserting_valid_scheduled_evidence_is_rejecte
     for parity (Codex review, PR #219: "Deny scheduled evidence when account
     pinning fails")."""
     jsonschema = pytest.importorskip("jsonschema")
-    cfg = MorningConfig(
-        tickers=("SMALL",), morning_run_state_root=str(tmp_path), target_account_number=cast(Any, None)
-    )
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path), target_account_number=cast(Any, None))
     rc = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
     assert rc["account_pinning_failed"] is True
     jsonschema.validate(rc, _morning_schema())  # the real value still passes
@@ -14653,9 +14930,7 @@ def test_a_pinning_failed_document_asserting_valid_scheduled_evidence_is_rejecte
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate({**rc, "valid_scheduled_evidence": True}, _morning_schema())
     with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(
-            {k: v for k, v in rc.items() if k != "valid_scheduled_evidence"}, _morning_schema()
-        )
+        jsonschema.validate({k: v for k, v in rc.items() if k != "valid_scheduled_evidence"}, _morning_schema())
 
 
 def test_a_normal_live_classification_carries_the_account_and_no_marker(tmp_path):
@@ -14733,6 +15008,7 @@ def test_the_schema_still_requires_an_account_for_unmarked_live_runs(tmp_path):
 # slot wrote no artifact at all and monitoring saw a MISSING run rather than a
 # blocked one (Codex review, PR #219).
 
+
 def test_the_live_path_loads_with_an_unset_account_variable(monkeypatch, tmp_path):
     monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path))
@@ -14768,16 +15044,12 @@ def test_the_schema_still_requires_a_broker_on_a_blocked_live_run(tmp_path):
     is known even when the account is not, and a truncated blocked-live
     classification with no broker used to validate (Codex review, PR #219)."""
     jsonschema = pytest.importorskip("jsonschema")
-    cfg = MorningConfig(
-        tickers=("SMALL",), morning_run_state_root=str(tmp_path), target_account_number=cast(Any, None)
-    )
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path), target_account_number=cast(Any, None))
     rc = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
     jsonschema.validate(rc, _morning_schema())
 
     with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(
-            {k: v for k, v in rc.items() if k != "execution_broker"}, _morning_schema()
-        )
+        jsonschema.validate({k: v for k, v in rc.items() if k != "execution_broker"}, _morning_schema())
 
 
 # --- The config-missing fallback resolves ALL artifact roots at load time ----
@@ -14787,6 +15059,7 @@ def test_the_schema_still_requires_a_broker_on_a_blocked_live_run(tmp_path):
 # STATE_ROOT -- import-time constants -- later. A $DCA_CRON_TRACKING_ROOT set
 # between import and this call left the executor writing run_state.json and
 # the preflight artifact under the OLD tree (Codex review, PR #219).
+
 
 def test_unconfigured_state_root_resolves_at_executor_construction_time_for_every_mode():
     """MorningConfig.morning_run_state_root/preflight_run_state_root stay None
@@ -15148,9 +15421,7 @@ def test_the_config_missing_fallback_fails_closed_for_live_mode_without_an_accou
 
 def test_the_config_missing_fallback_leaves_the_account_unset_when_allowed(monkeypatch, tmp_path):
     monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
-    cfg = load_morning_config(
-        config_dir=str(tmp_path), mode=MORNING_LIVE_MODE, allow_unpinned_account=True
-    )
+    cfg = load_morning_config(config_dir=str(tmp_path), mode=MORNING_LIVE_MODE, allow_unpinned_account=True)
     assert cfg.target_account_number is None
 
 
@@ -15356,7 +15627,6 @@ def test_ambiguous_placement_is_recorded_as_potentially_submitted(tmp_path):
     assert outcome["submitted_amount_usd"] > 0
 
 
-
 def test_blocked_live_retry_preserves_potentially_submitted_evidence(tmp_path):
     # Codex review, PR #1300 discussion_r3920155079 ("Preserve in-flight
     # statuses on blocked retries"): _existing_submitted_run_state()
@@ -15390,7 +15660,6 @@ def test_blocked_live_retry_preserves_potentially_submitted_evidence(tmp_path):
     preserved_rows = [c for c in artifacts["buy_candidates"] if c.get("status") == "potentially_submitted"]
     assert {c["ticker"] for c in preserved_rows} == {"SMALL"}
     assert Path(res["paths"]["run_state"]).exists()
-
 
 
 class _AmbiguousThenRawFailBroker(FakeLiveBroker):
@@ -15431,7 +15700,6 @@ class _AmbiguousThenRawFailBroker(FakeLiveBroker):
         return True
 
 
-
 def test_blocked_live_run_preserves_ambiguous_placement_on_later_raw_failure(tmp_path):
     pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
     cfg = MorningConfig(
@@ -15459,7 +15727,6 @@ def test_blocked_live_run_preserves_ambiguous_placement_on_later_raw_failure(tmp
     assert on_disk["broker_outcomes"]["AAA"]["status"] == "potentially_submitted"
 
 
-
 def test_carried_forward_order_rows_includes_potentially_submitted():
     # Same fix as _submitted_keys above, applied to the submitted_orders.csv
     # carry-forward path: an ambiguous placement preserved only as a
@@ -15485,14 +15752,11 @@ def test_carried_forward_order_rows_includes_potentially_submitted():
     # Codex review, PR #1300 discussion_r3920709301 ("Retain pending orders
     # in retry aggregates"): a "pending"/"unconfirmed" row must reach
     # submitted_orders.csv the same way, not just "potentially_submitted".
-    pending_rows = [
-        {"ticker": "FFF", "status": "pending", "order_id": None, "planned_amount_usd": 8.0}
-    ]
+    pending_rows = [{"ticker": "FFF", "status": "pending", "order_id": None, "planned_amount_usd": 8.0}]
     pending_extra = _carried_forward_order_rows({}, pending_rows)
     assert len(pending_extra) == 1
     assert pending_extra[0]["ticker"] == "FFF"
     assert pending_extra[0]["status"] == "pending"
-
 
 
 def test_morning_place_broker_orders_preserves_credit_for_every_candidate_after_raw_persistence_break(
@@ -15514,9 +15778,7 @@ def test_morning_place_broker_orders_preserves_credit_for_every_candidate_after_
     class _Broker(FakeLiveBroker):
         def __init__(self):
             self.placed = {}
-            self._recorder = type(
-                "_Recorder", (), {"error": "simulated raw persistence failure"}
-            )()
+            self._recorder = type("_Recorder", (), {"error": "simulated raw persistence failure"})()
 
         def account_number(self):
             return ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
@@ -15586,7 +15848,6 @@ def test_morning_place_broker_orders_preserves_credit_for_every_candidate_after_
     assert ex.credit_ledger.pending_usd("BBB", trading_day.isoformat()) == 0.45
 
 
-
 class _AmbiguousThenLegacyDupBroker(FakeLiveBroker):
     """Raises OrderPlacementAmbiguousError on the FIRST place_market_buy for
     a ticker, then reports that ticker's ordinary-ref_id attempt as a
@@ -15598,6 +15859,7 @@ class _AmbiguousThenLegacyDupBroker(FakeLiveBroker):
     """
 
     from near_close_dca import ROBINHOOD_AGENTIC_ACCOUNT_NUMBER as _acct
+
     supports_concurrent_fill_lookup: bool = False
 
     def __init__(self):
@@ -15633,7 +15895,6 @@ class _AmbiguousThenLegacyDupBroker(FakeLiveBroker):
             if t == ticker and any(rid.startswith(p) for p in ref_id_prefixes):
                 return {"id": f"ORDER-{ticker}"}
         return None
-
 
 
 def test_morning_scheduled_top_up_duplicate_preserves_ambiguous_amount_without_broker_details(tmp_path):
@@ -15688,7 +15949,6 @@ def test_morning_scheduled_top_up_duplicate_preserves_ambiguous_amount_without_b
     )
 
 
-
 def test_persisting_broker_adapter_treats_unreadable_placement_pointer_as_ambiguous(tmp_path):
     # Codex review, PR #1300 discussion_r3920988293 ("Treat unreadable
     # placement pointers as ambiguous"): the placement connector call
@@ -15718,7 +15978,6 @@ def test_persisting_broker_adapter_treats_unreadable_placement_pointer_as_ambigu
     assert "could not read output_path" in recorder.error
 
 
-
 def test_persisting_finance_provider_restores_native_datetime_after_raw_round_trip(tmp_path):
     native_timestamp = datetime(2026, 7, 8, 10, 20, tzinfo=EASTERN)
     provider = FinanceDataProvider(
@@ -15738,15 +15997,12 @@ def test_persisting_finance_provider_restores_native_datetime_after_raw_round_tr
     wrapped = _PersistingMarketDataProvider(provider, recorder)
     now = _now_live()
 
-    bars = wrapped.get_intraday_bars(
-        ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10
-    )
+    bars = wrapped.get_intraday_bars(ticker="AAPL", start=now - timedelta(hours=1), end=now, interval_minutes=10)
 
     assert len(bars) == 1
     assert bars[0].timestamp == native_timestamp
     archived = json.loads((tmp_path / "raw" / recorder.saved_filenames[0]).read_bytes())
     assert archived["data"][0]["timestamp"] == {"__datetime__": native_timestamp.isoformat()}
-
 
 
 def test_persisting_market_data_provider_persists_result_when_wrapped_connector_is_bypassed(tmp_path):
@@ -15769,7 +16025,6 @@ def test_persisting_market_data_provider_persists_result_when_wrapped_connector_
     assert quote[0] == 101.0
     assert quote[1] == now
     assert any(name.startswith("quote_AAPL_") for name in recorder.saved_filenames)
-
 
 
 def test_place_broker_orders_settles_ambiguous_credit_exactly_once(tmp_path):
@@ -15854,7 +16109,6 @@ def test_place_broker_orders_settles_ambiguous_credit_exactly_once(tmp_path):
     assert events[-1]["submitted_amount_usd"] == 1.0
 
 
-
 def test_seed_ledger_carries_forward_an_already_seeded_potentially_submitted_row(tmp_path):
     """Codex review, PR #1300 discussion_r3920642630 ("Carry ambiguous
     orders through normal retries"): _seed_ledger_from_prior_runs's
@@ -15910,7 +16164,6 @@ def test_seed_ledger_carries_forward_an_already_seeded_potentially_submitted_row
     assert ex._prior_same_day_candidate_rows[0]["status"] == "potentially_submitted"
 
 
-
 def test_startup_failure_counts_a_potentially_submitted_in_flight_order(tmp_path):
     # Codex review, PR #1300 discussion_r3920546920 ("Count ambiguous
     # orders in crash-recovery artifacts"): if an ambiguous placement is
@@ -15936,7 +16189,6 @@ def test_startup_failure_counts_a_potentially_submitted_in_flight_order(tmp_path
     run_state = json.loads((run_dir / "run_state.json").read_bytes())
     assert run_state["orders_submitted_count"] == 1
     assert run_state["buy_candidates"][0]["status"] == "potentially_submitted"
-
 
 
 def test_submitted_keys_counts_potentially_submitted_outcomes():
@@ -15965,9 +16217,6 @@ def test_submitted_keys_counts_potentially_submitted_outcomes():
     assert _submitted_keys(pending_outcomes, []) == {"o-1"}
     unconfirmed_rows = [{"ticker": "EEE", "status": "unconfirmed", "order_id": None}]
     assert _submitted_keys({}, unconfirmed_rows) == {"ticker:EEE"}
-
-
-
 
 
 def test_same_stream_order_exists_asks_for_every_entry_points_family(tmp_path):

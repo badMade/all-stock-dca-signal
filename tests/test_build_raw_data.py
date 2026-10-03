@@ -6,9 +6,7 @@ from pathlib import Path
 
 def test_build_raw_data(tmp_path):
     script = Path(__file__).resolve().parents[1] / "build_raw_data.py"
-    result = subprocess.run(
-        [sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True, check=False
-    )
+    result = subprocess.run([sys.executable, str(script)], cwd=tmp_path, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
 
     # Verify the file was created in the temporary directory
@@ -16,7 +14,7 @@ def test_build_raw_data(tmp_path):
     assert output_file.exists()
 
     # Load and verify the JSON contents
-    data = json.loads(output_file.read_text())
+    data = json.loads(output_file.read_bytes())
 
     assert set(data) == {"daily", "minute"}
 

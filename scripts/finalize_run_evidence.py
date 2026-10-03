@@ -204,7 +204,9 @@ def build_classification(slot: str, started: datetime) -> Dict[str, Any]:
         day = started.date().isoformat()
         # valid_scheduled_evidence is finalized from the completed state below.
         return build_afternoon_live_run_classification(
-            trading_day=day, run_id=scheduled_run_id(day), valid_scheduled_evidence=False,
+            trading_day=day,
+            run_id=scheduled_run_id(day),
+            valid_scheduled_evidence=False,
             triggered_at_utc=_utc_iso(started),
         )
     import intraday_dca
@@ -227,7 +229,7 @@ def _load_json(path: Optional[str], kind: type, label: str) -> Any:
     if path is None:
         return None
     try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        value = json.loads(Path(path).read_bytes())
     except (OSError, ValueError) as exc:
         raise FinalizeRefused(f"{label} {path!r} is not readable JSON: {exc}") from exc
     if not isinstance(value, kind) or (kind is list and not all(isinstance(row, dict) for row in value)):
@@ -284,11 +286,14 @@ def validate_orders(orders: Optional[List[Dict[str, Any]]]) -> None:
         if not isinstance(order_id, str) or not order_id.strip():
             raise FinalizeRefused(f"order row {index} ({ticker}) has no broker order_id")
         if status not in ORDER_ATTEMPT_STATUSES:
-            raise FinalizeRefused(f"order row {index} ({ticker}) status {status!r} is not a placed or in-flight "
-                                  f"order; expected one of {sorted(ORDER_ATTEMPT_STATUSES)}")
-        if isinstance(amount, bool) or not isinstance(amount, (int, float)) or not math.isfinite(amount) \
-                or amount <= 0:
-            raise FinalizeRefused(f"order row {index} ({ticker}) submitted_amount_usd {amount!r} is not a positive number")
+            raise FinalizeRefused(
+                f"order row {index} ({ticker}) status {status!r} is not a placed or in-flight "
+                f"order; expected one of {sorted(ORDER_ATTEMPT_STATUSES)}"
+            )
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)) or not math.isfinite(amount) or amount <= 0:
+            raise FinalizeRefused(
+                f"order row {index} ({ticker}) submitted_amount_usd {amount!r} is not a positive number"
+            )
         if order_id in seen:
             raise FinalizeRefused(f"order_id {order_id!r} appears more than once")
         seen.add(order_id)
@@ -497,8 +502,10 @@ def find_gate5_documents(run_dir: Path, slot: str, day: date) -> tuple[List[tupl
     return [(path, doc) for _, path, doc in documents], strays
 
 
-RELABEL_HINT = ("if market data failed, finalize as --order-submit-status not_submitted_error "
-                "--error-class market_data_unavailable --error-detail \"<what failed>\" and alert per Gate 9")
+RELABEL_HINT = (
+    "if market data failed, finalize as --order-submit-status not_submitted_error "
+    '--error-class market_data_unavailable --error-detail "<what failed>" and alert per Gate 9'
+)
 
 
 def check_zero_order_gate5_evidence(
@@ -536,14 +543,16 @@ def check_zero_order_gate5_evidence(
             raise FinalizeRefused(
                 "not_submitted_no_candidates needs this slot's Gate 5 generator document in the run "
                 f"directory (none for runner_slot_id {slot} / {day.isoformat()}); save the generator's "
-                f"output there, or {RELABEL_HINT}")
+                f"output there, or {RELABEL_HINT}"
+            )
         if strays:
             raise FinalizeRefused(
                 f"{', '.join(strays)} look like candidate files but none is a Gate 5 generator document "
                 f"for runner_slot_id {slot} / {day.isoformat()}; a hand-written candidates file (or the "
                 f"cands array saved without its document, or a file with duplicate JSON keys) is not "
                 f"evidence of a quiet tape -- save the generator's full output document in the run "
-                f"directory, or {RELABEL_HINT}")
+                f"directory, or {RELABEL_HINT}"
+            )
         return None
     path, doc = documents[0]
     evaluated = doc["evaluated_count"]
@@ -564,7 +573,8 @@ def check_zero_order_gate5_evidence(
         raise FinalizeRefused(
             f"{path.name} shows zero candidates from zero usable tickers (evaluated {evaluated}, "
             f"provider errors {doc['provider_error_count']}, no data {no_data}): "
-            f"that is a data outage, not a quiet tape -- {RELABEL_HINT}")
+            f"that is a data outage, not a quiet tape -- {RELABEL_HINT}"
+        )
     return evidence
 
 
@@ -594,7 +604,8 @@ def check_existing_state_gate5_evidence(run_dir: Path, slot: str, day: date, sta
         raise FinalizeRefused(
             f"run_state.json (not written by this command) records zero candidates from zero usable "
             f"tickers (evaluated {evaluated}, no data {no_data}): that is a data outage, not a quiet "
-            f"tape -- {RELABEL_HINT}")
+            f"tape -- {RELABEL_HINT}"
+        )
 
 
 def _csv_rows(path: Path) -> List[Dict[str, str]]:
@@ -695,7 +706,9 @@ def finalize(
     started = started.astimezone(ET)
     check_window(slot, started)
     if order_submit_status not in ORDER_SUBMIT_STATUSES:
-        raise FinalizeRefused(f"--order-submit-status {order_submit_status!r} is not one of {list(ORDER_SUBMIT_STATUSES)}")
+        raise FinalizeRefused(
+            f"--order-submit-status {order_submit_status!r} is not one of {list(ORDER_SUBMIT_STATUSES)}"
+        )
     if not outcome.strip():
         raise FinalizeRefused("--outcome must name the Gate 9 outcome")
     validate_orders(orders)
@@ -706,10 +719,22 @@ def finalize(
     # Beside the run directory, not inside it: the lock must not be mistaken
     # for evidence that the slot started.
     with cross_process_lock(run_dir.parent / f".{run_dir.name}.finalize.lock"):
-        return _finalize_locked(slot, started, base, run_dir, outcome=outcome,
-                                order_submit_status=order_submit_status, orders=orders, signals=signals,
-                                report=report, budget=budget, error_class=error_class,
-                                error_detail=error_detail, code_version=code_version, now=now)
+        return _finalize_locked(
+            slot,
+            started,
+            base,
+            run_dir,
+            outcome=outcome,
+            order_submit_status=order_submit_status,
+            orders=orders,
+            signals=signals,
+            report=report,
+            budget=budget,
+            error_class=error_class,
+            error_detail=error_detail,
+            code_version=code_version,
+            now=now,
+        )
 
 
 def _repair_companions(run_dir: Path, state: Dict[str, Any], stream: str) -> List[str]:
@@ -766,8 +791,10 @@ def _finalize_locked(
         except (OSError, ValueError):
             existing = None
         if existing is None:
-            raise FinalizeRefused(f"{state_path.relative_to(base)} exists but is not a JSON object; "
-                                  "refusing to overwrite it -- inspect it by hand")
+            raise FinalizeRefused(
+                f"{state_path.relative_to(base)} exists but is not a JSON object; "
+                "refusing to overwrite it -- inspect it by hand"
+            )
 
     if code_version is not None and existing is not None:
         recorded = existing.get("code_version")
@@ -790,8 +817,10 @@ def _finalize_locked(
         state = existing
         wrote = False
         if orders is not None or signals is not None or report is not None or budget is not None:
-            warnings.append("run_state.json was written by the executor, not this command; it was kept "
-                            "unchanged and the supplied orders/signals/report/budget were NOT recorded")
+            warnings.append(
+                "run_state.json was written by the executor, not this command; it was kept "
+                "unchanged and the supplied orders/signals/report/budget were NOT recorded"
+            )
         if code_version is not None and state.get("code_version") is None:
             # The one field this command may add: provenance is immutable and the executors
             # do not know the pin, so leaving it out would record a cloud run with no release.
@@ -809,41 +838,60 @@ def _finalize_locked(
             # orders does not double them, and one that supplies only its own
             # new orders does not drop the first attempt's.
             supplied_ids = {str(row.get("order_id")) for row in orders if row.get("order_id")}
-            order_rows = [row for row in prior_rows
-                          if not row.get("order_id") or str(row.get("order_id")) not in supplied_ids] + orders
+            order_rows = [
+                row for row in prior_rows if not row.get("order_id") or str(row.get("order_id")) not in supplied_ids
+            ] + orders
         count = len(order_rows)
         # The status and the order rows must tell the same story, or the drift
         # detector and the evidence disagree about whether money moved.
         if order_submit_status == ORDER_SUBMIT_STATUS_SUBMITTED and count == 0:
-            raise FinalizeRefused("order_submit_status 'submitted' needs at least one order row "
-                                  "(--orders-json or an existing submitted_orders.csv)")
+            raise FinalizeRefused(
+                "order_submit_status 'submitted' needs at least one order row "
+                "(--orders-json or an existing submitted_orders.csv)"
+            )
         if order_submit_status != ORDER_SUBMIT_STATUS_SUBMITTED and orders:
-            raise FinalizeRefused(f"{len(orders)} order row(s) supplied with order_submit_status "
-                                  f"{order_submit_status!r}; use 'submitted'")
+            raise FinalizeRefused(
+                f"{len(orders)} order row(s) supplied with order_submit_status {order_submit_status!r}; use 'submitted'"
+            )
         if order_submit_status != ORDER_SUBMIT_STATUS_SUBMITTED and count:
             # An earlier attempt of this firing already placed orders; a retry
             # that placed nothing more must not relabel the slot as order-free.
             order_submit_status = ORDER_SUBMIT_STATUS_SUBMITTED
-            warnings.append(f"{count} order row(s) already recorded for this slot; "
-                            "order_submit_status kept as 'submitted'")
+            warnings.append(
+                f"{count} order row(s) already recorded for this slot; order_submit_status kept as 'submitted'"
+            )
         if budget is None and ours and isinstance(existing.get("budget"), dict):
             budget = existing["budget"]  # a retry keeps the first attempt's Gate 6 budget
         if code_version is None and ours and isinstance(existing.get("code_version"), dict):
             code_version = existing["code_version"]  # ...and the release it traded from
-        if order_submit_status == ORDER_SUBMIT_STATUS_SUBMITTED and (budget is None or budget.get("budget_evaluated") is False):
+        if order_submit_status == ORDER_SUBMIT_STATUS_SUBMITTED and (
+            budget is None or budget.get("budget_evaluated") is False
+        ):
             # Placing an order means Gate 6 ran and selected a tier; writing
             # budget_evaluated=false for it would be false evidence.
-            raise FinalizeRefused("orders were placed, so Gate 6 ran: pass --budget-json with budget_tier, "
-                                  "daily_cap_usd and weekly_cap_usd")
+            raise FinalizeRefused(
+                "orders were placed, so Gate 6 ran: pass --budget-json with budget_tier, "
+                "daily_cap_usd and weekly_cap_usd"
+            )
         # After the status is final (a retry above may have promoted it to
         # 'submitted', which this check never blocks) and before anything is
         # written, so a refusal leaves the directory as the session left it.
-        gate5_evidence = check_zero_order_gate5_evidence(run_dir, slot, day, order_submit_status=order_submit_status,
-                                                         error_class=error_class)
-        state = build_run_state(slot, started, outcome=outcome, order_submit_status=order_submit_status,
-                                orders_submitted_count=count, error_class=error_class,
-                                error_detail=error_detail, report=report, budget=budget,
-                                code_version=code_version, now=now)
+        gate5_evidence = check_zero_order_gate5_evidence(
+            run_dir, slot, day, order_submit_status=order_submit_status, error_class=error_class
+        )
+        state = build_run_state(
+            slot,
+            started,
+            outcome=outcome,
+            order_submit_status=order_submit_status,
+            orders_submitted_count=count,
+            error_class=error_class,
+            error_detail=error_detail,
+            report=report,
+            budget=budget,
+            code_version=code_version,
+            now=now,
+        )
         if gate5_evidence is not None:
             state["gate5_evidence"] = gate5_evidence
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -879,64 +927,91 @@ def _finalize_locked(
         if contract.ok:
             rc = state.get("run_classification") or {}
             pointer = refresh_latest_pointer(
-                pointer_root / POINTER_NAMES[stream], run_id=rc.get("run_id") or state.get("run_id"),
-                run_state_path=state_path, stream=stream, trading_day=day.isoformat(), run_state=state,
+                pointer_root / POINTER_NAMES[stream],
+                run_id=rc.get("run_id") or state.get("run_id"),
+                run_state_path=state_path,
+                stream=stream,
+                trading_day=day.isoformat(),
+                run_state=state,
                 extra={"slot": f"{slot}ET", "runner_slot_id": slot},
             )
 
     pointer_status = None
     if pointer is not None:
-        validation = validate_pointer(pointer, expected_stream=stream, expected_root=pointer_root,
-                                      today=day.isoformat())
+        validation = validate_pointer(
+            pointer, expected_stream=stream, expected_root=pointer_root, today=day.isoformat()
+        )
         pointer_status = validation.status
         if not validation.is_valid:
             errors.extend(f"pointer: {reason}" for reason in validation.reasons)
-    slot_row = classify_slot_evidence(slot, day, now or datetime.now(ET), run_dir_present=True,
-                                      run_state=state, run_state_present=True, market_closed=None,
-                                      artifact_errors=contract.errors)
+    slot_row = classify_slot_evidence(
+        slot,
+        day,
+        now or datetime.now(ET),
+        run_dir_present=True,
+        run_state=state,
+        run_state_present=True,
+        market_closed=None,
+        artifact_errors=contract.errors,
+    )
     errors.extend(f"slot: {reason}" for reason in slot_row["reasons"])
     verified = slot_row["status"] == STATUS_VERIFIED and pointer_status == "valid" and contract.ok
     return {
-        "slot": f"{slot}ET", "stream": stream, "trading_day": day.isoformat(),
-        "run_dir": slot_run_dir_relative(slot, day).as_posix(), "run_state_written": wrote,
+        "slot": f"{slot}ET",
+        "stream": stream,
+        "trading_day": day.isoformat(),
+        "run_dir": slot_run_dir_relative(slot, day).as_posix(),
+        "run_state_written": wrote,
         "pointer": pointer.relative_to(base).as_posix() if pointer is not None else None,
-        "pointer_status": pointer_status, "slot_status": slot_row["status"], "verified": verified,
-        "errors": list(dict.fromkeys(errors)), "warnings": warnings,
+        "pointer_status": pointer_status,
+        "slot_status": slot_row["status"],
+        "verified": verified,
+        "errors": list(dict.fromkeys(errors)),
+        "warnings": warnings,
     }
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--slot", required=True, help="roster slot: 0935 1030 1130 1230 1330 1430 1530 (ET suffix ok)")
-    parser.add_argument("--started-at", required=True,
-                        help="ISO-8601 instant this run started (Gate 1's clock); naive values are ET")
+    parser.add_argument(
+        "--started-at", required=True, help="ISO-8601 instant this run started (Gate 1's clock); naive values are ET"
+    )
     parser.add_argument("--outcome", required=True, help="Gate 9 outcome label, e.g. ORDERS_PLACED, END_SILENTLY")
     parser.add_argument("--order-submit-status", required=True, choices=ORDER_SUBMIT_STATUSES)
     parser.add_argument("--orders-json", help="JSON array of {ticker, order_id, submitted_amount_usd, status}")
     parser.add_argument("--signals-json", help="JSON array of signal rows for the stream's signals CSV")
     parser.add_argument("--report-json", help="JSON object embedded in run_state as gate9_report")
-    parser.add_argument("--budget-json",
-                        help='Gate 6 budget object {"budget_tier","daily_cap_usd","weekly_cap_usd",...}; '
-                        'required when orders were placed; omit only when Gate 6 never ran')
+    parser.add_argument(
+        "--budget-json",
+        help='Gate 6 budget object {"budget_tier","daily_cap_usd","weekly_cap_usd",...}; '
+        "required when orders were placed; omit only when Gate 6 never ran",
+    )
     parser.add_argument("--code-version-json",
                         help='{"git_sha": <40 hex>, "tag": ..., "pinned_by": ...} inline, or a path to a file holding it: '
                         'the pinned release this run traded from')
     parser.add_argument("--error-class", help="concrete error class for a blocked/failed run")
     parser.add_argument("--error-detail", help="one-line detail for a blocked/failed run")
-    parser.add_argument("--root", help="cron-tracking root (default: $DCA_CRON_TRACKING_ROOT or <checkout>/cron_tracking)")
+    parser.add_argument(
+        "--root", help="cron-tracking root (default: $DCA_CRON_TRACKING_ROOT or <checkout>/cron_tracking)"
+    )
     args = parser.parse_args(argv)
     try:
         code_version = _load_inline_or_file_json(args.code_version_json, "--code-version-json")
         check_code_version_pin(code_version, os.environ)
         result = finalize(
-            args.slot, parse_started_at(args.started_at), outcome=args.outcome,
-            order_submit_status=args.order_submit_status, root=Path(args.root) if args.root else None,
+            args.slot,
+            parse_started_at(args.started_at),
+            outcome=args.outcome,
+            order_submit_status=args.order_submit_status,
+            root=Path(args.root) if args.root else None,
             orders=_load_json(args.orders_json, list, "--orders-json"),
             signals=_load_json(args.signals_json, list, "--signals-json"),
             report=_load_json(args.report_json, dict, "--report-json"),
             budget=_load_json(args.budget_json, dict, "--budget-json"),
             code_version=code_version,
-            error_class=args.error_class, error_detail=args.error_detail,
+            error_class=args.error_class,
+            error_detail=args.error_detail,
         )
     except FinalizeRefused as exc:
         print(json.dumps({"verified": False, "refused": str(exc)}, indent=2))

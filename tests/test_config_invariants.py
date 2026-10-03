@@ -59,6 +59,7 @@ def _load(name: str) -> dict:
 
 # --- config/*.json is well-formed --------------------------------------------
 
+
 def test_every_config_file_parses_as_a_json_object():
     files = sorted(CONFIG_DIR.glob("*.json"))
     assert files, "config/ must not be empty"
@@ -145,8 +146,7 @@ def _manifest_block_citing(key: str) -> tuple[str, str]:
     blocks = SCHEDULE_MANIFEST.read_text(encoding="utf-8").split("\n#### ")
     matches = [block for block in blocks[1:] if key in block]
     assert len(matches) == 1, (
-        f"expected exactly one '#### ' block in docs/schedule_manifest.md citing {key}, "
-        f"found {len(matches)}"
+        f"expected exactly one '#### ' block in docs/schedule_manifest.md citing {key}, found {len(matches)}"
     )
     heading, _, body = matches[0].partition("\n")
     return heading, body
@@ -161,12 +161,8 @@ def test_an_expired_authorization_override_is_marked_expired_in_the_manifest():
             f"{key} lapsed after {trading_day}, but its docs/schedule_manifest.md heading "
             f"does not end with '(EXPIRED)': {heading!r}"
         )
-        assert "expired" in body.lower(), (
-            f"{key} lapsed after {trading_day}, but its manifest block never says so"
-        )
-        assert trading_day in body, (
-            f"{key}'s manifest block must name the trading day {trading_day} it expired after"
-        )
+        assert "expired" in body.lower(), f"{key} lapsed after {trading_day}, but its manifest block never says so"
+        assert trading_day in body, f"{key}'s manifest block must name the trading day {trading_day} it expired after"
 
 
 def test_a_one_time_buy_task_from_an_expired_override_is_disabled():
@@ -181,8 +177,7 @@ def test_a_one_time_buy_task_from_an_expired_override_is_disabled():
             task = tasks.get(one_time_id)
             assert task is not None, f"{one_time_id} (from {key}) has no tasks[] entry"
             assert task["status"] == "disabled", (
-                f"{one_time_id} was authorized only for {key}'s expired window but is "
-                f"status={task['status']!r}"
+                f"{one_time_id} was authorized only for {key}'s expired window but is status={task['status']!r}"
             )
 
 
@@ -695,19 +690,16 @@ def test_run_state_schema_allows_an_unevaluated_budget_for_pre_budget_exits():
     pre_budget_exit = _run_state_document({"budget_evaluated": False})
     jsonschema.validate(pre_budget_exit, schema)
 
-    legacy_full_budget = _run_state_document(
-        {"budget_tier": "normal", "daily_cap_usd": 180.0, "weekly_cap_usd": 900.0}
-    )
+    legacy_full_budget = _run_state_document({"budget_tier": "normal", "daily_cap_usd": 180.0, "weekly_cap_usd": 900.0})
     jsonschema.validate(legacy_full_budget, schema)
 
-    legacy_incomplete_budget = _run_state_document(
-        {"daily_cap_usd": 180.0, "weekly_cap_usd": 900.0}
-    )
+    legacy_incomplete_budget = _run_state_document({"daily_cap_usd": 180.0, "weekly_cap_usd": 900.0})
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(legacy_incomplete_budget, schema)
 
 
 # --- Two documented dev-install paths install the same tooling ---------------
+
 
 def test_pyproject_dev_extra_and_requirements_dev_txt_name_the_same_packages():
     """pyproject.toml's `dev` extra backs `pip install -e '.[dev]'`;
@@ -757,9 +749,7 @@ def test_pyproject_ships_every_live_stream_module_and_config():
 
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     py_modules = set(pyproject["tool"]["setuptools"]["py-modules"])
-    config_data_files = set(
-        pyproject["tool"]["setuptools"]["data-files"]["share/all-stock-dca/config"]
-    )
+    config_data_files = set(pyproject["tool"]["setuptools"]["data-files"]["share/all-stock-dca/config"])
 
     for module in (
         # dca_alerts imports the shared outbound-network validation module at
@@ -785,9 +775,7 @@ def test_pyproject_ships_every_live_stream_module_and_config():
         assert module in py_modules, f"{module} must be listed in [tool.setuptools] py-modules"
 
     for config_file in ("config/market_open_dca.json", "config/intraday_dca.json"):
-        assert config_file in config_data_files, (
-            f"{config_file} must be listed in [tool.setuptools.data-files]"
-        )
+        assert config_file in config_data_files, f"{config_file} must be listed in [tool.setuptools.data-files]"
 
 
 def test_per_ticker_calibration_wires_the_artifact_event_to_the_guarded_command():
@@ -825,12 +813,12 @@ def test_no_live_task_routes_to_a_disabled_in_repo_executor():
         )
         if ships_disabled:
             assert task.get("no_python_entry_point") is True, (
-                f"{task.get('id')}: entry_point ships disabled but "
-                "no_python_entry_point is not true"
+                f"{task.get('id')}: entry_point ships disabled but no_python_entry_point is not true"
             )
 
 
 # --- Budget ladder -----------------------------------------------------------
+
 
 def test_budget_tiers_match_config_budgets_json():
     """The runtime ladder and the documented ladder must be the same ladder.
@@ -843,8 +831,7 @@ def test_budget_tiers_match_config_budgets_json():
     documented = _load("budgets.json")["budget_tiers"]
 
     assert [t["name"] for t in documented] == [t.name for t in BUDGET_TIERS], (
-        "budget tier names/order drifted between near_close_dca.BUDGET_TIERS and "
-        "config/budgets.json"
+        "budget tier names/order drifted between near_close_dca.BUDGET_TIERS and config/budgets.json"
     )
     for doc, code in zip(documented, BUDGET_TIERS, strict=True):
         assert doc["daily_cap_usd"] == code.daily_cap_usd, f"{code.name} daily cap drifted"
@@ -895,9 +882,7 @@ def test_budget_tier_selection_thresholds_match_config_select_when():
             f"near_close_dca.TIER_SPEND_THRESHOLDS_USD[{i}] "
             f"{TIER_SPEND_THRESHOLDS_USD[i]!r}"
         )
-        assert "non-gating" in str(
-            tier.get("escalate_above_planned_spend_usd_note", "")
-        ).lower(), (
+        assert "non-gating" in str(tier.get("escalate_above_planned_spend_usd_note", "")).lower(), (
             f"{tier['name']!r} must mark escalate_above_planned_spend_usd as "
             "non-gating via escalate_above_planned_spend_usd_note"
         )
@@ -927,9 +912,7 @@ def test_budget_tier_selection_thresholds_match_config_select_when():
     # ...and the intervals must be contiguous, so no signal count falls into a
     # gap or two tiers at once. This is what catches a range narrowed from
     # "6-10" to "7-10" while every threshold still appears somewhere.
-    for index, ((lower, _), (_, prev_upper)) in enumerate(
-        zip(intervals[1:], intervals[:-1], strict=True), start=1
-    ):
+    for index, ((lower, _), (_, prev_upper)) in enumerate(zip(intervals[1:], intervals[:-1], strict=True), start=1):
         assert prev_upper is not None
         assert lower == prev_upper + 1, (
             f"tier {documented[index]['name']!r} starts at {lower} but the "
@@ -953,13 +936,9 @@ def _parse_spend_boundary(clause: str) -> tuple[str, float]:
     """
     match = re.search(r"planned spend\s*(<=|>=|<|>)\s*\$([\d.]+)", clause)
     if not match:
-        raise AssertionError(
-            f"expected one 'planned spend <op> $N' boundary in select_when: {clause!r}"
-        )
+        raise AssertionError(f"expected one 'planned spend <op> $N' boundary in select_when: {clause!r}")
     if len(re.findall(r"\$[\d.]+", clause)) != 1:
-        raise AssertionError(
-            f"expected exactly one dollar boundary in select_when clause: {clause!r}"
-        )
+        raise AssertionError(f"expected exactly one dollar boundary in select_when clause: {clause!r}")
     return match.group(1), float(match.group(2))
 
 
@@ -999,9 +978,7 @@ def test_the_sibling_policy_prose_names_the_whole_share_carve_out():
         "circuit_breakers.skip_conditions": " ".join(breakers["skip_conditions"]),
     }
     for field, text in prose.items():
-        assert "whole_share" in text, (
-            f"{field} states the $10 ceiling without naming the whole-share allowance"
-        )
+        assert "whole_share" in text, f"{field} states the $10 ceiling without naming the whole-share allowance"
 
 
 def test_whole_share_max_per_order_matches_the_strategy_config_default():
@@ -1044,9 +1021,9 @@ def test_max_consecutive_placement_failures_matches_the_runner_constant():
     assert morning_dca.load_max_consecutive_placement_failures(CONFIG_DIR) == documented
     # Required by the schema too: dca_runner indexes it at import time with no
     # fallback, so a "schema-valid" budgets.json without it would KeyError.
-    circuit_breakers_schema = json.loads(
-        (SCHEMAS_DIR / "budgets.schema.json").read_text(encoding="utf-8")
-    )["properties"]["circuit_breakers"]
+    circuit_breakers_schema = json.loads((SCHEMAS_DIR / "budgets.schema.json").read_bytes())["properties"][
+        "circuit_breakers"
+    ]
     assert "max_consecutive_placement_failures" in circuit_breakers_schema["required"]
     # >= 2 or the breaker collapses back to halt-on-first-rejection, the exact
     # behavior it was introduced to replace (2026-08-24).
@@ -1091,15 +1068,11 @@ def test_every_loader_refuses_a_budgets_file_that_omits_the_breaker(tmp_path):
         # LIVE mode specifically: load_morning_config only overlays the live
         # circuit breakers under MORNING_LIVE_MODE, and a watchlist-mode config
         # places nothing, so there is no breaker for it to bypass.
-        "load_morning_config": lambda: morning_dca.load_morning_config(
-            str(cfg_dir), morning_dca.MORNING_LIVE_MODE
-        ),
+        "load_morning_config": lambda: morning_dca.load_morning_config(str(cfg_dir), morning_dca.MORNING_LIVE_MODE),
         # The two real load_stream_config callers, rather than the shared
         # helper: these are what the market-open and intraday streams actually
         # start from.
-        "load_market_open_config": lambda: market_open_dca.load_market_open_config(
-            str(cfg_dir)
-        ),
+        "load_market_open_config": lambda: market_open_dca.load_market_open_config(str(cfg_dir)),
         "load_intraday_config": lambda: intraday_dca.load_intraday_config(str(cfg_dir)),
         "load_midday_config": lambda: midday_dca.load_midday_config(str(cfg_dir)),
     }
@@ -1132,19 +1105,18 @@ def test_budget_tiers_are_monotonically_non_decreasing():
 
 # --- Ticker universe ---------------------------------------------------------
 
+
 def test_active_tickers_match_config_tickers_json():
     documented = _load("tickers.json")["active"]
     assert list(documented) == list(ACTIVE_TICKERS), (
-        "the active universe drifted between near_close_dca.ACTIVE_TICKERS and "
-        "config/tickers.json"
+        "the active universe drifted between near_close_dca.ACTIVE_TICKERS and config/tickers.json"
     )
 
 
 def test_excluded_tickers_match_config_tickers_json():
     documented = _load("tickers.json")["excluded"]
     assert set(documented) == set(EXCLUDED_TICKERS), (
-        "the exclusion list drifted between near_close_dca.EXCLUDED_TICKERS and "
-        "config/tickers.json"
+        "the exclusion list drifted between near_close_dca.EXCLUDED_TICKERS and config/tickers.json"
     )
 
 
@@ -1159,8 +1131,7 @@ def test_active_tickers_have_no_duplicates():
 def test_whole_share_tickers_match_config_tickers_json():
     documented = _load("tickers.json")["whole_share"]
     assert set(documented) == set(WHOLE_SHARE_TICKERS), (
-        "the whole-share ticker list drifted between near_close_dca.WHOLE_SHARE_TICKERS "
-        "and config/tickers.json"
+        "the whole-share ticker list drifted between near_close_dca.WHOLE_SHARE_TICKERS and config/tickers.json"
     )
 
 
@@ -1230,8 +1201,7 @@ def test_scheduled_tasks_circuit_breaker_mirror_carries_the_whole_share_ceiling(
     budgets_breakers = _load("budgets.json")["circuit_breakers"]
     assert breakers["whole_share_max_per_order_usd"] == budgets_breakers["whole_share_max_per_order_usd"]
     assert "No single order may exceed $10" not in breakers["max_per_order_note"], (
-        "the mirror must not restate the $10 cap as absolute now that a "
-        "whole-share exception exists"
+        "the mirror must not restate the $10 cap as absolute now that a whole-share exception exists"
     )
     assert "whole_share_max_per_order_usd" in breakers["max_per_order_note"]
 
@@ -1315,9 +1285,7 @@ _ACCOUNT_SHAPED = re.compile(r"(?<![.\w])\d{6,12}(?![\w.])")
 # measured against the tree it costs zero false positives either way, and for a
 # guard whose misses are silent while its false positives are one line to
 # exempt, the wider form is the right side to err on.
-_LABELED_ACCOUNT = re.compile(
-    r"(?i)(?:account|acct|broker|robinhood|alpaca|rh)[^0-9A-Za-z]{0,3}(\d{6,12})"
-)
+_LABELED_ACCOUNT = re.compile(r"(?i)(?:account|acct|broker|robinhood|alpaca|rh)[^0-9A-Za-z]{0,3}(\d{6,12})")
 
 # YYYYMM / YYYYMMDD. Trading days and dated artifact slots are all over config,
 # docs, and tests; none is an account, and they are recognized by shape rather
@@ -1410,6 +1378,7 @@ def _is_real_date(value: str) -> bool:
     except ValueError:
         return False
     return True
+
 
 # Literals in the tree that widening to 6-12 digits newly matches, each reviewed
 # individually and none an account number. Grouped by what they actually are:
@@ -1552,9 +1521,27 @@ _ALLOWED = {
 # extend. These suffixes are skipped before the read purely to avoid pulling
 # large binaries into memory; adding one is an optimisation, not a policy.
 _BINARY_SUFFIXES = {
-    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".svgz",
-    ".pdf", ".zip", ".gz", ".tar", ".xz", ".bz2",
-    ".woff", ".woff2", ".ttf", ".eot", ".pyc", ".so", ".dylib", ".dll",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".ico",
+    ".webp",
+    ".svgz",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".tar",
+    ".xz",
+    ".bz2",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".pyc",
+    ".so",
+    ".dylib",
+    ".dll",
 }
 
 
@@ -1616,9 +1603,7 @@ def test_no_account_shaped_literal_in_tracked_config_source_or_docs():
                     continue
                 if value in _NON_ACCOUNT_LITERALS:
                     continue
-                if _is_real_date(value) and (
-                    _in_date_context(line, match) or _in_regex_pattern(line, match)
-                ):
+                if _is_real_date(value) and (_in_date_context(line, match) or _in_regex_pattern(line, match)):
                     continue
                 # A six-digit run right after "#" is a CSS hex colour, not an
                 # account. Length-bounded on purpose: a nine-digit account
@@ -1649,9 +1634,7 @@ def test_the_guard_rejects_a_real_account_literal_in_a_test_file(tmp_path, monke
     probe_account = "1112" + "22333"
     offender = "test_regression_probe.py"
     # Written in a labeled form, which the previous pattern let through.
-    (tmp_path / offender).write_text(
-        f'ACCOUNT = "robinhood-{probe_account}"\n', encoding="utf-8"
-    )
+    (tmp_path / offender).write_text(f'ACCOUNT = "robinhood-{probe_account}"\n', encoding="utf-8")
     monkeypatch.setattr(f"{__name__}.REPO_ROOT", tmp_path)
     monkeypatch.setattr(f"{__name__}._tracked_files", lambda: [offender])
 
@@ -1758,9 +1741,7 @@ def test_spend_boundaries_carry_their_operator(clause, expected):
     assert _parse_spend_boundary(clause) == expected
 
 
-@pytest.mark.parametrize(
-    "rel", [".gitignore", ".env", "scripts/deploy", "Makefile", "tox.ini", "setup.cfg"]
-)
+@pytest.mark.parametrize("rel", [".gitignore", ".env", "scripts/deploy", "Makefile", "tox.ini", "setup.cfg"])
 def test_extensionless_and_dotfiles_are_scanned(rel):
     """The guard used to allowlist text SUFFIXES, which can only ever be
     incomplete -- .gitignore was tracked and unscanned, and an extensionless
@@ -1800,7 +1781,7 @@ _A_DATE = datetime(2026, 7, 28).strftime("%Y%m%d")
 
 
 def test_a_date_cue_in_the_filename_does_not_exempt_the_whole_file():
-    """"config/midday_dca.json" contains "day" and "scheduled_tasks.json"
+    """ "config/midday_dca.json" contains "day" and "scheduled_tasks.json"
     contains "schedule", so consulting the filename exempted every date-shaped
     value in them, including on an account line (Codex review, PR #219)."""
     line = f'  "broker_account": "{_A_DATE}",'
@@ -1958,9 +1939,7 @@ def _prompt_text(filename: str) -> str:
 
 
 def _midday_live_mirror_text() -> str:
-    return (
-        PROMPTS_DIR / "live-mirror" / "1230ET-1230-pm-midday-buying-run.txt"
-    ).read_text(encoding="utf-8")
+    return (PROMPTS_DIR / "live-mirror" / "1230ET-1230-pm-midday-buying-run.txt").read_text(encoding="utf-8")
 
 
 def test_alert_digest_docs_resolve_the_artifact_root_portably():
@@ -2030,11 +2009,7 @@ def _six_file_placing_prompt_texts() -> dict:
     must not run those same assertions against midday's differently-worded
     text.
     """
-    return {
-        name: text
-        for name, text in _live_mirror_placing_prompt_texts().items()
-        if name != _MIDDAY_MIRROR_KEY
-    }
+    return {name: text for name, text in _live_mirror_placing_prompt_texts().items() if name != _MIDDAY_MIRROR_KEY}
 
 
 def test_every_placing_prompt_isolates_only_proven_no_order_failures():
@@ -2261,7 +2236,7 @@ def test_every_placing_prompt_isolates_only_proven_no_order_failures():
         # check", not "no order found" -- the code's own bounds fail closed
         # for the same reason (Codex review, PR #786: "Fail closed when
         # response traversal is truncated").
-        "that is not \"no order found\"",
+        'that is not "no order found"',
         # `cancelled`/`expired` mean an order existed and was then killed, so
         # they need an explicit zero even with no id, while `rejected`/
         # `failed`/`voided` stay ordinary refusals (Codex review, PR #786:
@@ -2285,15 +2260,9 @@ def test_every_placing_prompt_isolates_only_proven_no_order_failures():
     ]
     texts = _placing_prompt_texts()
     assert len(texts) >= 13, f"expected every placing prompt, got {sorted(texts)}"
-    missing = [
-        f"{name}: {phrase!r}"
-        for name, text in texts.items()
-        for phrase in required
-        if phrase not in text
-    ]
+    missing = [f"{name}: {phrase!r}" for name, text in texts.items() for phrase in required if phrase not in text]
     assert not missing, (
-        "every placing prompt must carry the full halt-vs-isolate rule, not "
-        f"an unconditional 'continue': {missing}"
+        f"every placing prompt must carry the full halt-vs-isolate rule, not an unconditional 'continue': {missing}"
     )
 
 
@@ -2323,10 +2292,7 @@ def test_no_prompt_escalates_a_bare_order_rejection():
         "safety, account, or order rejection",
     )
     offenders = [
-        f"{name}: {phrase!r}"
-        for name, text in texts.items()
-        for phrase in forbidden
-        if phrase.lower() in text.lower()
+        f"{name}: {phrase!r}" for name, text in texts.items() for phrase in forbidden if phrase.lower() in text.lower()
     ]
     assert not offenders, (
         "an order rejection at Gate 7 is isolated, not escalated -- these "
@@ -2339,18 +2305,12 @@ def test_no_placing_prompt_still_claims_only_two_stop_conditions():
     conditions Gate 7 itself names'. Leaving that count behind while Gate 7
     grew a third one tells the executor the ambiguous-response halt is not one
     of them."""
-    offenders = [
-        name
-        for name, text in _placing_prompt_texts().items()
-        if "two batch-level stop conditions" in text
-    ]
+    offenders = [name for name, text in _placing_prompt_texts().items() if "two batch-level stop conditions" in text]
     assert not offenders, offenders
 
 
 def _market_open_live_mirror_text() -> str:
-    return (
-        PROMPTS_DIR / "live-mirror" / "0935ET-935-am-dca-morning-buy.txt"
-    ).read_text(encoding="utf-8")
+    return (PROMPTS_DIR / "live-mirror" / "0935ET-935-am-dca-morning-buy.txt").read_text(encoding="utf-8")
 
 
 def test_market_open_live_mirror_fail_closes_reviewed_placement_boundaries():
@@ -2443,7 +2403,10 @@ def test_midday_live_mirror_requires_qualifying_in_window_afternoon_evidence():
     text = _midday_live_mirror_text()
 
     assert "is_afternoon_evidence = dca_risk.is_afternoon_scheduled_evidence(state)" in text
-    assert "if is_validated_evidence and window_start <= trading_day < today and scheduled_for in ('14:30', '15:30'):" in text
+    assert (
+        "if is_validated_evidence and window_start <= trading_day < today and scheduled_for in ('14:30', '15:30'):"
+        in text
+    )
     assert "if missing_pairs:" in text
 
 
@@ -2460,7 +2423,7 @@ def test_midday_gate_5_fetches_configured_yfinance_fallback():
         gate_5 = text[text.index("GATE 5 - BUY LIST") : text.index("GATE 6 - BUDGET")]
         assert "If Finance is unavailable, stale, incomplete, or unresolved" in gate_5, slot
         assert "fetch yfinance evidence for EVERY ordinary ticker" in gate_5, slot
-        assert 'sources.yahoo_finance_yfinance' in gate_5, slot
+        assert "sources.yahoo_finance_yfinance" in gate_5, slot
         assert '"yahoo_finance_yfinance": []' in gate_5, slot
         assert "before invoking the generator" in gate_5, slot
 
@@ -2488,8 +2451,7 @@ def test_market_open_gate_5_hands_rich_candidates_to_gate_6_5():
         "selected_base_amount_usd",
     ):
         assert required_field in named_fields, (
-            f"Gate 5 no longer names {required_field} as a distinct field; "
-            "Gate 6.5 drops any candidate row missing it"
+            f"Gate 5 no longer names {required_field} as a distinct field; Gate 6.5 drops any candidate row missing it"
         )
 
 
@@ -2696,14 +2658,10 @@ def test_every_live_mirror_probes_outside_the_cowork_mount_layout():
         text = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")
         gate_2 = _gate_section(text, "GATE 2 - REPO REACHABLE")
         assert probe_4 in gate_2, f"{filename}: Gate 2 never looks outside /sessions/*/mnt/"
-        assert "FOUR probes" in gate_2, (
-            f"{filename}: Gate 2 still tells the executor to run three probes"
-        )
+        assert "FOUR probes" in gate_2, f"{filename}: Gate 2 still tells the executor to run three probes"
         # The added probe must not become an exception to the ambiguity rules
         # the other three are bound by.
-        assert "same deduplicated union" in gate_2, (
-            f"{filename}: probe 4 must fold into the same union as the others"
-        )
+        assert "same deduplicated union" in gate_2, f"{filename}: probe 4 must fold into the same union as the others"
         assert "exactly-one-surviving-checkout" in gate_2, (
             f"{filename}: probe 4 must count toward the same exactly-one rule"
         )
@@ -2998,9 +2956,7 @@ def test_every_live_mirror_front_loads_the_shell_unavailable_rule():
         assert "READ config/trading_window.json" in prefix, (
             f"{filename}: the truncation-safe rule must try a file read before blaming the repo"
         )
-        assert "Gate 2 PASSED" in prefix, (
-            f"{filename}: a truncated fire must know a successful read clears Gate 2"
-        )
+        assert "Gate 2 PASSED" in prefix, f"{filename}: a truncated fire must know a successful read clears Gate 2"
         assert "never to the checkout's artifacts/ directory" in prefix, (
             f"{filename}: the durable alert destination must survive truncation"
         )
@@ -3044,9 +3000,7 @@ def test_every_live_mirror_gate2_separates_a_dead_shell_from_a_missing_repo():
         assert "GATE 2 PASSED and must NOT be reported as the failure" in gate_2, (
             f"{filename}: a successful repo read must clear Gate 2 rather than blame it"
         )
-        assert "scripts/alert_digest.py" in gate_2, (
-            f"{filename}: Gate 2 must say why the gate number matters"
-        )
+        assert "scripts/alert_digest.py" in gate_2, f"{filename}: Gate 2 must say why the gate number matters"
 
         # A dead shell is not a dead session: file writes can still persist
         # evidence, and the durable alert must not land in gitignored output.
@@ -3171,9 +3125,7 @@ def test_gate5_override_header_defines_alert_channels_before_any_abort():
         header = _prompt_text(filename).split("\n", 1)[0]
         channel_index = header.find("(1) IN-APP MESSAGE CENTER")
         assert channel_index != -1, f"{filename}: header is missing the channel list"
-        abort_indices = [
-            match.start() for match in re.finditer(re.escape(abort_phrase), header)
-        ]
+        abort_indices = [match.start() for match in re.finditer(re.escape(abort_phrase), header)]
         assert abort_indices, f"{filename}: header is missing an abort branch"
         assert all(index > channel_index for index in abort_indices), (
             f"{filename}: the three-channel alert list must be defined before "
@@ -3183,10 +3135,7 @@ def test_gate5_override_header_defines_alert_channels_before_any_abort():
 
 def test_gate5_disabled_alerts_every_fire_in_header_and_gate9_of_every_prompt():
     header_phrase = "GATE5_DISABLED alerts every fire as of 2026-07-30"
-    gate9_phrase = (
-        "GATE5_DISABLED: alert on ALL THREE channels above, in order, "
-        "exactly like any abort or skip"
-    )
+    gate9_phrase = "GATE5_DISABLED: alert on ALL THREE channels above, in order, exactly like any abort or skip"
     for filename in _SLOT_FILES:
         text = _prompt_text(filename)
         assert header_phrase in text, (
@@ -3217,8 +3166,7 @@ def test_gate4_expected_overlap_classification_matches_the_documented_three_slot
                 "attempt the GATE4_EXPECTED_OVERLAP classification"
             )
             assert "does NOT attempt a GATE4_EXPECTED_OVERLAP classification" in text, (
-                f"{filename}: must explicitly say it does not attempt the "
-                "classification, not merely omit it"
+                f"{filename}: must explicitly say it does not attempt the classification, not merely omit it"
             )
 
 
@@ -3251,9 +3199,7 @@ def test_market_open_prompt_requires_canonical_and_fresh_budget_plans():
     gates.  Pin both canonical planner calls so prompt edits cannot silently
     restore either unsafe shortcut.
     """
-    text = (
-        PROMPTS_DIR / "live-mirror" / "0935ET-935-am-dca-morning-buy.txt"
-    ).read_text()
+    text = (PROMPTS_DIR / "live-mirror" / "0935ET-935-am-dca-morning-buy.txt").read_text()
 
     assert "The canonical planner is MANDATORY" in text
     assert "NEVER fall back to the raw `cands` list" in text
@@ -3276,8 +3222,7 @@ def test_every_executor_prompt_declares_the_correct_gate1_time_window():
             "copy-pasted neighbor's"
         )
         assert f"It must fall inside {expected}" in body, (
-            f"{filename}: Gate 1's own body section must declare the same "
-            f"{expected!r} window as the header"
+            f"{filename}: Gate 1's own body section must declare the same {expected!r} window as the header"
         )
 
 
@@ -3312,12 +3257,7 @@ def test_no_prompt_tells_its_placement_loop_to_stop_on_the_first_rejection():
         "A confirmed rejection, tool error, or response that proves neither "
         "success nor rejection stops further placement",
     )
-    offenders = [
-        f"{name}: {phrase!r}"
-        for name, text in texts.items()
-        for phrase in forbidden
-        if phrase in text
-    ]
+    offenders = [f"{name}: {phrase!r}" for name, text in texts.items() for phrase in forbidden if phrase in text]
     assert not offenders, (
         "a placement loop still halts the whole batch on an order rejection, "
         "contradicting the Gate 7 carve-out in the same prompt: " + "; ".join(offenders)
@@ -3343,22 +3283,14 @@ def test_the_missing_budgets_fallback_defaults_match_the_shipped_config():
 
     import dca_config
 
-    shipped = json.loads(
-        (dca_config.get_config_dir() / "budgets.json").read_text(encoding="utf-8")
-    )["circuit_breakers"]
-    assert (
-        dca_config.DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
-        == shipped["max_consecutive_placement_failures"]
-    )
+    shipped = json.loads((dca_config.get_config_dir() / "budgets.json").read_bytes())["circuit_breakers"]
+    assert dca_config.DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES == shipped["max_consecutive_placement_failures"]
     assert dca_config.DEFAULT_MAX_ORDERS_PER_DAY == shipped["max_orders_per_day"]
 
     # ... and the fallback really resolves to them, rather than to None.
     with tempfile.TemporaryDirectory() as empty:
         cfg = dca_config.load_strategy_config(config_dir=str(Path(empty)))
-        assert (
-            cfg.max_consecutive_placement_failures
-            == dca_config.DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
-        )
+        assert cfg.max_consecutive_placement_failures == dca_config.DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
         assert cfg.max_orders_per_day == dca_config.DEFAULT_MAX_ORDERS_PER_DAY
 
     # An explicit override still wins -- the fallback fills in where nothing
@@ -3407,10 +3339,7 @@ def test_the_missing_budgets_fallback_defaults_match_the_shipped_config():
             ),
             encoding="utf-8",
         )
-        assert (
-            dca_config.load_strategy_config(config_dir=str(Path(present))).max_orders_per_day
-            is None
-        )
+        assert dca_config.load_strategy_config(config_dir=str(Path(present))).max_orders_per_day is None
 
     # The marker is deliberately not a StrategyConfig field: a standalone
     # `load_budgets` caller that splatted the overlay would raise on it, the
@@ -3423,22 +3352,12 @@ def test_the_missing_budgets_fallback_defaults_match_the_shipped_config():
     import morning_dca
 
     with tempfile.TemporaryDirectory() as empty:
-        overrides = morning_dca._live_circuit_breaker_overrides(
-            Path(empty), morning_dca.MORNING_LIVE_MODE
-        )
-        assert (
-            overrides["max_consecutive_placement_failures"]
-            == dca_config.DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
-        )
+        overrides = morning_dca._live_circuit_breaker_overrides(Path(empty), morning_dca.MORNING_LIVE_MODE)
+        assert overrides["max_consecutive_placement_failures"] == dca_config.DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
         assert overrides["max_orders_per_day"] == dca_config.DEFAULT_MAX_ORDERS_PER_DAY
         # Watchlist/preflight never place, and must stay off this path so a
         # malformed budgets.json cannot block the 9:45 validation artifact.
-        assert (
-            morning_dca._live_circuit_breaker_overrides(
-                Path(empty), morning_dca.MORNING_PREFLIGHT_MODE
-            )
-            == {}
-        )
+        assert morning_dca._live_circuit_breaker_overrides(Path(empty), morning_dca.MORNING_PREFLIGHT_MODE) == {}
 
     # ...and SCOPED THE SAME WAY on that side, which the round-50 fix asserted
     # for `dca_config` and never asked of the loader it was fixing.
@@ -3465,12 +3384,7 @@ def test_the_missing_budgets_fallback_defaults_match_the_shipped_config():
         # Absent from the overlay entirely, so MorningConfig's own None
         # survives -- uncapped, exactly as load_strategy_config resolves it.
         assert "max_orders_per_day" not in present_overrides
-        assert (
-            dca_config.load_strategy_config(
-                config_dir=str(Path(present_morning))
-            ).max_orders_per_day
-            is None
-        )
+        assert dca_config.load_strategy_config(config_dir=str(Path(present_morning))).max_orders_per_day is None
         # The breaker is NOT optional and still resolves from the file.
         assert present_overrides["max_consecutive_placement_failures"] == 3
         # A present file that DOES set the cap is still honoured.
@@ -3487,9 +3401,9 @@ def test_the_missing_budgets_fallback_defaults_match_the_shipped_config():
             encoding="utf-8",
         )
         assert (
-            morning_dca._live_circuit_breaker_overrides(
-                Path(present_morning), morning_dca.MORNING_LIVE_MODE
-            )["max_orders_per_day"]
+            morning_dca._live_circuit_breaker_overrides(Path(present_morning), morning_dca.MORNING_LIVE_MODE)[
+                "max_orders_per_day"
+            ]
             == 2
         )
 
@@ -3541,13 +3455,8 @@ def test_every_live_loader_falls_back_to_the_shipped_count_limits(tmp_path, monk
             "intraday": intraday_dca.load_intraday_config(config_dir=str(config_dir)),
             "afternoon": dca_config.load_strategy_config(config_dir=str(config_dir)),
         }
-        resolved = {
-            name: (cfg.max_consecutive_placement_failures, cfg.max_orders_per_day)
-            for name, cfg in out.items()
-        }
-        overrides = morning_dca._live_circuit_breaker_overrides(
-            config_dir, morning_dca.MORNING_LIVE_MODE
-        )
+        resolved = {name: (cfg.max_consecutive_placement_failures, cfg.max_orders_per_day) for name, cfg in out.items()}
+        overrides = morning_dca._live_circuit_breaker_overrides(config_dir, morning_dca.MORNING_LIVE_MODE)
         resolved["morning_live"] = (
             overrides["max_consecutive_placement_failures"],
             # Absent from the overlay means the config's own None survives.
@@ -3580,21 +3489,29 @@ def test_every_live_loader_falls_back_to_the_shipped_count_limits(tmp_path, monk
     # undo now that it reaches three more loaders. (The breaker key is not
     # optional; an existing file omitting it raises.)
     omitted = _resolved(
-        _config_dir({"circuit_breakers": {
-            "max_per_order_usd": 10.0,
-            "max_consecutive_placement_failures": 3,
-        }})
+        _config_dir(
+            {
+                "circuit_breakers": {
+                    "max_per_order_usd": 10.0,
+                    "max_consecutive_placement_failures": 3,
+                }
+            }
+        )
     )
     for name, values in omitted.items():
         assert values == (3, None), (name, values)
 
     # A present file that sets both is honoured everywhere, fallback or not.
     configured = _resolved(
-        _config_dir({"circuit_breakers": {
-            "max_per_order_usd": 10.0,
-            "max_consecutive_placement_failures": 2,
-            "max_orders_per_day": 5,
-        }})
+        _config_dir(
+            {
+                "circuit_breakers": {
+                    "max_per_order_usd": 10.0,
+                    "max_consecutive_placement_failures": 2,
+                    "max_orders_per_day": 5,
+                }
+            }
+        )
     )
     for name, values in configured.items():
         assert values == (2, 5), (name, values)
@@ -3838,9 +3755,7 @@ def test_every_placing_prompt_revalidates_the_1x_drop_tier():
     its 1x floor to 0x/no-buy, so 1.0x is not exempt from either check
     (Codex review: "Revalidate the minimum-drop tier for 1x rows")."""
     five_with_price_eligibility = {
-        name: text
-        for name, text in _six_file_placing_prompt_texts().items()
-        if "1530ET" not in name
+        name: text for name, text in _six_file_placing_prompt_texts().items() if "1530ET" not in name
     }
     assert len(five_with_price_eligibility) == 5
     for name, text in five_with_price_eligibility.items():
@@ -4245,8 +4160,10 @@ def test_midday_live_mirror_reshape_carries_client_order_id():
     text = _midday_live_mirror_text()
     assert "Preserve client references in the reshaped history" in text
     gate4_reshape = text[
-        text.index("Gate 4's own broker fetch (for orders_week.json above)") :
-        text.index("Gate 4's own broker fetch (for orders_week.json above)") + 2000
+        text.index("Gate 4's own broker fetch (for orders_week.json above)") : text.index(
+            "Gate 4's own broker fetch (for orders_week.json above)"
+        )
+        + 2000
     ]
     assert '"client_order_id"' in gate4_reshape
 
@@ -4629,10 +4546,10 @@ def test_midday_live_mirror_documents_the_run_classification_template():
     documentation), or an LLM free-handing the write has no template to
     follow and can reproduce the exact unclassifiable-artifact incident."""
     text = _midday_live_mirror_text()
-    assert 'state_schema_version' in text
-    assert 'midday-live-v1' in text
-    assert 'midday_dca_live' in text
-    assert 'never a bare string' in text
+    assert "state_schema_version" in text
+    assert "midday-live-v1" in text
+    assert "midday_dca_live" in text
+    assert "never a bare string" in text
 
 
 def test_every_live_slot_gate_5_merges_its_prefetched_yfinance_fallback():
@@ -4647,7 +4564,9 @@ def test_every_live_slot_gate_5_merges_its_prefetched_yfinance_fallback():
         slot = mirror.name[:4]
         text = mirror.read_text(encoding="utf-8")
         gate_5 = text[text.index("GATE 5 - BUY LIST") : text.index("GATE 6 - BUDGET")]
-        assert f"stream_root('yfinance_prefetch', '<YYYY-MM-DD>', 'yfinance_fallback_<YYYY-MM-DD>_{slot}.json')" in gate_5, mirror.name
+        assert (
+            f"stream_root('yfinance_prefetch', '<YYYY-MM-DD>', 'yfinance_fallback_<YYYY-MM-DD>_{slot}.json')" in gate_5
+        ), mirror.name
         assert f'deploy/launchd/prefetch_slot.sh" {slot}' in gate_5, mirror.name
         assert "sources.yahoo_finance_yfinance" in gate_5, mirror.name
         # The prefetch tree is deliberately not the run directory.
