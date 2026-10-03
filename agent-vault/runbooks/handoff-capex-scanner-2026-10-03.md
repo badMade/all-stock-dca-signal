@@ -8,7 +8,7 @@ Nothing here is live trading authorization. The scanner is read-only research to
 - Scanner implementation completed in `agent-vault/scripts/scan_capex_deltas.py` with test suite `tests/test_scan_capex_deltas.py` (commit `d90435ec`).
 - Two-tier rule ($2,000M hyperscalers, $250M suppliers) and 15% delta thresholds verified test-first across 10 test cases.
 - Also implemented and tested: year-to-date cash flow differencing (with accession provenance), CIK mapping from `company_tickers.json`, and request pacing.
-- Remaining: live SEC fetching. `fetch_company_facts_offline_or_sec` is a stub that returns `None`; the `--report` CLI currently evaluates stored baselines only.
+- Live SEC fetching completed: fetch_sec_company_tickers and fetch_company_facts_from_sec support live EDGAR ingestion (--live) with SECRateLimiter pacing (10 req/s), contact User-Agent, and SSRF host protection.
 
 ## Inputs (all on `main`)
 

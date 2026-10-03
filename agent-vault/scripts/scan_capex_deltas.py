@@ -498,21 +498,158 @@ def extract_capex_from_facts(facts_payload: dict[str, Any]) -> tuple[str, float,
     return None
 
 
+def _http_get_sec(
+    url: str,
+    user_agent: str = DEFAULT_USER_AGENT,
+    timeout: float = 10.0,
+    limiter: SECRateLimiter | None = None,
+    fetch_fn: Callable[[str, dict[str, str], float], bytes] | None = None,
+) -> bytes | None:
+    """Fetch bytes from SEC endpoint with SSRF check, rate limiting, and fail-closed handling."""
+    if not validate_sec_url(url):
+        return None
+    if limiter is not None:
+        limiter.acquire()
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "application/json",
+    }
+    if fetch_fn is not None:
+        try:
+            return fetch_fn(url, headers, timeout)
+        except Exception:
+            return None
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
+            if response.status != 200:
+                return None
+            return response.read()
+    except Exception:
+        return None
+
+
+def fetch_sec_company_tickers(
+    user_agent: str = DEFAULT_USER_AGENT,
+    timeout: float = 10.0,
+    limiter: SECRateLimiter | None = None,
+    fetch_fn: Callable[[str, dict[str, str], float], bytes] | None = None,
+) -> dict[str, str]:
+    """Fetch and parse SEC company tickers mapping from company_tickers.json.
+
+    Args:
+        user_agent: SEC contact User-Agent header.
+        timeout: Request timeout in seconds.
+        limiter: Optional SECRateLimiter for pacing.
+        fetch_fn: Optional injected network fetcher for offline testing.
+
+    Returns:
+        Mapping of uppercase ticker symbol to 10-digit zero-padded CIK string.
+    """
+    url = "https://www.sec.gov/files/company_tickers.json"
+    raw_bytes = _http_get_sec(
+        url=url,
+        user_agent=user_agent,
+        timeout=timeout,
+        limiter=limiter,
+        fetch_fn=fetch_fn,
+    )
+    if not raw_bytes:
+        return {}
+    return parse_sec_company_tickers_mapping(raw_bytes)
+
+
+def fetch_company_facts_from_sec(
+    cik: str,
+    user_agent: str = DEFAULT_USER_AGENT,
+    timeout: float = 10.0,
+    limiter: SECRateLimiter | None = None,
+    fetch_fn: Callable[[str, dict[str, str], float], bytes] | None = None,
+) -> dict[str, Any] | None:
+    """Fetch company facts JSON for a given CIK from SEC EDGAR.
+
+    Args:
+        cik: Central Index Key (numeric or zero-padded string).
+        user_agent: SEC contact User-Agent header.
+        timeout: Request timeout in seconds.
+        limiter: Optional SECRateLimiter for pacing.
+        fetch_fn: Optional injected network fetcher for offline testing.
+
+    Returns:
+        Parsed company facts dict, or None on error or non-200 or malformed JSON.
+    """
+    clean_cik = str(cik).strip().zfill(10)
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{clean_cik}.json"
+    raw_bytes = _http_get_sec(
+        url=url,
+        user_agent=user_agent,
+        timeout=timeout,
+        limiter=limiter,
+        fetch_fn=fetch_fn,
+    )
+    if not raw_bytes:
+        return None
+    try:
+        data = json.loads(raw_bytes.decode("utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def fetch_company_facts_offline_or_sec(
     ticker: str,
     user_agent: str = DEFAULT_USER_AGENT,
     timeout: float = 10.0,
+    cik_mapping: dict[str, str] | None = None,
+    limiter: SECRateLimiter | None = None,
+    fetch_fn: Callable[[str, dict[str, str], float], bytes] | None = None,
 ) -> dict[str, Any] | None:
-    """Fetch company facts from SEC EDGAR with timeout and error containment."""
-    # Placeholder for live EDGAR requests: requires CIK resolution
-    # In live environments, CIK is looked up via sec.gov/files/company_tickers.json
-    return None
+    """Fetch company facts from SEC EDGAR with timeout, CIK lookup, and error containment.
+
+    Args:
+        ticker: Stock ticker symbol.
+        user_agent: SEC contact User-Agent header.
+        timeout: Request timeout in seconds.
+        cik_mapping: Optional pre-loaded ticker to CIK mapping.
+        limiter: Optional SECRateLimiter for pacing.
+        fetch_fn: Optional injected network fetcher for offline testing.
+
+    Returns:
+        Parsed company facts dict, or None if ticker not found or fetch fails.
+    """
+    sym = ticker.strip().upper()
+    if sym in UNSCANNABLE_TICKERS:
+        return None
+
+    mapping = cik_mapping
+    if mapping is None:
+        mapping = fetch_sec_company_tickers(
+            user_agent=user_agent,
+            timeout=timeout,
+            limiter=limiter,
+            fetch_fn=fetch_fn,
+        )
+
+    cik = mapping.get(sym)
+    if not cik:
+        return None
+
+    return fetch_company_facts_from_sec(
+        cik=cik,
+        user_agent=user_agent,
+        timeout=timeout,
+        limiter=limiter,
+        fetch_fn=fetch_fn,
+    )
 
 
 def main() -> int:
     """CLI entry point for recurring capex delta scans."""
     parser = argparse.ArgumentParser(description="Scan quarterly capex deltas for watched filers")
     parser.add_argument("--tickers", help="Comma-separated list of symbols to evaluate")
+    parser.add_argument("--live", action="store_true", help="Fetch live company facts from SEC EDGAR")
+    parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT, help="User-Agent string for SEC requests")
+    parser.add_argument("--timeout", type=float, default=10.0, help="HTTP request timeout in seconds")
     parser.add_argument("--dry-run", action="store_true", help="Run scanner using existing baselines only")
     parser.add_argument("--report", action="store_true", help="Format and output structured Markdown report")
     parser.add_argument("--report-file", type=Path, help="File path to save Markdown report")
@@ -528,6 +665,13 @@ def main() -> int:
 
     target_tickers = [t.strip().upper() for t in args.tickers.split(",")] if args.tickers else list(baselines.keys())
 
+    limiter = SECRateLimiter() if args.live else None
+    cik_map: dict[str, str] = {}
+    if args.live:
+        print(f"Fetching SEC company tickers mapping with User-Agent: {args.user_agent}...")
+        cik_map = fetch_sec_company_tickers(user_agent=args.user_agent, timeout=args.timeout, limiter=limiter)
+        print(f"Loaded {len(cik_map)} CIK mappings from SEC.")
+
     evaluations: list[CapexEvaluation] = []
     for ticker in target_tickers:
         if ticker in non_operating:
@@ -538,15 +682,63 @@ def main() -> int:
         period_str = base.period_end if base else ""
         co_name = operating.get(ticker, "")
 
-        ev = evaluate_capex_change(
-            ticker=ticker,
-            current_usd_m=curr_val,
-            previous_usd_m=prev_val,
-            config=cfg,
-            company_name=co_name,
-            period_end=period_str,
-        )
-        evaluations.append(ev)
+        if args.live:
+            if ticker in UNSCANNABLE_TICKERS:
+                ev = evaluate_capex_change(
+                    ticker=ticker,
+                    current_usd_m=0.0,
+                    previous_usd_m=prev_val,
+                    config=cfg,
+                    company_name=co_name,
+                    period_end=period_str,
+                )
+                evaluations.append(ev)
+                continue
+
+            facts = fetch_company_facts_offline_or_sec(
+                ticker=ticker,
+                user_agent=args.user_agent,
+                timeout=args.timeout,
+                cik_mapping=cik_map,
+                limiter=limiter,
+            )
+            extracted = extract_capex_from_facts(facts) if facts else None
+            if extracted is not None:
+                new_period, new_val, new_accn = extracted
+                ev = evaluate_capex_change(
+                    ticker=ticker,
+                    current_usd_m=new_val,
+                    previous_usd_m=prev_val,
+                    config=cfg,
+                    company_name=co_name,
+                    period_end=new_period,
+                )
+            else:
+                ev = CapexEvaluation(
+                    ticker=ticker,
+                    current_usd_m=curr_val,
+                    previous_usd_m=prev_val,
+                    delta_usd_m=None,
+                    pct_delta=None,
+                    flagged_pct=False,
+                    flagged_addition=False,
+                    tier="hyperscaler" if (prev_val and prev_val >= cfg.hyperscaler_spend_threshold_usd_m) else "supplier",
+                    status="not_found",
+                    company_name=co_name,
+                    period_end=period_str,
+                    notes="SEC company facts not found or unavailable",
+                )
+            evaluations.append(ev)
+        else:
+            ev = evaluate_capex_change(
+                ticker=ticker,
+                current_usd_m=curr_val,
+                previous_usd_m=prev_val,
+                config=cfg,
+                company_name=co_name,
+                period_end=period_str,
+            )
+            evaluations.append(ev)
 
     if args.report:
         report_md = format_capex_scan_report(evaluations, title="Quarterly CapEx Delta Scan Report")

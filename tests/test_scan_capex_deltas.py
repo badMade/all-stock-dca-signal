@@ -31,6 +31,9 @@ from scan_capex_deltas import (  # noqa: E402
     difference_quarterly_capex,
     evaluate_capex_change,
     extract_capex_from_facts,
+    fetch_company_facts_from_sec,
+    fetch_company_facts_offline_or_sec,
+    fetch_sec_company_tickers,
     format_capex_scan_report,
     load_scanner_config,
     parse_sec_company_tickers_mapping,
@@ -486,5 +489,153 @@ def test_format_capex_scan_report():
     assert "Passed: 1" in report
     assert "Baselines Recorded: 1" in report
     assert "Not Scannable: 1" in report
+
+
+def test_fetch_sec_company_tickers_success():
+    """Verify fetching and parsing company tickers mapping from mock SEC endpoint."""
+    sample_json = json.dumps({
+        "0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."},
+        "1": {"cik_str": 1045810, "ticker": "NVDA", "title": "NVIDIA CORP"},
+    }).encode("utf-8")
+
+    def mock_fetch(url: str, headers: dict[str, str], timeout: float) -> bytes:
+        assert url == "https://www.sec.gov/files/company_tickers.json"
+        assert "User-Agent" in headers
+        return sample_json
+
+    mapping = fetch_sec_company_tickers(user_agent="TestAgent/1.0", timeout=5.0, fetch_fn=mock_fetch)
+    assert mapping["AAPL"] == f"{320193:010d}"
+    assert mapping["NVDA"] == f"{1045810:010d}"
+
+
+def test_fetch_sec_company_tickers_failure_fails_closed():
+    """Network failure or non-200 response when fetching tickers returns empty dict."""
+    def mock_fetch(url: str, headers: dict[str, str], timeout: float) -> bytes:
+        raise OSError("Connection timed out")
+
+    mapping = fetch_sec_company_tickers(user_agent="TestAgent/1.0", timeout=5.0, fetch_fn=mock_fetch)
+    assert mapping == {}
+
+
+def test_fetch_company_facts_from_sec_success():
+    """Verify fetching company facts for a CIK from mock SEC endpoint."""
+    sample_facts = {
+        "cik": 1045810,
+        "entityName": "NVIDIA CORP",
+        "facts": {
+            "us-gaap": {
+                "PaymentsToAcquirePropertyPlantAndEquipment": {
+                    "units": {
+                        "USD": [
+                            {"end": "2024-07-28", "val": 1227000000, "form": "10-Q", "accn": "ACCN-001"}
+                        ]
+                    }
+                }
+            }
+        },
+    }
+
+    def mock_fetch(url: str, headers: dict[str, str], timeout: float) -> bytes:
+        assert url == f"https://data.sec.gov/api/xbrl/companyfacts/CIK{1045810:010d}.json"
+        assert "User-Agent" in headers
+        assert "application/json" in headers.get("Accept", "")
+        return json.dumps(sample_facts).encode("utf-8")
+
+    facts = fetch_company_facts_from_sec(
+        cik="1045810",
+        user_agent="TestAgent/1.0",
+        timeout=5.0,
+        fetch_fn=mock_fetch,
+    )
+    assert facts is not None
+    assert facts.get("entityName") == "NVIDIA CORP"
+
+
+def test_fetch_company_facts_from_sec_rate_limiting():
+    """Verify SECRateLimiter.acquire() is called during SEC facts fetch."""
+    calls = []
+
+    class MockLimiter(SECRateLimiter):
+        def acquire(self) -> None:
+            calls.append(1)
+
+    limiter = MockLimiter()
+
+    def mock_fetch(url: str, headers: dict[str, str], timeout: float) -> bytes:
+        return b'{"cik": 1045810}'
+
+    facts = fetch_company_facts_from_sec(
+        cik="1045810",
+        limiter=limiter,
+        fetch_fn=mock_fetch,
+    )
+    assert facts == {"cik": 1045810}
+    assert len(calls) == 1
+
+
+def test_fetch_company_facts_from_sec_network_error_fails_closed():
+    """Network errors or malformed payloads return None (fail closed)."""
+    def mock_error_fetch(url: str, headers: dict[str, str], timeout: float) -> bytes:
+        raise OSError("Network unreachable")
+
+    assert fetch_company_facts_from_sec("1045810", fetch_fn=mock_error_fetch) is None
+
+    def mock_bad_json(url: str, headers: dict[str, str], timeout: float) -> bytes:
+        return b"not json"
+
+    assert fetch_company_facts_from_sec("1045810", fetch_fn=mock_bad_json) is None
+
+
+def test_fetch_company_facts_offline_or_sec_end_to_end():
+    """End-to-end ticker resolution: ticker -> CIK -> facts -> extracted capex."""
+    sample_facts = {
+        "cik": 1045810,
+        "facts": {
+            "us-gaap": {
+                "PaymentsToAcquirePropertyPlantAndEquipment": {
+                    "units": {
+                        "USD": [
+                            {"end": "2024-07-28", "val": 1227000000, "form": "10-Q", "accn": "ACCN-NVDA"}
+                        ]
+                    }
+                }
+            }
+        },
+    }
+    cik_map = {"NVDA": f"{1045810:010d}"}
+
+    def mock_fetch(url: str, headers: dict[str, str], timeout: float) -> bytes:
+        return json.dumps(sample_facts).encode("utf-8")
+
+    facts = fetch_company_facts_offline_or_sec(
+        ticker="NVDA",
+        cik_mapping=cik_map,
+        fetch_fn=mock_fetch,
+    )
+    assert facts is not None
+    extracted = extract_capex_from_facts(facts)
+    assert extracted is not None
+    end, val, accn = extracted
+    assert end == "2024-07-28"
+    assert val == 1227.0
+    assert accn == "ACCN-NVDA"
+
+
+def test_fetch_company_facts_offline_or_sec_unknown_ticker():
+    """Unknown ticker returns None without making network calls."""
+    calls = []
+
+    def mock_fetch(url: str, headers: dict[str, str], timeout: float) -> bytes:
+        calls.append(url)
+        return b"{}"
+
+    facts = fetch_company_facts_offline_or_sec(
+        ticker="UNKNOWNXYZ",
+        cik_mapping={"NVDA": f"{1045810:010d}"},
+        fetch_fn=mock_fetch,
+    )
+    assert facts is None
+    assert len(calls) == 0
+
 
 
