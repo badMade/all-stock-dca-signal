@@ -20,6 +20,7 @@ research tooling, not a base to build production tooling on.
 
 from __future__ import annotations
 
+import functools
 import math
 import re
 import threading
@@ -1061,6 +1062,8 @@ def compute_ticker_sentiment(scored_items: Sequence[Mapping[str, Any]]) -> float
     return weighted_sum / total_weight
 
 
+# ⚡ Bolt Optimization: Cache HF Hub resolution to avoid repeated synchronous network calls
+@functools.lru_cache(maxsize=8)
 def _resolve_finbert_revision(
     model_name: str, revision: str, *, resolver: Callable[[str, str], str | None] | None = None
 ) -> str:
