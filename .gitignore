@@ -5,6 +5,8 @@ __pycache__/
 venv/
 .env
 .env.*
+# The tracked template for the local .env (placeholders only; see dca_env.py).
+!.env.example
 *.log
 cron_tracking/
 

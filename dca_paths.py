@@ -26,7 +26,8 @@ variable before Python starts) and it is why callers that need a *late* override
 ``DCA_*_LIVE_STATE_ROOT`` overrides in ``scripts/run_classification`` -- keep
 reading the environment at call time instead of relying on these.
 
-Standard library only; imports nothing from the rest of the project, so any
+Standard library only; imports nothing from the rest of the project except the
+dependency-free :mod:`dca_env` (which loads the operator's ``.env``), so any
 module (including ``scripts/*``) can use it without creating a cycle. Mirrors
 :mod:`dca_fileio` in that respect.
 """
@@ -36,6 +37,15 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any
+
+import dca_env
+
+# Load the operator's local .env BEFORE anything below (or any module that imports
+# this one, near_close_dca's import-time account read included) consults the
+# environment. The sandboxed executor shell does not inherit the operator's
+# exports, which left the account number and alert address unset on 2026-09-23;
+# see dca_env for the allowlist, no-override and mode-0600 rules.
+dca_env.load_dotenv()
 
 # The bundled production tree serialized in config/*.json. This must remain
 # stable so rebase_bundled_root() can detect and rewrite those paths.

@@ -34,6 +34,11 @@ FIXTURE_ACCOUNT_NUMBER = "999000111"
 
 os.environ["ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"] = FIXTURE_ACCOUNT_NUMBER
 
+# dca_paths loads the operator's local .env at import (see dca_env). Switch that off
+# for the whole suite, before any module is imported, so a real operator file can
+# never leak a live account number or alert address into a test.
+os.environ["DCA_DISABLE_DOTENV"] = "1"
+
 
 @pytest.fixture(autouse=True)
 def _isolate_ticker_history_and_intraday_archive(monkeypatch, tmp_path):

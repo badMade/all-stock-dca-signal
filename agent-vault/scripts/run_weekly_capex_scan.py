@@ -63,7 +63,11 @@ def execute_capex_scan(
     cfg = load_scanner_config(config_yaml)
     operating, non_operating, baselines = parse_watched_companies_and_baselines(kpis_note)
 
-    symbols = [t.strip().upper() for t in target_tickers] if target_tickers else list(baselines.keys())
+    symbols = (
+        [t.strip().upper() for t in target_tickers]
+        if target_tickers
+        else list(operating.keys()) if operating else list(baselines.keys())
+    )
 
     limiter = SECRateLimiter() if live else None
     cik_map: dict[str, str] = {}

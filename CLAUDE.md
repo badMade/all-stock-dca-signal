@@ -177,6 +177,12 @@ These are enforced by tests or by fail-closed runtime code. Violating one fails 
 | `DCA_ATTEMPT_LOG_ROOT` | `<cron root>/attempt_log` | Failed-start marker tree; read at call time |
 | `DCA_INTRADAY_LIVE_STATE_ROOT`, `DCA_MARKET_OPEN_LIVE_STATE_ROOT` | derived | *Replace* (not extend) recovery/prior-allocation search roots |
 | `DCA_DRIFT_SLACK_WEBHOOK` | unset | Webhook for `scripts/drift_detection.py --slack` |
+| `DCA_ALERT_EMAIL_ADDRESS` | unset | Operator address for the Gate 9 email channel (`config/notifications.json`) |
+| `DCA_DISABLE_DOTENV` | unset | When set, `dca_env` skips the local `.env` (`conftest.py` sets it for the suite) |
+
+`dca_paths` loads a gitignored, mode-`0600` `.env` at import for `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`,
+`DCA_ALERT_EMAIL_ADDRESS` and `DCA_CRON_TRACKING_ROOT` only, never overriding a variable already set,
+because the executor sandbox does not inherit the operator's shell. See `docs/local_env_file.md`.
 
 ## Run classification
 
@@ -228,6 +234,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `docs/dead_code_report.md` | Tiered dead/obsolete code candidates with evidence; nothing deleted |
 | `docs/README.md` | Doc index + quick-reference facts (universe, ladder, budgets, test window) |
 | `agent-vault/README.md` | Vendored loop-and-gate memory vault (self-improving agent memory, three task skills, runbooks). Start `claude` from inside `agent-vault/`; dry-run only, Notion read-only, pinned in `UPSTREAM.md` |
+| `docs/local_env_file.md`, `docs/adr-dotenv-loader.md` | The local `.env` loader: setup, verification, troubleshooting, and the decision record |
 | `docs/local_console.md` | Checkout-only console setup, API, authentication, LAN/proxy access and launchd runbooks; never places brokerage orders |
 | `docs/live_wiring.md` | Modules, dependency injection, the three entry points, state persistence, local agent quick reference |
 | `scripts/agent_entry_points.py` | Live index of existing entry points to reuse instead of writing new code (`--json`/`--search`) |

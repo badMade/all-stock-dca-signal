@@ -89,6 +89,9 @@ py-modules = [
     # Imported by morning/midday/alerts and by scripts/*, so it must ship with
     # the wheel or those imports fail outside a checkout.
     "dca_paths",
+    # Imported by dca_paths (loads the operator's .env), so it must ship with the
+    # wheel or `import dca_paths` fails outside a source checkout.
+    "dca_env",
     "dca_risk",
     "dca_live_adapters",
     "dca_reporting",

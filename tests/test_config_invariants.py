@@ -1466,6 +1466,8 @@ _NON_ACCOUNT_LITERALS = frozenset(
         "000120",
         "1227000000",
         "583000000",
+        # Device bridge shell timeout in milliseconds (180s) in executor prompts
+        "180000",
     }
 )
 
