@@ -9,13 +9,15 @@ two-tier addition rule ($2,000M hyperscalers, $250M suppliers).
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # Approved SEC EDGAR domains to protect against SSRF
 ALLOWED_SEC_DOMAINS = ("data.sec.gov", "www.sec.gov")
@@ -28,6 +30,16 @@ US_GAAP_CAPEX_TAGS = (
     "PaymentsForPropertyPlantAndEquipment",
     "AdditionsToPropertyPlantAndEquipment",
 )
+
+
+# Filers excluded from automated quarterly 10-Q XBRL parsing per capex-scanner-spec.md
+UNSCANNABLE_TICKERS = {
+    "TSM": "Form 20-F annual filer (NT$ reporting)",
+    "ASML": "Form 20-F annual filer (EUR reporting)",
+    "STM": "Form 20-F annual filer (EUR reporting)",
+    "CBRS": "Private entity / S-1 filing status",
+    "SPCX": "Private equity holding",
+}
 
 
 @dataclass(frozen=True)
@@ -63,7 +75,130 @@ class CapexEvaluation:
     flagged_pct: bool
     flagged_addition: bool
     tier: str
+    status: str = "passed"
+    company_name: str = ""
+    period_end: str = ""
     notes: str = ""
+
+
+@dataclass(frozen=True)
+class QuarterlyCapexFact:
+    """Quarterly capex fact after differencing or direct extraction."""
+
+    fiscal_period: str
+    fiscal_year: int
+    period_end: str
+    amount_usd_m: float
+    source: str  # accession(s) of the input fact(s); never a generic label
+
+
+def difference_quarterly_capex(ytd_facts: list[dict[str, Any]]) -> dict[str, QuarterlyCapexFact]:
+    """Calculate standalone quarterly capex amounts from cumulative YTD facts.
+
+    Every input fact must carry an accession (``accn``); one without is dropped, so a derived quarter is
+    never labelled with a generic source (PR 1590 review: "no source, no number"). A differenced quarter
+    cites both the minuend and the subtrahend filing.
+    """
+    if not isinstance(ytd_facts, list):
+        return {}
+
+    by_fp: dict[str, dict[str, Any]] = {}
+    for fact in ytd_facts:
+        if not isinstance(fact, dict):
+            continue
+        fp = str(fact.get("fp", "")).upper()
+        if fp in ("Q1", "Q2", "Q3", "FY"):
+            by_fp[fp] = fact
+
+    results: dict[str, QuarterlyCapexFact] = {}
+
+    def extract_val_end_fy(fact: dict[str, Any]) -> tuple[float, str, int, str] | None:
+        v = fact.get("val")
+        e = str(fact.get("end", ""))
+        fy = fact.get("fy", 0)
+        accn = str(fact.get("accn", "")).strip()
+        if isinstance(v, (int, float)) and v > 0 and e and accn:
+            return float(v), e, int(fy), accn
+        return None
+
+    def difference(later: tuple[float, str, int, str], earlier: tuple[float, str, int, str], fp: str) -> None:
+        # Fail closed on a cumulative total that drops (restatement or bad data).
+        if later[0] < earlier[0]:
+            return
+        source = later[3] if later[3] == earlier[3] else f"{later[3]} - {earlier[3]}"
+        results[fp] = QuarterlyCapexFact(
+            fiscal_period=fp,
+            fiscal_year=later[2],
+            period_end=later[1],
+            amount_usd_m=round((later[0] - earlier[0]) / 1_000_000.0, 2),
+            source=source,
+        )
+
+    parsed = {fp: extract_val_end_fy(fact) for fp, fact in by_fp.items()}
+
+    # Q1: direct from Q1 fact
+    q1 = parsed.get("Q1")
+    if q1:
+        val, end, fy, accn = q1
+        results["Q1"] = QuarterlyCapexFact(
+            fiscal_period="Q1",
+            fiscal_year=fy,
+            period_end=end,
+            amount_usd_m=round(val / 1_000_000.0, 2),
+            source=accn,
+        )
+
+    # Q2 = Q2 - Q1, Q3 = Q3 - Q2, Q4 = FY - Q3
+    for fp, later_key, earlier_key in (("Q2", "Q2", "Q1"), ("Q3", "Q3", "Q2"), ("Q4", "FY", "Q3")):
+        later, earlier = parsed.get(later_key), parsed.get(earlier_key)
+        if later and earlier:
+            difference(later, earlier, fp)
+
+    return results
+
+
+def parse_sec_company_tickers_mapping(json_bytes: bytes) -> dict[str, str]:
+    """Parse SEC company_tickers.json mapping ticker symbol to 10-digit zero-padded CIK."""
+    try:
+        data = json.loads(json_bytes.decode("utf-8"))
+    except Exception:
+        return {}
+
+    mapping: dict[str, str] = {}
+    if isinstance(data, dict):
+        for entry in data.values():
+            if isinstance(entry, dict):
+                ticker = entry.get("ticker")
+                cik = entry.get("cik_str")
+                if ticker and cik is not None:
+                    mapping[str(ticker).strip().upper()] = str(cik).strip().zfill(10)
+    return mapping
+
+
+class SECRateLimiter:
+    """Rate limiter enforcing max 10 requests/sec with injectable clock."""
+
+    def __init__(
+        self,
+        min_interval: float = 0.1,
+        time_fn: Callable[[], float] | None = None,
+        sleep_fn: Callable[[float], None] | None = None,
+    ) -> None:
+        self.min_interval = min_interval
+        self.time_fn = time_fn or time.time
+        self.sleep_fn = sleep_fn or time.sleep
+        self.last_request_time: float | None = None
+
+    def acquire(self) -> None:
+        """Acquire permission to send an SEC request, sleeping if needed to satisfy rate limit."""
+        now = self.time_fn()
+        if self.last_request_time is not None:
+            elapsed = now - self.last_request_time
+            if elapsed < self.min_interval:
+                to_sleep = self.min_interval - elapsed
+                self.sleep_fn(to_sleep)
+                now = self.time_fn()
+        self.last_request_time = now
 
 
 def validate_sec_url(url: str) -> bool:
@@ -144,7 +279,7 @@ def parse_watched_companies_and_baselines(
                 tickers_str, name, desc = match.groups()
                 primary_ticker = tickers_str.split("/")[0].strip()
                 if primary_ticker:
-                    operating[primary_ticker] = f"{name.strip()} ({desc.strip()})"
+                    operating[primary_ticker] = name.strip()
         elif section == "non_operating" and line.startswith("- "):
             match = re.match(r"^-\s+([A-Z0-9]+):\s*(.*)$", line)
             if match:
@@ -179,11 +314,29 @@ def evaluate_capex_change(
     current_usd_m: float,
     previous_usd_m: float | None,
     config: CapexScannerConfig,
+    company_name: str = "",
+    period_end: str = "",
 ) -> CapexEvaluation:
     """Evaluate quarter-over-quarter change and two-tier capex addition thresholds."""
+    if ticker in UNSCANNABLE_TICKERS:
+        return CapexEvaluation(
+            ticker=ticker,
+            current_usd_m=current_usd_m,
+            previous_usd_m=previous_usd_m,
+            delta_usd_m=None,
+            pct_delta=None,
+            flagged_pct=False,
+            flagged_addition=False,
+            tier="hyperscaler" if (previous_usd_m and previous_usd_m >= config.hyperscaler_spend_threshold_usd_m) else "supplier",
+            status="not_scannable",
+            company_name=company_name,
+            period_end=period_end,
+            notes=UNSCANNABLE_TICKERS[ticker],
+        )
+
     is_hyperscaler = (
-        current_usd_m >= config.hyperscaler_spend_threshold_usd_m
-        or (previous_usd_m is not None and previous_usd_m >= config.hyperscaler_spend_threshold_usd_m)
+        (previous_usd_m is not None and previous_usd_m >= config.hyperscaler_spend_threshold_usd_m)
+        or current_usd_m >= config.hyperscaler_spend_threshold_usd_m
     )
     tier = "hyperscaler" if is_hyperscaler else "supplier"
     addition_limit = config.hyperscaler_addition_usd_m if is_hyperscaler else config.supplier_addition_usd_m
@@ -198,6 +351,9 @@ def evaluate_capex_change(
             flagged_pct=False,
             flagged_addition=False,
             tier=tier,
+            status="baseline_recorded",
+            company_name=company_name,
+            period_end=period_end,
             notes="New baseline established, no prior baseline to compute delta",
         )
 
@@ -205,13 +361,21 @@ def evaluate_capex_change(
     pct_delta = (delta_usd_m / previous_usd_m) * 100.0
 
     flagged_pct = pct_delta > config.capex_delta_flag_pct
-    flagged_addition = delta_usd_m > addition_limit
+    flagged_addition = delta_usd_m >= addition_limit
+
+    # Decision 1 AND gate: flagged only if BOTH gates trip
+    is_flagged = flagged_pct and flagged_addition
+    status = "flagged" if is_flagged else "passed"
 
     notes = []
-    if flagged_pct:
-        notes.append(f"Exceeds {config.capex_delta_flag_pct:.1f}% QoQ delta")
-    if flagged_addition:
-        notes.append(f"Exceeds ${addition_limit:,.0f}M {tier} addition threshold")
+    if is_flagged:
+        notes.append(f"Breached both gates: {pct_delta:+.1f}% QoQ delta and ${delta_usd_m:+,.1f}M {tier} addition")
+    elif flagged_pct:
+        notes.append(f"Breached {config.capex_delta_flag_pct:.1f}% QoQ delta (+{pct_delta:.1f}%), but under ${addition_limit:,.0f}M {tier} addition")
+    elif flagged_addition:
+        notes.append(f"Breached ${addition_limit:,.0f}M {tier} addition (+${delta_usd_m:,.1f}M), but under {config.capex_delta_flag_pct:.1f}% QoQ delta")
+    else:
+        notes.append("Within normal thresholds")
 
     return CapexEvaluation(
         ticker=ticker,
@@ -222,8 +386,76 @@ def evaluate_capex_change(
         flagged_pct=flagged_pct,
         flagged_addition=flagged_addition,
         tier=tier,
-        notes="; ".join(notes) if notes else "Within normal thresholds",
+        status=status,
+        company_name=company_name,
+        period_end=period_end,
+        notes="; ".join(notes),
     )
+
+
+def format_capex_scan_report(
+    evaluations: list[CapexEvaluation],
+    title: str = "CapEx Scan Report",
+) -> str:
+    """Format evaluation results into a structured Markdown table and summary."""
+    lines = [
+        f"## {title}",
+        "",
+        "| Ticker | Company | Period End | Tier | Current ($M) | Prior ($M) | Delta ($M) | Delta (%) | Status | Notes |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+
+    counts = {
+        "flagged": 0,
+        "passed": 0,
+        "baseline_recorded": 0,
+        "not_scannable": 0,
+        "not_found": 0,
+    }
+
+    for ev in evaluations:
+        status_key = ev.status.lower()
+        counts[status_key] = counts.get(status_key, 0) + 1
+        status_display = "PASS" if ev.status == "passed" else ev.status.upper()
+
+        if ev.status == "not_scannable":
+            curr_str = "N/A"
+            prev_str = "N/A"
+            delta_str = "N/A"
+            pct_str = "N/A"
+            period_str = ev.period_end or "N/A"
+        elif ev.status == "baseline_recorded":
+            curr_str = f"${ev.current_usd_m:,.1f}M"
+            prev_str = "N/A"
+            delta_str = "N/A"
+            pct_str = "N/A"
+            period_str = ev.period_end or "N/A"
+        else:
+            curr_str = f"${ev.current_usd_m:,.1f}M"
+            prev_str = f"${ev.previous_usd_m:,.1f}M" if ev.previous_usd_m is not None else "N/A"
+            if ev.delta_usd_m is not None:
+                delta_str = f"+${ev.delta_usd_m:,.1f}M" if ev.delta_usd_m >= 0 else f"-${abs(ev.delta_usd_m):,.1f}M"
+            else:
+                delta_str = "N/A"
+            pct_str = f"{ev.pct_delta:+.1f}%".replace("+-", "-") if ev.pct_delta is not None else "N/A"
+            period_str = ev.period_end or "N/A"
+
+        co_name = ev.company_name or ev.ticker
+        lines.append(
+            f"| {ev.ticker} | {co_name} | {period_str} | {ev.tier} | {curr_str} | {prev_str} | {delta_str} | {pct_str} | {status_display} | {ev.notes} |"
+        )
+
+    lines.extend([
+        "",
+        "### Summary",
+        f"- Total Filers Evaluated: {len(evaluations)}",
+        f"- Flagged: {counts['flagged']}",
+        f"- Passed: {counts['passed']}",
+        f"- Baselines Recorded: {counts['baseline_recorded']}",
+        f"- Not Scannable: {counts['not_scannable']}",
+    ])
+
+    return "\n".join(lines)
 
 
 def extract_capex_from_facts(facts_payload: dict[str, Any]) -> tuple[str, float, str] | None:
@@ -282,6 +514,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Scan quarterly capex deltas for watched filers")
     parser.add_argument("--tickers", help="Comma-separated list of symbols to evaluate")
     parser.add_argument("--dry-run", action="store_true", help="Run scanner using existing baselines only")
+    parser.add_argument("--report", action="store_true", help="Format and output structured Markdown report")
+    parser.add_argument("--report-file", type=Path, help="File path to save Markdown report")
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent.parent
@@ -292,7 +526,6 @@ def main() -> int:
     cfg = load_scanner_config(config_yaml)
     operating, non_operating, baselines = parse_watched_companies_and_baselines(kpis_note)
 
-    print(f"Loaded {len(operating)} operating filers and {len(baselines)} baselines.")
     target_tickers = [t.strip().upper() for t in args.tickers.split(",")] if args.tickers else list(baselines.keys())
 
     evaluations: list[CapexEvaluation] = []
@@ -300,21 +533,35 @@ def main() -> int:
         if ticker in non_operating:
             continue
         base = baselines.get(ticker)
-        if not base or base.amount_usd_m is None:
-            continue
-        # In dry-run mode, self-evaluate recorded baseline as baseline check
+        curr_val = base.amount_usd_m if (base and base.amount_usd_m is not None) else 0.0
+        prev_val = base.amount_usd_m if base else None
+        period_str = base.period_end if base else ""
+        co_name = operating.get(ticker, "")
+
         ev = evaluate_capex_change(
             ticker=ticker,
-            current_usd_m=base.amount_usd_m,
-            previous_usd_m=base.amount_usd_m,
+            current_usd_m=curr_val,
+            previous_usd_m=prev_val,
             config=cfg,
+            company_name=co_name,
+            period_end=period_str,
         )
         evaluations.append(ev)
 
-    print(f"Evaluated {len(evaluations)} companies:")
-    for ev in evaluations:
-        flag_status = "FLAGGED" if (ev.flagged_pct or ev.flagged_addition) else "PASS"
-        print(f"  [{flag_status}] {ev.ticker} ({ev.tier}): ${ev.current_usd_m:,.1f}M - {ev.notes}")
+    if args.report:
+        report_md = format_capex_scan_report(evaluations, title="Quarterly CapEx Delta Scan Report")
+        if args.report_file:
+            args.report_file.parent.mkdir(parents=True, exist_ok=True)
+            args.report_file.write_text(report_md + "\n", encoding="utf-8")
+            print(f"Report written to {args.report_file}")
+        else:
+            print(report_md)
+    else:
+        print(f"Loaded {len(operating)} operating filers and {len(baselines)} baselines.")
+        print(f"Evaluated {len(evaluations)} companies:")
+        for ev in evaluations:
+            flag_status = "FLAGGED" if ev.status == "flagged" else ev.status.upper()
+            print(f"  [{flag_status}] {ev.ticker} ({ev.tier}): ${ev.current_usd_m:,.1f}M - {ev.notes}")
 
     return 0
 

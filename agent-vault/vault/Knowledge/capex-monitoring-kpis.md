@@ -78,7 +78,8 @@ These symbols are ETFs, closed-end funds, venture trusts, or preferred stock; th
 ## Thresholds
 
 Live in `config.yaml`: `capex_delta_flag_pct` (verified 2026-10-03 against the baseline run) and
-`capex_research_addition_usd_m` (still `UNVERIFIED`; requires scale-tiering, a flat $500M is scale-blind). See `threshold-review.md`.
+`capex_research_addition_usd_m` (settled 2026-10-03 under the two-tier rule: $2,000M for hyperscalers
+over $5B quarterly capex, $250M for suppliers and mid-caps). See `threshold-review.md`.
 
 ## Baselines
 
