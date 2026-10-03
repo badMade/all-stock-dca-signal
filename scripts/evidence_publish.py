@@ -250,21 +250,35 @@ def _run_numbers(root: Path, day: str, slot: str) -> List[str]:
         )
     except (OSError, ValueError):
         lines.append("run_summary.json: unavailable")
+    total = 0.0
+    rows_count = 0
     try:
         with (run_dir / "submitted_orders.csv").open(newline="", encoding="utf-8") as handle:
-            rows = list(csv.DictReader(handle))
+            reader = csv.reader(handle)
+            header = next(reader, None)
+            if header is not None:
+                t_idx = header.index("ticker") if "ticker" in header else None
+                o_idx = header.index("order_id") if "order_id" in header else None
+                a_idx = header.index("submitted_amount_usd") if "submitted_amount_usd" in header else None
+                s_idx = header.index("status") if "status" in header else None
+
+                for row in reader:
+                    ticker = row[t_idx] if (t_idx is not None and t_idx < len(row)) else None
+                    order_id = row[o_idx] if (o_idx is not None and o_idx < len(row)) else None
+                    raw_amount = row[a_idx] if (a_idx is not None and a_idx < len(row)) else None
+                    status = row[s_idx] if (s_idx is not None and s_idx < len(row)) else None
+
+                    amount = raw_amount if raw_amount is not None else ""
+                    lines.append(f"order: {ticker} {order_id} {amount} USD {status}")
+                    try:
+                        total += float(amount)
+                    except ValueError:
+                        pass
+                    rows_count += 1
     except OSError:
-        rows = []
-    total = 0.0
-    for row in rows:
-        amount = row.get("submitted_amount_usd", "")
-        lines.append(f"order: {row.get('ticker')} {row.get('order_id')} {amount} USD {row.get('status')}")
-        try:
-            total += float(amount)
-        except ValueError:
-            pass
-    if rows:
-        lines.append(f"total submitted: {total:g} USD across {len(rows)} order(s)")
+        pass
+    if rows_count:
+        lines.append(f"total submitted: {total:g} USD across {rows_count} order(s)")
     return lines
 
 
