@@ -103,11 +103,11 @@ BROKER_ORDER_TOOLS = (
 
 # Thresholds taken from the original brief rather than from this repo's own safeguards: they must stay flagged until
 # someone confirms them (the first /improve target is Knowledge/threshold-review.md).
+# capex_delta_flag_pct left this list when the 2026-10-03 baseline run verified it, and live_slippage_vs_model_bps
+# when it was retired (the DLTP audit found frictionless returns, so there is no model slippage to compare against).
 UNVERIFIED_KEYS = (
-    "capex_delta_flag_pct",
     "capex_research_addition_usd_m",
     "backtest_sharpe_min",
-    "live_slippage_vs_model_bps",
 )
 
 # Any claim of the form "the task runs like this" belongs in a runbook a person can follow without this chat.

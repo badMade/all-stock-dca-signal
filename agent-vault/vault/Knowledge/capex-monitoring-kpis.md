@@ -77,8 +77,8 @@ These symbols are ETFs, closed-end funds, venture trusts, or preferred stock; th
 
 ## Thresholds
 
-Live in `config.yaml`: `capex_delta_flag_pct` and `capex_research_addition_usd_m`. Both are `UNVERIFIED`
-(they come from the original brief). See `threshold-review.md`.
+Live in `config.yaml`: `capex_delta_flag_pct` (verified 2026-10-03 against the baseline run) and
+`capex_research_addition_usd_m` (still `UNVERIFIED`; requires scale-tiering, a flat $500M is scale-blind). See `threshold-review.md`.
 
 ## Baselines
 
@@ -88,6 +88,10 @@ Live in `config.yaml`: `capex_delta_flag_pct` and `capex_research_addition_usd_m
 | MSFT | 2026-06-30 | $35,802M (Q4) / $115,948M (FY26) | Form 10-K / 10-Q (SEC EDGAR) |
 | GOOGL | 2026-06-30 | $44,900M (Q2) / $80,600M (6-mo YTD) | Form 10-Q (SEC EDGAR) |
 | AMZN | 2026-06-30 | $53,100M (Q2) / $96,300M (6-mo YTD) | Form 10-Q (SEC EDGAR) |
+| TSM | 2025-12-31 | US$40.9B (NT$1,272,411M) | Form 20-F (SEC EDGAR) |
+| ASML | 2025-12-31 | €1,573.6M | Form 20-F (SEC EDGAR) |
+| AMAT | 2026-07-26 | $2,000M (9-mo YTD) | Form 10-Q (SEC EDGAR) |
+| AVGO | 2026-08-02 | $1,013M (9-mo YTD) | Form 10-Q (SEC EDGAR) |
 
 ## Sources the skill may read
 

@@ -28,7 +28,7 @@ not comparable with new ones.
    compute a slippage figure the pipeline does not produce.
 6. **Compare with live** only from a results file the user names. With none, log
    `no live comparison available`. Flag a mean Sharpe below `backtest_sharpe_min` in
-   `config.yaml`; both it and the slippage limit are `UNVERIFIED`.
+   `config.yaml`; it is `UNVERIFIED`. The slippage limit is retired (DLTP returns are frictionless).
 7. **Log** under today's `## Sessions` in `vault/Daily/YYYY-MM-DD.md`: seed, SHA,
    command, metrics, flags. Name the file by date only.
 8. **Capture** durable findings into the Knowledge note with the `capture` skill.

@@ -27,7 +27,8 @@ trial and say so in the log.
    value. If a value cannot be found, write `not found`; do not estimate.
 4. **Compare** with the baseline in the note. Flag a company when the change exceeds
    `capex_delta_flag_pct` in `config.yaml`, and flag research additions above
-   `capex_research_addition_usd_m`. State that both numbers are `UNVERIFIED`.
+   `capex_research_addition_usd_m`. State that `capex_delta_flag_pct` is verified (2026-10-03
+   baseline) and `capex_research_addition_usd_m` is still `UNVERIFIED`.
 5. **Log** under today's `## Sessions` in `vault/Daily/YYYY-MM-DD.md`: companies read,
    values, deltas, flags, sources. Name the file by date only, never by quarter.
 6. **Capture** new baselines and flagged items into the Knowledge note with the
