@@ -1,12 +1,13 @@
-# Runbook: capex monitoring (quarterly)
+# Runbook: capex monitoring (recurring)
 
-STATUS: untested. Every threshold here is UNVERIFIED (`vault/Knowledge/threshold-review.md`).
+STATUS: operational. Thresholds previously flagged as UNVERIFIED are now formally settled (`vault/Knowledge/threshold-review.md`) and verified by test suite `tests/test_scan_capex_deltas.py`.
 
-1. Fill the watched list in `vault/Knowledge/capex-monitoring-kpis.md` first. The skill refuses to guess one.
-2. `cd agent-vault && claude`, then ask: "Analyze the latest quarter's capex filings".
-3. The agent follows `skills/analyze-capex/SKILL.md` and reads filings with read-only tools only.
-4. Each extracted value carries its accession number or URL; a value it cannot find is `not found`, never estimated.
-5. It flags changes beyond `capex_delta_flag_pct` and research additions beyond `capex_research_addition_usd_m`.
-6. It logs to `vault/Daily/YYYY-MM-DD.md` (date name, never a quarter name) and updates the Knowledge note.
-7. It closes with `reflect`; the commit summary starts `[capex-monitoring] YYYY-MM-DD <outcome>`.
-8. After the first real run, review which thresholds fired and record the result in the threshold review note.
+1. Watched filers are maintained in `vault/Knowledge/capex-monitoring-kpis.md` (51 operating filers, 15 non-operating exclusions, 8 verified baselines).
+2. Execute the scanner tool:
+   - Offline dry-run: `python3 scripts/scan_capex_deltas.py --report`
+   - Live SEC EDGAR ingest: `python3 scripts/scan_capex_deltas.py --live --report`
+   - Recurring runner: `python3 scripts/run_weekly_capex_scan.py --live`
+3. The scanner enforces the Decision 1 AND gate: flags only when QoQ delta exceeds 15% AND dollar addition exceeds tier limit ($2,000M hyperscalers, $250M suppliers).
+4. Each extracted value carries its accession number provenance; missing data returns `not_found`, never an estimate. Form 20-F annual filers (TSM, ASML, STM) and private entities are marked `not_scannable`.
+5. Run reports are written in Markdown to `reports/capex-scan-YYYY-MM-DD.md` and summarized in `vault/Daily/YYYY-MM-DD.md`.
+6. Close the session with `reflect`; the commit summary starts `[capex-monitoring] YYYY-MM-DD <outcome>`.

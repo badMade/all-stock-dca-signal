@@ -498,6 +498,27 @@ def extract_capex_from_facts(facts_payload: dict[str, Any]) -> tuple[str, float,
     return None
 
 
+class SECRedirectDisallowedHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse HTTP redirects to protect against SSRF and credential exposure."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        """Deny following redirects unconditionally."""
+        return None
+
+
+def _build_sec_opener() -> urllib.request.OpenerDirector:
+    """Build an opener that disallows redirects to protect against SSRF."""
+    return urllib.request.build_opener(SECRedirectDisallowedHandler())
+
+
 def _http_get_sec(
     url: str,
     user_agent: str = DEFAULT_USER_AGENT,
@@ -521,7 +542,8 @@ def _http_get_sec(
             return None
     try:
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
+        opener = _build_sec_opener()
+        with opener.open(req, timeout=timeout) as response:  # noqa: S310
             if response.status != 200:
                 return None
             return response.read()

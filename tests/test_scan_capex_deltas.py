@@ -28,6 +28,7 @@ from scan_capex_deltas import (  # noqa: E402
     CapexEvaluation,
     CapexScannerConfig,
     SECRateLimiter,
+    SECRedirectDisallowedHandler,
     difference_quarterly_capex,
     evaluate_capex_change,
     extract_capex_from_facts,
@@ -636,6 +637,15 @@ def test_fetch_company_facts_offline_or_sec_unknown_ticker():
     )
     assert facts is None
     assert len(calls) == 0
+
+
+def test_sec_redirect_disallowed_handler_refuses_redirect():
+    """Verify SECRedirectDisallowedHandler returns None to prevent following redirects."""
+    handler = SECRedirectDisallowedHandler()
+    import urllib.request
+    req = urllib.request.Request("https://data.sec.gov/test")
+    res = handler.redirect_request(req, None, 302, "Found", {}, "https://evil.com")
+    assert res is None
 
 
 

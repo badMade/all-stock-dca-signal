@@ -10,8 +10,8 @@
 
 ## Active goals
 
-- Automated recurring capex delta scanner implemented (`agent-vault/scripts/scan_capex_deltas.py`).
-- Schedule weekly capex monitoring reports against the two-tier addition rule.
+- CapEx delta scanner operational with live SEC EDGAR fetching and weekly runner (`run_weekly_capex_scan.py`).
+- Maintain and review weekly monitoring reports against settled two-tier addition rules.
 
 ## Standing lessons
 
