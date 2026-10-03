@@ -1458,6 +1458,14 @@ _NON_ACCOUNT_LITERALS = frozenset(
         "109417000000",
         "000020",
         "0000000000",
+        # NVIDIA SEC CIK, accession-number pieces and capex amounts in
+        # tests/test_scan_capex_deltas.py's XBRL fixture, not brokerage accounts.
+        "1045810",
+        "0001045810",
+        "000213",
+        "000120",
+        "1227000000",
+        "583000000",
     }
 )
 
@@ -1652,6 +1660,26 @@ def test_the_guard_accepts_the_synthetic_fixture_value(tmp_path, monkeypatch):
     monkeypatch.setattr(f"{__name__}._tracked_files", lambda: [probe])
 
     test_no_account_shaped_literal_in_tracked_config_source_or_docs()
+
+
+def test_the_guard_accepts_sec_capex_fixture_literals(tmp_path, monkeypatch):
+    probe = "tests/test_scan_capex_deltas.py"
+    (tmp_path / "tests").mkdir()
+    (tmp_path / probe).write_text(
+        'facts = {"cik": 1045810, "val": 1227000000, "prior_val": 583000000,\n'
+        '         "accn": "0001045810-24-000213", "prior_accn": "0001045810-24-000120"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(f"{__name__}.REPO_ROOT", tmp_path)
+    monkeypatch.setattr(f"{__name__}._tracked_files", lambda: [probe])
+
+    test_no_account_shaped_literal_in_tracked_config_source_or_docs()
+
+    # The fixture file remains scanned: unrelated account literals still fail.
+    with (tmp_path / probe).open("a", encoding="utf-8") as handle:
+        handle.write('ACCOUNT = "' + "1112" + '22333"\n')
+    with pytest.raises(AssertionError, match=probe):
+        test_no_account_shaped_literal_in_tracked_config_source_or_docs()
 
 
 @pytest.mark.parametrize(

@@ -801,8 +801,10 @@ def _finalize_locked(
         # The release that produced a run cannot change afterwards; refuse before
         # anything below writes a companion file or the pointer.
         if recorded is not None and recorded != code_version:
-            raise FinalizeRefused(f"{state_path.relative_to(base)} already records a different code_version; "
-                                  "the release that produced a run is immutable")
+            raise FinalizeRefused(
+                f"{state_path.relative_to(base)} already records a different code_version; "
+                "the release that produced a run is immutable"
+            )
 
     warnings: List[str] = []
     # A state an executor's own run() wrote is authoritative and carries far
@@ -987,9 +989,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help='Gate 6 budget object {"budget_tier","daily_cap_usd","weekly_cap_usd",...}; '
         "required when orders were placed; omit only when Gate 6 never ran",
     )
-    parser.add_argument("--code-version-json",
-                        help='{"git_sha": <40 hex>, "tag": ..., "pinned_by": ...} inline, or a path to a file holding it: '
-                        'the pinned release this run traded from')
+    parser.add_argument(
+        "--code-version-json",
+        help='{"git_sha": <40 hex>, "tag": ..., "pinned_by": ...} inline, or a path to a file holding it: '
+        "the pinned release this run traded from",
+    )
     parser.add_argument("--error-class", help="concrete error class for a blocked/failed run")
     parser.add_argument("--error-detail", help="one-line detail for a blocked/failed run")
     parser.add_argument(

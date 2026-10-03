@@ -97,18 +97,22 @@ def _git_env(env: Mapping[str, str]) -> Dict[str, str]:
     return pinned
 
 
-def _git(
-    root: Path | str, env: Mapping[str, str], *args: str, network: bool = False
-) -> subprocess.CompletedProcess:
+def _git(root: Path | str, env: Mapping[str, str], *args: str, network: bool = False) -> subprocess.CompletedProcess:
     # An identity is always supplied so a container with no global git config can commit.
     command = ["git", "-c", "user.name=dca-evidence", "-c", "user.email=dca-evidence@localhost", *args]
     try:
         return subprocess.run(
-            command, cwd=str(root), env=_git_env(env), capture_output=True, text=True,
+            command,
+            cwd=str(root),
+            env=_git_env(env),
+            capture_output=True,
+            text=True,
             timeout=NETWORK_TIMEOUT_SECONDS if network else None,
         )
     except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(command, 124, "", f"git {args[0]} timed out after {NETWORK_TIMEOUT_SECONDS}s")
+        return subprocess.CompletedProcess(
+            command, 124, "", f"git {args[0]} timed out after {NETWORK_TIMEOUT_SECONDS}s"
+        )
     except OSError as exc:
         return subprocess.CompletedProcess(command, 127, "", f"git is not runnable: {exc.__class__.__name__}")
 
@@ -139,8 +143,10 @@ def _load_manifest(path: Path) -> Dict[str, Any]:
         manifest = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_keys)
     except (OSError, ValueError) as exc:
         raise Failure("evidence manifest is unusable: not valid JSON or has a duplicate key") from exc
-    if not isinstance(manifest, dict) or manifest.get("version") != MANIFEST_VERSION or not isinstance(
-        manifest.get("days"), dict
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("version") != MANIFEST_VERSION
+        or not isinstance(manifest.get("days"), dict)
     ):
         raise Failure("evidence manifest is unusable: expected version 1 with a days object")
     return manifest
@@ -358,8 +364,9 @@ def _manifest_from_text(text: str) -> Dict[str, Any]:
     return manifest
 
 
-def _push(root: Path, remote: str, env: Mapping[str, str], mine: Mapping[str, Any],
-          max_attempts: int, backoff: float) -> Optional[str]:
+def _push(
+    root: Path, remote: str, env: Mapping[str, str], mine: Mapping[str, Any], max_attempts: int, backoff: float
+) -> Optional[str]:
     """Push HEAD to the store; None on success, else the last failure detail."""
     detail = "push not attempted"
     for attempt in range(max_attempts):
@@ -378,7 +385,7 @@ def _push(root: Path, remote: str, env: Mapping[str, str], mine: Mapping[str, An
                     return None
                 detail = _last_line(retried)
         if attempt + 1 < max_attempts:
-            time.sleep(backoff * (2 ** attempt))
+            time.sleep(backoff * (2**attempt))
     return detail
 
 
@@ -399,9 +406,14 @@ def _publish(args: argparse.Namespace, env: Mapping[str, str]) -> Tuple[int, Dic
                 "refused_paths": refused,
                 "alert_text": _alert_text(
                     f"EVIDENCE PUBLISH REFUSED ({ACCOUNT_ENV} is not set, so the secret scan cannot clear the "
-                    "evidence; nothing was pushed)" if not refused else
-                    "EVIDENCE PUBLISH REFUSED (account number in evidence; nothing was pushed)",
-                    root, day, slot, sha, "contents were left uncommitted for a human to inspect",
+                    "evidence; nothing was pushed)"
+                    if not refused
+                    else "EVIDENCE PUBLISH REFUSED (account number in evidence; nothing was pushed)",
+                    root,
+                    day,
+                    slot,
+                    sha,
+                    "contents were left uncommitted for a human to inspect",
                 ),
             }
         mismatch = _provenance_mismatch(root, env, day, slot, sha)
@@ -411,7 +423,11 @@ def _publish(args: argparse.Namespace, env: Mapping[str, str]) -> Tuple[int, Dic
                 "detail": mismatch,
                 "alert_text": _alert_text(
                     "EVIDENCE PUBLISH REFUSED (release provenance mismatch; nothing was pushed)",
-                    root, day, slot, sha, mismatch,
+                    root,
+                    day,
+                    slot,
+                    sha,
+                    mismatch,
                 ),
             }
         _ensure_gitignore(root)
@@ -429,9 +445,18 @@ def _publish(args: argparse.Namespace, env: Mapping[str, str]) -> Tuple[int, Dic
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(
-            json.dumps({"day": day, "slot": slot, "code_sha": sha, "detail": detail,
-                        "failed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")},
-                       indent=2, sort_keys=True) + "\n",
+            json.dumps(
+                {
+                    "day": day,
+                    "slot": slot,
+                    "code_sha": sha,
+                    "detail": detail,
+                    "failed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
             encoding="utf-8",
         )
         _commit_all(root, env, f"evidence push failed {day} {slot}")
@@ -469,8 +494,11 @@ def _claim(args: argparse.Namespace, env: Mapping[str, str]) -> Tuple[int, Dict[
     # The claimant is written to a pushed file and a commit message, so it gets the same
     # account-number refusal publish applies to its files, before anything is committed.
     if _holds_account(args.claimant.encode("utf-8"), env):
-        return EXIT_REFUSED_SECRET, {"status": "refused_secret", "claimed_by": "",
-                                     "detail": "the claimant holds the account number; nothing was committed"}
+        return EXIT_REFUSED_SECRET, {
+            "status": "refused_secret",
+            "claimed_by": "",
+            "detail": "the claimant holds the account number; nothing was committed",
+        }
     if not (root / ".git").is_dir():
         return EXIT_STORE_UNREACHABLE, {**unreachable, "detail": "evidence root is not an evidence clone"}
     for _ in range(CLAIM_ATTEMPTS):
@@ -488,9 +516,17 @@ def _claim(args: argparse.Namespace, env: Mapping[str, str]) -> Tuple[int, Dict[
         claim_file = root / relative
         claim_file.parent.mkdir(parents=True, exist_ok=True)
         claim_file.write_text(
-            json.dumps({"claimed_by": args.claimant, "day": args.trading_day, "slot": args.slot,
-                        "claimed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")},
-                       indent=2, sort_keys=True) + "\n",
+            json.dumps(
+                {
+                    "claimed_by": args.claimant,
+                    "day": args.trading_day,
+                    "slot": args.slot,
+                    "claimed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
             encoding="utf-8",
         )
         committed = _git(root, env, "add", relative)
@@ -564,8 +600,10 @@ def main(argv: Optional[Sequence[str]] = None, env: Optional[Mapping[str, str]] 
         code, payload = runner(args, active_env)
     except Exception as exc:  # noqa: BLE001 -- fail closed: an unexpected error is a failed publish or an unreachable store
         code = EXIT_PUSH_FAILED if args.command == "publish" else EXIT_STORE_UNREACHABLE
-        payload = {"status": "push_failed" if args.command == "publish" else "store_unreachable",
-                   "detail": f"unexpected {exc.__class__.__name__}"}
+        payload = {
+            "status": "push_failed" if args.command == "publish" else "store_unreachable",
+            "detail": f"unexpected {exc.__class__.__name__}",
+        }
     _json_out(payload, active_env)
     return code
 
