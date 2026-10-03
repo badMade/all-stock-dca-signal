@@ -43,3 +43,21 @@ Look-ahead fixes active (macro not backfilled, fundamentals disabled). 20 ticker
 | **Mean** | - | - | **3.56** | **5.75** | **-3.66%** | **29.7%** | **100%** |
 
 Summary: All 5 folds substantially exceed `backtest_sharpe_min: 1.2` and the `> 1.0` DLTP health floor. Chart saved to `results/wf_lstm_chart.png`.
+
+### 2026-10-03: Paired Model Comparison: LSTM vs TCN (5 splits, seed 42)
+Command: `python backtest.py --model both --seed 42`
+Look-ahead fixes active, 20 tickers, 74,318 rows, 22 features, seed 42.
+
+| Metric | LSTMForecaster | TCNForecaster | Advantage | p-value (paired t-test) |
+| --- | --- | --- | --- | --- |
+| Mean Sharpe | 3.2625 | 3.5504 | +0.2880 (TCN) | 0.4199 (not statistically significant) |
+| Mean Sortino | 5.75 | 5.49 | +0.26 (LSTM) | - |
+| Mean 1d IC | 0.0346 | 0.0121 | +0.0225 (LSTM) | - |
+| Max Drawdown | -3.66% | -3.54% | +0.12% (TCN) | - |
+| Mean CAGR | 29.7% | 31.1% | +1.4% (TCN) | - |
+
+Findings:
+- TCN achieved higher raw risk-adjusted return (mean Sharpe 3.55 vs 3.26), with winner advantage of +0.288 Sharpe units.
+- With N=5 folds, the paired difference is not statistically significant (p=0.42).
+- LSTM demonstrated superior directional signal quality at 1-day horizon (IC 0.0346 vs 0.0121).
+- Artifacts: `results/wf_comparison.json`, `results/wf_lstm_chart.png`, `results/wf_tcn_chart.png`.

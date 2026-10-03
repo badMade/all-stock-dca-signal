@@ -11,8 +11,7 @@
 ## Active goals
 
 - Automate recurring capex delta scans across the 51 watched operating companies.
-- Settle capex_research_addition_usd_m with scale-relative tiering in threshold-review.md.
-- Evaluate paired TCN vs LSTM walk-forward performance in dl-trading-pipeline.
+- Schedule weekly capex monitoring reports against the two-tier addition rule.
 
 ## Standing lessons
 
@@ -24,5 +23,5 @@
 
 - [all-stock-dca rules](Knowledge/all-stock-dca-rules.md) - pointer to the repo's safeguards, ladder and run commands
 - [capex monitoring KPIs](Knowledge/capex-monitoring-kpis.md) - 51 watched companies, 8 verified baselines
-- [dl-trading backtests](Knowledge/dl-trading-backtests.md) - walk-forward backtest baseline established (mean Sharpe 3.56)
-- [threshold review](Knowledge/threshold-review.md) - status of all thresholds; 4 settled, 1 pending tiering
+- [dl-trading backtests](Knowledge/dl-trading-backtests.md) - LSTM vs TCN backtest comparison (TCN +0.288 Sharpe advantage)
+- [threshold review](Knowledge/threshold-review.md) - status of all thresholds; all 5 formally settled
