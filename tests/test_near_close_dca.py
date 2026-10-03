@@ -51329,6 +51329,7 @@ def test_build_alpaca_account_info_payload_malformed() -> None:
 def test_format_notional():
     from near_close_dca import format_notional
 
+    # 10.555 is slightly less than 10.555 in float representation, so it rounds down to 10.55
     assert format_notional(10.555) == "10.55"
     assert format_notional(10.554) == "10.55"
     assert format_notional(0.0) == "0.00"
