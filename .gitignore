@@ -47,6 +47,10 @@ artifacts_tmp*
 
 # Claude Code agent directory
 .claude/
+# agent-vault/ is a tracked, vendored Foundation copy: its hook config and skills live under .claude/ and must
+# be committed. Machine-local overrides there stay ignored.
+!agent-vault/.claude/
+agent-vault/.claude/settings.local.json
 
 # Local link to the Google Drive ticker archive (the archive itself is not source code).
 ticker_data

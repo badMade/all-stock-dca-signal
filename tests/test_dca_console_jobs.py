@@ -17,9 +17,14 @@ from dca_console_jobs import Command, JobManager
 def saved_job(root: Path, name: str, **updates):
     root.mkdir(parents=True, exist_ok=True)
     payload = {
-        "id": name, "status": "completed", "action": "demo-dca", "label": "DCA demo",
-        "started_at": "2026-01-01T00:00:00+00:00", "finished_at": "2026-01-01T00:01:00+00:00",
-        "returncode": 0, "log": "Completed normally.",
+        "id": name,
+        "status": "completed",
+        "action": "demo-dca",
+        "label": "DCA demo",
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "finished_at": "2026-01-01T00:01:00+00:00",
+        "returncode": 0,
+        "log": "Completed normally.",
     }
     payload.update(updates)
     (root / f"{name}.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -81,7 +86,9 @@ def test_restore_is_newest_first_and_new_job_takes_first_position(tmp_path):
     manager = JobManager(root)
     try:
         assert [item["id"] for item in manager.snapshot()] == [
-            "20260103T120000-example", "20260102T120000-example", "20260101T120000-example",
+            "20260103T120000-example",
+            "20260102T120000-example",
+            "20260101T120000-example",
         ]
         submitted = manager.submit("demo-dca", "New job", lambda job_id, log: 0)
         assert join_job(manager)["id"] == submitted["id"]
@@ -104,8 +111,12 @@ def test_command_timeout_and_shutdown_reap_the_child_process(tmp_path, monkeypat
 
     monkeypatch.setattr(dca_console_jobs.subprocess, "Popen", capture_process)
     manager = JobManager(tmp_path / "jobs")
-    command = Command((sys.executable, "-c", "import time; time.sleep(30)"), tmp_path, dict(os.environ),
-                      timeout=0.1 if stop_kind == "timeout" else 30)
+    command = Command(
+        (sys.executable, "-c", "import time; time.sleep(30)"),
+        tmp_path,
+        dict(os.environ),
+        timeout=0.1 if stop_kind == "timeout" else 30,
+    )
     try:
         manager.submit("demo-dca", "Bounded child", lambda job_id, log: manager.run_command(command, log))
         assert launched.wait(2)
@@ -179,7 +190,9 @@ def test_deadline_and_shutdown_reap_descendants_that_retain_stdout(tmp_path, mon
     )
     manager = JobManager(tmp_path / "jobs")
     command = Command(
-        (sys.executable, "-c", parent, child, str(tmp_path / "ready")), tmp_path, dict(os.environ),
+        (sys.executable, "-c", parent, child, str(tmp_path / "ready")),
+        tmp_path,
+        dict(os.environ),
         timeout=0.5 if stop_kind == "timeout" else 30,
     )
     try:
@@ -254,8 +267,10 @@ def test_submit_startup_failure_preserves_history_and_allows_retry(tmp_path, mon
 def test_capture_to_keeps_stdout_as_a_redacted_document_and_streams_stderr(tmp_path):
     manager = JobManager(tmp_path / "jobs")
     target = tmp_path / "out" / "document.json"
-    code = ("import json, sys; sys.stderr.write('progress line\\n'); "
-            "print(json.dumps({'volume': 1234567.5, 'note': 'account 999000111 seen', 'ok': True}))")
+    code = (
+        "import json, sys; sys.stderr.write('progress line\\n'); "
+        "print(json.dumps({'volume': 1234567.5, 'note': 'account 999000111 seen', 'ok': True}))"
+    )
     command = Command((sys.executable, "-c", code), tmp_path, dict(os.environ), capture_to=target)
     try:
         manager.submit("gate5-replay", "Capture", lambda job_id, log: manager.run_command(command, log))
@@ -266,7 +281,7 @@ def test_capture_to_keeps_stdout_as_a_redacted_document_and_streams_stderr(tmp_p
         # document is walked as JSON rather than scrubbed as text.
         assert '{"volume"' not in result["log"]
         assert "document.json" in result["log"]
-        document = json.loads(target.read_text())
+        document = json.loads(target.read_bytes())
         assert document["volume"] == 1234567.5 and document["ok"] is True
         assert "999000111" not in document["note"]
     finally:
@@ -315,7 +330,7 @@ def test_cancel_terminates_the_child_and_marks_the_job_cancelled(tmp_path, monke
         assert processes and all(process.poll() is not None for process in processes)
         # A finished job can no longer be cancelled, and its file says cancelled.
         assert manager.cancel(submitted["id"]) is False
-        assert json.loads((manager.root / f"{submitted['id']}.json").read_text())["status"] == "cancelled"
+        assert json.loads((manager.root / f"{submitted['id']}.json").read_bytes())["status"] == "cancelled"
         restored = JobManager(manager.root)
         assert restored.snapshot()[0]["status"] == "cancelled"
         restored.close()
@@ -357,8 +372,12 @@ def test_log_since_returns_only_unseen_text_and_reports_window_truncation(tmp_pa
 def test_job_log_shows_checkout_relative_argv_not_absolute_paths(tmp_path):
     manager = JobManager(tmp_path / "jobs")
     target = tmp_path / "out" / "document.json"
-    command = Command((sys.executable, "-c", "print('ok')", "--artifacts-dir", str(tmp_path / "out")),
-                      tmp_path, dict(os.environ), capture_to=target)
+    command = Command(
+        (sys.executable, "-c", "print('ok')", "--artifacts-dir", str(tmp_path / "out")),
+        tmp_path,
+        dict(os.environ),
+        capture_to=target,
+    )
     try:
         manager.submit("demo-dca", "Relative argv", lambda job_id, log: manager.run_command(command, log))
         result = join_job(manager)
@@ -372,8 +391,9 @@ def test_job_log_shows_checkout_relative_argv_not_absolute_paths(tmp_path):
 
 def test_restored_timestamps_are_validated_not_redacted(tmp_path):
     root = tmp_path / "jobs"
-    saved_job(root, "stamped", started_at="2026-09-17T23:36:05.123456+00:00", finished_at="not a timestamp",
-              log_total=12)
+    saved_job(
+        root, "stamped", started_at="2026-09-17T23:36:05.123456+00:00", finished_at="not a timestamp", log_total=12
+    )
     saved_job(root, "unstamped", started_at=None, log_total="many")
     manager = JobManager(root)
     try:

@@ -39,7 +39,7 @@ def load_scheduled_tickers() -> list[str]:
     cfg_path = REPO_ROOT / "config" / "tickers.json"
     if not cfg_path.exists():
         raise FileNotFoundError(f"Config file not found: {cfg_path}")
-    data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    data = json.loads(cfg_path.read_bytes())
     active = data.get("active") or []
     return sorted(list({t.upper() for t in active}))
 

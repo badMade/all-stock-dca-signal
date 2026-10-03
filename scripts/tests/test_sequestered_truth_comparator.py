@@ -76,12 +76,12 @@ def test_evaluate_ticker_inverse_direction() -> None:
     actuals = {
         "2026-05-14": {"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0},
         "2026-05-15": {"open": 101.0, "high": 110.0, "low": 100.0, "close": 110.0},  # Actual went UP
-        "2026-05-18": {"open": 109.0, "high": 110.0, "low": 95.0, "close": 95.0},    # Actual went DOWN
+        "2026-05-18": {"open": 109.0, "high": 110.0, "low": 95.0, "close": 95.0},  # Actual went DOWN
     }
 
     preds = [
         {"date": "2026-05-15", "ticker": "XYZ", "pred_close": 90.0},  # Predicted DOWN
-        {"date": "2026-05-18", "ticker": "XYZ", "pred_close": 120.0}, # Predicted UP
+        {"date": "2026-05-18", "ticker": "XYZ", "pred_close": 120.0},  # Predicted UP
     ]
 
     comparator = SequesteredComparator()
@@ -164,14 +164,17 @@ def test_csv_loading_and_multi_ticker_evaluation(tmp_path: Path) -> None:
     # CLI main execution
     cli_json = tmp_path / "summary.json"
     cli_args = [
-        "--predictions", str(pred_csv),
-        "--history-dir", str(ticker_dir),
-        "--json-out", str(cli_json),
+        "--predictions",
+        str(pred_csv),
+        "--history-dir",
+        str(ticker_dir),
+        "--json-out",
+        str(cli_json),
     ]
     exit_code = main(cli_args)
     assert exit_code == 0
     assert cli_json.is_file()
-    data = json.loads(cli_json.read_text(encoding="utf-8"))
+    data = json.loads(cli_json.read_bytes())
     assert data["total_days"] == 2
     assert "AAPL" in data["ticker_metrics"]
     assert "MSFT" in data["ticker_metrics"]

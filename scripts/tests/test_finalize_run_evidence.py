@@ -40,8 +40,15 @@ def started(slot_id, minute=2):
 def run(tmp_path, slot_id="1430", status="no_orders_submitted", **kwargs):
     if status == "submitted":
         kwargs.setdefault("budget", BUDGET)
-    return fre.finalize(slot_id, kwargs.pop("start", started(slot_id)), outcome=kwargs.pop("outcome", "NO_ORDERS"),
-                        order_submit_status=status, root=tmp_path, now=NOW, **kwargs)
+    return fre.finalize(
+        slot_id,
+        kwargs.pop("start", started(slot_id)),
+        outcome=kwargs.pop("outcome", "NO_ORDERS"),
+        order_submit_status=status,
+        root=tmp_path,
+        now=NOW,
+        **kwargs,
+    )
 
 
 def read_csv(path):
@@ -73,13 +80,13 @@ def test_every_slot_finalizes_to_verified_evidence(tmp_path, slot_id):
     check = validate_pointer(pointer, expected_stream=stream, expected_root=pointer.parent, today=DAY.isoformat())
     assert check.is_valid
     run_dir = tmp_path / slot_run_dir_relative(slot_id, DAY)
-    state = json.loads((run_dir / "run_state.json").read_text())
+    state = json.loads((run_dir / "run_state.json").read_bytes())
     rc = state["run_classification"]
     assert rc["run_origin"] == "scheduled" and rc["manual_run"] is False and rc["valid_scheduled_evidence"] is True
     assert state["finalized_by"] == "scripts.finalize_run_evidence"
     # The CSV contract: header-only files exist even with zero rows.
     assert (run_dir / "submitted_orders.csv").read_text().startswith("ticker,order_id")
-    assert json.loads((run_dir / "run_summary.json").read_text())["run_classification"] == rc
+    assert json.loads((run_dir / "run_summary.json").read_bytes())["run_classification"] == rc
     slots = {row["slot_id"]: row["status"] for row in verify_day(DAY, NOW, root=tmp_path)["slots"]}
     assert slots[slot_id] == "verified"
 
@@ -88,7 +95,7 @@ def test_live_classification_is_the_executors_own(tmp_path):
     import intraday_dca
 
     run(tmp_path, "1330")
-    state = json.loads((tmp_path / "intraday_dca/20260922_1330ET/run_state.json").read_text())
+    state = json.loads((tmp_path / "intraday_dca/20260922_1330ET/run_state.json").read_bytes())
     expected = intraday_dca.IntradayDCAExecutor(mode="live", slot="1330").run_classification(started("1330"))
     expected["valid_scheduled_evidence"] = True
     # The pinned account never reaches the artifact (Copilot review, PR #1514).
@@ -119,17 +126,20 @@ def test_off_window_start_is_refused_and_writes_nothing(tmp_path):
     assert not any(tmp_path.iterdir())
 
 
-@pytest.mark.parametrize("status, orders, match", [
-    ("submitted", None, "needs at least one order row"),
-    ("no_orders_submitted", [ORDER], "use 'submitted'"),
-    ("dry_run", None, "is not one of"),
-    ("submitted", [{**ORDER, "status": "rejected"}], "not a placed or in-flight order"),
-    ("submitted", [{**ORDER, "order_id": ""}], "no broker order_id"),
-    ("submitted", [{**ORDER, "ticker": None}], "no ticker"),
-    ("submitted", [{**ORDER, "submitted_amount_usd": 0}], "not a positive number"),
-    ("submitted", [{**ORDER, "submitted_amount_usd": "2.5"}], "not a positive number"),
-    ("submitted", [ORDER, {**ORDER, "ticker": "ANET"}], "appears more than once"),
-])
+@pytest.mark.parametrize(
+    "status, orders, match",
+    [
+        ("submitted", None, "needs at least one order row"),
+        ("no_orders_submitted", [ORDER], "use 'submitted'"),
+        ("dry_run", None, "is not one of"),
+        ("submitted", [{**ORDER, "status": "rejected"}], "not a placed or in-flight order"),
+        ("submitted", [{**ORDER, "order_id": ""}], "no broker order_id"),
+        ("submitted", [{**ORDER, "ticker": None}], "no ticker"),
+        ("submitted", [{**ORDER, "submitted_amount_usd": 0}], "not a positive number"),
+        ("submitted", [{**ORDER, "submitted_amount_usd": "2.5"}], "not a positive number"),
+        ("submitted", [ORDER, {**ORDER, "ticker": "ANET"}], "appears more than once"),
+    ],
+)
 def test_inconsistent_order_claims_are_refused(tmp_path, status, orders, match):
     with pytest.raises(fre.FinalizeRefused, match=match):
         run(tmp_path, status=status, orders=orders)
@@ -145,19 +155,20 @@ def test_placed_orders_need_the_gate6_budget(tmp_path):
 
 def test_run_state_carries_the_schemas_required_budget_and_counts(tmp_path):
     run(tmp_path, status="submitted", orders=[ORDER])
-    state = json.loads((tmp_path / "intraday_dca/20260922_1430ET/run_state.json").read_text())
+    state = json.loads((tmp_path / "intraday_dca/20260922_1430ET/run_state.json").read_bytes())
     assert state["budget"] == {**BUDGET, "budget_tier": "normal"} and state["counts"] == {"submitted": 1}
     run(tmp_path, "1130")
-    early = json.loads((tmp_path / "intraday_dca/20260922_1130ET/run_state.json").read_text())
+    early = json.loads((tmp_path / "intraday_dca/20260922_1130ET/run_state.json").read_bytes())
     assert early["budget"] == {"budget_evaluated": False} and early["counts"] == {"submitted": 0}
-    schema = json.loads((Path(__file__).resolve().parents[2] / "schemas/run_state.schema.json").read_text())
+    schema = json.loads((Path(__file__).resolve().parents[2] / "schemas/run_state.schema.json").read_bytes())
     assert all(key in state and key in early for key in schema["required"])
     jsonschema = pytest.importorskip("jsonschema")
     referencing = pytest.importorskip("referencing")
     schemas = Path(__file__).resolve().parents[2] / "schemas"
     registry = referencing.Registry().with_resources(
         (path.name, referencing.Resource.from_contents(json.loads(path.read_bytes())))
-        for path in schemas.glob("*.schema.json"))
+        for path in schemas.glob("*.schema.json")
+    )
     validator = jsonschema.Draft7Validator(schema, registry=registry)
     # Everything outside run_classification must validate. The nested block is
     # the executor's own (test_live_classification_is_the_executors_own), and
@@ -165,9 +176,11 @@ def test_run_state_carries_the_schemas_required_budget_and_counts(tmp_path):
     # so the executors' classifications fail it whoever writes them -- that is
     # a pre-existing schema gap, not this command's.
     for candidate in (state, early):
-        assert [e.message for e in validator.iter_errors(candidate) if not e.path or e.path[0] != "run_classification"] == []
+        assert [
+            e.message for e in validator.iter_errors(candidate) if not e.path or e.path[0] != "run_classification"
+        ] == []
     run(tmp_path, "1530")
-    afternoon = json.loads((tmp_path / "ce16ba6b/scheduled_runs/20260922_1530ET/run_state.json").read_text())
+    afternoon = json.loads((tmp_path / "ce16ba6b/scheduled_runs/20260922_1530ET/run_state.json").read_bytes())
     assert [e.message for e in validator.iter_errors(afternoon)] == []
 
 
@@ -182,15 +195,17 @@ def test_orders_and_report_are_recorded(tmp_path):
     result = run(tmp_path, status="submitted", orders=[ORDER], report=report, outcome="ORDERS_PLACED")
     assert result["verified"] is True
     run_dir = tmp_path / "intraday_dca/20260922_1430ET"
-    state = json.loads((run_dir / "run_state.json").read_text())
-    assert state["orders_submitted_count"] == 1 and state["gate9_report"] == report and state["status"] == "ORDERS_PLACED"
+    state = json.loads((run_dir / "run_state.json").read_bytes())
+    assert (
+        state["orders_submitted_count"] == 1 and state["gate9_report"] == report and state["status"] == "ORDERS_PLACED"
+    )
     assert [row["order_id"] for row in read_csv(run_dir / "submitted_orders.csv")] == ["ord-1"]
 
 
 def test_retry_keeps_the_first_attempts_budget(tmp_path):
     run(tmp_path, status="submitted", orders=[ORDER])
     run(tmp_path, status="no_orders_submitted")  # relabelled submitted; budget carried forward
-    state = json.loads((tmp_path / "intraday_dca/20260922_1430ET/run_state.json").read_text())
+    state = json.loads((tmp_path / "intraday_dca/20260922_1430ET/run_state.json").read_bytes())
     assert state["budget"]["budget_tier"] == "normal"
 
 
@@ -202,7 +217,7 @@ def test_retry_merges_orders_by_order_id_and_stays_submitted(tmp_path):
     assert [row["order_id"] for row in read_csv(run_dir / "submitted_orders.csv")] == ["ord-1", "ord-2"]
     # A later retry that placed nothing does not relabel the slot as order-free.
     result = run(tmp_path, status="no_orders_submitted")
-    state = json.loads((run_dir / "run_state.json").read_text())
+    state = json.loads((run_dir / "run_state.json").read_bytes())
     assert state["order_submit_status"] == "submitted" and state["orders_submitted_count"] == 2
     assert any("already recorded" in warning for warning in result["warnings"])
 
@@ -210,14 +225,14 @@ def test_retry_merges_orders_by_order_id_and_stays_submitted(tmp_path):
 def test_existing_executor_run_state_is_kept_and_only_the_pointer_refreshed(tmp_path):
     run(tmp_path, "1030")
     run_dir = tmp_path / "morning_dca/20260922_1030ET"
-    state = json.loads((run_dir / "run_state.json").read_text())
+    state = json.loads((run_dir / "run_state.json").read_bytes())
     state.pop("finalized_by")
     state["executor_payload"] = "kept"
     (run_dir / "run_state.json").write_text(json.dumps(state))
     (tmp_path / "morning_dca/latest_morning_run.json").unlink()
     result = run(tmp_path, "1030", status="submitted", orders=[ORDER])
     assert result["run_state_written"] is False and result["verified"] is True
-    assert json.loads((run_dir / "run_state.json").read_text())["executor_payload"] == "kept"
+    assert json.loads((run_dir / "run_state.json").read_bytes())["executor_payload"] == "kept"
     assert any("NOT recorded" in warning for warning in result["warnings"])
     assert (tmp_path / "morning_dca/latest_morning_run.json").is_file()
 
@@ -225,15 +240,16 @@ def test_existing_executor_run_state_is_kept_and_only_the_pointer_refreshed(tmp_
 def test_missing_companions_of_an_executor_state_are_repaired_never_overwritten(tmp_path):
     run(tmp_path, "1030")
     run_dir = tmp_path / "morning_dca/20260922_1030ET"
-    state = json.loads((run_dir / "run_state.json").read_text())
+    state = json.loads((run_dir / "run_state.json").read_bytes())
     state.pop("finalized_by")
     (run_dir / "run_state.json").write_text(json.dumps(state))
     (run_dir / "run_summary.json").unlink()
     (run_dir / "submitted_orders.csv").unlink()
     (run_dir / "morning_signals.csv").write_text("ticker,grade\nMA,2x\n")
     # Interrupted executor: the audit must not call this verified.
-    assert {r["slot_id"]: r["status"] for r in verify_day(DAY, NOW, root=tmp_path)["slots"]}["1030"] \
-        == "evidence_incomplete"
+    assert {r["slot_id"]: r["status"] for r in verify_day(DAY, NOW, root=tmp_path)["slots"]}[
+        "1030"
+    ] == "evidence_incomplete"
     result = run(tmp_path, "1030")
     assert result["verified"] is True
     assert any("run_summary.json" in warning and "submitted_orders.csv" in warning for warning in result["warnings"])
@@ -264,7 +280,9 @@ def test_cli_exit_codes(tmp_path, capsys):
     assert "acceptance window" in json.loads(capsys.readouterr().out)["refused"]
     assert fre.main(["--slot", "0900", "--started-at", "2026-09-22T09:00:00", *base]) == 2
     missing = tmp_path / "nope.json"
-    assert fre.main(["--slot", "1230", "--started-at", "2026-09-22T12:31:00", "--orders-json", str(missing), *base]) == 2
+    assert (
+        fre.main(["--slot", "1230", "--started-at", "2026-09-22T12:31:00", "--orders-json", str(missing), *base]) == 2
+    )
 
 
 # --- zero-order finalizes must show Gate 5 actually evaluated data -----------
@@ -276,19 +294,26 @@ def test_cli_exit_codes(tmp_path, capsys):
 def rows_for(evaluated, provider_error, no_data):
     """Candidate rows the way the generators emit them: a provider-error ticker is
     itself a NO_DATA row, then plain NO_DATA rows, then evaluated-and-quiet rows."""
-    rows = [{"ticker": f"T{i}", "action": "NO_DATA", "provider_error": i < provider_error}
-            for i in range(max(provider_error, no_data))]
-    rows += [{"ticker": f"T{i}", "action": "NO_ACTION", "provider_error": False}
-             for i in range(len(rows), evaluated)]
+    rows = [
+        {"ticker": f"T{i}", "action": "NO_DATA", "provider_error": i < provider_error}
+        for i in range(max(provider_error, no_data))
+    ]
+    rows += [{"ticker": f"T{i}", "action": "NO_ACTION", "provider_error": False} for i in range(len(rows), evaluated)]
     return rows
 
 
 def gate5_doc(slot_id="1430", **overrides):
     counts = {"evaluated_count": 64, "provider_error_count": 1, "no_data_count": 1}
     counts.update({k: overrides.pop(k) for k in list(overrides) if k in counts})
-    doc = {"slot": f"{slot_id}ET", "runner_slot_id": slot_id, "trading_day": DAY.isoformat(),
-           "buy_count": 0, "already_covered_tickers": [], **counts,
-           "candidates": rows_for(counts["evaluated_count"], counts["provider_error_count"], counts["no_data_count"])}
+    doc = {
+        "slot": f"{slot_id}ET",
+        "runner_slot_id": slot_id,
+        "trading_day": DAY.isoformat(),
+        "buy_count": 0,
+        "already_covered_tickers": [],
+        **counts,
+        "candidates": rows_for(counts["evaluated_count"], counts["provider_error_count"], counts["no_data_count"]),
+    }
     doc.update(overrides)
     return doc
 
@@ -313,11 +338,14 @@ def test_no_candidates_status_needs_the_generator_document(tmp_path):
         run(tmp_path, "1430", status="not_submitted_no_candidates")
 
 
-@pytest.mark.parametrize("counts", [
-    {"evaluated_count": 0},
-    {"evaluated_count": 64, "provider_error_count": 64},
-    {"evaluated_count": 64, "provider_error_count": 4, "no_data_count": 64},
-])
+@pytest.mark.parametrize(
+    "counts",
+    [
+        {"evaluated_count": 0},
+        {"evaluated_count": 64, "provider_error_count": 64},
+        {"evaluated_count": 64, "provider_error_count": 4, "no_data_count": 64},
+    ],
+)
 def test_zero_candidates_from_zero_usable_tickers_is_an_outage(tmp_path, counts):
     put(tmp_path, "1430", "gate5_document.json", gate5_doc(**counts))
     with pytest.raises(fre.FinalizeRefused, match="data outage, not a quiet tape"):
@@ -329,10 +357,16 @@ def test_genuinely_quiet_tape_verifies_and_records_its_evidence(tmp_path):
     run_dir = put(tmp_path, "1430", "gate5_document.json", gate5_doc(no_data_count=40))
     result = run(tmp_path, "1430", status="not_submitted_no_candidates")
     assert result["verified"] is True, result["errors"]
-    evidence = json.loads((run_dir / "run_state.json").read_text())["gate5_evidence"]
+    evidence = json.loads((run_dir / "run_state.json").read_bytes())["gate5_evidence"]
     # The provider-error ticker is one of the 40 NO_DATA rows, not subtracted twice.
-    assert evidence == {"document": "gate5_document.json", "evaluated_count": 64, "usable_count": 24,
-                        "buy_count": 0, "provider_error_count": 1, "no_data_count": 40}
+    assert evidence == {
+        "document": "gate5_document.json",
+        "evaluated_count": 64,
+        "usable_count": 24,
+        "buy_count": 0,
+        "provider_error_count": 1,
+        "no_data_count": 40,
+    }
 
 
 def test_fully_covered_universe_is_served_not_an_outage(tmp_path):
@@ -360,15 +394,30 @@ def test_a_document_for_another_slot_or_day_is_not_this_runs_evidence(tmp_path):
 
 def test_declared_failure_is_not_second_guessed(tmp_path):
     put(tmp_path, "1230", "candidates.json", [])
-    result = run(tmp_path, "1230", status="not_submitted_error", error_class="market_data_unavailable",
-                 error_detail="provider returned nothing")
+    result = run(
+        tmp_path,
+        "1230",
+        status="not_submitted_error",
+        error_class="market_data_unavailable",
+        error_detail="provider returned nothing",
+    )
     assert result["run_state_written"] is True
 
 
 def test_cli_maps_an_outage_dressed_as_quiet_tape_to_exit_2(tmp_path, capsys):
     put(tmp_path, "1530", "candidates.json", {"candidates": []})
-    argv = ["--slot", "1530", "--started-at", "2026-09-22T15:31:00-04:00", "--root", str(tmp_path),
-            "--outcome", "END_SILENTLY", "--order-submit-status", "no_orders_submitted"]
+    argv = [
+        "--slot",
+        "1530",
+        "--started-at",
+        "2026-09-22T15:31:00-04:00",
+        "--root",
+        str(tmp_path),
+        "--outcome",
+        "END_SILENTLY",
+        "--order-submit-status",
+        "no_orders_submitted",
+    ]
     assert fre.main(argv) == 2
     assert "market_data_unavailable" in json.loads(capsys.readouterr().out)["refused"]
 
@@ -411,8 +460,12 @@ def test_duplicate_json_keys_make_a_file_invalid_evidence(tmp_path):
 
 def executor_state(run_dir, **fields):
     run_dir.mkdir(parents=True, exist_ok=True)
-    state = {"trading_day": DAY.isoformat(), "stream": "intraday", "order_submit_status": "no_orders_submitted",
-             **fields}
+    state = {
+        "trading_day": DAY.isoformat(),
+        "stream": "intraday",
+        "order_submit_status": "no_orders_submitted",
+        **fields,
+    }
     (run_dir / "run_state.json").write_text(json.dumps(state))
     return state
 
@@ -437,7 +490,7 @@ def test_hand_written_state_beside_a_fabricated_candidates_file_is_refused(tmp_p
 def test_executor_state_with_usable_data_is_not_second_guessed(tmp_path):
     run_dir = tmp_path / slot_run_dir_relative("1430", DAY)
     executor_state(run_dir, counts={"evaluated": 64, "no_data": 1, "buy_candidates": 0})
-    fre.check_existing_state_gate5_evidence(run_dir, "1430", DAY, json.loads((run_dir / "run_state.json").read_text()))
+    fre.check_existing_state_gate5_evidence(run_dir, "1430", DAY, json.loads((run_dir / "run_state.json").read_bytes()))
 
 
 # --- code_version: which release produced this evidence (cloud-clone plan, step 5) ---------------------------

@@ -17,7 +17,7 @@ SHIPPED_CONFIG = REPO_ROOT / "config" / "self_heal.json"
 
 def _valid_document() -> dict[str, object]:
     """Return an independent mutable copy of the shipped JSON object."""
-    document = json.loads(SHIPPED_CONFIG.read_text(encoding="utf-8"))
+    document = json.loads(SHIPPED_CONFIG.read_bytes())
     assert isinstance(document, dict)
     return document
 
@@ -165,9 +165,7 @@ def test_zero_is_rejected_when_minimum_is_at_least_one(tmp_path: Path) -> None:
         ("execution_lease_seconds", 21_601, "above maximum 21600"),
     ],
 )
-def test_values_above_every_declared_maximum_are_rejected(
-    tmp_path: Path, key: str, value: int, failure: str
-) -> None:
+def test_values_above_every_declared_maximum_are_rejected(tmp_path: Path, key: str, value: int, failure: str) -> None:
     document = _valid_document()
     document[key] = value
 
@@ -195,9 +193,7 @@ def test_values_above_every_declared_maximum_are_rejected(
         ("execution_lease_seconds", 59, "below minimum 60"),
     ],
 )
-def test_values_below_every_declared_minimum_are_rejected(
-    tmp_path: Path, key: str, value: int, failure: str
-) -> None:
+def test_values_below_every_declared_minimum_are_rejected(tmp_path: Path, key: str, value: int, failure: str) -> None:
     document = _valid_document()
     document[key] = value
 

@@ -68,11 +68,16 @@ def test_main_experiment_orchestration(tmp_path: Path) -> None:
 
     exp_dir = tmp_path / "experiment"
     cli_args = [
-        "--tickers", "SPY",
-        "--days", "3",
-        "--history-dir", str(ticker_dir),
-        "--experiment-dir", str(exp_dir),
-        "--model", "persistence",
+        "--tickers",
+        "SPY",
+        "--days",
+        "3",
+        "--history-dir",
+        str(ticker_dir),
+        "--experiment-dir",
+        str(exp_dir),
+        "--model",
+        "persistence",
     ]
 
     ret = main(cli_args)
@@ -83,6 +88,6 @@ def test_main_experiment_orchestration(tmp_path: Path) -> None:
     assert (results_dir / "comparison_metrics.json").is_file()
     assert (results_dir / "daily_comparison_ledger.csv").is_file()
 
-    data = json.loads((results_dir / "comparison_metrics.json").read_text(encoding="utf-8"))
+    data = json.loads((results_dir / "comparison_metrics.json").read_bytes())
     assert "SPY" in data["ticker_metrics"]
     assert data["ticker_metrics"]["SPY"]["days_count"] == 3

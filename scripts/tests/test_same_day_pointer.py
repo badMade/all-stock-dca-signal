@@ -110,6 +110,7 @@ def _write_state(root: Path, stream_dir: str, state: dict) -> Path:
 
 # --- derive_valid_scheduled_evidence -----------------------------------------
 
+
 def test_today_et(monkeypatch):
     import datetime as dt
 
@@ -179,6 +180,7 @@ def test_evidence_false_when_manual_run_key_absent():
 
 # --- build_pointer_metadata --------------------------------------------------
 
+
 def test_build_metadata_has_required_fields():
     meta = build_pointer_metadata(
         run_id="scheduled_20260721_1520ET",
@@ -204,6 +206,7 @@ def test_build_metadata_has_required_fields():
 
 # --- validate_pointer happy path ---------------------------------------------
 
+
 def test_valid_pointer(tmp_path):
     root = tmp_path / "morning_dca"
     state_path = _write_state(root, "20260721_1030ET", _scheduled_state())
@@ -221,10 +224,9 @@ def test_valid_pointer(tmp_path):
 
 # --- rejection paths ---------------------------------------------------------
 
+
 def test_missing_pointer(tmp_path):
-    result = validate_pointer(
-        tmp_path / "nope.json", expected_stream="morning", expected_root=tmp_path, today=TODAY
-    )
+    result = validate_pointer(tmp_path / "nope.json", expected_stream="morning", expected_root=tmp_path, today=TODAY)
     assert result.status == STATUS_MISSING
     assert result.valid_scheduled_evidence is False
 
@@ -237,9 +239,7 @@ def test_malformed_pointer(tmp_path):
 
 
 def test_missing_required_keys_is_malformed(tmp_path):
-    result = validate_pointer(
-        {"run_id": "x"}, expected_stream="morning", expected_root=tmp_path, today=TODAY
-    )
+    result = validate_pointer({"run_id": "x"}, expected_stream="morning", expected_root=tmp_path, today=TODAY)
     assert result.status == STATUS_MALFORMED
 
 
@@ -436,6 +436,7 @@ def test_pointer_claim_not_trusted_over_manual_state(tmp_path):
 
 # --- refresh_latest_pointer --------------------------------------------------
 
+
 def test_refresh_writes_same_day_metadata(tmp_path):
     root = tmp_path / "morning_dca"
     state_path = _write_state(root, "20260721_1030ET", _scheduled_state())
@@ -474,6 +475,7 @@ def test_refresh_derives_false_evidence_for_manual(tmp_path):
 
 
 # --- select_same_day_run_state -----------------------------------------------
+
 
 def test_select_prefers_date_specific_state(tmp_path):
     root = tmp_path / "morning_dca"
@@ -621,9 +623,7 @@ def test_select_uses_perplexity_primary_alias_when_canonical_pointer_missing(tmp
     assert cast(dict[str, Any], state["run_classification"])["stream"] == "intraday"
 
 
-def test_select_uses_default_perplexity_primary_alias_for_1130_catchup(
-    tmp_path, monkeypatch
-):
+def test_select_uses_default_perplexity_primary_alias_for_1130_catchup(tmp_path, monkeypatch):
     monkeypatch.setattr(same_day_pointer_module, "CRON_TRACKING_ROOT", tmp_path)
     canonical_root = tmp_path / "intraday_dca"
     alias_root = tmp_path / "perplexity_primary_20260721"
@@ -807,9 +807,7 @@ def test_validate_recovery_pointer_rejects_non_recovery_stream(tmp_path):
 def test_validate_recovery_pointer_rejects_scheduled_target(tmp_path):
     # A scheduled artifact must not be discoverable through the recovery path.
     root = tmp_path / "midday_dca"
-    state_path = _write_state(
-        root, "20260721_1230ET_recovery_1305ET", _scheduled_state(stream="midday_recovery")
-    )
+    state_path = _write_state(root, "20260721_1230ET_recovery_1305ET", _scheduled_state(stream="midday_recovery"))
 
     result = validate_recovery_pointer(
         _recovery_pointer(state_path),
@@ -824,9 +822,7 @@ def test_validate_recovery_pointer_rejects_scheduled_target(tmp_path):
 
 def test_validate_recovery_pointer_enforces_same_day(tmp_path):
     root = tmp_path / "midday_dca"
-    state_path = _write_state(
-        root, "20260720_1230ET_recovery_1305ET", _recovery_state(trading_day="2026-07-20")
-    )
+    state_path = _write_state(root, "20260720_1230ET_recovery_1305ET", _recovery_state(trading_day="2026-07-20"))
 
     result = validate_recovery_pointer(
         _recovery_pointer(state_path, trading_day="2026-07-20"),
@@ -870,17 +866,21 @@ def test_derive_valid_recovery_context_requires_full_contract():
     # stream or run identity -- be trusted as usable context, contradicting
     # schemas/recovery_run_classification.schema.json.
     # The four-field subset that used to pass.
-    assert derive_valid_recovery_context({
-        "run_classification": {
-            "run_origin": "scheduled_recovery",
-            "manual_run": False,
-            "valid_recovery_context": True,
-            "valid_scheduled_evidence": False,
-        }
-    }) is False
+    assert (
+        derive_valid_recovery_context(
+            {
+                "run_classification": {
+                    "run_origin": "scheduled_recovery",
+                    "manual_run": False,
+                    "valid_recovery_context": True,
+                    "valid_scheduled_evidence": False,
+                }
+            }
+        )
+        is False
+    )
 
-    for missing in ("stream", "run_type", "run_id", "state_schema_version",
-                    "same_day_top_up_context_only"):
+    for missing in ("stream", "run_type", "run_id", "state_schema_version", "same_day_top_up_context_only"):
         state = _recovery_state()
         del state["run_classification"][missing]
         assert derive_valid_recovery_context(state) is False, missing
@@ -983,9 +983,7 @@ def test_recovery_pointer_rejects_bogus_identity_values():
     for override in ({"run_type": "bogus"}, {"state_schema_version": "bogus"}):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "midday_dca"
-            state_path = _write_state(
-                root, "20260721_1230ET_recovery_1305ET", _recovery_state(**override)
-            )
+            state_path = _write_state(root, "20260721_1230ET_recovery_1305ET", _recovery_state(**override))
             result = validate_recovery_pointer(
                 _recovery_pointer(state_path),
                 expected_stream="midday_recovery",
@@ -1026,9 +1024,7 @@ def test_recovery_pointer_rejects_contradictory_metadata():
     ):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "midday_dca"
-            state_path = _write_state(
-                root, "20260721_1230ET_recovery_1305ET", _recovery_state()
-            )
+            state_path = _write_state(root, "20260721_1230ET_recovery_1305ET", _recovery_state())
             pointer = _recovery_pointer(state_path)
             pointer.update(override)
 
@@ -1050,9 +1046,7 @@ def test_recovery_pointer_helper_agrees_with_its_schema():
     jsonschema = pytest.importorskip("jsonschema")
 
     repo_root = Path(__file__).resolve().parents[2]
-    schema = json.loads(
-        (repo_root / "schemas" / "latest_pointer.schema.json").read_text(encoding="utf-8")
-    )
+    schema = json.loads((repo_root / "schemas" / "latest_pointer.schema.json").read_bytes())
     validator = jsonschema.Draft7Validator(schema)
 
     with tempfile.TemporaryDirectory() as d:
@@ -1061,14 +1055,17 @@ def test_recovery_pointer_helper_agrees_with_its_schema():
 
         good = _recovery_pointer(state_path)
         assert list(validator.iter_errors(good)) == []
-        assert bool(
-            validate_recovery_pointer(
-                good,
-                expected_stream="midday_recovery",
-                expected_root=root,
-                today=TODAY,
+        assert (
+            bool(
+                validate_recovery_pointer(
+                    good,
+                    expected_stream="midday_recovery",
+                    expected_root=root,
+                    today=TODAY,
+                )
             )
-        ) is True
+            is True
+        )
 
         for override in (
             {"valid_scheduled_evidence": True},
@@ -1077,14 +1074,17 @@ def test_recovery_pointer_helper_agrees_with_its_schema():
             bad = _recovery_pointer(state_path)
             bad.update(override)
             assert list(validator.iter_errors(bad)), override
-            assert bool(
-                validate_recovery_pointer(
-                    bad,
-                    expected_stream="midday_recovery",
-                    expected_root=root,
-                    today=TODAY,
+            assert (
+                bool(
+                    validate_recovery_pointer(
+                        bad,
+                        expected_stream="midday_recovery",
+                        expected_root=root,
+                        today=TODAY,
+                    )
                 )
-            ) is False, override
+                is False
+            ), override
 
 
 def test_recovery_pointer_requires_boolean_evidence_and_same_day_fields():
@@ -1107,9 +1107,7 @@ def test_recovery_pointer_requires_boolean_evidence_and_same_day_fields():
     for variant in bad_variants:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "midday_dca"
-            state_path = _write_state(
-                root, "20260721_1230ET_recovery_1305ET", _recovery_state()
-            )
+            state_path = _write_state(root, "20260721_1230ET_recovery_1305ET", _recovery_state())
             pointer = _recovery_pointer(state_path)
             if variant == "drop_evidence":
                 del pointer["valid_scheduled_evidence"]
@@ -1133,15 +1131,18 @@ def test_recovery_pointer_requires_updated_at_utc():
     # Codex review: "Require recovery pointer update timestamps". The schema
     # marks updated_at_utc required with format date-time, and a recovery
     # pointer cannot be a legacy artifact, so the helper must enforce it too.
-    bad = [{"updated_at_utc": "not-a-timestamp"}, {"updated_at_utc": ""},
-           {"updated_at_utc": None}, {"updated_at_utc": 1730000000}, "drop"]
+    bad = [
+        {"updated_at_utc": "not-a-timestamp"},
+        {"updated_at_utc": ""},
+        {"updated_at_utc": None},
+        {"updated_at_utc": 1730000000},
+        "drop",
+    ]
 
     for variant in bad:
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "midday_dca"
-            state_path = _write_state(
-                root, "20260721_1230ET_recovery_1305ET", _recovery_state()
-            )
+            state_path = _write_state(root, "20260721_1230ET_recovery_1305ET", _recovery_state())
             pointer = _recovery_pointer(state_path)
             if variant == "drop":
                 del pointer["updated_at_utc"]
@@ -1163,9 +1164,7 @@ def test_recovery_pointer_accepts_both_utc_spellings():
     for stamp in ("2026-07-21T17:05:00Z", "2026-07-21T17:05:00+00:00"):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "midday_dca"
-            state_path = _write_state(
-                root, "20260721_1230ET_recovery_1305ET", _recovery_state()
-            )
+            state_path = _write_state(root, "20260721_1230ET_recovery_1305ET", _recovery_state())
             pointer = _recovery_pointer(state_path)
             pointer["updated_at_utc"] = stamp
 
@@ -1216,14 +1215,14 @@ def test_recovery_pointer_run_ids_are_compared_exactly():
     # ' run-1 ' and 'run-1' are each schema-valid but are DIFFERENT persisted
     # strings. A stripped comparison let this validator promise an identity
     # match while audit metadata named two different runs.
-    for padded in (" midday_recovery_20260721_1305ET",
-                   "midday_recovery_20260721_1305ET ",
-                   "\tmidday_recovery_20260721_1305ET"):
+    for padded in (
+        " midday_recovery_20260721_1305ET",
+        "midday_recovery_20260721_1305ET ",
+        "\tmidday_recovery_20260721_1305ET",
+    ):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "midday_dca"
-            state_path = _write_state(
-                root, "20260721_1230ET_recovery_1305ET", _recovery_state()
-            )
+            state_path = _write_state(root, "20260721_1230ET_recovery_1305ET", _recovery_state())
             pointer = _recovery_pointer(state_path)
             pointer["run_id"] = padded
 
@@ -1241,14 +1240,17 @@ def test_recovery_pointer_run_ids_are_compared_exactly():
     with tempfile.TemporaryDirectory() as d:
         root = Path(d) / "midday_dca"
         state_path = _write_state(root, "20260721_1230ET_recovery_1305ET", _recovery_state())
-        assert bool(
-            validate_recovery_pointer(
-                _recovery_pointer(state_path),
-                expected_stream="midday_recovery",
-                expected_root=root,
-                today=TODAY,
+        assert (
+            bool(
+                validate_recovery_pointer(
+                    _recovery_pointer(state_path),
+                    expected_stream="midday_recovery",
+                    expected_root=root,
+                    today=TODAY,
+                )
             )
-        ) is True
+            is True
+        )
 
 
 def test_recovery_pointer_rejects_padded_stream_names():
@@ -1258,13 +1260,16 @@ def test_recovery_pointer_rejects_padded_stream_names():
     # it -- the stream enum is exact. Validation must not repair malformed
     # metadata; rejecting reports wrong_stream, which is the fail-closed
     # direction.
-    for padded in (" midday_recovery", "midday_recovery ", " midday_recovery ",
-                   "\tmidday_recovery", "midday_recovery\n"):
+    for padded in (
+        " midday_recovery",
+        "midday_recovery ",
+        " midday_recovery ",
+        "\tmidday_recovery",
+        "midday_recovery\n",
+    ):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "midday_dca"
-            state_path = _write_state(
-                root, "20260721_1230ET_recovery_1305ET", _recovery_state()
-            )
+            state_path = _write_state(root, "20260721_1230ET_recovery_1305ET", _recovery_state())
             pointer = _recovery_pointer(state_path)
             pointer["stream"] = padded
 
@@ -1297,17 +1302,17 @@ def test_recovery_timestamp_requires_full_rfc3339_syntax():
     # therefore the schema's `format: date-time` -- does not, so the helper
     # still returned truthy for pointers a schema-aware consumer refuses.
     for bad in (
-        "20260721T170500+00:00",      # basic format, no separators
+        "20260721T170500+00:00",  # basic format, no separators
         "20260721T170500Z",
         "2026-W30-2T17:05:00+00:00",  # ISO week date
-        "2026-202T17:05:00+00:00",    # ordinal date
+        "2026-202T17:05:00+00:00",  # ordinal date
         "2026-07-21T17:05:00+00:00:30",  # offset carrying seconds
         "2026-07-21 17:05:00+00:00",  # space separator
-        "2026-07-21T17:05+00:00",     # no seconds
-        " 2026-07-21T17:05:00Z",      # padded: the schema pattern is the whole string
+        "2026-07-21T17:05+00:00",  # no seconds
+        " 2026-07-21T17:05:00Z",  # padded: the schema pattern is the whole string
         "2026-07-21T17:05:00Z ",
-        "2026-07-21T17:05:00Z\n",     # `$` would match here; the pattern uses \Z
-        "2026-13-21T17:05:00Z",       # syntactically fine, semantically invalid
+        "2026-07-21T17:05:00Z\n",  # `$` would match here; the pattern uses \Z
+        "2026-13-21T17:05:00Z",  # syntactically fine, semantically invalid
         "2026-07-32T17:05:00Z",
     ):
         assert _is_iso_utc_timestamp(bad) is False, bad
@@ -1325,9 +1330,7 @@ def test_recovery_pointer_rejects_naive_or_date_only_timestamps():
     for stamp in ("2026-07-21", "2026-07-21T17:05:00"):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "midday_dca"
-            state_path = _write_state(
-                root, "20260721_1230ET_recovery_1305ET", _recovery_state()
-            )
+            state_path = _write_state(root, "20260721_1230ET_recovery_1305ET", _recovery_state())
             pointer = _recovery_pointer(state_path)
             pointer["updated_at_utc"] = stamp
 
@@ -1349,9 +1352,7 @@ def test_recovery_pointer_run_id_must_match_its_target():
     for bad_run_id in ("some_other_run", None, "", "   "):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d) / "midday_dca"
-            state_path = _write_state(
-                root, "20260721_1230ET_recovery_1305ET", _recovery_state()
-            )
+            state_path = _write_state(root, "20260721_1230ET_recovery_1305ET", _recovery_state())
             pointer = _recovery_pointer(state_path)
             pointer["run_id"] = bad_run_id
 

@@ -1,0 +1,52 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/inject-operating-rules.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/session-start-hook.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "deny": [
+      "mcp__Notion__notion-create-pages",
+      "mcp__Notion__notion-update-page",
+      "mcp__Notion__notion-create-database",
+      "mcp__Notion__notion-create-comment",
+      "mcp__Notion__notion-duplicate-page",
+      "mcp__Notion__notion-move-pages",
+      "mcp__Notion__notion-update-data-source",
+      "mcp__Notion__notion-create-view",
+      "mcp__Notion__notion-update-view",
+      "mcp__Notion__notion-create-folder",
+      "mcp__Notion__notion-update-folder",
+      "mcp__Notion__notion-create-file-upload",
+      "mcp__Notion__notion-create-attachment",
+      "mcp__Notion__notion-upload-skill",
+      "mcp__Notion__notion-convert-page-to-skill",
+      "mcp__Notion__notion-spawn-session",
+      "mcp__Notion__notion-send-message-to-session",
+      "mcp__Notion__notion-stop-session",
+      "mcp__Robinhood__place_equity_order",
+      "mcp__Robinhood__place_option_order",
+      "mcp__Robinhood__place_crypto_order",
+      "mcp__Robinhood__cancel_equity_order",
+      "mcp__Robinhood__cancel_option_order",
+      "mcp__Robinhood__cancel_crypto_order",
+      "mcp__Robinhood__cancel_option_exercise",
+      "mcp__Robinhood__exercise_option"
+    ]
+  }
+}

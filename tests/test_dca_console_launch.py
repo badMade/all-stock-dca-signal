@@ -255,3 +255,16 @@ def test_payload_discovery_is_cached_briefly_per_root_set(app, tmp_path, monkeyp
     assert resolved_payload is not None
     assert resolved_payload["trading_day"] == "2026-09-20"
     launch._PAYLOAD_CACHE.clear()
+
+def test_junit_summary_rejects_xxe_and_doctype_entities(tmp_path):
+    from dca_console_launch import junit_summary
+    report = tmp_path / "xxe.xml"
+    report.write_text('<?xml version="1.0"?><!DOCTYPE root [<!ENTITY foo "bar">]><root>&foo;</root>')
+    summary = junit_summary(report)
+    assert summary["parsed"] is False
+    assert summary["passed"] == 0
+
+    report2 = tmp_path / "xxe2.xml"
+    report2.write_text('<?xml version="1.0"?><!DOCTYPE root SYSTEM "http://example.com/evil.dtd"><root></root>')
+    summary2 = junit_summary(report2)
+    assert summary2["parsed"] is False

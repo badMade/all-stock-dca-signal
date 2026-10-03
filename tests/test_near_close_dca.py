@@ -37,6 +37,8 @@ from dca_cumulative import CumulativeCreditLedger, MinimumOrderDiscard
 from dca_whole_share_accumulator import WholeShareAccumulationLedger
 from near_close_dca import (
     ACTIVE_TICKERS,
+    ALPACA_ACCOUNT_INFO_TOOL,
+    ALPACA_SOURCE_ID,
     BASE_BELOW_CLOSE_AND_LOW,
     BASE_BELOW_CLOSE_ONLY,
     BASE_NOT_BELOW_CLOSE,
@@ -84,6 +86,7 @@ from near_close_dca import (
     _select_reconciled_signal_rows,
     account_pinning_failure,
     allocation_sort_key,
+    build_alpaca_account_info_payload,
     build_broker,
     build_execution_record,
     build_report,
@@ -326,6 +329,7 @@ def test_book_reconciled_attempt_notional_restores_each_missing_attempt_independ
     assert state.day_order_count(trading_day) == 2
     assert state.day_notional(trading_day) == 5.0
 
+
 def test_book_reconciled_attempt_notional_retains_every_source_run_id_for_a_duplicate_order():
     """codex review discussion_r3888079734 ("Retain every source run when
     deduplicating recovered orders"): two duplicate artifacts for the SAME
@@ -338,17 +342,13 @@ def test_book_reconciled_attempt_notional_retains_every_source_run_id_for_a_dupl
     state = StrategyState()
     trading_day = date(2026, 7, 6)
 
-    state.book_reconciled_attempt_notional(
-        "AAPL", trading_day, 2.0, order_id="ORD-SHARED", source_run_id="run-copy-a"
-    )
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 2.0, order_id="ORD-SHARED", source_run_id="run-copy-a")
     assert state.day_order_count(trading_day) == 1
     assert state.day_notional(trading_day) == 2.0
 
     # A second artifact copy of the SAME economic event, resolved under a
     # DIFFERENT source_run_id.
-    state.book_reconciled_attempt_notional(
-        "AAPL", trading_day, 2.0, order_id="ORD-SHARED", source_run_id="run-copy-b"
-    )
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 2.0, order_id="ORD-SHARED", source_run_id="run-copy-b")
 
     # No double-booking...
     assert state.day_order_count(trading_day) == 1
@@ -457,18 +457,12 @@ def test_book_reconciled_attempt_notional_keeps_the_recovery_baseline_consistent
     state = StrategyState()
     trading_day = date(2026, 7, 6)
 
-    state.book_reconciled_attempt_notional(
-        "XYZ", trading_day, 2.0, order_id="O1", source_run_id="R1"
-    )
+    state.book_reconciled_attempt_notional("XYZ", trading_day, 2.0, order_id="O1", source_run_id="R1")
     # A genuine replay of the SAME order_id/amount (retried evidence, a
     # duplicate cron firing) must be a true no-op on both the ledger and
     # the per-run baseline, not a second $2 addition.
-    state.book_reconciled_attempt_notional(
-        "XYZ", trading_day, 2.0, order_id="O1", source_run_id="R1"
-    )
-    state.book_reconciled_attempt_notional(
-        "XYZ", trading_day, 2.0, order_id="O2", source_run_id="R1"
-    )
+    state.book_reconciled_attempt_notional("XYZ", trading_day, 2.0, order_id="O1", source_run_id="R1")
+    state.book_reconciled_attempt_notional("XYZ", trading_day, 2.0, order_id="O2", source_run_id="R1")
 
     assert state.day_notional(trading_day) == 4.0
     assert state.day_order_count(trading_day) == 2
@@ -498,9 +492,7 @@ def test_book_reconciled_attempt_notional_baseline_includes_a_durably_persisted_
     # This run's first call for a NAMED order_id it has never seen before --
     # buys_today() is already positive, so _attempt_restored is False, but
     # the named order_id proves this is a distinct attempt overlapping R1.
-    state.book_reconciled_attempt_notional(
-        "ABC", trading_day, 3.0, order_id="OA", source_run_id="R1"
-    )
+    state.book_reconciled_attempt_notional("ABC", trading_day, 3.0, order_id="OA", source_run_id="R1")
 
     assert state.own_recovered_attempts_by_ticker_day_run_id[("ABC", trading_day, "R1")] == 1
     # An order-ID-less legacy repeat must still keep the narrower gate (no
@@ -937,10 +929,9 @@ def test_reconcile_prior_allocation_deduplicates_normalized_ids_before_counting_
     state.reconcile_prior_allocation("AAPL", trading_day, 8.0, 2, order_ids=["123", "123.0"])
 
     assert state.recorded_attempt_order_ids[("AAPL", trading_day)] == {"123"}
-    assert (
-        state.seeded_prior_context_registered_id_count_by_ticker_day.get("AAPL", {}).get(trading_day, 0)
-        == 1
-    ), "the registered-id counter must count the one DISTINCT id actually added, not two"
+    assert state.seeded_prior_context_registered_id_count_by_ticker_day.get("AAPL", {}).get(trading_day, 0) == 1, (
+        "the registered-id counter must count the one DISTINCT id actually added, not two"
+    )
     assert len(state.recorded_attempt_order_ids[("AAPL", trading_day)]) <= state.day_order_count(trading_day)
 
 
@@ -1513,9 +1504,8 @@ def test_normalized_order_id_preserves_exact_fractional_scientific_precision():
 
     assert near_close_dca._normalized_order_id("9007199254740993.5e0") == "9007199254740993.5"
     assert near_close_dca._normalized_order_id("9007199254740994.5e0") == "9007199254740994.5"
-    assert (
-        near_close_dca._normalized_order_id("9007199254740993.5e0")
-        != near_close_dca._normalized_order_id("9007199254740994.5e0")
+    assert near_close_dca._normalized_order_id("9007199254740993.5e0") != near_close_dca._normalized_order_id(
+        "9007199254740994.5e0"
     )
     # A tiny value ("1e-5000") is bounded, not fully expanded -- see
     # test_normalized_order_id_bounds_negative_scientific_exponents below
@@ -1819,9 +1809,7 @@ def test_normalized_order_id_canonicalizes_oversized_trailing_dot_decimal_string
         == near_close_dca._normalized_order_id(_huge_digits)
         == _canonical_all_nines_numeral(5000)
     )
-    assert near_close_dca._normalized_order_id(
-        "0" * 10 + _huge_digits + "."
-    ) == _canonical_all_nines_numeral(5000)
+    assert near_close_dca._normalized_order_id("0" * 10 + _huge_digits + ".") == _canonical_all_nines_numeral(5000)
 
 
 def test_normalized_order_id_canonicalizes_bounded_and_expanded_numeric_ids_consistently():
@@ -2186,8 +2174,7 @@ def test_backfill_known_order_id_marks_a_dollar_backed_id_as_notional_applied():
 
     state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="ORD-KNOWN")
     assert state.day_notional(trading_day) == 4.0, (
-        "a reconciliation replay for a dollar-backed backfilled id must not add its "
-        "notional a second time"
+        "a reconciliation replay for a dollar-backed backfilled id must not add its notional a second time"
     )
 
 
@@ -2219,9 +2206,7 @@ def test_book_recovered_lease_backfills_a_known_id_when_already_on_disk(monkeypa
     ambiguous order could mistake this attempt for its own charge."""
     import near_close_dca
 
-    monkeypatch.setattr(
-        near_close_dca, "_same_day_order_recorded_in_any_stream", lambda *a, **k: True
-    )
+    monkeypatch.setattr(near_close_dca, "_same_day_order_recorded_in_any_stream", lambda *a, **k: True)
 
     state = StrategyState()
     trading_day = date(2026, 7, 6)
@@ -2240,7 +2225,10 @@ def test_book_recovered_lease_backfills_a_known_id_when_already_on_disk(monkeypa
     )
 
     im_already_on_disk = near_close_dca._book_recovered_lease_durably(
-        im_recovery, state, trading_day, deployment_history_root="/tmp/does-not-matter"  # nosec
+        im_recovery,
+        state,
+        trading_day,
+        deployment_history_root="/tmp/does-not-matter",  # nosec
     )
 
     assert im_already_on_disk is True
@@ -2263,9 +2251,7 @@ def test_book_recovered_lease_marks_the_backfilled_id_as_notional_applied(monkey
     add the same $4 again, producing an $8 ledger for one order."""
     import near_close_dca
 
-    monkeypatch.setattr(
-        near_close_dca, "_same_day_order_recorded_in_any_stream", lambda *a, **k: True
-    )
+    monkeypatch.setattr(near_close_dca, "_same_day_order_recorded_in_any_stream", lambda *a, **k: True)
 
     state = StrategyState()
     trading_day = date(2026, 7, 6)
@@ -2279,15 +2265,17 @@ def test_book_recovered_lease_marks_the_backfilled_id_as_notional_applied(monkey
         order_id="ORD-RECOVERED",
     )
     near_close_dca._book_recovered_lease_durably(
-        im_recovery, state, trading_day, deployment_history_root="/tmp/does-not-matter"  # nosec
+        im_recovery,
+        state,
+        trading_day,
+        deployment_history_root="/tmp/does-not-matter",  # nosec
     )
 
     assert state.notional_applied_order_ids.get(("AAPL", trading_day)) == {"ORD-RECOVERED"}
 
     state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="ORD-RECOVERED")
     assert state.day_notional(trading_day) == 4.0, (
-        "a reconciliation replay for the backfilled id must not add its notional a "
-        "second time"
+        "a reconciliation replay for the backfilled id must not add its notional a second time"
     )
 
 
@@ -2397,9 +2385,7 @@ class _FakeData:
         self._quote = quote
 
     def get_previous_close_bar(self, ticker, as_of):
-        ts = datetime.combine(
-            as_of.date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
-        )
+        ts = datetime.combine(as_of.date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN)
         return Bar(ts, self._prev, self._prev, self._prev, self._prev, 1000)
 
     def get_intraday_bars(self, ticker, start, end, interval_minutes):
@@ -2419,9 +2405,7 @@ class _FakeData:
 
 
 class _FakeDataWithBidAsk(_FakeData):
-    def __init__(
-        self, source: SourceName, close_price, prev_close, quote=None, bid_ask=(97.0, 99.0)
-    ):
+    def __init__(self, source: SourceName, close_price, prev_close, quote=None, bid_ask=(97.0, 99.0)):
         super().__init__(source, close_price, prev_close, quote=quote)
         self._bid_ask = bid_ask
 
@@ -2439,12 +2423,8 @@ class _FakeDataWithRaisingBidAsk(_FakeData):
 def test_target_price_defaults_to_signal_quote():
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     quote_time = datetime(2026, 6, 29, 15, 44, tzinfo=EASTERN)
-    data = _FakeData(
-        SourceName.FINANCE, close_price=98.0, prev_close=100.0, quote=(97.5, quote_time)
-    )
-    signal = evaluate_source_signal(
-        "AAPL", now, StrategyConfig(), data, interval_minutes=15
-    )
+    data = _FakeData(SourceName.FINANCE, close_price=98.0, prev_close=100.0, quote=(97.5, quote_time))
+    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
     # target (quote) is distinct from the completed decision-bar close.
     assert signal.quote_price == 97.5
     assert signal.decision_bar_close == 98.0
@@ -2454,9 +2434,7 @@ def test_target_price_defaults_to_signal_quote():
 def test_target_price_falls_back_to_bar_close_without_quote():
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     data = _FakeData(SourceName.FINANCE, close_price=98.0, prev_close=100.0, quote=None)
-    signal = evaluate_source_signal(
-        "AAPL", now, StrategyConfig(), data, interval_minutes=15
-    )
+    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
     assert signal.quote_price == 98.0
     assert signal.decision_bar_close == 98.0
 
@@ -2474,9 +2452,7 @@ class _FakeDataWithLow(_FakeData):
         self._prev_low = prev_low
 
     def get_previous_close_bar(self, ticker, as_of):
-        ts = datetime.combine(
-            as_of.date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN
-        )
+        ts = datetime.combine(as_of.date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN)
         # open/high sit at/above the close; low is the distinct prior-session low.
         return Bar(ts, self._prev, self._prev, self._prev_low, self._prev, 1000)
 
@@ -2485,12 +2461,8 @@ def test_first_allocation_below_close_only_uses_one_dollar_base():
     # Decision price below the prior close (100) but not below the prior low (95)
     # -> $1 base scale. Drop is 2% -> 1.5x multiplier -> $1 * 1.5 = $1.50 suggested.
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    data = _FakeDataWithLow(
-        SourceName.FINANCE, close_price=98.0, prev_close=100.0, prev_low=95.0
-    )
-    signal = evaluate_source_signal(
-        "AAPL", now, StrategyConfig(), data, interval_minutes=15
-    )
+    data = _FakeDataWithLow(SourceName.FINANCE, close_price=98.0, prev_close=100.0, prev_low=95.0)
+    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
     assert signal.action == Action.BUY
     assert signal.previous_low == 95.0
     assert signal.base_selection_reason == BASE_BELOW_CLOSE_ONLY
@@ -2503,12 +2475,8 @@ def test_first_allocation_below_close_and_low_uses_two_dollar_base():
     # Decision price below both the prior close (100) and the prior low (95)
     # -> $2 base scale. Drop is 6% -> 3x multiplier -> $2 * 3 = $6 suggested.
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    data = _FakeDataWithLow(
-        SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=95.0
-    )
-    signal = evaluate_source_signal(
-        "AAPL", now, StrategyConfig(), data, interval_minutes=15
-    )
+    data = _FakeDataWithLow(SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=95.0)
+    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
     assert signal.action == Action.BUY
     assert signal.previous_low == 95.0
     assert signal.base_selection_reason == BASE_BELOW_CLOSE_AND_LOW
@@ -2525,9 +2493,7 @@ def test_calibrated_first_tier_overrides_global_minimum_drop():
     # 0.1% floor -- flooring it at the global minimum would silently veto a
     # buy the checked-in per-symbol model already approved.
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    config = StrategyConfig(
-        per_ticker_sizing={"AAAU": {"tiers": ((0.0001, 1.0), (0.02, 1.5))}}
-    )
+    config = StrategyConfig(per_ticker_sizing={"AAAU": {"tiers": ((0.0001, 1.0), (0.02, 1.5))}})
     data = _FakeData(SourceName.FINANCE, close_price=99.95, prev_close=100.0)
     signal = evaluate_source_signal("AAAU", now, config, data, interval_minutes=15)
     assert signal.action == Action.BUY
@@ -2539,9 +2505,7 @@ def test_uncalibrated_ticker_still_floored_at_global_minimum_drop():
     # per_ticker_sizing entry) must still be blocked by the global 0.1%
     # minimum -- only an explicit calibration overrides the floor.
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    config = StrategyConfig(
-        per_ticker_sizing={"AAAU": {"tiers": ((0.0001, 1.0), (0.02, 1.5))}}
-    )
+    config = StrategyConfig(per_ticker_sizing={"AAAU": {"tiers": ((0.0001, 1.0), (0.02, 1.5))}})
     data = _FakeData(SourceName.FINANCE, close_price=99.95, prev_close=100.0)
     signal = evaluate_source_signal("AAPL", now, config, data, interval_minutes=15)
     assert signal.action == Action.NO_ACTION
@@ -2551,12 +2515,8 @@ def test_uncalibrated_ticker_still_floored_at_global_minimum_drop():
 def test_first_allocation_above_close_is_no_buy():
     # Decision price above the prior close -> no buy, $0 base, zeroed amount.
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    data = _FakeDataWithLow(
-        SourceName.FINANCE, close_price=101.0, prev_close=100.0, prev_low=95.0
-    )
-    signal = evaluate_source_signal(
-        "AAPL", now, StrategyConfig(), data, interval_minutes=15
-    )
+    data = _FakeDataWithLow(SourceName.FINANCE, close_price=101.0, prev_close=100.0, prev_low=95.0)
+    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
     assert signal.action != Action.BUY
     assert signal.selected_base_amount_usd == 0.0
     assert signal.suggested_amount_usd == 0.0
@@ -2566,12 +2526,8 @@ def test_first_allocation_missing_prior_low_treated_as_below_close_only():
     # A non-positive/missing prior low is treated conservatively as not-below-low,
     # so the $1 (below-close-only) scale is selected even on a deep drop.
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    data = _FakeDataWithLow(
-        SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=0.0
-    )
-    signal = evaluate_source_signal(
-        "AAPL", now, StrategyConfig(), data, interval_minutes=15
-    )
+    data = _FakeDataWithLow(SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=0.0)
+    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
     assert signal.action == Action.BUY
     assert signal.base_selection_reason == BASE_BELOW_CLOSE_ONLY
     assert signal.selected_base_amount_usd == 1.0
@@ -2586,12 +2542,8 @@ def test_first_allocation_zero_multiplier_normalizes_reason_to_no_buy():
     # ticker must not carry a first-buy sizing reason for what the rule says was a
     # no-buy.
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    data = _FakeDataWithLow(
-        SourceName.FINANCE, close_price=99.95, prev_close=100.0, prev_low=95.0
-    )
-    signal = evaluate_source_signal(
-        "AAPL", now, StrategyConfig(), data, interval_minutes=15
-    )
+    data = _FakeDataWithLow(SourceName.FINANCE, close_price=99.95, prev_close=100.0, prev_low=95.0)
+    signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
     assert signal.action != Action.BUY
     assert signal.buy_multiplier == 0.0
     assert signal.base_selection_reason == BASE_NOT_BELOW_CLOSE
@@ -2634,12 +2586,8 @@ def test_first_buy_ticker_uses_close_and_low_even_when_other_tickers_have_prior_
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     config = StrategyConfig()
 
-    aaa_data = _FakeDataWithLow(
-        SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=95.0
-    )
-    aaa_signal = evaluate_source_signal(
-        "AAA", now, config, aaa_data, interval_minutes=15
-    )
+    aaa_data = _FakeDataWithLow(SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=95.0)
+    aaa_signal = evaluate_source_signal("AAA", now, config, aaa_data, interval_minutes=15)
     assert aaa_signal.action == Action.BUY
     assert aaa_signal.base_selection_reason == BASE_BELOW_CLOSE_AND_LOW
     assert aaa_signal.selected_base_amount_usd == 2.0
@@ -2672,9 +2620,7 @@ def test_run_daily_compact_prior_allocation_scoped_to_its_own_ticker(tmp_path):
         fin,
         rh,
         broker,
-        options=CompactRunOptions(
-            artifacts_dir=artifacts_dir, prior_same_day_allocations=prior
-        ),
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, prior_same_day_allocations=prior),
     )
 
     assert result["blocked"] is False
@@ -2722,9 +2668,7 @@ def test_budget_tier_is_selected_from_post_topup_spend_not_pre_topup_desired(tmp
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 90.0})
     # 10% drop vs. the prior close -> the ladder's 5x tier -> $30 base * 5 = $150 desired.
     fin = _FakeData(SourceName.FINANCE, 90.0, 100.0, quote=(90.0, now))
-    rh = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 90.0, 100.0, quote=(90.0, now), bid_ask=(89.9, 90.1)
-    )
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 90.0, 100.0, quote=(90.0, now), bid_ask=(89.9, 90.1))
     prior_same_day_allocations = {
         "AAPL": PriorSameDayAllocation(
             "AAPL",
@@ -2793,9 +2737,7 @@ def test_merge_manual_top_up_context_poisons_base_to_unknown():
         ),
     }
     manual_context = {
-        "AAPL": PriorAllocation(
-            ticker="AAPL", prior_usd=1.0, reference_price=99.0, sources=["manual_csv"]
-        ),
+        "AAPL": PriorAllocation(ticker="AAPL", prior_usd=1.0, reference_price=99.0, sources=["manual_csv"]),
     }
     merge_manual_top_up_context(prior_same_day_allocations, cast(Any, manual_context))
     merged = prior_same_day_allocations["AAPL"]
@@ -2919,8 +2861,7 @@ def test_merge_manual_top_up_context_preserves_order_id_provenance():
         "manual-context merge, not be silently dropped to empty"
     )
     assert merged.uncertain_contributor_ids == frozenset({"uncertain:AAPL:run1:abcdef"}), (
-        "the scheduled side's own synthetic uncertain-contributor identity "
-        "must survive the manual-context merge too"
+        "the scheduled side's own synthetic uncertain-contributor identity must survive the manual-context merge too"
     )
     assert merged.attempt_run_ids == frozenset({"run1", "manual_csv"})
 
@@ -3050,10 +2991,7 @@ def test_merge_manual_top_up_context_gives_an_uncertain_manual_row_its_own_ident
         ),
     }
     merge_manual_top_up_context(prior_same_day_allocations_2, cast(Any, manual_context))
-    assert (
-        prior_same_day_allocations_2["AAPL"].uncertain_contributor_ids
-        == merged.uncertain_contributor_ids
-    )
+    assert prior_same_day_allocations_2["AAPL"].uncertain_contributor_ids == merged.uncertain_contributor_ids
 
 
 def test_merge_manual_top_up_context_retains_base_when_manual_fill_is_later():
@@ -3249,9 +3187,7 @@ def test_reconcile_signals_agree_preserves_base_from_winning_signal():
     )
     decision = reconcile_signals("AAPL", finance, robinhood)
     assert decision.suggested_amount_usd == 2.0  # finance's smaller amount wins
-    assert (
-        decision.selected_base_amount_usd == 2.0
-    )  # finance's base, not Robinhood's $1
+    assert decision.selected_base_amount_usd == 2.0  # finance's base, not Robinhood's $1
 
 
 def test_reconcile_signals_agree_pairs_multiplier_with_winning_signal():
@@ -3282,10 +3218,7 @@ def test_reconcile_signals_agree_pairs_multiplier_with_winning_signal():
     assert decision.suggested_amount_usd == 3.5
     assert decision.selected_base_amount_usd == 1.0
     assert decision.buy_multiplier == 3.5  # Robinhood's, paired with its own $1 base
-    assert (
-        decision.selected_base_amount_usd * decision.buy_multiplier
-        == decision.suggested_amount_usd
-    )
+    assert decision.selected_base_amount_usd * decision.buy_multiplier == decision.suggested_amount_usd
 
 
 def _im_signal(source, *, decision_price=100.0, previous_close=100.0):
@@ -3314,8 +3247,11 @@ def test_inverse_martingale_reconciled_price_rejects_non_finite_finance_decision
     finance = _im_signal(SourceName.FINANCE, decision_price=bad_value)
     robinhood = _im_signal(SourceName.ROBINHOOD, decision_price=100.0)
     decision = ReconciledDecision(
-        ticker="AAPL", action=Action.NO_ACTION, reason="test",
-        finance_signal=finance, robinhood_signal=robinhood,
+        ticker="AAPL",
+        action=Action.NO_ACTION,
+        reason="test",
+        finance_signal=finance,
+        robinhood_signal=robinhood,
     )
     assert _inverse_martingale_reconciled_price(decision) is None
 
@@ -3325,8 +3261,11 @@ def test_inverse_martingale_reconciled_price_rejects_non_finite_previous_close(b
     finance = _im_signal(SourceName.FINANCE, previous_close=bad_value)
     robinhood = _im_signal(SourceName.ROBINHOOD, previous_close=100.0)
     decision = ReconciledDecision(
-        ticker="AAPL", action=Action.NO_ACTION, reason="test",
-        finance_signal=finance, robinhood_signal=robinhood,
+        ticker="AAPL",
+        action=Action.NO_ACTION,
+        reason="test",
+        finance_signal=finance,
+        robinhood_signal=robinhood,
     )
     assert _inverse_martingale_reconciled_price(decision) is None
 
@@ -3335,8 +3274,11 @@ def test_inverse_martingale_reconciled_price_accepts_agreeing_finite_signals():
     finance = _im_signal(SourceName.FINANCE, decision_price=99.0, previous_close=100.0)
     robinhood = _im_signal(SourceName.ROBINHOOD, decision_price=99.1, previous_close=100.0)
     decision = ReconciledDecision(
-        ticker="AAPL", action=Action.NO_ACTION, reason="test",
-        finance_signal=finance, robinhood_signal=robinhood,
+        ticker="AAPL",
+        action=Action.NO_ACTION,
+        reason="test",
+        finance_signal=finance,
+        robinhood_signal=robinhood,
     )
     result = _inverse_martingale_reconciled_price(decision)
     assert result is not None
@@ -3510,9 +3452,7 @@ def test_process_buy_candidate_records_potentially_submitted_on_ambiguous_placem
     state = StrategyState()
     broker = _AmbiguousPlacementBroker(cash=500.0, reference_prices={"AAPL": 98.0})
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     candidate_outcome, _, running_deployed_7d, errors_count_inc, _ = _process_buy_candidate(
         decision,
@@ -3634,9 +3574,7 @@ class _RefIdTrackingBroker:
     def same_day_strategy_order_exists(self, ticker, trading_day):
         return any(t == ticker for t, _rid, _amt, _oid in self._orders)
 
-    def same_day_strategy_order_exists_with_ref_id_prefix(
-        self, ticker, trading_day, ref_id_prefixes
-    ):
+    def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
         for t, rid, amt, order_id in self._orders:
             if t == ticker and rid in ref_id_prefixes:
                 return {"id": order_id, "dollar_amount": amt}
@@ -3665,12 +3603,8 @@ class _RefIdTrackingBroker:
         self._orders.append((ticker, ref_id, notional_usd, order_id))
         return order_id
 
-    def same_day_order_with_ref_id_prefix_any_state(
-        self, ticker, trading_day, ref_id_prefixes
-    ):
-        return self.same_day_strategy_order_exists_with_ref_id_prefix(
-            ticker, trading_day, ref_id_prefixes
-        )
+    def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
+        return self.same_day_strategy_order_exists_with_ref_id_prefix(ticker, trading_day, ref_id_prefixes)
 
     def is_tradable_for_whole_share_buy(self, ticker):
         return True
@@ -3725,9 +3659,7 @@ def test_guarded_top_up_retry_does_not_place_a_duplicate_order():
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     # Attempt 1: places the guarded top-up for real.
     state1 = StrategyState()
@@ -3768,9 +3700,7 @@ def test_guarded_top_up_retry_does_not_place_a_duplicate_order():
     # own earlier same-day runs): must find the same-stream order already on the
     # broker and must NOT place a second one.
     state2 = StrategyState()
-    run_result = RunResult(
-        trading_day=trading_day, decisions=[decision], active_universe=["AAPL"]
-    )
+    run_result = RunResult(trading_day=trading_day, decisions=[decision], active_universe=["AAPL"])
     outcome2, _, _, _, _ = _process_buy_candidate(
         decision,
         ctx=ProcessCandidateContext(
@@ -3825,9 +3755,7 @@ def test_same_stream_duplicate_does_not_double_log_an_already_recorded_order():
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     state1 = StrategyState()
     outcome1, _, _, _, _ = _process_buy_candidate(
@@ -3856,9 +3784,7 @@ def test_same_stream_duplicate_does_not_double_log_an_already_recorded_order():
     )
 
     state2 = StrategyState()
-    run_result = RunResult(
-        trading_day=trading_day, decisions=[decision], active_universe=["AAPL"]
-    )
+    run_result = RunResult(trading_day=trading_day, decisions=[decision], active_universe=["AAPL"])
     # Simulates the recovery-publish loop having already appended an
     # execution record for this exact order earlier in the same run.
     run_result.execution_records.append(
@@ -3950,9 +3876,7 @@ def test_guarded_top_up_retry_does_not_double_count_deployed_7d():
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     _process_buy_candidate(
         decision,
         ctx=ProcessCandidateContext(
@@ -3987,8 +3911,7 @@ def test_guarded_top_up_retry_does_not_double_count_deployed_7d():
         running_deployed_7d=starting_deployed_7d,
     )
     assert returned_deployed_7d == starting_deployed_7d, (
-        "a duplicate-preserved outcome places no new capital and must not "
-        "increment running_deployed_7d"
+        "a duplicate-preserved outcome places no new capital and must not increment running_deployed_7d"
     )
 
 
@@ -4012,9 +3935,7 @@ def test_guarded_top_up_retry_counts_recovered_order_when_not_yet_on_disk(tmp_pa
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     history_root = os.path.join(str(tmp_path), "history")
     _process_buy_candidate(
         decision,
@@ -4052,11 +3973,8 @@ def test_guarded_top_up_retry_counts_recovered_order_when_not_yet_on_disk(tmp_pa
         ),
         running_deployed_7d=starting_deployed_7d,
     )
-    assert returned_deployed_7d == pytest.approx(
-        starting_deployed_7d + placed_amount
-    ), (
-        "a preserved duplicate not yet reflected in any written artifact must "
-        "still be added to running_deployed_7d"
+    assert returned_deployed_7d == pytest.approx(starting_deployed_7d + placed_amount), (
+        "a preserved duplicate not yet reflected in any written artifact must still be added to running_deployed_7d"
     )
 
 
@@ -4085,9 +4003,7 @@ def test_guarded_top_up_retry_does_not_recount_when_ticker_already_on_disk(tmp_p
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     history_root = os.path.join(str(tmp_path), "history")
     _write_scheduled_afternoon_artifact(
         history_root,
@@ -4154,9 +4070,7 @@ def test_guarded_top_up_retry_counts_ticker_when_only_a_different_ticker_is_on_d
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     history_root = os.path.join(str(tmp_path), "history")
     _write_scheduled_afternoon_artifact(
         history_root,
@@ -4222,9 +4136,7 @@ def test_guarded_top_up_retry_records_recovered_buy_despite_seeded_prior_context
         reference_price=99.0,
         selected_base_amount_usd=1.0,
     )
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     # A fresh, never-before-used StrategyState -- exactly what a process
     # restart looks like -- seeded with the morning allocation the same way
     # _run_once_impl seeds it before ever reaching _process_buy_candidate.
@@ -4236,9 +4148,7 @@ def test_guarded_top_up_retry_records_recovered_buy_despite_seeded_prior_context
         {"AAPL": prior},
         one_order_per_ticker_per_day=False,
     )
-    assert (
-        fresh_state.buys_today("AAPL", trading_day) == 1
-    ), "seeding must land the morning allocation"
+    assert fresh_state.buys_today("AAPL", trading_day) == 1, "seeding must land the morning allocation"
     assert fresh_state.day_notional(trading_day) == pytest.approx(1.0)
 
     # The broker already has this stream's own afternoon order from an
@@ -4296,9 +4206,7 @@ def test_guarded_top_up_retry_does_not_rebook_when_state_already_recorded_it():
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     shared_state = StrategyState()
     _process_buy_candidate(
         decision,
@@ -4337,12 +4245,10 @@ def test_guarded_top_up_retry_does_not_rebook_when_state_already_recorded_it():
         running_deployed_7d=0.0,
     )
     assert shared_state.buys_today("AAPL", trading_day) == 1, (
-        "a duplicate-preserved outcome must not rebook a buy already recorded "
-        "in this same StrategyState instance"
+        "a duplicate-preserved outcome must not rebook a buy already recorded in this same StrategyState instance"
     )
     assert shared_state.day_notional(trading_day) == pytest.approx(placed_amount), (
-        "rebooking would double-count this order's notional in the same "
-        "StrategyState instance's day spend"
+        "rebooking would double-count this order's notional in the same StrategyState instance's day spend"
     )
 
 
@@ -4369,9 +4275,7 @@ def test_guarded_top_up_retry_recognizes_a_fractional_recovery_as_its_own_order(
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    narrow_spread_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    narrow_spread_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     state = StrategyState()
 
     # Simulates a fractional-placement recovery that already ran earlier
@@ -4402,16 +4306,11 @@ def test_guarded_top_up_retry_recognizes_a_fractional_recovery_as_its_own_order(
     )
 
     assert outcome["status"] == "skipped", (
-        "must not publish a second submitted row for the order the recovery "
-        "already accounted for"
+        "must not publish a second submitted row for the order the recovery already accounted for"
     )
     assert outcome["duplicate_preserved"] is True
-    assert state.day_notional(trading_day) == 2.0, (
-        "must not double-book the recovered order's notional"
-    )
-    assert state.day_order_count(trading_day) == 1, (
-        "must not double-charge the recovered order's attempt slot"
-    )
+    assert state.day_notional(trading_day) == 2.0, "must not double-book the recovered order's notional"
+    assert state.day_order_count(trading_day) == 1, "must not double-charge the recovered order's attempt slot"
 
 
 def test_guarded_top_up_retry_does_not_double_count_a_recovery_in_the_kill_switch(tmp_path):
@@ -4437,9 +4336,7 @@ def test_guarded_top_up_retry_does_not_double_count_a_recovery_in_the_kill_switc
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    narrow_spread_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    narrow_spread_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     state = StrategyState()
 
     # An EMPTY deployment-history root -- the recovered order genuinely
@@ -4501,9 +4398,7 @@ def test_guarded_top_up_retry_still_books_a_genuinely_different_recovered_order(
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    narrow_spread_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    narrow_spread_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     state = StrategyState()
 
     # A DIFFERENT broker order than the one about to be found by the
@@ -4541,8 +4436,7 @@ def test_guarded_top_up_retry_still_books_a_genuinely_different_recovered_order(
     )
     assert outcome["order_id"] == "ORDER-AAPL-1"
     assert state.day_notional(trading_day) == 5.0, (
-        "the second, distinct order's own $3 must be added on top of the "
-        "$2 already booked for the first"
+        "the second, distinct order's own $3 must be added on top of the $2 already booked for the first"
     )
     assert state.day_order_count(trading_day) == 2, (
         "the second, distinct order is its own attempt, not a duplicate of the first"
@@ -4574,9 +4468,7 @@ def test_guarded_top_up_retry_counts_a_second_recovered_order_in_deployment_hist
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    narrow_spread_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    narrow_spread_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     state = StrategyState()
 
     # Order A: a DIFFERENT broker order than the one about to be found by
@@ -4589,17 +4481,25 @@ def test_guarded_top_up_retry_counts_a_second_recovered_order_in_deployment_hist
     other_dir = os.path.join(history_root, "2026-06-29-other-slot")
     os.makedirs(other_dir)
     with open(os.path.join(other_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": trading_day_iso,
-            "generated_at": triggered_at_utc,
-            "run_classification": build_scheduled_classification(
-                trading_day_iso, triggered_at_utc=triggered_at_utc
-            ),
-            "buy_candidates": [{
-                "ticker": "AAPL", "status": "submitted", "order_id": "ORD-RECOVERED-EARLIER",
-                "planned_amount_usd": 2.0, "buy_multiplier": 1.0,
-            }],
-        }, handle)
+        json.dump(
+            {
+                "trading_day": trading_day_iso,
+                "generated_at": triggered_at_utc,
+                "run_classification": build_scheduled_classification(
+                    trading_day_iso, triggered_at_utc=triggered_at_utc
+                ),
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "submitted",
+                        "order_id": "ORD-RECOVERED-EARLIER",
+                        "planned_amount_usd": 2.0,
+                        "buy_multiplier": 1.0,
+                    }
+                ],
+            },
+            handle,
+        )
 
     # This run's own duplicate lookup finds a genuinely different, real
     # broker order (order B) under the plain (non-topup) ref_id -- never
@@ -4655,9 +4555,7 @@ def test_guarded_top_up_retry_counts_deployment_despite_an_unrelated_legacy_row(
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    narrow_spread_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    narrow_spread_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     state = StrategyState()
 
     # Order A: a LEGACY on-disk row for this ticker/day -- no order_id at
@@ -4669,17 +4567,24 @@ def test_guarded_top_up_retry_counts_deployment_despite_an_unrelated_legacy_row(
     other_dir = os.path.join(history_root, "2026-06-29-other-slot")
     os.makedirs(other_dir)
     with open(os.path.join(other_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": trading_day_iso,
-            "generated_at": triggered_at_utc,
-            "run_classification": build_scheduled_classification(
-                trading_day_iso, triggered_at_utc=triggered_at_utc
-            ),
-            "buy_candidates": [{
-                "ticker": "AAPL", "status": "submitted", "planned_amount_usd": 2.0,
-                "buy_multiplier": 1.0,
-            }],
-        }, handle)
+        json.dump(
+            {
+                "trading_day": trading_day_iso,
+                "generated_at": triggered_at_utc,
+                "run_classification": build_scheduled_classification(
+                    trading_day_iso, triggered_at_utc=triggered_at_utc
+                ),
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "submitted",
+                        "planned_amount_usd": 2.0,
+                        "buy_multiplier": 1.0,
+                    }
+                ],
+            },
+            handle,
+        )
 
     # This run's own duplicate lookup finds a genuinely different, real
     # broker order (order B, $3) -- never itself written to disk.
@@ -4732,9 +4637,7 @@ def test_guarded_top_up_retry_recognizes_an_earlier_of_two_recovered_orders():
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    narrow_spread_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    narrow_spread_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     state = StrategyState()
 
     # TWO distinct broker orders recovered earlier this same invocation
@@ -4746,9 +4649,7 @@ def test_guarded_top_up_retry_recognizes_an_earlier_of_two_recovered_orders():
 
     # This run's own duplicate lookup rediscovers the FIRST recovered
     # order -- not the second (and therefore last-tracked) one.
-    broker._orders.append(
-        ("AAPL", f"graded-dca-{trading_day.isoformat()}-AAPL", 2.0, "ORD-RECOVERED-FIRST")
-    )
+    broker._orders.append(("AAPL", f"graded-dca-{trading_day.isoformat()}-AAPL", 2.0, "ORD-RECOVERED-FIRST"))
 
     outcome, _, _, _, _ = _process_buy_candidate(
         decision,
@@ -4799,9 +4700,7 @@ def test_guarded_top_up_retry_recognizes_a_recovered_order_reported_with_a_numer
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    narrow_spread_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    narrow_spread_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     state = StrategyState()
 
     # Recovered earlier this same invocation with the STRING id, exactly
@@ -4811,9 +4710,7 @@ def test_guarded_top_up_retry_recognizes_a_recovered_order_reported_with_a_numer
 
     # This run's own duplicate lookup rediscovers the SAME order, but the
     # broker reports its id as a bare int.
-    broker._orders.append(
-        ("AAPL", f"graded-dca-{trading_day.isoformat()}-AAPL", 2.0, 12345)
-    )
+    broker._orders.append(("AAPL", f"graded-dca-{trading_day.isoformat()}-AAPL", 2.0, 12345))
 
     outcome, _, _, _, _ = _process_buy_candidate(
         decision,
@@ -4867,9 +4764,7 @@ def test_guarded_top_up_retry_records_recovered_spread_status_without_a_verdict(
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
     # Attempt 1: a narrow spread that actually authorizes the placement.
-    narrow_spread_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    narrow_spread_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     _process_buy_candidate(
         decision,
         ctx=ProcessCandidateContext(
@@ -4889,9 +4784,7 @@ def test_guarded_top_up_retry_records_recovered_spread_status_without_a_verdict(
     # Attempt 2 (retry): the spread has since widened past the gate's limit.
     # A wide/failing spread on the RETRY must not surface as this row's
     # verdict -- the original placement is what was actually authorized.
-    wide_spread_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(90.0, 110.0)
-    )
+    wide_spread_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(90.0, 110.0))
     outcome2, _, _, _, _ = _process_buy_candidate(
         decision,
         ctx=ProcessCandidateContext(
@@ -4928,14 +4821,10 @@ def test_guarded_top_up_retry_blocks_when_broker_returns_no_order_id():
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {"dollar_amount": 5.0}  # no id / order_id
 
-        def same_day_order_with_ref_id_prefix_any_state(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"dollar_amount": 5.0}
 
         def is_tradable_for_fractional_buy(self, ticker):
@@ -4945,9 +4834,7 @@ def test_guarded_top_up_retry_blocks_when_broker_returns_no_order_id():
             return True, "ok"
 
         def place_market_buy(self, ticker, notional_usd, ref_id):
-            raise AssertionError(
-                "must not place a fresh order when a same-stream duplicate is found"
-            )
+            raise AssertionError("must not place a fresh order when a same-stream duplicate is found")
 
     config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
     decision = _graded_decision()
@@ -4960,9 +4847,7 @@ def test_guarded_top_up_retry_blocks_when_broker_returns_no_order_id():
     broker = _NoIdDupBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     outcome, _, _, errors_count_inc, _ = _process_buy_candidate(
         decision,
         ctx=ProcessCandidateContext(
@@ -5001,16 +4886,12 @@ def test_duplicate_with_no_amount_fields_is_never_booked_as_a_zero_buy():
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             # Identifies the order but carries neither dollar_amount nor
             # notional, nor any quantity/price to recover a fill from.
             return {"id": "DUP-NO-AMOUNT"}
 
-        def same_day_order_with_ref_id_prefix_any_state(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "DUP-NO-AMOUNT"}
 
         def is_tradable_for_fractional_buy(self, ticker):
@@ -5035,9 +4916,7 @@ def test_duplicate_with_no_amount_fields_is_never_booked_as_a_zero_buy():
     state = StrategyState()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     _process_buy_candidate(
         decision,
@@ -5080,16 +4959,12 @@ def test_duplicate_with_no_amount_fields_is_never_shrunk_to_the_retry_delta():
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             # Neither dollar_amount/notional nor quantity/price: this path
             # genuinely cannot price the duplicate from anything the broker said.
             return {"id": "DUP-NO-AMOUNT"}
 
-        def same_day_order_with_ref_id_prefix_any_state(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "DUP-NO-AMOUNT"}
 
         def is_tradable_for_fractional_buy(self, ticker):
@@ -5119,9 +4994,7 @@ def test_duplicate_with_no_amount_fields_is_never_shrunk_to_the_retry_delta():
     state = StrategyState()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     _process_buy_candidate(
         decision,
@@ -5164,15 +5037,11 @@ def test_a_duplicate_with_no_amount_or_fill_detail_is_booked_at_the_per_order_ce
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             # No dollar_amount/notional AND no cumulative_quantity/average_price.
             return {"id": "DUP-NO-AMOUNT-NO-FILL", "state": "confirmed"}
 
-        def same_day_order_with_ref_id_prefix_any_state(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {"id": "DUP-NO-AMOUNT-NO-FILL", "state": "confirmed"}
 
         def is_tradable_for_fractional_buy(self, ticker):
@@ -5196,9 +5065,7 @@ def test_a_duplicate_with_no_amount_or_fill_detail_is_booked_at_the_per_order_ce
     state = StrategyState()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     outcome, _guard, _rd7d, _errs, _reviews = _process_buy_candidate(
         decision,
@@ -5222,9 +5089,7 @@ def test_a_duplicate_with_no_amount_or_fill_detail_is_booked_at_the_per_order_ce
         "configured absolute per-order ceiling, not at today's smaller "
         "recomputed order_amount alone"
     )
-    assert state.week_notional(trading_day) >= max(
-        tier.weekly_cap_usd for tier in BUDGET_TIERS
-    ), (
+    assert state.week_notional(trading_day) >= max(tier.weekly_cap_usd for tier in BUDGET_TIERS), (
         "config.max_per_order_usd is only this retry's OWN ceiling, not "
         "proof against whatever ceiling governed the order actually placed "
         "(Codex review: 'Bound duplicates by the originating order "
@@ -5258,9 +5123,7 @@ def test_a_partially_filled_amountless_duplicate_is_not_booked_at_the_executed_s
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "DUP-PARTIAL",
                 "state": "partially_filled",
@@ -5268,9 +5131,7 @@ def test_a_partially_filled_amountless_duplicate_is_not_booked_at_the_executed_s
                 "average_price": "4.00",
             }
 
-        def same_day_order_with_ref_id_prefix_any_state(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "DUP-PARTIAL",
                 "state": "partially_filled",
@@ -5300,9 +5161,7 @@ def test_a_partially_filled_amountless_duplicate_is_not_booked_at_the_executed_s
     state = StrategyState()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     _process_buy_candidate(
         decision,
@@ -5345,9 +5204,7 @@ def test_a_partially_filled_amountless_duplicate_smaller_than_the_retry_is_booke
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "DUP-PARTIAL-SMALL",
                 "state": "partially_filled",
@@ -5355,9 +5212,7 @@ def test_a_partially_filled_amountless_duplicate_smaller_than_the_retry_is_booke
                 "average_price": "2.00",
             }
 
-        def same_day_order_with_ref_id_prefix_any_state(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "DUP-PARTIAL-SMALL",
                 "state": "partially_filled",
@@ -5386,9 +5241,7 @@ def test_a_partially_filled_amountless_duplicate_smaller_than_the_retry_is_booke
     state = StrategyState()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     outcome, _guard, _rd7d, _errs, _reviews = _process_buy_candidate(
         decision,
@@ -5413,9 +5266,7 @@ def test_a_partially_filled_amountless_duplicate_smaller_than_the_retry_is_booke
         "ceiling, not at the smaller of the executed slice or today's "
         "recomputed retry amount"
     )
-    assert state.week_notional(trading_day) >= max(
-        tier.weekly_cap_usd for tier in BUDGET_TIERS
-    ), (
+    assert state.week_notional(trading_day) >= max(tier.weekly_cap_usd for tier in BUDGET_TIERS), (
         "config.max_per_order_usd is only this retry's OWN ceiling, not "
         "proof against whatever ceiling governed the order actually placed "
         "(Codex review: 'Bound duplicates by the originating order "
@@ -5443,9 +5294,7 @@ def test_a_settled_amountless_duplicate_is_booked_at_its_exact_fill():
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "DUP-FILLED",
                 "state": "filled",
@@ -5453,9 +5302,7 @@ def test_a_settled_amountless_duplicate_is_booked_at_its_exact_fill():
                 "average_price": "7.00",
             }
 
-        def same_day_order_with_ref_id_prefix_any_state(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "DUP-FILLED",
                 "state": "filled",
@@ -5485,9 +5332,7 @@ def test_a_settled_amountless_duplicate_is_booked_at_its_exact_fill():
     state = StrategyState()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     _process_buy_candidate(
         decision,
@@ -5522,9 +5367,7 @@ def test_duplicate_with_no_amount_fields_recovers_the_real_fill(tmp_path):
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "DUP-FILLED",
                 "state": "filled",
@@ -5532,9 +5375,7 @@ def test_duplicate_with_no_amount_fields_recovers_the_real_fill(tmp_path):
                 "average_price": "7.00",
             }
 
-        def same_day_order_with_ref_id_prefix_any_state(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {
                 "id": "DUP-FILLED",
                 "state": "filled",
@@ -5562,9 +5403,7 @@ def test_duplicate_with_no_amount_fields_recovers_the_real_fill(tmp_path):
     state = StrategyState()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     _process_buy_candidate(
         decision,
@@ -5614,14 +5453,10 @@ def test_a_live_partial_duplicate_stays_reserved_at_its_full_notional(live_state
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return self._dup()
 
-        def same_day_order_with_ref_id_prefix_any_state(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return self._dup()
 
         def is_tradable_for_fractional_buy(self, ticker):
@@ -5644,9 +5479,7 @@ def test_a_live_partial_duplicate_stays_reserved_at_its_full_notional(live_state
     state = StrategyState()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     _process_buy_candidate(
         decision,
@@ -5693,14 +5526,10 @@ def test_a_terminally_canceled_partial_duplicate_books_its_executed_amount(termi
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return self._dup()
 
-        def same_day_order_with_ref_id_prefix_any_state(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return self._dup()
 
         def is_tradable_for_fractional_buy(self, ticker):
@@ -5723,9 +5552,7 @@ def test_a_terminally_canceled_partial_duplicate_books_its_executed_amount(termi
     state = StrategyState()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     _process_buy_candidate(
         decision,
@@ -5775,14 +5602,10 @@ def test_a_terminal_partial_without_a_cumulative_quantity_is_not_valued_at_reque
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return self._dup()
 
-        def same_day_order_with_ref_id_prefix_any_state(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return self._dup()
 
         def is_tradable_for_fractional_buy(self, ticker):
@@ -5805,9 +5628,7 @@ def test_a_terminal_partial_without_a_cumulative_quantity_is_not_valued_at_reque
     state = StrategyState()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     _process_buy_candidate(
         decision,
@@ -5827,10 +5648,7 @@ def test_a_terminal_partial_without_a_cumulative_quantity_is_not_valued_at_reque
     )
 
     booked = state.day_notional(trading_day)
-    assert booked != 50.0, (
-        "5 REQUESTED shares at $10 is not evidence $50 executed on a "
-        f"{terminal_state} order"
-    )
+    assert booked != 50.0, f"5 REQUESTED shares at $10 is not evidence $50 executed on a {terminal_state} order"
     assert booked == decision.suggested_amount_usd, (
         "with no executed quantity to read, the conservative order_amount stands"
     )
@@ -5855,14 +5673,10 @@ def test_a_filled_duplicate_may_still_fall_back_to_plain_quantity():
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             return self._dup()
 
-        def same_day_order_with_ref_id_prefix_any_state(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return self._dup()
 
         def is_tradable_for_fractional_buy(self, ticker):
@@ -5885,9 +5699,7 @@ def test_a_filled_duplicate_may_still_fall_back_to_plain_quantity():
     state = StrategyState()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     _process_buy_candidate(
         decision,
@@ -5927,9 +5739,7 @@ def test_guarded_top_up_retry_finds_duplicate_even_when_fresh_guard_would_skip()
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     # Attempt 1: target_price (98.0) below prior.reference_price (99.0) -> a
     # real incremental top-up is computed and placed.
@@ -6011,9 +5821,7 @@ def test_manual_placement_uses_distinct_ref_id_namespace():
     )
     assert outcome["status"] == "submitted"
     ref_id = broker._orders[0][1]
-    assert (
-        "manual" in ref_id
-    ), f"manual placement must use a distinct ref_id namespace, got {ref_id!r}"
+    assert "manual" in ref_id, f"manual placement must use a distinct ref_id namespace, got {ref_id!r}"
 
 
 def test_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id():
@@ -6026,15 +5834,11 @@ def test_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id():
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     # Manual run: no prior allocation, so ticker_guarded=False and the ref_id
     # is the manual-namespaced one.
-    manual_decision = _graded_decision(
-        suggested_amount_usd=3.0, selected_base_amount_usd=1.0, buy_multiplier=3.0
-    )
+    manual_decision = _graded_decision(suggested_amount_usd=3.0, selected_base_amount_usd=1.0, buy_multiplier=3.0)
     manual_outcome, _, _, _, _ = _process_buy_candidate(
         manual_decision,
         ctx=ProcessCandidateContext(
@@ -6079,13 +5883,10 @@ def test_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id():
         running_deployed_7d=0.0,
     )
     assert scheduled_outcome.get("duplicate_preserved") is not True, (
-        "the manual fill's ref_id must not be mistaken for this scheduled "
-        "run's own earlier attempt"
+        "the manual fill's ref_id must not be mistaken for this scheduled run's own earlier attempt"
     )
     assert scheduled_outcome["status"] == "submitted"
-    assert (
-        len(broker._orders) == 2
-    ), "the scheduled run must place its own real incremental order"
+    assert len(broker._orders) == 2, "the scheduled run must place its own real incremental order"
 
 
 def test_alpaca_get_order_fill():
@@ -6233,9 +6034,7 @@ def test_alpaca_get_order_fill_accepts_calculated_status_for_day_tif():
             }
         }
 
-    broker = AlpacaBroker(
-        config=AlpacaConfig(time_in_force="day"), order_fill_fn=mock_order_fill_fn
-    )
+    broker = AlpacaBroker(config=AlpacaConfig(time_in_force="day"), order_fill_fn=mock_order_fill_fn)
     fill = broker.get_order_fill("12345")
     assert fill is not None
     assert fill.quantity_filled == 10.0
@@ -6251,9 +6050,7 @@ def test_alpaca_get_order_fill_accepts_calculated_status_for_day_tif():
             }
         }
 
-    broker_no_fill = AlpacaBroker(
-        config=AlpacaConfig(time_in_force="day"), order_fill_fn=mock_order_fill_fn_no_fill
-    )
+    broker_no_fill = AlpacaBroker(config=AlpacaConfig(time_in_force="day"), order_fill_fn=mock_order_fill_fn_no_fill)
     assert broker_no_fill.get_order_fill("12345") is None
 
 
@@ -6273,9 +6070,7 @@ def test_alpaca_get_order_fill_calculated_stays_non_terminal_for_other_tif():
             }
         }
 
-    broker = AlpacaBroker(
-        config=AlpacaConfig(time_in_force="gtc"), order_fill_fn=mock_order_fill_fn
-    )
+    broker = AlpacaBroker(config=AlpacaConfig(time_in_force="gtc"), order_fill_fn=mock_order_fill_fn)
     assert broker.get_order_fill("12345") is None
 
 
@@ -6296,9 +6091,7 @@ def test_alpaca_get_order_fill_accepts_done_for_day_for_day_tif():
             }
         }
 
-    broker = AlpacaBroker(
-        config=AlpacaConfig(time_in_force="day"), order_fill_fn=mock_order_fill_fn
-    )
+    broker = AlpacaBroker(config=AlpacaConfig(time_in_force="day"), order_fill_fn=mock_order_fill_fn)
     fill = broker.get_order_fill("12345")
     assert fill is not None
     assert fill.quantity_filled == 6.0
@@ -6314,9 +6107,7 @@ def test_alpaca_get_order_fill_accepts_done_for_day_for_day_tif():
             }
         }
 
-    broker_no_fill = AlpacaBroker(
-        config=AlpacaConfig(time_in_force="day"), order_fill_fn=mock_order_fill_fn_no_fill
-    )
+    broker_no_fill = AlpacaBroker(config=AlpacaConfig(time_in_force="day"), order_fill_fn=mock_order_fill_fn_no_fill)
     assert broker_no_fill.get_order_fill("12345") is None
 
 
@@ -6335,9 +6126,7 @@ def test_alpaca_get_order_fill_done_for_day_stays_non_terminal_for_other_tif():
             }
         }
 
-    broker = AlpacaBroker(
-        config=AlpacaConfig(time_in_force="gtc"), order_fill_fn=mock_order_fill_fn
-    )
+    broker = AlpacaBroker(config=AlpacaConfig(time_in_force="gtc"), order_fill_fn=mock_order_fill_fn)
     assert broker.get_order_fill("12345") is None
 
 
@@ -6921,9 +6710,7 @@ def test_guarded_top_up_dry_run_skips_duplicate_check_entirely():
     broker = AlpacaBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     outcome, _, _, errors_count_inc, _ = _process_buy_candidate(
         decision,
         ctx=ProcessCandidateContext(
@@ -6965,9 +6752,7 @@ def test_guarded_top_up_first_attempt_bypasses_broad_same_day_check():
 
     broker = _CrossStreamBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     outcome, _, _, _, _ = _process_buy_candidate(
         decision,
         ctx=ProcessCandidateContext(
@@ -7043,9 +6828,7 @@ def test_same_stream_order_exists_does_not_cross_canonical_slots(monkeypatch):
     # "this run's own retry" and silently skipped placing it.
     broker = _RefIdTrackingBroker()
     trading_day = date(2026, 6, 29)
-    morning_ref_id = (
-        f"{_graded_dca_ref_id_prefix('morning')}-{trading_day.isoformat()}-AAPL"
-    )
+    morning_ref_id = f"{_graded_dca_ref_id_prefix('morning')}-{trading_day.isoformat()}-AAPL"
     broker._orders.append(("AAPL", morning_ref_id, 1.0, "ORDER-MORNING-AAPL"))
 
     # The midday slot's own same-stream check must NOT find the morning
@@ -7073,18 +6856,13 @@ def test_same_stream_duplicate_check_or_assume_exists_fails_closed():
 
     trading_day = date(2026, 6, 29)
     assert (
-        _same_stream_duplicate_check_or_assume_exists(
-            cast(Any, _RaisingBroker()), "AAPL", trading_day, "afternoon"
-        )
+        _same_stream_duplicate_check_or_assume_exists(cast(Any, _RaisingBroker()), "AAPL", trading_day, "afternoon")
         is True
     )
 
     # A real, conclusive "no duplicate" result is still respected.
     broker = _RefIdTrackingBroker()
-    assert (
-        _same_stream_duplicate_check_or_assume_exists(broker, "AAPL", trading_day, "afternoon")
-        is False
-    )
+    assert _same_stream_duplicate_check_or_assume_exists(broker, "AAPL", trading_day, "afternoon") is False
 
 
 def test_guarded_top_up_across_canonical_slots_places_a_new_order_not_a_duplicate():
@@ -7095,9 +6873,7 @@ def test_guarded_top_up_across_canonical_slots_places_a_new_order_not_a_duplicat
     config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
     decision = _graded_decision()  # target_price=98.0, below the $99 prior reference.
     trading_day = date(2026, 6, 29)
-    morning_ref_id = (
-        f"{_graded_dca_ref_id_prefix('morning')}-{trading_day.isoformat()}-AAPL"
-    )
+    morning_ref_id = f"{_graded_dca_ref_id_prefix('morning')}-{trading_day.isoformat()}-AAPL"
     broker = _RefIdTrackingBroker()
     broker._orders.append(("AAPL", morning_ref_id, 1.0, "ORDER-MORNING-AAPL"))
     prior = PriorSameDayAllocation(
@@ -7109,9 +6885,7 @@ def test_guarded_top_up_across_canonical_slots_places_a_new_order_not_a_duplicat
         selected_base_amount_usd=2.0,
     )
     now = datetime(2026, 6, 29, 12, 30, tzinfo=EASTERN)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
         decision,
@@ -7137,9 +6911,7 @@ def test_guarded_top_up_across_canonical_slots_places_a_new_order_not_a_duplicat
     assert top_up_outcome.top_up_guard_result == "incremental_top_up"
     # $10 desired (2.0 base * 5.0 multiplier) - $1.0 already bought = $9.0 incremental.
     assert broker.placed["AAPL"] == 9.0
-    midday_ref_id = (
-        f"{_graded_dca_ref_id_prefix('midday', 'topup')}-{trading_day.isoformat()}-AAPL"
-    )
+    midday_ref_id = f"{_graded_dca_ref_id_prefix('midday', 'topup')}-{trading_day.isoformat()}-AAPL"
     assert broker._orders[-1][1] == midday_ref_id
 
 
@@ -7158,9 +6930,7 @@ def test_guarded_top_up_corrects_an_understated_artifact_prior_against_the_broke
     broker = _RefIdTrackingBroker()
     # A real $9.00 same-day order the artifact trail failed to capture, under
     # a ref id our own same-stream check does not recognize as a duplicate.
-    broker._orders.append(
-        ("AAPL", "some-other-untracked-ref-id", 9.0, "ORDER-UNTRACKED")
-    )
+    broker._orders.append(("AAPL", "some-other-untracked-ref-id", 9.0, "ORDER-UNTRACKED"))
     prior = PriorSameDayAllocation(
         ticker="AAPL",
         amount_usd=1.0,
@@ -7170,9 +6940,7 @@ def test_guarded_top_up_corrects_an_understated_artifact_prior_against_the_broke
         selected_base_amount_usd=2.0,
     )
     now = datetime(2026, 6, 29, 12, 30, tzinfo=EASTERN)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
         decision,
@@ -7220,9 +6988,7 @@ def test_guarded_top_up_fails_closed_when_broker_cannot_verify_same_day_notional
         selected_base_amount_usd=2.0,
     )
     now = datetime(2026, 6, 29, 12, 30, tzinfo=EASTERN)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     outcome, _, _, errors_count_inc, _ = _process_buy_candidate(
         decision,
@@ -7266,9 +7032,7 @@ def test_insufficient_buying_power_blocks_before_placement():
     decision = _graded_decision()
     broker = DryRunBroker(cash=0.50)
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     outcome, _, _, _, _ = _process_buy_candidate(
         decision,
         ctx=ProcessCandidateContext(
@@ -7299,9 +7063,7 @@ def test_not_tradable_for_fractional_buy_blocks_before_placement():
     decision = _graded_decision()
     broker = _UntradableBroker(cash=1000.0)
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     outcome, _, _, _, _ = _process_buy_candidate(
         decision,
         ctx=ProcessCandidateContext(
@@ -7334,9 +7096,7 @@ def test_broker_review_block_prevents_manual_order_placement():
     decision = _graded_decision()
     broker = _ReviewBlockedBroker(cash=1000.0)
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     outcome, _, _, _, reviews_attempted = _process_buy_candidate(
         decision,
         ctx=ProcessCandidateContext(
@@ -7378,11 +7138,7 @@ def test_allocation_sort_key_tie_break_is_alphabetical():
             ticker=ticker,
             buy_multiplier=mult,
             finance_signal=SimpleNamespace(drop_vs_previous_close_pct=drop),
-            robinhood_signal=(
-                None
-                if rh_drop is None
-                else SimpleNamespace(drop_vs_previous_close_pct=rh_drop)
-            ),
+            robinhood_signal=(None if rh_drop is None else SimpleNamespace(drop_vs_previous_close_pct=rh_drop)),
         )
 
     def order(cs):
@@ -7390,27 +7146,21 @@ def test_allocation_sort_key_tie_break_is_alphabetical():
 
     # Equal multiplier and drop -> ticker alphabetical breaks the tie (A->Z),
     # not the input/universe order.
-    assert order(
-        [cand("MSFT", 2.0, 3.0), cand("AAPL", 2.0, 3.0), cand("GOOG", 2.0, 3.0)]
-    ) == [
+    assert order([cand("MSFT", 2.0, 3.0), cand("AAPL", 2.0, 3.0), cand("GOOG", 2.0, 3.0)]) == [
         "AAPL",
         "GOOG",
         "MSFT",
     ]
 
     # Higher multiplier dominates both drop and alphabetical.
-    assert order(
-        [cand("AAPL", 1.0, 9.0), cand("ZZZ", 3.0, 0.5), cand("MSFT", 2.0, 5.0)]
-    ) == [
+    assert order([cand("AAPL", 1.0, 9.0), cand("ZZZ", 3.0, 0.5), cand("MSFT", 2.0, 5.0)]) == [
         "ZZZ",
         "MSFT",
         "AAPL",
     ]
 
     # Same multiplier -> larger drop first, then ticker.
-    assert order(
-        [cand("BBB", 2.0, 1.0), cand("AAA", 2.0, 4.0), cand("CCC", 2.0, 4.0)]
-    ) == [
+    assert order([cand("BBB", 2.0, 1.0), cand("AAA", 2.0, 4.0), cand("CCC", 2.0, 4.0)]) == [
         "AAA",
         "CCC",
         "BBB",
@@ -7428,11 +7178,7 @@ def _no_data_signal(source, provider_error):
         ticker="AAPL",
         source=source,
         action=Action.NO_DATA,
-        reason=(
-            "provider error: boom"
-            if provider_error
-            else "missing completed bar or previous close"
-        ),
+        reason=("provider error: boom" if provider_error else "missing completed bar or previous close"),
         provider_error=provider_error,
     )
 
@@ -7622,10 +7368,7 @@ def _decision(ticker, action):
 
 
 def test_missing_fill_loop_reason_none_decision():
-    assert (
-        classify_missing_fill(None, MISSING_FILL_BUDGET_CAPPED)
-        == MISSING_FILL_BUDGET_CAPPED
-    )
+    assert classify_missing_fill(None, MISSING_FILL_BUDGET_CAPPED) == MISSING_FILL_BUDGET_CAPPED
 
 
 def test_missing_fill_none_decision_no_loop_reason():
@@ -7633,35 +7376,14 @@ def test_missing_fill_none_decision_no_loop_reason():
 
 
 def test_missing_fill_classification():
-    assert (
-        classify_missing_fill(_decision("A", Action.NO_DATA), None)
-        == MISSING_FILL_DATA_ERROR
-    )
-    assert (
-        classify_missing_fill(_decision("A", Action.SKIP), None)
-        == MISSING_FILL_FAILED_TRIGGER
-    )
-    assert (
-        classify_missing_fill(_decision("A", Action.NO_ACTION), None)
-        == MISSING_FILL_FAILED_TRIGGER
-    )
-    assert (
-        classify_missing_fill(_decision("A", Action.MANUAL_REVIEW), None)
-        == MISSING_FILL_FAILED_TRIGGER
-    )
+    assert classify_missing_fill(_decision("A", Action.NO_DATA), None) == MISSING_FILL_DATA_ERROR
+    assert classify_missing_fill(_decision("A", Action.SKIP), None) == MISSING_FILL_FAILED_TRIGGER
+    assert classify_missing_fill(_decision("A", Action.NO_ACTION), None) == MISSING_FILL_FAILED_TRIGGER
+    assert classify_missing_fill(_decision("A", Action.MANUAL_REVIEW), None) == MISSING_FILL_FAILED_TRIGGER
     # loop reason takes precedence over the reconciled action.
-    assert (
-        classify_missing_fill(_decision("A", Action.BUY), MISSING_FILL_BUDGET_CAPPED)
-        == MISSING_FILL_BUDGET_CAPPED
-    )
-    assert (
-        classify_missing_fill(_decision("A", Action.BUY), MISSING_FILL_BROKER_BLOCKED)
-        == MISSING_FILL_BROKER_BLOCKED
-    )
-    assert (
-        classify_missing_fill(_decision("A", Action.BUY), MISSING_FILL_EXECUTION_GAP)
-        == MISSING_FILL_EXECUTION_GAP
-    )
+    assert classify_missing_fill(_decision("A", Action.BUY), MISSING_FILL_BUDGET_CAPPED) == MISSING_FILL_BUDGET_CAPPED
+    assert classify_missing_fill(_decision("A", Action.BUY), MISSING_FILL_BROKER_BLOCKED) == MISSING_FILL_BROKER_BLOCKED
+    assert classify_missing_fill(_decision("A", Action.BUY), MISSING_FILL_EXECUTION_GAP) == MISSING_FILL_EXECUTION_GAP
 
 
 def test_build_report_metrics_and_ranking():
@@ -7692,9 +7414,7 @@ def test_build_report_metrics_and_ranking():
         loop_block_reasons={},
         active_universe=["A", "B", "C", "D"],
     )
-    report = build_report(
-        run_result, "manual", datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN)
-    )
+    report = build_report(run_result, "manual", datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN))
     # A has larger abs slippage (1.0%) than B (0.2%), so A ranks first.
     assert [r.ticker for r in report.ranked_slippage] == ["A", "B"]
     assert report.top_slippage_tickers == ["A", "B"]
@@ -7746,9 +7466,7 @@ def test_build_report_total_filled_notional_falls_back_to_notional_usd():
         loop_block_reasons={},
         active_universe=["A", "B"],
     )
-    report = build_report(
-        run_result, "manual", datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN)
-    )
+    report = build_report(run_result, "manual", datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN))
     assert report.metrics["filled_order_count"] == 2
     assert report.metrics["total_filled_notional"] == pytest.approx(101.0 * 1.0 + 7.0)
 
@@ -7781,9 +7499,7 @@ def test_build_report_prefers_authoritative_recovered_notional_over_the_granular
         loop_block_reasons={},
         active_universe=["AAPL"],
     )
-    report = build_report(
-        run_result, "manual", datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN)
-    )
+    report = build_report(run_result, "manual", datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN))
     assert report.metrics["total_filled_notional"] == pytest.approx(7.0)
 
 
@@ -7813,9 +7529,7 @@ def test_build_report_excludes_unmeasured_fills_from_slippage_ranking():
         loop_block_reasons={},
         active_universe=["B"],
     )
-    report = build_report(
-        run_result, "manual", datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN)
-    )
+    report = build_report(run_result, "manual", datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN))
     assert report.metrics["filled_order_count"] == 1
     assert report.ranked_slippage == []
     assert report.top_slippage_tickers == []
@@ -7854,9 +7568,7 @@ def test_build_report_does_not_let_a_recovery_fill_mask_a_separate_candidate():
         loop_block_reasons={},
         active_universe=["AAPL"],
     )
-    report = build_report(
-        run_result, "manual", datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN)
-    )
+    report = build_report(run_result, "manual", datetime(2026, 6, 29, 16, 0, tzinfo=EASTERN))
     assert "AAPL" in report.missing_fills, (
         "the current candidate's own decision (reason='graded_dca') is "
         "distinct from the recovery -- it must still report as missing"
@@ -7903,9 +7615,7 @@ def test_generate_report_and_state_artifacts(tmp_path=None):
 
     with open(str(result["state_path"]), encoding="utf-8") as handle:
         payload = json.load(handle)
-    assert (
-        payload["artifacts"]["slippage_report_path"] == result["slippage_report_path"]
-    )
+    assert payload["artifacts"]["slippage_report_path"] == result["slippage_report_path"]
     assert payload["artifacts"]["orders_csv_path"] == result["orders_csv_path"]
     metrics = payload["summary_metrics"]
     for key in [
@@ -7977,18 +7687,14 @@ def _compact_setup(workdir):
         approved_test_dates=frozenset({date(2026, 6, 29)}),
     )
     state = StrategyState()
-    broker = DryRunBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
     # Tight bid/ask (0.2% spread, well under the default 1% breaker) so these
     # compact-mode tests -- which exercise usage-proxy logging, kill-switch
     # accounting, confirmation-required handling, and top-up recording, not
     # spread behavior itself -- still reach a submitted/dry_run outcome under
     # the scheduled-run fail-closed-on-missing-spread breaker.
-    rh = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
     return now, config, state, broker, fin, rh
 
 
@@ -8080,7 +7786,12 @@ def test_retry_preserves_two_distinct_id_less_orders_for_one_ticker(tmp_path):
 
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     result = run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
@@ -8096,8 +7807,7 @@ def test_retry_preserves_two_distinct_id_less_orders_for_one_ticker(tmp_path):
     assert dca_risk.deployed_usd(run_state) >= 10.0
     # And both keep distinct identities in broker_outcomes.
     tsla_outcomes = [
-        o for o in run_state["broker_outcomes"].values()
-        if isinstance(o, dict) and o.get("ticker") == "TSLA"
+        o for o in run_state["broker_outcomes"].values() if isinstance(o, dict) and o.get("ticker") == "TSLA"
     ]
     assert len(tsla_outcomes) == 2, run_state["broker_outcomes"]
     # The outcome-map key, rather than ticker, is persisted as an explicit
@@ -8120,22 +7830,22 @@ def test_retry_preserves_a_placed_candidate_that_has_no_order_id(tmp_path, statu
     import dca_risk
 
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-retry-noid")
-    _seed_failed_attempt_state(
-        artifacts_dir, ticker="TSLA", order_id=None, amount_usd=4.0, status=status
-    )
+    _seed_failed_attempt_state(artifacts_dir, ticker="TSLA", order_id=None, amount_usd=4.0, status=status)
 
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     result = run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
     with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
         run_state = json.load(handle)
-    carried = [
-        c for c in run_state["buy_candidates"]
-        if c.get("ticker") == "TSLA" and c.get("status") == status
-    ]
+    carried = [c for c in run_state["buy_candidates"] if c.get("ticker") == "TSLA" and c.get("status") == status]
     assert carried, (
         "an id-less placed candidate must survive into the retry's run_state; "
         f"got {[(c.get('ticker'), c.get('status')) for c in run_state['buy_candidates']]}"
@@ -8161,16 +7871,19 @@ def test_retry_preserves_a_prior_attempts_placed_candidate(tmp_path, status):
     import dca_risk
 
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-retry")
-    _seed_failed_attempt_state(
-        artifacts_dir, ticker="TSLA", order_id="ORDER-EARLIER", amount_usd=4.0, status=status
-    )
+    _seed_failed_attempt_state(artifacts_dir, ticker="TSLA", order_id="ORDER-EARLIER", amount_usd=4.0, status=status)
 
     # TSLA is NOT in this retry's universe, so the retry cannot reproduce that
     # outcome on its own -- exactly the "retry succeeds without reproducing it"
     # case the finding describes.
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     result = run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
@@ -8185,8 +7898,7 @@ def test_retry_preserves_a_prior_attempts_placed_candidate(tmp_path, status):
     assert dca_risk.deployed_usd(run_state) >= 4.0
     # Persisted into broker_outcomes too, so a SECOND retry re-derives it.
     assert any(
-        isinstance(o, dict) and o.get("order_id") == "ORDER-EARLIER"
-        for o in run_state["broker_outcomes"].values()
+        isinstance(o, dict) and o.get("order_id") == "ORDER-EARLIER" for o in run_state["broker_outcomes"].values()
     )
     # The submission metadata must AGREE with the artifacts. The carried-forward
     # order appears in the regenerated submitted_orders.csv, so a count that
@@ -8202,10 +7914,7 @@ def test_retry_preserves_a_prior_attempts_placed_candidate(tmp_path, status):
     # hid a usage_proxy filter that still recognized only submitted/filled --
     # so a carried pending/unconfirmed order counted in orders_submitted_count
     # and counts.submitted above while orders_placed_count silently dropped it.
-    own_dry_run_orders = [
-        c for c in run_state["buy_candidates"]
-        if c.get("status") == "dry_run" and c.get("order_id")
-    ]
+    own_dry_run_orders = [c for c in run_state["buy_candidates"] if c.get("status") == "dry_run" and c.get("order_id")]
     assert own_dry_run_orders, run_state["buy_candidates"]
     assert run_state["usage_proxy"]["orders_placed_count"] == len(own_dry_run_orders) + 1, (
         f"status={status}: orders_placed_count must count the carried-forward order on top of "
@@ -8222,17 +7931,25 @@ def test_retry_does_not_duplicate_a_candidate_it_reproduced_itself(tmp_path):
     # Dedup is by order id: if this retry re-derived the same order, the prior
     # copy must not be added a second time and inflate deployed capital.
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-dedup")
-    _seed_failed_attempt_state(
-        artifacts_dir, ticker="AAPL", order_id="ORDER-EARLIER", amount_usd=4.0
-    )
+    _seed_failed_attempt_state(artifacts_dir, ticker="AAPL", order_id="ORDER-EARLIER", amount_usd=4.0)
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
     # Run the same slot a second time; the carried-forward row must stay single.
     result = run_daily_compact(
-        now, config, StrategyState(), fin, rh, broker,
+        now,
+        config,
+        StrategyState(),
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
     with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
@@ -8250,9 +7967,7 @@ def test_retry_writes_the_real_ticker_for_a_collision_suffixed_outcome(tmp_path)
     # into the canonical CSV's ticker column (Codex review: "Preserve the real
     # ticker on collision-suffixed outcomes").
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-collision")
-    _seed_failed_attempt_state(
-        artifacts_dir, ticker="AAPL", order_id="ORDER-EARLIER", amount_usd=4.0
-    )
+    _seed_failed_attempt_state(artifacts_dir, ticker="AAPL", order_id="ORDER-EARLIER", amount_usd=4.0)
     # The seeded outcome deliberately carries NO "ticker" field, matching an
     # ordinary prior placed outcome.
     state_path = os.path.join(artifacts_dir, "run_state.json")
@@ -8264,7 +7979,12 @@ def test_retry_writes_the_real_ticker_for_a_collision_suffixed_outcome(tmp_path)
 
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     result = run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
@@ -8295,9 +8015,7 @@ def test_retry_writes_the_real_ticker_for_a_collision_suffixed_outcome(tmp_path)
     # WITHOUT one the key leaks, which is the bug.
     from scripts.scheduled_artifacts import submitted_order_rows
 
-    leaked = submitted_order_rows(
-        {"AAPL:ORDER-EARLIER": {"status": "submitted", "order_id": "ORDER-EARLIER"}}
-    )
+    leaked = submitted_order_rows({"AAPL:ORDER-EARLIER": {"status": "submitted", "order_id": "ORDER-EARLIER"}})
     assert leaked[0]["ticker"] == "AAPL:ORDER-EARLIER"  # what the fix prevents
     pinned = submitted_order_rows(
         {"AAPL:ORDER-EARLIER": {"status": "submitted", "order_id": "ORDER-EARLIER", "ticker": "AAPL"}}
@@ -8319,7 +8037,12 @@ def test_retry_does_not_carry_forward_an_order_that_never_reached_the_broker(tmp
     )
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     result = run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
     with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
@@ -8331,9 +8054,7 @@ def test_retry_does_not_carry_forward_a_different_slots_candidate(tmp_path):
     # The prior artifact belongs to the MIDDAY stream; an afternoon run that
     # reuses the directory is not its retry and must not absorb its orders.
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-other-slot")
-    payload = _seed_failed_attempt_state(
-        artifacts_dir, ticker="TSLA", order_id="ORDER-MIDDAY", amount_usd=4.0
-    )
+    payload = _seed_failed_attempt_state(artifacts_dir, ticker="TSLA", order_id="ORDER-MIDDAY", amount_usd=4.0)
     payload["run_classification"]["stream"] = "midday"
     payload["run_classification"]["scheduled_for_et"] = "12:30"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
@@ -8341,12 +8062,18 @@ def test_retry_does_not_carry_forward_a_different_slots_candidate(tmp_path):
 
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     result = run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
     with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
         run_state = json.load(handle)
     assert not any(c.get("order_id") == "ORDER-MIDDAY" for c in run_state["buy_candidates"])
+
 
 def test_usage_proxy_logged_in_run_state(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
@@ -8362,9 +8089,7 @@ def test_usage_proxy_logged_in_run_state(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir, notifications_sent=1),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     usage = run_state["usage_proxy"]
@@ -8382,9 +8107,7 @@ def test_usage_proxy_logged_in_run_state(tmp_path):
     assert usage["csv_artifact_count"] == 3
     # The backfill re-serializes until the recorded size matches what is on disk,
     # and the total must cover the state file plus every counted CSV exactly.
-    assert usage["state_file_bytes"] == os.path.getsize(
-        os.path.join(artifacts_dir, "run_state.json")
-    )
+    assert usage["state_file_bytes"] == os.path.getsize(os.path.join(artifacts_dir, "run_state.json"))
     csv_bytes = sum(
         os.path.getsize(os.path.join(artifacts_dir, name))
         for name in ("signals.csv", "buy_candidates.csv", "orders.csv")
@@ -8411,9 +8134,7 @@ def test_usage_proxy_counts_provider_errors(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     usage = run_state["usage_proxy"]
 
@@ -8426,9 +8147,7 @@ def test_usage_proxy_counts_provider_errors(tmp_path):
     assert run_state["counts"]["manual_review"] == 3
     assert sorted(run_state["manual_review_tickers"]) == ["AAPL", "MSFT", "NVDA"]
     # The artifact rows carry the provider_error flag, not just the reason text.
-    finance_rows = [
-        row for row in run_state["signal_rows"] if row["source"] == "finance"
-    ]
+    finance_rows = [row for row in run_state["signal_rows"] if row["source"] == "finance"]
     assert finance_rows and all(row["provider_error"] is True for row in finance_rows)
 
 
@@ -8447,9 +8166,7 @@ def test_finance_ticker_not_found_degrades_to_robinhood_only_buy(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     usage = run_state["usage_proxy"]
 
@@ -8460,9 +8177,7 @@ def test_finance_ticker_not_found_degrades_to_robinhood_only_buy(tmp_path):
     assert usage["errors_count"] == 0
     assert usage["manual_recovery_required"] is False
     assert usage["orders_placed_count"] == 3
-    finance_rows = [
-        row for row in run_state["signal_rows"] if row["source"] == "finance"
-    ]
+    finance_rows = [row for row in run_state["signal_rows"] if row["source"] == "finance"]
     assert finance_rows and all(row["provider_error"] is False for row in finance_rows)
     assert all("not found" in row["reason"] for row in finance_rows)
 
@@ -8515,9 +8230,7 @@ def test_run_daily_compact_stamps_scheduled_run_classification(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     rc = run_state["run_classification"]
     assert rc["run_origin"] == "scheduled"
@@ -8541,9 +8254,7 @@ def test_run_daily_compact_manual_stamps_manual_run_classification(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=False),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     rc = run_state["run_classification"]
     assert rc["run_origin"] == "manual"
@@ -8581,11 +8292,14 @@ def test_run_daily_compact_does_not_merge_across_a_different_streams_reused_dir(
     with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
         writer.writeheader()
-        writer.writerow({field: "" for field in _CSV_FIELDS} | {
-            "ticker": "ZZZZ_MORNING_SENTINEL",
-            "status": "filled",
-            "order_id": "sentinel-order-id",
-        })
+        writer.writerow(
+            {field: "" for field in _CSV_FIELDS}
+            | {
+                "ticker": "ZZZZ_MORNING_SENTINEL",
+                "status": "filled",
+                "order_id": "sentinel-order-id",
+            }
+        )
 
     # A DIFFERENT stream ("midday") reuses the same directory on the same
     # trading day -- not a retry of the morning run.
@@ -8633,29 +8347,34 @@ def test_run_daily_compact_merges_across_a_genuine_retry_of_the_same_slot(tmp_pa
         "run_classification_outcome": "completed_no_orders",
         "completion_reason": "no_ladder_candidates",
         "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
-        "buy_candidates": [{
-            "ticker": "ZZZZ_RECOVERED_SENTINEL",
-            "status": "submitted",
-            "order_id": "sentinel-order-id",
-            "buy_multiplier": 1.0,
-            "planned_amount_usd": 17.25,
-            # A field only the PRIOR attempt's candidate carries (a legacy/
-            # newer-producer schema difference) -- must not crash the merged
-            # buy_candidates.csv rewrite (Codex review: "Use a union schema
-            # when rewriting merged candidates").
-            "legacy_only_field": "still here",
-        }],
+        "buy_candidates": [
+            {
+                "ticker": "ZZZZ_RECOVERED_SENTINEL",
+                "status": "submitted",
+                "order_id": "sentinel-order-id",
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 17.25,
+                # A field only the PRIOR attempt's candidate carries (a legacy/
+                # newer-producer schema difference) -- must not crash the merged
+                # buy_candidates.csv rewrite (Codex review: "Use a union schema
+                # when rewriting merged candidates").
+                "legacy_only_field": "still here",
+            }
+        ],
     }
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(prior_run_state, handle)
     with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
         writer.writeheader()
-        writer.writerow({field: "" for field in _CSV_FIELDS} | {
-            "ticker": "ZZZZ_RECOVERED_SENTINEL",
-            "status": "filled",
-            "order_id": "sentinel-order-id",
-        })
+        writer.writerow(
+            {field: "" for field in _CSV_FIELDS}
+            | {
+                "ticker": "ZZZZ_RECOVERED_SENTINEL",
+                "status": "filled",
+                "order_id": "sentinel-order-id",
+            }
+        )
 
     run_daily_compact(
         now,
@@ -8684,10 +8403,9 @@ def test_run_daily_compact_merges_across_a_genuine_retry_of_the_same_slot(tmp_pa
     from dca_risk import deployed_usd
 
     assert deployed_usd(retried_state) == pytest.approx(17.25)
-    assert any(
-        candidate.get("order_id") == "sentinel-order-id"
-        for candidate in retried_state["buy_candidates"]
-    ), "the recovered candidate must remain in run_state kill-switch accounting"
+    assert any(candidate.get("order_id") == "sentinel-order-id" for candidate in retried_state["buy_candidates"]), (
+        "the recovered candidate must remain in run_state kill-switch accounting"
+    )
 
     # Regression coverage for "Regenerate artifacts after merging prior
     # candidates": the companion artifacts run_once() already wrote from the
@@ -8753,24 +8471,29 @@ def test_run_daily_compact_keeps_same_ticker_events_distinct_when_merging(tmp_pa
     prior_run_state = {
         "trading_day": "2026-06-29",
         "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
-        "buy_candidates": [{
-            "ticker": "AAPL",
-            "status": "submitted",
-            "order_id": "prior-aapl-order-id",
-            "buy_multiplier": 1.0,
-            "planned_amount_usd": 9.5,
-        }],
+        "buy_candidates": [
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "order_id": "prior-aapl-order-id",
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 9.5,
+            }
+        ],
     }
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(prior_run_state, handle)
     with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
         writer.writeheader()
-        writer.writerow({field: "" for field in _CSV_FIELDS} | {
-            "ticker": "AAPL",
-            "status": "filled",
-            "order_id": "prior-aapl-order-id",
-        })
+        writer.writerow(
+            {field: "" for field in _CSV_FIELDS}
+            | {
+                "ticker": "AAPL",
+                "status": "filled",
+                "order_id": "prior-aapl-order-id",
+            }
+        )
 
     run_daily_compact(
         now,
@@ -8790,9 +8513,7 @@ def test_run_daily_compact_keeps_same_ticker_events_distinct_when_merging(tmp_pa
 
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         retried_state = json.load(handle)
-    aapl_candidates = [
-        c for c in retried_state["buy_candidates"] if c.get("ticker") == "AAPL"
-    ]
+    aapl_candidates = [c for c in retried_state["buy_candidates"] if c.get("ticker") == "AAPL"]
     order_ids = {c.get("order_id") for c in aapl_candidates}
     assert "prior-aapl-order-id" in order_ids, (
         "the restored AAPL candidate must survive alongside this run's own AAPL candidate"
@@ -8821,25 +8542,30 @@ def test_run_daily_compact_does_not_compound_an_id_less_restored_candidate(tmp_p
     prior_run_state = {
         "trading_day": "2026-06-29",
         "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
-        "buy_candidates": [{
-            "ticker": "ZZZZ_NO_ID_SENTINEL",
-            "status": "submitted",
-            "order_id": None,
-            "buy_multiplier": None,
-            "planned_amount_usd": 5.0,
-            "order_submitted_at": "2026-06-29T15:31:00-04:00",
-        }],
+        "buy_candidates": [
+            {
+                "ticker": "ZZZZ_NO_ID_SENTINEL",
+                "status": "submitted",
+                "order_id": None,
+                "buy_multiplier": None,
+                "planned_amount_usd": 5.0,
+                "order_submitted_at": "2026-06-29T15:31:00-04:00",
+            }
+        ],
     }
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(prior_run_state, handle)
     with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
         writer.writeheader()
-        writer.writerow({field: "" for field in _CSV_FIELDS} | {
-            "ticker": "ZZZZ_NO_ID_SENTINEL",
-            "status": "filled",
-            "order_id": "",
-        })
+        writer.writerow(
+            {field: "" for field in _CSV_FIELDS}
+            | {
+                "ticker": "ZZZZ_NO_ID_SENTINEL",
+                "status": "filled",
+                "order_id": "",
+            }
+        )
 
     compact_options = CompactRunOptions(
         artifacts_dir=artifacts_dir,
@@ -8853,10 +8579,7 @@ def test_run_daily_compact_does_not_compound_an_id_less_restored_candidate(tmp_p
     run_daily_compact(now, config, state, fin, rh, broker, options=compact_options)
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         state_after_first_retry = json.load(handle)
-    first_count = sum(
-        1 for c in state_after_first_retry["buy_candidates"]
-        if c.get("ticker") == "ZZZZ_NO_ID_SENTINEL"
-    )
+    first_count = sum(1 for c in state_after_first_retry["buy_candidates"] if c.get("ticker") == "ZZZZ_NO_ID_SENTINEL")
     assert first_count == 1, "the id-less candidate must be restored exactly once"
 
     # Second retry of the SAME slot: reads the first retry's own already-
@@ -8865,12 +8588,9 @@ def test_run_daily_compact_does_not_compound_an_id_less_restored_candidate(tmp_p
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         state_after_second_retry = json.load(handle)
     second_count = sum(
-        1 for c in state_after_second_retry["buy_candidates"]
-        if c.get("ticker") == "ZZZZ_NO_ID_SENTINEL"
+        1 for c in state_after_second_retry["buy_candidates"] if c.get("ticker") == "ZZZZ_NO_ID_SENTINEL"
     )
-    assert second_count == 1, (
-        "a second retry must not compound the same id-less restored candidate a further time"
-    )
+    assert second_count == 1, "a second retry must not compound the same id-less restored candidate a further time"
 
 
 def test_run_daily_compact_restores_a_pending_prior_candidate_not_just_submitted(tmp_path):
@@ -8891,24 +8611,29 @@ def test_run_daily_compact_restores_a_pending_prior_candidate_not_just_submitted
     prior_run_state = {
         "trading_day": "2026-06-29",
         "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
-        "buy_candidates": [{
-            "ticker": "ZZZZ_PENDING_SENTINEL",
-            "status": "pending",
-            "order_id": "pending-order-id",
-            "buy_multiplier": 1.0,
-            "planned_amount_usd": 11.0,
-        }],
+        "buy_candidates": [
+            {
+                "ticker": "ZZZZ_PENDING_SENTINEL",
+                "status": "pending",
+                "order_id": "pending-order-id",
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 11.0,
+            }
+        ],
     }
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(prior_run_state, handle)
     with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
         writer.writeheader()
-        writer.writerow({field: "" for field in _CSV_FIELDS} | {
-            "ticker": "ZZZZ_PENDING_SENTINEL",
-            "status": "pending",
-            "order_id": "pending-order-id",
-        })
+        writer.writerow(
+            {field: "" for field in _CSV_FIELDS}
+            | {
+                "ticker": "ZZZZ_PENDING_SENTINEL",
+                "status": "pending",
+                "order_id": "pending-order-id",
+            }
+        )
 
     run_daily_compact(
         now,
@@ -8928,10 +8653,9 @@ def test_run_daily_compact_restores_a_pending_prior_candidate_not_just_submitted
 
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         retried_state = json.load(handle)
-    assert any(
-        candidate.get("order_id") == "pending-order-id"
-        for candidate in retried_state["buy_candidates"]
-    ), "a prior 'pending' candidate must be restored, not just 'submitted' ones"
+    assert any(candidate.get("order_id") == "pending-order-id" for candidate in retried_state["buy_candidates"]), (
+        "a prior 'pending' candidate must be restored, not just 'submitted' ones"
+    )
     # Regression for "Count restored order-attempt statuses consistently":
     # the restored "pending" attempt must also be reflected in the merged
     # aggregate counts, not just the buy_candidates list -- an aggregate
@@ -8966,25 +8690,30 @@ def test_run_daily_compact_rejects_a_restored_candidate_with_a_malformed_buy_mul
     prior_run_state = {
         "trading_day": "2026-06-29",
         "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
-        "buy_candidates": [{
-            "ticker": "ZZZZ_BAD_MULTIPLIER_SENTINEL",
-            "status": "submitted",
-            "order_id": "bad-multiplier-order-id",
-            # Wrong type -- schema requires number|null.
-            "buy_multiplier": "not-a-number",
-            "planned_amount_usd": 6.0,
-        }],
+        "buy_candidates": [
+            {
+                "ticker": "ZZZZ_BAD_MULTIPLIER_SENTINEL",
+                "status": "submitted",
+                "order_id": "bad-multiplier-order-id",
+                # Wrong type -- schema requires number|null.
+                "buy_multiplier": "not-a-number",
+                "planned_amount_usd": 6.0,
+            }
+        ],
     }
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(prior_run_state, handle)
     with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
         writer.writeheader()
-        writer.writerow({field: "" for field in _CSV_FIELDS} | {
-            "ticker": "ZZZZ_BAD_MULTIPLIER_SENTINEL",
-            "status": "filled",
-            "order_id": "bad-multiplier-order-id",
-        })
+        writer.writerow(
+            {field: "" for field in _CSV_FIELDS}
+            | {
+                "ticker": "ZZZZ_BAD_MULTIPLIER_SENTINEL",
+                "status": "filled",
+                "order_id": "bad-multiplier-order-id",
+            }
+        )
 
     run_daily_compact(
         now,
@@ -9005,8 +8734,7 @@ def test_run_daily_compact_rejects_a_restored_candidate_with_a_malformed_buy_mul
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         retried_state = json.load(handle)
     assert not any(
-        candidate.get("order_id") == "bad-multiplier-order-id"
-        for candidate in retried_state["buy_candidates"]
+        candidate.get("order_id") == "bad-multiplier-order-id" for candidate in retried_state["buy_candidates"]
     ), "a restored candidate with a malformed buy_multiplier must not be copied into the retried run's state"
 
 
@@ -9027,28 +8755,33 @@ def test_run_daily_compact_rejects_a_restored_candidate_with_schema_invalid_opti
     prior_run_state = {
         "trading_day": "2026-06-29",
         "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
-        "buy_candidates": [{
-            "ticker": "ZZZZ_BAD_OPTIONAL_FIELD_SENTINEL",
-            "status": "submitted",
-            # Schema requires order_id to be string|null -- an object here
-            # is schema-invalid even though the four required fields (and
-            # buy_multiplier's own type) all pass.
-            "order_id": {"nested": "not-a-string"},
-            "buy_multiplier": 1.0,
-            "planned_amount_usd": 3.0,
-            # Schema requires this to be a boolean.
-            "target_price_missing": "not-a-boolean",
-        }],
+        "buy_candidates": [
+            {
+                "ticker": "ZZZZ_BAD_OPTIONAL_FIELD_SENTINEL",
+                "status": "submitted",
+                # Schema requires order_id to be string|null -- an object here
+                # is schema-invalid even though the four required fields (and
+                # buy_multiplier's own type) all pass.
+                "order_id": {"nested": "not-a-string"},
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 3.0,
+                # Schema requires this to be a boolean.
+                "target_price_missing": "not-a-boolean",
+            }
+        ],
     }
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(prior_run_state, handle)
     with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
         writer.writeheader()
-        writer.writerow({field: "" for field in _CSV_FIELDS} | {
-            "ticker": "ZZZZ_BAD_OPTIONAL_FIELD_SENTINEL",
-            "status": "filled",
-        })
+        writer.writerow(
+            {field: "" for field in _CSV_FIELDS}
+            | {
+                "ticker": "ZZZZ_BAD_OPTIONAL_FIELD_SENTINEL",
+                "status": "filled",
+            }
+        )
 
     run_daily_compact(
         now,
@@ -9069,8 +8802,7 @@ def test_run_daily_compact_rejects_a_restored_candidate_with_schema_invalid_opti
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         retried_state = json.load(handle)
     assert not any(
-        candidate.get("ticker") == "ZZZZ_BAD_OPTIONAL_FIELD_SENTINEL"
-        for candidate in retried_state["buy_candidates"]
+        candidate.get("ticker") == "ZZZZ_BAD_OPTIONAL_FIELD_SENTINEL" for candidate in retried_state["buy_candidates"]
     ), "a restored candidate with a schema-invalid optional field must not be copied into the retried run's state"
 
 
@@ -9110,13 +8842,15 @@ def test_run_daily_compact_excludes_confirmation_holds_from_submitted_count(tmp_
     prior_run_state = {
         "trading_day": "2026-06-29",
         "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
-        "buy_candidates": [{
-            "ticker": "ZZZZ_CONFIRMATION_HOLD_SENTINEL",
-            "status": "not_submitted_confirmation_required",
-            "order_id": None,
-            "buy_multiplier": 1.0,
-            "planned_amount_usd": 4.0,
-        }],
+        "buy_candidates": [
+            {
+                "ticker": "ZZZZ_CONFIRMATION_HOLD_SENTINEL",
+                "status": "not_submitted_confirmation_required",
+                "order_id": None,
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 4.0,
+            }
+        ],
     }
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(prior_run_state, handle)
@@ -9143,8 +8877,7 @@ def test_run_daily_compact_excludes_confirmation_holds_from_submitted_count(tmp_
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         retried_state = json.load(handle)
     assert any(
-        candidate.get("ticker") == "ZZZZ_CONFIRMATION_HOLD_SENTINEL"
-        for candidate in retried_state["buy_candidates"]
+        candidate.get("ticker") == "ZZZZ_CONFIRMATION_HOLD_SENTINEL" for candidate in retried_state["buy_candidates"]
     ), "the confirmation-hold candidate must still be restored for audit purposes"
     assert retried_state["orders_submitted_count"] == 0, (
         "a confirmation hold that never reached the broker must not count as a submission"
@@ -9176,24 +8909,29 @@ def test_run_daily_compact_counts_restored_in_flight_orders_in_usage_proxy(tmp_p
     prior_run_state = {
         "trading_day": "2026-06-29",
         "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
-        "buy_candidates": [{
-            "ticker": "ZZZZ_USAGE_PROXY_SENTINEL",
-            "status": "pending",
-            "order_id": "usage-proxy-order-id",
-            "buy_multiplier": 1.0,
-            "planned_amount_usd": 7.5,
-        }],
+        "buy_candidates": [
+            {
+                "ticker": "ZZZZ_USAGE_PROXY_SENTINEL",
+                "status": "pending",
+                "order_id": "usage-proxy-order-id",
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 7.5,
+            }
+        ],
     }
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(prior_run_state, handle)
     with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
         writer.writeheader()
-        writer.writerow({field: "" for field in _CSV_FIELDS} | {
-            "ticker": "ZZZZ_USAGE_PROXY_SENTINEL",
-            "status": "pending",
-            "order_id": "usage-proxy-order-id",
-        })
+        writer.writerow(
+            {field: "" for field in _CSV_FIELDS}
+            | {
+                "ticker": "ZZZZ_USAGE_PROXY_SENTINEL",
+                "status": "pending",
+                "order_id": "usage-proxy-order-id",
+            }
+        )
 
     run_daily_compact(
         now,
@@ -9236,25 +8974,30 @@ def test_run_daily_compact_counts_an_id_less_restored_order_in_usage_proxy(tmp_p
     prior_run_state = {
         "trading_day": "2026-06-29",
         "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
-        "buy_candidates": [{
-            "ticker": "ZZZZ_ID_LESS_USAGE_PROXY_SENTINEL",
-            "status": "submitted",
-            "order_id": None,
-            "buy_multiplier": 1.0,
-            "planned_amount_usd": 6.0,
-            "order_submitted_at": "2026-06-29T15:31:00-04:00",
-        }],
+        "buy_candidates": [
+            {
+                "ticker": "ZZZZ_ID_LESS_USAGE_PROXY_SENTINEL",
+                "status": "submitted",
+                "order_id": None,
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 6.0,
+                "order_submitted_at": "2026-06-29T15:31:00-04:00",
+            }
+        ],
     }
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(prior_run_state, handle)
     with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
         writer.writeheader()
-        writer.writerow({field: "" for field in _CSV_FIELDS} | {
-            "ticker": "ZZZZ_ID_LESS_USAGE_PROXY_SENTINEL",
-            "status": "filled",
-            "order_id": "",
-        })
+        writer.writerow(
+            {field: "" for field in _CSV_FIELDS}
+            | {
+                "ticker": "ZZZZ_ID_LESS_USAGE_PROXY_SENTINEL",
+                "status": "filled",
+                "order_id": "",
+            }
+        )
 
     run_daily_compact(
         now,
@@ -9308,24 +9051,29 @@ def test_run_daily_compact_reclassifies_a_total_failure_once_a_submission_is_res
     prior_run_state = {
         "trading_day": "2026-06-29",
         "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
-        "buy_candidates": [{
-            "ticker": "ZZZZ_RECLASSIFY_SENTINEL",
-            "status": "submitted",
-            "order_id": "reclassify-order-id",
-            "buy_multiplier": 1.0,
-            "planned_amount_usd": 5.0,
-        }],
+        "buy_candidates": [
+            {
+                "ticker": "ZZZZ_RECLASSIFY_SENTINEL",
+                "status": "submitted",
+                "order_id": "reclassify-order-id",
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 5.0,
+            }
+        ],
     }
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(prior_run_state, handle)
     with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
         writer.writeheader()
-        writer.writerow({field: "" for field in _CSV_FIELDS} | {
-            "ticker": "ZZZZ_RECLASSIFY_SENTINEL",
-            "status": "filled",
-            "order_id": "reclassify-order-id",
-        })
+        writer.writerow(
+            {field: "" for field in _CSV_FIELDS}
+            | {
+                "ticker": "ZZZZ_RECLASSIFY_SENTINEL",
+                "status": "filled",
+                "order_id": "reclassify-order-id",
+            }
+        )
 
     # Every candidate here fails via a plain RuntimeError, which
     # run_once()'s own placement handler can never distinguish from a
@@ -9385,25 +9133,30 @@ def test_run_daily_compact_rejects_a_schema_invalid_restored_candidate(tmp_path)
     prior_run_state = {
         "trading_day": "2026-06-29",
         "run_classification": {"stream": "midday", "manual_run": False, "scheduled_for_et": "12:30"},
-        "buy_candidates": [{
-            # No "ticker" -- simulates a hand-edited/partially corrupted
-            # prior run_state.json that is still syntactically valid JSON.
-            "status": "submitted",
-            "order_id": "corrupt-order-id",
-            "buy_multiplier": 1.0,
-            "planned_amount_usd": 8.0,
-        }],
+        "buy_candidates": [
+            {
+                # No "ticker" -- simulates a hand-edited/partially corrupted
+                # prior run_state.json that is still syntactically valid JSON.
+                "status": "submitted",
+                "order_id": "corrupt-order-id",
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 8.0,
+            }
+        ],
     }
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(prior_run_state, handle)
     with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
         writer.writeheader()
-        writer.writerow({field: "" for field in _CSV_FIELDS} | {
-            "ticker": "",
-            "status": "filled",
-            "order_id": "corrupt-order-id",
-        })
+        writer.writerow(
+            {field: "" for field in _CSV_FIELDS}
+            | {
+                "ticker": "",
+                "status": "filled",
+                "order_id": "corrupt-order-id",
+            }
+        )
 
     run_daily_compact(
         now,
@@ -9423,10 +9176,9 @@ def test_run_daily_compact_rejects_a_schema_invalid_restored_candidate(tmp_path)
 
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         retried_state = json.load(handle)
-    assert not any(
-        candidate.get("order_id") == "corrupt-order-id"
-        for candidate in retried_state["buy_candidates"]
-    ), "a schema-invalid restored candidate must not be copied into the retried run's state"
+    assert not any(candidate.get("order_id") == "corrupt-order-id" for candidate in retried_state["buy_candidates"]), (
+        "a schema-invalid restored candidate must not be copied into the retried run's state"
+    )
 
 
 def test_run_daily_compact_does_not_merge_across_different_intraday_slots(tmp_path):
@@ -9448,7 +9200,9 @@ def test_run_daily_compact_does_not_merge_across_different_intraday_slots(tmp_pa
     prior_run_state = {
         "trading_day": "2026-06-29",
         "run_classification": {
-            "stream": "intraday", "manual_run": False, "scheduled_for_et": "11:30",
+            "stream": "intraday",
+            "manual_run": False,
+            "scheduled_for_et": "11:30",
         },
     }
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
@@ -9456,11 +9210,14 @@ def test_run_daily_compact_does_not_merge_across_different_intraday_slots(tmp_pa
     with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
         writer.writeheader()
-        writer.writerow({field: "" for field in _CSV_FIELDS} | {
-            "ticker": "ZZZZ_1130_SENTINEL",
-            "status": "filled",
-            "order_id": "sentinel-order-id",
-        })
+        writer.writerow(
+            {field: "" for field in _CSV_FIELDS}
+            | {
+                "ticker": "ZZZZ_1130_SENTINEL",
+                "status": "filled",
+                "order_id": "sentinel-order-id",
+            }
+        )
 
     # The 13:30 slot reuses the same directory on the same trading day --
     # same stream, but NOT a retry of the 11:30 run.
@@ -9516,11 +9273,14 @@ def test_run_daily_compact_does_not_merge_a_live_and_a_dry_run_attempt(tmp_path)
     with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
         writer.writeheader()
-        writer.writerow({field: "" for field in _CSV_FIELDS} | {
-            "ticker": "ZZZZ_LIVE_SENTINEL",
-            "status": "filled",
-            "order_id": "sentinel-order-id",
-        })
+        writer.writerow(
+            {field: "" for field in _CSV_FIELDS}
+            | {
+                "ticker": "ZZZZ_LIVE_SENTINEL",
+                "status": "filled",
+                "order_id": "sentinel-order-id",
+            }
+        )
 
     # THIS invocation is dry_run=True (config.dry_run) -- not a retry of the
     # live attempt above, despite matching day/stream/slot/origin.
@@ -9568,11 +9328,14 @@ def test_run_daily_compact_never_merges_two_manual_runs(tmp_path):
     with open(os.path.join(artifacts_dir, "orders.csv"), "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDS)
         writer.writeheader()
-        writer.writerow({field: "" for field in _CSV_FIELDS} | {
-            "ticker": "ZZZZ_MANUAL_A_SENTINEL",
-            "status": "filled",
-            "order_id": "sentinel-order-id",
-        })
+        writer.writerow(
+            {field: "" for field in _CSV_FIELDS}
+            | {
+                "ticker": "ZZZZ_MANUAL_A_SENTINEL",
+                "status": "filled",
+                "order_id": "sentinel-order-id",
+            }
+        )
 
     # A SECOND, unrelated manual run reuses the same directory the same day.
     run_daily_compact(
@@ -9612,15 +9375,11 @@ def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
         monthly_cash_allocation_usd=10.0,  # tiny allocation -> trivial to exceed 40%
     )
     state1 = StrategyState()
-    broker1 = DryRunBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker1 = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin1 = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now1))
     # Tight bid/ask so the scheduled-run fail-closed-on-missing-spread breaker
     # doesn't block this kill-switch scenario (spread behavior is not under test).
-    rh1 = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now1), bid_ask=(97.9, 98.1)
-    )
+    rh1 = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now1), bid_ask=(97.9, 98.1))
     run_daily_compact(
         now1,
         config,
@@ -9633,27 +9392,17 @@ def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
 
     with open(os.path.join(day1_dir, "run_state.json"), encoding="utf-8") as handle:
         day1_state = json.load(handle)
-    day1_deployed = sum(
-        c["planned_amount_usd"]
-        for c in day1_state["buy_candidates"]
-        if c["status"] == "submitted"
-    )
-    assert (
-        day1_deployed > 0.4 * config.monthly_cash_allocation_usd
-    )  # sanity: threshold is crossed
+    day1_deployed = sum(c["planned_amount_usd"] for c in day1_state["buy_candidates"] if c["status"] == "submitted")
+    assert day1_deployed > 0.4 * config.monthly_cash_allocation_usd  # sanity: threshold is crossed
 
     # Day 2 (within the trailing 7 days): the kill-switch must engage from day 1's
     # history alone, capping every buy multiplier to 1x.
     day2_dir = os.path.join(history_root, "2026-07-02")
     now2 = datetime(2026, 7, 2, 15, 45, tzinfo=EASTERN)
     state2 = StrategyState()
-    broker2 = DryRunBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker2 = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin2 = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now2))
-    rh2 = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now2), bid_ask=(97.9, 98.1)
-    )
+    rh2 = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now2), bid_ask=(97.9, 98.1))
     run_daily_compact(
         now2,
         config,
@@ -9661,9 +9410,7 @@ def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
         fin2,
         rh2,
         broker2,
-        options=CompactRunOptions(
-            artifacts_dir=day2_dir, deployment_history_root=history_root
-        ),
+        options=CompactRunOptions(artifacts_dir=day2_dir, deployment_history_root=history_root),
     )
 
     with open(os.path.join(day2_dir, "run_state.json"), encoding="utf-8") as handle:
@@ -9677,9 +9424,7 @@ def test_deployment_history_root_engages_kill_switch_on_later_run(tmp_path):
     # own submissions as they were made (see
     # test_kill_switch_caps_later_candidates_within_the_same_batch for the
     # narrower in-batch behavior) -- not just the pre-run historical figure.
-    assert day2_state["risk_guard"]["deployed_last_7d_usd"] == round(
-        day1_deployed + day2_deployed, 2
-    )
+    assert day2_state["risk_guard"]["deployed_last_7d_usd"] == round(day1_deployed + day2_deployed, 2)
 
 
 def test_recovered_fractional_notional_survives_deployment_history_injection(tmp_path):
@@ -9715,17 +9460,24 @@ def test_recovered_fractional_notional_survives_deployment_history_injection(tmp
     trading_day_iso = now.date().isoformat()
     triggered_at_utc = now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": trading_day_iso,
-            "generated_at": triggered_at_utc,
-            "run_classification": build_scheduled_classification(
-                trading_day_iso, triggered_at_utc=triggered_at_utc
-            ),
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 50.0,
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": trading_day_iso,
+                "generated_at": triggered_at_utc,
+                "run_classification": build_scheduled_classification(
+                    trading_day_iso, triggered_at_utc=triggered_at_utc
+                ),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 50.0,
+                    }
+                },
+            },
+            handle,
+        )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -9739,9 +9491,7 @@ def test_recovered_fractional_notional_survives_deployment_history_injection(tmp
         fin,
         rh,
         broker,
-        options=CompactRunOptions(
-            artifacts_dir=artifacts_dir, deployment_history_root=history_root
-        ),
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, deployment_history_root=history_root),
     )
 
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
@@ -9788,13 +9538,20 @@ def test_recovered_fractional_notional_still_counted_when_the_scan_skips_it(tmp_
     # scheduled evidence, but the reconciler's own permissive run-type check
     # still accepts and republishes it.
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": trading_day_iso,
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 50.0,
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": trading_day_iso,
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 50.0,
+                    }
+                },
+            },
+            handle,
+        )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -9808,9 +9565,7 @@ def test_recovered_fractional_notional_still_counted_when_the_scan_skips_it(tmp_
         fin,
         rh,
         broker,
-        options=CompactRunOptions(
-            artifacts_dir=artifacts_dir, deployment_history_root=history_root
-        ),
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, deployment_history_root=history_root),
     )
 
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
@@ -9849,14 +9604,21 @@ def test_recovered_fractional_notional_excluded_from_manual_deployment(tmp_path)
     )
     trading_day_iso = now.date().isoformat()
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": trading_day_iso,
-            "run_classification": {"run_origin": "manual"},
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 50.0,
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": trading_day_iso,
+                "run_classification": {"run_origin": "manual"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 50.0,
+                    }
+                },
+            },
+            handle,
+        )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -9880,10 +9642,7 @@ def test_recovered_fractional_notional_excluded_from_manual_deployment(tmp_path)
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     # The recovery itself still happened...
-    assert any(
-        c.get("reason") == "reconciled_fractional_placement"
-        for c in run_state["buy_candidates"]
-    )
+    assert any(c.get("reason") == "reconciled_fractional_placement" for c in run_state["buy_candidates"])
     # ...but the SCHEDULED kill-switch figure must not reflect it (nor, for
     # a manual run, this run's own ordinary submissions either -- every
     # bump to this figure is gated on ctx.scheduled the same way).
@@ -9915,14 +9674,21 @@ def test_recovered_fractional_notional_excluded_from_morning_deployment(tmp_path
     )
     trading_day_iso = now.date().isoformat()
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": trading_day_iso,
-            "run_classification": {"stream": "morning", "scheduled_for_et": "10:30"},
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "morning-AAPL-proof", "submitted_amount_usd": 50.0,
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": trading_day_iso,
+                "run_classification": {"stream": "morning", "scheduled_for_et": "10:30"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "morning-AAPL-proof",
+                        "submitted_amount_usd": 50.0,
+                    }
+                },
+            },
+            handle,
+        )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -9947,10 +9713,7 @@ def test_recovered_fractional_notional_excluded_from_morning_deployment(tmp_path
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     # The recovery itself still happened...
-    assert any(
-        c.get("reason") == "reconciled_fractional_placement"
-        for c in run_state["buy_candidates"]
-    )
+    assert any(c.get("reason") == "reconciled_fractional_placement" for c in run_state["buy_candidates"])
     # ...but the AFTERNOON-scoped kill-switch figure must not reflect a
     # morning slot's own $50 recovery -- only this run's own new (unrelated)
     # submissions, which bump the same figure regardless of stream, not
@@ -9994,28 +9757,43 @@ def test_recovered_fractional_notional_matched_by_order_id_not_just_ticker(tmp_p
     other_dir = os.path.join(history_root, "2026-06-29-other-slot")
     os.makedirs(other_dir)
     with open(os.path.join(other_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": trading_day_iso,
-            "generated_at": triggered_at_utc,
-            "run_classification": build_scheduled_classification(
-                trading_day_iso, triggered_at_utc=triggered_at_utc
-            ),
-            "buy_candidates": [{
-                "ticker": "AAPL", "status": "submitted", "order_id": "ORD-OTHER",
-                "planned_amount_usd": 30.0, "buy_multiplier": 1.0,
-            }],
-        }, handle)
+        json.dump(
+            {
+                "trading_day": trading_day_iso,
+                "generated_at": triggered_at_utc,
+                "run_classification": build_scheduled_classification(
+                    trading_day_iso, triggered_at_utc=triggered_at_utc
+                ),
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "submitted",
+                        "order_id": "ORD-OTHER",
+                        "planned_amount_usd": 30.0,
+                        "buy_multiplier": 1.0,
+                    }
+                ],
+            },
+            handle,
+        )
 
     # The artifact THIS run reconciles: an unresolved AAPL placement, no
     # valid scheduled classification of its own (skipped by the scan).
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": trading_day_iso,
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 50.0,
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": trading_day_iso,
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 50.0,
+                    }
+                },
+            },
+            handle,
+        )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -10029,9 +9807,7 @@ def test_recovered_fractional_notional_matched_by_order_id_not_just_ticker(tmp_p
         fin,
         rh,
         broker,
-        options=CompactRunOptions(
-            artifacts_dir=artifacts_dir, deployment_history_root=history_root
-        ),
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, deployment_history_root=history_root),
     )
 
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
@@ -10044,9 +9820,7 @@ def test_recovered_fractional_notional_matched_by_order_id_not_just_ticker(tmp_p
     # Both the OTHER order's $30 (from the scan) and the recovered order's
     # own $50 (from the manual bump, since ORD-RECOVERED specifically was
     # never counted) must be present.
-    assert run_state["risk_guard"]["deployed_last_7d_usd"] == round(
-        30.0 + 50.0 + own_new_submitted, 2
-    )
+    assert run_state["risk_guard"]["deployed_last_7d_usd"] == round(30.0 + 50.0 + own_new_submitted, 2)
 
 
 def test_run_state_account_number_is_a_fingerprint_not_the_raw_account(tmp_path):
@@ -10070,7 +9844,12 @@ def test_run_state_account_number_is_a_fingerprint_not_the_raw_account(tmp_path)
     broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
 
     run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
@@ -10083,9 +9862,7 @@ def test_run_state_account_number_is_a_fingerprint_not_the_raw_account(tmp_path)
     # The fingerprint reconciliation would independently recompute, using
     # the SAME key_dir convention (beside the artifacts tree), must agree --
     # otherwise a legitimate same-account retry could never verify itself.
-    recomputed = near_close_dca._broker_account_fingerprint(
-        broker, os.path.dirname(artifacts_dir)
-    )
+    recomputed = near_close_dca._broker_account_fingerprint(broker, os.path.dirname(artifacts_dir))
     assert recomputed == fingerprint
 
 
@@ -10134,9 +9911,7 @@ def test_apply_deployment_history_only_counts_trailing_7d(tmp_path):
                 }
             ],
         }
-        with open(
-            os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8"
-        ) as handle:
+        with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
             json.dump(state, handle, indent=2)
 
     history_root = os.path.join(str(tmp_path), "runs")
@@ -10265,9 +10040,7 @@ def test_apply_deployment_history_forces_the_kill_switch_on_an_uncertain_notiona
             },
             "buy_candidates": [candidate],
         }
-        with open(
-            os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8"
-        ) as handle:
+        with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
             json.dump(state, handle, indent=2)
 
     history_root = os.path.join(str(tmp_path), "runs")
@@ -10346,17 +10119,13 @@ def test_apply_deployment_history_ignores_unusable_notionals_outside_the_window(
                 "ticker": "AAPL",
                 "status": "submitted",
                 "planned_amount_usd": 10.0,
-                "whole_share_claim_breakdown": [
-                    {"trading_day": in_window_day.isoformat(), "amount_usd": 10.0}
-                ],
+                "whole_share_claim_breakdown": [{"trading_day": in_window_day.isoformat(), "amount_usd": 10.0}],
             },
             {
                 "ticker": "BYDDY",
                 "status": "submitted",
                 "planned_amount_usd": 999.0,
-                "whole_share_claim_breakdown": [
-                    {"trading_day": stale_artifact_day.isoformat(), "amount_usd": "NaN"}
-                ],
+                "whole_share_claim_breakdown": [{"trading_day": stale_artifact_day.isoformat(), "amount_usd": "NaN"}],
             },
         ],
     }
@@ -10409,9 +10178,7 @@ def test_apply_deployment_history_keeps_future_uncertain_evidence_during_a_repla
                 "ticker": "AAPL",
                 "status": "submitted",
                 "planned_amount_usd": "NaN",
-                "whole_share_claim_breakdown": [
-                    {"trading_day": replay_day.isoformat(), "amount_usd": 10.0}
-                ],
+                "whole_share_claim_breakdown": [{"trading_day": replay_day.isoformat(), "amount_usd": 10.0}],
             }
         ],
     }
@@ -10456,17 +10223,13 @@ def test_apply_deployment_history_ignores_explicit_future_only_uncertain_claims_
                 "ticker": "AAPL",
                 "status": "submitted",
                 "planned_amount_usd": 10.0,
-                "whole_share_claim_breakdown": [
-                    {"trading_day": replay_day.isoformat(), "amount_usd": 10.0}
-                ],
+                "whole_share_claim_breakdown": [{"trading_day": replay_day.isoformat(), "amount_usd": 10.0}],
             },
             {
                 "ticker": "MSFT",
                 "status": "submitted",
                 "planned_amount_usd": 10.0,
-                "whole_share_claim_breakdown": [
-                    {"trading_day": later_day.isoformat(), "amount_usd": "NaN"}
-                ],
+                "whole_share_claim_breakdown": [{"trading_day": later_day.isoformat(), "amount_usd": "NaN"}],
             },
         ],
     }
@@ -10513,9 +10276,7 @@ def test_apply_deployment_history_rejects_future_artifact_day_without_matching_p
                 "ticker": "AAPL",
                 "status": "submitted",
                 "planned_amount_usd": 10.0,
-                "whole_share_claim_breakdown": [
-                    {"trading_day": forged_artifact_day.isoformat(), "amount_usd": "NaN"}
-                ],
+                "whole_share_claim_breakdown": [{"trading_day": forged_artifact_day.isoformat(), "amount_usd": "NaN"}],
             }
         ],
     }
@@ -10567,9 +10328,7 @@ def test_apply_deployment_history_keeps_undated_future_artifact_uncertainty(monk
                 "ticker": "MSFT",
                 "status": "submitted",
                 "planned_amount_usd": 1.0,
-                "whole_share_claim_breakdown": [
-                    {"trading_day": replay_day.isoformat(), "amount_usd": 1.0}
-                ],
+                "whole_share_claim_breakdown": [{"trading_day": replay_day.isoformat(), "amount_usd": 1.0}],
             },
             {
                 # This explicit unusable claim has the same deduplicated date
@@ -10578,9 +10337,7 @@ def test_apply_deployment_history_keeps_undated_future_artifact_uncertainty(monk
                 "ticker": "NVDA",
                 "status": "submitted",
                 "planned_amount_usd": 1.0,
-                "whole_share_claim_breakdown": [
-                    {"trading_day": later_day.isoformat(), "amount_usd": "NaN"}
-                ],
+                "whole_share_claim_breakdown": [{"trading_day": later_day.isoformat(), "amount_usd": "NaN"}],
             },
         ],
     }
@@ -10739,9 +10496,7 @@ def test_apply_deployment_history_ignores_a_future_only_overfilled_breakdown(mon
                 "planned_amount_usd": 5.0,
                 # Individually valid ($10), but sums past the row's own $5
                 # total -- corrupt, yet dated entirely after replay_day.
-                "whole_share_claim_breakdown": [
-                    {"trading_day": later_day.isoformat(), "amount_usd": 10.0}
-                ],
+                "whole_share_claim_breakdown": [{"trading_day": later_day.isoformat(), "amount_usd": 10.0}],
             }
         ],
     }
@@ -10805,13 +10560,9 @@ def test_apply_deployment_history_leaves_a_healthy_total_alone(tmp_path):
                 "triggered_at_utc": f"{day.isoformat()}T19:45:00Z",
                 "state_schema_version": "run-classification-v1",
             },
-            "buy_candidates": [
-                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": deployed_usd}
-            ],
+            "buy_candidates": [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": deployed_usd}],
         }
-        with open(
-            os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8"
-        ) as handle:
+        with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
             json.dump(state, handle, indent=2)
 
     history_root = os.path.join(str(tmp_path), "runs")
@@ -10838,10 +10589,7 @@ def test_same_day_ticker_deployment_already_recorded(tmp_path):
     trading_day = date(2026, 7, 21)
 
     # No artifact for trading_day anywhere on disk yet -> not recorded.
-    assert (
-        _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root)
-        is False
-    )
+    assert _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root) is False
 
     # A same-day artifact exists but records a DIFFERENT ticker (e.g. an
     # earlier invocation placed MSFT then crashed before a later invocation's
@@ -10852,15 +10600,9 @@ def test_same_day_ticker_deployment_already_recorded(tmp_path):
         trading_day,
         [{"ticker": "MSFT", "status": "submitted", "planned_amount_usd": 5.0}],
     )
-    assert (
-        _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root)
-        is False
-    )
+    assert _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root) is False
     # MSFT itself, however, is recorded.
-    assert (
-        _same_day_ticker_deployment_already_recorded("MSFT", trading_day, history_root)
-        is True
-    )
+    assert _same_day_ticker_deployment_already_recorded("MSFT", trading_day, history_root) is True
 
     # Now AAPL's own submitted order is on disk for today -> recorded.
     _write_scheduled_afternoon_artifact(
@@ -10868,10 +10610,7 @@ def test_same_day_ticker_deployment_already_recorded(tmp_path):
         trading_day,
         [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 5.0}],
     )
-    assert (
-        _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root)
-        is True
-    )
+    assert _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root) is True
 
 
 def test_same_day_ticker_deployment_already_recorded_recognizes_filled_status(tmp_path):
@@ -10891,10 +10630,7 @@ def test_same_day_ticker_deployment_already_recorded_recognizes_filled_status(tm
         trading_day,
         [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 5.0}],
     )
-    assert (
-        _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root)
-        is True
-    )
+    assert _same_day_ticker_deployment_already_recorded("AAPL", trading_day, history_root) is True
 
 
 def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
@@ -10914,13 +10650,9 @@ def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
         monthly_cash_allocation_usd=5.0,
     )
     state = StrategyState()
-    broker = DryRunBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
-    rh = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     run_daily_compact(
         now,
@@ -10932,9 +10664,7 @@ def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     submitted = [c for c in run_state["buy_candidates"] if c["status"] == "submitted"]
@@ -10966,9 +10696,7 @@ def test_manual_run_submissions_do_not_advance_in_batch_burn(tmp_path):
         monthly_cash_allocation_usd=5.0,
     )
     state = StrategyState()
-    broker = DryRunBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = DryRunBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
     rh = _FakeData(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
 
@@ -10982,9 +10710,7 @@ def test_manual_run_submissions_do_not_advance_in_batch_burn(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=False),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     assert by_ticker["AAA"]["planned_amount_usd"] == 3.0
@@ -11138,14 +10864,21 @@ def test_run_daily_compact_reconciles_fractional_evidence_on_a_blocked_date(tmp_
     gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
 
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": gated_now.date().isoformat(),
-            "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": gated_now.date().isoformat(),
+                "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            },
+            handle,
+        )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -11198,14 +10931,21 @@ def test_run_daily_compact_reconciles_fractional_evidence_on_a_blocked_date_for_
     gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
 
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": gated_now.date().isoformat(),
-            "run_classification": {"run_origin": "manual"},
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": gated_now.date().isoformat(),
+                "run_classification": {"run_origin": "manual"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            },
+            handle,
+        )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -11256,14 +10996,21 @@ def test_run_daily_compact_pins_the_account_before_gated_reconciliation(tmp_path
     gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
 
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": gated_now.date().isoformat(),
-            "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": gated_now.date().isoformat(),
+                "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            },
+            handle,
+        )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -11313,14 +11060,21 @@ def test_run_daily_compact_refreshes_blocked_run_companions_after_reconciliation
     gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
 
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": gated_now.date().isoformat(),
-            "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": gated_now.date().isoformat(),
+                "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            },
+            handle,
+        )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -11368,14 +11122,21 @@ def test_run_daily_compact_refreshes_buy_candidates_csv_after_gated_reconciliati
     gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
 
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": gated_now.date().isoformat(),
-            "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": gated_now.date().isoformat(),
+                "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            },
+            handle,
+        )
     # As the ORIGINAL failure path would have written it: the ticker
     # reported "failed", no order_id yet.
     with open(os.path.join(artifacts_dir, "buy_candidates.csv"), "w", encoding="utf-8", newline="") as handle:
@@ -11431,21 +11192,26 @@ def test_run_daily_compact_reinjects_a_reconciled_fractional_placement_on_retry(
 
     prior_ticker = "BYDDY"  # not in config.tickers, so this run's own scan never touches it.
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "broker_outcomes": {
-                f"{prior_ticker}#fractional-recovery:ref-1": {
-                    "status": "submitted",
-                    "order_id": "ORD-FRACTIONAL-RECOVERED",
-                    "submitted_amount_usd": 7.5,
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "broker_outcomes": {
+                    f"{prior_ticker}#fractional-recovery:ref-1": {
+                        "status": "submitted",
+                        "order_id": "ORD-FRACTIONAL-RECOVERED",
+                        "submitted_amount_usd": 7.5,
+                        "reconciled_fractional_placement": True,
+                        "ticker": prior_ticker,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     result = run_daily_compact(
         now,
@@ -11485,21 +11251,26 @@ def test_run_daily_compact_reinjection_survives_a_non_scalar_recovered_order_id(
 
     prior_ticker = "BYDDY"  # not in config.tickers, so this run's own scan never touches it.
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "broker_outcomes": {
-                f"{prior_ticker}#fractional-recovery:ref-1": {
-                    "status": "submitted",
-                    "order_id": ["BAD"],
-                    "submitted_amount_usd": 7.5,
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "broker_outcomes": {
+                    f"{prior_ticker}#fractional-recovery:ref-1": {
+                        "status": "submitted",
+                        "order_id": ["BAD"],
+                        "submitted_amount_usd": 7.5,
+                        "reconciled_fractional_placement": True,
+                        "ticker": prior_ticker,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     result = run_daily_compact(
         now,
@@ -11532,21 +11303,26 @@ def test_run_daily_compact_reinjection_sanitizes_a_boolean_recovered_order_id(tm
 
     prior_ticker = "BYDDY"  # not in config.tickers, so this run's own scan never touches it.
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "broker_outcomes": {
-                f"{prior_ticker}#fractional-recovery:ref-1": {
-                    "status": "submitted",
-                    "order_id": True,
-                    "submitted_amount_usd": 7.5,
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "broker_outcomes": {
+                    f"{prior_ticker}#fractional-recovery:ref-1": {
+                        "status": "submitted",
+                        "order_id": True,
+                        "submitted_amount_usd": 7.5,
+                        "reconciled_fractional_placement": True,
+                        "ticker": prior_ticker,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     result = run_daily_compact(
         now,
@@ -11565,7 +11341,6 @@ def test_run_daily_compact_reinjection_sanitizes_a_boolean_recovered_order_id(tm
     reinjected = [row for row in run_state["buy_candidates"] if row.get("ticker") == prior_ticker]
     assert len(reinjected) == 1, "the prior reconciled fractional placement must survive the retry"
     assert reinjected[0]["order_id"] is None
-
 
 
 def test_grouped_submission_rows_merges_every_transitively_overlapping_group():
@@ -11636,7 +11411,9 @@ def test_grouped_submission_rows_counts_the_union_of_overlapping_aggregates():
             "status": "submitted",
         },
     ]
-    result2 = near_close_dca._grouped_submission_rows_by_represented_order(rows_with_adjustment, ticker_prefix="ticker:")
+    result2 = near_close_dca._grouped_submission_rows_by_represented_order(
+        rows_with_adjustment, ticker_prefix="ticker:"
+    )
     assert len(result2) == 1
     assert near_close_dca._submitted_orders_in_row(result2[0]) == 2
 
@@ -11680,27 +11457,34 @@ def test_run_daily_compact_reinjection_preserves_aggregate_submission_counts(tmp
     # No real candidates of this run's own, so every submitted-order count
     # in the final artifact derives solely from the reinjected row below.
     config = StrategyConfig(
-        dry_run=True, tickers=(), approved_test_dates=config.approved_test_dates,
+        dry_run=True,
+        tickers=(),
+        approved_test_dates=config.approved_test_dates,
     )
 
     prior_ticker = "BYDDY"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "broker_outcomes": {
-                f"{prior_ticker}#fractional-recovery:ref-1": {
-                    "status": "submitted",
-                    "order_id": "ORD-WHOLE-SHARE-AGGREGATE",
-                    "submitted_amount_usd": 22.5,
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
-                    "merged_submission_count": 3,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "broker_outcomes": {
+                    f"{prior_ticker}#fractional-recovery:ref-1": {
+                        "status": "submitted",
+                        "order_id": "ORD-WHOLE-SHARE-AGGREGATE",
+                        "submitted_amount_usd": 22.5,
+                        "reconciled_fractional_placement": True,
+                        "ticker": prior_ticker,
+                        "merged_submission_count": 3,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     result = run_daily_compact(
         now,
@@ -11737,26 +11521,33 @@ def test_run_daily_compact_reinjection_counts_a_filled_outcome_in_orders_placed(
     os.makedirs(artifacts_dir)
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     config = StrategyConfig(
-        dry_run=True, tickers=(), approved_test_dates=config.approved_test_dates,
+        dry_run=True,
+        tickers=(),
+        approved_test_dates=config.approved_test_dates,
     )
 
     prior_ticker = "BYDDY"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "broker_outcomes": {
-                f"{prior_ticker}#fractional-recovery:ref-1": {
-                    "status": "filled",
-                    "order_id": "ORD-FILLED-RECOVERY",
-                    "submitted_amount_usd": 12.5,
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "broker_outcomes": {
+                    f"{prior_ticker}#fractional-recovery:ref-1": {
+                        "status": "filled",
+                        "order_id": "ORD-FILLED-RECOVERY",
+                        "submitted_amount_usd": 12.5,
+                        "reconciled_fractional_placement": True,
+                        "ticker": prior_ticker,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     result = run_daily_compact(
         now,
@@ -11778,9 +11569,7 @@ def test_run_daily_compact_reinjection_counts_a_filled_outcome_in_orders_placed(
         assert usage_proxy["orders_placed_count"] == 1
 
 
-def test_run_daily_compact_reinjection_dedups_against_every_represented_fresh_id(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_reinjection_dedups_against_every_represented_fresh_id(tmp_path, monkeypatch):
     """Codex review, PR #1169: "Seed deduplication from every represented
     order ID". A fresh candidate can represent MULTIPLE physical orders
     via `whole_share_order_ids` (A and B) while exposing only ONE of them
@@ -11792,26 +11581,33 @@ def test_run_daily_compact_reinjection_dedups_against_every_represented_fresh_id
     os.makedirs(artifacts_dir)
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     config = StrategyConfig(
-        dry_run=True, tickers=(), approved_test_dates=config.approved_test_dates,
+        dry_run=True,
+        tickers=(),
+        approved_test_dates=config.approved_test_dates,
     )
 
     prior_ticker = "BYDDY"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "broker_outcomes": {
-                f"{prior_ticker}#fractional-recovery:ref-1": {
-                    "status": "submitted",
-                    "order_id": "A",
-                    "submitted_amount_usd": 12.5,
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "broker_outcomes": {
+                    f"{prior_ticker}#fractional-recovery:ref-1": {
+                        "status": "submitted",
+                        "order_id": "A",
+                        "submitted_amount_usd": 12.5,
+                        "reconciled_fractional_placement": True,
+                        "ticker": prior_ticker,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     import sys
 
@@ -11820,10 +11616,7 @@ def test_run_daily_compact_reinjection_dedups_against_every_represented_fresh_id
     real_lock = near_close_dca.cross_process_lock
 
     def claim_with_fresh_aggregate(path, *args, **kwargs):
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
                 fresh_state = json.load(handle)
             fresh_state["buy_candidates"] = [
@@ -11857,18 +11650,14 @@ def test_run_daily_compact_reinjection_dedups_against_every_represented_fresh_id
     with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
-    prior_ticker_rows = [
-        row for row in run_state.get("buy_candidates") or [] if row.get("ticker") == prior_ticker
-    ]
+    prior_ticker_rows = [row for row in run_state.get("buy_candidates") or [] if row.get("ticker") == prior_ticker]
     assert len(prior_ticker_rows) == 1, (
         "the prior recovery for 'A' must not be reinjected as a duplicate of the "
         "fresh aggregate that already represents it"
     )
 
 
-def test_run_daily_compact_reinjection_applies_overlap_grouping_before_summing(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_reinjection_applies_overlap_grouping_before_summing(tmp_path, monkeypatch):
     """Codex review, PR #1169: "Apply overlap grouping before summing
     submission counts". Two fresh aggregates representing {A, B} and
     {B, C} (each merged_submission_count=2) overlap on "B" -- summing
@@ -11883,26 +11672,33 @@ def test_run_daily_compact_reinjection_applies_overlap_grouping_before_summing(
     os.makedirs(artifacts_dir)
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     config = StrategyConfig(
-        dry_run=True, tickers=(), approved_test_dates=config.approved_test_dates,
+        dry_run=True,
+        tickers=(),
+        approved_test_dates=config.approved_test_dates,
     )
 
     solo_ticker = "SOLOTICKER"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "broker_outcomes": {
-                f"{solo_ticker}#fractional-recovery:ref-1": {
-                    "status": "submitted",
-                    "order_id": "Z",
-                    "submitted_amount_usd": 9.0,
-                    "reconciled_fractional_placement": True,
-                    "ticker": solo_ticker,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "broker_outcomes": {
+                    f"{solo_ticker}#fractional-recovery:ref-1": {
+                        "status": "submitted",
+                        "order_id": "Z",
+                        "submitted_amount_usd": 9.0,
+                        "reconciled_fractional_placement": True,
+                        "ticker": solo_ticker,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     import sys
 
@@ -11911,10 +11707,7 @@ def test_run_daily_compact_reinjection_applies_overlap_grouping_before_summing(
     real_lock = near_close_dca.cross_process_lock
 
     def claim_with_overlapping_fresh_aggregates(path, *args, **kwargs):
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
                 fresh_state = json.load(handle)
             fresh_state["buy_candidates"] = [
@@ -11971,9 +11764,7 @@ def test_run_daily_compact_reinjection_applies_overlap_grouping_before_summing(
         assert usage_proxy["orders_placed_count"] == 4
 
 
-def test_run_daily_compact_reinjection_resolves_peer_not_submitted_candidate(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_reinjection_resolves_peer_not_submitted_candidate(tmp_path, monkeypatch):
     """Codex review ("Resolve the peer candidate when folding its successful
     retry"): the surviving CONCURRENT PEER's state can already carry a
     "not_submitted" buy_candidates row for the SAME ticker as an order THIS
@@ -12001,10 +11792,7 @@ def test_run_daily_compact_reinjection_resolves_peer_not_submitted_candidate(
     real_lock = near_close_dca.cross_process_lock
 
     def claim_with_not_submitted_peer_row(path, *args, **kwargs):
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
                 fresh_state = json.load(handle)
             # A concurrent peer claimed the directory and wrote its OWN
@@ -12047,9 +11835,7 @@ def test_run_daily_compact_reinjection_resolves_peer_not_submitted_candidate(
     assert rows[0]["status"] == "submitted"
 
 
-def test_run_daily_compact_reinjection_retries_past_transient_lock_contention(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_reinjection_retries_past_transient_lock_contention(tmp_path, monkeypatch):
     """Codex review ("Do not drop recovered orders on reinjection lock
     timeouts"): a single TimeoutError used to silently drop this
     reinjection for good -- run_once() had already replaced run_state.json
@@ -12063,21 +11849,26 @@ def test_run_daily_compact_reinjection_retries_past_transient_lock_contention(
 
     prior_ticker = "BYDDY"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "broker_outcomes": {
-                f"{prior_ticker}#fractional-recovery:ref-1": {
-                    "status": "submitted",
-                    "order_id": "ORD-FRACTIONAL-RECOVERED",
-                    "submitted_amount_usd": 7.5,
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "broker_outcomes": {
+                    f"{prior_ticker}#fractional-recovery:ref-1": {
+                        "status": "submitted",
+                        "order_id": "ORD-FRACTIONAL-RECOVERED",
+                        "submitted_amount_usd": 7.5,
+                        "reconciled_fractional_placement": True,
+                        "ticker": prior_ticker,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     import sys
 
@@ -12093,10 +11884,7 @@ def test_run_daily_compact_reinjection_retries_past_transient_lock_contention(
         # this same run_state.json.lock during a normal run) -- an earlier
         # unscoped mock perturbed those unrelated locked sections too and
         # made the whole run fail a different way.
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             _attempts["count"] += 1
             if _attempts["count"] < 3:
                 raise TimeoutError("simulated transient contention")
@@ -12124,9 +11912,7 @@ def test_run_daily_compact_reinjection_retries_past_transient_lock_contention(
     assert _attempts["count"] == 3
 
 
-def test_run_daily_compact_reinjection_skips_a_directory_claimed_by_another_run(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_reinjection_skips_a_directory_claimed_by_another_run(tmp_path, monkeypatch):
     """Codex review ("Recheck run identity before reinjecting recoveries"):
     _orders_csv_same_run only proves identity against _prior_state_payload,
     read BEFORE run_once() ran. If an entirely different overlapping
@@ -12140,21 +11926,26 @@ def test_run_daily_compact_reinjection_skips_a_directory_claimed_by_another_run(
 
     prior_ticker = "BYDDY"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "broker_outcomes": {
-                f"{prior_ticker}#fractional-recovery:ref-1": {
-                    "status": "submitted",
-                    "order_id": "ORD-FRACTIONAL-RECOVERED",
-                    "submitted_amount_usd": 7.5,
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "broker_outcomes": {
+                    f"{prior_ticker}#fractional-recovery:ref-1": {
+                        "status": "submitted",
+                        "order_id": "ORD-FRACTIONAL-RECOVERED",
+                        "submitted_amount_usd": 7.5,
+                        "reconciled_fractional_placement": True,
+                        "ticker": prior_ticker,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     import sys
 
@@ -12171,7 +11962,9 @@ def test_run_daily_compact_reinjection_skips_a_directory_claimed_by_another_run(
     unrelated_run_state = {
         "trading_day": now.date().isoformat(),
         "run_classification": {
-            "stream": "midday", "scheduled_for_et": "12:30", "run_origin": "scheduled",
+            "stream": "midday",
+            "scheduled_for_et": "12:30",
+            "run_origin": "scheduled",
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "o-midday", "status": "submitted"},
@@ -12180,10 +11973,7 @@ def test_run_daily_compact_reinjection_skips_a_directory_claimed_by_another_run(
     }
 
     def claim_the_directory_then_lock(path, *args, **kwargs):
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
                 json.dump(unrelated_run_state, handle)
         return real_lock(path, *args, **kwargs)
@@ -12223,9 +12013,7 @@ def test_run_daily_compact_reinjection_skips_a_directory_claimed_by_another_run(
     # The BYDDY recovery this invocation could no longer reinject anywhere
     # is not silently dropped -- it survives in the same durable sidecar the
     # lock-exhaustion path already uses.
-    sidecars = [
-        p for p in pathlib.Path(artifacts_dir).glob("unreinjected_recovered_placement.*.json")
-    ]
+    sidecars = [p for p in pathlib.Path(artifacts_dir).glob("unreinjected_recovered_placement.*.json")]
     assert len(sidecars) == 1
     sidecar_entry = json.loads(sidecars[0].read_bytes())
     assert (
@@ -12235,9 +12023,7 @@ def test_run_daily_compact_reinjection_skips_a_directory_claimed_by_another_run(
     assert "account_fingerprint" in sidecar_entry
 
 
-def test_run_daily_compact_rechecks_ownership_even_with_nothing_to_reinject(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_rechecks_ownership_even_with_nothing_to_reinject(tmp_path, monkeypatch):
     """Codex review ("Recheck directory ownership even when no recovery
     exists"): _directory_claimed_by_foreign_run used to only get a chance to
     become True INSIDE the `if _prior_recovered_outcomes:` branch. When the
@@ -12253,13 +12039,18 @@ def test_run_daily_compact_rechecks_ownership_even_with_nothing_to_reinject(
     # Same-slot prior state, but with NO recovery rows to reinject -- the
     # exact condition under which the old code never rechecked ownership.
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "broker_outcomes": {},
             },
-            "broker_outcomes": {},
-        }, handle)
+            handle,
+        )
 
     import sys
 
@@ -12270,7 +12061,9 @@ def test_run_daily_compact_rechecks_ownership_even_with_nothing_to_reinject(
     unrelated_run_state = {
         "trading_day": now.date().isoformat(),
         "run_classification": {
-            "stream": "midday", "scheduled_for_et": "12:30", "run_origin": "scheduled",
+            "stream": "midday",
+            "scheduled_for_et": "12:30",
+            "run_origin": "scheduled",
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "o-midday", "status": "submitted"},
@@ -12279,10 +12072,7 @@ def test_run_daily_compact_rechecks_ownership_even_with_nothing_to_reinject(
     }
 
     def claim_the_directory_then_lock(path, *args, **kwargs):
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
                 json.dump(unrelated_run_state, handle)
         return real_lock(path, *args, **kwargs)
@@ -12311,9 +12101,7 @@ def test_run_daily_compact_rechecks_ownership_even_with_nothing_to_reinject(
     assert not os.path.exists(os.path.join(artifacts_dir, "orders.csv"))
 
 
-def test_run_daily_compact_rechecks_ownership_with_no_prior_state_at_all(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_rechecks_ownership_with_no_prior_state_at_all(tmp_path, monkeypatch):
     """Codex review ("Require verified ownership before merging
     executions"): the ownership recheck used to only run inside
     `if _orders_csv_same_run and _prior_state_payload is not None:` -- a
@@ -12341,7 +12129,9 @@ def test_run_daily_compact_rechecks_ownership_with_no_prior_state_at_all(
     unrelated_run_state = {
         "trading_day": now.date().isoformat(),
         "run_classification": {
-            "stream": "midday", "scheduled_for_et": "12:30", "run_origin": "scheduled",
+            "stream": "midday",
+            "scheduled_for_et": "12:30",
+            "run_origin": "scheduled",
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "o-midday", "status": "submitted"},
@@ -12350,10 +12140,7 @@ def test_run_daily_compact_rechecks_ownership_with_no_prior_state_at_all(
     }
 
     def claim_the_directory_then_lock(path, *args, **kwargs):
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
                 json.dump(unrelated_run_state, handle)
         return real_lock(path, *args, **kwargs)
@@ -12377,9 +12164,7 @@ def test_run_daily_compact_rechecks_ownership_with_no_prior_state_at_all(
     assert not os.path.exists(os.path.join(artifacts_dir, "orders.csv"))
 
 
-def test_run_daily_compact_fails_closed_when_ownership_cannot_be_verified(
-    tmp_path, monkeypatch, caplog
-):
+def test_run_daily_compact_fails_closed_when_ownership_cannot_be_verified(tmp_path, monkeypatch, caplog):
     """Codex review ("Require verified ownership before merging
     executions"): when there is nothing queued to reinject, a lock/read
     failure during the ownership recheck used to just log a WARNING and fall
@@ -12393,13 +12178,18 @@ def test_run_daily_compact_fails_closed_when_ownership_cannot_be_verified(
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
 
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "broker_outcomes": {},
             },
-            "broker_outcomes": {},
-        }, handle)
+            handle,
+        )
 
     import sys
 
@@ -12408,10 +12198,7 @@ def test_run_daily_compact_fails_closed_when_ownership_cannot_be_verified(
     real_lock = near_close_dca.cross_process_lock
 
     def always_times_out(path, *args, **kwargs):
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             raise TimeoutError("simulated stuck holder")
         return real_lock(path, *args, **kwargs)
 
@@ -12436,9 +12223,7 @@ def test_run_daily_compact_fails_closed_when_ownership_cannot_be_verified(
     assert not os.path.exists(os.path.join(artifacts_dir, "orders.csv"))
 
 
-def test_run_daily_compact_prior_state_account_mismatch_is_not_reinjected(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_prior_state_account_mismatch_is_not_reinjected(tmp_path, monkeypatch):
     """Codex review ("Include the broker account in directory ownership"):
     a prior run_state.json sharing this invocation's exact trading_day/
     stream/scheduled_for_et/run_origin is not necessarily THIS account's own
@@ -12456,29 +12241,35 @@ def test_run_daily_compact_prior_state_account_mismatch_is_not_reinjected(
     # own (nonexistent) account_number(): the prior state was recorded
     # under a different account than this invocation's own.
     monkeypatch.setattr(
-        near_close_dca, "_broker_account_fingerprint",
+        near_close_dca,
+        "_broker_account_fingerprint",
         lambda _broker, _key_dir: "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
     )
 
     prior_ticker = "BYDDY"
     prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "account_number": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
-            "broker_outcomes": {
-                prior_key: {
-                    "status": "submitted",
-                    "order_id": "ORD-OTHER-ACCOUNT",
-                    "submitted_amount_usd": 7.5,
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "account_number": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+                "broker_outcomes": {
+                    prior_key: {
+                        "status": "submitted",
+                        "order_id": "ORD-OTHER-ACCOUNT",
+                        "submitted_amount_usd": 7.5,
+                        "reconciled_fractional_placement": True,
+                        "ticker": prior_ticker,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     result = run_daily_compact(
         now,
@@ -12496,9 +12287,7 @@ def test_run_daily_compact_prior_state_account_mismatch_is_not_reinjected(
     # The other account's recovered order must never appear in this
     # account's fresh state.
     assert prior_key not in (run_state.get("broker_outcomes") or {})
-    assert not any(
-        row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or []
-    )
+    assert not any(row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or [])
 
     # Codex review ("Preserve prior-account evidence before publishing the
     # new run"): the other account's recovery must not simply vanish the
@@ -12510,7 +12299,8 @@ def test_run_daily_compact_prior_state_account_mismatch_is_not_reinjected(
     with open(sidecar_path, encoding="utf-8") as handle:
         sidecar_content = json.load(handle)
     matching_entries = [
-        entry for entry in sidecar_content.get("entries", [])
+        entry
+        for entry in sidecar_content.get("entries", [])
         if entry.get("broker_outcomes", {}).get(prior_key, {}).get("order_id") == "ORD-OTHER-ACCOUNT"
     ]
     assert len(matching_entries) == 1
@@ -12518,9 +12308,7 @@ def test_run_daily_compact_prior_state_account_mismatch_is_not_reinjected(
     assert matching_entries[0]["conflicting_artifact_account_number"] == "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
 
 
-def test_run_daily_compact_preserves_an_ordinary_prior_account_placement(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_preserves_an_ordinary_prior_account_placement(tmp_path, monkeypatch):
     """Codex review ("Preserve ordinary prior-account placements before
     overwrite"): the sibling test above covers a RECOVERY row (marked
     reconciled_fractional_placement, living in broker_outcomes) recorded
@@ -12539,32 +12327,38 @@ def test_run_daily_compact_preserves_an_ordinary_prior_account_placement(
     import near_close_dca
 
     monkeypatch.setattr(
-        near_close_dca, "_broker_account_fingerprint",
+        near_close_dca,
+        "_broker_account_fingerprint",
         lambda _broker, _key_dir: "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
     )
 
     prior_ticker = "BYDDY"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "dry_run": False,
-            "account_number": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
-            # An ORDINARY submitted order -- no recovery marker, no
-            # broker_outcomes entry at all -- exactly the shape a normal
-            # run_once() success leaves behind.
-            "buy_candidates": [
-                {
-                    "ticker": prior_ticker,
-                    "status": "submitted",
-                    "order_id": "ORD-OTHER-ACCOUNT-ORDINARY",
-                    "planned_amount_usd": 6.0,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
                 },
-            ],
-            "broker_outcomes": {},
-        }, handle)
+                "dry_run": False,
+                "account_number": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+                # An ORDINARY submitted order -- no recovery marker, no
+                # broker_outcomes entry at all -- exactly the shape a normal
+                # run_once() success leaves behind.
+                "buy_candidates": [
+                    {
+                        "ticker": prior_ticker,
+                        "status": "submitted",
+                        "order_id": "ORD-OTHER-ACCOUNT-ORDINARY",
+                        "planned_amount_usd": 6.0,
+                    },
+                ],
+                "broker_outcomes": {},
+            },
+            handle,
+        )
 
     result = run_daily_compact(
         now,
@@ -12581,9 +12375,7 @@ def test_run_daily_compact_preserves_an_ordinary_prior_account_placement(
         run_state = json.load(handle)
     # The other account's ordinary order must never appear in this
     # account's fresh state.
-    assert not any(
-        row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or []
-    )
+    assert not any(row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or [])
 
     # It must survive in the cross-account sidecar instead of vanishing
     # with no trace.
@@ -12604,9 +12396,7 @@ def test_run_daily_compact_preserves_an_ordinary_prior_account_placement(
     assert matching_entries[0]["conflicting_artifact_account_number"] == "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
 
 
-def test_run_daily_compact_preserves_a_pending_prior_account_placement(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_preserves_a_pending_prior_account_placement(tmp_path, monkeypatch):
     """Codex review ("Preserve pending placements before replacing foreign
     state"): the sibling test above covers a "submitted" ordinary order.
     dca_risk.DEPLOYED_CANDIDATE_STATUSES treats "pending" and "unconfirmed"
@@ -12624,31 +12414,37 @@ def test_run_daily_compact_preserves_a_pending_prior_account_placement(
     import near_close_dca
 
     monkeypatch.setattr(
-        near_close_dca, "_broker_account_fingerprint",
+        near_close_dca,
+        "_broker_account_fingerprint",
         lambda _broker, _key_dir: "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
     )
 
     prior_ticker = "BYDDY"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "dry_run": False,
-            "account_number": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
-            # A still-outstanding PENDING order -- broker acknowledgment
-            # in flight, not yet confirmed submitted or filled.
-            "buy_candidates": [
-                {
-                    "ticker": prior_ticker,
-                    "status": "pending",
-                    "order_id": "ORD-OTHER-ACCOUNT-PENDING",
-                    "planned_amount_usd": 6.0,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
                 },
-            ],
-            "broker_outcomes": {},
-        }, handle)
+                "dry_run": False,
+                "account_number": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+                # A still-outstanding PENDING order -- broker acknowledgment
+                # in flight, not yet confirmed submitted or filled.
+                "buy_candidates": [
+                    {
+                        "ticker": prior_ticker,
+                        "status": "pending",
+                        "order_id": "ORD-OTHER-ACCOUNT-PENDING",
+                        "planned_amount_usd": 6.0,
+                    },
+                ],
+                "broker_outcomes": {},
+            },
+            handle,
+        )
 
     result = run_daily_compact(
         now,
@@ -12663,9 +12459,7 @@ def test_run_daily_compact_preserves_a_pending_prior_account_placement(
 
     with open(cast(Any, result["run_state_path"]), encoding="utf-8") as handle:
         run_state = json.load(handle)
-    assert not any(
-        row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or []
-    )
+    assert not any(row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or [])
 
     sidecar_path = os.path.join(artifacts_dir, "cross_account_unresolved_placements.json")
     assert os.path.exists(sidecar_path)
@@ -12684,9 +12478,7 @@ def test_run_daily_compact_preserves_a_pending_prior_account_placement(
     assert matching_entries[0]["conflicting_artifact_account_number"] == "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
 
 
-def test_run_daily_compact_detects_peer_that_publishes_before_first_write(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_detects_peer_that_publishes_before_first_write(tmp_path, monkeypatch):
     """Codex review ("Detect peers that publish before this invocation's
     state"): when two overlapping FIRST invocations of the identical
     trading_day/stream/slot race, retry B can finish publishing its own
@@ -12715,7 +12507,9 @@ def test_run_daily_compact_detects_peer_that_publishes_before_first_write(
         "run_id": "peer-b-2026-06-29-152000",
         "trading_day": now.date().isoformat(),
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "ORD-PEER-B", "status": "submitted"},
@@ -12739,9 +12533,7 @@ def test_run_daily_compact_detects_peer_that_publishes_before_first_write(
                 json.dump(peer_state, handle)
         return real_lock(path, *args, **kwargs)
 
-    monkeypatch.setattr(
-        near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write
-    )
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write)
 
     result = run_daily_compact(
         now,
@@ -12771,9 +12563,7 @@ def test_run_daily_compact_detects_peer_that_publishes_before_first_write(
     assert "ORD-PEER-B" in on_disk_orders_csv
 
 
-def test_write_run_artifacts_does_not_replace_companion_csvs_on_displacement(
-    tmp_path, monkeypatch
-):
+def test_write_run_artifacts_does_not_replace_companion_csvs_on_displacement(tmp_path, monkeypatch):
     """Codex review ("Check first-write ownership before replacing companion
     CSVs"): write_run_artifacts() used to write signals.csv/buy_candidates.csv
     UNCONDITIONALLY, before ever acquiring run_state.json.lock and checking
@@ -12866,9 +12656,7 @@ class _NonDryRunOrderIdBroker(DryRunBroker):
         return order_id
 
 
-def test_run_daily_compact_archives_displaced_first_write_executions(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_archives_displaced_first_write_executions(tmp_path, monkeypatch):
     """Codex review ("Merge displaced first-run executions into canonical
     state"): when THIS invocation places real orders and then discovers a
     peer already published its own first write for the identical identity
@@ -12896,7 +12684,9 @@ def test_run_daily_compact_archives_displaced_first_write_executions(
         "run_id": "peer-b-2026-06-29-152000",
         "trading_day": now.date().isoformat(),
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "ORD-PEER-B", "status": "submitted"},
@@ -12917,9 +12707,7 @@ def test_run_daily_compact_archives_displaced_first_write_executions(
                 json.dump(peer_state, handle)
         return real_lock(path, *args, **kwargs)
 
-    monkeypatch.setattr(
-        near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write
-    )
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write)
 
     result = run_daily_compact(
         now,
@@ -12939,9 +12727,7 @@ def test_run_daily_compact_archives_displaced_first_write_executions(
     from dca_risk import find_run_state_files
 
     archived_states = list(
-        (pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions").rglob(
-            "run_state*.json"
-        )
+        (pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions").rglob("run_state*.json")
     )
     assert len(archived_states) == 1
     archived_state = json.loads(archived_states[0].read_bytes())
@@ -12951,9 +12737,7 @@ def test_run_daily_compact_archives_displaced_first_write_executions(
     # invocation's own placements (never the peer's MSFT/ORD-PEER-B row)
     # must have been archived.
     assert archived_tickers
-    assert "ORD-PEER-B" not in {
-        row.get("order_id") for row in archived_state.get("buy_candidates") or []
-    }
+    assert "ORD-PEER-B" not in {row.get("order_id") for row in archived_state.get("buy_candidates") or []}
 
     discovered = find_run_state_files(tmp_path)
     assert archived_states[0] in discovered
@@ -12975,9 +12759,7 @@ def test_run_daily_compact_archives_displaced_first_write_executions(
     assert sum(by_day.values()) > 0.0
 
 
-def test_run_daily_compact_deduplicates_displaced_orders_already_in_winner(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_deduplicates_displaced_orders_already_in_winner(tmp_path, monkeypatch):
     """Codex review ("Deduplicate displaced orders already present in the
     winner"): the opposite direction from
     test_run_daily_compact_archives_displaced_first_write_executions above
@@ -13008,11 +12790,14 @@ def test_run_daily_compact_deduplicates_displaced_orders_already_in_winner(
     # matching the main run's broker below so the "same deterministic
     # order_id" premise this test relies on still holds under the DRY-RUN-
     # exclusion Finding 3 added.
-    probe_broker = _NonDryRunOrderIdBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in probe_config.tickers}
-    )
+    probe_broker = _NonDryRunOrderIdBroker(cash=500.0, reference_prices={t: 98.0 for t in probe_config.tickers})
     run_daily_compact(
-        probe_now, probe_config, probe_state, probe_fin, probe_rh, probe_broker,
+        probe_now,
+        probe_config,
+        probe_state,
+        probe_fin,
+        probe_rh,
+        probe_broker,
         options=CompactRunOptions(artifacts_dir=probe_dir),
     )
     probe_state_payload = json.loads((pathlib.Path(probe_dir) / "run_state.json").read_bytes())
@@ -13023,9 +12808,7 @@ def test_run_daily_compact_deduplicates_displaced_orders_already_in_winner(
     # any row that reached the broker at all (has an order_id) identifies
     # the exact order_id this second, independent invocation will also
     # produce for that ticker.
-    probe_submitted = [
-        row for row in probe_state_payload.get("buy_candidates") or [] if row.get("order_id")
-    ]
+    probe_submitted = [row for row in probe_state_payload.get("buy_candidates") or [] if row.get("order_id")]
     assert probe_submitted, "expected at least one real submission from _compact_setup"
     _shared_ticker = probe_submitted[0]["ticker"]
     _shared_order_id = probe_submitted[0]["order_id"]
@@ -13041,7 +12824,9 @@ def test_run_daily_compact_deduplicates_displaced_orders_already_in_winner(
         "run_id": "peer-b-2026-06-29-152000",
         "trading_day": now.date().isoformat(),
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "buy_candidates": [
             {
@@ -13054,9 +12839,7 @@ def test_run_daily_compact_deduplicates_displaced_orders_already_in_winner(
         "broker_outcomes": {},
     }
     with open(os.path.join(artifacts_dir, "orders.csv"), "w", encoding="utf-8", newline="") as handle:
-        handle.write(
-            f"ticker,order_id,filled_amount_usd,status\n{_shared_ticker},{_shared_order_id},5.0,filled\n"
-        )
+        handle.write(f"ticker,order_id,filled_amount_usd,status\n{_shared_ticker},{_shared_order_id},5.0,filled\n")
 
     real_lock = near_close_dca.cross_process_lock
 
@@ -13069,29 +12852,28 @@ def test_run_daily_compact_deduplicates_displaced_orders_already_in_winner(
                 json.dump(peer_state, handle)
         return real_lock(path, *args, **kwargs)
 
-    monkeypatch.setattr(
-        near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write
-    )
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write)
 
     result = run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert result.get("directory_ownership_verified") is False
 
     archived_states = list(
-        (pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions").rglob(
-            "run_state*.json"
-        )
+        (pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions").rglob("run_state*.json")
     )
     # Whether an archive was written at all (nothing left once the
     # already-covered order is filtered out) or one was written without it,
     # the shared order_id must never appear archived a second time.
     for archived_path in archived_states:
         archived_state = json.loads(archived_path.read_bytes())
-        archived_order_ids = {
-            row.get("order_id") for row in archived_state.get("buy_candidates") or []
-        }
+        archived_order_ids = {row.get("order_id") for row in archived_state.get("buy_candidates") or []}
         assert _shared_order_id not in archived_order_ids
 
     # If this invocation's own run also submitted OTHER tickers beyond the
@@ -13108,9 +12890,7 @@ def test_run_daily_compact_deduplicates_displaced_orders_already_in_winner(
         assert archived_order_ids_all & other_probe_order_ids
 
 
-def test_run_daily_compact_displaced_execution_archive_uses_invocation_time(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_displaced_execution_archive_uses_invocation_time(tmp_path, monkeypatch):
     """Codex review ("Use the invocation time for displaced archive
     evidence"): the displaced-first-write execution archive must derive its
     `generated_at`/classification `triggered_at_utc` from the invocation's
@@ -13147,15 +12927,15 @@ def test_run_daily_compact_displaced_execution_archive_uses_invocation_time(
     # archive logic under test ever runs.
     broker = _NonDryRunOrderIdBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
-    rh = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     peer_state = {
         "run_id": "peer-b-2019-03-04-152000",
         "trading_day": now.date().isoformat(),
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "ORD-PEER-B", "status": "submitted"},
@@ -13176,28 +12956,28 @@ def test_run_daily_compact_displaced_execution_archive_uses_invocation_time(
                 json.dump(peer_state, handle)
         return real_lock(path, *args, **kwargs)
 
-    monkeypatch.setattr(
-        near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write
-    )
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write)
 
     result = run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert result.get("directory_ownership_verified") is False
 
     archived_states = list(
-        (pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions").rglob(
-            "run_state*.json"
-        )
+        (pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions").rglob("run_state*.json")
     )
     assert len(archived_states) == 1
     archived_state = json.loads(archived_states[0].read_bytes())
 
     assert archived_state["generated_at"] == now.astimezone(EASTERN).isoformat()
-    assert (
-        archived_state["run_classification"]["triggered_at_utc"]
-        == now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert archived_state["run_classification"]["triggered_at_utc"] == now.astimezone(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
     )
 
     from dca_risk import is_afternoon_scheduled_evidence, run_timestamp_et
@@ -13206,9 +12986,7 @@ def test_run_daily_compact_displaced_execution_archive_uses_invocation_time(
     assert is_afternoon_scheduled_evidence(archived_state) is True
 
 
-def test_run_daily_compact_excludes_dry_run_orders_from_displaced_execution_archive(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_excludes_dry_run_orders_from_displaced_execution_archive(tmp_path, monkeypatch):
     """Codex review (finding: "Exclude dry-run executions from displaced
     evidence"): `_log_execution()` records simulated `DRY-RUN-*` orders as
     `submitted`/`filled` too, so the displaced-execution archive's own
@@ -13234,7 +13012,9 @@ def test_run_daily_compact_excludes_dry_run_orders_from_displaced_execution_arch
         "run_id": "peer-b-2026-06-29-152000",
         "trading_day": now.date().isoformat(),
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "ORD-PEER-B", "status": "submitted"},
@@ -13255,12 +13035,15 @@ def test_run_daily_compact_excludes_dry_run_orders_from_displaced_execution_arch
                 json.dump(peer_state, handle)
         return real_lock(path, *args, **kwargs)
 
-    monkeypatch.setattr(
-        near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write
-    )
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write)
 
     result = run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert result.get("directory_ownership_verified") is False
@@ -13268,21 +13051,15 @@ def test_run_daily_compact_excludes_dry_run_orders_from_displaced_execution_arch
     # This invocation's own executions were all simulated (DryRunBroker) --
     # none of them may be archived as scanned deployment evidence.
     archived_states = list(
-        (pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions").rglob(
-            "run_state*.json"
-        )
+        (pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions").rglob("run_state*.json")
     )
     for archived_path in archived_states:
         archived_state = json.loads(archived_path.read_bytes())
         for row in archived_state.get("buy_candidates") or []:
-            assert not (
-                isinstance(row.get("order_id"), str) and row["order_id"].startswith("DRY-RUN-")
-            )
+            assert not (isinstance(row.get("order_id"), str) and row["order_id"].startswith("DRY-RUN-"))
 
 
-def test_run_daily_compact_dedups_displaced_execution_archive_across_losing_invocations(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_dedups_displaced_execution_archive_across_losing_invocations(tmp_path, monkeypatch):
     """Codex review (finding: "Deduplicate displaced archives across losing
     invocations"): the existing dedup only compares this invocation's
     candidates against the WINNER's canonical `run_state.json`. With three
@@ -13319,15 +13096,15 @@ def test_run_daily_compact_dedups_displaced_execution_archive_across_losing_invo
     state = StrategyState()
     broker = _NonDryRunOrderIdBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
-    rh = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     peer_state = {
         "run_id": "peer-b-2019-03-04-152000",
         "trading_day": now.date().isoformat(),
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "ORD-PEER-B", "status": "submitted"},
@@ -13348,29 +13125,28 @@ def test_run_daily_compact_dedups_displaced_execution_archive_across_losing_invo
                 json.dump(peer_state, handle)
         return real_lock(path, *args, **kwargs)
 
-    monkeypatch.setattr(
-        near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write
-    )
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write)
 
     # First "losing" invocation: places its own real order(s), discovers the
     # peer already claimed the directory, and archives its displaced
     # execution evidence.
     result_1 = run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert result_1.get("directory_ownership_verified") is False
 
     archived_after_first = list(
-        (pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions").rglob(
-            "run_state*.json"
-        )
+        (pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions").rglob("run_state*.json")
     )
     assert len(archived_after_first) == 1
     first_archived_state = json.loads(archived_after_first[0].read_bytes())
-    first_order_ids = {
-        row.get("order_id") for row in first_archived_state.get("buy_candidates") or []
-    }
+    first_order_ids = {row.get("order_id") for row in first_archived_state.get("buy_candidates") or []}
     assert first_order_ids
 
     # Remove the peer's canonical state the first invocation left behind so
@@ -13389,15 +13165,18 @@ def test_run_daily_compact_dedups_displaced_execution_archive_across_losing_invo
     # invocation racing for the same identity.
     state_2 = StrategyState()
     result_2 = run_daily_compact(
-        now, config, state_2, fin, rh, broker,
+        now,
+        config,
+        state_2,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert result_2.get("directory_ownership_verified") is False
 
     archived_after_second = list(
-        (pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions").rglob(
-            "run_state*.json"
-        )
+        (pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions").rglob("run_state*.json")
     )
     # No second archive was created: the second invocation's own order(s)
     # matched the first invocation's already-archived sibling exactly, so
@@ -13411,9 +13190,7 @@ def test_run_daily_compact_dedups_displaced_execution_archive_across_losing_invo
     assert sum(by_day.values()) > 0.0
 
 
-def test_run_daily_compact_locks_sibling_scan_together_with_archive_publication(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_locks_sibling_scan_together_with_archive_publication(tmp_path, monkeypatch):
     """Codex review (finding: "Lock sibling scanning together with archive
     publication"): the sibling-dedup fix above only helps when the sibling
     archive is already on disk by the time this invocation's OWN unlocked
@@ -13451,15 +13228,15 @@ def test_run_daily_compact_locks_sibling_scan_together_with_archive_publication(
     state = StrategyState()
     broker = _NonDryRunOrderIdBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
-    rh = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     peer_state = {
         "run_id": "peer-b-2019-03-04-152000",
         "trading_day": now.date().isoformat(),
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "ORD-PEER-B", "status": "submitted"},
@@ -13480,15 +13257,18 @@ def test_run_daily_compact_locks_sibling_scan_together_with_archive_publication(
                 json.dump(peer_state, handle)
         return real_lock(path, *args, **kwargs)
 
-    monkeypatch.setattr(
-        near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write
-    )
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write)
 
     # Probe invocation: places its own real deterministic order(s), loses
     # the first-write race, and archives its displaced execution evidence.
     # Its content stands in for a peer's already-published sibling archive.
     probe_result = run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert probe_result.get("directory_ownership_verified") is False
@@ -13522,13 +13302,16 @@ def test_run_daily_compact_locks_sibling_scan_together_with_archive_publication(
             peer_sibling_path.write_text(peer_sibling_text, encoding="utf-8")
         return real_lock(path, *args, **kwargs)
 
-    monkeypatch.setattr(
-        near_close_dca, "cross_process_lock", claim_and_publish_sibling_at_lock_boundary
-    )
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_and_publish_sibling_at_lock_boundary)
 
     state_2 = StrategyState()
     result_2 = run_daily_compact(
-        now, config, state_2, fin, rh, broker,
+        now,
+        config,
+        state_2,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert result_2.get("directory_ownership_verified") is False
@@ -13541,9 +13324,7 @@ def test_run_daily_compact_locks_sibling_scan_together_with_archive_publication(
     assert json.loads(archived_after_second[0].read_bytes()) == peer_sibling_state
 
 
-def test_run_daily_compact_scopes_sibling_order_ids_to_the_brokerage_account(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_scopes_sibling_order_ids_to_the_brokerage_account(tmp_path, monkeypatch):
     """Codex review (finding: "Scope sibling order IDs to the brokerage
     account"): the sibling-dedup scan imported every archived `order_id`
     without comparing the sibling's persisted `account_number` fingerprint
@@ -13574,15 +13355,15 @@ def test_run_daily_compact_scopes_sibling_order_ids_to_the_brokerage_account(
     )
     broker = _NonDryRunOrderIdBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
-    rh = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     peer_state = {
         "run_id": "peer-b-2019-03-04-152000",
         "trading_day": now.date().isoformat(),
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "ORD-PEER-B", "status": "submitted"},
@@ -13603,9 +13384,7 @@ def test_run_daily_compact_scopes_sibling_order_ids_to_the_brokerage_account(
                 json.dump(peer_state, handle)
         return real_lock(path, *args, **kwargs)
 
-    monkeypatch.setattr(
-        near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write
-    )
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", claim_the_directory_right_before_first_write)
 
     # Learn this invocation's own deterministic order_id for AAPL by
     # running it once first (probe), then reset the directory and re-seed
@@ -13613,7 +13392,12 @@ def test_run_daily_compact_scopes_sibling_order_ids_to_the_brokerage_account(
     # real run below.
     probe_state = StrategyState()
     run_daily_compact(
-        now, config, probe_state, fin, rh, broker,
+        now,
+        config,
+        probe_state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     displaced_dir = pathlib.Path(artifacts_dir) / "displaced_first_write_preserved_executions"
@@ -13634,7 +13418,9 @@ def test_run_daily_compact_scopes_sibling_order_ids_to_the_brokerage_account(
         "account_number": "fp-different-brokerage-account",
         "dry_run": True,
         "run_classification": {
-            "run_origin": "scheduled", "manual_run": False, "stream": "afternoon",
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
         },
         "buy_candidates": [
             {
@@ -13653,7 +13439,12 @@ def test_run_daily_compact_scopes_sibling_order_ids_to_the_brokerage_account(
 
     state_2 = StrategyState()
     result_2 = run_daily_compact(
-        now, config, state_2, fin, rh, broker,
+        now,
+        config,
+        state_2,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert result_2.get("directory_ownership_verified") is False
@@ -13703,29 +13494,35 @@ def test_run_daily_compact_locks_normal_path_mode_switch_promotion(tmp_path, mon
     )
 
     monkeypatch.setattr(
-        near_close_dca, "_broker_account_fingerprint",
+        near_close_dca,
+        "_broker_account_fingerprint",
         lambda _broker, _key_dir: "same-account-fp",
     )
 
     prior_ticker = "BYDDY"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "dry_run": False,
-            "account_number": "same-account-fp",
-            "buy_candidates": [
-                {
-                    "ticker": prior_ticker,
-                    "status": "submitted",
-                    "order_id": "ORD-LIVE-LOCKED-PROMOTION",
-                    "planned_amount_usd": 6.0,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
                 },
-            ],
-            "broker_outcomes": {},
-        }, handle)
+                "dry_run": False,
+                "account_number": "same-account-fp",
+                "buy_candidates": [
+                    {
+                        "ticker": prior_ticker,
+                        "status": "submitted",
+                        "order_id": "ORD-LIVE-LOCKED-PROMOTION",
+                        "planned_amount_usd": 6.0,
+                    },
+                ],
+                "broker_outcomes": {},
+            },
+            handle,
+        )
 
     canonical_lock_path = pathlib.Path(artifacts_dir) / "run_state.json.lock"
     real_lock = near_close_dca.cross_process_lock
@@ -13738,7 +13535,12 @@ def test_run_daily_compact_locks_normal_path_mode_switch_promotion(tmp_path, mon
     monkeypatch.setattr(near_close_dca, "cross_process_lock", recording_lock)
 
     result = run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert result["blocked"] is False
@@ -13760,9 +13562,7 @@ def test_run_daily_compact_locks_normal_path_mode_switch_promotion(tmp_path, mon
     assert len(canonical_lock_calls) >= 2
 
 
-def test_run_daily_compact_mode_switch_promotion_falls_back_when_lock_unavailable(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_mode_switch_promotion_falls_back_when_lock_unavailable(tmp_path, monkeypatch):
     """Codex review (finding: "Serialize normal and recovery mode-switch
     promotions"): companion to the sibling lock-acquisition test above --
     proves that when the canonical lock cannot be acquired for the
@@ -13785,29 +13585,35 @@ def test_run_daily_compact_mode_switch_promotion_falls_back_when_lock_unavailabl
     )
 
     monkeypatch.setattr(
-        near_close_dca, "_broker_account_fingerprint",
+        near_close_dca,
+        "_broker_account_fingerprint",
         lambda _broker, _key_dir: "same-account-fp",
     )
 
     prior_ticker = "BYDDY"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "dry_run": False,
-            "account_number": "same-account-fp",
-            "buy_candidates": [
-                {
-                    "ticker": prior_ticker,
-                    "status": "submitted",
-                    "order_id": "ORD-LIVE-LOCK-TIMEOUT",
-                    "planned_amount_usd": 6.0,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
                 },
-            ],
-            "broker_outcomes": {},
-        }, handle)
+                "dry_run": False,
+                "account_number": "same-account-fp",
+                "buy_candidates": [
+                    {
+                        "ticker": prior_ticker,
+                        "status": "submitted",
+                        "order_id": "ORD-LIVE-LOCK-TIMEOUT",
+                        "planned_amount_usd": 6.0,
+                    },
+                ],
+                "broker_outcomes": {},
+            },
+            handle,
+        )
 
     canonical_lock_path = pathlib.Path(artifacts_dir) / "run_state.json.lock"
     real_lock = near_close_dca.cross_process_lock
@@ -13820,17 +13626,19 @@ def test_run_daily_compact_mode_switch_promotion_falls_back_when_lock_unavailabl
         # still succeed for this invocation to even reach the promotion
         # step) -- is made to fail, standing in for sustained contention
         # from a peer at exactly that point.
-        if (
-            pathlib.Path(path) == canonical_lock_path
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path) == canonical_lock_path and sys._getframe(1).f_code.co_name == "run_daily_compact":
             raise TimeoutError("simulated sustained lock contention from a peer")
         return real_lock(path, *args, **kwargs)
 
     monkeypatch.setattr(near_close_dca, "cross_process_lock", flaky_lock)
 
     result = run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert result["blocked"] is False
@@ -13842,17 +13650,13 @@ def test_run_daily_compact_mode_switch_promotion_falls_back_when_lock_unavailabl
     assert finalized_archives == []
 
     # But the evidence is not lost: preserved in the generic sidecar.
-    sidecar_paths = list(
-        pathlib.Path(artifacts_dir).glob("unreinjected_recovered_placement.*.json")
-    )
+    sidecar_paths = list(pathlib.Path(artifacts_dir).glob("unreinjected_recovered_placement.*.json"))
     assert len(sidecar_paths) == 1
     sidecar_entry = json.loads(sidecar_paths[0].read_bytes())
     assert sidecar_entry["account_fingerprint"] == "same-account-fp"
 
 
-def test_run_daily_compact_preserves_live_evidence_on_a_dry_run_mode_switch(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_preserves_live_evidence_on_a_dry_run_mode_switch(tmp_path, monkeypatch):
     """Codex review ("Preserve live evidence on a dry-run mode switch",
     later hardened by "Fail closed on same-account execution-mode
     switches"): the SAME-account sequential case the execution-mode-parity
@@ -13886,31 +13690,37 @@ def test_run_daily_compact_preserves_live_evidence_on_a_dry_run_mode_switch(
     # SAME account fingerprint on both sides -- a genuine mode-only
     # mismatch, not a cross-account one.
     monkeypatch.setattr(
-        near_close_dca, "_broker_account_fingerprint",
+        near_close_dca,
+        "_broker_account_fingerprint",
         lambda _broker, _key_dir: "same-account-fp",
     )
 
     prior_ticker = "BYDDY"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            # A prior LIVE run under the SAME account, with a real
-            # ordinary submitted order.
-            "dry_run": False,
-            "account_number": "same-account-fp",
-            "buy_candidates": [
-                {
-                    "ticker": prior_ticker,
-                    "status": "submitted",
-                    "order_id": "ORD-LIVE-BEFORE-MODE-SWITCH",
-                    "planned_amount_usd": 6.0,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
                 },
-            ],
-            "broker_outcomes": {},
-        }, handle)
+                # A prior LIVE run under the SAME account, with a real
+                # ordinary submitted order.
+                "dry_run": False,
+                "account_number": "same-account-fp",
+                "buy_candidates": [
+                    {
+                        "ticker": prior_ticker,
+                        "status": "submitted",
+                        "order_id": "ORD-LIVE-BEFORE-MODE-SWITCH",
+                        "planned_amount_usd": 6.0,
+                    },
+                ],
+                "broker_outcomes": {},
+            },
+            handle,
+        )
 
     result = run_daily_compact(
         now,
@@ -13927,9 +13737,7 @@ def test_run_daily_compact_preserves_live_evidence_on_a_dry_run_mode_switch(
         run_state = json.load(handle)
     # The prior live order must never appear in this dry-run invocation's
     # own state.
-    assert not any(
-        row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or []
-    )
+    assert not any(row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or [])
     # It must survive somewhere discoverable instead of vanishing with no
     # trace -- and NOT via the cross-account sidecar: this is the SAME
     # account on both sides (a mode-only mismatch), and the cross-account
@@ -13938,30 +13746,21 @@ def test_run_daily_compact_preserves_live_evidence_on_a_dry_run_mode_switch(
     # unresolved evidence belonging to it, which would block every future
     # placement for this account until manual cleanup -- a disproportionate
     # lockout for a simple dry-run/live mode switch.
-    assert not os.path.exists(
-        os.path.join(artifacts_dir, "cross_account_unresolved_placements.json")
-    )
+    assert not os.path.exists(os.path.join(artifacts_dir, "cross_account_unresolved_placements.json"))
     # Nor the generic undurable-evidence sidecar, which is discoverable but
     # never automatically re-scanned by anything -- the load-bearing
     # assertion for "Fail closed on same-account execution-mode switches"
     # is that a subsequent LIVE run can actually find this evidence again.
-    assert not list(
-        pathlib.Path(artifacts_dir).glob("unreinjected_recovered_placement.*.json")
-    )
+    assert not list(pathlib.Path(artifacts_dir).glob("unreinjected_recovered_placement.*.json"))
     # Archived instead as its own run_state*.json-named file, day-keyed
     # under this same directory -- the exact filename pattern deployment-
     # history scans already recurse for.
-    archived_states = list(
-        (pathlib.Path(artifacts_dir) / "mode_switch_preserved_placements").rglob(
-            "run_state*.json"
-        )
-    )
+    archived_states = list((pathlib.Path(artifacts_dir) / "mode_switch_preserved_placements").rglob("run_state*.json"))
     assert len(archived_states) == 1
     archived_state = json.loads(archived_states[0].read_bytes())
     assert archived_state["account_number"] == "same-account-fp"
     assert any(
-        row.get("order_id") == "ORD-LIVE-BEFORE-MODE-SWITCH"
-        for row in archived_state.get("buy_candidates") or []
+        row.get("order_id") == "ORD-LIVE-BEFORE-MODE-SWITCH" for row in archived_state.get("buy_candidates") or []
     )
 
     # The load-bearing proof for "Fail closed on same-account
@@ -13976,9 +13775,7 @@ def test_run_daily_compact_preserves_live_evidence_on_a_dry_run_mode_switch(
     assert archived_states[0] in discovered
 
 
-def test_run_daily_compact_stages_mode_switch_archive_before_canonical_replacement(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_stages_mode_switch_archive_before_canonical_replacement(tmp_path, monkeypatch):
     """Codex review ("Make mode-switch preservation atomic with canonical
     replacement"): the mode-switch archive's own deferred write only ran
     AFTER run_once() confirmed the canonical run_state.json was replaced --
@@ -14007,29 +13804,35 @@ def test_run_daily_compact_stages_mode_switch_archive_before_canonical_replaceme
     )
 
     monkeypatch.setattr(
-        near_close_dca, "_broker_account_fingerprint",
+        near_close_dca,
+        "_broker_account_fingerprint",
         lambda _broker, _key_dir: "same-account-fp",
     )
 
     prior_ticker = "BYDDY"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "dry_run": False,
-            "account_number": "same-account-fp",
-            "buy_candidates": [
-                {
-                    "ticker": prior_ticker,
-                    "status": "submitted",
-                    "order_id": "ORD-LIVE-BEFORE-STAGED-CRASH",
-                    "planned_amount_usd": 6.0,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
                 },
-            ],
-            "broker_outcomes": {},
-        }, handle)
+                "dry_run": False,
+                "account_number": "same-account-fp",
+                "buy_candidates": [
+                    {
+                        "ticker": prior_ticker,
+                        "status": "submitted",
+                        "order_id": "ORD-LIVE-BEFORE-STAGED-CRASH",
+                        "planned_amount_usd": 6.0,
+                    },
+                ],
+                "broker_outcomes": {},
+            },
+            handle,
+        )
 
     # run_once() itself succeeds (publishing THIS invocation's own
     # replacement state) and then a bare exception simulates the process
@@ -14039,25 +13842,25 @@ def test_run_daily_compact_stages_mode_switch_archive_before_canonical_replaceme
 
     def run_once_then_simulated_crash(ctx):
         real_run_once(ctx)
-        raise RuntimeError(
-            "simulated crash between run_once() success and the deferred "
-            "mode-switch archive promotion"
-        )
+        raise RuntimeError("simulated crash between run_once() success and the deferred mode-switch archive promotion")
 
     monkeypatch.setattr(near_close_dca, "run_once", run_once_then_simulated_crash)
 
     with pytest.raises(RuntimeError, match="simulated crash"):
         run_daily_compact(
-            now, config, state, fin, rh, broker,
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
             options=CompactRunOptions(artifacts_dir=artifacts_dir),
         )
 
     # run_once() itself really did succeed: the canonical file now holds
     # THIS invocation's own replacement state, not the prior BYDDY order.
     canonical_state = json.loads((pathlib.Path(artifacts_dir) / "run_state.json").read_bytes())
-    assert not any(
-        row.get("ticker") == prior_ticker for row in canonical_state.get("buy_candidates") or []
-    )
+    assert not any(row.get("ticker") == prior_ticker for row in canonical_state.get("buy_candidates") or [])
 
     # The deferred promotion never ran (the simulated crash happened before
     # it), so no FINALIZED run_state*.json archive exists yet -- proving
@@ -14078,14 +13881,11 @@ def test_run_daily_compact_stages_mode_switch_archive_before_canonical_replaceme
     staged_state = json.loads(staged_files[0].read_bytes())
     assert staged_state["account_number"] == "same-account-fp"
     assert any(
-        row.get("order_id") == "ORD-LIVE-BEFORE-STAGED-CRASH"
-        for row in staged_state.get("buy_candidates") or []
+        row.get("order_id") == "ORD-LIVE-BEFORE-STAGED-CRASH" for row in staged_state.get("buy_candidates") or []
     )
 
 
-def test_run_daily_compact_recovers_orphaned_pending_mode_switch_archive_after_crash(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_recovers_orphaned_pending_mode_switch_archive_after_crash(tmp_path, monkeypatch):
     """Codex review (finding: "Recover staged mode-switch evidence after a
     crash"): the sibling test above
     (`..._stages_mode_switch_archive_before_canonical_replacement`) proves a
@@ -14114,29 +13914,35 @@ def test_run_daily_compact_recovers_orphaned_pending_mode_switch_archive_after_c
     )
 
     monkeypatch.setattr(
-        near_close_dca, "_broker_account_fingerprint",
+        near_close_dca,
+        "_broker_account_fingerprint",
         lambda _broker, _key_dir: "same-account-fp",
     )
 
     prior_ticker = "BYDDY"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "dry_run": False,
-            "account_number": "same-account-fp",
-            "buy_candidates": [
-                {
-                    "ticker": prior_ticker,
-                    "status": "submitted",
-                    "order_id": "ORD-LIVE-ORPHANED-PENDING",
-                    "planned_amount_usd": 6.0,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
                 },
-            ],
-            "broker_outcomes": {},
-        }, handle)
+                "dry_run": False,
+                "account_number": "same-account-fp",
+                "buy_candidates": [
+                    {
+                        "ticker": prior_ticker,
+                        "status": "submitted",
+                        "order_id": "ORD-LIVE-ORPHANED-PENDING",
+                        "planned_amount_usd": 6.0,
+                    },
+                ],
+                "broker_outcomes": {},
+            },
+            handle,
+        )
 
     # Same crash simulation as the sibling test: run_once() itself succeeds,
     # then the process dies before the deferred promotion runs, leaving the
@@ -14151,7 +13957,12 @@ def test_run_daily_compact_recovers_orphaned_pending_mode_switch_archive_after_c
 
     with pytest.raises(RuntimeError, match="simulated crash"):
         run_daily_compact(
-            now, dry_run_config, state, fin, rh, broker,
+            now,
+            dry_run_config,
+            state,
+            fin,
+            rh,
+            broker,
             options=CompactRunOptions(artifacts_dir=artifacts_dir),
         )
 
@@ -14168,7 +13979,12 @@ def test_run_daily_compact_recovers_orphaned_pending_mode_switch_archive_after_c
     # mode-switch logic even runs.
     monkeypatch.setattr(near_close_dca, "run_once", real_run_once)
     later_result = run_daily_compact(
-        now, dry_run_config, state, fin, rh, broker,
+        now,
+        dry_run_config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert later_result["blocked"] is False
@@ -14178,13 +13994,10 @@ def test_run_daily_compact_recovers_orphaned_pending_mode_switch_archive_after_c
     # ...promoted to its final run_state*.json name, in place, discoverable
     # by find_run_state_files() and carrying the real order it was staged
     # to preserve.
-    promoted_path = _staged_path.with_name(_staged_path.name[len("pending."):])
+    promoted_path = _staged_path.with_name(_staged_path.name[len("pending.") :])
     assert promoted_path.exists()
     promoted_state = json.loads(promoted_path.read_bytes())
-    assert any(
-        row.get("order_id") == "ORD-LIVE-ORPHANED-PENDING"
-        for row in promoted_state.get("buy_candidates") or []
-    )
+    assert any(row.get("order_id") == "ORD-LIVE-ORPHANED-PENDING" for row in promoted_state.get("buy_candidates") or [])
 
     from dca_risk import find_run_state_files
 
@@ -14216,7 +14029,9 @@ def test_recover_orphaned_pending_mode_switch_archive_skips_unreplaced_canonical
     canonical_state = {
         "trading_day": "2026-06-29",
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "dry_run": False,
         "account_number": "same-account-fp",
@@ -14283,9 +14098,7 @@ def test_recover_orphaned_pending_mode_switch_archive_skips_failure_stamped_pres
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-failure-stamped-pending"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-failure-stamped-pending")
     os.makedirs(artifacts_dir)
 
     shared_candidate = {
@@ -14300,7 +14113,9 @@ def test_recover_orphaned_pending_mode_switch_archive_skips_failure_stamped_pres
     pending_state = {
         "trading_day": "2026-06-29",
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "dry_run": False,
         "account_number": "same-account-fp",
@@ -14371,15 +14186,15 @@ def test_recover_orphaned_pending_mode_switch_archive_promotes_id_less_evidence_
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-id-less-pending"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-id-less-pending")
     os.makedirs(artifacts_dir)
 
     pending_state = {
         "trading_day": "2026-06-29",
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "dry_run": False,
         "account_number": "same-account-fp",
@@ -14402,7 +14217,9 @@ def test_recover_orphaned_pending_mode_switch_archive_promotes_id_less_evidence_
     canonical_state = {
         "trading_day": "2026-06-29",
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "dry_run": False,
         "account_number": "same-account-fp",
@@ -14467,9 +14284,7 @@ def test_recover_orphaned_pending_mode_switch_archive_survives_non_list_buy_cand
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-malformed-candidates"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-malformed-candidates")
     os.makedirs(artifacts_dir)
 
     # Canonical is well-formed; the PENDING file is the malformed side --
@@ -14524,9 +14339,7 @@ def test_recover_orphaned_pending_mode_switch_archive_skips_budget_backed_replac
     an unreplaced budget-backed pending file stays correctly unpromoted."""
     import near_close_dca
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-budget-backed-pending"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-budget-backed-pending")
     os.makedirs(artifacts_dir)
 
     # No "buy_candidates" key at all -- the legacy shape deployed_usd()
@@ -14589,9 +14402,7 @@ def test_recover_orphaned_pending_mode_switch_archive_survives_unhashable_candid
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-unhashable-candidate"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-unhashable-candidate")
     os.makedirs(artifacts_dir)
 
     canonical_state = {"trading_day": "2026-06-29", "buy_candidates": []}
@@ -14653,9 +14464,7 @@ def test_recover_orphaned_pending_mode_switch_archive_skips_additive_failure_mer
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-additive-merge-pending"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-additive-merge-pending")
     os.makedirs(artifacts_dir)
 
     preserved_candidate = {
@@ -14736,9 +14545,7 @@ def test_recover_orphaned_pending_mode_switch_archive_preserves_duplicate_id_les
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-duplicate-id-less"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-duplicate-id-less")
     os.makedirs(artifacts_dir)
 
     duplicate_row = {
@@ -14808,9 +14615,7 @@ def test_recover_orphaned_pending_mode_switch_archive_distinguishes_ambiguous_ma
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-ambiguous-marker"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-ambiguous-marker")
     os.makedirs(artifacts_dir)
 
     pending_state = {
@@ -14889,9 +14694,7 @@ def test_recover_orphaned_pending_mode_switch_archive_parses_numeric_string_budg
     """
     import near_close_dca
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-string-budget"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-string-budget")
     os.makedirs(artifacts_dir)
 
     # No "buy_candidates" key at all -- budget.day_notional_usd is a
@@ -14957,9 +14760,7 @@ def test_recover_orphaned_pending_mode_switch_archive_treats_null_like_absent_ca
     """
     import near_close_dca
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-null-candidates"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-null-candidates")
     os.makedirs(artifacts_dir)
 
     # buy_candidates truly absent -- legitimate legacy shape, budget
@@ -15027,9 +14828,7 @@ def test_recover_orphaned_pending_mode_switch_archive_rejects_mismatched_identit
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-mismatched-identity"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-mismatched-identity")
     os.makedirs(artifacts_dir)
 
     shared_candidate = {
@@ -15041,7 +14840,9 @@ def test_recover_orphaned_pending_mode_switch_archive_rejects_mismatched_identit
     pending_state = {
         "trading_day": "2026-06-29",
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "buy_candidates": [shared_candidate],
     }
@@ -15053,7 +14854,9 @@ def test_recover_orphaned_pending_mode_switch_archive_rejects_mismatched_identit
     canonical_state = {
         "trading_day": "2026-06-30",
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "buy_candidates": [dict(shared_candidate)],
     }
@@ -15106,9 +14909,7 @@ def test_recover_orphaned_pending_mode_switch_archive_promotes_replaced_order_of
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-replaced-order-same-amount"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-replaced-order-same-amount")
     os.makedirs(artifacts_dir)
 
     pending_state = {
@@ -15181,9 +14982,7 @@ def test_recover_orphaned_pending_mode_switch_archive_promotes_replaced_idless_r
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-idless-ref-id"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-idless-ref-id")
     os.makedirs(artifacts_dir)
 
     pending_state = {
@@ -15260,9 +15059,7 @@ def test_recover_orphaned_pending_mode_switch_archive_promotes_partially_replace
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-aggregate-partial-replace"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-aggregate-partial-replace")
     os.makedirs(artifacts_dir)
 
     pending_state = {
@@ -15340,9 +15137,7 @@ def test_recover_orphaned_pending_mode_switch_archive_skips_reconciled_placement
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-reconciled-ref"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-reconciled-ref")
     os.makedirs(artifacts_dir)
 
     pending_state = {
@@ -15417,9 +15212,7 @@ def test_recover_orphaned_pending_mode_switch_archive_distinguishes_scheduled_su
     from near_close_dca import _serialize_run_state
     from scripts.run_classification import build_scheduled_classification
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-substream-mismatch"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-substream-mismatch")
     os.makedirs(artifacts_dir)
 
     def _morning_classification() -> dict:
@@ -15524,9 +15317,7 @@ def test_recover_orphaned_pending_mode_switch_archive_dedupes_overlapping_siblin
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-dedupe-siblings"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-dedupe-siblings")
     os.makedirs(artifacts_dir)
 
     def _row(order_id: str, amount: float) -> dict:
@@ -15607,9 +15398,7 @@ def test_recover_orphaned_pending_mode_switch_archive_rejects_cross_account_cove
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-cross-account"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-cross-account")
     os.makedirs(artifacts_dir)
 
     pending_state = {
@@ -15689,9 +15478,7 @@ def test_recover_orphaned_pending_mode_switch_archive_rejects_live_null_binding(
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-live-null-binding"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-live-null-binding")
     os.makedirs(artifacts_dir)
 
     pending_state = {
@@ -15777,9 +15564,7 @@ def test_recover_orphaned_pending_mode_switch_archive_partitions_coverage_by_acc
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-account-partition"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-account-partition")
     os.makedirs(artifacts_dir)
 
     def _row(ticker: str, amount: float) -> dict:
@@ -15863,9 +15648,7 @@ def test_recover_orphaned_pending_mode_switch_archive_normalizes_order_ids(
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-order-id-normalization"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-order-id-normalization")
     os.makedirs(artifacts_dir)
 
     pending_state = {
@@ -15934,9 +15717,7 @@ def test_recover_orphaned_pending_mode_switch_archive_distinguishes_idless_conte
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-idless-content"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-idless-content")
     os.makedirs(artifacts_dir)
 
     pending_state = {
@@ -16007,9 +15788,7 @@ def test_recover_orphaned_pending_mode_switch_archive_promotes_supersets_before_
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-superset-before-subset"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-superset-before-subset")
     os.makedirs(artifacts_dir)
 
     canonical_state = {
@@ -16114,9 +15893,7 @@ def test_recover_orphaned_pending_mode_switch_archive_sees_prior_invocation_prom
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-prior-invocation-sibling"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-prior-invocation-sibling")
     os.makedirs(artifacts_dir)
 
     # Canonical was genuinely replaced and contains neither order.
@@ -16164,9 +15941,7 @@ def test_recover_orphaned_pending_mode_switch_archive_sees_prior_invocation_prom
         ],
     }
     already_promoted_path = staged_dir / "run_state.deadbeefdeadbeef.json"
-    already_promoted_path.write_text(
-        _serialize_run_state(already_promoted_state), encoding="utf-8"
-    )
+    already_promoted_path.write_text(_serialize_run_state(already_promoted_state), encoding="utf-8")
 
     # Still-staged subset: order X alone, now wholly covered by the
     # already-promoted sibling above.
@@ -16199,9 +15974,7 @@ def test_recover_orphaned_pending_mode_switch_archive_sees_prior_invocation_prom
     assert not subset_target.exists()
 
 
-def test_recover_orphaned_pending_mode_switch_archive_locks_canonical_through_promotion(
-    tmp_path, monkeypatch
-):
+def test_recover_orphaned_pending_mode_switch_archive_locks_canonical_through_promotion(tmp_path, monkeypatch):
     """Codex review (finding: "Lock the canonical check through pending
     promotion"): the read of canonical, the subset decision, and the
     eventual ``os.replace()`` promotion used to run completely unlocked. A
@@ -16231,15 +16004,15 @@ def test_recover_orphaned_pending_mode_switch_archive_locks_canonical_through_pr
     import near_close_dca
     from near_close_dca import _serialize_run_state
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-locked-recovery"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-locked-recovery")
     os.makedirs(artifacts_dir)
 
     pending_state = {
         "trading_day": "2026-06-29",
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "buy_candidates": [
             {
@@ -16285,9 +16058,7 @@ def test_recover_orphaned_pending_mode_switch_archive_locks_canonical_through_pr
                 canonical_path.write_text(peer_canonical_text, encoding="utf-8")
         return real_cross_process_lock(path, *args, **kwargs)
 
-    monkeypatch.setattr(
-        near_close_dca, "cross_process_lock", publish_peer_before_canonical_lock
-    )
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", publish_peer_before_canonical_lock)
 
     near_close_dca._recover_orphaned_pending_mode_switch_archives(artifacts_dir)
 
@@ -16325,9 +16096,7 @@ def test_recover_orphaned_pending_mode_switch_archive_promotes_unparseable_budge
     """
     import near_close_dca
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-malformed-budget"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-malformed-budget")
     os.makedirs(artifacts_dir)
 
     # No "buy_candidates" key -- budget.day_notional_usd is present but
@@ -16385,9 +16154,7 @@ def test_recover_orphaned_pending_mode_switch_archive_distinguishes_ambiguous_bo
     """
     import near_close_dca
 
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-mode-switch-ambiguous-bool-vs-int"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-mode-switch-ambiguous-bool-vs-int")
     os.makedirs(artifacts_dir)
 
     pending_text = json.dumps(
@@ -16473,34 +16240,45 @@ def test_run_daily_compact_preserves_every_mode_switch_archive(tmp_path, monkeyp
     import near_close_dca
 
     monkeypatch.setattr(
-        near_close_dca, "_broker_account_fingerprint",
+        near_close_dca,
+        "_broker_account_fingerprint",
         lambda _broker, _key_dir: "same-account-fp",
     )
 
     def _write_prior_live_state(order_id: str, ticker: str) -> None:
         with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-            json.dump({
-                "trading_day": now.date().isoformat(),
-                "run_classification": {
-                    "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-                },
-                "dry_run": False,
-                "account_number": "same-account-fp",
-                "buy_candidates": [
-                    {
-                        "ticker": ticker,
-                        "status": "submitted",
-                        "order_id": order_id,
-                        "planned_amount_usd": 6.0,
+            json.dump(
+                {
+                    "trading_day": now.date().isoformat(),
+                    "run_classification": {
+                        "stream": "afternoon",
+                        "scheduled_for_et": "15:30",
+                        "run_origin": "scheduled",
                     },
-                ],
-                "broker_outcomes": {},
-            }, handle)
+                    "dry_run": False,
+                    "account_number": "same-account-fp",
+                    "buy_candidates": [
+                        {
+                            "ticker": ticker,
+                            "status": "submitted",
+                            "order_id": order_id,
+                            "planned_amount_usd": 6.0,
+                        },
+                    ],
+                    "broker_outcomes": {},
+                },
+                handle,
+            )
 
     # First live -> dry-run mode switch: archives ORD-FIRST-LIVE.
     _write_prior_live_state("ORD-FIRST-LIVE", "BYDDY")
     result_one = run_daily_compact(
-        now, dry_run_config, state, fin, rh, broker,
+        now,
+        dry_run_config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert result_one["blocked"] is False
@@ -16509,16 +16287,17 @@ def test_run_daily_compact_preserves_every_mode_switch_archive(tmp_path, monkeyp
     # SECOND live -> dry-run mode switch: archives ORD-SECOND-LIVE.
     _write_prior_live_state("ORD-SECOND-LIVE", "AAPL")
     result_two = run_daily_compact(
-        now, dry_run_config, state, fin, rh, broker,
+        now,
+        dry_run_config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert result_two["blocked"] is False
 
-    archived_states = list(
-        (pathlib.Path(artifacts_dir) / "mode_switch_preserved_placements").rglob(
-            "run_state*.json"
-        )
-    )
+    archived_states = list((pathlib.Path(artifacts_dir) / "mode_switch_preserved_placements").rglob("run_state*.json"))
     # Both passes' archives must survive as DISTINCT files -- a single
     # deterministic filename would leave exactly one here, with the first
     # pass's order silently gone.
@@ -16537,9 +16316,7 @@ def test_run_daily_compact_preserves_every_mode_switch_archive(tmp_path, monkeyp
         assert archived_state_path in discovered
 
 
-def test_run_daily_compact_archives_each_prior_mode_switch_state_only_once(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_archives_each_prior_mode_switch_state_only_once(tmp_path, monkeypatch):
     """Codex review ("Archive each prior mode-switch state only once"): two
     same-account mode-switch invocations racing to archive the IDENTICAL
     prior ``run_state.json`` (this archive is not itself serialized with
@@ -16568,14 +16345,17 @@ def test_run_daily_compact_archives_each_prior_mode_switch_state_only_once(
     import near_close_dca
 
     monkeypatch.setattr(
-        near_close_dca, "_broker_account_fingerprint",
+        near_close_dca,
+        "_broker_account_fingerprint",
         lambda _broker, _key_dir: "same-account-fp",
     )
 
     prior_live_state = {
         "trading_day": now.date().isoformat(),
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "dry_run": False,
         "account_number": "same-account-fp",
@@ -16598,7 +16378,12 @@ def test_run_daily_compact_archives_each_prior_mode_switch_state_only_once(
     # canonical file with its own fresh dry-run state.
     _write_prior_live_state()
     result_one = run_daily_compact(
-        now, dry_run_config, state, fin, rh, broker,
+        now,
+        dry_run_config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert result_one["blocked"] is False
@@ -16609,16 +16394,17 @@ def test_run_daily_compact_archives_each_prior_mode_switch_state_only_once(
     # genuinely different one.
     _write_prior_live_state()
     result_two = run_daily_compact(
-        now, dry_run_config, state, fin, rh, broker,
+        now,
+        dry_run_config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert result_two["blocked"] is False
 
-    archived_states = list(
-        (pathlib.Path(artifacts_dir) / "mode_switch_preserved_placements").rglob(
-            "run_state*.json"
-        )
-    )
+    archived_states = list((pathlib.Path(artifacts_dir) / "mode_switch_preserved_placements").rglob("run_state*.json"))
     # Byte-identical prior evidence must collapse to exactly ONE archived
     # file, not one per invocation.
     assert len(archived_states) == 1
@@ -16630,9 +16416,7 @@ def test_run_daily_compact_archives_each_prior_mode_switch_state_only_once(
     assert archived_order_ids == {"ORD-RACED-LIVE"}
 
 
-def test_run_daily_compact_recovers_from_transiently_unreadable_prior_state(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_recovers_from_transiently_unreadable_prior_state(tmp_path, monkeypatch):
     """Codex review ("Distinguish unreadable state from an absent first
     write"): run_daily_compact()'s very first read of an EXISTING
     run_state.json can hit a transient OSError/decode error without the
@@ -16675,17 +16459,12 @@ def test_run_daily_compact_recovers_from_transiently_unreadable_prior_state(
     _fired = {"value": False}
 
     def loads_that_glitches_once_for_run_daily_compact(raw, *args, **kwargs):
-        if (
-            not _fired["value"]
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if not _fired["value"] and sys._getframe(1).f_code.co_name == "run_daily_compact":
             _fired["value"] = True
             raise json.JSONDecodeError("simulated transient glitch", "", 0)
         return real_json_loads(raw, *args, **kwargs)
 
-    monkeypatch.setattr(
-        near_close_dca.json, "loads", loads_that_glitches_once_for_run_daily_compact
-    )
+    monkeypatch.setattr(near_close_dca.json, "loads", loads_that_glitches_once_for_run_daily_compact)
 
     result = run_daily_compact(
         now,
@@ -16720,9 +16499,7 @@ def test_run_daily_compact_recovers_from_transiently_unreadable_prior_state(
     assert os.path.exists(os.path.join(artifacts_dir, "buy_candidates.csv"))
 
 
-def test_run_daily_compact_skips_mode_switch_archive_when_calendar_blocked(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_skips_mode_switch_archive_when_calendar_blocked(tmp_path, monkeypatch):
     """Codex review ("Archive mode-switch state only when replacing the
     canonical file"): a same-account mode-switched invocation that is ALSO
     calendar-blocked must not archive a copy of the prior canonical state --
@@ -16748,32 +16525,43 @@ def test_run_daily_compact_skips_mode_switch_archive_when_calendar_blocked(
     import near_close_dca
 
     monkeypatch.setattr(
-        near_close_dca, "_broker_account_fingerprint",
+        near_close_dca,
+        "_broker_account_fingerprint",
         lambda _broker, _key_dir: "same-account-fp",
     )
 
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "dry_run": False,
-            "account_number": "same-account-fp",
-            "buy_candidates": [
-                {
-                    "ticker": "BYDDY",
-                    "status": "submitted",
-                    "order_id": "ORD-LIVE-BEFORE-BLOCKED-RETRY",
-                    "planned_amount_usd": 6.0,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
                 },
-            ],
-            "broker_outcomes": {},
-        }, handle)
+                "dry_run": False,
+                "account_number": "same-account-fp",
+                "buy_candidates": [
+                    {
+                        "ticker": "BYDDY",
+                        "status": "submitted",
+                        "order_id": "ORD-LIVE-BEFORE-BLOCKED-RETRY",
+                        "planned_amount_usd": 6.0,
+                    },
+                ],
+                "broker_outcomes": {},
+            },
+            handle,
+        )
     prior_bytes = pathlib.Path(artifacts_dir, "run_state.json").read_bytes()
 
     result = run_daily_compact(
-        now, blocked_dry_run_config, state, fin, rh, broker,
+        now,
+        blocked_dry_run_config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert result["blocked"] is True
@@ -16789,9 +16577,7 @@ def test_run_daily_compact_skips_mode_switch_archive_when_calendar_blocked(
     assert pathlib.Path(artifacts_dir, "run_state.json").read_bytes() == prior_bytes
 
 
-def test_run_daily_compact_defers_mode_switch_archive_until_replacement_succeeds(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_defers_mode_switch_archive_until_replacement_succeeds(tmp_path, monkeypatch):
     """Codex review ("Defer mode-switch archival until replacement
     succeeds"): only the CALENDAR-BLOCKED case was previously guarded
     against archiving a copy of the prior canonical state before knowing
@@ -16817,9 +16603,11 @@ def test_run_daily_compact_defers_mode_switch_archive_until_replacement_succeeds
     import near_close_dca
 
     monkeypatch.setattr(
-        near_close_dca, "_broker_account_fingerprint",
+        near_close_dca,
+        "_broker_account_fingerprint",
         lambda _broker, _key_dir: "same-account-fp",
     )
+
     # This invocation is NOT calendar-blocked -- the mode switch would
     # ordinarily go on to replace the canonical file -- but it raises
     # before ever reaching finalization, so the replacement never happens.
@@ -16830,27 +16618,37 @@ def test_run_daily_compact_defers_mode_switch_archive_until_replacement_succeeds
 
     prior_ticker = "BYDDY"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "dry_run": False,
-            "account_number": "same-account-fp",
-            "buy_candidates": [
-                {
-                    "ticker": prior_ticker,
-                    "status": "submitted",
-                    "order_id": "ORD-LIVE-BEFORE-RAISING-MODE-SWITCH",
-                    "planned_amount_usd": 6.0,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
                 },
-            ],
-            "broker_outcomes": {},
-        }, handle)
+                "dry_run": False,
+                "account_number": "same-account-fp",
+                "buy_candidates": [
+                    {
+                        "ticker": prior_ticker,
+                        "status": "submitted",
+                        "order_id": "ORD-LIVE-BEFORE-RAISING-MODE-SWITCH",
+                        "planned_amount_usd": 6.0,
+                    },
+                ],
+                "broker_outcomes": {},
+            },
+            handle,
+        )
 
     with pytest.raises(RuntimeError, match="simulated failure before finalization"):
         run_daily_compact(
-            now, config, state, fin, rh, broker,
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
             options=CompactRunOptions(artifacts_dir=artifacts_dir),
         )
 
@@ -16861,9 +16659,7 @@ def test_run_daily_compact_defers_mode_switch_archive_until_replacement_succeeds
     assert not archive_root.exists() or not list(archive_root.rglob("run_state*.json"))
 
 
-def test_run_daily_compact_fresh_state_account_mismatch_is_foreign(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_fresh_state_account_mismatch_is_foreign(tmp_path, monkeypatch):
     """Codex review ("Include the broker account in directory ownership"):
     the fresh-state ownership recheck must ALSO fail on an account
     mismatch, not just day/stream/slot -- a directory claimed by a
@@ -16879,7 +16675,8 @@ def test_run_daily_compact_fresh_state_account_mismatch_is_foreign(
     import near_close_dca
 
     monkeypatch.setattr(
-        near_close_dca, "_broker_account_fingerprint",
+        near_close_dca,
+        "_broker_account_fingerprint",
         lambda _broker, _key_dir: "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
     )
 
@@ -16890,7 +16687,9 @@ def test_run_daily_compact_fresh_state_account_mismatch_is_foreign(
     other_account_state = {
         "trading_day": now.date().isoformat(),
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "account_number": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
         "buy_candidates": [
@@ -16900,10 +16699,7 @@ def test_run_daily_compact_fresh_state_account_mismatch_is_foreign(
     }
 
     def claim_with_other_account_then_lock(path, *args, **kwargs):
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
                 json.dump(other_account_state, handle)
         return real_lock(path, *args, **kwargs)
@@ -16947,29 +16743,35 @@ def test_run_daily_compact_rejects_unbound_account_ownership(tmp_path, monkeypat
     # Simulate "an account identity exists, but the HMAC key generation is
     # currently unavailable" -- the sentinel case, not a bare None.
     monkeypatch.setattr(
-        near_close_dca, "_account_number_for_unresolved_evidence",
+        near_close_dca,
+        "_account_number_for_unresolved_evidence",
         lambda _broker, _key_dir: near_close_dca._ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL,
     )
 
     prior_ticker = "BYDDY"
     prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "account_number": None,
-            "broker_outcomes": {
-                prior_key: {
-                    "status": "submitted",
-                    "order_id": "ORD-UNBOUND",
-                    "submitted_amount_usd": 7.5,
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "account_number": None,
+                "broker_outcomes": {
+                    prior_key: {
+                        "status": "submitted",
+                        "order_id": "ORD-UNBOUND",
+                        "submitted_amount_usd": 7.5,
+                        "reconciled_fractional_placement": True,
+                        "ticker": prior_ticker,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     result = run_daily_compact(
         now,
@@ -16987,14 +16789,10 @@ def test_run_daily_compact_rejects_unbound_account_ownership(tmp_path, monkeypat
     # The unverifiable prior recovery must never be reinjected while
     # ownership cannot be proven.
     assert prior_key not in (run_state.get("broker_outcomes") or {})
-    assert not any(
-        row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or []
-    )
+    assert not any(row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or [])
 
 
-def test_run_daily_compact_rejects_a_live_prior_state_with_unbound_account(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_rejects_a_live_prior_state_with_unbound_account(tmp_path, monkeypatch):
     """Codex review ("Reject prior states with unavailable account
     bindings"): build_run_artifacts() stamps "account_number" from the RAW,
     non-sentinel fingerprint call, so a LIVE (non-dry-run) prior run whose
@@ -17023,33 +16821,39 @@ def test_run_daily_compact_rejects_a_live_prior_state_with_unbound_account(
     # this invocation's own write disagree with its own comparison value
     # and fail for an unrelated reason.
     monkeypatch.setattr(
-        near_close_dca, "_broker_account_fingerprint",
+        near_close_dca,
+        "_broker_account_fingerprint",
         lambda _broker, _key_dir: "account-b-fingerprint",
     )
 
     prior_ticker = "BYDDY"
     prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            # Explicitly a LIVE prior run (not dry-run) whose account_number
-            # nonetheless came back null -- the unavailable-HMAC-key case,
-            # not "nothing to compare".
-            "dry_run": False,
-            "account_number": None,
-            "broker_outcomes": {
-                prior_key: {
-                    "status": "submitted",
-                    "order_id": "ORD-ACCOUNT-A-UNBOUND",
-                    "submitted_amount_usd": 7.5,
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                # Explicitly a LIVE prior run (not dry-run) whose account_number
+                # nonetheless came back null -- the unavailable-HMAC-key case,
+                # not "nothing to compare".
+                "dry_run": False,
+                "account_number": None,
+                "broker_outcomes": {
+                    prior_key: {
+                        "status": "submitted",
+                        "order_id": "ORD-ACCOUNT-A-UNBOUND",
+                        "submitted_amount_usd": 7.5,
+                        "reconciled_fractional_placement": True,
+                        "ticker": prior_ticker,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     result = run_daily_compact(
         now,
@@ -17067,14 +16871,10 @@ def test_run_daily_compact_rejects_a_live_prior_state_with_unbound_account(
     # Account A's unverifiable recovery must never be reinjected into
     # account B's state.
     assert prior_key not in (run_state.get("broker_outcomes") or {})
-    assert not any(
-        row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or []
-    )
+    assert not any(row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or [])
 
 
-def test_run_daily_compact_rejects_a_dry_run_prior_state_for_a_live_invocation(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_rejects_a_dry_run_prior_state_for_a_live_invocation(tmp_path, monkeypatch):
     """Codex review ("Keep dry-run artifacts outside live ownership
     matches"): a genuinely DRY-RUN prior state's null account_number is
     legitimately "nothing to compare" (the null-account leniency this
@@ -17098,32 +16898,38 @@ def test_run_daily_compact_rejects_a_dry_run_prior_state_for_a_live_invocation(
 
     # This LIVE invocation's own real, verifiable fingerprint.
     monkeypatch.setattr(
-        near_close_dca, "_broker_account_fingerprint",
+        near_close_dca,
+        "_broker_account_fingerprint",
         lambda _broker, _key_dir: "live-account-fingerprint",
     )
 
     prior_ticker = "BYDDY"
     prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            # A genuinely dry-run peer -- null account_number is the
-            # HONEST reading here, not an unavailable-binding case.
-            "dry_run": True,
-            "account_number": None,
-            "broker_outcomes": {
-                prior_key: {
-                    "status": "submitted",
-                    "order_id": "ORD-DRY-RUN-PEER",
-                    "submitted_amount_usd": 7.5,
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                # A genuinely dry-run peer -- null account_number is the
+                # HONEST reading here, not an unavailable-binding case.
+                "dry_run": True,
+                "account_number": None,
+                "broker_outcomes": {
+                    prior_key: {
+                        "status": "submitted",
+                        "order_id": "ORD-DRY-RUN-PEER",
+                        "submitted_amount_usd": 7.5,
+                        "reconciled_fractional_placement": True,
+                        "ticker": prior_ticker,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     result = run_daily_compact(
         now,
@@ -17141,17 +16947,13 @@ def test_run_daily_compact_rejects_a_dry_run_prior_state_for_a_live_invocation(
     # The dry-run peer's recovery must never be reinjected into this
     # live invocation's state.
     assert prior_key not in (run_state.get("broker_outcomes") or {})
-    assert not any(
-        row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or []
-    )
+    assert not any(row.get("ticker") == prior_ticker for row in run_state.get("buy_candidates") or [])
     # This invocation's own state is correctly stamped live, not silently
     # coerced into (or left ambiguous against) the dry-run peer's mode.
     assert run_state.get("dry_run") is False
 
 
-def test_run_daily_compact_merges_when_concurrent_first_invocation_confirmed(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_merges_when_concurrent_first_invocation_confirmed(tmp_path, monkeypatch):
     """Codex review ("Recompute replacement intent after acquiring the
     lock"): two FIRST invocations of the identical slot racing each other
     both start with no prior state at all (_orders_csv_same_run False for
@@ -17171,9 +16973,7 @@ def test_run_daily_compact_merges_when_concurrent_first_invocation_confirmed(
 
     real_lock = near_close_dca.cross_process_lock
 
-    other_process_row = {
-        field: "" for field in _CSV_FIELDS
-    }
+    other_process_row = {field: "" for field in _CSV_FIELDS}
     other_process_row.update(
         ticker="MSFT",
         status="submitted",
@@ -17183,10 +16983,7 @@ def test_run_daily_compact_merges_when_concurrent_first_invocation_confirmed(
     )
 
     def claim_with_concurrent_writer_then_lock(path, *args, **kwargs):
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             # Simulate a DIFFERENT, concurrent invocation of the SAME slot
             # having already published its own state and execution row in
             # the gap between this invocation's own run_once() write and
@@ -17222,9 +17019,7 @@ def test_run_daily_compact_merges_when_concurrent_first_invocation_confirmed(
     assert any(row.get("order_id") == "ORD-OTHER-PROCESS" for row in rows)
 
 
-def test_run_daily_compact_own_state_snapshot_survives_a_race_right_after_run_once(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_own_state_snapshot_survives_a_race_right_after_run_once(tmp_path, monkeypatch):
     """Codex review ("Capture this invocation's state at publication time"):
     a peer can replace run_state.json in the gap between run_once() itself
     returning and run_daily_compact capturing "this invocation's own state"
@@ -17300,9 +17095,7 @@ def test_run_daily_compact_own_state_snapshot_survives_a_race_right_after_run_on
     assert {"AAPL", "NVDA", "MSFT"} <= set(surviving_submitted_rows)
 
 
-def test_run_daily_compact_folds_own_placement_into_the_surviving_peer_state(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_folds_own_placement_into_the_surviving_peer_state(tmp_path, monkeypatch):
     """Codex review ("Merge concurrent placements into the surviving run
     state"): preserving the losing invocation's row in orders.csv is not
     enough -- dca_risk.deployed_usd() sums run_state.json's own
@@ -17330,10 +17123,7 @@ def test_run_daily_compact_folds_own_placement_into_the_surviving_peer_state(
     real_lock = near_close_dca.cross_process_lock
 
     def claim_with_concurrent_writer_then_lock(path, *args, **kwargs):
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             # Simulate a DIFFERENT, concurrent invocation of the SAME slot
             # (same identity/account) having already published its own
             # state -- with its OWN distinct (empty) buy_candidates/
@@ -17389,9 +17179,7 @@ def test_run_daily_compact_folds_own_placement_into_the_surviving_peer_state(
     assert all(row.get("planned_amount_usd") for row in surviving_submitted_rows.values())
 
 
-def test_run_daily_compact_reinjection_survives_a_malformed_fresh_broker_outcomes(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_reinjection_survives_a_malformed_fresh_broker_outcomes(tmp_path, monkeypatch):
     """Codex review ("Reject malformed fresh broker outcomes without
     raising"): a same-identity concurrent writer can leave a non-mapping
     "broker_outcomes" value (a corrupted or legacy shape, e.g. a JSON
@@ -17416,10 +17204,7 @@ def test_run_daily_compact_reinjection_survives_a_malformed_fresh_broker_outcome
     real_lock = near_close_dca.cross_process_lock
 
     def claim_with_malformed_broker_outcomes(path, *args, **kwargs):
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
                 fresh_state = json.load(handle)
             fresh_state["claimed_by"] = "concurrent-peer"
@@ -17457,9 +17242,7 @@ def test_run_daily_compact_reinjection_survives_a_malformed_fresh_broker_outcome
     assert {"AAPL", "NVDA", "MSFT"} <= set(surviving_submitted_rows)
 
 
-def test_run_daily_compact_reinjection_survives_a_malformed_fresh_counts(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_reinjection_survives_a_malformed_fresh_counts(tmp_path, monkeypatch):
     """Codex review ("Normalize malformed counts before reinjection"): the
     same shape of bug as the malformed broker_outcomes fix above, for the
     surviving state's "counts" field. `**(... or {})` raises TypeError --
@@ -17483,10 +17266,7 @@ def test_run_daily_compact_reinjection_survives_a_malformed_fresh_counts(
     real_lock = near_close_dca.cross_process_lock
 
     def claim_with_malformed_counts(path, *args, **kwargs):
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
                 fresh_state = json.load(handle)
             fresh_state["claimed_by"] = "concurrent-peer"
@@ -17525,9 +17305,7 @@ def test_run_daily_compact_reinjection_survives_a_malformed_fresh_counts(
     assert isinstance(surviving_state.get("counts"), dict)
 
 
-def test_run_daily_compact_reinjection_survives_a_malformed_fresh_buy_candidates(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_reinjection_survives_a_malformed_fresh_buy_candidates(tmp_path, monkeypatch):
     """Codex review ("Normalize fresh candidates before reinjection"): the
     same shape of bug as the malformed broker_outcomes/counts fixes above,
     for the surviving state's "buy_candidates" field. `for row in (... or
@@ -17552,10 +17330,7 @@ def test_run_daily_compact_reinjection_survives_a_malformed_fresh_buy_candidates
     real_lock = near_close_dca.cross_process_lock
 
     def claim_with_malformed_buy_candidates(path, *args, **kwargs):
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
                 fresh_state = json.load(handle)
             fresh_state["claimed_by"] = "concurrent-peer"
@@ -17591,9 +17366,7 @@ def test_run_daily_compact_reinjection_survives_a_malformed_fresh_buy_candidates
     assert {"AAPL", "NVDA", "MSFT"} <= set(surviving_submitted_rows)
 
 
-def test_run_daily_compact_carries_folded_concurrent_placement_through_a_later_retry(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_carries_folded_concurrent_placement_through_a_later_retry(tmp_path, monkeypatch):
     """Codex review ("Carry merged concurrent placements through later
     retries"): folding this invocation's own real placement into a
     surviving concurrent peer's state (the fix under
@@ -17604,9 +17377,7 @@ def test_run_daily_compact_carries_folded_concurrent_placement_through_a_later_r
     overwrites run_state.json yet again) silently drops it, permanently
     excluding a real order from the buy_candidates collection
     dca_risk.deployed_usd() sums."""
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-concurrent-fold-survives-retry"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-concurrent-fold-survives-retry")
     os.makedirs(artifacts_dir)
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     config = StrategyConfig(
@@ -17681,9 +17452,7 @@ def test_run_daily_compact_carries_folded_concurrent_placement_through_a_later_r
 
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         after_second = json.load(handle)
-    surviving_order_ids = {
-        row.get("order_id") for row in after_second.get("buy_candidates") or []
-    }
+    surviving_order_ids = {row.get("order_id") for row in after_second.get("buy_candidates") or []}
     # Every order_id folded in by the first retry must still be present --
     # not silently dropped by the second retry's own fresh overwrite.
     assert folded_order_ids <= surviving_order_ids
@@ -17711,21 +17480,26 @@ def test_run_daily_compact_counts_fresh_placements_alongside_reinjection(tmp_pat
     prior_ticker = "BYDDY"
     prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "broker_outcomes": {
-                prior_key: {
-                    "status": "submitted",
-                    "order_id": "ORD-FRACTIONAL-RECOVERED",
-                    "submitted_amount_usd": 7.5,
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "broker_outcomes": {
+                    prior_key: {
+                        "status": "submitted",
+                        "order_id": "ORD-FRACTIONAL-RECOVERED",
+                        "submitted_amount_usd": 7.5,
+                        "reconciled_fractional_placement": True,
+                        "ticker": prior_ticker,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     result = run_daily_compact(
         now,
@@ -17741,9 +17515,7 @@ def test_run_daily_compact_counts_fresh_placements_alongside_reinjection(tmp_pat
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
-    submitted_rows = [
-        row for row in run_state.get("buy_candidates") or [] if row.get("status") == "submitted"
-    ]
+    submitted_rows = [row for row in run_state.get("buy_candidates") or [] if row.get("status") == "submitted"]
     # AAPL/NVDA/MSFT (this invocation's own ordinary orders) + the reinjected
     # BYDDY recovery -- all four must be present in buy_candidates...
     assert {row.get("ticker") for row in submitted_rows} == {"AAPL", "NVDA", "MSFT", prior_ticker}
@@ -17764,9 +17536,7 @@ def test_run_daily_compact_counts_fresh_placements_alongside_reinjection(tmp_pat
         submitted_order_rows = list(csv.DictReader(handle))
     submitted_order_tickers = {row["ticker"] for row in submitted_order_rows}
     assert submitted_order_tickers == {"AAPL", "NVDA", "MSFT", prior_ticker}
-    assert {row["order_id"] for row in submitted_order_rows} == {
-        row["order_id"] for row in submitted_rows
-    }
+    assert {row["order_id"] for row in submitted_order_rows} == {row["order_id"] for row in submitted_rows}
 
 
 def test_run_daily_compact_retains_ticker_when_reinjected_outcome_omits_its_own(
@@ -17795,22 +17565,27 @@ def test_run_daily_compact_retains_ticker_when_reinjected_outcome_omits_its_own(
     prior_ticker = "BYDDY"
     prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "broker_outcomes": {
-                prior_key: {
-                    "status": "submitted",
-                    "order_id": "ORD-FRACTIONAL-RECOVERED-NO-TICKER",
-                    "submitted_amount_usd": 7.5,
-                    "reconciled_fractional_placement": True,
-                    # No "ticker" field at all -- relies purely on the
-                    # dict key (prior_key) for the symbol.
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "broker_outcomes": {
+                    prior_key: {
+                        "status": "submitted",
+                        "order_id": "ORD-FRACTIONAL-RECOVERED-NO-TICKER",
+                        "submitted_amount_usd": 7.5,
+                        "reconciled_fractional_placement": True,
+                        # No "ticker" field at all -- relies purely on the
+                        # dict key (prior_key) for the symbol.
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     result = run_daily_compact(
         now,
@@ -17826,7 +17601,8 @@ def test_run_daily_compact_retains_ticker_when_reinjected_outcome_omits_its_own(
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     matching_candidate_rows = [
-        row for row in run_state.get("buy_candidates") or []
+        row
+        for row in run_state.get("buy_candidates") or []
         if row.get("order_id") == "ORD-FRACTIONAL-RECOVERED-NO-TICKER"
     ]
     assert len(matching_candidate_rows) == 1
@@ -17837,9 +17613,7 @@ def test_run_daily_compact_retains_ticker_when_reinjected_outcome_omits_its_own(
 
     with open(os.path.join(artifacts_dir, "submitted_orders.csv"), encoding="utf-8") as handle:
         submitted_order_rows = list(csv.DictReader(handle))
-    matching_csv_rows = [
-        row for row in submitted_order_rows if row["order_id"] == "ORD-FRACTIONAL-RECOVERED-NO-TICKER"
-    ]
+    matching_csv_rows = [row for row in submitted_order_rows if row["order_id"] == "ORD-FRACTIONAL-RECOVERED-NO-TICKER"]
     assert len(matching_csv_rows) == 1
     # submitted_orders.csv must show the SAME ticker as buy_candidates --
     # not the literal "idx:<n>" row-index key this mapping is internally
@@ -17847,9 +17621,7 @@ def test_run_daily_compact_retains_ticker_when_reinjected_outcome_omits_its_own(
     assert matching_csv_rows[0]["ticker"] == prior_key
 
 
-def test_run_daily_compact_allocates_a_collision_free_key_for_a_third_concurrent_outcome(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_allocates_a_collision_free_key_for_a_third_concurrent_outcome(tmp_path, monkeypatch):
     """Codex review ("Allocate a collision-free key for every concurrent
     outcome"): a single fixed ":concurrent" suffix is not collision-free
     once folded concurrent placements persist across retries -- a
@@ -17857,9 +17629,7 @@ def test_run_daily_compact_allocates_a_collision_free_key_for_a_third_concurrent
     ":concurrent" suffix from two earlier overlapping retries. A THIRD
     overlapping retry folding its own placement for the SAME ticker must
     not silently overwrite either of the first two."""
-    artifacts_dir = os.path.join(
-        tmp_path, "runs", "2026-06-29-third-concurrent-same-ticker"
-    )
+    artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29-third-concurrent-same-ticker")
     os.makedirs(artifacts_dir)
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     config = StrategyConfig(
@@ -17873,28 +17643,33 @@ def test_run_daily_compact_allocates_a_collision_free_key_for_a_third_concurrent
     # suffix -- both distinct, real orders, both still owed a place in
     # broker_outcomes.
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "broker_outcomes": {
-                "AAPL": {
-                    "status": "submitted",
-                    "order_id": "MOCK-AAPL-FIRST",
-                    "submitted_amount_usd": 1.0,
-                    "reconciled_fractional_placement": True,
-                    "ticker": "AAPL",
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
                 },
-                "AAPL:concurrent": {
-                    "status": "submitted",
-                    "order_id": "MOCK-AAPL-SECOND",
-                    "submitted_amount_usd": 2.0,
-                    "reconciled_fractional_placement": True,
-                    "ticker": "AAPL",
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "submitted",
+                        "order_id": "MOCK-AAPL-FIRST",
+                        "submitted_amount_usd": 1.0,
+                        "reconciled_fractional_placement": True,
+                        "ticker": "AAPL",
+                    },
+                    "AAPL:concurrent": {
+                        "status": "submitted",
+                        "order_id": "MOCK-AAPL-SECOND",
+                        "submitted_amount_usd": 2.0,
+                        "reconciled_fractional_placement": True,
+                        "ticker": "AAPL",
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     import sys
 
@@ -17903,10 +17678,7 @@ def test_run_daily_compact_allocates_a_collision_free_key_for_a_third_concurrent
     real_lock = near_close_dca.cross_process_lock
 
     def claim_with_concurrent_writer_once(path, *args, **kwargs):
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
                 fresh_state = json.load(handle)
             fresh_state["claimed_by"] = "concurrent-peer"
@@ -17953,9 +17725,7 @@ def test_run_daily_compact_allocates_a_collision_free_key_for_a_third_concurrent
     assert submitted_csv_order_ids == surviving_order_ids
 
 
-def test_run_daily_compact_reinjection_logs_loudly_after_repeated_timeouts(
-    tmp_path, monkeypatch, caplog
-):
+def test_run_daily_compact_reinjection_logs_loudly_after_repeated_timeouts(tmp_path, monkeypatch, caplog):
     """The other side of the same fix: once every retry is exhausted, the
     recovered order is still lost (there is no further chance to reinject
     it once run_once()'s own fresh run_state.json has already been
@@ -17968,21 +17738,26 @@ def test_run_daily_compact_reinjection_logs_loudly_after_repeated_timeouts(
     prior_ticker = "BYDDY"
     prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "broker_outcomes": {
-                prior_key: {
-                    "status": "submitted",
-                    "order_id": "ORD-FRACTIONAL-RECOVERED",
-                    "submitted_amount_usd": 7.5,
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "broker_outcomes": {
+                    prior_key: {
+                        "status": "submitted",
+                        "order_id": "ORD-FRACTIONAL-RECOVERED",
+                        "submitted_amount_usd": 7.5,
+                        "reconciled_fractional_placement": True,
+                        "ticker": prior_ticker,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     import sys
 
@@ -17993,10 +17768,7 @@ def test_run_daily_compact_reinjection_logs_loudly_after_repeated_timeouts(
     def stuck_lock(path, *args, **kwargs):
         # See the matching comment in the retry-then-succeed test: scoped
         # to only the reinjection call site.
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             raise TimeoutError("simulated stuck holder")
         return real_lock(path, *args, **kwargs)
 
@@ -18021,9 +17793,7 @@ def test_run_daily_compact_reinjection_logs_loudly_after_repeated_timeouts(
     assert not [row for row in run_state["buy_candidates"] if row.get("ticker") == prior_ticker]
 
     assert any(
-        "run_state.json" in r.message
-        and "repeated lock failures" in r.message
-        and prior_key in r.message
+        "run_state.json" in r.message and "repeated lock failures" in r.message and prior_key in r.message
         for r in caplog.records
     )
 
@@ -18038,9 +17808,7 @@ def test_run_daily_compact_reinjection_logs_loudly_after_repeated_timeouts(
     assert "account_fingerprint" in sidecar_entry
 
 
-def test_run_daily_compact_reinjection_preserves_recovery_on_lock_oserror(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_reinjection_preserves_recovery_on_lock_oserror(tmp_path, monkeypatch):
     """Codex review ("Preserve recoveries when lock setup raises OSError"):
     cross_process_lock() can raise a plain OSError (not just TimeoutError)
     when the sidecar itself cannot be created or opened. That must be
@@ -18055,21 +17823,26 @@ def test_run_daily_compact_reinjection_preserves_recovery_on_lock_oserror(
     prior_ticker = "BYDDY"
     prior_key = f"{prior_ticker}#fractional-recovery:ref-1"
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "broker_outcomes": {
-                prior_key: {
-                    "status": "submitted",
-                    "order_id": "ORD-FRACTIONAL-RECOVERED",
-                    "submitted_amount_usd": 7.5,
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "broker_outcomes": {
+                    prior_key: {
+                        "status": "submitted",
+                        "order_id": "ORD-FRACTIONAL-RECOVERED",
+                        "submitted_amount_usd": 7.5,
+                        "reconciled_fractional_placement": True,
+                        "ticker": prior_ticker,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     import sys
 
@@ -18078,10 +17851,7 @@ def test_run_daily_compact_reinjection_preserves_recovery_on_lock_oserror(
     real_lock = near_close_dca.cross_process_lock
 
     def raises_oserror(path, *args, **kwargs):
-        if (
-            pathlib.Path(path).name == "run_state.json.lock"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if pathlib.Path(path).name == "run_state.json.lock" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             raise OSError("simulated descriptor exhaustion")
         return real_lock(path, *args, **kwargs)
 
@@ -18105,7 +17875,6 @@ def test_run_daily_compact_reinjection_preserves_recovery_on_lock_oserror(
     assert "account_fingerprint" in sidecar_entry
 
 
-
 def test_run_daily_compact_does_not_mark_a_reinjected_rejection_as_submitted(tmp_path):
     """`_prior_recovered_outcomes` includes ANY outcome marked
     `reconciled_fractional_placement`, not just a settled one -- reconciling
@@ -18127,19 +17896,24 @@ def test_run_daily_compact_does_not_mark_a_reinjected_rejection_as_submitted(tmp
 
     prior_ticker = "BYDDY"  # not in config.tickers, so this run's own scan never touches it.
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "broker_outcomes": {
-                f"{prior_ticker}#fractional-recovery:ref-1": {
-                    "status": "failed",
-                    "reconciled_fractional_placement": True,
-                    "ticker": prior_ticker,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
+                },
+                "broker_outcomes": {
+                    f"{prior_ticker}#fractional-recovery:ref-1": {
+                        "status": "failed",
+                        "reconciled_fractional_placement": True,
+                        "ticker": prior_ticker,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     result = run_daily_compact(
         now,
@@ -18182,37 +17956,44 @@ def test_run_daily_compact_does_not_mark_an_adjustment_only_reinjection_as_submi
     os.makedirs(artifacts_dir)
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
     config = StrategyConfig(
-        dry_run=True, tickers=(), approved_test_dates=config.approved_test_dates,
+        dry_run=True,
+        tickers=(),
+        approved_test_dates=config.approved_test_dates,
     )
 
     prior_ticker = "BYDDY"  # not in config.tickers, so this run's own scan never touches it.
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "run_classification": {
-                "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
-            },
-            "buy_candidates": [
-                {
-                    "ticker": prior_ticker,
-                    "status": "submitted",
-                    "order_id": "ORD-ADJUSTMENT-ONLY",
-                    "whole_share_order_ids": ["ORD-ADJUSTMENT-ONLY"],
-                    "submitted_amount_usd": 1.14,
-                    # A real settlement-adjustment-only row (see
-                    # _build_buy_candidates's recovered_whole_share_claim
-                    # branch) always carries buy_multiplier=0.0 and a
-                    # planned_amount_usd -- both required by
-                    # _prior_candidate_schema_compatible_for_retry_merge's
-                    # schema check before this row is eligible for
-                    # reinjection at all.
-                    "buy_multiplier": 0.0,
-                    "planned_amount_usd": 1.14,
-                    "merged_submission_count": 0,
-                    "whole_share_settlement_adjustment": True,
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                    "run_origin": "scheduled",
                 },
-            ],
-        }, handle)
+                "buy_candidates": [
+                    {
+                        "ticker": prior_ticker,
+                        "status": "submitted",
+                        "order_id": "ORD-ADJUSTMENT-ONLY",
+                        "whole_share_order_ids": ["ORD-ADJUSTMENT-ONLY"],
+                        "submitted_amount_usd": 1.14,
+                        # A real settlement-adjustment-only row (see
+                        # _build_buy_candidates's recovered_whole_share_claim
+                        # branch) always carries buy_multiplier=0.0 and a
+                        # planned_amount_usd -- both required by
+                        # _prior_candidate_schema_compatible_for_retry_merge's
+                        # schema check before this row is eligible for
+                        # reinjection at all.
+                        "buy_multiplier": 0.0,
+                        "planned_amount_usd": 1.14,
+                        "merged_submission_count": 0,
+                        "whole_share_settlement_adjustment": True,
+                    },
+                ],
+            },
+            handle,
+        )
 
     result = run_daily_compact(
         now,
@@ -18254,14 +18035,21 @@ def test_run_daily_compact_returns_artifact_paths_created_by_blocked_recovery(tm
     gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
 
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": gated_now.date().isoformat(),
-            "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": gated_now.date().isoformat(),
+                "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            },
+            handle,
+        )
     with open(os.path.join(artifacts_dir, "buy_candidates.csv"), "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["ticker", "status", "order_id", "planned_amount_usd"])
         writer.writeheader()
@@ -18316,14 +18104,21 @@ def test_run_daily_compact_omits_stale_blocked_recovery_paths_on_a_second_invoca
     gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
 
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": gated_now.date().isoformat(),
-            "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": gated_now.date().isoformat(),
+                "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            },
+            handle,
+        )
     with open(os.path.join(artifacts_dir, "buy_candidates.csv"), "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["ticker", "status", "order_id", "planned_amount_usd"])
         writer.writeheader()
@@ -18342,7 +18137,12 @@ def test_run_daily_compact_omits_stale_blocked_recovery_paths_on_a_second_invoca
 
     # FIRST invocation: genuine recovery happens, the durable marker gets set.
     first_result = run_daily_compact(
-        gated_now, config, state, fin, rh, broker,
+        gated_now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert first_result["blocked"] is True
@@ -18352,7 +18152,12 @@ def test_run_daily_compact_omits_stale_blocked_recovery_paths_on_a_second_invoca
     # already resolved, so there is nothing NEW to reconcile -- but the
     # durable marker from the FIRST pass is still on disk.
     second_result = run_daily_compact(
-        gated_now, config, state, fin, rh, broker,
+        gated_now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
     assert second_result["blocked"] is True
@@ -18416,13 +18221,19 @@ def test_run_daily_compact_omits_stale_artifact_paths_on_a_reused_blocked_direct
     # reconciled_on_retry marker anywhere -- alongside its own genuine
     # (but now stale, from that earlier completed run) companion files.
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": gated_now.date().isoformat(),
-            "broker_outcomes": {"AAPL": {
-                "status": "submitted", "placement_outcome_unproven": False,
-                "order_id": "ORD-OLD-COMPLETED",
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": gated_now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "submitted",
+                        "placement_outcome_unproven": False,
+                        "order_id": "ORD-OLD-COMPLETED",
+                    }
+                },
+            },
+            handle,
+        )
     with open(os.path.join(artifacts_dir, "buy_candidates.csv"), "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["ticker", "status", "order_id"])
         writer.writeheader()
@@ -18449,12 +18260,10 @@ def test_run_daily_compact_omits_stale_artifact_paths_on_a_reused_blocked_direct
     )
     assert result["blocked"] is True
     assert "buy_candidates_path" not in result, (
-        "a stale, pre-existing buy_candidates.csv must not be reported as "
-        "this invocation's own recovery output"
+        "a stale, pre-existing buy_candidates.csv must not be reported as this invocation's own recovery output"
     )
     assert "orders_csv_path" not in result, (
-        "a stale, pre-existing orders.csv must not be reported as this "
-        "invocation's own recovery output"
+        "a stale, pre-existing orders.csv must not be reported as this invocation's own recovery output"
     )
     # The stale files themselves are untouched, still on disk -- this fix
     # is about what the returned map claims, not about deleting anything.
@@ -18561,16 +18370,21 @@ def test_run_daily_compact_blocked_run_rejects_a_dry_run_peer_for_a_live_invocat
     # A genuinely dry-run peer's own valid, complete state -- same
     # identity fields a live invocation for this exact slot would carry.
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": gated_now.date().isoformat(),
-            "run_classification": {
-                "run_origin": "scheduled", "stream": "afternoon", "scheduled_for_et": "15:30",
+        json.dump(
+            {
+                "trading_day": gated_now.date().isoformat(),
+                "run_classification": {
+                    "run_origin": "scheduled",
+                    "stream": "afternoon",
+                    "scheduled_for_et": "15:30",
+                },
+                "dry_run": True,
+                "account_number": None,
+                "buy_candidates": [],
+                "broker_outcomes": {},
             },
-            "dry_run": True,
-            "account_number": None,
-            "buy_candidates": [],
-            "broker_outcomes": {},
-        }, handle)
+            handle,
+        )
 
     config = StrategyConfig(
         dry_run=False,
@@ -18591,9 +18405,7 @@ def test_run_daily_compact_blocked_run_rejects_a_dry_run_peer_for_a_live_invocat
     assert result.get("directory_ownership_verified") is False
 
 
-def test_run_daily_compact_blocked_run_survives_a_transient_read_error(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_blocked_run_survives_a_transient_read_error(tmp_path, monkeypatch):
     """Codex review ("Initialize the blocked-state snapshot before
     reading"): the ownership check just below the guarded run_state.json
     read uses `_blocked_run_state` unconditionally. A transient
@@ -18619,10 +18431,7 @@ def test_run_daily_compact_blocked_run_survives_a_transient_read_error(
     real_read_text = pathlib.Path.read_text
 
     def raise_on_blocked_state_read(self, *args, **kwargs):
-        if (
-            self.name == "run_state.json"
-            and sys._getframe(1).f_code.co_name == "run_daily_compact"
-        ):
+        if self.name == "run_state.json" and sys._getframe(1).f_code.co_name == "run_daily_compact":
             raise OSError("simulated transient read failure")
         return real_read_text(self, *args, **kwargs)
 
@@ -18643,9 +18452,7 @@ def test_run_daily_compact_blocked_run_survives_a_transient_read_error(
     assert result.get("directory_ownership_verified") is False
 
 
-def test_run_daily_compact_blocked_run_does_not_verify_ownership_of_a_peer_stub(
-    tmp_path, monkeypatch
-):
+def test_run_daily_compact_blocked_run_does_not_verify_ownership_of_a_peer_stub(tmp_path, monkeypatch):
     """Codex review ("Verify blocked-run ownership after writing the
     stub"): when the initial pre-run_once() check finds no prior state at
     all, a DIFFERENT overlapping invocation (a different slot, or a
@@ -18676,16 +18483,21 @@ def test_run_daily_compact_blocked_run_does_not_verify_ownership_of_a_peer_stub(
         # the gap between the initial "nothing here" check and this
         # invocation's own _write_blocked_run_stub() call.
         with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-            json.dump({
-                "trading_day": gated_now.date().isoformat(),
-                "run_classification": {
-                    "stream": "midday", "scheduled_for_et": "12:30", "run_origin": "scheduled",
+            json.dump(
+                {
+                    "trading_day": gated_now.date().isoformat(),
+                    "run_classification": {
+                        "stream": "midday",
+                        "scheduled_for_et": "12:30",
+                        "run_origin": "scheduled",
+                    },
+                    "dry_run": True,
+                    "account_number": None,
+                    "buy_candidates": [],
+                    "broker_outcomes": {},
                 },
-                "dry_run": True,
-                "account_number": None,
-                "buy_candidates": [],
-                "broker_outcomes": {},
-            }, handle)
+                handle,
+            )
         return real_write_blocked_run_stub(*args, **kwargs)
 
     monkeypatch.setattr(near_close_dca, "_write_blocked_run_stub", peer_claims_directory_first)
@@ -18728,20 +18540,27 @@ def test_run_daily_compact_refreshes_companions_after_partial_gated_reconciliati
     gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
 
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": gated_now.date().isoformat(),
-            "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
-            "broker_outcomes": {
-                "AAPL": {
-                    "status": "failed", "placement_outcome_unproven": True,
-                    "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-                },
-                "MSFT": {
-                    "status": "failed", "placement_outcome_unproven": True,
-                    "placement_ref_id": "afternoon-MSFT-proof", "submitted_amount_usd": 4.0,
+        json.dump(
+            {
+                "trading_day": gated_now.date().isoformat(),
+                "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    },
+                    "MSFT": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-MSFT-proof",
+                        "submitted_amount_usd": 4.0,
+                    },
                 },
             },
-        }, handle)
+            handle,
+        )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -18785,9 +18604,9 @@ def test_run_daily_compact_refreshes_companions_after_partial_gated_reconciliati
 
     with open(os.path.join(artifacts_dir, "submitted_orders.csv"), encoding="utf-8") as handle:
         submitted_rows = list(csv.DictReader(handle))
-    assert any(
-        r["ticker"] == "AAPL" and r["order_id"] == "ORD-RECOVERED" for r in submitted_rows
-    ), "AAPL's resolution must reach submitted_orders.csv despite MSFT's group raising"
+    assert any(r["ticker"] == "AAPL" and r["order_id"] == "ORD-RECOVERED" for r in submitted_rows), (
+        "AAPL's resolution must reach submitted_orders.csv despite MSFT's group raising"
+    )
 
     with open(os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8") as handle:
         run_summary = json.load(handle)
@@ -18796,8 +18615,7 @@ def test_run_daily_compact_refreshes_companions_after_partial_gated_reconciliati
     with open(os.path.join(artifacts_dir, "orders.csv"), encoding="utf-8") as handle:
         orders_rows = list(csv.DictReader(handle))
     assert any(
-        r["ticker"] == "AAPL" and r["order_id"] == "ORD-RECOVERED" and r["status"] == "submitted"
-        for r in orders_rows
+        r["ticker"] == "AAPL" and r["order_id"] == "ORD-RECOVERED" and r["status"] == "submitted" for r in orders_rows
     ), "AAPL's execution record must be merged into orders.csv despite MSFT's group raising"
 
 
@@ -18817,14 +18635,21 @@ def test_gated_reconciliation_persists_its_recovery_to_orders_csv(tmp_path):
     gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
 
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": gated_now.date().isoformat(),
-            "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": gated_now.date().isoformat(),
+                "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            },
+            handle,
+        )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -18850,10 +18675,7 @@ def test_gated_reconciliation_persists_its_recovery_to_orders_csv(tmp_path):
 
     with open(os.path.join(artifacts_dir, "orders.csv"), encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
-    assert any(
-        r["ticker"] == "AAPL" and r["order_id"] == "ORD-RECOVERED" and r["status"] == "submitted"
-        for r in rows
-    )
+    assert any(r["ticker"] == "AAPL" and r["order_id"] == "ORD-RECOVERED" and r["status"] == "submitted" for r in rows)
 
 
 def test_reconciliation_refreshes_failure_aggregates_alongside_submitted_count(tmp_path):
@@ -18872,26 +18694,38 @@ def test_reconciliation_refreshes_failure_aggregates_alongside_submitted_count(t
     gated_now = datetime(2026, 7, 1, 15, 45, tzinfo=EASTERN)  # not an approved date
 
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": gated_now.date().isoformat(),
-            "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            }},
-            "buy_candidates": [{
-                "ticker": "AAPL", "status": "failed", "order_id": None,
-                "buy_multiplier": 1.0, "planned_amount_usd": 2.0,
-                "skip_reason": "placement outcome unproven: RuntimeError",
-                "placement_ref_id": "afternoon-AAPL-proof",
-            }],
-            # Stale aggregates from the ORIGINAL unresolved-halt write, as
-            # the failure writer would have recorded them.
-            "orders_submitted_count": 0,
-            "orders_failed_count": 1,
-            "counts": {"evaluated": 1, "buy_candidates": 1, "submitted": 0},
-            "usage_proxy": {"errors_count": 1, "manual_recovery_required": True},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": gated_now.date().isoformat(),
+                "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "failed",
+                        "order_id": None,
+                        "buy_multiplier": 1.0,
+                        "planned_amount_usd": 2.0,
+                        "skip_reason": "placement outcome unproven: RuntimeError",
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                    }
+                ],
+                # Stale aggregates from the ORIGINAL unresolved-halt write, as
+                # the failure writer would have recorded them.
+                "orders_submitted_count": 0,
+                "orders_failed_count": 1,
+                "counts": {"evaluated": 1, "buy_candidates": 1, "submitted": 0},
+                "usage_proxy": {"errors_count": 1, "manual_recovery_required": True},
+            },
+            handle,
+        )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -18954,9 +18788,7 @@ def test_blocked_stub_is_contract_valid_but_never_scheduled_evidence(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     # Well-formed and attributable...
@@ -18983,9 +18815,7 @@ def test_run_daily_compact_date_gate_does_not_clobber_prior_artifacts(tmp_path):
         broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         original = json.load(handle)
     assert "usage_proxy" in original
 
@@ -19001,9 +18831,7 @@ def test_run_daily_compact_date_gate_does_not_clobber_prior_artifacts(tmp_path):
     )
 
     assert result["blocked"] is True
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         preserved = json.load(handle)
     # The blocked stub must never overwrite a previously recorded run.
     assert preserved == original
@@ -19027,9 +18855,7 @@ def test_build_run_artifacts_stamps_scheduled_classification(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     rc = run_state["run_classification"]
@@ -19056,9 +18882,7 @@ def test_build_run_artifacts_stamps_manual_classification(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=False),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     rc = run_state["run_classification"]
@@ -19104,9 +18928,7 @@ def test_scheduled_compact_writes_and_validates_artifact_contract(tmp_path):
     assert rc["same_day_required"] is True
     assert rc["valid_scheduled_evidence"] is True
     # the production contract validator passes on the written dir
-    assert validate_run_artifacts(
-        d, require_submitted_orders=True, require_summary=True
-    )
+    assert validate_run_artifacts(d, require_submitted_orders=True, require_summary=True)
 
 
 def test_manual_compact_does_not_write_scheduled_contract_files(tmp_path):
@@ -19315,9 +19137,7 @@ def test_contract_failure_persists_invalid_evidence_marker(tmp_path):
 
     persisted = json.loads((d / "run_state.json").read_bytes())
     assert persisted["status"] == "blocked"
-    assert (
-        persisted["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
-    )
+    assert persisted["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
     assert persisted["artifact_contract_failure"]["compute_only"] is True
     assert persisted["run_classification"]["valid_scheduled_evidence"] is False
     # The run as a whole is still denied as valid COMPLETION evidence...
@@ -19331,9 +19151,7 @@ def test_contract_failure_persists_invalid_evidence_marker(tmp_path):
     assert kept[0]["buy_candidates"][0]["ticker"] == "A"
 
 
-def test_contract_failure_annotation_retries_past_transient_lock_contention(
-    tmp_path, monkeypatch
-):
+def test_contract_failure_annotation_retries_past_transient_lock_contention(tmp_path, monkeypatch):
     # Codex review ("Keep failed contracts ineligible after lock timeouts"):
     # a single TimeoutError used to give up on annotating run_state.json for
     # good, and derive_valid_scheduled_evidence() trusts that file's own
@@ -19394,9 +19212,7 @@ def test_contract_failure_annotation_retries_past_transient_lock_contention(
     assert _attempts["count"] == 3
 
 
-def test_contract_failure_annotation_gives_up_loudly_after_repeated_timeouts(
-    tmp_path, monkeypatch, caplog
-):
+def test_contract_failure_annotation_gives_up_loudly_after_repeated_timeouts(tmp_path, monkeypatch, caplog):
     # The other side of the same fix: once every retry is exhausted, this
     # must still not raise (the annotation pass stays best-effort, per the
     # earlier "Keep lock timeouts inside best-effort contract handling"
@@ -19441,10 +19257,7 @@ def test_contract_failure_annotation_gives_up_loudly_after_repeated_timeouts(
     persisted = json.loads((d / "run_state.json").read_bytes())
     assert "artifact_contract_failure" not in persisted
 
-    assert any(
-        "run_state.json" in r.message and "repeated lock timeouts" in r.message
-        for r in caplog.records
-    )
+    assert any("run_state.json" in r.message and "repeated lock timeouts" in r.message for r in caplog.records)
 
     # Codex review ("Keep contract-invalid state denied after prolonged
     # contention"): the un-annotated verdict must not simply vanish once
@@ -19457,15 +19270,10 @@ def test_contract_failure_annotation_gives_up_loudly_after_repeated_timeouts(
     entries = [json.loads(p.read_bytes()) for p in sidecars]
     assert {e["run_id"] for e in entries} == {"2026-06-29-152000"}
     assert any("run_state.json" in e["artifact_path"] for e in entries)
-    assert all(
-        e["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
-        for e in entries
-    )
+    assert all(e["artifact_contract_failure"]["failure"] == "artifact_contract_failure" for e in entries)
 
 
-def test_contract_failure_annotation_skips_a_file_claimed_by_a_successful_retry(
-    tmp_path, monkeypatch
-):
+def test_contract_failure_annotation_skips_a_file_claimed_by_a_successful_retry(tmp_path, monkeypatch):
     # Codex review ("Bind contract-failure stamps to the validated
     # snapshot"): the annotation loop's own retries can span several lock
     # acquisitions, during which an overlapping retry sharing this artifact
@@ -19524,9 +19332,7 @@ def test_contract_failure_annotation_skips_a_file_claimed_by_a_successful_retry(
 
     def publish_a_successful_retry_then_lock(path, *args, **kwargs):
         if Path(path).name == "run_state.json.lock":
-            (d / "run_state.json").write_text(
-                json.dumps(successful_retry_state), encoding="utf-8"
-            )
+            (d / "run_state.json").write_text(json.dumps(successful_retry_state), encoding="utf-8")
         return real_lock(path, *args, **kwargs)
 
     monkeypatch.setattr(near_close_dca, "cross_process_lock", publish_a_successful_retry_then_lock)
@@ -19540,9 +19346,7 @@ def test_contract_failure_annotation_skips_a_file_claimed_by_a_successful_retry(
     assert "artifact_contract_failure" not in persisted
 
 
-def test_contract_failure_annotation_skips_a_same_run_id_collision(
-    tmp_path, monkeypatch
-):
+def test_contract_failure_annotation_skips_a_same_run_id_collision(tmp_path, monkeypatch):
     # Codex review ("Use a collision-resistant snapshot identifier"):
     # build_run_artifacts() gives run_id only second-level resolution
     # (YYYY-MM-DD-HHMMSS), so two overlapping retries starting within the
@@ -19598,9 +19402,7 @@ def test_contract_failure_annotation_skips_a_same_run_id_collision(
 
     def publish_a_same_run_id_retry_then_lock(path, *args, **kwargs):
         if Path(path).name == "run_state.json.lock":
-            (d / "run_state.json").write_text(
-                json.dumps(successful_retry_state), encoding="utf-8"
-            )
+            (d / "run_state.json").write_text(json.dumps(successful_retry_state), encoding="utf-8")
         return real_lock(path, *args, **kwargs)
 
     monkeypatch.setattr(near_close_dca, "cross_process_lock", publish_a_same_run_id_retry_then_lock)
@@ -19613,9 +19415,7 @@ def test_contract_failure_annotation_skips_a_same_run_id_collision(
     assert "artifact_contract_failure" not in persisted
 
 
-def test_contract_failure_annotation_snapshot_is_this_invocations_own_write(
-    tmp_path, monkeypatch
-):
+def test_contract_failure_annotation_snapshot_is_this_invocations_own_write(tmp_path, monkeypatch):
     # Codex review ("Bind snapshots to this invocation's writes"): the
     # earlier fix re-read run_summary.json from disk to build its
     # snapshot, immediately after writing it -- but if an overlapping
@@ -19664,9 +19464,7 @@ def test_contract_failure_annotation_snapshot_is_this_invocations_own_write(
         if self.name == "run_summary.json":
             # Simulate the overlapping retry's write landing immediately
             # after this invocation's own write completes.
-            real_write_bytes(
-                self, json.dumps(other_retrys_summary, indent=2, sort_keys=True).encode("utf-8")
-            )
+            real_write_bytes(self, json.dumps(other_retrys_summary, indent=2, sort_keys=True).encode("utf-8"))
         return result
 
     monkeypatch.setattr(Path, "write_bytes", hijack_run_summary_write)
@@ -19680,9 +19478,7 @@ def test_contract_failure_annotation_snapshot_is_this_invocations_own_write(
     assert persisted_summary == other_retrys_summary
 
 
-def test_contract_failure_annotation_run_state_snapshot_predates_this_functions_own_writes(
-    tmp_path, monkeypatch
-):
+def test_contract_failure_annotation_run_state_snapshot_predates_this_functions_own_writes(tmp_path, monkeypatch):
     # Codex review ("Bind snapshots to this invocation's writes"), the
     # run_state.json half: the exact scenario described is retry B
     # replacing run_state.json AFTER retry A writes its own summary but
@@ -19735,8 +19531,10 @@ def test_contract_failure_annotation_run_state_snapshot_predates_this_functions_
         "trading_day": "2026-06-29",
         "order_submit_status": "not_submitted",
         "run_classification": {
-            "run_origin": "scheduled", "manual_run": False,
-            "stream": "afternoon", "valid_scheduled_evidence": True,
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "not_submitted"},
@@ -19748,9 +19546,7 @@ def test_contract_failure_annotation_run_state_snapshot_predates_this_functions_
     def hijack_summary_write_to_race_run_state(self, data, *args, **kwargs):
         result = real_write_bytes(self, data, *args, **kwargs)
         if self.name == "run_summary.json":
-            (d / "run_state.json").write_text(
-                json.dumps(successful_retry_state), encoding="utf-8"
-            )
+            (d / "run_state.json").write_text(json.dumps(successful_retry_state), encoding="utf-8")
         return result
 
     monkeypatch.setattr(Path, "write_bytes", hijack_summary_write_to_race_run_state)
@@ -19814,8 +19610,10 @@ def test_write_and_validate_scheduled_contract_uses_callers_known_bytes_not_a_re
         "trading_day": "2026-06-29",
         "order_submit_status": "not_submitted",
         "run_classification": {
-            "run_origin": "scheduled", "manual_run": False,
-            "stream": "afternoon", "valid_scheduled_evidence": True,
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "not_submitted"},
@@ -19824,9 +19622,7 @@ def test_write_and_validate_scheduled_contract_uses_callers_known_bytes_not_a_re
     (d / "run_state.json").write_text(json.dumps(successful_retry_state), encoding="utf-8")
     (d / "signals.csv").write_text("ticker\nB\n", encoding="utf-8")
 
-    result = _write_and_validate_scheduled_contract(
-        artifacts, d, known_run_state_bytes=known_bytes
-    )
+    result = _write_and_validate_scheduled_contract(artifacts, d, known_run_state_bytes=known_bytes)
     assert not result
 
     # The other retry's run_state.json must survive completely untouched --
@@ -19838,9 +19634,7 @@ def test_write_and_validate_scheduled_contract_uses_callers_known_bytes_not_a_re
     assert "artifact_contract_failure" not in persisted_state
 
 
-def test_write_and_validate_scheduled_contract_verifies_snapshot_before_accepting_success(
-    tmp_path, monkeypatch
-):
+def test_write_and_validate_scheduled_contract_verifies_snapshot_before_accepting_success(tmp_path, monkeypatch):
     # Codex review ("Verify the state snapshot before accepting the
     # contract"): validate_run_artifacts() reads run_state.json/
     # run_summary.json fresh from disk, not the snapshot bytes this
@@ -19886,8 +19680,10 @@ def test_write_and_validate_scheduled_contract_verifies_snapshot_before_acceptin
         "trading_day": "2026-06-29",
         "order_submit_status": "not_submitted",
         "run_classification": {
-            "run_origin": "scheduled", "manual_run": False,
-            "stream": "afternoon", "valid_scheduled_evidence": True,
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "not_submitted"},
@@ -19909,9 +19705,7 @@ def test_write_and_validate_scheduled_contract_verifies_snapshot_before_acceptin
         lambda *args, **kwargs: ArtifactContractResult(True, []),
     )
 
-    result = _write_and_validate_scheduled_contract(
-        artifacts, d, known_run_state_bytes=known_bytes
-    )
+    result = _write_and_validate_scheduled_contract(artifacts, d, known_run_state_bytes=known_bytes)
     assert not result
 
     # B's run_state.json must survive completely untouched -- the mismatch
@@ -19922,9 +19716,7 @@ def test_write_and_validate_scheduled_contract_verifies_snapshot_before_acceptin
     assert "artifact_contract_failure" not in persisted_state
 
 
-def test_write_and_validate_scheduled_contract_snapshots_submitted_orders_csv(
-    tmp_path, monkeypatch
-):
+def test_write_and_validate_scheduled_contract_snapshots_submitted_orders_csv(tmp_path, monkeypatch):
     """Codex review ("Snapshot the submitted-orders artifact before
     validation"): the pre-validation snapshot set used to track only
     run_state.json/run_summary.json, never submitted_orders.csv -- the
@@ -19979,13 +19771,9 @@ def test_write_and_validate_scheduled_contract_snapshots_submitted_orders_csv(
         )
         return ArtifactContractResult(True, [])
 
-    monkeypatch.setattr(
-        scheduled_artifacts_module, "validate_run_artifacts", peer_overwrites_then_validation_succeeds
-    )
+    monkeypatch.setattr(scheduled_artifacts_module, "validate_run_artifacts", peer_overwrites_then_validation_succeeds)
 
-    result = _write_and_validate_scheduled_contract(
-        artifacts, d, known_run_state_bytes=known_bytes
-    )
+    result = _write_and_validate_scheduled_contract(artifacts, d, known_run_state_bytes=known_bytes)
     assert not result
 
     # Retry B's submitted_orders.csv must survive completely untouched --
@@ -19997,9 +19785,7 @@ def test_write_and_validate_scheduled_contract_snapshots_submitted_orders_csv(
     assert "artifact_contract_failure" not in persisted_state
 
 
-def test_write_and_validate_scheduled_contract_binds_csv_snapshot_to_its_own_write(
-    tmp_path, monkeypatch
-):
+def test_write_and_validate_scheduled_contract_binds_csv_snapshot_to_its_own_write(tmp_path, monkeypatch):
     """Codex review ("Bind the CSV snapshot to this invocation's write"),
     following up on the sibling snapshot test above: capturing the
     snapshot via a read-back immediately after write_submitted_orders_csv()
@@ -20062,9 +19848,7 @@ def test_write_and_validate_scheduled_contract_binds_csv_snapshot_to_its_own_wri
         lambda *args, **kwargs: ArtifactContractResult(True, []),
     )
 
-    result = _write_and_validate_scheduled_contract(
-        artifacts, d, known_run_state_bytes=known_bytes
-    )
+    result = _write_and_validate_scheduled_contract(artifacts, d, known_run_state_bytes=known_bytes)
     assert not result
 
     persisted_csv = (d / "submitted_orders.csv").read_text(encoding="utf-8")
@@ -20120,8 +19904,10 @@ def test_write_and_validate_scheduled_contract_verifies_state_before_writing_com
         "run_id": "peer-b-2026-06-29-152000",
         "trading_day": "2026-06-29",
         "run_classification": {
-            "run_origin": "scheduled", "manual_run": False,
-            "stream": "afternoon", "valid_scheduled_evidence": True,
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "not_submitted"},
@@ -20138,9 +19924,7 @@ def test_write_and_validate_scheduled_contract_verifies_state_before_writing_com
         encoding="utf-8",
     )
 
-    result = _write_and_validate_scheduled_contract(
-        artifacts, d, known_run_state_bytes=known_bytes
-    )
+    result = _write_and_validate_scheduled_contract(artifacts, d, known_run_state_bytes=known_bytes)
     assert not result
 
     # B's state and BOTH companions must survive completely untouched --
@@ -20154,9 +19938,7 @@ def test_write_and_validate_scheduled_contract_verifies_state_before_writing_com
     assert persisted_summary == {"run_id": "peer-b-2026-06-29-152000", "claimed_by": "peer-b"}
 
 
-def test_contract_failure_annotation_retries_past_a_non_timeout_lock_error(
-    tmp_path, monkeypatch
-):
+def test_contract_failure_annotation_retries_past_a_non_timeout_lock_error(tmp_path, monkeypatch):
     # Codex review ("Contain non-timeout failures from the annotation
     # lock"): cross_process_lock() can raise a plain OSError (not just
     # TimeoutError) when the sidecar itself cannot be created or opened --
@@ -20212,9 +19994,7 @@ def test_contract_failure_annotation_retries_past_a_non_timeout_lock_error(
     assert _attempts["count"] == 3
 
 
-def test_contract_failure_annotation_retries_past_a_transient_read_error(
-    tmp_path, monkeypatch
-):
+def test_contract_failure_annotation_retries_past_a_transient_read_error(tmp_path, monkeypatch):
     # Codex review ("Retry failed reads before abandoning the denial
     # stamp"): a transient OSError from fpath.read_bytes() inside the
     # annotation loop's own lock used to `break` straight out of the WHOLE
@@ -20281,9 +20061,7 @@ def test_contract_failure_annotation_retries_past_a_transient_read_error(
 
     monkeypatch.setattr(Path, "read_bytes", flaky_read_bytes)
 
-    result = _write_and_validate_scheduled_contract(
-        artifacts, d, known_run_state_bytes=known_bytes
-    )
+    result = _write_and_validate_scheduled_contract(artifacts, d, known_run_state_bytes=known_bytes)
     assert not result
 
     # Retried past the transient failures and successfully annotated on the
@@ -20309,9 +20087,7 @@ def test_contract_failure_blocks_scheduled_pointer_update(tmp_path, monkeypatch)
     monkeypatch.setattr(
         near_close_dca,
         "_write_and_validate_scheduled_contract",
-        lambda artifacts, artifacts_dir, **_kwargs: ArtifactContractResult(
-            False, ["forced contract failure"]
-        ),
+        lambda artifacts, artifacts_dir, **_kwargs: ArtifactContractResult(False, ["forced contract failure"]),
     )
 
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
@@ -20402,9 +20178,7 @@ def test_confirmation_required_broker_response_recorded_distinctly(tmp_path):
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _ConfirmationRequiredBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _ConfirmationRequiredBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
 
     run_daily_compact(
@@ -20417,9 +20191,7 @@ def test_confirmation_required_broker_response_recorded_distinctly(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     assert run_state["order_submit_status"] == "not_submitted_confirmation_required"
@@ -20445,9 +20217,7 @@ def test_fractional_confirmation_required_outcome_carries_the_no_submission_mark
 
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    config = StrategyConfig(
-        dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset({trading_day})
-    )
+    config = StrategyConfig(dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset({trading_day}))
 
     class _ConfirmationRequiredBroker(DryRunBroker):
         def place_market_buy(self, ticker, notional_usd, ref_id):
@@ -20515,9 +20285,7 @@ def test_confirmation_required_holds_do_not_consume_the_daily_attempt_cap(tmp_pa
         approved_test_dates=config.approved_test_dates,
         max_orders_per_day=1,
     )
-    broker = _ConfirmationRequiredBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _ConfirmationRequiredBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
 
     run_daily_compact(
@@ -20530,9 +20298,7 @@ def test_confirmation_required_holds_do_not_consume_the_daily_attempt_cap(tmp_pa
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     # All three tickers (AAPL, NVDA, MSFT) held for confirmation despite a
@@ -20570,9 +20336,7 @@ def test_scheduled_no_order_run_records_completed_no_orders_not_a_failure(tmp_pa
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     assert run_state["run_classification_outcome"] == "completed_no_orders"
@@ -20613,13 +20377,20 @@ def test_no_ladder_candidates_survives_an_unrelated_reconciled_rejection(tmp_pat
     # An unresolved placement from an EARLIER, unrelated invocation, left
     # for this run to reconcile before it evaluates anything of its own.
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            },
+            handle,
+        )
 
     class _ReconcilingBroker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -20639,15 +20410,12 @@ def test_no_ladder_candidates_survives_an_unrelated_reconciled_rejection(tmp_pat
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     # The reconciled rejection still landed in today's fresh artifact...
     recovered_rows = [
-        row for row in run_state["buy_candidates"]
-        if row.get("reason") == "reconciled_fractional_placement"
+        row for row in run_state["buy_candidates"] if row.get("reason") == "reconciled_fractional_placement"
     ]
     assert len(recovered_rows) == 1
     # ...but it must not be read as a current candidate this run evaluated.
@@ -20685,9 +20453,7 @@ def test_scheduled_run_blocked_only_by_missing_spread_records_missing_spread_dat
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     [candidate] = run_state["buy_candidates"]
@@ -20716,9 +20482,7 @@ def test_confirmation_required_status_survives_the_no_order_classification(tmp_p
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _ConfirmationRequiredBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _ConfirmationRequiredBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "confirmation")
 
     run_daily_compact(
@@ -20731,9 +20495,7 @@ def test_confirmation_required_status_survives_the_no_order_classification(tmp_p
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     assert run_state["order_submit_status"] == "not_submitted_confirmation_required"
@@ -20801,10 +20563,13 @@ def test_an_ambiguous_placement_raise_is_reconciled_against_its_ref_id():
     # live/filled states are an ALLOWLIST now.
     for state in ("new", "confirmed", "unconfirmed", "partially_filled", " QUEUED "):
         assert verdict({"id": "ORD", "state": state}) == (ACCEPTED, "ORD"), state
-    for partial in ({"id": "ORD"}, {"id": "ORD", "state": ""},
-                    {"id": "ORD", "state": None},
-                    {"id": "ORD", "state": "weird_broker_state"},
-                    {"id": "ORD", "state": "partially_rejected"}):
+    for partial in (
+        {"id": "ORD"},
+        {"id": "ORD", "state": ""},
+        {"id": "ORD", "state": None},
+        {"id": "ORD", "state": "weird_broker_state"},
+        {"id": "ORD", "state": "partially_rejected"},
+    ):
         assert verdict(partial) == (UNKNOWN, "ORD"), partial
 
     # A DECLINED terminal order was never working, so nothing executed. This
@@ -20823,14 +20588,19 @@ def test_an_ambiguous_placement_raise_is_reconciled_against_its_ref_id():
         # sat outside deployment and cap accounting (Codex review, PR #786:
         # "Inspect fills before declaring declined orders unplaced"). Round
         # 29's rule again: a carve-out no wider than its justification.
-        for fill in ({"cumulative_quantity": "3"}, {"executed_notional": "70.08"},
-                     {"cumulative_quantity": "oops"}, {"cumulative_quantity": False}):
+        for fill in (
+            {"cumulative_quantity": "3"},
+            {"executed_notional": "70.08"},
+            {"cumulative_quantity": "oops"},
+            {"cumulative_quantity": False},
+        ):
             assert verdict({"id": "ORD", "state": state, **fill}) == (UNKNOWN, "ORD"), (state, fill)
         # An explicit zero, or no fill fields at all, still proves it -- an
         # absent figure is expected on a declined order rather than suspicious.
-        assert verdict(
-            {"id": "ORD", "state": state, "executed_notional": "0", "cumulative_quantity": "0"}
-        ) == (NO_ORDER, "ORD"), state
+        assert verdict({"id": "ORD", "state": state, "executed_notional": "0", "cumulative_quantity": "0"}) == (
+            NO_ORDER,
+            "ORD",
+        ), state
 
     # An id this run cannot TRACK is not an id. `_is_blank_broker_field` covers
     # None/""/whitespace, and every other JSON-valid but unusable shape
@@ -20853,7 +20623,8 @@ def test_an_ambiguous_placement_raise_is_reconciled_against_its_ref_id():
     # so only an EXPLICIT zero rules a partial fill out.
     for state in ("cancelled", "canceled", "expired"):
         assert verdict({"id": "ORD", "state": state, "cumulative_quantity": "0"}) == (
-            NO_ORDER, "ORD",
+            NO_ORDER,
+            "ORD",
         ), state
     # The explicit zero can arrive through ANY of the seven fill-evidence
     # aliases _reconciled_order_may_have_executed reads, not only
@@ -20863,31 +20634,41 @@ def test_an_ambiguous_placement_raise_is_reconciled_against_its_ref_id():
     # fill (Codex review, PR #859: "Accept explicit zeroes from every
     # supported fill alias").
     for field in (
-        "executed_notional", "executed_dollar_amount", "filled_notional",
-        "executed_quantity", "filled_quantity", "quantity_filled",
+        "executed_notional",
+        "executed_dollar_amount",
+        "filled_notional",
+        "executed_quantity",
+        "filled_quantity",
+        "quantity_filled",
     ):
         assert verdict({"id": "ORD", "state": "cancelled", field: "0"}) == (
-            NO_ORDER, "ORD",
+            NO_ORDER,
+            "ORD",
         ), field
     # ... and an absent, blank or unreadable figure leaves it UNKNOWN, never
     # zero. The id is carried so the order stays reconcilable by hand: booking
     # the full requested notional would overstate real spend, booking nothing
     # would lose it.
-    for fill in ({"cumulative_quantity": "2"}, {}, {"cumulative_quantity": "  "},
-                 {"cumulative_quantity": "oops"},
-                 # A BOOLEAN is malformed evidence, not a measurement, and
-                 # `float(False)` is `0.0` -- so `cumulative_quantity: false`
-                 # read as a proven-unfilled order and let the caller call the
-                 # placement a proven failure. Round 33 caught the mirror of
-                 # this in `float(True) == 1.0` loading as a $1 ceiling (Codex
-                 # review, PR #786: "Reject boolean zero-fill evidence").
-                 {"cumulative_quantity": False},
-                 {"cumulative_quantity": True}):
+    for fill in (
+        {"cumulative_quantity": "2"},
+        {},
+        {"cumulative_quantity": "  "},
+        {"cumulative_quantity": "oops"},
+        # A BOOLEAN is malformed evidence, not a measurement, and
+        # `float(False)` is `0.0` -- so `cumulative_quantity: false`
+        # read as a proven-unfilled order and let the caller call the
+        # placement a proven failure. Round 33 caught the mirror of
+        # this in `float(True) == 1.0` loading as a $1 ceiling (Codex
+        # review, PR #786: "Reject boolean zero-fill evidence").
+        {"cumulative_quantity": False},
+        {"cumulative_quantity": True},
+    ):
         assert verdict({"id": "ORD", "state": "cancelled", **fill}) == (UNKNOWN, "ORD"), fill
     # A genuine numeric zero, in every spelling, still proves it.
     for zero in (0, 0.0, "0", "0.0", " 0 "):
         assert verdict({"id": "ORD", "state": "cancelled", "cumulative_quantity": zero}) == (
-            NO_ORDER, "ORD",
+            NO_ORDER,
+            "ORD",
         ), zero
 
     # An explicit zero on any of the OTHER three supported notional aliases
@@ -20902,21 +20683,24 @@ def test_an_ambiguous_placement_raise_is_reconciled_against_its_ref_id():
     for state in ("cancelled", "canceled", "expired"):
         for zero_field in ("executed_notional", "executed_dollar_amount", "filled_notional"):
             assert verdict({"id": "ORD", "state": state, zero_field: "0"}) == (
-                NO_ORDER, "ORD",
+                NO_ORDER,
+                "ORD",
             ), (state, zero_field)
     # Mapping-wrapped money form (`_reconciled_order_may_have_executed`'s own
     # unwrap): proves it identically.
     assert verdict({"id": "ORD", "state": "cancelled", "executed_notional": {"amount": "0"}}) == (
-        NO_ORDER, "ORD",
+        NO_ORDER,
+        "ORD",
     )
     # Any OTHER field on the same row still positively contradicting the
     # zero-proof halts it to UNKNOWN, exactly as a positive
     # `cumulative_quantity` would -- this is `_reconciled_order_may_have_
     # executed`'s own guard, not a new rule, so it is asserted here only as
     # a boundary check.
-    assert verdict(
-        {"id": "ORD", "state": "cancelled", "executed_notional": "0", "filled_notional": "5"}
-    ) == (UNKNOWN, "ORD")
+    assert verdict({"id": "ORD", "state": "cancelled", "executed_notional": "0", "filled_notional": "5"}) == (
+        UNKNOWN,
+        "ORD",
+    )
 
     # A NEGATIVE figure is malformed evidence, not a measurement of "nothing
     # was bought". `parsed > 0` read `-5` as proof of no fill, so a DECLINED
@@ -20929,12 +20713,14 @@ def test_an_ambiguous_placement_raise_is_reconciled_against_its_ref_id():
     # cannot drift apart again.
     for fill_field in ("executed_notional", "cumulative_quantity"):
         for negative in (-5, -0.01, "-5", -1e-9):
-            assert verdict(
-                {"id": "ORD", "state": "rejected", fill_field: negative}
-            ) == (UNKNOWN, "ORD"), (fill_field, negative)
-            assert verdict(
-                {"id": "ORD", "state": "cancelled", fill_field: negative}
-            ) == (UNKNOWN, "ORD"), (fill_field, negative)
+            assert verdict({"id": "ORD", "state": "rejected", fill_field: negative}) == (UNKNOWN, "ORD"), (
+                fill_field,
+                negative,
+            )
+            assert verdict({"id": "ORD", "state": "cancelled", fill_field: negative}) == (UNKNOWN, "ORD"), (
+                fill_field,
+                negative,
+            )
     # Imported locally: `near_close_dca` does not depend on `dca_runner`, and
     # this is a cross-module drift check rather than a use.
     import dca_runner
@@ -20943,14 +20729,21 @@ def test_an_ambiguous_placement_raise_is_reconciled_against_its_ref_id():
         dca_runner._combined_fill_evidence([{"cumulative_quantity": -1}])
         == dca_runner._FILL_EVIDENCE_POSITIVE_OR_UNREADABLE
     )
-    assert dca_runner.BrokerOrder(
-        symbol="AAPL", side="buy", dollar_amount=2.0,
-        created_at=datetime.fromisoformat("2026-08-16T15:45:00+00:00"), state="rejected",
-        executed_dollar_amount=-5.0,
-    ).counts_toward_budget is True
+    assert (
+        dca_runner.BrokerOrder(
+            symbol="AAPL",
+            side="buy",
+            dollar_amount=2.0,
+            created_at=datetime.fromisoformat("2026-08-16T15:45:00+00:00"),
+            state="rejected",
+            executed_dollar_amount=-5.0,
+        ).counts_toward_budget
+        is True
+    )
     # `-0.0` IS zero, and still proves it.
     assert verdict({"id": "ORD", "state": "cancelled", "cumulative_quantity": -0.0}) == (
-        NO_ORDER, "ORD",
+        NO_ORDER,
+        "ORD",
     )
 
     # A match history POSITIVELY FOUND but whose id is unusable is ambiguity,
@@ -20958,8 +20751,12 @@ def test_an_ambiguous_placement_raise_is_reconciled_against_its_ref_id():
     # cited it (Codex review, PR #786: "Preserve visible matches that lack a
     # usable ID"). Note a whitespace-only id previously passed through as
     # usable.
-    for bad in ({"id": "", "state": "queued"}, {"id": "   ", "state": "queued"},
-                {"state": "queued"}, {"id": None, "order_id": None, "state": "queued"}):
+    for bad in (
+        {"id": "", "state": "queued"},
+        {"id": "   ", "state": "queued"},
+        {"state": "queued"},
+        {"id": None, "order_id": None, "state": "queued"},
+    ):
         assert verdict(bad) == (UNKNOWN, None), bad
 
     # A clean miss proves nothing: this module documents Robinhood's order
@@ -20974,19 +20771,17 @@ def test_an_ambiguous_placement_raise_is_reconciled_against_its_ref_id():
         raise RuntimeError("order history could not be proven complete")
 
     with pytest.raises(RuntimeError):
-        near_close_dca._reconcile_ambiguous_fractional_placement(
-            ctx_with(unprovable), "AAPL", ref
-        )
+        near_close_dca._reconcile_ambiguous_fractional_placement(ctx_with(unprovable), "AAPL", ref)
     with pytest.raises(RuntimeError):
-        near_close_dca._reconcile_ambiguous_fractional_placement(
-            ctx_with(None, has_method=False), "AAPL", ref
-        )
+        near_close_dca._reconcile_ambiguous_fractional_placement(ctx_with(None, has_method=False), "AAPL", ref)
 
     # The match is on the EXACT reference, so another day's or another
     # stream's order for the same ticker cannot be mistaken for this one.
     ctx = ctx_with(lambda t, d, refs: None if ref in refs else {"id": "OTHER"})
     assert near_close_dca._reconcile_ambiguous_fractional_placement(ctx, "AAPL", ref) == (
-        UNKNOWN, None, None,
+        UNKNOWN,
+        None,
+        None,
     )
 
 
@@ -21004,14 +20799,14 @@ def test_reconciliation_ignores_a_blank_lifecycle_alias_when_checking_for_confli
     ctx = types.SimpleNamespace(
         broker=types.SimpleNamespace(
             same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
-                "id": "ORD", "state": "queued", "status": "",
+                "id": "ORD",
+                "state": "queued",
+                "status": "",
             }
         ),
         trading_day=date(2026, 8, 25),
     )
-    verdict, order_id, _ = near_close_dca._reconcile_ambiguous_fractional_placement(
-        ctx, "AAPL", "ref1"
-    )
+    verdict, order_id, _ = near_close_dca._reconcile_ambiguous_fractional_placement(ctx, "AAPL", "ref1")
     assert verdict == near_close_dca._PLACEMENT_ACCEPTED
     assert order_id == "ORD"
 
@@ -21033,15 +20828,15 @@ def test_reconciliation_treats_cancelled_and_canceled_as_the_same_lifecycle_stat
     ctx = types.SimpleNamespace(
         broker=types.SimpleNamespace(
             same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
-                "id": "ORD", "state": "cancelled", "status": "canceled",
+                "id": "ORD",
+                "state": "cancelled",
+                "status": "canceled",
                 "cumulative_quantity": "0",
             }
         ),
         trading_day=date(2026, 8, 25),
     )
-    verdict, order_id, _ = near_close_dca._reconcile_ambiguous_fractional_placement(
-        ctx, "AAPL", "ref1"
-    )
+    verdict, order_id, _ = near_close_dca._reconcile_ambiguous_fractional_placement(ctx, "AAPL", "ref1")
     assert verdict == near_close_dca._PLACEMENT_NO_ORDER
     assert order_id == "ORD"
 
@@ -21063,13 +20858,22 @@ def test_reconciliation_reads_recovered_fill_state_from_the_status_alias(tmp_pat
     artifacts_dir = tmp_path / "retry-execution-log-status-only-fill"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 5.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 5.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -21112,13 +20916,22 @@ def test_reconciliation_reads_every_supported_notional_alias_for_recovered_fills
     artifacts_dir = tmp_path / "retry-execution-log-alternate-notional-alias"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 10.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 10.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -21283,7 +21096,8 @@ def test_reconciliation_requires_positive_evidence_before_accepting_terminal_fil
                 # No id-fill fields anywhere: terminal_broker_row_proves_no_
                 # order stays False (no explicit zero), but
                 # _recovered_broker_notional's fallback still returns 0.0.
-                "id": "ORD", "state": "cancelled",
+                "id": "ORD",
+                "state": "cancelled",
             }
         ),
         trading_day=date(2026, 8, 25),
@@ -21315,7 +21129,9 @@ def test_reconciliation_reads_terminal_lifecycle_state_from_the_status_alias():
     ctx = types.SimpleNamespace(
         broker=types.SimpleNamespace(
             same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
-                "id": "ORD-RECOVERED", "status": "cancelled", "executed_notional": "3.00",
+                "id": "ORD-RECOVERED",
+                "status": "cancelled",
+                "executed_notional": "3.00",
             }
         ),
         trading_day=date(2026, 8, 25),
@@ -21337,9 +21153,7 @@ def test_an_unresolved_placement_halts_the_batch(monkeypatch):
 
     # A broker whose history works perfectly and truthfully reports that the
     # refused order does not exist -- the reported RVII shape.
-    broker = types.SimpleNamespace(
-        same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: None
-    )
+    broker = types.SimpleNamespace(same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: None)
     ctx = types.SimpleNamespace(broker=broker, trading_day=datetime.date(2026, 8, 25))
 
     verdict, order_id, _ = near_close_dca._reconcile_ambiguous_fractional_placement(
@@ -21349,9 +21163,11 @@ def test_an_unresolved_placement_halts_the_batch(monkeypatch):
 
     # A not-yet-indexed acceptance produces the byte-identical verdict, which
     # is the whole difficulty.
-    assert near_close_dca._reconcile_ambiguous_fractional_placement(
-        ctx, "AAPL", "dca-graded-1530-2026-08-25-AAPL"
-    ) == (near_close_dca._PLACEMENT_UNKNOWN, None, None)
+    assert near_close_dca._reconcile_ambiguous_fractional_placement(ctx, "AAPL", "dca-graded-1530-2026-08-25-AAPL") == (
+        near_close_dca._PLACEMENT_UNKNOWN,
+        None,
+        None,
+    )
 
     import inspect
 
@@ -21390,14 +21206,10 @@ def test_an_unresolved_placement_halts_the_batch(monkeypatch):
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
 
     with pytest.raises(near_close_dca.UnresolvedPlacementError):
-        _process_buy_candidates_batch(
-            [_isolation_buy_decision("AAPL"), _isolation_buy_decision("MSFT")], ctx
-        )
+        _process_buy_candidates_batch([_isolation_buy_decision("AAPL"), _isolation_buy_decision("MSFT")], ctx)
 
     assert seen == ["AAPL"]
-    assert near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]["AAPL"][
-        "placement_outcome_unproven"
-    ] is True
+    assert near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]["AAPL"]["placement_outcome_unproven"] is True
 
 
 def test_an_unresolved_halt_charges_a_known_order_id_not_anonymously(monkeypatch):
@@ -21465,7 +21277,9 @@ def test_reconciliation_rejects_conflicting_lifecycle_aliases_before_selecting_a
 
     broker = types.SimpleNamespace(
         same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
-            "id": "ORD-CONFLICT", "state": "queued", "status": "rejected",
+            "id": "ORD-CONFLICT",
+            "state": "queued",
+            "status": "rejected",
         }
     )
     ctx = types.SimpleNamespace(broker=broker, trading_day=date(2026, 8, 25))
@@ -21485,7 +21299,9 @@ def test_reconciliation_rejects_conflicting_lifecycle_aliases_before_selecting_a
     # otherwise "win").
     broker2 = types.SimpleNamespace(
         same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
-            "id": "ORD-CONFLICT-2", "state": "rejected", "status": "queued",
+            "id": "ORD-CONFLICT-2",
+            "state": "rejected",
+            "status": "queued",
         }
     )
     ctx2 = types.SimpleNamespace(broker=broker2, trading_day=date(2026, 8, 25))
@@ -21514,7 +21330,8 @@ def test_reconciliation_keeps_indistinguishable_resized_attempts_unresolved():
 
     broker = types.SimpleNamespace(
         same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
-            "id": "ORD-RESIZED", "state": "queued",
+            "id": "ORD-RESIZED",
+            "state": "queued",
         }
     )
     ctx = types.SimpleNamespace(broker=broker, trading_day=date(2026, 8, 25))
@@ -21566,7 +21383,9 @@ def test_reconciliation_requires_amount_evidence_to_uniquely_select_one_resized_
 
     broker = types.SimpleNamespace(
         same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
-            "id": "ORD-RESIZED", "state": "queued", "executed_notional": 5.0,
+            "id": "ORD-RESIZED",
+            "state": "queued",
+            "executed_notional": 5.0,
         }
     )
     ctx = types.SimpleNamespace(broker=broker, trading_day=date(2026, 8, 25))
@@ -21613,7 +21432,9 @@ def test_reconciliation_settles_a_terminal_partial_fill_with_a_readable_final_am
     # partially filled for exactly that amount before being killed.
     ctx.broker = types.SimpleNamespace(
         same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
-            "id": "ORD-SETTLED", "state": "cancelled", "executed_notional": 5.0,
+            "id": "ORD-SETTLED",
+            "state": "cancelled",
+            "executed_notional": 5.0,
         }
     )
     verdict, order_id, accepted_amount = near_close_dca._reconcile_ambiguous_fractional_placement(
@@ -21638,7 +21459,9 @@ def test_reconciliation_settles_a_terminal_partial_fill_with_a_readable_final_am
     # unresolved rather than guessing.
     ctx.broker = types.SimpleNamespace(
         same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
-            "id": "ORD-AMBIGUOUS", "state": "cancelled", "executed_notional": 1.0,
+            "id": "ORD-AMBIGUOUS",
+            "state": "cancelled",
+            "executed_notional": 1.0,
         }
     )
     verdict, order_id, accepted_amount = near_close_dca._reconcile_ambiguous_fractional_placement(
@@ -21658,8 +21481,10 @@ def test_reconciliation_settles_a_terminal_partial_fill_with_a_readable_final_am
     # disambiguate terminal partial fills").
     ctx.broker = types.SimpleNamespace(
         same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
-            "id": "ORD-REQUESTED-NOTIONAL", "state": "cancelled",
-            "executed_notional": 1.0, "dollar_amount": 8.0,
+            "id": "ORD-REQUESTED-NOTIONAL",
+            "state": "cancelled",
+            "executed_notional": 1.0,
+            "dollar_amount": 8.0,
         }
     )
     verdict, order_id, accepted_amount = near_close_dca._reconcile_ambiguous_fractional_placement(
@@ -21688,8 +21513,10 @@ def test_reconciliation_checks_every_execution_alias_before_settling_a_terminal_
     ctx = types.SimpleNamespace(trading_day=date(2026, 8, 25))
     ctx.broker = types.SimpleNamespace(
         same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
-            "id": "ORD-CONFLICTING-ALIASES", "state": "cancelled",
-            "executed_notional": 5.0, "filled_notional": 100.0,
+            "id": "ORD-CONFLICTING-ALIASES",
+            "state": "cancelled",
+            "executed_notional": 5.0,
+            "filled_notional": 100.0,
         }
     )
     verdict, order_id, accepted_amount = near_close_dca._reconcile_ambiguous_fractional_placement(
@@ -21718,8 +21545,10 @@ def test_reconciliation_grants_the_shared_monetary_tolerance_for_terminal_fills(
     ctx = types.SimpleNamespace(trading_day=date(2026, 8, 25))
     ctx.broker = types.SimpleNamespace(
         same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
-            "id": "ORD-SUBCENT-ROUNDING", "state": "cancelled",
-            "cumulative_quantity": 1, "average_price": 5.0005,
+            "id": "ORD-SUBCENT-ROUNDING",
+            "state": "cancelled",
+            "cumulative_quantity": 1,
+            "average_price": 5.0005,
         }
     )
     verdict, order_id, accepted_amount = near_close_dca._reconcile_ambiguous_fractional_placement(
@@ -21751,8 +21580,10 @@ def test_reconciliation_checks_a_reconstructed_notional_against_approval():
     ctx = types.SimpleNamespace(trading_day=date(2026, 8, 25))
     ctx.broker = types.SimpleNamespace(
         same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
-            "id": "ORD-RECONSTRUCTED-OVER-APPROVAL", "state": "cancelled",
-            "cumulative_quantity": 2, "average_price": 100.0,
+            "id": "ORD-RECONSTRUCTED-OVER-APPROVAL",
+            "state": "cancelled",
+            "cumulative_quantity": 2,
+            "average_price": 100.0,
         }
     )
     verdict, order_id, accepted_amount = near_close_dca._reconcile_ambiguous_fractional_placement(
@@ -21776,18 +21607,25 @@ def test_legacy_historical_recovery_is_accounted_without_republishing(tmp_path):
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    (legacy_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        # Invalid classification is accepted as STREAM_OTHER, but the raw
-        # stream must not be attributed to the current afternoon artifact.
-        "run_classification": {"stream": "legacy-unknown"},
-        "broker_outcomes": {"AAPL": {
-            "status": "failed",
-            "placement_outcome_unproven": True,
-            "placement_ref_id": "legacy-AAPL-proof",
-            "submitted_amount_usd": 50.0,
-        }},
-    }), encoding="utf-8")
+    (legacy_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                # Invalid classification is accepted as STREAM_OTHER, but the raw
+                # stream must not be attributed to the current afternoon artifact.
+                "run_classification": {"stream": "legacy-unknown"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "legacy-AAPL-proof",
+                        "submitted_amount_usd": 50.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -21808,9 +21646,7 @@ def test_legacy_historical_recovery_is_accounted_without_republishing(tmp_path):
 
     run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     own_new_submitted = sum(
-        row["planned_amount_usd"]
-        for row in run_state["buy_candidates"]
-        if row.get("status") == "submitted"
+        row["planned_amount_usd"] for row in run_state["buy_candidates"] if row.get("status") == "submitted"
     )
     assert all(row.get("order_id") != "ORD-LEGACY" for row in run_state["buy_candidates"])
     assert run_state["risk_guard"]["deployed_last_7d_usd"] == round(50.0 + own_new_submitted, 2)
@@ -21871,9 +21707,7 @@ def test_batch_publishes_earlier_candidate_errors_before_an_unresolved_halt(monk
 
     try:
         with pytest.raises(near_close_dca.UnresolvedPlacementError):
-            _process_buy_candidates_batch(
-                [_isolation_buy_decision("AAPL"), _isolation_buy_decision("MSFT")], ctx
-            )
+            _process_buy_candidates_batch([_isolation_buy_decision("AAPL"), _isolation_buy_decision("MSFT")], ctx)
         assert near_close_dca._IN_FLIGHT_RUN_EVALUATION.get("errors_count") == 1, (
             "AAPL's own batch-local error must survive the halt, not vanish "
             "along with the return value the raise skips past"
@@ -21904,10 +21738,7 @@ def test_attempt_accounting_is_independent_of_reconciliation_readability():
     source = inspect.getsource(near_close_dca._process_buy_candidate)
     assert '"broker_placement_failed": history_readable,' in source
     assert '"broker_placement_attempted": True,' in source
-    assert (
-        "placement_outcome_proven = history_readable and verdict == _PLACEMENT_NO_ORDER"
-        in source
-    )
+    assert "placement_outcome_proven = history_readable and verdict == _PLACEMENT_NO_ORDER" in source
     assert '"placement_outcome_unproven": not placement_outcome_proven,' in source
     # The found-but-unbookable order's id survives into the row, or it becomes
     # unreconcilable by hand.
@@ -21938,9 +21769,7 @@ def test_afternoon_placement_failures_are_recorded_as_a_trading_failure(tmp_path
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _FailingBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _FailingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "placement-failed")
 
     run_daily_compact(
@@ -21953,15 +21782,10 @@ def test_afternoon_placement_failures_are_recorded_as_a_trading_failure(tmp_path
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
-    assert (
-        run_state["run_classification_outcome"]
-        == "failed_after_connector_native_recovery_attempt"
-    )
+    assert run_state["run_classification_outcome"] == "failed_after_connector_native_recovery_attempt"
     assert run_state["error_class"] == "failed_after_connector_native_recovery_attempt"
     assert run_state["is_trading_failure"] is True
     assert run_state["order_submit_status"] == "not_submitted_error"
@@ -21992,13 +21816,9 @@ def test_afternoon_run_summary_carries_the_no_order_outcome_fields(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8") as handle:
         summary = json.load(handle)
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     assert summary["run_classification_outcome"] == "completed_no_orders"
@@ -22038,9 +21858,7 @@ def test_blocked_stub_completes_a_partial_legacy_directory(tmp_path):
         assert (artifacts_dir / name).exists(), f"{name} still missing"
     _assert_csv_header(str(artifacts_dir / "signals.csv"))
     _assert_csv_header(str(artifacts_dir / "submitted_orders.csv"))
-    summary = json.loads(
-        (artifacts_dir / "run_summary.json").read_text(encoding="utf-8")
-    )
+    summary = json.loads((artifacts_dir / "run_summary.json").read_bytes())
     # The summary mirrors what is actually on disk, not the fresh stub.
     assert summary["trading_day"] == "2026-07-01"
 
@@ -22076,9 +21894,7 @@ def test_provider_errors_are_not_recorded_as_a_healthy_no_order_run(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     assert run_state["usage_proxy"]["errors_count"] > 0
@@ -22134,9 +21950,7 @@ def test_a_raising_candidate_does_not_abort_the_rest_of_the_batch(monkeypatch, c
         tickers=("AAPL", "MSFT", "NVDA"),
         approved_test_dates=frozenset({trading_day}),
     )
-    broker = DryRunBroker(
-        cash=500.0, reference_prices={"AAPL": 98.0, "MSFT": 98.0, "NVDA": 98.0}
-    )
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0, "MSFT": 98.0, "NVDA": 98.0})
     ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
 
     original = ncd._process_buy_candidate
@@ -22149,15 +21963,13 @@ def test_a_raising_candidate_does_not_abort_the_rest_of_the_batch(monkeypatch, c
     monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_msft)
 
     with caplog.at_level(logging.ERROR, logger="near_close_dca"):
-        candidate_outcomes, _top_up, _deployed, errors_count, _reviews = (
-            _process_buy_candidates_batch(
-                buy_candidates=[
-                    _isolation_buy_decision("AAPL"),
-                    _isolation_buy_decision("MSFT"),
-                    _isolation_buy_decision("NVDA"),
-                ],
-                ctx=ctx,
-            )
+        candidate_outcomes, _top_up, _deployed, errors_count, _reviews = _process_buy_candidates_batch(
+            buy_candidates=[
+                _isolation_buy_decision("AAPL"),
+                _isolation_buy_decision("MSFT"),
+                _isolation_buy_decision("NVDA"),
+            ],
+            ctx=ctx,
         )
 
     # NVDA is sorted AFTER the raising MSFT: before the net it was never
@@ -22202,9 +22014,7 @@ def test_a_raise_after_an_accepted_order_fails_the_run(monkeypatch):
 
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    config = StrategyConfig(
-        dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset({trading_day})
-    )
+    config = StrategyConfig(dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset({trading_day}))
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
     ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
 
@@ -22257,7 +22067,12 @@ def test_the_candidate_processing_error_marker_reaches_the_artifact_rows(tmp_pat
     monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_for_nvda)
 
     run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
@@ -22314,9 +22129,18 @@ def test_a_seeded_recovery_still_gets_a_breaker_skip_and_keeps_its_evidence(monk
 
     def _always_fails(*, decision, ctx, running_deployed_7d):
         seen.append(decision.ticker)
-        return ({"status": "failed", "order_id": None, "skip_reason": "broker unavailable",
-                 "broker_placement_failed": True},
-                None, running_deployed_7d, 1, 0)
+        return (
+            {
+                "status": "failed",
+                "order_id": None,
+                "skip_reason": "broker unavailable",
+                "broker_placement_failed": True,
+            },
+            None,
+            running_deployed_7d,
+            1,
+            0,
+        )
 
     monkeypatch.setattr(ncd, "_process_buy_candidate", _always_fails)
 
@@ -22350,9 +22174,7 @@ def test_a_seeded_recovery_still_gets_a_breaker_skip_and_keeps_its_evidence(monk
     assert candidate_outcomes["NVDA"]["placement_breaker_halted"] is True
     assert candidate_outcomes["NVDA"]["placement_breaker_tripped_here"] is True
     # ... and it survives into the artifact, like every other annotation here.
-    assert ncd._failure_candidate_row(
-        "NVDA", candidate_outcomes["NVDA"]
-    )["placement_breaker_tripped_here"] is True
+    assert ncd._failure_candidate_row("NVDA", candidate_outcomes["NVDA"])["placement_breaker_tripped_here"] is True
 
     # ... and the annotations must SURVIVE into the artifact. Both builders
     # rebuild rows from explicit field lists, so a key that is only in the
@@ -22376,22 +22198,16 @@ def test_a_structurally_valid_but_malformed_signal_is_dropped():
     PR #786: "Discard malformed signals after reconciliation fails")."""
     import near_close_dca as ncd
 
-    malformed = ncd.SourceSignal(
-        ticker="RVII", source=ncd.SourceName.FINANCE, action=cast(Any, None), reason="x"
-    )
+    malformed = ncd.SourceSignal(ticker="RVII", source=ncd.SourceName.FINANCE, action=cast(Any, None), reason="x")
     # It really does take the artifact writer down if retained...
     with pytest.raises(AttributeError):
         ncd._signal_row("RVII", "finance", malformed)
     # ... so it is dropped, and the writer's own no-signal row covers it.
     assert ncd._serializable_signal(malformed) is None
-    assert ncd._signal_row("RVII", "finance", ncd._serializable_signal(malformed))[
-        "action"
-    ] == ncd.Action.NO_DATA.value
+    assert ncd._signal_row("RVII", "finance", ncd._serializable_signal(malformed))["action"] == ncd.Action.NO_DATA.value
 
     # A well-formed signal is kept untouched, and a non-signal still drops.
-    intact = ncd.SourceSignal(
-        ticker="RVII", source=ncd.SourceName.FINANCE, action=ncd.Action.NO_ACTION, reason="x"
-    )
+    intact = ncd.SourceSignal(ticker="RVII", source=ncd.SourceName.FINANCE, action=ncd.Action.NO_ACTION, reason="x")
     assert ncd._serializable_signal(intact) is intact
     assert ncd._serializable_signal({"action": "buy"}) is None
 
@@ -22422,9 +22238,7 @@ def test_serializable_signal_guards_every_field_the_writer_dereferences():
     )
     # ... and the .value dereference, which is `action` alone today.
     value_fields = set(re.findall(r"signal\.(\w+)\.value", source))
-    assert value_fields == {"action"}, (
-        "_signal_row dereferences a .value field _serializable_signal does not guard"
-    )
+    assert value_fields == {"action"}, "_signal_row dereferences a .value field _serializable_signal does not guard"
 
     # Each guarded field really is fatal if retained, and really is dropped.
     for bad_field in sorted(timestamp_fields):
@@ -22674,9 +22488,7 @@ def test_a_merged_recovery_does_not_mask_todays_blocked_placement():
     assert not ncd._outcome_records_a_broker_attempt(
         {"status": "blocked", "deliberate_skip": True, "skip_reason": "budget cap"}
     )
-    assert not ncd._outcome_records_a_broker_attempt(
-        {"status": "skipped", "deliberate_skip": True}
-    )
+    assert not ncd._outcome_records_a_broker_attempt({"status": "skipped", "deliberate_skip": True})
     # ... and the statuses that always merged still do.
     for attempted in sorted(ncd._PRIOR_ALLOCATION_ATTEMPT_STATUSES):
         assert ncd._outcome_records_a_broker_attempt({"status": attempted}), attempted
@@ -22751,9 +22563,7 @@ def test_a_breaker_skipped_fire_does_not_consume_a_retry_attempt():
         }
     )
     # ... as is an ordinary rejected placement with no breaker involved.
-    assert ncd._fire_attempt_reached_the_broker(
-        {"status": "failed", "broker_placement_failed": True}
-    )
+    assert ncd._fire_attempt_reached_the_broker({"status": "failed", "broker_placement_failed": True})
     assert ncd._fire_attempt_reached_the_broker({"status": "submitted"})
 
 
@@ -22799,8 +22609,7 @@ def test_every_broker_quantity_parse_survives_an_overflowing_figure():
     # the prose explaining WHY these handlers are wide, and a comment has no
     # handler to find.
     parses = [
-        i for i, line in enumerate(lines)
-        if re.search(r"int\(float\(", line) and not line.lstrip().startswith("#")
+        i for i, line in enumerate(lines) if re.search(r"int\(float\(", line) and not line.lstrip().startswith("#")
     ]
     # Two of the six parses this test originally found (the ordinary-success
     # and immediate-recovery whole-share settlement branches) were replaced
@@ -22828,10 +22637,9 @@ def test_every_broker_quantity_parse_survives_an_overflowing_figure():
     # or fail the build here.
     for i in parses:
         # The handler sits within a couple of lines of the parse in every case.
-        window = "\n".join(lines[i:i + 4])
+        window = "\n".join(lines[i : i + 4])
         assert "except (TypeError, ValueError, OverflowError)" in window, (
-            "an int(float(...)) over broker data does not catch OverflowError, "
-            f"near line {i + 1}: {lines[i].strip()}"
+            f"an int(float(...)) over broker data does not catch OverflowError, near line {i + 1}: {lines[i].strip()}"
         )
 
 
@@ -22862,7 +22670,16 @@ def test_parse_terminal_share_quantity_rejects_non_integral_and_negative_values(
         assert ncd._parse_terminal_share_quantity(unparseable) == (0, False), unparseable
     # A real whole-share quantity -- in every representation a broker might
     # send it -- is accepted and known, including a genuine explicit zero.
-    for good, expected in ((0, 0), ("0", 0), (0.0, 0), (2, 2), ("3", 3), (4.0, 4), ("5.0", 5), ("9007199254740993", 9007199254740993)):
+    for good, expected in (
+        (0, 0),
+        ("0", 0),
+        (0.0, 0),
+        (2, 2),
+        ("3", 3),
+        (4.0, 4),
+        ("5.0", 5),
+        ("9007199254740993", 9007199254740993),
+    ):
         assert ncd._parse_terminal_share_quantity(good) == (expected, True), good
 
 
@@ -22875,10 +22692,8 @@ def test_a_merged_recovery_counts_every_order_it_represents():
     "Count every order represented by a merged outcome")."""
     import near_close_dca as ncd
 
-    first = {"status": "submitted", "order_id": "ORD-A", "submitted_amount_usd": 23.36,
-             "whole_share_quantity": 1}
-    second = {"status": "submitted", "order_id": "ORD-B", "submitted_amount_usd": 23.40,
-              "whole_share_quantity": 1}
+    first = {"status": "submitted", "order_id": "ORD-A", "submitted_amount_usd": 23.36, "whole_share_quantity": 1}
+    second = {"status": "submitted", "order_id": "ORD-B", "submitted_amount_usd": 23.40, "whole_share_quantity": 1}
     merged = ncd._merge_whole_share_submission_outcomes(first, second)
     assert merged["merged_submission_count"] == 2
     assert merged["whole_share_order_ids"] == ["ORD-A", "ORD-B"]
@@ -22917,9 +22732,7 @@ def test_a_merged_recovery_counts_every_order_it_represents():
     artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
     ncd._apply_no_order_classification(artifacts, {"BYDDY": merged})
     assert artifacts["orders_submitted_count"] == 2
-    proxy = ncd.build_usage_proxy(
-        decisions=[], signal_rows=[], buy_candidates=[], candidate_outcomes={"BYDDY": merged}
-    )
+    proxy = ncd.build_usage_proxy(decisions=[], signal_rows=[], buy_candidates=[], candidate_outcomes={"BYDDY": merged})
     assert proxy["orders_placed_count"] == 2
 
     # An aggregate can itself be an input to another aggregate — the batch
@@ -22935,15 +22748,16 @@ def test_a_merged_recovery_counts_every_order_it_represents():
     # len(whole_share_order_ids).
     with_failure = ncd._merge_whole_share_submission_outcomes(
         first,
-        {"status": "failed", "order_id": "TERMINAL", "broker_placement_failed": True,
-         "submitted_amount_usd": 0.0},
+        {"status": "failed", "order_id": "TERMINAL", "broker_placement_failed": True, "submitted_amount_usd": 0.0},
     )
     assert with_failure["merged_submission_count"] == 1
     assert "TERMINAL" in with_failure["whole_share_order_ids"]
 
     # An ordinary unmerged row counts exactly as it always did.
     plain = ncd.build_usage_proxy(
-        decisions=[], signal_rows=[], buy_candidates=[],
+        decisions=[],
+        signal_rows=[],
+        buy_candidates=[],
         candidate_outcomes={"AAPL": {"status": "submitted", "order_id": "X"}},
     )
     assert plain["orders_placed_count"] == 1
@@ -22996,8 +22810,12 @@ def test_a_merged_confirmation_hold_is_not_a_connector_error():
     assert still_failed["merged_placement_failed"] is True
     still_blocked = ncd._merge_whole_share_submission_outcomes(
         {"status": "submitted", "order_id": "RECOVERED", "submitted_amount_usd": 23.36},
-        {"status": "blocked", "broker_placement_failed": True, "order_id": "TERMINAL",
-         "skip_reason": "claim left reserved pending manual reconciliation"},
+        {
+            "status": "blocked",
+            "broker_placement_failed": True,
+            "order_id": "TERMINAL",
+            "skip_reason": "claim left reserved pending manual reconciliation",
+        },
     )
     assert still_blocked["merged_placement_blocked"] is True
 
@@ -23016,10 +22834,14 @@ def test_a_settlement_adjustment_is_not_a_second_submission():
     counts")."""
     import near_close_dca as ncd
 
-    real = {"status": "submitted", "order_id": "ORD-A", "submitted_amount_usd": 23.36,
-            "whole_share_quantity": 1}
-    adjustment = {"status": "submitted", "order_id": "ORD-A", "submitted_amount_usd": 1.14,
-                  "whole_share_quantity": 0, "whole_share_settlement_adjustment": True}
+    real = {"status": "submitted", "order_id": "ORD-A", "submitted_amount_usd": 23.36, "whole_share_quantity": 1}
+    adjustment = {
+        "status": "submitted",
+        "order_id": "ORD-A",
+        "submitted_amount_usd": 1.14,
+        "whole_share_quantity": 0,
+        "whole_share_settlement_adjustment": True,
+    }
 
     merged = ncd._merge_whole_share_submission_outcomes(real, adjustment)
     assert merged["merged_submission_count"] == 1
@@ -23027,16 +22849,24 @@ def test_a_settlement_adjustment_is_not_a_second_submission():
     artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
     ncd._apply_no_order_classification(artifacts, {"BYDDY": merged})
     assert artifacts["orders_submitted_count"] == 1
-    assert ncd.build_usage_proxy(
-        decisions=[], signal_rows=[], buy_candidates=[], candidate_outcomes={"BYDDY": merged}
-    )["orders_placed_count"] == 1
+    assert (
+        ncd.build_usage_proxy(decisions=[], signal_rows=[], buy_candidates=[], candidate_outcomes={"BYDDY": merged})[
+            "orders_placed_count"
+        ]
+        == 1
+    )
 
     # The same rule for an adjustment published on its own: it corrects an
     # order some earlier run already counted, so this run placed nothing.
-    assert ncd.build_usage_proxy(
-        decisions=[], signal_rows=[], buy_candidates=[],
-        candidate_outcomes={"BYDDY": adjustment},
-    )["orders_placed_count"] == 0
+    assert (
+        ncd.build_usage_proxy(
+            decisions=[],
+            signal_rows=[],
+            buy_candidates=[],
+            candidate_outcomes={"BYDDY": adjustment},
+        )["orders_placed_count"]
+        == 0
+    )
 
     # Two genuinely distinct orders still count 2 — round 29's case is intact.
     two_real = ncd._merge_whole_share_submission_outcomes(
@@ -23057,10 +22887,14 @@ def test_a_mixed_aggregate_does_not_claim_to_be_a_settlement_adjustment():
     aggregates")."""
     import near_close_dca as ncd
 
-    real = {"status": "submitted", "order_id": "ORD-A", "submitted_amount_usd": 23.36,
-            "whole_share_quantity": 1}
-    adjustment = {"status": "submitted", "order_id": "ORD-A", "submitted_amount_usd": 1.14,
-                  "whole_share_quantity": 0, "whole_share_settlement_adjustment": True}
+    real = {"status": "submitted", "order_id": "ORD-A", "submitted_amount_usd": 23.36, "whole_share_quantity": 1}
+    adjustment = {
+        "status": "submitted",
+        "order_id": "ORD-A",
+        "submitted_amount_usd": 1.14,
+        "whole_share_quantity": 0,
+        "whole_share_settlement_adjustment": True,
+    }
 
     for label, merged in (
         ("adjustment newer", ncd._merge_whole_share_submission_outcomes(real, adjustment)),
@@ -23082,9 +22916,7 @@ def test_a_mixed_aggregate_does_not_claim_to_be_a_settlement_adjustment():
 
     # The one case where the claim is still true of the row as a whole: every
     # submitting side is an adjustment. Marker kept, count zero.
-    both = ncd._merge_whole_share_submission_outcomes(
-        adjustment, dict(adjustment, order_id="ORD-B")
-    )
+    both = ncd._merge_whole_share_submission_outcomes(adjustment, dict(adjustment, order_id="ORD-B"))
     assert both["whole_share_settlement_adjustment"] is True
     assert both["merged_submission_count"] == 0
     assert ncd._submission_count(both) == 0
@@ -23171,9 +23003,7 @@ def test_merge_whole_share_submission_outcomes_preserves_ambiguous_status():
         "submitted_amount_usd": 15.0,
         "whole_share_quantity": 1,
     }
-    merged_both_ambiguous = ncd._merge_whole_share_submission_outcomes(
-        ambiguous_outcome, other_ambiguous_outcome
-    )
+    merged_both_ambiguous = ncd._merge_whole_share_submission_outcomes(ambiguous_outcome, other_ambiguous_outcome)
     assert merged_both_ambiguous["submitted_amount_usd"] == 75.0
     assert merged_both_ambiguous["whole_share_quantity"] == 2
     assert merged_both_ambiguous["status"] == "potentially_submitted"
@@ -23192,13 +23022,30 @@ def test_aggregate_failure_markers_survive_a_second_merge():
     second_recovery = {"status": "submitted", "order_id": "ORD2", "submitted_amount_usd": 10.0}
 
     for label, today, marker in (
-        ("failed", {"status": "failed", "broker_placement_failed": True,
-                    "skip_reason": "RuntimeError"}, "merged_placement_failed"),
-        ("blocked", {"status": "blocked", "broker_placement_failed": True, "order_id": "T",
-                     "skip_reason": "claim left reserved"}, "merged_placement_blocked"),
-        ("hold", {"status": "not_submitted_confirmation_required",
-                  "broker_placement_failed": True, "skip_reason": "awaiting confirmation"},
-         "merged_confirmation_required"),
+        (
+            "failed",
+            {"status": "failed", "broker_placement_failed": True, "skip_reason": "RuntimeError"},
+            "merged_placement_failed",
+        ),
+        (
+            "blocked",
+            {
+                "status": "blocked",
+                "broker_placement_failed": True,
+                "order_id": "T",
+                "skip_reason": "claim left reserved",
+            },
+            "merged_placement_blocked",
+        ),
+        (
+            "hold",
+            {
+                "status": "not_submitted_confirmation_required",
+                "broker_placement_failed": True,
+                "skip_reason": "awaiting confirmation",
+            },
+            "merged_confirmation_required",
+        ),
     ):
         aggregate = ncd._merge_whole_share_submission_outcomes(recovery, today)
         assert aggregate[marker] is True, label
@@ -23212,9 +23059,7 @@ def test_aggregate_failure_markers_survive_a_second_merge():
         ):
             assert again.get(marker) is True, label
             reason_key = (
-                "merged_confirmation_reason"
-                if marker == "merged_confirmation_required"
-                else "merged_failure_reason"
+                "merged_confirmation_reason" if marker == "merged_confirmation_required" else "merged_failure_reason"
             )
             assert again.get(reason_key), label
 
@@ -23254,8 +23099,8 @@ def test_a_merged_failure_is_counted_even_when_the_breaker_trips():
     # A three-way merge can carry a failed AND a blocked side; each is its own
     # event, so neither may consume the other's branch either.
     both = ncd._merge_whole_share_submission_outcomes(
-        merged, {"status": "blocked", "broker_placement_failed": True, "order_id": "T",
-                 "skip_reason": "claim left reserved"},
+        merged,
+        {"status": "blocked", "broker_placement_failed": True, "order_id": "T", "skip_reason": "claim left reserved"},
     )
     assert both["merged_placement_failed"] is True
     assert both["merged_placement_blocked"] is True
@@ -23274,8 +23119,12 @@ def test_a_recovered_zero_fill_attempt_is_merged_not_overwritten():
     zero-fill attempts before later submissions")."""
     import near_close_dca as ncd
 
-    zero_fill = {"status": "failed", "whole_share_zero_fill_attempt": True,
-                 "order_id": "ZERO-ORD", "submitted_amount_usd": 0.0}
+    zero_fill = {
+        "status": "failed",
+        "whole_share_zero_fill_attempt": True,
+        "order_id": "ZERO-ORD",
+        "submitted_amount_usd": 0.0,
+    }
     # The publication site's own test, shared with the batch loop so the two
     # cannot drift apart again.
     assert ncd._outcome_is_mergeable_recovery(zero_fill)
@@ -23288,10 +23137,15 @@ def test_a_recovered_zero_fill_attempt_is_merged_not_overwritten():
     published = ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"]
     try:
         ncd._publish_or_merge_whole_share_outcome("BYDDY", zero_fill)
-        ncd._publish_or_merge_whole_share_outcome("BYDDY", {
-            "status": "submitted", "order_id": "FILL-ORD",
-            "submitted_amount_usd": 23.36, "whole_share_quantity": 1,
-        })
+        ncd._publish_or_merge_whole_share_outcome(
+            "BYDDY",
+            {
+                "status": "submitted",
+                "order_id": "FILL-ORD",
+                "submitted_amount_usd": 23.36,
+                "whole_share_quantity": 1,
+            },
+        )
         row = published["BYDDY"]
         # Both broker orders survive, so neither drops out of attempt counting.
         assert row["whole_share_order_ids"] == ["ZERO-ORD", "FILL-ORD"]
@@ -23318,8 +23172,13 @@ def test_a_merged_failure_reaches_the_zero_submission_classification():
     failures in zero-order classification")."""
     import near_close_dca as ncd
 
-    adjustment = {"status": "submitted", "order_id": "ORD-A", "submitted_amount_usd": 1.14,
-                  "whole_share_quantity": 0, "whole_share_settlement_adjustment": True}
+    adjustment = {
+        "status": "submitted",
+        "order_id": "ORD-A",
+        "submitted_amount_usd": 1.14,
+        "whole_share_quantity": 0,
+        "whole_share_settlement_adjustment": True,
+    }
     merged = ncd._merge_whole_share_submission_outcomes(
         adjustment,
         {"status": "failed", "broker_placement_failed": True, "skip_reason": "RuntimeError"},
@@ -23334,10 +23193,7 @@ def test_a_merged_failure_reaches_the_zero_submission_classification():
     artifacts = {"buy_candidates": [{"ticker": "BYDDY"}], "signal_rows": [], "usage_proxy": {}}
     ncd._apply_no_order_classification(artifacts, {"BYDDY": merged})
     assert artifacts["is_trading_failure"] is True
-    assert (
-        artifacts["run_classification_outcome"]
-        == "failed_after_connector_native_recovery_attempt"
-    )
+    assert artifacts["run_classification_outcome"] == "failed_after_connector_native_recovery_attempt"
     assert artifacts["error_class"] == "failed_after_connector_native_recovery_attempt"
     assert artifacts["orders_failed_count"] == 1
 
@@ -23346,8 +23202,7 @@ def test_a_merged_failure_reaches_the_zero_submission_classification():
     # SUBMITTED branch has always treated the two together.
     blocked = ncd._merge_whole_share_submission_outcomes(
         adjustment,
-        {"status": "blocked", "broker_placement_failed": True, "order_id": "T",
-         "skip_reason": "claim left reserved"},
+        {"status": "blocked", "broker_placement_failed": True, "order_id": "T", "skip_reason": "claim left reserved"},
     )
     artifacts = {"buy_candidates": [{"ticker": "BYDDY"}], "signal_rows": [], "usage_proxy": {}}
     ncd._apply_no_order_classification(artifacts, {"BYDDY": blocked})
@@ -23357,9 +23212,7 @@ def test_a_merged_failure_reaches_the_zero_submission_classification():
     # a clean no-order run. Widening this predicate must not make every
     # deliberate skip a trading failure.
     artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
-    ncd._apply_no_order_classification(
-        artifacts, {"AAPL": {"status": "skipped", "deliberate_skip": True}}
-    )
+    ncd._apply_no_order_classification(artifacts, {"AAPL": {"status": "skipped", "deliberate_skip": True}})
     assert artifacts["is_trading_failure"] is False
     assert artifacts["run_classification_outcome"] == "completed_no_orders"
     assert artifacts.get("orders_failed_count") is None
@@ -23378,14 +23231,21 @@ def test_a_merged_row_counts_every_broker_attempt_it_represents():
     outcomes")."""
     import near_close_dca as ncd
 
-    zero_fill = {"status": "failed", "whole_share_zero_fill_attempt": True,
-                 "order_id": "ZERO", "submitted_amount_usd": 0.0}
-    adjustment = {"status": "submitted", "order_id": "ADJ", "submitted_amount_usd": 1.14,
-                  "whole_share_quantity": 0, "whole_share_settlement_adjustment": True}
-    submitted = {"status": "submitted", "order_id": "SUB", "submitted_amount_usd": 23.36,
-                 "whole_share_quantity": 1}
-    failed = {"status": "failed", "broker_placement_failed": True, "order_id": "F1",
-              "skip_reason": "RuntimeError"}
+    zero_fill = {
+        "status": "failed",
+        "whole_share_zero_fill_attempt": True,
+        "order_id": "ZERO",
+        "submitted_amount_usd": 0.0,
+    }
+    adjustment = {
+        "status": "submitted",
+        "order_id": "ADJ",
+        "submitted_amount_usd": 1.14,
+        "whole_share_quantity": 0,
+        "whole_share_settlement_adjustment": True,
+    }
+    submitted = {"status": "submitted", "order_id": "SUB", "submitted_amount_usd": 23.36, "whole_share_quantity": 1}
+    failed = {"status": "failed", "broker_placement_failed": True, "order_id": "F1", "skip_reason": "RuntimeError"}
 
     # A zero-fill recovery and a rejected placement are each a real order that
     # took a slot, even though neither submitted anything.
@@ -23406,18 +23266,14 @@ def test_a_merged_row_counts_every_broker_attempt_it_represents():
 
     # Two adjustments and nothing else IS still an adjustment row, counting
     # neither an attempt nor a submission.
-    both = ncd._merge_whole_share_submission_outcomes(
-        adjustment, dict(adjustment, order_id="ADJ2")
-    )
+    both = ncd._merge_whole_share_submission_outcomes(adjustment, dict(adjustment, order_id="ADJ2"))
     assert both["whole_share_settlement_adjustment"] is True
     assert both["merged_attempt_count"] == 0
     assert both["merged_submission_count"] == 0
 
     # Attempts and submissions diverge, which is the whole point of counting
     # them separately.
-    two_zero = ncd._merge_whole_share_submission_outcomes(
-        zero_fill, dict(zero_fill, order_id="ZERO2")
-    )
+    two_zero = ncd._merge_whole_share_submission_outcomes(zero_fill, dict(zero_fill, order_id="ZERO2"))
     assert two_zero["merged_attempt_count"] == 2
     assert two_zero["merged_submission_count"] == 0
     assert two_zero["whole_share_order_ids"] == ["ZERO", "ZERO2"]
@@ -23450,7 +23306,9 @@ def test_merged_attempts_are_bucketed_by_trading_day():
 
     today = "2026-08-03"
     prior_day_recovery = {
-        "status": "submitted", "order_id": "OLD", "submitted_amount_usd": 23.36,
+        "status": "submitted",
+        "order_id": "OLD",
+        "submitted_amount_usd": 23.36,
         "whole_share_claim_breakdown": [{"trading_day": "2026-08-01", "amount_usd": 23.36}],
     }
     fresh_today = {"status": "submitted", "order_id": "NEW", "submitted_amount_usd": 23.40}
@@ -23463,18 +23321,19 @@ def test_merged_attempts_are_bucketed_by_trading_day():
 
     # The undercount this replaced stays fixed: two SAME-day zero-fill
     # recoveries still consume two of today's slots.
-    zero = {"status": "failed", "whole_share_zero_fill_attempt": True,
-            "order_id": "Z1", "submitted_amount_usd": 0.0}
+    zero = {"status": "failed", "whole_share_zero_fill_attempt": True, "order_id": "Z1", "submitted_amount_usd": 0.0}
     two_zero = ncd._merge_whole_share_submission_outcomes(zero, dict(zero, order_id="Z2"))
     assert ncd._broker_attempts_on_day(two_zero, today) == 2
 
     # An adjustment-only aggregate charges nothing, and an unmerged row counts
     # exactly 1 as it always did.
-    adjustment = {"status": "submitted", "order_id": "A1", "submitted_amount_usd": 1.0,
-                  "whole_share_settlement_adjustment": True}
-    both_adjustments = ncd._merge_whole_share_submission_outcomes(
-        adjustment, dict(adjustment, order_id="A2")
-    )
+    adjustment = {
+        "status": "submitted",
+        "order_id": "A1",
+        "submitted_amount_usd": 1.0,
+        "whole_share_settlement_adjustment": True,
+    }
+    both_adjustments = ncd._merge_whole_share_submission_outcomes(adjustment, dict(adjustment, order_id="A2"))
     assert ncd._broker_attempts_on_day(both_adjustments, today) == 0
     assert ncd._broker_attempts_on_day({"status": "submitted"}, today) == 1
     assert ncd._broker_attempts_on_day({"status": "skipped", "deliberate_skip": True}, today) == 1
@@ -23490,8 +23349,11 @@ def test_a_confirmation_hold_is_not_a_merged_attempt():
     confirmation holds from merged attempt counts")."""
     import near_close_dca as ncd
 
-    hold = {"status": "not_submitted_confirmation_required",
-            "broker_placement_failed": True, "skip_reason": "awaiting confirmation"}
+    hold = {
+        "status": "not_submitted_confirmation_required",
+        "broker_placement_failed": True,
+        "skip_reason": "awaiting confirmation",
+    }
     # The standalone exclusion this has to match.
     assert hold["status"] not in ncd._PRIOR_ALLOCATION_ATTEMPT_STATUSES
     assert not ncd._is_distinct_broker_attempt(hold)
@@ -23563,9 +23425,7 @@ def test_an_afternoon_breaker_halt_is_a_trading_failure(monkeypatch):
 
     # ... with an order already submitted.
     artifacts = {"buy_candidates": [], "signal_rows": [], "usage_proxy": {}}
-    ncd._apply_no_order_classification(
-        artifacts, {"AAPL": {"status": "submitted"}, "GS": dict(halted_tail)}
-    )
+    ncd._apply_no_order_classification(artifacts, {"AAPL": {"status": "submitted"}, "GS": dict(halted_tail)})
     assert artifacts["is_trading_failure"] is True
     assert artifacts["run_classification_outcome"] == "failed_after_partial_submission"
     assert artifacts["error_class"] == "partial_placement_failure"
@@ -23581,9 +23441,7 @@ def test_an_afternoon_breaker_halt_is_a_trading_failure(monkeypatch):
         },
     )
     assert artifacts["is_trading_failure"] is True
-    assert artifacts["run_classification_outcome"] == (
-        "failed_after_connector_native_recovery_attempt"
-    )
+    assert artifacts["run_classification_outcome"] == ("failed_after_connector_native_recovery_attempt")
 
 
 def test_consecutive_failed_placements_halt_the_afternoon_batch(monkeypatch):
@@ -23615,9 +23473,18 @@ def test_consecutive_failed_placements_halt_the_afternoon_batch(monkeypatch):
         # broker_placement_failed is what the breaker counts -- a real,
         # broker-facing placement call that failed, as opposed to a "failed"
         # row from a raise that never reached the broker.
-        return ({"status": "failed", "order_id": None, "skip_reason": "broker unavailable",
-                 "broker_placement_failed": True},
-                None, running_deployed_7d, 1, 0)
+        return (
+            {
+                "status": "failed",
+                "order_id": None,
+                "skip_reason": "broker unavailable",
+                "broker_placement_failed": True,
+            },
+            None,
+            running_deployed_7d,
+            1,
+            0,
+        )
 
     monkeypatch.setattr(ncd, "_process_buy_candidate", _always_fails)
 
@@ -23669,15 +23536,28 @@ def test_a_submission_between_failures_resets_the_afternoon_streak(monkeypatch):
     def _alternating(*, decision, ctx, running_deployed_7d):
         seen.append(decision.ticker)
         if len(seen) % 2 == 1:
-            return ({"status": "failed", "order_id": None, "skip_reason": "rejected",
-                     "broker_placement_failed": True},
-                    None, running_deployed_7d, 1, 0)
+            return (
+                {"status": "failed", "order_id": None, "skip_reason": "rejected", "broker_placement_failed": True},
+                None,
+                running_deployed_7d,
+                1,
+                0,
+            )
         # broker_placement_succeeded is what resets the streak -- a FRESH
         # placement, as opposed to a duplicate recovery that also reports
         # "submitted" without having placed anything this invocation.
-        return ({"status": "submitted", "order_id": f"ORD-{decision.ticker}",
-                 "submitted_amount_usd": 2.0, "broker_placement_succeeded": True},
-                None, running_deployed_7d, 0, 0)
+        return (
+            {
+                "status": "submitted",
+                "order_id": f"ORD-{decision.ticker}",
+                "submitted_amount_usd": 2.0,
+                "broker_placement_succeeded": True,
+            },
+            None,
+            running_deployed_7d,
+            0,
+            0,
+        )
 
     monkeypatch.setattr(ncd, "_process_buy_candidate", _alternating)
 
@@ -23769,9 +23649,7 @@ def test_confirmation_required_placements_count_toward_the_streak(monkeypatch):
 
     monkeypatch.setattr(ncd, "_process_buy_candidate", _confirmation_required)
 
-    _process_buy_candidates_batch(
-        buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx
-    )
+    _process_buy_candidates_batch(buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx)
 
     assert len(seen) == 3, "the breaker must stop the batch after three refusals"
     # A confirmation-required streak contributes nothing to errors_count on its
@@ -23803,9 +23681,7 @@ def test_a_malformed_provider_signal_is_normalized_instead_of_poisoning_artifact
     def _returns_garbage(*, ticker, now, config, data, interval_minutes):
         if data.source == SourceName.FINANCE:
             return {"not": "a signal"}
-        return original(
-            ticker=ticker, now=now, config=config, data=data, interval_minutes=interval_minutes
-        )
+        return original(ticker=ticker, now=now, config=config, data=data, interval_minutes=interval_minutes)
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(ncd, "evaluate_source_signal", _returns_garbage)
@@ -23851,18 +23727,34 @@ def test_a_duplicate_recovery_does_not_reset_the_streak(monkeypatch):
         if len(seen) == 2:
             # The duplicate-recovery shape: "submitted", a real order id from an
             # EARLIER attempt, and no fresh placement this invocation.
-            return ({"status": "submitted", "order_id": "ORD-EARLIER",
-                     "submitted_amount_usd": 2.0, "duplicate_preserved": True},
-                    None, running_deployed_7d, 0, 0)
-        return ({"status": "failed", "order_id": None, "skip_reason": "broker unavailable",
-                 "broker_placement_failed": True},
-                None, running_deployed_7d, 1, 0)
+            return (
+                {
+                    "status": "submitted",
+                    "order_id": "ORD-EARLIER",
+                    "submitted_amount_usd": 2.0,
+                    "duplicate_preserved": True,
+                },
+                None,
+                running_deployed_7d,
+                0,
+                0,
+            )
+        return (
+            {
+                "status": "failed",
+                "order_id": None,
+                "skip_reason": "broker unavailable",
+                "broker_placement_failed": True,
+            },
+            None,
+            running_deployed_7d,
+            1,
+            0,
+        )
 
     monkeypatch.setattr(ncd, "_process_buy_candidate", _failure_then_duplicate)
 
-    _process_buy_candidates_batch(
-        buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx
-    )
+    _process_buy_candidates_batch(buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx)
 
     # fail, duplicate (no reset), fail, fail -> tripped on the third real failure.
     assert len(seen) == 4
@@ -23896,20 +23788,35 @@ def test_a_whole_share_placement_failure_counts_toward_the_streak(monkeypatch):
         if decision.ticker == "BYDDY":
             # A whole-share no-order placement failure, as
             # _process_whole_share_candidate now reports one.
-            return ({"status": "failed", "order_id": None,
-                     "skip_reason": "whole-share placement failed",
-                     "broker_placement_failed": True,
-                     "whole_share_quantity": 0},
-                    None, running_deployed_7d, 1, 0)
-        return ({"status": "failed", "order_id": None, "skip_reason": "broker unavailable",
-                 "broker_placement_failed": True},
-                None, running_deployed_7d, 1, 0)
+            return (
+                {
+                    "status": "failed",
+                    "order_id": None,
+                    "skip_reason": "whole-share placement failed",
+                    "broker_placement_failed": True,
+                    "whole_share_quantity": 0,
+                },
+                None,
+                running_deployed_7d,
+                1,
+                0,
+            )
+        return (
+            {
+                "status": "failed",
+                "order_id": None,
+                "skip_reason": "broker unavailable",
+                "broker_placement_failed": True,
+            },
+            None,
+            running_deployed_7d,
+            1,
+            0,
+        )
 
     monkeypatch.setattr(ncd, "_process_buy_candidate", _mixed_failures)
 
-    _process_buy_candidates_batch(
-        buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx
-    )
+    _process_buy_candidates_batch(buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx)
 
     assert len(seen) == 3, "the whole-share failure must count toward the same streak"
 
@@ -23945,8 +23852,9 @@ def test_an_isolated_failure_row_validates_against_the_run_state_schema():
     import near_close_dca as ncd
 
     schema = json.loads(
-        (pathlib.Path(__file__).resolve().parent.parent / "schemas" / "run_state.schema.json")
-        .read_text(encoding="utf-8")
+        (pathlib.Path(__file__).resolve().parent.parent / "schemas" / "run_state.schema.json").read_text(
+            encoding="utf-8"
+        )
     )
     row_schema = schema["properties"]["buy_candidates"]["items"]
 
@@ -23998,14 +23906,17 @@ def test_a_blocked_candidate_does_not_count_toward_the_streak(monkeypatch):
 
     def _always_blocked(*, decision, ctx, running_deployed_7d):
         seen.append(decision.ticker)
-        return ({"status": "blocked", "skip_reason": "spread too wide", "deliberate_skip": True},
-                None, running_deployed_7d, 0, 0)
+        return (
+            {"status": "blocked", "skip_reason": "spread too wide", "deliberate_skip": True},
+            None,
+            running_deployed_7d,
+            0,
+            0,
+        )
 
     monkeypatch.setattr(ncd, "_process_buy_candidate", _always_blocked)
 
-    _process_buy_candidates_batch(
-        buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx
-    )
+    _process_buy_candidates_batch(buy_candidates=[_isolation_buy_decision(t) for t in tickers], ctx=ctx)
 
     assert len(seen) == len(tickers), "policy blocks must never trip the broker-health breaker"
 
@@ -24025,9 +23936,7 @@ def test_an_accepted_whole_share_order_that_never_published_fails_the_run(monkey
 
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    config = StrategyConfig(
-        dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset({trading_day})
-    )
+    config = StrategyConfig(dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset({trading_day}))
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
     ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
     ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
@@ -24043,9 +23952,7 @@ def test_an_accepted_whole_share_order_that_never_published_fails_the_run(monkey
     monkeypatch.setattr(ncd, "_process_buy_candidate", _accept_then_boom)
 
     with pytest.raises(OverflowError):
-        _process_buy_candidates_batch(
-            buy_candidates=[_isolation_buy_decision("AAPL")], ctx=ctx
-        )
+        _process_buy_candidates_batch(buy_candidates=[_isolation_buy_decision("AAPL")], ctx=ctx)
 
     # The accepted order still has to reach the failure writer, which reads
     # exactly this dict -- otherwise failing the run would ALSO lose it.
@@ -24073,9 +23980,7 @@ def test_a_pre_broker_raise_is_still_isolated_on_the_whole_share_path(monkeypatc
 
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    config = StrategyConfig(
-        dry_run=False, tickers=("AAPL", "MSFT"), approved_test_dates=frozenset({trading_day})
-    )
+    config = StrategyConfig(dry_run=False, tickers=("AAPL", "MSFT"), approved_test_dates=frozenset({trading_day}))
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0, "MSFT": 98.0})
     ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
     ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
@@ -24090,10 +23995,8 @@ def test_a_pre_broker_raise_is_still_isolated_on_the_whole_share_path(monkeypatc
 
     monkeypatch.setattr(ncd, "_process_buy_candidate", _boom_before_the_broker)
 
-    candidate_outcomes, _top_up, _deployed, errors_count, _reviews = (
-        _process_buy_candidates_batch(
-            buy_candidates=[_isolation_buy_decision(t) for t in ("AAPL", "MSFT")], ctx=ctx
-        )
+    candidate_outcomes, _top_up, _deployed, errors_count, _reviews = _process_buy_candidates_batch(
+        buy_candidates=[_isolation_buy_decision(t) for t in ("AAPL", "MSFT")], ctx=ctx
     )
 
     assert seen == ["AAPL", "MSFT"], "the rest of the batch must still be attempted"
@@ -24153,18 +24056,14 @@ def test_a_structurally_ambiguous_whole_share_response_halts_instead_of_reconcil
 
         def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             lookup_calls.append((ticker, ref_id_prefixes))
-            return super().same_day_strategy_order_exists_with_ref_id_prefix(
-                ticker, trading_day, ref_id_prefixes
-            )
+            return super().same_day_strategy_order_exists_with_ref_id_prefix(ticker, trading_day, ref_id_prefixes)
 
     broker = _StructurallyAmbiguousBroker(cash=5000.0, reference_prices={"BYDDY": 98.0})
 
     # Pre-seed the whole-share accumulator's own pending balance right up to
     # one share's price, so even a tiny further contribution below crosses
     # the threshold and fires a real placement attempt through the broker.
-    WholeShareAccumulationLedger().preserve_pending(
-        "BYDDY", trading_day.isoformat(), 200.0, stream="test"
-    )
+    WholeShareAccumulationLedger().preserve_pending("BYDDY", trading_day.isoformat(), 200.0, stream="test")
 
     # Built directly rather than via `_isolation_context`: that helper hardcodes
     # `scheduled=True`, which requires real bid/ask spread data the DryRunBroker
@@ -24218,9 +24117,7 @@ def test_a_raising_candidate_does_not_erase_a_seeded_cross_day_recovery(monkeypa
 
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    config = StrategyConfig(
-        dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset({trading_day})
-    )
+    config = StrategyConfig(dry_run=False, tickers=("AAPL",), approved_test_dates=frozenset({trading_day}))
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
     ctx = _isolation_context(config, StrategyState(), broker, now, trading_day)
 
@@ -24229,18 +24126,16 @@ def test_a_raising_candidate_does_not_erase_a_seeded_cross_day_recovery(monkeypa
 
     monkeypatch.setattr(ncd, "_process_buy_candidate", _boom)
 
-    candidate_outcomes, _top_up, _deployed, errors_count, _reviews = (
-        _process_buy_candidates_batch(
-            buy_candidates=[_isolation_buy_decision("AAPL")],
-            ctx=ctx,
-            initial_candidate_outcomes={
-                "AAPL": {
-                    "status": "submitted",
-                    "order_id": "recovered-from-yesterday",
-                    "submitted_amount_usd": 5.0,
-                }
-            },
-        )
+    candidate_outcomes, _top_up, _deployed, errors_count, _reviews = _process_buy_candidates_batch(
+        buy_candidates=[_isolation_buy_decision("AAPL")],
+        ctx=ctx,
+        initial_candidate_outcomes={
+            "AAPL": {
+                "status": "submitted",
+                "order_id": "recovered-from-yesterday",
+                "submitted_amount_usd": 5.0,
+            }
+        },
     )
 
     outcome = candidate_outcomes["AAPL"]
@@ -24313,9 +24208,7 @@ def test_signal_reconciliation_failure_degrades_only_that_ticker(monkeypatch, ca
     monkeypatch.setattr(ncd, "reconcile_signals", _boom_for_msft)
 
     with caplog.at_level(logging.ERROR, logger="near_close_dca"):
-        decisions, errors_count = _evaluate_all_signals(
-            now, config, ["AAPL", "MSFT", "NVDA"], fin, rh
-        )
+        decisions, errors_count = _evaluate_all_signals(now, config, ["AAPL", "MSFT", "NVDA"], fin, rh)
 
     by_ticker = {d.ticker: d for d in decisions}
     assert set(by_ticker) == {"AAPL", "MSFT", "NVDA"}
@@ -24355,9 +24248,7 @@ def test_empty_universe_still_writes_a_signals_header(tmp_path):
     header requirement would reject, failing the run and blocking the pointer
     update (Codex review)."""
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    config = StrategyConfig(
-        dry_run=True, tickers=(), approved_test_dates=frozenset({date(2026, 6, 29)})
-    )
+    config = StrategyConfig(dry_run=True, tickers=(), approved_test_dates=frozenset({date(2026, 6, 29)}))
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
@@ -24391,9 +24282,7 @@ def test_a_manual_afternoon_placement_failure_is_not_a_scheduled_recovery_failur
 
     class _FailingBroker(DryRunBroker):
         def place_market_buy(self, ticker, notional_usd, ref_id):
-            raise near_close_dca.FractionalPlacementRejectedError(
-                "broker explicitly rejected the order"
-            )
+            raise near_close_dca.FractionalPlacementRejectedError("broker explicitly rejected the order")
 
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             # The immediate response above already proves rejection; a clean
@@ -24406,9 +24295,7 @@ def test_a_manual_afternoon_placement_failure_is_not_a_scheduled_recovery_failur
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _FailingBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _FailingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "manual-placement-failed")
 
     run_daily_compact(
@@ -24421,9 +24308,7 @@ def test_a_manual_afternoon_placement_failure_is_not_a_scheduled_recovery_failur
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=False),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     assert run_state["run_classification_outcome"] == "failed_placement"
@@ -24448,9 +24333,7 @@ def test_manual_unresolved_placement_writes_failure_artifacts_before_raising(tmp
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _AmbiguousBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _AmbiguousBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "manual-unresolved-placement")
 
     with pytest.raises(near_close_dca.UnresolvedPlacementError):
@@ -24467,9 +24350,7 @@ def test_manual_unresolved_placement_writes_failure_artifacts_before_raising(tmp
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     assert run_state["run_classification"]["run_origin"] == "manual"
-    assert run_state["broker_outcomes"][config.tickers[0]][
-        "placement_outcome_unproven"
-    ] is True
+    assert run_state["broker_outcomes"][config.tickers[0]]["placement_outcome_unproven"] is True
     # The run reached the broker placement boundary, so it is a PLACEMENT
     # failure -- never `startup_failed`, which sends monitoring and recovery
     # looking at initialization (Codex review, PR #859: "Classify unresolved
@@ -24537,9 +24418,7 @@ def test_mismatched_response_and_history_ids_stay_unresolved(tmp_path):
         "a WORKING history match under a DIFFERENT id than the response's own "
         "must not silently prove this placement accepted"
     )
-    assert state.day_notional(now.date()) == 0.0, (
-        "the mismatched history row must not be booked as a real submission"
-    )
+    assert state.day_notional(now.date()) == 0.0, "the mismatched history row must not be booked as a real submission"
 
 
 def test_mismatched_response_and_history_ids_persist_the_response_id(tmp_path):
@@ -24763,12 +24642,9 @@ def test_reconciliation_rejects_conflicting_id_aliases_on_the_matched_history_ro
         run_state = json.load(handle)
     outcome = run_state["broker_outcomes"][config.tickers[0]]
     assert outcome["placement_outcome_unproven"] is True, (
-        "a history row whose own id/order_id aliases disagree must not be "
-        "silently resolved by picking one alias"
+        "a history row whose own id/order_id aliases disagree must not be silently resolved by picking one alias"
     )
-    assert state.day_notional(now.date()) == 0.0, (
-        "the disputed history row must not be booked as a real submission"
-    )
+    assert state.day_notional(now.date()) == 0.0, "the disputed history row must not be booked as a real submission"
 
 
 def test_reconciliation_accepts_equivalent_id_aliases_on_the_matched_history_row():
@@ -24787,7 +24663,9 @@ def test_reconciliation_accepts_equivalent_id_aliases_on_the_matched_history_row
     ctx = types.SimpleNamespace(
         broker=types.SimpleNamespace(
             same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
-                "id": 123.0, "order_id": 123, "state": "queued",
+                "id": 123.0,
+                "order_id": 123,
+                "state": "queued",
             }
         ),
         trading_day=date(2026, 8, 25),
@@ -24802,7 +24680,9 @@ def test_reconciliation_accepts_equivalent_id_aliases_on_the_matched_history_row
     ctx_conflict = types.SimpleNamespace(
         broker=types.SimpleNamespace(
             same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: {
-                "id": 123.0, "order_id": 456, "state": "queued",
+                "id": 123.0,
+                "order_id": 456,
+                "state": "queued",
             }
         ),
         trading_day=date(2026, 8, 25),
@@ -24856,12 +24736,9 @@ def test_reconciliation_rejects_conflicting_state_status_on_the_matched_history_
         run_state = json.load(handle)
     outcome = run_state["broker_outcomes"][config.tickers[0]]
     assert outcome["placement_outcome_unproven"] is True, (
-        "a history row whose own state/status disagree must not be read via "
-        "'state' alone"
+        "a history row whose own state/status disagree must not be read via 'state' alone"
     )
-    assert state.day_notional(now.date()) == 0.0, (
-        "the disputed history row must not be booked as a real submission"
-    )
+    assert state.day_notional(now.date()) == 0.0, "the disputed history row must not be booked as a real submission"
 
 
 def test_reconciliation_rejects_a_stale_working_match_disputing_response_evidence(tmp_path):
@@ -24922,9 +24799,7 @@ def test_reconciliation_rejects_a_stale_working_match_disputing_response_evidenc
         "a working history match that does not corroborate the response's own "
         "$100 fill evidence must not be silently accepted at the $2 requested size"
     )
-    assert state.day_notional(now.date()) == 0.0, (
-        "the disputed working match must not be booked as a real submission"
-    )
+    assert state.day_notional(now.date()) == 0.0, "the disputed working match must not be booked as a real submission"
 
 
 def test_restarted_reconciliation_honors_a_persisted_response_notional(tmp_path):
@@ -24944,17 +24819,24 @@ def test_restarted_reconciliation_honors_a_persisted_response_notional(tmp_path)
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     trading_day_iso = now.date().isoformat()
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": trading_day_iso,
-        "broker_outcomes": {"AAPL": {
-            "status": "failed",
-            "order_id": "ORD",
-            "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof",
-            "submitted_amount_usd": 2.0,
-            "response_notional_usd": 100.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": trading_day_iso,
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "order_id": "ORD",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                        "response_notional_usd": 100.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -24998,9 +24880,7 @@ def test_a_scheduled_unresolved_placement_halt_records_every_skipped_candidate(t
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _AmbiguousBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _AmbiguousBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "scheduled-unresolved-placement")
 
     with pytest.raises(near_close_dca.UnresolvedPlacementError):
@@ -25020,15 +24900,11 @@ def test_a_scheduled_unresolved_placement_halt_records_every_skipped_candidate(t
     # A scheduled run DOES run the connector-native recovery policy, so it
     # carries that outcome rather than the manual one -- and neither is
     # `startup_failed`.
-    assert run_state["run_classification_outcome"] == (
-        "failed_after_connector_native_recovery_attempt"
-    )
+    assert run_state["run_classification_outcome"] == ("failed_after_connector_native_recovery_attempt")
     assert run_state["error_class"] == "failed_after_connector_native_recovery_attempt"
 
     rows = {row["ticker"]: row for row in run_state["buy_candidates"]}
-    halted = [
-        row for row in rows.values() if row.get("unresolved_placement_halted")
-    ]
+    halted = [row for row in rows.values() if row.get("unresolved_placement_halted")]
     # Every candidate the halt skipped is present, marked, and says why -- and
     # is a deliberate skip, not an attempt nobody made.
     assert halted, run_state["buy_candidates"]
@@ -25060,9 +24936,7 @@ def test_nested_queued_failure_order_reconciles_before_later_batch_placement(tmp
                 enable_live_orders=True,
                 place_fn=lambda **kwargs: {
                     "success": False,
-                    "connector_failure": {
-                        "context": {"order": {"id": "ORD-HIDDEN", "state": "queued"}}
-                    },
+                    "connector_failure": {"context": {"order": {"id": "ORD-HIDDEN", "state": "queued"}}},
                 },
             )
             return adapter.place_market_buy(ticker, notional_usd, ref_id)
@@ -25119,9 +24993,7 @@ def test_a_manual_unresolved_halt_reports_only_completed_reviews(tmp_path):
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _AmbiguousBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _AmbiguousBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "manual-unresolved-placement-reviews")
 
     with pytest.raises(near_close_dca.UnresolvedPlacementError):
@@ -25144,7 +25016,8 @@ def test_a_manual_unresolved_halt_reports_only_completed_reviews(tmp_path):
     # reviewed_order is carried on the published broker_outcomes, not the
     # reconstructed buy_candidates rows (_failure_candidate_row omits it).
     reviewed = sum(
-        1 for outcome in run_state["broker_outcomes"].values()
+        1
+        for outcome in run_state["broker_outcomes"].values()
         if isinstance(outcome, dict) and outcome.get("reviewed_order") is not None
     )
     assert reviewed >= 1
@@ -25173,9 +25046,7 @@ def test_an_unresolved_halt_charges_the_daily_attempt_cap(tmp_path):
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _AmbiguousBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _AmbiguousBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     trading_day = now.astimezone(EASTERN).date()
     assert state.day_order_count(trading_day) == 0
 
@@ -25221,9 +25092,7 @@ def test_an_unresolved_halt_artifact_carries_the_completed_evaluation(tmp_path):
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _AmbiguousBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _AmbiguousBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "halt-evaluation")
 
     with pytest.raises(near_close_dca.UnresolvedPlacementError):
@@ -25266,9 +25135,7 @@ def test_an_unresolved_halt_preserves_accumulated_pre_placement_errors(tmp_path)
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
 
     now2, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    decisions, _errs = near_close_dca._evaluate_all_signals(
-        now2, config, list(config.tickers), fin, rh
-    )
+    decisions, _errs = near_close_dca._evaluate_all_signals(now2, config, list(config.tickers), fin, rh)
     # Two errors already accumulated BEFORE the halt -- neither of which
     # the unresolved placement itself represents.
     near_close_dca._publish_in_flight_evaluation(
@@ -25282,8 +25149,11 @@ def test_an_unresolved_halt_preserves_accumulated_pre_placement_errors(tmp_path)
     )
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
         }
     }
     try:
@@ -25300,8 +25170,7 @@ def test_an_unresolved_halt_preserves_accumulated_pre_placement_errors(tmp_path)
     run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert run_state["orders_failed_count"] == 1
     assert run_state["usage_proxy"]["errors_count"] == 3, (
-        "the 2 pre-placement errors must be ADDED to the unresolved "
-        "placement's own error, not discarded"
+        "the 2 pre-placement errors must be ADDED to the unresolved placement's own error, not discarded"
     )
 
 
@@ -25322,12 +25191,9 @@ def test_an_unresolved_retry_outcome_survives_the_failure_artifact_merge(tmp_pat
         "run_id": "prior",
         "trading_day": trading_day,
         "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
-        "broker_outcomes": {
-            "AAPL": {"status": "failed", "order_id": None, "skip_reason": "earlier"}
-        },
+        "broker_outcomes": {"AAPL": {"status": "failed", "order_id": None, "skip_reason": "earlier"}},
         "buy_candidates": [
-            {"ticker": "AAPL", "status": "failed", "order_id": None,
-             "buy_multiplier": 1.0, "planned_amount_usd": 2.0}
+            {"ticker": "AAPL", "status": "failed", "order_id": None, "buy_multiplier": 1.0, "planned_amount_usd": 2.0}
         ],
     }
     (artifacts_dir / "run_state.json").write_text(json.dumps(prior), encoding="utf-8")
@@ -25353,9 +25219,7 @@ def test_an_unresolved_retry_outcome_survives_the_failure_artifact_merge(tmp_pat
 
     merged = json.loads((artifacts_dir / "run_state.json").read_bytes())
     unproven = [
-        oc
-        for oc in merged["broker_outcomes"].values()
-        if isinstance(oc, dict) and oc.get("placement_outcome_unproven")
+        oc for oc in merged["broker_outcomes"].values() if isinstance(oc, dict) and oc.get("placement_outcome_unproven")
     ]
     # The retry kept its own row under an attempt-specific key, and the real
     # ticker travels inside the outcome so no consumer reads the synthetic key
@@ -25391,9 +25255,7 @@ def test_afternoon_failure_counts_a_potentially_submitted_in_flight_order(tmp_pa
         }
     }
     try:
-        near_close_dca._write_afternoon_failure_artifacts(
-            artifacts_dir, now, RuntimeError("boom")
-        )
+        near_close_dca._write_afternoon_failure_artifacts(artifacts_dir, now, RuntimeError("boom"))
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
@@ -25452,9 +25314,7 @@ def test_a_merged_retry_preserves_a_potentially_submitted_count(tmp_path):
         }
     }
     try:
-        near_close_dca._write_afternoon_failure_artifacts(
-            artifacts_dir, now, RuntimeError("boom")
-        )
+        near_close_dca._write_afternoon_failure_artifacts(artifacts_dir, now, RuntimeError("boom"))
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
@@ -25472,9 +25332,7 @@ def test_a_merged_retry_preserves_a_potentially_submitted_count(tmp_path):
     assert run_state["usage_proxy"]["orders_placed_count"] == 1
 
 
-def test_write_afternoon_failure_artifacts_preserves_placement_after_lock_timeout(
-    tmp_path, monkeypatch
-):
+def test_write_afternoon_failure_artifacts_preserves_placement_after_lock_timeout(tmp_path, monkeypatch):
     # Codex review ("Preserve submitted-order evidence after lock
     # timeouts"): when this invocation's own broker call already placed a
     # real order (recorded in _IN_FLIGHT_CANDIDATE_OUTCOMES) and the
@@ -25490,8 +25348,10 @@ def test_write_afternoon_failure_artifacts_preserves_placement_after_lock_timeou
 
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "submitted", "order_id": "ORD-REAL-PLACEMENT",
-            "submitted_amount_usd": 2.0, "ticker": "AAPL",
+            "status": "submitted",
+            "order_id": "ORD-REAL-PLACEMENT",
+            "submitted_amount_usd": 2.0,
+            "ticker": "AAPL",
         }
     }
 
@@ -25519,9 +25379,7 @@ def test_write_afternoon_failure_artifacts_preserves_placement_after_lock_timeou
     assert "account_fingerprint" in entry
 
 
-def test_write_afternoon_failure_artifacts_preserves_a_concurrent_writers_state(
-    tmp_path, monkeypatch
-):
+def test_write_afternoon_failure_artifacts_preserves_a_concurrent_writers_state(tmp_path, monkeypatch):
     # Codex review ("Preserve the concurrent writer after rejecting stale
     # state"): reconciliation's own run_state.json compare-and-swap already
     # correctly rejected this invocation's (A's) stale replacement because
@@ -25554,14 +25412,14 @@ def test_write_afternoon_failure_artifacts_preserves_a_concurrent_writers_state(
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "submitted", "order_id": "ORD-B-REAL"},
         ],
     }
-    (artifacts_dir / "run_state.json").write_text(
-        json.dumps(concurrent_writers_state), encoding="utf-8"
-    )
+    (artifacts_dir / "run_state.json").write_text(json.dumps(concurrent_writers_state), encoding="utf-8")
 
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "submitted", "order_id": "ORD-A-REAL",
-            "submitted_amount_usd": 2.0, "ticker": "AAPL",
+            "status": "submitted",
+            "order_id": "ORD-A-REAL",
+            "submitted_amount_usd": 2.0,
+            "ticker": "AAPL",
         }
     }
 
@@ -25585,18 +25443,14 @@ def test_write_afternoon_failure_artifacts_preserves_a_concurrent_writers_state(
     assert "artifact_contract_failure" not in persisted
 
     # A's own real order is not silently dropped -- it survives in a sidecar.
-    sidecars = list(
-        artifacts_dir.glob("foreign_run_state_after_concurrency_rejection.*.json")
-    )
+    sidecars = list(artifacts_dir.glob("foreign_run_state_after_concurrency_rejection.*.json"))
     assert len(sidecars) == 1
     entry = json.loads(sidecars[0].read_bytes())
     assert entry["broker_outcomes"]["AAPL"]["order_id"] == "ORD-A-REAL"
     assert "account_fingerprint" in entry
 
 
-def test_run_once_threads_expect_no_prior_state_into_the_failure_writer(
-    tmp_path, monkeypatch
-):
+def test_run_once_threads_expect_no_prior_state_into_the_failure_writer(tmp_path, monkeypatch):
     # Codex review ("Propagate first-write ownership through exception
     # finalization"): run_once()'s own exception handler is the only caller
     # of _write_afternoon_failure_artifacts, and ctx.expect_no_prior_state
@@ -25619,7 +25473,8 @@ def test_run_once_threads_expect_no_prior_state_into_the_failure_writer(
         raise RuntimeError("simulated failure before finalization")
 
     monkeypatch.setattr(
-        near_close_dca, "_write_afternoon_failure_artifacts",
+        near_close_dca,
+        "_write_afternoon_failure_artifacts",
         fake_write_afternoon_failure_artifacts,
     )
     monkeypatch.setattr(near_close_dca, "_run_once_impl", raise_before_finalization)
@@ -25642,9 +25497,7 @@ def test_run_once_threads_expect_no_prior_state_into_the_failure_writer(
     assert captured.get("expect_no_prior_state") is True
 
 
-def test_write_afternoon_failure_artifacts_preserves_a_first_write_peers_state(
-    tmp_path, monkeypatch
-):
+def test_write_afternoon_failure_artifacts_preserves_a_first_write_peers_state(tmp_path, monkeypatch):
     # Codex review ("Propagate first-write ownership through exception
     # finalization"): two overlapping FIRST invocations of the identical
     # identity both observe an absent run_state.json. Peer B goes on to
@@ -25682,14 +25535,14 @@ def test_write_afternoon_failure_artifacts_preserves_a_first_write_peers_state(
     # A's own initial "nothing here" read (that read is what set
     # ctx.expect_no_prior_state=True in the first place) but before A's
     # exception handler runs.
-    (artifacts_dir / "run_state.json").write_text(
-        json.dumps(peer_b_state), encoding="utf-8"
-    )
+    (artifacts_dir / "run_state.json").write_text(json.dumps(peer_b_state), encoding="utf-8")
 
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "submitted", "order_id": "ORD-A-REAL",
-            "submitted_amount_usd": 2.0, "ticker": "AAPL",
+            "status": "submitted",
+            "order_id": "ORD-A-REAL",
+            "submitted_amount_usd": 2.0,
+            "ticker": "AAPL",
         }
     }
 
@@ -25713,11 +25566,7 @@ def test_write_afternoon_failure_artifacts_preserves_a_first_write_peers_state(
     # A's own real order is not silently dropped -- it survives as a scanned
     # run_state*.json archive (Codex review: "Put displaced failure orders
     # into scanned evidence"), not the old never-rescanned generic sidecar.
-    archives = list(
-        (artifacts_dir / "first_write_displaced_after_absence_check").glob(
-            "**/run_state.*.json"
-        )
-    )
+    archives = list((artifacts_dir / "first_write_displaced_after_absence_check").glob("**/run_state.*.json"))
     assert len(archives) == 1
     archived = json.loads(archives[0].read_bytes())
     assert archived["broker_outcomes"]["AAPL"]["order_id"] == "ORD-A-REAL"
@@ -25734,9 +25583,7 @@ def test_write_afternoon_failure_artifacts_preserves_a_first_write_peers_state(
     assert sum(by_day.values()) > 0.0
 
 
-def test_write_afternoon_failure_artifacts_rechecks_first_write_guard_inside_one_lock(
-    tmp_path, monkeypatch
-):
+def test_write_afternoon_failure_artifacts_rechecks_first_write_guard_inside_one_lock(tmp_path, monkeypatch):
     """Codex review ("Keep the first-write guard inside the write lock"): an
     EARLIER version of the first-write-peer fix re-verified
     `expect_no_prior_state` under its OWN separate `run_state.json.lock`
@@ -25769,9 +25616,7 @@ def test_write_afternoon_failure_artifacts_rechecks_first_write_guard_inside_one
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "submitted", "order_id": "ORD-B-REAL"},
         ],
     }
-    (artifacts_dir / "run_state.json").write_text(
-        json.dumps(peer_b_state), encoding="utf-8"
-    )
+    (artifacts_dir / "run_state.json").write_text(json.dumps(peer_b_state), encoding="utf-8")
 
     real_lock = near_close_dca.cross_process_lock
     lock_acquisitions = []
@@ -25785,8 +25630,10 @@ def test_write_afternoon_failure_artifacts_rechecks_first_write_guard_inside_one
 
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "submitted", "order_id": "ORD-A-REAL",
-            "submitted_amount_usd": 2.0, "ticker": "AAPL",
+            "status": "submitted",
+            "order_id": "ORD-A-REAL",
+            "submitted_amount_usd": 2.0,
+            "ticker": "AAPL",
         }
     }
     try:
@@ -25842,9 +25689,7 @@ def test_write_afternoon_failure_artifacts_archives_execution_only_displaced_ord
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "submitted", "order_id": "ORD-B-REAL"},
         ],
     }
-    (artifacts_dir / "run_state.json").write_text(
-        json.dumps(peer_b_state), encoding="utf-8"
-    )
+    (artifacts_dir / "run_state.json").write_text(json.dumps(peer_b_state), encoding="utf-8")
 
     # `_IN_FLIGHT_CANDIDATE_OUTCOMES` is deliberately left empty -- the whole
     # point of this test is that `placed` (built from it) is empty while a
@@ -25869,9 +25714,7 @@ def test_write_afternoon_failure_artifacts_archives_execution_only_displaced_ord
     persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert persisted == peer_b_state
 
-    archived_states = list(
-        (artifacts_dir / "first_write_displaced_after_absence_check").rglob("run_state*.json")
-    )
+    archived_states = list((artifacts_dir / "first_write_displaced_after_absence_check").rglob("run_state*.json"))
     assert len(archived_states) == 1
     archived_state = json.loads(archived_states[0].read_bytes())
     archived_rows = {row.get("order_id"): row for row in archived_state.get("buy_candidates") or []}
@@ -25927,16 +25770,12 @@ def test_write_afternoon_failure_artifacts_excludes_dry_run_execution_only_recor
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "submitted", "order_id": "ORD-B-REAL"},
         ],
     }
-    (artifacts_dir / "run_state.json").write_text(
-        json.dumps(peer_b_state), encoding="utf-8"
-    )
+    (artifacts_dir / "run_state.json").write_text(json.dumps(peer_b_state), encoding="utf-8")
 
     assert not near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.get("outcomes")
 
     execution_records = [
-        OrderExecutionRecord(
-            ticker="AAPL", status="submitted", order_id="DRY-RUN-AAPL-2.50-abc123", notional_usd=2.5
-        ),
+        OrderExecutionRecord(ticker="AAPL", status="submitted", order_id="DRY-RUN-AAPL-2.50-abc123", notional_usd=2.5),
     ]
 
     near_close_dca._write_afternoon_failure_artifacts(
@@ -25993,17 +25832,13 @@ def test_write_afternoon_failure_artifacts_excludes_dry_run_execution_only_recor
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "submitted", "order_id": "ORD-B-REAL"},
         ],
     }
-    (artifacts_dir / "run_state.json").write_text(
-        json.dumps(peer_state), encoding="utf-8"
-    )
+    (artifacts_dir / "run_state.json").write_text(json.dumps(peer_state), encoding="utf-8")
 
     assert not near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.get("outcomes")
 
     execution_records = [
         OrderExecutionRecord(ticker="AAPL", status="submitted", order_id="ORD-A-REAL", notional_usd=2.5),
-        OrderExecutionRecord(
-            ticker="NVDA", status="submitted", order_id="DRY-RUN-NVDA-3.00-ref", notional_usd=3.0
-        ),
+        OrderExecutionRecord(ticker="NVDA", status="submitted", order_id="DRY-RUN-NVDA-3.00-ref", notional_usd=3.0),
     ]
 
     near_close_dca._write_afternoon_failure_artifacts(
@@ -26018,9 +25853,7 @@ def test_write_afternoon_failure_artifacts_excludes_dry_run_execution_only_recor
     persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert persisted == peer_state
 
-    archived_states = list(
-        (artifacts_dir / "first_write_displaced_after_absence_check").rglob("run_state*.json")
-    )
+    archived_states = list((artifacts_dir / "first_write_displaced_after_absence_check").rglob("run_state*.json"))
     assert len(archived_states) == 1
     archived_state = json.loads(archived_states[0].read_bytes())
     archived_rows = {row.get("order_id"): row for row in archived_state.get("buy_candidates") or []}
@@ -26034,9 +25867,7 @@ def test_write_afternoon_failure_artifacts_excludes_dry_run_execution_only_recor
     )
 
 
-def test_write_afternoon_failure_artifacts_preserves_execution_only_evidence_in_fallback_sidecar(
-    tmp_path, monkeypatch
-):
+def test_write_afternoon_failure_artifacts_preserves_execution_only_evidence_in_fallback_sidecar(tmp_path, monkeypatch):
     """Codex review (finding: "Preserve execution-only evidence in the
     fallback sidecar"): when writing the primary scanned displaced-failure
     archive raises `OSError`, the fallback sidecar payload used to retain
@@ -26071,9 +25902,7 @@ def test_write_afternoon_failure_artifacts_preserves_execution_only_evidence_in_
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "submitted", "order_id": "ORD-B-REAL"},
         ],
     }
-    (artifacts_dir / "run_state.json").write_text(
-        json.dumps(peer_state), encoding="utf-8"
-    )
+    (artifacts_dir / "run_state.json").write_text(json.dumps(peer_state), encoding="utf-8")
 
     assert not near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.get("outcomes")
 
@@ -26101,13 +25930,9 @@ def test_write_afternoon_failure_artifacts_preserves_execution_only_evidence_in_
 
     # The primary archive was never written (its own atomic_write_text call
     # raised).
-    assert not list(
-        (artifacts_dir / "first_write_displaced_after_absence_check").rglob("run_state*.json")
-    )
+    assert not list((artifacts_dir / "first_write_displaced_after_absence_check").rglob("run_state*.json"))
 
-    sidecar_paths = list(
-        artifacts_dir.glob("first_write_displaced_after_absence_check.*.json")
-    )
+    sidecar_paths = list(artifacts_dir.glob("first_write_displaced_after_absence_check.*.json"))
     assert len(sidecar_paths) == 1
     sidecar_entry = json.loads(sidecar_paths[0].read_bytes())
     execution_only_records = sidecar_entry.get("execution_only_records") or []
@@ -26150,9 +25975,7 @@ def test_write_afternoon_failure_artifacts_dedups_execution_only_records_by_orde
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "submitted", "order_id": "ORD-B-REAL"},
         ],
     }
-    (artifacts_dir / "run_state.json").write_text(
-        json.dumps(peer_b_state), encoding="utf-8"
-    )
+    (artifacts_dir / "run_state.json").write_text(json.dumps(peer_b_state), encoding="utf-8")
 
     # An in-flight outcome for AAPL (order-A, from a RECOVERED earlier
     # attempt) -- `placed` is built from this.
@@ -26166,15 +25989,11 @@ def test_write_afternoon_failure_artifacts_dedups_execution_only_records_by_orde
         # A ticker-keyed filter would have dropped this row entirely; an
         # order_id-keyed filter must keep it.
         execution_records = [
-            OrderExecutionRecord(
-                ticker="AAPL", status="submitted", order_id="ORD-AAPL-NEW-ATTEMPT", notional_usd=1.0
-            ),
+            OrderExecutionRecord(ticker="AAPL", status="submitted", order_id="ORD-AAPL-NEW-ATTEMPT", notional_usd=1.0),
             # A genuine duplicate of the in-flight outcome's own order_id --
             # this one must still be excluded (it is the SAME order, not a
             # distinct one).
-            OrderExecutionRecord(
-                ticker="AAPL", status="submitted", order_id="ORD-AAPL-RECOVERED", notional_usd=2.5
-            ),
+            OrderExecutionRecord(ticker="AAPL", status="submitted", order_id="ORD-AAPL-RECOVERED", notional_usd=2.5),
         ]
 
         near_close_dca._write_afternoon_failure_artifacts(
@@ -26188,9 +26007,7 @@ def test_write_afternoon_failure_artifacts_dedups_execution_only_records_by_orde
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    archived_states = list(
-        (artifacts_dir / "first_write_displaced_after_absence_check").rglob("run_state*.json")
-    )
+    archived_states = list((artifacts_dir / "first_write_displaced_after_absence_check").rglob("run_state*.json"))
     assert len(archived_states) == 1
     archived_state = json.loads(archived_states[0].read_bytes())
     archived_order_ids = {row.get("order_id") for row in archived_state.get("buy_candidates") or []}
@@ -26245,9 +26062,7 @@ def test_write_afternoon_failure_artifacts_dedups_against_the_winners_canonical_
             "NVDA": {"status": "submitted", "order_id": "ORD-NVDA-SHARED", "planned_amount_usd": 3.0},
         },
     }
-    (artifacts_dir / "run_state.json").write_text(
-        json.dumps(winner_state), encoding="utf-8"
-    )
+    (artifacts_dir / "run_state.json").write_text(json.dumps(winner_state), encoding="utf-8")
 
     # `placed` (in-flight outcomes) carries the SAME MSFT order_id the
     # winner already published, plus a genuinely NEW AAPL order.
@@ -26258,9 +26073,7 @@ def test_write_afternoon_failure_artifacts_dedups_against_the_winners_canonical_
     try:
         # An execution-only record duplicating the winner's own NVDA order.
         execution_records = [
-            OrderExecutionRecord(
-                ticker="NVDA", status="submitted", order_id="ORD-NVDA-SHARED", notional_usd=3.0
-            ),
+            OrderExecutionRecord(ticker="NVDA", status="submitted", order_id="ORD-NVDA-SHARED", notional_usd=3.0),
         ]
 
         near_close_dca._write_afternoon_failure_artifacts(
@@ -26278,9 +26091,7 @@ def test_write_afternoon_failure_artifacts_dedups_against_the_winners_canonical_
     persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert persisted == winner_state
 
-    archived_states = list(
-        (artifacts_dir / "first_write_displaced_after_absence_check").rglob("run_state*.json")
-    )
+    archived_states = list((artifacts_dir / "first_write_displaced_after_absence_check").rglob("run_state*.json"))
     assert len(archived_states) == 1
     archived_state = json.loads(archived_states[0].read_bytes())
     archived_order_ids = {row.get("order_id") for row in archived_state.get("buy_candidates") or []}
@@ -26359,17 +26170,11 @@ def test_write_afternoon_failure_artifacts_recognizes_its_own_publish_not_a_peer
 
     # No peer-preservation sidecar/archive -- this was never treated as a
     # displaced-by-peer race.
-    assert not list(
-        artifacts_dir.glob("first_write_displaced_after_absence_check.*.json")
-    )
-    assert not list(
-        (artifacts_dir / "first_write_displaced_after_absence_check").rglob("run_state*.json")
-    )
+    assert not list(artifacts_dir.glob("first_write_displaced_after_absence_check.*.json"))
+    assert not list((artifacts_dir / "first_write_displaced_after_absence_check").rglob("run_state*.json"))
 
 
-def test_write_afternoon_failure_artifacts_merges_normally_without_the_first_write_signal(
-    tmp_path, monkeypatch
-):
+def test_write_afternoon_failure_artifacts_merges_normally_without_the_first_write_signal(tmp_path, monkeypatch):
     # The other side of the same fix: `expect_no_prior_state` defaults to
     # False, so an ordinary retry over its OWN prior preserved state (the
     # overwhelmingly common case -- this invocation genuinely saw its own
@@ -26397,9 +26202,7 @@ def test_write_afternoon_failure_artifacts_merges_normally_without_the_first_wri
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "status": "submitted", "order_id": "ORD-EARLIER"},
         ],
     }
-    (artifacts_dir / "run_state.json").write_text(
-        json.dumps(own_prior_state), encoding="utf-8"
-    )
+    (artifacts_dir / "run_state.json").write_text(json.dumps(own_prior_state), encoding="utf-8")
 
     near_close_dca._write_afternoon_failure_artifacts(
         artifacts_dir,
@@ -26410,17 +26213,13 @@ def test_write_afternoon_failure_artifacts_merges_normally_without_the_first_wri
     )
 
     # No peer-preservation sidecar -- the merge/synthesize path ran instead.
-    assert not list(
-        artifacts_dir.glob("first_write_displaced_after_absence_check.*.json")
-    )
+    assert not list(artifacts_dir.glob("first_write_displaced_after_absence_check.*.json"))
     persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert persisted.get("is_trading_failure") is True
     assert persisted["buy_candidates"][0]["order_id"] == "ORD-EARLIER"
 
 
-def test_write_afternoon_failure_artifacts_leaves_another_accounts_state_untouched(
-    tmp_path, monkeypatch
-):
+def test_write_afternoon_failure_artifacts_leaves_another_accounts_state_untouched(tmp_path, monkeypatch):
     # Codex review ("Leave another account's failure state untouched"): a
     # prior run_state.json sharing this invocation's exact trading_day/
     # stream/scheduled_for_et/run_origin can still be bound to a DIFFERENT
@@ -26457,7 +26256,8 @@ def test_write_afternoon_failure_artifacts_leaves_another_accounts_state_untouch
     (artifacts_dir / "run_state.json").write_text(json.dumps(account_a_state), encoding="utf-8")
 
     monkeypatch.setattr(
-        near_close_dca, "_account_number_for_unresolved_evidence",
+        near_close_dca,
+        "_account_number_for_unresolved_evidence",
         lambda _broker, _key_dir: "account-b-fp",
     )
 
@@ -26475,9 +26275,7 @@ def test_write_afternoon_failure_artifacts_leaves_another_accounts_state_untouch
     assert persisted == account_a_state
 
 
-def test_write_afternoon_failure_artifacts_sidecars_placement_on_account_mismatch(
-    tmp_path, monkeypatch
-):
+def test_write_afternoon_failure_artifacts_sidecars_placement_on_account_mismatch(tmp_path, monkeypatch):
     # The other side of the same fix: when this invocation DID place a real
     # order before the account-mismatch check runs, that placement must not
     # be silently dropped just because it cannot be merged into account A's
@@ -26504,14 +26302,17 @@ def test_write_afternoon_failure_artifacts_sidecars_placement_on_account_mismatc
     (artifacts_dir / "run_state.json").write_text(json.dumps(account_a_state), encoding="utf-8")
 
     monkeypatch.setattr(
-        near_close_dca, "_account_number_for_unresolved_evidence",
+        near_close_dca,
+        "_account_number_for_unresolved_evidence",
         lambda _broker, _key_dir: "account-b-fp",
     )
 
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "submitted", "order_id": "ORD-ACCOUNT-B-REAL",
-            "submitted_amount_usd": 2.0, "ticker": "AAPL",
+            "status": "submitted",
+            "order_id": "ORD-ACCOUNT-B-REAL",
+            "submitted_amount_usd": 2.0,
+            "ticker": "AAPL",
         }
     }
     try:
@@ -26576,14 +26377,17 @@ def test_write_afternoon_failure_artifacts_keeps_unavailable_fingerprint_out_of_
     # THIS invocation's own fingerprint could not be computed -- the
     # sentinel, not None and not a real fingerprint string.
     monkeypatch.setattr(
-        near_close_dca, "_account_number_for_unresolved_evidence",
+        near_close_dca,
+        "_account_number_for_unresolved_evidence",
         lambda _broker, _key_dir: near_close_dca._ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL,
     )
 
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "submitted", "order_id": "ORD-UNAVAILABLE-FP",
-            "submitted_amount_usd": 2.0, "ticker": "AAPL",
+            "status": "submitted",
+            "order_id": "ORD-UNAVAILABLE-FP",
+            "submitted_amount_usd": 2.0,
+            "ticker": "AAPL",
         }
     }
     try:
@@ -26613,9 +26417,7 @@ def test_write_afternoon_failure_artifacts_keeps_unavailable_fingerprint_out_of_
 
     # The placement instead survives via the generic undurable-evidence
     # sidecar.
-    generic_sidecars = list(
-        artifacts_dir.glob("unwritten_failure_artifact_placement.*.json")
-    )
+    generic_sidecars = list(artifacts_dir.glob("unwritten_failure_artifact_placement.*.json"))
     assert len(generic_sidecars) == 1
     entry = json.loads(generic_sidecars[0].read_bytes())
     assert entry["broker_outcomes"]["AAPL"]["order_id"] == "ORD-UNAVAILABLE-FP"
@@ -26642,9 +26444,7 @@ def test_persist_foreign_directory_execution_sidecar_keeps_only_placed_orders(tm
         OrderExecutionRecord(ticker="NVDA", status="filled", order_id="ORD-REAL-2", notional_usd=10.0),
     ]
 
-    near_close_dca._persist_foreign_directory_execution_sidecar(
-        artifacts_dir, now, records, broker=None
-    )
+    near_close_dca._persist_foreign_directory_execution_sidecar(artifacts_dir, now, records, broker=None)
 
     sidecars = list(artifacts_dir.glob("unwritten_execution_after_foreign_directory_claim.*.json"))
     assert len(sidecars) == 1
@@ -26671,14 +26471,10 @@ def test_persist_foreign_directory_execution_sidecar_is_a_noop_with_nothing_plac
         broker=None,
     )
 
-    assert not list(
-        artifacts_dir.glob("unwritten_execution_after_foreign_directory_claim.*.json")
-    )
+    assert not list(artifacts_dir.glob("unwritten_execution_after_foreign_directory_claim.*.json"))
 
 
-def test_write_afternoon_failure_artifacts_contains_a_non_timeout_lock_error(
-    tmp_path, monkeypatch
-):
+def test_write_afternoon_failure_artifacts_contains_a_non_timeout_lock_error(tmp_path, monkeypatch):
     # Codex review ("Contain lock I/O failures in the failure writer"):
     # cross_process_lock() can raise a plain OSError (not just
     # TimeoutError) when the sidecar itself cannot be created or opened.
@@ -26704,9 +26500,7 @@ def test_write_afternoon_failure_artifacts_contains_a_non_timeout_lock_error(
     )
 
 
-def test_write_afternoon_failure_artifacts_skips_a_contract_stamp_on_stale_snapshot(
-    tmp_path, monkeypatch
-):
+def test_write_afternoon_failure_artifacts_skips_a_contract_stamp_on_stale_snapshot(tmp_path, monkeypatch):
     # Codex review ("Bind failure stamps to the run that was validated"):
     # the merge/synthesis pass releases the lock before validate_run_
     # artifacts runs, so an overlapping retry can publish its own,
@@ -26722,8 +26516,11 @@ def test_write_afternoon_failure_artifacts_skips_a_contract_stamp_on_stale_snaps
 
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": False, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": False,
+            "submitted_amount_usd": 2.0,
         }
     }
 
@@ -26732,8 +26529,10 @@ def test_write_afternoon_failure_artifacts_skips_a_contract_stamp_on_stale_snaps
         "trading_day": now.astimezone(EASTERN).date().isoformat(),
         "status": "ok",
         "run_classification": {
-            "run_origin": "scheduled", "manual_run": False,
-            "stream": "afternoon", "valid_scheduled_evidence": True,
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "o1", "status": "submitted"},
@@ -26774,14 +26573,10 @@ def test_write_afternoon_failure_artifacts_skips_a_contract_stamp_on_stale_snaps
         ):
             _own_frame_lock_calls["count"] += 1
             if _own_frame_lock_calls["count"] == 2:
-                (artifacts_dir / "run_state.json").write_text(
-                    json.dumps(successful_retry_state), encoding="utf-8"
-                )
+                (artifacts_dir / "run_state.json").write_text(json.dumps(successful_retry_state), encoding="utf-8")
         return real_lock(path, *args, **kwargs)
 
-    monkeypatch.setattr(
-        near_close_dca, "cross_process_lock", publish_a_successful_retry_before_the_second_lock
-    )
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", publish_a_successful_retry_before_the_second_lock)
 
     try:
         near_close_dca._write_afternoon_failure_artifacts(
@@ -26798,9 +26593,7 @@ def test_write_afternoon_failure_artifacts_skips_a_contract_stamp_on_stale_snaps
     assert "artifact_contract_failure" not in persisted
 
 
-def test_write_afternoon_failure_artifacts_skips_pointer_publication_on_stale_snapshot(
-    tmp_path, monkeypatch
-):
+def test_write_afternoon_failure_artifacts_skips_pointer_publication_on_stale_snapshot(tmp_path, monkeypatch):
     """Codex review ("Skip pointer publication after the state CAS is
     rejected"): the SAME stale-snapshot scenario as the sibling
     "skips_a_contract_stamp" test above correctly refuses to STAMP the
@@ -26820,8 +26613,11 @@ def test_write_afternoon_failure_artifacts_skips_pointer_publication_on_stale_sn
 
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": False, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": False,
+            "submitted_amount_usd": 2.0,
         }
     }
 
@@ -26830,8 +26626,10 @@ def test_write_afternoon_failure_artifacts_skips_pointer_publication_on_stale_sn
         "trading_day": now.astimezone(EASTERN).date().isoformat(),
         "status": "ok",
         "run_classification": {
-            "run_origin": "scheduled", "manual_run": False,
-            "stream": "afternoon", "valid_scheduled_evidence": True,
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "o1", "status": "submitted"},
@@ -26865,14 +26663,10 @@ def test_write_afternoon_failure_artifacts_skips_pointer_publication_on_stale_sn
         ):
             _own_frame_lock_calls["count"] += 1
             if _own_frame_lock_calls["count"] == 2:
-                (artifacts_dir / "run_state.json").write_text(
-                    json.dumps(successful_retry_state), encoding="utf-8"
-                )
+                (artifacts_dir / "run_state.json").write_text(json.dumps(successful_retry_state), encoding="utf-8")
         return real_lock(path, *args, **kwargs)
 
-    monkeypatch.setattr(
-        near_close_dca, "cross_process_lock", publish_a_successful_retry_before_the_second_lock
-    )
+    monkeypatch.setattr(near_close_dca, "cross_process_lock", publish_a_successful_retry_before_the_second_lock)
 
     try:
         near_close_dca._write_afternoon_failure_artifacts(
@@ -26894,9 +26688,7 @@ def test_write_afternoon_failure_artifacts_skips_pointer_publication_on_stale_sn
     assert pointer_calls == []
 
 
-def test_write_afternoon_failure_artifacts_snapshot_is_this_invocations_own_write(
-    tmp_path, monkeypatch
-):
+def test_write_afternoon_failure_artifacts_snapshot_is_this_invocations_own_write(tmp_path, monkeypatch):
     # Codex review ("Bind the failure snapshot to this invocation's
     # state"): the earlier fix still re-read run_state.json from disk
     # immediately before validate_run_artifacts(), after the merge/
@@ -26914,8 +26706,11 @@ def test_write_afternoon_failure_artifacts_snapshot_is_this_invocations_own_writ
 
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": False, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": False,
+            "submitted_amount_usd": 2.0,
         }
     }
 
@@ -26924,8 +26719,10 @@ def test_write_afternoon_failure_artifacts_snapshot_is_this_invocations_own_writ
         "trading_day": now.astimezone(EASTERN).date().isoformat(),
         "status": "ok",
         "run_classification": {
-            "run_origin": "scheduled", "manual_run": False,
-            "stream": "afternoon", "valid_scheduled_evidence": True,
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "stream": "afternoon",
+            "valid_scheduled_evidence": True,
         },
         "buy_candidates": [
             {"ticker": "MSFT", "planned_amount_usd": 5.0, "order_id": "o1", "status": "submitted"},
@@ -26988,13 +26785,20 @@ def test_retry_reconciliation_survives_into_the_fresh_run_artifacts(tmp_path):
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     os.makedirs(artifacts_dir, exist_ok=True)
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            },
+            handle,
+        )
 
     class _ReconcilingBroker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -27010,7 +26814,12 @@ def test_retry_reconciliation_survives_into_the_fresh_run_artifacts(tmp_path):
     broker = _ReconcilingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
 
     run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
@@ -27018,8 +26827,7 @@ def test_retry_reconciliation_survives_into_the_fresh_run_artifacts(tmp_path):
         run_state = json.load(handle)
 
     recovered_rows = [
-        row for row in run_state["buy_candidates"]
-        if row.get("reason") == "reconciled_fractional_placement"
+        row for row in run_state["buy_candidates"] if row.get("reason") == "reconciled_fractional_placement"
     ]
     assert len(recovered_rows) == 1
     assert recovered_rows[0]["ticker"] == "AAPL"
@@ -27044,13 +26852,22 @@ def test_retry_reconciles_and_books_prior_ambiguous_placement_before_candidates(
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     trading_day_iso = now.date().isoformat()
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": trading_day_iso,
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": trading_day_iso,
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -27106,9 +26923,7 @@ def test_retry_reconciles_and_books_prior_ambiguous_placement_before_candidates(
     }
 
 
-def test_reconcile_prior_unproven_fractional_placements_locks_only_its_writes(
-    tmp_path, monkeypatch
-):
+def test_reconcile_prior_unproven_fractional_placements_locks_only_its_writes(tmp_path, monkeypatch):
     # Codex review discussion_r3899712466 ("Include reconciliation writes in
     # the run-state lock"), discussion_r3904674538 ("Release the run-state
     # lock before broker I/O"), and discussion_r3905308175 ("Check for
@@ -27132,13 +26947,22 @@ def test_reconcile_prior_unproven_fractional_placements_locks_only_its_writes(
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     trading_day_iso = now.date().isoformat()
     state_path = artifacts_dir / "run_state.json"
-    state_path.write_text(json.dumps({
-        "trading_day": trading_day_iso,
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    state_path.write_text(
+        json.dumps(
+            {
+                "trading_day": trading_day_iso,
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     lock_active = False
     broker_call_seen_lock_active: Optional[bool] = None
@@ -27201,9 +27025,7 @@ def test_reconcile_prior_unproven_fractional_placements_locks_only_its_writes(
     assert saved["broker_outcomes"]["AAPL"]["status"] == "submitted"
 
 
-def test_reconcile_prior_unproven_fractional_placements_fails_closed_on_concurrent_write(
-    tmp_path, monkeypatch
-):
+def test_reconcile_prior_unproven_fractional_placements_fails_closed_on_concurrent_write(tmp_path, monkeypatch):
     """Codex review discussion (PR #1166, "Merge fresh run state before
     reconciliation writes"): `persisted` is read once, up front, before the
     (potentially slow) broker lookup. If an overlapping retry sharing this
@@ -27223,13 +27045,22 @@ def test_reconcile_prior_unproven_fractional_placements_fails_closed_on_concurre
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     trading_day_iso = now.date().isoformat()
     state_path = artifacts_dir / "run_state.json"
-    state_path.write_text(json.dumps({
-        "trading_day": trading_day_iso,
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    state_path.write_text(
+        json.dumps(
+            {
+                "trading_day": trading_day_iso,
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -27237,14 +27068,23 @@ def test_reconcile_prior_unproven_fractional_placements_fails_closed_on_concurre
             # into run_state.json while THIS invocation is out making its
             # own broker call -- the exact gap the lock cannot cover,
             # since it must be released before this call is made.
-            state_path.write_text(json.dumps({
-                "trading_day": trading_day_iso,
-                "broker_outcomes": {"AAPL": {
-                    "status": "failed", "placement_outcome_unproven": True,
-                    "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-                    "concurrently_published_by": "another-retry",
-                }},
-            }), encoding="utf-8")
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "trading_day": trading_day_iso,
+                        "broker_outcomes": {
+                            "AAPL": {
+                                "status": "failed",
+                                "placement_outcome_unproven": True,
+                                "placement_ref_id": "afternoon-AAPL-proof",
+                                "submitted_amount_usd": 2.0,
+                                "concurrently_published_by": "another-retry",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             return {"id": "ORD-RECOVERED", "state": "queued", "dollar_amount": "2.00"}
 
     ctx = near_close_dca.RunContext(
@@ -27285,13 +27125,19 @@ def test_dry_run_fails_closed_on_unresolved_live_evidence_in_its_directory(tmp_p
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     trading_day_iso = now.date().isoformat()
-    original_contents = json.dumps({
-        "trading_day": trading_day_iso,
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    })
+    original_contents = json.dumps(
+        {
+            "trading_day": trading_day_iso,
+            "broker_outcomes": {
+                "AAPL": {
+                    "status": "failed",
+                    "placement_outcome_unproven": True,
+                    "placement_ref_id": "afternoon-AAPL-proof",
+                    "submitted_amount_usd": 2.0,
+                }
+            },
+        }
+    )
     (artifacts_dir / "run_state.json").write_text(original_contents, encoding="utf-8")
 
     class Broker(DryRunBroker):
@@ -27307,9 +27153,7 @@ def test_dry_run_fails_closed_on_unresolved_live_evidence_in_its_directory(tmp_p
         broker=Broker(cash=500.0),
         artifacts_dir=artifacts_dir,
     )
-    with pytest.raises(
-        near_close_dca.UnresolvedPlacementError, match="dry run"
-    ):
+    with pytest.raises(near_close_dca.UnresolvedPlacementError, match="dry run"):
         near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
     # Nothing was booked, and the original evidence survives untouched.
@@ -27333,11 +27177,16 @@ def test_fails_closed_on_malformed_outcome_storage_with_incomplete_evidence(tmp_
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     trading_day_iso = now.date().isoformat()
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": trading_day_iso,
-        "placement_evidence_incomplete": True,
-        "broker_outcomes": None,
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": trading_day_iso,
+                "placement_evidence_incomplete": True,
+                "broker_outcomes": None,
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -27372,28 +27221,31 @@ def test_a_structurally_ambiguous_row_blocks_a_later_invocation(tmp_path):
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
-            raise AssertionError(
-                "a structurally ambiguous row must never reach the single-reference lookup"
-            )
+            raise AssertionError("a structurally ambiguous row must never reach the single-reference lookup")
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     trading_day_iso = now.date().isoformat()
 
     artifacts_dir = tmp_path / "structurally-ambiguous-prior-run"
     artifacts_dir.mkdir()
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": trading_day_iso,
-        "placement_evidence_incomplete": True,
-        "broker_outcomes": {
-            "BYDDY": {
-                "status": "blocked",
-                "broker_placement_failed": True,
-                "order_id": None,
-                "structurally_ambiguous_unresolved": True,
-                "skip_reason": "claim left reserved pending manual reconciliation",
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": trading_day_iso,
+                "placement_evidence_incomplete": True,
+                "broker_outcomes": {
+                    "BYDDY": {
+                        "status": "blocked",
+                        "broker_placement_failed": True,
+                        "order_id": None,
+                        "structurally_ambiguous_unresolved": True,
+                        "skip_reason": "claim left reserved pending manual reconciliation",
+                    }
+                },
             }
-        },
-    }), encoding="utf-8")
+        ),
+        encoding="utf-8",
+    )
     ctx = near_close_dca.RunContext(
         now=now,
         config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
@@ -27418,10 +27270,15 @@ def test_returns_cleanly_on_malformed_outcome_storage_when_evidence_is_complete(
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     trading_day_iso = now.date().isoformat()
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": trading_day_iso,
-        "broker_outcomes": None,
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": trading_day_iso,
+                "broker_outcomes": None,
+            }
+        ),
+        encoding="utf-8",
+    )
 
     ctx = near_close_dca.RunContext(
         now=now,
@@ -27460,11 +27317,16 @@ def test_fails_closed_when_flagged_evidence_has_no_readable_unproven_rows(tmp_pa
     # An EMPTY broker_outcomes mapping -- well-formed, but no rows at all.
     artifacts_dir = tmp_path / "flagged-empty-outcomes"
     artifacts_dir.mkdir()
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": trading_day_iso,
-        "placement_evidence_incomplete": True,
-        "broker_outcomes": {},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": trading_day_iso,
+                "placement_evidence_incomplete": True,
+                "broker_outcomes": {},
+            }
+        ),
+        encoding="utf-8",
+    )
     ctx = near_close_dca.RunContext(
         now=now,
         config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
@@ -27481,11 +27343,16 @@ def test_fails_closed_when_flagged_evidence_has_no_readable_unproven_rows(tmp_pa
     # dict) -- passes the container-shape check, but every row is unreadable.
     artifacts_dir2 = tmp_path / "flagged-malformed-rows"
     artifacts_dir2.mkdir()
-    (artifacts_dir2 / "run_state.json").write_text(json.dumps({
-        "trading_day": trading_day_iso,
-        "placement_evidence_incomplete": True,
-        "broker_outcomes": {"AAPL": "not-a-mapping", "MSFT": None},
-    }), encoding="utf-8")
+    (artifacts_dir2 / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": trading_day_iso,
+                "placement_evidence_incomplete": True,
+                "broker_outcomes": {"AAPL": "not-a-mapping", "MSFT": None},
+            }
+        ),
+        encoding="utf-8",
+    )
     ctx2 = near_close_dca.RunContext(
         now=now,
         config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
@@ -27523,17 +27390,23 @@ def test_fails_closed_on_a_mix_of_one_resolved_row_and_one_malformed_row(tmp_pat
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     artifacts_dir = tmp_path / "flagged-mixed-outcomes"
     artifacts_dir.mkdir()
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "placement_evidence_incomplete": True,
-        "broker_outcomes": {
-            "AAPL": {
-                "status": "submitted", "placement_outcome_unproven": False,
-                "order_id": "ORD-PROVEN",
-            },
-            "MSFT": "not-a-mapping",
-        },
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "placement_evidence_incomplete": True,
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "submitted",
+                        "placement_outcome_unproven": False,
+                        "order_id": "ORD-PROVEN",
+                    },
+                    "MSFT": "not-a-mapping",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     ctx = near_close_dca.RunContext(
         now=now,
         config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
@@ -27568,17 +27441,24 @@ def test_fails_closed_on_a_malformed_row_alongside_a_genuinely_unproven_row(tmp_
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     artifacts_dir = tmp_path / "flagged-unproven-plus-malformed"
     artifacts_dir.mkdir()
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "placement_evidence_incomplete": True,
-        "broker_outcomes": {
-            "AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            },
-            "MSFT": "not-a-mapping",
-        },
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "placement_evidence_incomplete": True,
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    },
+                    "MSFT": "not-a-mapping",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     ctx = near_close_dca.RunContext(
         now=now,
         config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
@@ -27639,12 +27519,16 @@ def test_recovered_notional_checks_every_executed_quantity_alias():
 def test_recovered_notional_rejects_unreadable_alias_and_conflicting_lifecycle():
     import near_close_dca
 
-    assert near_close_dca._recovered_broker_notional(
-        {"state": "cancelled", "executed_notional": "unknown", "filled_notional": "5"}
-    ) is None
-    assert near_close_dca._recovered_broker_notional(
-        {"state": "filled", "status": "queued", "executed_notional": "5"}
-    ) is None
+    assert (
+        near_close_dca._recovered_broker_notional(
+            {"state": "cancelled", "executed_notional": "unknown", "filled_notional": "5"}
+        )
+        is None
+    )
+    assert (
+        near_close_dca._recovered_broker_notional({"state": "filled", "status": "queued", "executed_notional": "5"})
+        is None
+    )
 
 
 def test_terminal_reconciliation_rejects_non_notional_response_execution_evidence():
@@ -27680,9 +27564,7 @@ def test_filled_working_match_rejects_conflicting_reconstructed_notional():
                     "average_price": 100,
                 }
 
-    verdict, order_id, amount = near_close_dca._reconcile_ambiguous_fractional_placement(
-        _Ctx, "AAPL", "REF", 10
-    )
+    verdict, order_id, amount = near_close_dca._reconcile_ambiguous_fractional_placement(_Ctx, "AAPL", "REF", 10)
     assert (verdict, order_id, amount) == (near_close_dca._PLACEMENT_UNKNOWN, "ORD", None)
 
 
@@ -27692,15 +27574,22 @@ def test_restarted_reconciliation_rejects_unreadable_response_notional(tmp_path)
     artifacts_dir = tmp_path / "unreadable-response-notional"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "placement_outcome_unproven": True,
-            "placement_ref_id": "REF",
-            "submitted_amount_usd": 10,
-            "response_notional_usd": "unknown",
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "REF",
+                        "submitted_amount_usd": 10,
+                        "response_notional_usd": "unknown",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     ctx = near_close_dca.RunContext(
         now=now,
         config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
@@ -27726,14 +27615,22 @@ def test_returns_cleanly_when_every_outcome_row_is_genuinely_resolved(tmp_path):
     artifacts_dir = tmp_path / "genuinely-resolved-outcomes"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "placement_evidence_incomplete": True,
-        "broker_outcomes": {"AAPL": {
-            "status": "submitted", "placement_outcome_unproven": False,
-            "order_id": "ORD-PROVEN",
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "placement_evidence_incomplete": True,
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "submitted",
+                        "placement_outcome_unproven": False,
+                        "order_id": "ORD-PROVEN",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -27778,14 +27675,23 @@ def test_retry_reconciliation_threads_the_source_run_id_into_seeding_protection(
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     trading_day_iso = now.date().isoformat()
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": trading_day_iso,
-        "run_classification": {"run_id": "morning_live_20260629_1030ET"},
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "morning-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": trading_day_iso,
+                "run_classification": {"run_id": "morning_live_20260629_1030ET"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "morning-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -27843,12 +27749,8 @@ def test_seed_prior_allocations_scopes_recovery_baseline_to_aggregate_run_ids():
 
     trading_day = date(2026, 6, 29)
     state = StrategyState()
-    state.book_reconciled_attempt_notional(
-        "AAPL", trading_day, 2.0, order_id="ORD-A", source_run_id="run-A"
-    )
-    state.book_reconciled_attempt_notional(
-        "AAPL", trading_day, 3.0, order_id="ORD-B", source_run_id="run-B"
-    )
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 2.0, order_id="ORD-A", source_run_id="run-A")
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 3.0, order_id="ORD-B", source_run_id="run-B")
 
     near_close_dca._seed_prior_allocations(
         state,
@@ -27876,12 +27778,8 @@ def test_seed_prior_allocations_preserves_order_id_less_recovery_attempt_residua
 
     trading_day = date(2026, 6, 29)
     state = StrategyState()
-    state.book_reconciled_attempt_notional(
-        "AAPL", trading_day, 0.0, source_run_id="legacy-run"
-    )
-    state.book_reconciled_attempt_notional(
-        "AAPL", trading_day, 0.0, source_run_id="legacy-run"
-    )
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 0.0, source_run_id="legacy-run")
+    state.book_reconciled_attempt_notional("AAPL", trading_day, 0.0, source_run_id="legacy-run")
     assert state.day_order_count(trading_day) == 1
 
     near_close_dca._seed_prior_allocations(
@@ -27918,14 +27816,23 @@ def test_seed_prior_allocations_still_skips_a_genuinely_single_attempt_run(tmp_p
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     trading_day_iso = now.date().isoformat()
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": trading_day_iso,
-        "run_classification": {"run_id": "morning_live_20260629_1030ET"},
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "morning-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": trading_day_iso,
+                "run_classification": {"run_id": "morning_live_20260629_1030ET"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "morning-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -27981,19 +27888,28 @@ def test_retry_reconciliation_rejects_a_reference_group_spanning_multiple_ticker
     artifacts_dir = tmp_path / "retry-mixed-ticker-reference-group"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {
-            "AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "shared-corrupted-ref", "submitted_amount_usd": 2.0,
-            },
-            "MSFT": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "shared-corrupted-ref", "submitted_amount_usd": 3.0,
-            },
-        },
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "shared-corrupted-ref",
+                        "submitted_amount_usd": 2.0,
+                    },
+                    "MSFT": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "shared-corrupted-ref",
+                        "submitted_amount_usd": 3.0,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     lookup_calls = []
 
@@ -28039,13 +27955,22 @@ def test_retry_reconciliation_rejects_a_zero_dollar_submitted_amount(tmp_path):
     artifacts_dir = tmp_path / "retry-zero-dollar-evidence"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 0.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 0.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     lookup_calls = []
 
@@ -28089,17 +28014,26 @@ def test_retry_reconciliation_preserves_conflicts_with_persisted_response_order_
     artifacts_dir = tmp_path / "retry-persisted-response-id-conflict"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            # The ORIGINAL immediate placement response already named
-            # this order id -- a real, live-looking candidate history
-            # now disagrees with.
-            "order_id": "ORD-RESPONSE",
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                        # The ORIGINAL immediate placement response already named
+                        # this order id -- a real, live-looking candidate history
+                        # now disagrees with.
+                        "order_id": "ORD-RESPONSE",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -28120,8 +28054,7 @@ def test_retry_reconciliation_preserves_conflicts_with_persisted_response_order_
 
     persisted = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert persisted["broker_outcomes"]["AAPL"]["order_id"] == "ORD-RESPONSE", (
-        "a conflicting history-reconciled id must never overwrite the "
-        "persisted response id"
+        "a conflicting history-reconciled id must never overwrite the persisted response id"
     )
     assert state.day_notional(now.date()) == 0.0
 
@@ -28166,13 +28099,22 @@ def test_retry_reconciliation_restores_a_missing_attempt_charge(tmp_path):
     artifacts_dir = tmp_path / "retry-missing-attempt"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -28208,13 +28150,22 @@ def test_retry_reconciliation_preserves_cross_stream_allocation_context(tmp_path
     artifacts_dir = tmp_path / "retry-cross-stream"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -28241,9 +28192,7 @@ def test_retry_reconciliation_preserves_cross_stream_allocation_context(tmp_path
             now.date(),
             guard_active=True,
             prior_same_day_allocations={
-                "AAPL": PriorSameDayAllocation(
-                    "AAPL", amount_usd=amount_usd, attempt_count=attempt_count
-                )
+                "AAPL": PriorSameDayAllocation("AAPL", amount_usd=amount_usd, attempt_count=attempt_count)
             },
             one_order_per_ticker_per_day=True,
         )
@@ -28283,20 +28232,29 @@ def test_retry_reconciliation_deduplicates_rows_sharing_a_reference(tmp_path):
     artifacts_dir = tmp_path / "retry-dedup"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {
-            "AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            },
-            "AAPL:unproven-2": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-                "ticker": "AAPL",
-            },
-        },
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    },
+                    "AAPL:unproven-2": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                        "ticker": "AAPL",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     lookup_calls = []
 
@@ -28358,23 +28316,32 @@ def test_retry_reconciliation_counts_a_merged_whole_share_aggregate_beyond_one(t
     artifacts_dir = tmp_path / "merged-aggregate"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {
-            "AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            },
-            # Already resolved by an earlier pass THIS same artifact: a
-            # whole-share row aggregating two distinct broker orders under
-            # one scalar order_id, not itself part of the unproven groups
-            # this reconciliation call resolves.
-            "BYDDY": {
-                "status": "submitted", "order_id": "ORD-WHOLE-SHARE",
-                "merged_submission_count": 2, "submitted_amount_usd": 500.0,
-            },
-        },
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    },
+                    # Already resolved by an earlier pass THIS same artifact: a
+                    # whole-share row aggregating two distinct broker orders under
+                    # one scalar order_id, not itself part of the unproven groups
+                    # this reconciliation call resolves.
+                    "BYDDY": {
+                        "status": "submitted",
+                        "order_id": "ORD-WHOLE-SHARE",
+                        "merged_submission_count": 2,
+                        "submitted_amount_usd": 500.0,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -28411,14 +28378,23 @@ def test_retry_reconciliation_preserves_the_originating_stream(tmp_path):
     artifacts_dir = tmp_path / "retry-stream-mismatch"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "run_classification": {"stream": "morning", "scheduled_for_et": "10:30"},
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "morning-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {"stream": "morning", "scheduled_for_et": "10:30"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "morning-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -28461,14 +28437,23 @@ def test_retry_reconciliation_preserves_the_originating_run_type(tmp_path):
     artifacts_dir = tmp_path / "retry-run-type-mismatch"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "run_classification": {"run_origin": "manual", "manual_run": True},
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "manual-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {"run_origin": "manual", "manual_run": True},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "manual-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -28514,14 +28499,23 @@ def test_retry_reconciliation_excludes_incompatible_same_day_recoveries_from_the
     artifacts_dir = tmp_path / "retry-run-type-mismatch-execution-log"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "run_classification": {"run_origin": "manual", "manual_run": True},
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "manual-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {"run_origin": "manual", "manual_run": True},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "manual-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -28545,8 +28539,7 @@ def test_retry_reconciliation_excludes_incompatible_same_day_recoveries_from_the
 
     assert recovered == {}
     assert run_result.execution_records == [], (
-        "a manual run's own order must not be attributed to this scheduled "
-        "run's orders.csv"
+        "a manual run's own order must not be attributed to this scheduled run's orders.csv"
     )
 
 
@@ -28562,13 +28555,22 @@ def test_retry_reconciliation_uses_the_persisted_trading_day(tmp_path):
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     earlier_day = now.date() - timedelta(days=1)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": earlier_day.isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": earlier_day.isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -28608,13 +28610,22 @@ def test_retry_reconciliation_keeps_prior_day_recoveries_in_deployment_accountin
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     earlier_day = now.date() - timedelta(days=1)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": earlier_day.isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": earlier_day.isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -28652,13 +28663,22 @@ def test_retry_reconciliation_records_a_same_day_recovery_in_the_execution_log(t
     artifacts_dir = tmp_path / "retry-execution-log"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -28713,13 +28733,22 @@ def test_retry_reconciliation_records_a_prior_day_recovery_in_the_execution_log(
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     earlier_day = now.date() - timedelta(days=1)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": earlier_day.isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": earlier_day.isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -28736,9 +28765,7 @@ def test_retry_reconciliation_records_a_prior_day_recovery_in_the_execution_log(
         artifacts_dir=artifacts_dir,
         run_result=run_result,
     )
-    recovered = near_close_dca._reconcile_prior_unproven_fractional_placements(
-        ctx, persist_stale_day_execution=True
-    )
+    recovered = near_close_dca._reconcile_prior_unproven_fractional_placements(ctx, persist_stale_day_execution=True)
 
     # Still never surfaced as one of TODAY's own candidates...
     assert recovered == {}
@@ -28774,13 +28801,22 @@ def test_retry_reconciliation_keeps_a_prior_day_recovery_out_of_the_current_run_
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     earlier_day = now.date() - timedelta(days=1)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": earlier_day.isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": earlier_day.isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -28903,22 +28939,31 @@ def test_retry_replays_a_booking_pending_marker_preserving_settled_fill_details(
     artifacts_dir = tmp_path / "booking-pending-filled"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "submitted",
-            "placement_outcome_unproven": False,
-            "order_id": "ORD-RECOVERED",
-            "reconciliation_booking_pending": {
-                "ticker": "AAPL", "amount_usd": 5.0, "order_id": "ORD-RECOVERED",
-                "placement_ref_id": "afternoon-AAPL-proof",
-                "verdict": near_close_dca._PLACEMENT_ACCEPTED,
-                # A partial fill: settled for LESS than the approved amount.
-                "force_filled": True,
-                "actual_notional_usd": 3.0,
-            },
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "submitted",
+                        "placement_outcome_unproven": False,
+                        "order_id": "ORD-RECOVERED",
+                        "reconciliation_booking_pending": {
+                            "ticker": "AAPL",
+                            "amount_usd": 5.0,
+                            "order_id": "ORD-RECOVERED",
+                            "placement_ref_id": "afternoon-AAPL-proof",
+                            "verdict": near_close_dca._PLACEMENT_ACCEPTED,
+                            # A partial fill: settled for LESS than the approved amount.
+                            "force_filled": True,
+                            "actual_notional_usd": 3.0,
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     run_result = near_close_dca.RunResult(trading_day=now.date(), decisions=[])
     ctx = near_close_dca.RunContext(
@@ -28949,19 +28994,28 @@ def test_retry_replays_a_durable_booking_pending_marker(tmp_path):
     artifacts_dir = tmp_path / "booking-pending"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "submitted",
-            "placement_outcome_unproven": False,
-            "order_id": "ORD-RECOVERED",
-            "reconciliation_booking_pending": {
-                "ticker": "AAPL", "amount_usd": 5.0, "order_id": "ORD-RECOVERED",
-                "placement_ref_id": "afternoon-AAPL-proof",
-                "verdict": near_close_dca._PLACEMENT_ACCEPTED,
-            },
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "submitted",
+                        "placement_outcome_unproven": False,
+                        "order_id": "ORD-RECOVERED",
+                        "reconciliation_booking_pending": {
+                            "ticker": "AAPL",
+                            "amount_usd": 5.0,
+                            "order_id": "ORD-RECOVERED",
+                            "placement_ref_id": "afternoon-AAPL-proof",
+                            "verdict": near_close_dca._PLACEMENT_ACCEPTED,
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -29019,15 +29073,22 @@ def test_retry_republishes_a_durable_rejection_pending_marker(tmp_path):
         "placement_ref_id": "afternoon-AAPL-proof",
         "verdict": near_close_dca._PLACEMENT_NO_ORDER,
     }
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed",
-            "placement_outcome_unproven": False,
-            "order_id": "ORD-REJECTED",
-            "reconciliation_booking_pending": marker,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": False,
+                        "order_id": "ORD-REJECTED",
+                        "reconciliation_booking_pending": marker,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     ctx = near_close_dca.RunContext(
         now=now,
@@ -29071,14 +29132,21 @@ def test_retry_rejects_a_truthy_non_dict_booking_pending_marker(tmp_path):
     artifacts_dir = tmp_path / "malformed-booking-pending"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "submitted",
-            "placement_outcome_unproven": False,
-            "reconciliation_booking_pending": True,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "submitted",
+                        "placement_outcome_unproven": False,
+                        "reconciliation_booking_pending": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     ctx = near_close_dca.RunContext(
         now=now,
@@ -29107,18 +29175,27 @@ def test_retry_rejects_a_booking_pending_marker_with_an_unsupported_verdict(tmp_
     artifacts_dir = tmp_path / "unsupported-verdict-booking-pending"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "submitted",
-            "placement_outcome_unproven": False,
-            "reconciliation_booking_pending": {
-                "ticker": "AAPL", "amount_usd": 100.0, "order_id": "ORD-X",
-                "placement_ref_id": "afternoon-AAPL-proof",
-                "verdict": bad_verdict,
-            },
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "submitted",
+                        "placement_outcome_unproven": False,
+                        "reconciliation_booking_pending": {
+                            "ticker": "AAPL",
+                            "amount_usd": 100.0,
+                            "order_id": "ORD-X",
+                            "placement_ref_id": "afternoon-AAPL-proof",
+                            "verdict": bad_verdict,
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     ctx = near_close_dca.RunContext(
         now=now,
@@ -29144,18 +29221,27 @@ def test_retry_rejects_a_no_order_booking_pending_marker_with_a_nonzero_amount(t
     artifacts_dir = tmp_path / "nonzero-rejection-booking-pending"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed",
-            "placement_outcome_unproven": False,
-            "reconciliation_booking_pending": {
-                "ticker": "AAPL", "amount_usd": 5.0, "order_id": "ORD-X",
-                "placement_ref_id": "afternoon-AAPL-proof",
-                "verdict": near_close_dca._PLACEMENT_NO_ORDER,
-            },
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": False,
+                        "reconciliation_booking_pending": {
+                            "ticker": "AAPL",
+                            "amount_usd": 5.0,
+                            "order_id": "ORD-X",
+                            "placement_ref_id": "afternoon-AAPL-proof",
+                            "verdict": near_close_dca._PLACEMENT_NO_ORDER,
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     ctx = near_close_dca.RunContext(
         now=now,
@@ -29182,13 +29268,22 @@ def test_retry_reconciliation_records_a_filled_recovery_as_filled(tmp_path):
     artifacts_dir = tmp_path / "retry-execution-log-filled"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -29228,18 +29323,28 @@ def test_retry_reconciliation_records_a_terminal_partial_recovery_at_its_execute
     artifacts_dir = tmp_path / "retry-execution-log-terminal-partial"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 5.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 5.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {
-                "id": "ORD-RECOVERED", "state": "cancelled",
+                "id": "ORD-RECOVERED",
+                "state": "cancelled",
                 "executed_notional": "3.00",
             }
 
@@ -29280,13 +29385,22 @@ def test_retry_reconciliation_reuses_the_matched_row_without_a_second_broker_loo
     artifacts_dir = tmp_path / "retry-execution-log-single-lookup"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 5.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 5.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     call_count = {"n": 0}
 
@@ -29296,7 +29410,8 @@ def test_retry_reconciliation_reuses_the_matched_row_without_a_second_broker_loo
             if call_count["n"] > 1:
                 raise RuntimeError("broker connector unavailable on a repeated call")
             return {
-                "id": "ORD-RECOVERED", "state": "filled",
+                "id": "ORD-RECOVERED",
+                "state": "filled",
                 "executed_notional": "3.00",
             }
 
@@ -29330,18 +29445,28 @@ def test_retry_reconciliation_does_not_force_filled_on_a_proven_zero_fill_termin
     artifacts_dir = tmp_path / "retry-execution-log-terminal-zero"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 5.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 5.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {
-                "id": "ORD-RECOVERED", "state": "cancelled",
+                "id": "ORD-RECOVERED",
+                "state": "cancelled",
                 "executed_notional": "0",
             }
 
@@ -29371,16 +29496,23 @@ def test_retry_reconciliation_scans_prior_artifact_directories(tmp_path):
     current_dir = history_root / "2026-06-29" / "1530"
     prior_dir.mkdir(parents=True)
     current_dir.mkdir(parents=True)
-    (prior_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "run_classification": {"stream": "afternoon", "run_id": "prior-slot"},
-        "broker_outcomes": {"AAPL": {
-            "status": "failed",
-            "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-prior-slot",
-            "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (prior_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {"stream": "afternoon", "run_id": "prior-slot"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-prior-slot",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -29425,16 +29557,23 @@ def test_retry_reconciliation_persists_execution_to_historical_artifact_log(tmp_
     current_dir = history_root / "2026-06-29" / "1530"
     prior_dir.mkdir(parents=True)
     current_dir.mkdir(parents=True)
-    (prior_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "run_classification": {"stream": "afternoon", "run_id": "prior-slot"},
-        "broker_outcomes": {"AAPL": {
-            "status": "failed",
-            "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-prior-slot",
-            "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (prior_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "run_classification": {"stream": "afternoon", "run_id": "prior-slot"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-prior-slot",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -29480,17 +29619,24 @@ def test_retry_reconciliation_excludes_dry_run_historical_artifacts(tmp_path):
     current_dir = history_root / "2026-06-29" / "1530"
     dry_run_dir.mkdir(parents=True)
     current_dir.mkdir(parents=True)
-    (dry_run_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "dry_run": True,
-        "run_classification": {"stream": "afternoon", "run_id": "demo-slot"},
-        "broker_outcomes": {"AAPL": {
-            "status": "failed",
-            "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-demo-slot",
-            "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (dry_run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "dry_run": True,
+                "run_classification": {"stream": "afternoon", "run_id": "demo-slot"},
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-demo-slot",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -29526,23 +29672,28 @@ def test_retry_reconciliation_rejects_every_unreferenced_row_in_prior_artifact(t
     current_dir = history_root / "2026-06-29" / "1530"
     prior_dir.mkdir(parents=True)
     current_dir.mkdir(parents=True)
-    (prior_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "placement_evidence_incomplete": True,
-        "broker_outcomes": {
-            "AAPL": {
-                "status": "failed",
-                "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-prior-slot",
-                "submitted_amount_usd": 2.0,
-            },
-            "MSFT": {
-                "status": "failed",
-                "placement_outcome_unproven": True,
-                "submitted_amount_usd": 3.0,
-            },
-        },
-    }), encoding="utf-8")
+    (prior_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "placement_evidence_incomplete": True,
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-prior-slot",
+                        "submitted_amount_usd": 2.0,
+                    },
+                    "MSFT": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "submitted_amount_usd": 3.0,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -29577,10 +29728,14 @@ def test_retry_reconciliation_deduplicates_placement_refs_across_artifacts(tmp_p
     current_dir.mkdir(parents=True)
     evidence = {
         "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-shared", "submitted_amount_usd": 2.0,
-        }},
+        "broker_outcomes": {
+            "AAPL": {
+                "status": "failed",
+                "placement_outcome_unproven": True,
+                "placement_ref_id": "afternoon-AAPL-shared",
+                "submitted_amount_usd": 2.0,
+            }
+        },
     }
     for name in ("copy-a", "copy-b"):
         artifact_dir = history_root / name
@@ -29627,15 +29782,15 @@ def test_retry_reconciliation_deduplicates_placement_refs_across_artifacts(tmp_p
     "broker_outcomes",
     [
         [],
-        {"AAPL": {
-            "placement_outcome_unproven": True,
-            "submitted_amount_usd": 2.0,
-        }},
+        {
+            "AAPL": {
+                "placement_outcome_unproven": True,
+                "submitted_amount_usd": 2.0,
+            }
+        },
     ],
 )
-def test_retry_reconciliation_fails_closed_on_flagged_history_without_reference(
-    tmp_path, broker_outcomes
-):
+def test_retry_reconciliation_fails_closed_on_flagged_history_without_reference(tmp_path, broker_outcomes):
     """Flagged historical evidence must be checked even when no ref can be extracted."""
     import near_close_dca
 
@@ -29645,11 +29800,16 @@ def test_retry_reconciliation_fails_closed_on_flagged_history_without_reference(
     current_dir = history_root / "current"
     prior_dir.mkdir(parents=True)
     current_dir.mkdir()
-    (prior_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "placement_evidence_incomplete": True,
-        "broker_outcomes": broker_outcomes,
-    }), encoding="utf-8")
+    (prior_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "placement_evidence_incomplete": True,
+                "broker_outcomes": broker_outcomes,
+            }
+        ),
+        encoding="utf-8",
+    )
     ctx = near_close_dca.RunContext(
         now=now,
         config=StrategyConfig(dry_run=False, approved_test_dates=config.approved_test_dates),
@@ -29681,19 +29841,30 @@ def test_retry_reconciliation_records_the_actual_fill_notional_not_the_request(t
     artifacts_dir = tmp_path / "retry-execution-log-actual-notional"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             return {
-                "id": "ORD-RECOVERED", "state": "filled",
-                "dollar_amount": "2.00", "executed_notional": "1.50",
+                "id": "ORD-RECOVERED",
+                "state": "filled",
+                "dollar_amount": "2.00",
+                "executed_notional": "1.50",
             }
 
     run_result = near_close_dca.RunResult(trading_day=now.date(), decisions=[])
@@ -29730,13 +29901,22 @@ def test_account_pinning_runs_before_reconciling_prior_placements(tmp_path):
     artifacts_dir = tmp_path / "runs" / "account-pinning-order"
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     artifacts_dir.mkdir(parents=True)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     lookup_calls = []
 
@@ -29758,7 +29938,12 @@ def test_account_pinning_runs_before_reconciling_prior_placements(tmp_path):
 
     with pytest.raises(RuntimeError, match="Refusing to trade account"):
         run_daily_compact(
-            now, config, state, fin, rh, broker,
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
             options=CompactRunOptions(artifacts_dir=str(artifacts_dir), scheduled=True),
         )
 
@@ -29773,12 +29958,21 @@ def test_retry_reconciliation_requires_a_valid_persisted_trading_day(tmp_path):
 
     artifacts_dir = tmp_path / "retry-missing-day"
     artifacts_dir.mkdir()
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     ctx = near_close_dca.RunContext(
@@ -29807,13 +30001,22 @@ def test_retry_reconciliation_restores_the_attempt_for_a_reconciled_rejection(tm
     artifacts_dir = tmp_path / "retry-rejection-attempt-restore"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -29859,13 +30062,22 @@ def test_retry_reconciliation_publishes_a_recovery_row_for_a_reconciled_rejectio
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     trading_day_iso = now.date().isoformat()
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": trading_day_iso,
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": trading_day_iso,
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -29884,24 +30096,24 @@ def test_retry_reconciliation_publishes_a_recovery_row_for_a_reconciled_rejectio
     recovered = near_close_dca._reconcile_prior_unproven_fractional_placements(ctx)
 
     assert recovered["AAPL#fractional-recovery:afternoon-AAPL-proof"] == {
-            "status": "failed",
-            "order_id": "ORD-REJECTED",
-            "skip_reason": None,
-            "reviewed_order": None,
-            "submitted_amount_usd": 0.0,
-            "reconciled_fractional_placement": True,
+        "status": "failed",
+        "order_id": "ORD-REJECTED",
+        "skip_reason": None,
+        "reviewed_order": None,
+        "submitted_amount_usd": 0.0,
+        "reconciled_fractional_placement": True,
+        "ticker": "AAPL",
+        "reconciliation_booking_pending": {
             "ticker": "AAPL",
-            "reconciliation_booking_pending": {
-                "ticker": "AAPL",
-                "amount_usd": 0.0,
-                "order_id": "ORD-REJECTED",
-                "placement_ref_id": "afternoon-AAPL-proof",
-                "verdict": near_close_dca._PLACEMENT_NO_ORDER,
-                # A rejection is never "filled", regardless of the matched
-                # row's own state.
-                "force_filled": False,
-                "actual_notional_usd": None,
-            },
+            "amount_usd": 0.0,
+            "order_id": "ORD-REJECTED",
+            "placement_ref_id": "afternoon-AAPL-proof",
+            "verdict": near_close_dca._PLACEMENT_NO_ORDER,
+            # A rejection is never "filled", regardless of the matched
+            # row's own state.
+            "force_filled": False,
+            "actual_notional_usd": None,
+        },
     }
 
 
@@ -29917,13 +30129,20 @@ def test_reconciled_rejection_survives_into_the_fresh_run_artifacts(tmp_path):
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     os.makedirs(artifacts_dir, exist_ok=True)
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": now.date().isoformat(),
-            "broker_outcomes": {"AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            }},
-        }, handle)
+        json.dump(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            },
+            handle,
+        )
 
     class _ReconcilingBroker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -29939,7 +30158,12 @@ def test_reconciled_rejection_survives_into_the_fresh_run_artifacts(tmp_path):
     broker = _ReconcilingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
 
     run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
@@ -29947,8 +30171,7 @@ def test_reconciled_rejection_survives_into_the_fresh_run_artifacts(tmp_path):
         run_state = json.load(handle)
 
     recovered_rows = [
-        row for row in run_state["buy_candidates"]
-        if row.get("reason") == "reconciled_fractional_placement"
+        row for row in run_state["buy_candidates"] if row.get("reason") == "reconciled_fractional_placement"
     ]
     assert len(recovered_rows) == 1
     assert recovered_rows[0]["ticker"] == "AAPL"
@@ -29971,13 +30194,22 @@ def test_retry_reconciliation_does_not_book_state_when_the_artifact_write_fails(
     artifacts_dir = tmp_path / "retry-durable-write"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -30023,14 +30255,23 @@ def test_retry_reconciliation_refuses_evidence_recorded_for_a_different_account(
     artifacts_dir = tmp_path / "retry-wrong-account-evidence"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "account_number": "123456789",
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "account_number": "123456789",
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     lookup_calls = []
 
@@ -30073,14 +30314,23 @@ def test_retry_reconciliation_rejects_a_malformed_persisted_account_fingerprint(
     artifacts_dir = tmp_path / "retry-malformed-account-fingerprint"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "account_number": 123456789,
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "account_number": 123456789,
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     lookup_calls = []
 
@@ -30124,14 +30374,23 @@ def test_retry_reconciliation_rejects_an_empty_persisted_account_fingerprint(tmp
     artifacts_dir = tmp_path / "retry-empty-account-fingerprint"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "account_number": "",
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "account_number": "",
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     lookup_calls = []
 
@@ -30171,14 +30430,23 @@ def test_retry_reconciliation_fails_closed_when_fingerprint_is_unavailable(tmp_p
     artifacts_dir = tmp_path / "retry-fingerprint-unavailable"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "account_number": "some-persisted-fingerprint",
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "account_number": "some-persisted-fingerprint",
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     lookup_calls = []
 
@@ -30220,14 +30488,23 @@ def test_retry_reconciliation_fails_closed_on_a_persisted_fingerprint_sentinel(t
     artifacts_dir = tmp_path / "retry-fingerprint-sentinel"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "account_number": near_close_dca._ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL,
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "account_number": near_close_dca._ACCOUNT_FINGERPRINT_UNAVAILABLE_SENTINEL,
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     lookup_calls = []
 
@@ -30266,15 +30543,23 @@ def test_retry_reconciliation_checks_fingerprint_only_when_evidence_is_unresolve
     artifacts_dir = tmp_path / "retry-resolved-foreign-fingerprint"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "account_number": "123456789",
-        "status": "completed",
-        "broker_outcomes": {"AAPL": {
-            "status": "submitted", "order_id": "ORD-DONE",
-            "placement_outcome_unproven": False,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "account_number": "123456789",
+                "status": "completed",
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "submitted",
+                        "order_id": "ORD-DONE",
+                        "placement_outcome_unproven": False,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     ctx = near_close_dca.RunContext(
         now=now,
@@ -30305,20 +30590,29 @@ def test_retry_reconciliation_validates_against_the_latest_grouped_amount(tmp_pa
     artifacts_dir = tmp_path / "retry-resized-amount"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {
-            "AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            },
-            "AAPL:unproven-2": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 3.0,
-                "ticker": "AAPL",
-            },
-        },
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    },
+                    "AAPL:unproven-2": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 3.0,
+                        "ticker": "AAPL",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -30363,20 +30657,29 @@ def test_retry_reconciliation_validates_against_an_earlier_grouped_amount(tmp_pa
     artifacts_dir = tmp_path / "retry-earlier-amount-accepted"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {
-            "AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            },
-            "AAPL:unproven-2": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 3.0,
-                "ticker": "AAPL",
-            },
-        },
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    },
+                    "AAPL:unproven-2": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 3.0,
+                        "ticker": "AAPL",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -30421,13 +30724,22 @@ def test_retry_reconciliation_persists_matched_id_on_unknown_verdict(tmp_path):
     artifacts_dir = tmp_path / "retry-unknown-with-id"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -30435,8 +30747,10 @@ def test_retry_reconciliation_persists_matched_id_on_unknown_verdict(tmp_path):
             # exactly the shape _reconcile_ambiguous_fractional_placement
             # reads as UNKNOWN despite returning a perfectly usable id.
             return {
-                "id": "ORD-AMBIGUOUS", "state": "filled",
-                "executed_notional": "500.00", "dollar_amount": "2.00",
+                "id": "ORD-AMBIGUOUS",
+                "state": "filled",
+                "executed_notional": "500.00",
+                "dollar_amount": "2.00",
             }
 
     ctx = near_close_dca.RunContext(
@@ -30469,19 +30783,28 @@ def test_retry_reconciliation_persists_earlier_groups_before_a_later_raise(tmp_p
     artifacts_dir = tmp_path / "retry-partial-persist"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {
-            "AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            },
-            "MSFT": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-MSFT-proof", "submitted_amount_usd": 3.0,
-            },
-        },
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    },
+                    "MSFT": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-MSFT-proof",
+                        "submitted_amount_usd": 3.0,
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -30518,6 +30841,7 @@ def test_retry_reconciliation_persists_earlier_groups_before_a_later_raise(tmp_p
     # being booked into StrategyState (Codex review, PR #911 round 4:
     # "Publish each recovered group before processing the next").
     from dca_risk import deployed_usd
+
     assert deployed_usd(saved) == 2.0
 
     # A SECOND retry must not re-book AAPL's already-settled dollars again.
@@ -30539,18 +30863,32 @@ def test_retry_reconciliation_updates_the_original_candidate_row(tmp_path):
     artifacts_dir = tmp_path / "retry-update-original-candidate"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-        "buy_candidates": [{
-            "ticker": "AAPL", "status": "failed", "order_id": None,
-            "buy_multiplier": 1.0, "planned_amount_usd": 2.0,
-            "skip_reason": "placement outcome unproven: RuntimeError",
-        }],
-    }), encoding="utf-8")
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "failed",
+                        "order_id": None,
+                        "buy_multiplier": 1.0,
+                        "planned_amount_usd": 2.0,
+                        "skip_reason": "placement outcome unproven: RuntimeError",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -30590,25 +30928,40 @@ def test_retry_reconciliation_appends_when_the_original_row_is_ambiguous(tmp_pat
     artifacts_dir = tmp_path / "retry-ambiguous-original-candidate"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
-        "buy_candidates": [
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
             {
-                "ticker": "AAPL", "status": "failed", "order_id": None,
-                "buy_multiplier": 1.0, "planned_amount_usd": 2.0,
-                "skip_reason": "placement outcome unproven: RuntimeError",
-            },
-            {
-                "ticker": "AAPL", "status": "failed", "order_id": None,
-                "buy_multiplier": 1.0, "planned_amount_usd": 3.0,
-                "skip_reason": "placement outcome unproven: RuntimeError",
-            },
-        ],
-    }), encoding="utf-8")
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    }
+                },
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "failed",
+                        "order_id": None,
+                        "buy_multiplier": 1.0,
+                        "planned_amount_usd": 2.0,
+                        "skip_reason": "placement outcome unproven: RuntimeError",
+                    },
+                    {
+                        "ticker": "AAPL",
+                        "status": "failed",
+                        "order_id": None,
+                        "buy_multiplier": 1.0,
+                        "planned_amount_usd": 3.0,
+                        "skip_reason": "placement outcome unproven: RuntimeError",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -30647,34 +31000,49 @@ def test_retry_reconciliation_replaces_each_groups_own_row_by_ref_id(tmp_path):
     artifacts_dir = tmp_path / "retry-two-groups-by-ref-id"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {
-            "AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            },
-            "AAPL:unproven-2": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-topup-proof", "submitted_amount_usd": 3.0,
-                "ticker": "AAPL",
-            },
-        },
-        "buy_candidates": [
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
             {
-                "ticker": "AAPL", "status": "failed", "order_id": None,
-                "buy_multiplier": 1.0, "planned_amount_usd": 2.0,
-                "skip_reason": "placement outcome unproven: RuntimeError",
-                "placement_ref_id": "afternoon-AAPL-proof",
-            },
-            {
-                "ticker": "AAPL", "status": "failed", "order_id": None,
-                "buy_multiplier": 1.0, "planned_amount_usd": 3.0,
-                "skip_reason": "placement outcome unproven: RuntimeError",
-                "placement_ref_id": "afternoon-AAPL-topup-proof",
-            },
-        ],
-    }), encoding="utf-8")
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    },
+                    "AAPL:unproven-2": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-topup-proof",
+                        "submitted_amount_usd": 3.0,
+                        "ticker": "AAPL",
+                    },
+                },
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "failed",
+                        "order_id": None,
+                        "buy_multiplier": 1.0,
+                        "planned_amount_usd": 2.0,
+                        "skip_reason": "placement outcome unproven: RuntimeError",
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                    },
+                    {
+                        "ticker": "AAPL",
+                        "status": "failed",
+                        "order_id": None,
+                        "buy_multiplier": 1.0,
+                        "planned_amount_usd": 3.0,
+                        "skip_reason": "placement outcome unproven: RuntimeError",
+                        "placement_ref_id": "afternoon-AAPL-topup-proof",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -30735,37 +31103,52 @@ def test_retry_reconciliation_collapses_retries_sharing_one_reference(tmp_path):
     artifacts_dir = tmp_path / "retry-collapse-shared-reference"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {
-            "AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            },
-            "AAPL:unproven-2": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-                "ticker": "AAPL",
-            },
-        },
-        # Two ORIGINAL candidate rows, both already carrying the shared
-        # ref_id -- one per retry attempt, as _failure_candidate_row would
-        # have persisted them across two earlier halted invocations.
-        "buy_candidates": [
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
             {
-                "ticker": "AAPL", "status": "failed", "order_id": None,
-                "buy_multiplier": 1.0, "planned_amount_usd": 2.0,
-                "skip_reason": "placement outcome unproven: RuntimeError",
-                "placement_ref_id": "afternoon-AAPL-proof",
-            },
-            {
-                "ticker": "AAPL", "status": "failed", "order_id": None,
-                "buy_multiplier": 1.0, "planned_amount_usd": 2.0,
-                "skip_reason": "placement outcome unproven: RuntimeError",
-                "placement_ref_id": "afternoon-AAPL-proof",
-            },
-        ],
-    }), encoding="utf-8")
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    },
+                    "AAPL:unproven-2": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                        "ticker": "AAPL",
+                    },
+                },
+                # Two ORIGINAL candidate rows, both already carrying the shared
+                # ref_id -- one per retry attempt, as _failure_candidate_row would
+                # have persisted them across two earlier halted invocations.
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "failed",
+                        "order_id": None,
+                        "buy_multiplier": 1.0,
+                        "planned_amount_usd": 2.0,
+                        "skip_reason": "placement outcome unproven: RuntimeError",
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                    },
+                    {
+                        "ticker": "AAPL",
+                        "status": "failed",
+                        "order_id": None,
+                        "buy_multiplier": 1.0,
+                        "planned_amount_usd": 2.0,
+                        "skip_reason": "placement outcome unproven: RuntimeError",
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -30809,34 +31192,49 @@ def test_retry_reconciliation_collapses_retries_sharing_one_reference_on_rejecti
     artifacts_dir = tmp_path / "retry-collapse-shared-reference-rejection"
     artifacts_dir.mkdir()
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    (artifacts_dir / "run_state.json").write_text(json.dumps({
-        "trading_day": now.date().isoformat(),
-        "broker_outcomes": {
-            "AAPL": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-            },
-            "AAPL:unproven-2": {
-                "status": "failed", "placement_outcome_unproven": True,
-                "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-                "ticker": "AAPL",
-            },
-        },
-        "buy_candidates": [
+    (artifacts_dir / "run_state.json").write_text(
+        json.dumps(
             {
-                "ticker": "AAPL", "status": "failed", "order_id": None,
-                "buy_multiplier": 1.0, "planned_amount_usd": 2.0,
-                "skip_reason": "placement outcome unproven: RuntimeError",
-                "placement_ref_id": "afternoon-AAPL-proof",
-            },
-            {
-                "ticker": "AAPL", "status": "failed", "order_id": None,
-                "buy_multiplier": 1.0, "planned_amount_usd": 2.0,
-                "skip_reason": "placement outcome unproven: RuntimeError",
-                "placement_ref_id": "afternoon-AAPL-proof",
-            },
-        ],
-    }), encoding="utf-8")
+                "trading_day": now.date().isoformat(),
+                "broker_outcomes": {
+                    "AAPL": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                    },
+                    "AAPL:unproven-2": {
+                        "status": "failed",
+                        "placement_outcome_unproven": True,
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                        "submitted_amount_usd": 2.0,
+                        "ticker": "AAPL",
+                    },
+                },
+                "buy_candidates": [
+                    {
+                        "ticker": "AAPL",
+                        "status": "failed",
+                        "order_id": None,
+                        "buy_multiplier": 1.0,
+                        "planned_amount_usd": 2.0,
+                        "skip_reason": "placement outcome unproven: RuntimeError",
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                    },
+                    {
+                        "ticker": "AAPL",
+                        "status": "failed",
+                        "order_id": None,
+                        "buy_multiplier": 1.0,
+                        "planned_amount_usd": 2.0,
+                        "skip_reason": "placement outcome unproven: RuntimeError",
+                        "placement_ref_id": "afternoon-AAPL-proof",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Broker(DryRunBroker):
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
@@ -30881,26 +31279,46 @@ def test_failed_placement_count_deduplicates_by_placement_ref_id():
 
     count = near_close_dca._failed_placement_count
 
-    assert count({
-        "AAPL": {"status": "failed", "placement_ref_id": "ref-1"},
-        "AAPL:unproven-2": {"status": "failed", "placement_ref_id": "ref-1"},
-    }) == 1
+    assert (
+        count(
+            {
+                "AAPL": {"status": "failed", "placement_ref_id": "ref-1"},
+                "AAPL:unproven-2": {"status": "failed", "placement_ref_id": "ref-1"},
+            }
+        )
+        == 1
+    )
     # A different ref_id is a genuinely different broker call.
-    assert count({
-        "AAPL": {"status": "failed", "placement_ref_id": "ref-1"},
-        "MSFT": {"status": "failed", "placement_ref_id": "ref-2"},
-    }) == 2
+    assert (
+        count(
+            {
+                "AAPL": {"status": "failed", "placement_ref_id": "ref-1"},
+                "MSFT": {"status": "failed", "placement_ref_id": "ref-2"},
+            }
+        )
+        == 2
+    )
     # No ref_id at all: counted individually, matching the pre-existing
     # behavior this helper's other call site (the failure writer's own
     # retry merge) already relies on.
-    assert count({
-        "AAPL": {"status": "failed"},
-        "AAPL:unproven-2": {"status": "failed"},
-    }) == 2
+    assert (
+        count(
+            {
+                "AAPL": {"status": "failed"},
+                "AAPL:unproven-2": {"status": "failed"},
+            }
+        )
+        == 2
+    )
     # A non-"failed" row is never counted, ref_id or not.
-    assert count({
-        "AAPL": {"status": "submitted", "placement_ref_id": "ref-1"},
-    }) == 0
+    assert (
+        count(
+            {
+                "AAPL": {"status": "submitted", "placement_ref_id": "ref-1"},
+            }
+        )
+        == 0
+    )
 
 
 def test_failed_placement_count_tolerates_an_unhashable_ref_id():
@@ -30916,13 +31334,23 @@ def test_failed_placement_count_tolerates_an_unhashable_ref_id():
 
     count = near_close_dca._failed_placement_count
 
-    assert count({
-        "AAPL": {"status": "failed", "placement_ref_id": ["not", "hashable"]},
-    }) == 1
-    assert count({
-        "AAPL": {"status": "failed", "placement_ref_id": {"not": "hashable"}},
-        "MSFT": {"status": "failed", "placement_ref_id": {"not": "hashable"}},
-    }) == 2
+    assert (
+        count(
+            {
+                "AAPL": {"status": "failed", "placement_ref_id": ["not", "hashable"]},
+            }
+        )
+        == 1
+    )
+    assert (
+        count(
+            {
+                "AAPL": {"status": "failed", "placement_ref_id": {"not": "hashable"}},
+                "MSFT": {"status": "failed", "placement_ref_id": {"not": "hashable"}},
+            }
+        )
+        == 2
+    )
 
 
 def test_retry_stays_blocked_while_prior_placement_is_not_visible(tmp_path):
@@ -30933,10 +31361,14 @@ def test_retry_stays_blocked_while_prior_placement_is_not_visible(tmp_path):
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
     original = {
         "trading_day": now.date().isoformat(),
-        "broker_outcomes": {"AAPL": {
-            "status": "failed", "placement_outcome_unproven": True,
-            "placement_ref_id": "afternoon-AAPL-proof", "submitted_amount_usd": 2.0,
-        }},
+        "broker_outcomes": {
+            "AAPL": {
+                "status": "failed",
+                "placement_outcome_unproven": True,
+                "placement_ref_id": "afternoon-AAPL-proof",
+                "submitted_amount_usd": 2.0,
+            }
+        },
     }
     (artifacts_dir / "run_state.json").write_text(json.dumps(original), encoding="utf-8")
 
@@ -30978,12 +31410,15 @@ def test_retry_merge_survives_a_malformed_nested_order_id(tmp_path):
         "run_id": "prior",
         "trading_day": trading_day,
         "run_classification": {"stream": "afternoon", "scheduled_for_et": "15:30"},
-        "broker_outcomes": {
-            "MSFT": {"status": "submitted", "order_id": ["BAD"], "skip_reason": None}
-        },
+        "broker_outcomes": {"MSFT": {"status": "submitted", "order_id": ["BAD"], "skip_reason": None}},
         "buy_candidates": [
-            {"ticker": "MSFT", "status": "submitted", "order_id": ["BAD"],
-             "buy_multiplier": 1.0, "planned_amount_usd": 3.0}
+            {
+                "ticker": "MSFT",
+                "status": "submitted",
+                "order_id": ["BAD"],
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 3.0,
+            }
         ],
     }
     (artifacts_dir / "run_state.json").write_text(json.dumps(prior), encoding="utf-8")
@@ -31030,18 +31465,23 @@ def test_a_fully_deduped_unresolved_retry_still_stamps_the_failure(tmp_path):
         "trading_day": trading_day,
         "status": "completed",
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "run_classification_outcome": "completed_with_orders",
         "error_class": None,
         "is_trading_failure": False,
         "orders_submitted_count": 1,
-        "broker_outcomes": {
-            "AAPL": {"status": "submitted", "order_id": "ORD-IDEMPOTENT"}
-        },
+        "broker_outcomes": {"AAPL": {"status": "submitted", "order_id": "ORD-IDEMPOTENT"}},
         "buy_candidates": [
-            {"ticker": "AAPL", "status": "submitted", "order_id": "ORD-IDEMPOTENT",
-             "buy_multiplier": 1.0, "planned_amount_usd": 2.0}
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "order_id": "ORD-IDEMPOTENT",
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 2.0,
+            }
         ],
     }
     (artifacts_dir / "run_state.json").write_text(json.dumps(prior), encoding="utf-8")
@@ -31050,8 +31490,11 @@ def test_a_fully_deduped_unresolved_retry_still_stamps_the_failure(tmp_path):
     # every row dedupes away and nothing is added.
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "failed", "order_id": "ORD-IDEMPOTENT", "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": "ORD-IDEMPOTENT",
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
         }
     }
     try:
@@ -31105,14 +31548,17 @@ def test_an_unresolved_halt_artifact_stamps_the_account_fingerprint(tmp_path):
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _AmbiguousBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _AmbiguousBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "halt-account-fingerprint")
 
     with pytest.raises(near_close_dca.UnresolvedPlacementError):
         run_daily_compact(
-            now, config, state, fin, rh, broker,
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
             options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
         )
 
@@ -31122,9 +31568,7 @@ def test_an_unresolved_halt_artifact_stamps_the_account_fingerprint(tmp_path):
     assert fingerprint is not None
     assert fingerprint != config.target_account_number
     assert fingerprint != broker.account_number()
-    recomputed = near_close_dca._broker_account_fingerprint(
-        broker, os.path.dirname(artifacts_dir)
-    )
+    recomputed = near_close_dca._broker_account_fingerprint(broker, os.path.dirname(artifacts_dir))
     assert recomputed == fingerprint
 
 
@@ -31155,9 +31599,7 @@ def test_an_unresolved_halt_stamps_a_sentinel_when_fingerprinting_fails(tmp_path
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _AmbiguousBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _AmbiguousBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "halt-fingerprint-failure")
 
     # The broker genuinely has an identity (DryRunBroker.account_number()
@@ -31166,7 +31608,12 @@ def test_an_unresolved_halt_stamps_a_sentinel_when_fingerprinting_fails(tmp_path
 
     with pytest.raises(near_close_dca.UnresolvedPlacementError):
         run_daily_compact(
-            now, config, state, fin, rh, broker,
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
             options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
         )
 
@@ -31248,18 +31695,23 @@ def test_retry_merge_preserves_a_halted_tail_row(tmp_path):
         "trading_day": trading_day,
         "status": "completed",
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "run_classification_outcome": "completed_with_orders",
         "error_class": None,
         "is_trading_failure": False,
         "orders_submitted_count": 1,
-        "broker_outcomes": {
-            "MSFT": {"status": "submitted", "order_id": "ORD-PRIOR"}
-        },
+        "broker_outcomes": {"MSFT": {"status": "submitted", "order_id": "ORD-PRIOR"}},
         "buy_candidates": [
-            {"ticker": "MSFT", "status": "submitted", "order_id": "ORD-PRIOR",
-             "buy_multiplier": 1.0, "planned_amount_usd": 2.0}
+            {
+                "ticker": "MSFT",
+                "status": "submitted",
+                "order_id": "ORD-PRIOR",
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 2.0,
+            }
         ],
     }
     (artifacts_dir / "run_state.json").write_text(json.dumps(prior), encoding="utf-8")
@@ -31268,12 +31720,18 @@ def test_retry_merge_preserves_a_halted_tail_row(tmp_path):
     # batch -- never got a chance to place at all.
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
         },
         "MSFT": {
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "unresolved_placement_halted": True, "skip_reason": "halted after AAPL",
+            "status": "failed",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "unresolved_placement_halted": True,
+            "skip_reason": "halted after AAPL",
         },
     }
     try:
@@ -31292,7 +31750,8 @@ def test_retry_merge_preserves_a_halted_tail_row(tmp_path):
     # ...and THIS run's own halted-tail evidence for MSFT survived under
     # its own key, rather than being silently dropped as a restatement.
     halted_rows = [
-        row for row in merged["broker_outcomes"].values()
+        row
+        for row in merged["broker_outcomes"].values()
         if isinstance(row, dict) and row.get("unresolved_placement_halted")
     ]
     assert len(halted_rows) == 1, merged["broker_outcomes"]
@@ -31321,33 +31780,46 @@ def test_a_fully_deduped_unresolved_retry_regenerates_a_stale_summary(tmp_path):
         "trading_day": trading_day,
         "status": "completed",
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "run_classification_outcome": "completed_with_orders",
         "error_class": None,
         "is_trading_failure": False,
         "orders_submitted_count": 1,
-        "broker_outcomes": {
-            "AAPL": {"status": "submitted", "order_id": "ORD-IDEMPOTENT"}
-        },
+        "broker_outcomes": {"AAPL": {"status": "submitted", "order_id": "ORD-IDEMPOTENT"}},
         "buy_candidates": [
-            {"ticker": "AAPL", "status": "submitted", "order_id": "ORD-IDEMPOTENT",
-             "buy_multiplier": 1.0, "planned_amount_usd": 2.0}
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "order_id": "ORD-IDEMPOTENT",
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 2.0,
+            }
         ],
     }
     (artifacts_dir / "run_state.json").write_text(json.dumps(prior), encoding="utf-8")
     # A STALE run_summary.json already on disk, matching the prior SUCCESS.
-    (artifacts_dir / "run_summary.json").write_text(json.dumps({
-        "run_classification_outcome": "completed_with_orders",
-        "is_trading_failure": False,
-    }), encoding="utf-8")
+    (artifacts_dir / "run_summary.json").write_text(
+        json.dumps(
+            {
+                "run_classification_outcome": "completed_with_orders",
+                "is_trading_failure": False,
+            }
+        ),
+        encoding="utf-8",
+    )
 
     # This invocation halts, and its only outcome carries the SAME order id,
     # so every row dedupes away and nothing is added.
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "failed", "order_id": "ORD-IDEMPOTENT", "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": "ORD-IDEMPOTENT",
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
         }
     }
     try:
@@ -31400,20 +31872,28 @@ def test_a_manual_retry_failing_with_no_new_outcomes_regenerates_a_stale_summary
         "error_class": None,
         "is_trading_failure": False,
         "orders_submitted_count": 1,
-        "broker_outcomes": {
-            "AAPL": {"status": "submitted", "order_id": "ORD-EARLIER-MANUAL"}
-        },
+        "broker_outcomes": {"AAPL": {"status": "submitted", "order_id": "ORD-EARLIER-MANUAL"}},
         "buy_candidates": [
-            {"ticker": "AAPL", "status": "submitted", "order_id": "ORD-EARLIER-MANUAL",
-             "buy_multiplier": 1.0, "planned_amount_usd": 2.0}
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "order_id": "ORD-EARLIER-MANUAL",
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 2.0,
+            }
         ],
     }
     (artifacts_dir / "run_state.json").write_text(json.dumps(prior), encoding="utf-8")
     # A STALE run_summary.json already on disk, matching the prior SUCCESS.
-    (artifacts_dir / "run_summary.json").write_text(json.dumps({
-        "run_classification_outcome": "completed_with_orders",
-        "is_trading_failure": False,
-    }), encoding="utf-8")
+    (artifacts_dir / "run_summary.json").write_text(
+        json.dumps(
+            {
+                "run_classification_outcome": "completed_with_orders",
+                "is_trading_failure": False,
+            }
+        ),
+        encoding="utf-8",
+    )
 
     # This second manual invocation crashes before publishing any outcome
     # at all -- nothing to merge, and not an unresolved placement.
@@ -31462,7 +31942,9 @@ def test_unresolved_retry_merge_parses_a_malformed_preserved_counts_field(tmp_pa
         "trading_day": trading_day,
         "status": "completed",
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "run_classification_outcome": "completed_with_orders",
         "error_class": None,
@@ -31470,20 +31952,21 @@ def test_unresolved_retry_merge_parses_a_malformed_preserved_counts_field(tmp_pa
         "orders_submitted_count": 1,
         # Malformed: a string, not a mapping.
         "counts": "not-a-mapping",
-        "broker_outcomes": {
-            "AAPL": {"status": "submitted", "order_id": "ORD-IDEMPOTENT"}
-        },
+        "broker_outcomes": {"AAPL": {"status": "submitted", "order_id": "ORD-IDEMPOTENT"}},
         "buy_candidates": [
-            {"ticker": "AAPL", "status": "submitted", "order_id": "ORD-IDEMPOTENT",
-             "buy_multiplier": 1.0, "planned_amount_usd": 2.0}
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "order_id": "ORD-IDEMPOTENT",
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 2.0,
+            }
         ],
     }
     (artifacts_dir / "run_state.json").write_text(json.dumps(prior), encoding="utf-8")
 
     now2, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    decisions, _errs = near_close_dca._evaluate_all_signals(
-        now2, config, list(config.tickers), fin, rh
-    )
+    decisions, _errs = near_close_dca._evaluate_all_signals(now2, config, list(config.tickers), fin, rh)
     near_close_dca._publish_in_flight_evaluation(
         decisions=decisions,
         config=config,
@@ -31497,8 +31980,11 @@ def test_unresolved_retry_merge_parses_a_malformed_preserved_counts_field(tmp_pa
     # evaluation-refresh block independent of `added`.
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "failed", "order_id": "ORD-IDEMPOTENT", "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": "ORD-IDEMPOTENT",
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
         }
     }
     try:
@@ -31543,7 +32029,9 @@ def test_retry_merge_validates_preserved_counts_before_merging_new_outcomes(tmp_
         "trading_day": trading_day,
         "status": "completed",
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "run_classification_outcome": "completed_with_orders",
         "error_class": None,
@@ -31551,12 +32039,15 @@ def test_retry_merge_validates_preserved_counts_before_merging_new_outcomes(tmp_
         "orders_submitted_count": 1,
         # Malformed: a list, not a mapping.
         "counts": ["not", "a", "mapping"],
-        "broker_outcomes": {
-            "AAPL": {"status": "submitted", "order_id": "ORD-IDEMPOTENT"}
-        },
+        "broker_outcomes": {"AAPL": {"status": "submitted", "order_id": "ORD-IDEMPOTENT"}},
         "buy_candidates": [
-            {"ticker": "AAPL", "status": "submitted", "order_id": "ORD-IDEMPOTENT",
-             "buy_multiplier": 1.0, "planned_amount_usd": 2.0}
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "order_id": "ORD-IDEMPOTENT",
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 2.0,
+            }
         ],
     }
     (artifacts_dir / "run_state.json").write_text(json.dumps(prior), encoding="utf-8")
@@ -31567,8 +32058,11 @@ def test_retry_merge_validates_preserved_counts_before_merging_new_outcomes(tmp_
     # is what exercises the malformed counts field.
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "MSFT": {
-            "status": "failed", "order_id": "ORD-NEW", "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": "ORD-NEW",
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
         }
     }
     try:
@@ -31612,7 +32106,9 @@ def test_unresolved_retry_merge_weights_usage_proxy_by_submission_multiplicity(t
         "trading_day": trading_day,
         "status": "completed",
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "run_classification_outcome": "completed_with_orders",
         "error_class": None,
@@ -31623,20 +32119,30 @@ def test_unresolved_retry_merge_weights_usage_proxy_by_submission_multiplicity(t
             # A whole-share aggregate standing for TWO physical broker
             # orders behind one identity.
             "AAPL": {
-                "status": "submitted", "order_id": "ORD-AGG", "merged_submission_count": 2,
+                "status": "submitted",
+                "order_id": "ORD-AGG",
+                "merged_submission_count": 2,
             }
         },
         "buy_candidates": [
-            {"ticker": "AAPL", "status": "submitted", "order_id": "ORD-AGG",
-             "buy_multiplier": 1.0, "planned_amount_usd": 2.0}
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "order_id": "ORD-AGG",
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 2.0,
+            }
         ],
     }
     (artifacts_dir / "run_state.json").write_text(json.dumps(prior), encoding="utf-8")
 
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "MSFT": {
-            "status": "failed", "order_id": "ORD-NEW", "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": "ORD-NEW",
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
         }
     }
     try:
@@ -31678,27 +32184,30 @@ def test_unresolved_retry_merge_includes_current_evaluation_errors_in_usage_prox
         "trading_day": trading_day,
         "status": "completed",
         "run_classification": {
-            "stream": "afternoon", "scheduled_for_et": "15:30", "run_origin": "scheduled",
+            "stream": "afternoon",
+            "scheduled_for_et": "15:30",
+            "run_origin": "scheduled",
         },
         "run_classification_outcome": "completed_with_orders",
         "error_class": None,
         "is_trading_failure": False,
         "orders_submitted_count": 1,
         "usage_proxy": {"errors_count": 0},
-        "broker_outcomes": {
-            "AAPL": {"status": "submitted", "order_id": "ORD-IDEMPOTENT"}
-        },
+        "broker_outcomes": {"AAPL": {"status": "submitted", "order_id": "ORD-IDEMPOTENT"}},
         "buy_candidates": [
-            {"ticker": "AAPL", "status": "submitted", "order_id": "ORD-IDEMPOTENT",
-             "buy_multiplier": 1.0, "planned_amount_usd": 2.0}
+            {
+                "ticker": "AAPL",
+                "status": "submitted",
+                "order_id": "ORD-IDEMPOTENT",
+                "buy_multiplier": 1.0,
+                "planned_amount_usd": 2.0,
+            }
         ],
     }
     (artifacts_dir / "run_state.json").write_text(json.dumps(prior), encoding="utf-8")
 
     now2, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    decisions, _errs = near_close_dca._evaluate_all_signals(
-        now2, config, list(config.tickers), fin, rh
-    )
+    decisions, _errs = near_close_dca._evaluate_all_signals(now2, config, list(config.tickers), fin, rh)
     near_close_dca._publish_in_flight_evaluation(
         decisions=decisions,
         config=config,
@@ -31713,8 +32222,11 @@ def test_unresolved_retry_merge_includes_current_evaluation_errors_in_usage_prox
     # still logged two evaluation errors before the halt.
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "failed", "order_id": "ORD-IDEMPOTENT", "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": "ORD-IDEMPOTENT",
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
         }
     }
     try:
@@ -31906,9 +32418,7 @@ def test_redacted_exception_detail_masks_account_numbers_before_a_period():
     punctuation")."""
     import near_close_dca
 
-    detail = near_close_dca._redacted_exception_detail(
-        RuntimeError("connection failed for account 123456789.")
-    )
+    detail = near_close_dca._redacted_exception_detail(RuntimeError("connection failed for account 123456789."))
     assert "123456789" not in detail
     assert "[REDACTED]" in detail
 
@@ -32028,23 +32538,17 @@ def test_redacted_exception_detail_masks_camelcase_credential_labels():
     #859/#911 round 44: "Redact camelCase credential labels")."""
     import near_close_dca
 
-    detail = near_close_dca._redacted_exception_detail(
-        RuntimeError('connector failed: {"clientSecret":"supersecret"}')
-    )
+    detail = near_close_dca._redacted_exception_detail(RuntimeError('connector failed: {"clientSecret":"supersecret"}'))
     assert "supersecret" not in detail
     assert "[REDACTED]" in detail
 
-    detail = near_close_dca._redacted_exception_detail(
-        RuntimeError('connector failed: {"accessToken":"supersecret"}')
-    )
+    detail = near_close_dca._redacted_exception_detail(RuntimeError('connector failed: {"accessToken":"supersecret"}'))
     assert "supersecret" not in detail
     assert "[REDACTED]" in detail
 
     # Case-insensitive matching for ordinary (non-camelCase) labels must
     # still hold -- the scoped (?i:...) replacing the old blanket (?i).
-    detail = near_close_dca._redacted_exception_detail(
-        RuntimeError("connector failed: BEARER supersecret")
-    )
+    detail = near_close_dca._redacted_exception_detail(RuntimeError("connector failed: BEARER supersecret"))
     assert "supersecret" not in detail
 
 
@@ -33129,9 +33633,7 @@ def test_manual_failure_artifact_redacts_exception_secrets(tmp_path):
         near_close_dca._write_afternoon_failure_artifacts(
             artifacts_dir,
             now,
-            RuntimeError(
-                "auth failed for account 123456789 using token=abcXYZ789secret"
-            ),
+            RuntimeError("auth failed for account 123456789 using token=abcXYZ789secret"),
             scheduled=False,
         )
     finally:
@@ -33162,14 +33664,17 @@ def test_an_unresolved_halt_flags_manual_recovery_required(tmp_path):
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _AmbiguousBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _AmbiguousBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "halt-manual-recovery")
 
     with pytest.raises(near_close_dca.UnresolvedPlacementError):
         run_daily_compact(
-            now, config, state, fin, rh, broker,
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
             options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
         )
 
@@ -33199,8 +33704,11 @@ def test_an_unresolved_retry_merge_recomputes_the_failed_placement_count(tmp_pat
     def _write():
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
             "AAPL": {
-                "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-                "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+                "status": "failed",
+                "order_id": None,
+                "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True,
+                "submitted_amount_usd": 2.0,
             }
         }
         try:
@@ -33218,8 +33726,7 @@ def test_an_unresolved_retry_merge_recomputes_the_failed_placement_count(tmp_pat
 
     merged = json.loads((artifacts_dir / "run_state.json").read_bytes())
     failed_rows = [
-        oc for oc in merged["broker_outcomes"].values()
-        if isinstance(oc, dict) and oc.get("status") == "failed"
+        oc for oc in merged["broker_outcomes"].values() if isinstance(oc, dict) and oc.get("status") == "failed"
     ]
     assert len(failed_rows) == 2
     assert merged["orders_failed_count"] == 2
@@ -33246,8 +33753,11 @@ def test_an_unresolved_retry_merge_survives_a_malformed_preserved_errors_count(t
     def _write():
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
             "AAPL": {
-                "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-                "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+                "status": "failed",
+                "order_id": None,
+                "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True,
+                "submitted_amount_usd": 2.0,
             }
         }
         try:
@@ -33317,17 +33827,13 @@ def test_an_unresolved_retry_merge_refreshes_the_evaluation_context(tmp_path):
         )
     finally:
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
-    startup_state = json.loads(
-        (artifacts_dir / "run_state.json").read_text(encoding="utf-8")
-    )
+    startup_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert startup_state["counts"]["evaluated"] == 0
     assert startup_state["signal_rows"] == []
 
     # ...then an unresolved halt into the SAME directory, which DID evaluate.
     now2, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    decisions, _errs = near_close_dca._evaluate_all_signals(
-        now2, config, list(config.tickers), fin, rh
-    )
+    decisions, _errs = near_close_dca._evaluate_all_signals(now2, config, list(config.tickers), fin, rh)
     near_close_dca._publish_in_flight_evaluation(
         decisions=decisions,
         config=config,
@@ -33338,8 +33844,11 @@ def test_an_unresolved_retry_merge_refreshes_the_evaluation_context(tmp_path):
     )
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
         }
     }
     try:
@@ -33357,9 +33866,7 @@ def test_an_unresolved_retry_merge_refreshes_the_evaluation_context(tmp_path):
     assert merged["counts"]["evaluated"] == len(decisions)
     assert merged["signal_rows"]
     assert merged["budget"]["daily_cap_usd"] > 0
-    assert merged["run_classification_outcome"] == (
-        "failed_after_connector_native_recovery_attempt"
-    )
+    assert merged["run_classification_outcome"] == ("failed_after_connector_native_recovery_attempt")
     # The companion CSV is rewritten to match the rows just written.
     signals_csv = (artifacts_dir / "signals.csv").read_text(encoding="utf-8")
     assert "AAPL" in signals_csv
@@ -33390,7 +33897,9 @@ def test_an_unresolved_retry_merge_refreshes_evaluation_despite_a_prior_submissi
     near_close_dca._IN_FLIGHT_RUN_EVALUATION.clear()
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "MSFT": {
-            "status": "submitted", "order_id": "PRIOR-SUBMIT", "buy_multiplier": 1.0,
+            "status": "submitted",
+            "order_id": "PRIOR-SUBMIT",
+            "buy_multiplier": 1.0,
             "submitted_amount_usd": 2.0,
         }
     }
@@ -33408,9 +33917,7 @@ def test_an_unresolved_retry_merge_refreshes_evaluation_despite_a_prior_submissi
     # ...then a genuinely NEW unresolved candidate (AAPL) halts into the
     # SAME directory, having actually evaluated this run's own signals.
     now2, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    decisions, _errs = near_close_dca._evaluate_all_signals(
-        now2, config, list(config.tickers), fin, rh
-    )
+    decisions, _errs = near_close_dca._evaluate_all_signals(now2, config, list(config.tickers), fin, rh)
     near_close_dca._publish_in_flight_evaluation(
         decisions=decisions,
         config=config,
@@ -33421,8 +33928,11 @@ def test_an_unresolved_retry_merge_refreshes_evaluation_despite_a_prior_submissi
     )
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
         }
     }
     try:
@@ -33471,17 +33981,33 @@ def test_an_unresolved_retry_merge_is_classified_as_a_placement_failure(tmp_path
         finally:
             near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    _write({"AAPL": {"status": "failed", "order_id": None, "buy_multiplier": 1.0,
-                     "placement_outcome_unproven": True, "submitted_amount_usd": 2.0}})
+    _write(
+        {
+            "AAPL": {
+                "status": "failed",
+                "order_id": None,
+                "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True,
+                "submitted_amount_usd": 2.0,
+            }
+        }
+    )
     # Second halted attempt into the SAME slot directory takes the merge branch.
-    _write({"AAPL": {"status": "failed", "order_id": None, "buy_multiplier": 1.0,
-                     "placement_outcome_unproven": True, "submitted_amount_usd": 2.0}})
+    _write(
+        {
+            "AAPL": {
+                "status": "failed",
+                "order_id": None,
+                "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True,
+                "submitted_amount_usd": 2.0,
+            }
+        }
+    )
 
     merged = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert merged["orders_submitted_count"] == 0
-    assert merged["run_classification_outcome"] == (
-        "failed_after_connector_native_recovery_attempt"
-    )
+    assert merged["run_classification_outcome"] == ("failed_after_connector_native_recovery_attempt")
     assert merged["error_class"] == "failed_after_connector_native_recovery_attempt"
 
 
@@ -33505,14 +34031,17 @@ def test_an_unresolved_halt_artifact_reports_the_spread_gate_counts(tmp_path):
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _AmbiguousBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _AmbiguousBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "halt-spread-counts")
 
     with pytest.raises(near_close_dca.UnresolvedPlacementError):
         run_daily_compact(
-            now, config, state, fin, rh, broker,
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
             options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
         )
 
@@ -33547,14 +34076,17 @@ def test_an_unresolved_halt_preserves_the_candidates_buy_multiplier_and_csv(tmp_
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _AmbiguousBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _AmbiguousBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "halt-multiplier-and-csv")
 
     with pytest.raises(near_close_dca.UnresolvedPlacementError):
         run_daily_compact(
-            now, config, state, fin, rh, broker,
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
             options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
         )
 
@@ -33592,8 +34124,11 @@ def test_an_unresolved_retry_merge_backfills_the_account_fingerprint(tmp_path):
     def _write(*, broker):
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
             "AAPL": {
-                "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-                "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+                "status": "failed",
+                "order_id": None,
+                "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True,
+                "submitted_amount_usd": 2.0,
             }
         }
         try:
@@ -33633,8 +34168,11 @@ def test_an_unresolved_retry_merge_never_overwrites_an_existing_fingerprint(tmp_
     def _write(*, broker):
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
             "AAPL": {
-                "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-                "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+                "status": "failed",
+                "order_id": None,
+                "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True,
+                "submitted_amount_usd": 2.0,
             }
         }
         try:
@@ -33709,8 +34247,11 @@ def test_an_unresolved_retry_merge_rejects_a_malformed_preserved_fingerprint(tmp
     def _write(*, broker):
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
             "AAPL": {
-                "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-                "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+                "status": "failed",
+                "order_id": None,
+                "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True,
+                "submitted_amount_usd": 2.0,
             }
         }
         try:
@@ -33770,8 +34311,11 @@ def test_an_unresolved_retry_merge_rejects_a_falsey_malformed_preserved_fingerpr
     def _write(*, broker):
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
             "AAPL": {
-                "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-                "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+                "status": "failed",
+                "order_id": None,
+                "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True,
+                "submitted_amount_usd": 2.0,
             }
         }
         try:
@@ -33825,8 +34369,11 @@ def test_cross_account_mismatch_does_not_contaminate_orders_csv(tmp_path):
     def _write(*, broker, execution_records=None):
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
             "AAPL": {
-                "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-                "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+                "status": "failed",
+                "order_id": None,
+                "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True,
+                "submitted_amount_usd": 2.0,
             }
         }
         try:
@@ -33849,7 +34396,10 @@ def test_cross_account_mismatch_does_not_contaminate_orders_csv(tmp_path):
     # record -- a real fill it must not be allowed to smuggle into the
     # first account's durable execution log.
     mismatched_record = near_close_dca.OrderExecutionRecord(
-        ticker="IBM", status="filled", order_id="MISMATCHED-ORD", notional_usd=5.0,
+        ticker="IBM",
+        status="filled",
+        order_id="MISMATCHED-ORD",
+        notional_usd=5.0,
     )
     _write(broker=DryRunBroker(cash=500.0, account="123456789"), execution_records=[mismatched_record])
 
@@ -33878,8 +34428,11 @@ def test_cross_account_mismatch_does_not_stamp_a_contract_failure(tmp_path):
     def _write(*, broker):
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
             "AAPL": {
-                "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-                "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+                "status": "failed",
+                "order_id": None,
+                "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True,
+                "submitted_amount_usd": 2.0,
             }
         }
         try:
@@ -33946,8 +34499,11 @@ def test_cross_account_mismatch_gate_ignores_outcomes_with_no_broker_call(tmp_pa
     _write(
         broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
         outcome={
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
         },
     )
     first = json.loads((artifacts_dir / "run_state.json").read_bytes())
@@ -33999,8 +34555,11 @@ def test_cross_account_mismatch_gate_ignores_dry_run_outcomes(tmp_path):
     _write(
         broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
         outcome={
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
         },
     )
     first = json.loads((artifacts_dir / "run_state.json").read_bytes())
@@ -34012,8 +34571,10 @@ def test_cross_account_mismatch_gate_ignores_dry_run_outcomes(tmp_path):
     _write(
         broker=DryRunBroker(cash=500.0, account="123456789"),
         outcome={
-            "status": "dry_run", "order_id": "DRY-RUN-SIM-AAPL-2.00-ref1",
-            "buy_multiplier": 1.0, "submitted_amount_usd": 2.0,
+            "status": "dry_run",
+            "order_id": "DRY-RUN-SIM-AAPL-2.00-ref1",
+            "buy_multiplier": 1.0,
+            "submitted_amount_usd": 2.0,
         },
     )
 
@@ -34057,8 +34618,11 @@ def test_cross_account_mismatch_gate_still_skips_merge_with_no_sidecar_evidence(
     _write(
         broker=DryRunBroker(cash=500.0, account=FIXTURE_ACCOUNT_NUMBER),
         outcome={
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
         },
     )
     first = json.loads((artifacts_dir / "run_state.json").read_bytes())
@@ -34100,8 +34664,11 @@ def test_cross_account_mismatch_gate_covers_execution_only_failures(tmp_path):
 
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
         }
     }
     try:
@@ -34121,7 +34688,10 @@ def test_cross_account_mismatch_gate_covers_execution_only_failures(tmp_path):
     # record but NO in-flight candidate outcomes at all -- the
     # execution-only failure path the fix above closes.
     mismatched_record = near_close_dca.OrderExecutionRecord(
-        ticker="IBM", status="filled", order_id="EXECUTION-ONLY-ORD", notional_usd=5.0,
+        ticker="IBM",
+        status="filled",
+        order_id="EXECUTION-ONLY-ORD",
+        notional_usd=5.0,
     )
     near_close_dca._write_afternoon_failure_artifacts(
         artifacts_dir,
@@ -34155,7 +34725,9 @@ def test_retry_dedup_validates_current_order_ids_before_deduplication(tmp_path):
 
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "submitted", "order_id": "ORD-1", "buy_multiplier": 1.0,
+            "status": "submitted",
+            "order_id": "ORD-1",
+            "buy_multiplier": 1.0,
             "submitted_amount_usd": 2.0,
         },
     }
@@ -34174,7 +34746,9 @@ def test_retry_dedup_validates_current_order_ids_before_deduplication(tmp_path):
     # must not raise, and must not be silently dropped either.
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "MSFT": {
-            "status": "failed", "order_id": ["BAD"], "buy_multiplier": 1.0,
+            "status": "failed",
+            "order_id": ["BAD"],
+            "buy_multiplier": 1.0,
             "submitted_amount_usd": 3.0,
         },
     }
@@ -34230,7 +34804,10 @@ def test_cross_account_mismatch_gate_ignores_dry_run_execution_records(tmp_path)
     # marker a dry run stamps when ctx.broker is not itself a
     # DryRunBroker. This must NOT be read as broker-confirmed evidence.
     dry_run_record = near_close_dca.OrderExecutionRecord(
-        ticker="IBM", status="submitted", order_id="DRY-RUN-SIM-IBM-5.00-ref-1", notional_usd=5.0,
+        ticker="IBM",
+        status="submitted",
+        order_id="DRY-RUN-SIM-IBM-5.00-ref-1",
+        notional_usd=5.0,
     )
     near_close_dca._write_afternoon_failure_artifacts(
         artifacts_dir,
@@ -34263,8 +34840,11 @@ def test_cross_account_mismatch_sidecar_persists_execution_only_evidence(tmp_pat
 
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
         }
     }
     try:
@@ -34279,7 +34859,10 @@ def test_cross_account_mismatch_sidecar_persists_execution_only_evidence(tmp_pat
         near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
     mismatched_record = near_close_dca.OrderExecutionRecord(
-        ticker="IBM", status="filled", order_id="SIDECAR-EXEC-ORD", notional_usd=5.0,
+        ticker="IBM",
+        status="filled",
+        order_id="SIDECAR-EXEC-ORD",
+        notional_usd=5.0,
     )
     near_close_dca._write_afternoon_failure_artifacts(
         artifacts_dir,
@@ -34325,10 +34908,16 @@ def test_cross_account_mismatch_sidecar_excludes_dry_run_rows_from_mixed_evidenc
     )
 
     real_record = near_close_dca.OrderExecutionRecord(
-        ticker="IBM", status="filled", order_id="REAL-EXEC-ORD", notional_usd=5.0,
+        ticker="IBM",
+        status="filled",
+        order_id="REAL-EXEC-ORD",
+        notional_usd=5.0,
     )
     dry_run_record = near_close_dca.OrderExecutionRecord(
-        ticker="MSFT", status="submitted", order_id="DRY-RUN-SIM-MSFT-3.00-ref-1", notional_usd=3.0,
+        ticker="MSFT",
+        status="submitted",
+        order_id="DRY-RUN-SIM-MSFT-3.00-ref-1",
+        notional_usd=3.0,
     )
     near_close_dca._write_afternoon_failure_artifacts(
         artifacts_dir,
@@ -34561,8 +35150,7 @@ def test_cross_account_mismatch_sidecar_excludes_a_failed_confirmation_restorati
             "buy_multiplier": 1.0,
             "broker_placement_failed": True,
             "skip_reason": (
-                "whole-share broker requires confirmation before submission; "
-                "restoration also failed: lock timeout"
+                "whole-share broker requires confirmation before submission; restoration also failed: lock timeout"
             ),
             "submitted_amount_usd": 0.0,
             "confirmation_required_no_submission": True,
@@ -35090,8 +35678,11 @@ def test_an_unresolved_retry_merge_recomputes_spread_gate_counts(tmp_path):
     # only reach place_market_buy after passing the spread gate.
     near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {
         "AAPL": {
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
+            "status": "failed",
+            "order_id": None,
+            "buy_multiplier": 1.0,
+            "placement_outcome_unproven": True,
+            "submitted_amount_usd": 2.0,
             "spread_status": "spread_ok",
         }
     }
@@ -35153,14 +35744,17 @@ def test_an_unresolved_halt_artifact_backfills_reconciled_signal_amounts(tmp_pat
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _AmbiguousBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _AmbiguousBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "halt-signal-amounts")
 
     with pytest.raises(near_close_dca.UnresolvedPlacementError):
         run_daily_compact(
-            now, config, state, fin, rh, broker,
+            now,
+            config,
+            state,
+            fin,
+            rh,
+            broker,
             options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
         )
 
@@ -35174,8 +35768,7 @@ def test_an_unresolved_halt_artifact_backfills_reconciled_signal_amounts(tmp_pat
     }
     assert planned_by_ticker
     backfilled = [
-        row for row in run_state["signal_rows"]
-        if row.get("auto_buy_signal") and row["ticker"] in planned_by_ticker
+        row for row in run_state["signal_rows"] if row.get("auto_buy_signal") and row["ticker"] in planned_by_ticker
     ]
     assert backfilled
     # Every auto-buy row reports the RECONCILED amount, not its provider's own.
@@ -35208,23 +35801,33 @@ def test_a_manual_unresolved_retry_does_not_replace_the_prior_manual_attempt(tmp
         finally:
             near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    _write({
-        "AAPL": {
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
-            "skip_reason": "first manual attempt",
+    _write(
+        {
+            "AAPL": {
+                "status": "failed",
+                "order_id": None,
+                "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True,
+                "submitted_amount_usd": 2.0,
+                "skip_reason": "first manual attempt",
+            }
         }
-    })
+    )
     first = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert first["run_classification"]["run_origin"] == "manual"
 
-    _write({
-        "NVDA": {
-            "status": "failed", "order_id": None, "buy_multiplier": 1.0,
-            "placement_outcome_unproven": True, "submitted_amount_usd": 2.0,
-            "skip_reason": "second manual attempt",
+    _write(
+        {
+            "NVDA": {
+                "status": "failed",
+                "order_id": None,
+                "buy_multiplier": 1.0,
+                "placement_outcome_unproven": True,
+                "submitted_amount_usd": 2.0,
+                "skip_reason": "second manual attempt",
+            }
         }
-    })
+    )
     second = json.loads((artifacts_dir / "run_state.json").read_bytes())
 
     # The prior manual attempt is RECOGNIZED as the same run and preserved --
@@ -35255,12 +35858,15 @@ def test_a_successful_manual_retry_merges_into_its_own_prior_manual_attempt(tmp_
     # shape build_manual_classification/_write_afternoon_failure_artifacts
     # produce: run_origin="manual", no "stream"/"scheduled_for_et" keys.
     with open(os.path.join(artifacts_dir, "run_state.json"), "w", encoding="utf-8") as handle:
-        json.dump({
-            "trading_day": trading_day_iso,
-            "run_classification": {"run_origin": "manual"},
-            "broker_outcomes": {},
-            "buy_candidates": [],
-        }, handle)
+        json.dump(
+            {
+                "trading_day": trading_day_iso,
+                "run_classification": {"run_origin": "manual"},
+                "broker_outcomes": {},
+                "buy_candidates": [],
+            },
+            handle,
+        )
     with open(os.path.join(artifacts_dir, "orders.csv"), "w", encoding="utf-8") as handle:
         handle.write("ticker,status,order_id\nMSFT,submitted,PRIOR-ORDER\n")
 
@@ -35272,9 +35878,7 @@ def test_a_successful_manual_retry_merges_into_its_own_prior_manual_attempt(tmp_
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
-    rh = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     run_daily_compact(
         now,
@@ -35315,18 +35919,12 @@ def test_a_manual_failure_artifact_is_still_foreign_to_a_scheduled_one(tmp_path)
         finally:
             near_close_dca._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
-    _write(True, {"AAPL": {"status": "failed", "order_id": None,
-                           "buy_multiplier": 1.0, "submitted_amount_usd": 2.0}})
-    scheduled_state = json.loads(
-        (artifacts_dir / "run_state.json").read_text(encoding="utf-8")
-    )
+    _write(True, {"AAPL": {"status": "failed", "order_id": None, "buy_multiplier": 1.0, "submitted_amount_usd": 2.0}})
+    scheduled_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert scheduled_state["run_classification"]["run_origin"] == "scheduled"
 
-    _write(False, {"NVDA": {"status": "failed", "order_id": None,
-                            "buy_multiplier": 1.0, "submitted_amount_usd": 2.0}})
-    manual_state = json.loads(
-        (artifacts_dir / "run_state.json").read_text(encoding="utf-8")
-    )
+    _write(False, {"NVDA": {"status": "failed", "order_id": None, "buy_multiplier": 1.0, "submitted_amount_usd": 2.0}})
+    manual_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert manual_state["run_classification"]["run_origin"] == "manual"
     assert manual_state["run_id"] != scheduled_state["run_id"]
     assert "AAPL" not in manual_state["broker_outcomes"]
@@ -35356,23 +35954,23 @@ def test_a_proven_rejection_keeps_the_brokers_own_order_id(tmp_path):
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _TerminalIdBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _TerminalIdBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "proven-rejection-id")
 
     run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
-    failed = [
-        row for row in run_state["buy_candidates"]
-        if row.get("status") == "failed"
-    ]
+    failed = [row for row in run_state["buy_candidates"] if row.get("status") == "failed"]
     assert failed
     # The id is carried, and the run is still a FAILURE -- the verdict decides
     # booking, not the presence of an id.
@@ -35385,9 +35983,7 @@ def test_a_proven_rejection_keeps_the_brokers_own_order_id(tmp_path):
     # attempt charges"). Without this, the attempt is anonymous in
     # recorded_attempt_order_ids even though the broker's own response
     # named the order.
-    assert any(
-        "ORD-CANCELLED-1" in ids for ids in state.recorded_attempt_order_ids.values()
-    )
+    assert any("ORD-CANCELLED-1" in ids for ids in state.recorded_attempt_order_ids.values())
 
 
 def test_an_unusable_rejected_order_id_is_not_recorded_as_trackable(tmp_path):
@@ -35397,9 +35993,7 @@ def test_an_unusable_rejected_order_id_is_not_recorded_as_trackable(tmp_path):
 
     class _BadIdBroker(DryRunBroker):
         def place_market_buy(self, ticker, notional_usd, ref_id):
-            raise near_close_dca.FractionalPlacementRejectedError(
-                "explicitly rejected", order_id=True
-            )
+            raise near_close_dca.FractionalPlacementRejectedError("explicitly rejected", order_id=True)
 
         def same_day_order_with_ref_id_prefix_any_state(self, ticker, trading_day, ref_id_prefixes):
             raise AssertionError("history must not be read for a proven rejection")
@@ -35410,22 +36004,22 @@ def test_an_unusable_rejected_order_id_is_not_recorded_as_trackable(tmp_path):
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _BadIdBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _BadIdBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "unusable-rejection-id")
 
     run_daily_compact(
-        now, config, state, fin, rh, broker,
+        now,
+        config,
+        state,
+        fin,
+        rh,
+        broker,
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
-    failed = [
-        row for row in run_state["buy_candidates"]
-        if row.get("status") == "failed"
-    ]
+    failed = [row for row in run_state["buy_candidates"] if row.get("status") == "failed"]
     assert failed
     assert all(row["order_id"] is None for row in failed)
 
@@ -35452,9 +36046,7 @@ def test_afternoon_partially_submitted_batch_records_the_failed_placement(tmp_pa
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _PartlyFailingBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _PartlyFailingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "partial-batch")
 
     run_daily_compact(
@@ -35467,9 +36059,7 @@ def test_afternoon_partially_submitted_batch_records_the_failed_placement(tmp_pa
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     assert run_state["orders_submitted_count"] >= 1
@@ -35477,9 +36067,7 @@ def test_afternoon_partially_submitted_batch_records_the_failed_placement(tmp_pa
     assert run_state["run_classification_outcome"] == "failed_after_partial_submission"
     assert run_state["is_trading_failure"] is True
     # The summary carries it too, so a summary-only consumer sees the failure.
-    with open(
-        os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8") as handle:
         summary = json.load(handle)
     assert summary["is_trading_failure"] is True
 
@@ -35521,9 +36109,7 @@ def test_afternoon_startup_failure_still_writes_the_complete_artifact_set(tmp_pa
             raise RuntimeError("account lookup exploded")
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    broker = _ExplodingBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _ExplodingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "afternoon-startup-failure")
 
     with pytest.raises(RuntimeError):
@@ -35546,9 +36132,7 @@ def test_afternoon_startup_failure_still_writes_the_complete_artifact_set(tmp_pa
         assert os.path.exists(os.path.join(artifacts_dir, name)), f"{name} missing"
     assert validate_run_artifacts(artifacts_dir, require_summary=True)
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     assert run_state["status"] == "failed"
     assert run_state["error_class"] == "scheduled_run_startup_failure"
@@ -35579,9 +36163,7 @@ def test_an_afternoon_failure_after_placement_preserves_the_order(tmp_path):
         tickers=config.tickers,
         approved_test_dates=config.approved_test_dates,
     )
-    broker = _FailAfterFirstBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _FailAfterFirstBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "afternoon-mid-batch")
 
     # The batch catches per-candidate placement errors, so this completes rather
@@ -35599,14 +36181,10 @@ def test_an_afternoon_failure_after_placement_preserves_the_order(tmp_path):
     except RuntimeError:
         pass
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     assert run_state["orders_submitted_count"] >= 1
-    submitted = [
-        c for c in run_state["buy_candidates"] if c.get("status") == "submitted"
-    ]
+    submitted = [c for c in run_state["buy_candidates"] if c.get("status") == "submitted"]
     assert submitted and submitted[0].get("order_id")
 
 
@@ -35641,9 +36219,7 @@ def test_an_accepted_order_survives_a_raise_in_post_placement_work(tmp_path):
             raise RuntimeError("fill lookup exploded after the order was accepted")
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    config = StrategyConfig(
-        dry_run=False, tickers=("AAPL",), approved_test_dates=config.approved_test_dates
-    )
+    config = StrategyConfig(dry_run=False, tickers=("AAPL",), approved_test_dates=config.approved_test_dates)
     broker = _FillLookupExplodes(cash=500.0, reference_prices={"AAPL": 98.0})
     artifacts_dir = os.path.join(tmp_path, "runs", "post-placement-raise")
 
@@ -35660,16 +36236,12 @@ def test_an_accepted_order_survives_a_raise_in_post_placement_work(tmp_path):
     except RuntimeError:
         pass
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     # The accepted order is in the artifact no matter which path wrote it.
     assert run_state["orders_submitted_count"] >= 1
-    submitted = [
-        c for c in run_state.get("buy_candidates", []) if c.get("status") == "submitted"
-    ]
+    submitted = [c for c in run_state.get("buy_candidates", []) if c.get("status") == "submitted"]
     assert submitted and submitted[0].get("order_id"), run_state.get("buy_candidates")
 
 
@@ -35683,9 +36255,7 @@ def test_an_afternoon_failure_refreshes_the_latest_scheduled_pointer(tmp_path):
             raise RuntimeError("account lookup exploded")
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    broker = _ExplodingBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _ExplodingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "pointer-on-failure")
     classification_root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
 
@@ -35722,9 +36292,7 @@ def test_an_afternoon_failure_state_carries_the_scheduled_run_id(tmp_path):
             raise RuntimeError("boom")
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    broker = _ExplodingBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _ExplodingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = os.path.join(tmp_path, "runs", "failure-run-id")
 
     with pytest.raises(RuntimeError):
@@ -35738,14 +36306,10 @@ def test_an_afternoon_failure_state_carries_the_scheduled_run_id(tmp_path):
             options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
         )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     assert run_state["run_id"], "failure state has no top-level run_id"
-    with open(
-        os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_summary.json"), encoding="utf-8") as handle:
         summary = json.load(handle)
     assert summary["run_id"] == run_state["run_id"]
 
@@ -35770,9 +36334,7 @@ def test_an_unreadable_blocked_state_is_replaced_not_wrapped(tmp_path):
         options=CompactRunOptions(artifacts_dir=str(artifacts_dir)),
     )
 
-    run_state = json.loads(
-        (artifacts_dir / "run_state.json").read_text(encoding="utf-8")
-    )
+    run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
     assert run_state["status"] == "blocked"
     assert run_state["completion_reason"] == "date_or_holiday_gate_blocked"
 
@@ -35793,9 +36355,7 @@ def test_a_failing_afternoon_run_with_broken_companions_denies_its_own_evidence(
             raise RuntimeError("boom")
 
     now, config, state, _broker, fin, rh = _compact_setup(tmp_path)
-    broker = _ExplodingBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    broker = _ExplodingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     artifacts_dir = pathlib.Path(tmp_path) / "runs" / "broken-companions"
     artifacts_dir.mkdir(parents=True)
     classification_root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
@@ -35858,18 +36418,10 @@ def test_a_failing_afternoon_run_with_broken_companions_denies_its_own_evidence(
             ),
         )
 
-    run_state = json.loads(
-        (artifacts_dir / "run_state.json").read_text(encoding="utf-8")
-    )
-    assert (
-        run_state["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
-    )
+    run_state = json.loads((artifacts_dir / "run_state.json").read_bytes())
+    assert run_state["artifact_contract_failure"]["failure"] == "artifact_contract_failure"
     assert run_state["scheduled_evidence_denied"] is True
-    payload = json.loads(
-        latest_scheduled_run_path(pathlib.Path(classification_root)).read_text(
-            encoding="utf-8"
-        )
-    )
+    payload = json.loads(latest_scheduled_run_path(pathlib.Path(classification_root)).read_text(encoding="utf-8"))
     assert payload["valid_scheduled_evidence"] is False
 
 
@@ -35904,9 +36456,7 @@ def test_a_cap_blocked_candidate_never_reaches_the_spread_gate(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     [candidate] = run_state["buy_candidates"]
@@ -35953,9 +36503,7 @@ def test_run_daily_compact_stops_at_the_order_count_cap(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     [candidate] = run_state["buy_candidates"]
@@ -36008,9 +36556,7 @@ def _preserved_state() -> dict[str, Any]:
                 "submitted_amount_usd": 2.0,
             }
         },
-        "buy_candidates": [
-            {"ticker": "AAA", "status": "submitted", "order_id": "o-earlier"}
-        ],
+        "buy_candidates": [{"ticker": "AAA", "status": "submitted", "order_id": "o-earlier"}],
         "orders_submitted_count": 1,
     }
 
@@ -36035,9 +36581,7 @@ def test_dry_run_backfill_persists_even_when_nothing_else_is_added(tmp_path):
     (out / "run_state.json").write_text(json.dumps(preserved), encoding="utf-8")
     _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
     try:
-        _n._write_afternoon_failure_artifacts(
-            out, _now_et(), RuntimeError("boom"), dry_run=False
-        )
+        _n._write_afternoon_failure_artifacts(out, _now_et(), RuntimeError("boom"), dry_run=False)
     finally:
         _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
@@ -36067,9 +36611,7 @@ def test_rejects_preserved_state_with_a_conflicting_dry_run_mode(tmp_path):
     (out / "run_state.json").write_text(json.dumps(preserved), encoding="utf-8")
     _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
     try:
-        _n._write_afternoon_failure_artifacts(
-            out, _now_et(), RuntimeError("boom"), dry_run=False
-        )
+        _n._write_afternoon_failure_artifacts(out, _now_et(), RuntimeError("boom"), dry_run=False)
     finally:
         _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
@@ -36104,9 +36646,7 @@ def test_preserves_a_live_state_when_a_dry_run_retry_fails(tmp_path):
     (out / "run_state.json").write_text(json.dumps(preserved), encoding="utf-8")
     _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
     try:
-        _n._write_afternoon_failure_artifacts(
-            out, _now_et(), RuntimeError("boom"), dry_run=True
-        )
+        _n._write_afternoon_failure_artifacts(out, _now_et(), RuntimeError("boom"), dry_run=True)
     finally:
         _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
@@ -36145,9 +36685,7 @@ def test_dry_run_failure_over_live_state_sidecar_redacts_outcomes(tmp_path):
         }
     }
     try:
-        _n._write_afternoon_failure_artifacts(
-            out, _now_et(), RuntimeError("boom"), dry_run=True
-        )
+        _n._write_afternoon_failure_artifacts(out, _now_et(), RuntimeError("boom"), dry_run=True)
     finally:
         _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
@@ -36188,9 +36726,7 @@ def test_dry_run_backfill_alone_still_regenerates_the_summary(tmp_path):
 
     _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
     try:
-        _n._write_afternoon_failure_artifacts(
-            out, _now_et(), RuntimeError("boom"), dry_run=False
-        )
+        _n._write_afternoon_failure_artifacts(out, _now_et(), RuntimeError("boom"), dry_run=False)
     finally:
         _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
@@ -36222,9 +36758,7 @@ def test_normalizes_a_malformed_dry_run_field_when_preserving_state(tmp_path):
     (out / "run_state.json").write_text(json.dumps(preserved), encoding="utf-8")
     _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
     try:
-        _n._write_afternoon_failure_artifacts(
-            out, _now_et(), RuntimeError("boom"), dry_run=False
-        )
+        _n._write_afternoon_failure_artifacts(out, _now_et(), RuntimeError("boom"), dry_run=False)
     finally:
         _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
@@ -36419,9 +36953,7 @@ def test_scheduled_afternoon_blocks_wide_spread_before_ordering(tmp_path):
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
     # 97 x 99 is a ~2.04% midpoint spread, above the configured 1% hard breaker.
-    rh = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.0, 99.0)
-    )
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.0, 99.0))
     artifacts_dir = os.path.join(tmp_path, "runs", "wide-spread")
 
     run_daily_compact(
@@ -36434,9 +36966,7 @@ def test_scheduled_afternoon_blocks_wide_spread_before_ordering(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     [candidate] = run_state["buy_candidates"]
@@ -36474,9 +37004,7 @@ def test_scheduled_afternoon_blocks_when_spread_unavailable(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     [candidate] = run_state["buy_candidates"]
@@ -36522,9 +37050,7 @@ def test_scheduled_afternoon_blocks_non_finite_bid_ask_quote(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     [candidate] = run_state["buy_candidates"]
@@ -36560,9 +37086,7 @@ def test_manual_run_not_blocked_when_spread_unavailable(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=False),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     [candidate] = run_state["buy_candidates"]
@@ -36581,9 +37105,7 @@ def test_scheduled_afternoon_spread_error_is_caught_and_recorded(tmp_path):
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
     fin = _FakeData(SourceName.FINANCE, 98.0, 100.0, quote=(98.0, now))
     # Provider raises on get_bid_ask (e.g. halted or missing bid/ask fields).
-    rh = _FakeDataWithRaisingBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now)
-    )
+    rh = _FakeDataWithRaisingBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now))
     artifacts_dir = os.path.join(tmp_path, "runs", "spread-error")
 
     run_daily_compact(
@@ -36596,9 +37118,7 @@ def test_scheduled_afternoon_spread_error_is_caught_and_recorded(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir, scheduled=True),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     [candidate] = run_state["buy_candidates"]
@@ -36633,9 +37153,7 @@ def test_run_daily_compact_blocks_orders_above_per_order_ceiling(tmp_path):
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
 
     candidate = run_state["buy_candidates"][0]
@@ -36669,9 +37187,9 @@ def test_write_run_artifacts_ignores_stale_orders_csv(tmp_path):
     assert usage["csv_artifact_count"] == 2
     state_size = os.path.getsize(os.path.join(out, "run_state.json"))
     assert usage["state_file_bytes"] == state_size
-    written_csv_bytes = os.path.getsize(
-        os.path.join(out, "signals.csv")
-    ) + os.path.getsize(os.path.join(out, "buy_candidates.csv"))
+    written_csv_bytes = os.path.getsize(os.path.join(out, "signals.csv")) + os.path.getsize(
+        os.path.join(out, "buy_candidates.csv")
+    )
     assert usage["total_artifact_bytes"] == state_size + written_csv_bytes
 
 
@@ -36699,12 +37217,12 @@ def test_scheduled_finalize_archives_only_after_the_contract_is_written(tmp_path
     monkeypatch.setattr(
         m,
         "_write_and_validate_scheduled_contract",
-        lambda artifacts, artifacts_dir, **_kwargs: (call_order.append("contract") or True),
+        lambda artifacts, artifacts_dir, **_kwargs: call_order.append("contract") or True,
     )
     monkeypatch.setattr(
         m,
         "_archive_intraday_observations",
-        lambda artifacts, out, decisions=(), run_state_path=None, **_kwargs: (call_order.append("archive") or None),
+        lambda artifacts, out, decisions=(), run_state_path=None, **_kwargs: call_order.append("archive") or None,
     )
 
     m._finalize_and_write_artifacts(
@@ -36726,9 +37244,7 @@ def test_scheduled_finalize_archives_only_after_the_contract_is_written(tmp_path
     assert call_order == ["write_run_artifacts", "contract", "archive"]
 
 
-def test_finalize_skips_pointer_publication_after_archive_ownership_rejection(
-    tmp_path, monkeypatch
-):
+def test_finalize_skips_pointer_publication_after_archive_ownership_rejection(tmp_path, monkeypatch):
     """Codex review ("Propagate archive ownership rejection before publishing
     the pointer"): _archive_intraday_observations can discover, under the
     run_state.json lock, that a PEER replaced this invocation's own
@@ -36773,9 +37289,7 @@ def test_finalize_skips_pointer_publication_after_archive_ownership_rejection(
     monkeypatch.setattr(
         m,
         "write_run_artifacts",
-        lambda artifacts, artifacts_dir, **_kwargs: {
-            "run_state": os.path.join(str(artifacts_dir), "run_state.json")
-        },
+        lambda artifacts, artifacts_dir, **_kwargs: {"run_state": os.path.join(str(artifacts_dir), "run_state.json")},
     )
     monkeypatch.setattr(
         m,
@@ -36839,12 +37353,12 @@ def test_manual_finalize_archives_right_after_write_run_artifacts(tmp_path, monk
     monkeypatch.setattr(
         m,
         "_write_and_validate_scheduled_contract",
-        lambda artifacts, artifacts_dir, **_kwargs: (call_order.append("contract") or True),
+        lambda artifacts, artifacts_dir, **_kwargs: call_order.append("contract") or True,
     )
     monkeypatch.setattr(
         m,
         "_archive_intraday_observations",
-        lambda artifacts, out, decisions=(), run_state_path=None, **_kwargs: (call_order.append("archive") or None),
+        lambda artifacts, out, decisions=(), run_state_path=None, **_kwargs: call_order.append("archive") or None,
     )
 
     m._finalize_and_write_artifacts(
@@ -36887,9 +37401,7 @@ def test_archive_intraday_observations_persists_failure_to_run_state(tmp_path, m
     run_state_path.write_text(json.dumps({"run_id": "r1", "signal_rows": []}))
     artifacts = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
 
-    result = m._archive_intraday_observations(
-        artifacts, tmp_path, run_state_path=run_state_path
-    )
+    result = m._archive_intraday_observations(artifacts, tmp_path, run_state_path=run_state_path)
 
     assert result is None
     assert cast(dict, artifacts["intraday_archive"])["ok"] is False
@@ -36903,17 +37415,13 @@ def test_archive_intraday_observations_persists_success_summary_too(tmp_path, mo
     import near_close_dca as m
 
     monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: "snap.json")
-    monkeypatch.setattr(
-        m, "archive_observations_safely", lambda observations: {"ok": True}
-    )
+    monkeypatch.setattr(m, "archive_observations_safely", lambda observations: {"ok": True})
 
     run_state_path = tmp_path / "run_state.json"
     run_state_path.write_text(json.dumps({"run_id": "r1", "signal_rows": []}))
     artifacts = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
 
-    result = m._archive_intraday_observations(
-        artifacts, tmp_path, run_state_path=run_state_path
-    )
+    result = m._archive_intraday_observations(artifacts, tmp_path, run_state_path=run_state_path)
 
     assert result == "snap.json"
     persisted = json.loads(run_state_path.read_bytes())
@@ -36921,10 +37429,7 @@ def test_archive_intraday_observations_persists_success_summary_too(tmp_path, mo
     assert persisted["intraday_archive"]["run_snapshot"] == "snap.json"
 
 
-
-def test_archive_intraday_observations_rejects_a_peer_state_before_annotating(
-    tmp_path, monkeypatch
-):
+def test_archive_intraday_observations_rejects_a_peer_state_before_annotating(tmp_path, monkeypatch):
     """Codex review ("Reject peer state before advancing the publication
     snapshot"): the cross_process_lock alone only serializes writers
     against EACH OTHER -- it says nothing about whether the bytes now on
@@ -36938,9 +37443,7 @@ def test_archive_intraday_observations_rejects_a_peer_state_before_annotating(
     import near_close_dca as m
 
     monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: "snap.json")
-    monkeypatch.setattr(
-        m, "archive_observations_safely", lambda observations: {"ok": True}
-    )
+    monkeypatch.setattr(m, "archive_observations_safely", lambda observations: {"ok": True})
 
     run_state_path = tmp_path / "run_state.json"
     # This invocation's own last-known-published bytes...
@@ -36956,9 +37459,7 @@ def test_archive_intraday_observations_rejects_a_peer_state_before_annotating(
 
     artifacts = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
 
-    result = m._archive_intraday_observations(
-        artifacts, tmp_path, run_state_path=run_state_path, run_result=run_result
-    )
+    result = m._archive_intraday_observations(artifacts, tmp_path, run_state_path=run_state_path, run_result=run_result)
 
     assert result == "snap.json"  # the archive write itself still succeeds
     # The peer's state on disk is untouched -- not annotated over.
@@ -36969,9 +37470,7 @@ def test_archive_intraday_observations_rejects_a_peer_state_before_annotating(
     assert run_result.published_run_state_bytes == own_published_bytes
 
 
-def test_archive_intraday_observations_preserves_contract_failure_markers(
-    tmp_path, monkeypatch
-):
+def test_archive_intraday_observations_preserves_contract_failure_markers(tmp_path, monkeypatch):
     # Codex review ("Preserve contract-failure markers when annotating run
     # state"): _write_and_validate_scheduled_contract amends the ON-DISK
     # run_state.json in place (status='blocked', artifact_contract_failure)
@@ -36982,9 +37481,7 @@ def test_archive_intraday_observations_preserves_contract_failure_markers(
     import near_close_dca as m
 
     monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: None)
-    monkeypatch.setattr(
-        m, "archive_observations_safely", lambda observations: {"ok": True}
-    )
+    monkeypatch.setattr(m, "archive_observations_safely", lambda observations: {"ok": True})
 
     run_state_path = tmp_path / "run_state.json"
     # The on-disk file already carries the contract-failure amendment that
@@ -37029,9 +37526,7 @@ def test_archive_intraday_observations_resettles_usage_bytes(tmp_path, monkeypat
     import near_close_dca as m
 
     monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: None)
-    monkeypatch.setattr(
-        m, "archive_observations_safely", lambda observations: {"ok": True}
-    )
+    monkeypatch.setattr(m, "archive_observations_safely", lambda observations: {"ok": True})
 
     (tmp_path / "signals.csv").write_text("ticker\nAAPL\n")
     run_state_path = tmp_path / "run_state.json"
@@ -37053,9 +37548,7 @@ def test_archive_intraday_observations_resettles_usage_bytes(tmp_path, monkeypat
     assert usage["total_artifact_bytes"] == state_bytes + csv_bytes
 
 
-def test_archive_intraday_observations_without_run_state_path_does_not_persist(
-    tmp_path, monkeypatch
-):
+def test_archive_intraday_observations_without_run_state_path_does_not_persist(tmp_path, monkeypatch):
     # Backward compatible: omitting run_state_path (the default) must not
     # attempt to write anywhere, matching every existing caller that has no
     # durable run_state to annotate.
@@ -37076,9 +37569,7 @@ def test_archive_intraday_observations_without_run_state_path_does_not_persist(
     assert not (tmp_path / "run_state.json").exists()
 
 
-def test_archive_intraday_observations_does_not_synthesize_missing_run_state(
-    tmp_path, monkeypatch
-):
+def test_archive_intraday_observations_does_not_synthesize_missing_run_state(tmp_path, monkeypatch):
     # Codex review ("Never synthesize run_state from in-memory artifacts when
     # the on-disk file is unusable"): if run_state.json is missing entirely --
     # e.g. because contract validation could not attach its failure marker
@@ -37089,17 +37580,13 @@ def test_archive_intraday_observations_does_not_synthesize_missing_run_state(
     import near_close_dca as m
 
     monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: None)
-    monkeypatch.setattr(
-        m, "archive_observations_safely", lambda observations: {"ok": True}
-    )
+    monkeypatch.setattr(m, "archive_observations_safely", lambda observations: {"ok": True})
 
     run_state_path = tmp_path / "run_state.json"
     assert not run_state_path.exists()
     artifacts: dict[str, Any] = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
 
-    result = m._archive_intraday_observations(
-        artifacts, tmp_path, run_state_path=run_state_path
-    )
+    result = m._archive_intraday_observations(artifacts, tmp_path, run_state_path=run_state_path)
 
     assert result is None
     # The in-memory copy is still annotated for this call's own return value...
@@ -37108,26 +37595,20 @@ def test_archive_intraday_observations_does_not_synthesize_missing_run_state(
     assert not run_state_path.exists()
 
 
-def test_archive_intraday_observations_does_not_clobber_unreadable_run_state(
-    tmp_path, monkeypatch
-):
+def test_archive_intraday_observations_does_not_clobber_unreadable_run_state(tmp_path, monkeypatch):
     # Same fail-closed rule as above, but for a run_state.json that exists
     # on disk yet cannot be parsed (malformed JSON) -- also must be left
     # untouched rather than overwritten with the in-memory artifacts.
     import near_close_dca as m
 
     monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: None)
-    monkeypatch.setattr(
-        m, "archive_observations_safely", lambda observations: {"ok": True}
-    )
+    monkeypatch.setattr(m, "archive_observations_safely", lambda observations: {"ok": True})
 
     run_state_path = tmp_path / "run_state.json"
     run_state_path.write_text("not valid json{{{")
     artifacts = {"run_id": "r1", "signal_rows": [], "trading_day": "2026-08-03"}
 
-    result = m._archive_intraday_observations(
-        artifacts, tmp_path, run_state_path=run_state_path
-    )
+    result = m._archive_intraday_observations(artifacts, tmp_path, run_state_path=run_state_path)
 
     assert result is None
     assert run_state_path.read_text() == "not valid json{{{"
@@ -37146,9 +37627,7 @@ def test_archive_intraday_observations_locks_read_modify_write(tmp_path, monkeyp
     import near_close_dca as m
 
     monkeypatch.setattr(m, "write_run_snapshot", lambda out, observations: None)
-    monkeypatch.setattr(
-        m, "archive_observations_safely", lambda observations: {"ok": True}
-    )
+    monkeypatch.setattr(m, "archive_observations_safely", lambda observations: {"ok": True})
 
     run_state_path = tmp_path / "run_state.json"
     run_state_path.write_text(json.dumps({"run_id": "r1", "signal_rows": [], "status": "ok"}))
@@ -37201,12 +37680,20 @@ def test_select_reconciled_signal_rows_picks_the_buy_winning_provider(tmp_path):
     # Robinhood here -- even when Finance is the one that actually produced
     # the reconciled BUY.
     finance_signal = SourceSignal(
-        ticker="AAPL", source=SourceName.FINANCE, action=Action.BUY, reason="ok",
-        decision_price=98.0, quote_price=98.0,
+        ticker="AAPL",
+        source=SourceName.FINANCE,
+        action=Action.BUY,
+        reason="ok",
+        decision_price=98.0,
+        quote_price=98.0,
     )
     robinhood_signal = SourceSignal(
-        ticker="AAPL", source=SourceName.ROBINHOOD, action=Action.BUY, reason="ok",
-        decision_price=97.0, quote_price=97.0,
+        ticker="AAPL",
+        source=SourceName.ROBINHOOD,
+        action=Action.BUY,
+        reason="ok",
+        decision_price=97.0,
+        quote_price=97.0,
     )
     decision = ReconciledDecision(
         ticker="AAPL",
@@ -37240,8 +37727,13 @@ def test_select_reconciled_signal_rows_picks_the_buy_winning_provider(tmp_path):
 def test_select_reconciled_signal_rows_overlays_the_target_quote_time():
     quote_time = datetime(2026, 6, 29, 15, 29, 50, tzinfo=EASTERN)
     finance_signal = SourceSignal(
-        ticker="AAPL", source=SourceName.FINANCE, action=Action.BUY, reason="ok",
-        decision_price=98.0, quote_price=98.5, quote_time=quote_time,
+        ticker="AAPL",
+        source=SourceName.FINANCE,
+        action=Action.BUY,
+        reason="ok",
+        decision_price=98.0,
+        quote_price=98.5,
+        quote_time=quote_time,
     )
     decision = ReconciledDecision(
         ticker="AAPL",
@@ -37291,21 +37783,15 @@ def test_select_reconciled_signal_rows_prefers_finance_for_non_buy_decisions():
         ticker="AAPL",
         action=Action.NO_ACTION,
         reason="mixed or flat conditions",
-        finance_signal=SourceSignal(
-            ticker="AAPL", source=SourceName.FINANCE, action=Action.NO_ACTION, reason="ok"
-        ),
-        robinhood_signal=SourceSignal(
-            ticker="AAPL", source=SourceName.ROBINHOOD, action=Action.NO_ACTION, reason="ok"
-        ),
+        finance_signal=SourceSignal(ticker="AAPL", source=SourceName.FINANCE, action=Action.NO_ACTION, reason="ok"),
+        robinhood_signal=SourceSignal(ticker="AAPL", source=SourceName.ROBINHOOD, action=Action.NO_ACTION, reason="ok"),
     )
     decision_finance_only = ReconciledDecision(
         ticker="MSFT",
         action=Action.NO_ACTION,
         reason="mixed or flat conditions",
         finance_signal=None,
-        robinhood_signal=SourceSignal(
-            ticker="MSFT", source=SourceName.ROBINHOOD, action=Action.NO_ACTION, reason="ok"
-        ),
+        robinhood_signal=SourceSignal(ticker="MSFT", source=SourceName.ROBINHOOD, action=Action.NO_ACTION, reason="ok"),
     )
     signal_rows = [
         {"ticker": "AAPL", "source": "finance"},
@@ -37445,9 +37931,7 @@ def test_top_up_guard_discards_sub_threshold_pending_credit_with_no_prior_alloca
         target_price=100.0,
     )
 
-    outcome = evaluate_top_up_guard(
-        decision, None, StrategyConfig(), existing_pending_credit_usd=0.40
-    )
+    outcome = evaluate_top_up_guard(decision, None, StrategyConfig(), existing_pending_credit_usd=0.40)
 
     assert outcome.incremental_order_amount == 0.0
     assert outcome.skipped is True
@@ -37486,16 +37970,12 @@ def test_top_up_guard_price_not_below_prior_buys_zero():
         selected_base_amount_usd=3.0,
     )
     # Equal price -> not strictly below -> $0.
-    equal = evaluate_top_up_guard(
-        _buy_decision("AAPL", 6.0, target_price=98.0), prior, StrategyConfig()
-    )
+    equal = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=98.0), prior, StrategyConfig())
     assert equal.top_up_guard_result == TOP_UP_NOT_LOWER_OR_NO_DELTA
     assert equal.incremental_order_amount == 0.0
     assert equal.skipped is True
     # Higher price -> also $0.
-    higher = evaluate_top_up_guard(
-        _buy_decision("AAPL", 6.0, target_price=98.5), prior, StrategyConfig()
-    )
+    higher = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=98.5), prior, StrategyConfig())
     assert higher.top_up_guard_result == TOP_UP_NOT_LOWER_OR_NO_DELTA
     assert higher.incremental_order_amount == 0.0
     assert higher.skipped is True
@@ -37512,9 +37992,7 @@ def test_top_up_guard_prior_exceeds_afternoon_desired_buys_zero():
         source="manual",
         selected_base_amount_usd=1.5,
     )
-    outcome = evaluate_top_up_guard(
-        _buy_decision("AAPL", 3.0, target_price=98.0), prior, StrategyConfig()
-    )
+    outcome = evaluate_top_up_guard(_buy_decision("AAPL", 3.0, target_price=98.0), prior, StrategyConfig())
     assert outcome.top_up_guard_result == TOP_UP_NOT_LOWER_OR_NO_DELTA
     assert outcome.incremental_order_amount == 0.0
     assert outcome.skipped is True
@@ -37589,9 +38067,7 @@ def test_top_up_guard_final_session_discards_sub_threshold_decline():
         source="manual",
         selected_base_amount_usd=3.0,
     )
-    outcome = evaluate_top_up_guard(
-        _buy_decision("AAPL", 6.0, target_price=98.70), prior, StrategyConfig()
-    )
+    outcome = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=98.70), prior, StrategyConfig())
     assert outcome.top_up_guard_result == TOP_UP_NOT_LOWER_OR_NO_DELTA
     assert outcome.incremental_order_amount == 0.0
     assert outcome.skipped is True
@@ -37616,9 +38092,7 @@ def test_top_up_guard_ordinary_ladder_increment_has_no_cumulative_credit_marker(
         source="manual",
         selected_base_amount_usd=3.0,
     )
-    outcome = evaluate_top_up_guard(
-        _buy_decision("AAPL", 6.0, target_price=98.0), prior, StrategyConfig()
-    )
+    outcome = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=98.0), prior, StrategyConfig())
     assert outcome.top_up_guard_result == TOP_UP_INCREMENTAL
     assert outcome.incremental_order_amount == 3.0
     assert outcome.cumulative_credit_decline_usd is None
@@ -37943,9 +38417,7 @@ def test_fresh_placement_settle_records_the_order_id_for_idempotent_dedup(tmp_pa
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.40, 100.0, quote=(98.40, now), bid_ask=(98.3, 98.5)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.40, 100.0, quote=(98.40, now), bid_ask=(98.3, 98.5))
     ledger = CumulativeCreditLedger(root=tmp_path)
     ledger.record("AAPL", trading_day.isoformat(), 0.30, stream="morning")
 
@@ -38174,9 +38646,7 @@ def test_process_buy_candidate_ignores_pending_credit_outside_the_afternoon_stre
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
     now = datetime(2026, 6, 29, 12, 30, tzinfo=EASTERN)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.0, 100.0, quote=(98.0, now), bid_ask=(97.9, 98.1))
 
     candidate_outcome, top_up_outcome, _, _, _ = _process_buy_candidate(
         decision,
@@ -38679,9 +39149,7 @@ def test_top_up_guard_cannot_flush_pending_credit_from_an_unsafe_decision():
     ("stream", "hour", "minute"),
     (("morning", 10, 30), ("midday", 12, 30)),
 )
-def test_final_session_credit_flush_is_restricted_to_the_afternoon_stream(
-    tmp_path, monkeypatch, stream, hour, minute
-):
+def test_final_session_credit_flush_is_restricted_to_the_afternoon_stream(tmp_path, monkeypatch, stream, hour, minute):
     # Codex review discussion on commit 8720cec ("Restrict the final credit
     # flush to the afternoon stream"): guard_active alone does not mean
     # "this is the 15:30 run" -- run_dca.run_slot() routes 1030ET
@@ -38708,9 +39176,7 @@ def test_final_session_credit_flush_is_restricted_to_the_afternoon_stream(
     # it would only ever reach the credit-ledger flush/discard path, never
     # the ordinary buy_candidates list.
     fin = _FakeData(SourceName.FINANCE, 100.0, 100.0, quote=(100.0, now))
-    rh = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 100.0, 100.0, quote=(100.0, now), bid_ask=(99.99, 100.01)
-    )
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 100.0, 100.0, quote=(100.0, now), bid_ask=(99.99, 100.01))
     artifacts_dir = os.path.join(tmp_path, "runs", stream)
 
     pending_scan_calls = 0
@@ -38789,9 +39255,7 @@ def test_duplicate_recovery_settles_the_aggregate_credit_ledger(tmp_path):
     broker = _RefIdTrackingBroker()
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     trading_day = date(2026, 6, 29)
-    robinhood_data = _FakeDataWithBidAsk(
-        SourceName.ROBINHOOD, 98.40, 100.0, quote=(98.40, now), bid_ask=(98.3, 98.5)
-    )
+    robinhood_data = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 98.40, 100.0, quote=(98.40, now), bid_ask=(98.3, 98.5))
     ledger = CumulativeCreditLedger(root=tmp_path)
     ledger.record("AAPL", trading_day.isoformat(), 0.30, stream="morning")
 
@@ -39027,9 +39491,7 @@ def test_prior_less_duplicate_recovery_sizes_from_the_computed_flush(tmp_path):
     # incremental_order_amount (the real $1 flush here) instead of silently
     # booking and auditing the full per-order ceiling.
     class _NoAmountDupBroker(_RefIdTrackingBroker):
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             for t, rid, _amt, order_id in self._orders:
                 if t == ticker and rid in ref_id_prefixes:
                     return {"id": order_id}  # no dollar_amount/notional
@@ -39171,9 +39633,7 @@ def test_unsafe_decision_duplicate_recovery_sizes_from_the_pending_credit(tmp_pa
     # -- it must recompute the same flush apply_cumulative_credit's own
     # branch would produce from the pending balance.
     class _NoAmountDupBroker(_RefIdTrackingBroker):
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ):
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes):
             for t, rid, _amt, order_id in self._orders:
                 if t == ticker and rid in ref_id_prefixes:
                     return {"id": order_id}  # no dollar_amount/notional
@@ -39639,9 +40099,7 @@ def test_process_buy_candidate_retries_a_still_sub_threshold_discard():
     # without a retry the balance is left pending after the day's LAST pass
     # with nothing left to resolve it. The retry carries the refreshed
     # observation, which matches the locked amount and clears.
-    ledger = _ConcurrentlySubThresholdLedger(
-        initial={"AAPL": 0.10}, updated={"AAPL": 0.20}
-    )
+    ledger = _ConcurrentlySubThresholdLedger(initial={"AAPL": 0.10}, updated={"AAPL": 0.20})
     trading_day = date(2026, 6, 29)
 
     prior = PriorSameDayAllocation(
@@ -39706,9 +40164,7 @@ def test_process_buy_candidate_re_evaluates_a_concurrently_enlarged_discard(tmp_
     # re-evaluating with the fresh $0.60 must let the now-qualifying order
     # actually place, rather than leaving the candidate at the stale
     # "skipped" verdict computed against the smaller balance.
-    ledger = _ConcurrentlyEnlargedLedger(
-        initial={"AAPL": 0.10}, enlarged={"AAPL": 0.60}
-    )
+    ledger = _ConcurrentlyEnlargedLedger(initial={"AAPL": 0.10}, enlarged={"AAPL": 0.60})
     trading_day = date(2026, 6, 29)
 
     prior = PriorSameDayAllocation(
@@ -40005,9 +40461,7 @@ def test_process_buy_candidate_restores_discarded_credit_when_the_duplicate_lack
             super().__init__(*args, **kwargs)
             self.duplicate_checks = 0
 
-        def same_day_strategy_order_exists_with_ref_id_prefix(
-            self, ticker, trading_day, ref_id_prefixes
-        ) -> Any:
+        def same_day_strategy_order_exists_with_ref_id_prefix(self, ticker, trading_day, ref_id_prefixes) -> Any:
             self.duplicate_checks += 1
             if self.duplicate_checks == 1:
                 return None
@@ -40250,9 +40704,7 @@ def test_process_buy_candidate_retries_discard_for_a_changed_sub_threshold_balan
     # against the fresh $0.30 rather than leaving it stranded in the ledger
     # forever on the mistaken assumption that False always means "now
     # qualifies for an order".
-    ledger = _ConcurrentlyChangedSubThresholdLedger(
-        initial={"AAPL": 0.20}, changed={"AAPL": 0.30}
-    )
+    ledger = _ConcurrentlyChangedSubThresholdLedger(initial={"AAPL": 0.20}, changed={"AAPL": 0.30})
     trading_day = date(2026, 6, 29)
 
     prior = PriorSameDayAllocation(
@@ -40399,9 +40851,7 @@ def test_top_up_guard_missing_prior_price_is_conservative_manual_review():
         source="manual",
         selected_base_amount_usd=3.0,
     )
-    outcome = evaluate_top_up_guard(
-        _buy_decision("AAPL", 6.0, target_price=98.0), prior, StrategyConfig()
-    )
+    outcome = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=98.0), prior, StrategyConfig())
     assert outcome.top_up_guard_result == TOP_UP_MISSING_PRIOR_PRICE
     assert outcome.incremental_order_amount == 0.0
     assert outcome.skipped is True
@@ -40418,9 +40868,7 @@ def test_top_up_guard_missing_afternoon_price_is_conservative():
         source="manual",
         selected_base_amount_usd=3.0,
     )
-    outcome = evaluate_top_up_guard(
-        _buy_decision("AAPL", 6.0, target_price=0.0), prior, StrategyConfig()
-    )
+    outcome = evaluate_top_up_guard(_buy_decision("AAPL", 6.0, target_price=0.0), prior, StrategyConfig())
     assert outcome.top_up_guard_result == TOP_UP_MISSING_PRIOR_PRICE
     assert outcome.incremental_order_amount == 0.0
     assert outcome.manual_review is True
@@ -40455,9 +40903,7 @@ def test_top_up_guard_reuses_first_allocation_base_for_later_top_up():
         target_price=94.0,
     )
     outcome = evaluate_top_up_guard(decision, prior, StrategyConfig())
-    assert (
-        outcome.afternoon_desired_amount == 4.0
-    )  # 1.0 (preserved base) * 4x, not 2.0 * 4x
+    assert outcome.afternoon_desired_amount == 4.0  # 1.0 (preserved base) * 4x, not 2.0 * 4x
     assert outcome.top_up_guard_result == TOP_UP_INCREMENTAL
     assert outcome.incremental_order_amount == 2.0  # 4.0 - 2.0, not 8.0 - 2.0 == 6.0
     # Codex review ("Persist the preserved base on top-up candidates"): the
@@ -40511,9 +40957,7 @@ def _write_prior_run(root, subdir, run_state, orders_rows=None):
         with open(os.path.join(run_dir, "orders.csv"), "w", encoding="utf-8") as handle:
             handle.write("ticker,status,avg_fill_price\n")
             for row in orders_rows:
-                handle.write(
-                    f"{row['ticker']},{row['status']},{row['avg_fill_price']}\n"
-                )
+                handle.write(f"{row['ticker']},{row['status']},{row['avg_fill_price']}\n")
     return run_dir
 
 
@@ -40523,9 +40967,7 @@ def _stamp_mtime_on_trading_day(path, trading_day):
     os.utime(path, (stamp, stamp))
 
 
-def _manual_run_state(
-    candidates, generated_at="2026-06-29T10:00:00-04:00", run_origin="manual"
-):
+def _manual_run_state(candidates, generated_at="2026-06-29T10:00:00-04:00", run_origin="manual"):
     return {
         "trading_day": "2026-06-29",
         "generated_at": generated_at,
@@ -40718,9 +41160,7 @@ def test_load_prior_same_day_counts_blocked_broker_attempt_with_zero_amount(tmp_
         },
         top_up_outcomes=None,
     )
-    assert next(row for row in buy_candidates if row["ticker"] == "AAPL")[
-        "broker_placement_failed"
-    ] is True
+    assert next(row for row in buy_candidates if row["ticker"] == "AAPL")["broker_placement_failed"] is True
     _write_prior_run(
         root,
         "20260629_1030ET",
@@ -40867,8 +41307,7 @@ def test_load_prior_same_day_excludes_a_cross_day_zero_fill_recovery_from_attemp
                     "status": "failed",
                     "planned_amount_usd": 0.0,
                     "skip_reason": (
-                        "whole-share: confirmed zero-fill terminal order reconciled cross-day "
-                        "(trading_day=2026-06-27)"
+                        "whole-share: confirmed zero-fill terminal order reconciled cross-day (trading_day=2026-06-27)"
                     ),
                     "whole_share_zero_fill_attempt": True,
                     "whole_share_claim_breakdown": [
@@ -41101,17 +41540,10 @@ def test_load_prior_same_day_csv_only_reconstruction_does_not_crash_when_merged_
     os.makedirs(csv_only_dir, exist_ok=True)
     csv_only_state = _recovery_run_state([], generated_at="2026-06-29T12:30:00-04:00")
     csv_only_state["artifacts"] = {"orders_csv_path": "filled_orders.csv"}
-    with open(
-        os.path.join(csv_only_dir, "run_state.json"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(csv_only_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(csv_only_state, handle)
-    with open(
-        os.path.join(csv_only_dir, "filled_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
-        handle.write(
-            "ticker,amount_usd,state,average_fill_price,quantity\n"
-            "SPCX,3.50,filled,109.989900,0.031821\n"
-        )
+    with open(os.path.join(csv_only_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write("ticker,amount_usd,state,average_fill_price,quantity\nSPCX,3.50,filled,109.989900,0.031821\n")
 
     # Run 2 (scanned second: later generated_at): embedded candidate for the
     # SAME ticker, reusing run 1's aggregated entry.
@@ -41121,13 +41553,9 @@ def test_load_prior_same_day_csv_only_reconstruction_does_not_crash_when_merged_
         [{"ticker": "SPCX", "status": "filled", "planned_amount_usd": 2.0}],
         generated_at="2026-06-29T13:05:00-04:00",
     )
-    with open(
-        os.path.join(candidate_dir, "run_state.json"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(candidate_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(candidate_state, handle)
-    with open(
-        os.path.join(candidate_dir, "orders.csv"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(candidate_dir, "orders.csv"), "w", encoding="utf-8") as handle:
         handle.write("ticker,status,avg_fill_price\nSPCX,filled,110.00\n")
 
     # Must not raise KeyError.
@@ -41165,12 +41593,8 @@ def test_load_prior_same_day_survives_malformed_buy_candidates(tmp_path):
                 "artifacts": {"orders_csv_path": "orders.csv"},
             },
         )
-        with open(
-            os.path.join(root, "20260629_0945ET", "orders.csv"), "w", encoding="utf-8"
-        ) as handle:
-            handle.write(
-                "ticker,status,amount_usd,avg_fill_price\nAAPL,filled,3.00,98.25\n"
-            )
+        with open(os.path.join(root, "20260629_0945ET", "orders.csv"), "w", encoding="utf-8") as handle:
+            handle.write("ticker,status,amount_usd,avg_fill_price\nAAPL,filled,3.00,98.25\n")
 
         # No TypeError, and the sibling CSV's fill is still counted.
         allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -41223,9 +41647,7 @@ def test_load_prior_same_day_flags_incomplete_when_every_status_is_malformed(tmp
     )
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), skip_sink=skip_sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
 
     assert "AAPL" not in allocations, (
         "a malformed status leaves no usable candidate evidence, and the "
@@ -41251,16 +41673,12 @@ def test_load_prior_same_day_marks_scan_incomplete_on_a_malformed_candidate_stat
     run_dir = _write_prior_run(
         root,
         "20260629_0945ET",
-        _manual_run_state(
-            [{"ticker": "BROKEN", "status": ["submitted"], "planned_amount_usd": 5.0}]
-        ),
+        _manual_run_state([{"ticker": "BROKEN", "status": ["submitted"], "planned_amount_usd": 5.0}]),
         orders_rows=[{"ticker": "BROKEN", "status": "filled", "avg_fill_price": 10.0}],
     )
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), skip_sink=skip_sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
 
     assert "BROKEN" not in allocations
     assert pathlib.Path(run_dir, "run_state.json") in skip_sink
@@ -41282,16 +41700,12 @@ def test_load_prior_same_day_marks_scan_incomplete_on_a_falsy_non_string_status(
     run_dir = _write_prior_run(
         root,
         "20260629_0945ET",
-        _manual_run_state(
-            [{"ticker": "BROKEN", "status": falsy_status, "planned_amount_usd": 5.0}]
-        ),
+        _manual_run_state([{"ticker": "BROKEN", "status": falsy_status, "planned_amount_usd": 5.0}]),
         orders_rows=[{"ticker": "BROKEN", "status": "filled", "avg_fill_price": 10.0}],
     )
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), skip_sink=skip_sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
 
     assert "BROKEN" not in allocations
     assert pathlib.Path(run_dir, "run_state.json") in skip_sink
@@ -41464,9 +41878,7 @@ def test_load_prior_same_day_processes_runs_by_timestamp_not_path_order(tmp_path
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
 
     assert allocations["AAPL"].amount_usd == 3.0
-    assert (
-        allocations["AAPL"].selected_base_amount_usd == 1.0
-    )  # 09:00's base, not 11:00's
+    assert allocations["AAPL"].selected_base_amount_usd == 1.0  # 09:00's base, not 11:00's
 
 
 def test_load_prior_same_day_allocation_unconfirmed_base_not_trusted(tmp_path):
@@ -41577,9 +41989,7 @@ def test_load_prior_same_day_unreconstructable_sentinel_uses_the_callers_ceiling
     run_state = _manual_run_state([])
     run_state["unreconstructable_submitted_tickers"] = ["AAPL"]
     _write_prior_run(root, "manual_runs/0900", run_state)
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), unreconstructable_submission_amount_usd=25.0
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), unreconstructable_submission_amount_usd=25.0)
     assert allocations["AAPL"].amount_usd == 25.0
     assert allocations["AAPL"].reference_price is None
 
@@ -41598,9 +42008,7 @@ def test_load_prior_same_day_unreconstructable_sink_records_the_ticker(tmp_path)
     run_state["unreconstructable_submitted_tickers"] = ["AAPL"]
     _write_prior_run(root, "manual_runs/0900", run_state)
     sink = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), unreconstructable_sink=sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), unreconstructable_sink=sink)
     assert "AAPL" in allocations
     assert sink == ["AAPL"]
 
@@ -41630,9 +42038,9 @@ def test_load_prior_same_day_counts_two_unreconstructable_submissions_from_separ
     assert "AAPL" in allocations
     from near_close_dca import _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
 
-    assert allocations["AAPL"].amount_usd == pytest.approx(
-        2 * _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
-    ), "each contributing run's own unreconstructable submission must be counted"
+    assert allocations["AAPL"].amount_usd == pytest.approx(2 * _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD), (
+        "each contributing run's own unreconstructable submission must be counted"
+    )
     assert allocations["AAPL"].attempt_count == 2
     assert allocations["AAPL"].reference_price is None
     assert allocations["AAPL"].notional_uncertain is True, (
@@ -41652,9 +42060,7 @@ def test_load_prior_same_day_a_resolved_allocation_is_not_notional_uncertain(tmp
     # perfectly good reconstructed amount as if it were still the
     # fail-closed sentinel estimate.
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
-    state = _manual_run_state(
-        [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 5.0}]
-    )
+    state = _manual_run_state([{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 5.0}])
     _write_prior_run(root, "manual_runs/0900", state)
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -41691,8 +42097,7 @@ def test_load_prior_same_day_records_order_ids_even_for_uncertain_rows(tmp_path)
 
     assert allocations["AAPL"].notional_uncertain is True
     assert allocations["AAPL"].contributing_order_ids == frozenset({"order-A"}), (
-        "an uncertain row's own order_id must still be recorded in "
-        "contributing_order_ids, not silently omitted"
+        "an uncertain row's own order_id must still be recorded in contributing_order_ids, not silently omitted"
     )
 
 
@@ -41764,8 +42169,7 @@ def test_load_prior_same_day_gives_a_synthetic_identity_to_an_id_less_uncertain_
         "stay empty rather than inventing an identity there"
     )
     assert allocations["AAPL"].uncertain_contributor_ids, (
-        "an id-less uncertain row must still get SOME synthetic identity, "
-        "recorded in uncertain_contributor_ids instead"
+        "an id-less uncertain row must still get SOME synthetic identity, recorded in uncertain_contributor_ids instead"
     )
 
 
@@ -41780,9 +42184,7 @@ def test_load_prior_same_day_an_id_less_row_keeps_its_identity_after_resolving(t
     # run_dca.py's bounded-reload merge from ever recognizing the
     # resolution as the SAME contributor.
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
-    unresolved_state = _manual_run_state(
-        [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": "NaN"}]
-    )
+    unresolved_state = _manual_run_state([{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": "NaN"}])
     _write_prior_run(root, "manual_runs/0900", unresolved_state)
 
     first_scan = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -41792,9 +42194,7 @@ def test_load_prior_same_day_an_id_less_row_keeps_its_identity_after_resolving(t
     # Same artifact path, same run_id, same decision-time fields -- only
     # the amount itself is corrected, exactly the "clean reload" transition
     # this loader must support.
-    resolved_state = _manual_run_state(
-        [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 4.0}]
-    )
+    resolved_state = _manual_run_state([{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 4.0}])
     _write_prior_run(root, "manual_runs/0900", resolved_state)
 
     second_scan = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -41839,8 +42239,7 @@ def test_load_prior_same_day_an_id_full_row_never_populates_uncertain_contributo
     first_scan = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert first_scan["AAPL"].contributing_order_ids == frozenset({"order-A"})
     assert first_scan["AAPL"].uncertain_contributor_ids == frozenset(), (
-        "a row that already carries an order_id must never populate "
-        "uncertain_contributor_ids"
+        "a row that already carries an order_id must never populate uncertain_contributor_ids"
     )
 
     # Same order_id, but a clean reload legitimately corrects target_price
@@ -41861,8 +42260,7 @@ def test_load_prior_same_day_an_id_full_row_never_populates_uncertain_contributo
     second_scan = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert second_scan["AAPL"].contributing_order_ids == frozenset({"order-A"})
     assert second_scan["AAPL"].uncertain_contributor_ids == frozenset(), (
-        "still id-full, still empty -- a corrected decision field must not "
-        "start populating this set"
+        "still id-full, still empty -- a corrected decision field must not start populating this set"
     )
 
 
@@ -41912,10 +42310,7 @@ def test_load_prior_same_day_different_id_less_rows_get_different_identities(tmp
     second_scan = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert second_scan["AAPL"].notional_uncertain is True
 
-    assert (
-        second_scan["AAPL"].uncertain_contributor_ids
-        != first_scan["AAPL"].uncertain_contributor_ids
-    ), (
+    assert second_scan["AAPL"].uncertain_contributor_ids != first_scan["AAPL"].uncertain_contributor_ids, (
         "two genuinely different id-less contributions must not collide "
         "onto the same synthetic identity merely by sharing a list position"
     )
@@ -41968,10 +42363,7 @@ def test_load_prior_same_day_different_decision_price_rows_get_different_identit
     second_scan = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert second_scan["AAPL"].notional_uncertain is True
 
-    assert (
-        second_scan["AAPL"].uncertain_contributor_ids
-        != first_scan["AAPL"].uncertain_contributor_ids
-    ), (
+    assert second_scan["AAPL"].uncertain_contributor_ids != first_scan["AAPL"].uncertain_contributor_ids, (
         "two genuinely different id-less morning-shaped contributions "
         "(distinct decision_price) must not collide onto the same "
         "synthetic identity"
@@ -42038,9 +42430,9 @@ def test_load_prior_same_day_counts_two_unreconstructable_submissions_with_no_ru
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
 
     assert "AAPL" in allocations
-    assert allocations["AAPL"].amount_usd == pytest.approx(
-        2 * _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
-    ), "two distinct run_id-less artifacts must each be counted, not collapsed into one"
+    assert allocations["AAPL"].amount_usd == pytest.approx(2 * _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD), (
+        "two distinct run_id-less artifacts must each be counted, not collapsed into one"
+    )
     assert allocations["AAPL"].attempt_count == 2
 
 
@@ -42091,9 +42483,9 @@ def test_load_prior_same_day_counts_two_unreconstructable_submissions_with_a_boo
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
 
     assert "AAPL" in allocations
-    assert allocations["AAPL"].amount_usd == pytest.approx(
-        2 * _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
-    ), "two distinct artifacts sharing a corrupted boolean run_id must each be counted"
+    assert allocations["AAPL"].amount_usd == pytest.approx(2 * _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD), (
+        "two distinct artifacts sharing a corrupted boolean run_id must each be counted"
+    )
     assert allocations["AAPL"].attempt_count == 2
 
 
@@ -42121,9 +42513,7 @@ def test_load_prior_same_day_admits_a_pending_row_with_a_usable_ticker_only(tmp_
 
 
 @pytest.mark.parametrize("bad_amount", ["NaN", "unknown"])
-def test_load_prior_same_day_rejects_an_unusable_notional_on_a_pending_row(
-    tmp_path, bad_amount
-):
+def test_load_prior_same_day_rejects_an_unusable_notional_on_a_pending_row(tmp_path, bad_amount):
     # Codex review ("Reject non-finite notionals for newly admitted
     # statuses"; "Fail shared caps closed for non-finite prior notionals"):
     # a newly admitted "pending"/"unconfirmed" candidate with
@@ -42142,42 +42532,32 @@ def test_load_prior_same_day_rejects_an_unusable_notional_on_a_pending_row(
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     from near_close_dca import _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
 
-    state = _manual_run_state(
-        [{"ticker": "NANTICK", "status": "pending", "planned_amount_usd": bad_amount}]
-    )
+    state = _manual_run_state([{"ticker": "NANTICK", "status": "pending", "planned_amount_usd": bad_amount}])
     _write_prior_run(root, "manual_runs/0900", state)
 
     sink: list = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), unreconstructable_sink=sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), unreconstructable_sink=sink)
 
     assert "NANTICK" in allocations
     import math as _math
 
     assert _math.isfinite(allocations["NANTICK"].amount_usd), (
-        "a non-finite planned_amount_usd must not survive into "
-        "PriorSameDayAllocation.amount_usd"
+        "a non-finite planned_amount_usd must not survive into PriorSameDayAllocation.amount_usd"
     )
     assert allocations["NANTICK"].amount_usd == _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
     assert allocations["NANTICK"].reference_price is None
     assert sink == ["NANTICK"], (
-        "a non-finite prior notional must poison the shared fail-closed "
-        "sink, not just be silently zeroed"
+        "a non-finite prior notional must poison the shared fail-closed sink, not just be silently zeroed"
     )
 
 
 def test_load_prior_same_day_rejects_a_boolean_pending_notional(tmp_path):
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
-    state = _manual_run_state(
-        [{"ticker": "BOOL", "status": "pending", "planned_amount_usd": True}]
-    )
+    state = _manual_run_state([{"ticker": "BOOL", "status": "pending", "planned_amount_usd": True}])
     _write_prior_run(root, "manual_runs/0900", state)
     sink: list = []
 
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), unreconstructable_sink=sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), unreconstructable_sink=sink)
 
     assert allocations["BOOL"].notional_uncertain is True
     assert sink == ["BOOL"]
@@ -42185,15 +42565,11 @@ def test_load_prior_same_day_rejects_a_boolean_pending_notional(tmp_path):
 
 def test_load_prior_same_day_rejects_an_oversized_pending_notional(tmp_path):
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
-    state = _manual_run_state(
-        [{"ticker": "HUGE", "status": "pending", "planned_amount_usd": 10**4000}]
-    )
+    state = _manual_run_state([{"ticker": "HUGE", "status": "pending", "planned_amount_usd": 10**4000}])
     _write_prior_run(root, "manual_runs/0900", state)
     sink: list = []
 
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), unreconstructable_sink=sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), unreconstructable_sink=sink)
 
     assert allocations["HUGE"].notional_uncertain is True
     assert sink == ["HUGE"]
@@ -42202,30 +42578,26 @@ def test_load_prior_same_day_rejects_an_oversized_pending_notional(tmp_path):
 def test_load_prior_same_day_poisons_an_overfilled_claim_breakdown(tmp_path):
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     state = _manual_run_state(
-        [{
-            "ticker": "OVER",
-            "status": "filled",
-            "planned_amount_usd": 30.0,
-            "whole_share_claim_breakdown": [
-                {"trading_day": "2026-06-28", "amount_usd": 40.0}
-            ],
-        }]
+        [
+            {
+                "ticker": "OVER",
+                "status": "filled",
+                "planned_amount_usd": 30.0,
+                "whole_share_claim_breakdown": [{"trading_day": "2026-06-28", "amount_usd": 40.0}],
+            }
+        ]
     )
     _write_prior_run(root, "manual_runs/0900", state)
     sink: list = []
 
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), unreconstructable_sink=sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), unreconstructable_sink=sink)
 
     assert allocations["OVER"].notional_uncertain is True
     assert sink == ["OVER"]
 
 
 @pytest.mark.parametrize("bad_amount", ["NaN", "unknown"])
-def test_load_prior_same_day_prefers_a_confirmed_fill_over_a_malformed_plan(
-    tmp_path, bad_amount
-):
+def test_load_prior_same_day_prefers_a_confirmed_fill_over_a_malformed_plan(tmp_path, bad_amount):
     # Codex review ("Prefer confirmed fills before poisoning malformed
     # plans"): the non-finite check used to run BEFORE the fill-override
     # attempt, so a candidate with a corrupted planned_amount_usd poisoned
@@ -42237,20 +42609,14 @@ def test_load_prior_same_day_prefers_a_confirmed_fill_over_a_malformed_plan(
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(
-            _manual_run_state(
-                [{"ticker": "AMZN", "status": "filled", "planned_amount_usd": bad_amount}]
-            ),
+            _manual_run_state([{"ticker": "AMZN", "status": "filled", "planned_amount_usd": bad_amount}]),
             handle,
         )
-    with open(
-        os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
         handle.write("ticker,amount_usd,avg_fill_price\nAMZN,2.5,242.1099\n")
 
     sink: list = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), unreconstructable_sink=sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), unreconstructable_sink=sink)
 
     assert allocations["AMZN"].amount_usd == 2.5, (
         "the confirmed CSV fill must recover the authoritative amount "
@@ -42271,15 +42637,11 @@ def test_load_prior_same_day_poisons_a_nonpositive_in_flight_amount(tmp_path):
     root = os.path.join(tmp_path, "cron_tracking", "ce16ba6b")
     from near_close_dca import _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
 
-    state = _manual_run_state(
-        [{"ticker": "ZEROTICK", "status": "pending", "planned_amount_usd": -5.0}]
-    )
+    state = _manual_run_state([{"ticker": "ZEROTICK", "status": "pending", "planned_amount_usd": -5.0}])
     _write_prior_run(root, "manual_runs/0900", state)
 
     sink: list = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), unreconstructable_sink=sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), unreconstructable_sink=sink)
 
     assert allocations["ZEROTICK"].amount_usd == _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD
     assert allocations["ZEROTICK"].reference_price is None
@@ -42321,9 +42683,7 @@ def test_load_prior_same_day_still_exempts_a_recovered_lease_zero(tmp_path):
     _write_prior_run(root, "manual_runs/0900", state)
 
     sink: list = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), unreconstructable_sink=sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), unreconstructable_sink=sink)
 
     assert allocations["LEASETICK"].amount_usd == 0.0
     assert sink == []
@@ -42417,12 +42777,9 @@ def test_load_prior_same_day_counts_unreconstructable_submissions_once_per_run(t
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
 
     assert allocations["AAPL"].amount_usd == 2 * _UNRECONSTRUCTABLE_SUBMISSION_AMOUNT_USD, (
-        "each contributing run's own sentinel amount must be counted, not "
-        "just the first run scanned"
+        "each contributing run's own sentinel amount must be counted, not just the first run scanned"
     )
-    assert allocations["AAPL"].attempt_count == 2, (
-        "each contributing run consumed its own max_orders_per_day slot"
-    )
+    assert allocations["AAPL"].attempt_count == 2, "each contributing run consumed its own max_orders_per_day slot"
     assert allocations["AAPL"].reference_price is None
 
 
@@ -42448,9 +42805,7 @@ def test_load_prior_same_day_includes_correctly_classified_manual_recovery(tmp_p
     _write_prior_run(
         root,
         "manual_recovery/20260629_1048ET",
-        _manual_recovery_run_state(
-            [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0}]
-        ),
+        _manual_recovery_run_state([{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0}]),
     )
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert set(allocations) == {"AAPL"}
@@ -42482,9 +42837,7 @@ def test_load_prior_same_day_excludes_manual_recovery_missing_classification(tmp
         {
             "trading_day": "2026-06-29",
             "generated_at": "2026-06-29T10:48:00-04:00",
-            "buy_candidates": [
-                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0}
-            ],
+            "buy_candidates": [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0}],
         },
     )
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -42547,9 +42900,7 @@ def test_load_prior_same_day_reads_manual_override_filled_orders_csv(tmp_path):
             ),
             handle,
         )
-    with open(
-        os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
         handle.write("ticker,amount_usd,avg_fill_price\nAMZN,2.5,242.1099\n")
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
     assert allocations["AMZN"].amount_usd == 2.5
@@ -42572,9 +42923,7 @@ def test_load_prior_same_day_reads_documented_manual_filled_orders_shape(tmp_pat
             ),
             handle,
         )
-    with open(
-        os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
         handle.write("ticker,amount_usd,avg_fill_price\nAMZN,4.25,242.1099\n")
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -42765,9 +43114,7 @@ def test_submitted_notionals_keep_rows_without_a_state_column(tmp_path):
     from near_close_dca import _orders_csv_submitted_notionals
 
     csv_path = tmp_path / "submitted_orders.csv"
-    csv_path.write_text(
-        "ticker,status,notional_usd\nAAPL,submitted,5.00\n", encoding="utf-8"
-    )
+    csv_path.write_text("ticker,status,notional_usd\nAAPL,submitted,5.00\n", encoding="utf-8")
 
     assert _orders_csv_submitted_notionals(csv_path) == {"AAPL": 5.00}
 
@@ -42789,8 +43136,7 @@ def test_submitted_notionals_reserve_potentially_submitted_rows(tmp_path):
 
     csv_path = tmp_path / "submitted_orders.csv"
     csv_path.write_text(
-        "ticker,status,submitted_amount_usd\n"
-        "NVDA,potentially_submitted,10.00\n",
+        "ticker,status,submitted_amount_usd\nNVDA,potentially_submitted,10.00\n",
         encoding="utf-8",
     )
 
@@ -42808,8 +43154,7 @@ def test_orders_csv_fills_accepts_broker_state_filled_over_submitted_status(tmp_
     run_dir = tmp_path / "20260727_1430ET_recovery_1432ET"
     run_dir.mkdir(parents=True)
     (run_dir / "filled_orders.csv").write_text(
-        "ticker,status,state,amount_usd,average_fill_price,quantity\n"
-        "EVR,submitted,filled,1.00,336.916900,0.002968\n",
+        "ticker,status,state,amount_usd,average_fill_price,quantity\nEVR,submitted,filled,1.00,336.916900,0.002968\n",
         encoding="utf-8",
     )
 
@@ -42923,13 +43268,8 @@ def test_load_prior_same_day_reads_midday_recovery_artifact(tmp_path):
             ),
             handle,
         )
-    with open(
-        os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
-        handle.write(
-            "ticker,amount_usd,state,average_fill_price,quantity\n"
-            "SPCX,3.50,filled,109.989900,0.031821\n"
-        )
+    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write("ticker,amount_usd,state,average_fill_price,quantity\nSPCX,3.50,filled,109.989900,0.031821\n")
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
 
@@ -42963,14 +43303,11 @@ def test_load_prior_same_day_follows_recorded_csv_for_candidate_backed_recovery(
         ]
     )
     state["artifacts"] = {"orders_csv_path": "../executions.csv"}
-    with open(
-        os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(state, handle)
     with open(os.path.join(run_dir, "executions.csv"), "w", encoding="utf-8") as handle:
         handle.write(
-            "ticker,amount_usd,state,average_fill_price,quantity\n"
-            "SPCX,1.20,partially_filled,109.989900,0.010910\n"
+            "ticker,amount_usd,state,average_fill_price,quantity\nSPCX,1.20,partially_filled,109.989900,0.010910\n"
         )
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -43006,9 +43343,7 @@ def test_load_prior_same_day_survives_malformed_recorded_csv_path(tmp_path):
 
     good_dir = os.path.join(root, "manual_reruns", "1505")
     os.makedirs(good_dir, exist_ok=True)
-    with open(
-        os.path.join(good_dir, "run_state.json"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(good_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(
             _manual_run_state(
                 [
@@ -43017,15 +43352,11 @@ def test_load_prior_same_day_survives_malformed_recorded_csv_path(tmp_path):
             ),
             handle,
         )
-    with open(
-        os.path.join(good_dir, "filled_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(good_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
         handle.write("ticker,amount_usd,avg_fill_price\nAMZN,2.5,242.1099\n")
 
     skipped = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), skip_sink=skipped
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skipped)
 
     # The scan completed rather than raising, and the good artifact loaded.
     assert allocations["AMZN"].amount_usd == 2.5
@@ -43067,9 +43398,7 @@ def test_load_prior_same_day_honors_terminal_rejection_for_candidate_recovery(tm
     state["artifacts"] = {"orders_csv_path": "filled_orders.csv"}
     with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(state, handle)
-    with open(
-        os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
         handle.write(
             "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
             "EVR,ORD-REJECTED,5.00,rejected,,0\n"
@@ -43114,12 +43443,9 @@ def test_load_prior_same_day_records_order_ids_for_terminal_rejections(tmp_path)
     state["artifacts"] = {"orders_csv_path": "filled_orders.csv"}
     with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(state, handle)
-    with open(
-        os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
         handle.write(
-            "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
-            "EVR,ORD-REJECTED,5.00,rejected,,0\n"
+            "ticker,order_id,amount_usd,state,average_fill_price,quantity\nEVR,ORD-REJECTED,5.00,rejected,,0\n"
         )
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -43133,19 +43459,22 @@ def test_idless_ambiguous_candidate_ignores_ticker_level_terminal_rejection(tmp_
     root = os.path.join(tmp_path, "cron_tracking", "midday_dca")
     run_dir = os.path.join(root, "20260629_1230ET_recovery_1305ET")
     os.makedirs(run_dir, exist_ok=True)
-    state = _recovery_run_state([{
-        "ticker": "EVR",
-        "status": "failed",
-        "ambiguous_placement_exception": True,
-        "planned_amount_usd": 5.0,
-    }])
+    state = _recovery_run_state(
+        [
+            {
+                "ticker": "EVR",
+                "status": "failed",
+                "ambiguous_placement_exception": True,
+                "planned_amount_usd": 5.0,
+            }
+        ]
+    )
     state["artifacts"] = {"orders_csv_path": "filled_orders.csv"}
     with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(state, handle)
     with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
         handle.write(
-            "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
-            "EVR,UNRELATED-REJECTED,0,rejected,,0\n"
+            "ticker,order_id,amount_usd,state,average_fill_price,quantity\nEVR,UNRELATED-REJECTED,0,rejected,,0\n"
         )
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -43215,23 +43544,15 @@ def test_load_prior_same_day_merges_recorded_fills_with_sibling_fills(tmp_path):
         ]
     )
     state["artifacts"] = {"orders_csv_path": "../executions.csv"}
-    with open(
-        os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(state, handle)
     # A fill sits BESIDE run_state.json, so `fills` is already truthy.
-    with open(
-        os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
-        handle.write(
-            "ticker,amount_usd,state,average_fill_price,quantity\n"
-            "AMZN,1.00,filled,231.429900,0.004320\n"
-        )
+    with open(os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write("ticker,amount_usd,state,average_fill_price,quantity\nAMZN,1.00,filled,231.429900,0.004320\n")
     # The recorded in-root CSV confirms a DIFFERENT ticker.
     with open(os.path.join(run_dir, "executions.csv"), "w", encoding="utf-8") as handle:
         handle.write(
-            "ticker,amount_usd,state,average_fill_price,quantity\n"
-            "GFUZ,10.00,partially_filled,6.249900,0.480000\n"
+            "ticker,amount_usd,state,average_fill_price,quantity\nGFUZ,10.00,partially_filled,6.249900,0.480000\n"
         )
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -43290,14 +43611,10 @@ def test_load_prior_same_day_prefers_a_final_fill_over_a_stale_partial(tmp_path)
         ]
     )
     state["artifacts"] = {"orders_csv_path": "../executions.csv"}
-    with open(
-        os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(state, handle)
     # Stale snapshot beside the state: only part of the order had executed.
-    with open(
-        os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
         handle.write(
             "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
             "GFUZ,ORD-GFUZ,10.00,partially_filled,6.249900,0.480000\n"
@@ -43374,7 +43691,7 @@ def test_submitted_notionals_read_the_recovery_amount_column(tmp_path):
 
     csv_path = tmp_path / "submitted_orders.csv"
     csv_path.write_text(
-        "ticker,state,amount_usd\n" "AMZN,pending,1.00\n" "GFUZ,queued,10.00\n",
+        "ticker,state,amount_usd\nAMZN,pending,1.00\nGFUZ,queued,10.00\n",
         encoding="utf-8",
     )
     notionals = _orders_csv_submitted_notionals(csv_path)
@@ -43412,21 +43729,15 @@ def test_load_prior_same_day_sums_two_distinct_orders_for_one_ticker(tmp_path):
         ]
     )
     state["artifacts"] = {"orders_csv_path": "../executions.csv"}
-    with open(
-        os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(state, handle)
-    with open(
-        os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
         handle.write(
-            "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
-            "GFUZ,ORD-A,4.00,filled,4.000000,1.000000\n"
+            "ticker,order_id,amount_usd,state,average_fill_price,quantity\nGFUZ,ORD-A,4.00,filled,4.000000,1.000000\n"
         )
     with open(os.path.join(run_dir, "executions.csv"), "w", encoding="utf-8") as handle:
         handle.write(
-            "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
-            "GFUZ,ORD-B,6.00,filled,2.000000,3.000000\n"
+            "ticker,order_id,amount_usd,state,average_fill_price,quantity\nGFUZ,ORD-B,6.00,filled,2.000000,3.000000\n"
         )
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -43458,21 +43769,16 @@ def test_load_prior_same_day_does_not_sum_the_same_order_twice(tmp_path):
         ]
     )
     state["artifacts"] = {"orders_csv_path": "../executions.csv"}
-    with open(
-        os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(state_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(state, handle)
-    with open(
-        os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(state_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
         handle.write(
             "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
             "GFUZ,ORD-A,4.00,partially_filled,4.000000,1.000000\n"
         )
     with open(os.path.join(run_dir, "executions.csv"), "w", encoding="utf-8") as handle:
         handle.write(
-            "ticker,order_id,amount_usd,state,average_fill_price,quantity\n"
-            "GFUZ,ORD-A,4.00,filled,4.000000,1.000000\n"
+            "ticker,order_id,amount_usd,state,average_fill_price,quantity\nGFUZ,ORD-A,4.00,filled,4.000000,1.000000\n"
         )
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -43510,16 +43816,9 @@ def test_prior_run_is_scheduled_treats_recovery_streams_as_prior_context():
         assert _prior_run_is_scheduled(state) is False, stream
         # Without it the artifact is ignored (True = treated as scheduled), the
         # safe direction and the one the allocation loader already takes.
-        assert (
-            _prior_run_is_scheduled(
-                {"run_classification": _recovery_classification(stream)}
-            )
-            is True
-        ), stream
+        assert _prior_run_is_scheduled({"run_classification": _recovery_classification(stream)}) is True, stream
 
-    afternoon = {
-        "run_classification": {"stream": "afternoon", "run_origin": "scheduled"}
-    }
+    afternoon = {"run_classification": {"stream": "afternoon", "run_origin": "scheduled"}}
     assert _prior_run_is_scheduled(afternoon) is True
 
 
@@ -43581,10 +43880,7 @@ def test_recovery_orders_csv_path_outside_run_dir_is_ignored(tmp_path):
     os.makedirs(outside_dir, exist_ok=True)
     outside_csv = os.path.join(outside_dir, "filled_orders.csv")
     with open(outside_csv, "w", encoding="utf-8") as handle:
-        handle.write(
-            "ticker,amount_usd,state,average_fill_price,quantity\n"
-            "AAPL,99.00,filled,100.0,0.99\n"
-        )
+        handle.write("ticker,amount_usd,state,average_fill_price,quantity\nAAPL,99.00,filled,100.0,0.99\n")
 
     state = _recovery_run_state([])  # no buy_candidates -> the CSV branch
     state["artifacts"] = {"orders_csv_path": outside_csv}
@@ -43605,10 +43901,7 @@ def test_recovery_orders_csv_path_inside_run_dir_is_loaded(tmp_path):
     os.makedirs(run_dir, exist_ok=True)
     inside_csv = os.path.join(run_dir, "dca_recovery_20260629_orders.csv")
     with open(inside_csv, "w", encoding="utf-8") as handle:
-        handle.write(
-            "ticker,amount_usd,state,average_fill_price,quantity\n"
-            "SPCX,3.50,filled,109.9899,0.031821\n"
-        )
+        handle.write("ticker,amount_usd,state,average_fill_price,quantity\nSPCX,3.50,filled,109.9899,0.031821\n")
 
     state = _recovery_run_state([])
     state["artifacts"] = {"orders_csv_path": inside_csv}
@@ -43650,9 +43943,7 @@ def test_market_open_bare_submitted_orders_csv_is_read_with_no_candidates_or_rec
     }
     with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(state, handle)
-    with open(
-        os.path.join(run_dir, "submitted_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(run_dir, "submitted_orders.csv"), "w", encoding="utf-8") as handle:
         handle.write(
             "ticker,order_id,status,submitted_amount_usd,avg_fill_price,quantity_filled\n"
             "AAAU,ORD-1,filled,2.00,50.00,0.04\n"
@@ -43688,12 +43979,9 @@ def test_market_open_bare_submitted_orders_csv_unresolved_submitted_row(tmp_path
     }
     with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(state, handle)
-    with open(
-        os.path.join(run_dir, "submitted_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(run_dir, "submitted_orders.csv"), "w", encoding="utf-8") as handle:
         handle.write(
-            "ticker,order_id,status,submitted_amount_usd,avg_fill_price,quantity_filled\n"
-            "AAAU,ORD-1,submitted,2.00,,\n"
+            "ticker,order_id,status,submitted_amount_usd,avg_fill_price,quantity_filled\nAAAU,ORD-1,submitted,2.00,,\n"
         )
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -43733,9 +44021,7 @@ def test_market_open_bare_submitted_orders_csv_reserves_pending_and_unconfirmed_
     }
     with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(state, handle)
-    with open(
-        os.path.join(run_dir, "submitted_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(run_dir, "submitted_orders.csv"), "w", encoding="utf-8") as handle:
         handle.write(
             "ticker,order_id,status,submitted_amount_usd,avg_fill_price,quantity_filled\n"
             "AAAU,ORD-1,pending,2.00,,\n"
@@ -43764,18 +44050,10 @@ def test_recovery_external_csv_path_falls_back_to_the_local_sibling(tmp_path):
     os.makedirs(outside_dir, exist_ok=True)
     outside_csv = os.path.join(outside_dir, "filled_orders.csv")
     with open(outside_csv, "w", encoding="utf-8") as handle:
-        handle.write(
-            "ticker,amount_usd,state,average_fill_price,quantity\n"
-            "AAPL,99.00,filled,100.0,0.99\n"
-        )
+        handle.write("ticker,amount_usd,state,average_fill_price,quantity\nAAPL,99.00,filled,100.0,0.99\n")
     # The SAME basename, locally, with this run's real fills.
-    with open(
-        os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
-        handle.write(
-            "ticker,amount_usd,state,average_fill_price,quantity\n"
-            "SPCX,3.50,filled,109.9899,0.031821\n"
-        )
+    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
+        handle.write("ticker,amount_usd,state,average_fill_price,quantity\nSPCX,3.50,filled,109.9899,0.031821\n")
 
     state = _recovery_run_state([])
     state["artifacts"] = {"orders_csv_path": outside_csv}
@@ -43800,9 +44078,7 @@ def test_prior_run_is_scheduled_gates_on_recovery_origin_not_stream_name():
     from near_close_dca import _prior_run_is_scheduled
 
     for stream in ("intraday_bogus", None, 123, "", "midday", [], {}):
-        state = {
-            "run_classification": {"run_origin": "scheduled_recovery", "stream": stream}
-        }
+        state = {"run_classification": {"run_origin": "scheduled_recovery", "stream": stream}}
         assert _prior_run_is_scheduled(state) is True, stream
 
     # A conforming recovery artifact is still eligible prior context. It needs
@@ -43893,9 +44169,7 @@ def test_load_prior_same_day_multi_merges_roots_sums_amounts_most_recent_referen
             run_origin="manual_midday",
         ),
     )
-    allocations = load_prior_same_day_allocations_multi(
-        (morning_root, midday_root), date(2026, 6, 29)
-    )
+    allocations = load_prior_same_day_allocations_multi((morning_root, midday_root), date(2026, 6, 29))
     assert allocations["AAPL"].amount_usd == 7.5
     assert allocations["AAPL"].reference_price == 99.0
 
@@ -44115,9 +44389,7 @@ def test_load_prior_same_day_multi_partial_overlap_falls_back_to_summing(tmp_pat
         },
     )
 
-    allocations = load_prior_same_day_allocations_multi(
-        (root_a, root_b), date(2026, 6, 29)
-    )
+    allocations = load_prior_same_day_allocations_multi((root_a, root_b), date(2026, 6, 29))
 
     # root_b's own per-root total is already 2.0 (mirrored) + 3.0 (genuine) =
     # 5.0; only a FULL subset match against root_a's {shared_run_A} would
@@ -44163,9 +44435,7 @@ def test_load_prior_same_day_multi_missing_reference_poisons_to_none(tmp_path):
         ),
         orders_rows=[{"ticker": "AAPL", "status": "submitted", "avg_fill_price": ""}],
     )
-    allocations = load_prior_same_day_allocations_multi(
-        (morning_root, midday_root), date(2026, 6, 29)
-    )
+    allocations = load_prior_same_day_allocations_multi((morning_root, midday_root), date(2026, 6, 29))
     assert allocations["AAPL"].amount_usd == 7.5
     assert allocations["AAPL"].reference_price is None
     assert allocations["AAPL"].reference_ts is None
@@ -44335,17 +44605,11 @@ def test_load_prior_same_day_includes_morning_scheduled_run(tmp_path):
                 "manual_run": False,
                 "run_id": "morning_live_20260629_0945ET",
             },
-            "buy_candidates": [
-                {"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0}
-            ],
+            "buy_candidates": [{"ticker": "AAPL", "status": "submitted", "planned_amount_usd": 3.0}],
         },
     )
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), additional_state_roots=[morning_root]
-    )
-    assert (
-        "AAPL" in allocations
-    ), "morning scheduled run must appear as prior allocation context"
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), additional_state_roots=[morning_root])
+    assert "AAPL" in allocations, "morning scheduled run must appear as prior allocation context"
     assert allocations["AAPL"].amount_usd == 3.0
 
 
@@ -44452,14 +44716,10 @@ def test_load_prior_same_day_preserves_amount_only_fill_as_unknown_price(tmp_pat
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(
-            _manual_run_state(
-                [{"ticker": "AMZN", "status": "filled", "planned_amount_usd": 3.0}]
-            ),
+            _manual_run_state([{"ticker": "AMZN", "status": "filled", "planned_amount_usd": 3.0}]),
             handle,
         )
-    with open(
-        os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(run_dir, "filled_orders.csv"), "w", encoding="utf-8") as handle:
         handle.write("ticker,amount_usd,avg_fill_price\nAMZN,2.5,\n")
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -44477,15 +44737,11 @@ def test_load_prior_same_day_quantity_only_fill_without_price_does_not_crash(tmp
     _write_prior_run(
         root,
         "manual_runs/0900",
-        _manual_run_state(
-            [{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0}]
-        ),
+        _manual_run_state([{"ticker": "AAPL", "status": "filled", "planned_amount_usd": 3.0}]),
     )
     orders_csv = os.path.join(root, "manual_runs", "0900", "orders.csv")
     with open(orders_csv, "w", encoding="utf-8") as handle:
-        handle.write(
-            "ticker,status,avg_fill_price,quantity_filled\nAAPL,filled,,0.05\n"
-        )
+        handle.write("ticker,status,avg_fill_price,quantity_filled\nAAPL,filled,,0.05\n")
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
 
@@ -44532,9 +44788,7 @@ def test_run_daily_compact_checks_per_order_cap_before_broker_duplicate_lookup(
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     candidate = run_state["buy_candidates"][0]
     assert candidate["status"] == "blocked"
@@ -44663,14 +44917,10 @@ def test_run_daily_compact_top_up_records_incremental(tmp_path):
         fin,
         rh,
         broker,
-        options=CompactRunOptions(
-            artifacts_dir=artifacts_dir, prior_same_day_allocations=prior
-        ),
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, prior_same_day_allocations=prior),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     aapl = by_ticker["AAPL"]
@@ -44720,9 +44970,7 @@ def test_run_daily_compact_fully_offset_still_writes_valid_state(tmp_path):
         fin,
         rh,
         broker,
-        options=CompactRunOptions(
-            artifacts_dir=artifacts_dir, prior_same_day_allocations=prior
-        ),
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, prior_same_day_allocations=prior),
     )
 
     assert result["blocked"] is False
@@ -44749,9 +44997,7 @@ def test_run_daily_compact_manual_run_does_not_block_scheduled(tmp_path):
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-    blocking = _BlockingBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    blocking = _BlockingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     prior = {
         "AAPL": PriorSameDayAllocation(
             "AAPL",
@@ -44770,14 +45016,10 @@ def test_run_daily_compact_manual_run_does_not_block_scheduled(tmp_path):
         fin,
         rh,
         blocking,
-        options=CompactRunOptions(
-            artifacts_dir=artifacts_dir, prior_same_day_allocations=prior
-        ),
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, prior_same_day_allocations=prior),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     # Guard bypassed the same-day broker block and still topped up AAPL, which
@@ -44835,12 +45077,12 @@ def test_build_run_artifacts_uses_guarded_amount_as_planned_notional(tmp_path):
         run_context=ArtifactRunContext(top_up_outcomes={"AAPL": guard}),
     )
     candidates = {c["ticker"]: c for c in artifacts["buy_candidates"]}
-    assert (
-        candidates["AAPL"]["planned_amount_usd"] == 3.0
-    ), "planned_amount_usd must equal incremental_order_amount, not the full desired amount"
-    assert (
-        candidates["AAPL"]["afternoon_desired_amount_usd"] == 6.0
-    ), "original desired amount must be preserved in afternoon_desired_amount_usd"
+    assert candidates["AAPL"]["planned_amount_usd"] == 3.0, (
+        "planned_amount_usd must equal incremental_order_amount, not the full desired amount"
+    )
+    assert candidates["AAPL"]["afternoon_desired_amount_usd"] == 6.0, (
+        "original desired amount must be preserved in afternoon_desired_amount_usd"
+    )
 
 
 def test_build_buy_candidates_copies_aggregate_topup_fields_into_every_row(tmp_path):
@@ -44969,9 +45211,7 @@ def test_build_run_artifacts_includes_a_submitted_pending_credit_flush(tmp_path)
         config,
         state,
         [decision],
-        candidate_outcomes={
-            "AAPL": {"order_id": "FLUSH-1", "status": "dry_run", "submitted_amount_usd": 1.0}
-        },
+        candidate_outcomes={"AAPL": {"order_id": "FLUSH-1", "status": "dry_run", "submitted_amount_usd": 1.0}},
         run_context=ArtifactRunContext(top_up_outcomes={"AAPL": guard}),
     )
 
@@ -45022,11 +45262,13 @@ def test_build_run_artifacts_counts_selloff_breadth_from_the_raw_ladder_tier(tmp
         for ticker in tickers
     ]
     candidate_outcomes = {
-        ticker: {"order_id": f"{ticker}-1", "status": "dry_run", "submitted_amount_usd": 5.0}
-        for ticker in tickers
+        ticker: {"order_id": f"{ticker}-1", "status": "dry_run", "submitted_amount_usd": 5.0} for ticker in tickers
     }
     artifacts = build_run_artifacts(
-        now, config, state, decisions,
+        now,
+        config,
+        state,
+        decisions,
         candidate_outcomes=candidate_outcomes,
         run_context=ArtifactRunContext(),
     )
@@ -45057,7 +45299,10 @@ def test_build_run_artifacts_still_drops_a_non_buy_decision_with_no_order(tmp_pa
         robinhood_signal=None,
     )
     artifacts = build_run_artifacts(
-        now, config, state, [decision],
+        now,
+        config,
+        state,
+        [decision],
         candidate_outcomes={},
         run_context=ArtifactRunContext(top_up_outcomes=None),
     )
@@ -45231,9 +45476,7 @@ def test_prior_allocations_count_against_cap(tmp_path):
         fin,
         rh,
         broker,
-        options=CompactRunOptions(
-            artifacts_dir=artifacts_dir, prior_same_day_allocations=prior
-        ),
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, prior_same_day_allocations=prior),
     )
 
     with open(result["run_state_path"], encoding="utf-8") as handle:
@@ -45299,15 +45542,11 @@ def test_load_prior_same_day_skip_sink_records_scan_failures(tmp_path):
     # out before ever reaching json.loads) but is truncated mid-flush, like a
     # sibling stream's writer caught mid-write.
     partial_json = root / "run_state_partial.json"
-    partial_json.write_text(
-        '{"trading_day": "2026-06-29", "buy_candidates": [', encoding="utf-8"
-    )
+    partial_json.write_text('{"trading_day": "2026-06-29", "buy_candidates": [', encoding="utf-8")
     _stamp_mtime_on_trading_day(partial_json, date(2026, 6, 29))
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), skip_sink=skip_sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
 
     assert allocations == {}
     assert set(skip_sink) == {unreadable_json, partial_json}
@@ -45333,9 +45572,7 @@ def test_load_prior_same_day_skip_sink_records_truncated_prefix_missing_day(tmp_
     _stamp_mtime_on_trading_day(truncated_prefix_json, date(2026, 6, 29))
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), skip_sink=skip_sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
 
     assert allocations == {}
     assert set(skip_sink) == {empty_json, truncated_prefix_json}
@@ -45358,9 +45595,7 @@ def test_load_prior_same_day_skip_sink_records_undecodable_bytes(tmp_path):
     _stamp_mtime_on_trading_day(undecodable_json, date(2026, 6, 29))
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), skip_sink=skip_sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
 
     assert allocations == {}
     assert skip_sink == [undecodable_json]
@@ -45378,15 +45613,11 @@ def test_load_prior_same_day_skip_sink_records_nested_brace_truncation(tmp_path)
     root.mkdir()
 
     nested_brace_prefix = root / "run_state_nested.json"
-    nested_brace_prefix.write_text(
-        '{"artifacts": {"orders_csv_path": "orders.csv"}', encoding="utf-8"
-    )
+    nested_brace_prefix.write_text('{"artifacts": {"orders_csv_path": "orders.csv"}', encoding="utf-8")
     _stamp_mtime_on_trading_day(nested_brace_prefix, date(2026, 6, 29))
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), skip_sink=skip_sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
 
     assert allocations == {}
     assert skip_sink == [nested_brace_prefix]
@@ -45409,9 +45640,7 @@ def test_load_prior_same_day_skip_sink_excludes_old_historical_parse_failure(tmp
     _stamp_mtime_on_trading_day(old_corrupt_json, date(2025, 1, 15))  # long-past day
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), skip_sink=skip_sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
 
     assert allocations == {}
     assert skip_sink == []
@@ -45520,9 +45749,9 @@ def test_load_prior_same_day_reads_full_report_run_state_via_orders_csv(tmp_path
         _json.dump(run_state, fh)
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
-    assert (
-        "AAPL" in allocations
-    ), "full-report run_state without buy_candidates must produce an AAPL allocation via orders_csv_path"
+    assert "AAPL" in allocations, (
+        "full-report run_state without buy_candidates must produce an AAPL allocation via orders_csv_path"
+    )
     alloc = allocations["AAPL"]
     assert alloc.reference_price is not None
     assert alloc.amount_usd is not None
@@ -45544,9 +45773,7 @@ def test_load_prior_same_day_orders_csv_unknown_reference_clears_reference_times
 
     known_orders_csv_path = os.path.join(known_run_dir, "orders.csv")
     with open(known_orders_csv_path, "w", newline="", encoding="utf-8") as fh:
-        writer = _csv.DictWriter(
-            fh, fieldnames=["ticker", "status", "avg_fill_price", "quantity_filled"]
-        )
+        writer = _csv.DictWriter(fh, fieldnames=["ticker", "status", "avg_fill_price", "quantity_filled"])
         writer.writeheader()
         writer.writerow(
             {
@@ -45561,13 +45788,9 @@ def test_load_prior_same_day_orders_csv_unknown_reference_clears_reference_times
     with open(unknown_orders_csv_path, "w", newline="", encoding="utf-8") as fh:
         writer = _csv.DictWriter(fh, fieldnames=["ticker", "status", "notional_usd"])
         writer.writeheader()
-        writer.writerow(
-            {"ticker": "AAPL", "status": "submitted", "notional_usd": "4.5"}
-        )
+        writer.writerow({"ticker": "AAPL", "status": "submitted", "notional_usd": "4.5"})
 
-    with open(
-        os.path.join(known_run_dir, "run_state.json"), "w", encoding="utf-8"
-    ) as fh:
+    with open(os.path.join(known_run_dir, "run_state.json"), "w", encoding="utf-8") as fh:
         _json.dump(
             {
                 "trading_day": "2026-06-29",
@@ -45580,9 +45803,7 @@ def test_load_prior_same_day_orders_csv_unknown_reference_clears_reference_times
             },
             fh,
         )
-    with open(
-        os.path.join(unknown_run_dir, "run_state.json"), "w", encoding="utf-8"
-    ) as fh:
+    with open(os.path.join(unknown_run_dir, "run_state.json"), "w", encoding="utf-8") as fh:
         _json.dump(
             {
                 "trading_day": "2026-06-29",
@@ -45635,9 +45856,7 @@ def test_load_prior_same_day_skip_sink_records_missing_referenced_orders_csv(tmp
         _json.dump(run_state, fh)
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), skip_sink=skip_sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
     assert "AAPL" not in allocations
     assert skip_sink, (
         "a full-report run_state referencing a missing orders CSV must be "
@@ -45760,9 +45979,7 @@ def test_load_prior_same_day_skip_sink_records_truncated_orders_csv_row(tmp_path
     orders_csv_path = os.path.join(run_dir, "orders.csv")
     with open(orders_csv_path, "w", newline="", encoding="utf-8") as fh:
         fh.write("ticker,status,order_id,avg_fill_price,quantity_filled\n")
-        fh.write(
-            "AAPL,filled"
-        )  # truncated mid-write -- no trailing columns, no newline
+        fh.write("AAPL,filled")  # truncated mid-write -- no trailing columns, no newline
 
     run_state = {
         "trading_day": "2026-06-29",
@@ -45776,9 +45993,7 @@ def test_load_prior_same_day_skip_sink_records_truncated_orders_csv_row(tmp_path
         _json.dump(run_state, fh)
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), skip_sink=skip_sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
     assert "AAPL" not in allocations
     assert skip_sink, (
         "a truncated final row in a referenced orders CSV must be recorded "
@@ -45814,9 +46029,7 @@ def test_load_prior_same_day_csv_only_counts_every_order_row_for_one_ticker(tmp_
     }
     with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(state, handle)
-    with open(
-        os.path.join(run_dir, "submitted_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(run_dir, "submitted_orders.csv"), "w", encoding="utf-8") as handle:
         handle.write(
             "ticker,order_id,status,submitted_amount_usd,avg_fill_price,quantity_filled\n"
             "AAAU,ORD-1,filled,2.00,50.00,0.04\n"
@@ -45853,12 +46066,9 @@ def test_load_prior_same_day_csv_only_counts_a_terminal_rejected_only_ticker(tmp
     }
     with open(os.path.join(run_dir, "run_state.json"), "w", encoding="utf-8") as handle:
         json.dump(state, handle)
-    with open(
-        os.path.join(run_dir, "submitted_orders.csv"), "w", encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(run_dir, "submitted_orders.csv"), "w", encoding="utf-8") as handle:
         handle.write(
-            "ticker,order_id,status,submitted_amount_usd,avg_fill_price,quantity_filled\n"
-            "MSFT,ORD-9,rejected,0,,\n"
+            "ticker,order_id,status,submitted_amount_usd,avg_fill_price,quantity_filled\nMSFT,ORD-9,rejected,0,,\n"
         )
 
     allocations = load_prior_same_day_allocations(root, date(2026, 6, 29))
@@ -45901,9 +46111,7 @@ def test_load_prior_same_day_skip_sink_records_empty_orders_csv_snapshot(tmp_pat
         _json.dump(run_state, fh)
 
     skip_sink: list = []
-    allocations = load_prior_same_day_allocations(
-        root, date(2026, 6, 29), skip_sink=skip_sink
-    )
+    allocations = load_prior_same_day_allocations(root, date(2026, 6, 29), skip_sink=skip_sink)
     assert "AAPL" not in allocations
     assert skip_sink, (
         "a completely empty referenced orders CSV (no header at all) must be "
@@ -45998,16 +46206,12 @@ def test_approved_window_status_counts_remaining_days():
     from near_close_dca import approved_window_status
 
     approved = frozenset({date(2026, 8, 24), date(2026, 8, 25), date(2026, 8, 26)})
-    in_window, window_end, remaining = approved_window_status(
-        approved, date(2026, 8, 25)
-    )
+    in_window, window_end, remaining = approved_window_status(approved, date(2026, 8, 25))
     assert in_window is True
     assert window_end == date(2026, 8, 26)
     assert remaining == 2  # the 25th and 26th
 
-    in_window, window_end, remaining = approved_window_status(
-        approved, date(2026, 9, 1)
-    )
+    in_window, window_end, remaining = approved_window_status(approved, date(2026, 9, 1))
     assert in_window is False
     assert remaining == 0
 
@@ -46020,10 +46224,7 @@ def test_warn_if_window_expiring_warns_near_end(caplog):
     approved = frozenset({date(2026, 8, 27), date(2026, 8, 28)})
     with caplog.at_level("WARNING", logger="near_close_dca"):
         warn_if_window_expiring(approved, date(2026, 8, 27))
-    assert any(
-        "approved trading window ends 2026-08-28" in record.getMessage()
-        for record in caplog.records
-    )
+    assert any("approved trading window ends 2026-08-28" in record.getMessage() for record in caplog.records)
 
 
 def test_warn_if_window_expiring_errors_after_end(caplog):
@@ -46032,10 +46233,7 @@ def test_warn_if_window_expiring_errors_after_end(caplog):
     approved = frozenset({date(2026, 8, 28)})
     with caplog.at_level("ERROR", logger="near_close_dca"):
         warn_if_window_expiring(approved, date(2026, 8, 31))
-    assert any(
-        "approved trading window ended 2026-08-28" in record.getMessage()
-        for record in caplog.records
-    )
+    assert any("approved trading window ended 2026-08-28" in record.getMessage() for record in caplog.records)
 
 
 def test_warn_if_window_expiring_quiet_far_from_end(caplog):
@@ -46052,9 +46250,7 @@ def test_execution_gate_blocked_after_window_end_logs_error(tmp_path, caplog):
 
     config = StrategyConfig(approved_test_dates=frozenset({date(2026, 8, 28)}))
     with caplog.at_level("ERROR", logger="near_close_dca"):
-        allowed = _check_execution_gates(
-            date(2026, 8, 31), config, DryRunBroker(), str(tmp_path)
-        )
+        allowed = _check_execution_gates(date(2026, 8, 31), config, DryRunBroker(), str(tmp_path))
     assert allowed is False
     assert any("hard-stopped" in record.getMessage() for record in caplog.records)
     # The blocked stub artifact is still written as before.
@@ -46106,9 +46302,7 @@ def test_blocked_run_replaces_unreadable_prior_placement_storage(tmp_path, damag
     assert validate_run_artifacts(str(artifacts_dir), require_summary=True)
 
 
-def test_execution_gate_blocks_nyse_holiday_even_if_config_approves_it(
-    tmp_path, caplog
-):
+def test_execution_gate_blocks_nyse_holiday_even_if_config_approves_it(tmp_path, caplog):
     """A config-driven window (e.g. an extended trading_window.json) can widen
     approved_test_dates to any weekday range with no holiday subtraction of its
     own; the gate must still block full NYSE closures like Labor Day and
@@ -46118,14 +46312,9 @@ def test_execution_gate_blocks_nyse_holiday_even_if_config_approves_it(
     for holiday in (date(2026, 9, 7), date(2026, 11, 26)):  # Labor Day, Thanksgiving
         config = StrategyConfig(approved_test_dates=frozenset({holiday}))
         with caplog.at_level("WARNING", logger="near_close_dca"):
-            allowed = _check_execution_gates(
-                holiday, config, DryRunBroker(), str(tmp_path / str(holiday))
-            )
+            allowed = _check_execution_gates(holiday, config, DryRunBroker(), str(tmp_path / str(holiday)))
         assert allowed is False
-        assert any(
-            "NYSE holiday gate blocked execution" in record.getMessage()
-            for record in caplog.records
-        )
+        assert any("NYSE holiday gate blocked execution" in record.getMessage() for record in caplog.records)
         caplog.clear()
 
 
@@ -46143,16 +46332,11 @@ def test_orders_csv_fills_logs_and_keeps_partial_rows_on_corrupt_csv(tmp_path, c
     from near_close_dca import _orders_csv_fills
 
     orders_csv = tmp_path / "orders.csv"
-    good = (
-        "ticker,status,avg_fill_price,quantity_filled,order_id\n"
-        "AAPL,filled,100.0,0.02,oid-1\n"
-    )
+    good = "ticker,status,avg_fill_price,quantity_filled,order_id\nAAPL,filled,100.0,0.02,oid-1\n"
     # An oversized field raises csv.Error (field larger than field limit) on the
     # row AFTER the valid AAPL row, so parsing fails mid-iteration.
     oversized = "x" * (csv.field_size_limit() + 1)
-    orders_csv.write_text(
-        good + f"MSFT,filled,{oversized},0.01,oid-2\n", encoding="utf-8"
-    )
+    orders_csv.write_text(good + f"MSFT,filled,{oversized},0.01,oid-2\n", encoding="utf-8")
 
     with caplog.at_level("ERROR", logger="near_close_dca"):
         fills = _orders_csv_fills(tmp_path)
@@ -46201,9 +46385,7 @@ def test_blocked_stub_refreshes_the_latest_scheduled_pointer(tmp_path):
 
     _write_blocked_run_stub(date(2026, 7, 1), artifacts_dir, state_root)
 
-    pointer = json.loads(
-        latest_scheduled_run_path(state_root).read_text(encoding="utf-8")
-    )
+    pointer = json.loads(latest_scheduled_run_path(state_root).read_bytes())
     assert pointer["trading_day"] == "2026-07-01"
     assert pointer["run_state_path"] == str(artifacts_dir / "run_state.json")
     # A market-closed day proves the slot fired but is never scheduled evidence.
@@ -46234,9 +46416,7 @@ def test_blocked_stub_populates_a_base_amount_for_the_weekly_dashboard(tmp_path)
 
     from dca_weekly_dashboard import build_graded_vs_fixed
 
-    run_state["buy_candidates"] = [
-        {"ticker": "BYDDY", "status": "submitted", "planned_amount_usd": 15.0}
-    ]
+    run_state["buy_candidates"] = [{"ticker": "BYDDY", "status": "submitted", "planned_amount_usd": 15.0}]
     # Must not raise -- this is the regression: previously ValueError aborted
     # the whole dashboard build for a day with a recovered whole-share order.
     build_graded_vs_fixed([run_state])
@@ -46261,10 +46441,7 @@ def test_blocked_stub_withholds_the_pointer_when_the_contract_fails(tmp_path, ca
     # No run_classification on the preserved legacy state, so the contract fails.
     assert not latest_scheduled_run_path(state_root).exists()
     assert (artifacts_dir / "run_state.json").read_text(encoding="utf-8") == legacy
-    assert any(
-        "not refreshing the latest scheduled pointer" in r.message
-        for r in caplog.records
-    )
+    assert any("not refreshing the latest scheduled pointer" in r.message for r in caplog.records)
 
 
 def test_placement_failure_outranks_a_confirmation_hold(tmp_path):
@@ -46283,9 +46460,7 @@ def test_placement_failure_outranks_a_confirmation_hold(tmp_path):
         {"ticker": "MSFT", "status": "failed"},
     ]
 
-    assert (
-        _derive_order_submit_status(config, buy_candidates, 0) == "not_submitted_error"
-    )
+    assert _derive_order_submit_status(config, buy_candidates, 0) == "not_submitted_error"
 
     artifacts = {
         "buy_candidates": buy_candidates,
@@ -46327,10 +46502,7 @@ def test_derive_order_submit_status_excludes_a_recovered_rejection_row():
 
     # An ORDINARY failed candidate (no recovery reason) must still trip it.
     buy_candidates_ordinary_failure = [{"ticker": "AAPL", "status": "failed"}]
-    assert (
-        _derive_order_submit_status(config, buy_candidates_ordinary_failure, 0)
-        == "not_submitted_error"
-    )
+    assert _derive_order_submit_status(config, buy_candidates_ordinary_failure, 0) == "not_submitted_error"
 
 
 def test_derive_order_submit_status_ignores_recovery_rows_for_emptiness():
@@ -46432,22 +46604,15 @@ def test_confirmation_hold_survives_when_no_placement_failed(tmp_path):
     )
 
     config = StrategyConfig(dry_run=False, tickers=("AAPL",))
-    buy_candidates = [
-        {"ticker": "AAPL", "status": "not_submitted_confirmation_required"}
-    ]
+    buy_candidates = [{"ticker": "AAPL", "status": "not_submitted_confirmation_required"}]
 
-    assert (
-        _derive_order_submit_status(config, buy_candidates, 0)
-        == "not_submitted_confirmation_required"
-    )
+    assert _derive_order_submit_status(config, buy_candidates, 0) == "not_submitted_confirmation_required"
 
     artifacts = {
         "buy_candidates": buy_candidates,
         "order_submit_status": "not_submitted_confirmation_required",
     }
-    _apply_no_order_classification(
-        artifacts, {"AAPL": {"status": "not_submitted_confirmation_required"}}
-    )
+    _apply_no_order_classification(artifacts, {"AAPL": {"status": "not_submitted_confirmation_required"}})
 
     assert artifacts["order_submit_status"] == "not_submitted_confirmation_required"
 
@@ -46481,9 +46646,7 @@ def test_a_failure_synthesized_candidate_row_satisfies_the_schema():
 
     assert row["buy_multiplier"] == 1.5
     schema = _json.loads(
-        (_Path(__file__).parent.parent / "schemas" / "run_state.schema.json").read_text(
-            encoding="utf-8"
-        )
+        (_Path(__file__).parent.parent / "schemas" / "run_state.schema.json").read_text(encoding="utf-8")
     )
     item_schema = schema["properties"]["buy_candidates"]["items"]
     # The required-field check is the defect this test was written for, so it
@@ -46880,9 +47043,7 @@ def test_replacing_an_unreadable_afternoon_state_regenerates_its_companions(tmp_
     out.mkdir(parents=True, exist_ok=True)
     # Unreadable state plus a full set of an earlier attempt's leftovers.
     (out / "run_state.json").write_text("{not json", encoding="utf-8")
-    (out / "run_summary.json").write_text(
-        json.dumps({"run_classification": None, "stale": True}), encoding="utf-8"
-    )
+    (out / "run_summary.json").write_text(json.dumps({"run_classification": None, "stale": True}), encoding="utf-8")
     (out / "signals.csv").write_text("", encoding="utf-8")
     (out / "submitted_orders.csv").write_text("stale,garbage\n", encoding="utf-8")
 
@@ -47100,9 +47261,7 @@ def test_contract_failure_stamp_preserves_the_backfilled_usage_proxy(tmp_path):
 
     _n._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
     try:
-        _n._write_afternoon_failure_artifacts(
-            out, _now_et(), RuntimeError("boom"), execution_records=[record]
-        )
+        _n._write_afternoon_failure_artifacts(out, _now_et(), RuntimeError("boom"), execution_records=[record])
     finally:
         _n._IN_FLIGHT_CANDIDATE_OUTCOMES.pop("outcomes", None)
 
@@ -47196,12 +47355,8 @@ def test_a_malformed_account_from_the_fallback_path_cannot_go_live(tmp_path):
         check=True,
     )
     configured, blocked = out.stdout.strip().splitlines()[-2:]
-    assert (
-        configured == "None"
-    ), f"malformed account should be caught at load time, not passed through: {out.stdout}"
-    assert (
-        blocked == "True"
-    ), f"malformed account was accepted for live execution: {out.stdout}"
+    assert configured == "None", f"malformed account should be caught at load time, not passed through: {out.stdout}"
+    assert blocked == "True", f"malformed account was accepted for live execution: {out.stdout}"
 
 
 # --- The digit shape is Robinhood's, not every broker's ----------------------
@@ -47212,17 +47367,13 @@ def test_a_malformed_account_from_the_fallback_path_cannot_go_live(tmp_path):
 
 
 def test_an_alpaca_account_is_not_held_to_the_robinhood_digit_shape():
-    config = StrategyConfig(
-        dry_run=False, broker=BrokerName.ALPACA, target_account_number="PA3ABCDEF123"
-    )
+    config = StrategyConfig(dry_run=False, broker=BrokerName.ALPACA, target_account_number="PA3ABCDEF123")
     assert account_pinning_failure(config.target_account_number, config.broker) is None
     assert isinstance(build_broker(config), AlpacaBroker)
 
 
 @pytest.mark.parametrize("broker", [BrokerName.ALPACA, BrokerName.ROBINHOOD, None])
-@pytest.mark.parametrize(
-    "unusable", [None, "", "UNSET_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"]
-)
+@pytest.mark.parametrize("unusable", [None, "", "UNSET_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"])
 def test_no_backend_may_trade_an_account_nobody_named(broker, unusable):
     """The nonempty/placeholder half of the gate stays broker-agnostic."""
     assert account_pinning_failure(unusable, broker)
@@ -47230,9 +47381,7 @@ def test_no_backend_may_trade_an_account_nobody_named(broker, unusable):
 
 def test_robinhood_still_requires_the_digit_shape():
     assert account_pinning_failure("PA3ABCDEF123", BrokerName.ROBINHOOD)
-    assert (
-        account_pinning_failure("PA3ABCDEF123") is not None
-    ), "default must stay Robinhood"
+    assert account_pinning_failure("PA3ABCDEF123") is not None, "default must stay Robinhood"
 
 
 # --- The execution gate fails closed on an injected broker -------------------
@@ -47249,36 +47398,24 @@ class _InjectedBroker(DryRunBroker):
 
 
 def _an_approved_day(config):
-    return (
-        sorted(config.approved_test_dates)[0]
-        if config.approved_test_dates
-        else date(2026, 7, 6)
-    )
+    return sorted(config.approved_test_dates)[0] if config.approved_test_dates else date(2026, 7, 6)
 
 
-@pytest.mark.parametrize(
-    "account", ["", "UNSET_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "acct-1", "12345"]
-)
+@pytest.mark.parametrize("account", ["", "UNSET_ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "acct-1", "12345"])
 def test_an_injected_broker_cannot_trade_an_unpinned_live_account(account):
     config = StrategyConfig(dry_run=False, target_account_number=account)
     with pytest.raises(RuntimeError, match="Refusing to trade live"):
-        _check_execution_gates(
-            _an_approved_day(config), config, _InjectedBroker(account), None
-        )
+        _check_execution_gates(_an_approved_day(config), config, _InjectedBroker(account), None)
 
 
 def test_a_properly_pinned_injected_broker_still_passes():
     config = StrategyConfig(dry_run=False, target_account_number=FIXTURE_ACCOUNT_NUMBER)
-    assert _check_execution_gates(
-        _an_approved_day(config), config, _InjectedBroker(FIXTURE_ACCOUNT_NUMBER), None
-    )
+    assert _check_execution_gates(_an_approved_day(config), config, _InjectedBroker(FIXTURE_ACCOUNT_NUMBER), None)
 
 
 def test_a_dry_run_is_unaffected_by_the_pinning_gate():
     config = StrategyConfig(dry_run=True, target_account_number="")
-    assert _check_execution_gates(
-        _an_approved_day(config), config, _InjectedBroker(""), None
-    )
+    assert _check_execution_gates(_an_approved_day(config), config, _InjectedBroker(""), None)
 
 
 # --- one_order_per_ticker_per_day: closing the ticker_guarded bypass ---------
@@ -47312,9 +47449,7 @@ def test_flag_makes_the_broker_same_day_gate_beat_a_loaded_prior_allocation(tmp_
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-    blocking = _BlockingBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    blocking = _BlockingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     prior = {
         "AAPL": PriorSameDayAllocation(
             "AAPL",
@@ -47333,14 +47468,10 @@ def test_flag_makes_the_broker_same_day_gate_beat_a_loaded_prior_allocation(tmp_
         fin,
         rh,
         blocking,
-        options=CompactRunOptions(
-            artifacts_dir=artifacts_dir, prior_same_day_allocations=prior
-        ),
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, prior_same_day_allocations=prior),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     # Same setup as test_run_daily_compact_manual_run_does_not_block_scheduled,
@@ -47391,9 +47522,7 @@ def test_flag_checks_the_hard_ceiling_before_its_own_broker_duplicate_lookup(tmp
         options=CompactRunOptions(artifacts_dir=artifacts_dir),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     candidate = run_state["buy_candidates"][0]
     assert candidate["status"] == "blocked"
@@ -47427,14 +47556,10 @@ def test_flag_makes_local_buys_today_gate_beat_a_loaded_prior_allocation(tmp_pat
         fin,
         rh,
         broker,
-        options=CompactRunOptions(
-            artifacts_dir=artifacts_dir, prior_same_day_allocations=prior
-        ),
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, prior_same_day_allocations=prior),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     assert by_ticker["AAPL"]["status"] == "skipped"
@@ -47451,9 +47576,7 @@ def test_flag_off_leaves_the_documented_top_up_bypass_intact(tmp_path):
         def same_day_strategy_order_exists(self, ticker, trading_day):
             return True
 
-    blocking = _BlockingBroker(
-        cash=500.0, reference_prices={t: 98.0 for t in config.tickers}
-    )
+    blocking = _BlockingBroker(cash=500.0, reference_prices={t: 98.0 for t in config.tickers})
     prior = {
         "AAPL": PriorSameDayAllocation(
             "AAPL",
@@ -47472,14 +47595,10 @@ def test_flag_off_leaves_the_documented_top_up_bypass_intact(tmp_path):
         fin,
         rh,
         blocking,
-        options=CompactRunOptions(
-            artifacts_dir=artifacts_dir, prior_same_day_allocations=prior
-        ),
+        options=CompactRunOptions(artifacts_dir=artifacts_dir, prior_same_day_allocations=prior),
     )
 
-    with open(
-        os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8"
-    ) as handle:
+    with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     assert by_ticker["AAPL"]["status"] == "dry_run"
@@ -47538,7 +47657,10 @@ def test_seed_prior_allocations_skips_a_ticker_already_restored_by_reconciliatio
     # The reconciliation this same run already performed for AAPL, from a
     # source artifact whose run_id is "slot_1030_attempt_1".
     state.book_reconciled_attempt_notional(
-        "AAPL", trading_day, 2.0, order_id="ORD-RECOVERED",
+        "AAPL",
+        trading_day,
+        2.0,
+        order_id="ORD-RECOVERED",
         source_run_id="slot_1030_attempt_1",
     )
     assert state.buys_today("AAPL", trading_day) == 1
@@ -47596,9 +47718,7 @@ def test_seed_prior_allocations_tops_up_a_retry_that_discovers_more_evidence():
         trading_day,
         True,
         {
-            "AAPL": PriorSameDayAllocation(
-                ticker="AAPL", amount_usd=2.0, reference_price=99.0, attempt_count=1
-            ),
+            "AAPL": PriorSameDayAllocation(ticker="AAPL", amount_usd=2.0, reference_price=99.0, attempt_count=1),
         },
         one_order_per_ticker_per_day=False,
     )
@@ -47611,9 +47731,7 @@ def test_seed_prior_allocations_tops_up_a_retry_that_discovers_more_evidence():
         trading_day,
         True,
         {
-            "AAPL": PriorSameDayAllocation(
-                ticker="AAPL", amount_usd=4.0, reference_price=99.0, attempt_count=2
-            ),
+            "AAPL": PriorSameDayAllocation(ticker="AAPL", amount_usd=4.0, reference_price=99.0, attempt_count=2),
         },
         one_order_per_ticker_per_day=False,
     )
@@ -47630,9 +47748,7 @@ def test_seed_prior_allocations_tops_up_a_retry_that_discovers_more_evidence():
         trading_day,
         True,
         {
-            "AAPL": PriorSameDayAllocation(
-                ticker="AAPL", amount_usd=4.0, reference_price=99.0, attempt_count=2
-            ),
+            "AAPL": PriorSameDayAllocation(ticker="AAPL", amount_usd=4.0, reference_price=99.0, attempt_count=2),
         },
         one_order_per_ticker_per_day=False,
     )
@@ -47673,9 +47789,7 @@ def test_reconcile_prior_allocation_marks_a_dollar_backed_registered_id_as_notio
     state = StrategyState()
     trading_day = date(2026, 7, 6)
 
-    state.reconcile_prior_allocation(
-        "AAPL", trading_day, amount_usd=4.0, attempt_count=1, order_ids=["X"]
-    )
+    state.reconcile_prior_allocation("AAPL", trading_day, amount_usd=4.0, attempt_count=1, order_ids=["X"])
     assert state.notional_applied_order_ids.get(("AAPL", trading_day)) == {"X"}
     assert state.day_notional(trading_day) == pytest.approx(4.0)
 
@@ -47703,17 +47817,14 @@ def test_reconcile_prior_allocation_marks_a_zero_delta_id_backfill_as_notional_a
     assert state.notional_applied_order_ids.get(("AAPL", trading_day), set()) == set()
     assert state.day_notional(trading_day) == pytest.approx(4.0)
 
-    state.reconcile_prior_allocation(
-        "AAPL", trading_day, amount_usd=4.0, attempt_count=1, order_ids=["X"]
-    )
+    state.reconcile_prior_allocation("AAPL", trading_day, amount_usd=4.0, attempt_count=1, order_ids=["X"])
     assert state.notional_applied_order_ids.get(("AAPL", trading_day)) == {"X"}, (
         "a late ID backfill onto an already dollar-backed aggregate must be marked applied"
     )
 
     state.book_reconciled_attempt_notional("AAPL", trading_day, 4.0, order_id="X")
     assert state.day_notional(trading_day) == pytest.approx(4.0), (
-        "a reconciliation replay for a zero-delta-backfilled id must not add its notional "
-        "a second time"
+        "a reconciliation replay for a zero-delta-backfilled id must not add its notional a second time"
     )
 
 
@@ -47766,9 +47877,7 @@ def test_seed_prior_allocations_skips_a_ticker_this_stream_already_bought_for_re
         trading_day,
         True,
         {
-            "AAPL": PriorSameDayAllocation(
-                ticker="AAPL", amount_usd=8.0, reference_price=99.0, attempt_count=2
-            ),
+            "AAPL": PriorSameDayAllocation(ticker="AAPL", amount_usd=8.0, reference_price=99.0, attempt_count=2),
         },
         one_order_per_ticker_per_day=False,
     )
@@ -47794,9 +47903,7 @@ def test_seed_prior_allocations_is_a_noop_when_guard_inactive_regardless_of_the_
         ),
     }
 
-    _seed_prior_allocations(
-        state, trading_day, False, prior, one_order_per_ticker_per_day=True
-    )
+    _seed_prior_allocations(state, trading_day, False, prior, one_order_per_ticker_per_day=True)
 
     assert state.buys_today("AAPL", trading_day) == 0
     assert state.day_notional(trading_day) == pytest.approx(0.0)
@@ -47815,17 +47922,11 @@ def test_seed_prior_allocations_preserves_the_real_attempt_count():
     prior = {
         # 5 attempts, all rejected -- zero capital moved, but still 5 of the
         # shared cap's 8 slots.
-        "AAAU": PriorSameDayAllocation(
-            ticker="AAAU", amount_usd=0.0, attempt_count=5
-        ),
+        "AAAU": PriorSameDayAllocation(ticker="AAAU", amount_usd=0.0, attempt_count=5),
         # 2 attempts, only the second filled.
-        "TRIN": PriorSameDayAllocation(
-            ticker="TRIN", amount_usd=3.0, reference_price=50.0, attempt_count=2
-        ),
+        "TRIN": PriorSameDayAllocation(ticker="TRIN", amount_usd=3.0, reference_price=50.0, attempt_count=2),
         # 1 attempt, filled.
-        "EVR": PriorSameDayAllocation(
-            ticker="EVR", amount_usd=2.0, reference_price=25.0, attempt_count=1
-        ),
+        "EVR": PriorSameDayAllocation(ticker="EVR", amount_usd=2.0, reference_price=25.0, attempt_count=1),
     }
 
     _seed_prior_allocations(
@@ -48133,7 +48234,9 @@ def test_mixed_day_aggregate_still_charges_todays_own_attempt(tmp_path):
     today = date(2026, 6, 29)
 
     recovery = {
-        "ticker": "RVII", "status": "submitted", "order_id": "OLD",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "OLD",
         "whole_share_claim_breakdown": [{"trading_day": prior_day, "amount_usd": 23.0}],
     }
     fresh_today = {"ticker": "RVII", "status": "submitted", "order_id": "NEW"}
@@ -48147,14 +48250,17 @@ def test_mixed_day_aggregate_still_charges_todays_own_attempt(tmp_path):
 
     run_dir = tmp_path / "morning_dca" / "20260629_0935ET"
     run_dir.mkdir(parents=True)
-    (run_dir / "run_state.json").write_text(json.dumps({
-        "run_id": "r1",
-        "generated_at_et": "2026-06-29T09:35:00-04:00",
-        "trading_day": today.isoformat(),
-        "stream": "morning",
-        "buy_candidates": [dict(merged, planned_amount_usd=23.36,
-                                amount_usd=23.36, target_price=23.36)],
-    }))
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "r1",
+                "generated_at_et": "2026-06-29T09:35:00-04:00",
+                "trading_day": today.isoformat(),
+                "stream": "morning",
+                "buy_candidates": [dict(merged, planned_amount_usd=23.36, amount_usd=23.36, target_price=23.36)],
+            }
+        )
+    )
 
     prior = load_prior_same_day_allocations(tmp_path, today)
     # ... and now the LOADER agrees with the helper, where it used to say 0.
@@ -48175,19 +48281,29 @@ def test_a_pure_cross_day_recovery_still_charges_today_nothing(tmp_path):
     prior_day = "2026-06-27"
     today = date(2026, 6, 29)
     row = {
-        "ticker": "RVII", "status": "submitted", "order_id": "OLD",
-        "planned_amount_usd": 23.36, "amount_usd": 23.36, "target_price": 23.36,
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "OLD",
+        "planned_amount_usd": 23.36,
+        "amount_usd": 23.36,
+        "target_price": 23.36,
         "whole_share_claim_breakdown": [{"trading_day": prior_day, "amount_usd": 23.0}],
         "merged_attempt_days": {prior_day: 1},
         "merged_attempt_count": 1,
     }
     run_dir = tmp_path / "morning_dca" / "20260629_0935ET"
     run_dir.mkdir(parents=True)
-    (run_dir / "run_state.json").write_text(json.dumps({
-        "run_id": "r1", "generated_at_et": "2026-06-29T09:35:00-04:00",
-        "trading_day": today.isoformat(), "stream": "morning",
-        "buy_candidates": [row],
-    }))
+    (run_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "run_id": "r1",
+                "generated_at_et": "2026-06-29T09:35:00-04:00",
+                "trading_day": today.isoformat(),
+                "stream": "morning",
+                "buy_candidates": [row],
+            }
+        )
+    )
 
     prior = load_prior_same_day_allocations(tmp_path, today)
     assert prior["RVII"].attempt_count == 0
@@ -48215,15 +48331,20 @@ def test_every_candidate_row_builder_persists_merged_attempt_buckets():
     )
 
     zero_fill = {
-        "ticker": "RVII", "status": "failed", "order_id": "Z1",
-        "whole_share_zero_fill_attempt": True, "broker_placement_failed": True,
+        "ticker": "RVII",
+        "status": "failed",
+        "order_id": "Z1",
+        "whole_share_zero_fill_attempt": True,
+        "broker_placement_failed": True,
     }
     second = dict(zero_fill, order_id="Z2")
     merged = _merge_whole_share_submission_outcomes(zero_fill, second)
     assert merged["merged_attempt_count"] == 2
 
     outcome = dict(
-        merged, status="submitted", submitted_amount_usd=23.36,
+        merged,
+        status="submitted",
+        submitted_amount_usd=23.36,
         whole_share_quantity=1,
         whole_share_claim_breakdown=[{"trading_day": "2026-06-29", "amount_usd": 23.36}],
     )
@@ -48239,14 +48360,19 @@ def test_every_candidate_row_builder_persists_merged_attempt_buckets():
     # merged at all -- the CSV-header contract every sibling field here already
     # follows, since _write_csv derives the header from row 0 alone.
     plain_decision = ReconciledDecision(
-        ticker="AAA", action=Action.BUY, reason="ladder buy",
-        finance_signal=None, robinhood_signal=None, buy_multiplier=1.0,
-        suggested_amount_usd=2.0, selected_base_amount_usd=2.0, target_price=97.0,
+        ticker="AAA",
+        action=Action.BUY,
+        reason="ladder buy",
+        finance_signal=None,
+        robinhood_signal=None,
+        buy_multiplier=1.0,
+        suggested_amount_usd=2.0,
+        selected_base_amount_usd=2.0,
+        target_price=97.0,
     )
     plain = _build_buy_candidates(
         [plain_decision],
-        {"AAA": {"order_id": "AAA-1", "status": "dry_run",
-                 "submitted_amount_usd": 2.0}},
+        {"AAA": {"order_id": "AAA-1", "status": "dry_run", "submitted_amount_usd": 2.0}},
         top_up_outcomes=None,
     )
     assert "merged_attempt_days" in plain[0]
@@ -48279,7 +48405,10 @@ def test_a_malformed_but_well_typed_signal_is_degraded_on_the_normal_path():
     from near_close_dca import Action, SourceName, SourceSignal, _serializable_signal, _signal_row
 
     bad = SourceSignal(
-        source=SourceName.FINANCE, ticker="AAA", action=Action.BUY, reason=object()  # type: ignore[arg-type]
+        source=SourceName.FINANCE,
+        ticker="AAA",
+        action=Action.BUY,
+        reason=object(),  # type: ignore[arg-type]
     )
     # The trap: well-typed, valid action, and fatal to the writer.
     assert isinstance(bad, SourceSignal)
@@ -48288,9 +48417,7 @@ def test_a_malformed_but_well_typed_signal_is_degraded_on_the_normal_path():
         _json.dumps(_signal_row("AAA", "finance", bad))
 
     # A well-formed signal is untouched by the same guard.
-    good = SourceSignal(
-        source=SourceName.FINANCE, ticker="AAA", action=Action.BUY, reason="ladder buy"
-    )
+    good = SourceSignal(source=SourceName.FINANCE, ticker="AAA", action=Action.BUY, reason="ladder buy")
     assert _serializable_signal(good) is good
     _json.dumps(_signal_row("AAA", "finance", good))
 
@@ -48326,8 +48453,11 @@ def test_terminal_evidence_applies_per_represented_order_not_per_row(tmp_path):
         return load_prior_same_day_allocations(root, date(2026, 6, 29)).get("RVII")
 
     aggregate = {
-        "ticker": "RVII", "status": "submitted", "order_id": "NEW",
-        "whole_share_order_ids": ["OLD", "NEW"], "planned_amount_usd": 23.36,
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "NEW",
+        "whole_share_order_ids": ["OLD", "NEW"],
+        "planned_amount_usd": 23.36,
     }
     mixed = "RVII,OLD,23.00,filled,23.000000,1\nRVII,NEW,23.36,cancelled,,0\n"
 
@@ -48346,14 +48476,11 @@ def test_terminal_evidence_applies_per_represented_order_not_per_row(tmp_path):
     # The carve-out is no WIDER than its justification: when EVERY represented
     # order is terminal the row still contributes no dollars, and a plain row
     # is unchanged because it represents exactly its own scalar id.
-    all_dead = _load(
-        aggregate, "RVII,OLD,23.36,rejected,,0\nRVII,NEW,23.36,cancelled,,0\n"
-    )
+    all_dead = _load(aggregate, "RVII,OLD,23.36,rejected,,0\nRVII,NEW,23.36,cancelled,,0\n")
     assert all_dead is not None
     assert all_dead.amount_usd == 0.0
     plain_dead = _load(
-        {"ticker": "RVII", "status": "submitted", "order_id": "NEW",
-         "planned_amount_usd": 23.36},
+        {"ticker": "RVII", "status": "submitted", "order_id": "NEW", "planned_amount_usd": 23.36},
         "RVII,NEW,23.36,cancelled,,0\n",
     )
     assert plain_dead is not None
@@ -48372,12 +48499,17 @@ def test_merge_attributes_submitted_notional_to_the_id_that_earned_it():
     from near_close_dca import _merge_whole_share_submission_outcomes
 
     submitted_b = {
-        "ticker": "RVII", "status": "submitted", "order_id": "B",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
         "submitted_amount_usd": 23.0,
     }
     blocked_a = {
-        "ticker": "RVII", "status": "blocked", "order_id": "A",
-        "broker_placement_failed": True, "submitted_amount_usd": 0.0,
+        "ticker": "RVII",
+        "status": "blocked",
+        "order_id": "A",
+        "broker_placement_failed": True,
+        "submitted_amount_usd": 0.0,
     }
 
     merged = _merge_whole_share_submission_outcomes(blocked_a, submitted_b)
@@ -48388,7 +48520,9 @@ def test_merge_attributes_submitted_notional_to_the_id_that_earned_it():
     # A later merge (a second retry) must carry the map forward rather than
     # re-derive it from the aggregate's own now-combined total.
     submitted_c = {
-        "ticker": "RVII", "status": "submitted", "order_id": "C",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "C",
         "submitted_amount_usd": 5.0,
     }
     twice_merged = _merge_whole_share_submission_outcomes(merged, submitted_c)
@@ -48423,7 +48557,9 @@ def test_retry_trimming_preserves_notional_for_a_previously_blocked_sibling():
     # (unrelated) notional -- the exact shape the old subtraction-based
     # trim conflated with B's carried total.
     fresh_row_for_a = {
-        "ticker": "RVII", "status": "submitted", "order_id": "A",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "A",
         "submitted_amount_usd": 99.0,
     }
 
@@ -48493,8 +48629,11 @@ def test_retry_trimming_preserves_quantity_for_a_previously_blocked_sibling():
     # Fresh A buys 4 shares -- a quantity that was never part of B's prior
     # quantity of 1.
     fresh_row_for_a = {
-        "ticker": "RVII", "status": "submitted", "order_id": "A",
-        "submitted_amount_usd": 99.0, "whole_share_quantity": 4,
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "A",
+        "submitted_amount_usd": 99.0,
+        "whole_share_quantity": 4,
     }
 
     trimmed = _unrepresented_prior_candidate_part(prior_aggregate, [fresh_row_for_a])
@@ -48546,8 +48685,11 @@ def test_retry_trimming_aggregates_duplicate_legacy_attribution_ids():
         ],
     }
     fresh_row_for_a = {
-        "ticker": "RVII", "status": "submitted", "order_id": "A",
-        "submitted_amount_usd": 99.0, "whole_share_quantity": 4,
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "A",
+        "submitted_amount_usd": 99.0,
+        "whole_share_quantity": 4,
     }
 
     trimmed = _unrepresented_prior_candidate_part(prior_aggregate, [fresh_row_for_a])
@@ -48587,7 +48729,9 @@ def test_retry_trimming_drops_refreshed_ids_from_the_legacy_attribution_list():
     }
     # A is refreshed by the retry -- B is the trimmed, still-missing part.
     fresh_row_for_a = {
-        "ticker": "RVII", "status": "submitted", "order_id": "A",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "A",
         "submitted_amount_usd": 99.0,
     }
 
@@ -48621,7 +48765,9 @@ def test_retry_trimming_does_not_promote_a_trimmed_blocked_member_to_submitted()
         "_order_amount_usd_by_id": {"str:B": 23.0},
     }
     fresh_row_for_b = {
-        "ticker": "RVII", "status": "submitted", "order_id": "B",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
         "submitted_amount_usd": 23.0,
     }
 
@@ -48669,7 +48815,9 @@ def test_trimming_preserves_failure_type_for_a_proven_non_submitting_member():
         "_order_amount_usd_by_id": {"str:B": 23.0},
     }
     fresh_row_for_b = {
-        "ticker": "RVII", "status": "submitted", "order_id": "B",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
         "submitted_amount_usd": 23.0,
     }
 
@@ -48715,7 +48863,9 @@ def test_trimming_drops_a_failure_marker_for_the_refreshed_member():
     }
     # A -- the FAILED member -- is refreshed by the retry this time.
     fresh_row_for_a = {
-        "ticker": "RVII", "status": "submitted", "order_id": "A",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "A",
         "submitted_amount_usd": 99.0,
     }
 
@@ -48745,16 +48895,23 @@ def test_trimming_attributes_failure_markers_to_the_right_member():
     from near_close_dca import _merge_whole_share_submission_outcomes, _unrepresented_prior_candidate_part
 
     submitted_b = {
-        "ticker": "RVII", "status": "submitted", "order_id": "B",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
         "submitted_amount_usd": 23.0,
     }
     failed_a = {
-        "ticker": "RVII", "status": "failed", "order_id": "A",
+        "ticker": "RVII",
+        "status": "failed",
+        "order_id": "A",
         "skip_reason": "broker rejected",
     }
     blocked_d = {
-        "ticker": "RVII", "status": "blocked", "order_id": "D",
-        "broker_placement_failed": True, "submitted_amount_usd": 0.0,
+        "ticker": "RVII",
+        "status": "blocked",
+        "order_id": "D",
+        "broker_placement_failed": True,
+        "submitted_amount_usd": 0.0,
     }
 
     merged_ab = _merge_whole_share_submission_outcomes(failed_a, submitted_b)
@@ -48767,17 +48924,19 @@ def test_trimming_attributes_failure_markers_to_the_right_member():
     # A and B are refreshed by the retry -- D is the trimmed, still-missing
     # part, and D was never the failed member.
     fresh_row_for_a = {
-        "ticker": "RVII", "status": "submitted", "order_id": "A",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "A",
         "submitted_amount_usd": 99.0,
     }
     fresh_row_for_b = {
-        "ticker": "RVII", "status": "submitted", "order_id": "B",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
         "submitted_amount_usd": 23.0,
     }
 
-    trimmed = _unrepresented_prior_candidate_part(
-        prior_aggregate, [fresh_row_for_a, fresh_row_for_b]
-    )
+    trimmed = _unrepresented_prior_candidate_part(prior_aggregate, [fresh_row_for_a, fresh_row_for_b])
 
     assert trimmed is not None
     assert trimmed["whole_share_order_ids"] == ["D"]
@@ -48800,20 +48959,29 @@ def test_trimming_recomputes_failure_markers_for_a_mixed_retained_set():
     from near_close_dca import _merge_whole_share_submission_outcomes, _unrepresented_prior_candidate_part
 
     submitted_b = {
-        "ticker": "RVII", "status": "submitted", "order_id": "B",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
         "submitted_amount_usd": 23.0,
     }
     submitted_c = {
-        "ticker": "RVII", "status": "submitted", "order_id": "C",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "C",
         "submitted_amount_usd": 5.0,
     }
     failed_a = {
-        "ticker": "RVII", "status": "failed", "order_id": "A",
+        "ticker": "RVII",
+        "status": "failed",
+        "order_id": "A",
         "skip_reason": "broker rejected",
     }
     blocked_d = {
-        "ticker": "RVII", "status": "blocked", "order_id": "D",
-        "broker_placement_failed": True, "submitted_amount_usd": 0.0,
+        "ticker": "RVII",
+        "status": "blocked",
+        "order_id": "D",
+        "broker_placement_failed": True,
+        "submitted_amount_usd": 0.0,
     }
 
     merged_ab = _merge_whole_share_submission_outcomes(failed_a, submitted_b)
@@ -48825,17 +48993,19 @@ def test_trimming_recomputes_failure_markers_for_a_mixed_retained_set():
     # A and C are refreshed by the retry -- B and D are the trimmed,
     # still-missing (mixed) part.
     fresh_row_for_a = {
-        "ticker": "RVII", "status": "submitted", "order_id": "A",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "A",
         "submitted_amount_usd": 99.0,
     }
     fresh_row_for_c = {
-        "ticker": "RVII", "status": "submitted", "order_id": "C",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "C",
         "submitted_amount_usd": 5.0,
     }
 
-    trimmed = _unrepresented_prior_candidate_part(
-        prior_aggregate, [fresh_row_for_a, fresh_row_for_c]
-    )
+    trimmed = _unrepresented_prior_candidate_part(prior_aggregate, [fresh_row_for_a, fresh_row_for_c])
 
     assert trimmed is not None
     assert set(trimmed["whole_share_order_ids"]) == {"B", "D"}
@@ -48872,7 +49042,9 @@ def test_trimming_excludes_settlement_adjustments_from_the_submission_count():
         "_order_adjustment_ids": ["str:E"],
     }
     fresh_row_for_a = {
-        "ticker": "RVII", "status": "submitted", "order_id": "A",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "A",
         "submitted_amount_usd": 99.0,
     }
 
@@ -48928,7 +49100,9 @@ def test_merge_keeps_a_shared_adjustment_id_countable_as_a_physical_submission()
         "_order_adjustment_ids": merged.get("_order_adjustment_ids") or [],
     }
     fresh_row_for_a = {
-        "ticker": "RVII", "status": "submitted", "order_id": "A",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "A",
         "submitted_amount_usd": 99.0,
     }
     trimmed = ncd._unrepresented_prior_candidate_part(prior_aggregate, [fresh_row_for_a])
@@ -49061,7 +49235,9 @@ def test_trimming_preserves_a_zero_net_submitted_order():
         "_order_amount_usd_by_id": {"str:A": 0.0, "str:B": 23.0},
     }
     fresh_row_for_b = {
-        "ticker": "RVII", "status": "submitted", "order_id": "B",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
         "submitted_amount_usd": 23.0,
     }
 
@@ -49097,7 +49273,9 @@ def test_trimming_counts_only_attributed_submissions_in_a_mixed_retained_set():
         "_order_amount_usd_by_id": {"str:B": 23.0, "str:C": 5.0},
     }
     fresh_row_for_c = {
-        "ticker": "RVII", "status": "submitted", "order_id": "C",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "C",
         "submitted_amount_usd": 5.0,
     }
 
@@ -49139,7 +49317,9 @@ def test_leg_attribution_prefers_legacy_breakdown_over_an_equal_split():
         ],
     }
     fresh_order_c = {
-        "ticker": "RVII", "status": "submitted", "order_id": "C",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "C",
         "submitted_amount_usd": 5.0,
     }
 
@@ -49181,7 +49361,9 @@ def test_leg_attribution_treats_an_ambiguous_legacy_zero_as_unknown_not_proven()
         ],
     }
     fresh_order_c = {
-        "ticker": "RVII", "status": "submitted", "order_id": "C",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "C",
         "submitted_amount_usd": 5.0,
     }
 
@@ -49217,7 +49399,9 @@ def test_leg_attribution_omits_uncertain_multi_id_aggregates_entirely():
         "submitted_amount_usd": 23.0,
     }
     fresh_order_c = {
-        "ticker": "RVII", "status": "submitted", "order_id": "C",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "C",
         "submitted_amount_usd": 5.0,
     }
 
@@ -49248,7 +49432,9 @@ def test_leg_attribution_clears_an_inherited_map_when_the_other_side_is_ambiguou
     # A newer, already-aggregated outcome with its own EXACT attribution
     # map (as if a prior merge of two ordinary submitted legs).
     already_aggregated_cd = {
-        "ticker": "RVII", "status": "submitted", "order_id": "C",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "C",
         "whole_share_order_ids": ["C", "D"],
         "submitted_amount_usd": 23.0,
         "_order_amount_usd_by_id": {"str:C": 5.0, "str:D": 18.0},
@@ -49256,7 +49442,9 @@ def test_leg_attribution_clears_an_inherited_map_when_the_other_side_is_ambiguou
     # An uncertain pre-upgrade aggregate -- no exact split available for
     # its own A/B members.
     uncertain_ab = {
-        "ticker": "RVII", "status": "submitted", "order_id": "B",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "B",
         "whole_share_order_ids": ["A", "B"],
         "submitted_amount_usd": 23.0,
     }
@@ -49283,11 +49471,15 @@ def test_merge_sums_notional_when_attribution_ids_collide():
     from near_close_dca import _merge_whole_share_submission_outcomes
 
     physical_order = {
-        "ticker": "RVII", "status": "submitted", "order_id": "ORD-1",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "ORD-1",
         "submitted_amount_usd": 23.36,
     }
     adjustment = {
-        "ticker": "RVII", "status": "submitted", "order_id": "ORD-1",
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "ORD-1",
         "submitted_amount_usd": 1.14,
         "whole_share_settlement_adjustment": True,
     }
@@ -49334,11 +49526,20 @@ def test_build_buy_candidates_carries_deliberate_skip_and_merged_submission_coun
         "merged_submission_count": 2,
     }
     [row2] = _build_buy_candidates(
-        [ReconciledDecision(
-            ticker="RVII", action=Action.BUY, buy_multiplier=1.0, ladder_multiplier=1.0,
-            reason="ladder buy", selected_base_amount_usd=1.0, suggested_amount_usd=1.0,
-            decision_bar_close=100.0, finance_signal=None, robinhood_signal=None,
-        )],
+        [
+            ReconciledDecision(
+                ticker="RVII",
+                action=Action.BUY,
+                buy_multiplier=1.0,
+                ladder_multiplier=1.0,
+                reason="ladder buy",
+                selected_base_amount_usd=1.0,
+                suggested_amount_usd=1.0,
+                decision_bar_close=100.0,
+                finance_signal=None,
+                robinhood_signal=None,
+            )
+        ],
         {"RVII": aggregate_outcome},
         None,
     )
@@ -49373,13 +49574,19 @@ def test_a_zero_fill_recovery_merges_whatever_order_it_arrives_in():
     )
 
     filled = {
-        "ticker": "RVII", "status": "submitted", "order_id": "FILLED",
-        "submitted_amount_usd": 23.0, "whole_share_quantity": 1,
+        "ticker": "RVII",
+        "status": "submitted",
+        "order_id": "FILLED",
+        "submitted_amount_usd": 23.0,
+        "whole_share_quantity": 1,
         "whole_share_claim_breakdown": [{"trading_day": "2026-06-27", "amount_usd": 23.0}],
     }
     zero = {
-        "ticker": "RVII", "status": "failed", "order_id": "ZERO",
-        "whole_share_zero_fill_attempt": True, "broker_placement_failed": True,
+        "ticker": "RVII",
+        "status": "failed",
+        "order_id": "ZERO",
+        "whole_share_zero_fill_attempt": True,
+        "broker_placement_failed": True,
         "whole_share_claim_breakdown": [{"trading_day": "2026-06-28", "amount_usd": 0.0}],
     }
 
@@ -49446,8 +49653,14 @@ def test_share_eligibility_and_the_placement_notional_agree_on_cents():
     # The invariant, stated directly: whatever count this returns, the
     # notional the placement path computes for it is within the ceiling.
     for ceiling, price in [
-        (50.0, 50.005), (10.0, 10.00), (10.0, 10.01), (50.0, 23.36),
-        (10.0, 23.36), (10.0, 0.10), (50.0, 25.00), (50.0, 16.665),
+        (50.0, 50.005),
+        (10.0, 10.00),
+        (10.0, 10.01),
+        (50.0, 23.36),
+        (10.0, 23.36),
+        (10.0, 0.10),
+        (50.0, 25.00),
+        (50.0, 16.665),
     ]:
         shares = _whole_share_max_shares_by_ceiling(ceiling, price)
         assert shares >= 0
@@ -49543,9 +49756,7 @@ def test_a_failed_broker_call_consumes_a_daily_order_slot():
     import inspect
 
     source = inspect.getsource(near_close_dca._process_buy_candidates_batch)
-    charge_block = source.split("if raw_broker_call_attempted:", 1)[1].split(
-        "if raw_broker_placement_failed:", 1
-    )[0]
+    charge_block = source.split("if raw_broker_call_attempted:", 1)[1].split("if raw_broker_placement_failed:", 1)[0]
     assert 'record_buy(decision.ticker, ctx.trading_day, 0.0, order_id=c_outcome.get("order_id"))' in charge_block
     assert "own_orders_recorded" in charge_block
     # ...and the charge is NOT gated on that set — only the seeding dedup is.
@@ -49639,9 +49850,13 @@ def test_seeding_does_not_double_charge_a_failure_this_run_already_counted():
         state,
         day,
         True,
-        {"AAPL": near_close_dca.PriorSameDayAllocation(
-            ticker="AAPL", amount_usd=0.0, attempt_count=1,
-        )},
+        {
+            "AAPL": near_close_dca.PriorSameDayAllocation(
+                ticker="AAPL",
+                amount_usd=0.0,
+                attempt_count=1,
+            )
+        },
         one_order_per_ticker_per_day=True,
     )
     assert state.day_order_count(day) == 1, "the artifact row was charged twice"
@@ -49679,9 +49894,7 @@ def test_a_recovered_fill_above_the_approved_amount_is_not_booked_as_the_request
         # here, so accepted_amount_usd (the third element) is just
         # `approved` itself on ACCEPTED; every (verdict, order_id)
         # assertion below stays unchanged.
-        return near_close_dca._reconcile_ambiguous_fractional_placement(
-            _Ctx, "AAPL", "REF-AAPL", approved
-        )[:2]
+        return near_close_dca._reconcile_ambiguous_fractional_placement(_Ctx, "AAPL", "REF-AAPL", approved)[:2]
 
     UNKNOWN = near_close_dca._PLACEMENT_UNKNOWN
     ACCEPTED = near_close_dca._PLACEMENT_ACCEPTED
@@ -49696,17 +49909,20 @@ def test_a_recovered_fill_above_the_approved_amount_is_not_booked_as_the_request
         # the order stays reconcilable by hand.
         for value in (100, 2.02):
             assert verdict({"id": "ORD", "state": "filled", field: value}) == (
-                OVERSPENT, "ORD",
+                OVERSPENT,
+                "ORD",
             ), (field, value)
         # Supplied but unreadable, or negative: cannot establish the spend.
         for value in (True, "unknown", float("nan"), float("inf"), {}, [], -5):
             assert verdict({"id": "ORD", "state": "filled", field: value}) == (
-                UNKNOWN, "ORD",
+                UNKNOWN,
+                "ORD",
             ), (field, value)
         # At or below it: an ordinary recovered fill.
         for value in (2.0, 1.5, 0, 2.0005):
             assert verdict({"id": "ORD", "state": "filled", field: value}) == (
-                ACCEPTED, "ORD",
+                ACCEPTED,
+                "ORD",
             ), (field, value)
 
     # ABSENT is not evidence of anything — a `queued` order has not executed,
@@ -49716,9 +49932,7 @@ def test_a_recovered_fill_above_the_approved_amount_is_not_booked_as_the_request
 
     # With no approved amount to compare against, the check cannot run and the
     # verdict is unchanged — the caller always passes one.
-    assert verdict(
-        {"id": "ORD", "state": "filled", "executed_notional": 100}, None
-    ) == (ACCEPTED, "ORD")
+    assert verdict({"id": "ORD", "state": "filled", "executed_notional": 100}, None) == (ACCEPTED, "ORD")
 
 
 def test_a_mapping_shaped_execution_figure_is_a_number_not_an_unreadable_value():
@@ -49829,15 +50043,9 @@ def test_terminal_row_requires_an_explicit_scalar_zero_not_a_blank_mapping():
     ):
         for state in ("cancelled", "canceled", "expired"):
             # A blank mapping amount proves nothing -- unresolved, not proven.
-            assert (
-                proves_no_order({"id": "ORD", "state": state, field: {"amount": ""}})
-                is False
-            ), (field, state)
+            assert proves_no_order({"id": "ORD", "state": state, field: {"amount": ""}}) is False, (field, state)
             # An explicit scalar-inside-mapping zero still proves it.
-            assert (
-                proves_no_order({"id": "ORD", "state": state, field: {"amount": "0"}})
-                is True
-            ), (field, state)
+            assert proves_no_order({"id": "ORD", "state": state, field: {"amount": "0"}}) is True, (field, state)
 
 
 def test_terminal_row_rejects_conflicting_state_and_status_aliases():
@@ -49892,7 +50100,7 @@ def test_reconciled_execution_check_inspects_every_terminal_notional_alias():
 
 
 def test_a_recovered_working_order_is_checked_against_the_amount_it_was_placed_for():
-    """"Is there a real order?" and "for how much?" are different questions,
+    """ "Is there a real order?" and "for how much?" are different questions,
     and a WORKING row can only answer the second one from its REQUESTED amount.
 
     Round 58 brought the executed-notional ceiling to this path, which settles
@@ -49923,9 +50131,7 @@ def test_a_recovered_working_order_is_checked_against_the_amount_it_was_placed_f
 
     def full_verdict(row, approved=2.0):
         _Ctx.broker.row = row
-        return near_close_dca._reconcile_ambiguous_fractional_placement(
-            _Ctx, "AAPL", "REF-AAPL", approved
-        )
+        return near_close_dca._reconcile_ambiguous_fractional_placement(_Ctx, "AAPL", "REF-AAPL", approved)
 
     def verdict(row, approved=2.0):
         return full_verdict(row, approved)[:2]
@@ -49947,23 +50153,20 @@ def test_a_recovered_working_order_is_checked_against_the_amount_it_was_placed_f
             # what was requested, not what remains to execute — so it stays
             # UNKNOWN.
             assert full_verdict({"id": "ORD", "state": state, field: 100}) == (
-                (UNKNOWN, "ORD", None)
-                if state == "filled"
-                else (OVERSPENT, "ORD", (100.0, "requested"))
+                (UNKNOWN, "ORD", None) if state == "filled" else (OVERSPENT, "ORD", (100.0, "requested"))
             ), (field, state)
             # Placed for LESS is a mismatch too: this run placed exactly the
             # approved amount, so a different figure is a different order.
             assert verdict({"id": "ORD", "state": state, field: 1.0}) == (
-                UNKNOWN, "ORD",
+                UNKNOWN,
+                "ORD",
             ), (field, state)
             # Supplied but unreadable cannot establish agreement. For a live
             # order it also leaves the exposure ceiling unbounded, even before
             # any fill is readable; a terminal fill remains generic UNKNOWN.
             for value in (True, "unknown", float("nan"), {}, [], -5):
                 assert full_verdict({"id": "ORD", "state": state, field: value}) == (
-                    (UNKNOWN, "ORD", None)
-                    if state == "filled"
-                    else (OVERSPENT, "ORD", (0.0, "executed_unbounded"))
+                    (UNKNOWN, "ORD", None) if state == "filled" else (OVERSPENT, "ORD", (0.0, "executed_unbounded"))
                 ), (field, state, value)
             # Broker adapters commonly preserve unavailable optional fields as
             # null or blank strings. Those values are absent evidence, just as
@@ -49972,17 +50175,19 @@ def test_a_recovered_working_order_is_checked_against_the_amount_it_was_placed_f
             # "Treat blank requested-notional fields as absent").
             for value in (None, "", "   "):
                 assert verdict({"id": "ORD", "state": state, field: value}) == (
-                    ACCEPTED, "ORD",
+                    ACCEPTED,
+                    "ORD",
                 ), (field, state, value)
             # Blank optional aliases are absent, not contradictory. A second,
             # populated alias can still establish the approved request.
-            assert verdict(
-                {"id": "ORD", "state": state, "dollar_amount": None, "notional": 2}
-            ) == (ACCEPTED, "ORD"), state
+            assert verdict({"id": "ORD", "state": state, "dollar_amount": None, "notional": 2}) == (ACCEPTED, "ORD"), (
+                state
+            )
             # The approved amount, however the broker spells it.
             for value in (2.0, "2.00", 2.0005, {"amount": "2.00"}):
                 assert verdict({"id": "ORD", "state": state, field: value}) == (
-                    ACCEPTED, "ORD",
+                    ACCEPTED,
+                    "ORD",
                 ), (field, state, value)
 
     # ABSENT is not a mismatch, for the same reason it is not a fill: silence
@@ -49994,9 +50199,10 @@ def test_a_recovered_working_order_is_checked_against_the_amount_it_was_placed_f
     # reports an oversized FILL is still unaccounted spend -- and a READABLE
     # one is OVERSPENT rather than UNKNOWN, because the exact figure is known
     # and the caller books it.
-    assert verdict(
-        {"id": "ORD", "state": "filled", "dollar_amount": 2.0, "executed_notional": 100}
-    ) == (OVERSPENT, "ORD")
+    assert verdict({"id": "ORD", "state": "filled", "dollar_amount": 2.0, "executed_notional": 100}) == (
+        OVERSPENT,
+        "ORD",
+    )
     # Unreadable partial-fill evidence does not erase the readable live-order
     # exposure.  The remaining order can still execute up to the requested
     # amount, so later slots must reserve that amount rather than book zero.
@@ -50052,7 +50258,8 @@ def test_a_recovered_working_order_is_checked_against_the_amount_it_was_placed_f
 
     # With no approved amount there is nothing to compare against.
     assert verdict({"id": "ORD", "state": "queued", "dollar_amount": 100}, None) == (
-        ACCEPTED, "ORD",
+        ACCEPTED,
+        "ORD",
     )
 
 
@@ -50084,22 +50291,18 @@ def test_a_failed_broker_call_is_never_marked_as_an_order_this_stream_booked():
     day = date(2026, 8, 25)
 
     def alloc(amount, attempts):
-        return near_close_dca.PriorSameDayAllocation(
-            ticker="AAPL", amount_usd=amount, attempt_count=attempts
-        )
+        return near_close_dca.PriorSameDayAllocation(ticker="AAPL", amount_usd=amount, attempt_count=attempts)
 
     def seed(state, allocations):
-        near_close_dca._seed_prior_allocations(
-            state, day, True, allocations, one_order_per_ticker_per_day=True
-        )
+        near_close_dca._seed_prior_allocations(state, day, True, allocations, one_order_per_ticker_per_day=True)
 
     def run(mark_the_failure):
         state = near_close_dca.StrategyState()
-        seed(state, {"AAPL": alloc(2.0, 1)})     # an earlier slot's $2 attempt
-        state.record_buy("AAPL", day, 0.0)       # this stream's failed call
+        seed(state, {"AAPL": alloc(2.0, 1)})  # an earlier slot's $2 attempt
+        state.record_buy("AAPL", day, 0.0)  # this stream's failed call
         if mark_the_failure:
             state.own_orders_recorded.add(("AAPL", day))
-        seed(state, {"AAPL": alloc(5.0, 2)})     # a later scan: the day grew
+        seed(state, {"AAPL": alloc(5.0, 2)})  # a later scan: the day grew
         return state
 
     # The defect: the marker froze the ticker's reconstruction where it stood.
@@ -50110,9 +50313,7 @@ def test_a_failed_broker_call_is_never_marked_as_an_order_this_stream_booked():
         "a later scan discovering another stream's order must still fold in, "
         "which is what reconcile_prior_allocation exists to do"
     )
-    assert (
-        live.seeded_prior_context_attempts_by_ticker_day.get("AAPL", {}).get(day) == 2
-    )
+    assert live.seeded_prior_context_attempts_by_ticker_day.get("AAPL", {}).get(day) == 2
 
     # ...and the dedup survives WITHOUT the marker: re-scanning this failure's
     # own artifact row contributes nothing, however many times it is scanned.
@@ -50184,9 +50385,7 @@ def test_an_oversized_reconciled_order_id_does_not_disable_the_breaker():
                 return _Ctx.broker.row
 
     _Ctx.broker.row = {"id": 10**1000, "state": "rejected", "cumulative_quantity": 0}
-    verdict, order_id, _ = near_close_dca._reconcile_ambiguous_fractional_placement(
-        _Ctx, "AAPL", "REF-AAPL", 2.0
-    )
+    verdict, order_id, _ = near_close_dca._reconcile_ambiguous_fractional_placement(_Ctx, "AAPL", "REF-AAPL", 2.0)
     assert verdict == near_close_dca._PLACEMENT_UNKNOWN
     assert order_id is None
 
@@ -50225,9 +50424,7 @@ def test_an_unresolved_placement_cannot_halt_without_the_adapter_distinction():
 
     # A broker whose history works perfectly and truthfully reports that the
     # refused order does not exist -- the reported RVII shape.
-    broker = types.SimpleNamespace(
-        same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: None
-    )
+    broker = types.SimpleNamespace(same_day_order_with_ref_id_prefix_any_state=lambda t, d, refs: None)
     ctx = types.SimpleNamespace(broker=broker, trading_day=datetime.date(2026, 8, 25))
 
     verdict, order_id, executed_usd = near_close_dca._reconcile_ambiguous_fractional_placement(
@@ -50359,9 +50556,7 @@ def test_unbounded_recovered_exposure_is_persisted_and_blocks_later_batches(tmp_
         "unapproved_execution_basis": "executed_unbounded",
         "placement_outcome_unproven": True,
     }
-    row = ncd._build_buy_candidates(
-        [_isolation_buy_decision("AAPL")], {"AAPL": outcome}, top_up_outcomes=None
-    )[0]
+    row = ncd._build_buy_candidates([_isolation_buy_decision("AAPL")], {"AAPL": outcome}, top_up_outcomes=None)[0]
     assert row["planned_amount_usd"] == 30.0
     assert row["placement_outcome_unproven"] is True
 
@@ -50430,8 +50625,11 @@ def test_an_unapproved_execution_is_logged_like_any_accepted_order(monkeypatch, 
         logged.append((decision.ticker, order_id, notional_usd, kwargs.get("force_filled")))
 
     ctx = _isolation_context(
-        config, StrategyState(), _Broker(cash=500.0, reference_prices={"AAPL": 98.0}),
-        now, trading_day,
+        config,
+        StrategyState(),
+        _Broker(cash=500.0, reference_prices={"AAPL": 98.0}),
+        now,
+        trading_day,
     )
     ctx = replace(ctx, run_result=cast(Any, object()))
     ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
@@ -50439,9 +50637,7 @@ def test_an_unapproved_execution_is_logged_like_any_accepted_order(monkeypatch, 
     monkeypatch.setattr(ncd, "_log_execution", _capture)
 
     with caplog.at_level(logging.ERROR, logger="near_close_dca"):
-        ncd._process_buy_candidate(
-            decision=_isolation_buy_decision("AAPL"), ctx=ctx, running_deployed_7d=0.0
-        )
+        ncd._process_buy_candidate(decision=_isolation_buy_decision("AAPL"), ctx=ctx, running_deployed_7d=0.0)
 
     # Logged at the REAL amount, like every other figure on this branch, and
     # FORCE-FILLED: the row proved the fill through `executed_notional` alone,
@@ -50465,8 +50661,11 @@ def test_an_unapproved_execution_is_logged_like_any_accepted_order(monkeypatch, 
     ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
     live_ctx = replace(
         _isolation_context(
-            config, StrategyState(),
-            _LiveBroker(cash=500.0, reference_prices={"AAPL": 98.0}), now, trading_day,
+            config,
+            StrategyState(),
+            _LiveBroker(cash=500.0, reference_prices={"AAPL": 98.0}),
+            now,
+            trading_day,
         ),
         run_result=cast(Any, object()),
     )
@@ -50494,8 +50693,11 @@ def test_an_unapproved_execution_is_logged_like_any_accepted_order(monkeypatch, 
     monkeypatch.setattr(ncd, "_log_execution", _raises)
     ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
     ctx2 = _isolation_context(
-        config, StrategyState(), _Broker(cash=500.0, reference_prices={"AAPL": 98.0}),
-        now, trading_day,
+        config,
+        StrategyState(),
+        _Broker(cash=500.0, reference_prices={"AAPL": 98.0}),
+        now,
+        trading_day,
     )
     ctx2 = replace(ctx2, run_result=cast(Any, object()))
     outcome, _t, _d, _e, _r = ncd._process_buy_candidate(
@@ -50556,8 +50758,11 @@ def test_an_unapproved_execution_settles_the_carried_top_up_credit(monkeypatch):
             settled.append((ticker, trading_day, submitted_amount_usd, stream, order_id))
 
     ctx = _isolation_context(
-        config, StrategyState(), _Broker(cash=500.0, reference_prices={"AAPL": 98.0}),
-        now, trading_day,
+        config,
+        StrategyState(),
+        _Broker(cash=500.0, reference_prices={"AAPL": 98.0}),
+        now,
+        trading_day,
     )
     ctx = replace(ctx, guard_active=True, credit_ledger=_Ledger())
     ncd._IN_FLIGHT_CANDIDATE_OUTCOMES["outcomes"] = {}
@@ -50672,9 +50877,16 @@ def test_a_detected_unapproved_execution_stops_the_afternoon_batch(monkeypatch):
         seen.append(decision.ticker)
         if len(seen) < 2:
             return (
-                {"status": "submitted", "order_id": "ORD-1",
-                 "submitted_amount_usd": 2.0, "broker_placement_succeeded": True},
-                None, running_deployed_7d + 2.0, 0, 0,
+                {
+                    "status": "submitted",
+                    "order_id": "ORD-1",
+                    "submitted_amount_usd": 2.0,
+                    "broker_placement_succeeded": True,
+                },
+                None,
+                running_deployed_7d + 2.0,
+                0,
+                0,
             )
         return (
             {
@@ -50697,7 +50909,10 @@ def test_a_detected_unapproved_execution_stops_the_afternoon_batch(monkeypatch):
                 "unapproved_execution_basis": "executed",
                 "approved_amount_usd": 2.0,
             },
-            None, running_deployed_7d + 100.0, 1, 0,
+            None,
+            running_deployed_7d + 100.0,
+            1,
+            0,
         )
 
     monkeypatch.setattr(ncd, "_process_buy_candidate", _overspends_on_the_second)
@@ -50775,7 +50990,10 @@ def test_a_requested_only_halt_reason_does_not_claim_a_fill(monkeypatch):
                 "unapproved_execution_basis": "requested",
                 "approved_amount_usd": 2.0,
             },
-            None, running_deployed_7d + 100.0, 1, 0,
+            None,
+            running_deployed_7d + 100.0,
+            1,
+            0,
         )
 
     monkeypatch.setattr(ncd, "_process_buy_candidate", _requested_only_overspend)
@@ -50831,7 +51049,10 @@ def test_batch_halt_reason_words_the_unbounded_basis_as_executed_at_least(monkey
                 "unapproved_execution_basis": "executed_unbounded",
                 "approved_amount_usd": 2.0,
             },
-            None, running_deployed_7d + 30.0, 1, 0,
+            None,
+            running_deployed_7d + 30.0,
+            1,
+            0,
         )
 
     monkeypatch.setattr(ncd, "_process_buy_candidate", _unbounded_overspend)
@@ -51009,8 +51230,7 @@ def test_unproven_placement_scan_still_reads_an_artifact_whose_keys_use_json_uni
     # "placement_evidence_incomplete" with its 'o' spelled as o: no literal
     # match for the key, but the parsed document carries it.
     (escaped_dir / "run_state.json").write_text(
-        '{"trading_day": "%s", "placement_evidence_inc\\u006fmplete": true, "broker_outcomes": null}'
-        % trading_day_iso,
+        '{"trading_day": "%s", "placement_evidence_inc\\u006fmplete": true, "broker_outcomes": null}' % trading_day_iso,
         encoding="utf-8",
     )
     current_dir = tmp_path / "current"
@@ -51083,3 +51303,37 @@ def test_same_stream_order_exists_recognizes_the_other_entry_points_ref_ids_for_
         assert found is not None and found["id"] == "ORDER-FOREIGN", foreign_ref
         # Still scoped to the slot: the midday engine does not claim it.
         assert _same_stream_order_exists(broker, "AAPL", trading_day, "midday") is None
+
+
+def test_build_alpaca_account_info_payload_happy_path() -> None:
+    # Test True
+    payload_true = build_alpaca_account_info_payload(True)
+    assert payload_true["source_id"] == ALPACA_SOURCE_ID
+    assert payload_true["tool"] == ALPACA_ACCOUNT_INFO_TOOL
+    assert payload_true["input"] == {"isPaperAPI": True}
+
+    # Test False
+    payload_false = build_alpaca_account_info_payload(False)
+    assert payload_false["source_id"] == ALPACA_SOURCE_ID
+    assert payload_false["tool"] == ALPACA_ACCOUNT_INFO_TOOL
+    assert payload_false["input"] == {"isPaperAPI": False}
+
+
+def test_build_alpaca_account_info_payload_malformed() -> None:
+    with pytest.raises(TypeError, match="is_paper_api must be a boolean"):
+        build_alpaca_account_info_payload("not a bool")  # type: ignore
+
+    with pytest.raises(TypeError, match="is_paper_api must be a boolean"):
+        build_alpaca_account_info_payload(None)  # type: ignore
+
+def test_format_notional():
+    from near_close_dca import format_notional
+
+    # 10.555 is slightly less than 10.555 in float representation, so it rounds down to 10.55
+    assert format_notional(10.555) == "10.55"
+    assert format_notional(10.554) == "10.55"
+    assert format_notional(0.0) == "0.00"
+    assert format_notional(100) == "100.00"
+    assert format_notional(100.0) == "100.00"
+    assert format_notional(123456789.12) == "123456789.12" # Avoid scientific notation
+    assert format_notional(-5.5) == "-5.50"

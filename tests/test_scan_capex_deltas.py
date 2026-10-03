@@ -486,3 +486,5 @@ def test_format_capex_scan_report():
     assert "Passed: 1" in report
     assert "Baselines Recorded: 1" in report
     assert "Not Scannable: 1" in report
+
+

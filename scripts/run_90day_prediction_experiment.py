@@ -337,7 +337,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.all_scheduled or (args.tickers is None):
         tickers_cfg_path = REPO_ROOT / "config" / "tickers.json"
         if tickers_cfg_path.exists():
-            cfg_data = json.loads(tickers_cfg_path.read_text(encoding="utf-8"))
+            cfg_data = json.loads(tickers_cfg_path.read_bytes())
             active_list = cfg_data.get("active") or []
             target_tickers = sorted([t.upper() for t in active_list if (history_dir / f"{t}.csv").exists()])
         else:
