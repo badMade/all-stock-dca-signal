@@ -34,7 +34,7 @@ def write(cfg, stem, value):
 
 
 def load(cfg, stem):
-    return json.loads((cfg / f"{stem}.json").read_bytes())
+    return json.loads((cfg / f"{stem}.json").read_text(encoding="utf-8"))
 
 
 def approved_window_days(cfg):
@@ -55,17 +55,10 @@ def every_builder(cfg):
     # path for the reader, exactly as the other console readers split them.
     cfg = RootSpec.of(cfg, "config").path
     return [
-        reader.config_catalog(cfg, REPO),
-        reader.config_file_view(cfg, "tickers"),
-        reader.parity_checks(cfg),
-        reader.effective_config(cfg, NOW),
-        reader.ladder_preview(cfg),
-        reader.ladder_point(cfg, 2.0, "AAPL"),
-        reader.stream_flags(cfg),
-        reader.sizing_sources(cfg, NOW),
-        reader.live_gate_summary(cfg, DAY),
-        reader.window_countdown(cfg, DAY),
-        reader.build_config_snapshot(cfg, REPO, NOW, DAY),
+        reader.config_catalog(cfg, REPO), reader.config_file_view(cfg, "tickers"), reader.parity_checks(cfg),
+        reader.effective_config(cfg, NOW), reader.ladder_preview(cfg), reader.ladder_point(cfg, 2.0, "AAPL"),
+        reader.stream_flags(cfg), reader.sizing_sources(cfg, NOW), reader.live_gate_summary(cfg, DAY),
+        reader.window_countdown(cfg, DAY), reader.build_config_snapshot(cfg, REPO, NOW, DAY),
     ]
 
 
@@ -74,16 +67,13 @@ def test_config_files_enumerates_the_committed_configs_and_schemas():
     assert stems == {path.stem for path in CONFIG.glob("*.json")}
     assert len(reader.CONFIG_FILES) == 21
     for stem, schema, _publisher in reader.CONFIG_FILES:
-        committed = json.loads((CONFIG / f"{stem}.json").read_bytes()).get("$schema")
+        committed = json.loads((CONFIG / f"{stem}.json").read_text(encoding="utf-8")).get("$schema")
         if schema is None:
             assert committed is None, stem
         else:
             assert committed.endswith(f"{schema}.schema.json"), stem
             assert (REPO / "schemas" / f"{schema}.schema.json").is_file(), stem
-    assert {s for s, _sc, publisher in reader.CONFIG_FILES if publisher} == {
-        "per_ticker_sizing",
-        "ml_sizing_adjustment",
-    }
+    assert {s for s, _sc, publisher in reader.CONFIG_FILES if publisher} == {"per_ticker_sizing", "ml_sizing_adjustment"}
     assert sum(1 for _s, schema, _p in reader.CONFIG_FILES if schema is None) == 7
 
 
@@ -113,16 +103,8 @@ def test_catalog_reports_absent_and_rejected_files_without_paths(cfg, tmp_path):
 def test_file_view_neutralises_env_references_and_secret_values(cfg, monkeypatch):
     monkeypatch.setenv("CONSOLE_TEST_SET_VAR", "value-that-must-not-appear")
     monkeypatch.delenv("CONSOLE_TEST_UNSET_VAR", raising=False)
-    write(
-        cfg,
-        "near_close_dca",
-        {
-            "a": "${CONSOLE_TEST_SET_VAR}",
-            "b": "${CONSOLE_TEST_UNSET_VAR}",
-            "account_number": SYNTHETIC_ACCOUNT,
-            "n": 1.5,
-        },
-    )
+    write(cfg, "near_close_dca", {"a": "${CONSOLE_TEST_SET_VAR}", "b": "${CONSOLE_TEST_UNSET_VAR}",
+                                  "account_number": SYNTHETIC_ACCOUNT, "n": 1.5})
     view = reader.config_file_view(cfg, "near_close_dca")
     assert view["found"] is True and view["truncated"] is False and view["error"] is None
     assert "env reference CONSOLE_TEST_SET_VAR (set)" in view["text"]
@@ -147,14 +129,9 @@ def test_file_view_rejects_unknown_stems_and_reports_rejected_files(cfg):
 def test_parity_checks_agree_on_committed_config_and_diverge_on_mutation(cfg):
     committed = reader.parity_checks(cfg)
     assert {check["name"]: check["ok"] for check in committed["checks"]} == {
-        "active_tickers_order": True,
-        "excluded_tickers_set": True,
-        "whole_share_tickers_set": True,
-        "categories_disjoint": True,
-        "whole_share_sizing_entries": True,
-        "budgets_breaker": True,
-        "schema_files_exist": True,
-    }
+        "active_tickers_order": True, "excluded_tickers_set": True, "whole_share_tickers_set": True,
+        "categories_disjoint": True, "whole_share_sizing_entries": True, "budgets_breaker": True,
+        "schema_files_exist": True}
     assert "config-invariants" in committed["note"]
     tickers = load(cfg, "tickers")
     tickers["active"] = list(reversed(tickers["active"]))
@@ -190,20 +167,12 @@ def test_effective_config_labels_sources_and_never_exposes_the_account(cfg):
     result = reader.effective_config(cfg, NOW)
     fields = {field["name"]: field for field in result["fields"]}
     assert len(fields) == len(reader.dataclasses.fields(reader.near_close_dca.StrategyConfig))
-    assert fields["trend_lookback_minutes"] == {
-        "name": "trend_lookback_minutes",
-        "value": 90,
-        "default_differs": True,
-        "source": "json",
-        "note": None,
-    }
+    assert fields["trend_lookback_minutes"] == {"name": "trend_lookback_minutes", "value": 90, "default_differs": True,
+                                                "source": "json", "note": None}
     assert fields["dry_run"]["value"] is True and fields["dry_run"]["note"] == "never settable from JSON"
     assert fields["broker"]["value"] == "robinhood" and fields["broker"]["note"] == "never settable from JSON"
     assert fields["target_account_number"]["value"] in {"configured", "unset"}
-    assert (
-        isinstance(fields["approved_test_dates"]["value"], list)
-        and fields["approved_test_dates"]["value"][0] == "2026-07-02"
-    )
+    assert isinstance(fields["approved_test_dates"]["value"], list) and fields["approved_test_dates"]["value"][0] == "2026-07-02"
     assert isinstance(fields["sizing_tiers"]["value"][0], list)
     encoded = json.dumps(result, allow_nan=False)
     assert SYNTHETIC_ACCOUNT not in encoded and result["unresolved_env"] == []
@@ -212,7 +181,6 @@ def test_effective_config_labels_sources_and_never_exposes_the_account(cfg):
 def test_effective_config_reports_unresolved_env_by_name_and_loader_failures(cfg, monkeypatch, tmp_path):
     def raise_missing(*args, **kwargs):
         raise dca_config.MissingConfigEnvError(f"{tmp_path} references ${{CONSOLE_TEST_SECRET}} but it is unset")
-
     monkeypatch.setattr(dca_config, "load_strategy_config", raise_missing)
     result = reader.effective_config(cfg, NOW)
     assert result["fields"] == [] and result["unresolved_env"] == ["CONSOLE_TEST_SECRET"]
@@ -230,13 +198,8 @@ def test_ladder_preview_matches_the_strategy_functions(cfg):
     result = reader.ladder_preview(cfg)
     grid = {row["drop_pct"]: row for row in result["grid"]}
     assert len(grid) == 49 and result["warnings"] == []
-    assert grid[0.0] == {
-        "drop_pct": 0.0,
-        "multiplier": 0.0,
-        "base_usd": 0.0,
-        "base_reason": "not_below_prior_close_no_buy",
-        "candidate_usd": 0.0,
-    }
+    assert grid[0.0] == {"drop_pct": 0.0, "multiplier": 0.0, "base_usd": 0.0,
+                         "base_reason": "not_below_prior_close_no_buy", "candidate_usd": 0.0}
     config = dca_config.load_strategy_config(cfg)
     for drop in (0.25, 2.0, 4.0, 12.0):
         assert grid[drop]["multiplier"] == reader.near_close_dca.graded_buy_multiplier(drop / 100, config)
@@ -248,15 +211,7 @@ def test_ladder_preview_matches_the_strategy_functions(cfg):
 
 
 def test_ladder_point_validates_drop_and_ticker(cfg):
-    for bad in (
-        (-1, "AAPL"),
-        (50.5, "AAPL"),
-        ("x", "AAPL"),
-        (float("nan"), "AAPL"),
-        (3, "NOPE"),
-        (3, None),
-        (3, "QBUT"),
-    ):
+    for bad in ((-1, "AAPL"), (50.5, "AAPL"), ("x", "AAPL"), (float("nan"), "AAPL"), (3, "NOPE"), (3, None), (3, "QBUT")):
         assert reader.ladder_point(cfg, *bad)["found"] is False
     point = reader.ladder_point(cfg, 3.0, " aapl ")
     assert point["found"] is True and point["ticker"] == "AAPL" and point["base_usd"] == 1.0
@@ -270,15 +225,10 @@ def test_ladder_point_validates_drop_and_ticker(cfg):
 def test_stream_flags_come_from_raw_json(cfg, tmp_path):
     result = reader.stream_flags(cfg)
     streams = {row["stream"]: row for row in result["streams"]}
-    assert (
-        streams["midday"]["live_execution_enabled"] is True
-        and streams["market_open"]["live_execution_enabled"] is False
-    )
+    assert streams["midday"]["live_execution_enabled"] is True and streams["market_open"]["live_execution_enabled"] is False
     assert streams["morning"]["live_execution_enabled"] is None and "not declared" in streams["morning"]["note"]
     assert streams["intraday"]["slots"] == ["1130", "1330", "1430"] and streams["midday"]["slots"] == ["12:30"]
-    assert all(
-        row["trend_min_bars"] == 6 and len(row["confidence_rule"]) <= reader.MAX_TEXT for row in streams.values()
-    )
+    assert all(row["trend_min_bars"] == 6 and len(row["confidence_rule"]) <= reader.MAX_TEXT for row in streams.values())
     assert result["run_classification"]["scheduled"]["run_origin"] == "scheduled"
     assert result["run_classification"]["manual"]["manual_run"] is True
     write(cfg, "midday_dca", "{broken")
@@ -307,9 +257,7 @@ def test_sizing_sources_report_staleness_and_publisher_only(cfg):
     # symbol, no archived history yet to calibrate against).
     assert committed["per_ticker"]["fallback_count"] == 11
     ml = load(cfg, "ml_sizing_adjustment")
-    ml.update(
-        {"status": "active", "generated_at": (NOW - timedelta(hours=1)).isoformat(), "adjustments": {"AAPL": 1.1}}
-    )
+    ml.update({"status": "active", "generated_at": (NOW - timedelta(hours=1)).isoformat(), "adjustments": {"AAPL": 1.1}})
     write(cfg, "ml_sizing_adjustment", ml)
     fresh = reader.sizing_sources(cfg, NOW)["ml"]
     assert fresh["stale"] is False and fresh["applied_count"] == 1 and fresh["adjustment_count"] == 1
@@ -322,9 +270,7 @@ def test_sizing_sources_report_staleness_and_publisher_only(cfg):
     assert reader.sizing_sources(cfg, NOW)["ml"]["stale"] is None
     write(cfg, "per_ticker_sizing", {"status": "active", "tickers": {"AAPL": {"tiers": []}}})
     broken = reader.sizing_sources(cfg, NOW)
-    assert broken["per_ticker"]["loaded_count"] is None and any(
-        "per_ticker_sizing.json" in w for w in broken["warnings"]
-    )
+    assert broken["per_ticker"]["loaded_count"] is None and any("per_ticker_sizing.json" in w for w in broken["warnings"])
 
 
 def test_live_gate_summary_reports_names_never_values(cfg, monkeypatch):
@@ -332,14 +278,9 @@ def test_live_gate_summary_reports_names_never_values(cfg, monkeypatch):
     result = reader.live_gate_summary(cfg, DAY)
     gates = {gate["name"]: gate for gate in result["gates"]}
     assert result["banner"] == reader.BANNER and len(gates) == 6
-    assert (
-        gates["strategy_dry_run"]["state"] == "unconfigured" and "literally {}" in gates["strategy_dry_run"]["detail"]
-    )
+    assert gates["strategy_dry_run"]["state"] == "unconfigured" and "literally {}" in gates["strategy_dry_run"]["detail"]
     assert gates["broker_enable_live_orders"]["state"] == "unknown"
-    assert (
-        gates["stream_live_execution_enabled"]["state"] == "configured"
-        and "midday" in gates["stream_live_execution_enabled"]["detail"]
-    )
+    assert gates["stream_live_execution_enabled"]["state"] == "configured" and "midday" in gates["stream_live_execution_enabled"]["detail"]
     assert gates["account_number_env"]["state"] == "unconfigured"
     assert gates["approved_trading_window"]["state"] == "configured"
     assert gates["slot_windows"]["state"] == "configured" and "7 slot" in gates["slot_windows"]["detail"]
@@ -375,9 +316,7 @@ def test_absent_config_dir_is_unavailable_not_zero(tmp_path):
     absent = tmp_path / "nope"
     catalog = reader.config_catalog(absent, REPO)
     assert all(row["exists"] is False and row["parse_ok"] is None for row in catalog["files"])
-    assert all(
-        check["ok"] is None for check in reader.parity_checks(absent)["checks"] if check["name"] != "schema_files_exist"
-    )
+    assert all(check["ok"] is None for check in reader.parity_checks(absent)["checks"] if check["name"] != "schema_files_exist")
     countdown = reader.window_countdown(absent, DAY)
     assert countdown["in_window"] is None and countdown["calendar_years"] is None
     assert all(row["found"] is False for row in reader.stream_flags(absent)["streams"])
@@ -404,10 +343,7 @@ def test_snapshot_never_leaks_paths_or_the_account(cfg, tmp_path, monkeypatch):
     write(cfg, "ml_sizing_adjustment", ml)
     write(cfg, "budgets", "[" + leak)
     write(cfg, "self_heal", "{" + leak)
-    everything = every_builder(cfg) + [
-        reader.config_file_view(cfg, "midday_dca"),
-        reader.config_file_view(cfg, "near_close_dca"),
-    ]
+    everything = every_builder(cfg) + [reader.config_file_view(cfg, "midday_dca"), reader.config_file_view(cfg, "near_close_dca")]
     raw = json.dumps(everything, allow_nan=False)
     assert str(tmp_path) not in raw
     redacted = json.dumps(walk_redact(everything), allow_nan=False)
@@ -424,7 +360,6 @@ def test_builders_never_take_a_cross_process_lock(cfg, monkeypatch):
 
     def refuse(*args, **kwargs):
         raise AssertionError("a console reader took a lock")
-
     monkeypatch.setattr(scripts.file_lock, "cross_process_lock", refuse)
     monkeypatch.setattr(dca_runner, "state_transaction", refuse)
     results = every_builder(cfg)
@@ -462,15 +397,8 @@ def test_text_redacts_and_scrubs_before_bounding():
 def test_per_ticker_sizing_type_error_degrades_instead_of_raising(cfg):
     # dca_config.load_per_ticker_sizing does float(tier["min_drop_pct"]) (line 672):
     # null there is a TypeError, the failure a bad publish actually produces.
-    write(
-        cfg,
-        "per_ticker_sizing",
-        {
-            "status": "active",
-            "version": "v9",
-            "tickers": {"AAPL": {"tiers": [{"min_drop_pct": None, "multiplier": 1.0}]}},
-        },
-    )
+    write(cfg, "per_ticker_sizing", {"status": "active", "version": "v9",
+                                     "tickers": {"AAPL": {"tiers": [{"min_drop_pct": None, "multiplier": 1.0}]}}})
     with pytest.raises(TypeError):
         dca_config.load_per_ticker_sizing(cfg)
     preview = reader.ladder_preview(cfg)

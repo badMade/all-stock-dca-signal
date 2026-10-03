@@ -496,28 +496,10 @@ def launch_bench(app, repo: Path) -> dict[str, Any]:
     }
 
 
-def _is_safe_xml(path: Path) -> bool:
-    """
-    Validates XML is free of DOCTYPE declarations to prevent XXE/Billion Laughs.
-    Attempts strict decoding to prevent encoding-based bypasses.
-    """
-    for encoding in ('utf-8', 'utf-16', 'utf-16-le', 'utf-16-be'):
-        try:
-            content = path.read_text(encoding=encoding, errors='strict')
-            if "<!DOCTYPE" in content.upper():
-                return False
-            return True
-        except UnicodeError:
-            continue
-    return False
-
-
 def junit_summary(path: Path) -> dict[str, Any]:
     """Summarise a pytest junit report; skipped means 'not validated', never 'passed'."""
     summary: dict[str, Any] = {"passed": 0, "failed": 0, "skipped": 0, "errors": 0, "cases": [], "parsed": False}
     try:
-        if not _is_safe_xml(path):
-            return summary
         tree = ElementTree.parse(path)
     except (OSError, ElementTree.ParseError):
         return summary

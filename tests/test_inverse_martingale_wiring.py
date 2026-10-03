@@ -108,21 +108,9 @@ def _base_config(**overrides):
 
 
 def _run_day(
-    tmp_path,
-    config,
-    state,
-    trading_day,
-    decision_price,
-    artifacts_label,
-    scheduled=True,
-    robinhood_price=None,
-    broker_cash=500.0,
-    prior_same_day_allocations=None,
-    stream="afternoon",
-    now_time=time(15, 45),
-    prev_close=100.0,
-    broker=None,
-    deployment_history_root=None,
+    tmp_path, config, state, trading_day, decision_price, artifacts_label, scheduled=True,
+    robinhood_price=None, broker_cash=500.0, prior_same_day_allocations=None, stream="afternoon",
+    now_time=time(15, 45), prev_close=100.0, broker=None, deployment_history_root=None,
     classification_overrides=None,
 ):
     now = datetime.combine(trading_day, now_time, tzinfo=EASTERN)
@@ -570,7 +558,9 @@ def test_removing_a_ticker_from_the_tradable_universe_resets_its_active_cycle(tm
     # AAPL is removed from the tradable universe (config.tickers), but its
     # config.inverse_martingale entry is left untouched -- still "enrolled"
     # by that mapping alone.
-    removed_from_universe_config = _base_config(tickers=("MSFT",), inverse_martingale={"AAPL": PCT_ENROLLMENT})
+    removed_from_universe_config = _base_config(
+        tickers=("MSFT",), inverse_martingale={"AAPL": PCT_ENROLLMENT}
+    )
     _run_day(tmp_path, removed_from_universe_config, state, TEST_DATES[1], 96.0, "day2")
 
     after = json.loads(tracker_path.read_bytes())
@@ -674,16 +664,11 @@ def test_missing_data_age_advance_leaves_a_pending_settlement_lease_untouched(tm
     ledger = InverseMartingaleLedger(root=tmp_path)
     pending_state = _pending_tracker_state()
     ledger.record_step(
-        "AAPL",
-        pending_state,
+        "AAPL", pending_state,
         InverseMartingaleStep(
-            status_before=STATUS_FIRING,
-            status_after=STATUS_FIRING,
-            accumulated_usd_before=10.0,
-            accumulated_usd_after=5.0,
-            newly_crossed_tiers=(),
-            fired=True,
-            fire_amount_usd=5.0,
+            status_before=STATUS_FIRING, status_after=STATUS_FIRING,
+            accumulated_usd_before=10.0, accumulated_usd_after=5.0,
+            newly_crossed_tiers=(), fired=True, fire_amount_usd=5.0,
             reason="fire_continuation",
         ),
     )
@@ -704,16 +689,11 @@ def test_disabled_enrollment_reset_leaves_a_pending_settlement_lease_untouched(t
     ledger = InverseMartingaleLedger(root=tmp_path)
     pending_state = _pending_tracker_state()
     ledger.record_step(
-        "AAPL",
-        pending_state,
+        "AAPL", pending_state,
         InverseMartingaleStep(
-            status_before=STATUS_FIRING,
-            status_after=STATUS_FIRING,
-            accumulated_usd_before=10.0,
-            accumulated_usd_after=5.0,
-            newly_crossed_tiers=(),
-            fired=True,
-            fire_amount_usd=5.0,
+            status_before=STATUS_FIRING, status_after=STATUS_FIRING,
+            accumulated_usd_before=10.0, accumulated_usd_after=5.0,
+            newly_crossed_tiers=(), fired=True, fire_amount_usd=5.0,
             reason="fire_continuation",
         ),
     )
@@ -758,13 +738,7 @@ def test_morning_slot_ticker_gating_does_not_reset_the_cycle(tmp_path, monkeypat
     # preflight gate merely excluded it from today's morning scan.
     config_morning_gated = _base_config(tickers=(), inverse_martingale=enrollment)
     _run_day(
-        tmp_path,
-        config_morning_gated,
-        state,
-        TEST_DATES[1],
-        99.0,
-        "day2-morning",
-        stream="morning",
+        tmp_path, config_morning_gated, state, TEST_DATES[1], 99.0, "day2-morning", stream="morning",
     )
 
     after_morning = json.loads(tracker_path.read_bytes())
@@ -1072,25 +1046,15 @@ def test_live_corporate_action_lookup_is_counted_in_the_usage_proxy(tmp_path, mo
     trading_day = TEST_DATES[2]
     now = datetime.combine(trading_day, time(15, 45), tzinfo=EASTERN)
     fin = _LiveCorporateActionData(
-        prev_close=100.0,
-        decision_price=99.0,
-        source=SourceName.FINANCE,
-        corporate_action_result=1.0,
-        calls=calls,
+        prev_close=100.0, decision_price=99.0, source=SourceName.FINANCE,
+        corporate_action_result=1.0, calls=calls,
     )
     rh = _FixedPriceData(prev_close=100.0, decision_price=99.0, source=SourceName.ROBINHOOD)
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 99.0})
     result = run_daily_compact(
-        now,
-        config,
-        state,
-        fin,
-        rh,
-        broker,
+        now, config, state, fin, rh, broker,
         options=CompactRunOptions(
-            artifacts_dir=str(tmp_path / "runs/day3"),
-            scheduled=True,
-            stream="afternoon",
+            artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon",
         ),
     )
     with open(cast(str, result["run_state_path"]), encoding="utf-8") as handle:
@@ -1136,16 +1100,9 @@ def test_cache_served_corporate_action_lookup_is_not_counted_in_the_usage_proxy(
     rh = _FixedPriceData(prev_close=100.0, decision_price=99.0, source=SourceName.ROBINHOOD)
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 99.0})
     result = run_daily_compact(
-        now,
-        config,
-        state,
-        fin,
-        rh,
-        broker,
+        now, config, state, fin, rh, broker,
         options=CompactRunOptions(
-            artifacts_dir=str(tmp_path / "runs/day3"),
-            scheduled=True,
-            stream="afternoon",
+            artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon",
         ),
     )
     with open(cast(str, result["run_state_path"]), encoding="utf-8") as handle:
@@ -1159,7 +1116,9 @@ def test_cache_served_corporate_action_lookup_is_not_counted_in_the_usage_proxy(
     "failure",
     [RuntimeError("transient connector outage"), KeyError("bad payload"), IndexError("missing field")],
 )
-def test_direct_corporate_action_lookup_failure_holds_only_that_tickers_latch(tmp_path, monkeypatch, caplog, failure):
+def test_direct_corporate_action_lookup_failure_holds_only_that_tickers_latch(
+    tmp_path, monkeypatch, caplog, failure
+):
     """A direct (non-frozen) provider whose live corporate-action lookup RAISES
     -- a transient connector error, or a KeyError/IndexError from decoding a
     malformed third-party payload, neither of which is part of any connector's
@@ -1195,7 +1154,9 @@ def test_direct_corporate_action_lookup_failure_holds_only_that_tickers_latch(tm
             fin,
             rh,
             DryRunBroker(cash=500.0, reference_prices={"AAPL": 110.0}),
-            options=CompactRunOptions(artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon"),
+            options=CompactRunOptions(
+                artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon"
+            ),
         )
 
     # The run completed normally (no exception escaped the per-ticker loop) ...
@@ -1203,7 +1164,9 @@ def test_direct_corporate_action_lookup_failure_holds_only_that_tickers_latch(tm
     # ... the latch was held, not evaluated against the stale reference ...
     assert json.loads(tracker_path.read_bytes()) == before
     # ... and the raise was surfaced, not swallowed silently.
-    assert any("corporate-action lookup failed for AAPL" in record.message for record in caplog.records)
+    assert any(
+        "corporate-action lookup failed for AAPL" in record.message for record in caplog.records
+    )
 
 
 class _ArchiveFallbackProviderWithPersistHook(_LiveCorporateActionData):
@@ -1256,16 +1219,9 @@ def _evaluate_day3_with(fin, tmp_path, config, state):
     rh = _FixedPriceData(prev_close=49.0, decision_price=49.0, source=SourceName.ROBINHOOD)
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 49.0})
     return run_daily_compact(
-        now,
-        config,
-        state,
-        fin,
-        rh,
-        broker,
+        now, config, state, fin, rh, broker,
         options=CompactRunOptions(
-            artifacts_dir=str(tmp_path / "runs/day3"),
-            scheduled=True,
-            stream="afternoon",
+            artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon",
         ),
     )
 
@@ -1280,12 +1236,11 @@ def test_archive_fallback_evidence_is_frozen_through_the_provider_hook_before_us
     and only then rebase the latch (PR #1357: "Fix corporate action isolation
     and state update races"; Codex review: "Persist corporate-action evidence
     before using it")."""
-    config, state, tracker_path, before = _arm_a_dormant_latch_with_a_confirming_archive(tmp_path, monkeypatch)
+    config, state, tracker_path, before = _arm_a_dormant_latch_with_a_confirming_archive(
+        tmp_path, monkeypatch
+    )
     fin = _ArchiveFallbackProviderWithPersistHook(
-        prev_close=49.0,
-        decision_price=49.0,
-        source=SourceName.FINANCE,
-        hook_result=True,
+        prev_close=49.0, decision_price=49.0, source=SourceName.FINANCE, hook_result=True,
     )
     _evaluate_day3_with(fin, tmp_path, config, state)
 
@@ -1306,19 +1261,20 @@ def test_archive_fallback_evidence_is_frozen_through_the_provider_hook_before_us
 
 
 @pytest.mark.parametrize("hook_result", [False, OSError("raw snapshot not writable")])
-def test_archive_fallback_evidence_that_cannot_be_frozen_holds_the_rearm_latch(tmp_path, monkeypatch, hook_result):
+def test_archive_fallback_evidence_that_cannot_be_frozen_holds_the_rearm_latch(
+    tmp_path, monkeypatch, hook_result
+):
     """If the persist hook reports it could not validate or write the archive
     evidence (False), or itself raises, the strategy must NOT act on evidence
     no replay of the raw snapshot can ever see: the latch is held byte-for-
     byte, the same fail-closed direction an unconfirmed window takes, and the
     run still completes for every other ticker (PR #1357: "Fix corporate
     action isolation and state update races")."""
-    config, state, tracker_path, before = _arm_a_dormant_latch_with_a_confirming_archive(tmp_path, monkeypatch)
+    config, state, tracker_path, before = _arm_a_dormant_latch_with_a_confirming_archive(
+        tmp_path, monkeypatch
+    )
     fin = _ArchiveFallbackProviderWithPersistHook(
-        prev_close=49.0,
-        decision_price=49.0,
-        source=SourceName.FINANCE,
-        hook_result=hook_result,
+        prev_close=49.0, decision_price=49.0, source=SourceName.FINANCE, hook_result=hook_result,
     )
     result = _evaluate_day3_with(fin, tmp_path, config, state)
 
@@ -1339,9 +1295,7 @@ def test_archive_fallback_evidence_that_cannot_be_frozen_holds_the_rearm_latch(t
     ],
 )
 def test_direct_live_corporate_action_lookup_rejects_invalid_results(
-    tmp_path,
-    monkeypatch,
-    invalid_result,
+    tmp_path, monkeypatch, invalid_result,
 ):
     """Direct ``run_daily_compact`` callers get the same fail-closed action
     validation as orchestrated frozen-provider runs.
@@ -1415,24 +1369,15 @@ def test_falls_back_to_archive_when_the_live_lookup_cannot_confirm(tmp_path, mon
     trading_day = TEST_DATES[2]
     now = datetime.combine(trading_day, time(15, 45), tzinfo=EASTERN)
     fin = _LiveCorporateActionData(
-        prev_close=49.0,
-        decision_price=49.0,
-        source=SourceName.FINANCE,
+        prev_close=49.0, decision_price=49.0, source=SourceName.FINANCE,
         corporate_action_result=None,
     )
     rh = _FixedPriceData(prev_close=49.0, decision_price=49.0, source=SourceName.ROBINHOOD)
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 49.0})
     run_daily_compact(
-        now,
-        config,
-        state,
-        fin,
-        rh,
-        broker,
+        now, config, state, fin, rh, broker,
         options=CompactRunOptions(
-            artifacts_dir=str(tmp_path / "runs/day3"),
-            scheduled=True,
-            stream="afternoon",
+            artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon",
         ),
     )
     after = json.loads(tracker_path.read_bytes())
@@ -1479,7 +1424,9 @@ def test_unavailable_live_and_archive_evidence_holds_the_rearm_latch(tmp_path, m
         fin,
         rh,
         broker,
-        options=CompactRunOptions(artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon"),
+        options=CompactRunOptions(
+            artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon"
+        ),
     )
 
     assert json.loads(tracker_path.read_bytes()) == before
@@ -1493,7 +1440,8 @@ def test_archive_ending_before_evaluation_day_holds_the_rearm_latch(tmp_path, mo
     # Fresh enough for archived_split_factor's general staleness tolerance, but
     # not enough to rule out an action on the evaluation day itself.
     (tmp_path / "ticker_data" / "AAPL.csv").write_text(
-        f"Date,Close,Adj Close,Stock Splits,Dividends\n{TEST_DATES[1].isoformat()},96.5,96.5,0.0,0.0\n",
+        "Date,Close,Adj Close,Stock Splits,Dividends\n"
+        f"{TEST_DATES[1].isoformat()},96.5,96.5,0.0,0.0\n",
         encoding="utf-8",
     )
     config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
@@ -1523,7 +1471,9 @@ def test_archive_ending_before_evaluation_day_holds_the_rearm_latch(tmp_path, mo
         fin,
         rh,
         broker,
-        options=CompactRunOptions(artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon"),
+        options=CompactRunOptions(
+            artifacts_dir=str(tmp_path / "runs/day3"), scheduled=True, stream="afternoon"
+        ),
     )
 
     assert json.loads(tracker_path.read_bytes()) == before
@@ -1633,23 +1583,14 @@ def test_prior_same_day_allocation_defers_fire_but_still_tracks_the_dip(tmp_path
     config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
     state = StrategyState()
     prior = PriorSameDayAllocation(
-        "AAPL",
-        amount_usd=5.0,
-        reference_price=100.0,
-        run_id="morning",
-        source="scheduled",
-        selected_base_amount_usd=2.0,
+        "AAPL", amount_usd=5.0, reference_price=100.0, run_id="morning",
+        source="scheduled", selected_base_amount_usd=2.0,
     )
 
     # Day 1: guarded by the prior allocation, but the dip must still be
     # tracked (1% -> tier 1, $1 accumulated), not skipped entirely.
     r1, s1, _ = _run_day(
-        tmp_path,
-        config,
-        state,
-        TEST_DATES[0],
-        99.0,
-        "day1",
+        tmp_path, config, state, TEST_DATES[0], 99.0, "day1",
         prior_same_day_allocations={"AAPL": prior},
     )
     assert s1["buy_candidates"] == []
@@ -1661,12 +1602,7 @@ def test_prior_same_day_allocation_defers_fire_but_still_tracks_the_dip(tmp_path
     # Day 2: still guarded, dips further (crosses tier 2, +$2 -> $3) --
     # again tracked, not lost.
     r2, s2, _ = _run_day(
-        tmp_path,
-        config,
-        state,
-        TEST_DATES[1],
-        97.0,
-        "day2",
+        tmp_path, config, state, TEST_DATES[1], 97.0, "day2",
         prior_same_day_allocations={"AAPL": prior},
     )
     assert s2["buy_candidates"] == []
@@ -1690,12 +1626,7 @@ def test_discarded_sub_threshold_credit_still_tracks_the_dip(tmp_path, monkeypat
     credit_ledger.record("AAPL", TEST_DATES[0].isoformat(), 0.20)
 
     r1, s1, _ = _run_day(
-        tmp_path,
-        config,
-        state,
-        TEST_DATES[0],
-        99.0,
-        "day1",
+        tmp_path, config, state, TEST_DATES[0], 99.0, "day1",
         prior_same_day_allocations={},
     )
     assert s1["buy_candidates"] == []
@@ -1726,21 +1657,12 @@ def test_prior_same_day_allocation_defers_a_ready_to_fire_recovery(tmp_path, mon
     assert before["status"] == "dipping"
 
     prior = PriorSameDayAllocation(
-        "AAPL",
-        amount_usd=5.0,
-        reference_price=100.0,
-        run_id="morning",
-        source="scheduled",
-        selected_base_amount_usd=2.0,
+        "AAPL", amount_usd=5.0, reference_price=100.0, run_id="morning",
+        source="scheduled", selected_base_amount_usd=2.0,
     )
     # Day 2: recovers -> would fire, but guarded by a prior same-day allocation.
     r2, s2, _ = _run_day(
-        tmp_path,
-        config,
-        state,
-        TEST_DATES[1],
-        96.5,
-        "day2",
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2",
         prior_same_day_allocations={"AAPL": prior},
     )
     assert s2["buy_candidates"] == []  # deferred, not claimed
@@ -1835,7 +1757,9 @@ def test_next_day_crash_recovery_reconciles_terminal_partial_order(tmp_path, mon
             }
 
     broker = HistoricalBroker()
-    _, run_state, _ = _run_day(tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker)
+    _, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker
+    )
     recovered = json.loads(tracker_path.read_bytes())
     assert broker.queried_days == [TEST_DATES[1]]
     # This lease was claimed YESTERDAY, so its $3 must NOT appear among today's
@@ -1910,28 +1834,18 @@ def test_an_expired_lease_release_folds_the_outage_into_trading_days_active(tmp_
 
     ledger = InverseMartingaleLedger(root=tmp_path)
     ledger.record_step(
-        "AAPL",
-        tracker_state,
+        "AAPL", tracker_state,
         InverseMartingaleStep(
-            status_before=STATUS_FIRING,
-            status_after=STATUS_FIRING,
-            accumulated_usd_before=10.0,
-            accumulated_usd_after=5.0,
-            newly_crossed_tiers=(),
-            fired=True,
-            fire_amount_usd=5.0,
+            status_before=STATUS_FIRING, status_after=STATUS_FIRING,
+            accumulated_usd_before=10.0, accumulated_usd_after=5.0,
+            newly_crossed_tiers=(), fired=True, fire_amount_usd=5.0,
             reason="fire_continuation",
         ),
     )
     persisted_tracker_state = ledger.read("AAPL")
     recovery = ncd._inverse_martingale_recover_pending_lease(
-        ledger,
-        "AAPL",
-        persisted_tracker_state,
-        broker=cast(Any, _NoOrderBroker()),
-        dry_run=False,
-        trading_day=resolution_day,
-        stream="afternoon",
+        ledger, "AAPL", persisted_tracker_state,
+        broker=cast(Any, _NoOrderBroker()), dry_run=False, trading_day=resolution_day, stream="afternoon",
     )
 
     assert recovery is not None
@@ -1999,28 +1913,18 @@ def test_an_exact_fill_reconciliation_ages_a_capped_continuation(tmp_path):
 
     ledger = InverseMartingaleLedger(root=tmp_path)
     ledger.record_step(
-        "AAPL",
-        tracker_state,
+        "AAPL", tracker_state,
         InverseMartingaleStep(
-            status_before=STATUS_FIRING,
-            status_after=STATUS_FIRING,
-            accumulated_usd_before=15.0,
-            accumulated_usd_after=15.0,
-            newly_crossed_tiers=(),
-            fired=True,
-            fire_amount_usd=5.0,
+            status_before=STATUS_FIRING, status_after=STATUS_FIRING,
+            accumulated_usd_before=15.0, accumulated_usd_after=15.0,
+            newly_crossed_tiers=(), fired=True, fire_amount_usd=5.0,
             reason="fire_continuation",
         ),
     )
     persisted_tracker_state = ledger.read("AAPL")
     recovery = ncd._inverse_martingale_recover_pending_lease(
-        ledger,
-        "AAPL",
-        persisted_tracker_state,
-        broker=cast(Any, _ExactFillBroker()),
-        dry_run=False,
-        trading_day=resolution_day,
-        stream="afternoon",
+        ledger, "AAPL", persisted_tracker_state,
+        broker=cast(Any, _ExactFillBroker()), dry_run=False, trading_day=resolution_day, stream="afternoon",
     )
 
     assert recovery is not None
@@ -2065,7 +1969,9 @@ class _HistoryBroker(DryRunBroker):
 
 
 @pytest.mark.parametrize("terminal_state", ["cancelled", "canceled", "voided", "rejected", "failed"])
-def test_zero_fill_terminal_order_restores_the_whole_claimed_balance(tmp_path, monkeypatch, terminal_state):
+def test_zero_fill_terminal_order_restores_the_whole_claimed_balance(
+    tmp_path, monkeypatch, terminal_state
+):
     """Regression test for "Recognize every terminal spelling before settling
     the claim". Robinhood reports both "cancelled" and "canceled" (and
     "voided"). Reading any of them as nonterminal made reconciliation
@@ -2123,7 +2029,9 @@ def test_finite_nonnegative_float_catches_overflow_instead_of_raising():
     assert ncd._finite_nonnegative_float({"amount": 10**400}) is None
     # An order carrying an unparseable-by-overflow executed_notional must be
     # treated as indeterminate (preserve the lease), not crash the caller.
-    assert ncd._recovered_broker_notional({"state": "filled", "executed_notional": 10**400}) is None
+    assert ncd._recovered_broker_notional(
+        {"state": "filled", "executed_notional": 10**400}
+    ) is None
 
 
 def test_recovered_broker_notional_rejects_an_overflowed_product():
@@ -2137,16 +2045,18 @@ def test_recovered_broker_notional_rejects_an_overflowed_product():
     import near_close_dca as ncd
 
     huge = 1e308
-    assert (
-        ncd._recovered_broker_notional({"state": "filled", "cumulative_quantity": huge, "average_price": huge}) is None
-    )
+    assert ncd._recovered_broker_notional(
+        {"state": "filled", "cumulative_quantity": huge, "average_price": huge}
+    ) is None
     # A genuinely representable product is unaffected.
     assert ncd._recovered_broker_notional(
         {"state": "filled", "cumulative_quantity": 0.07, "average_price": 100.0}
     ) == pytest.approx(7.0)
 
 
-@pytest.mark.parametrize("live_state", ["partially_filled", "new", "queued", "confirmed", "unconfirmed"])
+@pytest.mark.parametrize(
+    "live_state", ["partially_filled", "new", "queued", "confirmed", "unconfirmed"]
+)
 def test_live_order_keeps_the_lease_until_it_is_terminal(tmp_path, monkeypatch, live_state):
     """Regression test for "Keep live partial fills leased until the order is
     terminal". A working order can still fill its own remainder. Rebuilding an
@@ -2233,7 +2143,9 @@ def test_recovery_against_a_different_broker_account_keeps_the_lease(tmp_path, m
         def account_number(self):
             return self._account
 
-    config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT}, target_account_number=claiming_account)
+    config = _base_config(
+        inverse_martingale={"AAPL": PCT_ENROLLMENT}, target_account_number=claiming_account
+    )
     state = StrategyState()
     claiming = _AccountBroker(claiming_account)
     _run_day(tmp_path, config, state, TEST_DATES[0], 95.0, "day1", broker=claiming)
@@ -2256,7 +2168,9 @@ def test_recovery_against_a_different_broker_account_keeps_the_lease(tmp_path, m
 
     # A later run wired to a different account must not release the lease on the
     # strength of that account's (necessarily empty) history.
-    other_config = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT}, target_account_number=other_account)
+    other_config = _base_config(
+        inverse_martingale={"AAPL": PCT_ENROLLMENT}, target_account_number=other_account
+    )
     other = _AccountBroker(other_account, order=None)
     _run_day(tmp_path, other_config, state, TEST_DATES[2], 96.5, "day3", broker=other)
     # The lookup still runs -- a positive match would be trustworthy however the
@@ -2380,8 +2294,12 @@ def test_same_day_recovery_of_a_removed_ticker_is_still_published(tmp_path, monk
     # SAME trading day as the claim, but the ticker is gone from the universe,
     # so this run produces no decision for it at all.
     removed = _base_config(inverse_martingale={}, tickers=("MSFT",))
-    broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"}, price=96.5)
-    _, run_state, _ = _run_day(tmp_path, removed, state, TEST_DATES[1], 96.5, "day2b", broker=broker)
+    broker = _HistoryBroker(
+        {"state": "filled", "executed_notional": "7.00"}, price=96.5
+    )
+    _, run_state, _ = _run_day(
+        tmp_path, removed, state, TEST_DATES[1], 96.5, "day2b", broker=broker
+    )
 
     assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     rows = [row for row in run_state["buy_candidates"] if row["ticker"] == "AAPL"]
@@ -2464,7 +2382,9 @@ def test_dry_run_lease_expires_without_a_broker_lookup(tmp_path, monkeypatch):
             return None
 
     live = _base_config(inverse_martingale={"AAPL": PCT_ENROLLMENT})
-    _run_day(tmp_path, live, StrategyState(), TEST_DATES[2], 96.5, "day3", broker=_NoHistoryBroker())
+    _run_day(
+        tmp_path, live, StrategyState(), TEST_DATES[2], 96.5, "day3", broker=_NoHistoryBroker()
+    )
     assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
 
 
@@ -2495,10 +2415,15 @@ def test_partial_fill_that_exhausts_the_balance_resolves_the_cycle(tmp_path, mon
     assert recovered.get("fired_floor_price") is not None
     assert recovered["fired_floor_price"] > 0
     # A resolved marker, never an active cycle holding a zero balance.
-    assert not (recovered.get("status") == STATUS_FIRING and float(recovered.get("accumulated_usd", 0.0)) <= 0)
+    assert not (
+        recovered.get("status") == STATUS_FIRING
+        and float(recovered.get("accumulated_usd", 0.0)) <= 0
+    )
     # And it must still be readable -- the corruption this guards against showed
     # up only on the NEXT load.
-    InverseMartingaleLedger(root=tmp_path / "cron_tracking" / "inverse_martingale_dca").read("AAPL")
+    InverseMartingaleLedger(
+        root=tmp_path / "cron_tracking" / "inverse_martingale_dca"
+    ).read("AAPL")
     # The claim's own rearm_last_seen_day must survive into the recovered
     # marker (Codex review: "Preserve the pre-split close in recovered
     # resolution"). Without it, the split-rebase lookup on the next
@@ -2545,7 +2470,9 @@ def test_filled_order_without_cumulative_quantity_uses_quantity(tmp_path, monkey
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
 
 
-def test_filled_order_with_empty_string_cumulative_quantity_falls_back_to_quantity(tmp_path, monkeypatch):
+def test_filled_order_with_empty_string_cumulative_quantity_falls_back_to_quantity(
+    tmp_path, monkeypatch
+):
     """Regression test (Antigravity review: "Empty String Check for
     cumulative_quantity"). A broker payload with `cumulative_quantity: ""`
     is not None, so the plain `is not None` check picked "cumulative_quantity"
@@ -2567,7 +2494,9 @@ def test_filled_order_with_empty_string_cumulative_quantity_falls_back_to_quanti
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(7.0)
 
 
-def test_filled_order_with_whitespace_only_cumulative_quantity_falls_back_to_quantity(tmp_path, monkeypatch):
+def test_filled_order_with_whitespace_only_cumulative_quantity_falls_back_to_quantity(
+    tmp_path, monkeypatch
+):
     """Regression test (Codex review: "Treat whitespace-only cumulative
     quantities as absent"). A broker payload with `cumulative_quantity: " "`
     (whitespace, not empty) is not caught by an empty-string check either --
@@ -2619,7 +2548,9 @@ def test_same_day_recovery_of_an_enrolled_ticker_is_not_a_credit_flush(tmp_path,
 
     # SAME trading day as the claim, ticker still enrolled -> it has a decision.
     broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"}, price=96.5)
-    _, run_state, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2b", broker=broker)
+    _, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2b", broker=broker
+    )
     rows = [r for r in run_state["buy_candidates"] if r["ticker"] == "AAPL"]
     assert len(rows) == 1
     assert rows[0]["reason"] == "recovered_inverse_martingale_lease"
@@ -2642,7 +2573,9 @@ def test_recovery_does_not_rebook_spend_already_on_disk(tmp_path, monkeypatch):
 
     # Model the durable evidence: an on-disk artifact already records this
     # ticker/day submission, exactly as the failure handler would have written.
-    monkeypatch.setattr(ncd, "_same_day_order_recorded_in_any_stream", lambda *a, **k: True)
+    monkeypatch.setattr(
+        ncd, "_same_day_order_recorded_in_any_stream", lambda *a, **k: True
+    )
     # A fresh StrategyState carrying the already-persisted spend, and an EMPTY
     # own_orders_recorded -- the post-restart shape.
     restored = StrategyState()
@@ -2651,13 +2584,7 @@ def test_recovery_does_not_rebook_spend_already_on_disk(tmp_path, monkeypatch):
 
     broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
     _run_day(
-        tmp_path,
-        config,
-        restored,
-        TEST_DATES[2],
-        96.5,
-        "day3",
-        broker=broker,
+        tmp_path, config, restored, TEST_DATES[2], 96.5, "day3", broker=broker,
         deployment_history_root=tmp_path / "runs",
     )
 
@@ -2753,7 +2680,10 @@ def test_lease_fingerprint_key_is_published_atomically(tmp_path):
     # No temp files left behind. The publish lock's own file is expected: both
     # publication paths now serialize on it, so it is created on the way to the
     # key rather than being leftover scratch.
-    leftover = sorted(p.name for p in key_dir.iterdir() if p.name != f"{_LEASE_FINGERPRINT_KEY_FILENAME}.lock")
+    leftover = sorted(
+        p.name for p in key_dir.iterdir()
+        if p.name != f"{_LEASE_FINGERPRINT_KEY_FILENAME}.lock"
+    )
     assert leftover == [_LEASE_FINGERPRINT_KEY_FILENAME]
 
 
@@ -2886,8 +2816,7 @@ def test_lease_fingerprint_key_falls_back_when_hard_links_are_unavailable(tmp_pa
     assert results[0] == (key_dir / _LEASE_FINGERPRINT_KEY_FILENAME).read_bytes().strip()
     # No temp files left behind; the sidecar lock file is expected.
     leftovers = {p.name for p in key_dir.iterdir()} - {
-        _LEASE_FINGERPRINT_KEY_FILENAME,
-        f"{_LEASE_FINGERPRINT_KEY_FILENAME}.lock",
+        _LEASE_FINGERPRINT_KEY_FILENAME, f"{_LEASE_FINGERPRINT_KEY_FILENAME}.lock"
     }
     assert leftovers == set()
 
@@ -3138,11 +3067,8 @@ def _write_morning_deployment_artifact(root, trading_day, order_id):
                 "run_classification": classification,
                 "buy_candidates": [
                     {
-                        "ticker": "AAPL",
-                        "buy_multiplier": 1.0,
-                        "planned_amount_usd": 7.0,
-                        "status": "submitted",
-                        "order_id": order_id,
+                        "ticker": "AAPL", "buy_multiplier": 1.0, "planned_amount_usd": 7.0,
+                        "status": "submitted", "order_id": order_id,
                     }
                 ],
             }
@@ -3230,15 +3156,8 @@ def test_a_morning_claim_recovered_by_the_afternoon_stays_out_of_that_stream(tmp
     baseline_7d = config.deployed_last_7d_usd
     broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
     result, run_state, _ = _run_day(
-        tmp_path,
-        config,
-        state,
-        TEST_DATES[1],
-        96.5,
-        "day2-afternoon",
-        broker=broker,
-        stream="afternoon",
-        deployment_history_root=tmp_path / "runs",
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-afternoon", broker=broker,
+        stream="afternoon", deployment_history_root=tmp_path / "runs",
     )
 
     assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
@@ -3247,7 +3166,10 @@ def test_a_morning_claim_recovered_by_the_afternoon_stays_out_of_that_stream(tmp
     # But the afternoon-only kill-switch figure is untouched, and no row lands
     # in this afternoon artifact to be re-read as afternoon deployment later.
     assert config.deployed_last_7d_usd == pytest.approx(baseline_7d)
-    assert [r for r in run_state["buy_candidates"] if r["reason"] == "recovered_inverse_martingale_lease"] == []
+    assert [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ] == []
     # Regression assertion for "Persist claim metadata before suppressing
     # cross-stream recovery rows": since no run artifact carries this
     # recovery, the tracker itself must durably record which claim it
@@ -3296,10 +3218,15 @@ def test_a_same_day_zero_fill_recovery_still_publishes_an_attempt_row(tmp_path, 
     broker = _HistoryBroker(
         {"state": "cancelled", "dollar_amount": "7.00", "cumulative_quantity": "0", "average_price": "0"}
     )
-    _, run_state, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover", broker=broker)
+    _, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover", broker=broker
+    )
 
     assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
-    recoveries = [r for r in run_state["buy_candidates"] if r["reason"] == "recovered_inverse_martingale_lease"]
+    recoveries = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
     # The attempt is preserved as a ZERO-notional row: a real order reached the
     # broker (so it carries its id) but bought nothing.
     assert len(recoveries) == 1
@@ -3328,16 +3255,12 @@ def test_a_recovery_already_recorded_on_disk_is_not_republished(tmp_path, monkey
     tracker_path, _ = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
 
     # The crashed worker's own artifact already records this exact order.
-    monkeypatch.setattr(ncd, "_same_day_order_recorded_in_any_stream", lambda *a, **k: True)
+    monkeypatch.setattr(
+        ncd, "_same_day_order_recorded_in_any_stream", lambda *a, **k: True
+    )
     broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
     _, run_state, _ = _run_day(
-        tmp_path,
-        config,
-        state,
-        TEST_DATES[1],
-        96.5,
-        "day2-recover",
-        broker=broker,
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover", broker=broker,
         deployment_history_root=tmp_path / "runs",
     )
 
@@ -3346,7 +3269,10 @@ def test_a_recovery_already_recorded_on_disk_is_not_republished(tmp_path, monkey
     # ...but nothing is re-booked into state...
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
     # ...and no second artifact row carries the already-audited order.
-    assert [r for r in run_state["buy_candidates"] if r["reason"] == "recovered_inverse_martingale_lease"] == []
+    assert [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ] == []
 
 
 def test_recovery_is_logged_in_the_execution_record(tmp_path, monkeypatch):
@@ -3365,9 +3291,14 @@ def test_recovery_is_logged_in_the_execution_record(tmp_path, monkeypatch):
     assert claim["settlement_claimed_usd"] == pytest.approx(7.0)
 
     broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
-    result, run_state, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover", broker=broker)
+    result, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover", broker=broker
+    )
     assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
-    [recovery] = [r for r in run_state["buy_candidates"] if r["reason"] == "recovered_inverse_martingale_lease"]
+    [recovery] = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
 
     with open(result["orders_csv_path"], encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -3399,14 +3330,19 @@ def test_recovery_terminal_zero_fill_does_not_fabricate_a_fill(tmp_path, monkeyp
             "average_price": "96.50",
         }
     )
-    result, run_state, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2-zero-fill", broker=broker)
+    result, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-zero-fill", broker=broker
+    )
     recovered = json.loads(tracker_path.read_bytes())
     assert "settlement_pending" not in recovered
     # Nothing executed, so nothing is booked...
     assert state.day_notional(TEST_DATES[1]) == pytest.approx(0.0)
     # ...and buy_candidates.csv correctly shows a zero-notional attempt, not a
     # fabricated purchase.
-    [recovery] = [r for r in run_state["buy_candidates"] if r["reason"] == "recovered_inverse_martingale_lease"]
+    [recovery] = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
     assert float(recovery["planned_amount_usd"]) == pytest.approx(0.0)
 
     with open(result["orders_csv_path"], encoding="utf-8") as handle:
@@ -3523,7 +3459,9 @@ def test_recovered_candidate_survives_a_successful_retry_in_run_state(tmp_path, 
 
     restore_msft_candidate = _fail_the_run_on_msft_candidate(ncd, monkeypatch)
     with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
-        _run_day(tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-retry-state", broker=broker)
+        _run_day(
+            tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-retry-state", broker=broker
+        )
     restore_msft_candidate()
 
     broker2 = DryRunBroker(cash=500.0, reference_prices={"AAPL": 96.5, "MSFT": 96.5})
@@ -3532,7 +3470,8 @@ def test_recovered_candidate_survives_a_successful_retry_in_run_state(tmp_path, 
     )
 
     assert any(
-        c.get("ticker") == "AAPL" and c.get("status") == "submitted" for c in run_state_after_retry["buy_candidates"]
+        c.get("ticker") == "AAPL" and c.get("status") == "submitted"
+        for c in run_state_after_retry["buy_candidates"]
     ), "the recovered AAPL candidate must survive into the retry's own run_state.json"
 
     # Regression for "Persist reinjected recoveries for the next retry": a
@@ -3573,11 +3512,15 @@ def test_recovered_candidate_reaches_companion_artifacts_across_a_retry(tmp_path
 
     restore_msft_candidate = _fail_the_run_on_msft_candidate(ncd, monkeypatch)
     with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
-        _run_day(tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-retry-companions", broker=broker)
+        _run_day(
+            tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-retry-companions", broker=broker
+        )
     restore_msft_candidate()
 
     broker2 = DryRunBroker(cash=500.0, reference_prices={"AAPL": 96.5, "MSFT": 96.5})
-    _run_day(tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-retry-companions", broker=broker2)
+    _run_day(
+        tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-retry-companions", broker=broker2
+    )
 
     run_dir = tmp_path / "runs" / "day2-retry-companions"
     with open(run_dir / "buy_candidates.csv", encoding="utf-8") as handle:
@@ -3632,7 +3575,9 @@ def test_reinjection_recomputes_classification_after_a_zero_order_retry(tmp_path
 
     restore_msft_candidate = _fail_the_run_on_msft_candidate(ncd, monkeypatch)
     with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
-        _run_day(tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-reclass", broker=broker)
+        _run_day(
+            tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-reclass", broker=broker
+        )
     restore_msft_candidate()
 
     # Retry with AAPL as the ONLY ticker, unenrolled, and no price drop -- the
@@ -3646,14 +3591,17 @@ def test_reinjection_recomputes_classification_after_a_zero_order_retry(tmp_path
     )
 
     assert any(
-        c.get("ticker") == "AAPL" and c.get("status") == "submitted" for c in run_state_after_retry["buy_candidates"]
+        c.get("ticker") == "AAPL" and c.get("status") == "submitted"
+        for c in run_state_after_retry["buy_candidates"]
     ), "the recovered AAPL candidate must be reinjected into the retry's run_state.json"
     assert run_state_after_retry["orders_submitted_count"] >= 1
     assert run_state_after_retry["order_submit_status"] == "submitted"
     assert run_state_after_retry.get("run_classification_outcome") != "completed_no_orders"
     assert not run_state_after_retry.get("completion_reason")
 
-    summary = json.loads((tmp_path / "runs" / "day2-reclass" / "run_summary.json").read_bytes())
+    summary = json.loads(
+        (tmp_path / "runs" / "day2-reclass" / "run_summary.json").read_text(encoding="utf-8")
+    )
     assert summary.get("run_classification_outcome") != "completed_no_orders"
 
 
@@ -3681,7 +3629,9 @@ def test_a_malformed_prior_broker_outcomes_does_not_abort_a_successful_retry(tmp
 
     restore_msft_candidate = _fail_the_run_on_msft_candidate(ncd, monkeypatch)
     with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
-        _run_day(tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-malformed-prior", broker=broker)
+        _run_day(
+            tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-malformed-prior", broker=broker
+        )
     restore_msft_candidate()
 
     run_dir = tmp_path / "runs" / "day2-malformed-prior"
@@ -3707,12 +3657,15 @@ def test_a_malformed_prior_broker_outcomes_does_not_abort_a_successful_retry(tmp
     broker2 = DryRunBroker(cash=500.0, reference_prices={"AAPL": 96.5, "MSFT": 96.5})
     # Must not raise -- the malformed prior broker_outcomes must be ignored,
     # not crash the reinjection block after orders were already placed.
-    _run_day(tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-malformed-prior", broker=broker2)
+    _run_day(
+        tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-malformed-prior", broker=broker2
+    )
 
     with open(run_dir / "submitted_orders.csv", encoding="utf-8") as handle:
         order_rows = list(csv.DictReader(handle))
     assert any(r.get("ticker") == "MSFT" for r in order_rows), (
-        "orders.csv merge/usage backfill after the reinjection block must still run despite the malformed prior state"
+        "orders.csv merge/usage backfill after the reinjection block must "
+        "still run despite the malformed prior state"
     )
 
 
@@ -3748,7 +3701,9 @@ def test_recovery_is_rebooked_when_already_on_disk_in_this_same_directory(tmp_pa
                 "run_id": "earlier-attempt",
                 "trading_day": TEST_DATES[1].isoformat(),
                 "run_classification": {"stream": "afternoon"},
-                "buy_candidates": [{"ticker": "AAPL", "status": "submitted", "order_id": order_id}],
+                "buy_candidates": [
+                    {"ticker": "AAPL", "status": "submitted", "order_id": order_id}
+                ],
                 "broker_outcomes": {},
             }
         ),
@@ -3761,7 +3716,9 @@ def test_recovery_is_rebooked_when_already_on_disk_in_this_same_directory(tmp_pa
     monkeypatch.setattr(ncd, "_same_day_order_recorded_in_any_stream", lambda *a, **k: True)
 
     broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
-    _, run_state, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-here", broker=broker)
+    _, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-here", broker=broker
+    )
     assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     assert any(
         r["reason"] == "recovered_inverse_martingale_lease" and r.get("order_id") == order_id
@@ -3934,16 +3891,12 @@ def test_afternoon_failure_artifacts_replaces_execution_log_for_a_foreign_stream
     # A parseable run_state.json belonging to a DIFFERENT stream than this
     # invocation (default "afternoon") on the SAME trading_day.
     (artifacts_dir / "run_state.json").write_text(
-        json.dumps(
-            {
-                "trading_day": "2026-07-01",
-                "run_classification": {
-                    "stream": "morning",
-                    "manual_run": False,
-                    "scheduled_for_et": "10:30",
-                },
-            }
-        ),
+        json.dumps({
+            "trading_day": "2026-07-01",
+            "run_classification": {
+                "stream": "morning", "manual_run": False, "scheduled_for_et": "10:30",
+            },
+        }),
         encoding="utf-8",
     )
     stale_csv = artifacts_dir / "orders.csv"
@@ -3979,7 +3932,9 @@ def test_afternoon_failure_artifacts_replaces_execution_log_for_a_foreign_stream
     )
 
 
-def test_orders_csv_is_replaced_when_artifacts_dir_is_reused_for_a_different_day(tmp_path, monkeypatch):
+def test_orders_csv_is_replaced_when_artifacts_dir_is_reused_for_a_different_day(
+    tmp_path, monkeypatch
+):
     """Regression test for "Merge executions only when retrying the same
     run". Reusing artifacts_dir for an UNRELATED trading day must not keep
     the previous day's execution rows -- they belong to a different run
@@ -4005,7 +3960,9 @@ def test_orders_csv_is_replaced_when_artifacts_dir_is_reused_for_a_different_day
     )
 
 
-def test_orders_csv_is_replaced_when_a_different_stream_reuses_the_same_day_dir(tmp_path, monkeypatch):
+def test_orders_csv_is_replaced_when_a_different_stream_reuses_the_same_day_dir(
+    tmp_path, monkeypatch
+):
     """Regression test for "Match the prior artifact's slot before merging
     executions". A trading_day match alone is not proof of a retry: two
     DIFFERENT scheduled slots on the SAME day (e.g. a stale morning artifact
@@ -4025,13 +3982,7 @@ def test_orders_csv_is_replaced_when_a_different_stream_reuses_the_same_day_dir(
     # test_orders_csv_survives_a_retry_when_stream_is_not_mirrored_into_classification
     # for the case where a caller does NOT keep the two in sync.
     result1, _run_state1, _ = _run_day(
-        tmp_path,
-        config,
-        state,
-        TEST_DATES[0],
-        90.0,
-        "shared-dir",
-        stream="morning",
+        tmp_path, config, state, TEST_DATES[0], 90.0, "shared-dir", stream="morning",
         classification_overrides={"stream": "morning"},
     )
     with open(result1["orders_csv_path"], encoding="utf-8") as handle:
@@ -4040,13 +3991,7 @@ def test_orders_csv_is_replaced_when_a_different_stream_reuses_the_same_day_dir(
 
     state2 = StrategyState()
     result2, _run_state2, _ = _run_day(
-        tmp_path,
-        config,
-        state2,
-        TEST_DATES[0],
-        90.0,
-        "shared-dir",
-        stream="midday",
+        tmp_path, config, state2, TEST_DATES[0], 90.0, "shared-dir", stream="midday",
         classification_overrides={"stream": "midday"},
     )
     with open(result2["orders_csv_path"], encoding="utf-8") as handle:
@@ -4057,7 +4002,9 @@ def test_orders_csv_is_replaced_when_a_different_stream_reuses_the_same_day_dir(
     )
 
 
-def test_orders_csv_is_replaced_when_a_manual_run_reuses_a_scheduled_dir(tmp_path, monkeypatch):
+def test_orders_csv_is_replaced_when_a_manual_run_reuses_a_scheduled_dir(
+    tmp_path, monkeypatch
+):
     """Regression test for "Separate manual runs from scheduled retries".
     A manual run (options.scheduled=False) invoked into a directory holding a
     same-day SCHEDULED afternoon artifact must not be treated as a retry of
@@ -4072,12 +4019,7 @@ def test_orders_csv_is_replaced_when_a_manual_run_reuses_a_scheduled_dir(tmp_pat
     state = StrategyState()
 
     result1, _run_state1, _ = _run_day(
-        tmp_path,
-        config,
-        state,
-        TEST_DATES[0],
-        90.0,
-        "manual-vs-scheduled-dir",
+        tmp_path, config, state, TEST_DATES[0], 90.0, "manual-vs-scheduled-dir",
         classification_overrides={"stream": "afternoon"},
     )
     with open(result1["orders_csv_path"], encoding="utf-8") as handle:
@@ -4086,12 +4028,7 @@ def test_orders_csv_is_replaced_when_a_manual_run_reuses_a_scheduled_dir(tmp_pat
 
     state2 = StrategyState()
     result2, run_state2, _ = _run_day(
-        tmp_path,
-        config,
-        state2,
-        TEST_DATES[0],
-        90.0,
-        "manual-vs-scheduled-dir",
+        tmp_path, config, state2, TEST_DATES[0], 90.0, "manual-vs-scheduled-dir",
         scheduled=False,
     )
     assert run_state2["run_classification"]["run_origin"] == "manual"
@@ -4099,11 +4036,14 @@ def test_orders_csv_is_replaced_when_a_manual_run_reuses_a_scheduled_dir(tmp_pat
         rows2 = list(csv.DictReader(handle))
     assert rows2
     assert {r["order_id"] for r in rows1}.isdisjoint({r["order_id"] for r in rows2}), (
-        "a manual run must not be treated as a retry of a prior scheduled run sharing the same directory"
+        "a manual run must not be treated as a retry of a prior scheduled run "
+        "sharing the same directory"
     )
 
 
-def test_orders_csv_is_replaced_when_a_different_slot_shares_the_same_stream(tmp_path, monkeypatch):
+def test_orders_csv_is_replaced_when_a_different_slot_shares_the_same_stream(
+    tmp_path, monkeypatch
+):
     """Regression test for "Include the scheduled slot when identifying
     retries". A shared stream is not proof of a retry either: the intraday
     stream in particular covers three distinct fire times (11:30/13:30/14:30
@@ -4120,13 +4060,8 @@ def test_orders_csv_is_replaced_when_a_different_slot_shares_the_same_stream(tmp
     # DIFFERENT fire times of the SAME stream would otherwise generate the
     # SAME order id and make an order-id-disjointness assertion meaningless.
     result1, _run_state1, _ = _run_day(
-        tmp_path,
-        _base_config(tickers=("AAPL",)),
-        state,
-        TEST_DATES[0],
-        90.0,
-        "shared-slot-dir",
-        stream="intraday",
+        tmp_path, _base_config(tickers=("AAPL",)), state, TEST_DATES[0], 90.0,
+        "shared-slot-dir", stream="intraday",
         classification_overrides={"stream": "intraday", "scheduled_for_et": "11:30"},
     )
     with open(result1["orders_csv_path"], encoding="utf-8") as handle:
@@ -4136,24 +4071,22 @@ def test_orders_csv_is_replaced_when_a_different_slot_shares_the_same_stream(tmp
 
     state2 = StrategyState()
     result2, _run_state2, _ = _run_day(
-        tmp_path,
-        _base_config(tickers=("MSFT",)),
-        state2,
-        TEST_DATES[0],
-        90.0,
-        "shared-slot-dir",
-        stream="intraday",
+        tmp_path, _base_config(tickers=("MSFT",)), state2, TEST_DATES[0], 90.0,
+        "shared-slot-dir", stream="intraday",
         classification_overrides={"stream": "intraday", "scheduled_for_et": "13:30"},
     )
     with open(result2["orders_csv_path"], encoding="utf-8") as handle:
         rows2 = list(csv.DictReader(handle))
     assert rows2
     assert {r["ticker"] for r in rows2} == {"MSFT"}, (
-        "a different fire time sharing the same stream must not survive into another slot's run"
+        "a different fire time sharing the same stream must not survive into "
+        "another slot's run"
     )
 
 
-def test_orders_csv_survives_a_retry_when_stream_is_not_mirrored_into_classification(tmp_path, monkeypatch):
+def test_orders_csv_survives_a_retry_when_stream_is_not_mirrored_into_classification(
+    tmp_path, monkeypatch
+):
     """Regression test for "Compare retries against the persisted
     classification stream". CompactRunOptions.stream and
     classification_overrides["stream"] are two SEPARATE fields -- this
@@ -4557,7 +4490,9 @@ def test_get_order_fill_does_not_fabricate_a_cancelled_orders_quantity(tmp_path)
     assert broker.get_order_fill("cancelled-order") is None
 
 
-def test_recovery_execution_row_keeps_history_fill_details_without_a_second_lookup(tmp_path, monkeypatch):
+def test_recovery_execution_row_keeps_history_fill_details_without_a_second_lookup(
+    tmp_path, monkeypatch
+):
     """Regression test for "Preserve known fill details during recovery
     logging". The broker's optional get_order_fill() can return None (unwired,
     or a transient follow-up failure) even though the SAME history lookup that
@@ -4585,9 +4520,14 @@ def test_recovery_execution_row_keeps_history_fill_details_without_a_second_look
     )
     assert broker.get_order_fill("anything") is None  # the scenario under test
 
-    result, run_state, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover", broker=broker)
+    result, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover", broker=broker
+    )
     assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
-    [recovery] = [r for r in run_state["buy_candidates"] if r["reason"] == "recovered_inverse_martingale_lease"]
+    [recovery] = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
 
     with open(result["orders_csv_path"], encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -4596,7 +4536,9 @@ def test_recovery_execution_row_keeps_history_fill_details_without_a_second_look
     assert float(row["quantity_filled"]) == pytest.approx(0.0725389)
 
 
-def test_recovery_prefers_the_terminal_history_quantity_over_a_stale_follow_up(tmp_path, monkeypatch):
+def test_recovery_prefers_the_terminal_history_quantity_over_a_stale_follow_up(
+    tmp_path, monkeypatch
+):
     """Regression test for "Prefer the terminal recovery quantity over the
     follow-up lookup". get_order_fill() can be eventually consistent: it can
     return a real (non-None) OrderFill that still reflects an earlier PARTIAL
@@ -4626,9 +4568,14 @@ def test_recovery_prefers_the_terminal_history_quantity_over_a_stale_follow_up(t
         }
     )
 
-    result, run_state, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-stale", broker=broker)
+    result, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-stale", broker=broker
+    )
     assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
-    [recovery] = [r for r in run_state["buy_candidates"] if r["reason"] == "recovered_inverse_martingale_lease"]
+    [recovery] = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
 
     with open(result["orders_csv_path"], encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -4638,7 +4585,9 @@ def test_recovery_prefers_the_terminal_history_quantity_over_a_stale_follow_up(t
     assert float(row["quantity_filled"]) == pytest.approx(0.0725389)
 
 
-def test_recovery_rejects_stale_partial_timestamps_that_disagree_with_terminal_quantity(tmp_path, monkeypatch):
+def test_recovery_rejects_stale_partial_timestamps_that_disagree_with_terminal_quantity(
+    tmp_path, monkeypatch
+):
     """Regression test for "Reject stale partial timestamps during terminal
     recovery". get_order_fill() can return a real OrderFill reflecting an
     EARLIER PARTIAL fill even though the terminal history quantity is
@@ -4682,7 +4631,10 @@ def test_recovery_rejects_stale_partial_timestamps_that_disagree_with_terminal_q
         tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-stale-ts", broker=broker
     )
     assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
-    [recovery] = [r for r in run_state["buy_candidates"] if r["reason"] == "recovered_inverse_martingale_lease"]
+    [recovery] = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
 
     with open(result["orders_csv_path"], encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -4734,7 +4686,10 @@ def test_recovery_rejects_partial_timestamps_for_a_notional_only_recovery(tmp_pa
         tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-notional-ts", broker=broker
     )
     assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
-    [recovery] = [r for r in run_state["buy_candidates"] if r["reason"] == "recovered_inverse_martingale_lease"]
+    [recovery] = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
 
     with open(result["orders_csv_path"], encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -4777,9 +4732,14 @@ def test_recovery_logging_survives_a_raising_fill_lookup(tmp_path, monkeypatch):
         }
     )
 
-    result, run_state, _ = _run_day(tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-raise", broker=broker)
+    result, run_state, _ = _run_day(
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-raise", broker=broker
+    )
     assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
-    [recovery] = [r for r in run_state["buy_candidates"] if r["reason"] == "recovered_inverse_martingale_lease"]
+    [recovery] = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
     with open(result["orders_csv_path"], encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     [row] = [r for r in rows if r.get("order_id") == recovery["order_id"]]
@@ -4787,7 +4747,9 @@ def test_recovery_logging_survives_a_raising_fill_lookup(tmp_path, monkeypatch):
     assert float(row["quantity_filled"]) == pytest.approx(0.0725389)
 
 
-def test_recovery_ignores_a_stale_fill_lookup_when_history_had_no_granular_breakdown(tmp_path, monkeypatch):
+def test_recovery_ignores_a_stale_fill_lookup_when_history_had_no_granular_breakdown(
+    tmp_path, monkeypatch
+):
     """Regression test for "Preserve terminal notional over a stale fill
     lookup". When terminal history confirms a fill only through
     executed_notional (im_recovery.fill_price/fill_quantity both None), a
@@ -4819,7 +4781,10 @@ def test_recovery_ignores_a_stale_fill_lookup_when_history_had_no_granular_break
         tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover-notional-only", broker=broker
     )
     assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
-    [recovery] = [r for r in run_state["buy_candidates"] if r["reason"] == "recovered_inverse_martingale_lease"]
+    [recovery] = [
+        r for r in run_state["buy_candidates"]
+        if r["reason"] == "recovered_inverse_martingale_lease"
+    ]
 
     with open(result["orders_csv_path"], encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
@@ -4856,12 +4821,7 @@ def test_recovered_execution_row_persists_when_a_later_candidate_raises(tmp_path
 
     with pytest.raises(RuntimeError, match="simulated failure for MSFT"):
         _run_day(
-            tmp_path,
-            reopened,
-            state,
-            TEST_DATES[1],
-            96.5,
-            "day2-recover-fail",
+            tmp_path, reopened, state, TEST_DATES[1], 96.5, "day2-recover-fail",
             broker=broker,
         )
 
@@ -4930,10 +4890,12 @@ def test_recovered_outcomes_survive_a_later_candidate_raising_mid_batch(monkeypa
     # test exists for is unchanged and is now checkable on the RETURNED dict as
     # well as the in-flight one: the seeded recovery is still there, untouched
     # by the candidate that blew up.
-    candidate_outcomes, _top_up, _deployed, errors_count, _reviews = ncd._process_buy_candidates_batch(
-        buy_candidates=[decision],
-        ctx=ctx,
-        initial_candidate_outcomes=recovered_outcomes,
+    candidate_outcomes, _top_up, _deployed, errors_count, _reviews = (
+        ncd._process_buy_candidates_batch(
+            buy_candidates=[decision],
+            ctx=ctx,
+            initial_candidate_outcomes=recovered_outcomes,
+        )
     )
 
     assert candidate_outcomes["AAPL#imart-recovery"] == recovered_outcomes["AAPL#imart-recovery"]
@@ -4964,7 +4926,9 @@ def test_recovery_row_survives_alongside_a_same_ticker_candidate(tmp_path, monke
     # ordinary ladder candidate of its own AND carries a recovery.
     reopened = _base_config(inverse_martingale={}, tickers=("AAPL",))
     broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"}, price=96.5)
-    _, run_state, _ = _run_day(tmp_path, reopened, state, TEST_DATES[1], 90.0, "day2b", broker=broker)
+    _, run_state, _ = _run_day(
+        tmp_path, reopened, state, TEST_DATES[1], 90.0, "day2b", broker=broker
+    )
 
     assert "settlement_pending" not in json.loads(tracker_path.read_bytes())
     rows = [r for r in run_state["buy_candidates"] if r["ticker"] == "AAPL"]
@@ -4991,16 +4955,12 @@ def test_another_same_ticker_order_does_not_suppress_recovery_booking(tmp_path, 
     tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
 
     # The TICKER has a submitted order on the claim day, but not THIS order.
-    monkeypatch.setattr(ncd, "_same_day_ticker_deployment_already_recorded", lambda *a, **k: True)
+    monkeypatch.setattr(
+        ncd, "_same_day_ticker_deployment_already_recorded", lambda *a, **k: True
+    )
     broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
     _run_day(
-        tmp_path,
-        config,
-        state,
-        TEST_DATES[2],
-        96.5,
-        "day3",
-        broker=broker,
+        tmp_path, config, state, TEST_DATES[2], 96.5, "day3", broker=broker,
         deployment_history_root=tmp_path / "runs",
     )
 
@@ -5034,26 +4994,15 @@ def test_recovery_booking_still_seeds_a_separate_prior_allocation(tmp_path, monk
     # stream after the crash -- and therefore present in the artifact scan the
     # recovered order is missing from.
     separate = PriorSameDayAllocation(
-        "AAPL",
-        amount_usd=5.0,
-        reference_price=100.0,
-        run_id="morning",
-        source="scheduled",
-        selected_base_amount_usd=2.0,
-        attempt_count=1,
+        "AAPL", amount_usd=5.0, reference_price=100.0, run_id="morning",
+        source="scheduled", selected_base_amount_usd=2.0, attempt_count=1,
     )
     # Resolved on the SAME day it was claimed (a matched, filled order settles
     # immediately) so the recovery and the seeding pass address the same day --
     # the only arrangement in which the old key could collide at all.
     broker = _HistoryBroker({"state": "filled", "executed_notional": "7.00"})
     _run_day(
-        tmp_path,
-        config,
-        state,
-        TEST_DATES[1],
-        96.5,
-        "day2-recover",
-        broker=broker,
+        tmp_path, config, state, TEST_DATES[1], 96.5, "day2-recover", broker=broker,
         prior_same_day_allocations={"AAPL": separate},
     )
 
@@ -5078,21 +5027,13 @@ def test_book_recovered_lease_durably_keys_idempotency_by_the_individual_claim()
     state = StrategyState()
     day = date(2026, 7, 1)
     morning = InverseMartingaleLeaseRecovery(
-        ticker="AAPL",
-        claim_trading_day=day,
-        recovered_amount_usd=7.0,
-        recovered_state={},
-        order_id="order-morning",
-        claim_ref="ref-morning",
+        ticker="AAPL", claim_trading_day=day, recovered_amount_usd=7.0,
+        recovered_state={}, order_id="order-morning", claim_ref="ref-morning",
         claim_stream="morning",
     )
     afternoon = InverseMartingaleLeaseRecovery(
-        ticker="AAPL",
-        claim_trading_day=day,
-        recovered_amount_usd=5.0,
-        recovered_state={},
-        order_id="order-afternoon",
-        claim_ref="ref-afternoon",
+        ticker="AAPL", claim_trading_day=day, recovered_amount_usd=5.0,
+        recovered_state={}, order_id="order-afternoon", claim_ref="ref-afternoon",
         claim_stream="afternoon",
     )
 
@@ -5148,7 +5089,9 @@ def test_matched_terminal_zero_fill_resolves_on_the_claim_day(tmp_path, monkeypa
     tracker_path, claim = _crash_a_fire_claim(tmp_path, monkeypatch, config, state)
     claim_day = date.fromisoformat(claim["settlement_trading_day"])
 
-    broker = _HistoryBroker({"state": "cancelled", "cumulative_quantity": "0", "average_price": "0"}, price=96.5)
+    broker = _HistoryBroker(
+        {"state": "cancelled", "cumulative_quantity": "0", "average_price": "0"}, price=96.5
+    )
     # SAME trading day as the claim -- a later stream on the crash day.
     _run_day(tmp_path, config, state, claim_day, 96.5, "day2b", broker=broker)
 
@@ -5412,9 +5355,7 @@ def test_settlement_skips_rather_than_overwrites_a_concurrently_advanced_ledger(
     real_claim_fire = ncd.InverseMartingaleLedger.claim_fire
     call_count = {"n": 0}
     intruder_marker = {
-        "status": "dipping",
-        "accumulated_usd": 42.0,
-        "intruder": True,
+        "status": "dipping", "accumulated_usd": 42.0, "intruder": True,
         # A realistic intruder write still carries the fields a real
         # evaluate_inverse_martingale_step() call always produces for an
         # active "dipping" cycle -- see "Require complete snapshots for
@@ -5422,11 +5363,8 @@ def test_settlement_skips_rather_than_overwrites_a_concurrently_advanced_ledger(
         # trackers" -- so this fixture is a genuinely valid (if
         # unexpected) state, not one _validate_tracker_payload itself
         # would reject for an unrelated reason.
-        "crossed_tier_thresholds": [1.0],
-        "cycle_reference_close": 100.0,
-        "lowest_drop_seen": 1.0,
-        "cycle_start_trading_day": "2026-06-25",
-        "trading_days_active": 1,
+        "crossed_tier_thresholds": [1.0], "cycle_reference_close": 100.0, "lowest_drop_seen": 1.0,
+        "cycle_start_trading_day": "2026-06-25", "trading_days_active": 1,
     }
 
     def spying_claim_fire(self, ticker, *, expected_prior_state, new_state, step):
@@ -5480,9 +5418,7 @@ def test_non_fire_transition_is_also_compare_and_swap_protected(tmp_path, monkey
     real_compare_and_swap = ncd.InverseMartingaleLedger.compare_and_swap_transition
     call_count = {"n": 0}
     intruder_marker = {
-        "status": "dipping",
-        "accumulated_usd": 42.0,
-        "intruder": True,
+        "status": "dipping", "accumulated_usd": 42.0, "intruder": True,
         # A realistic intruder write still carries the fields a real
         # evaluate_inverse_martingale_step() call always produces for an
         # active "dipping" cycle -- see "Require complete snapshots for
@@ -5490,11 +5426,8 @@ def test_non_fire_transition_is_also_compare_and_swap_protected(tmp_path, monkey
         # trackers" -- so this fixture is a genuinely valid (if
         # unexpected) state, not one _validate_tracker_payload itself
         # would reject for an unrelated reason.
-        "crossed_tier_thresholds": [1.0],
-        "cycle_reference_close": 100.0,
-        "lowest_drop_seen": 1.0,
-        "cycle_start_trading_day": "2026-06-25",
-        "trading_days_active": 1,
+        "crossed_tier_thresholds": [1.0], "cycle_reference_close": 100.0, "lowest_drop_seen": 1.0,
+        "cycle_start_trading_day": "2026-06-25", "trading_days_active": 1,
     }
 
     def spying_compare_and_swap(self, ticker, *, expected_prior_state, new_state, step):

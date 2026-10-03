@@ -174,7 +174,7 @@ def _live_body(lines: List[str]) -> List[str]:
         return lines
     for index in range(1, len(lines)):
         if lines[index].strip() == "---":
-            return lines[index + 1 :]
+            return lines[index + 1:]
     return lines
 
 
@@ -194,7 +194,7 @@ def mask(line: str, account_number: Optional[str] = None) -> str:
 def _stale_window_dates(text: str, window_end_date: str) -> List[str]:
     found: List[str] = []
     for phrase in _END_DATE_PHRASE_RE.finditer(text):
-        context = text[phrase.end() : phrase.end() + _END_DATE_CONTEXT_CHARS]
+        context = text[phrase.end(): phrase.end() + _END_DATE_CONTEXT_CHARS]
         for date in _DATE_RE.findall(context):
             if date != window_end_date and date not in found:
                 found.append(date)
@@ -205,54 +205,42 @@ def findings_for(live_text: str, window_end_date: Optional[str]) -> List[Dict[st
     """The named failure modes present in one live body."""
     findings: List[Dict[str, str]] = []
     if TOP_UP_GATE_MODULE not in live_text:
-        findings.append(
-            {
-                "code": "missing_top_up_gate",
-                "detail": f"never runs {TOP_UP_GATE_MODULE}: a repeat buy would be sized as a first allocation",
-            }
-        )
+        findings.append({
+            "code": "missing_top_up_gate",
+            "detail": f"never runs {TOP_UP_GATE_MODULE}: a repeat buy would be sized as a first allocation",
+        })
     elif any(key not in live_text for key in ORDER_PAGES_ENVELOPE_KEYS):
-        findings.append(
-            {
-                "code": "bare_array_order_pages",
-                "detail": 'runs the gate but never wraps saved pages as {"account_number", "trading_day", "pages"}; '
-                "the gate rejects a bare array",
-            }
-        )
+        findings.append({
+            "code": "bare_array_order_pages",
+            "detail": 'runs the gate but never wraps saved pages as {"account_number", "trading_day", "pages"}; '
+            "the gate rejects a bare array",
+        })
     if FINALIZE_EVIDENCE_MODULE not in live_text:
-        findings.append(
-            {
-                "code": "missing_finalize_evidence",
-                "detail": f"never runs {FINALIZE_EVIDENCE_MODULE}: the slot fires but leaves no verifiable run_state "
-                "or pointer, so scripts.verify_schedule reports it evidence_incomplete",
-            }
-        )
+        findings.append({
+            "code": "missing_finalize_evidence",
+            "detail": f"never runs {FINALIZE_EVIDENCE_MODULE}: the slot fires but leaves no verifiable run_state "
+            "or pointer, so scripts.verify_schedule reports it evidence_incomplete",
+        })
     if GET_EQUITY_ORDERS_CALL in live_text and ORDER_PAGES_HELPER_MODULE not in live_text:
-        findings.append(
-            {
-                "code": "missing_oversized_order_pages_helper",
-                "detail": f"calls {GET_EQUITY_ORDERS_CALL} but never runs {ORDER_PAGES_HELPER_MODULE}: an oversized "
-                "page would be hand-transcribed instead of assembled and proven complete (2026-09-09 incident)",
-            }
-        )
+        findings.append({
+            "code": "missing_oversized_order_pages_helper",
+            "detail": f"calls {GET_EQUITY_ORDERS_CALL} but never runs {ORDER_PAGES_HELPER_MODULE}: an oversized "
+            "page would be hand-transcribed instead of assembled and proven complete (2026-09-09 incident)",
+        })
     if window_end_date:
         stale = _stale_window_dates(live_text, window_end_date)
         if stale:
-            findings.append(
-                {
-                    "code": "stale_window_end_date",
-                    "detail": f"hardcodes {', '.join(stale)} as the window end; config/trading_window.json says "
-                    f"{window_end_date}",
-                }
-            )
+            findings.append({
+                "code": "stale_window_end_date",
+                "detail": f"hardcodes {', '.join(stale)} as the window end; config/trading_window.json says "
+                f"{window_end_date}",
+            })
     if GATE_2_PROBE_MARKER in live_text and SHELL_UNAVAILABLE_ABORT_REASON not in live_text:
-        findings.append(
-            {
-                "code": "missing_shell_unavailable_fallback",
-                "detail": f'runs Gate 2\'s repo probes without the distinct abort reason "{SHELL_UNAVAILABLE_ABORT_REASON}"'
-                ": a dead sandboxed shell can misdiagnose as repo-unreachable (2026-09-08 incident)",
-            }
-        )
+        findings.append({
+            "code": "missing_shell_unavailable_fallback",
+            "detail": f'runs Gate 2\'s repo probes without the distinct abort reason "{SHELL_UNAVAILABLE_ABORT_REASON}"'
+            ": a dead sandboxed shell can misdiagnose as repo-unreachable (2026-09-08 incident)",
+        })
     if GATE_2_PROBE_MARKER in live_text and BRIDGE_ONLY_ABORT_REASON not in live_text:
         findings.append({
             "code": "missing_bridge_only_abort",
@@ -261,13 +249,11 @@ def findings_for(live_text: str, window_end_date: Optional[str]) -> List[Dict[st
             "(2026-09-29 incident)",
         })
     if EMAIL_DRAFT_PHRASE in live_text:
-        findings.append(
-            {
-                "code": "email_draft_not_send",
-                "detail": "still tells the operator to DRAFT the Gate 9 alert email instead of sending it "
-                "(2026-08-26 regression: docs/alert_digest.md counted ~50 undelivered drafts)",
-            }
-        )
+        findings.append({
+            "code": "email_draft_not_send",
+            "detail": "still tells the operator to DRAFT the Gate 9 alert email instead of sending it "
+            "(2026-08-26 regression: docs/alert_digest.md counted ~50 undelivered drafts)",
+        })
     return findings
 
 
@@ -308,17 +294,15 @@ def check(
         slot["findings"] = findings_for(live_text, window_end_date)
         if not same:
             diff = list(difflib.unified_diff(mirror_lines, live_lines, "mirror", "live", lineterm="", n=0))
-            slot["changed_lines"] = sum(1 for line in diff if line[:1] in "+-" and not line.startswith(("+++", "---")))
+            slot["changed_lines"] = sum(
+                1 for line in diff if line[:1] in "+-" and not line.startswith(("+++", "---"))
+            )
             if with_diff:
                 slot["diff"] = [mask(line, account_number) for line in diff]
         slots.append(slot)
     drifted = sum(1 for s in slots if s["status"] != "match" or s["findings"])
-    return {
-        "scheduled_dir": str(scheduled_dir),
-        "window_end_date": window_end_date,
-        "drifted_slots": drifted,
-        "slots": slots,
-    }
+    return {"scheduled_dir": str(scheduled_dir), "window_end_date": window_end_date,
+            "drifted_slots": drifted, "slots": slots}
 
 
 def shared_live_account(mirror_dir: Path, scheduled_dir: Path) -> Optional[str]:
@@ -373,7 +357,7 @@ def _window_end_date_from_config() -> Optional[str]:
     # executor's Gate 3 reads the window from.
     path = Path(dca_config.get_config_dir()) / "trading_window.json"
     try:
-        return str(json.loads(path.read_bytes())["end_date"])
+        return str(json.loads(path.read_text(encoding="utf-8"))["end_date"])
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
@@ -393,10 +377,10 @@ def _print_text(report: Dict[str, Any]) -> None:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--mirror-dir", type=Path, default=DEFAULT_MIRROR_DIR)
-    parser.add_argument(
-        "--scheduled-dir", type=Path, default=None, help="Default: $CLAUDE_SCHEDULED_DIR, else ~/Claude/Scheduled"
-    )
-    parser.add_argument("--window-end-date", default=None, help="Default: config/trading_window.json's end_date")
+    parser.add_argument("--scheduled-dir", type=Path, default=None,
+                        help="Default: $CLAUDE_SCHEDULED_DIR, else ~/Claude/Scheduled")
+    parser.add_argument("--window-end-date", default=None,
+                        help="Default: config/trading_window.json's end_date")
     parser.add_argument("--diff", action="store_true", help="Include masked unified diffs")
     parser.add_argument("--json", action="store_true", help="Emit the report as JSON")
     args = parser.parse_args(argv)
@@ -420,9 +404,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         mirror_dir=args.mirror_dir,
         scheduled_dir=scheduled_dir,
         window_end_date=window_end_date,
-        account_number=(
-            os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER") or shared_live_account(args.mirror_dir, scheduled_dir)
-        ),
+        account_number=(os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER")
+                        or shared_live_account(args.mirror_dir, scheduled_dir)),
         with_diff=args.diff,
     )
     if args.json:

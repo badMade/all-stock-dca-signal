@@ -226,9 +226,8 @@ def test_redact_url_with_port():
     assert redacted == "http://example.com:8080"
 
 def test_file_handler_blocked():
-    opener = urllib.request.build_opener(dca_net_utils.BlockedFileHandler())
     with pytest.raises(urllib.error.URLError, match="file:// scheme is blocked for security"):
-        opener.open("file:///etc/passwd")  # nosec
+        urllib.request.urlopen("file:///etc/passwd")  # nosec
 
 def test_ftp_handler_blocked():
     with pytest.raises(urllib.error.URLError, match="ftp:// scheme is blocked for security"):

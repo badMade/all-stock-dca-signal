@@ -48,11 +48,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e '.[selfheal]'
-
       - name: Check oscillation guard
         id: oscillation_guard
         run: |

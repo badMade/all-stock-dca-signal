@@ -24,8 +24,7 @@ selfheal = [
     "types-requests==2.33.0.20260906",
     "types-PyYAML==6.0.12.20260906",
     "types-beautifulsoup4==4.12.0.20250516",
-    "types-Pillow",
-    "ruamel.yaml==0.18.6"
+    "types-Pillow"
 ]
 
 # Test/lint tooling. Kept in sync with requirements-dev.txt, which pins exact

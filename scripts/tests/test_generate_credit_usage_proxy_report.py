@@ -174,11 +174,8 @@ def test_did_not_run_model_usage_depends_on_attempt_marker_coverage(tmp_path):
     # Not marker-covered: market_open, both 09:45 sub-invocations, all three
     # intraday slots, and the two consumer-only roles.
     for task_id, et in (
-        ("2ba19526", "09:35"),
-        ("bb4f6ef1", "09:45"),
-        ("7be82b97", "11:30"),
-        ("67aa802b", "15:35"),
-        ("a46bf007", "15:40"),
+        ("2ba19526", "09:35"), ("bb4f6ef1", "09:45"), ("7be82b97", "11:30"),
+        ("67aa802b", "15:35"), ("a46bf007", "15:40"),
     ):
         assert rows[(task_id, et)]["model_usage_rows"] == "not_available", task_id
 
@@ -583,8 +580,7 @@ def test_consumer_with_missing_output_is_not_scheduled_evidence(tmp_path):
     assert report["usage_counts"]["run_count_scheduled"] == 0
 
     escalations = [
-        r
-        for r in report["recovery_and_escalation_runs"]
+        r for r in report["recovery_and_escalation_runs"]
         if r["task_id"] == "67aa802b" and r["source"] == "failed_start_escalation"
     ]
     assert len(escalations) == 1
@@ -718,7 +714,10 @@ def test_perplexity_manual_override_wildcard_root_is_scanned(tmp_path):
     # PR #680 discussion_r3838729845: "Expand wildcard roots in the
     # credit-usage scanner").
     _write_json(
-        tmp_path / "perplexity_primary_20260818" / "manual_override_1555ET" / "run_state.json",
+        tmp_path
+        / "perplexity_primary_20260818"
+        / "manual_override_1555ET"
+        / "run_state.json",
         {
             "run_id": "manual_override_1555ET",
             "trading_day": TRADING_DAY,
@@ -741,7 +740,9 @@ def test_perplexity_manual_override_wildcard_root_orphan_csv_is_scanned(tmp_path
     run_dir.mkdir(parents=True)
     (run_dir / "submitted_orders.csv").write_text("ticker,order_id\nAAPL,ORDER-1\n")
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    recovery_dirs = {r["triggering_issue"] for r in report["recovery_and_escalation_runs"] if r["run_id"] == NO_RUN_ID}
+    recovery_dirs = {
+        r["triggering_issue"] for r in report["recovery_and_escalation_runs"] if r["run_id"] == NO_RUN_ID
+    }
     assert any(str(run_dir) in issue for issue in recovery_dirs)
 
 
@@ -885,17 +886,15 @@ def test_malformed_triggered_at_utc_is_rejected(tmp_path):
     # for lack of a comparable date.
     _write_json(
         tmp_path / "market_open_dca" / "20260727_0935ET" / "run_state.json",
-        _run_state(
-            run_classification={
-                "run_origin": "scheduled",
-                "manual_run": False,
-                "cron_id": "2ba19526",
-                "scheduled_for_et": "09:35",
-                "run_id": "market_open_live_20260727_0935ET",
-                "triggered_at_utc": "not-a-real-timestamp",
-                "state_schema_version": "test-v1",
-            }
-        ),
+        _run_state(run_classification={
+            "run_origin": "scheduled",
+            "manual_run": False,
+            "cron_id": "2ba19526",
+            "scheduled_for_et": "09:35",
+            "run_id": "market_open_live_20260727_0935ET",
+            "triggered_at_utc": "not-a-real-timestamp",
+            "state_schema_version": "test-v1",
+        }),
     )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
     row = next(r for r in report["scheduled_runs"] if r["task_id"] == "2ba19526")
@@ -910,10 +909,7 @@ def test_incomplete_scheduled_classification_rejected_as_failed_start(tmp_path):
     # codex review discussion_r3659124641.
     _write_json(
         tmp_path / "market_open_dca" / "20260727_0935ET" / "run_state.json",
-        {
-            "run_id": "market_open_live_20260727_0935ET",
-            "run_classification": {"run_origin": "scheduled", "manual_run": False},
-        },
+        {"run_id": "market_open_live_20260727_0935ET", "run_classification": {"run_origin": "scheduled", "manual_run": False}},
     )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
     row = next(r for r in report["scheduled_runs"] if r["task_id"] == "2ba19526")
@@ -1186,9 +1182,7 @@ def test_manual_recovery_preserves_originating_stream(tmp_path):
         },
     )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    row = next(
-        r for r in report["recovery_and_escalation_runs"] if r["run_id"] == "morning_manual_recovery_20260727_1100ET"
-    )
+    row = next(r for r in report["recovery_and_escalation_runs"] if r["run_id"] == "morning_manual_recovery_20260727_1100ET")
     assert row["stream"] == "morning"
     assert report["usage_counts"]["recovery_run_count_by_stream"]["morning"] == 1
     assert report["usage_counts"]["recovery_run_count_by_stream"]["recovery"] == 0
@@ -1211,7 +1205,8 @@ def test_manual_recovery_normalizes_a_producer_specific_stream_alias(tmp_path):
     )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
     row = next(
-        r for r in report["recovery_and_escalation_runs"] if r["run_id"] == "midday_manual_recovery_20260727_1300ET"
+        r for r in report["recovery_and_escalation_runs"]
+        if r["run_id"] == "midday_manual_recovery_20260727_1300ET"
     )
     assert row["stream"] == "midday"
     by_stream = report["usage_counts"]["recovery_run_count_by_stream"]
@@ -1234,9 +1229,7 @@ def test_manual_recovery_reads_concrete_triggering_issue(tmp_path):
         },
     )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    row = next(
-        r for r in report["recovery_and_escalation_runs"] if r["run_id"] == "midday_manual_recovery_20260727_1300ET"
-    )
+    row = next(r for r in report["recovery_and_escalation_runs"] if r["run_id"] == "midday_manual_recovery_20260727_1300ET")
     assert row["triggering_issue"] == "missed the 12:30 PM scheduled slot"
 
 
@@ -1250,9 +1243,7 @@ def test_manual_recovery_without_recorded_cause_falls_back_to_generic_label(tmp_
         },
     )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    row = next(
-        r for r in report["recovery_and_escalation_runs"] if r["run_id"] == "midday_manual_recovery_20260727_1305ET"
-    )
+    row = next(r for r in report["recovery_and_escalation_runs"] if r["run_id"] == "midday_manual_recovery_20260727_1305ET")
     assert row["triggering_issue"] == "manual recovery (reason not recorded)"
 
 
@@ -1274,9 +1265,7 @@ def test_manual_recovery_order_attempts_are_counted(tmp_path):
         encoding="utf-8",
     )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    row = next(
-        r for r in report["recovery_and_escalation_runs"] if r["run_id"] == "midday_manual_recovery_20260727_1310ET"
-    )
+    row = next(r for r in report["recovery_and_escalation_runs"] if r["run_id"] == "midday_manual_recovery_20260727_1310ET")
     assert row["order_attempts"] == 2
     assert report["usage_counts"]["placed_order_count"] == 2
 
@@ -1353,7 +1342,9 @@ def test_main_creates_output_parent_directories(tmp_path):
     assert json.loads(json_out.read_bytes())["trading_day"] == TRADING_DAY
 
 
-def test_main_write_defaults_derives_root_and_paths_without_any_shell_hardcoding(monkeypatch, tmp_path):
+def test_main_write_defaults_derives_root_and_paths_without_any_shell_hardcoding(
+    monkeypatch, tmp_path
+):
     """Codex review: "Keep the report command on the shared artifact root".
     The registered scheduler command used to hardcode a shell
     ${DCA_CRON_TRACKING_ROOT:-/home/user/workspace/cron_tracking} fallback
@@ -1371,7 +1362,9 @@ def test_main_write_defaults_derives_root_and_paths_without_any_shell_hardcoding
     )
 
     monkeypatch.setenv(CRON_TRACKING_ROOT_ENV, str(tmp_path))
-    exit_code = _main(["--trading-day", TRADING_DAY, "--write-defaults"])
+    exit_code = _main(
+        ["--trading-day", TRADING_DAY, "--write-defaults"]
+    )
     assert exit_code == 0
 
     expected = default_report_paths(TRADING_DAY, tmp_path)
@@ -1601,7 +1594,9 @@ def test_valid_header_zero_data_rows_is_still_a_measured_zero(tmp_path):
     # zero-order run writes, and must still read as a real, measured 0.
     run_dir = tmp_path / "market_open_dca" / "20260727_0935ET"
     _write_json(run_dir / "run_state.json", _run_state())
-    (run_dir / "submitted_orders.csv").write_text("ticker,order_id,submitted_amount_usd,status\n", encoding="utf-8")
+    (run_dir / "submitted_orders.csv").write_text(
+        "ticker,order_id,submitted_amount_usd,status\n", encoding="utf-8"
+    )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
     row = next(r for r in report["scheduled_runs"] if r["task_id"] == "2ba19526")
     assert row["order_attempts"] == 0
@@ -1713,8 +1708,7 @@ def test_failed_start_marker_survives_a_successful_retry(tmp_path):
     # The successful retry keeps its own scheduled row.
     assert row["classification"] == "valid_scheduled_evidence"
     escalations = [
-        r
-        for r in report["recovery_and_escalation_runs"]
+        r for r in report["recovery_and_escalation_runs"]
         if r["task_id"] == "42173154" and r["source"] == "failed_start_escalation"
     ]
     assert len(escalations) == 1
@@ -1754,13 +1748,7 @@ def test_premium_routed_run_outranks_equal_row_count_runs(tmp_path):
     # discussion_r3658688929.
     slots = [
         ("market_open_dca/20260727_0935ET", "2ba19526", "r1", "cost_conscious", "09:35"),
-        (
-            "morning_dca_preflight/20260727_0945ET",
-            "bb4f6ef1",
-            "morning_preflight_20260727_0945ET",
-            "cost_conscious",
-            "09:45",
-        ),
+        ("morning_dca_preflight/20260727_0945ET", "bb4f6ef1", "morning_preflight_20260727_0945ET", "cost_conscious", "09:45"),
         ("morning_dca_watchlist/20260727_0945ET", "bb4f6ef1", "morning_20260727_0945ET", "cost_conscious", "09:45"),
         ("morning_dca/20260727_1030ET", "42173154", "r4", "cost_conscious", "10:30"),
         ("intraday_dca/20260727_1130ET", "7be82b97", "r5", "cost_conscious", "11:30"),
@@ -1850,60 +1838,26 @@ def _write_fully_covered_day(tmp_path, extra_entries=None, extra_state=None):
     }
     orders_header = "ticker,order_id,submitted_amount_usd,status\n"
     for slot_dir, cron_id, run_id, extra_rc, extra_files in [
-        (
-            "market_open_dca/20260727_0935ET",
-            "2ba19526",
-            "r1",
-            {"scheduled_for_et": "09:35"},
-            ["run_summary.json", "market_open_signals.csv", "submitted_orders.csv"],
-        ),
+        ("market_open_dca/20260727_0935ET", "2ba19526", "r1", {"scheduled_for_et": "09:35"},
+         ["run_summary.json", "market_open_signals.csv", "submitted_orders.csv"]),
         # validation.csv is one of the four files
         # also_runs_required_preflight_writer.preflight_artifacts.files
         # declares (discussion_r3660192627).
-        (
-            "morning_dca_preflight/20260727_0945ET",
-            "bb4f6ef1",
-            "morning_preflight_20260727_0945ET",
-            {"run_type": "morning_dca_preflight", "scheduled_for_et": "09:45"},
-            ["signals.csv", "validation.csv", "run_summary.json"],
-        ),
-        (
-            "morning_dca_watchlist/20260727_0945ET",
-            "bb4f6ef1",
-            "morning_20260727_0945ET",
-            {"run_type": "morning_dca_watchlist_scan", "scheduled_for_et": "09:45"},
-            ["watchlist_signals.csv"],
-        ),
+        ("morning_dca_preflight/20260727_0945ET", "bb4f6ef1", "morning_preflight_20260727_0945ET",
+         {"run_type": "morning_dca_preflight", "scheduled_for_et": "09:45"},
+         ["signals.csv", "validation.csv", "run_summary.json"]),
+        ("morning_dca_watchlist/20260727_0945ET", "bb4f6ef1", "morning_20260727_0945ET",
+         {"run_type": "morning_dca_watchlist_scan", "scheduled_for_et": "09:45"}, ["watchlist_signals.csv"]),
         ("morning_dca/20260727_1030ET", "42173154", "r4", {"scheduled_for_et": "10:30"}, ["morning_signals.csv"]),
-        (
-            "intraday_dca/20260727_1130ET",
-            "7be82b97",
-            "r5",
-            {"scheduled_for_et": "11:30"},
-            ["run_summary.json", "intraday_signals.csv", "submitted_orders.csv"],
-        ),
+        ("intraday_dca/20260727_1130ET", "7be82b97", "r5", {"scheduled_for_et": "11:30"},
+         ["run_summary.json", "intraday_signals.csv", "submitted_orders.csv"]),
         ("midday_dca/20260727_1230ET", "a6239dae", "r6", {"scheduled_for_et": "12:30"}, ["run_summary.json"]),
-        (
-            "intraday_dca/20260727_1330ET",
-            "7be82b97",
-            "r7",
-            {"scheduled_for_et": "13:30"},
-            ["run_summary.json", "intraday_signals.csv", "submitted_orders.csv"],
-        ),
-        (
-            "intraday_dca/20260727_1430ET",
-            "7be82b97",
-            "r8",
-            {"scheduled_for_et": "14:30"},
-            ["run_summary.json", "intraday_signals.csv", "submitted_orders.csv"],
-        ),
-        (
-            "ce16ba6b/scheduled_runs/20260727_1530ET",
-            "10ce362c",
-            "r9",
-            {"scheduled_for_et": "15:30"},
-            ["run_summary.json", "submitted_orders.csv"],
-        ),
+        ("intraday_dca/20260727_1330ET", "7be82b97", "r7", {"scheduled_for_et": "13:30"},
+         ["run_summary.json", "intraday_signals.csv", "submitted_orders.csv"]),
+        ("intraday_dca/20260727_1430ET", "7be82b97", "r8", {"scheduled_for_et": "14:30"},
+         ["run_summary.json", "intraday_signals.csv", "submitted_orders.csv"]),
+        ("ce16ba6b/scheduled_runs/20260727_1530ET", "10ce362c", "r9", {"scheduled_for_et": "15:30"},
+         ["run_summary.json", "submitted_orders.csv"]),
     ]:
         run_dir = tmp_path / slot_dir
         _write_json(
@@ -1934,22 +1888,18 @@ def _write_fully_covered_day(tmp_path, extra_entries=None, extra_state=None):
         else:
             artifact = out_dir / f"{stream}.json"
             artifact.write_text("{}", encoding="utf-8")
-        entries.append(
-            {
-                "run_id": run_id,
-                "cron_id": cron_id,
-                "run_origin": "scheduled",
-                "stream": stream,
-                "triggered_at_utc": f"2026-07-27T{hhmm}:00Z",
-                "model_routing_mode": "cost_conscious",
-                "artifact_path": str(artifact),
-            }
-        )
+        entries.append({
+            "run_id": run_id, "cron_id": cron_id, "run_origin": "scheduled", "stream": stream,
+            "triggered_at_utc": f"2026-07-27T{hhmm}:00Z", "model_routing_mode": "cost_conscious",
+            "artifact_path": str(artifact),
+        })
     # Every covered run logs its own model usage, as a real clean day does.
     # Without this, a run with no matching row reports not_available (a
     # missing row never proves zero usage -- discussion_r3658096711) and the
     # aggregate is unavailable even on a fully covered tree.
-    entries.extend({"run_id": run_id, "model_routing_mode": "cost_conscious"} for run_id in covered_run_ids)
+    entries.extend(
+        {"run_id": run_id, "model_routing_mode": "cost_conscious"} for run_id in covered_run_ids
+    )
     entries.extend(extra_entries or [])
     model_usage_dir = tmp_path / "model_usage" / "202607"
     model_usage_dir.mkdir(parents=True)
@@ -2040,7 +1990,10 @@ def test_missing_scheduled_slots_are_actionable(tmp_path):
     from generate_credit_usage_proxy_report import NO_ACTIONABLE_ISSUES_STATEMENT, render_markdown
 
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    missing = [r for r in report["scheduled_runs"] if r["classification"] == "did_not_run" and not r.get("paused")]
+    missing = [
+        r for r in report["scheduled_runs"]
+        if r["classification"] == "did_not_run" and not r.get("paused")
+    ]
     assert len(missing) == 11
     assert len(report["actionable_issues"]) == 1
     issue = report["actionable_issues"][0]
@@ -2536,9 +2489,7 @@ def test_repair_artifact_filename_surfaces_without_any_recovery_flag(tmp_path):
     )
     (run_dir / "parent_recovery_submission_summary.json").write_text("{}", encoding="utf-8")
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    recovery_rows = [
-        r for r in report["recovery_and_escalation_runs"] if r["task_id"] == "7be82b97" and r["et"] == "11:30"
-    ]
+    recovery_rows = [r for r in report["recovery_and_escalation_runs"] if r["task_id"] == "7be82b97" and r["et"] == "11:30"]
     assert len(recovery_rows) == 1
     assert recovery_rows[0]["source"] == "repair_artifact"
 
@@ -2553,11 +2504,7 @@ def test_missing_required_artifact_surfaces_as_actionable_issue(tmp_path):
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
     row = next(r for r in report["scheduled_runs"] if r["task_id"] == "2ba19526")
     assert row["classification"] == "valid_scheduled_evidence"
-    assert set(row["missing_required_artifacts"]) == {
-        "run_summary.json",
-        "market_open_signals.csv",
-        "submitted_orders.csv",
-    }
+    assert set(row["missing_required_artifacts"]) == {"run_summary.json", "market_open_signals.csv", "submitted_orders.csv"}
     assert any("missing required artifact" in issue for issue in report["actionable_issues"])
 
 
@@ -2599,7 +2546,9 @@ def test_afternoon_latest_run_summary_does_not_substitute_for_the_canonical_one(
         ),
     )
     (run_dir / "latest_run_summary.json").write_text("{}", encoding="utf-8")
-    (run_dir / "submitted_orders.csv").write_text("ticker,order_id,submitted_amount_usd,status\n", encoding="utf-8")
+    (run_dir / "submitted_orders.csv").write_text(
+        "ticker,order_id,submitted_amount_usd,status\n", encoding="utf-8"
+    )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
     row = next(r for r in report["scheduled_runs"] if r["task_id"] == "10ce362c")
     assert row["missing_required_artifacts"] == ["run_summary.json"]
@@ -2626,7 +2575,9 @@ def test_afternoon_canonical_run_summary_satisfies_the_requirement(tmp_path):
         ),
     )
     (run_dir / "run_summary.json").write_text("{}", encoding="utf-8")
-    (run_dir / "submitted_orders.csv").write_text("ticker,order_id,submitted_amount_usd,status\n", encoding="utf-8")
+    (run_dir / "submitted_orders.csv").write_text(
+        "ticker,order_id,submitted_amount_usd,status\n", encoding="utf-8"
+    )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
     row = next(r for r in report["scheduled_runs"] if r["task_id"] == "10ce362c")
     assert row["missing_required_artifacts"] == []
@@ -2860,18 +2811,14 @@ def test_repeated_late_phase_failures_are_each_counted(tmp_path):
     day_dir = tmp_path / "attempt_log" / "20260727"
     day_dir.mkdir(parents=True)
     first = {
-        "stream": "morning",
-        "error_class": "RuntimeError",
+        "stream": "morning", "error_class": "RuntimeError",
         "error_message": "report generation failed the first time",
-        "failure_phase": "after_run_artifact",
-        "triggered_at_utc": "2026-07-27T14:32:00Z",
+        "failure_phase": "after_run_artifact", "triggered_at_utc": "2026-07-27T14:32:00Z",
     }
     second = {
-        "stream": "morning",
-        "error_class": "RuntimeError",
+        "stream": "morning", "error_class": "RuntimeError",
         "error_message": "report generation failed again on retry",
-        "failure_phase": "after_run_artifact",
-        "triggered_at_utc": "2026-07-27T14:35:00Z",
+        "failure_phase": "after_run_artifact", "triggered_at_utc": "2026-07-27T14:35:00Z",
     }
     (day_dir / "morning.attempts.jsonl").write_text(
         json.dumps(first) + "\n" + json.dumps(second) + "\n", encoding="utf-8"
@@ -2916,12 +2863,8 @@ def test_pre_artifact_marker_is_still_a_failed_start(tmp_path, monkeypatch):
     # must be cleared here so each iteration's own root is what gets read.
     monkeypatch.delenv("DCA_ATTEMPT_LOG_ROOT", raising=False)
     for marker in (
-        {
-            "stream": "morning",
-            "error_class": "ConnectionError",
-            "error_message": "died early",
-            "failure_phase": "before_run_artifact",
-        },
+        {"stream": "morning", "error_class": "ConnectionError", "error_message": "died early",
+         "failure_phase": "before_run_artifact"},
         {"stream": "morning", "error_class": "ConnectionError", "error_message": "died early"},
     ):
         root = tmp_path / marker.get("failure_phase", "legacy")
@@ -3211,16 +3154,12 @@ def test_corrupt_middle_history_line_is_surfaced_as_a_caveat(tmp_path):
     day_dir = tmp_path / "attempt_log" / "20260727"
     day_dir.mkdir(parents=True)
     first = {
-        "stream": "morning",
-        "error_class": "ConnectionError",
-        "error_message": "first attempt",
-        "triggered_at_utc": "2026-07-27T13:31:00Z",
+        "stream": "morning", "error_class": "ConnectionError",
+        "error_message": "first attempt", "triggered_at_utc": "2026-07-27T13:31:00Z",
     }
     third = {
-        "stream": "morning",
-        "error_class": "ValueError",
-        "error_message": "third attempt",
-        "triggered_at_utc": "2026-07-27T14:05:00Z",
+        "stream": "morning", "error_class": "ValueError",
+        "error_message": "third attempt", "triggered_at_utc": "2026-07-27T14:05:00Z",
     }
     (day_dir / "morning.attempts.jsonl").write_text(
         json.dumps(first) + "\n" + '{"truncated middle line": ' + "\n" + json.dumps(third) + "\n",
@@ -3261,7 +3200,9 @@ def test_partially_corrupt_history_still_recovers_the_latest_marker(tmp_path):
         "error_message": "second attempt",
         "triggered_at_utc": "2026-07-27T14:05:00Z",
     }
-    (day_dir / "morning.attempts.jsonl").write_text(json.dumps(older) + "\n" + '{"truncated": ', encoding="utf-8")
+    (day_dir / "morning.attempts.jsonl").write_text(
+        json.dumps(older) + "\n" + '{"truncated": ', encoding="utf-8"
+    )
     (day_dir / "morning.json").write_text(json.dumps(latest), encoding="utf-8")
 
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
@@ -3434,31 +3375,19 @@ def test_duplicate_consumer_artifact_paths_are_counted_once(tmp_path):
     model_usage_dir.mkdir(parents=True)
     entries = [
         {
-            "run_id": "slip",
-            "cron_id": "67aa802b",
-            "run_origin": "scheduled",
-            "stream": "slippage",
-            "triggered_at_utc": "2026-07-27T19:35:00Z",
-            "model_routing_mode": "cost_conscious",
+            "run_id": "slip", "cron_id": "67aa802b", "run_origin": "scheduled", "stream": "slippage",
+            "triggered_at_utc": "2026-07-27T19:35:00Z", "model_routing_mode": "cost_conscious",
             "artifact_path": str(out_dir),
         },
         # Same directory logged a second time, plus a file already inside it.
         {
-            "run_id": "slip",
-            "cron_id": "67aa802b",
-            "run_origin": "scheduled",
-            "stream": "slippage",
-            "triggered_at_utc": "2026-07-27T19:36:00Z",
-            "model_routing_mode": "cost_conscious",
+            "run_id": "slip", "cron_id": "67aa802b", "run_origin": "scheduled", "stream": "slippage",
+            "triggered_at_utc": "2026-07-27T19:36:00Z", "model_routing_mode": "cost_conscious",
             "artifact_path": str(out_dir),
         },
         {
-            "run_id": "slip",
-            "cron_id": "67aa802b",
-            "run_origin": "scheduled",
-            "stream": "slippage",
-            "triggered_at_utc": "2026-07-27T19:37:00Z",
-            "model_routing_mode": "cost_conscious",
+            "run_id": "slip", "cron_id": "67aa802b", "run_origin": "scheduled", "stream": "slippage",
+            "triggered_at_utc": "2026-07-27T19:37:00Z", "model_routing_mode": "cost_conscious",
             "artifact_path": str(out_dir / "slippage_ranked.csv"),
         },
     ]
@@ -3504,19 +3433,15 @@ def test_read_only_0945_slots_record_zero_orders(tmp_path):
     _write_json(
         tmp_path / "morning_dca_preflight/20260727_0945ET/run_state.json",
         _scheduled_run_state(
-            "bb4f6ef1",
-            "morning_preflight_20260727_0945ET",
-            run_type="morning_dca_preflight",
-            scheduled_for_et="09:45",
+            "bb4f6ef1", "morning_preflight_20260727_0945ET",
+            run_type="morning_dca_preflight", scheduled_for_et="09:45",
         ),
     )
     _write_json(
         tmp_path / "morning_dca_watchlist/20260727_0945ET/run_state.json",
         _scheduled_run_state(
-            "bb4f6ef1",
-            "morning_20260727_0945ET",
-            run_type="morning_dca_watchlist_scan",
-            scheduled_for_et="09:45",
+            "bb4f6ef1", "morning_20260727_0945ET",
+            run_type="morning_dca_watchlist_scan", scheduled_for_et="09:45",
         ),
     )
 
@@ -3542,14 +3467,13 @@ def test_read_only_slot_still_prefers_a_real_order_artifact(tmp_path):
     _write_json(
         run_dir / "run_state.json",
         _scheduled_run_state(
-            "bb4f6ef1",
-            "morning_preflight_20260727_0945ET",
-            run_type="morning_dca_preflight",
-            scheduled_for_et="09:45",
+            "bb4f6ef1", "morning_preflight_20260727_0945ET",
+            run_type="morning_dca_preflight", scheduled_for_et="09:45",
         ),
     )
     (run_dir / "submitted_orders.csv").write_text(
-        "ticker,order_id,submitted_amount_usd,status\nAAPL,o1,1.00,submitted\nMSFT,o2,2.00,submitted\n",
+        "ticker,order_id,submitted_amount_usd,status\n"
+        "AAPL,o1,1.00,submitted\nMSFT,o2,2.00,submitted\n",
         encoding="utf-8",
     )
 
@@ -3606,7 +3530,9 @@ def _stamp_to_trading_day(path, trading_day=None):
     started failing at the following ET midnight with no code change. Stamping
     the mtime makes such a fixture hermetic (Codex review, PR #219).
     """
-    when = datetime.fromisoformat(f"{trading_day or TRADING_DAY}T12:00:00").replace(tzinfo=ZoneInfo("America/New_York"))
+    when = datetime.fromisoformat(f"{trading_day or TRADING_DAY}T12:00:00").replace(
+        tzinfo=ZoneInfo("America/New_York")
+    )
     stamp = when.timestamp()
     path = Path(path)
     targets = [path, *path.rglob("*")] if path.is_dir() else [path]
@@ -3813,7 +3739,9 @@ def test_registered_command_derives_the_root_with_no_shell_hardcoding():
     # root the way a static shell fallback could.
     repo_root = Path(__file__).resolve().parents[2]
     manifest = json.loads((repo_root / "config" / "scheduled_tasks.json").read_bytes())
-    command = next(t["command"] for t in manifest["tasks"] if t.get("id", "").startswith("onetime-1630-credit"))
+    command = next(
+        t["command"] for t in manifest["tasks"] if t.get("id", "").startswith("onetime-1630-credit")
+    )
     assert "--write-defaults" in command
     assert "DCA_CRON_TRACKING_ROOT" not in command
     assert "/home/user/workspace/cron_tracking" not in command
@@ -3896,7 +3824,10 @@ def test_url_embedded_credential_is_redacted_end_to_end(tmp_path):
     _write_json(
         tmp_path / "market_open_dca" / "20260727_0935ET" / "run_state.json",
         _run_state(
-            blocking_reason=(f"broker rejected: https://hooks.slack.com/services/T00000000/B00000000/{slack_tail}")
+            blocking_reason=(
+                "broker rejected: https://hooks.slack.com/services/"
+                f"T00000000/B00000000/{slack_tail}"
+            )
         ),
     )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
@@ -3909,7 +3840,9 @@ def test_partial_slippage_output_set_is_a_failed_invocation(tmp_path):
     # logs its model_usage row from a finally block -- so an invocation that
     # wrote the first report and then raised must not pass as successful on
     # the strength of that one file -- codex review discussion_r3660192605.
-    out_dir = _write_slippage_outputs(tmp_path / "reports" / "20260727", names=("slippage_ranked.csv",))
+    out_dir = _write_slippage_outputs(
+        tmp_path / "reports" / "20260727", names=("slippage_ranked.csv",)
+    )
     _write_model_usage(tmp_path, [_consumer_entry("slip", out_dir, "2026-07-27T19:35:00Z")])
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
     row = next(r for r in report["scheduled_runs"] if r["task_id"] == "67aa802b")
@@ -3956,16 +3889,12 @@ def test_latest_marker_merges_after_a_clean_append_failure(tmp_path):
     day_dir = tmp_path / "attempt_log" / "20260727"
     day_dir.mkdir(parents=True)
     older = {
-        "stream": "morning",
-        "error_class": "ConnectionError",
-        "error_message": "first attempt",
-        "triggered_at_utc": "2026-07-27T13:31:00Z",
+        "stream": "morning", "error_class": "ConnectionError",
+        "error_message": "first attempt", "triggered_at_utc": "2026-07-27T13:31:00Z",
     }
     newest = {
-        "stream": "morning",
-        "error_class": "ValueError",
-        "error_message": "second attempt",
-        "triggered_at_utc": "2026-07-27T14:05:00Z",
+        "stream": "morning", "error_class": "ValueError",
+        "error_message": "second attempt", "triggered_at_utc": "2026-07-27T14:05:00Z",
     }
     # A perfectly valid history -- no truncation, nothing malformed.
     (day_dir / "morning.attempts.jsonl").write_text(json.dumps(older) + "\n", encoding="utf-8")
@@ -3991,14 +3920,11 @@ def test_preflight_missing_validation_csv_is_an_actionable_issue(tmp_path):
         {
             "run_id": "morning_preflight_20260727_0945ET",
             "run_classification": {
-                "run_origin": "scheduled",
-                "manual_run": False,
-                "cron_id": "bb4f6ef1",
+                "run_origin": "scheduled", "manual_run": False, "cron_id": "bb4f6ef1",
                 "scheduled_for_et": "09:45",
                 "run_id": "morning_preflight_20260727_0945ET",
                 "run_type": "morning_dca_preflight",
-                "triggered_at_utc": "2026-07-27T13:45:00Z",
-                "state_schema_version": "test-v1",
+                "triggered_at_utc": "2026-07-27T13:45:00Z", "state_schema_version": "test-v1",
             },
         },
     )
@@ -4074,7 +4000,9 @@ def test_recovery_stream_keys_match_the_canonical_names(tmp_path):
 def test_contract_and_report_agree_on_recovery_stream_names():
     # The contract text itself must name the canonical streams, or a consumer
     # reading it cannot tell an omitted stream from a confirmed zero.
-    manifest = json.loads((Path(__file__).resolve().parents[2] / "config" / "scheduled_tasks.json").read_bytes())
+    manifest = json.loads(
+        (Path(__file__).resolve().parents[2] / "config" / "scheduled_tasks.json").read_text(encoding="utf-8")
+    )
     rule = manifest["credit_usage_proxy_report_2026_07_27"]["recovery_counts_by_stream_rule"]
     # Only the DECLARED list matters; the trailing note legitimately mentions
     # the old post_trade name to explain why it was replaced.

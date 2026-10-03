@@ -13,22 +13,6 @@ This project preserves the live DCA strategy in a reproducible form so humans an
 
 No credentials, tokens, or account identifiers are stored in this repository.
 
-This is a **library driven from outside, not a self-contained app**: the live scheduled runs
-are executed by external agent sessions that hold Robinhood MCP access and inject plain
-callables into the adapters. The repo makes no network calls, and the CLI is dry-run only.
-A module with no in-repo caller is usually not dead code. Runtime is **Python ≥3.11,
-standard library only**.
-
-### Three entry points
-
-A fix to one does not propagate to the others (details in [`docs/live_wiring.md`](docs/live_wiring.md)).
-
-| Entry point | Driven by |
-| --- | --- |
-| `run_dca.run_slot()` | The 3:30 PM live path; the only one with a real CLI `__main__` (dry-run only). |
-| `MorningDCAExecutor` + `market_open_dca` / `midday_dca` / `intraday_dca` subclasses | An external agent calling `.run(now, data, broker=...)`. |
-| `dca_runner.py` | An external agent session running the gate sequence with injected callables. |
-
 ### Required environment
 
 The live brokerage account number is supplied by the environment, never by git.
@@ -113,17 +97,6 @@ run-dca --demo --report --now <YYYY-MM-DDTHH:MM> --artifacts-dir /tmp/dca-demo
 run-dca-risk --help
 ```
 
-### Local tests and coverage
-
-```bash
-.venv/bin/python -m pytest                 # ~8,300 tests, ~5 min; tests live in tests/
-.venv/bin/python -m pytest tests/test_midday_dca.py -q
-.venv/bin/python -m pytest scripts/tests -q   # reliability engines; separate from the root sweep
-pytest --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90   # the CI gate
-```
-
-Each adjacent subproject (below) has its own suite and is run from its own directory.
-
 ### Python API example
 
 ```python
@@ -150,20 +123,18 @@ print(base_amount_usd * multiplier)
 | Path | Purpose |
 | --- | --- |
 | `AGENTS.md` | Codex/agent operating guide for safe autonomous work. |
-| `near_close_dca.py`, `morning_dca.py` | Core strategy and artifact-building logic; `market_open_dca.py`, `midday_dca.py`, `intraday_dca.py` are thin stream subclasses. |
-| `run_dca.py`, `dca_runner.py` | CLI/pipeline orchestrator and the gate-sequence live runner. |
+| `near_close_dca.py`, `morning_dca.py` | Core strategy and artifact-building logic. |
+| `run_dca.py` | CLI orchestrator. |
 | `dca_config.py` | Config discovery and loading. |
 | `dca_risk.py` | Risk checks and safety validation. |
 | `dca_live_adapters.py` | Broker/data-provider interfaces and adapters. |
 | `dca_reporting.py`, `dca_cost_tracker.py`, `dca_notion_sync.py`, `dca_weekly_dashboard.py` | Reporting, cost tracking, and dashboard helpers. |
 | `config/` | Version-controlled JSON strategy configuration. |
 | `schemas/` | JSON schemas for configs and generated artifacts. |
-| `scripts/` | Reliability engines, backup, run-classification, and drift utilities. |
-| `from.py`, `dca_console*.py`, `console/` | Checkout-only local console (observe/dry-run only). |
-| `dca_market_graph.py`, `viz/` | 3D market graph (see `docs/market_graph.md`). |
+| `scripts/` | Backup and run-classification utilities. |
 | `docs/` | Detailed strategy docs, runbooks, and operational notes. |
-| `tests/`, `scripts/tests/` | Automated tests (`tests/test_<module>.py` per core module). |
-| `ticker-advisor/`, `trading-strategies/`, `analysis/`, `production-safe-agent-loop/`, and more | Adjacent projects — see below. |
+| `test_*.py`, `scripts/tests/` | Automated tests. |
+| `ticker-advisor/`, `trading-strategies/`, `analysis/`, `production-safe-agent-loop/` | Adjacent projects — see below. |
 | `tickers.txt`, `historical_stock_data.csv`, `stock_fetch_progress.json` | Operational data files used by fetch/analysis scripts; do not delete. |
 | `FETCH_*.md`, `FILE_MANIFEST.txt`, `FINAL_EXECUTION_REPORT.md`, `TASK_SUMMARY.txt`, `README_*.md` | Generated operational reports from fetch runs; treat as read-only artifacts. |
 
@@ -179,7 +150,6 @@ schedule or by hand.
 | `ticker-advisor/` | Scores candidate tickers on strategy-health, backtested performance, and sentiment signals; proposes universe additions for manual review. Never edits `config/tickers.json` itself. | `cd ticker-advisor && pip install -r requirements.txt && python advise_tickers.py --candidates TICK1 TICK2` — see `docs/ticker_advisory.md`. |
 | `trading-strategies/` | Separate research tree: a standalone vectorbt-based backtester plus strategy/sentiment monitors, decoupled from the live pipeline. | `cd trading-strategies && pip install -r requirements.txt` — see `trading-strategies/README.md`. |
 | `analysis/` | Dated one-off analysis folders: ladder revisions, execution audits, reliability writeups. Nothing here runs on a schedule. | Browse `analysis/README.md` for an index of what's in each dated folder. |
-| `ml-forecaster/`, `wondrous-octopus/`, `ticker-market-breadth/`, `llm-providers/`, `yfinance-prefetch/` | Sizing-adjustment ML retrain, walk-forward OHLC forecasting, `^TICK` breadth archive, provider-agnostic LLM chat interface, and yfinance fallback prefetch. Each has its own `README.md` and `requirements.txt`; none is wired into live sizing. | `cd <dir> && pip install -r requirements.txt && python -m pytest tests/` |
 | `production-safe-agent-loop/` | Two safety primitives for running an AI agent loop against something that costs real money: a turn/token circuit breaker, and a forced pre-flight spec. Not wired into any live executor today. | `cd production-safe-agent-loop && pip install -r requirements.txt && python -m pytest tests/` — see `production-safe-agent-loop/README.md`. |
 
 ## Agentic workflow compatibility

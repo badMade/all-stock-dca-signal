@@ -262,7 +262,9 @@ def _validate_slot_schedule(now: datetime, window: str) -> None:
         )
 
 
-def _slot_classification_overrides(stream_name: str, window: str, trading_day: str) -> Optional[Dict[str, Any]]:
+def _slot_classification_overrides(
+    stream_name: str, window: str, trading_day: str
+) -> Optional[Dict[str, Any]]:
     """Per-slot ``run_classification`` identity for a non-afternoon roster slot.
 
     ``near_close_dca.build_run_artifacts`` stamps every scheduled run through
@@ -444,7 +446,9 @@ def _resolve_cross_stream_prior_allocation_roots(
     _env_config_dir = os.environ.get("DCA_CONFIG_DIR")
     _env_config_dir_valid = bool(_env_config_dir and Path(_env_config_dir).is_dir())
 
-    def _configured_root(loader_root: Optional[str], default_root: str) -> Optional[Path]:
+    def _configured_root(
+        loader_root: Optional[str], default_root: str
+    ) -> Optional[Path]:
         root = Path(loader_root or default_root)
         # An empty string is treated as "not configured" everywhere else this
         # field is consumed (e.g. MorningDCAExecutor.state_root's own
@@ -453,7 +457,9 @@ def _resolve_cross_stream_prior_allocation_roots(
         # root either -- `loader_root is not None` alone would still trust an
         # empty override, and `root` above already silently fell back to
         # default_root (the production path) for it.
-        trusted = bool(loader_root) and (config_dir is not None or _env_config_dir_valid)
+        trusted = bool(loader_root) and (
+            config_dir is not None or _env_config_dir_valid
+        )
         if not trusted and not _is_within(root.resolve(), cron_base.resolve()):
             # Neither an explicit config_dir argument nor a DCA_CONFIG_DIR
             # override for this specific stream was in play, and the resolved
@@ -466,12 +472,18 @@ def _resolve_cross_stream_prior_allocation_roots(
         return root
 
     try:
-        morning_root = load_morning_config(config_dir, mode=MORNING_LIVE_MODE).morning_run_state_root
-    except Exception:  # noqa: BLE001 - never let a bad morning config block the afternoon run
+        morning_root = load_morning_config(
+            config_dir, mode=MORNING_LIVE_MODE
+        ).morning_run_state_root
+    except (
+        Exception
+    ):  # noqa: BLE001 - never let a bad morning config block the afternoon run
         morning_root = None
     try:
         midday_root = load_midday_config(config_dir).morning_run_state_root
-    except Exception:  # noqa: BLE001 - never let a bad midday config block the afternoon run
+    except (
+        Exception
+    ):  # noqa: BLE001 - never let a bad midday config block the afternoon run
         midday_root = None
 
     # There is no IntradayConfig loader (see DEFAULT_INTRADAY_LIVE_STATE_ROOT
@@ -520,8 +532,12 @@ def _resolve_cross_stream_prior_allocation_roots(
     _intraday_is_nested_under_afternoon = intraday_root is not None and _is_within(
         intraday_root.resolve(), afternoon_root.resolve()
     )
-    intraday_override_configured = intraday_root is not None and not _intraday_is_ancestor_of_afternoon
-    intraday_override_active = intraday_override_configured and not _intraday_is_nested_under_afternoon
+    intraday_override_configured = (
+        intraday_root is not None and not _intraday_is_ancestor_of_afternoon
+    )
+    intraday_override_active = (
+        intraday_override_configured and not _intraday_is_nested_under_afternoon
+    )
 
     # Same ancestor/nested/equal reasoning as intraday above, applied to the
     # market-open override.
@@ -530,11 +546,16 @@ def _resolve_cross_stream_prior_allocation_roots(
         and _is_within(afternoon_root.resolve(), market_open_root.resolve())
         and market_open_root.resolve() != afternoon_root.resolve()
     )
-    _market_open_is_nested_under_afternoon = market_open_root is not None and _is_within(
-        market_open_root.resolve(), afternoon_root.resolve()
+    _market_open_is_nested_under_afternoon = (
+        market_open_root is not None
+        and _is_within(market_open_root.resolve(), afternoon_root.resolve())
     )
-    market_open_override_configured = market_open_root is not None and not _market_open_is_ancestor_of_afternoon
-    market_open_override_active = market_open_override_configured and not _market_open_is_nested_under_afternoon
+    market_open_override_configured = (
+        market_open_root is not None and not _market_open_is_ancestor_of_afternoon
+    )
+    market_open_override_active = (
+        market_open_override_configured and not _market_open_is_nested_under_afternoon
+    )
 
     # For FALLBACK discovery, include an override that is merely "configured"
     # rather than "active". The active gate drops an override nested under
@@ -544,8 +565,16 @@ def _resolve_cross_stream_prior_allocation_roots(
     # directories (Codex review: "Preserve nested configured roots for fallback
     # discovery"). An override that is an ANCESTOR of afternoon_root stays
     # excluded either way: *_override_configured is already false for it.
-    _intraday_included = intraday_override_configured if for_fallback_discovery else intraday_override_active
-    _market_open_included = market_open_override_configured if for_fallback_discovery else market_open_override_active
+    _intraday_included = (
+        intraday_override_configured
+        if for_fallback_discovery
+        else intraday_override_active
+    )
+    _market_open_included = (
+        market_open_override_configured
+        if for_fallback_discovery
+        else market_open_override_active
+    )
     configured_roots = tuple(
         r
         for r in (
@@ -569,7 +598,9 @@ def _resolve_cross_stream_prior_allocation_roots(
         r
         for r in _CROSS_STREAM_PRIOR_ALLOCATION_ROOTS
         if not (r == DEFAULT_INTRADAY_LIVE_STATE_ROOT and intraday_override_configured)
-        and not (r == DEFAULT_MARKET_OPEN_LIVE_STATE_ROOT and market_open_override_configured)
+        and not (
+            r == DEFAULT_MARKET_OPEN_LIVE_STATE_ROOT and market_open_override_configured
+        )
     )
     sibling_roots = tuple(cron_base / Path(r).name for r in _cross_stream_defaults)
 
@@ -626,7 +657,10 @@ def _resolve_cross_stream_prior_allocation_roots(
     resolved: List[Path] = [
         orig
         for orig, key in non_afternoon
-        if not any(key != other_key and _is_within(key, other_key) for _, other_key in non_afternoon)
+        if not any(
+            key != other_key and _is_within(key, other_key)
+            for _, other_key in non_afternoon
+        )
     ]
 
     return tuple(resolved)
@@ -634,7 +668,6 @@ def _resolve_cross_stream_prior_allocation_roots(
 
 def _parse_raw_json(path):
     import json
-
     try:
         return path.name, json.loads(path.read_bytes()), None
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
@@ -744,7 +777,11 @@ def _build_frozen_providers_from_raw(
             # wrapped pointer shape dca_reporting._order_list_from_payload
             # already handles) -- so keep stepping in, not just once.
             seen_ids: set = set()
-            while isinstance(payload, dict) and "results" not in payload and isinstance(payload.get("data"), dict):
+            while (
+                isinstance(payload, dict)
+                and "results" not in payload
+                and isinstance(payload.get("data"), dict)
+            ):
                 if id(payload) in seen_ids:
                     break  # defend against a cyclic/self-referential payload
                 seen_ids.add(id(payload))
@@ -763,7 +800,9 @@ def _build_frozen_providers_from_raw(
                     tkr = str(entry.get("ticker") or "").strip().upper()
                     ivl = int(entry.get("interval_minutes") or 0)
                     if tkr and ivl:
-                        finance_bars.setdefault((tkr, ivl), []).extend(entry.get("bars") or [])
+                        finance_bars.setdefault((tkr, ivl), []).extend(
+                            entry.get("bars") or []
+                        )
             elif name.startswith("finance_close_batch") and name.endswith(".json"):
                 finance_files_seen = True
                 for entry in payload.get("results") or []:
@@ -789,7 +828,13 @@ def _build_frozen_providers_from_raw(
 
         def _frozen_quotes(symbols=None, **_kw):
             sym_set = set(symbols or [])
-            return {"results": [r for r in _q if not sym_set or (r.get("quote") or {}).get("symbol") in sym_set]}
+            return {
+                "results": [
+                    r
+                    for r in _q
+                    if not sym_set or (r.get("quote") or {}).get("symbol") in sym_set
+                ]
+            }
 
         from dca_live_adapters import RobinhoodDataProvider as _RDP
 
@@ -809,7 +854,9 @@ def _build_frozen_providers_from_raw(
         # silently falling back to frozen data.
         _live_get_bid_ask = getattr(original_robinhood, "get_bid_ask", None)
         frozen_robinhood.get_bid_ask = (  # type: ignore[attr-defined]
-            _live_get_bid_ask if callable(_live_get_bid_ask) else (lambda ticker, as_of: None)
+            _live_get_bid_ask
+            if callable(_live_get_bid_ask)
+            else (lambda ticker, as_of: None)
         )
     else:
         if strict_robinhood:
@@ -944,7 +991,9 @@ def _build_frozen_providers_from_raw(
                 since_iso = since.isoformat()
                 as_of_iso = as_of.isoformat()
                 persisted_path = _raw_dir / f"corporate_action_{symbol}.json"
-                query_path = _raw_dir / (f"corporate_action_{symbol}_{since_iso}_{as_of_iso}.json")
+                query_path = _raw_dir / (
+                    f"corporate_action_{symbol}_{since_iso}_{as_of_iso}.json"
+                )
                 persisted_file_present = persisted_path.is_file()
                 # Reset on every call before deciding: near_close_dca.py reads
                 # this right after invoking us to decide whether to count a
@@ -978,7 +1027,9 @@ def _build_frozen_providers_from_raw(
                         cached_cursor = cached.get("cursor")
                         if cached_factor is None or cached_cursor is None:
                             return None
-                        return _validated_corporate_action_result((cached_factor, cached_cursor), as_of)
+                        return _validated_corporate_action_result(
+                            (cached_factor, cached_cursor), as_of
+                        )
 
                 # Validated the same way a cached replay is, before either
                 # persisting or returning it: a non-conforming fresh result
@@ -1013,7 +1064,9 @@ def _build_frozen_providers_from_raw(
                     # query's immutable evidence.  A retry with different
                     # window parameters gets its own snapshot rather than
                     # replacing evidence an in-flight run already consumed.
-                    output_name = query_path.name if persisted_file_present else persisted_path.name
+                    output_name = (
+                        query_path.name if persisted_file_present else persisted_path.name
+                    )
                     save_raw_input(
                         "",
                         output_name,
@@ -1024,7 +1077,9 @@ def _build_frozen_providers_from_raw(
                     return None
                 return result
 
-            def _persisted_corporate_action_factor(ticker: str, since: "date", as_of: "date", *, _raw_dir=raw_dir):
+            def _persisted_corporate_action_factor(
+                ticker: str, since: "date", as_of: "date", *, _raw_dir=raw_dir
+            ):
                 """Serialize snapshot selection, lookup, and persistence.
 
                 Retries can construct separate frozen providers over the same
@@ -1354,16 +1409,8 @@ def _refresh_fills_from_broker(
             status = (row[idx_status] or "").lower()
             if not order_id:
                 continue
-            fill_price = (
-                (row[idx_avg_fill_price] or "").strip()
-                if idx_avg_fill_price >= 0 and idx_avg_fill_price < len(row)
-                else ""
-            )
-            filled_qty = (
-                (row[idx_quantity_filled] or "").strip()
-                if idx_quantity_filled >= 0 and idx_quantity_filled < len(row)
-                else ""
-            )
+            fill_price = (row[idx_avg_fill_price] or "").strip() if idx_avg_fill_price >= 0 and idx_avg_fill_price < len(row) else ""
+            filled_qty = (row[idx_quantity_filled] or "").strip() if idx_quantity_filled >= 0 and idx_quantity_filled < len(row) else ""
             has_complete_fill_data = fill_price not in ("", "-") and filled_qty not in ("", "-")
             # A terminal crash-lease recovery valued ONLY through
             # executed_notional (action_reason ==
@@ -1440,10 +1487,9 @@ def _refresh_fills_from_broker(
             try:
                 # Need to handle potential KeyError if the batch result was partial or empty map was returned
                 results.append((oid, tkr, row_status, fills_map.get(oid)))
-            except Exception:  # noqa: BLE001
+            except Exception: # noqa: BLE001
                 results.append((oid, tkr, row_status, None))
     else:
-
         def _fetch(query_tuple):
             oid, tkr, row_status = query_tuple
             try:
@@ -1569,7 +1615,9 @@ def _compute_auto_derived_prior_allocations(
     # Each stream's root is read from its OWN config rather than assumed from
     # directory-naming convention, so a relocated artifact root is still found.
     afternoon_root = _default_prior_allocation_state_root(Path(artifacts_dir))
-    cross_stream_roots = _resolve_cross_stream_prior_allocation_roots(config_dir, afternoon_root)
+    cross_stream_roots = _resolve_cross_stream_prior_allocation_roots(
+        config_dir, afternoon_root
+    )
     # Unpruned companion set for the bare-CSV fallback below; see that call site.
     fallback_discovery_roots = _resolve_cross_stream_prior_allocation_roots(
         config_dir, afternoon_root, for_fallback_discovery=True
@@ -1658,15 +1706,17 @@ def _compute_auto_derived_prior_allocations(
         # test_compute_auto_derived_prior_allocations_full_duplicate_merge_
         # unions_order_ids, an existing, deliberately-tested contract that
         # already accepts this exact tradeoff for contributing_order_ids.
-        is_full_duplicate = (
-            bool(alloc.contributing_run_ids) and alloc.contributing_run_ids <= existing.contributing_run_ids
-        )
+        is_full_duplicate = bool(
+            alloc.contributing_run_ids
+        ) and alloc.contributing_run_ids <= existing.contributing_run_ids
         if is_full_duplicate:
             merged_amount = existing.amount_usd
             merged_contributing_run_ids = existing.contributing_run_ids
         else:
             merged_amount = existing.amount_usd + alloc.amount_usd
-            merged_contributing_run_ids = existing.contributing_run_ids | alloc.contributing_run_ids
+            merged_contributing_run_ids = (
+                existing.contributing_run_ids | alloc.contributing_run_ids
+            )
         # order_ids are ALWAYS unioned, independent of is_full_duplicate:
         # is_full_duplicate is decided on run-id subset alone, but one
         # run_id can expose multiple distinct orders for the same ticker
@@ -1678,7 +1728,9 @@ def _compute_auto_derived_prior_allocations(
         # branch would drop that identity and let a later reload's equal
         # order-id set wrongly look like a provenance match (Codex review:
         # "Preserve uncertain order IDs across duplicate-root merges").
-        merged_contributing_order_ids = existing.contributing_order_ids | alloc.contributing_order_ids
+        merged_contributing_order_ids = (
+            existing.contributing_order_ids | alloc.contributing_order_ids
+        )
         # Same reasoning, same union, for id-less uncertain contributors
         # (no order_id at all -- see PriorSameDayAllocation.
         # uncertain_contributor_ids' own docstring): a root whose run_ids
@@ -1686,7 +1738,9 @@ def _compute_auto_derived_prior_allocations(
         # identity existing has never seen, and dropping it would let a
         # later reload's equal uncertain_contributor_ids set wrongly look
         # like proof this root's own anonymous contributor was re-verified.
-        merged_uncertain_contributor_ids = existing.uncertain_contributor_ids | alloc.uncertain_contributor_ids
+        merged_uncertain_contributor_ids = (
+            existing.uncertain_contributor_ids | alloc.uncertain_contributor_ids
+        )
         # Attempt-count dedup is decided INDEPENDENTLY of the dollar dedup
         # above, using attempt_run_ids (a strict superset of
         # contributing_run_ids that also covers zero-dollar attempts). A
@@ -1701,7 +1755,9 @@ def _compute_auto_derived_prior_allocations(
         # against the shared max_orders_per_day breaker and can permit an
         # extra live order (Codex review: "Carry attempt counts through the
         # final cross-stream merge").
-        is_full_attempt_duplicate = bool(alloc.attempt_run_ids) and alloc.attempt_run_ids <= existing.attempt_run_ids
+        is_full_attempt_duplicate = bool(
+            alloc.attempt_run_ids
+        ) and alloc.attempt_run_ids <= existing.attempt_run_ids
         if is_full_attempt_duplicate:
             merged_attempt_count = existing.attempt_count
             merged_attempt_run_ids = existing.attempt_run_ids
@@ -1722,13 +1778,17 @@ def _compute_auto_derived_prior_allocations(
             contributing_order_ids=merged_contributing_order_ids,
             uncertain_contributor_ids=merged_uncertain_contributor_ids,
             attempt_run_ids=merged_attempt_run_ids,
-            unresolved_live_exposure=(existing.unresolved_live_exposure or alloc.unresolved_live_exposure),
+            unresolved_live_exposure=(
+                existing.unresolved_live_exposure or alloc.unresolved_live_exposure
+            ),
             # Either source may only know a conservative sentinel for this
             # ticker.  Preserve that uncertainty through the cross-stream
             # merge: losing it makes the later bounded reload regard the
             # sentinel as an authoritative amount and reopen shared-cap
             # headroom.
-            notional_uncertain=(existing.notional_uncertain or alloc.notional_uncertain),
+            notional_uncertain=(
+                existing.notional_uncertain or alloc.notional_uncertain
+            ),
         )
     # Manual-context discovery (scripts.run_classification.load_same_day_top_up_context)
     # only runs for the auto-derived root: it scans SIBLINGS of afternoon_root's
@@ -1843,7 +1903,9 @@ def _compute_earlier_week_cross_stream_notional(
     config actually was.
     """
     afternoon_root = _default_prior_allocation_state_root(Path(artifacts_dir))
-    cross_stream_roots = _resolve_cross_stream_prior_allocation_roots(config_dir, afternoon_root)
+    cross_stream_roots = _resolve_cross_stream_prior_allocation_roots(
+        config_dir, afternoon_root
+    )
     # Unpruned companion set for the bare-CSV fallback below -- mirrors
     # _compute_auto_derived_prior_allocations's own fallback_discovery_roots:
     # cross_stream_roots is pruned of roots contained by afternoon_root
@@ -2010,15 +2072,13 @@ def _prior_submitted_order_rows(run_dir: Path) -> List[Dict[str, Any]]:
                     ticker = str(row.get("ticker") or "").strip()
                     if not ticker:
                         continue
-                    rows.append(
-                        {
-                            "ticker": ticker,
-                            "status": status,
-                            "order_id": order_id,
-                            "buy_multiplier": None,
-                            "planned_amount_usd": max(0.0, amount),
-                        }
-                    )
+                    rows.append({
+                        "ticker": ticker,
+                        "status": status,
+                        "order_id": order_id,
+                        "buy_multiplier": None,
+                        "planned_amount_usd": max(0.0, amount),
+                    })
                 return rows
 
             _max_idx = max(_status_idx, _oid_idx, _amount_idx, _ticker_idx)
@@ -2086,7 +2146,9 @@ def _accepted_order_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [
         row
         for row in rows
-        if row.get("order_id") or str(row.get("status", "")).strip() != ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED
+        if row.get("order_id")
+        or str(row.get("status", "")).strip()
+        != ORDER_SUBMIT_STATUS_CONFIRMATION_REQUIRED
     ]
 
 
@@ -2248,7 +2310,9 @@ def run_pipeline(
     # below can tell this invocation's own write from a stale run_state.json
     # a retry's directory reuse left behind from an earlier attempt -- codex
     # review discussion_r3660858013.
-    run_artifact_written = artifact_freshness_probe(Path(artifacts_dir) / RUN_STATE_FILENAME)
+    run_artifact_written = artifact_freshness_probe(
+        Path(artifacts_dir) / RUN_STATE_FILENAME
+    )
 
     def _invoke() -> Dict[str, Any]:
         result = _run_pipeline_impl(
@@ -2370,7 +2434,9 @@ def run_slot(
     """Run one canonical roster slot with slot-scoped identity and guardrails."""
     normalized_slot = slot.strip().upper()
     if normalized_slot in DISABLED_SLOTS:
-        raise UnsupportedSlotError(f"slot {normalized_slot} is disabled: prior-allocation chain is not modeled for it")
+        raise UnsupportedSlotError(
+            f"slot {normalized_slot} is disabled: prior-allocation chain is not modeled for it"
+        )
     if normalized_slot not in SLOT_MAP:
         raise UnsupportedSlotError(f"unsupported slot label: {slot!r}")
     stream_name, window = SLOT_MAP[normalized_slot]
@@ -2393,7 +2459,9 @@ def run_slot(
         # call only needs the preflight root/forbidden-roots/bounded-recovery
         # fields, not an account -- the broker/account this slot actually
         # trades through is the caller-supplied ``broker`` above.
-        morning_config = load_morning_config(config_dir=config_dir, mode=MORNING_LIVE_MODE, allow_unpinned_account=True)
+        morning_config = load_morning_config(
+            config_dir=config_dir, mode=MORNING_LIVE_MODE, allow_unpinned_account=True
+        )
         slot_tickers, preflight_gate = morning_preflight_eligible_tickers(
             now,
             config.tickers,
@@ -2477,7 +2545,9 @@ def run_slot(
         # run_pipeline()" -- left at the default, log_model_usage() recorded
         # every 1030ET/1230ET slot under the afternoon task id.
         cron_id=_SLOT_CRON_ID[stream_name],
-        classification_overrides=_slot_classification_overrides(stream_name, window, trading_day),
+        classification_overrides=_slot_classification_overrides(
+            stream_name, window, trading_day
+        ),
         correlation_id=correlation_id,
         preflight_gate=preflight_gate,
     )
@@ -2503,6 +2573,7 @@ def _final_buy_trend_override_window_start(now: datetime) -> time:
     )
     hh, mm = (int(part) for part in window_start_et.split(":"))
     return time(hh, mm)
+
 
 
 def _persist_raw_inputs(
@@ -2583,7 +2654,8 @@ def _persist_raw_inputs(
             missing = required_raw_filenames - set(raw_connector_inputs.keys())
             if missing:
                 raise RuntimeError(
-                    f"scheduled live run: required raw inputs absent from raw_connector_inputs: {sorted(missing)}"
+                    f"scheduled live run: required raw inputs absent from "
+                    f"raw_connector_inputs: {sorted(missing)}"
                 )
 
         # Stage this attempt's raw saves in a separate directory so a
@@ -2594,7 +2666,9 @@ def _persist_raw_inputs(
             path = save_raw_input(trading_day_raw, filename, payload, raw_dir=staging_dir)
             written = json.loads(path.read_bytes())
             if "normalize_error" in written:
-                raise RuntimeError(f"normalization failed for {filename!r}: {written['normalize_error']}")
+                raise RuntimeError(
+                    f"normalization failed for {filename!r}: {written['normalize_error']}"
+                )
 
         # Every file staged and normalized cleanly -- swap the staging
         # directory into place as this run's raw/, replacing whatever
@@ -2703,7 +2777,9 @@ def _persist_raw_inputs(
                     strict_finance=not config.dry_run,
                     strict_robinhood=not config.dry_run,
                 )
-                _persistence_state = build_raw_persistence_state(trading_day_raw, raw_dir=raw_dir)
+                _persistence_state = build_raw_persistence_state(
+                    trading_day_raw, raw_dir=raw_dir
+                )
             except Exception:
                 if _had_backup:
                     # This attempt's raw/ never became usable -- restore
@@ -2877,12 +2953,10 @@ def _persist_raw_inputs(
             failure_state["orders_submitted_count"] = len(_accepted)
             _counts = failure_state.get("counts")
             _counts_dict = dict(_counts) if isinstance(_counts, Mapping) else {}
-            _counts_dict.update(
-                {
-                    "submitted": len(_accepted),
-                    "buy_candidates": len(_prior_rows),
-                }
-            )
+            _counts_dict.update({
+                "submitted": len(_accepted),
+                "buy_candidates": len(_prior_rows),
+            })
             failure_state["counts"] = _counts_dict
 
         if _accepted:
@@ -2946,7 +3020,8 @@ def _persist_raw_inputs(
             )
         elif classification_state_root is not None:
             logger.error(
-                "Not updating latest_scheduled_run.json: raw-persistence failure-state artifact contract failed."
+                "Not updating latest_scheduled_run.json: raw-persistence "
+                "failure-state artifact contract failed."
             )
 
         # signals.csv carries only its header, so detect_drift() finds an
@@ -2999,7 +3074,9 @@ def _persist_raw_inputs(
                 out / "drift_report.json",
                 _fail_report.to_json(compact=False),
             )
-            atomic_write_text(out / "drift_report.md", _fail_report.to_markdown())
+            atomic_write_text(
+                out / "drift_report.md", _fail_report.to_markdown()
+            )
             if scheduled and not config.dry_run:
                 send_slack_alert(_fail_report, env_var=DEFAULT_SLACK_WEBHOOK_ENV)
             failure_result["drift_report"] = _fail_report.to_dict()
@@ -3037,10 +3114,7 @@ def _resolve_prior_allocations(
                 earlier_week_notional_usd,
                 earlier_week_scan_had_failures,
             ) = _compute_earlier_week_cross_stream_notional(
-                now,
-                trading_day,
-                artifacts_dir,
-                config_dir,
+                now, trading_day, artifacts_dir, config_dir,
                 max_per_order_usd=config.max_per_order_usd,
             )
             # Auto-derive the afternoon task root and fold in the morning/midday
@@ -3063,11 +3137,7 @@ def _resolve_prior_allocations(
             # whole branch can always reference it unconditionally.
             _reload_unreconstructable_sink: List[str] = []
             first_pass, scan_had_failures = _compute_auto_derived_prior_allocations(
-                now,
-                trading_day,
-                artifacts_dir,
-                config_dir,
-                max_per_order_usd=config.max_per_order_usd,
+                now, trading_day, artifacts_dir, config_dir, max_per_order_usd=config.max_per_order_usd,
                 unreconstructable_sink=_first_pass_unreconstructable_sink,
             )
             # Default/final answer when no reload ends up running below: the
@@ -3114,13 +3184,11 @@ def _resolve_prior_allocations(
                 # than resolving, is retained VERBATIM from first_pass by the
                 # merge below and is exactly as uncertain as before; using
                 # only this reload's own sink lost that ticker entirely).
-                second_pass, second_scan_had_failures = _compute_auto_derived_prior_allocations(
-                    now,
-                    trading_day,
-                    artifacts_dir,
-                    config_dir,
-                    max_per_order_usd=config.max_per_order_usd,
-                    unreconstructable_sink=_reload_unreconstructable_sink,
+                second_pass, second_scan_had_failures = (
+                    _compute_auto_derived_prior_allocations(
+                        now, trading_day, artifacts_dir, config_dir, max_per_order_usd=config.max_per_order_usd,
+                        unreconstructable_sink=_reload_unreconstructable_sink,
+                    )
                 )
                 # Merge by COMPLETENESS rather than replacing wholesale or
                 # trusting the reload just because a ticker was unresolved:
@@ -3251,12 +3319,18 @@ def _resolve_prior_allocations(
                         # missing/corrupt.
                         import dataclasses as _dc
 
-                        base = alloc if alloc.amount_usd >= existing.amount_usd else existing
+                        base = (
+                            alloc
+                            if alloc.amount_usd >= existing.amount_usd
+                            else existing
+                        )
                         prior_same_day_allocations[ticker] = _dc.replace(
                             base,
                             reference_price=None,
                             reference_ts=None,
-                            notional_uncertain=(existing.notional_uncertain or alloc.notional_uncertain),
+                            notional_uncertain=(
+                                existing.notional_uncertain or alloc.notional_uncertain
+                            ),
                         )
                     elif alloc.amount_usd > existing.amount_usd:
                         # A clean, larger reload naturally supersedes
@@ -3306,11 +3380,18 @@ def _resolve_prior_allocations(
                         # THOSE contributions, so both sets must be proven
                         # subsets before trusting alloc's own flag.
                         _prior_order_ids_proven = (
-                            (bool(existing.contributing_order_ids) or bool(existing.uncertain_contributor_ids))
-                            and (existing.contributing_order_ids <= alloc.contributing_order_ids)
-                            and (existing.uncertain_contributor_ids <= alloc.uncertain_contributor_ids)
+                            bool(existing.contributing_order_ids)
+                            or bool(existing.uncertain_contributor_ids)
+                        ) and (
+                            existing.contributing_order_ids <= alloc.contributing_order_ids
+                        ) and (
+                            existing.uncertain_contributor_ids <= alloc.uncertain_contributor_ids
                         )
-                        if existing.notional_uncertain and not alloc.notional_uncertain and not _prior_order_ids_proven:
+                        if (
+                            existing.notional_uncertain
+                            and not alloc.notional_uncertain
+                            and not _prior_order_ids_proven
+                        ):
                             alloc = replace(alloc, notional_uncertain=True)
                         prior_same_day_allocations[ticker] = alloc
                     elif alloc.amount_usd == existing.amount_usd:
@@ -3399,7 +3480,10 @@ def _resolve_prior_allocations(
                         # already-resolved-ticker case addressed earlier in this
                         # PR (Codex review: "Preserve resolved ticker context
                         # across the reload").
-                        if alloc.reference_price is not None and alloc.reference_price != existing.reference_price:
+                        if (
+                            alloc.reference_price is not None
+                            and alloc.reference_price != existing.reference_price
+                        ):
                             # A bare `alloc` assignment would silently drop
                             # `existing.notional_uncertain` through a path the
                             # provenance check above never guards -- the check
@@ -3422,11 +3506,15 @@ def _resolve_prior_allocations(
                             # verdict intact through this replacement too.
                             prior_same_day_allocations[ticker] = replace(
                                 alloc,
-                                notional_uncertain=(existing.notional_uncertain or alloc.notional_uncertain),
+                                notional_uncertain=(
+                                    existing.notional_uncertain or alloc.notional_uncertain
+                                ),
                             )
                         elif (
-                            alloc.selected_base_amount_usd != existing.selected_base_amount_usd
-                            or alloc.selected_base_amount_usd_at != existing.selected_base_amount_usd_at
+                            alloc.selected_base_amount_usd
+                            != existing.selected_base_amount_usd
+                            or alloc.selected_base_amount_usd_at
+                            != existing.selected_base_amount_usd_at
                         ):
                             # The reference price didn't change (or the reload
                             # doesn't know it), but selected_base_amount_usd is
@@ -3518,9 +3606,14 @@ def _resolve_prior_allocations(
                         # "Handle base corrections on smaller clean
                         # reloads").
                         if (
-                            (alloc.reference_price is not None and alloc.reference_price != existing.reference_price)
-                            or alloc.selected_base_amount_usd != existing.selected_base_amount_usd
-                            or alloc.selected_base_amount_usd_at != existing.selected_base_amount_usd_at
+                            (
+                                alloc.reference_price is not None
+                                and alloc.reference_price != existing.reference_price
+                            )
+                            or alloc.selected_base_amount_usd
+                            != existing.selected_base_amount_usd
+                            or alloc.selected_base_amount_usd_at
+                            != existing.selected_base_amount_usd_at
                         ):
                             import dataclasses as _dc
 
@@ -3554,7 +3647,9 @@ def _resolve_prior_allocations(
                         prior_same_day_allocations[ticker] = _dc.replace(
                             existing, reference_price=None, reference_ts=None
                         )
-                still_unresolved = _tickers_with_unresolved_same_day_context(prior_same_day_allocations)
+                still_unresolved = _tickers_with_unresolved_same_day_context(
+                    prior_same_day_allocations
+                )
                 if still_unresolved:
                     logger.warning(
                         "same-day context still unresolved for %s after bounded reload; "
@@ -3612,7 +3707,9 @@ def _resolve_prior_allocations(
                 # those sinks (Codex review: "Include fallback uncertainty
                 # when poisoning shared caps").
                 _same_day_unreconstructable_sink = [
-                    ticker for ticker, allocation in prior_same_day_allocations.items() if allocation.notional_uncertain
+                    ticker
+                    for ticker, allocation in prior_same_day_allocations.items()
+                    if allocation.notional_uncertain
                 ]
             else:
                 prior_same_day_allocations = first_pass
@@ -3974,8 +4071,12 @@ def _run_pipeline_impl(
                 # the rescan can observe a different invocation's snapshot and
                 # publish its filenames into this run's state.
                 with cross_process_lock(_raw_input_dir_obj.parent / ".corporate_actions.lock"):
-                    _refreshed_persistence = build_raw_persistence_state(trading_day_raw, raw_dir=_raw_input_dir_obj)
-                if _refreshed_persistence.get("raw_inputs_saved") != raw_persistence_state.get("raw_inputs_saved"):
+                    _refreshed_persistence = build_raw_persistence_state(
+                        trading_day_raw, raw_dir=_raw_input_dir_obj
+                    )
+                if _refreshed_persistence.get("raw_inputs_saved") != raw_persistence_state.get(
+                    "raw_inputs_saved"
+                ):
                     _run_state_path = result.get("run_state_path")
                     if _run_state_path:
                         _run_state_path_obj = Path(_run_state_path)
@@ -4063,7 +4164,10 @@ def _run_pipeline_impl(
                                     _current_bytes = _run_state_path_obj.read_bytes()
                                 except OSError:
                                     _current_bytes = None
-                                if _known_run_state_bytes is not None and _current_bytes == _known_run_state_bytes:
+                                if (
+                                    _known_run_state_bytes is not None
+                                    and _current_bytes == _known_run_state_bytes
+                                ):
                                     atomic_write_text(_run_state_path, _serialized)
                                     # Advance the shared pipeline-level
                                     # snapshot to what THIS rewrite itself
@@ -4090,7 +4194,9 @@ def _run_pipeline_impl(
                                         _run_state_path,
                                     )
             except OSError:
-                logger.warning("failed to refresh raw-input manifest for %s", _raw_input_dir, exc_info=True)
+                logger.warning(
+                    "failed to refresh raw-input manifest for %s", _raw_input_dir, exc_info=True
+                )
     if preflight_gate is not None:
         # Persist run_slot's morning-preflight diagnostic dict onto every
         # return path below, not just log it: this docstring already
@@ -4187,7 +4293,10 @@ def _run_pipeline_impl(
                         # comparing against it self-confirms nothing (Codex
                         # review: "Recheck artifact identity inside each
                         # post-run lock").
-                        if _known_run_state_bytes is not None and _preflight_current_bytes == _known_run_state_bytes:
+                        if (
+                            _known_run_state_bytes is not None
+                            and _preflight_current_bytes == _known_run_state_bytes
+                        ):
                             atomic_write_text(run_state_path, serialized)
                             _known_run_state_bytes = serialized.encode("utf-8")
                         else:
@@ -4314,18 +4423,29 @@ def _run_pipeline_impl(
                 prior_orders: list = []
                 if oap_path.exists():
                     try:
-                        prior_orders = json.loads(oap_path.read_bytes()).get("orders", []) or []
+                        prior_orders = (
+                            json.loads(oap_path.read_bytes()).get(
+                                "orders", []
+                            )
+                            or []
+                        )
                     except (json.JSONDecodeError, OSError, AttributeError):
                         prior_orders = []
                 new_ids = {r.get("order_id") or r.get("id") for r in raw_responses} - {None}
-                merged = raw_responses + [o for o in prior_orders if (o.get("order_id") or o.get("id")) not in new_ids]
+                merged = raw_responses + [
+                    o
+                    for o in prior_orders
+                    if (o.get("order_id") or o.get("id")) not in new_ids
+                ]
                 # The rows spread the broker's whole order dict (**order in
                 # RobinhoodBroker.place_market_buy), which can echo the account
                 # number and account URLs; this file lives under cron_tracking/
                 # and is synced onward by reporting tooling, so every string in
                 # it goes through the same redaction the run artifacts get
                 # (2026-09-07 diagnostic, S:ADP-05).
-                atomic_write_text(oap_path, json.dumps({"orders": _redacted_strings(merged)}, indent=2) + "\n")
+                atomic_write_text(
+                    oap_path, json.dumps({"orders": _redacted_strings(merged)}, indent=2) + "\n"
+                )
                 result["orders_after_place_path"] = str(oap_path)
 
             # Codex review (finding: "Keep ownership through the downstream
@@ -4349,7 +4469,9 @@ def _run_pipeline_impl(
                     from scripts.file_lock import cross_process_lock
 
                     _oap_lock_path_obj = Path(_pre_merge_run_state_path)
-                    with cross_process_lock(_oap_lock_path_obj.with_name(f"{_oap_lock_path_obj.name}.lock")):
+                    with cross_process_lock(
+                        _oap_lock_path_obj.with_name(f"{_oap_lock_path_obj.name}.lock")
+                    ):
                         try:
                             _oap_current_bytes = _oap_lock_path_obj.read_bytes()
                         except OSError:
@@ -4363,7 +4485,8 @@ def _run_pipeline_impl(
                     # unverifiable check right at the write site must not be
                     # read as "ownership fine".
                     logger.warning(
-                        "failed to reverify ownership of %s immediately before the raw-response merge write",
+                        "failed to reverify ownership of %s immediately "
+                        "before the raw-response merge write",
                         _pre_merge_run_state_path,
                         exc_info=True,
                     )
@@ -4414,7 +4537,9 @@ def _run_pipeline_impl(
             from scripts.file_lock import cross_process_lock
 
             _report_lock_path_obj = Path(_pre_merge_run_state_path)
-            with cross_process_lock(_report_lock_path_obj.with_name(f"{_report_lock_path_obj.name}.lock")):
+            with cross_process_lock(
+                _report_lock_path_obj.with_name(f"{_report_lock_path_obj.name}.lock")
+            ):
                 try:
                     _report_run_state_bytes: Optional[bytes] = _report_lock_path_obj.read_bytes()
                 except OSError:
@@ -4434,7 +4559,8 @@ def _run_pipeline_impl(
             # check immediately before generating and publishing reports
             # must not be treated as "ownership fine, proceed".
             logger.warning(
-                "failed to reverify ownership of %s immediately before full-report generation",
+                "failed to reverify ownership of %s immediately before "
+                "full-report generation",
                 _pre_merge_run_state_path,
                 exc_info=True,
             )
@@ -4485,8 +4611,12 @@ def _run_pipeline_impl(
             json.loads(orders_after_place.read_bytes()),
             order_id_to_ticker=order_id_to_ticker,
         )
-        persisted_ids = {f.get("order_id") for f in persisted_fills if f.get("order_id")}
-        fills = [f for f in fills if f.get("order_id") not in persisted_ids] + persisted_fills
+        persisted_ids = {
+            f.get("order_id") for f in persisted_fills if f.get("order_id")
+        }
+        fills = [
+            f for f in fills if f.get("order_id") not in persisted_ids
+        ] + persisted_fills
         # The persisted snapshot captures order state at placement time; orders that
         # were accepted/open then may have settled by now. Refresh any order ID that
         # appears in orders.csv but not in persisted_fills (i.e. not yet filled at
@@ -4500,7 +4630,9 @@ def _run_pipeline_impl(
     # report ranks against the same target the orders CSV uses (the signal-time quote).
     targets = _execution_targets_from_orders_csv(orders_csv)
     targets_by_order_id = _execution_targets_by_order_id_from_orders_csv(orders_csv)
-    _apply_execution_targets_to_candidates(run_state.get("buy_candidates") or [], targets, targets_by_order_id)
+    _apply_execution_targets_to_candidates(
+        run_state.get("buy_candidates") or [], targets, targets_by_order_id
+    )
     # Codex review (finding: "Keep ownership while publishing full
     # reports"): the lock+compare a little further up (`_report_run_state_
     # bytes`) only protects the READ that produced `run_state` -- it
@@ -4561,7 +4693,9 @@ def _run_pipeline_impl(
         # below runs in a separate `try/finally` that guarantees the lock
         # is released but lets any OSError it raises propagate untouched.
         try:
-            _final_lock_ctx = cross_process_lock(_final_lock_path_obj.with_name(f"{_final_lock_path_obj.name}.lock"))
+            _final_lock_ctx = cross_process_lock(
+                _final_lock_path_obj.with_name(f"{_final_lock_path_obj.name}.lock")
+            )
             _final_lock_ctx.__enter__()
         except (TimeoutError, OSError):
             # Fail closed (the same reasoning as every other ownership-loss
@@ -4569,7 +4703,8 @@ def _run_pipeline_impl(
             # before publishing reports must not be treated as "ownership
             # fine, proceed".
             logger.warning(
-                "failed to reverify ownership of %s immediately before publishing full reports",
+                "failed to reverify ownership of %s immediately before "
+                "publishing full reports",
                 _pre_merge_run_state_path,
                 exc_info=True,
             )
@@ -4623,7 +4758,9 @@ class DemoDataProvider:
         # 0.0 .. ~4.5% depending on the ticker, stable across runs.
         return (sum(ord(ch) for ch in ticker) % 46) / 1000.0
 
-    def get_intraday_bars(self, ticker: str, start: datetime, end: datetime, interval_minutes: int) -> List[Bar]:
+    def get_intraday_bars(
+        self, ticker: str, start: datetime, end: datetime, interval_minutes: int
+    ) -> List[Bar]:
         drop = self._drop_fraction(ticker)
         decision_close = self._previous_close * (1.0 - drop)
         # Lookback (session open) sits above the decision close -> 60-minute trend down.
@@ -4690,7 +4827,9 @@ def _demo_runtime(
 def main(argv: Optional[Sequence[str]] = None) -> int:
     if argv is None and len(sys.argv) == 1:
         argv = ["--demo"]
-    parser = argparse.ArgumentParser(description="Near-close graded DCA orchestrator (dry-run CLI).")
+    parser = argparse.ArgumentParser(
+        description="Near-close graded DCA orchestrator (dry-run CLI)."
+    )
     parser.add_argument(
         "--config-dir",
         default=str(DEFAULT_CONFIG_DIR),
@@ -4706,7 +4845,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=None,
         help="Override decision time (ISO 8601, e.g. 2026-07-06T15:45). For testing.",
     )
-    parser.add_argument("--run-label", default="daily", help="Run label recorded in artifacts.")
+    parser.add_argument(
+        "--run-label", default="daily", help="Run label recorded in artifacts."
+    )
     parser.add_argument(
         "--slot",
         default=None,
@@ -4722,7 +4863,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="Use the deterministic in-memory demo provider (no broker/network).",
     )
-    parser.add_argument("--log-level", default="INFO", help="Logging level (DEBUG/INFO/WARNING/ERROR).")
+    parser.add_argument(
+        "--log-level", default="INFO", help="Logging level (DEBUG/INFO/WARNING/ERROR)."
+    )
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -4759,7 +4902,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     now = _resolve_now(args.now, preliminary_config)
     config = load_strategy_config(args.config_dir, now=now)
     trading_day = now.astimezone(EASTERN).date()
-    artifacts_dir = Path(args.artifacts_dir) if args.artifacts_dir else Path("artifacts") / trading_day.isoformat()
+    artifacts_dir = (
+        Path(args.artifacts_dir)
+        if args.artifacts_dir
+        else Path("artifacts") / trading_day.isoformat()
+    )
 
     if not args.demo:
         logger.error(

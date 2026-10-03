@@ -71,7 +71,7 @@ def test_complete_two_page_chain_writes_the_envelope_verbatim(tmp_path):
     code, out = _run(tmp_path, files)
 
     assert code == 0
-    envelope = json.loads(out.read_bytes())
+    envelope = json.loads(out.read_text(encoding="utf-8"))
     assert envelope == {"account_number": ACCOUNT, "trading_day": DAY, "pages": [p1, p2]}
 
 
@@ -79,13 +79,13 @@ def test_single_final_page_is_a_complete_history(tmp_path):
     p1 = _page([_order("o1")])
     code, out = _run(tmp_path, [_write(tmp_path, "p1.txt", p1)])
     assert code == 0
-    assert json.loads(out.read_bytes())["pages"] == [p1]
+    assert json.loads(out.read_text(encoding="utf-8"))["pages"] == [p1]
 
 
 def test_genuinely_empty_day_is_a_complete_history(tmp_path):
     code, out = _run(tmp_path, [_write(tmp_path, "p1.txt", _page([]))])
     assert code == 0
-    assert json.loads(out.read_bytes())["pages"] == [{"orders": []}]
+    assert json.loads(out.read_text(encoding="utf-8"))["pages"] == [{"orders": []}]
 
 
 def test_mcp_text_content_block_wrapper_is_unwrapped(tmp_path):
@@ -96,15 +96,17 @@ def test_mcp_text_content_block_wrapper_is_unwrapped(tmp_path):
     wrapped = [{"type": "text", "text": json.dumps(p1)}]
     code, out = _run(tmp_path, [_write(tmp_path, "p1.txt", wrapped)])
     assert code == 0
-    assert json.loads(out.read_bytes())["pages"] == [p1]
+    assert json.loads(out.read_text(encoding="utf-8"))["pages"] == [p1]
 
 
 def test_snapshot_at_is_passed_through_when_supplied(tmp_path):
     """The 09:35 prompt's envelope carries ``snapshot_at``; the others do not."""
     stamp = f"{DAY}T13:40:05-04:00"
-    code, out = _run(tmp_path, [_write(tmp_path, "p1.txt", _page([]))], extra=("--snapshot-at", stamp))
+    code, out = _run(
+        tmp_path, [_write(tmp_path, "p1.txt", _page([]))], extra=("--snapshot-at", stamp)
+    )
     assert code == 0
-    assert json.loads(out.read_bytes())["snapshot_at"] == stamp
+    assert json.loads(out.read_text(encoding="utf-8"))["snapshot_at"] == stamp
 
 
 def test_summary_line_reports_page_and_order_counts(tmp_path, capsys):
@@ -122,7 +124,9 @@ def test_output_round_trips_through_the_top_up_gate_binding(tmp_path):
     p1 = _page([_order("o1")])
     code, out = _run(tmp_path, [_write(tmp_path, "p1.txt", p1)])
     assert code == 0
-    pages, err = gate._bind_saved_pages(json.loads(out.read_bytes()), account_number=ACCOUNT, trading_day=DAY)
+    pages, err = gate._bind_saved_pages(
+        json.loads(out.read_text(encoding="utf-8")), account_number=ACCOUNT, trading_day=DAY
+    )
     assert err is None
     assert pages == [p1]
 
@@ -151,11 +155,15 @@ def test_duplicate_json_keys_are_refused(tmp_path, capsys):
 
 
 def test_bare_order_array_is_not_a_page(tmp_path, capsys):
-    _assert_refused(tmp_path, [_write(tmp_path, "p1.txt", [_order("o1")])], "page_not_an_orders_page", capsys)
+    _assert_refused(
+        tmp_path, [_write(tmp_path, "p1.txt", [_order("o1")])], "page_not_an_orders_page", capsys
+    )
 
 
 def test_page_without_an_orders_list_is_refused(tmp_path, capsys):
-    _assert_refused(tmp_path, [_write(tmp_path, "p1.txt", {"result": "ok"})], "page_not_an_orders_page", capsys)
+    _assert_refused(
+        tmp_path, [_write(tmp_path, "p1.txt", {"result": "ok"})], "page_not_an_orders_page", capsys
+    )
 
 
 def test_text_block_wrapper_holding_non_json_is_refused(tmp_path, capsys):
@@ -187,18 +195,24 @@ def test_no_page_files_is_refused(tmp_path, capsys):
 
 @pytest.mark.parametrize("day", ["", "2026-9-9", "2026-13-01", "today"])
 def test_malformed_trading_day_is_refused(tmp_path, capsys, day):
-    _assert_refused(tmp_path, [_write(tmp_path, "p1.txt", _page([]))], "invalid_trading_day", capsys, day=day)
+    _assert_refused(
+        tmp_path, [_write(tmp_path, "p1.txt", _page([]))], "invalid_trading_day", capsys, day=day
+    )
 
 
 def test_blank_account_is_refused(tmp_path, capsys):
-    _assert_refused(tmp_path, [_write(tmp_path, "p1.txt", _page([]))], "missing_account", capsys, account="  ")
+    _assert_refused(
+        tmp_path, [_write(tmp_path, "p1.txt", _page([]))], "missing_account", capsys, account="  "
+    )
 
 
 def test_refusal_leaves_an_existing_envelope_untouched(tmp_path, capsys):
     """A failed re-assembly must not clobber (or truncate) earlier evidence."""
     out = tmp_path / "orders_pages_out.json"
     out.write_text('{"sentinel": true}', encoding="utf-8")
-    code = asm.main(["--account", ACCOUNT, "--trading-day", DAY, "--out", str(out), _write(tmp_path, "p1.txt", "{")])
+    code = asm.main(
+        ["--account", ACCOUNT, "--trading-day", DAY, "--out", str(out), _write(tmp_path, "p1.txt", "{")]
+    )
     assert code == 2
     assert out.read_text(encoding="utf-8") == '{"sentinel": true}'
 
