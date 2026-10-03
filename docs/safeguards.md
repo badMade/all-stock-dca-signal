@@ -300,10 +300,10 @@ Hard limits that skip an order rather than trade when any is hit:
   purchasable unit smaller than one share (see
   `docs/whole_share_accumulation.md`); every other limit below still applies to
   it unchanged.
-- **Max 8 buy attempts per day, account-wide** — shared across every stream and
+- **Max 120 buy attempts per day, account-wide** — shared across every stream and
   manual buying combined (`config/budgets.json`'s
   `circuit_breakers.max_orders_per_day`). Counts attempts, not just fills, so a
-  rejected or cancelled order still uses one of the day's 8 slots.
+  rejected or cancelled order still uses one of the day's 120 slots.
 - Never exceed the selected **daily cap**, **weekly cap**, or **available buying
   power**.
 - **Whitelisted (active-universe) tickers only.**

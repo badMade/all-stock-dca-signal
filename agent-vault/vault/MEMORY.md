@@ -5,8 +5,7 @@
 
 ## Who I'm working for
 
-- The owner of badMade/all-stock-dca. The profile interview has not run yet; `Profiles/` holds a seed from the
-  setup brief only.
+- The owner of badMade/all-stock-dca. Voice and taste profiles calibrated ([Profiles/voice.md](Profiles/voice.md), [Profiles/taste.md](Profiles/taste.md)).
 - Notion is the human-curated reference and is read-only for me. Exports to it are manual (`../runbooks/notion-export.md`).
 
 ## Active goals

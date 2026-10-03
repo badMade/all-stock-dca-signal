@@ -24,11 +24,9 @@ None defined yet. Add one line per scenario: name, data window, model, seed, exp
 
 ## Things to know before trusting a comparison
 
-- No model slippage figure was found in `backtest.py`, `config.py`, `train.py` or `utils.py`, so
-  `live_slippage_vs_model_bps` in `config.yaml` has nothing to compare against yet. `models.py` and
-  `rl_agent.py` were not searched.
-- `.mcp.json` in that repo configures order-capable MCP servers (Robinhood trading, Alpaca). Backtests do not
-  need them; a vault session denies the Robinhood order tools in `.claude/settings.json`.
+- Full codebase audit across `dl-trading-pipeline` (including `models.py`, `rl_agent.py`, `train.py`, `backtest.py`, `config.py`) confirmed that no slippage model or output exists in DLTP. Returns are computed frictionlessly (`position * next_ret`). Thus, `live_slippage_vs_model_bps` in `config.yaml` has no model baseline to compare against.
+- DLTP's internal health metric table in its `README.md` defines minimum acceptable annualised Sharpe as `> 1.0`. The `1.2` in `config.yaml` is an aspirational filter above the repository baseline.
+- `.mcp.json` in that repo configures order-capable MCP servers (Robinhood trading, Alpaca). Backtests do not need them; a vault session denies the Robinhood order tools in `.claude/settings.json`.
 
 ## Prior results
 
