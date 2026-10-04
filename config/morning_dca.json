@@ -3,6 +3,8 @@
   "version": "2026-07-19",
   "purpose": "Configuration and separation policy for the MORNING graded-DCA stream, which now has TWO modes. (1) A 9:45 AM ET read-only watchlist / early-warning scan (mode='watchlist', run_type='morning_dca_watchlist_scan', trades=false): analytics only, no orders, no Robinhood order review, no broker placement; it may surface early candidates but every dollar amount is hypothetical / watchlist-only. (2) A 10:30 AM ET live Robinhood execution (mode='live', run_type='morning_dca_live', trades=true) using a true 60-minute intraday trend window. Both modes share the shared $2-base 0x-to-5x live ladder and the morning budget ledger but write to distinct artifact roots. Both are INDEPENDENT of, and never valid evidence for, the afternoon live task 10ce362c (which supersedes the deleted ce16ba6b).",
   "stream": "morning",
+  "live_execution_enabled": true,
+  "live_execution_enabled_note": "SHIPS ENABLED for 10:30 ET live execution (cron 42173154). When true, the 10:30 AM live executor runs the full pipeline and places orders with the broker if preflight passes. Read-only scan modes (9:45 watchlist/preflight) stay strictly read-only by mode design.",
   "confidence_rule": "In LIVE mode, a candidate whose price/drop passes the ladder is auto-bought ONLY when the intraday trend can be validated (>= trend_min_bars usable intraday bars at or before the decision time). If price/drop passes but the intraday trend cannot be validated, the run must NOT auto-buy; it classifies the candidate as execution_status='manual_review_candidate'. There is no loosened trend-unavailable execution path.",
   "trend_min_bars": 6,
   "watchlist_task": {
