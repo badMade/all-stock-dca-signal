@@ -465,9 +465,11 @@ async function startJob(action) {
   try {
     await postWithToken("/api/jobs", { action });
     await refresh();
-    // Job output lives on the Workflows page; a launch from Today must land there.
-    if (currentPage() !== "workflows") location.hash = "workflows";
-    $("jobs").scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+    // Job output lives on the Workflows page; a launch from Today lands there.
+    if (currentPage() === "today") {
+      location.hash = "workflows";
+      $("jobs").scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+    }
   } catch (error) {
     showError(`Could not start ${words(action)}: ${error.message}. Check job history before trying again; a connection timeout can occur after a job was accepted.`);
   } finally {

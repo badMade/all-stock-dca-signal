@@ -589,8 +589,8 @@ class ConsoleApp:
              research and self.octopus_run is not None, update_reason),
             ("octopus-estimate", "Estimate archive replay", "Read the archive and estimate a quick replay; fits no models.",
              research, research_reason),
-            ("ticker-refresh-missing", "Refresh missing ticker data",
-             "Download missing daily OHLCV bars for active tickers from Yahoo chart feed (preserves existing data).",
+            ("ticker-refresh-missing", "Update active ticker data",
+             "Gather and update daily OHLCV bars for active DCA tickers from Yahoo chart feed.",
              True, ""),
             ("train-foundation-smoke", "Train Octopus foundation (smoke run)",
              "Run Stage 1 curriculum pre-training smoke run on PyTorch with the neural Octopus model.",
@@ -782,7 +782,7 @@ class ConsoleApp:
                                          str(self.settings.root), "--output-dir",
                                          str(self.settings.output / "reports" / job_id)], log))
         if action == "ticker-refresh-missing":
-            results.append(self._command(["-m", "scripts.refresh_active_ticker_histories"], log, timeout=600))
+            results.append(self._command(["-m", "scripts.refresh_active_ticker_histories", "--force"], log, timeout=600))
         if action == "train-foundation-smoke":
             target = self.settings.output / "launches" / job_id
             results.append(self._command([

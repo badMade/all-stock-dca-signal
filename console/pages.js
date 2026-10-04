@@ -862,10 +862,12 @@ window.ConsolePages = (() => {
   const tickersSection = document.querySelector('section.page[data-page="tickers"]');
   if (tickersSection) {
     let lastTickers = "";
-    register("tickers", async () => {
+    register("tickers", async (snapshot) => {
       try {
         const data = await fetchJson("/api/tickers", { ttl: 20000 });
-        const fingerprint = JSON.stringify(data);
+        const jobs = Array.isArray(snapshot?.jobs) ? snapshot.jobs : [];
+        const running = jobs.some((job) => job.action === "ticker-refresh-missing" && ["running", "queued"].includes(job.status));
+        const fingerprint = JSON.stringify([data, running]);
         if (fingerprint === lastTickers && tickersSection.querySelector(".metrics-grid")) return;
         lastTickers = fingerprint;
 
@@ -887,13 +889,20 @@ window.ConsolePages = (() => {
         actionLeft.append(text("h3", "", "Ticker Archive & Historical Bars"), text("p", "muted compact", `Archive: ${data.archive?.label || "ticker_data"} · Status: ${data.archive?.available ? "Connected" : "Not connected"}`));
         actionTop.append(actionLeft);
 
-        const refreshBtn = text("button", "button primary small", "↻ Refresh Missing Histories");
+        const refreshBtn = text("button", "button primary small", running ? "↻ Updating Tickers..." : "↻ Update Ticker Histories");
         refreshBtn.type = "button";
+        refreshBtn.disabled = running;
         refreshBtn.addEventListener("click", () => {
+          refreshBtn.disabled = true;
+          refreshBtn.textContent = "↻ Starting update...";
           if (typeof window.startJob === "function") window.startJob("ticker-refresh-missing");
         });
         actionTop.append(refreshBtn);
         actionStrip.append(actionTop);
+
+        if (running) {
+          actionStrip.append(text("div", "notice", "Ticker gathering process in progress: fetching latest daily bars from Yahoo chart feed..."));
+        }
 
         if (Array.isArray(data.archive?.recent_logs) && data.archive.recent_logs.length) {
           const logBlock = text("div", "subtle-json");
