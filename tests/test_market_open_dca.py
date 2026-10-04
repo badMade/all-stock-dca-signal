@@ -208,11 +208,12 @@ def test_market_open_does_not_gate_on_the_preflight_artifact(tmp_path):
     assert ex.preflight_gate is None
 
 
-# --- The live placement switch ----------------------------------------------
-def test_shipped_market_open_config_has_execution_enabled():
-    # Promoted to live following full shadow-versus-live parity validation.
+# --- The ships-disabled placement switch ------------------------------------
+def test_shipped_market_open_config_has_execution_disabled():
+    # The whole point of shipping this stream disabled. If this flips to True
+    # unintentionally, the 9:35 slot starts placing real orders.
     cfg = load_market_open_config(allow_unpinned_account=True)
-    assert cfg.live_execution_enabled is True
+    assert cfg.live_execution_enabled is False
 
 
 def test_market_open_disabled_writes_full_artifacts_and_places_nothing(tmp_path):

@@ -2519,7 +2519,7 @@ def test_midday_live_mirror_treats_a_closed_window_as_a_batch_halt():
 
 
 def test_every_live_mirror_front_loads_the_sent_email_contract():
-    boundary = 30_000
+    boundary = 6500
     # Dotfiles in this directory are generator scratch, not scheduled-task
     # prompt captures.  In particular, .template.txt deliberately contains no
     # delivery contract and must not let this candidate-prompt check pretend it
@@ -2609,7 +2609,7 @@ def test_1530_live_mirror_front_loads_the_alert_file_path_and_pagination_guard()
     pagination interlock rule. Both must be restated inside the
     front-loaded, truncation-safe prefix.
     """
-    boundary = 30_000
+    boundary = 6500
     path = PROMPTS_DIR / "live-mirror" / "1530ET-330-final-buying-run.txt"
     prefix = path.read_text(encoding="utf-8")[:boundary]
     assert "TRUNCATION-SAFE ALERT FILE PATH:" in prefix
@@ -2619,7 +2619,7 @@ def test_1530_live_mirror_front_loads_the_alert_file_path_and_pagination_guard()
 
 
 def test_live_order_prompts_front_load_the_checkout_selection_interlock():
-    boundary = 30_000
+    boundary = 6500
     filenames = (
         "1030ET-1030-dca-recurring-buy.txt",
         "1130ET-1130-mornig-buying-run.txt",
@@ -2663,7 +2663,7 @@ def test_midday_live_mirror_counts_complete_afternoon_evidence_by_trading_day():
 
 def test_market_open_live_mirror_checks_the_union_of_all_repo_probes():
     text = _market_open_live_mirror_text()
-    gate_2 = text.split("GATE 2 - REPO REACHABLE", 1)[1].split("GATE 3 - TRADING WINDOW", 1)[0] if "GATE 2 - REPO REACHABLE" in text else ""
+    gate_2 = text.split("GATE 2 - REPO REACHABLE", 1)[1].split("GATE 3 - TRADING WINDOW", 1)[0]
     assert "Run ALL FOUR probes" in gate_2
     assert "DEDUPLICATED UNION" in gate_2
     assert "require exactly one surviving checkout" in gate_2
@@ -2713,7 +2713,7 @@ def test_every_live_mirror_forbids_the_account_number_in_alerts():
     rule belongs in the truncation-safe prefix because every abort path emits
     an alert, including the ones that never reach Gate 9 -- as this one did not.
     """
-    boundary = 30_000
+    boundary = 6500
     for filename in _LIVE_MIRROR_FILES:
         prefix = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")[:boundary]
         assert "TRUNCATION-SAFE SECRET RULE:" in prefix, (
@@ -2912,7 +2912,7 @@ def test_live_mirror_interlock_prefix_names_the_fourth_probe():
     # The four files carrying the compact interlock are the ones whose Gate 2
     # body sits past the truncation boundary; a truncated fire there sees only
     # this line, so a probe missing from it does not exist for that fire.
-    boundary = 30_000
+    boundary = 6500
     filenames = (
         "1030ET-1030-dca-recurring-buy.txt",
         "1130ET-1130-mornig-buying-run.txt",
@@ -2959,7 +2959,7 @@ _SHELL_UNAVAILABLE_REASON = "executor shell tool unavailable, repo probes could 
 
 
 def test_every_live_mirror_front_loads_the_shell_unavailable_rule():
-    boundary = 30_000
+    boundary = 6500
     for filename in _LIVE_MIRROR_FILES:
         prefix = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")[:boundary]
         lowered = prefix.casefold()
@@ -3067,11 +3067,11 @@ def test_every_live_mirror_gate2_has_a_distinct_bridge_only_abort():
     for filename in _LIVE_MIRROR_FILES:
         text = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")
         gate_2 = _gate_section(text, "GATE 2 - REPO REACHABLE")
-        assert _BRIDGE_ONLY_REASON in gate_2 or "TRUNCATION-SAFE BRIDGE-SHELL RULE" in text, f"{filename}: Gate 2 has no distinct bridge-only reason"
+        assert _BRIDGE_ONLY_REASON in gate_2, f"{filename}: Gate 2 has no distinct bridge-only reason"
         # scripts/alert_digest.py buckets on this exact token; unlike a dead
         # shell with a readable repo, this case genuinely fails Gate 2.
         assert "Failing gate: Gate 2" in gate_2, f"{filename}: the bridge-only abort must be labelled Gate 2"
-        assert "a bridge read never authorizes placement" in gate_2 or "A bridge READ alone, with no execution, never authorizes placement" in text, (
+        assert "a bridge read never authorizes placement" in gate_2, (
             f"{filename}: a repo readable only through the bridge must not count as a located checkout"
         )
         # The probes, dedupe and exactly-one rule stay exactly as strict.
@@ -3089,16 +3089,16 @@ def test_every_live_mirror_gate2_makes_bridge_tool_presence_diagnostic_only():
             f"{filename}: Gate 2 still states as fact that the bridge tool is absent (false on 2026-09-29)"
         )
         # Running repo code through the bridge stays forbidden.
-        assert "Do NOT reach for mcp__remote-devices__device_bash" in gate_2 or "TRUNCATION-SAFE BRIDGE-SHELL RULE" in text, (
+        assert "Do NOT reach for mcp__remote-devices__device_bash" in gate_2, (
             f"{filename}: the ban on executing repo code through the bridge must survive"
         )
-        assert ("presence of mcp__remote-devices__" in gate_2 and "diagnostic only" in gate_2) or "TRUNCATION-SAFE BRIDGE-SHELL RULE" in text, (
+        assert "presence of mcp__remote-devices__" in gate_2 and "diagnostic only" in gate_2, (
             f"{filename}: tool presence must be reported, never used to satisfy Gate 2"
         )
 
 
 def test_every_live_mirror_front_loads_the_bridge_only_reason():
-    boundary = 30_000
+    boundary = 6500
     for filename in _LIVE_MIRROR_FILES:
         prefix = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")[:boundary]
         assert _BRIDGE_ONLY_REASON in prefix, (

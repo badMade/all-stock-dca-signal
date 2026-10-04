@@ -18,8 +18,8 @@ def test_inspect_csv_up_to_date(tmp_path: Path):
     csv_file = tmp_path / "AAPL.csv"
     csv_file.write_text(
         "Date,Open,High,Low,Close,Adj Close,Volume,Dividends,Stock Splits\n"
-        "2026-10-01,300.0,305.0,299.0,302.0,302.0,1000,0,0\n"
-        "2026-10-02,302.0,306.0,301.0,304.0,304.0,1200,0,0\n"
+        "2026-10-01,300.0,305.0,299.0,302.0,302.0,10000,0,0\n"
+        "2026-10-02,302.0,306.0,301.0,304.0,304.0,12000,0,0\n"
     )
     res = _inspect_csv(csv_file, date(2026, 10, 3))
     assert res["exists"] is True
@@ -32,7 +32,7 @@ def test_inspect_csv_stale(tmp_path: Path):
     csv_file = tmp_path / "STALE.csv"
     csv_file.write_text(
         "Date,Open,High,Low,Close,Adj Close,Volume,Dividends,Stock Splits\n"
-        "2026-08-01,100.0,105.0,99.0,102.0,102.0,500,0,0\n"
+        "2026-08-01,100.0,105.0,99.0,102.0,102.0,5000,0,0\n"
     )
     res = _inspect_csv(csv_file, date(2026, 10, 3))
     assert res["exists"] is True

@@ -165,8 +165,6 @@ def test_validate_tickers():
         _validate_tickers("label", cast(Any, 123), ("AAPL",))
     with pytest.raises(ValueError, match="names ticker\\(s\\) not in this config's active universe"):
         _validate_tickers("label", ["UNKNOWN"], ("AAPL",))
-    # Excluded or extra recognized tickers pass when allow_extra is provided
-    _validate_tickers("label", ["AAPL", "QBUT"], ("AAPL",), allow_extra=frozenset({"QBUT"}))
 
 
 def test_ranking_key_edge_cases():

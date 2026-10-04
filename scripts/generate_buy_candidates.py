@@ -328,7 +328,7 @@ import json
 import math
 import os
 import sys
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
@@ -925,12 +925,6 @@ class _StaticMarketData:
                 # bar date signals a broken caller payload, not a routine
                 # per-source outage the reconciler should route around.
                 bar_date = bar.timestamp.astimezone(ET).date()
-                if (
-                    bar_date != previous_trading_day
-                    and bar.timestamp.astimezone(timezone.utc).time() == time(0, 0)
-                    and bar.timestamp.astimezone(timezone.utc).date() == previous_trading_day
-                ):
-                    bar_date = previous_trading_day
                 if bar_date != previous_trading_day:
                     raise ValueError(
                         f"previous_close_bar for {ticker!r} ({source.value}) is dated {bar_date}, "

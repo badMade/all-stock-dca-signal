@@ -5,8 +5,8 @@
   "stream": "market_open",
   "added_on_et": "2026-08-02",
   "added_reason": "Until now this slot had no in-repo Python entry point (config/scheduled_tasks.json:2ba19526 no_python_entry_point=true): an external scheduler/agent ran it directly from the task manifest's prose, so NONE of this repo's code enforced its trading-window cutoff, budget ledger, per-order ceiling, or same-day top-up guard. market_open_dca.py closes that gap by reusing the same MorningDCAExecutor pipeline the 10:30 and 12:30 streams already run on.",
-  "live_execution_enabled": true,
-  "live_execution_enabled_note": "SHIPS ENABLED for 09:35 ET live execution (cron 2ba19526). When true, the 9:35 AM market-open live executor runs the full pipeline and places orders with the broker if preflight passes. Promoted to live following full shadow-versus-live parity validation against external execution.",
+  "live_execution_enabled": false,
+  "live_execution_enabled_note": "SHIPS DISABLED. When false the executor runs the full evaluate/signal/top-up/budget/artifact path and writes every artifact, but never calls the broker -- a shadow run. Flip to true only after a full trading day of shadow output has been diffed against the orders the external scheduler actually placed for this slot, per docs/safeguards.md#live-execution-roster. The value is surfaced on every run_state as live_execution_enabled so a reader can tell a deliberate shadow run apart from a live run that simply found no candidates.",
   "confidence_rule": "Trend validation is DISABLED for this slot (see trend_validation_exemption). A candidate whose price/drop passes the ladder is auto-buy eligible without a validated 60-minute intraday downtrend. Every other circuit breaker -- whitelist, budget caps, buying power, spread threshold, data confidence, per-order ceiling, regular-hours-only -- stays fully enforced.",
   "trend_min_bars": 6,
   "trend_validation_exemption": {

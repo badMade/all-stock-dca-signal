@@ -1688,10 +1688,6 @@ def load_morning_config(
 
     if "trend_min_bars" in raw:
         kwargs["trend_min_bars"] = int(raw["trend_min_bars"])
-    if "live_execution_enabled" in raw:
-        kwargs["live_execution_enabled"] = _coerce_live_execution_enabled(
-            raw["live_execution_enabled"], source_label="morning"
-        )
 
     live_task = raw.get("live_task", {})
 

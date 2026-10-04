@@ -5,8 +5,8 @@
   "stream": "intraday",
   "added_on_et": "2026-08-02",
   "added_reason": "Until now these three slots had no in-repo Python entry point (config/scheduled_tasks.json:7be82b97 no_python_entry_point=true): an external scheduler/agent ran them directly from the task manifest's prose, so NONE of this repo's code enforced their trading-window cutoff, budget ledger, per-order ceiling, or same-day top-up guard. intraday_dca.py closes that gap by reusing the same MorningDCAExecutor pipeline the 10:30 and 12:30 streams already run on.",
-  "live_execution_enabled": true,
-  "live_execution_enabled_note": "SHIPS ENABLED for 11:30/13:30/14:30 ET live execution (cron 7be82b97). When true, the intraday live executor runs the full pipeline and places orders with the broker if preflight passes. Promoted to live following full shadow-versus-live parity validation against external execution.",
+  "live_execution_enabled": false,
+  "live_execution_enabled_note": "SHIPS DISABLED. When false the executor runs the full evaluate/signal/top-up/budget/artifact path and writes every artifact, but never calls the broker -- a shadow run. Flip to true only after a full trading day of shadow output has been diffed against the orders the external scheduler actually placed for these slots, per docs/safeguards.md#live-execution-roster. The value is surfaced on every run_state as live_execution_enabled so a reader can tell a deliberate shadow run apart from a live run that simply found no candidates.",
   "confidence_rule": "A candidate whose price/drop passes the ladder is auto-bought ONLY when the intraday trend can be validated (>= trend_min_bars usable intraday bars at or before the slot's decision time). If price/drop passes but the intraday trend cannot be validated, the run must NOT auto-buy; it classifies the candidate as execution_status='manual_review_candidate'. There is no loosened trend-unavailable execution path. Unlike the 9:35 market-open slot, all three intraday slots have a full 60-minute regular-session window available and so are NOT exempt from trend validation.",
   "trend_min_bars": 6,
   "live_task": {

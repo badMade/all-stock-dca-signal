@@ -164,7 +164,7 @@ def _candidate_dirs(reader: BoundedReader) -> list[str]:
     return found
 
 
-def _payload_sort_key(day: str | None, source: str, modified: float) -> tuple[int, str, int, float]:
+def _payload_sort_key(day: str | None, source: str, modified: float) -> tuple[int, str, float]:
     """Prefer payloads whose trading day is encoded more explicitly.
 
     A bare ``market_data_1130ET.json`` can only fall back to its mtime, which is
@@ -172,8 +172,7 @@ def _payload_sort_key(day: str | None, source: str, modified: float) -> tuple[in
     filename or parent run directory states the trading day is safer to replay,
     even if an undated sibling happened to be touched more recently.
     """
-    is_explicit = 1 if _PAYLOAD_DAY_SOURCE_RANK.get(source, -1) >= 1 else 0
-    return (is_explicit, day or "", _PAYLOAD_DAY_SOURCE_RANK.get(source, -1), modified)
+    return (_PAYLOAD_DAY_SOURCE_RANK.get(source, -1), day or "", modified)
 
 
 def _discover(roots: Sequence[RootSpec]) -> list[dict[str, Any]]:
@@ -280,8 +279,7 @@ def launch_actions(app, repo: Path, *, payloads: dict[str, dict | None] | None =
         elif spec.id == "market-graph-csv":
             available, reason = (repo / "historical_stock_data.csv").is_file(), "historical_stock_data.csv is missing from the checkout."
         elif spec.id == "octopus-inspect-html":
-            active_run = getattr(app, "octopus_run", None) or settings.octopus_run
-            available = not research_reason and active_run is not None
+            available = not research_reason and settings.octopus_run is not None
             reason = research_reason or "Supply --octopus-run with an existing Octopus run directory."
         elif spec.id == "ml-train-dry-run":
             available, reason = not research_reason, research_reason
@@ -403,13 +401,12 @@ def run_launch(app, action: str, job_id: str, log: Callable[[str], None], *, rep
             inputs["start"] = start.isoformat()
         results.append(run_command(argv, log, timeout=spec.timeout))
     elif action == "octopus-inspect-html":
-        active_run = getattr(app, "octopus_run", None) or settings.octopus_run
-        if active_run is None:
+        if settings.octopus_run is None:
             log("No Octopus run directory is configured.\n")
             results.append(1)
         else:
-            inputs["octopus_run"] = root_label(active_run)
-            results.append(run_command(["wondrous-octopus/inspect_run.py", "--run-dir", str(active_run),
+            inputs["octopus_run"] = root_label(settings.octopus_run)
+            results.append(run_command(["wondrous-octopus/inspect_run.py", "--run-dir", str(settings.octopus_run),
                                         "--html", str(directory / "octopus.html"), "--summary"],
                                        log, research=True, timeout=spec.timeout))
     elif action == "ml-train-dry-run":

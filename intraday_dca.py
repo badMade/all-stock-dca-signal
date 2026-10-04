@@ -51,8 +51,9 @@ Other key properties (see ``config/intraday_dca.json``):
     - **Independent** of every other stream: ``stream='intraday'``,
       ``valid_morning_evidence=false``, ``valid_afternoon_evidence=false``.
 
-Configured with ``live_execution_enabled=true`` in its config (promoted to live
-following full shadow-versus-live parity validation against external execution).
+Ships with ``live_execution_enabled=false`` in its config: the run evaluates
+fully and writes every artifact but places nothing, so its decisions can be
+diffed against whatever actually traded the slots before it is trusted with money.
 
 Writes ONLY under its own run-state root
 ``<cron_tracking_root>/intraday_dca/YYYYMMDD_<slot>ET/`` and never touches the
