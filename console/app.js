@@ -364,6 +364,7 @@ async function openDocs(path) {
 /* Hash router. Every top-level page is a <section class="page" data-page>; the
    hash names the page and nothing else, so an unknown or empty hash shows Today.
    Pages never receive a path or a query from the hash: each page renderer reads
+   the snapshot the server already produced (GUI expansion Phase 0). */
 const PAGE_TITLES = {
   today: "Today", runs: "Runs", schedule: "Schedule", state: "State & ledgers",
   alerts: "Alerts & health", config: "Config", tickers: "Tickers", reports: "Reports",
@@ -388,7 +389,7 @@ function route() {
   }
   $("breadcrumb-page").textContent = PAGE_TITLES[page] || page;
   window.scrollTo({ top: 0, behavior: "auto" });
-  if (state.snapshot && window.ConsolePages) window.ConsolePages.render(page, state.snapshot);
+  if (window.ConsolePages) window.ConsolePages.render(page, state.snapshot);
 }
 
 function renderSnapshot(snapshot) {
