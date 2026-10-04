@@ -279,7 +279,8 @@ def launch_actions(app, repo: Path, *, payloads: dict[str, dict | None] | None =
         elif spec.id == "market-graph-csv":
             available, reason = (repo / "historical_stock_data.csv").is_file(), "historical_stock_data.csv is missing from the checkout."
         elif spec.id == "octopus-inspect-html":
-            available = not research_reason and settings.octopus_run is not None
+            active_run = getattr(app, "octopus_run", None) or settings.octopus_run
+            available = not research_reason and active_run is not None
             reason = research_reason or "Supply --octopus-run with an existing Octopus run directory."
         elif spec.id == "ml-train-dry-run":
             available, reason = not research_reason, research_reason
@@ -401,12 +402,13 @@ def run_launch(app, action: str, job_id: str, log: Callable[[str], None], *, rep
             inputs["start"] = start.isoformat()
         results.append(run_command(argv, log, timeout=spec.timeout))
     elif action == "octopus-inspect-html":
-        if settings.octopus_run is None:
+        active_run = getattr(app, "octopus_run", None) or settings.octopus_run
+        if active_run is None:
             log("No Octopus run directory is configured.\n")
             results.append(1)
         else:
-            inputs["octopus_run"] = root_label(settings.octopus_run)
-            results.append(run_command(["wondrous-octopus/inspect_run.py", "--run-dir", str(settings.octopus_run),
+            inputs["octopus_run"] = root_label(active_run)
+            results.append(run_command(["wondrous-octopus/inspect_run.py", "--run-dir", str(active_run),
                                         "--html", str(directory / "octopus.html"), "--summary"],
                                        log, research=True, timeout=spec.timeout))
     elif action == "ml-train-dry-run":
