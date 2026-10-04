@@ -863,11 +863,10 @@ window.ConsolePages = (() => {
   if (tickersSection) {
     let lastTickers = "";
     register("tickers", async () => {
-      loading(tickersSection, "Loading ticker universe and checking data freshness...");
       try {
         const data = await fetchJson("/api/tickers", { ttl: 20000 });
         const fingerprint = JSON.stringify(data);
-        if (fingerprint === lastTickers) return;
+        if (fingerprint === lastTickers && tickersSection.querySelector(".metrics-grid")) return;
         lastTickers = fingerprint;
 
         const metrics = text("section", "metrics-grid");
@@ -975,11 +974,10 @@ window.ConsolePages = (() => {
   if (trainingSection) {
     let lastTraining = "";
     register("training", async () => {
-      loading(trainingSection, "Loading model training options, loss history and diagnostics...");
       try {
         const data = await fetchJson("/api/training", { ttl: 20000 });
         const fingerprint = JSON.stringify(data);
-        if (fingerprint === lastTraining) return;
+        if (fingerprint === lastTraining && trainingSection.querySelector(".actions-grid")) return;
         lastTraining = fingerprint;
 
         const hw = data.hardware || {};
