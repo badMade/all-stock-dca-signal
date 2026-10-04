@@ -164,7 +164,7 @@ def _candidate_dirs(reader: BoundedReader) -> list[str]:
     return found
 
 
-def _payload_sort_key(day: str | None, source: str, modified: float) -> tuple[int, str, float]:
+def _payload_sort_key(day: str | None, source: str, modified: float) -> tuple[int, str, int, float]:
     """Prefer payloads whose trading day is encoded more explicitly.
 
     A bare ``market_data_1130ET.json`` can only fall back to its mtime, which is
@@ -172,7 +172,8 @@ def _payload_sort_key(day: str | None, source: str, modified: float) -> tuple[in
     filename or parent run directory states the trading day is safer to replay,
     even if an undated sibling happened to be touched more recently.
     """
-    return (_PAYLOAD_DAY_SOURCE_RANK.get(source, -1), day or "", modified)
+    is_explicit = 1 if _PAYLOAD_DAY_SOURCE_RANK.get(source, -1) >= 1 else 0
+    return (is_explicit, day or "", _PAYLOAD_DAY_SOURCE_RANK.get(source, -1), modified)
 
 
 def _discover(roots: Sequence[RootSpec]) -> list[dict[str, Any]]:
