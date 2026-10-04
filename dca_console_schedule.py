@@ -541,8 +541,8 @@ def roster_identity(config_dir: Path) -> dict[str, Any]:
     ``run_dca_entry`` is ``run_slot`` when ``run_dca.SLOT_MAP`` owns the slot,
     ``disabled`` when it is in ``DISABLED_SLOTS``, else ``not owned``.
     ``live_execution_enabled`` is the raw boolean from ``config/<stream>_dca.json``
-    (None when the file or key is absent: morning and the 3:30 stream carry no
-    such flag). ``window`` is the runner's acceptance window, ``executor_window``
+    (None when the file or key is absent, or the value is not a boolean).
+    ``window`` is the runner's acceptance window, ``executor_window``
     the executor profile's own, which may differ. Nothing here says a slot ran.
     """
     from dca_runner import SLOTS

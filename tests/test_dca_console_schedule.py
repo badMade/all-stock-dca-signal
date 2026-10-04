@@ -226,7 +226,9 @@ def test_roster_identity_names_every_runner_slot():
     assert morning["run_dca_entry"] == "run_slot" and morning["window"] == {"start": "10:30", "end": "11:00"}
     assert morning["executor_window"] == {"start": "10:25", "end": "10:35"} and morning["trades"] is True
     assert morning["artifact_dir"] == "morning_dca" and morning["pointer_name"] == "latest_morning_run.json"
-    assert morning["config_file"] == "morning_dca.json" and morning["live_execution_enabled"] is None
+    assert morning["config_file"] == "morning_dca.json"
+    morning_config = json.loads((CONFIG / morning["config_file"]).read_text(encoding="utf-8"))
+    assert morning["live_execution_enabled"] is morning_config.get("live_execution_enabled")
     assert rows["0935"]["run_dca_entry"] == "disabled" and rows["0935"]["executor_class"] == "MarketOpenDCAExecutor"
     assert rows["1330"]["stream"] == "intraday" and rows["1330"]["executor_class"] == "IntradayDCAExecutor"
     final = rows["1530"]
@@ -235,13 +237,14 @@ def test_roster_identity_names_every_runner_slot():
     assert ABSOLUTE.search(json.dumps(result)) is None
 
 
-def test_roster_identity_missing_config_reports_unknown_flag(tmp_path):
+@pytest.mark.parametrize(("flag", "expected"), [(True, True), (False, False), (None, None), ("true", None), (1, None)])
+def test_roster_identity_missing_config_reports_unknown_flag(tmp_path, flag, expected):
     result = roster_identity(tmp_path)
     assert all(row["live_execution_enabled"] is None for row in result["slots"])
     assert any("midday_dca.json is missing" in warning for warning in result["warnings"])
-    (tmp_path / "midday_dca.json").write_text(json.dumps({"live_execution_enabled": False}), encoding="utf-8")
+    (tmp_path / "midday_dca.json").write_text(json.dumps({"live_execution_enabled": flag}), encoding="utf-8")
     rows = {row["slot_id"]: row for row in roster_identity(tmp_path)["slots"]}
-    assert rows["1230"]["live_execution_enabled"] is False
+    assert rows["1230"]["live_execution_enabled"] is expected
 
 
 def test_build_schedule_layers_matrix_without_observed(tmp_path):
