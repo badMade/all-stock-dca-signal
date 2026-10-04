@@ -760,7 +760,7 @@ class ConsoleApp:
                     results.append(self._command(
                         daily_args, log, demo=True, research=True,
                     ))
-                if result == 0 and (self.settings.mode == "demo" or self.octopus_run is None):
+                if result == 0 and (self.settings.mode == "demo" or self.settings.octopus_run is None):
                     with self.lock:
                         self.octopus_run = target
                     atomic_write_text(self.settings.output / "demo" / "octopus-current.json",
@@ -801,8 +801,9 @@ class ConsoleApp:
         with self.lock:
             self.cache.clear()
         snapshot = self.snapshot()
-        log("\n" + "\n".join(snapshot["daily"]["summary"]) + "\n")
-        log(f"Daily summaries: {self.settings.output / 'summaries' / self.settings.mode}\n")
+        if action in {"demo-all", "demo-dca", "reports"}:
+            log("\n" + "\n".join(snapshot["daily"]["summary"]) + "\n")
+            log(f"Daily summaries: {self.settings.output / 'summaries' / self.settings.mode}\n")
         return next((code for code in results if code != 0), 0)
 
 
