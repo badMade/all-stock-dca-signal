@@ -194,6 +194,19 @@ Characteristics of this generation:
   Gate 5 claim in these files as proposed, not active.
 * `GATE 6.5 - SAME-DAY TOP-UP GUARD` (step 4.5 in the 1230 slot) invokes
   `scripts/same_day_top_up_gate.py`.
+* On 2026-10-03 the live tasks were AHEAD of these mirrors: they carry the operator-approved
+  BRIDGE-SHELL RULE and BRIDGE PROTOCOL (Gate 2 may run repo commands through
+  `mcp__remote-devices__device_bash` when the executor's own shell has no checkout), which the
+  mirrors lacked, so `check_live_prompt_drift` reported 7 of 7 slots "differs" and its
+  "repaste from live-mirror/" advice would have REVERTED that change. When the checker says
+  repaste, diff first (`--diff`): the mirror is the source of truth only when the live body is
+  the stale side. `apply_dotenv_edits.py` (dry run by default, `--write` applies, live files
+  backed up first) edits the live bodies with the `.env` loader changes from
+  `dotenv-loader.draft.md` and then RE-CAPTURES every mirror from the edited live body
+  (frontmatter dropped, account masked), so the mirrors end identical to live whatever state
+  they started in. Until it has been run with `--write`, these mirrors contain neither the
+  bridge-shell change nor the `.env` edits. `drafts/*.bridge-shell.draft.txt` hold the
+  bridge-shell text and become redundant once the mirrors are re-captured.
 
 ## `1-executor-*.txt` … `7-executor-*.txt` — SUPERSEDED. Do not patch these
 

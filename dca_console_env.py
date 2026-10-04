@@ -43,6 +43,7 @@ ENV_VARS: tuple[EnvVar, ...] = (
     EnvVar("DCA_COMBINED_CSV", "Alternate combined OHLCV CSV for the market graph's csv source"),
     EnvVar("DCA_TICKER_DAILY_UPDATE_SCRIPT", "Override for the resumable ticker-history updater script"),
     EnvVar("DCA_BREADTH_FETCH_PYTHON", "Interpreter used for the ticker-market-breadth fetch"),
+    EnvVar("DCA_ALERT_EMAIL_ADDRESS", "Operator address for the Gate 9 email channel (config/notifications.json)"),
     EnvVar("DCA_DRIFT_SLACK_WEBHOOK", "Slack webhook for scripts/drift_detection.py --slack", True),
     EnvVar("DCA_ALERT_SLACK_WEBHOOK", "Slack webhook for dca_alerts failure alerts", True),
     EnvVar("DCA_HEARTBEAT_URL", "Dead-man heartbeat URL prefix (per-stream suffixes in dca_alerts)", True),

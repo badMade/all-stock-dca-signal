@@ -183,6 +183,17 @@ function renderForecasts() {
   const component = $("component-filter").value;
   const ticker = $("ticker-filter").value.trim().toUpperCase();
   const all = normalizeForecasts(state.snapshot?.octopus?.forecasts);
+  const datalist = $("ticker-options");
+  if (datalist && all.length > 0) {
+    const uniqueTickers = Array.from(new Set(all.map((f) => f.ticker).filter(Boolean))).sort();
+    if (datalist.children.length !== uniqueTickers.length) {
+      datalist.replaceChildren(...uniqueTickers.map((sym) => {
+        const opt = document.createElement("option");
+        opt.value = sym;
+        return opt;
+      }));
+    }
+  }
   const rows = all.filter((row) => String(row.component).toLowerCase() === component && (!ticker || String(row.ticker || "").toUpperCase().includes(ticker)));
   $("forecast-count").textContent = `${rows.length} ${component} ${rows.length === 1 ? "forecast" : "forecasts"}${rows.length > 100 ? " · showing first 100" : ""}`;
   if (!rows.length) {
@@ -201,7 +212,7 @@ function renderForecasts() {
 }
 
 function renderForecastChart(rows) {
-  const eligible = rows.filter((row) => isNumber(row.point) && isNumber(row.p10) && isNumber(row.p90) && Number(row.p90) >= Number(row.p10)).slice(0, 6);
+  const eligible = rows.filter((row) => isNumber(row.point) && isNumber(row.p10) && isNumber(row.p90) && Number(row.p90) >= Number(row.p10));
   if (!eligible.length) { $("forecast-chart").replaceChildren(); return; }
   const ns = "http://www.w3.org/2000/svg";
   const svgNode = (name, attributes) => {
@@ -222,7 +233,10 @@ function renderForecastChart(rows) {
     row.append(label, svg, el("div", "range-value", `${usd(forecast.p10)} – ${usd(forecast.p90)}`));
     return row;
   });
-  nodes.push(el("p", "chart-note", `First ${eligible.length} available ranges. Each row has its own price scale; use the dollar labels to compare uncertainty.`));
+  const noteText = eligible.length > 1
+    ? `All ${eligible.length} available ranges. Each row has its own price scale; use the dollar labels to compare uncertainty.`
+    : `1 available range. Each row has its own price scale; use the dollar labels to compare uncertainty.`;
+  nodes.push(el("p", "chart-note", noteText));
   $("forecast-chart").replaceChildren(...nodes);
 }
 
