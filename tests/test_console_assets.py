@@ -44,8 +44,8 @@ def test_every_nav_link_has_a_page_section_in_the_same_order():
     sections = re.findall(r'<section class="page" data-page="([a-z]+)"', html)
     assert [page for _, page in nav] == sections
     assert sections[0] == "today"
-    assert len(sections) == len(set(sections)) == 11
+    assert len(sections) == len(set(sections)) == 13
     # Every page except Today starts hidden; the router reveals exactly one.
     assert html.count('class="page" data-page="today"') == 1
     assert all(f'data-page="{page}"' in html and (page == "today" or f'id="page-{page}"' in html) for page in sections)
-    assert len(re.findall(r'<section class="page" data-page="[a-z]+" id="page-[a-z]+"(?: data-placeholder)? hidden>', html)) == 10
+    assert len(re.findall(r'<section class="page" data-page="[a-z]+" id="page-[a-z]+"(?: data-placeholder)? hidden>', html)) == 12
