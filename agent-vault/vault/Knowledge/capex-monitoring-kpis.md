@@ -93,6 +93,43 @@ over $5B quarterly capex, $250M for suppliers and mid-caps). See `threshold-revi
 | ASML | 2025-12-31 | €1,573.6M | Form 20-F (SEC EDGAR) |
 | AMAT | 2026-07-26 | $2,000M (9-mo YTD) | Form 10-Q (SEC EDGAR) |
 | AVGO | 2026-08-02 | $1,013M (9-mo YTD) | Form 10-Q (SEC EDGAR) |
+| AAPL | 2026-06-27 | $6,799.0M | Form 10-Q (SEC EDGAR) |
+| ABBV | 2026-06-30 | $587.0M | Form 10-Q (SEC EDGAR) |
+| AMD | 2026-06-27 | $1,197.0M | Form 10-Q (SEC EDGAR) |
+| ANET | 2026-06-30 | $84.2M | Form 10-Q (SEC EDGAR) |
+| CAT | 2026-06-30 | $1,315.0M | Form 10-Q (SEC EDGAR) |
+| CIEN | 2026-08-01 | $194.9M | Form 10-Q (SEC EDGAR) |
+| COHR | 2026-06-30 | $1,102.9M | Form 10-Q (SEC EDGAR) |
+| CSCO | 2026-07-25 | $1,410.0M | Form 10-Q (SEC EDGAR) |
+| EVR | 2026-06-30 | $13.8M | Form 10-Q (SEC EDGAR) |
+| FFIV | 2026-06-30 | $63.7M | Form 10-Q (SEC EDGAR) |
+| GE | 2023-03-31 | $279.0M | Form 10-Q (SEC EDGAR) |
+| GFUZ | 2026-06-30 | $0.4M | Form 10-Q (SEC EDGAR) |
+| GLW | 2020-09-30 | $986.0M | Form 10-Q (SEC EDGAR) |
+| GS | 2026-06-30 | $1,067.0M | Form 10-Q (SEC EDGAR) |
+| IBM | 2026-06-30 | $461.0M | Form 10-Q (SEC EDGAR) |
+| INTC | 2026-06-27 | $6,192.0M | Form 10-Q (SEC EDGAR) |
+| IRDM | 2026-06-30 | $51.8M | Form 10-Q (SEC EDGAR) |
+| LITE | 2026-06-27 | $451.3M | Form 10-Q (SEC EDGAR) |
+| LLY | 2022-09-30 | $1,353.6M | Form 10-Q (SEC EDGAR) |
+| LUNR | 2026-06-30 | $33.9M | Form 10-Q (SEC EDGAR) |
+| MA | 2026-06-30 | $445.0M | Form 10-Q (SEC EDGAR) |
+| MRVL | 2026-08-01 | $282.4M | Form 10-Q (SEC EDGAR) |
+| MU | 2026-05-28 | $19,602.0M | Form 10-Q (SEC EDGAR) |
+| NFLX | 2026-06-30 | $414.8M | Form 10-Q (SEC EDGAR) |
+| QBTS | 2026-06-30 | $5.5M | Form 10-Q (SEC EDGAR) |
+| QCOM | 2026-06-28 | $1,578.0M | Form 10-Q (SEC EDGAR) |
+| QUBT | 2026-06-30 | $4.5M | Form 10-Q (SEC EDGAR) |
+| RGTI | 2026-06-30 | $16.4M | Form 10-Q (SEC EDGAR) |
+| RKLB | 2026-06-30 | $53.1M | Form 10-Q (SEC EDGAR) |
+| SNDK | 2026-07-03 | $177.0M | Form 10-Q (SEC EDGAR) |
+| STX | 2026-07-03 | $569.0M | Form 10-Q (SEC EDGAR) |
+| TRLV | 2025-12-31 | $44.2M | Form 10-Q (SEC EDGAR) |
+| TSLA | 2026-06-30 | $8,282.0M | Form 10-Q (SEC EDGAR) |
+| TXN | 2026-06-30 | $1,190.0M | Form 10-Q (SEC EDGAR) |
+| VIAV | 2026-06-27 | $31.1M | Form 10-Q (SEC EDGAR) |
+| VRT | 2026-06-30 | $285.9M | Form 10-Q (SEC EDGAR) |
+| WDC | 2026-07-03 | $418.0M | Form 10-Q (SEC EDGAR) |
 
 ## Sources the skill may read
 

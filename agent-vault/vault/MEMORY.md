@@ -22,6 +22,6 @@
 <!-- One line per note in Knowledge/, added by the capture skill. -->
 
 - [all-stock-dca rules](Knowledge/all-stock-dca-rules.md) - pointer to the repo's safeguards, ladder and run commands
-- [capex monitoring KPIs](Knowledge/capex-monitoring-kpis.md) - 51 watched companies, 8 verified baselines
+- [capex monitoring KPIs](Knowledge/capex-monitoring-kpis.md) - 51 watched companies, 45 verified baselines
 - [dl-trading backtests](Knowledge/dl-trading-backtests.md) - LSTM vs TCN backtest comparison (TCN +0.288 Sharpe advantage)
 - [threshold review](Knowledge/threshold-review.md) - status of all thresholds; all 5 formally settled

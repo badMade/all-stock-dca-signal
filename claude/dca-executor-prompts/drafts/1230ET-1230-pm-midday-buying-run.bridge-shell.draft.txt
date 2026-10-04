@@ -1,3 +1,5 @@
+# MIRROR of the LIVE scheduled task `1230-pm-midday-buying-run` (1230ET slot)
+# Source of truth: ~/Claude/Scheduled/1230-pm-midday-buying-run/SKILL.md
 # The prior "STANDING GATE 5 OVERRIDE" preamble that lived here dictated an
 # unconditional placement-off fallback (dating from before this slot had a
 # signal-generation entry point). That unconditional-off block is removed,
