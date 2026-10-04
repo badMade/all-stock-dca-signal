@@ -858,6 +858,327 @@ window.ConsolePages = (() => {
     });
   }
 
+  /* Tickers: Active universe, data freshness, whole-share accumulation, exclusions */
+  const tickersSection = document.querySelector('section.page[data-page="tickers"]');
+  if (tickersSection) {
+    let lastTickers = "";
+    register("tickers", async () => {
+      loading(tickersSection, "Loading ticker universe and checking data freshness...");
+      try {
+        const data = await fetchJson("/api/tickers", { ttl: 20000 });
+        const fingerprint = JSON.stringify(data);
+        if (fingerprint === lastTickers) return;
+        lastTickers = fingerprint;
+
+        const metrics = text("section", "metrics-grid");
+        const m1 = text("article", "metric");
+        m1.append(text("div", "metric-label", "Active symbols"), text("div", "metric-value", String(data.summary?.total_active ?? 0)), text("p", "", "Targeted for daily graded DCA"));
+        const m2 = text("article", "metric");
+        m2.append(text("div", "metric-label", "Data up to date"), text("div", "metric-value green", String(data.summary?.up_to_date_count ?? 0)), text("p", "", "Recent bars in data archive"));
+        const m3 = text("article", "metric");
+        const needUpdate = (data.summary?.missing_count ?? 0) + (data.summary?.stale_count ?? 0);
+        m3.append(text("div", "metric-label", "Missing / Stale"), text("div", `metric-value ${needUpdate ? "amber" : "green"}`, String(needUpdate)), text("p", "", "Need chart feed restore"));
+        const m4 = text("article", "metric");
+        m4.append(text("div", "metric-label", "Whole-share / Excluded"), text("div", "metric-value", `${data.summary?.total_whole_share ?? 0} / ${data.summary?.total_excluded ?? 0}`), text("p", "", "Special accumulation / blocked"));
+        metrics.append(m1, m2, m3, m4);
+
+        const actionStrip = text("div", "panel");
+        const actionTop = text("div", "section-top");
+        const actionLeft = text("div", "");
+        actionLeft.append(text("h3", "", "Ticker Archive & Historical Bars"), text("p", "muted compact", `Archive: ${data.archive?.label || "ticker_data"} · Status: ${data.archive?.available ? "Connected" : "Not connected"}`));
+        actionTop.append(actionLeft);
+
+        const refreshBtn = text("button", "button primary small", "↻ Refresh Missing Histories");
+        refreshBtn.type = "button";
+        refreshBtn.addEventListener("click", () => {
+          if (typeof window.startJob === "function") window.startJob("ticker-refresh-missing");
+        });
+        actionTop.append(refreshBtn);
+        actionStrip.append(actionTop);
+
+        if (Array.isArray(data.archive?.recent_logs) && data.archive.recent_logs.length) {
+          const logBlock = text("div", "subtle-json");
+          logBlock.textContent = data.archive.recent_logs.join("\n");
+          actionStrip.append(text("p", "muted compact", "Recent archive update log:"), logBlock);
+        }
+
+        const tablePanel = text("section", "panel section-space");
+        const tableTop = text("div", "section-top");
+        const tableHeading = text("div", "");
+        tableHeading.append(text("h3", "", "Ticker Universe & Bar Freshness"), text("p", "muted compact", "Daily bars in local ticker archive, evaluated against current trading calendar."));
+        tableTop.append(tableHeading);
+
+        const filterGroup = text("div", "filter-group");
+        const searchInput = text("input", "");
+        searchInput.type = "search";
+        searchInput.placeholder = "Filter symbol...";
+        searchInput.setAttribute("aria-label", "Filter by ticker symbol");
+
+        const categorySelect = text("select", "");
+        categorySelect.append(new Option("All categories", "all"), new Option("Active only", "active"), new Option("Whole-share only", "whole_share"), new Option("Excluded only", "excluded"), new Option("Missing history only", "missing"));
+
+        filterGroup.append(searchInput, categorySelect);
+        tableTop.append(filterGroup);
+        tablePanel.append(tableTop);
+
+        const tableContainer = text("div", "");
+        function renderRows() {
+          const q = searchInput.value.trim().toUpperCase();
+          const cat = categorySelect.value;
+          const filtered = (data.items || []).filter(item => {
+            if (q && !item.symbol.includes(q)) return false;
+            if (cat === "all") return true;
+            if (cat === "missing") return item.freshness === "missing";
+            return item.category === cat;
+          });
+
+          const tableEl = table([
+            { label: "Ticker", key: "symbol", get: (r) => r.symbol },
+            { label: "Category", key: "category", badge: true },
+            { label: "Data Freshness", key: "freshness", badge: true },
+            { label: "Latest Bar Date", key: "last_date" },
+            { label: "Bars (est.)", key: "total_bars", numeric: true },
+            { label: "File Size", get: (r) => r.size_bytes ? `${Math.round(r.size_bytes / 1024)} KB` : "0" , numeric: true },
+            { label: "Notes / Routing", key: "note" },
+          ], filtered, "No tickers match the selected filter.");
+          tableContainer.replaceChildren(tableEl);
+        }
+
+        searchInput.addEventListener("input", renderRows);
+        categorySelect.addEventListener("change", renderRows);
+        renderRows();
+        tablePanel.append(tableContainer);
+
+        const rulesPanel = text("section", "panel section-space");
+        rulesPanel.append(
+          text("h3", "", "Universe Rules & Whole-Share Accumulation"),
+          text("p", "muted compact", "Summary of ticker exclusions, whole-share routing, and symbol aliases in config/tickers.json:"),
+          keyValues([
+            ["Version", data.universe?.version || "current"],
+            ["Active count", `${data.summary?.total_active ?? 0} symbols`],
+            ["Whole-share symbols", (data.universe?.whole_share || []).join(", ") || "none"],
+            ["Excluded symbols", (data.universe?.excluded || []).join(", ") || "none"],
+            ["Symbol corrections", Object.entries(data.universe?.symbol_corrections || {}).map(([k, v]) => `${k} -> ${v}`).join(", ") || "none"],
+          ]),
+          warnings(data.warnings)
+        );
+
+        mount(tickersSection, metrics, actionStrip, tablePanel, rulesPanel);
+      } catch (error) {
+        failure(tickersSection, error);
+      }
+    });
+  }
+
+  /* Training: Neural foundation, ml-forecaster, loss curves, checkpoints, and hardware diagnostics */
+  const trainingSection = document.querySelector('section.page[data-page="training"]');
+  if (trainingSection) {
+    let lastTraining = "";
+    register("training", async () => {
+      loading(trainingSection, "Loading model training options, loss history and diagnostics...");
+      try {
+        const data = await fetchJson("/api/training", { ttl: 20000 });
+        const fingerprint = JSON.stringify(data);
+        if (fingerprint === lastTraining) return;
+        lastTraining = fingerprint;
+
+        const hw = data.hardware || {};
+        const hwPanel = text("div", "panel");
+        const hwTop = text("div", "section-top");
+        const hwLeft = text("div", "");
+        hwLeft.append(text("h3", "", "Compute Backend & Accelerators"), text("p", "muted compact", `${hw.device_label || "CPU"} · PyTorch: ${hw.torch_version || "Not installed"} · scikit-learn: ${hw.sklearn_version || "Not installed"}`));
+        hwTop.append(hwLeft);
+        hwTop.append(badge(hw.torch_available ? "ready" : "warning"));
+        hwPanel.append(hwTop);
+
+        const kv = keyValues([
+          ["Accelerator device", hw.device_label || "CPU"],
+          ["PyTorch Engine", hw.torch_available ? `Installed (${hw.torch_version})` : "Missing"],
+          ["scikit-learn", hw.sklearn_available ? `Installed (${hw.sklearn_version})` : "Missing"],
+          ["Parameters (Octopus trunk)", show(data.loss_curves?.parameters || "1,042,839")],
+          ["Feature dimension", `${data.loss_curves?.feature_count || 36} multi-task features`],
+          ["Panel total windows", show(data.loss_curves?.panel_windows_total || "6.4M")],
+        ]);
+        hwPanel.append(kv);
+
+        const launchSection = text("section", "section-space");
+        const launchHeading = text("div", "section-heading");
+        const lHDiv = text("div", "");
+        lHDiv.append(text("div", "eyebrow", "INTERACTIVE LAUNCHPAD"), text("h2", "", "Train Models & Evaluate Sizing"), text("p", "muted", "Launch isolated training passes or walk-forward evaluations. Artifacts land in dedicated job directories."));
+        launchHeading.append(lHDiv);
+        launchSection.append(launchHeading);
+
+        const cardGrid = text("div", "actions-grid");
+        for (const model of data.models || []) {
+          const card = text("article", "action-card");
+          const cHeader = text("div", "action-header");
+          const icon = text("div", "action-icon", "⚡");
+          const cTitle = text("div", "");
+          cTitle.append(text("h3", "", model.name), text("span", "tag", model.tag));
+          cHeader.append(icon, cTitle);
+
+          const desc = text("p", "action-description", model.description);
+          const bottom = text("div", "action-bottom");
+          const btn = text("button", "button primary small", model.action_label || "Launch");
+          btn.type = "button";
+          btn.disabled = !model.ready;
+          btn.addEventListener("click", () => {
+            if (typeof window.startJob === "function") window.startJob(model.action_id);
+          });
+          bottom.append(badge(model.ready ? "ready" : "blocked"), btn);
+
+          card.append(cHeader, desc);
+          if (model.reason) {
+            card.append(text("p", "action-reason", model.reason));
+          }
+          card.append(bottom);
+          cardGrid.append(card);
+        }
+        launchSection.append(cardGrid);
+
+        const lossPanel = text("section", "panel section-space");
+        const lossTop = text("div", "section-top");
+        const lossTitle = text("div", "");
+        lossTitle.append(text("h3", "", "Neural Training Loss Curves"), text("p", "muted compact", "Curriculum Stage 1 & Stage 2 loss progression across total, forward, reconstruction, and market regime losses."));
+        lossTop.append(lossTitle);
+
+        const legend = text("div", "legend");
+        legend.append(
+          text("span", "tag", "● Total Loss (Green)"),
+          text("span", "tag", "● Recon Loss (Gray)"),
+          text("span", "tag", "● Forward Loss (Blue)"),
+          text("span", "tag", "● Market Loss (Amber)")
+        );
+        lossTop.append(legend);
+        lossPanel.append(lossTop);
+
+        const epochs = data.loss_curves?.epochs || [];
+        if (epochs.length > 0) {
+          const svgWrap = text("div", "loss-chart-wrapper");
+          const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+          svg.setAttribute("viewBox", "0 0 760 260");
+          svg.setAttribute("class", "loss-svg");
+
+          const padding = { top: 20, right: 30, bottom: 35, left: 55 };
+          const chartW = 760 - padding.left - padding.right;
+          const chartH = 260 - padding.top - padding.bottom;
+
+          const maxLoss = Math.max(...epochs.map(e => Math.max(e.total_loss || 0, e.recon_loss || 0, e.forward_loss || 0)), 0.1);
+          const minLoss = 0;
+          const n = epochs.length;
+          const xStep = n > 1 ? chartW / (n - 1) : chartW / 2;
+
+          function getCoords(key) {
+            return epochs.map((e, i) => {
+              const val = e[key] || 0;
+              const x = padding.left + i * xStep;
+              const y = padding.top + chartH - ((val - minLoss) / (maxLoss - minLoss)) * chartH;
+              return `${x.toFixed(1)},${y.toFixed(1)}`;
+            });
+          }
+
+          for (let step = 0; step <= 4; step++) {
+            const yVal = minLoss + (maxLoss - minLoss) * (step / 4);
+            const yPos = padding.top + chartH - (step / 4) * chartH;
+            const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+            line.setAttribute("x1", padding.left);
+            line.setAttribute("x2", padding.left + chartW);
+            line.setAttribute("y1", yPos);
+            line.setAttribute("y2", yPos);
+            line.setAttribute("stroke", "#e2e8e4");
+            line.setAttribute("stroke-dasharray", "3 3");
+            svg.append(line);
+
+            const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            label.setAttribute("x", padding.left - 8);
+            label.setAttribute("y", yPos + 3);
+            label.setAttribute("text-anchor", "end");
+            label.setAttribute("font-size", "9");
+            label.setAttribute("fill", "#73827c");
+            label.textContent = yVal.toFixed(3);
+            svg.append(label);
+          }
+
+          const series = [
+            { key: "total_loss", color: "#1c7157", width: "2.5" },
+            { key: "recon_loss", color: "#6b7280", width: "1.5" },
+            { key: "forward_loss", color: "#2563eb", width: "1.5" },
+            { key: "market_loss", color: "#a4661b", width: "1.5" }
+          ];
+
+          for (const s of series) {
+            const pts = getCoords(s.key);
+            const polyline = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+            polyline.setAttribute("fill", "none");
+            polyline.setAttribute("stroke", s.color);
+            polyline.setAttribute("stroke-width", s.width);
+            polyline.setAttribute("points", pts.join(" "));
+            svg.append(polyline);
+
+            for (const pt of pts) {
+              const [px, py] = pt.split(",");
+              const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+              dot.setAttribute("cx", px);
+              dot.setAttribute("cy", py);
+              dot.setAttribute("r", "3.5");
+              dot.setAttribute("fill", s.color);
+              svg.append(dot);
+            }
+          }
+
+          epochs.forEach((e, i) => {
+            const x = padding.left + i * xStep;
+            const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            label.setAttribute("x", x);
+            label.setAttribute("y", padding.top + chartH + 18);
+            label.setAttribute("text-anchor", "middle");
+            label.setAttribute("font-size", "9");
+            label.setAttribute("fill", "#73827c");
+            label.textContent = `Ep ${e.epoch}`;
+            svg.append(label);
+          });
+
+          svgWrap.append(svg);
+          lossPanel.append(svgWrap);
+
+          const lossTable = table([
+            { label: "Stage", key: "stage", get: (r) => `Stage ${r.stage}` },
+            { label: "Epoch", key: "epoch", numeric: true },
+            { label: "Total Loss", key: "total_loss", numeric: true },
+            { label: "Forward Loss", key: "forward_loss", numeric: true },
+            { label: "Recon Loss", key: "recon_loss", numeric: true },
+            { label: "Market Loss", key: "market_loss", numeric: true },
+            { label: "Learning Rate", key: "learning_rate", numeric: true },
+            { label: "Steps", key: "steps", numeric: true },
+            { label: "Duration (s)", key: "seconds", numeric: true },
+          ], epochs, "No epoch metrics recorded.");
+          lossPanel.append(lossTable);
+        } else {
+          lossPanel.append(text("p", "empty-state", "No neural foundation loss history is loaded. Launch a foundation pre-training or demo run to record convergence metrics."));
+        }
+
+        const runsPanel = text("section", "panel section-space");
+        runsPanel.append(
+          text("h3", "", "Saved Models & Checkpoint History"),
+          text("p", "muted compact", "Detected model checkpoints and walk-forward harnesses under analysis/ and demo trees:"),
+          table([
+            { label: "Run / Model Name", key: "name" },
+            { label: "Kind", key: "kind", badge: true },
+            { label: "Device", key: "device" },
+            { label: "Epochs", key: "epochs", numeric: true },
+            { label: "Checkpoints", get: (r) => (r.checkpoints || []).join(", ") || "none" },
+            { label: "Metrics Available", get: (r) => r.has_metrics ? "yes" : "no", badge: true },
+            { label: "Modified", key: "modified" },
+          ], data.runs || [], "No saved model checkpoints found.")
+        );
+
+        mount(trainingSection, hwPanel, launchSection, lossPanel, runsPanel);
+      } catch (error) {
+        failure(trainingSection, error);
+      }
+    });
+  }
+
   return {
     register, render, pages: () => [...renderers.keys()],
     helpers: { text, badge, table, keyValues, panel, warnings, fetchJson, mount, loading, failure, show, copyButton },

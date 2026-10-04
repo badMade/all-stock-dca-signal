@@ -364,8 +364,12 @@ async function openDocs(path) {
 /* Hash router. Every top-level page is a <section class="page" data-page>; the
    hash names the page and nothing else, so an unknown or empty hash shows Today.
    Pages never receive a path or a query from the hash: each page renderer reads
-   the snapshot the server already produced (GUI expansion Phase 0). */
-const PAGE_TITLES = { today: "Today", runs: "Runs", schedule: "Schedule", state: "State & ledgers", alerts: "Alerts & health", config: "Config", reports: "Reports", research: "Research", workflows: "Workflows & jobs", environment: "Environment", docs: "Docs" };
+const PAGE_TITLES = {
+  today: "Today", runs: "Runs", schedule: "Schedule", state: "State & ledgers",
+  alerts: "Alerts & health", config: "Config", tickers: "Tickers", reports: "Reports",
+  research: "Research", training: "Training", workflows: "Workflows & jobs",
+  environment: "Environment", docs: "Docs"
+};
 const PAGES = [...document.querySelectorAll("section.page[data-page]")].map((section) => section.dataset.page);
 
 function currentPage() {
@@ -470,6 +474,7 @@ async function startJob(action) {
     renderActions(state.snapshot?.actions);
   }
 }
+window.startJob = startJob;
 
 async function postWithToken(path, body) {
   const submit = () => fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Console-Token": state.token }, body: JSON.stringify(body), signal: AbortSignal.timeout(15000) });

@@ -540,6 +540,22 @@ def _route_research(app, request: RouteRequest) -> Response:
     return Response.json(200, build_research_snapshot(app, REPO))
 
 
+def _route_tickers(app, request: RouteRequest) -> Response:
+    from dca_console import REPO
+    from dca_console_tickers import build_tickers_snapshot
+
+    query(request.url.query, (), max_fields=1)
+    return Response.json(200, build_tickers_snapshot(REPO, app.settings.config_dir))
+
+
+def _route_training(app, request: RouteRequest) -> Response:
+    from dca_console import REPO
+    from dca_console_training import build_training_snapshot
+
+    query(request.url.query, (), max_fields=1)
+    return Response.json(200, build_training_snapshot(app, REPO))
+
+
 GET_ROUTES: dict[str, Callable[[Any, RouteRequest], Response]] = {
     "/api/bootstrap": _route_bootstrap,
     "/api/snapshot": _route_snapshot,
@@ -580,4 +596,6 @@ GET_ROUTES: dict[str, Callable[[Any, RouteRequest], Response]] = {
     "/api/reports/latest": _route_reports_latest,
     "/api/reports/summary": _route_reports_summary,
     "/api/research": _route_research,
+    "/api/tickers": _route_tickers,
+    "/api/training": _route_training,
 }

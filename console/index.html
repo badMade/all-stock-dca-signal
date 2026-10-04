@@ -22,8 +22,10 @@
       <a href="#state" data-page="state"><span aria-hidden="true">◈</span> State &amp; ledgers</a>
       <a href="#alerts" data-page="alerts"><span aria-hidden="true">△</span> Alerts &amp; health</a>
       <a href="#config" data-page="config"><span aria-hidden="true">⚙</span> Config</a>
+      <a href="#tickers" data-page="tickers"><span aria-hidden="true">🏷</span> Tickers</a>
       <a href="#reports" data-page="reports"><span aria-hidden="true">≣</span> Reports</a>
       <a href="#research" data-page="research"><span aria-hidden="true">⌁</span> Research</a>
+      <a href="#training" data-page="training"><span aria-hidden="true">⚡</span> Training</a>
       <a href="#workflows" data-page="workflows"><span aria-hidden="true">⊞</span> Workflows &amp; jobs</a>
       <a href="#environment" data-page="environment"><span aria-hidden="true">◎</span> Environment</a>
       <a href="#docs" data-page="docs"><span aria-hidden="true">¶</span> Docs</a>
@@ -89,6 +91,11 @@
         <div data-page-body><div class="panel empty-state">Loading…</div></div>
       </section>
 
+      <section class="page" data-page="tickers" id="page-tickers" hidden>
+        <div class="section-heading"><div><div class="eyebrow">UNIVERSE &amp; FRESHNESS</div><h2>Tickers &amp; Data Archive</h2><p class="muted">Active graded DCA universe, whole-share accumulation tracking, exclusions, symbol corrections and historical OHLCV bar freshness in the local archive.</p></div></div>
+        <div data-page-body><div class="panel empty-state">Loading ticker universe…</div></div>
+      </section>
+
       <section class="page" data-page="reports" id="page-reports" hidden>
         <div class="section-heading"><div><div class="eyebrow">REPORTS</div><h2>Rendered from the artifacts.</h2><p class="muted">The weekly performance dashboard, the monthly cost tracker (proxy units, never dollars), the latest run summary with its Notion preview, the console's own daily digests and the average-cost snapshot. Everything is built in memory; nothing writes a report file or pushes anywhere.</p></div></div>
         <div data-page-body><div class="panel empty-state">Loading…</div></div>
@@ -103,6 +110,11 @@
 
           <div class="panel section-space"><div class="section-top"><div><h3>Historical period comparison</h3><p class="muted compact">Measured walk-forward performance, compared with persistence where available.</p></div><div class="filter-group"><div><label for="period-filter">Market period</label><select id="period-filter"><option value="all">All periods</option></select></div></div></div><div class="table-scroll"><table><caption class="sr-only">Historical forecast accuracy by model and market period</caption><thead><tr><th>Period</th><th>Model</th><th>Price</th><th class="numeric">Samples</th><th class="numeric">MAE ($)</th><th class="numeric">Band coverage</th><th class="numeric">Skill vs baseline</th></tr></thead><tbody id="periods-body"><tr><td colspan="7" class="empty-cell">No historical evaluations loaded.</td></tr></tbody></table></div><p class="panel-footnote">MAE is mean absolute error. Band coverage is the share of realized values within P10–P90; its target is 80%. Positive skill means lower error than persistence.</p></div>
         </section>
+      </section>
+
+      <section class="page" data-page="training" id="page-training" hidden>
+        <div class="section-heading"><div><div class="eyebrow">MODEL TRAINING &amp; DIAGNOSTICS</div><h2>Training &amp; Loss Curves</h2><p class="muted">Interactive training controls for the Octopus neural foundation, ml-forecaster Ridge model, and walk-forward evaluations with convergence telemetry and loss curves.</p></div></div>
+        <div data-page-body><div class="panel empty-state">Loading training controls…</div></div>
       </section>
 
       <section class="page" data-page="workflows" id="page-workflows" hidden>

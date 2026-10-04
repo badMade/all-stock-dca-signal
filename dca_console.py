@@ -589,6 +589,12 @@ class ConsoleApp:
              research and self.octopus_run is not None, update_reason),
             ("octopus-estimate", "Estimate archive replay", "Read the archive and estimate a quick replay; fits no models.",
              research, research_reason),
+            ("ticker-refresh-missing", "Refresh missing ticker data",
+             "Download missing daily OHLCV bars for active tickers from Yahoo chart feed (preserves existing data).",
+             True, ""),
+            ("train-foundation-smoke", "Train Octopus foundation (smoke run)",
+             "Run Stage 1 curriculum pre-training smoke run on PyTorch with the neural Octopus model.",
+             not neural_reason, neural_reason),
         ]
         # Demo actions always write under output/demo, never into the observed local root.
         from dca_console_launch import launch_actions
@@ -775,6 +781,14 @@ class ConsoleApp:
             results.append(self._command(["-m", "scripts.purchase_history", "--cron-tracking-root",
                                          str(self.settings.root), "--output-dir",
                                          str(self.settings.output / "reports" / job_id)], log))
+        if action == "ticker-refresh-missing":
+            results.append(self._command(["-m", "scripts.refresh_active_ticker_histories"], log, timeout=600))
+        if action == "train-foundation-smoke":
+            target = self.settings.output / "launches" / job_id
+            results.append(self._command([
+                "wondrous-octopus/train_foundation.py", "--limit-steps", "10", "--epochs", "1",
+                "--stage", "1", "--device", "cpu", "--max-tickers", "5", "--run-dir", str(target),
+            ], log, research=True, timeout=600))
         with self.lock:
             self.cache.clear()
         snapshot = self.snapshot()
