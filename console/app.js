@@ -152,36 +152,58 @@ function normalizeForecasts(rows) {
 }
 
 function renderResearch(octopus = {}) {
-  $("research-status").replaceWith(Object.assign(statusPill(octopus.status || "not available"), { id: "research-status" }));
-  $("research-freshness").textContent = `Latest Octopus run${octopus.as_of ? ` · as of ${octopus.as_of}` : " · source date unavailable"}. Independent of the daily DCA date selector.`;
-  $("research-summary").replaceChildren(...arr(octopus.summary).map((text) => el("p", "", text)));
-  renderWarnings("research-warnings", octopus.warnings);
-  const forecasts = normalizeForecasts(octopus.forecasts);
+  const statusEl = $("research-status");
+  if (statusEl) {
+    const pill = statusPill(octopus?.status || "not available");
+    statusEl.className = pill.className;
+    statusEl.textContent = pill.textContent;
+  }
+  const freshnessEl = $("research-freshness");
+  if (freshnessEl) {
+    freshnessEl.textContent = `Latest Octopus run${octopus?.as_of ? ` · as of ${octopus.as_of}` : " · source date unavailable"}. Independent of the daily DCA date selector.`;
+  }
+  const summaryEl = $("research-summary");
+  if (summaryEl) {
+    summaryEl.replaceChildren(...arr(octopus?.summary).map((text) => el("p", "", text)));
+  }
+  renderWarnings("research-warnings", octopus?.warnings);
+  const forecasts = normalizeForecasts(octopus?.forecasts);
   const tickers = [...new Set(forecasts.map((row) => row.ticker).filter(Boolean))].sort();
-  $("ticker-options").replaceChildren(...tickers.map((ticker) => {
-    const option = el("option");
-    option.value = ticker;
-    return option;
-  }));
-  const selectedPeriod = $("period-filter").value;
-  const periodNames = new Map(arr(octopus.period_options).map((period) => [period.id, period.name]));
-  const periods = [...new Set(arr(octopus.periods).map((row) => row.id || row.period || row.regime).filter(Boolean))].sort();
-  const all = el("option", "", "All periods");
-  all.value = "all";
-  $("period-filter").replaceChildren(all, ...periods.filter((period) => period !== "all").map((period) => {
-    const option = el("option", "", periodNames.get(period) || words(period));
-    option.value = period;
-    return option;
-  }));
-  $("period-filter").value = periods.includes(selectedPeriod) ? selectedPeriod : "all";
-  $("forecast-footnote").textContent = `${octopus.as_of ? `Research as of ${octopus.as_of}. ` : ""}Forecasts retain their source dates. Older artifacts are not current predictions.${octopus.truncated ? ` The source contains ${fmt(octopus.forecast_count)} rows; this snapshot is capped.` : ""}`;
+  const datalist = $("ticker-options");
+  if (datalist) {
+    datalist.replaceChildren(...tickers.map((ticker) => {
+      const option = el("option");
+      option.value = ticker;
+      return option;
+    }));
+  }
+  const periodFilter = $("period-filter");
+  if (periodFilter) {
+    const selectedPeriod = periodFilter.value;
+    const periodNames = new Map(arr(octopus?.period_options).map((period) => [period.id, period.name]));
+    const periods = [...new Set(arr(octopus?.periods).map((row) => row.id || row.period || row.regime).filter(Boolean))].sort();
+    const all = el("option", "", "All periods");
+    all.value = "all";
+    periodFilter.replaceChildren(all, ...periods.filter((period) => period !== "all").map((period) => {
+      const option = el("option", "", periodNames.get(period) || words(period));
+      option.value = period;
+      return option;
+    }));
+    periodFilter.value = periods.includes(selectedPeriod) ? selectedPeriod : "all";
+  }
+  const footnoteEl = $("forecast-footnote");
+  if (footnoteEl) {
+    footnoteEl.textContent = `${octopus?.as_of ? `Research as of ${octopus.as_of}. ` : ""}Forecasts retain their source dates. Older artifacts are not current predictions.${octopus?.truncated ? ` The source contains ${fmt(octopus.forecast_count)} rows; this snapshot is capped.` : ""}`;
+  }
   renderForecasts();
   renderPeriods();
 }
 
 function renderForecasts() {
-  const component = $("component-filter").value;
-  const ticker = $("ticker-filter").value.trim().toUpperCase();
+  const componentFilter = $("component-filter");
+  const component = componentFilter ? componentFilter.value : "close";
+  const tickerFilter = $("ticker-filter");
+  const ticker = tickerFilter ? tickerFilter.value.trim().toUpperCase() : "";
   const all = normalizeForecasts(state.snapshot?.octopus?.forecasts);
   const datalist = $("ticker-options");
   if (datalist && all.length > 0) {
@@ -195,25 +217,32 @@ function renderForecasts() {
     }
   }
   const rows = all.filter((row) => String(row.component).toLowerCase() === component && (!ticker || String(row.ticker || "").toUpperCase().includes(ticker)));
-  $("forecast-count").textContent = `${rows.length} ${component} ${rows.length === 1 ? "forecast" : "forecasts"}${rows.length > 100 ? " · showing first 100" : ""}`;
+  const countEl = $("forecast-count");
+  if (countEl) countEl.textContent = `${rows.length} ${component} ${rows.length === 1 ? "forecast" : "forecasts"}${rows.length > 100 ? " · showing first 100" : ""}`;
+  const forecastsBody = $("forecasts-body");
   if (!rows.length) {
-    emptyRow($("forecasts-body"), 7, all.length ? "No forecasts match these filters." : "No forecasts are available. Run the Octopus demo or connect an existing research run.");
-    $("forecast-chart").replaceChildren();
+    if (forecastsBody) emptyRow(forecastsBody, 7, all.length ? "No forecasts match these filters." : "No forecasts are available. Run the Octopus demo or connect an existing research run.");
+    const chartEl = $("forecast-chart");
+    if (chartEl) chartEl.replaceChildren();
     return;
   }
-  $("forecasts-body").replaceChildren(...rows.slice(0, 100).map((forecast) => {
-    const row = el("tr");
-    const name = el("td");
-    name.append(el("strong", "", forecast.ticker || "—"));
-    row.append(name, el("td", "", words(forecast.model)), el("td", "", `${forecast.origin_date || forecast.as_of || "—"} → ${forecast.forecast_date || forecast.target_label || "Date unresolved"}`), ...[forecast.point, forecast.p10, forecast.p50, forecast.p90].map((value) => el("td", "numeric", usd(value))));
-    return row;
-  }));
+  if (forecastsBody) {
+    forecastsBody.replaceChildren(...rows.slice(0, 100).map((forecast) => {
+      const row = el("tr");
+      const name = el("td");
+      name.append(el("strong", "", forecast.ticker || "-"));
+      row.append(name, el("td", "", words(forecast.model)), el("td", "", `${forecast.origin_date || forecast.as_of || "-"} → ${forecast.forecast_date || forecast.target_label || "Date unresolved"}`), ...[forecast.point, forecast.p10, forecast.p50, forecast.p90].map((value) => el("td", "numeric", usd(value))));
+      return row;
+    }));
+  }
   renderForecastChart(rows);
 }
 
 function renderForecastChart(rows) {
+  const chartEl = $("forecast-chart");
+  if (!chartEl) return;
   const eligible = rows.filter((row) => isNumber(row.point) && isNumber(row.p10) && isNumber(row.p90) && Number(row.p90) >= Number(row.p10));
-  if (!eligible.length) { $("forecast-chart").replaceChildren(); return; }
+  if (!eligible.length) { chartEl.replaceChildren(); return; }
   const ns = "http://www.w3.org/2000/svg";
   const svgNode = (name, attributes) => {
     const node = document.createElementNS(ns, name);
@@ -230,22 +259,26 @@ function renderForecastChart(rows) {
     const spread = high - low || Math.max(Math.abs(low) * .01, 1);
     const x = (value) => 25 + ((Number(value) - low) / spread) * 350;
     svg.append(svgNode("line", { x1: 0, x2: 400, y1: 14, y2: 14, stroke: "#edf2ed", "stroke-width": 1 }), svgNode("rect", { x: x(forecast.p10), y: 8, width: Math.max(2, x(forecast.p90) - x(forecast.p10)), height: 12, rx: 6, fill: "#d7eadc" }), svgNode("line", { x1: x(forecast.p10), x2: x(forecast.p10), y1: 7, y2: 21, stroke: "#91b69b", "stroke-width": 1 }), svgNode("line", { x1: x(forecast.p90), x2: x(forecast.p90), y1: 7, y2: 21, stroke: "#91b69b", "stroke-width": 1 }), svgNode("circle", { cx: x(forecast.point), cy: 14, r: 4, fill: "#277451" }));
-    row.append(label, svg, el("div", "range-value", `${usd(forecast.p10)} – ${usd(forecast.p90)}`));
+    row.append(label, svg, el("div", "range-value", `${usd(forecast.p10)} - ${usd(forecast.p90)}`));
     return row;
   });
   const noteText = eligible.length > 1
     ? `All ${eligible.length} available ranges. Each row has its own price scale; use the dollar labels to compare uncertainty.`
     : `1 available range. Each row has its own price scale; use the dollar labels to compare uncertainty.`;
   nodes.push(el("p", "chart-note", noteText));
-  $("forecast-chart").replaceChildren(...nodes);
+  chartEl.replaceChildren(...nodes);
 }
 
 function renderPeriods() {
-  const chosen = $("period-filter").value;
-  const component = $("component-filter").value;
+  const periodFilter = $("period-filter");
+  const chosen = periodFilter ? periodFilter.value : "all";
+  const componentFilter = $("component-filter");
+  const component = componentFilter ? componentFilter.value : "close";
   const rows = arr(state.snapshot?.octopus?.periods).filter((row) => (chosen === "all" || (row.id || row.period || row.regime) === chosen) && (!row.component || row.component.toLowerCase() === component));
-  if (!rows.length) return emptyRow($("periods-body"), 7, "No measured evaluations match this period and price component. Empty periods are not estimated.");
-  $("periods-body").replaceChildren(...rows.map((period) => {
+  const periodsBody = $("periods-body");
+  if (!periodsBody) return;
+  if (!rows.length) return emptyRow(periodsBody, 7, "No measured evaluations match this period and price component. Empty periods are not estimated.");
+  periodsBody.replaceChildren(...rows.map((period) => {
     const row = el("tr");
     const skill = period.skill_vs_persistence ?? period.skill;
     row.append(el("td", "", period.name || words(period.period || period.regime || period.id)), el("td", "", words(period.model)), el("td", "", words(period.component || component)), el("td", "numeric", fmt(period.n ?? period.samples ?? period.count)), el("td", "numeric", usd(period.mae_usd ?? period.mae_price ?? period.mae_dollar)), el("td", "numeric", pct(period.coverage ?? period.coverage_p10_p90)), el("td", `numeric${isNumber(skill) && Number(skill) > 0 ? " green" : ""}`, pct(skill)));
@@ -390,6 +423,7 @@ function route() {
   $("breadcrumb-page").textContent = PAGE_TITLES[page] || page;
   window.scrollTo({ top: 0, behavior: "auto" });
   if (window.ConsolePages) window.ConsolePages.render(page, state.snapshot);
+  if (page === "research" && state.snapshot) renderResearch(state.snapshot.octopus);
 }
 
 function renderSnapshot(snapshot) {

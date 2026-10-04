@@ -814,7 +814,7 @@ window.ConsolePages = (() => {
       try {
         const data = await fetchJson("/api/research", { ttl: 30000 });
         const fingerprint = JSON.stringify(data);
-        if (fingerprint === lastResearch) return;
+        if (fingerprint === lastResearch && researchExtra.querySelector(".panel:not(.empty-state)")) return;
         lastResearch = fingerprint;
         const artifactLink = (job, item) => {
           const link = text("a", "", `${item.name} (${item.kind})`);

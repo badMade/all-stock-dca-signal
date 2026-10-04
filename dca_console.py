@@ -542,7 +542,7 @@ class ConsoleApp:
         self._load_demo_pointer()
 
     def _load_demo_pointer(self) -> None:
-        if self.settings.mode != "demo" or self.octopus_run is not None:
+        if self.octopus_run is not None:
             return
         pointer = self.settings.output / "demo" / "octopus-current.json"
         try:
@@ -550,8 +550,17 @@ class ConsoleApp:
             path = Path(value["path"]).resolve()
             if path.is_relative_to((self.settings.output / "demo" / "octopus").resolve()) and path.is_dir():
                 self.octopus_run = path
+                return
         except (OSError, ValueError, KeyError, TypeError):
             pass
+        demo_base = (self.settings.output / "demo" / "octopus").resolve()
+        if demo_base.is_dir():
+            candidates = sorted(
+                [p for p in demo_base.iterdir() if p.is_dir() and (p / "checkpoint").is_dir()],
+                reverse=True,
+            )
+            if candidates:
+                self.octopus_run = candidates[0]
 
     def default_day(self) -> date:
         """Return the pinned day or today's Eastern date for an unpinned session."""
@@ -751,7 +760,7 @@ class ConsoleApp:
                     results.append(self._command(
                         daily_args, log, demo=True, research=True,
                     ))
-                if result == 0 and self.settings.mode == "demo":
+                if result == 0 and (self.settings.mode == "demo" or self.octopus_run is None):
                     with self.lock:
                         self.octopus_run = target
                     atomic_write_text(self.settings.output / "demo" / "octopus-current.json",
