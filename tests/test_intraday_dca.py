@@ -342,10 +342,11 @@ def test_all_intraday_slots_validate_trend(tmp_path):
         assert IntradayDCAExecutor(_cfg(tmp_path), slot=slot).profile["validate_trend"] is True
 
 
-# --- The ships-disabled placement switch ------------------------------------
-def test_shipped_intraday_config_has_execution_disabled():
+# --- The live placement switch ----------------------------------------------
+def test_shipped_intraday_config_has_execution_enabled():
+    # Promoted to live following full shadow-versus-live parity validation.
     cfg = load_intraday_config(allow_unpinned_account=True)
-    assert cfg.live_execution_enabled is False
+    assert cfg.live_execution_enabled is True
 
 
 def test_intraday_disabled_writes_full_artifacts_and_places_nothing(tmp_path):

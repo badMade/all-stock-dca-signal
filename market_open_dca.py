@@ -43,9 +43,8 @@ Key properties (see ``config/market_open_dca.json`` and
       fills are prior-allocation context for every later same-day slot and are
       never those streams' scheduled evidence.
 
-Ships with ``live_execution_enabled=false`` in its config: the run evaluates
-fully and writes every artifact but places nothing, so its decisions can be
-diffed against whatever actually traded the slot before it is trusted with money.
+Configured with ``live_execution_enabled=true`` in its config (promoted to live
+following full shadow-versus-live parity validation against external execution).
 
 Writes ONLY under its own run-state root
 ``<cron_tracking_root>/market_open_dca/YYYYMMDD_0935ET/`` and never touches the
