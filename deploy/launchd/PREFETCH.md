@@ -117,9 +117,13 @@ Every `claude/dca-executor-prompts/live-mirror/*.txt` Gate 5 carries a
 "PREFETCHED YFINANCE FALLBACK" paragraph. It tells the session to:
 - merge the file when it exists, is dated today, and was modified after the
   decision time;
-- for Robinhood slots, record `robinhood` in `source_errors` rather than
-  hand-fetch bars in pieces when its own fetch fails or would exceed a
-  limit;
+- for Robinhood slots, record `robinhood` in `source_errors` only when its
+  own fetch was attempted and failed; when the fetch would exceed a limit,
+  skip it, omit `sources.robinhood` and leave `source_errors` empty rather
+  than hand-fetch bars in pieces. `source_errors` means "attempted and
+  raised": the generator already treats an absent `robinhood` key as a
+  whole-source outage and falls back to yfinance, so a skipped fetch must
+  not be recorded as a broker data failure (2026-10-05, 9:35);
 - when the file is missing, poll for up to 3 minutes, then run
   `prefetch_slot.sh <HHMM>` once;
 - when neither source yields data, abort as `not_submitted_error

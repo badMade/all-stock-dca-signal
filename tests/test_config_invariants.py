@@ -4646,6 +4646,35 @@ def test_every_live_slot_gate_5_merges_its_prefetched_yfinance_fallback():
         assert "$ROOT/yfinance_fallback_" not in gate_5, mirror.name
 
 
+def test_robinhood_slots_never_record_a_skipped_fetch_as_a_robinhood_source_error():
+    """2026-10-05 9:35 run: the session skipped its Robinhood fetch to stay under the
+    tool output cap, then listed "robinhood" in source_errors because the prompt said
+    to ("or would exceed a tool output or token limit"). The yfinance fallback was
+    chosen correctly, but the run evidence carried a Robinhood data-failure code for
+    an outage that never happened -- and the Notion DCA Issues database and the
+    self-heal logic key on exactly those codes.
+
+    ``source_errors`` means "I attempted this fetch and it raised". A fetch the
+    session chose not to attempt is an ABSENT ``sources.robinhood`` key, which the
+    generator already treats as a whole-source outage and answers with the labeled
+    yfinance fallback (scripts/tests/test_generate_market_open_candidates.py::
+    test_cli_substitutes_yfinance_when_the_robinhood_key_is_absent).
+    """
+    offenders = []
+    for mirror in sorted((PROMPTS_DIR / "live-mirror").glob("[0-9][0-9][0-9][0-9]ET-*.txt")):
+        text = mirror.read_text(encoding="utf-8")
+        gate_5 = text[text.index("GATE 5 - BUY LIST") : text.index("GATE 6 - BUDGET")]
+        if 'put "robinhood" in source_errors' not in gate_5:
+            continue  # Finance-primary slots (12:30, 15:30) have no Robinhood-primary rule to pin
+        sentence_start = gate_5.rfind(". ", 0, gate_5.index('put "robinhood" in source_errors')) + 2
+        instruction = gate_5[sentence_start : gate_5.index('put "robinhood" in source_errors')]
+        if "would exceed" in instruction:
+            offenders.append(f"{mirror.name}: a fetch skipped for size is still told to set source_errors")
+        if 'omit "robinhood" from sources' not in gate_5:
+            offenders.append(f"{mirror.name}: no rule to omit sources.robinhood for a fetch not attempted")
+    assert not offenders, offenders
+
+
 def test_every_live_mirror_routes_oversized_order_pages_through_the_assembler():
     """All seven live mirrors must carry the OVERSIZED ORDER PAGES rule, ahead
     of their first ``get_equity_orders`` call, invoking the assembler as a
