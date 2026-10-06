@@ -4707,6 +4707,48 @@ def test_every_live_mirror_routes_oversized_order_pages_through_the_assembler():
     assert not offenders, offenders
 
 
+def test_every_live_mirror_gate_7_records_per_order_timing_evidence():
+    """2026-10-05 9:35 run: Gate 7 aborted out of window with 26 candidates built and
+    no per-order checks completed before 10:00, and nothing on disk said where the
+    time went. Every order repeats a fresh clock/window recheck, a full paginated
+    order-history refetch, a Gate 4 rescan and a plan rebuild before its placement
+    call; whether that routine is what outruns the slot window is unproven until a
+    run records it.
+
+    Each live mirror's Gate 7 must therefore carry a PER-ORDER TIMING rule: a
+    timezone-aware timestamp around each step, per order, written into the Gate 9
+    evidence. It is evidence only -- the rule must say it never skips, reorders or
+    loosens a check, so the "revalidate before every order" guard stays whole.
+    """
+    texts = _live_mirror_placing_prompt_texts()
+    assert len(texts) == 7, sorted(texts)
+    offenders = []
+    for name, text in texts.items():
+        gate_7 = text[text.index("GATE 7 - PLACE THE ORDERS") : text.index("GATE 8")]
+        start = gate_7.find("PER-ORDER TIMING")
+        if start == -1:
+            offenders.append(f"{name}: no PER-ORDER TIMING rule in Gate 7")
+            continue
+        paragraph = gate_7[start : gate_7.find("\n", start)]
+        # Every step of the per-order routine must be named, and the rule must ask for a
+        # start AND end timestamp around each: naming the steps alone would pass a prompt
+        # that yields no duration evidence for the suspected bottleneck (Copilot review).
+        for required in (
+            "America/New_York",
+            "start and end timestamp",
+            "clock/window recheck",
+            "order-history refetch",
+            "Gate 4 rescan",
+            "plan rebuild",
+            "placement call",
+            "Gate 9",
+            "never skips, reorders or loosens",
+        ):
+            if required not in paragraph:
+                offenders.append(f"{name}: PER-ORDER TIMING rule lacks {required!r}")
+    assert not offenders, offenders
+
+
 @pytest.mark.parametrize(
     ("css", "exempt"),
     [
