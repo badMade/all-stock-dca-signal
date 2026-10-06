@@ -102,21 +102,22 @@ def _row_fingerprint(frame: pd.DataFrame) -> str:
     Missing values render as the literal "nan", which is itself a meaningful
     change of content when a correction fills or clears a cell.
     """
+    ticker_idx = frame.columns.get_loc("ticker")
+    date_idx = frame.columns.get_loc("date")
     scored_columns = [
         column
         for column in (*NUMERIC_FEATURE_COLUMNS, TARGET_COLUMN)
         if column in frame.columns
     ]
+    col_indices = {c: frame.columns.get_loc(c) for c in scored_columns}
     identities = sorted(
         "|".join(
             (
-                f"{ticker}:{pd.Timestamp(date).date().isoformat()}",
-                *(f"{column}={row[column]!r}" for column in scored_columns),
+                f"{row[ticker_idx]}:{pd.Timestamp(row[date_idx]).date().isoformat()}",
+                *(f"{column}={row[col_indices[column]]!r}" for column in scored_columns),
             )
         )
-        for ticker, date, row in zip(
-            frame["ticker"].astype(str), frame["date"], frame.to_dict('records'), strict=True
-        )
+        for row in frame.itertuples(index=False, name=None)
     )
     return hashlib.sha256("\u241f".join(identities).encode("utf-8")).hexdigest()
 
