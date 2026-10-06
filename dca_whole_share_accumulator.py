@@ -3180,7 +3180,7 @@ class WholeShareAccumulationLedger:
                             pending_before_usd=pending_after,
                             pending_after_usd=round(pending_after - redispatch.order_notional_usd, 2),
                         )
-                # Mirrors record_contribution's own resolved-entry fix: this
+                # Mirrors record_contribution's own resolved-entry logic: this
                 # preview call makes no new contribution, so contribution_usd
                 # must be 0.0, not the original cached amount -- otherwise a
                 # dry-run preview of a resolved-slot retry would report a

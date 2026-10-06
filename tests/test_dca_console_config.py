@@ -274,10 +274,13 @@ def test_stream_flags_come_from_raw_json(cfg, tmp_path):
     streams = {row["stream"]: row for row in result["streams"]}
     assert (
         streams["midday"]["live_execution_enabled"] is True
+        and streams["morning"]["live_execution_enabled"] is True
         and streams["market_open"]["live_execution_enabled"] is True
         and streams["intraday"]["live_execution_enabled"] is True
-        and streams["morning"]["live_execution_enabled"] is True
     )
+    assert "ENABLED" in streams["morning"]["note"]
+    assert "ENABLED" in streams["market_open"]["note"]
+    assert "ENABLED" in streams["intraday"]["note"]
     assert streams["intraday"]["slots"] == ["1130", "1330", "1430"] and streams["midday"]["slots"] == ["12:30"]
     assert all(
         row["trend_min_bars"] == 6 and len(row["confidence_rule"]) <= reader.MAX_TEXT for row in streams.values()

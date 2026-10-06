@@ -1440,6 +1440,22 @@ def test_previous_close_bar_from_weeks_earlier_is_rejected():
         _run(data, _config())
 
 
+def test_previous_close_bar_utc_midnight_timestamp_is_accepted():
+    """Daily bars from provider endpoints (such as Robinhood daily historicals)
+    are stamped at UTC midnight (00:00:00Z) on the session date. Converting
+    them to America/New_York shifts the timestamp into the prior evening, but
+    the session date is preserved from the UTC date."""
+    data = _market_data("TEST", early_price=100.0, late_price=96.0, previous_close=100.0, previous_low=97.0)
+    prev_day = gbc._previous_trading_day(DAY)
+    utc_midnight = f"{prev_day.isoformat()}T00:00:00Z"
+    for source_payload in data["sources"].values():
+        source_payload["TEST"]["previous_close_bar"]["timestamp"] = utc_midnight
+    candidates = _run(data, _config())
+    assert len(candidates) == 1
+    assert candidates[0]["ticker"] == "TEST"
+    assert candidates[0]["action"] == Action.BUY.value
+
+
 def test_previous_close_bar_with_midnight_utc_timestamp_accepted():
     """Daily bars timestamped at midnight UTC (00:00:00Z) carry the session
     date directly (e.g. Robinhood daily bars). Converting midnight UTC to ET

@@ -873,8 +873,14 @@ def build_document(
     _require_matching_runner_config_dir(config_dir)
 
     universe = tuple(t for t in config.tickers if t not in config.excluded_tickers)
+    allowed_extra_tickers = frozenset(config.excluded_tickers) | frozenset(
+        getattr(config, "whole_share_tickers", ()) or ()
+    )
     _validate_tickers(
-        f"--market-data's 'ticker_errors.{spec.source.value}'", ticker_errors, universe
+        f"--market-data's 'ticker_errors.{spec.source.value}'",
+        ticker_errors,
+        universe,
+        allow_extra=allowed_extra_tickers,
     )
     _validate_tickers("--already-covered-tickers", already_covered_tickers, universe)
 
@@ -887,11 +893,13 @@ def build_document(
         f"--market-data's 'sources.{spec.source.value}'",
         tuple(market_data),
         universe,
-        # An excluded ticker (BYDDY, which is not tradable for fractional buys)
-        # in the payload is a caller who fetched more than this slot trades, not
-        # a typo: harmless, since the executor never scores it. Rejecting it
-        # would force a separate fetch per stream for no safety gain.
-        allow_extra=frozenset(config.excluded_tickers),
+        # An excluded ticker (QBUT) or whole-share ticker (BYDDY, which is not
+        # tradable for fractional buys) in the payload is a caller who fetched
+        # more than this slot trades, not a typo: harmless, since the executor
+        # never scores it. Rejecting it would force a separate fetch per stream
+        # for no safety gain. Same recognized-tickers tolerance
+        # generate_buy_candidates applies across sources and ticker_errors.
+        allow_extra=allowed_extra_tickers,
     )
 
     accepted_error_sources = {spec.source.value} | {
@@ -1045,7 +1053,10 @@ def build_document(
     )
     alternate_market_data = alternate_market_data or {}
     _validate_tickers(
-        "--market-data's 'ticker_errors.robinhood'", alternate_ticker_errors, universe
+        "--market-data's 'ticker_errors.robinhood'",
+        alternate_ticker_errors,
+        universe,
+        allow_extra=allowed_extra_tickers,
     )
     override_providers: Dict[str, StreamMarketData] = {}
     for ticker, override_source in spec.ticker_source_overrides.items():

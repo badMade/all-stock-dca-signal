@@ -328,7 +328,7 @@ import json
 import math
 import os
 import sys
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
@@ -924,14 +924,15 @@ class _StaticMarketData:
                 # severity as a boolean/non-finite price above: a nonsensical
                 # bar date signals a broken caller payload, not a routine
                 # per-source outage the reconciler should route around.
-                # Daily bars timestamped at midnight UTC (00:00:00Z) carry the session
-                # date directly; converting midnight UTC to ET would subtract 4/5 hours
-                # and falsely shift the bar to the prior calendar day.
-                bar_date = (
-                    bar.timestamp.date()
-                    if bar.timestamp.time() == time(0, 0)
-                    else bar.timestamp.astimezone(ET).date()
-                )
+                # UTC-midnight daily bars label the session date directly, even
+                # though converting the timestamp to ET lands in the prior evening.
+                bar_date = bar.timestamp.astimezone(ET).date()
+                if (
+                    bar_date != previous_trading_day
+                    and bar.timestamp.astimezone(timezone.utc).time() == time(0, 0)
+                    and bar.timestamp.astimezone(timezone.utc).date() == previous_trading_day
+                ):
+                    bar_date = previous_trading_day
                 if bar_date != previous_trading_day:
                     raise ValueError(
                         f"previous_close_bar for {ticker!r} ({source.value}) is dated {bar_date}, "

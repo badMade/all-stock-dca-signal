@@ -726,7 +726,7 @@ def main(argv: list[str] | None = None) -> int:
     # future iteration could instead publish only for tickers currently
     # mid-dip, or refresh adjustments intraday.
     feature_frame = build_feature_frame(history_dir, tickers, as_of=as_of)
-    latest_rows = feature_frame.sort_values("date", kind="stable").drop_duplicates(subset=["ticker"], keep="last")
+    latest_rows = feature_frame.sort_values("date", kind="stable").groupby("ticker", as_index=False).tail(1)
 
     # A ticker whose archive refresh has stalled (or whose whole archive is
     # old) still has SOME latest row -- silently scoring it would let

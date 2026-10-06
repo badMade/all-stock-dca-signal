@@ -209,7 +209,7 @@ def test_market_open_does_not_gate_on_the_preflight_artifact(tmp_path):
     assert ex.preflight_gate is None
 
 
-# --- The ships-disabled placement switch ------------------------------------
+# --- The live placement switch ----------------------------------------------
 def test_shipped_market_open_config_has_execution_enabled():
     # Operator-promoted on 2026-10-04 for live Robinhood execution.
     cfg = load_market_open_config(allow_unpinned_account=True)

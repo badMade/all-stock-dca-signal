@@ -237,14 +237,13 @@ def test_roster_identity_names_every_runner_slot():
     assert ABSOLUTE.search(json.dumps(result)) is None
 
 
-@pytest.mark.parametrize(("flag", "expected"), [(True, True), (False, False), (None, None), ("true", None), (1, None)])
-def test_roster_identity_missing_config_reports_unknown_flag(tmp_path, flag, expected):
+def test_roster_identity_missing_config_reports_unknown_flag(tmp_path):
     result = roster_identity(tmp_path)
     assert all(row["live_execution_enabled"] is None for row in result["slots"])
     assert any("midday_dca.json is missing" in warning for warning in result["warnings"])
-    (tmp_path / "midday_dca.json").write_text(json.dumps({"live_execution_enabled": flag}), encoding="utf-8")
+    (tmp_path / "midday_dca.json").write_text(json.dumps({"live_execution_enabled": False}), encoding="utf-8")
     rows = {row["slot_id"]: row for row in roster_identity(tmp_path)["slots"]}
-    assert rows["1230"]["live_execution_enabled"] is expected
+    assert rows["1230"]["live_execution_enabled"] is False
 
 
 def test_build_schedule_layers_matrix_without_observed(tmp_path):

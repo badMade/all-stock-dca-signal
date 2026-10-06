@@ -342,7 +342,7 @@ def test_all_intraday_slots_validate_trend(tmp_path):
         assert IntradayDCAExecutor(_cfg(tmp_path), slot=slot).profile["validate_trend"] is True
 
 
-# --- The ships-disabled placement switch ------------------------------------
+# --- The live placement switch ----------------------------------------------
 def test_shipped_intraday_config_has_execution_enabled():
     # Operator-promoted on 2026-10-04 for live Robinhood execution.
     cfg = load_intraday_config(allow_unpinned_account=True)

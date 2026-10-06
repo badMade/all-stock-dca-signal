@@ -557,7 +557,7 @@ class ConsoleApp:
         self._load_demo_pointer()
 
     def _load_demo_pointer(self) -> None:
-        if self.settings.mode != "demo" or self.octopus_run is not None:
+        if self.octopus_run is not None:
             return
         pointer = self.settings.output / "demo" / "octopus-current.json"
         try:
@@ -565,8 +565,17 @@ class ConsoleApp:
             path = Path(value["path"]).resolve()
             if path.is_relative_to((self.settings.output / "demo" / "octopus").resolve()) and path.is_dir():
                 self.octopus_run = path
+                return
         except (OSError, ValueError, KeyError, TypeError):
             pass
+        demo_base = (self.settings.output / "demo" / "octopus").resolve()
+        if demo_base.is_dir():
+            candidates = sorted(
+                [p for p in demo_base.iterdir() if p.is_dir() and (p / "checkpoint").is_dir()],
+                reverse=True,
+            )
+            if candidates:
+                self.octopus_run = candidates[0]
 
     def default_day(self) -> date:
         """Return the pinned day or today's Eastern date for an unpinned session."""
@@ -652,8 +661,8 @@ class ConsoleApp:
              research and self.octopus_run is not None, update_reason),
             ("octopus-estimate", "Estimate archive replay", "Read the archive and estimate a quick replay; fits no models.",
              research, research_reason),
-            ("ticker-refresh-missing", "Refresh missing ticker data",
-             "Download missing daily OHLCV bars for active tickers from Yahoo chart feed (preserves existing data).",
+            ("ticker-refresh-missing", "Update active ticker data",
+             "Gather and update daily OHLCV bars for active DCA tickers from Yahoo chart feed.",
              True, ""),
             ("train-foundation-smoke", "Train Octopus foundation (smoke run)",
              "Run Stage 1 curriculum pre-training smoke run on PyTorch with the neural Octopus model.",
@@ -817,7 +826,7 @@ class ConsoleApp:
                     results.append(self._command(
                         daily_args, log, demo=True, research=True,
                     ))
-                if result == 0 and self.settings.mode == "demo":
+                if result == 0 and (self.settings.mode == "demo" or self.settings.octopus_run is None):
                     with self.lock:
                         self.octopus_run = target
                     atomic_write_text(self.settings.output / "demo" / "octopus-current.json",
@@ -855,7 +864,7 @@ class ConsoleApp:
                                          str(self.settings.root), "--output-dir",
                                          str(self.settings.output / "reports" / job_id)], log))
         if action == "ticker-refresh-missing":
-            results.append(self._command(["-m", "scripts.refresh_active_ticker_histories"], log, timeout=600))
+            results.append(self._command(["-m", "scripts.refresh_active_ticker_histories", "--force"], log, timeout=600))
         if action == "train-foundation-smoke":
             target = self.settings.output / "launches" / job_id
             results.append(self._command([
@@ -865,8 +874,9 @@ class ConsoleApp:
         with self.lock:
             self.cache.clear()
         snapshot = self.snapshot()
-        log("\n" + "\n".join(snapshot["daily"]["summary"]) + "\n")
-        log(f"Daily summaries: {self.settings.output / 'summaries' / self.settings.mode}\n")
+        if action in {"demo-all", "demo-dca", "reports"}:
+            log("\n" + "\n".join(snapshot["daily"]["summary"]) + "\n")
+            log(f"Daily summaries: {self.settings.output / 'summaries' / self.settings.mode}\n")
         return next((code for code in results if code != 0), 0)
 
 

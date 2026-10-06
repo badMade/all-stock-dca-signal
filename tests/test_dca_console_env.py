@@ -102,3 +102,52 @@ def test_env_route_is_strict_and_redacted(app, monkeypatch):
         assert data["access"]["auth"] == "none"
         assert "999000111" not in body.decode()
         assert request(server, "/api/env?x=1")[0] == 400
+
+def test_stray_root_files_edge_cases(tmp_path):
+    from dca_console_env import stray_root_files
+
+    repo = tmp_path / "mock_repo"
+    repo.mkdir()
+
+    # 1. Present static stray file
+    (repo / "midday_run.log").touch()
+
+    # 2. Dynamic root log file
+    (repo / "unknown_error.log").write_text("error log content")
+
+    # 3. Another root log file
+    (repo / "another.log").touch()
+
+    # 4. Non-log root file (should be ignored by dynamic scan)
+    (repo / "ignored.txt").touch()
+
+    # 5. Deeply nested log file (should be ignored by dynamic scan)
+    nested = repo / "deep"
+    nested.mkdir()
+    (nested / "nested.log").touch()
+
+    rows = stray_root_files(repo)
+
+    names = {r["name"]: r for r in rows}
+
+    # Static stray present
+    assert "midday_run.log" in names
+    assert names["midday_run.log"]["present"] is True
+
+    # Static stray missing
+    assert "signal_generation.log" in names
+    assert names["signal_generation.log"]["present"] is False
+    assert names["signal_generation.log"]["size"] is None
+
+    # Dynamic strays
+    assert "unknown_error.log" in names
+    assert names["unknown_error.log"]["present"] is True
+    assert names["unknown_error.log"]["note"] == "Root-level log file"
+    assert names["unknown_error.log"]["size"] == len("error log content")
+
+    assert "another.log" in names
+    assert names["another.log"]["present"] is True
+
+    # Ignored files
+    assert "ignored.txt" not in names
+    assert "deep/nested.log" not in names

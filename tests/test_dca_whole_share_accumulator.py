@@ -559,7 +559,7 @@ def test_cached_fire_decision_is_zero_shares_once_resolved(tmp_path):
     assert decision.shares_to_buy == 0
     assert decision.order_notional_usd == 0.0
     # Codex review ("Report zero contribution for resolved slot retries"):
-    # mirrors record_contribution's own fix for this preview path too.
+    # mirrors record_contribution's own logic for this preview path too.
     assert decision.contribution_usd == 0.0
 
 

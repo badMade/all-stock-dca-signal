@@ -945,7 +945,7 @@ window.ConsolePages = (() => {
       try {
         const data = await fetchJson("/api/research", { ttl: 30000 });
         const fingerprint = JSON.stringify(data);
-        if (fingerprint === lastResearch) return;
+        if (fingerprint === lastResearch && researchExtra.querySelector(".panel:not(.empty-state)")) return;
         lastResearch = fingerprint;
         const artifactLink = (job, item) => {
           const link = text("a", "", `${item.name} (${item.kind})`);
@@ -993,12 +993,13 @@ window.ConsolePages = (() => {
   const tickersSection = document.querySelector('section.page[data-page="tickers"]');
   if (tickersSection) {
     let lastTickers = "";
-    register("tickers", async () => {
-      loading(tickersSection, "Loading ticker universe and checking data freshness...");
+    register("tickers", async (snapshot) => {
       try {
         const data = await fetchJson("/api/tickers", { ttl: 20000 });
-        const fingerprint = JSON.stringify(data);
-        if (fingerprint === lastTickers) return;
+        const jobs = Array.isArray(snapshot?.jobs) ? snapshot.jobs : [];
+        const running = jobs.some((job) => job.action === "ticker-refresh-missing" && ["running", "queued"].includes(job.status));
+        const fingerprint = JSON.stringify([data, running]);
+        if (fingerprint === lastTickers && tickersSection.querySelector(".metrics-grid")) return;
         lastTickers = fingerprint;
 
         const metrics = text("section", "metrics-grid");
@@ -1019,13 +1020,20 @@ window.ConsolePages = (() => {
         actionLeft.append(text("h3", "", "Ticker Archive & Historical Bars"), text("p", "muted compact", `Archive: ${data.archive?.label || "ticker_data"} · Status: ${data.archive?.available ? "Connected" : "Not connected"}`));
         actionTop.append(actionLeft);
 
-        const refreshBtn = text("button", "button primary small", "↻ Refresh Missing Histories");
+        const refreshBtn = text("button", "button primary small", running ? "↻ Updating Tickers..." : "↻ Update Ticker Histories");
         refreshBtn.type = "button";
+        refreshBtn.disabled = running;
         refreshBtn.addEventListener("click", () => {
+          refreshBtn.disabled = true;
+          refreshBtn.textContent = "↻ Starting update...";
           if (typeof window.startJob === "function") window.startJob("ticker-refresh-missing");
         });
         actionTop.append(refreshBtn);
         actionStrip.append(actionTop);
+
+        if (running) {
+          actionStrip.append(text("div", "notice", "Ticker gathering process in progress: fetching latest daily bars from Yahoo chart feed..."));
+        }
 
         if (Array.isArray(data.archive?.recent_logs) && data.archive.recent_logs.length) {
           const logBlock = text("div", "subtle-json");
@@ -1106,11 +1114,13 @@ window.ConsolePages = (() => {
   if (trainingSection) {
     let lastTraining = "";
     register("training", async (snapshot) => {
-      loading(trainingSection, "Loading model training options, loss history and diagnostics...");
+      if (!trainingSection.querySelector(".actions-grid")) {
+        loading(trainingSection, "Loading model training options, loss history and diagnostics...");
+      }
       try {
         const data = await fetchJson("/api/training", { ttl: 6000 });
         const fingerprint = JSON.stringify(data) + (snapshot?.jobs?.map(j => `${j.id}:${j.status}`).join(",") || "");
-        if (fingerprint === lastTraining) return;
+        if (fingerprint === lastTraining && trainingSection.querySelector(".actions-grid")) return;
         lastTraining = fingerprint;
 
         const hw = data.hardware || {};
