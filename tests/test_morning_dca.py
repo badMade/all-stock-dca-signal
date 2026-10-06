@@ -337,20 +337,23 @@ def test_ladder_brackets():
     # test only asserts multiplier brackets, not dollar amounts, so it uses the
     # default base_buy_amount_usd rather than overriding it.
     ex = MorningDCAExecutor(MorningConfig())
+    # 2026-10-04 ladder rescale (c31d660): log-scaled 0.1%-16% -> 1x-8x, so the
+    # expected multipliers below were recomputed from config/morning_dca.json.
     cases = {
         0.0005: 0.0,  # < 0.1%  -> 0x
         0.001: 1.0,  # 0.1%    -> 1x
-        0.019: 1.0,  # < 2%    -> 1x
-        0.020: 1.5,  # 2%      -> 1.5x
-        0.039: 1.5,  # < 4%    -> 1.5x
-        0.040: 2.0,  # 4%      -> 2x
-        0.050: 2.5,  # 5%      -> 2.5x
-        0.060: 3.0,  # 6%      -> 3x
-        0.065: 3.5,  # 6.5%    -> 3.5x
-        0.070: 4.0,  # 7%      -> 4x
-        0.075: 4.5,  # 7.5%    -> 4.5x
-        0.080: 5.0,  # 8%      -> 5x
-        0.20: 5.0,  # >= 8%   -> 5x (no upper cutoff)
+        0.019: 2.5,  # 1.5-2%  -> 2.5x
+        0.020: 3.0,  # 2%      -> 3x
+        0.039: 4.0,  # 3.5-4.5% -> 4x
+        0.040: 4.0,  # 4%      -> 4x
+        0.050: 4.5,  # 5%      -> 4.5x
+        0.060: 5.0,  # 6%      -> 5x
+        0.065: 5.0,  # 6.5%    -> 5x
+        0.070: 5.5,  # 7%      -> 5.5x
+        0.075: 5.5,  # 7.5%    -> 5.5x
+        0.080: 5.5,  # 8%      -> 5.5x
+        0.16: 8.0,  # >= 16%  -> 8x
+        0.20: 8.0,  # >= 16%  -> 8x (no upper cutoff)
     }
     for drop, expected in cases.items():
         assert ex.multiplier_for_drop(drop) == expected, (drop, expected)
@@ -361,8 +364,9 @@ def test_ladder_matches_afternoon_live():
     from near_close_dca import StrategyConfig, graded_buy_multiplier
 
     morning = MorningDCAExecutor(MorningConfig())
-    assert morning.multiplier_for_drop(0.08) == 5.0
-    assert graded_buy_multiplier(0.08, StrategyConfig()) == 5.0
+    # 2026-10-04 ladder rescale: 8% is now 5.5x (the 8x cap starts at 16%).
+    assert morning.multiplier_for_drop(0.08) == 5.5
+    assert graded_buy_multiplier(0.08, StrategyConfig()) == 5.5
     assert MORNING_SIZING_TIERS == StrategyConfig().sizing_tiers
 
 
@@ -387,10 +391,11 @@ def test_signal_amounts_and_actions():
     assert sigs["TINY"].selected_base_amount_usd == 0.0
     assert sigs["TINY"].base_selection_reason == "not_below_prior_close_no_buy"
     assert sigs["SMALL"].action == Action.BUY
-    assert sigs["SMALL"].multiplier == 1.5  # 3% drop -> 1.5x on the 0x-to-5x ladder
-    assert sigs["SMALL"].hypothetical_amount_usd == 3.0
-    assert sigs["BIG"].multiplier == 5.0  # 10% drop -> 5x
-    assert sigs["BIG"].hypothetical_amount_usd == 10.0
+    # 2026-10-04 ladder rescale: 3% -> 3.5x, 10% -> 6x on the log-scaled 0x-to-8x ladder.
+    assert sigs["SMALL"].multiplier == 3.5
+    assert sigs["SMALL"].hypothetical_amount_usd == 7.0
+    assert sigs["BIG"].multiplier == 6.0
+    assert sigs["BIG"].hypothetical_amount_usd == 12.0
 
 
 def test_signal_zero_multiplier_below_configured_minimum_drop_normalizes_to_no_action():
@@ -435,18 +440,19 @@ class FixedDropProviderWithLow(FixedDropProvider):
 
 def test_morning_dynamic_first_allocation_base():
     # Two tickers at the same 3% drop (1.5x) but on opposite sides of the prior low.
-    # SHALLOW closes at 97 (below prior close 100, above prior low 96) -> $1 base -> $1.50.
-    # DEEP closes at 97 too but with a higher prior low so it is below both -> $2 base -> $3.00.
+    # SHALLOW closes at 97 (below prior close 100, above prior low 96) -> $1 base -> $3.50.
+    # DEEP closes at 97 too but with a higher prior low so it is below both -> $2 base -> $7.00.
+    # 2026-10-04 ladder rescale: a 3% drop is now 3.5x (was 1.5x).
     cfg = MorningConfig(tickers=("SHALLOW",), base_buy_amount_usd=2.0, base_buy_amount_below_close_usd=1.0)
     ex = MorningDCAExecutor(cfg)
     shallow = FixedDropProviderWithLow(SourceName.ROBINHOOD, 100.0, {"SHALLOW": 0.03}, previous_low=96.0)
     sig = ex.evaluate(_now(), shallow)[0]
     assert sig.action == Action.BUY
-    assert sig.multiplier == 1.5
+    assert sig.multiplier == 3.5
     assert sig.previous_low == 96.0
     assert sig.selected_base_amount_usd == 1.0
     assert sig.base_selection_reason == "below_prior_close_only"
-    assert sig.hypothetical_amount_usd == 1.5
+    assert sig.hypothetical_amount_usd == 3.5
 
     cfg_deep = MorningConfig(tickers=("DEEP",), base_buy_amount_usd=2.0, base_buy_amount_below_close_usd=1.0)
     deep = FixedDropProviderWithLow(SourceName.ROBINHOOD, 100.0, {"DEEP": 0.03}, previous_low=98.0)
@@ -454,7 +460,7 @@ def test_morning_dynamic_first_allocation_base():
     assert sig_deep.action == Action.BUY
     assert sig_deep.selected_base_amount_usd == 2.0
     assert sig_deep.base_selection_reason == "below_prior_close_and_low"
-    assert sig_deep.hypothetical_amount_usd == 3.0
+    assert sig_deep.hypothetical_amount_usd == 7.0
 
 
 class FixedQuoteProvider(FixedDropProvider):
@@ -705,7 +711,7 @@ def test_build_artifacts_does_not_double_count_ledger(tmp_path):
         morning_run_state_root=str(tmp_path),
     )
     ex = MorningDCAExecutor(cfg)
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.06})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     now = _now()
     day = now.astimezone(EASTERN).date()
 
@@ -1399,7 +1405,7 @@ def test_morning_run_reviews_places_and_records_orders_csv(tmp_path):
     # bypasses the preflight-gate/approved-window checks for this unit test.
     cfg = MorningConfig(tickers=("SMALL",), base_buy_amount_usd=3.0, morning_run_state_root=str(tmp_path))
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     broker = DryRunBroker(account="999000111", reference_prices={"SMALL": 97.0})
 
     res = ex.run(_now_live(), data, broker=broker, manual=True)
@@ -1465,7 +1471,7 @@ class RecordingLiveBroker(FakeLiveBroker):
 def test_morning_artifacts_include_planned_amount_for_prior_allocation_loader(tmp_path):
     cfg = MorningConfig(tickers=("SMALL",), base_buy_amount_usd=3.0, morning_run_state_root=str(tmp_path))
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     broker = DryRunBroker(account="999000111", reference_prices={"SMALL": 97.0})
 
     res = ex.run(_now_live(), data, broker=broker, manual=True)
@@ -1488,7 +1494,7 @@ def test_morning_live_orders_are_blocked_before_exceeding_daily_cap(tmp_path):
         morning_run_state_root=str(tmp_path),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03, "BBB": 0.03})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.007, "BBB": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     broker = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 97.0, "BBB": 97.0})
 
     res = ex.run(_now_live(), data, broker=broker, manual=True)
@@ -1524,7 +1530,7 @@ def test_morning_live_ledger_seeds_cap_spend_from_earlier_same_process_day_run(t
         morning_run_state_root=str(tmp_path),
     )
     ex1 = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
+    data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     broker1 = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 97.0})
     res1 = ex1.run(_now_live(), data1, broker=broker1, manual=True)
     assert res1["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
@@ -1539,7 +1545,7 @@ def test_morning_live_ledger_seeds_cap_spend_from_earlier_same_process_day_run(t
         morning_run_state_root=str(tmp_path),
     )
     ex2 = MorningDCAExecutor(cfg2, mode=MORNING_LIVE_MODE)
-    data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
+    data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     broker2 = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
     res2 = ex2.run(_now_live(), data2, broker=broker2, manual=True)
 
@@ -1564,7 +1570,7 @@ def test_morning_live_ledger_seeds_weekly_cap_from_earlier_day_same_week(tmp_pat
         morning_run_state_root=str(tmp_path),
     )
     ex1 = MorningDCAExecutor(cfg1, mode=MORNING_LIVE_MODE)
-    data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
+    data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     broker1 = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 97.0})
     res1 = ex1.run(monday, data1, broker=broker1, manual=True)
     assert res1["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
@@ -1579,7 +1585,7 @@ def test_morning_live_ledger_seeds_weekly_cap_from_earlier_day_same_week(tmp_pat
         morning_run_state_root=str(tmp_path),
     )
     ex2 = MorningDCAExecutor(cfg2, mode=MORNING_LIVE_MODE)
-    data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
+    data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     broker2 = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
     res2 = ex2.run(_now_live(), data2, broker=broker2, manual=True)
 
@@ -4200,7 +4206,7 @@ def test_morning_live_no_broker_does_not_record_hypothetical_ledger_spend(tmp_pa
     # (hypothetical_amount_usd > 0); FixedDropProvider's flat intraday bars fail
     # trend validation, routing SMALL to manual_review_candidate instead, which
     # would make this test pass vacuously regardless of the fix.
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     res = ex.run(_now_live(), data, manual=True, broker=None)
     assert res["artifacts"].get("status") != "blocked"
     sm = res["artifacts"]["buy_candidates"][0]
@@ -6595,7 +6601,7 @@ def test_morning_top_up_guard_buys_incremental_when_prior_fill_exists(tmp_path):
             return f"ORDER-{ticker}"
 
     prior_root = tmp_path / "prior"
-    _write_prior_run_state(prior_root, "TOPUP", amount_usd=4.50, decision_price=99.0, selected_base_amount_usd=3.0)
+    _write_prior_run_state(prior_root, "TOPUP", amount_usd=10.50, decision_price=99.0, selected_base_amount_usd=3.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
@@ -6608,7 +6614,8 @@ def test_morning_top_up_guard_buys_incremental_when_prior_fill_exists(tmp_path):
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _Broker()
     # 3% drop: current $97.0 < prior ref $99.0 → incremental eligible
-    # desired = 1.5x * $3.00 = $4.50; ladder_inc = $4.50 - $4.50 = $0;
+    # 2026-10-04 ladder rescale: 3% is now 3.5x (was 1.5x), so the prior fill is $10.50.
+    # desired = 3.5x * $3.00 = $10.50; ladder_inc = $10.50 - $10.50 = $0;
     # price_step = max($1, $99-$97=$2) = $2 → incremental = $2.00
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
     res = ex.run(_now_live(), data, broker=broker)
@@ -7286,7 +7293,7 @@ def test_run_persists_ambiguous_placement_marker_in_candidate_rows(tmp_path):
 
     cfg = MorningConfig(tickers=("AAPL",), morning_run_state_root=str(tmp_path))
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.02})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.0075})  # 2026-10-04 ladder rescale: 0.75% keeps the old 1.5x ($3)
 
     result = ex.run(_now_live(), data, broker=_AmbiguousBroker(), manual=True)
 
@@ -7759,7 +7766,7 @@ def test_morning_top_up_guard_inactive_in_watchlist_mode(tmp_path):
     )
     # Default mode is watchlist — no preflight root needed, no broker.
     ex = MorningDCAExecutor(cfg)
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     res = ex.run(_now(), data)
     candidates = {r["ticker"]: r for r in res["artifacts"].get("buy_candidates", [])}
     assert "TOPUP" in candidates
@@ -7953,7 +7960,7 @@ def test_morning_top_up_guard_afternoon_fills_do_not_reduce_morning_cap(tmp_path
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _Broker()
     # 3% drop: TOPUP desired = 1.5x * $3 = $4.50; full $90 cap available
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     res = ex.run(_now_live(), data, broker=broker)
     broker_outcomes = res["artifacts"].get("broker_outcomes", {})
     assert broker_outcomes.get("TOPUP", {}).get("status") == "submitted", (
@@ -8186,7 +8193,7 @@ def test_cap_seed_scan_failure_poison_clears_on_a_recovered_rescan(tmp_path, mon
 
     monkeypatch.setattr(_md, "load_prior_same_day_allocations_multi", _fake_loader)
 
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
 
     # First run: cap artifact unreadable -> fail closed, cap fully exhausted.
     broker1 = _Broker()
@@ -8970,7 +8977,7 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.03})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
 
     # Step 1: manual run at 9:35 AM — buys TICK ($4.50), writes artifact to manual_runs/.
     # Use an earlier timestamp so the artifact's generated_at is before the 10:30 AM
@@ -9298,7 +9305,7 @@ def test_morning_ledger_seed_still_covers_scheduled_slot_when_cap_roots_are_manu
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex1 = MorningDCAExecutor(cfg1, mode=MORNING_LIVE_MODE)
-    data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
+    data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     broker1 = RecordingLiveBroker(account="999000111", reference_prices={"AAA": 97.0})
     res1 = ex1.run(_now_live(), data1, broker=broker1)
     assert res1["artifacts"]["broker_outcomes"]["AAA"]["status"] == "submitted"
@@ -9316,7 +9323,7 @@ def test_morning_ledger_seed_still_covers_scheduled_slot_when_cap_roots_are_manu
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex2 = MorningDCAExecutor(cfg2, mode=MORNING_LIVE_MODE)
-    data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
+    data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     broker2 = RecordingLiveBroker(account="999000111", reference_prices={"BBB": 97.0})
     res2 = ex2.run(_now_live() + timedelta(minutes=1), data2, broker=broker2)
 
@@ -9376,7 +9383,7 @@ def test_morning_top_up_guard_no_prior_run_when_default_roots_empty(tmp_path):
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _Broker()
     # 3% drop → desired 1.5x * $3.00 = $4.50; no prior fill → full amount placed
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     res = ex.run(_now_live(), data, broker=broker)
     candidates = {r["ticker"]: r for r in res["artifacts"].get("buy_candidates", [])}
     assert "TOPUP" in candidates
@@ -9494,7 +9501,7 @@ def test_morning_live_applies_prior_manual_offset_incremental(tmp_path):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _TopUpBroker()
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.06})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     res = ex.run(_now_live(), data, broker=broker)
     assert "NVDA" in broker.placed, (
         f"expected incremental order; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
@@ -9558,7 +9565,7 @@ def test_morning_live_top_up_accounts_for_broker_spend(tmp_path, monkeypatch, br
     )
     assert broker.same_day_ticker_notional_usd("NVDA", now.date()) == broker_prior_usd
     executor = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.06})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     result = executor.run(now, data, broker=broker, manual=False)
 
     # The preserved $2 base and 10% decline produce a $10 ladder target.
@@ -9654,7 +9661,7 @@ def test_morning_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id(tm
     # Step 1: manual run, 3% drop -> 1.5x * $3 = $4.50 placed with the
     # ORDINARY ref_id (top-up computation is disabled for manual+MORNING).
     manual_now = datetime.combine(date(2026, 7, 8), time(9, 35), tzinfo=EASTERN)
-    manual_data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.03})
+    manual_data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     manual_res = ex.run(manual_now, manual_data, broker=broker, manual=True)
     assert broker.placed.get("NVDA") == pytest.approx(4.5)
     manual_ref_ids = list(broker._ref_ids)
@@ -9675,7 +9682,7 @@ def test_morning_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id(tm
     # manual fill above is now visible as a prior allocation ($4.50 at the
     # manual run's decision price), so this should compute an incremental
     # top-up and actually place it, not skip it as a phantom duplicate.
-    scheduled_data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    scheduled_data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.06})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     res = ex.run(_now_live(), scheduled_data, broker=broker)
     outcomes = res["artifacts"].get("broker_outcomes", {})
     nvda_outcome = outcomes.get("NVDA", {})
@@ -9719,7 +9726,7 @@ def test_morning_scheduled_top_up_duplicate_preserves_original_submitted_amount(
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _RefIdTrackingBroker()
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.06})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
 
     # First scheduled attempt: no prior allocation yet -> full $15 placed
     # with the ordinary (non-topup) ref_id.
@@ -9786,7 +9793,7 @@ def test_morning_scheduled_duplicate_with_pending_prior_preserves_sent_amount(tm
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _DuplicateWithoutAmountBroker()
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.06})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
 
     first = ex.run(_now_live(), data, broker=broker)
     run_state_path = Path(first["paths"]["run_state"])
@@ -9845,7 +9852,7 @@ def test_morning_scheduled_duplicate_with_pending_prior_without_amount_fails_clo
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _DuplicateWithoutAmountBroker()
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.06})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
 
     first = ex.run(_now_live(), data, broker=broker)
     run_state_path = Path(first["paths"]["run_state"])
@@ -9895,7 +9902,7 @@ def test_morning_scheduled_duplicate_check_preserved_when_cap_fully_consumed(tmp
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _RefIdTrackingBroker()
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.06})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
 
     first = ex.run(_now_live(), data, broker=broker)
     assert broker.placed.get("NVDA") == pytest.approx(12.0)
@@ -9941,7 +9948,7 @@ def test_morning_scheduled_duplicate_not_rebooked_into_ledger(tmp_path):
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _RefIdTrackingBroker()
     # 10% drop -> 5x * $3 = $15 desired; incremental = $15 - $3 = $12.
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.06})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
 
     ex.run(_now_live(), data, broker=broker)
     assert ex.ledger.day_planned(date(2026, 7, 8)) == pytest.approx(12.0)
@@ -9990,7 +9997,7 @@ def test_morning_live_full_buy_when_no_prior_allocation(tmp_path):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _TopUpBroker()
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.06})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     res = ex.run(_now_live(), data, broker=broker)
     assert "NVDA" in broker.placed, f"expected full buy; broker.placed={broker.placed}"
     assert abs(broker.placed["NVDA"] - 10.0) < 0.01, f"expected $10; got {broker.placed['NVDA']}"
@@ -10134,7 +10141,7 @@ def test_morning_live_prior_from_configured_root_only(tmp_path):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _TopUpBroker()
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.06})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     res = ex.run(_now_live(), data, broker=broker)
     # Configured root contributes $3 only → incremental $8, not no_incremental.
     assert "NVDA" in broker.placed, (
@@ -10171,7 +10178,7 @@ def test_morning_live_default_roots_include_market_open(tmp_path, monkeypatch):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _TopUpBroker()
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.06})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     res = ex.run(_now_live(), data, broker=broker)
     assert "NVDA" in broker.placed, (
         f"expected incremental order; broker_outcomes={res['artifacts'].get('broker_outcomes')}"
@@ -10463,7 +10470,7 @@ def test_morning_cap_seeding_own_amount_scoped_to_cap_roots(tmp_path):
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.03})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
 
     # Step 1: manual run buys TICK ($4.50) → _own_recorded[day]=4.50
     _now_manual = datetime.combine(date(2026, 7, 8), time(9, 35), tzinfo=EASTERN)
@@ -10811,7 +10818,7 @@ def test_morning_live_same_stream_check_ignores_manual_fill_ref_id(tmp_path):
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _ManualFillBroker()
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.06})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     res = ex.run(_now_live(), data, broker=broker)
     # The incremental top-up ($15 - $3 = $12) must be placed.  _same_stream_order_exists
     # checks morning-dca-topup-* and morning-dca-<date>-*, neither of which matches the
@@ -13546,7 +13553,7 @@ def test_terminal_rejection_with_unreadable_quantity_halts_the_batch(tmp_path, m
         return {"data": {"order": {"id": "ORD-NVDA", "state": "confirmed"}}}
 
     ex = _live_executor(tmp_path, ("AAPL", "NVDA"))
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.10, "NVDA": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.06, "NVDA": 0.06})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     broker = RobinhoodBroker(
         place_fn=_place_fn,
         buying_power_fn=lambda **_kwargs: {"buying_power": "1000"},
@@ -13787,7 +13794,7 @@ def test_generic_placement_exception_halt_preserves_credit_for_unreached_candida
                 raise RuntimeError("unexpected broker connector crash")
             return super().place_market_buy(ticker, notional_usd, ref_id)
 
-    # TOPUP: prior same-day fill of $4.50 at reference $99.0, base $3.00.
+    # TOPUP: prior same-day fill of $10.50 at reference $99.0 (2026-10-04 ladder rescale: 3% is now 3.5x), base $3.00.
     # 3% drop to $97.0 -> ladder_incremental == 0 but the $2.00 price-step
     # floor routes through the cumulative-credit policy, crossing the order
     # threshold immediately (cumulative_credit_decline_usd == 2.0,
@@ -13795,7 +13802,7 @@ def test_generic_placement_exception_halt_preserves_credit_for_unreached_candida
     # test_morning_top_up_guard_buys_incremental_when_prior_fill_exists for
     # the identical math worked out in isolation.
     prior_root = tmp_path / "prior"
-    _write_prior_run_state(prior_root, "TOPUP", amount_usd=4.50, decision_price=99.0, selected_base_amount_usd=3.0)
+    _write_prior_run_state(prior_root, "TOPUP", amount_usd=10.50, decision_price=99.0, selected_base_amount_usd=3.0)
     pf_root = _seed_preflight(tmp_path / "pf", ("AAPL", "TOPUP"))
     cfg = MorningConfig(
         tickers=("AAPL", "TOPUP"),
@@ -13804,7 +13811,7 @@ def test_generic_placement_exception_halt_preserves_credit_for_unreached_candida
         preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
-        # A 10% drop's 5x graded multiplier * $3 base = $15, over the default
+        # A 6% drop's 5x graded multiplier * $3 base = $15, over the default
         # $10 per-order ceiling -- that gate runs BEFORE the broker call, so
         # a raised ceiling is needed here for AAPL's placement (not just its
         # ladder eligibility) to actually be attempted.
@@ -13813,7 +13820,7 @@ def test_generic_placement_exception_halt_preserves_credit_for_unreached_candida
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     ex.credit_ledger = CumulativeCreditLedger(root=tmp_path / "credits")
     broker = _UnexpectedPlacementExceptionBroker()
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.10, "TOPUP": 0.03})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.06, "TOPUP": 0.03})
 
     res = ex.run(_now_live(), data, broker=broker)
 
@@ -15924,7 +15931,7 @@ def test_morning_scheduled_top_up_duplicate_preserves_ambiguous_amount_without_b
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     broker = _AmbiguousThenLegacyDupBroker()
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.06})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
 
     # First scheduled attempt: no prior allocation -> full $15 desired,
     # placement raises OrderPlacementAmbiguousError.
@@ -16238,3 +16245,324 @@ def test_same_stream_order_exists_asks_for_every_entry_points_family(tmp_path):
     assert "graded-dca-morning-2026-07-08-AAPL" in asked[0]
     assert "dca-runner-1030-2026-07-08-AAPL" in asked[0]
     assert "morning-dca-manual-2026-07-08-AAPL" not in asked[0]
+
+
+# --- GFUZ Supplemental Preflight Tests (2026-10-04) ---------------------------
+def test_gfuz_supplemental_preflight_absent_validator_gates_out(tmp_path):
+    """When GFUZ is absent from a valid preflight and no validator is provided,
+    GFUZ remains gated out fail-closed (regression test)."""
+    from morning_dca import morning_preflight_eligible_tickers
+
+    pf_root = tmp_path / "preflight"
+    _seed_preflight(pf_root, ("AAPL",))
+
+    now = _now_live()
+    admitted, gate = morning_preflight_eligible_tickers(
+        now,
+        ["AAPL", "GFUZ"],
+        preflight_run_state_root=str(pf_root),
+        supplemental_validator=None,
+    )
+
+    assert admitted == ["AAPL"]
+    assert gate["gated_out_tickers"] == ["GFUZ"]
+    assert gate["gfuz_supplemental"] == {"attempted": False, "reason": "no_supplemental_validator"}
+
+
+def test_gfuz_supplemental_preflight_valid_admits_gfuz_and_persists_artifact(tmp_path):
+    """When validator returns valid=True, GFUZ is admitted, and
+    gfuz_supplemental_preflight.json is persisted before decisioning."""
+    from morning_dca import morning_preflight_eligible_tickers
+
+    pf_root = tmp_path / "preflight"
+    _seed_preflight(pf_root, ("AAPL",))
+    out_dir = tmp_path / "1030_out"
+
+    called_with = []
+
+    def mock_validator(ticker: str):
+        called_with.append(ticker)
+        return {
+            "valid": True,
+            "ticker": ticker,
+            "broker": "robinhood",
+            "price": 12.34,
+            "checked_at": "2026-07-08T10:29:00Z",
+        }
+
+    now = _now_live()
+    admitted, gate = morning_preflight_eligible_tickers(
+        now,
+        ["AAPL", "GFUZ"],
+        preflight_run_state_root=str(pf_root),
+        supplemental_validator=mock_validator,
+        output_dir=out_dir,
+    )
+
+    assert called_with == ["GFUZ"]
+    assert admitted == ["AAPL", "GFUZ"]
+    assert gate["gated_out_tickers"] == []
+    assert gate["gfuz_supplemental"]["attempted"] is True
+    assert gate["gfuz_supplemental"]["valid"] is True
+
+    persisted_path = out_dir / "gfuz_supplemental_preflight.json"
+    assert persisted_path.exists()
+    payload = json.loads(persisted_path.read_text(encoding="utf-8"))
+    assert payload["valid"] is True
+    assert payload["ticker"] == "GFUZ"
+
+
+def test_gfuz_supplemental_preflight_invalid_or_raises_fails_closed(tmp_path):
+    """If supplemental validator returns valid=False, raises, or returns a non-mapping,
+    GFUZ stays gated out fail-closed."""
+    from morning_dca import morning_preflight_eligible_tickers
+
+    pf_root = tmp_path / "preflight"
+    _seed_preflight(pf_root, ("AAPL",))
+
+    now = _now_live()
+
+    # Case 1: validator returns valid=False
+    def invalid_validator(ticker: str):
+        return {"valid": False, "reason": "wide_spread"}
+
+    admitted, gate = morning_preflight_eligible_tickers(
+        now,
+        ["AAPL", "GFUZ"],
+        preflight_run_state_root=str(pf_root),
+        supplemental_validator=invalid_validator,
+        output_dir=tmp_path / "out1",
+    )
+    assert admitted == ["AAPL"]
+    assert gate["gated_out_tickers"] == ["GFUZ"]
+    assert gate["gfuz_supplemental"]["valid"] is False
+    assert gate["gfuz_supplemental"]["reason"] == "wide_spread"
+
+    # Case 2: validator raises
+    def exploding_validator(ticker: str):
+        raise ConnectionError("network unreachable")
+
+    admitted, gate = morning_preflight_eligible_tickers(
+        now,
+        ["AAPL", "GFUZ"],
+        preflight_run_state_root=str(pf_root),
+        supplemental_validator=exploding_validator,
+        output_dir=tmp_path / "out2",
+    )
+    assert admitted == ["AAPL"]
+    assert gate["gated_out_tickers"] == ["GFUZ"]
+    assert gate["gfuz_supplemental"]["valid"] is False
+    # Class name only: the injected connector's message ("network unreachable")
+    # can carry response bodies or credentials and must not reach run artifacts.
+    assert gate["gfuz_supplemental"]["error"] == "validator raised ConnectionError"
+    assert "network unreachable" not in json.dumps(gate)
+
+    # Case 3: validator returns non-mapping
+    def bad_type_validator(ticker: str):
+        return "not a mapping"
+
+    admitted, gate = morning_preflight_eligible_tickers(
+        now,
+        ["AAPL", "GFUZ"],
+        preflight_run_state_root=str(pf_root),
+        supplemental_validator=bad_type_validator,
+        output_dir=tmp_path / "out3",
+    )
+    assert admitted == ["AAPL"]
+    assert gate["gated_out_tickers"] == ["GFUZ"]
+    assert gate["gfuz_supplemental"]["valid"] is False
+    assert "non-mapping" in gate["gfuz_supplemental"]["error"]
+
+
+def test_gfuz_supplemental_preflight_never_called_if_gfuz_in_preflight(tmp_path):
+    """If GFUZ was already declared eligible in the 9:45 preflight, the supplemental
+    validator is never invoked."""
+    from morning_dca import morning_preflight_eligible_tickers
+
+    pf_root = tmp_path / "preflight"
+    _seed_preflight(pf_root, ("AAPL", "GFUZ"))
+
+    called = []
+
+    def mock_validator(ticker: str):
+        called.append(ticker)
+        return {"valid": True}
+
+    now = _now_live()
+    admitted, gate = morning_preflight_eligible_tickers(
+        now,
+        ["AAPL", "GFUZ"],
+        preflight_run_state_root=str(pf_root),
+        supplemental_validator=mock_validator,
+    )
+    assert called == []
+    assert admitted == ["AAPL", "GFUZ"]
+    assert "gfuz_supplemental" not in gate
+
+
+def test_gfuz_supplemental_preflight_missing_or_empty_preflight_leaves_full_universe(tmp_path):
+    """If the preflight artifact is missing or has empty eligible list (degraded mode),
+    the preflight gate degrades to full universe and does not call supplemental validator."""
+    from morning_dca import morning_preflight_eligible_tickers
+
+    called = []
+
+    def mock_validator(ticker: str):
+        called.append(ticker)
+        return {"valid": True}
+
+    now = _now_live()
+    # Missing preflight
+    admitted, gate = morning_preflight_eligible_tickers(
+        now,
+        ["AAPL", "GFUZ"],
+        preflight_run_state_root=str(tmp_path / "nonexistent"),
+        supplemental_validator=mock_validator,
+    )
+    assert called == []
+    assert admitted == ["AAPL", "GFUZ"]
+    assert gate["preflight_found"] is False
+    assert "gfuz_supplemental" not in gate
+
+
+def test_morning_dca_executor_threads_supplemental_validator(tmp_path):
+    """MorningDCAExecutor receives supplemental_validator in constructor and
+    threads it into _apply_preflight_gate."""
+    pf_root = tmp_path / "preflight"
+    _seed_preflight(pf_root, ("AAPL",))
+    run_root = tmp_path / "morning_runs"
+
+    cfg = MorningConfig(
+        tickers=("AAPL", "GFUZ"),
+        morning_run_state_root=str(run_root),
+        preflight_run_state_root=str(pf_root),
+    )
+
+    validator_called = []
+
+    def mock_validator(ticker: str):
+        validator_called.append(ticker)
+        return {"valid": True, "ticker": ticker}
+
+    ex = MorningDCAExecutor(cfg, mode="live", supplemental_validator=mock_validator)
+    assert ex.supplemental_validator is mock_validator
+
+    now = _now_live()
+    admitted = ex._apply_preflight_gate(now, ["AAPL", "GFUZ"], manual=False)
+    assert validator_called == ["GFUZ"]
+    assert admitted == ["AAPL", "GFUZ"]
+    assert ex.preflight_gate is not None
+    assert ex.preflight_gate["gfuz_supplemental"]["valid"] is True
+
+
+def test_morning_dca_executor_run_accepts_supplemental_validator(tmp_path):
+    """run() forwards supplemental_validator and persists its admission result."""
+    pf_root = tmp_path / "preflight"
+    _seed_preflight(pf_root, ("AAPL",))
+    run_root = tmp_path / "morning_runs"
+
+    cfg = MorningConfig(
+        tickers=("AAPL", "GFUZ"),
+        morning_run_state_root=str(run_root),
+        preflight_run_state_root=str(pf_root),
+    )
+
+    called = []
+
+    def mock_validator(ticker: str):
+        called.append(ticker)
+        return {"valid": True, "ticker": ticker}
+
+    ex = MorningDCAExecutor(cfg, mode="live")
+    assert ex.supplemental_validator is None
+
+    now = _now_live()
+    result = ex.run(
+        now,
+        FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.03, "GFUZ": 0.03}),
+        manual=True,
+        supplemental_validator=mock_validator,
+    )
+    assert called == ["GFUZ"]
+    run_state_path = Path(result["paths"]["run_state"])
+    run_state = json.loads(run_state_path.read_text(encoding="utf-8"))
+    assert run_state["preflight_gate"]["gfuz_supplemental"]["valid"] is True
+    assert run_state["preflight_gate"]["admitted_tickers"] == ["AAPL", "GFUZ"]
+    assert {row["ticker"] for row in run_state["signal_rows"]} == {"AAPL", "GFUZ"}
+    supplemental_path = Path(run_state["preflight_gate"]["gfuz_supplemental"]["persisted_file"])
+    assert json.loads(supplemental_path.read_text(encoding="utf-8"))["valid"] is True
+
+
+@pytest.mark.parametrize("loose_valid", ["false", "true", 1, ["x"], {"a": 1}])
+def test_gfuz_supplemental_preflight_requires_literal_true(tmp_path, loose_valid):
+    """A loosely-typed ``valid`` (a truthy string/int/container) must NOT admit GFUZ:
+    only the JSON literal ``true`` does (Copilot review, PR #1597)."""
+    from morning_dca import morning_preflight_eligible_tickers
+
+    pf_root = tmp_path / "preflight"
+    _seed_preflight(pf_root, ("AAPL",))
+
+    admitted, gate = morning_preflight_eligible_tickers(
+        _now_live(),
+        ["AAPL", "GFUZ"],
+        preflight_run_state_root=str(pf_root),
+        supplemental_validator=lambda ticker: {"valid": loose_valid},
+        output_dir=tmp_path / "out",
+    )
+
+    assert admitted == ["AAPL"]
+    assert gate["gated_out_tickers"] == ["GFUZ"]
+    assert gate["gfuz_supplemental"]["valid"] is False
+
+
+def test_morning_dca_executor_run_threads_supplemental_validator(tmp_path):
+    """``run()`` itself must carry the injected validator through _run_impl to the
+    preflight gate: admit GFUZ, persist the supplemental artifact, and place the order.
+    The sibling ``evaluate()`` test would still pass if ``run`` dropped the validator."""
+    pf_root = tmp_path / "preflight"
+    _seed_preflight(pf_root, ("AAPL",))
+    cfg = MorningConfig(
+        tickers=("AAPL", "GFUZ"),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "morning_runs"),
+        preflight_run_state_root=str(pf_root),
+    )
+    called: list[str] = []
+
+    def validator(ticker: str):
+        called.append(ticker)
+        return {"valid": True, "ticker": ticker}
+
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.03, "GFUZ": 0.03})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"AAPL": 97.0, "GFUZ": 97.0})
+
+    res = ex.run(_now_live(), data, broker=broker, manual=True, supplemental_validator=validator)
+
+    assert called == ["GFUZ"]
+    assert ex.preflight_gate["gfuz_supplemental"]["valid"] is True
+    persisted = list((tmp_path / "morning_runs").rglob("gfuz_supplemental_preflight.json"))
+    assert len(persisted) == 1 and json.loads(persisted[0].read_text())["valid"] is True
+    assert {c["ticker"] for c in res["artifacts"]["buy_candidates"]} == {"AAPL", "GFUZ"}
+    assert {order[0] for order in broker.placed_orders} == {"AAPL", "GFUZ"}
+
+
+def test_morning_dca_executor_run_without_validator_gates_gfuz_out(tmp_path):
+    """Regression pair for the run() path: no validator -> GFUZ stays gated out."""
+    pf_root = tmp_path / "preflight"
+    _seed_preflight(pf_root, ("AAPL",))
+    cfg = MorningConfig(
+        tickers=("AAPL", "GFUZ"),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "morning_runs"),
+        preflight_run_state_root=str(pf_root),
+    )
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.03, "GFUZ": 0.03})
+    broker = RecordingLiveBroker(account="999000111", reference_prices={"AAPL": 97.0, "GFUZ": 97.0})
+
+    ex.run(_now_live(), data, broker=broker, manual=True)
+
+    assert {order[0] for order in broker.placed_orders} == {"AAPL"}
+    assert ex.preflight_gate["gated_out_tickers"] == ["GFUZ"]
+

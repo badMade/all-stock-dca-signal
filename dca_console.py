@@ -25,7 +25,7 @@ import time
 import webbrowser
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
@@ -495,9 +495,23 @@ def module_catalog(python: str) -> list[dict]:
                 return interpreter + " " + command[len(prefix):]
         return command
 
+    entry_actions = {
+        0: "demo-all",
+        1: "demo-dca",
+        6: "drift-check",
+        7: "alert-digest",
+    }
     rows = [{"id": f"entry-{i}", "name": e.need, "description": e.notes,
-             "command": runnable(e.command), "docs": e.doc_ref, "status": "Existing entry point"}
+             "command": runnable(e.command), "docs": e.doc_ref, "status": "Existing entry point",
+             "action_id": entry_actions.get(i)}
             for i, e in enumerate(ENTRY_POINTS)]
+    extra_actions = {
+        0: "demo-octopus",
+        1: "octopus-update",
+        2: "octopus-inspect-html",
+        3: "ml-train-dry-run",
+        4: "market-graph-archive",
+    }
     extras = [
         ("Octopus replay", "Walk-forward OHLC predictions and regime validation.",
          "wondrous-octopus/run_walkforward.py --preset quick --dry-run", "docs/wondrous_octopus.md"),
@@ -520,7 +534,8 @@ def module_catalog(python: str) -> list[dict]:
     ]
     rows.extend({"id": f"extra-{i}", "name": name, "description": description,
                  "command": f"{interpreter} {command}" if command else "Library API; see documentation",
-                 "docs": docs, "status": "Optional research / manual inputs"}
+                 "docs": docs, "status": "Optional research / manual inputs",
+                 "action_id": extra_actions.get(i)}
                 for i, (name, description, command, docs) in enumerate(extras))
     return rows
 
@@ -561,6 +576,54 @@ class ConsoleApp:
         # through the module's datetime name on every request so a new tab does
         # not inherit the process-start date (Same Page round 2).
         return datetime.now(ET).date()
+
+    def _find_action_last_updated(self, action_id: str) -> dict:
+        """Find the most recent execution or artifact timestamp for a console action."""
+        job_match = None
+        try:
+            jobs = self.jobs.snapshot() if hasattr(self, "jobs") and hasattr(self.jobs, "snapshot") else []
+        except Exception:
+            jobs = []
+        for job in jobs:
+            if job.get("action") == action_id:
+                job_match = job
+                break
+        if job_match:
+            status = job_match.get("status")
+            ts = job_match.get("finished_at") or job_match.get("started_at")
+            if status in {"running", "queued"}:
+                return {"timestamp": ts, "status": status, "label": "Updating…"}
+        disk_ts: str | None = None
+        try:
+            if action_id == "reports" and (self.settings.output / "summaries").is_dir():
+                files = [p for p in (self.settings.output / "summaries").rglob("*.json") if p.is_file()]
+                if files:
+                    disk_ts = datetime.fromtimestamp(max(p.stat().st_mtime for p in files), tz=timezone.utc).isoformat()
+            elif action_id.startswith("demo-") and (self.settings.output / "demo").is_dir():
+                files = [p for p in (self.settings.output / "demo").rglob("*.json") if p.is_file()]
+                if files:
+                    disk_ts = datetime.fromtimestamp(max(p.stat().st_mtime for p in files), tz=timezone.utc).isoformat()
+            elif action_id in {"octopus-update", "octopus-estimate"}:
+                target = getattr(self, "octopus_run", None) or (REPO / "analysis" / "real-octopus-run")
+                if target and target.is_dir():
+                    val = target / "octopus_validation_metrics.json"
+                    disk_ts = datetime.fromtimestamp((val if val.is_file() else target).stat().st_mtime, tz=timezone.utc).isoformat()
+            elif action_id == "ticker-refresh-missing" and (REPO / "historical_stock_data.csv").is_file():
+                disk_ts = datetime.fromtimestamp((REPO / "historical_stock_data.csv").stat().st_mtime, tz=timezone.utc).isoformat()
+            elif action_id == "train-foundation-smoke":
+                f_path = REPO / "analysis" / "foundation-octopus-run" / "shard_1_metrics.json"
+                if f_path.is_file():
+                    disk_ts = datetime.fromtimestamp(f_path.stat().st_mtime, tz=timezone.utc).isoformat()
+        except Exception:
+            pass
+        if job_match:
+            status = job_match.get("status", "completed")
+            job_ts = job_match.get("finished_at") or job_match.get("started_at")
+            if job_ts and (not disk_ts or job_ts >= disk_ts):
+                return {"timestamp": job_ts, "status": status, "label": None if status == "completed" else status.title()}
+        if disk_ts:
+            return {"timestamp": disk_ts, "status": "completed", "label": None}
+        return {"timestamp": None, "status": "never", "label": "Never run"}
 
     def actions(self) -> list[dict]:
         """List fixed actions, with explicit dependency/setup availability."""
@@ -605,6 +668,9 @@ class ConsoleApp:
         # The Phase 4 launchers join the same closed list; their inputs are
         # resolved server-side, never posted (dca_console_launch).
         rows.extend(launch_actions(self, REPO))
+        for row in rows:
+            if "last_updated" not in row:
+                row["last_updated"] = self._find_action_last_updated(row["id"])
         return rows
 
     def snapshot(self, day: date | None = None, ticker: str = "", period: str = "all") -> dict:
@@ -759,16 +825,23 @@ class ConsoleApp:
                 elif result == 0:
                     log("Demo forecast artifacts saved. Use demo mode to inspect them; local view keeps your configured run.\n")
         if action == "octopus-update":
-            argv = ["wondrous-octopus/daily_update.py", "--run-dir", str(self.octopus_run)]
-            # A synthetic neural smoke run stops at a fixed historical cursor.
-            # The full update is still available for genuine local research runs.
-            if self.settings.mode == "demo" and self.octopus_run:
-                meta = json.loads((self.octopus_run / "run_meta.json").read_bytes())
-                if meta.get("model_selection") == "octopus":
-                    argv.extend(["--now", "2019-09-14"])
+            is_sharded = bool(
+                self.octopus_run
+                and (self.octopus_run / "shard_1" / "checkpoint").is_dir()
+                and not (self.octopus_run / "checkpoint").is_dir()
+            )
+            if is_sharded:
+                argv = ["wondrous-octopus/run_sharded.py", "--parallel", "--run-dir-base", str(self.octopus_run)]
+            else:
+                argv = ["wondrous-octopus/daily_update.py", "--run-dir", str(self.octopus_run)]
+                if self.settings.mode == "demo" and self.octopus_run:
+                    meta = json.loads((self.octopus_run / "run_meta.json").read_bytes())
+                    if meta.get("model_selection") == "octopus":
+                        argv.extend(["--now", "2019-09-14"])
             results.append(self._command(argv, log, research=True, timeout=1800))
             if results[-1] == 0:
-                results.append(self._command(["wondrous-octopus/run_walkforward.py", "--report-only", str(self.octopus_run)],
+                report_target = (self.octopus_run / "shard_1") if is_sharded else self.octopus_run
+                results.append(self._command(["wondrous-octopus/run_walkforward.py", "--report-only", str(report_target)],
                                              log, research=True))
         if action == "octopus-estimate":
             results.append(self._command(["wondrous-octopus/run_walkforward.py", "--preset", "quick", "--dry-run"],

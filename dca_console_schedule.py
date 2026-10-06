@@ -121,10 +121,20 @@ def _task_timing(task: dict[str, Any]) -> str:
 def _task_details(task: dict[str, Any]) -> dict[str, Any]:
     executor = next((task[field] for field in _TASK_EXECUTOR_FIELDS if isinstance(task.get(field), str)), None)
     slots = task.get("et_slots")
+    reg = _flag(task.get("scheduler_registered"))
+    if reg is None:
+        if task.get("in_live_scheduler") is True:
+            reg = True
+        elif task.get("in_live_scheduler") is False:
+            reg = False
+        elif task.get("status") in ("disabled", "retired", "expired"):
+            reg = False
+        elif task.get("status") == "active" and bool(task.get("cron_utc")):
+            reg = True
     return {
         "type": _text(task.get("type"), 40), "trades": _flag(task.get("trades")), "enabled": _flag(task.get("enabled")),
         "manifest_status": _text(task.get("status"), 40),
-        "scheduler_registered": _flag(task.get("scheduler_registered")),
+        "scheduler_registered": reg,
         "in_live_scheduler": _flag(task.get("in_live_scheduler")),
         "cron_utc": _cron_utc(task.get("cron_utc")),
         "et_slots": [_text(slot, 8) for slot in slots[:LIST_LIMIT]] if isinstance(slots, list) else None,
@@ -601,6 +611,10 @@ def observed_from_pointer_strip(strip: dict[str, Any] | None) -> dict[str, dict[
             continue
         if stream not in observed or _observed_rank(row) > _observed_rank(observed[stream]):
             observed[stream] = row
+        slot_id = row.get("slot_id")
+        if slot_id:
+            observed[slot_id] = row
+            observed[f"{stream}@{slot_id}"] = row
     return observed
 
 

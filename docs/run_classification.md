@@ -1,18 +1,17 @@
 # Run Classification Contract
 
-> **Stale as of 2026-07-28:** the scheduled-vs-manual **contract mechanics**
-> below (paths, required fields, exclusion rules) still apply, but examples
-> and stream names referencing the pre-2026-07-28 three-stream Perplexity-era
-> roster (morning `42173154`, midday `a6239dae`, afternoon `10ce362c`) use
-> the OLD three-stream naming -- those five tasks are still the account's
-> ONLY currently-functioning live execution, not a stream that has been
-> replaced. A seven-slot Claude roster is the intended eventual replacement;
-> its Gate 5 has had a real entry point per slot since 2026-08-26 and
-> placement was authorized for all seven slots on 2026-09-02 (see
-> `PRODUCTION_READINESS.md`, "Status, 2026-08-26"); the older "hard-aborts at
-> Gate 5" wording elsewhere predates that. See
-> [`safeguards.md`](safeguards.md#live-execution-roster) for the current
-> roster.
+> **Roster reconciliation (updated 2026-10-04):** the seven-slot roster (09:35,
+> 10:30, 11:30, 12:30, 13:30, 14:30, 15:30) is the current framing; the older
+> three-stream wording (morning `42173154`, midday `a6239dae`, afternoon
+> `10ce362c`) is historical. What each slot's in-repo executor actually does is set
+> by its config, not by this page: `config/market_open_dca.json`,
+> `config/morning_dca.json`, `config/midday_dca.json`, and
+> `config/intraday_dca.json` currently ship `live_execution_enabled: true`.
+> This records executor capability when invoked, not proof that an external scheduler
+> fired or placed an order. The 15:30 final buy runs under `run_dca.py` / `10ce362c`.
+> places orders. The scheduled-vs-manual contract mechanics below (paths, required
+> fields, exclusion rules) apply across every stream regardless. See
+> [`safeguards.md`](safeguards.md#live-execution-roster) for the roster.
 
 Prevents **manual runs** of the graded DCA task from being confused with
 **scheduled live runs**. This is a binding contract: every run_state artifact
@@ -29,6 +28,23 @@ must declare its origin, and every downstream reporting task must honor it.
 accepted (see [Accepted schema versions](#accepted-schema-versions-v1--v2)):
 downstream consumers accept **both** versions when the required scheduled
 identity fields are correct.
+
+## Stream Artifact Roots and Latest Pointers
+
+Each currently-functioning stream writes under its **own** artifact root and updates its **own**
+pointer -- there is no shared `scheduled_runs/` path for most of them:
+
+| Stream | Nominal ET Slots | Cron ID | Artifact Root | Latest Pointer |
+|---|---|---|---|---|
+| `market_open` | 09:35 | `2ba19526` | `market_open_dca/YYYYMMDD_0935ET/` | `latest_market_open_run.json` |
+| `morning` | 10:30 | `42173154` | `morning_dca/YYYYMMDD_1030ET/` | `latest_morning_run.json` |
+| `intraday` | 11:30, 13:30, 14:30 | `7be82b97` | `intraday_dca/YYYYMMDD_<slot>ET/` | `latest_intraday_run.json` |
+| `midday` | 12:30 | `a6239dae` | `midday_dca/YYYYMMDD_1230ET/` | `latest_midday_run.json` |
+| `afternoon` (final buy) | 15:30 | `10ce362c` (supersedes `ce16ba6b`) | `scheduled_runs/YYYYMMDD_1530ET/` (under legacy `ce16ba6b` root) | `latest_scheduled_run.json` |
+
+Manual runs write under each stream's own `manual_runs/<timestamp>/` and **never** update a
+pointer; reporting excludes manual runs and manual order IDs from scheduled-live metrics. Route
+scheduled-vs-manual decisions through `scripts/run_classification.py`.
 
 ## Live scheduled task
 

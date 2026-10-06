@@ -1246,7 +1246,7 @@ def test_ml_adjustment_cannot_push_a_real_buy_below_the_broker_minimum():
     with the base 1x tier must never produce a sub-dollar suggested amount
     for a genuine buy -- brokers reject sub-dollar notional orders."""
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
-    data = _FixedSignalData(prev_close=100.0, decision_price=99.0)  # -1.0% -> 1x tier
+    data = _FixedSignalData(prev_close=100.0, decision_price=99.7)  # -0.3% -> 1x tier
     config = StrategyConfig(ml_sizing_adjustment={"AAPL": 0.5})
     signal = evaluate_source_signal("AAPL", now, config, data, 15)
     assert signal.action == Action.BUY
@@ -1990,10 +1990,10 @@ def test_absent_budgets_json_does_not_enable_the_whole_share_allowance(tmp_path)
     assert set(out) == {"_whole_share_ceiling_not_opted_in", "_budgets_file_absent"}
 
     config = load_strategy_config(config_dir=tmp_path)
-    assert config.max_per_order_usd == 10.0
+    assert config.max_per_order_usd == 16.0  # 2026-10-04 ladder rescale: StrategyConfig default ceiling 10 -> 16
     # Collapsed to the ordinary ceiling -- exactly the behaviour before this
     # knob existed, which is what "never opted in" has to mean.
-    assert config.whole_share_max_per_order_usd == 10.0
+    assert config.whole_share_max_per_order_usd == 16.0
 
 
 def test_absent_budgets_json_is_still_not_an_unvalidated_config(tmp_path):
@@ -2007,7 +2007,7 @@ def test_absent_budgets_json_is_still_not_an_unvalidated_config(tmp_path):
 
     # Absent file: loads, does not raise, breaker left at its prior default.
     config = load_strategy_config(config_dir=tmp_path)
-    assert config.whole_share_max_per_order_usd == 10.0
+    assert config.whole_share_max_per_order_usd == 16.0
 
     # Present file omitting the breaker: still refused, unchanged.
     (tmp_path / "budgets.json").write_text(

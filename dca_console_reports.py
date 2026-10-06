@@ -221,7 +221,7 @@ def average_cost(roots: Sequence[RootSpec]) -> dict[str, Any]:
     combined: dict[str, Any] = {}
     accounts: dict[str, Any] = {}
     if isinstance(snapshot, dict):
-        raw_combined = snapshot.get("combined")
+        raw_combined = snapshot.get("combined") or snapshot.get("combined_by_ticker")
         if isinstance(raw_combined, dict):
             combined = raw_combined
         raw_accounts = snapshot.get("accounts")

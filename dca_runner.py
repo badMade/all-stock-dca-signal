@@ -1764,7 +1764,7 @@ def _candidate_multiplier_notional_mismatch(cand: Candidate) -> bool:
 
 
 def _parse_candidate_rows(candidates) -> list[Candidate]:
-    """Parse raw ``(ticker, amount_usd[, multiplier[, drop_pct]])`` rows into
+    """Parse raw ``(ticker, amount_usd[, multiplier[, drop_pct[, sizing_base_usd, sizing_min_drop_pct, sizing_max_drop_pct]]])`` rows into
     ``Candidate`` objects, exactly as ``assess()`` does.
 
     A row that already IS a ``Candidate`` (as the "direct Python caller"
@@ -1832,6 +1832,14 @@ def _parse_candidate_rows(candidates) -> list[Candidate]:
                 "candidate row must be a (ticker, amount_usd[, multiplier[, drop_pct]]) "
                 f"list/tuple or a Candidate instance, got {row!r}"
             )
+        elif len(row) == 7:
+            # (ticker, amount, multiplier, drop_pct, sizing_base_usd, sizing_min_drop_pct,
+            # sizing_max_drop_pct): the JSON-serializable form of a calibrated Candidate, as
+            # published in planner_candidates. Without these slots a JSON row could never
+            # carry calibration evidence, so every calibrated row was validated against the
+            # global ladder alone (Copilot review, PR #1597). The values are still bound to
+            # the ticker's ACTIVE configured tier in _candidate_multiplier_notional_mismatch.
+            ticker, amount, multiplier, drop_pct, sizing_base_usd, sizing_min_drop_pct, sizing_max_drop_pct = row
         elif len(row) == 4:
             ticker, amount, multiplier, drop_pct = row
             sizing_base_usd = sizing_min_drop_pct = sizing_max_drop_pct = None

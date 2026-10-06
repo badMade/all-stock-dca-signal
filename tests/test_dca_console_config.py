@@ -95,6 +95,8 @@ def test_catalog_on_committed_config_parses_every_file(cfg):
     assert rows["tickers"]["schema_exists"] is True and rows["tickers"]["schema_ref"].endswith("tickers.schema.json")
     assert rows["per_ticker_sizing"]["schema_exists"] is None and rows["per_ticker_sizing"]["publisher_only"] is True
     assert rows["budgets"]["fail_mode"] == "raises" and rows["ml_sizing_adjustment"]["fail_mode"] == "degrades"
+    assert rows["intraday_dca"]["fail_mode"] == "fails closed"
+    assert all(row["fail_mode"] != "unknown" for row in rows.values())
     assert rows["budgets"]["loader"] == "dca_config.load_budgets"
     assert isinstance(rows["budgets"]["size"], int) and rows["budgets"]["modified"].endswith("+00:00")
 
@@ -229,7 +231,7 @@ def test_effective_config_reports_unresolved_env_by_name_and_loader_failures(cfg
 def test_ladder_preview_matches_the_strategy_functions(cfg):
     result = reader.ladder_preview(cfg)
     grid = {row["drop_pct"]: row for row in result["grid"]}
-    assert len(grid) == 49 and result["warnings"] == []
+    assert len(grid) == 65 and result["warnings"] == []
     assert grid[0.0] == {
         "drop_pct": 0.0,
         "multiplier": 0.0,
@@ -238,7 +240,7 @@ def test_ladder_preview_matches_the_strategy_functions(cfg):
         "candidate_usd": 0.0,
     }
     config = dca_config.load_strategy_config(cfg)
-    for drop in (0.25, 2.0, 4.0, 12.0):
+    for drop in (0.25, 2.0, 4.0, 12.0, 16.0):
         assert grid[drop]["multiplier"] == reader.near_close_dca.graded_buy_multiplier(drop / 100, config)
         assert grid[drop]["base_usd"] == 1.0 and grid[drop]["base_reason"] == "below_prior_close_only"
     assert [tier["name"] for tier in result["tiers"]] == ["normal", "elevated", "high_volatility", "stress"]
@@ -272,9 +274,10 @@ def test_stream_flags_come_from_raw_json(cfg, tmp_path):
     streams = {row["stream"]: row for row in result["streams"]}
     assert (
         streams["midday"]["live_execution_enabled"] is True
-        and streams["market_open"]["live_execution_enabled"] is False
+        and streams["market_open"]["live_execution_enabled"] is True
+        and streams["intraday"]["live_execution_enabled"] is True
+        and streams["morning"]["live_execution_enabled"] is True
     )
-    assert streams["morning"]["live_execution_enabled"] is None and "not declared" in streams["morning"]["note"]
     assert streams["intraday"]["slots"] == ["1130", "1330", "1430"] and streams["midday"]["slots"] == ["12:30"]
     assert all(
         row["trend_min_bars"] == 6 and len(row["confidence_rule"]) <= reader.MAX_TEXT for row in streams.values()
@@ -335,7 +338,14 @@ def test_live_gate_summary_reports_names_never_values(cfg, monkeypatch):
     assert (
         gates["strategy_dry_run"]["state"] == "unconfigured" and "literally {}" in gates["strategy_dry_run"]["detail"]
     )
+    # The broker's enable_live_orders is injected by the external runner, so a checkout can
+    # never observe it: the gate is "unknown" whatever this process's environment says
+    # (ed4745aa dropped the env/stream-policy inference that used to report "configured").
     assert gates["broker_enable_live_orders"]["state"] == "unknown"
+    for env_value in ("false", "true"):
+        monkeypatch.setenv("ROBINHOOD_ENABLE_LIVE_ORDERS", env_value)
+        assert reader.live_gate_summary(cfg, DAY)["gates"][1]["state"] == "unknown"
+    monkeypatch.delenv("ROBINHOOD_ENABLE_LIVE_ORDERS", raising=False)
     assert (
         gates["stream_live_execution_enabled"]["state"] == "configured"
         and "midday" in gates["stream_live_execution_enabled"]["detail"]
@@ -383,7 +393,7 @@ def test_absent_config_dir_is_unavailable_not_zero(tmp_path):
     assert all(row["found"] is False for row in reader.stream_flags(absent)["streams"])
     sizing = reader.sizing_sources(absent, NOW)
     assert sizing["ml"]["adjustment_count"] is None and sizing["per_ticker"]["entry_count"] is None
-    assert reader.ladder_preview(absent)["per_ticker"] == [] and len(reader.ladder_preview(absent)["grid"]) == 49
+    assert reader.ladder_preview(absent)["per_ticker"] == [] and len(reader.ladder_preview(absent)["grid"]) == 65
     snapshot = reader.build_config_snapshot(absent, REPO, NOW, DAY)
     assert snapshot["gates"]["gates"][4]["state"] == "unknown"
     # Zero readable stream files is no evidence either way, never "blocks live money".
@@ -474,7 +484,7 @@ def test_per_ticker_sizing_type_error_degrades_instead_of_raising(cfg):
     with pytest.raises(TypeError):
         dca_config.load_per_ticker_sizing(cfg)
     preview = reader.ladder_preview(cfg)
-    assert preview["per_ticker"] == [] and len(preview["grid"]) == 49
+    assert preview["per_ticker"] == [] and len(preview["grid"]) == 65
     assert any(w.startswith("per_ticker_sizing.json:") for w in preview["warnings"])
     sizing = reader.sizing_sources(cfg, NOW)
     assert sizing["per_ticker"]["loaded_count"] is None and sizing["per_ticker"]["entry_count"] == 1

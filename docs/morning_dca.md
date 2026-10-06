@@ -192,12 +192,12 @@ gate. The scheduled live run_state carries
   budget/top-up/order decisioning, with the decision engine reading GFUZ only
   from the persisted file.
 
-  > **Not yet implemented.** `_apply_preflight_gate()` admits tickers via a
-  > plain `tickers ∩ eligible_tickers` intersection with no GFUZ-specific
-  > exception, so a same-day preflight artifact missing a GFUZ row simply gates
-  > GFUZ out for that run — a safe, fail-closed degradation (GFUZ is skipped,
-  > never bought on unvalidated data), not the supplemental-validation flow
-  > above. See `config/morning_dca.json`'s
+  > **Implemented (2026-10-04).** When GFUZ is in `tickers` and missing from a
+  > valid, non-empty 9:45 preflight artifact, an optional injected
+  > `supplemental_validator` callable performs a read-only validation check and
+  > atomically writes `gfuz_supplemental_preflight.json` before decisioning. If
+  > the validator is absent, raises, or returns invalid, GFUZ remains gated out
+  > fail-closed. See `config/morning_dca.json`'s
   > `gfuz_special_handling.supplemental_preflight.implementation_status`.
 
 ### Raw data persistence (added Jul 15 2026, confirmed Jul 16 2026; implemented Jul 21 2026)
@@ -538,9 +538,9 @@ under `.../cron_tracking/morning_dca/YYYYMMDD_1030ET/`, plus
 `submitted_orders.csv` whenever at least one order was actually submitted;
 `filled_orders.csv` is **never** written by this task (there is no
 fill-confirmation step). Raw connector persistence under a `raw/` subdirectory
-and `gfuz_supplemental_preflight.json` are both **not yet implemented** (see
-**Raw data persistence** and **GFUZ special handling** above). See
-`config/morning_dca.json`'s `artifacts.manifest_accuracy_note`. The live
+is implemented in MorningDCAExecutor, and `gfuz_supplemental_preflight.json` is
+implemented as of 2026-10-04 (see **Raw data persistence** and **GFUZ special handling**
+above). See `config/morning_dca.json`'s `artifacts.manifest_accuracy_note`. The live
 `run_classification` block carries `run_origin='scheduled'`,
 `run_type='morning_dca_live'`, `scheduled_for_et='10:30'`, `manual_run=false`,
 `state_schema_version='morning-live-v2-preauthorized'`,

@@ -376,13 +376,36 @@ def _load_pointer(pointer: str | Path | Mapping[str, Any]) -> Optional[Dict[str,
     return data if isinstance(data, dict) else {"__malformed__": True}
 
 
+def _resolve_target_path(candidate: Path, root: Path) -> Optional[Path]:
+    """Resolve candidate within root, tolerating re-basing for cross-host/container paths."""
+    try:
+        resolved = candidate.resolve()
+        if resolved.is_relative_to(root.resolve()):
+            return resolved
+    except (ValueError, OSError):
+        pass
+    try:
+        parts = candidate.parts
+        if root.name in parts:
+            idx = parts.index(root.name)
+            subpath = Path(*parts[idx + 1:])
+            local = (root / subpath).resolve()
+            if local.is_relative_to(root.resolve()):
+                return local
+        if "cron_tracking" in parts:
+            idx = parts.index("cron_tracking")
+            subpath = Path(*parts[idx + 1:])
+            local = (root.parent / subpath).resolve()
+            if local.is_relative_to(root.resolve()):
+                return local
+    except (ValueError, OSError):
+        pass
+    return None
+
+
 def _within_root(candidate: Path, root: Path) -> bool:
     """True if ``candidate`` resolves inside ``root`` (no path escape)."""
-    try:
-        candidate.resolve().relative_to(root.resolve())
-        return True
-    except (ValueError, OSError):
-        return False
+    return _resolve_target_path(candidate, root) is not None
 
 
 def validate_pointer(
@@ -463,7 +486,8 @@ def validate_pointer(
         )
 
     # The run_state_path must live inside the expected stream root.
-    if not _within_root(ptr_path, root):
+    target_path = _resolve_target_path(ptr_path, root)
+    if target_path is None:
         return PointerValidation(
             STATUS_OUTSIDE_ROOT,
             False,
@@ -525,7 +549,7 @@ def validate_pointer(
         )
 
     # The target run_state must actually exist to prove the stream ran.
-    if require_run_state_exists and not ptr_path.exists():
+    if require_run_state_exists and not target_path.exists():
         return PointerValidation(
             STATUS_PENDING,
             False,
@@ -539,9 +563,9 @@ def validate_pointer(
     # own claim: a pointer that asserts valid_scheduled_evidence=true but points
     # at a manual/malformed state is not trusted.
     run_state: Optional[Dict[str, object]] = None
-    if ptr_path.exists():
+    if target_path.exists():
         try:
-            loaded = json.loads(ptr_path.read_bytes())
+            loaded = json.loads(target_path.read_bytes())
             run_state = loaded if isinstance(loaded, dict) else None
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
             return PointerValidation(
@@ -701,7 +725,12 @@ def validate_pointer(
             STATUS_VALID_RECOVERY_CONTEXT,
             False,
             trading_day=ptr_day,
-            run_state_path=ptr_path_raw,
+            # The RESOLVED local target, not the persisted (possibly cross-host)
+            # path: consumers read result.run_state_path to load the file, and a
+            # re-based pointer would otherwise validate against the local copy
+            # and then fail to load the unavailable remote path (Copilot review,
+            # PR #1597).
+            run_state_path=str(target_path),
             stream=ptr_stream,
             recovery_context=True,
         )
@@ -721,7 +750,8 @@ def validate_pointer(
         STATUS_VALID,
         True,
         trading_day=ptr_day,
-        run_state_path=ptr_path_raw,
+        # Resolved local target, same reasoning as the recovery return above.
+        run_state_path=str(target_path),
         stream=ptr_stream,
     )
 

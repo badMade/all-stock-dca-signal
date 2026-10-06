@@ -61,7 +61,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Dict, List, Optional, Sequence, Set, Tuple, cast
+from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Sequence, Set, Tuple, cast
 
 from dca_alerts import GuardedRunConfig, artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
 from dca_common import TopUpContext, build_top_up_outcome
@@ -722,9 +722,9 @@ class MorningConfig:
     # so morning/midday honour the same trading-window config as the afternoon.
     approved_test_dates: frozenset[date] = field(default_factory=frozenset)
     # Absolute per-order ceiling loaded from config/budgets.json
-    # circuit_breakers.max_per_order_usd. 5x * $2 base = $10 default. Any
+    # circuit_breakers.max_per_order_usd. 8x * $2 base = $16 default. Any
     # single order amount above this is blocked before it reaches the broker.
-    max_per_order_usd: float = 10.0
+    max_per_order_usd: float = 16.0
     # Shared daily order-ATTEMPT circuit breaker loaded from config/budgets.json
     # circuit_breakers.max_orders_per_day -- the same knob near_close_dca's own
     # StrategyConfig.max_orders_per_day enforces, shared across all seven live
@@ -3267,6 +3267,8 @@ def morning_preflight_eligible_tickers(
     preflight_run_state_root: Optional[str] = None,
     preflight_forbidden_roots: Sequence[str] = (),
     preflight_bounded_recovery: bool = True,
+    supplemental_validator: Optional[Callable[[str], Mapping[str, Any]]] = None,
+    output_dir: Optional[str | Path] = None,
 ) -> tuple[List[str], Dict[str, Any]]:
     """Restrict ``tickers`` to the same-day 9:45 pre-flight verdict.
 
@@ -3280,6 +3282,12 @@ def morning_preflight_eligible_tickers(
     through its required preflight gate", originally about a fail-closed
     contract this function no longer implements; superseded 2026-08-02 by
     Geoff's "should not block any later runs" direction).
+
+    If GFUZ is in ``tickers`` and missing from a valid, non-empty 9:45 preflight
+    artifact, an optional injected ``supplemental_validator`` is invoked to run
+    a read-only check and write ``gfuz_supplemental_preflight.json`` before
+    admitting GFUZ. If the validator is absent, raises, or returns invalid, GFUZ
+    remains gated out fail-closed.
 
     Returns ``(admitted_tickers, gate_diagnostic)``: the same
     ``preflight_gate``-shaped dict :class:`MorningDCAExecutor` stores on
@@ -3342,7 +3350,7 @@ def morning_preflight_eligible_tickers(
         }
     admitted = [t for t in tickers if t in eligible]
     gated_out = [t for t in tickers if t not in eligible]
-    gate = {
+    gate: Dict[str, Any] = {
         "preflight_found": True,
         "preflight_run_id": loaded["run_id"],
         "eligible_to_execute_tickers": sorted(eligible),
@@ -3350,6 +3358,44 @@ def morning_preflight_eligible_tickers(
         "gated_out_tickers": gated_out,
         "recovered_via_bounded_lookup": loaded.get("recovered_via_bounded_lookup", False),
     }
+
+    if "GFUZ" in tickers and "GFUZ" not in eligible:
+        if supplemental_validator is not None:
+            gfuz_supp: Dict[str, Any] = {"attempted": True, "valid": False}
+            try:
+                res = supplemental_validator("GFUZ")
+                if not isinstance(res, Mapping):
+                    gfuz_supp["error"] = f"validator returned non-mapping: {type(res).__name__}"
+                else:
+                    if output_dir is not None:
+                        out_path = Path(output_dir)
+                    else:
+                        now_et = now.astimezone(EASTERN)
+                        out_path = Path(stream_root("morning_dca")) / f"{now_et.strftime('%Y%m%d')}_1030ET"
+                    out_path.mkdir(parents=True, exist_ok=True)
+                    persist_file = out_path / "gfuz_supplemental_preflight.json"
+                    atomic_write_text(persist_file, json.dumps(dict(res), indent=2, sort_keys=True))
+                    # Re-read persisted file so we never buy GFUZ on unpersisted data
+                    read_back = json.loads(persist_file.read_text(encoding="utf-8"))
+                    is_valid = read_back.get("valid") is True
+                    gfuz_supp["valid"] = is_valid
+                    gfuz_supp["persisted_file"] = str(persist_file)
+                    if not is_valid:
+                        gfuz_supp["reason"] = read_back.get("reason", "validation_failed")
+            except Exception as exc:
+                gfuz_supp["valid"] = False
+                gfuz_supp["error"] = f"validator raised {type(exc).__name__}"
+
+            if gfuz_supp.get("valid"):
+                admitted = [t for t in tickers if t in eligible or t == "GFUZ"]
+                gated_out = [t for t in tickers if t not in eligible and t != "GFUZ"]
+                gate["admitted_tickers"] = admitted
+                gate["gated_out_tickers"] = gated_out
+
+            gate["gfuz_supplemental"] = gfuz_supp
+        else:
+            gate["gfuz_supplemental"] = {"attempted": False, "reason": "no_supplemental_validator"}
+
     return admitted, gate
 
 
@@ -3440,10 +3486,12 @@ class MorningDCAExecutor(DCAExecutor):
         *,
         mode: str = MORNING_WATCHLIST_MODE,
         config_dir: Optional[str] = None,
+        supplemental_validator: Optional[Callable[[str], Mapping[str, Any]]] = None,
     ) -> None:
         if mode not in self.PROFILES:
             raise ValueError(f"unknown mode {mode!r}; expected one of {sorted(self.PROFILES)}")
         self.mode = mode
+        self.supplemental_validator = supplemental_validator
         self.profile = self.PROFILES[mode]
         self.run_type = self.profile["run_type"]
         self.trades = self.profile["trades"]
@@ -5105,7 +5153,14 @@ class MorningDCAExecutor(DCAExecutor):
         _record(price_source="completed_bar", price_as_of=bar.timestamp)
         return bar.close
 
-    def evaluate(self, now: datetime, data: Any, *, manual: bool = False) -> List[MorningSignal]:
+    def evaluate(
+        self,
+        now: datetime,
+        data: Any,
+        *,
+        manual: bool = False,
+        supplemental_validator: Optional[Callable[[str], Mapping[str, Any]]] = None,
+    ) -> List[MorningSignal]:
         """Evaluate every non-excluded ticker for the morning stream.
 
         In morning live (10:30) mode the universe is first narrowed by the
@@ -5114,6 +5169,8 @@ class MorningDCAExecutor(DCAExecutor):
         (non-manual) runs a missing pre-flight artifact is fatal; for manual
         runs the gate degrades to the full universe with a warning.
         """
+        if supplemental_validator is not None:
+            self.supplemental_validator = supplemental_validator
         tickers = [t for t in self.config.tickers if t not in self.config.excluded_tickers]
         tickers = self._apply_preflight_gate(now, tickers, manual=manual)
         return [self.evaluate_signal(t, now, data) for t in tickers]
@@ -5127,12 +5184,19 @@ class MorningDCAExecutor(DCAExecutor):
         self.preflight_gate = None
         if not (self.mode == MORNING_LIVE_MODE and self.stream == MORNING_STREAM):
             return tickers
+        out_dir = (
+            Path(self.state_root) / self.manual_run_subdir / self.run_id(now, manual=True)
+            if manual
+            else self.run_state_dir(now)
+        )
         admitted, gate = morning_preflight_eligible_tickers(
             now,
             tickers,
             preflight_run_state_root=self.config.preflight_run_state_root,
             preflight_forbidden_roots=self.config.preflight_forbidden_roots,
             preflight_bounded_recovery=self.config.preflight_bounded_recovery,
+            supplemental_validator=self.supplemental_validator,
+            output_dir=out_dir,
         )
         self.preflight_gate = gate
         return admitted
@@ -8876,6 +8940,7 @@ class MorningDCAExecutor(DCAExecutor):
         broker: Optional[BrokerAdapter] = None,
         data_source: Optional[str] = None,
         manual: bool = False,
+        supplemental_validator: Optional[Callable[[str], Mapping[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Evaluate the stream and write its artifacts for the active mode.
 
@@ -8900,9 +8965,19 @@ class MorningDCAExecutor(DCAExecutor):
         a log handler ensured.
         """
 
+        if supplemental_validator is not None:
+            self.supplemental_validator = supplemental_validator
+
         def _invoke() -> Dict[str, Any]:
             def _execute() -> Dict[str, Any]:
-                return self._run_impl(now, data, broker=broker, data_source=data_source, manual=manual)
+                return self._run_impl(
+                    now,
+                    data,
+                    broker=broker,
+                    data_source=data_source,
+                    manual=manual,
+                    supplemental_validator=supplemental_validator,
+                )
 
             # The dated live slot is serialized one level up, by
             # _invoke_serialized(): the lock has to span the failure
@@ -9482,7 +9557,10 @@ class MorningDCAExecutor(DCAExecutor):
         broker: Optional[BrokerAdapter] = None,
         data_source: Optional[str] = None,
         manual: bool = False,
+        supplemental_validator: Optional[Callable[[str], Mapping[str, Any]]] = None,
     ) -> Dict[str, Any]:
+        if supplemental_validator is not None:
+            self.supplemental_validator = supplemental_validator
         blocked = self._maybe_block_for_holiday(now, manual=manual)
         if blocked is not None:
             return blocked

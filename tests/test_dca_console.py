@@ -1452,3 +1452,17 @@ def test_octopus_update_reason_separates_the_run_directory_from_dependencies(tmp
 
     with probed_console(tmp_path, monkeypatch, installed, octopus_run=run_dir) as application:
         assert action_state(application, "octopus-update") == (True, "")
+
+
+def test_actions_include_last_updated_metadata(tmp_path, monkeypatch):
+    """Every workflow action row includes dynamic last_updated metadata for launchpad cards."""
+    packages = {"numpy": True, "pandas": True, "sklearn": True, "torch": True}
+    with probed_console(tmp_path, monkeypatch, packages) as application:
+        actions = application.actions()
+        assert len(actions) >= 9
+        for item in actions:
+            assert "last_updated" in item
+            lu = item["last_updated"]
+            assert isinstance(lu, dict)
+            assert "status" in lu and "timestamp" in lu and "label" in lu
+

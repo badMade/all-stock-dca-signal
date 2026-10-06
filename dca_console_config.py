@@ -31,7 +31,7 @@ from dca_console_reader import BoundedReader
 MAX_TEXT = 500
 MAX_ROWS = 200
 MAX_VIEW_CHARS = 200_000
-GRID_MAX_DROP_PCT = 12.0
+GRID_MAX_DROP_PCT = 16.0
 GRID_STEP_PCT = 0.25
 BANNER = ("This console never places, reviews or cancels orders; "
           "live placement happens only in external agent sessions.")
@@ -92,7 +92,13 @@ LOADERS: dict[str, str] = {
 FAIL_MODES: dict[str, str] = {
     "tickers": "raises", "budgets": "raises", "sizing_ladder": "raises", "per_ticker_sizing": "raises",
     "inverse_martingale": "raises", "trading_window": "raises", "near_close_dca": "raises",
-    "backtest_sizing_ladder": "raises", "ml_sizing_adjustment": "degrades", "scheduled_tasks": "degrades",
+    "backtest_sizing_ladder": "raises", "self_heal": "raises", "notion_issue_loop": "raises",
+    "market_calendar": "raises",
+    "market_open_dca": "fails closed", "morning_dca": "fails closed", "midday_dca": "fails closed",
+    "intraday_dca": "fails closed",
+    "ml_sizing_adjustment": "degrades", "scheduled_tasks": "degrades", "notifications": "degrades",
+    "reporting": "degrades", "run_classification": "degrades",
+    "backtest_intraday_cap_curve": "n/a",
 }
 
 
@@ -572,18 +578,19 @@ def live_gate_summary(config_dir: Path, day: date) -> dict[str, Any]:
     warnings: list[str] = []
     overrides = _raw(config_dir, "near_close_dca", warnings)
     empty = overrides == {}
+    flags = stream_flags(config_dir)
+    warnings.extend(w for w in flags["warnings"] if w not in warnings)
+    observed = [row for row in flags["streams"] if row["found"]]
+    enabled = [row["stream"] for row in observed if row["live_execution_enabled"] is True]
+    broker_gate = _gate(
+        "broker_enable_live_orders",
+        "unknown",
+        "RobinhoodBroker.enable_live_orders is injected by the external runner and is not observable from this checkout.",
+    )
     gates = [_gate("strategy_dry_run", "unconfigured",
                    f"StrategyConfig.dry_run defaults to {near_close_dca.StrategyConfig().dry_run} and no JSON can set it; "
                    f"near_close_dca.json is {'literally {}' if empty else 'not empty' if overrides is not None else 'absent'}."),
-             _gate("broker_enable_live_orders", "unknown", "RobinhoodBroker.enable_live_orders is not observable from a checkout.")]
-    flags = stream_flags(config_dir)
-    warnings.extend(w for w in flags["warnings"] if w not in warnings)
-    # Only a stream file that was actually read is evidence. Zero readable files
-    # is "unknown", never "unconfigured": a banner that said "blocks live money"
-    # from no observations is the None-vs-false confusion the brief forbids
-    # (adversarial review, config area).
-    observed = [row for row in flags["streams"] if row["found"]]
-    enabled = [row["stream"] for row in observed if row["live_execution_enabled"] is True]
+             broker_gate]
     if not observed:
         gates.append(_gate("stream_live_execution_enabled", "unknown", "no stream policy file could be read."))
     else:

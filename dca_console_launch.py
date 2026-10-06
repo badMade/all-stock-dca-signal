@@ -164,15 +164,17 @@ def _candidate_dirs(reader: BoundedReader) -> list[str]:
     return found
 
 
-def _payload_sort_key(day: str | None, source: str, modified: float) -> tuple[int, str, float]:
-    """Prefer payloads whose trading day is encoded more explicitly.
+def _payload_sort_key(day: str | None, source: str, modified: float) -> tuple[int, str, int, float]:
+    """Prefer payloads with explicit trading days, then by newest day.
 
     A bare ``market_data_1130ET.json`` can only fall back to its mtime, which is
     the weakest hint and drifts every time the file is recopied. A payload whose
     filename or parent run directory states the trading day is safer to replay,
-    even if an undated sibling happened to be touched more recently.
+    even if an undated sibling happened to be touched more recently. Among
+    explicitly dated payloads, the newest trading day is preferred.
     """
-    return (_PAYLOAD_DAY_SOURCE_RANK.get(source, -1), day or "", modified)
+    explicit = 1 if source in {"filename", "run directory"} else 0
+    return (explicit, day or "", _PAYLOAD_DAY_SOURCE_RANK.get(source, -1), modified)
 
 
 def _discover(roots: Sequence[RootSpec]) -> list[dict[str, Any]]:
@@ -405,8 +407,11 @@ def run_launch(app, action: str, job_id: str, log: Callable[[str], None], *, rep
             log("No Octopus run directory is configured.\n")
             results.append(1)
         else:
-            inputs["octopus_run"] = root_label(settings.octopus_run)
-            results.append(run_command(["wondrous-octopus/inspect_run.py", "--run-dir", str(settings.octopus_run),
+            target = settings.octopus_run
+            if (target / "shard_1" / "checkpoint").is_dir() and not (target / "checkpoint").is_dir():
+                target = target / "shard_1"
+            inputs["octopus_run"] = root_label(target)
+            results.append(run_command(["wondrous-octopus/inspect_run.py", "--run-dir", str(target),
                                         "--html", str(directory / "octopus.html"), "--summary"],
                                        log, research=True, timeout=spec.timeout))
     elif action == "ml-train-dry-run":

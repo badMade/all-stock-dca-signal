@@ -196,3 +196,58 @@ def test_newer_same_day_csv_is_still_accepted(tmp_path):
     assert result["forecasts"][0]["close"] == 105
     assert result["forecast_source"].endswith("_next_day_forecasts.csv")
     assert not any("same-day checkpoint" in warning for warning in result["warnings"])
+
+
+def test_csv_expected_target_date_is_an_expectation_not_a_resolved_target(tmp_path):
+    daily = tmp_path / "daily"
+    daily.mkdir()
+    csv_path = daily / "2026-09-04_next_day_forecasts.csv"
+    csv_path.write_text(
+        "ticker,model,origin_date,pred_close,expected_target_date,expected_target_date_basis\n"
+        "AAPL,octopus,2026-09-04,105,2026-09-08,calendar\n",
+        encoding="utf-8",
+    )
+    result = adapter.build_octopus_snapshot(tmp_path)
+    forecast = result["forecasts"][0]
+    # target_date stays unresolved and the warning still fires: the calendar value is
+    # only what the next NYSE session would be, not the ticker's next data row.
+    assert forecast["target_date"] is None
+    assert forecast["expected_target_date"] == "2026-09-08"
+    assert forecast["expected_target_date_basis"] == "calendar"
+    assert forecast["target_label"] == "Next trading row (expected 2026-09-08)"
+    assert any("exact target date is not yet recorded" in w for w in result["warnings"])
+
+
+def test_csv_weekday_estimate_expected_date_is_labelled_est(tmp_path):
+    daily = tmp_path / "daily"
+    daily.mkdir()
+    csv_path = daily / "2026-09-04_next_day_forecasts.csv"
+    csv_path.write_text(
+        "ticker,model,origin_date,pred_close,expected_target_date,expected_target_date_basis\n"
+        "AAPL,octopus,2026-09-04,105,2026-09-08,weekday_estimate\n",
+        encoding="utf-8",
+    )
+    result = adapter.build_octopus_snapshot(tmp_path)
+    forecast = result["forecasts"][0]
+    assert forecast["target_date"] is None
+    assert forecast["expected_target_date_basis"] == "weekday_estimate"
+    assert forecast["target_label"] == "Next trading row (expected 2026-09-08 (est.))"
+    assert any("exact target date is not yet recorded" in w for w in result["warnings"])
+
+
+def test_csv_without_target_date_keeps_unresolved_label_and_warns(tmp_path):
+    daily = tmp_path / "daily"
+    daily.mkdir()
+    csv_path = daily / "2026-09-04_next_day_forecasts.csv"
+    csv_path.write_text(
+        "ticker,model,origin_date,pred_close\n"
+        "AAPL,octopus,2026-09-04,105\n",
+        encoding="utf-8",
+    )
+    result = adapter.build_octopus_snapshot(tmp_path)
+    forecast = result["forecasts"][0]
+    assert forecast["target_date"] is None
+    assert forecast["expected_target_date"] is None
+    assert forecast["expected_target_date_basis"] is None
+    assert forecast["target_label"] == "Next trading row (date unresolved)"
+    assert any("exact target date is not yet recorded" in w for w in result["warnings"])

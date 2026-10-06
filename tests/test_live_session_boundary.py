@@ -189,8 +189,9 @@ def test_manual_live_placement_allows_regular_session_outside_slot(tmp_path, mon
     if path == "morning":
         _manual_morning(tmp_path, now, broker)
     elif path == "compact":
+        # 2026-10-04 ladder rescale: a 10% drop is now 6x = $12.00, above _base_config()'s $10 ceiling, so lift it to the new $16 max.
         _run_day(
-            tmp_path, _base_config(approved_test_dates=frozenset({now.date()})), StrategyState(),
+            tmp_path, _base_config(approved_test_dates=frozenset({now.date()}), max_per_order_usd=16.0), StrategyState(),
             now.date(), 90, "manual", now_time=now.time(), broker=broker, scheduled=False,
         )
     else:
@@ -213,8 +214,10 @@ def test_close_between_candidates_preserves_first_submission(tmp_path, monkeypat
         artifact, executor = _manual_morning(tmp_path, now, broker, tickers=("AAPL", "MSFT"))
         assert executor.ledger.day_attempts(now.date()) == 1
     else:
+        # 2026-10-04 ladder rescale: a 10% drop is now 6x = $12.00, above _base_config()'s $10 ceiling, so lift it to the new $16 max.
         _, artifact, _ = _run_day(
-            tmp_path, _base_config(tickers=("AAPL", "MSFT"), approved_test_dates=frozenset({now.date()})),
+            tmp_path,
+            _base_config(tickers=("AAPL", "MSFT"), approved_test_dates=frozenset({now.date()}), max_per_order_usd=16.0),
             StrategyState(), now.date(), 90, "cross-close", now_time=now.time(), broker=broker,
         )
     assert len(placed) == 1
@@ -307,8 +310,9 @@ def test_historical_dry_run_does_not_consult_live_clock(tmp_path, monkeypatch):
         pytest.fail("dry run must not consult the live placement clock")
 
     monkeypatch.setattr(near_close_dca, "_live_placement_now", fail)
+    # 2026-10-04 ladder rescale: a 10% drop is now 6x = $12.00, above _base_config()'s $10 ceiling, so lift it to the new $16 max.
     result, artifact, _ = _run_day(
-        tmp_path, _base_config(dry_run=True), StrategyState(), TEST_DATES[0], 90, "dry", now_time=time(17),
+        tmp_path, _base_config(dry_run=True, max_per_order_usd=16.0), StrategyState(), TEST_DATES[0], 90, "dry", now_time=time(17),
     )
     assert not result["blocked"]
     assert artifact["buy_candidates"][0]["status"] == "dry_run"

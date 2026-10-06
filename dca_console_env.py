@@ -53,17 +53,35 @@ ENV_VARS: tuple[EnvVar, ...] = (
     EnvVar("PIPEDREAM_TOKEN", "trading-strategies monitor delivery", True),
 )
 
+@dataclass(frozen=True)
+class RepositoryGate:
+    name: str
+    command: str
+    description: str = ""
+    badge: str = ""
+    action_id: str | None = None
+
+
 # Copyable gate commands; the console never runs these on a page view.
-REPOSITORY_GATES: tuple[tuple[str, str], ...] = (
-    ("Lint (core)", "ruff check ."),
-    ("Tests (core, ~5 min)", ".venv/bin/python -m pytest"),
-    ("Coverage gate", ".venv/bin/python -m pytest --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90"),
-    ("Config invariants", ".venv/bin/python -m pytest tests/test_config_invariants.py -q"),
-    ("Console suites", ".venv/bin/python -m pytest tests/test_dca_console*.py tests/test_console_*.py -q"),
-    ("Scripts suite", ".venv/bin/python -m pytest scripts/tests -q"),
-    ("Dry-run smoke test", "python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo"),
-    ("Dependency audit", "pip-audit --requirement requirements-dev.txt --strict"),
-    ("Readiness", "python3 from.py --check"),
+REPOSITORY_GATES: tuple[RepositoryGate, ...] = (
+    RepositoryGate("Lint (core)", "ruff check .",
+                   "Fast Python linter checking PEP 8 style, import ordering, and bug patterns.", "Quality"),
+    RepositoryGate("Tests (core, ~5 min)", ".venv/bin/python -m pytest",
+                   "Full pytest suite across core DCA modules, runners, and risk validation.", "CI Gate"),
+    RepositoryGate("Coverage gate", ".venv/bin/python -m pytest --cov=. --cov-report=term-missing:skip-covered --cov-fail-under=90",
+                   "Enforces a strict 90%+ test coverage threshold across core modules before merging.", "CI Gate"),
+    RepositoryGate("Config invariants", ".venv/bin/python -m pytest tests/test_config_invariants.py -q",
+                   "Validates JSON schemas, budget caps, date bounds, and guards against unredacted account numbers.", "Security", "config-invariants"),
+    RepositoryGate("Console suites", ".venv/bin/python -m pytest tests/test_dca_console*.py tests/test_console_*.py -q",
+                   "Verifies console HTTP and reader routes, authentication policies, and web UI assets.", "Console"),
+    RepositoryGate("Scripts suite", ".venv/bin/python -m pytest scripts/tests -q",
+                   "Validates candidate generators, run classification helpers, and recovery tools.", "Scripts"),
+    RepositoryGate("Dry-run smoke test", "python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir /tmp/dca-demo",
+                   "Simulates near-close DCA pipeline run with synthetic market data.", "Smoke Test", "demo-dca"),
+    RepositoryGate("Dependency audit", "pip-audit --requirement requirements-dev.txt --strict",
+                   "Scans environment dependencies against the PyPA vulnerability database for known CVEs.", "Audit"),
+    RepositoryGate("Readiness", "python3 from.py --check",
+                   "Pre-flight health check verifying interpreters, packages, and model readiness.", "Readiness"),
 )
 
 # Root-level residue the repo map already flags; presence only, never content.
@@ -190,7 +208,10 @@ def build_env_snapshot(app, repo: Path, *, port: int | None = None) -> dict:
         "env": environment_variables(),
         "roots": roots_and_mounts(settings),
         "access": access_policy(getattr(app, "access", None), port),
-        "gates": [{"name": name, "command": command} for name, command in REPOSITORY_GATES],
+        "gates": [
+            {"name": g.name, "command": g.command, "description": g.description, "badge": g.badge, "action_id": g.action_id}
+            for g in REPOSITORY_GATES
+        ],
         "stray_files": stray_root_files(repo),
         "warnings": warnings,
     }

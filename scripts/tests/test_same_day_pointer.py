@@ -298,6 +298,24 @@ def test_outside_root_pointer(tmp_path):
     assert result.status == STATUS_OUTSIDE_ROOT
 
 
+def test_rebased_cross_host_pointer_returns_the_resolved_local_path(tmp_path):
+    """A pointer whose persisted path is a cross-host/container path is re-based into
+    the local root for validation; the ACCEPTED result must carry that local path,
+    since consumers load the file from ``result.run_state_path`` (Copilot review, PR #1597)."""
+    root = tmp_path / "morning_dca"
+    local_state = _write_state(root, "20260721_1030ET", _scheduled_state())
+    pointer = {
+        "run_id": "scheduled_20260721_1520ET",
+        "run_state_path": "/home/user/workspace/cron_tracking/morning_dca/20260721_1030ET/run_state.json",
+        "trading_day": TODAY,
+        "stream": "morning",
+    }
+    result = validate_pointer(pointer, expected_stream="morning", expected_root=root, today=TODAY)
+    assert result.status == STATUS_VALID
+    assert Path(result.run_state_path) == local_state.resolve()
+    assert Path(result.run_state_path).is_file()
+
+
 def test_pending_when_target_missing(tmp_path):
     root = tmp_path / "morning_dca"
     root.mkdir(parents=True)

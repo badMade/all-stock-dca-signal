@@ -113,12 +113,27 @@ def _forecast(raw: dict, *, log_returns: bool = False, target: Any = None) -> di
     # A checkpoint bucket can be a deferred *scoring* date after a ticker
     # recovers missing history. It is not authoritative for the target date.
     target_date = _date(raw.get("target_date"))
+    # The CSV's calendar value is an EXPECTATION only: the forecast's true target is
+    # the ticker's next available data row, so it never fills target_date or
+    # suppresses the unresolved-target warning (Copilot review, PR #1597).
+    expected_date = _date(raw.get("expected_target_date"))
+    expected_basis = raw.get("expected_target_date_basis")
+    if expected_basis not in ("calendar", "weekday_estimate"):
+        expected_basis = None
+    target_label = "Next trading row (date unresolved)"
+    if target_date:
+        target_label = target_date
+    elif expected_date:
+        suffix = " (est.)" if expected_basis == "weekday_estimate" else ""
+        target_label = f"Next trading row (expected {expected_date}{suffix})"
     row: dict[str, Any] = {
         "ticker": ticker,
         "model": model,
         "origin_date": _date(raw.get("origin_date")),
         "target_date": target_date,
-        "target_label": target_date or "Next trading row (date unresolved)",
+        "expected_target_date": expected_date,
+        "expected_target_date_basis": expected_basis,
+        "target_label": target_label,
         "price_basis": "adjusted dollars",
         "ref_close": _number(raw.get("ref_close")),
     }
@@ -267,6 +282,8 @@ def build_octopus_snapshot(
         snapshot["status"] = "missing"
         snapshot["summary"] = ["The selected Wondrous Octopus run directory does not exist."]
         return snapshot
+    if (root / "shard_1" / "checkpoint").is_dir() and not (root / "checkpoint").is_dir():
+        root = root / "shard_1"
     reader = _Reader(root, snapshot["warnings"])
     report = reader.json("report/report.json")
     meta = reader.json("run_meta.json")

@@ -154,29 +154,19 @@ doc's §1.4 identified (see PRODUCTION_READINESS.md gap #1), in both
 directions.
 
 **They ship disabled.** `config/market_open_dca.json` and
-`config/intraday_dca.json` both set `live_execution_enabled: false`: the
-executors evaluate fully and write every artifact but never call the broker.
+`config/intraday_dca.json` originally set `live_execution_enabled: false`: the
+executors evaluated fully and wrote every artifact but never called the broker.
 Until that flag is flipped, these slots' real orders still come from the
-external scheduler/agent exactly as before, and the in-repo executors are a
-shadow run whose decisions can be diffed against what actually traded. Flip
-the flag only after a full trading day of that comparison, and expect the
-per-order and cap behavior to match before trusting it with money. Each run
-records `live_execution_enabled` on its `run_state` so a shadow run is
-distinguishable from a live run that merely found no candidates. Once the seven-slot
+external scheduler/agent, and the in-repo executors are a shadow run whose
+decisions can be diffed against what actually traded. **Following explicit operator authorization on 2026-10-04, all stream configs are promoted to `live_execution_enabled: true`** (`config/market_open_dca.json`, `config/morning_dca.json`, `config/midday_dca.json`, and `config/intraday_dca.json`). Each run records `live_execution_enabled` on its `run_state` so a live run is auditable. Once the seven-slot
 roster is wired, the daily and weekly caps in
 [Budget caps](#budget-caps) become fully **shared totals across all seven
 slots combined** with dynamic tier escalation available to every slot, not
 just the final one: whichever slot spends first exhausts that much of the
 shared cap, and a later slot the same day can find less headroom left, or
 none. Earlier slots therefore have effective priority within a day. This
-falls out of the existing "never exceed the selected daily cap" rule — it is
+falls out of the existing "never exceed the selected daily cap" rule -- it is
 not a new rule, just a new consequence of having more slots share one cap.
-
-`docs/schedule_manifest.md` and `docs/run_classification.md` still describe
-the prior three-stream (morning/midday/afternoon) framing of the currently-
-live Perplexity-era roster and have not yet been reconciled with the
-seven-slot model's naming above; that reconciliation is separate from, and
-does not change, which roster is actually placing orders today.
 
 **Perplexity compatible-executor carve-out (2026-08-07, expired 2026-08-14,
 renewed and confirmed 2026-09-09).** Six of the seven Cowork-scheduled Claude

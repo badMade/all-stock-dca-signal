@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+from datetime import date
 from types import SimpleNamespace
 from typing import Any
 
@@ -1326,3 +1327,104 @@ class TestEncoderHealthRetrainBaseline:
         harness = SimpleNamespace(config=SimpleNamespace(models=("persistence",)))
         verdict = daily_update._encoder_health(run_dir, harness)
         assert verdict["status"] == "OK"
+
+
+def test_next_trading_date_weekday_fallback():
+    # Friday -> Monday
+    res_date, basis = daily_update.next_trading_target(date(2026, 6, 5))
+    assert res_date == date(2026, 6, 8)
+    assert basis == "weekday_estimate"
+    assert daily_update.next_trading_date(date(2026, 6, 5)) == date(2026, 6, 8)
+
+    # Monday -> Tuesday
+    res_date, basis = daily_update.next_trading_target(date(2026, 6, 8))
+    assert res_date == date(2026, 6, 9)
+    assert basis == "weekday_estimate"
+
+    # String ISO format
+    assert daily_update.next_trading_date("2026-06-05") == date(2026, 6, 8)
+
+
+def test_next_trading_date_calendar_and_holiday_rollover(tmp_path):
+    cal_file = tmp_path / "market_calendar.json"
+    cal_file.write_text(
+        json.dumps({
+            "years_covered": [2026],
+            "holidays_closed": ["2026-07-03", "2026-09-07"],
+        }),
+        encoding="utf-8",
+    )
+
+    # 2026-07-02 is Thursday; 2026-07-03 is Friday (holiday); rolls to Monday 2026-07-06
+    target, basis = daily_update.next_trading_target(date(2026, 7, 2), calendar_path=cal_file)
+    assert target == date(2026, 7, 6)
+    assert basis == "calendar"
+
+    # 2026-09-04 is Friday; 2026-09-07 is Monday (holiday); rolls to Tuesday 2026-09-08
+    target, basis = daily_update.next_trading_target(date(2026, 9, 4), calendar_path=cal_file)
+    assert target == date(2026, 9, 8)
+    assert basis == "calendar"
+
+    # Year 2025 outside years_covered: fallback to weekday_estimate without guessing holidays
+    target, basis = daily_update.next_trading_target(date(2025, 7, 3), calendar_path=cal_file)
+    assert target == date(2025, 7, 4)
+    assert basis == "weekday_estimate"
+
+    # Direct holidays set
+    target, basis = daily_update.next_trading_target(date(2026, 7, 2), holidays={date(2026, 7, 3)})
+    assert target == date(2026, 7, 6)
+    assert basis == "calendar"
+
+
+def test_write_next_day_forecasts_includes_expected_target_date_columns(tmp_path):
+    cal_file = tmp_path / "market_calendar.json"
+    cal_file.write_text(
+        json.dumps({
+            "years_covered": [2026],
+            "holidays_closed": ["2026-07-03"],
+        }),
+        encoding="utf-8",
+    )
+    band = {c: {"p10": -0.01, "p50": 0.0, "p90": 0.01} for c in ("open", "high", "low", "close")}
+    point = {c: 0.0 for c in ("open", "high", "low", "close")}
+    entry = {
+        "model": "persistence",
+        "ticker": "AAPL",
+        "origin_date": "2026-07-02",
+        "point": point,
+        "quantiles": band,
+        "ref_close": 100.0,
+    }
+    fake_harness = SimpleNamespace(
+        outstanding={UNRESOLVED_KEY: [entry]},
+        panel=SimpleNamespace(series={"AAPL": object()}),
+    )
+    path = daily_update._write_next_day_forecasts(
+        tmp_path / "run", fake_harness, "2026-07-02", calendar_path=cal_file
+    )
+    assert path is not None
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        header = next(reader)
+        row = next(reader)
+    # Expected-date columns must be appended at the end, and the resolved
+    # target_date column must NOT exist: the calendar value is only an expectation.
+    assert header[-2:] == ["expected_target_date", "expected_target_date_basis"]
+    assert "target_date" not in header
+    assert row[-2:] == ["2026-07-06", "calendar"]
+
+
+def test_daily_artifacts_complete_tolerates_old_csv(tmp_path):
+    summary_path = tmp_path / "daily/2026-09-04_summary.json"
+    csv_path = tmp_path / "daily/2026-09-04_next_day_forecasts.csv"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_path.write_text(
+        "ticker,model,origin_date,pred_open,pred_high,pred_low,pred_close,close_p10,close_p90\n"
+        "AAPL,octopus,2026-09-04,101,105,99,102,98,106\n",
+        encoding="utf-8",
+    )
+    summary_path.write_text(
+        json.dumps({"next_day_forecasts_csv": str(csv_path)}),
+        encoding="utf-8",
+    )
+    assert daily_update._daily_artifacts_are_complete(summary_path) is True

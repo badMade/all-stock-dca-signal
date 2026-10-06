@@ -33,6 +33,22 @@ function displayTime(value) {
   return Number.isNaN(parsed.getTime()) ? String(value) : etTime.format(parsed);
 }
 
+function formatRelativeTime(isoString) {
+  if (!isoString) return "";
+  const then = new Date(isoString).getTime();
+  if (Number.isNaN(then)) return String(isoString);
+  const diffSec = Math.max(0, Math.floor((Date.now() - then) / 1000));
+  if (diffSec < 45) return "just now";
+  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
+  if (diffSec < 86400 * 7) return `${Math.floor(diffSec / 86400)}d ago`;
+  try {
+    return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(new Date(then));
+  } catch (_) {
+    return `${Math.floor(diffSec / 86400)}d ago`;
+  }
+}
+
 function statusPill(value) {
   const normalized = String(value || "unknown").toLowerCase();
   let tone = "neutral";
@@ -211,6 +227,23 @@ function renderForecasts() {
   renderForecastChart(rows);
 }
 
+// One shared tooltip node and ONE scroll listener for the page's lifetime. The
+// chart re-renders on every console refresh; a per-render tooltip would append a new
+// node and a permanent window listener each time (Copilot review, PR #1597).
+let chartTooltip = null;
+function getChartTooltip() {
+  if (!chartTooltip || !chartTooltip.isConnected) {
+    const firstUse = chartTooltip === null;
+    chartTooltip = el("div", "chart-tooltip");
+    chartTooltip.hidden = true;
+    document.body.append(chartTooltip);
+    if (firstUse) {
+      window.addEventListener("scroll", () => { if (chartTooltip) chartTooltip.hidden = true; }, { passive: true });
+    }
+  }
+  return chartTooltip;
+}
+
 function renderForecastChart(rows) {
   const eligible = rows.filter((row) => isNumber(row.point) && isNumber(row.p10) && isNumber(row.p90) && Number(row.p90) >= Number(row.p10));
   if (!eligible.length) { $("forecast-chart").replaceChildren(); return; }
@@ -220,24 +253,115 @@ function renderForecastChart(rows) {
     for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value));
     return node;
   };
-  const nodes = eligible.map((forecast) => {
+  const parsed = eligible.map((forecast) => {
+    const baseline = isNumber(forecast.ref_close)
+      ? Number(forecast.ref_close)
+      : (isNumber(forecast.p50) ? Number(forecast.p50) : Number(forecast.point));
+    const p10 = Number(forecast.p10);
+    const p90 = Number(forecast.p90);
+    const point = Number(forecast.point);
+    const base = baseline || 1;
+    const p10Pct = (p10 - base) / base;
+    const p90Pct = (p90 - base) / base;
+    const pointPct = (point - base) / base;
+    return { forecast, baseline, p10, p90, point, p10Pct, p90Pct, pointPct };
+  });
+  const allMinPct = Math.min(0, ...parsed.flatMap((r) => [r.p10Pct, r.pointPct]));
+  const allMaxPct = Math.max(0, ...parsed.flatMap((r) => [r.p90Pct, r.pointPct]));
+  const maxAbs = Math.max(Math.abs(allMinPct), Math.abs(allMaxPct), 0.02);
+  const headroom = maxAbs * 1.25;
+  const scaleMin = -headroom;
+  const scaleMax = headroom;
+  const scaleSpan = scaleMax - scaleMin || 1;
+  const x = (pct) => 15 + ((pct - scaleMin) / scaleSpan) * 370;
+  const zeroX = x(0);
+
+  function showChartTip(e, title, value, detail) {
+    const tip = getChartTooltip();
+    tip.replaceChildren(
+      el("div", "tip-title", title),
+      el("div", "tip-value", value),
+      el("div", "tip-detail", detail)
+    );
+    tip.hidden = false;
+    positionChartTip(e);
+  }
+  function positionChartTip(e) {
+    const tip = getChartTooltip();
+    if (!tip || tip.hidden) return;
+    const target = e.currentTarget || e.target;
+    const rect = target.getBoundingClientRect();
+    const tipRect = tip.getBoundingClientRect();
+    const left = Math.max(10, Math.min(window.innerWidth - tipRect.width - 10, rect.left + rect.width / 2 - tipRect.width / 2));
+    const top = rect.top - tipRect.height - 8 > 10 ? rect.top - tipRect.height - 8 : rect.bottom + 8;
+    tip.style.left = `${left + window.scrollX}px`;
+    tip.style.top = `${top + window.scrollY}px`;
+  }
+  function hideChartTip() {
+    const tip = getChartTooltip();
+    if (tip) tip.hidden = true;
+  }
+
+  const nodes = parsed.map(({ forecast, p10, p90, point, p10Pct, p90Pct, pointPct }) => {
     const row = el("div", "range-row");
     const label = el("div", "range-label");
     label.append(el("strong", "", forecast.ticker), el("span", "range-model", words(forecast.model)));
-    const svg = svgNode("svg", { viewBox: "0 0 400 28", preserveAspectRatio: "none", class: "range-graphic", role: "img", "aria-label": `${forecast.ticker}: P10 ${usd(forecast.p10)}, point ${usd(forecast.point)}, P90 ${usd(forecast.p90)}. Each row uses its own price scale.` });
-    const low = Math.min(Number(forecast.p10), Number(forecast.point));
-    const high = Math.max(Number(forecast.p90), Number(forecast.point));
-    const spread = high - low || Math.max(Math.abs(low) * .01, 1);
-    const x = (value) => 25 + ((Number(value) - low) / spread) * 350;
-    svg.append(svgNode("line", { x1: 0, x2: 400, y1: 14, y2: 14, stroke: "#edf2ed", "stroke-width": 1 }), svgNode("rect", { x: x(forecast.p10), y: 8, width: Math.max(2, x(forecast.p90) - x(forecast.p10)), height: 12, rx: 6, fill: "#d7eadc" }), svgNode("line", { x1: x(forecast.p10), x2: x(forecast.p10), y1: 7, y2: 21, stroke: "#91b69b", "stroke-width": 1 }), svgNode("line", { x1: x(forecast.p90), x2: x(forecast.p90), y1: 7, y2: 21, stroke: "#91b69b", "stroke-width": 1 }), svgNode("circle", { cx: x(forecast.point), cy: 14, r: 4, fill: "#277451" }));
-    row.append(label, svg, el("div", "range-value", `${usd(forecast.p10)} – ${usd(forecast.p90)}`));
+    const svg = svgNode("svg", {
+      viewBox: "0 0 400 28",
+      preserveAspectRatio: "none",
+      class: "range-graphic",
+      role: "img",
+      "aria-label": `${forecast.ticker}: P10 ${usd(p10)}, point ${usd(point)}, P90 ${usd(p90)}.`
+    });
+    const x1 = Math.min(x(p10Pct), x(p90Pct));
+    const x2 = Math.max(x(p10Pct), x(p90Pct));
+    const ptX = x(pointPct);
+    const bandWidth = Math.max(4, x2 - x1);
+
+    const ref = isNumber(forecast.ref_close) ? Number(forecast.ref_close) : null;
+    const baseVal = ref || (isNumber(forecast.p50) ? Number(forecast.p50) : point);
+    const diff = ref ? ((point - ref) / ref) * 100 : 0;
+    const p10Diff = ref ? ((p10 - ref) / ref) * 100 : 0;
+    const p90Diff = ref ? ((p90 - ref) / ref) * 100 : 0;
+    const p10PctStr = ref ? ` (${p10Diff >= 0 ? "+" : ""}${p10Diff.toFixed(1)}%)` : "";
+    const p90PctStr = ref ? ` (${p90Diff >= 0 ? "+" : ""}${p90Diff.toFixed(1)}%)` : "";
+    const ptPctStr = ref ? ` (${diff >= 0 ? "+" : ""}${diff.toFixed(1)}%)` : "";
+
+    const track = svgNode("line", { x1: 0, x2: 400, y1: 14, y2: 14, class: "range-track" });
+    const refLine = svgNode("line", { x1: zeroX, x2: zeroX, y1: 4, y2: 24, class: "range-ref" });
+    const band = svgNode("rect", { x: x1, y: 7, width: bandWidth, height: 14, rx: 7, class: "range-band" });
+    const cap1 = svgNode("line", { x1, x2: x1, y1: 6, y2: 22, class: "range-cap" });
+    const cap2 = svgNode("line", { x1: x2, x2, y1: 6, y2: 22, class: "range-cap" });
+    const pointDot = svgNode("circle", { cx: ptX, cy: 14, r: 4.5, class: "range-point" });
+
+    const bind = (elem, title, value, detail) => {
+      const t = document.createElementNS(ns, "title");
+      t.textContent = `${title}: ${value} — ${detail}`;
+      elem.append(t);
+      elem.addEventListener("mouseenter", (e) => showChartTip(e, title, value, detail));
+      elem.addEventListener("mousemove", positionChartTip);
+      elem.addEventListener("mouseleave", hideChartTip);
+    };
+
+    bind(refLine, `${forecast.ticker} · Prior Close Baseline`, `${usd(baseVal)} (0.0%)`, "Observed reference close prior to forecast horizon.");
+    bind(band, `${forecast.ticker} · P10–P90 Uncertainty Interval`, `${usd(p10)} — ${usd(p90)}`, `80% confidence interval spanning ${usd(p90 - p10)} (${((p90 - p10) / (baseVal || 1) * 100).toFixed(1)}% range of estimated uncertainty).`);
+    bind(cap1, `${forecast.ticker} · P10 Downside Bound`, `${usd(p10)}${p10PctStr}`, "10th percentile bound: estimated 10% chance price falls below this level.");
+    bind(cap2, `${forecast.ticker} · P90 Upside Bound`, `${usd(p90)}${p90PctStr}`, "90th percentile bound: estimated 90% of outcomes expected below this level.");
+    bind(pointDot, `${forecast.ticker} · Point Forecast`, `${usd(point)}${ptPctStr}`, `Primary predicted close price relative to prior close ${usd(baseVal)}.`);
+
+    svg.append(track, refLine, band, cap1, cap2, pointDot);
+
+    const pctLabel = ref ? ` (${diff >= 0 ? "+" : ""}${diff.toFixed(1)}%)` : "";
+    row.append(label, svg, el("div", "range-value", `${usd(p10)} - ${usd(p90)}${pctLabel}`));
     return row;
   });
   const noteText = eligible.length > 1
-    ? `All ${eligible.length} available ranges. Each row has its own price scale; use the dollar labels to compare uncertainty.`
-    : `1 available range. Each row has its own price scale; use the dollar labels to compare uncertainty.`;
+    ? `All ${eligible.length} available ranges. Centered on prior close (dashed line); hover any point to view explanation.`
+    : `1 available range. Centered on prior close (dashed line); hover any point to view explanation.`;
   nodes.push(el("p", "chart-note", noteText));
-  $("forecast-chart").replaceChildren(...nodes);
+  const chart = $("forecast-chart");
+  chart.onscroll = hideChartTip;
+  chart.replaceChildren(...nodes);
 }
 
 function renderPeriods() {
@@ -257,11 +381,40 @@ function renderActions(actions) {
   const nodes = arr(actions).map((action) => {
     const card = el("article", "action-card");
     const heading = el("div", "action-header");
-    heading.append(el("span", "action-icon", /octopus/.test(action.id) ? "⌁" : /report/.test(action.id) ? "≡" : "↗"), el("h3", "", action.label || words(action.id)));
+    const icon = el("span", "action-icon", /octopus/.test(action.id) ? "⌁" : /report/.test(action.id) ? "≡" : "↗");
+    const title = el("div", "action-title");
+    title.append(el("h3", "", action.label || words(action.id)));
+
+    const meta = el("div", "action-meta");
+    const runningJob = arr(state.snapshot?.jobs).find((job) => job.action === action.id && ["running", "queued"].includes(job.status));
+    let lu = action.last_updated;
+    if (state.launching.has(action.id) || runningJob) {
+      lu = { status: "running", label: "Updating…", timestamp: runningJob?.started_at || new Date().toISOString() };
+    }
+    if (lu) {
+      let label = lu.label;
+      let badgeClass = "tag action-updated";
+      if (lu.status === "running" || lu.status === "queued") {
+        label = "Updating…";
+        badgeClass = "status-pill running";
+      } else if (!label && lu.timestamp) {
+        label = `Updated ${formatRelativeTime(lu.timestamp)}`;
+      } else if (!label) {
+        label = "Never run";
+      }
+      const updatedEl = el("span", badgeClass, label);
+      if (lu.timestamp) {
+        try {
+          updatedEl.title = `Last update: ${new Date(lu.timestamp).toLocaleString()}`;
+        } catch (_) {}
+      }
+      meta.append(updatedEl);
+    }
+    heading.append(icon, title, meta);
     card.append(heading, el("p", "action-description", action.description || "Launch this configured program entry point."));
     if (action.reason) card.append(el("p", "action-reason", action.reason));
     const bottom = el("div", "action-bottom");
-    const pending = state.launching.has(action.id) || arr(state.snapshot?.jobs).some((job) => job.action === action.id && ["running", "queued"].includes(job.status));
+    const pending = state.launching.has(action.id) || Boolean(runningJob);
     const button = el("button", "button ghost", pending ? "Running…" : "Run workflow →");
     button.type = "button";
     button.disabled = !action.available || !state.token || pending;
@@ -306,25 +459,68 @@ function renderJobs(jobs) {
   }) : [el("p", "empty-state", "No jobs started in this console session. Run the full demo to test the complete path.")]));
 }
 
+function viewJobOutput(jobId) {
+  const details = $("jobs-list").querySelector(`details[data-job-id="${CSS.escape(String(jobId))}"]`);
+  if (details) {
+    details.open = true;
+    details.scrollIntoView({ behavior: "smooth", block: "center" });
+    const pre = details.querySelector("pre");
+    if (pre) {
+      pre.style.outline = "2px solid var(--green)";
+      setTimeout(() => { pre.style.outline = ""; }, 2500);
+    }
+  } else {
+    $("jobs").scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+}
+window.viewJobOutput = viewJobOutput;
+
 function renderModules(modules) {
   const nodes = arr(modules).map((module) => {
-    const card = el("article", "module-row");
-    const heading = el("div", "module-heading");
-    heading.append(el("h3", "", module.name || words(module.id)), statusPill(module.status));
-    card.append(heading, el("p", "muted", module.description || ""));
-    if (module.command) {
-      const command = Array.isArray(module.command) ? module.command.join(" ") : String(module.command);
+    const card = el("article", "module-row module-card");
+    const heading = el("div", "module-card-header");
+    const title = el("h3", "module-card-title", module.name || words(module.id));
+
+    const infoWrap = el("div", "module-info-wrap");
+    const infoBtn = el("button", "module-info-btn", "ⓘ");
+    infoBtn.type = "button";
+    infoBtn.setAttribute("aria-label", `Information for ${module.name || module.id}`);
+    infoBtn.title = "View description & copy command";
+
+    const popover = el("div", "module-info-popover");
+    const popoverTop = el("div", "module-info-top");
+    popoverTop.append(statusPill(module.status));
+    const closeBtn = el("button", "module-info-close", "×");
+    closeBtn.type = "button";
+    closeBtn.setAttribute("aria-label", "Close");
+    closeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      infoWrap.classList.remove("active");
+    });
+    popoverTop.append(closeBtn);
+
+    const popoverDesc = el("p", "module-info-desc", module.description || "No description provided.");
+    popover.append(popoverTop, popoverDesc);
+
+    const command = Array.isArray(module.command) ? module.command.join(" ") : String(module.command || "");
+    if (command && command !== "Library API; see documentation") {
       const line = el("div", "module-command");
-      const button = el("button", "button secondary small", "Copy");
-      button.type = "button";
-      button.setAttribute("aria-label", `Copy command for ${module.name || module.id}`);
-      button.addEventListener("click", async () => {
-        try { await navigator.clipboard.writeText(command); button.textContent = "Copied"; }
-        catch { button.textContent = "Select to copy"; }
+      const copyBtn = el("button", "button secondary small", "Copy");
+      copyBtn.type = "button";
+      copyBtn.setAttribute("aria-label", `Copy command for ${module.name || module.id}`);
+      copyBtn.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(command);
+          copyBtn.textContent = "Copied";
+          setTimeout(() => { copyBtn.textContent = "Copy"; }, 2000);
+        } catch (_) {
+          copyBtn.textContent = "Select to copy";
+        }
       });
-      line.append(el("code", "", command), button);
-      card.append(line);
+      line.append(el("code", "", command), copyBtn);
+      popover.append(line);
     }
+
     if (module.docs) {
       const docs = el("p", "module-docs", "Documentation: ");
       for (const [index, path] of (Array.isArray(module.docs) ? module.docs : [module.docs]).entries()) {
@@ -339,8 +535,83 @@ function renderModules(modules) {
         });
         docs.append(link);
       }
-      card.append(docs);
+      popover.append(docs);
     }
+
+    infoWrap.append(infoBtn, popover);
+    infoBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      infoWrap.classList.toggle("active");
+    });
+    heading.append(title, infoWrap);
+
+    const body = el("div", "module-card-body");
+    const actionsRow = el("div", "module-actions-row");
+
+    const actionObj = module.action_id
+      ? arr(state.snapshot?.actions).find((a) => a.id === module.action_id)
+      : null;
+    const runningJob = module.action_id
+      ? arr(state.snapshot?.jobs).find((j) => j.action === module.action_id && ["running", "queued"].includes(j.status))
+      : null;
+    const latestJob = module.action_id
+      ? arr(state.snapshot?.jobs).find((j) => j.action === module.action_id)
+      : null;
+    const isPending = Boolean(runningJob || (module.action_id && state.launching.has(module.action_id)));
+    const isAvailable = !actionObj || actionObj.available !== false;
+
+    let execBtn;
+    if (module.action_id) {
+      if (!isAvailable) {
+        execBtn = el("button", "button secondary small module-exec-btn", "Setup needed");
+        execBtn.type = "button";
+        execBtn.title = `${actionObj?.reason || "Setup needed"}. Click for details.`;
+        execBtn.addEventListener("click", () => {
+          showError(`Cannot run ${module.name}: ${actionObj?.reason || "Prerequisite setup missing"}. Supply --octopus-run when launching from.py`);
+        });
+      } else {
+        execBtn = el("button", "button ghost small module-exec-btn", isPending ? "Running…" : "▶ Run entry point");
+        execBtn.type = "button";
+        execBtn.disabled = !state.token || isPending;
+        execBtn.addEventListener("click", () => startJob(module.action_id));
+      }
+    } else if (command && /<[^>]+>/.test(command)) {
+      execBtn = el("button", "button secondary small module-exec-btn", "Requires CLI args");
+      execBtn.type = "button";
+      execBtn.title = "This entry point requires CLI arguments. Click to copy command.";
+      execBtn.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(command);
+          execBtn.textContent = "Copied command";
+          setTimeout(() => { execBtn.textContent = "Requires CLI args"; }, 2000);
+        } catch (_) {}
+      });
+    } else {
+      execBtn = el("span", "tag", "Library API");
+    }
+
+    const resultBox = el("div", "module-result");
+    if (latestJob) {
+      resultBox.append(statusPill(latestJob.status));
+      const timeStr = `${displayTime(latestJob.finished_at || latestJob.started_at)}${latestJob.returncode !== null && latestJob.returncode !== undefined ? ` · exit ${latestJob.returncode}` : ""}`;
+      resultBox.append(el("span", "module-result-time", timeStr));
+      const viewBtn = el("button", "button ghost small", "View output →");
+      viewBtn.type = "button";
+      viewBtn.addEventListener("click", () => viewJobOutput(latestJob.id));
+      resultBox.append(viewBtn);
+    } else if (module.action_id) {
+      if (!isAvailable && actionObj?.reason) {
+        const setupTag = el("span", "tag action-updated", "Setup needed");
+        setupTag.title = actionObj.reason;
+        resultBox.append(setupTag);
+      } else {
+        resultBox.append(el("span", "tag action-updated", "Not executed yet"));
+      }
+    }
+
+    actionsRow.append(execBtn, resultBox);
+    body.append(actionsRow);
+    card.append(heading, body);
     return card;
   });
   $("modules").replaceChildren(...(nodes.length ? nodes : [el("p", "empty-state", "No additional program modules loaded.")]));
@@ -364,6 +635,7 @@ async function openDocs(path) {
 /* Hash router. Every top-level page is a <section class="page" data-page>; the
    hash names the page and nothing else, so an unknown or empty hash shows Today.
    Pages never receive a path or a query from the hash: each page renderer reads
+   the snapshot the server already produced (GUI expansion Phase 0). */
 const PAGE_TITLES = {
   today: "Today", runs: "Runs", schedule: "Schedule", state: "State & ledgers",
   alerts: "Alerts & health", config: "Config", tickers: "Tickers", reports: "Reports",
@@ -541,6 +813,60 @@ function updateClock() {
   }
 }
 
+function initTheme() {
+  const toggle = $("theme-toggle");
+  const icon = $("theme-icon");
+  let saved = null;
+  try {
+    saved = localStorage.getItem("dca_theme");
+  } catch (error) {
+    // Local storage access may fail in sandboxed or strict privacy contexts.
+  }
+  const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  const currentTheme = saved || (prefersDark ? "dark" : "light");
+
+  // Only an explicit toggle click persists: the initial and OS-driven applications
+  // must stay unsaved, or the media-query listener below would see a "saved"
+  // preference and ignore later system theme changes (Copilot review, PR #1597).
+  function applyTheme(theme, { persist = false } = {}) {
+    document.documentElement.dataset.theme = theme;
+    if (icon) icon.textContent = theme === "dark" ? "☀️" : "🌙";
+    if (toggle) {
+      const label = theme === "dark" ? "Switch to light mode" : "Switch to dark mode";
+      toggle.title = label;
+      toggle.setAttribute("aria-label", label);
+    }
+    if (!persist) return;
+    try {
+      localStorage.setItem("dca_theme", theme);
+    } catch (error) {
+      // Ignore storage errors.
+    }
+  }
+
+  applyTheme(currentTheme);
+
+  if (toggle) {
+    toggle.addEventListener("click", () => {
+      const active = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+      applyTheme(active, { persist: true });
+    });
+  }
+
+  if (window.matchMedia) {
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (event) => {
+      try {
+        if (!localStorage.getItem("dca_theme")) {
+          applyTheme(event.matches ? "dark" : "light");
+        }
+      } catch (error) {
+        applyTheme(event.matches ? "dark" : "light");
+      }
+    });
+  }
+}
+
+initTheme();
 $("report-date").value = dateInET();
 $("report-date").addEventListener("change", () => { if ($("report-date").value) { state.dateInitialized = true; refresh(); } });
 $("refresh").addEventListener("click", refresh);
@@ -549,8 +875,14 @@ $("ticker-filter").addEventListener("input", renderForecasts);
 $("component-filter").addEventListener("change", () => { renderForecasts(); renderPeriods(); });
 $("period-filter").addEventListener("change", renderPeriods);
 $("docs-close").addEventListener("click", () => $("docs-dialog").close());
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".module-info-wrap")) {
+    document.querySelectorAll(".module-info-wrap.active").forEach((w) => w.classList.remove("active"));
+  }
+});
 window.addEventListener("hashchange", route);
 route();
 updateClock();
 setInterval(updateClock, 1000);
 refresh();
+

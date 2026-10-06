@@ -924,7 +924,14 @@ class _StaticMarketData:
                 # severity as a boolean/non-finite price above: a nonsensical
                 # bar date signals a broken caller payload, not a routine
                 # per-source outage the reconciler should route around.
-                bar_date = bar.timestamp.astimezone(ET).date()
+                # Daily bars timestamped at midnight UTC (00:00:00Z) carry the session
+                # date directly; converting midnight UTC to ET would subtract 4/5 hours
+                # and falsely shift the bar to the prior calendar day.
+                bar_date = (
+                    bar.timestamp.date()
+                    if bar.timestamp.time() == time(0, 0)
+                    else bar.timestamp.astimezone(ET).date()
+                )
                 if bar_date != previous_trading_day:
                     raise ValueError(
                         f"previous_close_bar for {ticker!r} ({source.value}) is dated {bar_date}, "

@@ -52,6 +52,7 @@ import csv
 import io
 import json
 import math
+from datetime import date, datetime, timedelta
 from typing import Any  # noqa: E402
 
 import features as _features  # noqa: E402
@@ -135,6 +136,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--history-dir", type=Path, default=None)
     parser.add_argument("--now", default=None, help="as-of override: rows on/after this day are unseen")
     parser.add_argument("--dry-run", action="store_true", help="report what would run; write nothing")
+    default_cal = REPO_ROOT / "config" / "market_calendar.json"
+    parser.add_argument(
+        "--calendar-path",
+        type=Path,
+        default=default_cal if default_cal.exists() else None,
+        help="path to market_calendar.json for NYSE holiday resolution",
+    )
     return parser
 
 
@@ -367,7 +375,104 @@ def _current_universe_unresolved(harness: Any) -> list[dict]:
     ]
 
 
-def _write_next_day_forecasts(run_dir: Path, harness: Any, last_date: str) -> Path | None:
+def next_trading_target(
+    origin: date | str,
+    calendar_path: Path | str | None = None,
+    *,
+    holidays: set[date] | set[str] | None = None,
+) -> tuple[date, str]:
+    """Calculate the next expected trading date following origin.
+
+    Skips weekends (Saturday and Sunday) and any NYSE holidays if calendar data is
+    provided. If no calendar path or holiday set is supplied, or if the candidate
+    year is outside the calendar's covered years, falls back to the next weekday
+    and labels the basis as 'weekday_estimate'. Guessing holiday schedules
+    silently is prohibited (see dca_runner.py ~L211).
+
+    Args:
+        origin: The origin date as a date object or ISO date string.
+        calendar_path: Optional path to a market calendar JSON file.
+        holidays: Optional set of holiday date objects or ISO date strings.
+
+    Returns:
+        A tuple of (expected_target_date, expected_target_date_basis), where basis is either
+        'calendar' or 'weekday_estimate'.
+    """
+    if isinstance(origin, str):
+        origin = date.fromisoformat(origin)
+    elif isinstance(origin, datetime):
+        origin = origin.date()
+    elif not isinstance(origin, date):
+        raise TypeError(f"origin must be a date or ISO date string, got {type(origin).__name__}")
+
+    holidays_set: set[date] = set()
+    years_covered: set[int] = set()
+    has_calendar = False
+
+    if holidays is not None:
+        has_calendar = True
+        for h in holidays:
+            if isinstance(h, str):
+                holidays_set.add(date.fromisoformat(h))
+            elif isinstance(h, datetime):
+                holidays_set.add(h.date())
+            elif isinstance(h, date):
+                holidays_set.add(h)
+    elif calendar_path is not None:
+        c_path = Path(calendar_path)
+        if c_path.exists() and c_path.is_file():
+            try:
+                with c_path.open("r", encoding="utf-8") as f:
+                    cal_data = json.load(f)
+                if isinstance(cal_data, dict):
+                    years_covered = set(cal_data.get("years_covered", []))
+                    raw_holidays = cal_data.get("holidays_closed", [])
+                    if isinstance(raw_holidays, list):
+                        for item in raw_holidays:
+                            if isinstance(item, str):
+                                try:
+                                    holidays_set.add(date.fromisoformat(item))
+                                except ValueError:
+                                    pass
+                    has_calendar = True
+            except (OSError, json.JSONDecodeError):
+                has_calendar = False
+
+    candidate = origin + timedelta(days=1)
+    while True:
+        if candidate.weekday() >= 5:
+            candidate += timedelta(days=1)
+            continue
+        if has_calendar:
+            if years_covered and candidate.year not in years_covered:
+                # Outside covered years; do not guess holidays silently
+                return candidate, "weekday_estimate"
+            if candidate in holidays_set:
+                candidate += timedelta(days=1)
+                continue
+            return candidate, "calendar"
+        else:
+            return candidate, "weekday_estimate"
+
+
+def next_trading_date(
+    origin: date | str,
+    calendar_path: Path | str | None = None,
+    *,
+    holidays: set[date] | set[str] | None = None,
+) -> date:
+    """Return the next trading date following origin as a datetime.date."""
+    target, _ = next_trading_target(origin, calendar_path=calendar_path, holidays=holidays)
+    return target
+
+
+def _write_next_day_forecasts(
+    run_dir: Path,
+    harness: Any,
+    last_date: str,
+    *,
+    calendar_path: Path | None = None,
+) -> Path | None:
     """Tomorrow's OHLC for all tickers, in adjusted dollars, as a ready CSV.
 
     Sourced from ``outstanding[UNRESOLVED_KEY]`` -- by construction, exactly
@@ -383,6 +488,12 @@ def _write_next_day_forecasts(run_dir: Path, harness: Any, last_date: str) -> Pa
     would have silently dropped it.
     """
     rows = []
+    cal_path = calendar_path
+    if cal_path is None:
+        default_cal = REPO_ROOT / "config" / "market_calendar.json"
+        if default_cal.exists() and default_cal.is_file():
+            cal_path = default_cal
+
     for entry in _current_universe_unresolved(harness):
         row: dict[str, object] = {
             "ticker": entry["ticker"],
@@ -394,6 +505,14 @@ def _write_next_day_forecasts(run_dir: Path, harness: Any, last_date: str) -> Pa
             row[f"pred_{component}"] = _dollar_cell(entry["point"][component], entry["ref_close"])
             for key in QUANTILE_KEYS:
                 row[f"{component}_{key}"] = _dollar_cell(entry["quantiles"][component][key], entry["ref_close"])
+        target_dt, basis = next_trading_target(entry["origin_date"], calendar_path=cal_path)
+        # EXPECTED, not resolved: these entries come from UNRESOLVED_KEY, so the
+        # forecast's true target stays the ticker's next available data row, which
+        # can differ from the next NYSE session after a data gap. The calendar
+        # result is exported under expected_* so readers never mistake it for a
+        # resolved target_date (Copilot review, PR #1597).
+        row["expected_target_date"] = target_dt.isoformat()
+        row["expected_target_date_basis"] = basis
         rows.append(row)
     if not rows:
         return None
@@ -503,6 +622,7 @@ def _emit_daily_artifacts(
     days_processed: list[str],
     *,
     new_records: list[dict] | None = None,
+    calendar_path: Path | None = None,
 ) -> None:
     """Write daily/<date>_summary.json + the next-day forecasts CSV, and
     print the one-glance digest. Shared by the normal processed-day path and
@@ -511,7 +631,7 @@ def _emit_daily_artifacts(
     _day_scores() -- lets the normal path avoid a full ledger rescan."""
     scores = _day_scores(run_dir, harness, last_date, records=new_records)
     health = _encoder_health(run_dir, harness)
-    forecasts_path = _write_next_day_forecasts(run_dir, harness, last_date)
+    forecasts_path = _write_next_day_forecasts(run_dir, harness, last_date, calendar_path=calendar_path)
     # Same selection as _write_next_day_forecasts(): a recovered or newly
     # warmed-up ticker's forecast deliberately keeps its OWN (older)
     # origin_date, not today's last_date, and the CSV already counts it as
@@ -810,7 +930,9 @@ def _dispatch(args: argparse.Namespace) -> int:
                 "recovering missing daily artifacts"
             )
             print(f"NOOP: {last} already processed; {reason}")
-            _emit_daily_artifacts(run_dir, harness, config, last, rebound, [last])
+            _emit_daily_artifacts(
+                run_dir, harness, config, last, rebound, [last], calendar_path=args.calendar_path
+            )
             return 0
         print(f"NOOP: {last} already processed")
         return 0
@@ -845,7 +967,16 @@ def _dispatch(args: argparse.Namespace) -> int:
             print("interrupted cleanly; checkpoint saved")
             return 3
         last_date = pending_dates[-1]
-        _emit_daily_artifacts(run_dir, harness, config, last_date, rebound, pending_dates, new_records=new_records)
+        _emit_daily_artifacts(
+            run_dir,
+            harness,
+            config,
+            last_date,
+            rebound,
+            pending_dates,
+            new_records=new_records,
+            calendar_path=args.calendar_path,
+        )
         return 0
     finally:
         _release_run_lock(lock_handle)

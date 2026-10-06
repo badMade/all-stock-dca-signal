@@ -110,26 +110,39 @@ from near_close_dca import (
 from scripts.run_classification import PriorAllocation
 
 # (drop percent from prior close, expected multiplier).
+# 2026-10-04 ladder rescale: log-scaled ladder, 1x at 0.1% up to 8x at 16%+ (config/sizing_ladder.json).
 LADDER_BOUNDARY_CASES = [
     (0.09, 0.0),  # below the 0.1% minimum -> no buy
     (0.1, 1.0),  # 1x tier begins
-    (1.999, 1.0),  # still 1x just under 2.0%
-    (2.0, 1.5),  # 1.5x tier begins
-    (3.999, 1.5),  # still 1.5x just under 4.0%
-    (4.0, 2.0),  # 2x tier begins
-    (4.999, 2.0),  # still 2x just under 5.0%
-    (5.0, 2.5),  # 2.5x tier begins
-    (5.999, 2.5),  # still 2.5x just under 6.0%
-    (6.0, 3.0),  # 3x tier begins
-    (6.499, 3.0),  # still 3x just under 6.5%
-    (6.5, 3.5),  # 3.5x tier begins
-    (6.999, 3.5),  # still 3.5x just under 7.0%
-    (7.0, 4.0),  # 4x tier begins
-    (7.499, 4.0),  # still 4x just under 7.5%
-    (7.5, 4.5),  # 4.5x tier begins
-    (7.999, 4.5),  # still 4.5x just under 8.0%
-    (8.0, 5.0),  # 5x tier begins
-    (12.0, 5.0),  # no upper cutoff, still 5x
+    (0.499, 1.0),  # still 1x just under 0.5%
+    (0.5, 1.5),  # 1.5x tier begins
+    (0.999, 1.5),  # still 1.5x just under 1.0%
+    (1.0, 2.0),  # 2x tier begins
+    (1.499, 2.0),  # still 2x just under 1.5%
+    (1.5, 2.5),  # 2.5x tier begins
+    (1.999, 2.5),  # still 2.5x just under 2.0%
+    (2.0, 3.0),  # 3x tier begins
+    (2.749, 3.0),  # still 3x just under 2.75%
+    (2.75, 3.5),  # 3.5x tier begins
+    (3.499, 3.5),  # still 3.5x just under 3.5%
+    (3.5, 4.0),  # 4x tier begins
+    (4.499, 4.0),  # still 4x just under 4.5%
+    (4.5, 4.5),  # 4.5x tier begins
+    (5.499, 4.5),  # still 4.5x just under 5.5%
+    (5.5, 5.0),  # 5x tier begins
+    (6.999, 5.0),  # still 5x just under 7.0%
+    (7.0, 5.5),  # 5.5x tier begins
+    (8.499, 5.5),  # still 5.5x just under 8.5%
+    (8.5, 6.0),  # 6x tier begins
+    (10.499, 6.0),  # still 6x just under 10.5%
+    (10.5, 6.5),  # 6.5x tier begins
+    (12.499, 6.5),  # still 6.5x just under 12.5%
+    (12.5, 7.0),  # 7x tier begins
+    (14.499, 7.0),  # still 7x just under 14.5%
+    (14.5, 7.5),  # 7.5x tier begins
+    (15.999, 7.5),  # still 7.5x just under 16.0%
+    (16.0, 8.0),  # 8x tier begins
+    (25.0, 8.0),  # no upper cutoff, still 8x
 ]
 
 
@@ -149,13 +162,14 @@ def test_raw_ladder_multiplier_ignores_the_ml_nudge_and_caps():
     """Regression test for "Preserve the raw ladder tier for selloff-breadth
     counting". raw_ladder_multiplier() must return the ladder's OWN tier
     match, unaffected by the ml-forecaster sizing nudge (or the kill-switch
-    cap) that graded_buy_multiplier() applies on top of it -- a 5.0% drop
+    cap) that graded_buy_multiplier() applies on top of it -- a 1.75% drop
     is a 2.5x ladder tier regardless of any per-ticker ML factor.
     """
     from near_close_dca import raw_ladder_multiplier
 
     config = StrategyConfig(ml_sizing_adjustment={"AAPL": 1.2})
-    drop_fraction = 5.0 / 100.0  # the 2.5x ladder tier
+    # 2026-10-04 ladder rescale: 2.5x is now the 1.5-2.0% tier (was 5.0%).
+    drop_fraction = 1.75 / 100.0  # the 2.5x ladder tier
     assert raw_ladder_multiplier(drop_fraction, config, "AAPL") == 2.5
     # graded_buy_multiplier applies the SAME ticker's ML factor on top --
     # 2.5 * 1.2 = 3.0, crossing the default high_multiplier_threshold (3.0)
@@ -2467,13 +2481,13 @@ def test_first_allocation_below_close_only_uses_one_dollar_base():
     assert signal.previous_low == 95.0
     assert signal.base_selection_reason == BASE_BELOW_CLOSE_ONLY
     assert signal.selected_base_amount_usd == 1.0
-    assert signal.buy_multiplier == 1.5
-    assert signal.suggested_amount_usd == 1.0 * 1.5
+    assert signal.buy_multiplier == 3.0
+    assert signal.suggested_amount_usd == 1.0 * 3.0
 
 
 def test_first_allocation_below_close_and_low_uses_two_dollar_base():
     # Decision price below both the prior close (100) and the prior low (95)
-    # -> $2 base scale. Drop is 6% -> 3x multiplier -> $2 * 3 = $6 suggested.
+    # -> $2 base scale. Drop is 6% -> 5x multiplier (2026-10-04 ladder rescale) -> $2 * 5 = $10 suggested.
     now = datetime(2026, 6, 29, 15, 45, tzinfo=EASTERN)
     data = _FakeDataWithLow(SourceName.FINANCE, close_price=94.0, prev_close=100.0, prev_low=95.0)
     signal = evaluate_source_signal("AAPL", now, StrategyConfig(), data, interval_minutes=15)
@@ -2481,8 +2495,8 @@ def test_first_allocation_below_close_and_low_uses_two_dollar_base():
     assert signal.previous_low == 95.0
     assert signal.base_selection_reason == BASE_BELOW_CLOSE_AND_LOW
     assert signal.selected_base_amount_usd == 2.0
-    assert signal.buy_multiplier == 3.0
-    assert signal.suggested_amount_usd == 2.0 * 3.0
+    assert signal.buy_multiplier == 5.0
+    assert signal.suggested_amount_usd == 2.0 * 5.0
 
 
 def test_calibrated_first_tier_overrides_global_minimum_drop():
@@ -2574,8 +2588,9 @@ def test_select_first_allocation_base_helper_branches():
         1.0,
         BASE_BELOW_CLOSE_ONLY,
     )
-    # Per-order ceiling holds: deepest drop (5x) on the $2 scale tops out at $10.
-    assert 2.0 * 5.0 == config.max_per_order_usd
+    # Per-order ceiling holds: deepest drop (8x) on the $2 scale tops out at $16
+    # (2026-10-04 ladder rescale: 5x/$10 -> 8x/$16).
+    assert 2.0 * 8.0 == config.max_per_order_usd
 
 
 def test_first_buy_ticker_uses_close_and_low_even_when_other_tickers_have_prior_same_day_buys():
@@ -2630,15 +2645,17 @@ def test_run_daily_compact_prior_allocation_scoped_to_its_own_ticker(tmp_path):
 
     # AAPL has its own prior ($3 at ref 99.0); the afternoon price (98.0) is
     # below that reference, so it tops up only the incremental difference.
+    # 2026-10-04 ladder rescale: 2% is 3x -> $2 base * 3 = $6 desired, $6 - $3 = $3.
     assert by_ticker["AAPL"]["top_up_guard_result"] == TOP_UP_INCREMENTAL
-    assert by_ticker["AAPL"]["incremental_order_amount"] == 1.0
+    assert by_ticker["AAPL"]["incremental_order_amount"] == 3.0
 
     # NVDA and MSFT have no prior allocation of their own -- AAPL's presence in
     # the SAME prior_same_day_allocations mapping must never suppress their
     # first allocation, which must be the full suggested amount.
     for ticker in ("NVDA", "MSFT"):
         assert by_ticker[ticker]["top_up_guard_result"] == TOP_UP_NO_PRIOR_RUN
-        assert by_ticker[ticker]["incremental_order_amount"] == 3.0
+        # 2026-10-04 ladder rescale: full first allocation is $2 * 3x = $6 (was $2 * 1.5x).
+        assert by_ticker[ticker]["incremental_order_amount"] == 6.0
 
 
 def test_budget_tier_is_selected_from_post_topup_spend_not_pre_topup_desired(tmp_path):
@@ -2665,15 +2682,16 @@ def test_budget_tier_is_selected_from_post_topup_spend_not_pre_topup_desired(tmp
         max_per_order_usd=200.0,
     )
     state = StrategyState()
-    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 90.0})
-    # 10% drop vs. the prior close -> the ladder's 5x tier -> $30 base * 5 = $150 desired.
-    fin = _FakeData(SourceName.FINANCE, 90.0, 100.0, quote=(90.0, now))
-    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 90.0, 100.0, quote=(90.0, now), bid_ask=(89.9, 90.1))
+    broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 94.0})
+    # 6% drop vs. the prior close -> the ladder's 5x tier -> $30 base * 5 = $150 desired.
+    # (2026-10-04 ladder rescale: 5x is now the 5.5-7% tier; it was 10% when 5x was the cap.)
+    fin = _FakeData(SourceName.FINANCE, 94.0, 100.0, quote=(94.0, now))
+    rh = _FakeDataWithBidAsk(SourceName.ROBINHOOD, 94.0, 100.0, quote=(94.0, now), bid_ask=(93.9, 94.1))
     prior_same_day_allocations = {
         "AAPL": PriorSameDayAllocation(
             "AAPL",
             amount_usd=140.0,
-            reference_price=95.0,  # above today's ~90.0 decision price -> qualifies for top-up
+            reference_price=95.0,  # above today's ~94.0 decision price -> qualifies for top-up
             run_id="am",
             source="scheduled",
             selected_base_amount_usd=30.0,
@@ -4976,7 +4994,9 @@ def test_duplicate_with_no_amount_fields_is_never_shrunk_to_the_retry_delta():
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise AssertionError("must not place a fresh order for a known duplicate")
 
-    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    # Pinned to the pre-rescale $10 ceiling: this test is about the duplicate-booking
+    # ceiling mechanism, not the ladder (2026-10-04 rescale moved the default 10 -> 16).
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False, max_per_order_usd=10.0)
     # target_price BELOW prior.reference_price -> a real incremental top-up.
     decision = _graded_decision(target_price=98.0)
     prior = PriorSameDayAllocation(
@@ -5053,7 +5073,9 @@ def test_a_duplicate_with_no_amount_or_fill_detail_is_booked_at_the_per_order_ce
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise AssertionError("must not place a fresh order for a known duplicate")
 
-    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    # Pinned to the pre-rescale $10 ceiling: this test is about the duplicate-booking
+    # ceiling mechanism, not the ladder (2026-10-04 rescale moved the default 10 -> 16).
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False, max_per_order_usd=10.0)
     assert config.max_per_order_usd == 10.0
     decision = _graded_decision(suggested_amount_usd=3.0, target_price=100.0)
     prior = PriorSameDayAllocation(
@@ -5148,7 +5170,9 @@ def test_a_partially_filled_amountless_duplicate_is_not_booked_at_the_executed_s
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise AssertionError("must not place a fresh order for a known duplicate")
 
-    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    # Pinned to the pre-rescale $10 ceiling: this test is about the duplicate-booking
+    # ceiling mechanism, not the ladder (2026-10-04 rescale moved the default 10 -> 16).
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False, max_per_order_usd=10.0)
     decision = _graded_decision(target_price=100.0)
     # A prior same-day allocation is what routes this candidate through the
     # same-stream duplicate branch the fallback lives in.
@@ -5229,7 +5253,9 @@ def test_a_partially_filled_amountless_duplicate_smaller_than_the_retry_is_booke
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise AssertionError("must not place a fresh order for a known duplicate")
 
-    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    # Pinned to the pre-rescale $10 ceiling: this test is about the duplicate-booking
+    # ceiling mechanism, not the ladder (2026-10-04 rescale moved the default 10 -> 16).
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False, max_per_order_usd=10.0)
     assert config.max_per_order_usd == 10.0
     decision = _graded_decision(suggested_amount_usd=3.0, target_price=100.0)
     prior = PriorSameDayAllocation(
@@ -5468,7 +5494,9 @@ def test_a_live_partial_duplicate_stays_reserved_at_its_full_notional(live_state
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise AssertionError("must not place a fresh order for a known duplicate")
 
-    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    # Pinned to the pre-rescale $10 ceiling: this test is about the duplicate-booking
+    # ceiling mechanism, not the ladder (2026-10-04 rescale moved the default 10 -> 16).
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False, max_per_order_usd=10.0)
     decision = _graded_decision(target_price=100.0)
     prior = PriorSameDayAllocation(
         ticker="AAPL",
@@ -5617,7 +5645,9 @@ def test_a_terminal_partial_without_a_cumulative_quantity_is_not_valued_at_reque
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise AssertionError("must not place a fresh order for a known duplicate")
 
-    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False)
+    # Pinned to the pre-rescale $10 ceiling: this test is about the duplicate-booking
+    # ceiling mechanism, not the ladder (2026-10-04 rescale moved the default 10 -> 16).
+    config = StrategyConfig(monthly_cash_allocation_usd=100.0, dry_run=False, max_per_order_usd=10.0)
     decision = _graded_decision(target_price=100.0)
     prior = PriorSameDayAllocation(
         ticker="AAPL",
@@ -10635,10 +10665,11 @@ def test_same_day_ticker_deployment_already_recorded_recognizes_filled_status(tm
 
 def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
     # No prior-day history is needed: two same-day candidates each priced at
-    # $3 (1.5x the $2 base on the 2% drop below) with a $5.00 monthly allocation
+    # $6 (3x the $2 base on the 2% drop below; 2026-10-04 ladder rescale, was 1.5x/$3)
+    # with a $5.00 monthly allocation
     # (40% threshold = $2) mean the FIRST submitted order alone already crosses
     # the threshold. The SECOND candidate in the same run must then be capped to
-    # the $2 base instead of keeping its uncapped 1.5x amount -- otherwise a
+    # the $2 base instead of keeping its uncapped 3x amount -- otherwise a
     # volatile day could overshoot the guard well beyond the base amount before
     # the guard is even visible to tomorrow's run.
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
@@ -10670,15 +10701,15 @@ def test_kill_switch_caps_later_candidates_within_the_same_batch(tmp_path):
     submitted = [c for c in run_state["buy_candidates"] if c["status"] == "submitted"]
     assert len(submitted) == 2
     # AAA is filled first (alphabetical tiebreak at equal multiplier/drop) at
-    # its full 1.5x amount, which alone crosses the $2 threshold.
-    assert by_ticker["AAA"]["planned_amount_usd"] == 3.0
-    assert by_ticker["AAA"]["buy_multiplier"] == 1.5
+    # its full 3x amount, which alone crosses the $2 threshold.
+    assert by_ticker["AAA"]["planned_amount_usd"] == 6.0
+    assert by_ticker["AAA"]["buy_multiplier"] == 3.0
     # BBB, priced after the threshold is crossed, is capped to the $2 base --
     # even though its ladder multiplier (still reported for audit purposes)
-    # remains 1.5, showing the cap is a dollar-amount guard, not a multiplier
+    # remains 3.0, showing the cap is a dollar-amount guard, not a multiplier
     # rewrite.
     assert by_ticker["BBB"]["planned_amount_usd"] == 2.0
-    assert by_ticker["BBB"]["buy_multiplier"] == 1.5
+    assert by_ticker["BBB"]["buy_multiplier"] == 3.0
 
 
 def test_manual_run_submissions_do_not_advance_in_batch_burn(tmp_path):
@@ -10713,8 +10744,9 @@ def test_manual_run_submissions_do_not_advance_in_batch_burn(tmp_path):
     with open(os.path.join(artifacts_dir, "run_state.json"), encoding="utf-8") as handle:
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
-    assert by_ticker["AAA"]["planned_amount_usd"] == 3.0
-    assert by_ticker["BBB"]["planned_amount_usd"] == 3.0  # NOT capped to the $2 base
+    # 2026-10-04 ladder rescale: 2% drop is 3x -> $6 (was 1.5x -> $3).
+    assert by_ticker["AAA"]["planned_amount_usd"] == 6.0
+    assert by_ticker["BBB"]["planned_amount_usd"] == 6.0  # NOT capped to the $2 base
     assert run_state["risk_guard"]["kill_switch_engaged"] is False
 
 
@@ -37137,8 +37169,9 @@ def test_run_daily_compact_blocks_orders_above_per_order_ceiling(tmp_path):
         tickers=("AAPL",),
         approved_test_dates=config.approved_test_dates,
         base_buy_amount_usd=10.0,
-        # The 2% drop below is 1.5x on the current ladder, so a $10 base plans
-        # $15; the ceiling sits below that so the candidate is blocked.
+        # The 2% drop below is 3x on the current ladder (2026-10-04 ladder
+        # rescale), so a $10 base plans $30; the ceiling sits below that so the
+        # candidate is blocked.
         max_per_order_usd=10.0,
     )
     broker = DryRunBroker(cash=500.0, reference_prices={"AAPL": 98.0})
@@ -37158,7 +37191,7 @@ def test_run_daily_compact_blocks_orders_above_per_order_ceiling(tmp_path):
 
     candidate = run_state["buy_candidates"][0]
     assert candidate["ticker"] == "AAPL"
-    assert candidate["planned_amount_usd"] == 15.0
+    assert candidate["planned_amount_usd"] == 30.0
     assert candidate["status"] == "blocked"
     assert candidate["skip_reason"] == "max per-order ceiling exceeded"
     assert run_state["usage_proxy"]["orders_placed_count"] == 0
@@ -44762,8 +44795,9 @@ def test_run_daily_compact_checks_per_order_cap_before_broker_duplicate_lookup(
         tickers=("AAPL",),
         approved_test_dates=config.approved_test_dates,
         base_buy_amount_usd=10.0,
-        # The 2% drop below is 1.5x on the current ladder, so a $10 base plans
-        # $15; the ceiling sits below that so the candidate is blocked.
+        # The 2% drop below is 3x on the current ladder (2026-10-04 ladder
+        # rescale), so a $10 base plans $30; the ceiling sits below that so the
+        # candidate is blocked.
         max_per_order_usd=10.0,
     )
 
@@ -44897,8 +44931,9 @@ def test_load_prior_same_day_skips_non_utf8_artifact_without_crashing(tmp_path):
 def test_run_daily_compact_top_up_records_incremental(tmp_path):
     artifacts_dir = os.path.join(tmp_path, "runs", "2026-06-29")
     now, config, state, broker, fin, rh = _compact_setup(tmp_path)
-    # 100 -> 98 is a 2% drop -> 1.5x -> $3 desired. Morning bought $2 at 99.0; the
-    # afternoon quote is 98.0 (< 99.0) so only the $1 difference is bought.
+    # 100 -> 98 is a 2% drop -> 3x -> $6 desired (2026-10-04 ladder rescale; was
+    # 1.5x -> $3). Morning bought $2 at 99.0; the afternoon quote is 98.0 (< 99.0)
+    # so only the $4 difference is bought.
     prior = {
         "AAPL": PriorSameDayAllocation(
             "AAPL",
@@ -44925,8 +44960,8 @@ def test_run_daily_compact_top_up_records_incremental(tmp_path):
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     aapl = by_ticker["AAPL"]
     assert aapl["top_up_guard_result"] == TOP_UP_INCREMENTAL
-    assert aapl["incremental_order_amount"] == 1.0
-    assert aapl["afternoon_desired_amount"] == 3.0
+    assert aapl["incremental_order_amount"] == 4.0
+    assert aapl["afternoon_desired_amount"] == 6.0
     assert aapl["prior_same_day_amount"] == 2.0
     assert aapl["prior_same_day_reference_price"] == 99.0
     assert aapl["prior_same_day_run_id"] == "manual_am"
@@ -44940,7 +44975,7 @@ def test_run_daily_compact_top_up_records_incremental(tmp_path):
     # A ticker with no prior allocation still buys its full amount, using the
     # plain (non-topup) ref_id formula.
     assert by_ticker["NVDA"]["top_up_guard_result"] == TOP_UP_NO_PRIOR_RUN
-    assert by_ticker["NVDA"]["incremental_order_amount"] == 3.0
+    assert by_ticker["NVDA"]["incremental_order_amount"] == 6.0  # 2026-10-04 ladder rescale: $2 * 3x
     assert "graded-dca-topup" not in by_ticker["NVDA"]["order_id"]
     assert "graded-dca-2026-06-29-NVDA" in by_ticker["NVDA"]["order_id"]
 
@@ -45025,7 +45060,8 @@ def test_run_daily_compact_manual_run_does_not_block_scheduled(tmp_path):
     # Guard bypassed the same-day broker block and still topped up AAPL, which
     # has a loaded prior allocation.
     assert by_ticker["AAPL"]["status"] == "dry_run"
-    assert by_ticker["AAPL"]["incremental_order_amount"] == 1.0
+    # 2026-10-04 ladder rescale: $2 base * 3x = $6 desired, less the $2 prior.
+    assert by_ticker["AAPL"]["incremental_order_amount"] == 4.0
     # NVDA has NO loaded prior allocation, so the broker's same-day-order check
     # must still apply -- the guard bypass is scoped per-ticker, not blanket.
     assert by_ticker["NVDA"]["status"] == "skipped"
@@ -47496,8 +47532,9 @@ def test_flag_checks_the_hard_ceiling_before_its_own_broker_duplicate_lookup(tmp
         one_order_per_ticker_per_day=True,
         tickers=("AAPL",),
         base_buy_amount_usd=10.0,
-        # The 2% drop below is 1.5x on the current ladder, so a $10 base plans
-        # $15; the ceiling sits below that so the candidate is blocked.
+        # The 2% drop below is 3x on the current ladder (2026-10-04 ladder
+        # rescale), so a $10 base plans $30; the ceiling sits below that so the
+        # candidate is blocked.
         max_per_order_usd=10.0,
     )
 
@@ -47602,7 +47639,8 @@ def test_flag_off_leaves_the_documented_top_up_bypass_intact(tmp_path):
         run_state = json.load(handle)
     by_ticker = {c["ticker"]: c for c in run_state["buy_candidates"]}
     assert by_ticker["AAPL"]["status"] == "dry_run"
-    assert by_ticker["AAPL"]["incremental_order_amount"] == 1.0
+    # 2026-10-04 ladder rescale: $2 base * 3x = $6 desired, less the $2 prior.
+    assert by_ticker["AAPL"]["incremental_order_amount"] == 4.0
 
 
 def test_seed_prior_allocations_still_seeds_notional_when_the_flag_is_on():

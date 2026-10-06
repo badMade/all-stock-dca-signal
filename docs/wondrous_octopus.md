@@ -137,8 +137,10 @@ python daily_update.py --run-dir ~/octopus/quick
 
 Scores yesterday's forecasts, runs the encoder diagnostic, applies the online update, predicts
 the next day, checkpoints, writes `daily/<date>_summary.json` **and
-`daily/<date>_next_day_forecasts.csv`** — tomorrow's predicted O/H/L/C with bands, in dollars,
-for every eligible ticker — and prints a one-line digest. Idempotent (`NOOP` on rerun);
+`daily/<date>_next_day_forecasts.csv`** -- tomorrow's predicted O/H/L/C with bands, in dollars,
+for every eligible ticker, with an expected calendar date (`expected_target_date`,
+`expected_target_date_basis` = `calendar` | `weekday_estimate`; the resolved `target_date` stays
+unset until the ticker's next data row exists) -- and prints a one-line digest. Idempotent (`NOOP` on rerun);
 catches up automatically if days were missed. Scheduling it is the operator's choice.
 
 ### Recovery retrains

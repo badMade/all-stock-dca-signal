@@ -46,6 +46,63 @@ window.ConsolePages = (() => {
     return text("span", `status-pill ${tone}`, String(value ?? "unknown").replaceAll("_", " "));
   }
 
+  function formatRelativeTime(isoString) {
+    if (!isoString) return "";
+    const then = new Date(isoString).getTime();
+    if (Number.isNaN(then)) return String(isoString);
+    const diffSec = Math.max(0, Math.floor((Date.now() - then) / 1000));
+    if (diffSec < 45) return "just now";
+    if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
+    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h ago`;
+    if (diffSec < 86400 * 7) return `${Math.floor(diffSec / 86400)}d ago`;
+    try {
+      return new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" }).format(new Date(then));
+    } catch (_) {
+      return `${Math.floor(diffSec / 86400)}d ago`;
+    }
+  }
+
+  let pageTip = null;
+  function showTip(e, title, value, detail) {
+    if (!pageTip) {
+      pageTip = text("div", "chart-tooltip");
+      pageTip.hidden = true;
+      document.body.append(pageTip);
+      window.addEventListener("scroll", () => { if (pageTip) pageTip.hidden = true; }, { passive: true });
+    }
+    pageTip.replaceChildren(
+      text("div", "tip-title", title),
+      text("div", "tip-value", value),
+      text("div", "tip-detail", detail)
+    );
+    pageTip.hidden = false;
+    const target = e.currentTarget || e.target;
+    const rect = target.getBoundingClientRect();
+    const tipRect = pageTip.getBoundingClientRect();
+    const left = Math.max(10, Math.min(window.innerWidth - tipRect.width - 10, rect.left + rect.width / 2 - tipRect.width / 2));
+    const top = rect.top - tipRect.height - 8 > 10 ? rect.top - tipRect.height - 8 : rect.bottom + 8;
+    pageTip.style.left = `${left + window.scrollX}px`;
+    pageTip.style.top = `${top + window.scrollY}px`;
+  }
+  function hideTip() {
+    if (pageTip) pageTip.hidden = true;
+  }
+
+  function infoButton(title, description) {
+    const btn = text("button", "info-btn", "i");
+    btn.type = "button";
+    btn.setAttribute("aria-label", title || "Information");
+    btn.addEventListener("mouseenter", (e) => {
+      showTip(e, title || "Information", "", description);
+    });
+    btn.addEventListener("mouseleave", () => hideTip());
+    btn.addEventListener("focus", (e) => {
+      showTip(e, title || "Information", "", description);
+    });
+    btn.addEventListener("blur", () => hideTip());
+    return btn;
+  }
+
   function table(columns, rows, emptyMessage) {
     const wrap = text("div", "table-scroll");
     const node = document.createElement("table");
@@ -94,11 +151,18 @@ window.ConsolePages = (() => {
     return list;
   }
 
+  function panelTitle(label, infoTitle, infoDesc) {
+    const h3 = text("h3", "", label);
+    if (infoDesc) h3.append(infoButton(infoTitle || label, infoDesc));
+    return h3;
+  }
+
   function panel(title, body, meta) {
     const section = text("section", "panel section-space");
     const top = text("div", "section-top");
     const heading = text("div", "");
-    heading.append(text("h3", "", title));
+    if (title instanceof Node) heading.append(title);
+    else heading.append(text("h3", "", title));
     top.append(heading);
     if (meta !== undefined) top.append(meta instanceof Node ? meta : text("span", "tag", meta));
     section.append(top);
@@ -231,9 +295,32 @@ window.ConsolePages = (() => {
         renderedEnv = fingerprint;
         const session = data.session;
         const gateRows = data.gates.map((gate) => {
+          const gateCell = text("div", "gate-info-cell");
+          const titleLine = text("div", "gate-title-line");
+          titleLine.append(text("strong", "gate-name", gate.name));
+          if (gate.badge) {
+            titleLine.append(badge(gate.badge));
+          }
+          if (gate.description) {
+            titleLine.append(infoButton(gate.name, gate.description));
+          }
+          gateCell.append(titleLine);
+          if (gate.description) {
+            gateCell.append(text("small", "gate-desc muted", gate.description));
+          }
+
           const line = text("div", "module-command");
           line.append(text("code", "", gate.command), copyButton(gate.command));
-          return { name: gate.name, command: line };
+          if (gate.action_id && typeof window.startJob === "function") {
+            const runBtn = text("button", "button ghost small", "▶ Run in console");
+            runBtn.type = "button";
+            runBtn.title = `Launch ${gate.name} as a background console job`;
+            runBtn.addEventListener("click", () => {
+              window.startJob(gate.action_id);
+            });
+            line.append(runBtn);
+          }
+          return { gate: gateCell, command: line };
         });
         const packageKeys = Object.keys(Object.assign({}, ...data.interpreters.map((row) => row.packages))).filter((key) => key !== "error");
         mount(envSection,
@@ -262,9 +349,19 @@ window.ConsolePages = (() => {
             ["Auth", data.access.auth], ["Behind proxy", data.access.behind_proxy],
             ["Transport", data.access.plaintext_warning ? "plain HTTP on a non-loopback bind: credential and token visible on the network" : "loopback"],
           ])),
-          panel("Repository gates", table([
-            { label: "Gate", key: "name" }, { label: "Command", key: "command" },
-          ], gateRows, "No gates listed."), "Run from the checkout; the console never runs these on a page view."),
+          (() => {
+            const gatesMeta = text("div", "toolbar-right");
+            gatesMeta.append(
+              text("span", "tag", "Run from checkout"),
+              infoButton(
+                "Repository Verification Gates",
+                "Pre-commit and CI verification commands that ensure code quality, test correctness, configuration invariants, and dependency security before code reaches main or production. These commands run directly in your terminal from the checkout; the console exposes them for quick copy-paste verification."
+              )
+            );
+            return panel("Repository gates", table([
+              { label: "Gate", key: "gate" }, { label: "Command", key: "command" },
+            ], gateRows, "No gates listed."), gatesMeta);
+          })(),
           panel("Stray root-level files", table([
             { label: "File", key: "name" }, { label: "Present", get: (row) => row.present ? "present" : "absent", badge: true },
             { label: "Size", key: "size", numeric: true }, { label: "Note", key: "note" },
@@ -557,7 +654,7 @@ window.ConsolePages = (() => {
         const fingerprint = JSON.stringify(data);
         if (fingerprint === lastSchedule) return;
         lastSchedule = fingerprint;
-        const matrix = panel("Configured vs deployable vs observed", [
+        const matrix = panel(panelTitle("Configured vs deployable vs observed", "Roster Schedule Verification", "Cross-references three operational planes: what the manifest specifies, what cron/systemd deploy, and what run_state.json evidence proves actually ran today."), [
           text("p", "muted", "Configured: the manifest names this slot. Deployable: deploy/ cron or systemd mentions it. Observed: a run_state.json exists for the day. Scheduled evidence: the same-day pointer is valid. Slot verified: the slot's own dated run_state.json was finalized as scheduled evidence (python -m scripts.verify_schedule), which proves it fired, not that any order filled."),
           table([
             { label: "Time", key: "time_et" }, { label: "Stream", key: "stream" },
@@ -570,12 +667,12 @@ window.ConsolePages = (() => {
             { label: "Manifest tasks", get: (row) => arr(row.manifest_task_ids).join(", ") }, { label: "Note", key: "observed_note" },
           ], arr(data.matrix), "No roster slots."),
         ], "per roster slot");
-        const tasks = panel("Manifest tasks (config/scheduled_tasks.json)", [
+        const tasks = panel(panelTitle("Manifest tasks (config/scheduled_tasks.json)", "Scheduled Manifest Tasks", "Machine-readable task definitions specifying execution time, target stream, live trading status, and cron trigger patterns."), [
           warnings(data.manifest?.warnings),
           table([
             { label: "Time (ET)", key: "time" }, { label: "Task", key: "name" }, { label: "Type", key: "type" },
             { label: "Trades", get: (row) => row.trades }, { label: "Status today", key: "status", badge: true },
-            { label: "Manifest status", key: "manifest_status", badge: true }, { label: "Registered", get: (row) => row.scheduler_registered === null ? "unknown" : row.scheduler_registered ? "yes" : "not registered", badge: true },
+            { label: "Manifest status", key: "manifest_status", badge: true }, { label: "Registered", get: (row) => row.scheduler_registered === null ? "unknown" : row.scheduler_registered ? "registered" : "not registered", badge: true },
             { label: "Cron (UTC)", key: "cron_utc" }, { label: "Next", key: "next_at" }, { label: "Id", key: "id" },
           ], arr(data.manifest?.tasks), "No tasks in the manifest."),
           text("p", "panel-footnote", `Policy blocks in the manifest: ${arr(data.manifest?.policy_keys).length}. Select one below to view it.`),
@@ -600,12 +697,35 @@ window.ConsolePages = (() => {
           ...arr(data.launchd?.logs).map((log) => { const pre = text("pre", "subtle-json", arr(log.tail).join("\n") || "(empty)"); const block = text("div", ""); block.append(text("h3", "auto-title", `${log.name} (${show(log.size)} bytes, last lines)`), pre); return block; }),
           warnings(data.launchd?.warnings),
         ]);
-        const roster = panel("Roster identity", table([
-          { label: "Slot", key: "slot_id" }, { label: "Time", key: "time_et" }, { label: "Stream", key: "stream" }, { label: "Executor", key: "executor_class" },
-          { label: "Cron id", key: "cron_id" }, { label: "Live execution", get: (row) => row.live_execution_enabled === null ? "unknown" : row.live_execution_enabled ? "enabled" : "disabled", badge: true },
-          { label: "run_dca entry", key: "run_dca_entry", badge: true }, { label: "Artifact dir", key: "artifact_dir" }, { label: "Pointer", key: "pointer_name" }, { label: "Config", key: "config_file" },
+        const roster = panel(panelTitle("Roster identity", "Seven-Slot Daily Roster", "Canonical seven-slot daily execution roster mapping time slots to executor classes, artifact directories, and live execution authorization."), table([
+          { label: "Slot", key: "slot_id" }, { label: "Time", key: "time_et" }, { label: "Stream", key: "stream" },
+          { label: "Executor", get: (row) => row.executor_class || (row.run_dca_entry === "run_slot" ? "run_dca.run_slot" : "—") },
+          { label: "Cron id", key: "cron_id" },
+          { label: "Live execution", get: (row) => {
+            if (row.live_execution_enabled === true) return "enabled";
+            if (row.live_execution_enabled === false) return "disabled";
+            if (row.trades && row.run_dca_entry === "run_slot") return "enabled (default)";
+            return "unknown";
+          }, badge: true },
+          { label: "run_dca entry", get: (row) => {
+            if (row.run_dca_entry === "run_slot") {
+              const b = badge("run_slot");
+              b.title = "Directly targetable via python run_dca.py --slot";
+              return b;
+            }
+            if (row.run_dca_entry === "disabled") {
+              const b = badge("dedicated executor");
+              b.title = `Trades live via ${row.executor_class || "dedicated class"}; direct run_dca.py --slot is disabled to protect prior-allocation chain`;
+              return b;
+            }
+            return badge(row.run_dca_entry || "—");
+          } }, { label: "Artifact dir", key: "artifact_dir" }, { label: "Pointer", key: "pointer_name" }, { label: "Config", key: "config_file" },
         ], arr(data.roster?.slots), "No roster."), "from the executor profiles");
-        mount(scheduleSection, warnings(data.warnings), matrix, tasks, policyPanel, roster, deploy, workflows, launchd);
+        const isInfoNotice = (w) => /is per-stream, not per-slot|means a scheduled run_state was finalized/.test(w);
+        const actionableWarnings = arr(data.warnings).filter((w) => !isInfoNotice(w));
+        const infoNotes = arr(data.warnings).filter(isInfoNotice);
+        for (const note of infoNotes) matrix.append(text("p", "panel-footnote", note));
+        mount(scheduleSection, warnings(actionableWarnings), matrix, tasks, policyPanel, roster, deploy, workflows, launchd);
       } catch (error) {
         failure(scheduleSection, error);
       }
@@ -622,14 +742,14 @@ window.ConsolePages = (() => {
         const fingerprint = JSON.stringify(data);
         if (fingerprint === lastState) return;
         lastState = fingerprint;
-        const stateCard = panel("Strategy state (durable budget ledger)", [
+        const stateCard = panel(panelTitle("Strategy state (durable budget ledger)", "Strategy Budget State", "Persistent JSON budget state tracking daily spend caps, weekly rollover pools, circuit breaker trips, and 7-day kill switches."), [
           keyValues([["Status", badge(data.strategy_state?.status)], ["File", data.strategy_state?.path_label], ["Modified", data.strategy_state?.modified], ["Lock file", data.strategy_state?.lock_file_present ? "present (never acquired by the console)" : "absent"]]),
           Object.keys(data.strategy_state?.fields || {}).length ? auto(data.strategy_state.fields, "fields") : text("p", "muted", "No fields: absent means a fresh state; corrupt means the live loader would refuse to run."),
           warnings(data.strategy_state?.warnings),
         ], data.strategy_state?.status === "corrupt" ? "ALARM" : "read-only");
         const ledgerRows = Object.entries(data.ledgers || {}).map(([kind, summary]) => ({ kind, ...summary }));
         const ledgerHost = text("div", "");
-        const ledgerPanel = panel("Accumulation ledgers", [
+        const ledgerPanel = panel(panelTitle("Accumulation ledgers", "Whole-Share Accumulation", "Tracks incremental whole-share purchase contributions for fractional-ineligible tickers (e.g. RVII, BYDDY) until a full share threshold is met."), [
           table([
             { label: "Ledger", key: "kind" }, { label: "Entries", key: "entries", numeric: true }, { label: "Listed", key: "listed", numeric: true },
             { label: "Corrupt", key: "corrupt", numeric: true }, { label: "Lock files present", key: "lock_files_present", numeric: true },
@@ -640,7 +760,7 @@ window.ConsolePages = (() => {
           ledgerHost,
         ]);
         const risk = data.risk || {};
-        const riskPanel = panel("Risk report and kill switch", [
+        const riskPanel = panel(panelTitle("Risk report and kill switch", "Risk Evaluation & Kill Switch", "Gate 7 risk validator inspecting cumulative 7-day cash burn and verifying evidence completeness before order approval."), [
           keyValues([["Usable", badge(risk.usable ? "usable" : "evidence incomplete")], ["Scope", risk.scope?.note], ["Root", risk.scope?.root_label]]),
           risk.evidence ? keyValues(Object.entries(risk.evidence).map(([key, value]) => [key.replaceAll("_", " "), value])) : text("p", "muted", "No evidence block."),
           risk.report ? auto(risk.report, "report") : null,
@@ -650,8 +770,8 @@ window.ConsolePages = (() => {
         const purchasesButton = text("button", "button ghost", "Load confirmed purchases");
         purchasesButton.type = "button";
         purchasesButton.addEventListener("click", async () => { purchasesHost.replaceChildren(text("div", "panel empty-state", "Loading…")); try { const view = await fetchJson("/api/state/purchases", { ttl: 30000 }); purchasesHost.replaceChildren(auto(view, "purchases")); } catch (error) { purchasesHost.replaceChildren(text("div", "error-banner", error.message)); } });
-        const purchasesPanel = panel("Confirmed purchases", [keyValues([["Records", data.purchases?.record_count], ["Total USD", data.purchases?.total_usd], ["Last trading day", data.purchases?.last_trading_day]]), purchasesButton, purchasesHost], "confirmed fills only");
-        const maintenancePanel = panel("Maintenance events", auto(data.maintenance || {}, "maintenance"), "archive updates and calibration");
+        const purchasesPanel = panel(panelTitle("Confirmed purchases", "Confirmed Broker Fills", "Audited ledger of confirmed broker fills and total capital deployed across active trading days."), [keyValues([["Records", data.purchases?.record_count], ["Total USD", data.purchases?.total_usd], ["Last trading day", data.purchases?.last_trading_day]]), purchasesButton, purchasesHost], "confirmed fills only");
+        const maintenancePanel = panel(panelTitle("Maintenance events", "Maintenance & Calibration Events", "Historical log of archive synchronizations, calibration passes, and ticker catalog updates."), auto(data.maintenance || {}, "maintenance"), "archive updates and calibration");
         mount(stateSection, warnings(data.warnings), stateCard, riskPanel, ledgerPanel, purchasesPanel, maintenancePanel);
       } catch (error) {
         failure(stateSection, error);
@@ -679,7 +799,7 @@ window.ConsolePages = (() => {
             catch (error) { viewer.textContent = error.message; }
           });
         };
-        const catalog = panel("Config catalog", [
+        const catalog = panel(panelTitle("Config catalog", "Configuration Catalog", "All version-controlled JSON configuration files, JSON schema bindings, fail modes, and validation status."), [
           warnings(data.catalog?.warnings),
           table([
             { label: "File", get: (row) => `${row.stem}.json` }, { label: "Exists", get: (row) => row.exists }, { label: "Size", key: "size", numeric: true },
@@ -690,12 +810,12 @@ window.ConsolePages = (() => {
           ], files, "No config files."),
           viewer,
         ], `${files.length} files`);
-        const parity = panel("Parity checks (config vs constants)", [
+        const parity = panel(panelTitle("Parity checks (config vs constants)", "Configuration Parity Checks", "Validates consistency between Python code constants and JSON configuration files to prevent drift or uncoordinated changes."), [
           table([{ label: "Check", key: "name" }, { label: "Result", get: (row) => row.ok === null ? "unknown" : row.ok ? "ok" : "mismatch", badge: true }, { label: "Detail", key: "detail" }], arr(data.parity?.checks), "No checks."),
           text("p", "panel-footnote", data.parity?.note || ""),
           warnings(data.parity?.warnings),
         ]);
-        const streams = panel("Executor streams and authorization", [
+        const streams = panel(panelTitle("Executor streams and authorization", "Stream Authorization & Roster", "Inspects per-stream live execution flags, assigned trading slots, and minimum trend bar requirements."), [
           table([
             { label: "Stream", key: "stream" }, { label: "File", key: "file" }, { label: "Found", get: (row) => row.found },
             { label: "Live execution", get: (row) => row.live_execution_enabled === null ? "unknown" : row.live_execution_enabled ? "enabled" : "disabled", badge: true },
@@ -703,7 +823,7 @@ window.ConsolePages = (() => {
           ], arr(data.streams?.streams), "No stream files."),
           data.streams?.run_classification ? auto(data.streams.run_classification, "run_classification") : null,
         ]);
-        const sizing = panel("Sizing adjustment sources (publisher-only)", auto(data.sizing || {}, "sizing"), "never edited here");
+        const sizing = panel(panelTitle("Sizing adjustment sources (publisher-only)", "Sizing Adjustment Sources", "External research and machine-learning sizing multiplier sources; read-only and never edited directly by the console."), auto(data.sizing || {}, "sizing"), "never edited here");
         const gates = data.gates ? panel("Live-money gates", auto(data.gates, "gates")) : null;
         const windowPanel = data.window ? panel("Approved trading window", auto(data.window, "window")) : null;
         const ladderHost = text("div", "");
@@ -726,6 +846,17 @@ window.ConsolePages = (() => {
   const alertsSection = document.querySelector('section.page[data-page="alerts"]');
   if (alertsSection && alertsSection.querySelector("[data-page-body]")) {
     let lastAlerts = "";
+    const alertTips = {
+      inbox: "Active alerts and unacknowledged failure markers generated by Gate 9 monitoring.",
+      channels: "Configured alert delivery destinations (Slack webhooks, dead-man heartbeat URLs, email channels).",
+      drift: "Automated drift detection audits comparing runtime execution results against baseline expectations.",
+      self_heal: "Automated recovery policies and remediation rules for transient failure recovery.",
+      digest: "Aggregated historical audit of alert frequencies, categories, and resolution timelines.",
+      attempt_log: "Audit log of execution attempts and start failures recorded under cron_tracking.",
+      engines: "Telemetry and health metrics for candidate generation and execution engine processes.",
+      usage: "System resource consumption, memory bounds, and subprocess lifecycle tracking.",
+      model_usage: "Evaluation of ML inference requests and latency measurements across trading slots.",
+    };
     register("alerts", async () => {
       try {
         const data = await fetchJson("/api/alerts", { ttl: 30000 });
@@ -739,7 +870,7 @@ window.ConsolePages = (() => {
         for (const key of keys) {
           const value = data[key];
           if (value === null || typeof value !== "object") continue;
-          parts.push(panel(key.replaceAll("_", " "), auto(value, key)));
+          parts.push(panel(panelTitle(key.replaceAll("_", " "), key.replaceAll("_", " "), alertTips[key]), auto(value, key)));
         }
         mount(alertsSection, ...parts);
       } catch (error) {
@@ -974,11 +1105,11 @@ window.ConsolePages = (() => {
   const trainingSection = document.querySelector('section.page[data-page="training"]');
   if (trainingSection) {
     let lastTraining = "";
-    register("training", async () => {
+    register("training", async (snapshot) => {
       loading(trainingSection, "Loading model training options, loss history and diagnostics...");
       try {
-        const data = await fetchJson("/api/training", { ttl: 20000 });
-        const fingerprint = JSON.stringify(data);
+        const data = await fetchJson("/api/training", { ttl: 6000 });
+        const fingerprint = JSON.stringify(data) + (snapshot?.jobs?.map(j => `${j.id}:${j.status}`).join(",") || "");
         if (fingerprint === lastTraining) return;
         lastTraining = fingerprint;
 
@@ -986,7 +1117,9 @@ window.ConsolePages = (() => {
         const hwPanel = text("div", "panel");
         const hwTop = text("div", "section-top");
         const hwLeft = text("div", "");
-        hwLeft.append(text("h3", "", "Compute Backend & Accelerators"), text("p", "muted compact", `${hw.device_label || "CPU"} · PyTorch: ${hw.torch_version || "Not installed"} · scikit-learn: ${hw.sklearn_version || "Not installed"}`));
+        const hwTitle = text("h3", "", "Compute Backend & Accelerators");
+        hwTitle.append(infoButton("Compute Backend & Accelerators", "Evaluates host compute hardware (Apple Silicon GPU via MPS or NVIDIA CUDA) and confirms PyTorch and scikit-learn dependency availability."));
+        hwLeft.append(hwTitle, text("p", "muted compact", `${hw.device_label || "CPU"} · PyTorch: ${hw.torch_version || "Not installed"} · scikit-learn: ${hw.sklearn_version || "Not installed"}`));
         hwTop.append(hwLeft);
         hwTop.append(badge(hw.torch_available ? "ready" : "warning"));
         hwPanel.append(hwTop);
@@ -1004,7 +1137,9 @@ window.ConsolePages = (() => {
         const launchSection = text("section", "section-space");
         const launchHeading = text("div", "section-heading");
         const lHDiv = text("div", "");
-        lHDiv.append(text("div", "eyebrow", "INTERACTIVE LAUNCHPAD"), text("h2", "", "Train Models & Evaluate Sizing"), text("p", "muted", "Launch isolated training passes or walk-forward evaluations. Artifacts land in dedicated job directories."));
+        const launchTitle = text("h2", "", "Train Models & Evaluate Sizing");
+        launchTitle.append(infoButton("Interactive Model Launchpad", "Triggers isolated asynchronous jobs for model pre-training or sizing backtests. Runs execute asynchronously as background jobs without altering production config."));
+        lHDiv.append(text("div", "eyebrow", "INTERACTIVE LAUNCHPAD"), launchTitle, text("p", "muted", "Launch isolated training passes or walk-forward evaluations. Artifacts land in dedicated job directories."));
         launchHeading.append(lHDiv);
         launchSection.append(launchHeading);
 
@@ -1013,9 +1148,36 @@ window.ConsolePages = (() => {
           const card = text("article", "action-card");
           const cHeader = text("div", "action-header");
           const icon = text("div", "action-icon", "⚡");
-          const cTitle = text("div", "");
+          const cTitle = text("div", "action-title");
           cTitle.append(text("h3", "", model.name), text("span", "tag", model.tag));
           cHeader.append(icon, cTitle);
+
+          const metaDiv = text("div", "action-meta");
+          const runningJob = (snapshot?.jobs || []).find((j) => j.action === model.action_id && (j.status === "running" || j.status === "queued"));
+          let lu = model.last_updated;
+          if (runningJob) {
+            lu = { status: "running", label: "Updating…", timestamp: runningJob.started_at };
+          }
+          if (lu) {
+            let label = lu.label;
+            let badgeClass = "tag action-updated";
+            if (lu.status === "running" || lu.status === "queued") {
+              label = "Updating…";
+              badgeClass = "status-pill running";
+            } else if (!label && lu.timestamp) {
+              label = `Updated ${formatRelativeTime(lu.timestamp)}`;
+            } else if (!label) {
+              label = "Never run";
+            }
+            const updatedEl = text("span", badgeClass, label);
+            if (lu.timestamp) {
+              try {
+                updatedEl.title = `Last update: ${new Date(lu.timestamp).toLocaleString()}`;
+              } catch (_) {}
+            }
+            metaDiv.append(updatedEl);
+          }
+          cHeader.append(metaDiv);
 
           const desc = text("p", "action-description", model.description);
           const bottom = text("div", "action-bottom");
@@ -1039,7 +1201,12 @@ window.ConsolePages = (() => {
         const lossPanel = text("section", "panel section-space");
         const lossTop = text("div", "section-top");
         const lossTitle = text("div", "");
-        lossTitle.append(text("h3", "", "Neural Training Loss Curves"), text("p", "muted compact", "Curriculum Stage 1 & Stage 2 loss progression across total, forward, reconstruction, and market regime losses."));
+        const lossHead = text("h3", "", "Neural Training Loss Curves & Benchmarks");
+        lossHead.append(infoButton("Multi-Task Loss Benchmarks", "Tracks multi-task convergence: Total Loss = 1.0*Forward (return MSE) + 0.3*Recon (feature autoencoder) + 0.1*Market (regime classification) across historical Stage 1 and calibrated Stage 2."));
+        lossTitle.append(
+          lossHead,
+          text("p", "muted compact", "Curriculum Stage 1 (1962–Present History) & Stage 2 (2015–Present Modern Calibration) loss progression across multi-task objectives.")
+        );
         lossTop.append(lossTitle);
 
         const legend = text("div", "legend");
@@ -1054,14 +1221,61 @@ window.ConsolePages = (() => {
 
         const epochs = data.loss_curves?.epochs || [];
         if (epochs.length > 0) {
+          const latest = epochs[epochs.length - 1] || {};
+          // text() assigns textContent, so markup in the string would show literally;
+          // build the real <span> child instead (Copilot review, PR #1597).
+          const benchLabel = (title, note) => {
+            const label = text("div", "metric-label", title);
+            label.append(text("span", "", note));
+            return label;
+          };
+          const bGrid = text("div", "loss-benchmarks");
+
+          const bTotal = text("article", "metric");
+          bTotal.append(
+            benchLabel("Composite Total Loss", "1.0 / 0.3 / 0.1"),
+            text("div", "metric-value green", Number(latest.total_loss || 0).toFixed(4)),
+            text("p", "", "Target < 0.0800 · Combined objective")
+          );
+
+          const bFwd = text("article", "metric");
+          bFwd.append(
+            benchLabel("Forward Return Loss", "Weight 1.0"),
+            text("div", "metric-value", Number(latest.forward_loss || 0).toFixed(4)),
+            text("p", "", "Target < 0.0200 · Multi-horizon price return (MSE)")
+          );
+
+          const bRecon = text("article", "metric");
+          bRecon.append(
+            benchLabel("Feature Reconstruction", "Weight 0.3"),
+            text("div", "metric-value", Number(latest.recon_loss || 0).toFixed(4)),
+            text("p", "", "Target < 0.2000 · 36-Feature latent representation")
+          );
+
+          const bMkt = text("article", "metric");
+          bMkt.append(
+            benchLabel("Market Regime Loss", "Weight 0.1"),
+            text("div", "metric-value", Number(latest.market_loss || 0).toFixed(4)),
+            text("p", "", "Target < 0.0030 · Regime classification gate")
+          );
+          bGrid.append(bTotal, bFwd, bRecon, bMkt);
+          lossPanel.append(bGrid);
+
+          const guideBanner = text("div", "mode-banner");
+          guideBanner.style.marginBottom = "16px";
+          const gTag = text("span", "mode-marker", "CURRICULUM BENCHMARKS");
+          const gDesc = text("span", "", "Stage 1 trains across 64 years of historical regimes (1962–present) to encode rare structural shocks, with cosine LR decay. Stage 2 warm-loads weights and calibrates on modern liquidity (2015–present) at 5e-5 LR. Hover points on the curves for detailed metrics.");
+          guideBanner.append(gTag, gDesc);
+          lossPanel.append(guideBanner);
+
           const svgWrap = text("div", "loss-chart-wrapper");
           const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-          svg.setAttribute("viewBox", "0 0 760 260");
+          svg.setAttribute("viewBox", "0 0 760 270");
           svg.setAttribute("class", "loss-svg");
 
-          const padding = { top: 20, right: 30, bottom: 35, left: 55 };
+          const padding = { top: 25, right: 30, bottom: 35, left: 55 };
           const chartW = 760 - padding.left - padding.right;
-          const chartH = 260 - padding.top - padding.bottom;
+          const chartH = 270 - padding.top - padding.bottom;
 
           const maxLoss = Math.max(...epochs.map(e => Math.max(e.total_loss || 0, e.recon_loss || 0, e.forward_loss || 0)), 0.1);
           const minLoss = 0;
@@ -1085,25 +1299,58 @@ window.ConsolePages = (() => {
             line.setAttribute("x2", padding.left + chartW);
             line.setAttribute("y1", yPos);
             line.setAttribute("y2", yPos);
-            line.setAttribute("stroke", "#e2e8e4");
-            line.setAttribute("stroke-dasharray", "3 3");
+            line.setAttribute("class", "loss-grid");
             svg.append(line);
 
             const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
             label.setAttribute("x", padding.left - 8);
             label.setAttribute("y", yPos + 3);
             label.setAttribute("text-anchor", "end");
-            label.setAttribute("font-size", "9");
-            label.setAttribute("fill", "#73827c");
+            label.setAttribute("class", "loss-axis");
             label.textContent = yVal.toFixed(3);
             svg.append(label);
           }
 
+          const stage2Idx = epochs.findIndex(e => e.stage === 2);
+          if (stage2Idx > 0) {
+            const splitX = padding.left + (stage2Idx - 0.5) * xStep;
+            const divider = document.createElementNS("http://www.w3.org/2000/svg", "line");
+            divider.setAttribute("x1", splitX);
+            divider.setAttribute("x2", splitX);
+            divider.setAttribute("y1", padding.top);
+            divider.setAttribute("y2", padding.top + chartH);
+            divider.setAttribute("stroke", "#4ade80");
+            divider.setAttribute("stroke-width", "1.5");
+            divider.setAttribute("stroke-dasharray", "4 4");
+            divider.setAttribute("stroke-opacity", "0.7");
+            svg.append(divider);
+
+            const s1Label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            s1Label.setAttribute("x", splitX - 10);
+            s1Label.setAttribute("y", padding.top - 8);
+            s1Label.setAttribute("text-anchor", "end");
+            s1Label.setAttribute("font-size", "9");
+            s1Label.setAttribute("font-weight", "600");
+            s1Label.setAttribute("fill", "#73827c");
+            s1Label.textContent = "Stage 1: History (1962–Present)";
+            svg.append(s1Label);
+
+            const s2Label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            s2Label.setAttribute("x", splitX + 10);
+            s2Label.setAttribute("y", padding.top - 8);
+            s2Label.setAttribute("text-anchor", "start");
+            s2Label.setAttribute("font-size", "9");
+            s2Label.setAttribute("font-weight", "600");
+            s2Label.setAttribute("fill", "#4ade80");
+            s2Label.textContent = "Stage 2: Modern Calibration (2015–Present)";
+            svg.append(s2Label);
+          }
+
           const series = [
-            { key: "total_loss", color: "#1c7157", width: "2.5" },
-            { key: "recon_loss", color: "#6b7280", width: "1.5" },
-            { key: "forward_loss", color: "#2563eb", width: "1.5" },
-            { key: "market_loss", color: "#a4661b", width: "1.5" }
+            { key: "total_loss", name: "Total Composite Loss", color: "#4ade80", width: "2.5" },
+            { key: "recon_loss", name: "Feature Recon Loss", color: "#9ca3af", width: "1.5" },
+            { key: "forward_loss", name: "Forward Return Loss", color: "#60a5fa", width: "1.5" },
+            { key: "market_loss", name: "Market Regime Loss", color: "#f59e0b", width: "1.5" }
           ];
 
           for (const s of series) {
@@ -1115,13 +1362,24 @@ window.ConsolePages = (() => {
             polyline.setAttribute("points", pts.join(" "));
             svg.append(polyline);
 
-            for (const pt of pts) {
-              const [px, py] = pt.split(",");
+            for (let i = 0; i < pts.length; i++) {
+              const [px, py] = pts[i].split(",");
+              const ep = epochs[i];
               const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
               dot.setAttribute("cx", px);
               dot.setAttribute("cy", py);
-              dot.setAttribute("r", "3.5");
+              dot.setAttribute("r", "4");
               dot.setAttribute("fill", s.color);
+              dot.setAttribute("class", "loss-dot");
+              dot.setAttribute("stroke", "#ffffff");
+              dot.setAttribute("stroke-width", "1");
+              dot.addEventListener("mouseenter", (evt) => {
+                const val = (ep[s.key] || 0).toFixed(4);
+                const title = `${s.name} · S${ep.stage}:E${ep.epoch}`;
+                const detail = `Stage ${ep.stage} · Epoch ${ep.epoch} | LR: ${ep.learning_rate != null ? Number(ep.learning_rate).toExponential(2) : "—"} | Steps: ${ep.steps?.toLocaleString() || "—"}`;
+                showTip(evt, title, `Loss: ${val}`, detail);
+              });
+              dot.addEventListener("mouseleave", () => hideTip());
               svg.append(dot);
             }
           }
@@ -1132,9 +1390,12 @@ window.ConsolePages = (() => {
             label.setAttribute("x", x);
             label.setAttribute("y", padding.top + chartH + 18);
             label.setAttribute("text-anchor", "middle");
-            label.setAttribute("font-size", "9");
-            label.setAttribute("fill", "#73827c");
-            label.textContent = `Ep ${e.epoch}`;
+            label.setAttribute("class", "loss-axis");
+            if (e.stage === 2) {
+              label.setAttribute("fill", "#4ade80");
+              label.setAttribute("font-weight", "600");
+            }
+            label.textContent = `S${e.stage}:E${e.epoch}`;
             svg.append(label);
           });
 
@@ -1143,14 +1404,14 @@ window.ConsolePages = (() => {
 
           const lossTable = table([
             { label: "Stage", key: "stage", get: (r) => `Stage ${r.stage}` },
-            { label: "Epoch", key: "epoch", numeric: true },
-            { label: "Total Loss", key: "total_loss", numeric: true },
-            { label: "Forward Loss", key: "forward_loss", numeric: true },
-            { label: "Recon Loss", key: "recon_loss", numeric: true },
-            { label: "Market Loss", key: "market_loss", numeric: true },
-            { label: "Learning Rate", key: "learning_rate", numeric: true },
-            { label: "Steps", key: "steps", numeric: true },
-            { label: "Duration (s)", key: "seconds", numeric: true },
+            { label: "Epoch", key: "epoch", get: (r) => `Ep ${r.epoch}`, numeric: true },
+            { label: "Total Loss", key: "total_loss", get: (r) => Number(r.total_loss).toFixed(4), numeric: true },
+            { label: "Forward Loss", key: "forward_loss", get: (r) => Number(r.forward_loss).toFixed(4), numeric: true },
+            { label: "Recon Loss", key: "recon_loss", get: (r) => Number(r.recon_loss).toFixed(4), numeric: true },
+            { label: "Market Loss", key: "market_loss", get: (r) => Number(r.market_loss).toFixed(4), numeric: true },
+            { label: "Learning Rate", key: "learning_rate", get: (r) => r.learning_rate != null ? Number(r.learning_rate).toExponential(2) : "—", numeric: true },
+            { label: "Steps", key: "steps", get: (r) => Number(r.steps).toLocaleString(), numeric: true },
+            { label: "Duration", key: "seconds", get: (r) => `${Number(r.seconds).toFixed(1)}s (${(r.seconds / 60).toFixed(1)}m)`, numeric: true },
           ], epochs, "No epoch metrics recorded.");
           lossPanel.append(lossTable);
         } else {
@@ -1158,19 +1419,58 @@ window.ConsolePages = (() => {
         }
 
         const runsPanel = text("section", "panel section-space");
-        runsPanel.append(
-          text("h3", "", "Saved Models & Checkpoint History"),
-          text("p", "muted compact", "Detected model checkpoints and walk-forward harnesses under analysis/ and demo trees:"),
-          table([
-            { label: "Run / Model Name", key: "name" },
-            { label: "Kind", key: "kind", badge: true },
-            { label: "Device", key: "device" },
-            { label: "Epochs", key: "epochs", numeric: true },
-            { label: "Checkpoints", get: (r) => (r.checkpoints || []).join(", ") || "none" },
-            { label: "Metrics Available", get: (r) => r.has_metrics ? "yes" : "no", badge: true },
-            { label: "Modified", key: "modified" },
-          ], data.runs || [], "No saved model checkpoints found.")
+        const runsTop = text("div", "section-top");
+        const runsTitle = text("div", "");
+        const rHead = text("h3", "", "Saved Models & Checkpoint History");
+        rHead.append(infoButton("Model Checkpoint Registry", "Discovers PyTorch model weights (.pt), walk-forward harness states, and synthetic demo replays stored on disk under analysis/ and demo/ directories."));
+        runsTitle.append(
+          rHead,
+          text("p", "muted compact", "Detected model checkpoints and walk-forward harnesses under analysis/ and demo trees:")
         );
+        runsTop.append(runsTitle);
+        runsPanel.append(runsTop);
+
+        const runsGuide = text("div", "mode-banner");
+        runsGuide.style.marginBottom = "16px";
+        const rTag = text("span", "mode-marker", "CHECKPOINT GUIDE");
+        const rDesc = text("span", "", "Foundation Checkpoints (.pt) provide warm-start weights for neural forecasting (stage1=history, final=calibrated). Walk-Forward Baselines preserve walk-forward harness state and sizing audit logs. Demo Replays allow dry-run pipeline testing.");
+        runsGuide.append(rTag, rDesc);
+        runsPanel.append(runsGuide);
+
+        const runsTable = table([
+          { label: "Run / Model Name", key: "name" },
+          { label: "Kind", key: "kind", badge: true },
+          { label: "Device", key: "device" },
+          { label: "Epochs", key: "epochs", numeric: true },
+          {
+            label: "Checkpoints",
+            get: (r) => {
+              const list = r.checkpoints || [];
+              if (!list.length) return "none";
+              const wrap = text("span", "");
+              list.forEach((cp, idx) => {
+                const isGood = cp === "checkpoint.good";
+                wrap.append(text("span", isGood ? "tag green" : "tag", cp));
+                if (idx < list.length - 1) wrap.append(document.createTextNode(" "));
+              });
+              return wrap;
+            }
+          },
+          { label: "Metrics Available", get: (r) => r.has_metrics ? "yes" : "no", badge: true },
+          {
+            label: "Last Modified",
+            key: "modified",
+            get: (r) => {
+              if (!r.modified) return "—";
+              const span = text("span", "", formatRelativeTime(r.modified));
+              try {
+                span.title = `Last modified: ${new Date(r.modified).toLocaleString()}`;
+              } catch (_) {}
+              return span;
+            }
+          },
+        ], data.runs || [], "No saved model checkpoints found.");
+        runsPanel.append(runsTable);
 
         mount(trainingSection, hwPanel, launchSection, lossPanel, runsPanel);
       } catch (error) {

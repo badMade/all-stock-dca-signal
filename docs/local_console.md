@@ -73,8 +73,9 @@ Every section is backed by a reader today.
   scheduler fired or that an order executed.
 - Forecasts: adjusted-dollar open/high/low/close predictions and p10/p90 bands,
   ticker filtering and source dates. A pending target without a known date is
-  labeled as the next trading row. The latest research run is independent of
-  the selected historical DCA date.
+  labeled as the next trading row (date unresolved); resolved targets show their
+  exact target date (with (est.) for weekday estimates). The latest research run
+  is independent of the selected historical DCA date.
 - Historical periods: measured model errors, coverage and skill versus
   persistence where recorded. Only periods actually present in the report have
   results; the synthetic demo does not cover all historical crises.

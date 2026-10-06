@@ -239,8 +239,9 @@ def test_midday_ladder_matches_afternoon_and_morning():
     # As of the Jul 10 2026 update all live streams (morning, midday, afternoon)
     # share the SAME $2-base 0x-to-5x ladder.
     assert MIDDAY_SIZING_TIERS == StrategyConfig().sizing_tiers
-    assert ex.multiplier_for_drop(0.08) == 5.0
-    assert graded_buy_multiplier(0.08, StrategyConfig()) == 5.0
+    # 2026-10-04 ladder rescale: log-scaled, 8% -> 5.5x (max 8x at 16%+).
+    assert ex.multiplier_for_drop(0.08) == 5.5
+    assert graded_buy_multiplier(0.08, StrategyConfig()) == 5.5
     assert MIDDAY_SIZING_TIERS == MORNING_SIZING_TIERS
 
 
@@ -306,20 +307,22 @@ def test_midday_default_prior_allocation_roots_resolve_at_construction_time():
 
 def test_midday_ladder_brackets():
     ex = MiddayDCAExecutor(MiddayConfig(base_buy_amount_usd=2.0))
+    # 2026-10-04 ladder rescale: log-scaled 0.1%..16% -> 1x..8x (values recomputed).
     cases = {
         0.0005: 0.0,
         0.001: 1.0,
-        0.019: 1.0,
-        0.02: 1.5,
-        0.039: 1.5,
-        0.04: 2.0,
-        0.05: 2.5,
-        0.06: 3.0,
-        0.065: 3.5,
-        0.07: 4.0,
-        0.075: 4.5,
-        0.08: 5.0,
-        0.20: 5.0,
+        0.019: 2.5,
+        0.02: 3.0,
+        0.039: 4.0,
+        0.04: 4.0,
+        0.05: 4.5,
+        0.06: 5.0,
+        0.065: 5.0,
+        0.07: 5.5,
+        0.075: 5.5,
+        0.08: 5.5,
+        0.16: 8.0,
+        0.20: 8.0,
     }
     for drop, expected in cases.items():
         assert ex.multiplier_for_drop(drop) == expected, (drop, expected)
@@ -487,18 +490,20 @@ def test_midday_cap_ledger_seeded_from_cross_stream_morning_fill(tmp_path):
     assert cfg.morning_daily_cap_usd == 180.0  # the shared Normal-tier ceiling, not an isolated 90.0
     ex = MiddayDCAExecutor(cfg, mode="live")
     broker = _Broker()
-    # 3% drop: TOPUP desired = 1.5x * $3 = $4.50; remaining shared cap = $180 - $170 = $10.
-    # $4.50 fits under $10, proving the fill was seen (a stale isolated-$90 cap
+    # 2.5% drop: TOPUP desired = 3.0x * $3 = $9.00; remaining shared cap = $180 - $170 = $10.
+    # (2026-10-04 ladder rescale: this was a 3% drop / 1.5x / $4.50; 3% is now 3.5x = $10.5,
+    # which would exceed the $10 headroom, so the drop was lowered to keep the intent.)
+    # $9.00 fits under $10, proving the fill was seen (a stale isolated-$90 cap
     # with no seeding at all would ALSO have allowed this by coincidence, so the
     # cap-exceeded case below is the one that actually proves seeding occurred).
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.03})
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.025})
     res = ex.run(_now_midday(), data, broker=cast(Any, broker))
     broker_outcomes = res["artifacts"].get("broker_outcomes", {})
     assert broker_outcomes.get("TOPUP", {}).get("status") == "submitted"
-    assert broker.placed.get("TOPUP") == pytest.approx(4.50)
+    assert broker.placed.get("TOPUP") == pytest.approx(9.00)
 
     # Now push the prior morning fill up to $177: remaining shared cap = $3,
-    # which TOPUP's $4.50 desired amount exceeds.
+    # which TOPUP's $9.00 desired amount exceeds.
     morning_root2 = tmp_path / "morning_prior_2"
     _write_prior_morning_run(
         morning_root2, ticker="PRIOR_TICKER", planned_amount=177.0, generated_at="2026-07-08T10:30:00-04:00"
@@ -515,7 +520,7 @@ def test_midday_cap_ledger_seeded_from_cross_stream_morning_fill(tmp_path):
     res2 = ex2.run(_now_midday(), data, broker=cast(Any, broker2))
     broker_outcomes2 = res2["artifacts"].get("broker_outcomes", {})
     assert broker_outcomes2.get("TOPUP", {}).get("status") == "cap_exceeded", (
-        "TOPUP ($4.50 desired) should be cap-gated once a $177 prior MORNING fill, "
+        "TOPUP ($9.00 desired) should be cap-gated once a $177 prior MORNING fill, "
         "seeded cross-stream via cap_seed_roots, leaves only $3 of the shared $180 cap"
     )
     assert "TOPUP" not in broker2.placed
@@ -543,8 +548,8 @@ def test_midday_confidence_rule_auto_buys_with_validated_trend():
     assert sig.action == Action.BUY
     assert sig.trend_validated is True
     assert sig.execution_status == EXEC_AUTO_BUY_ELIGIBLE
-    # 0x-to-5x ladder: 10% drop -> 5x -> $10.
-    assert sig.hypothetical_amount_usd == 10.0
+    # 2026-10-04 ladder rescale: 10% drop -> 6x -> $12 (was 5x -> $10).
+    assert sig.hypothetical_amount_usd == 12.0
 
 
 class FewBarsProvider(FixedDropProvider):
@@ -587,10 +592,11 @@ def test_top_up_no_prior_buys_full_amount(tmp_path):
     res = ex.run(_now_midday(), data, broker=cast(Any, FakeLiveBroker()))
     row = res["artifacts"]["buy_candidates"][0]
     assert row["top_up_guard_result"] == TOP_UP_NO_PRIOR_RUN
-    assert row["incremental_order_amount"] == 10.0
+    # 2026-10-04 ladder rescale: 10% drop is 6x * $2 = $12 (was 5x = $10).
+    assert row["incremental_order_amount"] == 12.0
     # Ledger recorded the full (un-offset) amount.
     day = _now_midday().astimezone(EASTERN).date()
-    assert ex.ledger.day_planned(day) == 10.0
+    assert ex.ledger.day_planned(day) == 12.0
 
 
 def test_top_up_incremental_when_price_below_prior(tmp_path):
@@ -614,10 +620,10 @@ def test_top_up_incremental_when_price_below_prior(tmp_path):
     assert row["prior_same_day_amount"] == 2.0
     assert row["prior_same_day_reference_price"] == 95.0
     assert row["midday_decision_price"] == 90.0
-    # Desired $10 minus prior $2 = $8 incremental.
-    assert row["incremental_order_amount"] == 8.0
+    # Desired $12 minus prior $2 = $10 incremental (2026-10-04 ladder rescale: 10% = 6x, was 5x/$10/$8).
+    assert row["incremental_order_amount"] == 10.0
     day = _now_midday().astimezone(EASTERN).date()
-    assert ex.ledger.day_planned(day) == 8.0
+    assert ex.ledger.day_planned(day) == 10.0
 
 
 def test_top_up_loads_manual_csv_only_context(tmp_path):
@@ -935,7 +941,7 @@ def test_guarded_midday_top_up_ignores_cross_stream_duplicate_for_incremental_or
 
     assert broker.broad_duplicate_calls == 0
     assert broker.same_stream_calls == 2
-    assert broker.placed == [("BIG", 8.0, "midday-dca-topup-2026-07-08-BIG")]
+    assert broker.placed == [("BIG", 10.0, "midday-dca-topup-2026-07-08-BIG")]
     assert res["artifacts"]["broker_outcomes"]["BIG"]["status"] == "submitted"
 
 
@@ -1064,9 +1070,9 @@ def test_manual_review_candidate_row_keeps_top_up_context_when_trend_unvalidated
     assert row["prior_same_day_amount"] == 3.0
     assert row["prior_same_day_reference_price"] == 95.0
     assert row["top_up_guard_result"] == TOP_UP_INCREMENTAL
-    # 10% drop is beyond the top 8% sizing tier -> capped at 5.0x * $3 base = $15
-    # desired; incremental = $15 - the prior $3 fill = $12.
-    assert row["incremental_order_amount"] == pytest.approx(12.0)
+    # 2026-10-04 ladder rescale: 10% drop -> 6.0x * $3 base = $18 desired (was the
+    # 5x cap = $15); incremental = $18 - the prior $3 fill = $15.
+    assert row["incremental_order_amount"] == pytest.approx(15.0)
 
 
 # --- Isolation from other streams -------------------------------------------

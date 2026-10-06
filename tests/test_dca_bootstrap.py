@@ -147,6 +147,10 @@ def test_ensure_venv_installs_torch_cpu_wheel_before_requirements_when_in_venv(t
     monkeypatch.setattr("dca_bootstrap._is_running_in_venv", lambda venv_python: True)
     monkeypatch.setattr("dca_bootstrap._missing_packages", lambda packages: ["torch"])
     monkeypatch.setattr("dca_bootstrap._cuda_gpu_available", lambda: False)
+    # The CPU-wheel pin is deliberately skipped on macOS (see dca_bootstrap's
+    # torch comment), so pin the platform: otherwise this test only passes on
+    # Linux/Windows hosts and fails on a developer Mac.
+    monkeypatch.setattr(sys, "platform", "linux")
 
     ensure_venv(packages=("torch",), requirements_files=(req_file,), venv_dir=venv_dir)
 
@@ -273,6 +277,10 @@ def test_ensure_venv_installs_torch_cpu_wheel_before_requirements_on_first_setup
     monkeypatch.setattr("dca_bootstrap._missing_packages", lambda packages: ["torch"])
     monkeypatch.setattr("dca_bootstrap._check_packages_installed", lambda python_bin, packages: False)
     monkeypatch.setattr("dca_bootstrap._cuda_gpu_available", lambda: False)
+    # The CPU-wheel pin is deliberately skipped on macOS (see dca_bootstrap's
+    # torch comment), so pin the platform: otherwise this test only passes on
+    # Linux/Windows hosts and fails on a developer Mac.
+    monkeypatch.setattr(sys, "platform", "linux")
 
     ensure_venv(packages=("torch",), requirements_files=(req_file,), venv_dir=venv_dir)
 

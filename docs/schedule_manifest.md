@@ -1,17 +1,16 @@
 # Scheduled Tasks Manifest
 
-> **Stale as of 2026-07-28:** this manifest and its machine-readable source
-> (`config/scheduled_tasks.json`) still describe the pre-2026-07-28
-> three-stream Perplexity-era live roster (morning `42173154`, midday
-> `a6239dae`, afternoon `10ce362c`) using the OLD three-stream naming, but
-> those five tasks are still the account's ONLY currently-functioning live
-> execution -- do not retire them. A seven-slot Claude roster is the
-> intended eventual replacement; its Gate 5 has had a real entry point per
-> slot since 2026-08-26 and placement was authorized for all seven slots on
-> 2026-09-02 (see `PRODUCTION_READINESS.md`, "Status, 2026-08-26"), so the
-> "hard-aborts at Gate 5" wording that survives further down this file is
-> historical. [`safeguards.md`](safeguards.md#live-execution-roster) is
-> authoritative for the current roster until this file is reconciled.
+> **Roster reconciliation (updated 2026-10-04):** the seven-slot roster is:
+> 09:35 market-open (`2ba19526`), 10:30 morning (`42173154`), 11:30 intraday (`7be82b97`),
+> 12:30 midday (`a6239dae`), 13:30 intraday (`7be82b97`), 14:30 intraday (`7be82b97`),
+> and 15:30 afternoon final buy (`10ce362c`); the older three-stream wording
+> (morning/midday/afternoon only) is historical. Which slots' in-repo executors
+> actually place orders is set by config: `config/market_open_dca.json`,
+> `config/morning_dca.json`, `config/midday_dca.json`, and
+> `config/intraday_dca.json` all ship with `live_execution_enabled: true`.
+> These flags describe executor capability when invoked; they do not by themselves
+> prove which external scheduler tasks are deployed. See
+> [`safeguards.md`](safeguards.md#live-execution-roster).
 
 Backup of the current scheduled tasks. Machine-readable source:
 [`config/scheduled_tasks.json`](../config/scheduled_tasks.json).
@@ -533,9 +532,10 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > GFUZ; an unresolved GFUZ on Finance does not block the run; the *intent* is
 > that if the 9:45 pre-flight lacks GFUZ the 10:30 task runs a supplemental
 > GFUZ read-only validation and persists `gfuz_supplemental_preflight.json`
-> before decisioning — **not yet implemented**: today `_apply_preflight_gate()`
-> simply gates GFUZ out (safe, fail-closed; it is just skipped for that run)
-> when the preflight artifact lacks a GFUZ row. See `config/morning_dca.json`'s
+> before decisioning -- **implemented as of 2026-10-04**: an optional injected
+> `supplemental_validator` performs read-only validation and persists
+> `gfuz_supplemental_preflight.json` before decisioning; if absent, failing, or
+> invalid, GFUZ remains gated out fail-closed. See `config/morning_dca.json`'s
 > `gfuz_special_handling.supplemental_preflight.implementation_status`.
 > **Raw data persistence (added Jul 15 2026, confirmed Jul 16 2026):** the
 > *intended* contract is that before any signal/budget/top-up computation or

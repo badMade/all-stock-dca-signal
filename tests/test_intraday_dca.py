@@ -262,7 +262,7 @@ def _cfg(tmp_path, **overrides):
 def test_intraday_ladder_is_the_shared_live_ladder():
     assert INTRADAY_SIZING_TIERS == StrategyConfig().sizing_tiers
     ex = IntradayDCAExecutor(IntradayConfig())
-    assert ex.multiplier_for_drop(0.08) == 5.0
+    assert ex.multiplier_for_drop(0.08) == 5.5  # 2026-10-04 ladder rescale: 7-8.5% is now 5.5x (was 5.0x at 8%+)
     assert ex.multiplier_for_drop(0.0005) == 0.0
 
 
@@ -343,9 +343,10 @@ def test_all_intraday_slots_validate_trend(tmp_path):
 
 
 # --- The ships-disabled placement switch ------------------------------------
-def test_shipped_intraday_config_has_execution_disabled():
+def test_shipped_intraday_config_has_execution_enabled():
+    # Operator-promoted on 2026-10-04 for live Robinhood execution.
     cfg = load_intraday_config(allow_unpinned_account=True)
-    assert cfg.live_execution_enabled is False
+    assert cfg.live_execution_enabled is True
 
 
 def test_intraday_disabled_writes_full_artifacts_and_places_nothing(tmp_path):
@@ -369,7 +370,7 @@ def test_intraday_enabled_does_place(tmp_path):
     broker = _Broker()
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.05})
     ex.run(_now_slot("1130"), data, broker=broker)
-    assert broker.placed.get("TICK") == 5.0  # 2.5x * $2 base
+    assert broker.placed.get("TICK") == 9.0  # 4.5x * $2 base (2026-10-04 ladder rescale: 5% drop was 2.5x/$5.00)
 
 
 # --- The prior-allocation chain the now-removed GATE5 proposal's section 1.4 flagged --------
@@ -400,7 +401,8 @@ def test_a_later_slot_sees_an_earlier_slots_fill_as_prior_allocation(tmp_path):
     )
     broker = _Broker()
     # 5% drop -> price 95.0, below the $97.0 prior reference, so the guard tops
-    # up only the difference rather than buying the full $5.00 again.
+    # up only the difference rather than buying the full $9.00 again (2026-10-04
+    # ladder rescale: a 5% drop is 4.5x * $2 = $9.00, was 2.5x = $5.00).
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.05})
     res = ex.run(_now_slot("1330"), data, broker=broker)
 
@@ -408,7 +410,7 @@ def test_a_later_slot_sees_an_earlier_slots_fill_as_prior_allocation(tmp_path):
     assert "TICK" in rows, "candidate row missing"
     assert rows["TICK"]["prior_same_day_amount"] == 3.0
     placed = broker.placed.get("TICK")
-    assert placed is not None and placed < 5.0, (
+    assert placed is not None and placed < 9.0, (
         "the 1:30 slot re-bought the full amount instead of topping up -- the "
         "prior-allocation gap (PRODUCTION_READINESS.md gap #1) has reopened"
     )
@@ -478,7 +480,7 @@ def test_later_slot_top_up_is_not_treated_as_earlier_slots_duplicate(tmp_path):
     now_1130 = datetime.combine(trading_day, time(11, 30), tzinfo=EASTERN)
     data_1130 = _DecliningBarsProvider(100.0, 0.03)
     res_1130 = ex_1130.run(now_1130, data_1130, broker=broker)
-    assert broker.placed.get("NVDA") == pytest.approx(4.5)  # 1.5x * $3
+    assert broker.placed.get("NVDA") == pytest.approx(10.5)  # 3.5x * $3 (2026-10-04 ladder rescale: a 3% drop was 1.5x/$4.50)
     first_ref_ids = list(broker._ref_ids)
 
     # Confirm the fill so the next slot's top-up guard has a known reference

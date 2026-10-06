@@ -207,6 +207,70 @@ def _extract_loss_curves(repo: Path) -> dict[str, Any]:
         return {"available": False, "epochs": [], "validation": {}}
 
 
+def _find_model_last_updated(action_id: str, app: Any, repo: Path, runs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Determine the most recent execution or checkpoint timestamp for a training model."""
+    job_match = None
+    try:
+        jobs = app.jobs.snapshot() if hasattr(app, "jobs") and hasattr(app.jobs, "snapshot") else []
+    except Exception:
+        jobs = []
+
+    for job in jobs:
+        if job.get("action") == action_id:
+            job_match = job
+            break
+
+    if job_match:
+        status = job_match.get("status")
+        ts = job_match.get("finished_at") or job_match.get("started_at")
+        if status in {"running", "queued"}:
+            return {"timestamp": ts, "status": "running", "label": "Updating now"}
+
+    disk_ts: str | None = None
+    if action_id == "train-foundation-smoke":
+        f_runs = [r for r in runs if r.get("kind") == "neural_foundation" and r.get("modified")]
+        if f_runs:
+            disk_ts = max(f_runs, key=lambda r: r["modified"])["modified"]
+        elif (repo / "analysis" / "foundation-octopus-run" / "shard_1_metrics.json").is_file():
+            disk_ts = _modified_iso(repo / "analysis" / "foundation-octopus-run" / "shard_1_metrics.json")
+    elif action_id == "demo-octopus":
+        d_runs = [r for r in runs if str(r.get("kind", "")).startswith("demo") and r.get("modified")]
+        if d_runs:
+            disk_ts = max(d_runs, key=lambda r: r["modified"])["modified"]
+    elif action_id == "octopus-update":
+        target = getattr(app, "octopus_run", None) or (repo / "analysis" / "real-octopus-run")
+        if target and target.is_dir():
+            val = target / "octopus_validation_metrics.json"
+            t_file = val if val.is_file() else target
+            disk_ts = _modified_iso(t_file)
+    elif action_id == "ml-train-dry-run":
+        ml_models = repo / "ml-forecaster" / "models"
+        if ml_models.is_dir():
+            pts = [p for p in ml_models.glob("*") if p.is_file() and not p.name.startswith(".")]
+            if pts:
+                disk_ts = _modified_iso(max(pts, key=lambda p: p.stat().st_mtime))
+
+    if job_match:
+        status = job_match.get("status")
+        job_ts = job_match.get("finished_at") or job_match.get("started_at")
+        if job_ts and (not disk_ts or job_ts >= disk_ts):
+            label = None if status == "completed" else f"{status.title()}" if status else None
+            return {"timestamp": job_ts, "status": status or "completed", "label": label}
+
+    if disk_ts:
+        return {"timestamp": disk_ts, "status": "checkpoint", "label": None}
+
+    if job_match and job_match.get("status"):
+        status = job_match["status"]
+        return {
+            "timestamp": job_match.get("finished_at") or job_match.get("started_at"),
+            "status": status,
+            "label": status.title(),
+        }
+
+    return {"timestamp": None, "status": "never", "label": "Never run"}
+
+
 def build_training_snapshot(app: Any, repo: Path) -> dict[str, Any]:
     """Compile training options, active hardware backend, loss history, and checkpoints."""
     warnings: list[str] = []
@@ -227,6 +291,7 @@ def build_training_snapshot(app: Any, repo: Path) -> dict[str, Any]:
             "reason": "" if neural_ready else "PyTorch is not installed in the research environment.",
             "action_id": "train-foundation-smoke",
             "action_label": "Run Foundation Smoke Train (10 steps)",
+            "last_updated": _find_model_last_updated("train-foundation-smoke", app, repo, runs),
             "options": {
                 "stages": ["1 (History)", "2 (Modern)", "both"],
                 "default_stage": "1",
@@ -243,6 +308,7 @@ def build_training_snapshot(app: Any, repo: Path) -> dict[str, Any]:
             "reason": "" if sklearn_ready else "scikit-learn is not installed.",
             "action_id": "ml-train-dry-run",
             "action_label": "Run ML Forecaster Dry Run",
+            "last_updated": _find_model_last_updated("ml-train-dry-run", app, repo, runs),
             "options": {
                 "n_splits": 4,
                 "alpha": 2.0,
@@ -258,6 +324,7 @@ def build_training_snapshot(app: Any, repo: Path) -> dict[str, Any]:
             "reason": "" if sklearn_ready else "scikit-learn is not installed.",
             "action_id": "demo-octopus",
             "action_label": "Test Octopus Baseline Pipeline",
+            "last_updated": _find_model_last_updated("demo-octopus", app, repo, runs),
             "options": {
                 "models": ["gbm_quantile", "persistence"],
                 "quantiles": [0.1, 0.5, 0.9],
@@ -272,6 +339,7 @@ def build_training_snapshot(app: Any, repo: Path) -> dict[str, Any]:
             "reason": "Supply --octopus-run with an existing Octopus run directory." if app.octopus_run is None else "",
             "action_id": "octopus-update",
             "action_label": "Update Octopus Day",
+            "last_updated": _find_model_last_updated("octopus-update", app, repo, runs),
             "options": {
                 "active_run": root_label(app.octopus_run) if app.octopus_run else None,
             },

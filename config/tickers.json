@@ -41,7 +41,7 @@
         "trigger": "If the same-day 9:45 pre-flight artifact does not contain a GFUZ row (e.g. GFUZ was unresolved at 9:45), the 10:30 live task should run a supplemental GFUZ read-only validation before decisioning.",
         "persist_file": "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/gfuz_supplemental_preflight.json",
         "note": "Persist the supplemental read-only validation to gfuz_supplemental_preflight.json before any GFUZ signal/budget/order decisioning; the decision engine reads only from the persisted file.",
-        "implementation_status": "not_implemented: MorningDCAExecutor._apply_preflight_gate() has no code path for this today. A missing GFUZ row in the 9:45 preflight artifact simply gates GFUZ out (tickers \u2229 eligible_tickers excludes it) for that run, a safe, fail-closed degradation, not the supplemental-validation flow described above. See config/morning_dca.json's gfuz_special_handling.supplemental_preflight.implementation_status for the authoritative note."
+        "implementation_status": "IMPLEMENTED in morning_dca.py as of 2026-10-04. When GFUZ is in the configured tickers and missing from a valid, non-empty same-day 9:45 pre-flight artifact, morning_preflight_eligible_tickers() invokes the injected supplemental_validator, persists gfuz_supplemental_preflight.json to the run directory before decisioning, and admits GFUZ only when the persisted result confirms validity; if the validator is absent, raises, or returns invalid, GFUZ remains gated out fail-closed."
       }
     }
   },

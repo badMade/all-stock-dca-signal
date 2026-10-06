@@ -232,10 +232,12 @@ The lists a caller acts on:
   is provisional — re-fetch each survivor's quote immediately before placement.
 - **`planner_candidates`** is an optional convenience for a caller driving
   `dca_runner.plan_orders()`. It is deliberately *not* a filter on the list above:
-  `plan_orders()` validates multipliers against only the global
-  `config/sizing_ladder.json`, with no awareness of the per-ticker calibration the
-  executor's own sizing respects, so a calibrated ticker's real, correct BUY is
-  routinely reported in `planner_incompatible_tickers`. On the 1530ET path those two
+  `plan_orders()` validates a bare 4-column row against only the global
+  `config/sizing_ladder.json`. A calibrated ticker's row therefore carries its selected
+  tier as three trailing columns (`sizing_base_usd`, `sizing_min_drop_pct`,
+  `sizing_max_drop_pct`, the same values `cands` publishes), which `plan_orders()` binds
+  to the ticker's own active curve; a calibrated row whose evidence is missing or fails
+  that check is still reported in `planner_incompatible_tickers`. On the 1530ET path those two
   lists are coupled because its Gate 6 *is* `plan_orders()`. The market-open prompt's
   Gate 6 is not — it sizes from paginated broker history and `config/budgets.json` —
   so coupling them here would empty the one file Gate 6.5 consumes, on ordinary days,

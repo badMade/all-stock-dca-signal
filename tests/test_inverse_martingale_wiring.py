@@ -3987,7 +3987,8 @@ def test_orders_csv_is_replaced_when_artifacts_dir_is_reused_for_a_different_day
     counts to this one.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
-    config = _base_config()
+    # 2026-10-04 ladder rescale: a 10% drop is now 6x = $12.00, above _base_config()'s $10 ceiling (was 5x = $10.00), so lift the ceiling to the new $16 max.
+    config = _base_config(max_per_order_usd=16.0)
     state = StrategyState()
 
     result1, _run_state1, _ = _run_day(tmp_path, config, state, TEST_DATES[0], 90.0, "reused-dir")
@@ -4015,7 +4016,8 @@ def test_orders_csv_is_replaced_when_a_different_stream_reuses_the_same_day_dir(
     run_state.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
-    config = _base_config()
+    # 2026-10-04 ladder rescale: a 10% drop is now 6x = $12.00, above _base_config()'s $10 ceiling (was 5x = $10.00), so lift the ceiling to the new $16 max.
+    config = _base_config(max_per_order_usd=16.0)
     state = StrategyState()
 
     # classification_overrides mirrors `stream` here exactly as this repo's
@@ -4068,7 +4070,8 @@ def test_orders_csv_is_replaced_when_a_manual_run_reuses_a_scheduled_dir(tmp_pat
     that distinction.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
-    config = _base_config()
+    # 2026-10-04 ladder rescale: a 10% drop is now 6x = $12.00, above _base_config()'s $10 ceiling (was 5x = $10.00), so lift the ceiling to the new $16 max.
+    config = _base_config(max_per_order_usd=16.0)
     state = StrategyState()
 
     result1, _run_state1, _ = _run_day(
@@ -4113,6 +4116,7 @@ def test_orders_csv_is_replaced_when_a_different_slot_shares_the_same_stream(tmp
     directory as a retry of an earlier, unrelated slot.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    # 2026-10-04 ladder rescale: a 10% drop is now 6x = $12.00, above _base_config()'s $10 ceiling (was 5x = $10.00), so lift the ceiling to the new $16 max.
     state = StrategyState()
 
     # Different tickers per slot -- the DryRunBroker's synthetic order id
@@ -4121,7 +4125,7 @@ def test_orders_csv_is_replaced_when_a_different_slot_shares_the_same_stream(tmp
     # SAME order id and make an order-id-disjointness assertion meaningless.
     result1, _run_state1, _ = _run_day(
         tmp_path,
-        _base_config(tickers=("AAPL",)),
+        _base_config(tickers=("AAPL",), max_per_order_usd=16.0),
         state,
         TEST_DATES[0],
         90.0,
@@ -4137,7 +4141,7 @@ def test_orders_csv_is_replaced_when_a_different_slot_shares_the_same_stream(tmp
     state2 = StrategyState()
     result2, _run_state2, _ = _run_day(
         tmp_path,
-        _base_config(tickers=("MSFT",)),
+        _base_config(tickers=("MSFT",), max_per_order_usd=16.0),
         state2,
         TEST_DATES[0],
         90.0,
@@ -4167,7 +4171,8 @@ def test_orders_csv_survives_a_retry_when_stream_is_not_mirrored_into_classifica
     retry.
     """
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
-    config = _base_config()
+    # 2026-10-04 ladder rescale: a 10% drop is now 6x = $12.00, above _base_config()'s $10 ceiling (was 5x = $10.00), so lift the ceiling to the new $16 max.
+    config = _base_config(max_per_order_usd=16.0)
 
     def _run(state, artifacts_label):
         now = datetime.combine(TEST_DATES[0], time(15, 45), tzinfo=EASTERN)

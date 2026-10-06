@@ -1309,11 +1309,30 @@ def build_document(
             row["buy_multiplier"],
             row["multiplier_drop_pct"],
         ]
-        # dca_runner.plan_orders() validates multiplier/drop against ONLY the
-        # global config/sizing_ladder.json, with no awareness of the per-ticker
-        # calibration graded_buy_multiplier does respect -- so a calibrated
-        # ticker's real, correct row can legitimately fall outside the global
-        # ladder's range and be refused there as REFUSED_INCONSISTENT_MULTIPLIER.
+        # A calibrated ticker's row also carries its selected tier as three trailing
+        # columns (sizing_base_usd, sizing_min_drop_pct, sizing_max_drop_pct -- the same
+        # fields `cands` publishes), which dca_runner._parse_candidate_rows reads into a
+        # Candidate so plan_orders() validates the row against the ticker's OWN curve
+        # instead of the global ladder. Without them every calibrated row is checked
+        # against the global ladder alone, and the 2026-10-04 log-scaled ladder (narrow
+        # per-multiplier ranges) withheld real, correctly sized calibrated buys such as
+        # DFTX at 5% / 2.5x (Copilot review, PR #1597). An uncalibrated row stays 4-wide.
+        calibration = _calibration_fields(
+            row["ticker"], row["buy_multiplier"], row["selected_base_amount_usd"]
+        )
+        if calibration:
+            planner_row.extend(
+                [
+                    calibration["sizing_base_usd"],
+                    calibration["sizing_min_drop_pct"],
+                    calibration["sizing_max_drop_pct"],
+                ]
+            )
+        # dca_runner.plan_orders() validates multiplier/drop against the global
+        # config/sizing_ladder.json for an UNcalibrated row (and against the ticker's own
+        # tier for a calibrated one that carries the evidence above), so a row whose
+        # evidence is absent or fails validation can still be refused there as
+        # REFUSED_INCONSISTENT_MULTIPLIER.
         # Such rows are withheld and named rather than shipped as planner-safe
         # (Codex review, 1530ET module: "Keep planner rows compatible with
         # calibrated ladders"); their full, correct decision is still in

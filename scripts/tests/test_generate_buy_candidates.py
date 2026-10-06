@@ -99,7 +99,14 @@ def _config(**overrides) -> StrategyConfig:
     base = dict(
         tickers=("TEST",),
         excluded_tickers=frozenset(),
-        sizing_tiers=((0.001, 1.0), (0.02, 1.5), (0.04, 2.0), (0.05, 2.5), (0.08, 5.0)),
+        # 2026-10-04 ladder rescale: mirror config/sizing_ladder.json's log-scaled
+        # 0.1%..16% -> 1x..8x ladder (the planner validates against the shipped
+        # ladder, so a stale hand-copied curve makes every row planner-incompatible).
+        sizing_tiers=(
+            (0.001, 1.0), (0.005, 1.5), (0.01, 2.0), (0.015, 2.5), (0.02, 3.0), (0.0275, 3.5),
+            (0.035, 4.0), (0.045, 4.5), (0.055, 5.0), (0.07, 5.5), (0.085, 6.0), (0.105, 6.5),
+            (0.125, 7.0), (0.145, 7.5), (0.16, 8.0),
+        ),
     )
     base.update(overrides)
     return StrategyConfig(**base)
@@ -180,13 +187,14 @@ def _only(candidates: list, ticker: str = "TEST") -> dict:
 
 
 def test_buy_candidate_below_close_and_low():
-    """4% drop below both prior close and prior low -> BUY at the $2 base, 2x tier."""
+    """4% drop below both prior close and prior low -> BUY at the $2 base, 4x tier
+    (2026-10-04 ladder rescale: 4% was 2x, now the log-scaled 3.5-4.5% tier = 4x)."""
     data = _market_data("TEST", early_price=100.0, late_price=96.0, previous_close=100.0, previous_low=97.0)
     candidate = _only(_run(data, _config()))
     assert candidate["action"] == Action.BUY.value
-    assert candidate["buy_multiplier"] == pytest.approx(2.0)
+    assert candidate["buy_multiplier"] == pytest.approx(4.0)
     assert candidate["selected_base_amount_usd"] == pytest.approx(2.0)
-    assert candidate["suggested_amount_usd"] == pytest.approx(4.0)
+    assert candidate["suggested_amount_usd"] == pytest.approx(8.0)
     # Gate 6's allocation-priority tie-break (higher multiplier, then larger
     # percent drop) needs this on every candidate, not just the ticker+amount.
     assert candidate["drop_vs_previous_close_pct"] == pytest.approx(4.0)
@@ -653,8 +661,9 @@ def test_drop_vs_previous_close_pct_matches_allocation_sort_key_not_winning_sour
     MAX drop across both sources, not whichever source's price the reconciled
     decision actually targeted (the smaller-amount "winning" source per
     reconcile_signals). Finance sees a shallow 2% drop and wins reconciliation
-    on its smaller $3.00 amount (1.5x tier); Robinhood sees a steeper 6% drop
-    but loses on its larger $5.00 amount (2.5x tier). The emitted field must
+    on its smaller $6.00 amount (3.0x tier); Robinhood sees a steeper 6% drop
+    but loses on its larger $10.00 amount (5.0x tier). (2026-10-04 ladder
+    rescale: these were $3.00/1.5x and $5.00/2.5x.) The emitted field must
     still reflect Robinhood's larger 6% drop, matching allocation_sort_key,
     not finance's smaller 2% (Codex review: "Emit the allocation-sort drop")."""
     market_data_by_source = {
@@ -678,14 +687,14 @@ def test_drop_vs_previous_close_pct_matches_allocation_sort_key_not_winning_sour
     candidate = _only(candidates)
     assert candidate["finance_action"] == Action.BUY.value
     assert candidate["robinhood_action"] == Action.BUY.value
-    # Finance wins reconciliation: $2.00 base * 1.5x = $3.00 < Robinhood's $2.00 * 2.5x = $5.00.
+    # Finance wins reconciliation: $2.00 base * 3.0x = $6.00 < Robinhood's $2.00 * 5.0x = $10.00.
     assert candidate["action"] == Action.BUY.value
-    assert candidate["suggested_amount_usd"] == pytest.approx(3.0)
-    assert candidate["buy_multiplier"] == pytest.approx(1.5)
+    assert candidate["suggested_amount_usd"] == pytest.approx(6.0)
+    assert candidate["buy_multiplier"] == pytest.approx(3.0)
     # But the allocation tie-break drop must be Robinhood's larger 6%, not finance's 2%.
     assert candidate["drop_vs_previous_close_pct"] == pytest.approx(6.0)
     # While multiplier_drop_pct -- the value planner_candidates actually uses --
-    # must stay finance's OWN 2%: it is what produced buy_multiplier=1.5, and
+    # must stay finance's OWN 2%: it is what produced buy_multiplier=3.0, and
     # dca_runner.plan_orders() would refuse the candidate if paired with 6%
     # instead (Codex review: "Keep planner drop consistent with multiplier").
     assert candidate["multiplier_drop_pct"] == pytest.approx(2.0)
@@ -800,7 +809,7 @@ def test_quote_in_market_data_becomes_target_price():
     data["sources"]["robinhood"]["TEST"]["quote"] = {"price": 95.50, "as_of": _iso(15, 30)}
     candidate = _only(_run(data, _config()))
     assert candidate["action"] == Action.BUY.value
-    assert candidate["buy_multiplier"] == pytest.approx(2.0)
+    assert candidate["buy_multiplier"] == pytest.approx(4.0)  # 2026-10-04 ladder rescale: 4% drop was 2x
     assert candidate["target_price"] == pytest.approx(95.50)
 
 
@@ -1078,7 +1087,7 @@ def test_previous_close_bar_zero_low_is_treated_as_unknown_not_rejected():
     # previous_low=0.0 means "unknown" -> conservative $1 base, NOT upgraded
     # to $2 even though decision_price(96) is numerically "below" 0.
     assert candidate["selected_base_amount_usd"] == pytest.approx(1.0)
-    assert candidate["suggested_amount_usd"] == pytest.approx(2.0)
+    assert candidate["suggested_amount_usd"] == pytest.approx(4.0)  # 4x * $1 (2026-10-04 ladder rescale; was 2x)
 
 
 def test_previous_close_bar_non_finite_low_still_rejected():
@@ -1429,6 +1438,20 @@ def test_previous_close_bar_from_weeks_earlier_is_rejected():
         source_payload["TEST"]["previous_close_bar"]["timestamp"] = stale_timestamp
     with pytest.raises(ValueError, match="immediately previous market session"):
         _run(data, _config())
+
+
+def test_previous_close_bar_with_midnight_utc_timestamp_accepted():
+    """Daily bars timestamped at midnight UTC (00:00:00Z) carry the session
+    date directly (e.g. Robinhood daily bars). Converting midnight UTC to ET
+    would subtract 4/5 hours and falsely shift the bar to the prior calendar
+    day. The session date must be correctly recognized."""
+    data = _market_data("TEST", early_price=100.0, late_price=96.0, previous_close=100.0, previous_low=97.0)
+    prev_day = gbc._previous_trading_day(DAY)
+    midnight_utc = f"{prev_day.isoformat()}T00:00:00Z"
+    for source_payload in data["sources"].values():
+        source_payload["TEST"]["previous_close_bar"]["timestamp"] = midnight_utc
+    candidates = _run(data, _config())
+    assert candidates[0]["action"] == Action.BUY.value
 
 
 def test_previous_trading_day_skips_the_weekend():

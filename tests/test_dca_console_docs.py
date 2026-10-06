@@ -3,6 +3,7 @@
 import io
 import json
 import os
+from pathlib import Path
 
 import pytest
 from test_dca_console import request, running_server
@@ -107,6 +108,22 @@ def test_docs_routes_serve_only_catalog_pages_and_the_index(app):
         index = json.loads(body)
         assert index["count"] > 30 and any(row["path"] == "docs/local_console.md" for row in index["docs"])
         assert request(server, "/api/docs/index?x=1")[0] == 400
+
+
+def test_docs_routes_redact_sensitive_values(app, monkeypatch):
+    import dca_console_docs
+    from conftest import FIXTURE_ACCOUNT_NUMBER
+
+    fake_doc = b"# Guide\nAccount: " + FIXTURE_ACCOUNT_NUMBER.encode() + b"\nUser path: " + str(Path.home()).encode() + b"/project"
+    monkeypatch.setattr(dca_console_docs, "read_doc", lambda repo, name: fake_doc)
+
+    with running_server(app, ConsoleAccess(), AuthFailureLog(interval=0, stream=io.StringIO())) as server:
+        status, headers, body = request(server, "/api/docs?path=docs/newcomer_guide.md")
+        assert status == 200
+        text = body.decode("utf-8")
+        assert FIXTURE_ACCOUNT_NUMBER not in text
+        assert "[redacted]" in text
+        assert str(Path.home()) not in text
 
 
 @pytest.fixture

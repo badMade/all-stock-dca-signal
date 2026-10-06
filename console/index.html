@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="light dark">
   <title>DCA · Operations console</title>
   <link rel="stylesheet" href="/styles.css">
   <script src="/markdown.js" defer></script>
@@ -34,7 +34,7 @@
   </aside>
 
   <main id="main-content">
-    <header class="topbar"><div class="breadcrumb">Workspace <span>/</span> <span id="breadcrumb-page">Today</span></div><div class="clock"><span id="clock">—</span><span class="tag">ET</span></div></header>
+    <header class="topbar"><div class="breadcrumb">Workspace <span>/</span> <span id="breadcrumb-page">Today</span></div><div class="topbar-actions"><div class="clock"><span id="clock">—</span><span class="tag">ET</span></div><button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle dark mode" title="Toggle dark mode"><span class="theme-toggle-icon" id="theme-icon" aria-hidden="true">🌙</span></button></div></header>
     <div class="page-content">
       <div class="mode-banner" id="mode-banner" role="status"><span class="mode-marker" id="mode-marker">LOCAL</span><span id="mode-message">Connecting to your local workspace…</span></div>
       <div class="error-banner" id="error-banner" role="alert" hidden></div>

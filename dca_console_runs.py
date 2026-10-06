@@ -688,7 +688,17 @@ def _pointer_target(reader: BoundedReader, run_state_path: str | None) -> Path |
     try:
         target = Path(run_state_path).resolve()
     except (OSError, RuntimeError):
-        return None
+        target = Path(run_state_path)
+    if not target.is_relative_to(reader.root):
+        parts = Path(run_state_path).parts
+        if reader.root.name in parts:
+            idx = parts.index(reader.root.name)
+            subpath = Path(*parts[idx + 1:])
+            target = (reader.root / subpath).resolve()
+        elif "cron_tracking" in parts:
+            idx = parts.index("cron_tracking")
+            subpath = Path(*parts[idx + 1:])
+            target = (reader.root.parent / subpath).resolve()
     if not target.is_relative_to(reader.root):
         return None
     return reader.confined(target.relative_to(reader.root))
@@ -721,9 +731,16 @@ def _pointer_row(root: RootSpec, stream: str, pointer: Path, expected_root: Path
         label = "unverified"
     else:
         label = "rejected"
+    pointer_data = reader.json(relative) if pointer.is_file() else {}
+    slot_id = None
+    if isinstance(pointer_data, dict):
+        raw_slot = pointer_data.get("runner_slot_id") or pointer_data.get("slot")
+        if isinstance(raw_slot, str):
+            slot_id = raw_slot.upper().removesuffix("ET").strip()
     return {
         "stream": stream, "label": root.label, "at_risk": root.kind == "secondary", "pointer_file": str(relative),
         "alias": alias, "status": outcome.status, "evidence": evidence, "evidence_label": label,
+        "slot_id": slot_id or None,
         "reasons": [_text(reason, roots) for reason in outcome.reasons[:20]],
         "trading_day": iso_date(outcome.trading_day), "run_state_present": present,
         "order_submit_status": _text(state.get("order_submit_status")) if state.get("order_submit_status") else None,

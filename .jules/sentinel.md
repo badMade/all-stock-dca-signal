@@ -77,3 +77,9 @@
 **Vulnerability:** The local `ThreadingHTTPServer` configured via `BaseHTTPRequestHandler` in `dca_console.py` lacked a socket timeout configuration. This meant connections could hang indefinitely during the header-reading phase.
 **Learning:** Adding `self.connection.settimeout()` inside `do_GET` or `do_POST` is insufficient for protection against Slowloris-style attacks, because `socketserver.StreamRequestHandler` parses HTTP headers *before* invoking `do_GET` or `do_POST`.
 **Prevention:** Always define a `timeout` class attribute directly on the `BaseHTTPRequestHandler` subclass (e.g., `timeout = 5`) so the underlying socket configuration applies the timeout immediately upon connection and during the vulnerable header-reading phase.
+
+## 2026-10-04 - Response Redaction on Document Serving Endpoints
+
+**Vulnerability:** Documentation files and live executor prompts served via `/api/docs?path=...` returned raw bytes without passing through `redact_value()`, potentially revealing account numbers, registered secrets, sensitive environment variables, or local user paths.
+**Learning:** Even when files are checked into version control under strict invariant checks, dynamic operator prompts and documentation pages can contain sample accounts or local filesystem paths that should never be broadcast over HTTP.
+**Prevention:** Enforce defense-in-depth output redaction (`redact_value`) at the HTTP handler boundary for all served documentation text.

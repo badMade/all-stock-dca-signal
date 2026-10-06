@@ -604,10 +604,10 @@ def test_normal_case_no_kill_switch_preserves_ladder():
 
     assert guarded.deployed_last_7d_usd == 600.0
     assert kill_switch_engaged(guarded) is False
-    # The current shared fallback ladder uses 1.5x at 2% and 2.5x at 5%.
-    # A 2% drop sizes to 1.5x, a 5%+ drop sizes to 2.5x — unchanged ladder.
-    assert graded_buy_multiplier(0.02, guarded) == 1.5
-    assert graded_buy_multiplier(0.05, guarded) == 2.5
+    # 2026-10-04 ladder rescale: the log-scaled ladder uses 3x at 2% and 4.5x at 5%.
+    # A 2% drop sizes to 3x, a 5% drop sizes to 4.5x — the guard leaves it intact.
+    assert graded_buy_multiplier(0.02, guarded) == 3.0
+    assert graded_buy_multiplier(0.05, guarded) == 4.5
 
 
 # --- Case 2: 7-day deployed > 40% monthly triggers cap to 1x -----------------
@@ -659,7 +659,7 @@ def test_zero_deployment_history():
     guarded = apply_risk_guard(_config(), by_day, as_of)
     assert guarded.deployed_last_7d_usd == 0.0
     assert kill_switch_engaged(guarded) is False
-    assert graded_buy_multiplier(0.08, guarded) == 5.0  # full ladder intact
+    assert graded_buy_multiplier(0.08, guarded) == 5.5  # full ladder intact (2026-10-04 ladder rescale: 8% -> 5.5x)
 
 
 def test_candidates_present_but_none_submitted_deploy_zero():
@@ -732,7 +732,7 @@ def test_non_positive_allocation_disables_guard():
     """A mis-/unconfigured allocation must never wedge the ladder to 1x."""
     guarded = dataclasses.replace(_config(monthly_cash_allocation_usd=0.0), deployed_last_7d_usd=9999.0)
     assert kill_switch_engaged(guarded) is False
-    assert graded_buy_multiplier(0.08, guarded) == 5.0
+    assert graded_buy_multiplier(0.08, guarded) == 5.5  # 2026-10-04 ladder rescale: 8% -> 5.5x
 
 
 # --- Case 4: streams / run-classification not conflated ----------------------

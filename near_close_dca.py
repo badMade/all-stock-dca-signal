@@ -1011,19 +1011,20 @@ class StrategyConfig:
     # regular-session low, the full ``base_buy_amount_usd`` ($2) scale is used;
     # when it is below the prior close only (not below the prior low), the reduced
     # ``base_buy_amount_below_close_usd`` ($1) scale is used. Not below the prior
-    # close is no buy. The 0x-to-5x ladder multiplier is applied after this
-    # selection, so the per-order ceiling stays 5x * $2 = $10.
+    # close is no buy. The 0x-to-8x ladder multiplier is applied after this
+    # selection, so the per-order ceiling is 8x * $2 = $16 (max_per_order_usd).
     base_buy_amount_usd: float = 2.0
     base_buy_amount_below_close_usd: float = 1.0
     minimum_order_usd: float = 1.0
-    max_per_order_usd: float = 10.0
+    max_per_order_usd: float = 16.0
     # A whole-share ticker (WHOLE_SHARE_TICKERS) cannot be bought in any
-    # smaller unit than ONE SHARE, so max_per_order_usd's $10 -- sized for
+    # smaller unit than ONE SHARE, so max_per_order_usd's $16 -- sized for
     # fractional dollar orders, where any amount is expressible -- reads as
     # "never buy this ticker at all" for any symbol trading above it. That is
     # not a theoretical edge: it is what blocked RVII (~$23/share) outright
-    # when it moved into the whole-share category, and BYDDY (~$10/share)
-    # clears the $10 cap only by a cent or two. This is the ceiling the
+    # when it moved into the whole-share category (it still exceeds $16), and
+    # BYDDY (~$10/share) only just cleared the former $10 cap, by a cent or
+    # two (the 2026-10-04 8x ladder raised the cap to $16). This is the ceiling the
     # whole-share path uses INSTEAD, and ONLY to authorize a single share
     # that the ordinary ceiling cannot fit -- never to enlarge a multi-share
     # fire, which max_per_order_usd still governs. See
@@ -1065,36 +1066,39 @@ class StrategyConfig:
     # Graded sizing ladder mapping the drop from prior close to a buy multiplier.
     # Thresholds are fractions of the previous close (0.001 == 0.1%). The largest
     # threshold less than or equal to the actual drop wins; a drop below the first
-    # threshold yields no buy (0x). There is no upper cutoff: any drop >= 8.0% is 5x.
+    # threshold yields no buy (0x). There is no upper cutoff: any drop >= 16.0% is 8x.
+    # The tuple below is the authoritative table (it mirrors config/sizing_ladder.json
+    # version 2026-10-04, enforced by tests/test_config_invariants.py); in short:
     #     drop < 0.1%             -> 0x  (no buy)
-    #     0.1% <= drop < 2.0%     -> 1x
-    #     2.0% <= drop < 4.0%     -> 1.5x
-    #     4.0% <= drop < 5.0%     -> 2x
-    #     5.0% <= drop < 6.0%     -> 2.5x
-    #     6.0% <= drop < 6.5%     -> 3x
-    #     6.5% <= drop < 7.0%     -> 3.5x
-    #     7.0% <= drop < 7.5%     -> 4x
-    #     7.5% <= drop < 8.0%     -> 4.5x
-    #     drop >= 8.0%            -> 5x
+    #     0.1% <= drop < 0.5%     -> 1x
+    #     0.5% <= drop < 1.0%     -> 1.5x
+    #     ... one 0.5x step per rung, rungs widening with depth ...
+    #     14.5% <= drop < 16.0%   -> 7.5x
+    #     drop >= 16.0%           -> 8x
     #
-    # Rescaled 2026-08-02 (user-directed). The prior curve stepped uniformly every
-    # 1% from 0.1% to 8%. This one is flatter on shallow dips (1x now runs to 2%,
-    # 1.5x to 4%) and back-loads the scaling into deep drops, slicing 6-8% every
-    # half percent. Same endpoints -- 0x below 0.1%, 5x at 8%+ -- so the $10
-    # per-order ceiling (5x * $2) is unchanged. Note the knock-on effect on budget
-    # tiering: high_multiplier_threshold counts 3x-or-greater signals, which now
-    # require a 6% drop rather than 4%, so tier escalation is correspondingly
-    # less frequent for the same market conditions.
+    # Rescaled 2026-10-04 to a log-scaled ladder (0.1%-16% drops -> 1x-8x). Both
+    # endpoints moved: the top multiplier is now 8x (was 5x at 8%+) and the
+    # per-order ceiling is 8x * $2 = $16 (was $10); max_per_order_usd follows it.
+    # Shallow dips now step up much sooner (1.5x from 0.5%, was 2%). Knock-on effect
+    # on budget tiering: high_multiplier_threshold counts 3x-or-greater signals,
+    # which now require only a 2.0% drop (was 6% after the 2026-08-02 rescale), so
+    # tier escalation is correspondingly MORE frequent for the same market conditions.
     sizing_tiers: tuple[tuple[float, float], ...] = (
-        (0.001, 1.0),  # down 0.1% to <2.0%
-        (0.020, 1.5),  # down 2.0% to <4.0%
-        (0.040, 2.0),  # down 4.0% to <5.0%
-        (0.050, 2.5),  # down 5.0% to <6.0%
-        (0.060, 3.0),  # down 6.0% to <6.5%
-        (0.065, 3.5),  # down 6.5% to <7.0%
-        (0.070, 4.0),  # down 7.0% to <7.5%
-        (0.075, 4.5),  # down 7.5% to <8.0%
-        (0.080, 5.0),  # down 8.0% or more (no upper cutoff)
+        (0.001, 1.0),   # 0.1% to <0.5%
+        (0.005, 1.5),   # 0.5% to <1.0%
+        (0.010, 2.0),   # 1.0% to <1.5%
+        (0.015, 2.5),   # 1.5% to <2.0%
+        (0.020, 3.0),   # 2.0% to <2.75%
+        (0.0275, 3.5),  # 2.75% to <3.5%
+        (0.035, 4.0),   # 3.5% to <4.5%
+        (0.045, 4.5),   # 4.5% to <5.5%
+        (0.055, 5.0),   # 5.5% to <7.0%
+        (0.070, 5.5),   # 7.0% to <8.5%
+        (0.085, 6.0),   # 8.5% to <10.5%
+        (0.105, 6.5),   # 10.5% to <12.5%
+        (0.125, 7.0),   # 12.5% to <14.5%
+        (0.145, 7.5),   # 14.5% to <16.0%
+        (0.160, 8.0),   # 16.0% or more (no upper cutoff)
     )
     # Optional symbol-specific historical calibration loaded from
     # config/per_ticker_sizing.json. Each value supplies ``tiers`` as
@@ -4719,7 +4723,7 @@ def graded_buy_multiplier(drop_vs_previous_close: float, config: StrategyConfig,
         # kill-switch remains the final word on scaling.
         ml_factor = config.ml_sizing_adjustment.get((ticker or "").upper(), 1.0)
         multiplier = multiplier * ml_factor
-    multiplier = min(multiplier, 5.0)
+    multiplier = min(multiplier, 8.0)
     if kill_switch_engaged(config):
         multiplier = min(multiplier, 1.0)
     return multiplier

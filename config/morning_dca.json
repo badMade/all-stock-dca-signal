@@ -5,6 +5,8 @@
   "stream": "morning",
   "confidence_rule": "In LIVE mode, a candidate whose price/drop passes the ladder is auto-bought ONLY when the intraday trend can be validated (>= trend_min_bars usable intraday bars at or before the decision time). If price/drop passes but the intraday trend cannot be validated, the run must NOT auto-buy; it classifies the candidate as execution_status='manual_review_candidate'. There is no loosened trend-unavailable execution path.",
   "trend_min_bars": 6,
+  "live_execution_enabled": true,
+  "live_execution_enabled_note": "SHIPS ENABLED. The 10:30 AM ET morning live stream (42173154) is one of the canonical live executions, authorized for live broker placement.",
   "watchlist_task": {
     "mode": "watchlist",
     "cron_id": "bb4f6ef1",
@@ -103,7 +105,7 @@
       "persist_file": "gfuz_supplemental_preflight.json",
       "persist_path": "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/gfuz_supplemental_preflight.json",
       "rule": "Persist the supplemental GFUZ read-only validation to gfuz_supplemental_preflight.json BEFORE any GFUZ signal/budget/top-up/order decisioning; the decision engine reads GFUZ only from the persisted file.",
-      "implementation_status": "NOT YET IMPLEMENTED in MorningDCAExecutor (morning_dca.py) as of 2026-07-18 -- flagged by Codex review on PR #78 ('Add the GFUZ supplemental path before gating it out'). _apply_preflight_gate currently admits tickers via a plain `tickers ∩ eligible_tickers` intersection with no GFUZ-specific exception, so a same-day preflight artifact missing a GFUZ row places GFUZ in gated_out_tickers and it is simply not evaluated that run (a safe, fail-closed degradation -- GFUZ is skipped, never bought on unvalidated data) rather than running this supplemental validation. Left as documented follow-up work rather than implemented unreviewed in a review-comment pass; GFUZ's active-universe membership itself is unaffected and unchanged."
+      "implementation_status": "IMPLEMENTED in MorningDCAExecutor (morning_dca.py) and run_dca.run_slot('1030ET') as of 2026-10-04. When GFUZ is in the configured tickers and missing from a valid, non-empty 9:45 pre-flight artifact, morning_preflight_eligible_tickers() invokes the injected supplemental_validator, persists gfuz_supplemental_preflight.json to the run directory before decisioning, and admits GFUZ only when the persisted result confirms validity; if the validator is absent, raises, or returns invalid, GFUZ remains gated out fail-closed."
     }
   },
   "raw_data_persistence": {
@@ -207,7 +209,7 @@
     "always_write": ["run_state.json", "run_summary.json", "morning_signals.csv", "submitted_orders.csv", "budget_ledger.json"],
     "root_level_required": true,
     "manifest_accuracy_note": "Updated 2026-07-27 to match MorningDCAExecutor.write_artifacts() after the root-level artifact contract landed, superseding the 2026-07-18 / 2026-07-19 / 2026-07-20 notes that recorded pre-contract behavior. A scheduled 10:30 LIVE run ALWAYS writes the complete ROOT-LEVEL set: run_state.json, run_summary.json, morning_signals.csv (the stream-specific signals name), and submitted_orders.csv with its canonical header even at zero orders. It also always writes budget_ledger.json (filename from budget_ledger.ledger_files), a snapshot of artifacts.budget, bootstrapped from the configured caps when no prior ledger file exists. run_summary.json was previously preflight-only and submitted_orders.csv was previously conditional on at least one submitted order; both are now unconditional for live runs, so a no-order run is a well-formed artifact rather than a contract failure. validation.csv stays preflight-only. filled_orders.csv is never written by this task: morning_dca.py has no fill-confirmation step, and that filename appears under a morning run directory only via a separate manual-override process (see near_close_dca.py / scripts/run_classification.py). See config/scheduled_tasks.json:scheduled_run_artifact_contract.root_level_artifact_set_2026_07_27.",
-    "gfuz_supplemental": "gfuz_supplemental_preflight.json (only when the 9:45 pre-flight lacked GFUZ; see gfuz_special_handling). NOT YET IMPLEMENTED -- see gfuz_special_handling.implementation_status.",
+    "gfuz_supplemental": "gfuz_supplemental_preflight.json (only when the 9:45 pre-flight lacked GFUZ; see gfuz_special_handling). IMPLEMENTED in morning_dca.py as of 2026-10-04 -- persists supplemental validation before decisioning.",
     "run_classification_fields": {
       "run_origin": "scheduled",
       "run_type": "morning_dca_live",
@@ -230,15 +232,21 @@
     "base_amount_below_close_usd": 1.0,
     "no_buy_below_pct": 0.1,
     "tiers": [
-      { "min_drop_pct": 0.1, "max_drop_pct": 2.0, "multiplier": 1.0 },
-      { "min_drop_pct": 2.0, "max_drop_pct": 4.0, "multiplier": 1.5 },
-      { "min_drop_pct": 4.0, "max_drop_pct": 5.0, "multiplier": 2.0 },
-      { "min_drop_pct": 5.0, "max_drop_pct": 6.0, "multiplier": 2.5 },
-      { "min_drop_pct": 6.0, "max_drop_pct": 6.5, "multiplier": 3.0 },
-      { "min_drop_pct": 6.5, "max_drop_pct": 7.0, "multiplier": 3.5 },
-      { "min_drop_pct": 7.0, "max_drop_pct": 7.5, "multiplier": 4.0 },
-      { "min_drop_pct": 7.5, "max_drop_pct": 8.0, "multiplier": 4.5 },
-      { "min_drop_pct": 8.0, "max_drop_pct": null, "multiplier": 5.0 }
+      { "min_drop_pct": 0.1, "max_drop_pct": 0.5, "multiplier": 1.0 },
+      { "min_drop_pct": 0.5, "max_drop_pct": 1.0, "multiplier": 1.5 },
+      { "min_drop_pct": 1.0, "max_drop_pct": 1.5, "multiplier": 2.0 },
+      { "min_drop_pct": 1.5, "max_drop_pct": 2.0, "multiplier": 2.5 },
+      { "min_drop_pct": 2.0, "max_drop_pct": 2.75, "multiplier": 3.0 },
+      { "min_drop_pct": 2.75, "max_drop_pct": 3.5, "multiplier": 3.5 },
+      { "min_drop_pct": 3.5, "max_drop_pct": 4.5, "multiplier": 4.0 },
+      { "min_drop_pct": 4.5, "max_drop_pct": 5.5, "multiplier": 4.5 },
+      { "min_drop_pct": 5.5, "max_drop_pct": 7.0, "multiplier": 5.0 },
+      { "min_drop_pct": 7.0, "max_drop_pct": 8.5, "multiplier": 5.5 },
+      { "min_drop_pct": 8.5, "max_drop_pct": 10.5, "multiplier": 6.0 },
+      { "min_drop_pct": 10.5, "max_drop_pct": 12.5, "multiplier": 6.5 },
+      { "min_drop_pct": 12.5, "max_drop_pct": 14.5, "multiplier": 7.0 },
+      { "min_drop_pct": 14.5, "max_drop_pct": 16.0, "multiplier": 7.5 },
+      { "min_drop_pct": 16.0, "max_drop_pct": null, "multiplier": 8.0 }
     ],
     "tier_boundary_rule": "min inclusive, max exclusive; the largest tier threshold <= actual drop wins; drop < 0.1% = 0x (no buy).",
     "separation_note": "As of the Fri Jul 10 2026 live-automation update the morning live stream uses the SAME shared $2-base 0x-to-5x ladder as the midday and afternoon streams (config/sizing_ladder.json). The former morning-only 0x-to-3x ladder (0.1-2/2-5/5-8/8+ -> 1x/1.5x/2x/3x) is HISTORICAL/SUPERSEDED. Max per order is therefore 5x * $2 = $10."

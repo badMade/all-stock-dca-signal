@@ -13,4 +13,12 @@ ensure_venv(
 from dca_console import main  # noqa: E402
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import sys
+
+    argv = list(sys.argv[1:])
+    if "--demo" not in argv and not any(arg.startswith("--octopus-run") for arg in argv):
+        default_octopus = REPO_ROOT / "analysis" / "real-octopus-run"
+        if default_octopus.is_dir():
+            argv = ["--octopus-run", str(default_octopus), *argv]
+    raise SystemExit(main(argv))
+

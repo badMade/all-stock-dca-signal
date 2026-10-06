@@ -48,7 +48,7 @@ python inspect_run.py --run-dir /tmp/octopus-demo --summary    # the short whole
 | `metrics.py` | Scoring payloads, regime × model × component reports, encoder-health verdicts |
 | `stacking.py` | The regime-weighted ensemble over the models' already-ledgered scores (library-only; see `docs/wondrous_octopus.md`) |
 | `run_walkforward.py` | CLI: the historical replay (`--demo`, `--preset`, `--resume`, `--retrain`, `--report-only`) |
-| `daily_update.py` | CLI: the live one-day cycle; writes the next-day forecast CSV + daily summary |
+| `daily_update.py` | CLI: the live one-day cycle; writes the next-day forecast CSV (with expected calendar target date and basis; the resolved `target_date` stays unset) + daily summary |
 | `analysis.py` / `inspect_run.py` | The observability layer: `--tomorrow`, `--latest`, `--ticker`, `--summary`, `--html` |
 
 ## Design commitments

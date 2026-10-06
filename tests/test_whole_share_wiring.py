@@ -10144,6 +10144,9 @@ def test_planned_spend_preview_is_clamped_to_the_max_per_order_ceiling(tmp_path,
         tickers=(),
         whole_share_tickers=frozenset({"BYDDY"}),
         approved_test_dates=frozenset({date(2026, 8, 17)}),
+        # Pinned: this test is about the ceiling mechanism, not the ladder (2026-10-04
+        # ladder rescale moved the StrategyConfig default 10 -> 16).
+        max_per_order_usd=10.0,
     )
     state = StrategyState()
     broker = DryRunBroker(cash=500.0, reference_prices={"BYDDY": 4.00})

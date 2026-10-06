@@ -74,6 +74,21 @@ def test_payload_discovery_picks_the_newest_per_slot_without_paths(app, tmp_path
     assert payloads["1530"]["root_label"] == root_label(tmp_path / "artifacts")
 
 
+def test_payload_discovery_prefers_newer_day_over_older_filename_dated_payload(app, tmp_path):
+    launch._PAYLOAD_CACHE.clear()
+    # Older payload with date in filename (Sep 10)
+    (app.settings.root / "midday_dca" / "20260910_1230ET").mkdir(parents=True)
+    (app.settings.root / "midday_dca" / "20260910_1230ET" / "market_data_2026-09-10_1230.json").write_text("{}")
+    # Newer payload with date in run directory only (Sep 22)
+    (app.settings.root / "midday_dca" / "20260922_1230ET").mkdir(parents=True)
+    (app.settings.root / "midday_dca" / "20260922_1230ET" / "market_data_1230ET.json").write_text("{}")
+    roots = (RootSpec.of(app.settings.root, "primary"),)
+    payloads = latest_gate5_payloads(roots)
+    assert payloads["1230"]["trading_day"] == "2026-09-22"
+    assert payloads["1230"]["relative_path"] == "midday_dca/20260922_1230ET/market_data_1230ET.json"
+    launch._PAYLOAD_CACHE.clear()
+
+
 def test_every_template_is_closed_and_forbidden_tokens_never_appear(app, tmp_path, monkeypatch):
     seed_payloads(app.settings.root, tmp_path / "artifacts")
     monkeypatch.setattr(launch, "_deployed_figure", lambda application, day, log: 42.5)

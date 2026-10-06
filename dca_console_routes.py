@@ -150,7 +150,7 @@ def _route_docs(app, request: RouteRequest) -> Response:
     data = read_doc(REPO, name) if name else None
     if data is None:
         return Response.json(404, {"error": "Documentation not found"})
-    return Response(200, data, "text/plain")
+    return Response(200, redact_value(data.decode("utf-8", errors="replace")).encode(), "text/plain")
 
 
 def _route_docs_index(app, request: RouteRequest) -> Response:

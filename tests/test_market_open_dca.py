@@ -126,7 +126,8 @@ def _cfg(tmp_path, **overrides):
 def test_market_open_ladder_is_the_shared_live_ladder():
     assert MARKET_OPEN_SIZING_TIERS == StrategyConfig().sizing_tiers
     ex = MarketOpenDCAExecutor(MarketOpenConfig())
-    assert ex.multiplier_for_drop(0.08) == 5.0
+    # 2026-10-04 ladder rescale: log-scaled, 8% -> 5.5x (max is 8x at 16%+).
+    assert ex.multiplier_for_drop(0.08) == 5.5
     assert ex.multiplier_for_drop(0.0005) == 0.0
 
 
@@ -191,7 +192,7 @@ def test_market_open_auto_buys_without_a_validatable_trend(tmp_path):
     flat = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.05})
     signal = ex.evaluate(_now_market_open(), flat)[0]
     assert signal.action == Action.BUY
-    assert signal.multiplier == 2.5
+    assert signal.multiplier == 4.5  # 2026-10-04 ladder rescale: 5% drop was 2.5x
     assert signal.execution_status != "manual_review_candidate"
 
 
@@ -209,11 +210,10 @@ def test_market_open_does_not_gate_on_the_preflight_artifact(tmp_path):
 
 
 # --- The ships-disabled placement switch ------------------------------------
-def test_shipped_market_open_config_has_execution_disabled():
-    # The whole point of shipping this stream disabled. If this flips to True
-    # unintentionally, the 9:35 slot starts placing real orders.
+def test_shipped_market_open_config_has_execution_enabled():
+    # Operator-promoted on 2026-10-04 for live Robinhood execution.
     cfg = load_market_open_config(allow_unpinned_account=True)
-    assert cfg.live_execution_enabled is False
+    assert cfg.live_execution_enabled is True
 
 
 def test_market_open_disabled_writes_full_artifacts_and_places_nothing(tmp_path):
@@ -243,7 +243,7 @@ def test_market_open_enabled_does_place(tmp_path):
     broker = _Broker()
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.05})
     ex.run(_now_market_open(), data, broker=broker)
-    assert broker.placed.get("TICK") == 5.0  # 2.5x * $2 base
+    assert broker.placed.get("TICK") == 9.0  # 4.5x * $2 base (2026-10-04 ladder rescale; was 2.5x)
 
 
 # --- Root resolution timing (Codex review, PR #219) -------------------------

@@ -38,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import dca_paths
 from dca_alerts import (
@@ -2366,6 +2366,7 @@ def run_slot(
     model_usage_model_actual: Optional[str] = None,
     model_usage_model_routing_mode: Optional[str] = None,
     model_usage_reason_for_premium_model: Optional[str] = None,
+    supplemental_validator: Optional[Callable[[str], Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Run one canonical roster slot with slot-scoped identity and guardrails."""
     normalized_slot = slot.strip().upper()
@@ -2400,6 +2401,8 @@ def run_slot(
             preflight_run_state_root=morning_config.preflight_run_state_root,
             preflight_forbidden_roots=morning_config.preflight_forbidden_roots,
             preflight_bounded_recovery=morning_config.preflight_bounded_recovery,
+            supplemental_validator=supplemental_validator,
+            output_dir=artifacts_dir,
         )
         if preflight_gate.get("warning"):
             # NON-BLOCKING as of 2026-08-02: morning_preflight_eligible_

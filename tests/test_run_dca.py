@@ -8768,3 +8768,57 @@ def test_redacted_strings_scrubs_account_shaped_dictionary_keys_too():
     scrubbed = _redacted_strings({f"account_number={synthetic_account}": {f"nested {synthetic_account}": "v"}})
     assert synthetic_account not in repr(scrubbed)
     assert len(scrubbed) == 1 and len(next(iter(scrubbed.values()))) == 1
+
+
+def test_run_slot_1030_threads_supplemental_validator(monkeypatch, tmp_path):
+    """run_slot passes supplemental_validator through to morning_preflight_eligible_tickers
+    when running 1030ET, and defaults to None when omitted."""
+    import run_dca as run_dca_module
+    from run_dca import run_slot
+
+    captured_kwargs = []
+
+    def mock_preflight(now, tickers, **kwargs):
+        captured_kwargs.append(kwargs)
+        return (list(tickers), {"gfuz_supplemental": {"attempted": kwargs.get("supplemental_validator") is not None}})
+
+    monkeypatch.setattr(run_dca_module, "morning_preflight_eligible_tickers", mock_preflight)
+    monkeypatch.setattr(run_dca_module, "run_pipeline", lambda *args, **kwargs: {"ok": True, "artifacts": {}})
+
+    config = _demo_config()
+    now = _now_for_slot("1030ET")
+
+    def dummy_validator(ticker: str):
+        return {"valid": True}
+
+    # 1. With supplemental_validator
+    run_slot(
+        "1030ET",
+        now=now,
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "run1",
+        supplemental_validator=dummy_validator,
+    )
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0]["supplemental_validator"] is dummy_validator
+    assert captured_kwargs[0]["output_dir"] == tmp_path / "run1"
+
+    # 2. Without supplemental_validator
+    run_slot(
+        "1030ET",
+        now=now,
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "run2",
+    )
+    assert len(captured_kwargs) == 2
+    assert captured_kwargs[1]["supplemental_validator"] is None
+    assert captured_kwargs[1]["output_dir"] == tmp_path / "run2"
+

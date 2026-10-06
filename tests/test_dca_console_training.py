@@ -42,6 +42,12 @@ def test_build_training_snapshot():
     assert "hardware" in snapshot
     assert "models" in snapshot
     assert len(snapshot["models"]) >= 4
+    for model in snapshot["models"]:
+        assert "last_updated" in model
+        lu = model["last_updated"]
+        assert isinstance(lu, dict)
+        assert "timestamp" in lu
+        assert "status" in lu
     assert any(m["id"] == "train-foundation-smoke" for m in snapshot["models"])
     assert any(m["id"] == "ml-train-dry-run" for m in snapshot["models"])
     assert "runs" in snapshot

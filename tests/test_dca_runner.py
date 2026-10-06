@@ -3650,9 +3650,9 @@ def test_gate6_reproduces_the_observed_2026_07_28_figures():
 
 
 def test_gate6_order_above_ceiling_is_refused_not_clamped():
-    """$10.00 = 5x the $2.00 base. Clamping to $10 would hide a sizing bug."""
+    """$16.00 = 8x the $2.00 base. Clamping to $16 would hide a sizing bug."""
     plan = dca_runner.plan_orders(
-        candidates=[dca_runner.Candidate("AAPL", 12.50)],
+        candidates=[dca_runner.Candidate("AAPL", 20.00)],
         snapshot=dca_runner.budget_snapshot([], date(2026, 7, 28)),
         tier=BudgetTier("normal", 180.0, 900.0),
     )
@@ -3662,12 +3662,12 @@ def test_gate6_order_above_ceiling_is_refused_not_clamped():
 
 def test_gate6_order_exactly_at_ceiling_is_allowed():
     plan = dca_runner.plan_orders(
-        candidates=[dca_runner.Candidate("AAPL", 10.00)],
+        candidates=[dca_runner.Candidate("AAPL", 16.00)],
         snapshot=dca_runner.budget_snapshot([], date(2026, 7, 28)),
         tier=BudgetTier("normal", 180.0, 900.0),
     )
     assert [c.ticker for c in plan.to_place] == ["AAPL"]
-    assert plan.to_place[0].amount_usd == pytest.approx(10.00)
+    assert plan.to_place[0].amount_usd == pytest.approx(16.00)
 
 
 def test_plan_orders_refuses_a_boolean_candidate_amount():
@@ -3920,15 +3920,15 @@ def test_gate6_allocation_priority_orders_by_multiplier_then_drop_then_ticker():
         # Alphabetically first of the three, but the lowest multiplier: must
         # still be placed last, proving multiplier outranks the ticker tie-break.
         dca_runner.Candidate("AAAU", 2.0, multiplier=1.0),
-        dca_runner.Candidate("MSFT", 6.0, multiplier=3.0, drop_pct=6.1),
-        dca_runner.Candidate("AAPL", 6.0, multiplier=3.0, drop_pct=6.3),
+        dca_runner.Candidate("MSFT", 6.0, multiplier=3.0, drop_pct=2.3),
+        dca_runner.Candidate("AAPL", 6.0, multiplier=3.0, drop_pct=2.5),
     ]
     plan = dca_runner.plan_orders(
         candidates=candidates,
         snapshot=dca_runner.budget_snapshot([], date(2026, 7, 28)),
         tier=BudgetTier("normal", 180.0, 900.0),
     )
-    # AAPL and MSFT both 3x; AAPL's larger drop (6.3 > 6.1) puts it first.
+    # AAPL and MSFT both 3x; AAPL's larger drop (2.5 > 2.3) puts it first.
     assert [c.ticker for c in plan.to_place] == ["AAPL", "MSFT", "AAAU"]
 
 
@@ -4030,7 +4030,7 @@ def test_gate6_accepts_a_candidate_with_no_multiplier_whose_drop_matches_some_ti
     drop-without-multiplier cross-check must not reject an otherwise
     consistent candidate."""
     plan = dca_runner.plan_orders(
-        candidates=[dca_runner.Candidate("AAPL", 2.0, drop_pct=0.5)],
+        candidates=[dca_runner.Candidate("AAPL", 2.0, drop_pct=0.3)],  # 2026-10-04 ladder rescale: 0.5% is now 1.5x, 1.0x is [0.1, 0.5)
         snapshot=dca_runner.budget_snapshot([], date(2026, 7, 28)),
         tier=BudgetTier("normal", 180.0, 900.0),
     )
@@ -4077,7 +4077,7 @@ def test_gate6_accepts_a_candidate_whose_drop_matches_its_claimed_multiplier():
     the new drop/multiplier cross-check must not reject a real, correctly
     consistent candidate."""
     plan = dca_runner.plan_orders(
-        candidates=[dca_runner.Candidate("AAPL", 10.0, multiplier=5.0, drop_pct=9.0)],
+        candidates=[dca_runner.Candidate("AAPL", 10.0, multiplier=5.0, drop_pct=6.0)],  # 2026-10-04 ladder rescale: 5.0x is now [5.5, 7.0), was 8%+
         snapshot=dca_runner.budget_snapshot([], date(2026, 7, 28)),
         tier=BudgetTier("normal", 180.0, 900.0),
     )
@@ -4293,7 +4293,7 @@ def test_plan_orders_accepts_the_same_raw_candidate_rows_assess_does():
     instead of producing a plan (Codex review: "Normalize documented
     candidate rows before planning")."""
     plan = dca_runner.plan_orders(
-        candidates=[("AAPL", 2.0), ("MSFT", 6.0, 3.0), ("GOOGL", 10.0, 5.0, 9.0)],
+        candidates=[("AAPL", 2.0), ("MSFT", 6.0, 3.0), ("GOOGL", 10.0, 5.0, 6.0)],  # 2026-10-04 ladder rescale: 5.0x tier is now [5.5, 7.0)
         snapshot=dca_runner.budget_snapshot([], date(2026, 7, 28)),
         tier=BudgetTier("normal", 180.0, 900.0),
     )
@@ -6191,7 +6191,7 @@ def test_execute_plan_refuses_a_plan_containing_an_over_cap_amount():
         dry_run=False,
         account_number=TEST_ACCOUNT_NUMBER,
     )
-    plan = dca_runner.Plan(to_place=[dca_runner.PlannedOrder("AAPL", 15.0)])  # over per-order, under daily cap
+    plan = dca_runner.Plan(to_place=[dca_runner.PlannedOrder("AAPL", 20.0)])  # over per-order ($16 since 2026-10-04 ladder rescale), under daily cap
     with pytest.raises(ValueError):
         dca_runner.execute_plan(
             plan,
@@ -6206,7 +6206,7 @@ def test_execute_plan_refuses_a_plan_containing_an_over_cap_amount():
             slot_id="0935",
             orders_fetched_at=datetime(2026, 7, 28, 9, 43, tzinfo=ET),
             buying_power_usd=TEST_BUYING_POWER_USD,
-            candidates=[("AAPL", 15.0)],
+            candidates=[("AAPL", 20.0)],
         )
     assert calls == []
 
@@ -10750,11 +10750,11 @@ def test_every_slot_window_tolerates_observed_scheduler_jitter():
 
 
 def test_per_order_cap_is_base_times_max_ladder_multiplier():
-    """$2.00 base x 5.0 max multiplier = $10.00. Pins the two configs together."""
+    """$2.00 base x 8.0 max multiplier = $16.00 (2026-10-04 ladder rescale; was 5.0x/$10). Pins the two configs together."""
     ladder = json.loads((dca_runner.CONFIG_DIR / "sizing_ladder.json").read_bytes())
     max_mult = max(t["multiplier"] for t in ladder["tiers"])
     assert dca_runner.MAX_PER_ORDER_USD == pytest.approx(ladder["base_amount_usd"] * max_mult)
-    assert dca_runner.MAX_PER_ORDER_USD == pytest.approx(10.0)
+    assert dca_runner.MAX_PER_ORDER_USD == pytest.approx(16.0)
 
 
 @pytest.mark.parametrize(
@@ -11776,8 +11776,8 @@ def test_assess_carries_drop_pct_through_to_the_allocation_priority():
     multiplier candidates fall back to alphabetical ordering (Codex review:
     "Carry drop percentage through assess")."""
     candidates = [
-        ("MSFT", 6.0, 3.0, 6.1),
-        ("AAPL", 6.0, 3.0, 6.3),  # same multiplier, larger drop -> placed first
+        ("MSFT", 6.0, 3.0, 2.1),  # 2026-10-04 ladder rescale: 3.0x tier is now [2.0, 2.75)
+        ("AAPL", 6.0, 3.0, 2.3),  # same multiplier, larger drop -> placed first
     ]
     r = dca_runner.assess(**_clean_kwargs(candidates=candidates))
     assert [o["ticker"] for o in r["plan"]["to_place"]] == ["AAPL", "MSFT"]
@@ -11979,7 +11979,7 @@ def test_estimated_multiplier_infers_the_reduced_base_multiplier_from_a_usable_d
     2x ($4.00 / $2.00), understating both high-multiplier tier counting and
     allocation priority against real 3x candidates (Codex review: "Infer
     reduced-base multipliers from usable drops")."""
-    cand = dca_runner.Candidate("AAPL", 4.0, drop_pct=7.0)
+    cand = dca_runner.Candidate("AAPL", 4.0, drop_pct=4.0)  # 2026-10-04 ladder rescale: 4x tier is now [3.5, 4.5)
     assert dca_runner._estimated_multiplier(cand) == pytest.approx(4.0)
 
 
@@ -11997,7 +11997,7 @@ def test_assess_counts_a_reduced_base_signal_as_high_multiplier_via_its_drop():
     """The same reduced-base inference must reach assess()'s tier selection:
     a 4x reduced-base candidate with no multiplier claim must count toward
     high_mult, matching HIGH_MULTIPLIER_THRESHOLD (3.0x)."""
-    r = dca_runner.assess(**_clean_kwargs(candidates=[("AAPL", 4.0, None, 7.0)]))
+    r = dca_runner.assess(**_clean_kwargs(candidates=[("AAPL", 4.0, None, 4.0)]))
     assert r["verdict"] == "PROCEED"
     assert r["plan"]["to_place"][0]["ticker"] == "AAPL"
 
@@ -12508,6 +12508,32 @@ def test_plan_orders_accepts_complete_per_ticker_calibration():
     plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
     assert [(order.ticker, order.amount_usd) for order in plan.to_place] == [("TRIN", 5.0)]
     assert plan.refused == []
+
+
+def test_plan_orders_accepts_a_seven_wide_json_row_carrying_calibration_evidence():
+    """planner_candidates is JSON, so a calibrated row carries its tier as three
+    trailing columns; a bare 4-tuple for the same buy is refused by the global ladder
+    (DFTX 5% / 2.5x sits outside the 2026-10-04 ladder's 2.5x range, 1.5-2%)
+    (Copilot review, PR #1597)."""
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    bare = [["DFTX", 2.5, 2.5, 5.0]]
+    wide = [["DFTX", 2.5, 2.5, 5.0, 1.0, 4.6269, 6.8569]]
+    refused = dca_runner.plan_orders(bare, snapshot, dca_runner.BUDGET_TIERS[0])
+    assert refused.to_place == []
+    assert refused.refused == [("DFTX", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
+    plan = dca_runner.plan_orders(wide, snapshot, dca_runner.BUDGET_TIERS[0])
+    assert [(o.ticker, o.amount_usd) for o in plan.to_place] == [("DFTX", 2.5)]
+    assert plan.refused == []
+
+
+def test_a_seven_wide_row_with_forged_evidence_is_still_refused():
+    """The extra columns are evidence, not authority: they are bound to the ticker's
+    ACTIVE configured tier, so a tier that is not the configured one is refused."""
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    forged = [["DFTX", 2.5, 2.5, 5.0, 1.0, 1.0, 9.0]]
+    plan = dca_runner.plan_orders(forged, snapshot, dca_runner.BUDGET_TIERS[0])
+    assert plan.to_place == []
+    assert plan.refused == [("DFTX", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
 
 
 def test_plan_orders_refuses_partial_per_ticker_calibration():

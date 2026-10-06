@@ -3503,7 +3503,7 @@
       "gfuz_special_handling": {
         "primary_source": "robinhood",
         "reason": "Finance may not resolve GFUZ; Robinhood is primary for GFUZ. Do not block the whole run if Finance cannot resolve GFUZ.",
-        "supplemental_preflight": "If the 9:45 pre-flight lacks GFUZ, the 10:30 live task runs a supplemental GFUZ read-only validation and persists gfuz_supplemental_preflight.json under morning_dca/YYYYMMDD_1030ET/ before GFUZ decisioning."
+        "supplemental_preflight": "If the 9:45 pre-flight lacks GFUZ, the 10:30 live task runs a supplemental GFUZ read-only validation and persists gfuz_supplemental_preflight.json under morning_dca/YYYYMMDD_1030ET/ before GFUZ decisioning. IMPLEMENTED as of 2026-10-04."
       },
       "raw_data_persistence": {
         "added": "2026-07-15",
@@ -3533,7 +3533,7 @@
         "always_write": ["run_state.json", "run_summary.json", "morning_signals.csv", "submitted_orders.csv", "budget_ledger.json"],
         "root_level_required": true,
         "manifest_accuracy_note": "Updated 2026-07-27 to match MorningDCAExecutor.write_artifacts() after the root-level artifact contract landed, superseding the 2026-07-19 note that recorded pre-contract behavior. A scheduled 10:30 LIVE run now ALWAYS writes the complete root-level set: run_state.json, run_summary.json, the signals CSV under its stream-specific name morning_signals.csv, and submitted_orders.csv with its canonical header even at zero orders. It also always writes budget_ledger.json. run_summary.json was previously preflight-only, which is why every live run directory failed the contract's require_summary check, and submitted_orders.csv was previously conditional on at least one submitted broker outcome; both are now unconditional for live runs, so a no-order run is a well-formed artifact rather than a contract failure. validation.csv stays preflight-only. filled_orders.csv is never written by this task; morning_dca.py has no fill-confirmation step. live_reliability_fix_2026_07_17.always_write_artifacts is now implemented for this stream. See scheduled_run_artifact_contract.root_level_artifact_set_2026_07_27 and config/morning_dca.json's artifacts.manifest_accuracy_note.",
-        "gfuz_supplemental": "gfuz_supplemental_preflight.json (only when the 9:45 pre-flight lacked GFUZ). NOT YET IMPLEMENTED -- see gfuz_special_handling."
+        "gfuz_supplemental": "gfuz_supplemental_preflight.json (only when the 9:45 pre-flight lacked GFUZ). IMPLEMENTED as of 2026-10-04 -- see gfuz_special_handling."
       },
       "circuit_breakers": {
         "max_per_order_usd": 10.0,

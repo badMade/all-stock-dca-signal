@@ -1334,6 +1334,41 @@ _DATE_CUE_WINDOW = 60
 _REGEX_CONTEXT = re.compile(r"\(\?:|\[0-9\]\{|\\d\{")
 
 
+def _css_without_comments(text: str) -> str:
+    """``text`` with every ``/* ... */`` comment blanked to spaces (newlines kept), so
+    line numbers and column positions still line up with the original file."""
+    return re.sub(r"/\*.*?\*/", lambda m: re.sub(r"[^\n]", " ", m.group(0)), text, flags=re.S)
+
+
+# A CSS declaration up to the colour token: ``prop: ... `` after a ``{``, ``;`` or the
+# line start, with no further brace/semicolon in between.
+_CSS_DECLARATION_PREFIX = re.compile(r"(?:^|[{;])\s*[A-Za-z-]+\s*:[^{};]*$")
+
+
+def _is_css_hex_colour_value(css_lines: list[str], index: int, match: re.Match) -> bool:
+    """True when an eight-digit run is a ``#RRGGBBAA`` colour VALUE in a declaration.
+
+    ``css_lines`` is the stylesheet with comments blanked (see _css_without_comments).
+    Requires, all on the comment-free line: exactly eight digits right after ``#``; the
+    text before it to be an open ``property:`` declaration outside any string; and the
+    next ``;``/``}`` to come before any ``{`` (so a selector like ``a:hover #<8 digits>{``
+    or a selector list is NOT a colour). Anything else stays an account-shaped offender.
+    """
+    if index >= len(css_lines) or len(match.group(0)) != 8:
+        return False
+    line = css_lines[index]
+    start, end = match.start(), match.end()
+    if line[start:end] != match.group(0) or start == 0 or line[start - 1] != "#":
+        return False
+    prefix, rest = line[: start - 1], line[end:]
+    if prefix.count('"') % 2 or prefix.count("'") % 2:
+        return False
+    if not _CSS_DECLARATION_PREFIX.search(prefix):
+        return False
+    terminator = re.search(r"[;}{]", rest)
+    return terminator is None or terminator.group(0) != "{"
+
+
 def _in_regex_pattern(line: str, match: re.Match) -> bool:
     """True when the match sits inside a regular expression rather than a value."""
     window = line[max(0, match.start() - _DATE_CUE_WINDOW) : match.start()]
@@ -1603,6 +1638,7 @@ def test_no_account_shaped_literal_in_tracked_config_source_or_docs():
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):  # pragma: no cover - defensive
             continue
+        css_lines = _css_without_comments(text).splitlines() if rel.endswith(".css") else []
         for lineno, line in enumerate(text.splitlines(), 1):
             for match in _LABELED_ACCOUNT.finditer(line):
                 if match.group(1) not in _SYNTHETIC_ACCOUNT_VALUES:
@@ -1619,6 +1655,13 @@ def test_no_account_shaped_literal_in_tracked_config_source_or_docs():
                 # account. Length-bounded on purpose: a nine-digit account
                 # written as "account #<digits>" must still be caught.
                 if len(value) == 6 and match.start() and line[match.start() - 1] == "#":
+                    continue
+                # Same for an eight-digit RGBA hex colour (a translucent black
+                # shadow, say) -- but ONLY as a real colour VALUE in a stylesheet:
+                # eight digits is also a valid account shape, so outside .css, and
+                # inside a CSS comment, string or selector, it must still be caught
+                # (Copilot review, PR #1597).
+                if rel.endswith(".css") and _is_css_hex_colour_value(css_lines, lineno - 1, match):
                     continue
                 offenders.append(f"{rel}:{lineno}: {match.group(0)}")
 
@@ -4633,3 +4676,31 @@ def test_every_live_mirror_routes_oversized_order_pages_through_the_assembler():
         if "python3 scripts/assemble_order_pages.py" in text:
             offenders.append(f"{name}: path-style invocation cannot import dca_config")
     assert not offenders, offenders
+
+
+@pytest.mark.parametrize(
+    ("css", "exempt"),
+    [
+        ("main{box-shadow:0 4px 16px #{SHADOW}}", True),
+        ("a{border:1px solid #{SHADOW2};color:red}", True),
+        ("/* tint: #{ACCT} */", False),
+        ("a{color:red} /* x: #{ACCT}; */", False),
+        ("a:hover #{ACCT}{color:red}", False),
+        ("#{ACCT},#abcdef{color:red}", False),
+        ('a{content:"#{ACCT}"}', False),
+        ("/* multi\n   line: #{ACCT};\n*/", False),
+    ],
+)
+def test_css_hex_colour_exemption_is_limited_to_real_colour_values(css, exempt):
+    """The eight-digit CSS exemption must not let an account-shaped run hide in a CSS
+    comment, string or selector (Copilot review, PR #1597)."""
+    # Digits are substituted at runtime so this file never holds an account-shaped literal
+    # itself (the repo-wide scan above reads the test tree too).
+    css = css.replace("{ACCT}", "1234" + "5678").replace("{SHADOW}", "0000" + "0090").replace("{SHADOW2}", "0000" + "0050")
+    lines = _css_without_comments(css).splitlines()
+    found = [
+        _is_css_hex_colour_value(lines, i, m)
+        for i, original in enumerate(css.splitlines())
+        for m in _ACCOUNT_SHAPED.finditer(original)
+    ]
+    assert found and all(found) is exempt
