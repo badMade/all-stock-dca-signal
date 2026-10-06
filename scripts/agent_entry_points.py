@@ -88,14 +88,33 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         need="Assemble saved oversized get_equity_orders pages into an orders_pages envelope",
         command=(
             "python3 -m scripts.assemble_order_pages --account <acct> --trading-day <YYYY-MM-DD> "
-            "--out <orders_pages file> [--snapshot-at <ISO>] <page file> [<page file> ...]"
+            "--out <orders_pages file> [--snapshot-at <ISO>] [--expect-count <N>] "
+            "[--expect-total-usd <X>] <page file | -> [<page file> ...]"
         ),
         exists_path="scripts/assemble_order_pages.py",
         doc_ref="docs/repo_map.md",
         symbols=("assemble", "main"),
         notes=(
-            "Use when a page's tool output was too large to show and was saved to a file. "
-            "Never transcribe rows by hand; any non-zero exit is incomplete history."
+            "The one validated way to get get_equity_orders output into the top-up gate: refuses "
+            "placeholder order ids, condensed captures and non-finite amounts, and records an "
+            "ingest block (provenance, hashes). Never re-key rows by hand; any non-zero exit is "
+            "incomplete or unvalidated history."
+        ),
+    ),
+    EntryPoint(
+        need="Ingest raw Robinhood bars and quotes into a Gate 5 market-data payload",
+        command=(
+            "python3 -m scripts.ingest_market_data --trading-day <YYYY-MM-DD> "
+            "--window-start-et <HH:MM> --window-end-et <HH:MM> --expected-tickers <A,B,C> "
+            "--bars-5m <file | -> --bars-daily <file | -> --quotes <file | -> --out <market_data file>"
+        ),
+        exists_path="scripts/ingest_market_data.py",
+        doc_ref="docs/repo_map.md",
+        symbols=("ingest", "main"),
+        notes=(
+            "Takes the raw get_equity_historicals / get_equity_quotes output (repeat a flag per "
+            "chunked response) instead of a hand-typed payload. A bad ticker is named in "
+            "ticker_errors, never trimmed; a stdin input is recorded as the weaker stdin_paste."
         ),
     ),
     EntryPoint(
