@@ -594,8 +594,8 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > **Dynamic first-allocation base (Jul 24 2026):** the user approved a dynamic
 > base for the first same-day allocation per ticker: **$2** below the prior close
 > and prior low, **$1** below the prior close only, no buy otherwise. The order
-> amount is `selected_base × multiplier`. The per-order ceiling is unchanged at
-> $10 (5x x $2); the $1 scale tops out at $5. This applies to every
+> amount is `selected_base × multiplier`. The per-order ceiling is now $16
+> (8x x $2); the $1 scale tops out at $8. This applies to every
 > universe-bearing live and analytics task below (morning 10:30, midday 12:30,
 > afternoon 3:30, and the analytics/monitor scans). Ladder multipliers, the
 > ticker universe, exclusions, budget caps, the top-up guard, pre-authorization,

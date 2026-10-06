@@ -1559,14 +1559,37 @@ def _configured_calibration_bounds(
             float(ticker_sizing["base_amount_below_close_usd"]),
         }
         tiers = ticker_sizing["tiers"]
-        configured_tier = next(tier for tier in tiers if float(tier["multiplier"]) == multiplier)
-        tier_index = tiers.index(configured_tier)
-        configured_min = float(configured_tier["min_drop_pct"])
-        configured_max = (
-            float(tiers[tier_index + 1]["min_drop_pct"])
-            if tier_index + 1 < len(tiers)
-            else None
-        )
+        if ticker_sizing.get("interpolation") == "linear":
+            # Interpolated curve (near_close_dca.interpolate_tier_multiplier): a drop between
+            # two tier points is sized by a blend of their multipliers, so a legitimate claim
+            # can sit strictly BETWEEN two configured values. Bind it to the segment that can
+            # produce it. A claim equal to a tier value (a plateau such as the flat 1.00x
+            # stretch included) takes the FIRST tier with that value and runs to the first
+            # tier with a larger multiplier -- the stepped contract's own first-match rule.
+            points = sorted((float(tier["min_drop_pct"]), float(tier["multiplier"])) for tier in tiers)
+            tolerance = 1e-4
+            exact = next((i for i, (_, value) in enumerate(points) if abs(value - multiplier) <= tolerance), None)
+            if exact is not None:
+                configured_min = points[exact][0]
+                configured_max = next(
+                    (threshold for threshold, value in points[exact + 1:] if value > points[exact][1] + tolerance),
+                    None,
+                )
+            else:
+                segment = next(
+                    i for i in range(len(points) - 1) if points[i][1] < multiplier < points[i + 1][1]
+                )
+                configured_min = points[segment][0]
+                configured_max = points[segment + 1][0]
+        else:
+            configured_tier = next(tier for tier in tiers if float(tier["multiplier"]) == multiplier)
+            tier_index = tiers.index(configured_tier)
+            configured_min = float(configured_tier["min_drop_pct"])
+            configured_max = (
+                float(tiers[tier_index + 1]["min_drop_pct"])
+                if tier_index + 1 < len(tiers)
+                else None
+            )
         minimum_order_usd = float(sizing["minimum_order_usd"])
     except (KeyError, TypeError, ValueError, StopIteration, OSError, json.JSONDecodeError):
         return None

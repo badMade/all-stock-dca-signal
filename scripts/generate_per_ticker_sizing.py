@@ -7,18 +7,51 @@ import argparse
 import csv
 import json
 import math
+import re
 import sys
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 from dca_fileio import atomic_write_text
 from dca_ticker_paths import configured_ticker_history_dir
 
-MINIMUM_HISTORY_SESSIONS = 252
-# Frequent first buys, then increasingly rare volatility-driven dollar amounts.
-PERCENTILE_MULTIPLIERS = ((0.25, 1.0), (0.50, 1.5), (0.75, 2.5), (0.90, 4.0), (0.975, 5.0))
-GLOBAL_FALLBACK_TIERS = ((0.1, 1.0), (2.0, 1.5), (4.0, 2.0), (5.0, 2.5), (6.0, 3.0), (6.5, 3.5), (7.0, 4.0), (7.5, 4.5), (8.0, 5.0))
+# 90 calendar days is roughly 63 sessions, so the old 252-session bar (a 3-year window)
+# can never be met. 40 keeps a ticker with under about two months of history (e.g. RVII)
+# on the global fallback ladder rather than reading percentiles off a handful of days.
+LOOKBACK_DAYS = 90
+MINIMUM_HISTORY_SESSIONS = 40
+# 2026-10-05: per-ticker tiers follow the owner-specified log-scaled curve, one tier per
+# percentile from the 5th to the 100th (96 tiers). It matches the global ladder's top
+# (config/sizing_ladder.json 2026-10-04 reaches 8.0x) at the 95th percentile, then the
+# 96th..100th climb to 10.0x -- the headroom near_close_dca.graded_buy_multiplier's 10x
+# ceiling (PR 1602) was raised to allow. The 100th percentile is a ticker's single
+# largest adjusted prior-close-to-low drop inside the lookback window. The curve is flat
+# at 1.00x through the 10th percentile (a calm day still buys the base amount).
+PERCENTILE_MULTIPLIERS = (
+    (0.05, 1.00), (0.06, 1.00), (0.07, 1.00), (0.08, 1.00), (0.09, 1.00), (0.10, 1.00),
+    (0.11, 1.03), (0.12, 1.06), (0.13, 1.08), (0.14, 1.11), (0.15, 1.14), (0.16, 1.17),
+    (0.17, 1.20), (0.18, 1.23), (0.19, 1.26), (0.20, 1.29), (0.21, 1.32), (0.22, 1.36),
+    (0.23, 1.39), (0.24, 1.42), (0.25, 1.45), (0.26, 1.49), (0.27, 1.52), (0.28, 1.55),
+    (0.29, 1.59), (0.30, 1.62), (0.31, 1.66), (0.32, 1.70), (0.33, 1.73), (0.34, 1.77),
+    (0.35, 1.81), (0.36, 1.85), (0.37, 1.89), (0.38, 1.93), (0.39, 1.97), (0.40, 2.01),
+    (0.41, 2.05), (0.42, 2.09), (0.43, 2.13), (0.44, 2.18), (0.45, 2.22), (0.46, 2.27),
+    (0.47, 2.31), (0.48, 2.36), (0.49, 2.41), (0.50, 2.46), (0.51, 2.51), (0.52, 2.56),
+    (0.53, 2.61), (0.54, 2.66), (0.55, 2.72), (0.56, 2.77), (0.57, 2.83), (0.58, 2.89),
+    (0.59, 2.95), (0.60, 3.01), (0.61, 3.07), (0.62, 3.14), (0.63, 3.20), (0.64, 3.27),
+    (0.65, 3.34), (0.66, 3.41), (0.67, 3.48), (0.68, 3.56), (0.69, 3.64), (0.70, 3.72),
+    (0.71, 3.80), (0.72, 3.89), (0.73, 3.98), (0.74, 4.07), (0.75, 4.17), (0.76, 4.27),
+    (0.77, 4.37), (0.78, 4.48), (0.79, 4.59), (0.80, 4.71), (0.81, 4.84), (0.82, 4.97),
+    (0.83, 5.11), (0.84, 5.25), (0.85, 5.41), (0.86, 5.58), (0.87, 5.76), (0.88, 5.95),
+    (0.89, 6.16), (0.90, 6.38), (0.91, 6.63), (0.92, 6.91), (0.93, 7.22), (0.94, 7.58),
+    (0.95, 8.00), (0.96, 8.17), (0.97, 8.38), (0.98, 8.66), (0.99, 9.08), (1.00, 10.00),
+)
+# Mirrors config/sizing_ladder.json's tiers (min_drop_pct, multiplier) -- what a ticker
+# without enough history of its own falls back to.
+GLOBAL_FALLBACK_TIERS = (
+    (0.1, 1.0), (0.5, 1.5), (1.0, 2.0), (1.5, 2.5), (2.0, 3.0), (2.75, 3.5), (3.5, 4.0), (4.5, 4.5),
+    (5.5, 5.0), (7.0, 5.5), (8.5, 6.0), (10.5, 6.5), (12.5, 7.0), (14.5, 7.5), (16.0, 8.0),
+)
 
 #: Minimum fraction of the active universe that must have a present history
 #: CSV before a freshly built calibration is trusted enough to publish.
@@ -65,7 +98,7 @@ def archive_unavailable_reason(history_dir: Path, ticker_config: Path) -> dict[s
 #: versus the currently-live config is treated as evidence of a truncated or
 #: malformed archive merge for THAT ticker, not a real change in available
 #: history: the daily updater's contract is to merge in recent rows without
-#: truncating older ones, and the rolling three-year lookback window used to
+#: truncating older ones, and the rolling lookback window used to
 #: count sessions only advances by about one trading day per nightly run, so
 #: a healthy day-to-day recalculation changes the count only marginally. 5%
 #: is already generous headroom for calendar/holiday edge effects across a
@@ -80,7 +113,7 @@ MAXIMUM_SESSION_COUNT_REGRESSION_FRACTION = 0.05
 
 
 def session_count_regressions(
-    new_tickers: dict[str, Any], output: Path
+    new_tickers: dict[str, Any], output: Path, lookback_days: int | None = None
 ) -> dict[str, dict[str, int]]:
     """Return ``{ticker: {"previous": N, "new": M}}`` for every ticker whose
     ``sample_sessions`` collapsed by more than the allowed fraction versus
@@ -96,6 +129,11 @@ def session_count_regressions(
         return {}
     previous_tickers = previous.get("tickers")
     if not isinstance(previous_tickers, dict):
+        return {}
+    # Session counts are only comparable across publishes that used the same window:
+    # the first publish after the 3-year -> 90-day switch (751 -> ~63 sessions) is a
+    # deliberate change of window, not a truncated archive.
+    if lookback_days is not None and previous.get("lookback_days") != lookback_days:
         return {}
     regressions: dict[str, dict[str, int]] = {}
     for ticker, entry in new_tickers.items():
@@ -164,18 +202,38 @@ def adjusted_low_drops(history_path: Path, start_date: str) -> list[float]:
 
 
 def tiers_from_drops(drops: list[float]) -> list[dict[str, float]]:
-    """Turn daily drop history into precise percentile-based dollar tiers."""
-    return [
-        {"min_drop_pct": round(max(0.01, quantile(drops, percentile)), 4), "multiplier": multiplier}
-        for percentile, multiplier in PERCENTILE_MULTIPLIERS
-    ]
+    """Turn daily drop history into precise percentile-based dollar tiers.
+
+    Ties (a low-volatility ticker whose adjacent percentiles round to the same drop)
+    collapse to the highest multiplier at that threshold -- exactly what the runtime's
+    "largest threshold <= drop wins, last of equals wins" lookup would pick anyway.
+    """
+    by_threshold: dict[float, float] = {}
+    for percentile, multiplier in PERCENTILE_MULTIPLIERS:
+        threshold = round(max(0.01, quantile(drops, percentile)), 4)
+        by_threshold[threshold] = max(multiplier, by_threshold.get(threshold, 0.0))
+    return [{"min_drop_pct": threshold, "multiplier": multiplier} for threshold, multiplier in sorted(by_threshold.items())]
+
+
+_TIER_BLOCK = re.compile(r'\{\s+"min_drop_pct": ([^,\n]+),\s+"multiplier": ([^\n]+)\s+\}')
+
+
+def render_payload(payload: dict[str, Any]) -> str:
+    """Serialize the calibration with each tier on ONE line.
+
+    A 96-tier-per-ticker payload at ``indent=2`` spends four lines per tier (about 22,000 lines
+    for the universe); one line per tier keeps the file and its git diffs reviewable
+    and parses identically.
+    """
+    text = json.dumps(payload, indent=2)
+    return _TIER_BLOCK.sub(lambda m: f'{{"min_drop_pct": {m.group(1)}, "multiplier": {m.group(2)}}}', text) + "\n"
 
 
 def build_sizing_payload(
     history_dir: Path,
     ticker_config: Path,
     *,
-    lookback_years: int = 3,
+    lookback_days: int = LOOKBACK_DAYS,
     as_of: date | None = None,
 ) -> dict[str, Any]:
     """Build the complete active-plus-whole-share-universe calibration without
@@ -198,9 +256,7 @@ def build_sizing_payload(
         ticker for ticker in ticker_data.get("whole_share", []) if ticker not in ticker_data["active"]
     ]
     effective_date = as_of or date.today()
-    start_date = (
-        f"{effective_date.year - lookback_years:04d}-{effective_date.month:02d}-{effective_date.day:02d}"
-    )
+    start_date = (effective_date - timedelta(days=lookback_days)).isoformat()
     tickers = {}
     fallback = []
     for ticker in universe:
@@ -208,7 +264,7 @@ def build_sizing_payload(
         drops = adjusted_low_drops(path, start_date) if path.exists() else []
         if len(drops) >= MINIMUM_HISTORY_SESSIONS:
             tiers = tiers_from_drops(drops)
-            source = "three_year_adjusted_daily_low_percentiles"
+            source = "ninety_day_adjusted_daily_low_percentiles"
         else:
             tiers = [
                 {"min_drop_pct": threshold, "multiplier": multiplier}
@@ -220,6 +276,9 @@ def build_sizing_payload(
             "base_amount_usd": 1.0,
             "base_amount_below_close_usd": 1.0,
             "tiers": tiers,
+            # Calibrated tickers' tier points are samples of one smooth curve, so the runtime
+            # blends between them; a fallback ticker carries the global ladder and stays stepped.
+            **({"interpolation": "linear"} if source != "global_fallback_insufficient_history" else {}),
             "source": source,
             "sample_sessions": len(drops),
         }
@@ -228,7 +287,11 @@ def build_sizing_payload(
         "version": effective_date.isoformat(),
         "status": "active",
         "description": "Per-stock DCA: all positive first orders start at $1.00; later amounts are precise historical-drop tiers.",
-        "method": "25th/50th/75th/90th/97.5th percentile adjusted prior-close-to-low drops map to 1x/1.5x/2.5x/4x/5x.",
+        "method": (
+            "Per ticker, the 5th..100th percentiles (96 tiers) of the last 90 days of adjusted prior-close-to-low drops "
+            "map to a log-scaled 1.00x..10.00x curve (8.00x at the 95th, 10.00x at the 100th = the window's largest drop)."
+        ),
+        "lookback_days": lookback_days,
         "minimum_order_usd": 1.0,
         "fallback_tickers": fallback,
         "tickers": tickers,
@@ -240,7 +303,7 @@ def main() -> int:
     parser.add_argument("--history-dir", type=Path, default=configured_ticker_history_dir())
     parser.add_argument("--ticker-config", type=Path, default=Path("config/tickers.json"))
     parser.add_argument("--output", type=Path, default=Path("config/per_ticker_sizing.json"))
-    parser.add_argument("--lookback-years", type=int, default=3)
+    parser.add_argument("--lookback-days", type=int, default=LOOKBACK_DAYS)
     args = parser.parse_args()
 
     # A direct or legacy invocation of this CLI has no upstream caller to
@@ -259,7 +322,7 @@ def main() -> int:
     payload = build_sizing_payload(
         args.history_dir,
         args.ticker_config,
-        lookback_years=args.lookback_years,
+        lookback_days=args.lookback_days,
     )
     # Passing the archive-availability guard only rules out an unmounted or
     # near-empty archive; it says nothing about a single established
@@ -268,14 +331,14 @@ def main() -> int:
     # silently downgrading that ticker to global_fallback_insufficient_
     # history for this and every future run (Codex review: "Check session
     # regressions in the standalone publisher").
-    regressions = session_count_regressions(payload["tickers"], args.output)
+    regressions = session_count_regressions(payload["tickers"], args.output, payload["lookback_days"])
     if regressions:
         print(
             f"REFUSED {args.output}: session count regression: {regressions}",
             file=sys.stderr,
         )
         return 1
-    atomic_write_text(args.output, json.dumps(payload, indent=2) + "\n")
+    atomic_write_text(args.output, render_payload(payload))
     active = payload["tickers"]
     fallback = payload["fallback_tickers"]
     print(f"WROTE {args.output}: calibrated={len(active) - len(fallback)} fallback={len(fallback)}")

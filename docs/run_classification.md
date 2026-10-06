@@ -9,7 +9,7 @@
 > `config/intraday_dca.json` currently ship `live_execution_enabled: true`.
 > This records executor capability when invoked, not proof that an external scheduler
 > fired or placed an order. The 15:30 final buy runs under `run_dca.py` / `10ce362c`.
-> places orders. The scheduled-vs-manual contract mechanics below (paths, required
+> The scheduled-vs-manual contract mechanics below (paths, required
 > fields, exclusion rules) apply across every stream regardless. See
 > [`safeguards.md`](safeguards.md#live-execution-roster) for the roster.
 

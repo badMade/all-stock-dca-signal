@@ -309,9 +309,9 @@ def test_sizing_sources_report_staleness_and_publisher_only(cfg):
     assert committed["ml"]["stale"] is None and committed["ml"]["applied_count"] == 0
     assert committed["per_ticker"]["status"] == "active" and committed["per_ticker"]["entry_count"] > 0
     assert committed["per_ticker"]["loaded_count"] == committed["per_ticker"]["entry_count"]
-    # 11 since QUBT joined fallback_tickers on 2026-09-24 (the corrected QBUT
-    # symbol, no archived history yet to calibrate against).
-    assert committed["per_ticker"]["fallback_count"] == 11
+    # Derived from the published config rather than pinned: the count moves every time the calibration is
+    # regenerated (11 under the 3-year window; only tickers with under 40 sessions fall back under the 90-day one).
+    assert committed["per_ticker"]["fallback_count"] == len(load(cfg, "per_ticker_sizing")["fallback_tickers"])
     ml = load(cfg, "ml_sizing_adjustment")
     ml.update(
         {"status": "active", "generated_at": (NOW - timedelta(hours=1)).isoformat(), "adjustments": {"AAPL": 1.1}}

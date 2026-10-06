@@ -631,7 +631,7 @@ class ReconciledDecision:
     robinhood_signal: Optional[SourceSignal]
     buy_multiplier: float = 0.0
     # The graded ladder's OWN tier match -- before the ML sizing nudge, the
-    # 5x cap, or the kill-switch cap that buy_multiplier already reflects.
+    # 10x cap, or the kill-switch cap that buy_multiplier already reflects.
     # Exists specifically so the high_multiplier_threshold selloff-breadth
     # count (how many tickers are showing a genuinely deep, ladder-severity
     # dip this run -- see select_budget_tier's own docstring) is judged on
@@ -4670,6 +4670,32 @@ def minimum_drop_for_ticker(config: StrategyConfig, ticker: Optional[str] = None
     return min(float(threshold) for threshold, _ in tiers)
 
 
+def interpolate_tier_multiplier(drop_vs_previous_close: float, tiers: Any) -> float:
+    """Linear blend between neighbouring ``(drop_fraction, multiplier)`` tier points.
+
+    The stepped lookup in :func:`raw_ladder_multiplier` jumps to the next tier's
+    multiplier the instant the drop crosses its threshold; a per-ticker
+    calibration with 96 percentile points is really one smooth curve sampled
+    at those points, so this returns the proportional blend instead (a drop
+    halfway between two thresholds gets the multiplier halfway between them).
+    It reproduces every tier point exactly, clamps at the last tier's value
+    for any drop beyond it, and returns 0.0 (no buy) below the first
+    threshold -- the same contract as the stepped lookup. Rounded to 4 dp so
+    the value a candidate row carries is exactly reproducible by the
+    validators in ``dca_runner._configured_calibration_bounds``.
+    """
+    ordered = sorted((float(threshold), float(multiplier)) for threshold, multiplier in tiers)
+    if not ordered or drop_vs_previous_close < ordered[0][0]:
+        return 0.0
+    if drop_vs_previous_close >= ordered[-1][0]:
+        return ordered[-1][1]
+    for (low, low_multiplier), (high, high_multiplier) in zip(ordered, ordered[1:], strict=False):
+        if low <= drop_vs_previous_close < high:
+            fraction = (drop_vs_previous_close - low) / (high - low)
+            return round(low_multiplier + (high_multiplier - low_multiplier) * fraction, 4)
+    return ordered[-1][1]  # pragma: no cover - unreachable: the bounds above cover every drop
+
+
 def raw_ladder_multiplier(drop_vs_previous_close: float, config: StrategyConfig, ticker: Optional[str] = None) -> float:
     """The graded ladder's own tier match -- BEFORE the ML nudge, the 5x cap, or
     the kill-switch cap -- for a drop from prior close.
@@ -4693,6 +4719,11 @@ def raw_ladder_multiplier(drop_vs_previous_close: float, config: StrategyConfig,
         return 0.0
     calibration = _ticker_sizing(ticker, config)
     tiers = calibration.get("tiers", config.sizing_tiers)
+    if calibration.get("interpolate"):
+        # Per-ticker calibrations published with ``interpolation: linear`` (see
+        # scripts/generate_per_ticker_sizing.py) blend between points; the global
+        # ladder and fallback tickers stay stepped.
+        return interpolate_tier_multiplier(drop_vs_previous_close, tiers)
     multiplier = 0.0
     for threshold, tier_multiplier in sorted(tiers):
         if drop_vs_previous_close >= threshold:
@@ -4723,7 +4754,11 @@ def graded_buy_multiplier(drop_vs_previous_close: float, config: StrategyConfig,
         # kill-switch remains the final word on scaling.
         ml_factor = config.ml_sizing_adjustment.get((ticker or "").upper(), 1.0)
         multiplier = multiplier * ml_factor
-    multiplier = min(multiplier, 8.0)
+    # Ceiling raised 8.0 -> 10.0 so per-ticker calibration can reach its 96th-100th
+    # percentile tiers (8.4x-10x) past the global ladder's 8x top tier; it still
+    # clamps an over-range tier or an ML-nudged product, and the kill-switch cap
+    # below stays the final word.
+    multiplier = min(multiplier, 10.0)
     if kill_switch_engaged(config):
         multiplier = min(multiplier, 1.0)
     return multiplier

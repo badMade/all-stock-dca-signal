@@ -96,6 +96,7 @@ from near_close_dca import (
     evaluate_source_signal,
     evaluate_top_up_guard,
     graded_buy_multiplier,
+    kill_switch_engaged,
     load_prior_same_day_allocations,
     load_prior_same_day_allocations_multi,
     merge_manual_top_up_context,
@@ -175,6 +176,40 @@ def test_raw_ladder_multiplier_ignores_the_ml_nudge_and_caps():
     # 2.5 * 1.2 = 3.0, crossing the default high_multiplier_threshold (3.0)
     # that raw_ladder_multiplier's own 2.5 never reaches.
     assert graded_buy_multiplier(drop_fraction, config, "AAPL") == pytest.approx(3.0)
+
+
+def test_graded_buy_multiplier_ceiling_is_ten_x():
+    """The 100th-percentile per-ticker tier (10x) must survive the final cap.
+
+    Per-ticker calibration extends past the global ladder's 8x top tier (the
+    96th-100th percentile tiers rise from 8.4x to 10x), so the cap applied at
+    the end of graded_buy_multiplier() has to sit at 10x, not 8x. A tier above
+    10x, or an ML nudge pushing the product above it, is still clamped, and the
+    kill-switch's 1x cap stays the final word.
+    """
+    config = StrategyConfig(
+        per_ticker_sizing={"AAAU": {"tiers": ((0.001, 1.0), (0.02, 8.0), (0.03, 9.6), (0.04, 10.0), (0.05, 12.0))}},
+        ml_sizing_adjustment={"AAAU": 1.2},
+    )
+    # Raw tiers pass through below the cap (9.6 * 1.2 = 11.52 clamps; use the
+    # un-nudged ticker for the pass-through checks).
+    plain = StrategyConfig(
+        per_ticker_sizing={"AAAU": {"tiers": ((0.001, 1.0), (0.02, 8.0), (0.03, 9.6), (0.04, 10.0), (0.05, 12.0))}}
+    )
+    assert graded_buy_multiplier(0.025, plain, "AAAU") == 8.0
+    assert graded_buy_multiplier(0.035, plain, "AAAU") == pytest.approx(9.6)
+    assert graded_buy_multiplier(0.045, plain, "AAAU") == 10.0
+    # A malformed/over-range tier is still clamped to 10x.
+    assert graded_buy_multiplier(0.06, plain, "AAAU") == 10.0
+    # The ML nudge cannot push the final multiplier past 10x either.
+    assert graded_buy_multiplier(0.045, config, "AAAU") == 10.0
+    # The kill-switch cap (1x) still overrides everything.
+    engaged = StrategyConfig(
+        per_ticker_sizing=plain.per_ticker_sizing,
+        deployed_last_7d_usd=10_000.0,
+    )
+    assert kill_switch_engaged(engaged)
+    assert graded_buy_multiplier(0.045, engaged, "AAAU") == 1.0
 
 
 def test_base_amount_is_two_dollars():
@@ -51375,3 +51410,39 @@ def test_format_notional():
     assert format_notional(100.0) == "100.00"
     assert format_notional(123456789.12) == "123456789.12" # Avoid scientific notation
     assert format_notional(-5.5) == "-5.50"
+
+
+def test_interpolate_tier_multiplier_blends_between_points_and_hits_every_point_exactly():
+    import near_close_dca
+
+    tiers = ((0.01, 1.0), (0.02, 2.0), (0.04, 4.0))
+    interpolate = near_close_dca.interpolate_tier_multiplier
+    assert interpolate(0.005, tiers) == 0.0  # below the first point: no buy, as in the stepped lookup
+    assert interpolate(0.01, tiers) == 1.0 and interpolate(0.02, tiers) == 2.0  # exact at each point
+    assert interpolate(0.015, tiers) == 1.5  # halfway between 1.0x and 2.0x
+    assert interpolate(0.03, tiers) == 3.0  # halfway between 2.0x and 4.0x (unequal spacing)
+    assert interpolate(0.04, tiers) == 4.0 and interpolate(0.5, tiers) == 4.0  # clamps at the last point
+    assert interpolate(0.0123, tiers) == 1.23  # rounded to 4 dp
+    assert interpolate(0.02, ()) == 0.0
+    # Monotone: a bigger drop never earns a smaller multiplier.
+    drops = [i / 10000 for i in range(0, 600)]
+    values = [interpolate(d, tiers) for d in drops]
+    assert values == sorted(values)
+
+
+def test_raw_ladder_multiplier_interpolates_only_for_calibrations_flagged_linear():
+    import near_close_dca
+
+    tiers = ((0.01, 1.0), (0.02, 2.0))
+    config = near_close_dca.StrategyConfig(
+        per_ticker_sizing={
+            "SMOOTH": {"tiers": tiers, "interpolate": True},
+            "STEPPED": {"tiers": tiers, "interpolate": False},
+            "LEGACY": {"tiers": tiers},  # an entry without the flag keeps stepping
+        }
+    )
+    assert near_close_dca.raw_ladder_multiplier(0.015, config, "SMOOTH") == 1.5
+    assert near_close_dca.raw_ladder_multiplier(0.015, config, "STEPPED") == 1.0
+    assert near_close_dca.raw_ladder_multiplier(0.015, config, "LEGACY") == 1.0
+    # A ticker with no calibration at all stays on the (stepped) global ladder.
+    assert near_close_dca.raw_ladder_multiplier(0.015, config, "OTHER") == near_close_dca.raw_ladder_multiplier(0.015, config)

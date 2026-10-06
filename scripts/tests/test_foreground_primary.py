@@ -726,3 +726,39 @@ def test_foreground_primary_edge_cases(tmp_path):
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
 
+
+
+def test_close_window_row_interpolates_only_flagged_calibrated_tickers():
+    """A calibration published "interpolation": "linear" is graded by blending between tier
+    points, like live sizing; a stepped calibration and a ticker on the shared ladder are not."""
+    quotes = {
+        "SMOOTH": {"decision_price": 98.0, "prior_close": 100.0, "lookback_price": 99.0, "data_source": "finance"},
+        "STEPPED": {"decision_price": 98.0, "prior_close": 100.0, "lookback_price": 99.0, "data_source": "finance"},
+        "OTHER": {"decision_price": 98.0, "prior_close": 100.0, "lookback_price": 99.0, "data_source": "finance"},
+    }
+    calibrated = ((0.01, 1.0), (0.03, 3.0))
+    summary = build_close_window_summary(
+        quotes,
+        tiers=LADDER,
+        trading_day=TODAY,
+        per_ticker_tiers={"SMOOTH": calibrated, "STEPPED": calibrated},
+        per_ticker_interpolate={"smooth", "OTHER"},  # case-insensitive; OTHER has no calibration of its own
+    )
+    rows = {row["ticker"]: row for row in summary["rows"]}
+    assert rows["SMOOTH"]["ladder_multiplier_capped_at_3x"] == pytest.approx(2.0)  # halfway between 1x and 3x
+    assert rows["STEPPED"]["ladder_multiplier_capped_at_3x"] == 1.0
+    global_row = build_close_window_summary(quotes, tiers=LADDER, trading_day=TODAY)["rows"][2]
+    assert rows["OTHER"]["ladder_multiplier_capped_at_3x"] == global_row["ladder_multiplier_capped_at_3x"]
+
+
+def test_close_window_interpolation_matches_the_live_function():
+    """close_window_signal keeps a stdlib-only copy of the blend; it must agree with the live one."""
+    from close_window_signal import ladder_multiplier_for_drop  # type: ignore
+
+    from near_close_dca import interpolate_tier_multiplier
+
+    tiers = ((0.0001, 1.0), (0.0004, 1.0), (0.001, 1.6), (0.0125, 4.2), (0.05, 8.0), (0.12, 10.0))
+    for step in range(0, 1400):
+        drop = step / 10000
+        assert ladder_multiplier_for_drop(drop, tiers, interpolate=True) == interpolate_tier_multiplier(drop, tiers)
+    assert ladder_multiplier_for_drop(0.02, (), interpolate=True) == 0.0

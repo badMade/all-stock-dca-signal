@@ -32,7 +32,7 @@ sizing, which continues to use the full ladder via
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Collection, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 # Reporting cap requested for the close-window summary. Not an execution cap.
 REPORTED_MULTIPLIER_CAP = 3.0
@@ -84,14 +84,35 @@ def reported_multiplier(raw_multiplier: float) -> Tuple[float, Optional[str]]:
     return (raw_multiplier, None)
 
 
-def ladder_multiplier_for_drop(drop_fraction: float, tiers: Sequence[Tuple[float, float]]) -> float:
+def ladder_multiplier_for_drop(
+    drop_fraction: float, tiers: Sequence[Tuple[float, float]], *, interpolate: bool = False
+) -> float:
     """Uncapped ladder multiplier for a drop fraction (0.02 == 2.0% down).
 
     Mirrors ``near_close_dca.graded_buy_multiplier``'s tier selection (largest
     threshold less than or equal to the drop wins, below the first tier is 0x),
     without its risk-guard and execution concerns: this is a summary of the
     ladder shape, not a sizing decision.
+
+    ``interpolate=True`` mirrors ``near_close_dca.interpolate_tier_multiplier``
+    instead: a per-ticker calibration published with ``"interpolation": "linear"``
+    is sized by a linear blend between its neighbouring tier points, so the report
+    must grade it the same way or it would disagree with live sizing between
+    points. This module stays stdlib-only and standalone, so the blend is a small
+    local copy; ``test_close_window_interpolation_matches_the_live_function`` pins
+    the two together.
     """
+    if interpolate:
+        ordered = sorted(tiers)
+        if not ordered or drop_fraction < ordered[0][0]:
+            return 0.0
+        if drop_fraction >= ordered[-1][0]:
+            return ordered[-1][1]
+        for (low, low_multiplier), (high, high_multiplier) in zip(ordered, ordered[1:], strict=False):
+            if low <= drop_fraction < high:
+                fraction = (drop_fraction - low) / (high - low)
+                return round(low_multiplier + (high_multiplier - low_multiplier) * fraction, 4)
+        return ordered[-1][1]  # pragma: no cover - unreachable: the bounds above cover every drop
     multiplier = 0.0
     for threshold, tier_multiplier in sorted(tiers):
         if drop_fraction >= threshold:
@@ -143,6 +164,7 @@ def build_close_window_row(
     background_mode_active: bool,
     foreground_primary_mode_active: bool,
     per_ticker_tiers: Optional[Mapping[str, Sequence[Tuple[float, float]]]] = None,
+    per_ticker_interpolate: Optional[Collection[str]] = None,
 ) -> CloseWindowRow:
     """Grade one ticker. See :func:`build_close_window_summary`.
 
@@ -169,12 +191,25 @@ def build_close_window_row(
     stricter calibrated first tier, systematically over-reporting
     ``would_have_fired`` relative to what live execution would actually do
     (Codex review: "Grade each ticker with its active per-ticker ladder").
+
+    ``per_ticker_interpolate`` names the tickers whose calibration is published with
+    ``"interpolation": "linear"`` (``StrategyConfig.per_ticker_sizing[t]["interpolate"]``);
+    those are graded by a linear blend between tier points like live sizing, and only
+    when the ticker actually has its own entry in ``per_ticker_tiers`` -- a ticker on
+    the shared global ladder stays stepped. Omitting it keeps every ticker stepped.
     """
     decision_price = _positive_float(quote.get("decision_price"))
     prior_close = _positive_float(quote.get("prior_close"))
     lookback_price = _positive_float(quote.get("lookback_price"))
     data_source = quote.get("data_source")
     data_source = data_source if isinstance(data_source, str) and data_source else None
+    interpolate = bool(
+        per_ticker_interpolate
+        and per_ticker_tiers
+        and ticker
+        and per_ticker_tiers.get(ticker.upper())
+        and ticker.upper() in {str(name).upper() for name in per_ticker_interpolate}
+    )
     tiers = _tiers_for_ticker(ticker, tiers, per_ticker_tiers)
 
     if decision_price is None or prior_close is None:
@@ -194,7 +229,7 @@ def build_close_window_row(
 
     drop_fraction = (prior_close - decision_price) / prior_close
     drop_pct = round(drop_fraction * 100.0, 4)
-    raw_multiplier = ladder_multiplier_for_drop(drop_fraction, tiers)
+    raw_multiplier = ladder_multiplier_for_drop(drop_fraction, tiers, interpolate=interpolate)
     capped, label = reported_multiplier(raw_multiplier)
 
     reason: Optional[str] = None
@@ -248,6 +283,7 @@ def build_close_window_summary(
     background_mode_active: bool = True,
     foreground_primary_mode_active: bool = False,
     per_ticker_tiers: Optional[Mapping[str, Sequence[Tuple[float, float]]]] = None,
+    per_ticker_interpolate: Optional[Collection[str]] = None,
 ) -> Dict[str, Any]:
     """Build the read-only ``what_would_have_fired`` summary for the watchlist.
 
@@ -275,6 +311,10 @@ def build_close_window_summary(
     ``_ticker_sizing`` selection. Omitting it grades every ticker with the
     shared ``tiers``, same as before this parameter existed.
 
+    ``per_ticker_interpolate`` names the calibrated tickers published with
+    ``"interpolation": "linear"``; they are graded with a linear blend between tier
+    points, matching live sizing (see :func:`build_close_window_row`).
+
     ``watchlist`` pins the tickers and their order; when omitted the keys of
     ``quotes`` are used, sorted. A watchlist ticker with no quote is still
     reported, as an ``unknown_missing_data`` row: a ticker silently dropped
@@ -297,6 +337,7 @@ def build_close_window_summary(
             background_mode_active=background_mode_active,
             foreground_primary_mode_active=foreground_primary_mode_active,
             per_ticker_tiers=per_ticker_tiers,
+            per_ticker_interpolate=per_ticker_interpolate,
         )
         for ticker in tickers
     ]

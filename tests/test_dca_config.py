@@ -2244,3 +2244,19 @@ def test_keyword_overrides_cannot_bypass_the_budget_field_validation():
             ).kill_switch_7d_deploy_fraction
             == _ok
         )
+
+
+def test_per_ticker_sizing_loader_exposes_linear_interpolation_flag(tmp_path):
+    tiers = [{"min_drop_pct": 0.5, "multiplier": 1.0}, {"min_drop_pct": 1.0, "multiplier": 2.0}]
+    _write(tmp_path, "per_ticker_sizing.json", {
+        "status": "active",
+        "tickers": {
+            "SMOOTH": {"base_amount_usd": 1.0, "base_amount_below_close_usd": 1.0, "tiers": tiers, "interpolation": "linear"},
+            "STEPPED": {"base_amount_usd": 1.0, "base_amount_below_close_usd": 1.0, "tiers": tiers},
+            "ODD": {"base_amount_usd": 1.0, "base_amount_below_close_usd": 1.0, "tiers": tiers, "interpolation": "cubic"},
+        },
+    })
+    loaded = load_per_ticker_sizing(tmp_path)["per_ticker_sizing"]
+    assert loaded["SMOOTH"]["interpolate"] is True
+    assert loaded["STEPPED"]["interpolate"] is False
+    assert loaded["ODD"]["interpolate"] is False  # anything but "linear" fails safe to the stepped lookup

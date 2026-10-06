@@ -54,7 +54,7 @@ def test_default_run_refuses_to_publish_a_session_count_regression(tmp_path, mon
     output = tmp_path / "per_ticker_sizing.json"
     _ticker_config(ticker_config)
     output.write_text(
-        json.dumps({"tickers": {"ABC": {"sample_sessions": 300}}}),
+        json.dumps({"lookback_days": 90, "tickers": {"ABC": {"sample_sessions": 300}}}),
         encoding="utf-8",
     )
     rows = ["Date,Open,High,Low,Close,Adj Close,Volume"]

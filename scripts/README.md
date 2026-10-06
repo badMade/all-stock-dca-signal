@@ -102,7 +102,7 @@ python -m pytest scripts/tests -q
 python scripts/tests/test_backup_strategy.py
 ```
 
-The tests assert the 45-ticker universe, the latest ladder (max 5x, no 12x-era
+The tests assert the 45-ticker universe, the latest ladder (max 8x, no 12x-era
 tiers), the budget caps, and that the **3:20 PM ET live task** stays distinct
 from the **3:35 PM ET slippage/Notion sync**.
 

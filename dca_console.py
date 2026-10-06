@@ -500,6 +500,9 @@ def module_catalog(python: str) -> list[dict]:
         1: "demo-dca",
         6: "drift-check",
         7: "alert-digest",
+        8: "test-signals",
+        9: "risk-report",
+        10: "config-invariants",
     }
     rows = [{"id": f"entry-{i}", "name": e.need, "description": e.notes,
              "command": runnable(e.command), "docs": e.doc_ref, "status": "Existing entry point",

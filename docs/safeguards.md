@@ -283,7 +283,7 @@ See the `market_data_source_policy` block in
 
 Hard limits that skip an order rather than trade when any is hit:
 
-- **Max per order: $10** (5x × $2 base) — the absolute per-order ceiling for
+- **Max per order: $16** (8x × $2 base) — the absolute per-order ceiling for
   every fractional (notional dollar) order, across all live streams. The one
   carve-out is a `whole_share` ticker's single-share fire, bounded instead by
   `circuit_breakers.whole_share_max_per_order_usd` because such a ticker has no

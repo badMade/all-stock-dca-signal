@@ -144,7 +144,7 @@ def test_standalone_run_refuses_to_publish_a_truncated_ticker_history(tmp_path):
     artifacts_dir = tmp_path / "artifacts"
     _ticker_config(ticker_config)
     output.write_text(
-        json.dumps({"tickers": {"ABC": {"sample_sessions": 300, "source": "three_year_adjusted_daily_low_percentiles"}}}),
+        json.dumps({"lookback_days": 90, "tickers": {"ABC": {"sample_sessions": 300, "source": "ninety_day_adjusted_daily_low_percentiles"}}}),
         encoding="utf-8",
     )
     # Only 2 rows -> 1 usable drop, far below the 150-session regression floor.

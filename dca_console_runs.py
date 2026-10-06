@@ -523,10 +523,15 @@ def _close_window(reader: BoundedReader, relative_dir: str, state: dict[str, Any
         return {"available": False, "reason": "signals.csv with decision and prior-close prices is absent"}
     try:
         tiers = load_sizing_tiers(config_dir).get("sizing_tiers")
-        per_ticker = {ticker: entry["tiers"] for ticker, entry in load_per_ticker_sizing(config_dir).items()
+        loaded_sizing = load_per_ticker_sizing(config_dir).get("per_ticker_sizing", {})
+        per_ticker = {ticker: entry["tiers"] for ticker, entry in loaded_sizing.items()
                       if isinstance(entry, dict) and entry.get("tiers")}
+        # Calibrations published "interpolation": "linear" are graded by blending between tier points,
+        # exactly as live sizing does (near_close_dca.interpolate_tier_multiplier).
+        interpolated = {ticker for ticker, entry in loaded_sizing.items()
+                        if isinstance(entry, dict) and entry.get("interpolate")}
     except (OSError, ValueError, TypeError, KeyError):
-        tiers, per_ticker = None, {}
+        tiers, per_ticker, interpolated = None, {}, set()
     if not tiers:
         return {"available": False, "reason": "config/sizing_ladder.json tiers are unavailable"}
     # Raw quote files are counted through the reader (confined, 32 MiB
@@ -537,7 +542,8 @@ def _close_window(reader: BoundedReader, relative_dir: str, state: dict[str, Any
         if entry.name.startswith("quotes") and entry.name.endswith(".json"):
             raw_quotes += _parsable_json(reader, entry)
     trading_day = _day_label(state, relative_dir) or "unknown"
-    summary = build_close_window_summary(quotes, tiers=tiers, trading_day=trading_day, per_ticker_tiers=per_ticker)
+    summary = build_close_window_summary(quotes, tiers=tiers, trading_day=trading_day, per_ticker_tiers=per_ticker,
+                                         per_ticker_interpolate=interpolated)
     safe = _json_safe(summary)
     safe.update({"available": True, "multiplier_label": MULTIPLIER_LABEL, "raw_quote_files": raw_quotes,
                  "source": "signals.csv"})

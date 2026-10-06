@@ -78,7 +78,7 @@ environment (see the repository README).
   `BYDDY` and `RVII` are whole-share tickers, not excluded (fractional-tradability; `RVII` moved
   out of the active list 2026-08-24 — see [whole_share_accumulation.md](whole_share_accumulation.md)); `IRDMI→IRDM`, `GLWR→GLW`, `QBUT→QUBT`; `GFUZ` uses
   Robinhood primary data (finance `NOT_FOUND`).
-- **Latest ladder:** 0.1%→8%+, base $2, max **5x** (no upper cutoff). Older
+- **Latest ladder:** 0.1%→16%+ log-scaled, base $2, max **8x** (no upper cutoff). Older
   0.1%–12% ladders are **superseded**.
 - **Budgets:** $2 base · tiered caps selected per run solely by 3x+ signal
   count (never planned spend) — Normal $180/$900 · Elevated $240/$1,200 · High-vol $300/$1,500 ·

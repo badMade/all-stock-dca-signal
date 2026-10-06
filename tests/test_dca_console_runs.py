@@ -450,3 +450,33 @@ def test_builders_never_take_a_lock(tmp_path, monkeypatch):
 @pytest.mark.parametrize("run_id", ["run-", "run-ABCDEF012345", "run-0123456789abc", ""])
 def test_run_id_regex_is_strict(tmp_path, run_id):
     assert build_run_detail([RootSpec.of(tmp_path)], run_id, config_dir=CONFIG)["found"] is False
+
+
+def test_close_window_grades_with_each_tickers_own_calibration_and_interpolates(tmp_path):
+    """The console loaded per-ticker sizing through the wrong level of the loader's return value, so its
+    per-ticker map was always empty and every ticker was graded on the global ladder. It must use the
+    ticker's own tiers, blending between points when the calibration is published as linear."""
+    import shutil
+
+    from dca_console_runs import _close_window
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    shutil.copy(Path(__file__).resolve().parents[1] / "config" / "sizing_ladder.json", config_dir / "sizing_ladder.json")
+    tiers = [{"min_drop_pct": 1.0, "multiplier": 1.0}, {"min_drop_pct": 3.0, "multiplier": 3.0}]
+    entry = {"base_amount_usd": 1.0, "base_amount_below_close_usd": 1.0, "tiers": tiers}
+    (config_dir / "per_ticker_sizing.json").write_text(json.dumps({
+        "status": "active",
+        "tickers": {"SMOOTH": {**entry, "interpolation": "linear"}, "STEPPED": entry},
+    }), encoding="utf-8")
+
+    class _Reader:
+        def entries(self, *_args, **_kwargs):
+            return []
+
+    row = {"decision_bar_close": "98", "previous_close": "100", "lookback_price": "99", "source": "finance"}
+    tables = {"signals.csv": {"rows": [{**row, "ticker": "SMOOTH"}, {**row, "ticker": "STEPPED"}]}}
+    window = _close_window(_Reader(), "run", {}, config_dir, tables)
+    rows = {r["ticker"]: r for r in window["rows"]}
+    assert rows["SMOOTH"]["ladder_multiplier_capped_at_3x"] == 2.0  # blended halfway between 1x and 3x
+    assert rows["STEPPED"]["ladder_multiplier_capped_at_3x"] == 1.0  # its own tiers, stepped (global ladder would give 1.5x)

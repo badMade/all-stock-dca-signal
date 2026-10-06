@@ -12497,8 +12497,127 @@ def test_assess_reports_the_count_cap_and_the_ticker_rule_in_its_verdict():
     assert r["budget"]["one_order_per_ticker_per_day"] is False
     assert r["budget"]["day_order_count"] == 0
 
+# Pinned STEPPED per-ticker calibration (the 2026-09-13 values for TRIN/DFTX plus SPCX as a fallback ticker).
+# These tests exercise the candidate-evidence validator, not the live calibration, so they must not
+# move every time config/per_ticker_sizing.json is regenerated (it now carries interpolated 96-tier curves).
+_STEPPED_CALIBRATION = json.loads("""
+{
+ "status": "active",
+ "minimum_order_usd": 1.0,
+ "fallback_tickers": [
+  "SPCX"
+ ],
+ "tickers": {
+  "DFTX": {
+   "base_amount_usd": 1.0,
+   "base_amount_below_close_usd": 1.0,
+   "tiers": [
+    {
+     "min_drop_pct": 1.139,
+     "multiplier": 1.0
+    },
+    {
+     "min_drop_pct": 2.5761,
+     "multiplier": 1.5
+    },
+    {
+     "min_drop_pct": 4.6269,
+     "multiplier": 2.5
+    },
+    {
+     "min_drop_pct": 6.8569,
+     "multiplier": 4.0
+    },
+    {
+     "min_drop_pct": 11.0453,
+     "multiplier": 5.0
+    }
+   ]
+  },
+  "TRIN": {
+   "base_amount_usd": 1.0,
+   "base_amount_below_close_usd": 1.0,
+   "tiers": [
+    {
+     "min_drop_pct": 0.124,
+     "multiplier": 1.0
+    },
+    {
+     "min_drop_pct": 0.5413,
+     "multiplier": 1.5
+    },
+    {
+     "min_drop_pct": 1.1656,
+     "multiplier": 2.5
+    },
+    {
+     "min_drop_pct": 1.977,
+     "multiplier": 4.0
+    },
+    {
+     "min_drop_pct": 3.0733,
+     "multiplier": 5.0
+    }
+   ]
+  },
+  "SPCX": {
+   "base_amount_usd": 1.0,
+   "base_amount_below_close_usd": 1.0,
+   "tiers": [
+    {
+     "min_drop_pct": 0.1,
+     "multiplier": 1.0
+    },
+    {
+     "min_drop_pct": 2.0,
+     "multiplier": 1.5
+    },
+    {
+     "min_drop_pct": 4.0,
+     "multiplier": 2.0
+    },
+    {
+     "min_drop_pct": 5.0,
+     "multiplier": 2.5
+    },
+    {
+     "min_drop_pct": 6.0,
+     "multiplier": 3.0
+    },
+    {
+     "min_drop_pct": 6.5,
+     "multiplier": 3.5
+    },
+    {
+     "min_drop_pct": 7.0,
+     "multiplier": 4.0
+    },
+    {
+     "min_drop_pct": 7.5,
+     "multiplier": 4.5
+    },
+    {
+     "min_drop_pct": 8.0,
+     "multiplier": 5.0
+    }
+   ]
+  }
+ }
+}
+""")
 
-def test_plan_orders_accepts_complete_per_ticker_calibration():
+
+@pytest.fixture
+def stepped_calibration(monkeypatch):
+    real_read_config = dca_runner._read_config
+
+    def _read(name):
+        return _STEPPED_CALIBRATION if name == "per_ticker_sizing.json" else real_read_config(name)
+
+    monkeypatch.setattr(dca_runner, "_read_config", _read)
+
+
+def test_plan_orders_accepts_complete_per_ticker_calibration(stepped_calibration):
     """A valid calibrated tier must not be checked against the global curve."""
     candidate = dca_runner.Candidate(
         "TRIN", 5.0, multiplier=5.0, drop_pct=3.1,
@@ -12513,16 +12632,26 @@ def test_plan_orders_accepts_complete_per_ticker_calibration():
 def test_plan_orders_accepts_a_seven_wide_json_row_carrying_calibration_evidence():
     """planner_candidates is JSON, so a calibrated row carries its tier as three
     trailing columns; a bare 4-tuple for the same buy is refused by the global ladder
-    (DFTX 5% / 2.5x sits outside the 2026-10-04 ladder's 2.5x range, 1.5-2%)
     (Copilot review, PR #1597)."""
+    sizing = dca_runner._read_config("per_ticker_sizing.json")
+    ticker_sizing = sizing["tickers"]["DFTX"]
+    tier = ticker_sizing["tiers"][0]
+    multiplier = float(tier["multiplier"])
+    drop_pct = float(tier["min_drop_pct"])
+    bounds = dca_runner._configured_calibration_bounds("DFTX", multiplier)
+    assert bounds is not None
+    configured_bases, min_drop_pct, max_drop_pct, _minimum_order_usd = bounds
+    base_usd = float(ticker_sizing["base_amount_usd"])
+    assert base_usd in configured_bases
+    amount_usd = round(base_usd * multiplier, 2)
     snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
-    bare = [["DFTX", 2.5, 2.5, 5.0]]
-    wide = [["DFTX", 2.5, 2.5, 5.0, 1.0, 4.6269, 6.8569]]
+    bare = [["DFTX", amount_usd, multiplier, drop_pct]]
+    wide = [bare[0] + [base_usd, min_drop_pct, max_drop_pct]]
     refused = dca_runner.plan_orders(bare, snapshot, dca_runner.BUDGET_TIERS[0])
     assert refused.to_place == []
     assert refused.refused == [("DFTX", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
     plan = dca_runner.plan_orders(wide, snapshot, dca_runner.BUDGET_TIERS[0])
-    assert [(o.ticker, o.amount_usd) for o in plan.to_place] == [("DFTX", 2.5)]
+    assert [(o.ticker, o.amount_usd) for o in plan.to_place] == [("DFTX", amount_usd)]
     assert plan.refused == []
 
 
@@ -12555,7 +12684,7 @@ def test_plan_orders_refuses_calibration_not_bound_to_ticker_config():
     assert plan.refused == [("AAPL", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
 
 
-def test_plan_orders_refuses_calibration_for_a_fallback_ticker():
+def test_plan_orders_refuses_calibration_for_a_fallback_ticker(stepped_calibration):
     """A ticker listed in per_ticker_sizing.json's fallback_tickers is sized
     off the global ladder; its own (stale) tickers[] entry is not
     authoritative and must not validate calibration evidence."""
@@ -12606,7 +12735,7 @@ def test_plan_orders_refuses_an_oversized_amount_usd_instead_of_crashing():
     assert plan.refused[0][0] == "AAPL"
 
 
-def test_plan_orders_keeps_kill_switch_capped_calibrated_candidate_eligible():
+def test_plan_orders_keeps_kill_switch_capped_calibrated_candidate_eligible(stepped_calibration):
     """dca_risk.apply_risk_guard can cap a deep-drop calibrated signal down
     to the floor multiplier while the candidate keeps its real, deep
     drop_pct -- the floor tier's own finite upper bound must not refuse it."""
@@ -12634,7 +12763,7 @@ def test_plan_orders_refuses_a_sub_threshold_drop_for_a_capped_minimum_calibrate
     assert plan.refused == [("TRIN", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
 
 
-def test_plan_orders_accepts_a_reduced_same_day_topup_calibrated_amount():
+def test_plan_orders_accepts_a_reduced_same_day_topup_calibrated_amount(stepped_calibration):
     """scripts/same_day_top_up_gate.py (Gate 6.5) can shrink buy_usd below
     the full calibrated allocation while the candidate still carries its
     original sizing evidence; the full-allocation product is a ceiling, not
@@ -12674,7 +12803,7 @@ def test_parse_candidate_rows_preserves_calibration_fields_on_a_prebuilt_candida
     assert parsed == [candidate]
 
 
-def test_assess_accepts_a_calibrated_candidate_carried_through_parsing():
+def test_assess_accepts_a_calibrated_candidate_carried_through_parsing(stepped_calibration):
     r = dca_runner.assess(**_clean_kwargs(
         candidates=[dca_runner.Candidate(
             "TRIN", 5.0, multiplier=5.0, drop_pct=3.1,
@@ -12687,7 +12816,7 @@ def test_assess_accepts_a_calibrated_candidate_carried_through_parsing():
                    for _, reason in r["plan"]["refused"])
 
 
-def test_plan_orders_accepts_a_configured_ticker_with_complete_calibration_evidence():
+def test_plan_orders_accepts_a_configured_ticker_with_complete_calibration_evidence(stepped_calibration):
     """Same DFTX candidate as above, but with the real calibration evidence
     supplied and an actually-qualifying drop, must still be accepted."""
     candidate = dca_runner.Candidate(
@@ -12737,7 +12866,7 @@ def test_plan_orders_rejects_a_boolean_calibrated_multiplier():
     assert plan.refused == [("DFTX", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
 
 
-def test_estimated_multiplier_trusts_a_reduced_calibrated_topup():
+def test_estimated_multiplier_trusts_a_reduced_calibrated_topup(stepped_calibration):
     """A same-day top-up reduced below the full calibrated allocation (e.g.
     a TRIN 5x buy shrunk from $5 to $3 by Gate 6.5) must still report its
     real 5x multiplier for tier counting and allocation priority, not fall
@@ -14921,3 +15050,67 @@ def test_a_same_slot_second_run_aborts_at_gate_4_with_the_first_runs_orders_in_h
             candidates=[("AAPL", 2.0), ("MSFT", 2.0)],
         )
     assert calls == []
+
+
+_INTERPOLATED_CALIBRATION = {
+    "status": "active",
+    "minimum_order_usd": 1.0,
+    "fallback_tickers": [],
+    "tickers": {
+        "DFTX": {
+            "base_amount_usd": 1.0,
+            "base_amount_below_close_usd": 1.0,
+            "interpolation": "linear",
+            "tiers": [
+                {"min_drop_pct": 0.1, "multiplier": 1.0},
+                {"min_drop_pct": 0.2, "multiplier": 1.0},  # a flat (plateau) stretch
+                {"min_drop_pct": 0.4, "multiplier": 2.0},
+                {"min_drop_pct": 0.8, "multiplier": 4.0},
+            ],
+        }
+    },
+}
+
+
+@pytest.fixture
+def interpolated_calibration(monkeypatch):
+    real_read_config = dca_runner._read_config
+    monkeypatch.setattr(
+        dca_runner,
+        "_read_config",
+        lambda name: _INTERPOLATED_CALIBRATION if name == "per_ticker_sizing.json" else real_read_config(name),
+    )
+
+
+def test_calibration_bounds_for_an_interpolated_curve(interpolated_calibration):
+    bounds = dca_runner._configured_calibration_bounds
+    # A claim strictly between two configured values binds to the segment that can produce it.
+    assert bounds("DFTX", 3.0)[1:3] == (0.4, 0.8)
+    assert bounds("DFTX", 1.5)[1:3] == (0.2, 0.4)
+    # A claim equal to a tier value (exact point, or the flat stretch) takes the first tier with that value
+    # and runs to the first tier with a LARGER multiplier.
+    assert bounds("DFTX", 1.0)[1:3] == (0.1, 0.4)
+    assert bounds("DFTX", 2.0)[1:3] == (0.4, 0.8)
+    # The last tier clamps: no upper bound.
+    assert bounds("DFTX", 4.0)[1:3] == (0.8, None)
+    # Outside the curve entirely (below the floor or above the ceiling): not a value this ticker can produce.
+    assert bounds("DFTX", 0.5) is None
+    assert bounds("DFTX", 4.5) is None
+
+
+def test_plan_orders_accepts_an_interpolated_in_between_calibrated_multiplier(interpolated_calibration):
+    candidate = dca_runner.Candidate(
+        "DFTX", 3.0, multiplier=3.0, drop_pct=0.6,
+        sizing_base_usd=1.0, sizing_min_drop_pct=0.4, sizing_max_drop_pct=0.8,
+    )
+    snapshot = dca_runner.BudgetSnapshot(date(2026, 8, 11), 0.0, 0.0, 0)
+    plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert [(order.ticker, order.amount_usd) for order in plan.to_place] == [("DFTX", 3.0)]
+    # The same claim bound to the WRONG segment is still refused as corrupted evidence.
+    wrong = dca_runner.Candidate(
+        "DFTX", 3.0, multiplier=3.0, drop_pct=0.6,
+        sizing_base_usd=1.0, sizing_min_drop_pct=0.2, sizing_max_drop_pct=0.4,
+    )
+    plan = dca_runner.plan_orders([wrong], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert plan.to_place == []
+    assert plan.refused == [("DFTX", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]

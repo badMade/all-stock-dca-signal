@@ -19,7 +19,7 @@ Graded DCA Dashboard
 │   └── Status + any errors
 ├── Strategy              (mirrors docs/strategy.md)
 │   ├── Active universe (53 tickers)
-│   ├── Sizing ladder (0.1%–8%+, max 5x)  ← older 0.1%–12% ladders are superseded
+│   ├── Sizing ladder (0.1%–16%+ log-scaled, max 8x)  ← older 0.1%–12% ladders are superseded
 │   └── Budget & reserve rules
 ├── Safeguards            (mirrors docs/safeguards.md)
 ├── Schedule Manifest     (mirrors docs/schedule_manifest.md)

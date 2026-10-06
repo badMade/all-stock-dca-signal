@@ -49,7 +49,7 @@ downward-trend filter** (condition 2 above). Every other gate still applies:
 
 - current / decision price **strictly below the prior completed regular-session
   close**,
-- ladder **multiplier > 0** (from the dynamic-base 0x-to-5x ladder),
+- ladder **multiplier > 0** (from the dynamic-base 0x-to-8x ladder),
 - **data-confidence** check passes,
 - **`spread_ok=true`**,
 - **budget / tiered-cap** pass,
@@ -184,42 +184,65 @@ VIAV CIEN ANET CSCO FFIV COHR QUBT
 Maps the drop vs. previous close to a buy multiplier, applied to the selected
 first-allocation base ($2 below prior close and low, $1 below prior close only).
 Boundaries are min-inclusive, max-exclusive. There is **no upper cutoff**: any
-drop of 8% or more is 5x. See [`config/sizing_ladder.json`](../config/sizing_ladder.json).
+drop of 16% or more is 8x. See [`config/sizing_ladder.json`](../config/sizing_ladder.json).
 
 | Drop vs. prior close | Multiplier | Dollars ($2 base) | Dollars ($1 base) |
 | --- | --- | --- | --- |
 | < 0.1% | 0x (no buy) | $0.00 | $0.00 |
-| 0.1% to < 2% | 1x | $2.00 | $1.00 |
-| 2% to < 4% | 1.5x | $3.00 | $1.50 |
-| 4% to < 5% | 2x | $4.00 | $2.00 |
-| 5% to < 6% | 2.5x | $5.00 | $2.50 |
-| 6% to < 6.5% | 3x | $6.00 | $3.00 |
-| 6.5% to < 7% | 3.5x | $7.00 | $3.50 |
-| 7% to < 7.5% | 4x | $8.00 | $4.00 |
-| 7.5% to < 8% | 4.5x | $9.00 | $4.50 |
-| >= 8% | 5x | $10.00 | $5.00 |
+| 0.1% to < 0.5% | 1x | $2.00 | $1.00 |
+| 0.5% to < 1% | 1.5x | $3.00 | $1.50 |
+| 1% to < 1.5% | 2x | $4.00 | $2.00 |
+| 1.5% to < 2% | 2.5x | $5.00 | $2.50 |
+| 2% to < 2.75% | 3x | $6.00 | $3.00 |
+| 2.75% to < 3.5% | 3.5x | $7.00 | $3.50 |
+| 3.5% to < 4.5% | 4x | $8.00 | $4.00 |
+| 4.5% to < 5.5% | 4.5x | $9.00 | $4.50 |
+| 5.5% to < 7% | 5x | $10.00 | $5.00 |
+| 7% to < 8.5% | 5.5x | $11.00 | $5.50 |
+| 8.5% to < 10.5% | 6x | $12.00 | $6.00 |
+| 10.5% to < 12.5% | 6.5x | $13.00 | $6.50 |
+| 12.5% to < 14.5% | 7x | $14.00 | $7.00 |
+| 14.5% to < 16% | 7.5x | $15.00 | $7.50 |
+| >= 16% | 8x | $16.00 | $8.00 |
 
-**Rescaled 2026-08-02.** The prior curve stepped uniformly every 1% from 0.1% to
-8%. This one is flatter on shallow dips — 1x now runs to 2% and 1.5x to 4% — and
-back-loads the scaling into deep drops, slicing 6–8% every half percent.
-Endpoints are unchanged, so the $10 max per order still stands. One knock-on
-effect worth tracking: budget-tier selection counts **3x-or-greater** signals,
-and 3x now needs a 6% drop rather than 4%, so escalation to
-Elevated/High-volatility/Stress is less frequent for the same market conditions.
+**Rescaled 2026-10-04 (log-scaled).** The curve is now log-scaled across 0.1% to 16%:
+fifteen tiers from 1x to 8x in half-step increments, dense on shallow dips and
+widening into deep drops, with no upper cutoff (>= 16% is 8x). It replaced the
+2026-08-02 curve (0.1%-to-8%+, max 5x). The per-order ceiling is now $16
+(8x x $2; the $1 scale tops out at $8) -- see `max_per_order_usd` in
+`config/budgets.json`. Budget-tier selection still counts **3x-or-greater**
+signals; 3x now needs a 2% drop.
 
-> **This table is the fallback, not the live curve.** As of 2026-09-11
-> [`config/per_ticker_sizing.json`](../config/per_ticker_sizing.json) is
-> `status: active` and carries an entry for all 64 active symbols (plus the two
-> whole-share symbols, which the ladder evaluates identically). 47 are
-> **per-ticker, volatility-calibrated** (percentile-derived,
-> 1x/1.5x/2.5x/4x/5x, $1.00 base); the 19 in `fallback_tickers` (SPCX, DRAM,
-> CBRS, SATA, GFUZ, VT, RVII, RVI, VCX, TRLV, BYDDY, LLY, TSLA, VIAV,
-> CIEN, ANET, CSCO, FFIV, COHR) lack the 252 sessions of history the
-> calibration requires and carry a copy of the global fallback ladder instead.
-> `graded_buy_multiplier` reads a ticker's calibrated tiers first and falls back
-> to the shared table above only for symbols with no entry — currently none. The
-> table above therefore governs the fallback path and the test suite, while
-> per-ticker calibration governs live sizing for every whitelisted symbol.
+> **This table is the fallback, not the live curve.** [`config/per_ticker_sizing.json`](../config/per_ticker_sizing.json)
+> is `status: active` and carries an entry for every active symbol plus the
+> whole-share symbols (which the ladder evaluates identically). Since 2026-10-05 it
+> is built by `scripts/generate_per_ticker_sizing.py` from each ticker's **last 90
+> days** of adjusted prior-close-to-low drops: one tier per percentile from the
+> **5th to the 100th** (96 tiers), on a log-scaled curve that is 1.00x through
+> the 10th percentile, 2.46x at the 50th, 8.00x at the 95th and 10.00x at the
+> 100th (the window's single largest drop). The base is $1.00, so a ticker's top
+> tier is at most $10. 66 symbols are calibrated this way; the ones in
+> `fallback_tickers` (currently only RVII, under the 40-session minimum) carry a
+> copy of the global ladder above. `graded_buy_multiplier` reads a ticker's
+> calibrated tiers first and falls back to the shared table only for symbols
+> with no entry; its ceiling is 10x. The table above therefore governs the
+> fallback path and the test suite, while per-ticker calibration governs live
+> sizing.
+>
+> **Per-ticker multipliers are interpolated, not stepped.** A calibrated entry
+> carries `"interpolation": "linear"`, and the 96 tier points are treated as
+> samples of one smooth curve: a drop between two thresholds earns the
+> proportional blend of their two multipliers
+> (`near_close_dca.interpolate_tier_multiplier`, rounded to 4 dp), so a slightly
+> bigger drop never waits for the next step. Below the 5th-percentile
+> threshold there is no buy, and beyond the 100th the multiplier clamps at 10x.
+> Fallback tickers and the global ladder stay stepped. `dca_runner`'s
+> candidate-evidence validation (`_configured_calibration_bounds`) binds an
+> in-between multiplier to the segment that can produce it.
+>
+> The close-window "what would have fired" report (`scripts/close_window_signal.py`,
+> shown in the console) grades flagged tickers the same way, so its per-ticker
+> multipliers agree with live sizing between tier points.
 
 ### Historical / superseded ladders
 
@@ -244,8 +267,8 @@ close only) as hardcoded, user-confirmed fallbacks.
 > **Dynamic first-allocation base (Jul 24 2026):** the user approved a dynamic
 > base for the first same-day allocation per ticker: **$2** below the prior close
 > and prior low, **$1** below the prior close only, no buy otherwise. The order
-> amount is `selected_base × multiplier`. The max per order is unchanged at $10
-> (5x x $2); the $1 scale tops out at $5. Ladder multipliers, the ticker
+> amount is `selected_base × multiplier`. The max per order is now $16
+> (8x x $2, since the 2026-10-04 ladder); the $1 scale tops out at $8. Ladder multipliers, the ticker
 > universe, exclusions, budget caps, the top-up guard, pre-authorization,
 > confidence, recovery, and all other safety rules are unchanged.
 >
@@ -397,7 +420,7 @@ same-day allocations (buying only the incremental difference into a lower price)
 and midday fills in turn become prior-allocation context for the afternoon guard.
 The morning stream ([morning_dca.md](morning_dca.md)) and the midday stream
 ([midday_dca.md](midday_dca.md), a 12:30 PM ET live execution) both run the same
-shared dynamic-base 0x-to-5x ladder as the afternoon run — as of the Fri Jul 10 2026
+shared dynamic-base 0x-to-8x ladder as the afternoon run — as of the Fri Jul 10 2026
 live-automation update every live stream shares one ladder (the former morning
 0x-to-3x ladder is historical/superseded). Both are independent of the afternoon
 3:30 PM task and never count as afternoon scheduled evidence.

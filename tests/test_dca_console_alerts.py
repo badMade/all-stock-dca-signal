@@ -275,7 +275,7 @@ def test_drift_summary_runs_the_detector_without_posting_and_caps_the_batch(tmp_
 
 def test_self_heal_view_reads_the_checkout_and_reports_a_rejected_config(tmp_path):
     result = self_heal_view(REPO)
-    assert result["config"]["enabled"] is False and result["config"]["max_tick_seconds"] == 600
+    assert result["config"]["enabled"] is True and result["config"]["max_tick_seconds"] == 600
     assert "ADMITTED" in result["reasons"] and "DISABLED" in result["refusal_reasons"]
     assert result["reasons"] == sorted(result["reasons"])
     workflows = {row["file"]: row for row in result["workflows"]}

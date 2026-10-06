@@ -1,6 +1,6 @@
 {
   "$schema": "../schemas/self_heal.schema.json",
-  "enabled": false,
+  "enabled": true,
   "max_repairs_per_day": 1,
   "max_repairs_per_epoch": 10,
   "breaker_failure_threshold": 3,

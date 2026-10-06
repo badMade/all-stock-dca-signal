@@ -39,7 +39,7 @@ def _write_text(tmp_path: Path, text: str) -> Path:
 def test_shipped_config_loads_with_required_defaults_and_canonical_units() -> None:
     loaded = load()
 
-    assert loaded.enabled is False
+    assert loaded.enabled is True
     assert loaded.max_repairs_per_day == 1
     assert loaded.max_repairs_per_epoch == 10
     assert loaded.breaker_failure_threshold == 3

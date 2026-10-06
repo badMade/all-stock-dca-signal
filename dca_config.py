@@ -679,6 +679,9 @@ def load_per_ticker_sizing(config_dir: Path) -> Dict[str, Any]:
             "tiers": tuple(sorted(parsed_tiers)),
             "base_amount_usd": full_base,
             "base_amount_below_close_usd": reduced_base,
+            # "linear" blends between neighbouring tier points instead of stepping
+            # (near_close_dca.interpolate_tier_multiplier); anything else steps.
+            "interpolate": model.get("interpolation") == "linear",
         }
     out: Dict[str, Any] = {"per_ticker_sizing": normalized}
     if "minimum_order_usd" in data:

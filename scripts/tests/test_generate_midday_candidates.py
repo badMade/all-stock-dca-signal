@@ -1322,10 +1322,9 @@ def test_withheld_rows_never_reach_planner_candidates():
 def test_a_full_window_row_does_reach_planner_candidates():
     """The control, and the guard against a fix that simply empties the list:
     the same ticker on a full window must still be planner-placeable."""
-    # The real per-ticker calibration for DFTX pairs 5% with 2.5x, which falls outside the
-    # 2026-10-04 GLOBAL ladder's 2.5x range (1.5-2%). It must still be planner-placeable:
-    # the planner row carries the ticker's own tier, so plan_orders() validates it against
-    # the calibrated curve (Copilot review, PR #1597).
+    # The 5% drop is calibrated differently from the global ladder. The planner row must
+    # carry the ticker's own tier so plan_orders() validates it against the calibrated curve
+    # (Copilot review, PR #1597).
     config = _real_universe_config()
     document = _run_planner(_bars_between(time(9, 30), DECISION_ET, early_price=99.0, late_price=95.0, step_at=time(12, 0)), config)
     assert document["withheld_incomplete_trend_window_tickers"] == []
@@ -1333,8 +1332,10 @@ def test_a_full_window_row_does_reach_planner_candidates():
     assert [row[0] for row in document["planner_candidates"]] == [config.tickers[0]]
     # ...and that row is the 7-wide calibrated shape, not a bare 4-tuple the global ladder rejects.
     (planner_row,) = document["planner_candidates"]
-    assert len(planner_row) == 7 and planner_row[2:4] == [2.5, 5.0]
-    assert planner_row[4:] == [1.0, 4.6269, 6.8569]
+    (candidate,) = document["cands"]
+    assert len(planner_row) == 7
+    assert planner_row[2:5] == [candidate["multiplier"], candidate["drop_pct"], candidate["selected_base_amount_usd"]]
+    assert planner_row[5] <= planner_row[3] <= planner_row[6]
     assert document["planner_incompatible_tickers"] == []
 
 

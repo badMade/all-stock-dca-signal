@@ -8359,7 +8359,10 @@ def test_run_slot_allows_a_guarded_top_up_the_old_forced_flag_used_to_block(tmp_
     # inactive -- see scripts/publish_octopus_sizing.py): this test targets
     # the top-up guard's own $3.00 - $1.00 = $2.00 incremental arithmetic,
     # not sizing adjustments layered on top of it.
-    config = replace(_demo_config(), ml_sizing_adjustment={})
+    # Likewise neutralize the live per-ticker calibration (regenerated on every publish, now a smooth
+    # 96-point curve): this test pins the top-up arithmetic on the shared global ladder, whose 0.5-1.0%
+    # tier is the 1.5x ($2 base) = $3.00 desired the docstring above relies on.
+    config = replace(_demo_config(), ml_sizing_adjustment={}, per_ticker_sizing={})
 
     class _RecordingBroker(DryRunBroker):
         def same_day_strategy_order_exists(self, ticker, trading_day):

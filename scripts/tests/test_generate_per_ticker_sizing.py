@@ -58,7 +58,7 @@ def test_default_run_refuses_to_publish_a_session_count_regression(tmp_path, mon
     output = tmp_path / "per_ticker_sizing.json"
     _ticker_config(ticker_config)
     output.write_text(
-        json.dumps({"tickers": {"ABC": {"sample_sessions": 300}}}),
+        json.dumps({"lookback_days": 90, "tickers": {"ABC": {"sample_sessions": 300}}}),
         encoding="utf-8",
     )
     rows = ["Date,Open,High,Low,Close,Adj Close,Volume"]
@@ -246,13 +246,11 @@ def test_adjusted_low_drops(tmp_path):
     assert abs(drops[0] - 20.0) < 0.01
 
 def test_tiers_from_drops():
-    # If PERCENTILE_MULTIPLIERS is [ (0.25, 1.0), (0.5, 1.5), (0.75, 2.5), (0.9, 4.0), (0.975, 5.0) ]
-    # Drops: 10, 20, 30, 40, 50
-    # Let's mock PERCENTILE_MULTIPLIERS just for robustness if we could, but we can just use real ones
-    drops = [1.0, 2.0, 3.0, 4.0, 5.0]
+    # 96 distinct drops -> every percentile lands on its own threshold, so no ties collapse.
+    drops = [float(i) for i in range(1, 97)]
     tiers = sizing.tiers_from_drops(drops)
 
-    assert len(tiers) == len(sizing.PERCENTILE_MULTIPLIERS)
+    assert len(tiers) == len(sizing.PERCENTILE_MULTIPLIERS) == 96
     for t in tiers:
         assert "min_drop_pct" in t
         assert "multiplier" in t
@@ -265,8 +263,8 @@ def test_build_sizing_payload(tmp_path):
 
     today_str = datetime.date.today().isoformat()
 
-    # A has enough history (MINIMUM_HISTORY_SESSIONS = 252)
-    # We need 252 valid drop entries. So we need at least 253 rows.
+    # A has enough history (MINIMUM_HISTORY_SESSIONS = 40)
+    # We need 40 valid drop entries, so 300 rows is ample.
     csv_rows = ["Date,Close,Adj Close,Low"]
     for _ in range(300):
         # We ensure they're past start_date by just using today
@@ -276,7 +274,7 @@ def test_build_sizing_payload(tmp_path):
 
     # B has no history
 
-    payload = sizing.build_sizing_payload(history_dir, ticker_config, lookback_years=3)
+    payload = sizing.build_sizing_payload(history_dir, ticker_config, lookback_days=90)
 
     assert "version" in payload
     assert "status" in payload
@@ -284,8 +282,85 @@ def test_build_sizing_payload(tmp_path):
     assert "A" in payload["tickers"]
     assert "B" in payload["tickers"]
 
-    assert payload["tickers"]["A"]["source"] == "three_year_adjusted_daily_low_percentiles"
+    assert payload["tickers"]["A"]["source"] == "ninety_day_adjusted_daily_low_percentiles"
     assert payload["tickers"]["B"]["source"] == "global_fallback_insufficient_history"
 
     assert "B" in payload["fallback_tickers"]
     assert "A" not in payload["fallback_tickers"]
+
+
+def test_percentile_ladder_is_the_owner_specified_96_tier_curve():
+    """2026-10-05: one tier per percentile 5th..100th; 8.00x at the 95th, 10.00x at the 100th."""
+    ladder = dict(sizing.PERCENTILE_MULTIPLIERS)
+    assert len(sizing.PERCENTILE_MULTIPLIERS) == 96
+    percentiles = [p for p, _ in sizing.PERCENTILE_MULTIPLIERS]
+    assert percentiles == [round(0.05 + i / 100, 2) for i in range(96)]
+    multipliers = [m for _, m in sizing.PERCENTILE_MULTIPLIERS]
+    assert multipliers == sorted(multipliers)  # never steps down as the drop gets rarer
+    # Spot checks against the owner's table.
+    assert [ladder[p] for p in (0.05, 0.10, 0.11, 0.25, 0.50, 0.75, 0.90, 0.95, 0.96, 0.99, 1.0)] == [
+        1.00, 1.00, 1.03, 1.45, 2.46, 4.17, 6.38, 8.00, 8.17, 9.08, 10.00
+    ]
+
+
+def test_lookback_is_ninety_days_and_hundredth_percentile_is_the_largest_drop(tmp_path):
+    assert sizing.LOOKBACK_DAYS == 90
+    history_dir = tmp_path / "h"
+    history_dir.mkdir()
+    ticker_config = tmp_path / "tickers.json"
+    ticker_config.write_text('{"active": ["A"]}', encoding="utf-8")
+    as_of = datetime.date(2026, 10, 5)
+    rows = ["Date,Close,Adj Close,Low", "2026-06-01,100,100,100"]  # outside the 90-day window
+    for day in range(60):
+        rows.append(f"{(as_of - datetime.timedelta(days=60 - day)).isoformat()},100,100,{100 - 1 - (day % 5)}")
+    rows.append(f"{(as_of - datetime.timedelta(days=1)).isoformat()},100,100,80")  # the window's worst day: 20%
+    (history_dir / "A.csv").write_text("\n".join(rows))
+    payload = sizing.build_sizing_payload(history_dir, ticker_config, as_of=as_of)
+    assert payload["lookback_days"] == 90
+    top = payload["tickers"]["A"]["tiers"][-1]
+    assert top == {"min_drop_pct": 20.0, "multiplier": 10.0}
+
+
+def test_session_count_guard_skips_when_the_lookback_window_changed(tmp_path):
+    output = tmp_path / "per_ticker_sizing.json"
+    output.write_text(json.dumps({"lookback_days": 1095, "tickers": {"A": {"sample_sessions": 751}}}))
+    new = {"A": {"sample_sessions": 63}}
+    # The 3-year -> 90-day switch is a deliberate window change, not a truncated archive.
+    assert sizing.session_count_regressions(new, output, 90) == {}
+    output.write_text(json.dumps({"lookback_days": 90, "tickers": {"A": {"sample_sessions": 63}}}))
+    assert sizing.session_count_regressions({"A": {"sample_sessions": 40}}, output, 90)["A"]["new"] == 40
+
+
+def test_tiers_from_drops_collapses_ties_to_highest_multiplier():
+    tiers = sizing.tiers_from_drops([0.0] * 300)  # every percentile clamps to 0.01
+    assert tiers == [{"min_drop_pct": 0.01, "multiplier": 10.0}]  # the 100th percentile's 10.00x wins the tie
+
+
+def test_global_fallback_tiers_match_sizing_ladder_config():
+    import json
+    from pathlib import Path
+
+    ladder = json.loads((Path(__file__).resolve().parents[2] / "config" / "sizing_ladder.json").read_text())
+    assert list(sizing.GLOBAL_FALLBACK_TIERS) == [(t["min_drop_pct"], t["multiplier"]) for t in ladder["tiers"]]
+
+
+def test_render_payload_puts_each_tier_on_one_line_and_round_trips():
+    payload = {"tickers": {"A": {"tiers": [{"min_drop_pct": 0.5, "multiplier": 1.0}, {"min_drop_pct": 1.25, "multiplier": 10.0}]}}}
+    text = sizing.render_payload(payload)
+    assert '{"min_drop_pct": 0.5, "multiplier": 1.0}' in text
+    assert json.loads(text) == payload
+
+
+def test_calibrated_tickers_are_marked_for_linear_interpolation_and_fallback_tickers_are_not(tmp_path):
+    history_dir = tmp_path / "h"
+    history_dir.mkdir()
+    ticker_config = tmp_path / "tickers.json"
+    ticker_config.write_text('{"active": ["A", "B"]}', encoding="utf-8")
+    as_of = datetime.date(2026, 10, 5)
+    rows = ["Date,Close,Adj Close,Low"] + [
+        f"{(as_of - datetime.timedelta(days=60 - day)).isoformat()},100,100,{99 - (day % 4)}" for day in range(60)
+    ]
+    (history_dir / "A.csv").write_text("\n".join(rows))
+    payload = sizing.build_sizing_payload(history_dir, ticker_config, as_of=as_of)
+    assert payload["tickers"]["A"]["interpolation"] == "linear"
+    assert "interpolation" not in payload["tickers"]["B"]  # B has no history: global fallback ladder, stepped

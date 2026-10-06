@@ -20,6 +20,7 @@ from dca_ticker_paths import configured_ticker_history_dir
 from scripts.generate_per_ticker_sizing import (
     archive_unavailable_reason,
     build_sizing_payload,
+    render_payload,
     session_count_regressions,
 )
 
@@ -46,10 +47,10 @@ def _build_and_publish(
     if unavailable is not None:
         return {"status": "blocked_archive_unavailable", "archive_unavailable": unavailable}
     payload = build_sizing_payload(history_dir, ticker_config, as_of=now.date())
-    regressions = _session_count_regressions(payload["tickers"], output)
+    regressions = _session_count_regressions(payload["tickers"], output, payload["lookback_days"])
     if regressions:
         return {"status": "blocked_session_count_regression", "session_count_regressions": regressions}
-    atomic_write_text(output, json.dumps(payload, indent=2) + "\n")
+    atomic_write_text(output, render_payload(payload))
     return {
         "status": "completed",
         "calibrated_tickers": len(payload["tickers"]),
