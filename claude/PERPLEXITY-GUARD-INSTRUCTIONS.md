@@ -1,5 +1,12 @@
 # Same-day top-up guard, self-contained for the Perplexity executor
 
+> **SUPERSEDED -- DO NOT PASTE THIS FILE'S §2.** The maintained copy is
+> `claude/PERPLEXITY-SAME-DAY-TOPUP-GUARD.md`. This older text counts cancelled
+> and rejected orders as prior exposure, has no $1-minimum handling, and does
+> not say that a whole-day "already bought today" duplicate gate is replaced by
+> the top-up guard (2026-10-06: Perplexity's 12:50 pass rejected eleven
+> cheaper-than-earlier-fill tickers that way). Kept only as history.
+
 Written 2026-07-31. **This file is a source document, not an executable path.**
 Perplexity runs inside its own app and cannot read this repo, so nothing here
 takes effect until the text in §2 is pasted into the Perplexity task prompts

@@ -55,6 +55,19 @@ is stale.
 > is a repeat sized as though nothing had been bought yet. Repeats must be sized
 > down to the incremental difference and only taken at a strictly lower price.
 >
+> **THIS GUARD REPLACES ANY "ALREADY BOUGHT TODAY" DUPLICATE GATE.** If this task
+> carries an older rule that rejects a ticker outright because it was bought
+> earlier today (a "duplicate gate", "one buy per ticker per day", or similar),
+> that rule is SUPERSEDED and must not run. A ticker bought earlier today is
+> never rejected for that reason alone; it goes through Steps 1-5 below and is
+> bought only when Step 3 says so. The ONLY outright exclusions are the two this
+> guard itself names: a ticker the other executor already bought in THIS SAME
+> slot window (first-come-first-serve check), and a second order for the same
+> ticker inside one batch (Step 4). On 2026-10-06 the 12:50 pass rejected
+> STX, WDC, DXYZ, AMAT and DRAM as "already bought today" although each was
+> 0.5%-3% cheaper than its earlier fill from a different slot -- exactly the
+> lower-price repeat this guard exists to buy.
+>
 > **Step 1 — Read today's fills.** Call `get_equity_orders` for the account with
 > `created_at_gte` set to today's date, and follow EVERY pagination cursor to
 > completion. If you cannot reach the final page, place NOTHING this pass and
@@ -138,8 +151,18 @@ is stale.
 >   nothing numeric yet to compare `current_price` against.
 > - Else if `current_price` is NOT strictly less than `prior_price` → buy
 >   **$0.00**. Skip it. Equal prices do not qualify.
-> - Else → buy `max(0, desired_usd - prior_usd)`. If that is $0.00 or less, skip
->   the ticker.
+> - Else → let `delta = desired_usd - prior_usd`, in whole cents.
+>   - `delta` is $0.00 or less → skip the ticker.
+>   - `delta` is at least $1.00 → buy exactly `delta`. This is the "difference
+>     bought in a later pass" case: any shortfall that was too small to place
+>     earlier is placed as soon as it reaches $1.00 or more.
+>   - `delta` is above $0.00 but below $1.00 → buy **$0.00** for now. Robinhood's
+>     minimum order is $1.00, so a smaller order would be rejected, and a
+>     rejection stops the rest of the batch. Do NOT round it up. Do NOT drop it
+>     either: `prior_usd` is unchanged, so the same shortfall is recomputed on
+>     every later pass and is bought on the first pass where `desired_usd -
+>     prior_usd` reaches $1.00 at a strictly lower price. Report it as
+>     "sub-minimum difference outstanding", not as a duplicate rejection.
 >
 > Never round a computed amount up. Never restore a $0.00 back to the desired
 > amount. Never place more than the computed amount.
