@@ -19,7 +19,7 @@ permissions:
 jobs:
   test:
     name: Lint & test (core DCA)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # The suite runs in well under a minute. A generous ceiling that still stops
     # a hung job from burning the full 6-hour runner default.
     timeout-minutes: 15
@@ -65,7 +65,7 @@ jobs:
 
   audit:
     name: Dependency & secret audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -101,7 +101,7 @@ jobs:
   # core lint/test/dev-audit surface and must not claim to repair research.
   research-audit:
     name: Dependency audit (research)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -152,7 +152,7 @@ jobs:
 
   production-safe-agent-loop:
     name: Lint & test (production-safe-agent-loop)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -186,7 +186,7 @@ jobs:
 
   ticker-advisor:
     name: Lint & test (ticker-advisor)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -228,7 +228,7 @@ jobs:
 
   ml-forecaster:
     name: Lint & test (ml-forecaster)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -270,7 +270,7 @@ jobs:
 
   wondrous-octopus:
     name: Lint & test (wondrous-octopus)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # 20 (not the sibling-standard 10): the CPU torch wheel adds ~200 MB of
     # download plus the transformer tests' training time.
     timeout-minutes: 20
@@ -320,7 +320,7 @@ jobs:
 
   ticker-market-breadth:
     name: Lint & test (ticker-market-breadth)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -349,7 +349,7 @@ jobs:
 
   llm-providers:
     name: Lint & test (llm-providers)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -378,7 +378,7 @@ jobs:
 
   yfinance-prefetch:
     name: Lint & test (yfinance-prefetch)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7

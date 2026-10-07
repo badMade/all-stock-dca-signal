@@ -120,6 +120,5 @@ def test_order_placement_rechecks_authorization_with_deterministic_ref_id(path):
 @pytest.mark.parametrize("path", BACKUPS, ids=lambda p: p.name)
 def test_finance_no_data_and_disagreement_are_distinguished(path):
     text = path.read_text(encoding="utf-8")
-    low = text.lower()
-    assert "no_data" in low and "disagree" in low
+    assert "finance NO_DATA" in text and "Finance DISAGREEMENT" in text
     assert "a finance gap, rate limit, or disagreement does NOT block" not in text
