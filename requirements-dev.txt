@@ -39,4 +39,4 @@ scipy-stubs==1.18.1.0 ; python_version >= "3.12"
 # Audit/type tooling uses the same reproducible installation path as lint/tests.
 pip-audit==2.10.1
 pyright==1.1.414
-uv==0.12.19
+uv==0.12.23
