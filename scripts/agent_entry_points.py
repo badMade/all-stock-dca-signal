@@ -85,6 +85,35 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         notes="The printed JSON's buy_usd per ticker is authoritative. Never recompute it by hand.",
     ),
     EntryPoint(
+        need="Write the slot's order plan file before Gate 7 places anything (plan-first backup executor)",
+        command=(
+            "python3 -m scripts.emit_order_plan --trading-day <YYYY-MM-DD> --slot <slot_id> "
+            "--candidates <resolved buy list file> [--out <plan file>]"
+        ),
+        exists_path="scripts/emit_order_plan.py",
+        doc_ref="docs/adr-plan-first-backup-executor.md",
+        symbols=("main",),
+        notes=(
+            "Emit only: places nothing and never resizes buy_usd. A FAILED result (exit 2) writes no "
+            "file and must not block placement. A plan is input for the backup executor, never "
+            "evidence of a purchase."
+        ),
+    ),
+    EntryPoint(
+        need="Read, compute, or finalize the backup executor's order plan (plan-first backup)",
+        command=(
+            "python3 -m scripts.backup_planner {plan|compute|finalize} --trading-day <YYYY-MM-DD> "
+            "--slot <slot_id> ..."
+        ),
+        exists_path="scripts/backup_planner.py",
+        doc_ref="docs/adr-plan-first-backup-executor.md",
+        symbols=("main",),
+        notes=(
+            "Prints one JSON document; exit 2 means place nothing. Always the Normal budget tier. "
+            "Never places an order and never prints the account number."
+        ),
+    ),
+    EntryPoint(
         need="Assemble saved oversized get_equity_orders pages into an orders_pages envelope",
         command=(
             "python3 -m scripts.assemble_order_pages --account <acct> --trading-day <YYYY-MM-DD> "

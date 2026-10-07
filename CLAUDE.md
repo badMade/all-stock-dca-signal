@@ -235,6 +235,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `docs/README.md` | Doc index + quick-reference facts (universe, ladder, budgets, test window) |
 | `agent-vault/README.md` | Vendored loop-and-gate memory vault (self-improving agent memory, three task skills, runbooks). Start `claude` from inside `agent-vault/`; dry-run only, Notion read-only, pinned in `UPSTREAM.md` |
 | `docs/local_env_file.md`, `docs/adr-dotenv-loader.md` | The local `.env` loader: setup, verification, troubleshooting, and the decision record |
+| `docs/adr-plan-first-backup-executor.md` | Proposed ADR for the plan-first backup executor: order-plan files (`dca_order_plan.py`, `schemas/order_plan.schema.json`), Mac-first backup, compute fallbacks, fail-closed re-validation |
 | `docs/local_console.md` | Checkout-only console setup, API, authentication, LAN/proxy access and launchd runbooks; never places brokerage orders |
 | `docs/live_wiring.md` | Modules, dependency injection, the three entry points, state persistence, local agent quick reference |
 | `scripts/agent_entry_points.py` | Live index of existing entry points to reuse instead of writing new code (`--json`/`--search`) |

@@ -1,0 +1,114 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "order_plan.schema.json",
+  "title": "Slot order plan",
+  "description": "DRAFT (ADR docs/adr-plan-first-backup-executor.md). One trading day and one slot's intended buys, written by the primary Claude slot runner BEFORE placement and re-derivable by the backup executor. A plan is INPUT only: it is never evidence that anything was bought (broker order history is the only such evidence), and every order in it is re-validated by code against universe, do-not-buy list, per-order cap, daily and weekly caps from a fresh full-day order pull, one-order-per-ticker, and a fresh quote below the prior close before any placement. Validation failure means an empty plan plus a structured error, never a partial buy.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "trading_day",
+    "slot",
+    "generated_at_et",
+    "generator",
+    "ladder_version",
+    "universe_hash",
+    "orders"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Bumped on any breaking change; a reader rejects every other value."
+    },
+    "trading_day": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+      "description": "America/New_York trading date the plan is valid for. A plan for any other date is rejected."
+    },
+    "slot": {
+      "type": "string",
+      "enum": ["0935", "1030", "1130", "1230", "1330", "1430", "1530"],
+      "description": "dca_runner slot id (the keys of dca_runner.SLOTS). A plan is valid only for its own slot."
+    },
+    "generated_at_et": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Timezone-aware America/New_York timestamp. Informational for audit; staleness is decided by trading_day and slot plus per-order fresh-quote checks, not by age."
+    },
+    "generator": {
+      "type": "string",
+      "enum": ["claude", "backup"],
+      "description": "Which engine produced the plan. Does not affect validation."
+    },
+    "ladder_version": {
+      "type": "string",
+      "description": "The `version` field of config/sizing_ladder.json the plan was sized with. A mismatch against the reader's current config rejects the plan."
+    },
+    "universe_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "sha256 over the sorted, newline-joined active tickers from config/tickers.json, followed by a final newline. A mismatch against the reader's current universe rejects the plan (tamper or drift)."
+    },
+    "orders": {
+      "type": "array",
+      "description": "Intended buys in allocation-priority order (higher multiplier, then larger drop_pct, then ticker alphabetical), matching dca_runner.plan_orders. At most one order per symbol.",
+      "items": {
+        "type": "object",
+        "required": [
+          "symbol",
+          "notional_usd",
+          "multiplier",
+          "drop_pct",
+          "decision_price",
+          "prior_close",
+          "prior_low",
+          "ref_id"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9.]{0,9}$",
+            "description": "Must be in config/tickers.json active and never in excluded (QBUT). whole_share tickers are out of scope for this plan."
+          },
+          "notional_usd": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 16,
+            "multipleOf": 0.01,
+            "description": "Dollar amount, cent precision. Equals selected base x multiplier. The schema ceiling mirrors config/budgets.json circuit_breakers.max_per_order_usd; the code check reads the live value, not this number."
+          },
+          "multiplier": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 10
+          },
+          "drop_pct": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Percent below the prior close at decision time. Always positive: a plan lists only buys. The smallest drop that buys is set by the ticker's sizing (0.1% on the global ladder, as low as 0.01% on a per-ticker calibration)."
+          },
+          "decision_price": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "prior_close": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          },
+          "prior_low": {
+            "type": ["number", "null"],
+            "exclusiveMinimum": 0,
+            "description": "Null when unknown; the base is then the $1 scale."
+          },
+          "ref_id": {
+            "type": "string",
+            "pattern": "^dca-runner-(0935|1030|1130|1230|1330|1430|1530)-[0-9]{4}-[0-9]{2}-[0-9]{2}-[A-Z][A-Z0-9.]{0,9}$",
+            "description": "dca-runner-<slot_id>-<trading_day>-<TICKER>, the same derivation dca_runner.execute_plan uses. Reuse is NOT assumed to give broker-side idempotency (ADR decision D6); reconciliation depends on a fresh order pull."
+          }
+        }
+      }
+    }
+  }
+}
