@@ -456,7 +456,7 @@ window.ConsolePages = (() => {
       if (value.every((item) => item && typeof item === "object" && !Array.isArray(item))) {
         const columns = [];
         for (const item of value.slice(0, 50)) for (const key of Object.keys(item)) if (!columns.includes(key) && columns.length < 10) columns.push(key);
-        return table(columns.map((key) => ({ label: key.replaceAll("_", " "), get: (row) => typeof row[key] === "object" && row[key] !== null ? JSON.stringify(row[key]).slice(0, 160) : row[key] })), value.slice(0, 200), "empty");
+        return table(columns.map((key) => ({ label: key.replaceAll("_", " "), get: (row) => key === "curve" && Array.isArray(row[key]) ? row[key].map((point) => `${point.drop_pct}%→${point.multiplier}x`).join("  ") : typeof row[key] === "object" && row[key] !== null ? JSON.stringify(row[key]).slice(0, 160) : row[key] })), value.slice(0, 200), "empty");
       }
       return text("p", "", value.map(show).join(", "));
     }

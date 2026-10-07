@@ -33,6 +33,9 @@ MAX_ROWS = 200
 MAX_VIEW_CHARS = 200_000
 GRID_MAX_DROP_PCT = 16.0
 GRID_STEP_PCT = 0.25
+# Sample drops for each per-ticker calibrated curve in ladder_preview (the 96-tier
+# curve is too long to list per ticker; these show its shape up to the 16% grid top).
+PER_TICKER_CURVE_DROPS_PCT = (0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0)
 BANNER = ("This console never places, reviews or cancels orders; "
           "live placement happens only in external agent sessions.")
 PARITY_NOTE = ("Structural, in-process comparison only; the authoritative gate is the "
@@ -463,7 +466,20 @@ def ladder_preview(config_dir: Path) -> dict[str, Any]:
         _warn_loader(warnings, config_dir, "per_ticker_sizing.json", exc)
         loaded = {}
     for ticker, model in sorted(loaded.items())[:MAX_ROWS]:
-        per_ticker.append({"ticker": _text(ticker, 16), "entries": len(model.get("tiers", ())), "version": version})
+        curve_tiers = model.get("tiers", ())
+        # The calibrated curve is what live sizing uses (the grid above is only the
+        # global fallback ladder), so each row carries its ceiling, whether tiers are
+        # blended or stepped, and sampled points from graded_buy_multiplier itself so
+        # the preview cannot drift from the live function.
+        per_ticker.append({
+            "ticker": _text(ticker, 16), "entries": len(curve_tiers), "version": version,
+            "max_multiplier": max((multiplier for _drop, multiplier in curve_tiers), default=0.0),
+            "interpolation": "linear" if model.get("interpolate") else "stepped",
+            "curve": [
+                {"drop_pct": drop, "multiplier": near_close_dca.graded_buy_multiplier(drop / 100, config, ticker=ticker)}
+                for drop in PER_TICKER_CURVE_DROPS_PCT
+            ],
+        })
     return {"grid": grid, "tiers": tiers, "per_ticker": per_ticker, "warnings": warnings}
 
 

@@ -688,7 +688,7 @@ class ConsoleApp:
     def snapshot(self, day: date | None = None, ticker: str = "", period: str = "all") -> dict:
         """Read current evidence, cache briefly, and save a sanitized daily digest."""
         from dca_console_data import build_daily_snapshot
-        from dca_console_octopus import build_octopus_snapshot
+        from dca_console_octopus import build_octopus_snapshot, primary_universe
 
         request_default_day = self.default_day()
         day = request_default_day if day is None else day
@@ -703,7 +703,12 @@ class ConsoleApp:
                     self.settings.root, day, now, self.settings.config_dir,
                     excluded_roots=(self.settings.output / "demo",) if self.settings.mode == "local" else (),
                 )
-                octopus = build_octopus_snapshot(self.octopus_run, ticker=ticker, period=period)
+                # Default research view = the primary universe (active minus whole-share);
+                # an explicit ticker overrides it so any ticker in the run stays reachable.
+                octopus = build_octopus_snapshot(
+                    self.octopus_run, ticker=ticker, period=period,
+                    universe=primary_universe(self.settings.config_dir) or None,
+                )
                 data = {
                     "mode": self.settings.mode, "now": now.isoformat(), "default_date": request_default_day.isoformat(),
                     "daily": daily, "octopus": octopus, "warnings": [],

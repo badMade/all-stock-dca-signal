@@ -2,7 +2,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const state = { snapshot: null, token: null, loading: false, queued: false, timer: null, logTimer: null, dateInitialized: false, docsRequest: 0, launching: new Set() };
+const state = { snapshot: null, token: null, loading: false, queued: false, timer: null, logTimer: null, dateInitialized: false, serverTicker: "", docsRequest: 0, launching: new Set() };
 const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
 const number = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
 const etTime = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" });
@@ -184,7 +184,8 @@ function renderResearch(octopus = {}) {
   }
   renderWarnings("research-warnings", octopus?.warnings);
   const forecasts = normalizeForecasts(octopus?.forecasts);
-  const tickers = [...new Set(forecasts.map((row) => row.ticker).filter(Boolean))].sort();
+  // Every ticker in the run, not just the (default-universe) rows shown, so the filter reaches any of them.
+  const tickers = arr(octopus?.available_tickers).length ? arr(octopus.available_tickers) : [...new Set(forecasts.map((row) => row.ticker).filter(Boolean))].sort();
   const datalist = $("ticker-options");
   if (datalist) {
     datalist.replaceChildren(...tickers.map((ticker) => {
@@ -223,7 +224,8 @@ function renderForecasts() {
   const all = normalizeForecasts(state.snapshot?.octopus?.forecasts);
   const datalist = $("ticker-options");
   if (datalist && all.length > 0) {
-    const uniqueTickers = Array.from(new Set(all.map((f) => f.ticker).filter(Boolean))).sort();
+    const available = arr(state.snapshot?.octopus?.available_tickers);
+    const uniqueTickers = available.length ? available : Array.from(new Set(all.map((f) => f.ticker).filter(Boolean))).sort();
     if (datalist.children.length !== uniqueTickers.length) {
       datalist.replaceChildren(...uniqueTickers.map((sym) => {
         const opt = document.createElement("option");
@@ -734,6 +736,7 @@ async function refresh() {
   $("refresh").disabled = true;
   const date = $("report-date").value;
   const query = new URLSearchParams(state.dateInitialized ? { date } : {});
+  if (state.serverTicker) query.set("ticker", state.serverTicker);
   $("export").href = `/api/export?${query}`;
   try {
     if (!state.token) {
@@ -906,7 +909,17 @@ $("report-date").value = dateInET();
 $("report-date").addEventListener("change", () => { if ($("report-date").value) { state.dateInitialized = true; refresh(); } });
 $("refresh").addEventListener("click", refresh);
 $("run-demo").addEventListener("click", () => startJob("demo-all"));
-$("ticker-filter").addEventListener("input", renderForecasts);
+// The default view is the primary universe; typing an exact ticker from the run asks the server for it
+// (any ticker is reachable), and clearing or typing a partial returns to the default view.
+function syncServerTicker() {
+  const typed = $("ticker-filter").value.trim().toUpperCase();
+  const available = arr(state.snapshot?.octopus?.available_tickers);
+  const wanted = typed && available.includes(typed) ? typed : "";
+  if (wanted === (state.serverTicker || "")) return;
+  state.serverTicker = wanted;
+  refresh();
+}
+$("ticker-filter").addEventListener("input", () => { renderForecasts(); syncServerTicker(); });
 $("component-filter").addEventListener("change", () => { renderForecasts(); renderPeriods(); });
 $("period-filter").addEventListener("change", renderPeriods);
 $("docs-close").addEventListener("click", () => $("docs-dialog").close());

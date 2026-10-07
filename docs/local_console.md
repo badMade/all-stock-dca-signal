@@ -75,7 +75,12 @@ Every section is backed by a reader today.
   ticker filtering and source dates. A pending target without a known date is
   labeled as the next trading row (date unresolved); resolved targets show their
   exact target date (with (est.) for weekday estimates). The latest research run
-  is independent of the selected historical DCA date.
+  is independent of the selected historical DCA date. The default view is the
+  primary universe (`config/tickers.json` `active`, which excludes the whole-share
+  and excluded symbols); typing an exact ticker from the run in the filter asks
+  the server for it, so any ticker in the run is reachable, and the filter's
+  choices come from every ticker in the run (`available_tickers`), not only the
+  rows shown.
 - Historical periods: measured model errors, coverage and skill versus
   persistence where recorded. Only periods actually present in the report have
   results; the synthetic demo does not cover all historical crises.

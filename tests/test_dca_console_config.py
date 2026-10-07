@@ -249,6 +249,33 @@ def test_ladder_preview_matches_the_strategy_functions(cfg):
     json.dumps(result, allow_nan=False)
 
 
+def test_ladder_preview_per_ticker_rows_expose_the_calibrated_curve(cfg):
+    # The per-ticker 90-day log-scaled curve (up to 10x) is what live sizing uses, but
+    # the preview used to show only "entries" + "version" for it, so the console's
+    # ladder table (the 8x global fallback) read as if it were the live curve. Each row
+    # must now carry the curve's ceiling, its interpolation mode and sampled points that
+    # agree with graded_buy_multiplier -- the same function live sizing calls.
+    result = reader.ladder_preview(cfg)
+    rows = {row["ticker"]: row for row in result["per_ticker"]}
+    raw = load(cfg, "per_ticker_sizing")["tickers"]
+    config = dca_config.load_strategy_config(cfg)
+    assert rows and result["warnings"] == []
+    for ticker, row in rows.items():
+        assert row["max_multiplier"] == max(tier["multiplier"] for tier in raw[ticker]["tiers"])
+        assert row["interpolation"] == ("linear" if raw[ticker].get("interpolation") == "linear" else "stepped")
+        curve = row["curve"]
+        assert len(curve) >= 5 and [p["drop_pct"] for p in curve] == sorted({p["drop_pct"] for p in curve})
+        for point in curve:
+            expected = reader.near_close_dca.graded_buy_multiplier(point["drop_pct"] / 100, config, ticker=ticker)
+            assert point["multiplier"] == expected
+        assert max(p["multiplier"] for p in curve) <= row["max_multiplier"]
+    # The headline fact the operator was looking for: some calibrated ticker reaches 10x,
+    # and a fallback ticker (global-ladder copy) is labelled stepped, not interpolated.
+    assert max(row["max_multiplier"] for row in rows.values()) == 10.0
+    assert rows["RVII"]["interpolation"] == "stepped"
+    json.dumps(result, allow_nan=False)
+
+
 def test_ladder_point_validates_drop_and_ticker(cfg):
     for bad in (
         (-1, "AAPL"),

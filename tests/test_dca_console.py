@@ -1466,3 +1466,28 @@ def test_actions_include_last_updated_metadata(tmp_path, monkeypatch):
             assert isinstance(lu, dict)
             assert "status" in lu and "timestamp" in lu and "label" in lu
 
+
+
+def test_snapshot_defaults_research_to_the_primary_universe_and_ticker_overrides_it(tmp_path, monkeypatch):
+    """Wiring check for the research page: the default view is tickers.json's active
+    list (never the whole-share BYDDY/RVII), an explicit ticker reaches any symbol in
+    the run, and the filter's choices cover every ticker in the run."""
+    packages = {"numpy": True, "pandas": True, "sklearn": True, "torch": True}
+    run_dir = tmp_path / "octopus"
+    pending = lambda ticker: {  # noqa: E731
+        "ticker": ticker, "model": "octopus", "origin_date": "2026-09-04", "ref_close": 100,
+        "point": {name: 0.01 for name in ("open", "high", "low", "close")},
+        "quantiles": {name: {"p10": -0.02, "p50": 0.01, "p90": 0.03} for name in ("open", "high", "low", "close")},
+    }
+    checkpoint = run_dir / "checkpoint" / "harness_state.json"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text(json.dumps({
+        "last_processed_date": "2026-09-04",
+        "outstanding": {"2026-09-08": [pending(t) for t in ("AAPL", "BYDDY", "ZZZZ")]},
+    }), encoding="utf-8")
+    with probed_console(tmp_path, monkeypatch, packages, octopus_run=run_dir) as application:
+        default = application.snapshot(date(2026, 9, 8))["octopus"]
+        assert {row["ticker"] for row in default["forecasts"]} == {"AAPL"}
+        assert default["available_tickers"] == ["AAPL", "BYDDY", "ZZZZ"]
+        override = application.snapshot(date(2026, 9, 8), ticker="ZZZZ")["octopus"]
+        assert {row["ticker"] for row in override["forecasts"]} == {"ZZZZ"}

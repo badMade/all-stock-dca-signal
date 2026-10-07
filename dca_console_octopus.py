@@ -1,7 +1,8 @@
 """Bounded, standard-library views of Wondrous Octopus research artifacts.
 
-This adapter never loads model weights, imports research dependencies, or reads
-the trading configuration. Forecasts are adjusted-dollar research observations.
+This adapter never loads model weights or imports research dependencies. The only
+trading configuration it reads is the ticker list (``primary_universe``), to pick
+the research page's default view. Forecasts are adjusted-dollar research observations.
 The checkpoint and published daily/report files are the authority; uncommitted
 ledger tails are deliberately not read.
 """
@@ -14,8 +15,9 @@ import math
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Collection
 
+import dca_config
 from dca_console_reader import MAX_BYTES, MAX_FILES, BoundedReader, iso_date, root_label
 
 # Module-level copies of the shared limits: tests tighten them per module, and
@@ -246,13 +248,34 @@ def _periods(report: dict, selected: str) -> list[dict]:
     return rows
 
 
+def primary_universe(config_dir: Path) -> tuple[str, ...]:
+    """The research page's default tickers: ``active`` minus whole-share and excluded symbols.
+
+    tickers.json keeps ``whole_share`` and ``excluded`` as arrays separate from
+    ``active``, so today this equals ``active``; the subtraction keeps the default
+    view right if a symbol is ever listed in both. Empty when the file is absent
+    or malformed (the caller then falls back to the unfiltered view).
+    """
+    try:
+        loaded = dca_config.load_tickers(Path(config_dir))
+    except (ValueError, TypeError):
+        return ()
+    skipped = set(loaded.get("whole_share_tickers", ())) | set(loaded.get("excluded_tickers", ()))
+    return tuple(sorted({str(t).upper() for t in loaded.get("tickers", ())} - {str(t).upper() for t in skipped}))
+
+
 def build_octopus_snapshot(
-    run_dir: Path | None, *, ticker: str = "", period: str = "all", limit: int = 200
+    run_dir: Path | None, *, ticker: str = "", period: str = "all", limit: int = 200,
+    universe: Collection[str] | None = None,
 ) -> dict:
     """Read a selected run for the console, without importing or updating models.
 
     ``period`` filters historical regime metrics (``all`` includes all regimes);
     ticker filters only pending forecasts, never changes aggregate metrics.
+    ``universe`` is the default view: when no ticker is requested only those
+    tickers' forecasts are returned, and an explicit ``ticker`` overrides it so any
+    ticker in the run stays reachable. ``available_tickers`` always lists every
+    ticker in the run, so a filter's choices do not depend on the rows shown.
     Unknown next-trading-row dates remain null. Returned numbers are finite or
     null, and only documented research fields are exposed to the interface.
     """
@@ -265,6 +288,8 @@ def build_octopus_snapshot(
         "warnings": [],
         "forecast_count": 0,
         "truncated": False,
+        "available_tickers": [],
+        "default_universe_count": 0,
     }
     if run_dir is None:
         snapshot["summary"] = ["Select a Wondrous Octopus run directory to view forecasts and scored periods."]
@@ -341,7 +366,16 @@ def build_octopus_snapshot(
         if key in _mapping(report.get("by_regime"))
     ]
     query = ticker.strip().upper()
-    filtered = sorted((row for row in rows if not query or row["ticker"] == query), key=lambda r: (r["ticker"], r["model"]))
+    default_view = {symbol.upper() for symbol in universe} if universe and not query else None
+    snapshot["available_tickers"] = sorted({row["ticker"] for row in rows})
+    snapshot["default_universe_count"] = (
+        len({universe_symbol.upper() for universe_symbol in universe} & set(snapshot["available_tickers"]))
+        if universe else 0
+    )
+    filtered = sorted(
+        (row for row in rows if (not query or row["ticker"] == query) and (default_view is None or row["ticker"] in default_view)),
+        key=lambda r: (r["ticker"], r["model"]),
+    )
     bound = max(1, min(_MAX_RESULTS, limit))
     snapshot["forecasts"] = filtered[:bound]
     snapshot["forecast_count"] = len(filtered)
@@ -356,6 +390,11 @@ def build_octopus_snapshot(
     if snapshot["as_of"]:
         lines.append(f"Latest processed trading day: {snapshot['as_of']}.")
     lines.append(f"{len(filtered)} pending forecast rows across {len({row['ticker'] for row in filtered})} tickers.")
+    if default_view is not None:
+        lines.append(
+            f"Showing the {snapshot['default_universe_count']} primary tickers; "
+            f"filter by ticker to see any of the run's {len(snapshot['available_tickers'])}."
+        )
     if snapshot["truncated"]:
         lines.append(f"Showing the first {bound} matching forecast rows.")
     for model, block in daily.get("models", {}).items():

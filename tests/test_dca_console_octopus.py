@@ -251,3 +251,41 @@ def test_csv_without_target_date_keeps_unresolved_label_and_warns(tmp_path):
     assert forecast["expected_target_date_basis"] is None
     assert forecast["target_label"] == "Next trading row (date unresolved)"
     assert any("exact target date is not yet recorded" in w for w in result["warnings"])
+
+
+def test_default_view_is_the_primary_universe_and_the_filter_reaches_any_ticker(tmp_path):
+    # Research page regression: the snapshot used to return the first 200 rows of
+    # ticker-sorted forecasts, so late-alphabet tickers never appeared and the page's
+    # ticker filter (which only searched those rows) could not reach them. The default
+    # view is now the primary universe, an explicit ticker overrides it server-side,
+    # and the filter's choices come from every ticker in the run, not the shown rows.
+    every = [f"T{index:03d}" for index in range(300)] + ["ZZZZ"]
+    primary = ["T005", "T150", "T299", "ZZZZ"]
+    _state(tmp_path, {"2026-09-08": [_pending(ticker) for ticker in every]})
+
+    capped = adapter.build_octopus_snapshot(tmp_path)  # no universe: unchanged, capped at the limit
+    assert len(capped["forecasts"]) == 200 and capped["truncated"] is True
+    assert capped["available_tickers"] == sorted(every)
+
+    default = adapter.build_octopus_snapshot(tmp_path, universe=primary)
+    assert [row["ticker"] for row in default["forecasts"]] == sorted(primary)
+    assert default["forecast_count"] == len(primary) and default["truncated"] is False
+    assert default["available_tickers"] == sorted(every)
+    assert default["default_universe_count"] == len(primary)
+
+    # An explicit ticker is not limited to the default universe.
+    outside = adapter.build_octopus_snapshot(tmp_path, ticker="t007", universe=primary)
+    assert [row["ticker"] for row in outside["forecasts"]] == ["T007"]
+    json.dumps(default, allow_nan=False)
+
+
+def test_primary_universe_is_the_active_tickers_without_whole_share_or_excluded():
+    # "The 65 active tickers minus the whole-share ones": tickers.json keeps whole_share
+    # and excluded as separate arrays, so the helper must equal "active" and never leak
+    # BYDDY / RVII (whole-share) or QBUT (excluded) into the default research view.
+    config = Path(__file__).resolve().parents[1] / "config"
+    raw = json.loads((config / "tickers.json").read_text(encoding="utf-8"))
+    expected = [ticker for ticker in raw["active"] if ticker not in raw["whole_share"] + raw["excluded"]]
+    universe = adapter.primary_universe(config)
+    assert list(universe) == sorted(expected) and len(universe) == len(set(universe)) > 0
+    assert not set(universe) & {"BYDDY", "RVII", "QBUT"}
