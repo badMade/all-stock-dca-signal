@@ -51452,8 +51452,9 @@ def test_raw_ladder_multiplier_interpolates_only_for_calibrations_flagged_linear
 def test_non_finite_drop_buys_nothing_on_stepped_and_interpolated_ladders(bad_drop):
     """Fail closed: a NaN/inf drop (a NaN or missing price upstream) must size to 0x.
 
-    NaN used to fall through every comparison in interpolate_tier_multiplier to its
-    final ``return ordered[-1][1]`` (the TOP tier), while the stepped lookup returned 0.0.
+    Before the fix: NaN fell through every comparison in interpolate_tier_multiplier to
+    its final ``return ordered[-1][1]`` (the TOP tier) while the stepped lookup returned
+    0.0; +inf matched the top tier on BOTH the interpolated and the stepped lookups.
     """
     import near_close_dca
 
