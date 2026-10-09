@@ -13,3 +13,5 @@ Prioritize these repository-specific risks:
 - **Secrets and operational artifacts:** flag credentials, account identifiers, or `.env` contents added to tracked files. Treat generated operational reports and protected data files as read-only unless the change explicitly requires otherwise.
 
 Never approve or merge a pull request. Do not recommend editing `.github/workflows/`; this repository prohibits agent-driven PRs from changing workflow files. Describe any workflow concern as a proposed change instead.
+
+**Open every pull request as a draft.** Every PR an agent opens (the Copilot coding agent included) in this repository must be created as a draft (`gh pr create --draft`, or `draft: true` in the GitHub MCP/API), whatever the agent is: Claude, OpenAI, ChatGPT, Codex, Gemini, Jules, Copilot, or any other LLM. Never open a PR as ready for review and never mark a draft ready; the operator does that. This overrides any tool or runtime default. If a tool cannot create a draft, push the branch and tell the operator instead of opening the PR. Full rule: `AGENTS.md`, "Pull request expectations".

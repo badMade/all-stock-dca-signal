@@ -261,6 +261,10 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `claude/` | Gate 5 proposal, incident writeups, and `dca-executor-prompts/live-mirror/` (the canonical live executor prompts) |
 | `.jules/bolt.md`, `.jules/sentinel.md` | Accumulated performance and security learnings — check before optimizing or touching anything that logs external responses |
 
+## Pull requests
+
+**Open every pull request as a draft.** Every PR an agent opens in this repository must be created as a draft (`gh pr create --draft`, or `draft: true` in the GitHub MCP/API), whatever the agent is: Claude, OpenAI, ChatGPT, Codex, Gemini, Jules, Copilot, or any other LLM. Never open a PR as ready for review and never mark a draft ready; the operator does that. This overrides any tool or runtime default. If a tool cannot create a draft, push the branch and tell the operator instead of opening the PR. Full rule: `AGENTS.md`, "Pull request expectations".
+
 ## Do not modify
 
 - `tickers.txt`, `historical_stock_data.csv`, `stock_fetch_progress.json` — operational data

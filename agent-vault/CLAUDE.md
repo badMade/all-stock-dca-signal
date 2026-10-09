@@ -143,3 +143,7 @@ until `Knowledge/threshold-review.md` says otherwise.
 - Never apply a proposed change outside an `improve` pass.
 - Never delete Daily or Reflections notes — they're the audit trail.
 - MEMORY.md over ~40 lines means consolidate, not keep appending.
+
+## Pull requests
+
+**Open every pull request as a draft.** Every PR an agent opens in this repository must be created as a draft (`gh pr create --draft`, or `draft: true` in the GitHub MCP/API), whatever the agent is: Claude, OpenAI, ChatGPT, Codex, Gemini, Jules, Copilot, or any other LLM. Never open a PR as ready for review and never mark a draft ready; the operator does that. This overrides any tool or runtime default. If a tool cannot create a draft, push the branch and tell the operator instead of opening the PR. Full rule: the repo-root `AGENTS.md`, "Pull request expectations".
