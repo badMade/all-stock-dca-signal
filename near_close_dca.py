@@ -4683,7 +4683,13 @@ def interpolate_tier_multiplier(drop_vs_previous_close: float, tiers: Any) -> fl
     threshold -- the same contract as the stepped lookup. Rounded to 4 dp so
     the value a candidate row carries is exactly reproducible by the
     validators in ``dca_runner._configured_calibration_bounds``.
+
+    A non-finite drop (NaN, +/-inf -- a NaN or missing price upstream) returns
+    0.0: every comparison with NaN is False, so it would otherwise fall through
+    to the last tier's multiplier, and +inf would clamp to it. Fail closed.
     """
+    if not math.isfinite(drop_vs_previous_close):
+        return 0.0
     ordered = sorted((float(threshold), float(multiplier)) for threshold, multiplier in tiers)
     if not ordered or drop_vs_previous_close < ordered[0][0]:
         return 0.0
@@ -4724,6 +4730,10 @@ def raw_ladder_multiplier(drop_vs_previous_close: float, config: StrategyConfig,
         # scripts/generate_per_ticker_sizing.py) blend between points; the global
         # ladder and fallback tickers stay stepped.
         return interpolate_tier_multiplier(drop_vs_previous_close, tiers)
+    if not math.isfinite(drop_vs_previous_close):
+        # Same fail-closed rule as interpolate_tier_multiplier: +inf would
+        # otherwise satisfy every threshold and match the top tier.
+        return 0.0
     multiplier = 0.0
     for threshold, tier_multiplier in sorted(tiers):
         if drop_vs_previous_close >= threshold:

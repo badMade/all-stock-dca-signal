@@ -51446,3 +51446,26 @@ def test_raw_ladder_multiplier_interpolates_only_for_calibrations_flagged_linear
     assert near_close_dca.raw_ladder_multiplier(0.015, config, "LEGACY") == 1.0
     # A ticker with no calibration at all stays on the (stepped) global ladder.
     assert near_close_dca.raw_ladder_multiplier(0.015, config, "OTHER") == near_close_dca.raw_ladder_multiplier(0.015, config)
+
+
+@pytest.mark.parametrize("bad_drop", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_drop_buys_nothing_on_stepped_and_interpolated_ladders(bad_drop):
+    """Fail closed: a NaN/inf drop (a NaN or missing price upstream) must size to 0x.
+
+    Before the fix: NaN fell through every comparison in interpolate_tier_multiplier to
+    its final ``return ordered[-1][1]`` (the TOP tier) while the stepped lookup returned
+    0.0; +inf matched the top tier on BOTH the interpolated and the stepped lookups.
+    """
+    import near_close_dca
+
+    tiers = ((0.01, 1.0), (0.02, 2.0), (0.04, 4.0))
+    config = near_close_dca.StrategyConfig(
+        per_ticker_sizing={
+            "SMOOTH": {"tiers": tiers, "interpolate": True},
+            "STEPPED": {"tiers": tiers, "interpolate": False},
+        }
+    )
+    assert near_close_dca.interpolate_tier_multiplier(bad_drop, tiers) == 0.0
+    for ticker in ("SMOOTH", "STEPPED", "OTHER", None):  # OTHER/None: the global stepped ladder
+        assert near_close_dca.raw_ladder_multiplier(bad_drop, config, ticker) == 0.0
+        assert near_close_dca.graded_buy_multiplier(bad_drop, config, ticker) == 0.0
