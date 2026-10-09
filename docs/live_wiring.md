@@ -491,6 +491,15 @@ Both `run_state.json` and `run_summary.json` must contain the same non-null
 `run_classification` object for the 3:30 task. A null
 `run_summary.run_classification` is an artifact-contract failure.
 
+## Execution routing (added Oct 8 2026)
+
+Who places the primary buy is decided by `dca_execution_router.py`, separate from tier logic. The local run
+is the sole executor; a cloud run is calculation-only (`guard_broker` blocks `place_order`); Perplexity acts
+only when local is unreachable, off, or errored (probe plus a 300s lease heartbeat, `UNKNOWN` stands down).
+Every decision is logged to `<cron root>/execution_routing/routing_<day>.jsonl`. Broker order history is still
+the only purchase evidence. See `docs/adr-plan-first-backup-executor.md` ("Amendment: execution routing").
+The router is a library: the live prompts still need the lease calls and regenerated Perplexity prompts.
+
 ## CLI (dry-run only)
 
 ```bash

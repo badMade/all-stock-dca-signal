@@ -136,6 +136,7 @@ py-modules = [
     "dca_whole_share_accumulator",
     # Plan-first backup executor: order-plan validation, reconciliation and the compute
     # fallback (docs/adr-plan-first-backup-executor.md). Imports near_close_dca/dca_runner.
+    "dca_execution_router",
     "dca_order_plan",
     # The 3D market-graph data layer and viewer emitter, imported by
     # scripts/generate_market_graph.py and by analysis/market-graph-3d/. Its browser

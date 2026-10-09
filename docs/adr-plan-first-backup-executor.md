@@ -172,6 +172,25 @@ primary Claude slots. Status after the follow-up change:
   coordination doc section 1).
 - Perplexity cannot read this repo, so the Phase 5 prompts remain a manual paste step.
 
+## Amendment: execution routing (2026-10-08)
+
+Status: implemented as `dca_execution_router.py` (pure decision and log layer; no ordering, no credentials,
+no ladder or sizing-suggester wiring). Wraps `dca_order_plan.choose_plan_path`; adds no second path selector.
+
+- **Roles.** `LOCAL` is the sole buyer when alive. `CLOUD` is calculation-only: `guard_broker` raises
+  `OrderPlacementForbidden` on `place_order`. `PERPLEXITY` acts only when local is `UNREACHABLE`, `OFF` or `ERRORED`.
+- **Detection (operator-approved).** A bounded probe (`DCA_LOCAL_PROBE_TIMEOUT_S`, default 60) maps
+  `choose_plan_path` statuses: offline/not_found -> OFF, timeout -> UNREACHABLE, device_error -> ERRORED, anything
+  else -> UNKNOWN. With the Mac online, the slot lease is the heartbeat: success marker -> SUCCEEDED, failure marker
+  -> ERRORED, no lease -> OFF (act), lease younger than `DCA_LOCAL_HEARTBEAT_STALE_S` (default 300) -> IN_PROGRESS,
+  older -> ERRORED. Lease not read -> UNKNOWN.
+- **UNKNOWN stands down** and alerts, since a false fallback risks a duplicate buy. Broker order history remains the
+  only purchase evidence; the routing log (`<cron root>/execution_routing/routing_<day>.jsonl`: path, reason,
+  timestamp) is only a second guard, and a recorded buy for the slot blocks any later fallback.
+- **Not yet done.** The local run must acquire, refresh (at most every 60s) and release the slot lease with a
+  success/failure marker, and the Perplexity prompts must be regenerated to follow the router. Both are manual
+  prompt pastes, as before.
+
 ## Rollback
 
 Every phase is additive. The backup prompts switch back by repasting the previous prompt text
