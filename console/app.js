@@ -155,6 +155,10 @@ function renderRuns(runs) {
   }));
 }
 
+// Matches the server's _MAX_RESULTS: 65 tickers x 3 models is 195 rows per component, which the old
+// 100-row table silently cut at the 33rd ticker. The ticker filter still narrows from the full set.
+const FORECAST_ROW_LIMIT = 2000;
+
 function normalizeForecasts(rows) {
   return arr(rows).flatMap((row) => {
     if (row.component) return [{ ...row, point: row.point ?? row.prediction ?? row.predicted, forecast_date: row.forecast_date || row.target_date }];
@@ -236,7 +240,7 @@ function renderForecasts() {
   }
   const rows = all.filter((row) => String(row.component).toLowerCase() === component && (!ticker || String(row.ticker || "").toUpperCase().includes(ticker)));
   const countEl = $("forecast-count");
-  if (countEl) countEl.textContent = `${rows.length} ${component} ${rows.length === 1 ? "forecast" : "forecasts"}${rows.length > 100 ? " · showing first 100" : ""}`;
+  if (countEl) countEl.textContent = `${rows.length} ${component} ${rows.length === 1 ? "forecast" : "forecasts"}${rows.length > FORECAST_ROW_LIMIT ? ` · showing first ${FORECAST_ROW_LIMIT}` : ""}`;
   const forecastsBody = $("forecasts-body");
   if (!rows.length) {
     if (forecastsBody) emptyRow(forecastsBody, 7, all.length ? "No forecasts match these filters." : "No forecasts are available. Run the Octopus demo or connect an existing research run.");
@@ -245,7 +249,7 @@ function renderForecasts() {
     return;
   }
   if (forecastsBody) {
-    forecastsBody.replaceChildren(...rows.slice(0, 100).map((forecast) => {
+    forecastsBody.replaceChildren(...rows.slice(0, FORECAST_ROW_LIMIT).map((forecast) => {
       const row = el("tr");
       const name = el("td");
       name.append(el("strong", "", forecast.ticker || "-"));

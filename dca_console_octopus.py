@@ -265,7 +265,7 @@ def primary_universe(config_dir: Path) -> tuple[str, ...]:
 
 
 def build_octopus_snapshot(
-    run_dir: Path | None, *, ticker: str = "", period: str = "all", limit: int = 200,
+    run_dir: Path | None, *, ticker: str = "", period: str = "all", limit: int = _MAX_RESULTS,
     universe: Collection[str] | None = None,
 ) -> dict:
     """Read a selected run for the console, without importing or updating models.

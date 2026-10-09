@@ -263,7 +263,11 @@ def test_default_view_is_the_primary_universe_and_the_filter_reaches_any_ticker(
     primary = ["T005", "T150", "T299", "ZZZZ"]
     _state(tmp_path, {"2026-09-08": [_pending(ticker) for ticker in every]})
 
-    capped = adapter.build_octopus_snapshot(tmp_path)  # no universe: unchanged, capped at the limit
+    # No universe: the default limit is the module ceiling, so a 65-ticker x 3-model run (195 rows,
+    # the old 200-row default's headroom) and this 301-row run both fit; only an explicit limit caps.
+    uncapped = adapter.build_octopus_snapshot(tmp_path)
+    assert len(uncapped["forecasts"]) == len(every) and uncapped["truncated"] is False
+    capped = adapter.build_octopus_snapshot(tmp_path, limit=200)
     assert len(capped["forecasts"]) == 200 and capped["truncated"] is True
     assert capped["available_tickers"] == sorted(every)
 
