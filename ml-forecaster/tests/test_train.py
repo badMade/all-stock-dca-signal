@@ -62,7 +62,7 @@ def test_main_scores_adjustments_from_build_feature_frames_latest_row_not_the_st
     fitted = model_module.TrainedModel.load(run_dir / "model.json")
 
     feature_frame = train_module.build_feature_frame(history_dir, ["AAA"])
-    latest_row = feature_frame.sort_values("date", kind="stable").groupby("ticker", as_index=False).tail(1)
+    latest_row = feature_frame.sort_values("date", kind="stable").drop_duplicates(subset=["ticker"], keep="last")
     expected_multiplier = fitted.predict_multipliers(latest_row)["AAA"]
     assert report["adjustments"]["AAA"] == pytest.approx(expected_multiplier)
 
@@ -73,7 +73,7 @@ def test_main_scores_adjustments_from_build_feature_frames_latest_row_not_the_st
     # a genuinely different multiplier -- pinning that main() is not
     # accidentally scoring that stale row instead.
     dataset = train_module.build_dataset(history_dir, ["AAA"], horizon=5)
-    stale_row = dataset.sort_values("date", kind="stable").groupby("ticker", as_index=False).tail(1)
+    stale_row = dataset.sort_values("date", kind="stable").drop_duplicates(subset=["ticker"], keep="last")
     assert stale_row["date"].iloc[0] < latest_row["date"].iloc[0]
     stale_multiplier = fitted.predict_multipliers(stale_row)["AAA"]
     assert report["adjustments"]["AAA"] != pytest.approx(stale_multiplier)
@@ -114,7 +114,7 @@ def test_main_excludes_archive_rows_after_now_for_a_historical_replay(tmp_path):
     # What SHOULD be scored: the row at/before replay_now, from a properly
     # truncated feature frame.
     truncated_frame = train_module.build_feature_frame(history_dir, ["AAA"], as_of=replay_now)
-    expected_row = truncated_frame.sort_values("date", kind="stable").groupby("ticker", as_index=False).tail(1)
+    expected_row = truncated_frame.sort_values("date", kind="stable").drop_duplicates(subset=["ticker"], keep="last")
     assert expected_row["date"].iloc[0] <= replay_now
     expected_multiplier = fitted.predict_multipliers(expected_row)["AAA"]
     assert report["adjustments"]["AAA"] == pytest.approx(expected_multiplier)
@@ -124,7 +124,7 @@ def test_main_excludes_archive_rows_after_now_for_a_historical_replay(tmp_path):
     # truncation actually mattered, not merely that it happened to be a
     # no-op for this seed.
     full_frame = train_module.build_feature_frame(history_dir, ["AAA"])
-    full_latest_row = full_frame.sort_values("date", kind="stable").groupby("ticker", as_index=False).tail(1)
+    full_latest_row = full_frame.sort_values("date", kind="stable").drop_duplicates(subset=["ticker"], keep="last")
     assert full_latest_row["date"].iloc[0] > replay_now
     future_multiplier = fitted.predict_multipliers(full_latest_row)["AAA"]
     assert report["adjustments"]["AAA"] != pytest.approx(future_multiplier)
