@@ -33,18 +33,33 @@ shadow mode (ADR phase 6) has run for at least five trading days.
    | --- | --- | --- |
    | `plan --source mac_plan --trading-day D --slot S` | the plan file at `dca_order_plan.order_plan_path(D, S)` | `{"status": "VALID_PLAN" or "NO_VALID_PLAN", "plan", "errors"}` via `load_plan` |
    | `compute --trading-day D --slot S --quotes F --orders-pages F --buying-power USD --now T` | quotes file `{"quotes": [...]}`, a poll-1 orders envelope (from the ISO-week Monday), fresh buying power | `{"status", "plan", "errors"}` via `compute_plan_from_file` with the Normal tier |
-   | `finalize --trading-day D --slot S --plan F --orders-pages F --fresh-quotes F --fresh-spreads F --buying-power USD` | a plan, a poll-2 envelope, `{"SYMBOL": price}`, `{"SYMBOL": {"bid", "ask"}}`, fresh buying power | `{"status": "PROCEED", "SHADOW_ONLY" or "ABORT", "to_place", "would_place", "skipped", "errors"}` via `reconcile` then `revalidate_for_placement` |
+   | `finalize --trading-day D --slot S --plan F --orders-pages F --fresh-quotes F --fresh-spreads F --buying-power USD --now T` | a plan, a poll-2 envelope, `{"SYMBOL": price}`, `{"SYMBOL": {"bid", "ask"}}`, fresh buying power | `{"status": "PROCEED", "SHADOW_ONLY" or "ABORT", "to_place", "would_place", "skipped", "errors"}` via `reconcile` then `revalidate_for_placement`; for a computed plan, first re-derives the trailing-7-day figure from poll 2 and ABORTs (`kill_switch_engaged_since_plan`) if the kill switch is now tripped and any order is above 1x (`--now` must be on the trading day in ET) |
 
-2. **No single-file build for the Perplexity sandbox.** The cloud fallback runs `python3 backup_planner.py ...`,
-   but the import closure of `dca_order_plan` is about 4.3 MB (`near_close_dca.py` alone is 2.4 MB). It needs
-   a separately reviewed extraction of a small shared ladder core first (ADR, "Cloud single-file build").
+2. **CLOSED 2026-10-08: the sandbox build exists, and these prompts now use it.** `python -m scripts.build_backup_planner
+   --out PATH` builds `backup_planner.pyz` (about 1.4 MB, deterministic, stamped with the source commit; `--check`
+   reports drift). The prompts run it in the sandbox (`python3 backup_planner.pyz ...`), verify it with
+   `--build-info` first, and record the build in the state record. **How the file reaches the task is still
+   undecided**: the prompts assume it is attached to the task's project files, a setup step you must confirm.
+
+## Which slots take the safety-gate path
+
+All seven, read from `scripts.backup_planner.GATED_SLOTS` when the prompts are generated. Each prompt asks the planner
+for the symbols to fetch (`backup_planner.pyz universe`), dumps the raw `get_equity_historicals` and `get_equity_quotes`
+responses to `raw.json`, runs `assemble-market-data`, then `compute --market-data market.json
+--deployed-last-7d-usd auto`, so the primary's own Gate 5 decides what to buy and the planner derives the kill-switch
+figure from the order history. No prompt names a stock or mentions Yahoo; the stocks live in the planner's configuration.
+
+Slot 15:30 runs the final-buy engine; the six executor-class slots run the stream CLI path, scored identically from
+Robinhood (`scripts/backup_stream_specs.py`). 10:30 and 12:30 are not special: no pre-flight, no Finance source, no
+per-ticker exception. A slot dropped from `GATED_SLOTS` falls back to a quotes-only prompt that reports `shadow_only`.
 
 ## Placement gates (added 2026-10-07 after review)
 
 - **Only `PROCEED` places.** A plan written by `compute` finalizes as `SHADOW_ONLY` (would-be orders reported,
-  nothing placed) because `compute` does not run the stream generator's trend and data-confidence gates. The
-  switch is `scripts.backup_planner.COMPUTE_PLACEMENT_ENABLED`, off until `compute` is rebuilt on
-  `scripts/stream_candidates.py`.
+  nothing placed). `compute --market-data` now runs the primary's own Gate 5 for all seven slots (15:30 through
+  `generate_buy_candidates`, the six executor-class slots through `scripts.stream_candidates`), so that gap is
+  closed everywhere. The switch `scripts.backup_planner.COMPUTE_PLACEMENT_ENABLED` stays off until the shadow run
+  has proven the output.
 - A Claude plan is reconciled against this slot's window only (later slots may top up); a computed plan excludes
   any ticker bought earlier that day.
 - Buying power and a per-ticker bid/ask spread are required inputs and fail closed.

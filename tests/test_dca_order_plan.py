@@ -986,3 +986,53 @@ def test_a_missing_crossed_or_unusable_spread_skips_that_ticker(config, quote):
 def test_a_ticker_with_no_spread_entry_at_all_is_skipped(config):
     result = _spread_result(config, {"AAPL": (99.9, 100.1)})
     assert ("MSFT", "spread_unavailable") in result.skipped
+
+
+# -- trailing deployment figure (the kill switch's input, derived from broker history in the cloud) ------------
+
+
+def _spent(symbol="MSFT", amount=100.0, *, when=NOW, state="filled", side="buy", agent="agentic", executed=None):
+    return BrokerOrder(symbol=symbol, side=side, dollar_amount=amount, created_at=when, placed_agent=agent, state=state,
+                       executed_dollar_amount=executed)
+
+
+def test_trailing_deployed_is_zero_with_no_history():
+    assert dop.trailing_deployed_usd([], now=NOW) == 0.0
+
+
+def test_trailing_deployed_sums_committed_buys_in_the_seven_days_to_now():
+    from datetime import timedelta
+
+    orders = [_spent(amount=100.0, when=NOW - timedelta(days=6, hours=23)), _spent("AAPL", 50.5, when=NOW - timedelta(minutes=1))]
+    assert dop.trailing_deployed_usd(orders, now=NOW) == pytest.approx(150.5)
+
+
+def test_trailing_deployed_ignores_anything_older_than_seven_days_or_after_now():
+    from datetime import timedelta
+
+    orders = [_spent(amount=999.0, when=NOW - timedelta(days=7, seconds=1)), _spent("AAPL", 7.0, when=NOW + timedelta(seconds=1)),
+              _spent("VT", 3.0, when=NOW - timedelta(days=7))]
+    assert dop.trailing_deployed_usd(orders, now=NOW) == pytest.approx(3.0)  # exactly seven days back is inside
+
+
+def test_trailing_deployed_counts_every_placed_agent_because_it_is_an_upper_bound_for_the_kill_switch():
+    """The primary counts only scheduled afternoon runs; the cloud cannot tell them apart, so it counts all buys.
+    Over-counting can only trip the 1x cap earlier, never later."""
+    orders = [_spent(agent="agentic", amount=10.0), _spent("AAPL", 20.0, agent="user"), _spent("VT", 30.0, agent=None)]
+    assert dop.trailing_deployed_usd(orders, now=NOW) == pytest.approx(60.0)
+
+
+def test_trailing_deployed_skips_sells_and_buys_that_never_filled():
+    orders = [_spent(side="sell", amount=500.0), _spent("AAPL", 40.0, state="cancelled"), _spent("VT", 5.0)]
+    assert dop.trailing_deployed_usd(orders, now=NOW) == pytest.approx(5.0)
+
+
+def test_trailing_deployed_counts_only_the_executed_part_of_a_cancelled_partial_fill():
+    assert dop.trailing_deployed_usd([_spent(amount=40.0, state="cancelled", executed=12.5)], now=NOW) == pytest.approx(12.5)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0, 0.0])
+def test_a_malformed_committed_amount_raises_instead_of_reading_as_zero(bad):
+    """An unknown fill is not a zero fill: a kill switch fed too little would stay off on the day it matters."""
+    with pytest.raises(dca_runner.BudgetDataError):
+        dop.trailing_deployed_usd([_spent(amount=bad)], now=NOW)
