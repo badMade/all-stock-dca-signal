@@ -224,11 +224,12 @@ def test_robinhood_slots_fetch_five_minute_bars_at_their_own_decision_time(tmp_p
     assert "GFUZ" in _arg(argv, "--tickers").split(",")
 
 
-def test_midday_fetches_finance_cadence_and_skips_its_robinhood_routed_ticker(tmp_path: Path) -> None:
+def test_midday_fetches_the_native_five_minute_cadence_for_the_whole_universe(tmp_path: Path) -> None:
+    # 12:30 is Robinhood-primary like every other executor slot: no Finance cadence, no ticker routed elsewhere.
     argv = _fetch_args(tmp_path, "1230", "12:31")
     assert _arg(argv, "--decision-time-et") == "12:30"
-    assert _arg(argv, "--interval-minutes") == "15"
-    assert "GFUZ" not in _arg(argv, "--tickers").split(",")
+    assert _arg(argv, "--interval-minutes") == "5"
+    assert "GFUZ" in _arg(argv, "--tickers").split(",")
 
 
 def test_auto_picks_the_slot_whose_decision_time_just_passed(tmp_path: Path) -> None:

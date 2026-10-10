@@ -2483,24 +2483,6 @@ def test_midday_live_mirror_requires_qualifying_in_window_afternoon_evidence():
     assert "if missing_pairs:" in text
 
 
-def test_midday_gate_5_fetches_configured_yfinance_fallback():
-    """Finance-primary midday fetches must satisfy the fallback contract.
-
-    Market-open is Robinhood-primary; test_provider_prompt_contract covers its
-    payload against the actual slot spec rather than applying this policy to it.
-    """
-    prompts = {
-        "midday": _midday_live_mirror_text(),
-    }
-    for slot, text in prompts.items():
-        gate_5 = text[text.index("GATE 5 - BUY LIST") : text.index("GATE 6 - BUDGET")]
-        assert "If Finance is unavailable, stale, incomplete, or unresolved" in gate_5, slot
-        assert "fetch yfinance evidence for EVERY ordinary ticker" in gate_5, slot
-        assert "sources.yahoo_finance_yfinance" in gate_5, slot
-        assert '"yahoo_finance_yfinance": []' in gate_5, slot
-        assert "before invoking the generator" in gate_5, slot
-
-
 def test_market_open_gate_5_hands_rich_candidates_to_gate_6_5():
     text = _market_open_live_mirror_text()
     gate_5 = text[text.index("GATE 5 - BUY LIST") : text.index("GATE 6 - BUDGET")]

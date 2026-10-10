@@ -917,7 +917,7 @@
     "validation_context_sources": ["alpaca", "robinhood"],
     "fallback_source": {
       "name": "yahoo_finance_yfinance",
-      "when": "Use Yahoo Finance through yfinance ONLY when the slot's primary source is unavailable, stale, incomplete, or unresolved. Finance-primary slots (12:30, 3:30) switch on any unresolved or stale ticker. Robinhood-primary slots (9:35, 10:30, 11:30, 1:30, 2:30) switch only when Robinhood failed as a whole (listed in source_errors, absent, or no scored ticker fresh for the slot); a single ticker's gap stays that ticker's provider error. The switch always moves the whole ordinary universe; sources are never mixed.",
+      "when": "Use Yahoo Finance through yfinance ONLY when the slot's primary source is unavailable, stale, incomplete, or unresolved. The Finance-primary slot (3:30) switches on any unresolved or stale ticker. Robinhood-primary slots (9:35, 10:30, 11:30, 12:30, 1:30, 2:30) switch only when Robinhood failed as a whole (listed in source_errors, absent, or no scored ticker fresh for the slot); a single ticker's gap stays that ticker's provider error. The switch always moves the whole ordinary universe; sources are never mixed.",
       "prefetch": "deploy/launchd/prefetch_slot.sh writes each slot's labeled payload to $ROOT/yfinance_fallback_<YYYY-MM-DD>_<HHMM>.json one minute after the slot's decision time, outside any session (deploy/launchd/PREFETCH.md). Added 2026-09-22: the Robinhood-primary slots' only data path had been a live session pulling every ticker's 5-minute bars through MCP tool output, which exceeded the tool output cap and the session token budget (Notion DCA Issues: output_size_limit, intraday_bars_unavailable, token_limit_exceeded, market_data_unavailable).",
       "labeling": "Fallback data must be labeled as fallback and must NOT weaken confidence, spread, trend, top-up, budget, whitelist, buy-only, regular-hours-only, or any safety rule."
     },
@@ -946,6 +946,14 @@
         "accepted_sources": ["robinhood", "yahoo_finance_yfinance"],
         "validation_context_sources": [],
         "yfinance_note": "Since 2026-09-22 yahoo_finance_yfinance IS a usable fallback for this Robinhood-primary slot: scripts/stream_candidates.py switches the whole universe to it when robinhood is listed in source_errors, absent, or has no scored ticker fresh for the slot, and never over a single ticker's gap (scripts/tests/test_generate_market_open_candidates.py::test_one_robinhood_ticker_error_does_not_move_the_universe_to_yfinance). Finance and Alpaca are not accepted keys at all for this slot -- supplying either raises 'unsupported key(s)'."
+      },
+      "1230ET": {
+        "primary_source": "robinhood",
+        "since": "2026-10-10",
+        "reason": "scripts/generate_midday_candidates.py's MIDDAY_SPEC (cron a6239dae) scores the 12:30 slot from Robinhood; recorded here to align the structured source policy with that generator.",
+        "accepted_sources": ["robinhood", "yahoo_finance_yfinance"],
+        "validation_context_sources": [],
+        "yfinance_note": "yahoo_finance_yfinance is the labeled whole-universe fallback for this Robinhood-primary slot: scripts/stream_candidates.py switches to it when robinhood is listed in source_errors, absent, or has no scored ticker fresh for the slot, and never over a single ticker's gap."
       },
       "1330ET": {
         "primary_source": "robinhood",
@@ -981,7 +989,7 @@
       ],
       "run_date_arg": "If the runner requires a RUN_DATE_ET argument, pass the current America/New_York date as YYYYMMDD.",
       "no_stale_reuse": "Do NOT assume raw/quotes.json or historicals already exist from a prior run.",
-      "data_sources": "Generate raw inputs from the Finance connector primary, Alpaca and Robinhood validation/context, and yfinance fallback ONLY when connector data is unavailable, stale, incomplete, or unresolved (see market_data_source_policy).",
+      "data_sources": "Generate raw inputs from Robinhood (get_equity_historicals 5-minute and daily bars, get_equity_quotes) for every active ticker. Robinhood is the 12:30 primary signal source. If Robinhood fails as a whole (listed in source_errors, absent, or no scored ticker fresh for the slot), use the explicitly labeled yfinance fallback for the entire ordinary universe; a single ticker gap remains that ticker's provider error. Do not use the Finance connector as the primary source (see market_data_source_policy.slot_overrides.1230ET).",
       "bounded_recovery": "If raw input generation fails once, perform ONE bounded recovery attempt with the alternate approved data source path, then stop."
     },
     "state_file_guarantee": {

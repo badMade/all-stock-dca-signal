@@ -56,7 +56,7 @@ def plan(slot):
         spec = INTRADAY_SPECS[slot]
     # The same loader and narrowing scripts/stream_candidates.py's run_cli
     # applies: configured universe minus excluded, and minus any ticker the
-    # policy routes to another source (GFUZ on 12:30), which the fallback
+    # policy routes to another source (none today), which the fallback
     # never scores.
     config = spec.config_loader(config_dir, allow_unpinned_account=True)
     executor = spec.executor_cls(config=config, mode=spec.live_mode, **spec.executor_kwargs)

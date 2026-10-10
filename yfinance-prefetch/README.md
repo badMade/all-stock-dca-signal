@@ -2,9 +2,9 @@
 
 Pre-fetches a labeled `sources.yahoo_finance_yfinance` market-data block from
 Yahoo Finance (`yfinance`) for the DCA strategy's yfinance fallback policy
-(`config/scheduled_tasks.json`'s `market_data_source_policy`: "yfinance is a
-fallback used ONLY if Finance connector data is unavailable, stale,
-incomplete, or unresolved").
+(`config/scheduled_tasks.json`'s `market_data_source_policy`): use as a
+whole-universe fallback when a slot's primary source is unavailable, stale,
+incomplete, or unresolved.
 
 This is a sibling of `ticker-advisor/`, `ml-forecaster/`, `wondrous-octopus/`,
 and `ticker-market-breadth/`: a self-contained, third-party-dependency
@@ -59,15 +59,14 @@ python fetch_yfinance_fallback.py \
     --tickers AAPL,MSFT,TXN \
     --trading-day 2026-08-05 \
     --decision-time-et 12:30 \
-    --interval-minutes 15 \
+    --interval-minutes 5 \
     --out /path/to/yfinance_fallback_1230.json
 ```
 
-`--interval-minutes` should match the primary source this fallback is
-standing in for: `15` for Finance (every slot's primary), `5` if a caller
-ever needs a Robinhood-granularity fallback instead. `--decision-time-et`
-is the slot's own decision anchor (e.g. `12:30` for the midday slot, `15:30`
-for the 3:30 final buy).
+`--interval-minutes` should match the slot's primary source: `5` for
+Robinhood-primary slots such as 12:30 and `15` for Finance-primary 15:30.
+`--decision-time-et` is the slot's own decision anchor (e.g. `12:30` for the
+midday slot, `15:30` for the 3:30 final buy).
 
 The output is ready to merge directly into an executor's own `--market-data`
 JSON:
