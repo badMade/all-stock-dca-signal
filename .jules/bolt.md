@@ -220,6 +220,11 @@ Added `get_order_fills` to `BrokerAdapter` protocol and Robinhood live adapter, 
 ## YYYY-MM-DD - [Refactor DictReader for speed]
 **Learning:** When substituting `csv.DictReader` for index-based `csv.reader` to optimize loop times, `csv.reader` creates sub-lists equivalent to the exact length of parsed objects in that row. If a CSV has rows missing trailing commas (mid-write truncation without flush), `csv.reader` length will be shorter than `fieldnames` length. A hard strict length constraint or indexing without a length bounds check on index-based `csv.reader` approaches may silently drop valid rows or raise IndexError that the `csv.DictReader` natively handled by yielding `None`.
 **Action:** When manually parsing CSV structures utilizing index-based lists via `csv.reader`, verify bounds via `len(row) > idx` and implement fallback length bounds logic to retain partial CSV reads the same way `csv.DictReader` resolves missing trailing tail values to `None`.
+
+## 2026-10-23 - Optimize DataFrame groupby.tail/head
+
+**Learning:** When extracting the latest or earliest row per group from a chronologically sorted DataFrame, using `df.groupby(group_col).tail(1)` or `head(1)` introduces significant computational overhead. Pandas groups the entire dataframe before selecting the rows. `df.drop_duplicates(subset=[group_col], keep='last'|'first')` achieves the exact same result ~3x faster by bypassing the group-by operation entirely, simply dropping duplicates.
+**Action:** Always prefer `df.drop_duplicates` over `groupby().tail(1)` or `head(1)` when selecting single extreme records per group from an already sorted DataFrame.
 ## 2024-05-19 - [Pandas Groupby Optimization]
 **Learning:** `DataFrame.groupby(col).tail(1)` requires building full groupby objects and is significantly slower than `DataFrame.drop_duplicates(subset=[col], keep="last")` when extracting the final chronological row per group from an already sorted DataFrame.
 **Action:** Always prefer `drop_duplicates(keep="last"|"first")` over `groupby.tail(1)`/`head(1)` for these extraction patterns.
