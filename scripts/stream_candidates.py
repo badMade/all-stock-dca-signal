@@ -1883,10 +1883,16 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
         or not isinstance(source_errors, Sequence)
     ):
         raise ValueError("--market-data's 'source_errors', if present, must be a list")
-    try:
-        unexpected_source_errors = sorted(set(source_errors) - accepted_sources)
-    except TypeError as exc:
-        raise ValueError("--market-data's 'source_errors' entries must be source-name strings") from exc
+    parsed_source_errors: list[str] = []
+    for entry in source_errors:
+        if isinstance(entry, str):
+            parsed_source_errors.append(entry)
+        elif isinstance(entry, Mapping) and isinstance(entry.get("source"), str):
+            parsed_source_errors.append(entry["source"])
+        else:
+            raise ValueError("--market-data's 'source_errors' entries must be source-name strings")
+    source_errors = parsed_source_errors
+    unexpected_source_errors = sorted(set(source_errors) - accepted_sources)
     if unexpected_source_errors:
         raise ValueError(
             "--market-data's 'source_errors' names unsupported source(s) "

@@ -455,7 +455,7 @@ function renderActions(actions) {
     const pending = state.launching.has(action.id) || Boolean(runningJob);
     const button = el("button", "button ghost", pending ? "Running…" : "Run workflow →");
     button.type = "button";
-    button.disabled = !action.available || !state.token || pending;
+    button.disabled = !action.available || pending;
     button.addEventListener("click", () => startJob(action.id));
     bottom.append(el("span", "tag", action.available ? "Available" : "Setup needed"), button);
     card.append(bottom);
@@ -464,7 +464,7 @@ function renderActions(actions) {
   $("actions").replaceChildren(...(nodes.length ? nodes : [el("div", "panel empty-state", "No workflows were advertised by the server.")]));
   const demo = arr(actions).find((action) => action.id === "demo-all");
   const running = state.launching.has("demo-all") || arr(state.snapshot?.jobs).some((job) => job.action === "demo-all" && ["running", "queued"].includes(job.status));
-  $("run-demo").disabled = !state.token || running || Boolean(demo && !demo.available);
+  $("run-demo").disabled = running || Boolean(demo && !demo.available);
   $("run-demo").textContent = running ? "Demo running…" : "▶ Run full demo";
 }
 
@@ -475,7 +475,13 @@ function renderJobs(jobs) {
   $("jobs-list").replaceChildren(...(rows.length ? rows.map((job) => {
     const detail = el("details", "job");
     detail.dataset.jobId = String(job.id);
-    detail.open = previousOpen.has(String(job.id)) ? previousOpen.get(String(job.id)) : /running|queued|failed|error/.test(job.status);
+    let isOpen = false;
+    if (previousOpen.has(String(job.id))) {
+      isOpen = previousOpen.get(String(job.id));
+    } else {
+      isOpen = (String(job.id) === state.lastLaunchedJobId) || /running|queued|failed|error/.test(job.status);
+    }
+    detail.open = isOpen;
     const summary = el("summary");
     const head = el("span", "job-head");
     const title = el("span", "job-title");
@@ -498,18 +504,25 @@ function renderJobs(jobs) {
 }
 
 function viewJobOutput(jobId) {
-  const details = $("jobs-list").querySelector(`details[data-job-id="${CSS.escape(String(jobId))}"]`);
-  if (details) {
-    details.open = true;
-    details.scrollIntoView({ behavior: "smooth", block: "center" });
-    const pre = details.querySelector("pre");
-    if (pre) {
-      pre.style.outline = "2px solid var(--green)";
-      setTimeout(() => { pre.style.outline = ""; }, 2500);
-    }
-  } else {
-    $("jobs").scrollIntoView({ behavior: "smooth", block: "start" });
+  if (currentPage() !== "workflows") {
+    location.hash = "workflows";
   }
+  requestAnimationFrame(() => {
+    setTimeout(() => {
+      const details = $("jobs-list")?.querySelector(`details[data-job-id="${CSS.escape(String(jobId))}"]`);
+      if (details) {
+        details.open = true;
+        details.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "center" });
+        const pre = details.querySelector("pre");
+        if (pre) {
+          pre.style.outline = "2px solid var(--green)";
+          setTimeout(() => { pre.style.outline = ""; }, 2500);
+        }
+      } else {
+        $("jobs")?.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+      }
+    }, 50);
+  });
 }
 window.viewJobOutput = viewJobOutput;
 
@@ -610,7 +623,7 @@ function renderModules(modules) {
       } else {
         execBtn = el("button", "button ghost small module-exec-btn", isPending ? "Running…" : "▶ Run entry point");
         execBtn.type = "button";
-        execBtn.disabled = !state.token || isPending;
+        execBtn.disabled = isPending;
         execBtn.addEventListener("click", () => startJob(module.action_id));
       }
     } else if (command && /<[^>]+>/.test(command)) {
@@ -770,17 +783,28 @@ async function refresh() {
 }
 
 async function startJob(action) {
-  if (!state.token || state.launching.has(action)) return;
+  if (state.launching.has(action)) return;
   state.launching.add(action);
   renderActions(state.snapshot?.actions);
+  if (currentPage() !== "workflows") {
+    location.hash = "workflows";
+  }
+  const jobsEl = $("jobs");
+  if (jobsEl) {
+    jobsEl.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+  }
   try {
-    await postWithToken("/api/jobs", { action });
-    await refresh();
-    // Job output lives on the Workflows page; a launch from Today lands there.
-    if (currentPage() === "today") {
-      location.hash = "workflows";
-      $("jobs").scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+    const started = await postWithToken("/api/jobs", { action });
+    if (started?.job?.id) {
+      state.lastLaunchedJobId = String(started.job.id);
+      if (state.snapshot) {
+        state.snapshot.jobs = [started.job, ...arr(state.snapshot.jobs).filter((j) => String(j.id) !== String(started.job.id))];
+        renderJobs(state.snapshot.jobs);
+        pollRunningLog();
+      }
+      viewJobOutput(started.job.id);
     }
+    await refresh();
   } catch (error) {
     showError(`Could not start ${words(action)}: ${error.message}. Check job history before trying again; a connection timeout can occur after a job was accepted.`);
   } finally {
@@ -791,6 +815,10 @@ async function startJob(action) {
 window.startJob = startJob;
 
 async function postWithToken(path, body) {
+  if (!state.token) {
+    const bootstrap = await readJson(await fetch("/api/bootstrap", { cache: "no-store", signal: AbortSignal.timeout(15000) }));
+    state.token = bootstrap.token;
+  }
   const submit = () => fetch(path, { method: "POST", headers: { "Content-Type": "application/json", "X-Console-Token": state.token }, body: JSON.stringify(body), signal: AbortSignal.timeout(15000) });
   let response = await submit();
   if (response.status === 403) {
@@ -804,7 +832,6 @@ async function postWithToken(path, body) {
 }
 
 async function cancelJob(id) {
-  if (!state.token) return;
   try {
     await postWithToken("/api/jobs/cancel", { job: id });
     await refresh();

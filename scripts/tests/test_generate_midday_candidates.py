@@ -780,6 +780,33 @@ def test_cli_all_covered_universe_allows_an_empty_finance_payload(tmp_path, monk
     assert document["buy_count"] == 0
     assert document["cands"] == []
 
+def test_cli_accepts_structured_source_errors_dict_entry(tmp_path, monkeypatch):
+    _patch_config(monkeypatch)
+    path = tmp_path / "market_data.json"
+    path.write_text(
+        json.dumps({
+            "sources": {"finance": {}, "yahoo_finance_yfinance": {}},
+            "source_errors": [{"source": "finance", "error": "Finance connector not available"}],
+            "ticker_errors": {"finance": []},
+        }),
+        encoding="utf-8",
+    )
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        exit_code = gmc.main(
+            [
+                "--trading-day", DAY.isoformat(),
+                "--market-data", str(path),
+                "--config-dir", str(REAL_CONFIG_DIR),
+                "--deployed-last-7d-usd", "0",
+                "--already-covered-tickers", "TEST",
+            ]
+        )
+    assert exit_code == 0
+    document = json.loads(stdout.getvalue())
+    assert document["buy_count"] == 0
+    assert document["validation_context_source_errors"] == ["finance"]
+
 
 @pytest.mark.parametrize("raw_value", ["-1", "NaN", "not-a-number"])
 def test_cli_rejects_a_non_finite_or_negative_deployment_figure(tmp_path, monkeypatch, raw_value):

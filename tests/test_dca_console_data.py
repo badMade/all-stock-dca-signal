@@ -126,7 +126,7 @@ def test_manifest_includes_all_tasks_and_all_intraday_slots(tmp_path):
     assert task(result, "claude-tickers-daily-update")["status"] == "not_registered"
     assert task(result, "d1f7a2c0")["status"] == "disabled"
     assert task(result, "f7411889")["status"] == "disabled"  # retired 2026-09-13, superseded by d2b6c23e
-    assert task(result, "d2b6c23e")["status"] == "planned"
+    assert task(result, "d2b6c23e")["status"] == "disabled"  # retired 2026-10-06 at user request
     assert task(result, "onetime-1630-credit-usage-proxy-2026-07-27")["next_at"] is None
 
 

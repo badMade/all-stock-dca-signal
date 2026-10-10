@@ -829,7 +829,81 @@ window.ConsolePages = (() => {
         const ladderHost = text("div", "");
         const ladderButton = text("button", "button ghost", "Load ladder preview");
         ladderButton.type = "button";
-        ladderButton.addEventListener("click", async () => { ladderHost.replaceChildren(text("div", "panel empty-state", "Loading…")); try { const view = await fetchJson("/api/config/ladder", { ttl: 60000 }); ladderHost.replaceChildren(auto(view, "ladder")); } catch (error) { ladderHost.replaceChildren(text("div", "error-banner", error.message)); } });
+        ladderButton.addEventListener("click", async () => {
+          ladderHost.replaceChildren(text("div", "panel empty-state", "Loading…"));
+          try {
+            const view = await fetchJson("/api/config/ladder", { ttl: 60000 });
+            const container = text("div", "auto-section");
+
+            const canonicalTiers = [
+              { range: "0.1% to <0.5%", mult: "1.0x", full: "$2.00", reduced: "$1.00" },
+              { range: "0.5% to <1.0%", mult: "1.5x", full: "$3.00", reduced: "$1.50" },
+              { range: "1.0% to <1.5%", mult: "2.0x", full: "$4.00", reduced: "$2.00" },
+              { range: "1.5% to <2.0%", mult: "2.5x", full: "$5.00", reduced: "$2.50" },
+              { range: "2.0% to <2.75%", mult: "3.0x", full: "$6.00", reduced: "$3.00" },
+              { range: "2.75% to <3.5%", mult: "3.5x", full: "$7.00", reduced: "$3.50" },
+              { range: "3.5% to <4.5%", mult: "4.0x", full: "$8.00", reduced: "$4.00" },
+              { range: "4.5% to <5.5%", mult: "4.5x", full: "$9.00", reduced: "$4.50" },
+              { range: "5.5% to <7.0%", mult: "5.0x", full: "$10.00", reduced: "$5.00" },
+              { range: "7.0% to <8.5%", mult: "5.5x", full: "$11.00", reduced: "$5.50" },
+              { range: "8.5% to <10.5%", mult: "6.0x", full: "$12.00", reduced: "$6.00" },
+              { range: "10.5% to <12.5%", mult: "6.5x", full: "$13.00", reduced: "$6.50" },
+              { range: "12.5% to <14.5%", mult: "7.0x", full: "$14.00", reduced: "$7.00" },
+              { range: "14.5% to <16.0%", mult: "7.5x", full: "$15.00", reduced: "$7.50" },
+              { range: ">= 16.0%", mult: "8.0x", full: "$16.00", reduced: "$8.00" },
+            ];
+
+            const summaryBlock = text("div", "auto-block");
+            summaryBlock.append(
+              text("h3", "auto-title", "Authoritative sizing ladder (2026-10-04 rescale: 0.1% – 16%+, 1x – 8x)"),
+              keyValues([
+                ["Full base ($2.00)", "Applies when decision price is below prior close AND prior regular-session low (order size: $2 – $16)"],
+                ["Reduced base ($1.00)", "Applies when decision price is below prior close only (order size: $1 – $8)"],
+                ["Per-ticker calibration", "66 active tickers trade on their own 90-day, 96-tier log-scaled curve with linear interpolation up to 10.0x ($10)"],
+                ["Max per order ceiling", "$16.00 (configured in budgets.json)"],
+              ]),
+              table([
+                { label: "Drop vs prior close", key: "range" },
+                { label: "Multiplier", key: "mult" },
+                { label: "Full base ($2.00)", key: "full" },
+                { label: "Reduced base ($1.00)", key: "reduced" },
+              ], canonicalTiers, "No tiers.")
+            );
+            container.append(summaryBlock);
+
+            if (Array.isArray(view.tiers) && view.tiers.length) {
+              const tb = text("div", "auto-block");
+              tb.append(text("h3", "auto-title", "Strategy budget tiers"), table([
+                { label: "Tier", key: "name" },
+                { label: "Base cap USD", key: "base_cap_usd" },
+                { label: "High multiplier threshold", key: "high_multiplier_threshold" },
+                { label: "High multiplier min signals", key: "high_multiplier_min_signals" },
+              ], view.tiers, "No budget tiers."));
+              container.append(tb);
+            }
+
+            if (Array.isArray(view.grid) && view.grid.length) {
+              const gb = text("div", "auto-block");
+              gb.append(
+                text("h3", "auto-title", "Synthetic drop grid (0% – 16% in 0.25% increments)"),
+                text("p", "panel-footnote", "Synthetic prices use previous_close=100 without simulated intraday low, which produces the reduced $1.00 base. With an intraday low present, candidate USD evaluates to the full $2.00 base shown in the column on the right."),
+                table([
+                  { label: "Drop %", key: "drop_pct" },
+                  { label: "Multiplier", get: (r) => `${r.multiplier}x` },
+                  { label: "Base USD", key: "base_usd" },
+                  { label: "Base reason", key: "base_reason" },
+                  { label: "Candidate USD ($1 reduced base)", get: (r) => `$${Number(r.candidate_usd).toFixed(2)}` },
+                  { label: "Candidate USD ($2 full base)", get: (r) => `$${(Number(r.multiplier) * 2).toFixed(2)}` },
+                ], view.grid, "No grid.")
+              );
+              container.append(gb);
+            }
+
+            ladderHost.replaceChildren(container);
+          } catch (error) {
+            ladderHost.replaceChildren(text("div", "error-banner", error.message));
+          }
+        });
         const effectiveHost = text("div", "");
         const effectiveButton = text("button", "button ghost", "Load effective StrategyConfig");
         effectiveButton.type = "button";
