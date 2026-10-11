@@ -635,7 +635,7 @@ def test_the_payload_feeds_the_morning_generator_and_scores_as_robinhood(ingest,
     files = _build(tmp_path, tickers=("AAA",))
     code, out = _run(ingest, tmp_path, files, tickers=("AAA",))
     assert code == 0
-    document = generate(_payload(out), _config(tickers=("AAA",)))
+    document = generate(_payload(out), _config(tmp_path, tickers=("AAA",)))
     assert document["source"] == "robinhood"
     assert document["provider_error_count"] == 0
     assert document["buy_count"] == 1

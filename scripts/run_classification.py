@@ -540,7 +540,7 @@ ORDER_SUBMIT_STATUS_NO_ORDERS = "no_orders_submitted"
 RUN_CLASSIFICATION_COMPLETED_NO_ORDERS = "completed_no_orders"
 RUN_CLASSIFICATION_PLACEMENT_FAILED = "failed_after_connector_native_recovery_attempt"
 # A run that never reached placement: it raised at startup, or a precondition /
-# wiring gate stopped it (absent broker adapter,
+# wiring gate stopped it (missing same-day pre-flight artifact, absent broker,
 # wrong live account). Distinct from RUN_CLASSIFICATION_PLACEMENT_FAILED, which
 # means placement WAS attempted and failed: reporting keyed on that outcome would
 # otherwise misattribute a startup, data, or precondition failure as a broker
@@ -592,7 +592,7 @@ ERROR_CLASS_RECOVERY_FAILURE = "recovery_failure"
 # reports a late post-trade failure as startup trouble.
 ERROR_CLASS_POST_SUBMISSION_FAILURE = "scheduled_run_failed_after_submission"
 # A scheduled live run stopped by a precondition or wiring gate before placement:
-# no broker adapter, or the wrong live account.
+# no same-day pre-flight artifact, no broker adapter, or the wrong live account.
 ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT = "scheduled_run_blocked_before_placement"
 
 # Marker stamped on a candidate outcome by the spread gate itself, so the run
@@ -1269,6 +1269,66 @@ def raw_persistence_failure_run_state(
     # (Codex review). The same-day prior-allocation loader reads these
     # artifacts as context regardless of the marker, so denying evidence here
     # cannot hide a carried order from the top-up guard.
+    return deny_scheduled_evidence(state)
+
+
+def morning_preflight_blocked_run_state(
+    trading_day: str,
+    block_reason: str,
+    *,
+    triggered_at_utc: Optional[str] = None,
+    generated_at: Optional[str] = None,
+    broker: str = "robinhood",
+    budget: Optional[Dict[str, object]] = None,
+    classification_overrides: Optional[Dict[str, Any]] = None,
+    correlation_id: Optional[str] = None,
+) -> Dict[str, object]:
+    """Build a valid scheduled run_state for a missing/invalid morning preflight.
+
+    Mirrors :func:`raw_persistence_failure_run_state`'s blocked-before-placement
+    shape (``run_classification_outcome=RUN_CLASSIFICATION_STARTUP_FAILED``,
+    ``is_trading_failure=True``, ``completion_reason=None``, evidence denied) --
+    the same outcome ``morning_dca._apply_blocked_before_placement_fields``
+    stamps for its own preflight-block path -- rather than the calendar gate's
+    completed-no-orders shape: a missing safety prerequisite is a failure, not
+    a clean no-op, and reporting it as one hides it from failure/watchdog
+    consumers entirely (Codex review: "Classify missing preflight as a startup
+    failure"). Deliberately its own function rather than reusing
+    ``raw_persistence_failure_run_state`` directly: that function's
+    ``raw_persistence_error`` field is a type discriminator several consumers
+    (``dca_alerts``, ``generate_credit_usage_proxy_report``) key off of
+    specifically for raw-persistence failures, and stamping it here would
+    misreport an unrelated failure mode to those consumers.
+
+    ``classification_overrides``/``correlation_id`` let a non-afternoon roster
+    slot (``run_dca.run_slot``'s 1030ET) stamp its own stream/cron_id/
+    scheduled_for_et/run_id and deterministic correlation id onto this failure
+    artifact, the same way ``raw_persistence_failure_run_state`` does.
+    """
+    ts = triggered_at_utc or _utc_now_iso()
+    _generated_at = generated_at or datetime.now(_EASTERN).strftime("%Y-%m-%dT%H:%M:%S")
+    run_classification = build_scheduled_classification(trading_day, ts, **(classification_overrides or {}))
+    state = {
+        "run_id": run_classification["run_id"],
+        "generated_at": _generated_at,
+        "trading_day": trading_day,
+        "broker": broker,
+        "order_submit_status": ORDER_SUBMIT_STATUS_ERROR,
+        "run_classification_outcome": RUN_CLASSIFICATION_STARTUP_FAILED,
+        "completion_reason": None,
+        "error_class": ERROR_CLASS_BLOCKED_BEFORE_PLACEMENT,
+        "is_trading_failure": True,
+        "candidates_reaching_spread_gate": 0,
+        "candidates_blocked_missing_spread": 0,
+        "budget": budget or {"budget_tier": "normal", "daily_cap_usd": 0, "weekly_cap_usd": 0},
+        "counts": {"evaluated": 0, "buy_candidates": 0, "submitted": 0},
+        "buy_candidates": [],
+        "run_classification": run_classification,
+        "orders_submitted_count": 0,
+        "block_reason": block_reason,
+    }
+    if correlation_id is not None:
+        state["correlation_id"] = correlation_id
     return deny_scheduled_evidence(state)
 
 
@@ -2187,8 +2247,8 @@ def update_latest_scheduled_run_pointer(
     against either dedicated schema outside tests. The seven-slot roster's
     10:30/12:30 LIVE trading decision (this function's actual caller) has
     already superseded those executors' own live-mode code path entirely;
-    MorningDCAExecutor's only confirmed remaining caller is the 9:45 AM
-    watchlist scan (read-only, no trading -- see docs/morning_dca.md), and
+    MorningDCAExecutor's only confirmed remaining live caller is the 9:45 AM
+    preflight scan (read-only, no trading -- see docs/morning_dca.md), and
     MiddayDCAExecutor has no live caller left at all. Writing a second,
     stream-specific pointer/schema pair here would be exercising a consumer
     that does not exist today. If an out-of-repo consumer (e.g. the external
@@ -4462,6 +4522,7 @@ __all__ = [
     "list_raw_inputs_saved",
     "build_raw_persistence_state",
     "raw_persistence_failure_run_state",
+    "morning_preflight_blocked_run_state",
     "RECOVERY_TRIGGER_REASONS",
     "build_recovery_state",
     "recovery_escalation_run_state",

@@ -92,13 +92,14 @@ def test_hard_rules_are_inline_in_every_prompt(prompts, prefix):
         "no review_equity_order",
         "gfd",
         "regular_hours",
+        "QBUT",
         "ONE ORDER PER TICKER PER SLOT",
         "BROKER ORDER HISTORY IS THE ONLY EVIDENCE",
         "Mac content is never purchase evidence",
         "FAIL CLOSED",
         "failed_unexpected_error",
         "place NOTHING",
-        "${ROBINHOOD_AGENTIC_ACCOUNT_LAST4}",
+        "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}",
     ):
         assert needle in text, needle
 
@@ -120,37 +121,14 @@ def test_universe_and_version_stamps_match_config(prompts, prefix):
     text = _by_prefix(prompts, prefix)
     config = dca_config.load_strategy_config(dca_config.get_config_dir())
     expected_hash = hashlib.sha256(("\n".join(sorted(set(config.tickers))) + "\n").encode()).hexdigest()
-    assert expected_hash in text and f"({len(config.tickers)} symbols)" in text
+    assert expected_hash in text
+    for ticker in config.tickers:
+        assert re.search(rf"(?<![A-Z0-9]){re.escape(ticker)}(?![A-Z0-9])", text), ticker
     versions = [json.loads((CONFIG / n).read_text())["version"] for n in ("sizing_ladder.json", "per_ticker_sizing.json")]
     assert "+".join(versions) in text
-
-
-def _all_symbols():
-    """Every symbol the program knows about: buyable, excluded, and whole-share."""
-    config = dca_config.load_strategy_config(dca_config.get_config_dir())
-    return set(config.tickers) | set(config.excluded_tickers) | set(getattr(config, "whole_share_tickers", ()) or ())
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_no_stock_is_named_in_any_prompt_the_universe_lives_in_config(prompts, prefix):
-    """Owner direction 2026-10-08: stocks live in config. A list in a prompt is a second copy that drifts."""
-    text = _by_prefix(prompts, prefix)
-    found = sorted(s for s in _all_symbols() if re.search(rf"(?<![A-Za-z0-9_]){re.escape(s)}(?![A-Za-z0-9_])", text))
-    assert not found, found
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_the_task_asks_the_planner_for_the_symbols_to_fetch(prompts, prefix):
-    text = _by_prefix(prompts, prefix)
-    assert "python3 backup_planner.pyz universe" in text and "python3 -m scripts.backup_planner universe" in text
-    assert "UNIVERSE (" not in text  # no inline list; the command's output is the list
-    assert "do-not-buy" in text.lower() and "planner" in text  # the exclusion is enforced by the planner, not by a name here
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_yahoo_is_never_mentioned_or_required(prompts, prefix):
-    text = _by_prefix(prompts, prefix).lower()
-    assert "yahoo" not in text and "yfinance" not in text
+    # QBUT may appear only as the do-not-buy symbol, never inside the universe list.
+    universe_line = next(line for line in text.splitlines() if line.startswith("UNIVERSE ("))
+    assert "QBUT" not in universe_line
 
 
 @pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
@@ -234,14 +212,12 @@ def test_write_and_check_cli_round_trip(tmp_path, capsys):
 
 
 @pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_both_polls_fetch_seven_days_so_the_weekly_cap_and_the_kill_switch_figure_are_both_provable(prompts, prefix):
-    """The ISO-week cap needs Monday onward; the kill switch needs the trailing seven days. One window of seven
-    full days back covers both, so the planner derives the figure itself (`--deployed-last-7d-usd auto`) and the
-    task never sums anything. Copilot review on PR 1619 (weekly cap) still holds: never a today-only fetch."""
+def test_both_polls_fetch_from_the_iso_week_monday_so_the_weekly_cap_is_provable(prompts, prefix):
+    """Copilot review on PR 1619: budget_snapshot sums the whole ISO week, so a today-only fetch
+    understates week_notional_usd and can approve a batch past the weekly cap."""
     text = _by_prefix(prompts, prefix)
-    assert "00:00 ET seven days before today" in text
+    assert "00:00 ET on the Monday of the current ISO week" in text
     assert "created_at_gte set to today" not in text
-    assert "Monday of the current ISO week" not in text
     assert "repeat the full poll of step 2" in text  # poll 2 inherits the same window
 
 
@@ -285,201 +261,3 @@ def test_latest_placement_times_come_from_the_library_table(prompts):
         text = _by_prefix(prompts, prefix)
         for slot in slots:
             assert dca_order_plan.LATEST_PLACEMENT_ET[slot] in text
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_local_first_routing_is_inline_and_unknown_stands_down(prompts, prefix):
-    text = next(t for name, t in prompts.items() if name.startswith(prefix))
-    assert "LOCAL FIRST" in text
-    assert "scripts.local_heartbeat status" in text
-    assert "300 seconds" in text
-    # Operator decisions 2026-10-08: no lease means act; unknown means stand down and notify.
-    assert "stood_down_local_unknown" in text and "Never act on unknown" in text
-    assert "stood_down_local_active" in text
-    assert "never places an order" in text  # cloud is calculation-only
-    assert "routing {path perplexity-fallback or none" in text
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_account_is_looked_up_never_stored(prompts, prefix):
-    text = _by_prefix(prompts, prefix)
-    assert "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER" not in text
-    assert "exactly one account qualifies" in text
-    assert "account_last4" in text
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_late_start_guard_and_per_order_repull_are_inline(prompts, prefix):
-    text = _by_prefix(prompts, prefix)
-    assert "LATE-START GUARD" in text and "wait 5 minutes" in text
-    assert "PER-ORDER REPULL" in text and "Never use a midnight window" in text
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_operational_lines_are_back(prompts, prefix):
-    text = _by_prefix(prompts, prefix)
-    for needle in ("${PPLX_RUN_STATE_DIR}", "submitted_orders.csv", "pplx project files sync",
-                   "pplx automation suppress-run-notification", "NEVER post to Slack"):
-        assert needle in text, needle
-
-
-# -- the sandbox file and the safety gate (2026-10-08) --------------------------------------------------------
-
-
-def _gated():
-    from scripts import backup_planner
-
-    return set(backup_planner.GATED_SLOTS)
-
-
-def _is_gated_prompt(prefix):
-    slots = {"0955ET": {"0935"}, "1050ET": {"1030"}, "1150ET": {"1130"}, "1250ET": {"1230"}, "1350-1450ET": {"1330", "1430"},
-             "1545ET": {"1530"}}[prefix]
-    return slots <= _gated()
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_the_cloud_planner_is_the_stamped_sandbox_file_not_a_vendored_script(prompts, prefix):
-    text = _by_prefix(prompts, prefix)
-    assert "backup_planner.pyz" in text
-    assert "python3 backup_planner.py " not in text and "vendored single-file" not in text
-    assert "--build-info" in text and "source_commit" in text  # the state record names the exact build that ran
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_the_task_does_no_sizing_of_its_own_and_says_so(prompts, prefix):
-    text = _by_prefix(prompts, prefix)
-    assert "NEVER compute ladder multipliers" in text
-    assert "--deployed-last-7d-usd auto" in text or not _is_gated_prompt(prefix)  # the figure is derived, never summed by hand
-
-
-@pytest.mark.parametrize("prefix", ["0955ET", "1150ET", "1350-1450ET", "1545ET"])
-def test_a_gated_slot_dumps_raw_responses_and_lets_the_assembler_build_the_payload(prompts, prefix):
-    text = _by_prefix(prompts, prefix)
-    assert _is_gated_prompt(prefix)
-    assert "assemble-market-data" in text and "raw.json" in text and "market.json" in text
-    assert "get_equity_historicals" in text and "5minute" in text and "get_equity_quotes" in text
-    assert '{"historicals": [' in text and '"quotes": [' in text
-    assert "--market-data market.json --deployed-last-7d-usd auto" in text
-    assert "--quotes quotes.json" not in text and '{"quotes": [{"symbol"' not in text  # no hand-shaped quotes for a gated slot
-
-
-def test_all_six_prompts_take_the_safety_gate_path():
-    assert _gated() == {"0935", "1030", "1130", "1230", "1330", "1430", "1530"}
-    assert all(_is_gated_prompt(e[0]) for e in EXPECTED)
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_every_prompt_uses_the_gated_commands_and_no_hand_shaped_quotes(prompts, prefix):
-    text = _by_prefix(prompts, prefix)
-    assert "--market-data market.json --deployed-last-7d-usd auto" in text and "assemble-market-data" in text
-    assert "--quotes quotes.json" not in text and "signal gate is not wired" not in text
-
-
-def test_a_slot_dropped_from_the_gated_set_falls_back_to_the_quotes_path_and_says_so(monkeypatch):
-    """The fallback is a real state (a slot's gate disabled), not dead code: it reports shadow_only and places nothing."""
-    from scripts import backup_planner
-
-    monkeypatch.setattr(backup_planner, "GATED_SLOTS", {k: v for k, v in backup_planner.GATED_SLOTS.items() if k != "1230"})
-    text = _by_prefix(gen.build_prompts(), "1250ET")
-    assert "--quotes quotes.json" in text and "--market-data" not in text
-    assert "signal gate is not wired for this slot" in text and "shadow_only" in text
-    assert "--market-data market.json" in _by_prefix(gen.build_prompts(), "1150ET")  # the others are untouched
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_the_mac_path_runs_the_same_commands_from_the_checkout(prompts, prefix):
-    text = _by_prefix(prompts, prefix)
-    assert "python3 -m scripts.backup_planner plan --source mac_plan" in text
-    if _is_gated_prompt(prefix):
-        assert "python3 -m scripts.assemble_market_data" in text and "python3 -m scripts.backup_planner compute" in text
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_how_the_planner_file_reaches_the_task_is_stated_as_a_setup_step_not_guessed(prompts, prefix):
-    text = _by_prefix(prompts, prefix)
-    assert "backup_planner.pyz is attached to this task's project files" in text
-    assert "if the file is missing or the command fails, place NOTHING" in text
-
-
-# ---------------------------------------------------------------------------
-# Build stamp: STEP 0 must COMPARE the attached planner's build, not just record it.
-# Written test-first (Copilot's high finding on #1624, thread PRRT_kwDOTH69qM6q8WGN). The expected value is
-# derived from an independent real build of the zipapp, not from the generator's own output.
-# ---------------------------------------------------------------------------
-
-_SHA = re.compile(r"[0-9a-f]{64}")
-
-
-@pytest.fixture(scope="module")
-def built_stamp(tmp_path_factory):
-    """The content_sha256 a real build of the current checkout reports in its own BUILD_INFO."""
-    from scripts import build_backup_planner as bbp
-
-    out = tmp_path_factory.mktemp("stamp") / "backup_planner.pyz"
-    return bbp.build(out, source_commit="0123456789abcdef0123456789abcdef01234567")["content_sha256"]
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_every_prompt_embeds_the_expected_build_stamp(prompts, prefix, built_stamp):
-    text = _by_prefix(prompts, prefix)
-    assert text.count(built_stamp) == 1, "the expected content_sha256 appears once, in STEP 0"
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_step_0_compares_the_stamp_before_any_planner_command_runs(prompts, prefix, built_stamp):
-    text = _by_prefix(prompts, prefix)
-    step0 = text[text.index("STEP 0"):text.index("STEP 1")]
-    assert step0.index(built_stamp) < step0.index("backup_planner.pyz universe"), "compare first, then run the planner"
-    assert "content_sha256" in step0 and "exactly" in step0
-    # A mismatch is a hard stop with the same fail-closed vocabulary the other STEP 0 refusals use.
-    compare = step0[step0.index(built_stamp):step0.index("backup_planner.pyz universe")]
-    assert "place NOTHING" in compare and "failed_unexpected_error" in compare and "notify" in compare
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_the_commit_is_recorded_but_never_compared(prompts, prefix):
-    """A prompt cannot embed the hash of the commit that regenerates it (circular), so only the content hash gates."""
-    text = _by_prefix(prompts, prefix)
-    assert not re.search(r"\b[0-9a-f]{40}\b", text), "no commit hash is embedded"
-    assert "source_commit" in text, "the state record still names the build's commit"
-
-
-def test_a_changed_bundle_changes_every_prompt_so_check_reports_drift(monkeypatch):
-    from scripts import build_backup_planner as bbp
-
-    before = gen.build_prompts()
-    monkeypatch.setattr(bbp, "content_sha256", lambda *a, **k: "f" * 64)
-    after = gen.build_prompts()
-    assert all(after[name] != before[name] and "f" * 64 in after[name] for name in before)
-
-
-@pytest.mark.parametrize("bad", ["", "xyz", "A" * 64, "a" * 63])
-def test_a_malformed_stamp_fails_closed_instead_of_rendering_an_unverifiable_prompt(monkeypatch, bad):
-    from scripts import build_backup_planner as bbp
-
-    monkeypatch.setattr(bbp, "content_sha256", lambda *a, **k: bad)
-    with pytest.raises(ValueError):
-        gen.build_prompts()
-
-
-def test_the_generator_is_not_in_the_bundle_so_the_stamp_is_not_circular():
-    from scripts import build_backup_planner as bbp
-
-    shipped = set(bbp.collect_files(REPO))
-    assert "scripts/generate_perplexity_backup_prompts.py" not in shipped
-    assert not any(name.startswith("claude/") for name in shipped), "the prompts are not part of what they stamp"
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_finalize_is_given_the_clock_so_the_poll_2_kill_switch_recheck_has_a_window(prompts, prefix):
-    """Copilot's second review on #1624: finalize recomputes the seven-day figure from poll 2, so it needs --now."""
-    finalize = next(line for line in _by_prefix(prompts, prefix).splitlines() if "scripts.backup_planner finalize" in line)
-    assert "--now <ET ISO timestamp>" in finalize
-
-
-@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_the_prompt_says_a_kill_switch_abort_means_place_nothing(prompts, prefix):
-    text = _by_prefix(prompts, prefix)
-    step6 = text[text.index("STEP 6"):text.index("STEP 7")]
-    assert "kill_switch_engaged_since_plan" in step6 and "place NOTHING" in step6

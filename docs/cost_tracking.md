@@ -115,7 +115,7 @@ behavior **only** — it does **not** relax any trading safety rule (see
 | ET | Task | Role |
 | --- | --- | --- |
 | 9:35 AM | `2ba19526` | market-open live execution (first buy of the day) |
-| 9:45 AM | `bb4f6ef1` | watchlist early-warning scan (read-only) |
+| 9:45 AM | `bb4f6ef1` | watchlist early-warning scan (read-only); also runs the required pre-flight writer absorbed from `morning-dca-0945` |
 | 10:30 AM | `42173154` | morning live execution |
 | 11:30 AM | `7be82b97` | intraday live execution |
 | 12:30 PM | `a6239dae` | midday live execution |

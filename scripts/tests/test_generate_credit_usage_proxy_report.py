@@ -26,8 +26,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(1, str(Path(__file__).resolve().parents[2]))
 
@@ -39,7 +37,6 @@ from generate_credit_usage_proxy_report import (  # noqa: E402
     RECOVERY_ARTIFACT_TYPES,
     _execution_date_refusal,
     _main,
-    _proxy_bands,
     generate_report,
     render_markdown,
 )
@@ -91,10 +88,9 @@ def _set_mtime_on_trading_day(path: Path) -> None:
 
 def test_empty_root_all_did_not_run(tmp_path):
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    # 8 chain ids (bb4f6ef1 is one row: the 9:45 watchlist scan), 7be82b97
-    # split into 3, plus the paused e3e6f09e monitor entry reported for
-    # completeness only.
-    assert len(report["scheduled_runs"]) == 11
+    # 8 chain ids, bb4f6ef1 split into 2, 7be82b97 split into 3, plus the
+    # paused e3e6f09e monitor entry reported for completeness only.
+    assert len(report["scheduled_runs"]) == 12
     assert all(row["classification"] == "did_not_run" for row in report["scheduled_runs"])
     assert all(row["run_id"] == "not_applicable_did_not_run" for row in report["scheduled_runs"])
     assert report["usage_counts"]["run_count_scheduled"] == 0
@@ -175,7 +171,7 @@ def test_did_not_run_model_usage_depends_on_attempt_marker_coverage(tmp_path):
     # Marker-covered: morning, midday, afternoon.
     for task_id, et in (("42173154", "10:30"), ("a6239dae", "12:30"), ("10ce362c", "15:30")):
         assert rows[(task_id, et)]["model_usage_rows"] == 0, task_id
-    # Not marker-covered: market_open, the 09:45 watchlist scan, all three
+    # Not marker-covered: market_open, both 09:45 sub-invocations, all three
     # intraday slots, and the two consumer-only roles.
     for task_id, et in (
         ("2ba19526", "09:35"),
@@ -193,8 +189,8 @@ def test_model_usage_jsonl_row_count_measurable_on_a_fully_covered_day(tmp_path)
     # absences, not to any day containing a did_not_run row.
     _write_fully_covered_day(tmp_path, extra_entries=[{"run_id": "r1", "model_routing_mode": "cost_conscious"}])
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    # 8 chain runs + 2 consumer rows + the one appended row for r1.
-    assert report["usage_counts"]["model_usage_jsonl_row_count"] == 11
+    # 9 chain runs + 2 consumer rows + the one appended row for r1.
+    assert report["usage_counts"]["model_usage_jsonl_row_count"] == 12
 
 
 def test_recovery_rerun_appears_in_both_sections(tmp_path):
@@ -831,7 +827,7 @@ def test_recovery_rerun_does_not_double_count_artifacts_or_model_usage(tmp_path)
     assert (
         baseline["usage_counts"]["model_usage_jsonl_row_count"]
         == reference["usage_counts"]["model_usage_jsonl_row_count"]
-        == 11
+        == 12
     )
 
 
@@ -1075,19 +1071,25 @@ def test_recursive_raw_directory_captures_are_counted(tmp_path):
     assert row["artifact_bytes"] == (run_dir / "run_state.json").stat().st_size + len("{}")
 
 
-def test_run_volume_low_band_covers_all_ten_baseline_executions(tmp_path):
-    # bb4f6ef1 (watchlist scan only), 7be82b97 x3, plus the other 6
-    # single-slot active ids = 10 scheduled executions on a clean day; this
+def test_run_volume_low_band_covers_all_eleven_baseline_executions(tmp_path):
+    # bb4f6ef1 (preflight + watchlist), 7be82b97 x3, plus the other 6
+    # single-slot active ids = 11 scheduled executions on a clean day; this
     # must still be "low", not "moderate".
     for slot_dir, cron_id, run_id, extra_rc in [
         ("market_open_dca/20260727_0935ET", "2ba19526", "r1", {"scheduled_for_et": "09:35"}),
-        # bb4f6ef1's 09:45 watchlist scan must carry its documented run_type and
-        # scheduled run_id for _identity_matches (still pinned via
-        # expected_run_type) -- codex review discussion_r3658790008,
-        # discussion_r3659293057. run_type is required by
-        # schemas/morning_run_classification.schema.json and always stamped by
-        # the real producers, so a fixture omitting it is not a realistic
+        # bb4f6ef1's two 09:45 sub-invocations share a task_id AND an ET, so
+        # each must carry its own documented run_type and scheduled run_id for
+        # _identity_matches to tell them apart -- codex review
+        # discussion_r3658790008, discussion_r3659293057. run_type is required
+        # by schemas/morning_run_classification.schema.json and always stamped
+        # by the real producers, so a fixture omitting it is not a realistic
         # artifact.
+        (
+            "morning_dca_preflight/20260727_0945ET",
+            "bb4f6ef1",
+            "morning_preflight_20260727_0945ET",
+            {"run_type": "morning_dca_preflight", "scheduled_for_et": "09:45"},
+        ),
         (
             "morning_dca_watchlist/20260727_0945ET",
             "bb4f6ef1",
@@ -1155,7 +1157,7 @@ def test_run_volume_low_band_covers_all_ten_baseline_executions(tmp_path):
         "\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8"
     )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    assert report["usage_counts"]["run_count_scheduled"] == 10
+    assert report["usage_counts"]["run_count_scheduled"] == 11
     assert report["proxy_bands"]["run_volume"]["band"] == "low"
 
 
@@ -1458,39 +1460,39 @@ def test_unreadable_artifact_size_makes_bytes_unavailable(tmp_path, monkeypatch)
     assert report["proxy_bands"]["artifact_load"]["band"] == "not_available"
 
 
-def test_retired_preflight_artifact_cannot_satisfy_the_watchlist_slot(tmp_path):
-    # The retired pre-flight shared bb4f6ef1's cron ID and scheduled ET with the
-    # watchlist scan, so run_type is the discriminator (expected_run_type) -- a
-    # leftover preflight-typed artifact sitting in the watchlist directory must
-    # not count as the watchlist scan's evidence.
+def test_watchlist_artifact_cannot_satisfy_the_preflight_slot(tmp_path):
+    # Both bb4f6ef1 sub-invocations share a cron ID and scheduled ET, so
+    # run_type is the only discriminator -- a watchlist artifact sitting in the
+    # preflight directory must not count as the machine-complete preflight the
+    # 10:30 gate depends on -- codex review discussion_r3658801012.
     _write_json(
-        tmp_path / "morning_dca_watchlist" / "20260727_0945ET" / "run_state.json",
+        tmp_path / "morning_dca_preflight" / "20260727_0945ET" / "run_state.json",
         {
             "run_id": "morning_20260727_0945ET",
             "run_classification": {
                 "run_origin": "scheduled",
                 "manual_run": False,
                 "cron_id": "bb4f6ef1",
-                "run_type": "morning_dca_preflight",
+                "run_type": "morning_dca_watchlist_scan",
             },
         },
     )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    watchlist = next(r for r in report["scheduled_runs"] if r["stream"] == "watchlist")
-    assert watchlist["classification"] == "failed_start_no_evidence"
+    preflight = next(r for r in report["scheduled_runs"] if r["stream"] == "preflight")
+    assert preflight["classification"] == "failed_start_no_evidence"
     assert report["usage_counts"]["run_count_scheduled"] == 0
 
 
 def test_copied_09_45_artifact_is_rejected_on_run_id_when_run_type_is_absent(tmp_path):
     # Same copied-artifact scenario, but the copy records no run_type at all,
     # so the run_type discriminator abstains. The expected run-ID shape is the
-    # second discriminator the reviewer asked for, and it still rejects a
-    # foreign (retired preflight) id sitting in the watchlist directory -- codex
-    # review discussion_r3658790008.
+    # second discriminator the reviewer asked for, and it still rejects the
+    # watchlist id sitting in the preflight directory -- codex review
+    # discussion_r3658790008.
     _write_json(
-        tmp_path / "morning_dca_watchlist" / "20260727_0945ET" / "run_state.json",
+        tmp_path / "morning_dca_preflight" / "20260727_0945ET" / "run_state.json",
         {
-            "run_id": "morning_preflight_20260727_0945ET",  # NOT the watchlist id
+            "run_id": "morning_20260727_0945ET",  # the WATCHLIST id
             "run_classification": {
                 "run_origin": "scheduled",
                 "manual_run": False,
@@ -1499,15 +1501,31 @@ def test_copied_09_45_artifact_is_rejected_on_run_id_when_run_type_is_absent(tmp
         },
     )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    watchlist = next(r for r in report["scheduled_runs"] if r["stream"] == "watchlist")
-    assert watchlist["classification"] == "failed_start_no_evidence"
+    preflight = next(r for r in report["scheduled_runs"] if r["stream"] == "preflight")
+    assert preflight["classification"] == "failed_start_no_evidence"
     assert report["usage_counts"]["run_count_scheduled"] == 0
 
 
-def test_09_45_slot_accepts_its_own_documented_identity(tmp_path):
-    # The mirror of the rejection tests: the watchlist scan's own documented
+def test_each_09_45_slot_accepts_its_own_documented_identity(tmp_path):
+    # The mirror of the rejection tests: each sub-invocation's own documented
     # run_type and scheduled run_id are accepted, so the discriminators cannot
     # produce a false failed_start_no_evidence on a clean day.
+    _write_json(
+        tmp_path / "morning_dca_preflight" / "20260727_0945ET" / "run_state.json",
+        {
+            "run_id": "morning_preflight_20260727_0945ET",
+            "run_classification": {
+                "run_origin": "scheduled",
+                "manual_run": False,
+                "cron_id": "bb4f6ef1",
+                "scheduled_for_et": "09:45",
+                "run_id": "morning_preflight_20260727_0945ET",
+                "triggered_at_utc": "2026-07-27T13:45:00Z",
+                "state_schema_version": "test-v1",
+                "run_type": "morning_dca_preflight",
+            },
+        },
+    )
     _write_json(
         tmp_path / "morning_dca_watchlist" / "20260727_0945ET" / "run_state.json",
         {
@@ -1525,10 +1543,10 @@ def test_09_45_slot_accepts_its_own_documented_identity(tmp_path):
         },
     )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    rows = [r for r in report["scheduled_runs"] if r["task_id"] == "bb4f6ef1"]
-    assert [r["stream"] for r in rows] == ["watchlist"]
-    assert rows[0]["classification"] == "valid_scheduled_evidence"
-    assert report["usage_counts"]["run_count_scheduled"] == 1
+    for stream in ("preflight", "watchlist"):
+        row = next(r for r in report["scheduled_runs"] if r["stream"] == stream)
+        assert row["classification"] == "valid_scheduled_evidence", stream
+    assert report["usage_counts"]["run_count_scheduled"] == 2
 
 
 def test_non_utf8_submitted_orders_csv_reads_as_not_logged(tmp_path):
@@ -1606,11 +1624,10 @@ def test_non_utf8_model_usage_log_is_treated_as_unavailable(tmp_path):
 
 
 def test_09_45_state_missing_run_type_is_not_scheduled_evidence(tmp_path):
-    # run_type is the field that pins the 09:45 row (expected_run_type) -- it
-    # was the ONLY thing telling it apart from the retired pre-flight, whose
-    # other identity fields were identical by construction -- so treating its
-    # absence as "unknown, pass" let a malformed state satisfy the slot and
-    # corrupt the scheduled/artifact counts. It is required by
+    # run_type is the ONLY field that tells the two 09:45 rows apart -- every
+    # other identity field they carry is identical by construction -- so
+    # treating its absence as "unknown, pass" let a malformed state satisfy
+    # EITHER slot and corrupt the scheduled/artifact counts. It is required by
     # schemas/morning_run_classification.schema.json and always stamped by the
     # real producers, so absence is malformed, not merely unknown -- codex
     # review discussion_r3659293057.
@@ -1619,14 +1636,14 @@ def test_09_45_state_missing_run_type_is_not_scheduled_evidence(tmp_path):
     # only thing missing and this asserts the run_type rule specifically
     # rather than passing via the generic required-field check.
     _write_json(
-        tmp_path / "morning_dca_watchlist" / "20260727_0945ET" / "run_state.json",
+        tmp_path / "morning_dca_preflight" / "20260727_0945ET" / "run_state.json",
         {
-            "run_id": "morning_20260727_0945ET",
+            "run_id": "morning_preflight_20260727_0945ET",
             "run_classification": {
                 "run_origin": "scheduled",
                 "manual_run": False,
                 "cron_id": "bb4f6ef1",
-                "run_id": "morning_20260727_0945ET",
+                "run_id": "morning_preflight_20260727_0945ET",
                 "triggered_at_utc": "2026-07-27T13:45:00Z",
                 "state_schema_version": "test-v1",
                 "scheduled_for_et": "09:45",
@@ -1634,8 +1651,8 @@ def test_09_45_state_missing_run_type_is_not_scheduled_evidence(tmp_path):
         },
     )
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    watchlist = next(r for r in report["scheduled_runs"] if r["stream"] == "watchlist")
-    assert watchlist["classification"] == "failed_start_no_evidence"
+    preflight = next(r for r in report["scheduled_runs"] if r["stream"] == "preflight")
+    assert preflight["classification"] == "failed_start_no_evidence"
     assert report["usage_counts"]["run_count_scheduled"] == 0
 
 
@@ -1737,6 +1754,13 @@ def test_premium_routed_run_outranks_equal_row_count_runs(tmp_path):
     # discussion_r3658688929.
     slots = [
         ("market_open_dca/20260727_0935ET", "2ba19526", "r1", "cost_conscious", "09:35"),
+        (
+            "morning_dca_preflight/20260727_0945ET",
+            "bb4f6ef1",
+            "morning_preflight_20260727_0945ET",
+            "cost_conscious",
+            "09:45",
+        ),
         ("morning_dca_watchlist/20260727_0945ET", "bb4f6ef1", "morning_20260727_0945ET", "cost_conscious", "09:45"),
         ("morning_dca/20260727_1030ET", "42173154", "r4", "cost_conscious", "10:30"),
         ("intraday_dca/20260727_1130ET", "7be82b97", "r5", "cost_conscious", "11:30"),
@@ -1832,6 +1856,16 @@ def _write_fully_covered_day(tmp_path, extra_entries=None, extra_state=None):
             "r1",
             {"scheduled_for_et": "09:35"},
             ["run_summary.json", "market_open_signals.csv", "submitted_orders.csv"],
+        ),
+        # validation.csv is one of the four files
+        # also_runs_required_preflight_writer.preflight_artifacts.files
+        # declares (discussion_r3660192627).
+        (
+            "morning_dca_preflight/20260727_0945ET",
+            "bb4f6ef1",
+            "morning_preflight_20260727_0945ET",
+            {"run_type": "morning_dca_preflight", "scheduled_for_et": "09:45"},
+            ["signals.csv", "validation.csv", "run_summary.json"],
         ),
         (
             "morning_dca_watchlist/20260727_0945ET",
@@ -1930,14 +1964,14 @@ def test_clean_day_emits_the_no_actionable_issues_statement(tmp_path):
     # discussion_r3658688924.
     #
     # Built on a FULLY COVERED tree. This test previously used an empty
-    # tmp_path, which is not a clean day at all -- it is 10 missing slots --
+    # tmp_path, which is not a clean day at all -- it is 11 missing slots --
     # so it was asserting the exact false-clean output discussion_r3659561357
     # flagged.
     from generate_credit_usage_proxy_report import NO_ACTIONABLE_ISSUES_STATEMENT, render_markdown
 
     _write_fully_covered_day(tmp_path)
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    assert report["usage_counts"]["run_count_scheduled"] == 10
+    assert report["usage_counts"]["run_count_scheduled"] == 11
     assert report["actionable_issues"] == []
     markdown = render_markdown(report)
     assert "## Actionable issues" in markdown
@@ -2007,10 +2041,10 @@ def test_missing_scheduled_slots_are_actionable(tmp_path):
 
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
     missing = [r for r in report["scheduled_runs"] if r["classification"] == "did_not_run" and not r.get("paused")]
-    assert len(missing) == 10
+    assert len(missing) == 11
     assert len(report["actionable_issues"]) == 1
     issue = report["actionable_issues"][0]
-    assert "10 expected scheduled slot(s) produced no run and no artifacts" in issue
+    assert "11 expected scheduled slot(s) produced no run and no artifacts" in issue
     # Every affected slot is named, so the line is actionable rather than a
     # bare count.
     for task_id in ("2ba19526", "bb4f6ef1", "42173154", "7be82b97", "a6239dae", "10ce362c", "67aa802b", "a46bf007"):
@@ -3460,13 +3494,22 @@ def _scheduled_run_state(cron_id, run_id, **extra_rc):
     }
 
 
-def test_read_only_0945_slot_records_zero_orders(tmp_path):
-    # Codex review discussion_r3660021380: the 9:45 watchlist scan is
-    # read-only, so its documented artifact set carries no order CSV and
+def test_read_only_0945_slots_record_zero_orders(tmp_path):
+    # Codex review discussion_r3660021380: the 9:45 pre-flight and watchlist
+    # are read-only, so their documented artifact sets carry no order CSV and
     # no order_submit_status. That made _count_submitted_orders return
     # not_logged, which propagates through placed_order_count (turning the
     # whole day's total not_available) and kept the row out of no_op_count --
     # even though a read-only role's order count is necessarily zero.
+    _write_json(
+        tmp_path / "morning_dca_preflight/20260727_0945ET/run_state.json",
+        _scheduled_run_state(
+            "bb4f6ef1",
+            "morning_preflight_20260727_0945ET",
+            run_type="morning_dca_preflight",
+            scheduled_for_et="09:45",
+        ),
+    )
     _write_json(
         tmp_path / "morning_dca_watchlist/20260727_0945ET/run_state.json",
         _scheduled_run_state(
@@ -3479,26 +3522,29 @@ def test_read_only_0945_slot_records_zero_orders(tmp_path):
 
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
 
+    preflight = next(r for r in report["scheduled_runs"] if r["stream"] == "preflight")
     watchlist = next(r for r in report["scheduled_runs"] if r["stream"] == "watchlist")
+    assert preflight["classification"] == "valid_scheduled_evidence"
     assert watchlist["classification"] == "valid_scheduled_evidence"
     # The known zero, not an unmeasured gap.
+    assert preflight["order_attempts"] == 0
     assert watchlist["order_attempts"] == 0
     # And therefore the day's aggregate stays measurable...
     assert report["usage_counts"]["placed_order_count"] == 0
-    # ...and the row counts as a no-op rather than being excluded.
-    assert report["usage_counts"]["no_op_count"] >= 1
+    # ...and both rows count as no-ops rather than being excluded.
+    assert report["usage_counts"]["no_op_count"] >= 2
 
 
 def test_read_only_slot_still_prefers_a_real_order_artifact(tmp_path):
     # The zero is a fallback for the unmeasured case only: a real order CSV, if
     # one somehow exists, must still win over the assumed zero.
-    run_dir = tmp_path / "morning_dca_watchlist/20260727_0945ET"
+    run_dir = tmp_path / "morning_dca_preflight/20260727_0945ET"
     _write_json(
         run_dir / "run_state.json",
         _scheduled_run_state(
             "bb4f6ef1",
-            "morning_20260727_0945ET",
-            run_type="morning_dca_watchlist_scan",
+            "morning_preflight_20260727_0945ET",
+            run_type="morning_dca_preflight",
             scheduled_for_et="09:45",
         ),
     )
@@ -3509,8 +3555,8 @@ def test_read_only_slot_still_prefers_a_real_order_artifact(tmp_path):
 
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
 
-    watchlist = next(r for r in report["scheduled_runs"] if r["stream"] == "watchlist")
-    assert watchlist["order_attempts"] == 2
+    preflight = next(r for r in report["scheduled_runs"] if r["stream"] == "preflight")
+    assert preflight["order_attempts"] == 2
 
 
 def _consumer_entry(run_id, artifact_path, triggered_at):
@@ -3933,31 +3979,35 @@ def test_latest_marker_merges_after_a_clean_append_failure(tmp_path):
     assert report["usage_counts"]["failed_start_escalation_count"] == 2
 
 
-def test_watchlist_missing_signals_csv_is_an_actionable_issue(tmp_path):
-    # The 9:45 watchlist scan's documented artifact set is watchlist_signals.csv
-    # (plus run_state.json); an incomplete scan must report it as missing rather
-    # than reading as a complete run.
-    run_dir = tmp_path / "morning_dca_watchlist" / "20260727_0945ET"
+def test_preflight_missing_validation_csv_is_an_actionable_issue(tmp_path):
+    # also_runs_required_preflight_writer.preflight_artifacts.files declares
+    # all four of run_state.json, validation.csv, signals.csv, run_summary.json
+    # -- validation.csv was the one this map omitted, so an incomplete
+    # preflight reported no missing artifacts -- codex review
+    # discussion_r3660192627.
+    run_dir = tmp_path / "morning_dca_preflight" / "20260727_0945ET"
     _write_json(
         run_dir / "run_state.json",
         {
-            "run_id": "morning_20260727_0945ET",
+            "run_id": "morning_preflight_20260727_0945ET",
             "run_classification": {
                 "run_origin": "scheduled",
                 "manual_run": False,
                 "cron_id": "bb4f6ef1",
                 "scheduled_for_et": "09:45",
-                "run_id": "morning_20260727_0945ET",
-                "run_type": "morning_dca_watchlist_scan",
+                "run_id": "morning_preflight_20260727_0945ET",
+                "run_type": "morning_dca_preflight",
                 "triggered_at_utc": "2026-07-27T13:45:00Z",
                 "state_schema_version": "test-v1",
             },
         },
     )
+    (run_dir / "signals.csv").write_text("ticker\n", encoding="utf-8")
+    (run_dir / "run_summary.json").write_text("{}", encoding="utf-8")
     report = generate_report(trading_day=TRADING_DAY, cron_tracking_root=tmp_path)
-    row = next(r for r in report["scheduled_runs"] if r["stream"] == "watchlist")
-    assert row["missing_required_artifacts"] == ["watchlist_signals.csv"]
-    assert any("watchlist_signals.csv" in issue for issue in report["actionable_issues"])
+    row = next(r for r in report["scheduled_runs"] if r["stream"] == "preflight")
+    assert row["missing_required_artifacts"] == ["validation.csv"]
+    assert any("validation.csv" in issue for issue in report["actionable_issues"])
 
 
 def test_cross_reference_recovery_is_not_ranked_as_a_second_driver(tmp_path):
@@ -4033,23 +4083,3 @@ def test_contract_and_report_agree_on_recovery_stream_names():
     assert "post_trade" not in declared
     for stream in ALL_STREAMS:
         assert stream in declared, stream
-
-
-@pytest.mark.parametrize(
-    ("scheduled", "recovery", "band"),
-    [(10, 0, "low"), (11, 0, "moderate"), (16, 0, "moderate"), (17, 0, "high"), (8, 3, "moderate"), (9, 8, "high")],
-)
-def test_run_volume_band_edges_follow_the_ten_run_baseline(scheduled, recovery, band):
-    """Baseline is 10 now that bb4f6ef1 fires once (low <= 10, moderate 11-16, high >= 17)."""
-    counts = {
-        "run_count_scheduled": scheduled,
-        "run_count_recovery": recovery,
-        "recovery_and_escalation_count": 0,
-        "connector_pull_count_where_logged": 0,
-        "artifact_count": 0,
-        "artifact_bytes_approx": 0,
-        "retry_count": 0,
-        "error_count": 0,
-        "failed_start_escalation_count": 0,
-    }
-    assert _proxy_bands(counts, 0)["run_volume"]["band"] == band

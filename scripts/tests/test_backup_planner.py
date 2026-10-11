@@ -95,7 +95,7 @@ def _spreads(tmp_path, spreads=None, name="spreads.json"):
 
 def _final_inputs(tmp_path, *, bp="1000", spreads=None):
     """The buying-power and spread inputs `finalize` now requires (review gaps 3 and 4)."""
-    return ["--buying-power", bp, "--fresh-spreads", _spreads(tmp_path, spreads), "--now", NOW]
+    return ["--buying-power", bp, "--fresh-spreads", _spreads(tmp_path, spreads)]
 
 
 def _common(extra=()):

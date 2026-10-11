@@ -7,10 +7,11 @@ mostly about those two:
 1. **It drives the BASE class in live mode**, so its config loader is the only
    one taking ``mode`` positionally-second -- and handing the shared CLI the bare
    function would silently load the 9:45 WATCHLIST profile for a 10:30 LIVE run.
-2. **Nothing narrows the universe.** The retired 9:45 pre-flight used to cut the
-   10:30 universe down to its verdict. Every configured, non-excluded ticker is
-   now scored, and the output is a pure function of the arguments (nothing reads
-   the artifact tree).
+2. **The 9:45 pre-flight gate runs.** ``MorningDCAExecutor.evaluate()`` narrows
+   the universe to the same-day pre-flight verdict for exactly this
+   stream+mode combination, which makes this the only Gate 5 command in the
+   family that reads the artifact tree -- and the only one whose output is not a
+   pure function of its arguments.
 
 The payload contract, the fail-closed input rules and the document shape are
 shared and covered by ``test_generate_market_open_candidates.py``; the
@@ -113,8 +114,14 @@ def _market_data(**per_ticker: dict) -> dict:
     }
 
 
-def _config(**overrides: Any) -> MorningConfig:
-    """A morning live config with a one-ticker universe and the standard ladder."""
+def _config(tmp_path: Path | None = None, **overrides: Any) -> MorningConfig:
+    """A morning live config whose pre-flight root points at an ISOLATED tree.
+
+    Never the bundled production default: the gate reads that tree off disk, so a
+    test that left the root unset would either pick up whatever a developer's
+    machine happens to have under ``cron_tracking/`` or silently exercise the
+    missing-artifact branch for the wrong reason.
+    """
     base: dict[str, Any] = dict(
         tickers=("TEST",),
         excluded_tickers=frozenset(),
@@ -125,17 +132,16 @@ def _config(**overrides: Any) -> MorningConfig:
         base_buy_amount_below_close_usd=1.0,
         interval_minutes=5,
         trend_min_bars=6,
+        preflight_run_state_root=str(
+            (tmp_path if tmp_path is not None else Path("/nonexistent")) / "preflight"
+        ),
     )
     base.update(overrides)
     return MorningConfig(**base)
 
 
 def _write_preflight(root: Path, eligibility: dict[str, bool], *, overall_ok: bool = True) -> None:
-    """Write a schema-shaped same-day artifact of the RETIRED 9:45 pre-flight.
-
-    Only used to prove nothing reads it any more: the pre-flight no longer exists
-    and the 10:30 stream must behave identically with or without a stale one.
-    """
+    """Write a schema-shaped same-day 9:45 pre-flight artifact under ``root``."""
     run_dir = root / f"{DAY.strftime('%Y%m%d')}_0945ET"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "run_state.json").write_text(
@@ -229,8 +235,8 @@ def test_the_spec_identifies_the_slot_and_stream_it_speaks_for():
     assert spec.executor_kwargs == {}
 
 
-def test_document_identifies_the_slot_and_stream_it_speaks_for():
-    document = _run(_market_data(TEST=_ticker_payload()), _config())
+def test_document_identifies_the_slot_and_stream_it_speaks_for(tmp_path):
+    document = _run(_market_data(TEST=_ticker_payload()), _config(tmp_path))
     assert document["slot"] == "1030ET"
     assert document["runner_slot_id"] == "1030"
     assert document["stream"] == MORNING_STREAM
@@ -240,34 +246,74 @@ def test_document_identifies_the_slot_and_stream_it_speaks_for():
     assert document["source"] == "robinhood"
 
 
-# --- the retired 9:45 pre-flight is not consulted ---------------------------
+# --- the 9:45 pre-flight gate -----------------------------------------------
 
 
-def test_a_stale_preflight_artifact_changes_nothing(tmp_path, monkeypatch):
-    """Owner direction: "There should be nothing left that is dependent on the
-    pre-flight." A leftover artifact of the retired pre-screen (here one that
-    would have gated GATED out) must not narrow the universe or alter any row:
-    the document is identical to the one produced with no artifact on disk."""
-    config = _config(tickers=("TEST", "GATED"))
-    data = _market_data(TEST=_ticker_payload(), GATED=_ticker_payload())
-    baseline = _run(data, config)
-
-    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str())
-    _write_preflight(tmp_path / "morning_dca_preflight", {"TEST": True, "GATED": False})
-    with_stale_artifact = _run(data, config)
-
-    assert with_stale_artifact == baseline
-    assert [row["ticker"] for row in baseline["candidates"]] == ["TEST", "GATED"]
-
-
-def test_the_document_has_no_preflight_gate_field():
-    document = _run(_market_data(TEST=_ticker_payload()))
+def test_a_missing_preflight_artifact_evaluates_the_full_universe(tmp_path):
+    """NON-BLOCKING by design (Geoff, 2026-08-02: "should not block any later
+    runs"). The 9:45 scan is a coarse pre-screen; the 10:30 slot's own signal,
+    trend, budget and top-up checks are the real safeguards. A fail-closed gate
+    here would turn every missed pre-flight into a silently empty buy list."""
+    document = _run(_market_data(TEST=_ticker_payload()), _config(tmp_path))
     assert document["buy_count"] == 1
-    assert "preflight_gate" not in document
+    gate = document["preflight_gate"]
+    assert gate["preflight_found"] is False
+    # Reported, not swallowed: this is how a reader tells a degraded gate apart
+    # from a pre-screen that genuinely admitted everything.
+    assert "no same-day 9:45 pre-flight artifact found" in gate["warning"]
 
 
-def test_sibling_slots_have_no_preflight_gate_field_either():
-    """The field was removed from the shared document for every slot."""
+def test_a_preflight_verdict_narrows_the_universe_and_says_so(tmp_path):
+    """The gate's real job. GATED is dropped before scoring, and the document
+    names it -- a short candidate list must be attributable."""
+    _write_preflight(tmp_path / "preflight", {"TEST": True, "GATED": False})
+    config = _config(tmp_path, tickers=("TEST", "GATED"))
+    data = _market_data(TEST=_ticker_payload(), GATED=_ticker_payload())
+    document = _run(data, config)
+    assert [row["ticker"] for row in document["candidates"]] == ["TEST"]
+    gate = document["preflight_gate"]
+    assert gate["preflight_found"] is True
+    assert gate["admitted_tickers"] == ["TEST"]
+    assert gate["gated_out_tickers"] == ["GATED"]
+    assert gate["eligible_to_execute_tickers"] == ["TEST"]
+    assert "warning" not in gate
+
+
+def test_a_valid_but_empty_preflight_stays_non_blocking(tmp_path):
+    """A quiet pre-flight must not be MORE restrictive than a missing one, which
+    already degrades to the full universe (Codex review, morning_dca: "Keep valid
+    empty preflights non-blocking")."""
+    _write_preflight(tmp_path / "preflight", {"TEST": False})
+    document = _run(_market_data(TEST=_ticker_payload()), _config(tmp_path))
+    assert document["buy_count"] == 1
+    gate = document["preflight_gate"]
+    assert gate["preflight_found"] is True
+    assert gate["eligible_to_execute_tickers"] == []
+    assert "zero eligible tickers" in gate["warning"]
+
+
+def test_a_preflight_that_flagged_itself_invalid_is_treated_as_missing(tmp_path):
+    """``overall_ok=false`` means the 9:45 scan itself failed; trusting whatever
+    eligibility data it happened to write would be worse than having none."""
+    _write_preflight(tmp_path / "preflight", {"TEST": True}, overall_ok=False)
+    document = _run(_market_data(TEST=_ticker_payload()), _config(tmp_path))
+    assert document["preflight_gate"]["preflight_found"] is False
+    assert document["buy_count"] == 1
+
+
+def test_the_gate_reads_only_the_configured_root(tmp_path):
+    """Containment: a relocated/staging run must not read production evidence.
+    An artifact under a DIFFERENT root than the config names is not consulted."""
+    _write_preflight(tmp_path / "elsewhere", {"TEST": False, "OTHER": True})
+    document = _run(_market_data(TEST=_ticker_payload()), _config(tmp_path))
+    assert document["preflight_gate"]["preflight_found"] is False
+    assert document["buy_count"] == 1
+
+
+def test_sibling_slots_report_no_preflight_gate():
+    """The field is stream-scoped: it must be null everywhere the gate does not
+    apply, so a reader cannot mistake "gate not applicable" for "gate found
+    nothing"."""
     midday = pytest.importorskip("scripts.generate_midday_candidates")
     from midday_dca import MiddayConfig
 
@@ -290,14 +336,14 @@ def test_sibling_slots_have_no_preflight_gate_field_either():
         config_dir=REAL_CONFIG_DIR,
         check_planner_compatibility=False,
     )
-    assert "preflight_gate" not in document
+    assert document["preflight_gate"] is None
 
 
 # --- trend validation applies ------------------------------------------------
 
 
-def test_qualifying_drop_with_a_validated_trend_buys():
-    document = _run(_market_data(TEST=_ticker_payload()), _config())
+def test_qualifying_drop_with_a_validated_trend_buys(tmp_path):
+    document = _run(_market_data(TEST=_ticker_payload()), _config(tmp_path))
     row = _only(document)
     assert row["action"] == Action.BUY.value
     assert row["buy_multiplier"] == pytest.approx(2.5)
@@ -308,12 +354,12 @@ def test_qualifying_drop_with_a_validated_trend_buys():
     assert document["trend_validation_exempt"] is False
 
 
-def test_unvalidated_trend_is_manual_review_not_an_auto_buy():
+def test_unvalidated_trend_is_manual_review_not_an_auto_buy(tmp_path):
     """Unlike 0935ET this slot is not trend-exempt: at 10:30 the full 60-minute
     window exists. Too few usable bars means manual review, and a truncated fetch
     does not error -- it quietly moves real buys out of ``cands``."""
     data = _market_data(TEST=_ticker_payload(start=time(10, 15)))
-    document = _run(data, _config())
+    document = _run(data, _config(tmp_path))
     row = _only(document)
     assert row["action"] == Action.BUY.value
     assert row["execution_status"] == "manual_review_candidate"
@@ -325,7 +371,7 @@ def test_unvalidated_trend_is_manual_review_not_an_auto_buy():
 # --- the kill switch is NOT this slot's job ---------------------------------
 
 
-def test_the_deployment_kill_switch_flag_is_not_accepted():
+def test_the_deployment_kill_switch_flag_is_not_accepted(tmp_path):
     """Like 0935ET and the intraday fires, and unlike 1230ET: this slot's prompt
     does not make the trailing-7-day guard the producer's responsibility, so
     accepting the figure would size DIFFERENTLY from the executor this mirrors."""
@@ -340,7 +386,7 @@ def test_the_deployment_kill_switch_flag_is_not_accepted():
                 ]
             )
     assert excinfo.value.code != 0
-    document = _run(_market_data(TEST=_ticker_payload()), _config())
+    document = _run(_market_data(TEST=_ticker_payload()), _config(tmp_path))
     assert document["deployed_last_7d_usd"] is None
     assert document["kill_switch_evaluated"] is False
     assert document["kill_switch_engaged"] is False
@@ -349,12 +395,14 @@ def test_the_deployment_kill_switch_flag_is_not_accepted():
 # --- parity with the executor itself ----------------------------------------
 
 
-def test_document_matches_the_executor_called_directly():
+def test_document_matches_the_executor_called_directly(tmp_path):
     """Parity check: every published row must equal what
-    ``MorningDCAExecutor.evaluate()`` produces for the same inputs, over the full
-    configured universe (both tickers are scored; nothing narrows it)."""
-    config = _config(tickers=("TEST", "OTHER"))
-    data = _market_data(TEST=_ticker_payload(), OTHER=_ticker_payload())
+    ``MorningDCAExecutor.evaluate()`` produces for the same inputs -- including
+    the pre-flight narrowing, which is part of ``evaluate()`` and therefore part
+    of what must not be reimplemented here."""
+    _write_preflight(tmp_path / "preflight", {"TEST": True, "GATED": False})
+    config = _config(tmp_path, tickers=("TEST", "GATED"))
+    data = _market_data(TEST=_ticker_payload(), GATED=_ticker_payload())
     document = _run(data, config)
 
     provider = StreamMarketData(
@@ -376,7 +424,7 @@ def test_document_matches_the_executor_called_directly():
         )
         assert row["target_price"] == signal.current_price
         assert row["execution_status"] == signal.execution_status
-    assert [s.ticker for s in signals] == ["TEST", "OTHER"]
+    assert document["preflight_gate"] == executor.preflight_gate
 
 
 # --- end to end through the CLI ---------------------------------------------
@@ -421,7 +469,8 @@ def _cli(tmp_path, *extra: str):
         env={
             **os.environ,
             "DCA_CONFIG_DIR": str(config_dir),
-            # Keep any artifact-root resolution inside the test's tmp tree.
+            # Contain the pre-flight gate's filesystem read: without this the
+            # bundled config's absolute production root would be consulted.
             "DCA_CRON_TRACKING_ROOT": str(tmp_path / "cron_tracking"),
         },
         capture_output=True,
@@ -439,10 +488,13 @@ def test_cli_emits_the_slots_document(tmp_path):
     assert document["cron_id"] == MORNING_LIVE_CRON_ID
     assert document["buy_count"] == 1
     assert [row["ticker"] for row in document["cands"]] == ["TEST"]
-    assert "preflight_gate" not in document
+    # No pre-flight artifact exists under the relocated tree, so the gate must
+    # degrade rather than empty the buy list -- the whole non-blocking contract,
+    # exercised through the real config for once.
+    assert document["preflight_gate"]["preflight_found"] is False
 
 
-def test_a_truncated_trend_window_is_withheld():
+def test_a_truncated_trend_window_is_withheld(tmp_path):
     """At 10:30 the 60-minute window is the whole session so far (09:30-10:30),
     so a payload starting at 10:00 is half of it. The executor's own rule counts
     bars in the window without requiring them to span it, so such a row grades
@@ -453,7 +505,7 @@ def test_a_truncated_trend_window_is_withheld():
     # usable bars, well over trend_min_bars (6) -- on 40 of the required 60
     # minutes, and reaching back nowhere near the 09:30 window start.
     data = _market_data(TEST=_ticker_payload(start=time(9, 50)))
-    document = _run(data, _config())
+    document = _run(data, _config(tmp_path))
     row = _only(document)
     assert row["execution_status"] == "auto_buy_eligible"
     assert row["trend_validated"] is True
@@ -462,21 +514,55 @@ def test_a_truncated_trend_window_is_withheld():
     assert document["same_day_top_up_candidates"] == []
 
 
-def test_a_full_trend_window_still_publishes():
+def test_a_full_trend_window_still_publishes(tmp_path):
     """The control: bars from the open, which at 10:30 is the full window."""
-    document = _run(_market_data(TEST=_ticker_payload()), _config())
+    document = _run(_market_data(TEST=_ticker_payload()), _config(tmp_path))
     assert document["withheld_incomplete_trend_window_tickers"] == []
     assert [c["ticker"] for c in document["cands"]] == ["TEST"]
 
 
-# --- every configured ticker's payload is validated ------------------------
+# --- the pre-flight gate must not let gated-out evidence abort the run ------
 
 
-def test_every_configured_tickers_malformed_payload_aborts():
-    """Nothing is gated out any more, so every configured ticker's payload is
-    evidence the executor reads. A truncated one is a broken fetch and must still
-    fail closed rather than be skipped."""
-    config = _config(tickers=("TEST", "OTHER"))
+def test_a_gated_out_tickers_malformed_payload_does_not_abort(tmp_path):
+    """MorningDCAExecutor.evaluate() narrows to the 09:45 verdict before it
+    scores anything, so a payload for a GATED-OUT ticker is evidence the executor
+    never reads. Validating and parsing it anyway let one malformed gated-out
+    payload abort a run the executor would have completed -- and the prompt tells
+    the caller to fetch the ENTIRE active universe, so gated-out evidence is the
+    normal case, not the exception (Codex review: "Apply preflight exclusions
+    before parsing payloads"; reproduced before fixing)."""
+    _write_preflight(tmp_path / "preflight", {"TEST": True, "GATED": False})
+    config = _config(tmp_path, tickers=("TEST", "GATED"))
+    data = _market_data(
+        TEST=_ticker_payload(),
+        # Truncated: previous_close_bar only, no intraday bars.
+        GATED={"previous_close_bar": _previous_close_bar(100.0, 97.0)},
+    )
+    document = _run(data, config)
+    assert [c["ticker"] for c in document["cands"]] == ["TEST"]
+    assert document["preflight_gate"]["gated_out_tickers"] == ["GATED"]
+
+
+def test_an_admitted_tickers_malformed_payload_still_aborts(tmp_path):
+    """The guard against over-correcting: narrowing must drop only what the
+    executor would never look at. A truncated payload for an ADMITTED ticker is
+    still a broken fetch and must still fail closed."""
+    _write_preflight(tmp_path / "preflight", {"TEST": True, "GATED": False})
+    config = _config(tmp_path, tickers=("TEST", "GATED"))
+    data = _market_data(
+        TEST={"previous_close_bar": _previous_close_bar(100.0, 97.0)},
+        GATED=_ticker_payload(),
+    )
+    with pytest.raises(ValueError, match="incomplete payload"):
+        _run(data, config)
+
+
+def test_with_no_preflight_artifact_every_payload_is_still_validated(tmp_path):
+    """The gate is non-blocking: a missing artifact degrades to the FULL
+    universe, so nothing is gated out and every payload must still be checked.
+    Narrowing must not become a way to skip validation on an ordinary run."""
+    config = _config(tmp_path, tickers=("TEST", "OTHER"))
     data = _market_data(
         TEST=_ticker_payload(),
         OTHER={"previous_close_bar": _previous_close_bar(100.0, 97.0)},
@@ -485,7 +571,7 @@ def test_every_configured_tickers_malformed_payload_aborts():
         _run(data, config)
 
 
-def test_the_spec_has_no_universe_filter():
-    """The morning spec used to be the only one carrying a universe filter."""
-    assert not hasattr(gmc.MORNING_SPEC, "universe_filter")
-    assert not hasattr(gmc, "preflight_admitted_tickers")
+def test_the_spec_carries_the_preflight_universe_filter():
+    """Pins the wiring: only this slot sets one, and it must be the shared
+    implementation rather than a second definition of eligibility."""
+    assert gmc.MORNING_SPEC.universe_filter is gmc.preflight_admitted_tickers

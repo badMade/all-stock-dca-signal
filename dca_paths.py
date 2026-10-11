@@ -127,7 +127,7 @@ def rebase_bundled_root(value: Any) -> Any:
 
     ``config/*.json`` records artifact locations as absolute paths under
     :data:`BUNDLED_CRON_TRACKING_ROOT` (``artifact_paths.live_run_state_root``,
-    ``prior_allocation_roots``, …). Those values
+    ``prior_allocation_roots``, the preflight resolution roots, …). Those values
     are loaded straight into the executors, so they *override* the roots derived
     from :func:`stream_root` -- meaning a deployment that set
     ``$DCA_CRON_TRACKING_ROOT`` still had its executors read and write the

@@ -93,7 +93,8 @@ One row per scheduled run of the active daily chain, **per ET slot**:
 | ET | Task | ID |
 | --- | --- | --- |
 | 9:35 AM | Market-open DCA live Robinhood execution | `2ba19526` |
-| 9:45 AM | Morning DCA watchlist early-warning scan | `bb4f6ef1` |
+| 9:45 AM | Morning DCA pre-flight validation (writes the artifact 42173154's gate requires) | `bb4f6ef1` (preflight) |
+| 9:45 AM | Morning DCA watchlist early-warning scan | `bb4f6ef1` (watchlist) |
 | 10:30 AM | Morning DCA live Robinhood execution | `42173154` |
 | 11:30 AM | Intraday DCA live Robinhood execution | `7be82b97` |
 | 12:30 PM | Midday DCA live Robinhood execution | `a6239dae` |
@@ -110,8 +111,14 @@ Rules:
   `did_not_run` with the reason, never omitted.
 - `7be82b97` is broken out **per ET slot** (11:30, 1:30, 2:30). It is one task
   with three slots and must not be collapsed to a single line.
-- `bb4f6ef1` fires **once** at the 9:45 AM slot, as the watchlist scan
-  (`MorningDCAExecutor` in watchlist mode); it appears as a single row.
+- `bb4f6ef1` fires **two distinct executions** at the same 9:45 AM slot: the
+  manifest requires it to invoke `MorningDCAExecutor` once in preflight mode
+  and once in watchlist mode, each producing its own run ID, artifact
+  directory, and model-usage row (see `stream_note` on
+  `model_usage_log.applies_to_daily_tasks_et` in
+  `config/scheduled_tasks.json`). List both executions separately even though
+  they share a scheduler ID and ET slot; do not merge them into one row or
+  omit one execution.
 - `e3e6f09e` is **paused**, so it is reported as paused rather than as missing.
 
 ### 2. Recovery and escalation runs
@@ -157,7 +164,7 @@ of its artifact set can promote it.
 
 The recovery section reports recovery run counts **broken down by stream**,
 keyed by the same canonical names `per_run_field_rules.stream` declares:
-`market_open`, `watchlist`, `morning`, `intraday`, `midday`,
+`market_open`, `preflight`, `watchlist`, `morning`, `intraday`, `midday`,
 `afternoon`, `slippage`, `watchdog`, `recovery`. A stream with no recovery
 activity is reported as `0`. The per-stream counts must sum to
 `recovery_and_escalation_count`, **not** `run_count_recovery` (see below).
@@ -165,8 +172,9 @@ activity is reported as `0`. The per-stream counts must sum to
 This rule previously named `post_trade`, contradicting the `slippage` every
 other part of the contract uses, so the promised key never appeared in a
 generated report -- a consumer following this rule could not distinguish an
-omitted stream from a confirmed zero. `recovery` is listed
-because the report emits a key for it: it is the fallback bucket for a
+omitted stream from a confirmed zero. `preflight` and `recovery` are listed
+because the report emits a key for each: `preflight` is `bb4f6ef1`'s
+separately-logged sub-invocation, and `recovery` is the fallback bucket for a
 manual artifact whose scanned root maps to no chain stream.
 
 ### Two recovery counters, defined
@@ -329,7 +337,7 @@ history as complete, the report discloses it in `caveats` by stream name.
 **Coverage:** `guarded_run` wraps the in-repo Python entrypoints for
 `42173154` (morning), `a6239dae` (midday, inherits
 `MorningDCAExecutor.run()`), and `10ce362c` (afternoon, via `run_dca.py`).
-`2ba19526`, `bb4f6ef1`, and `7be82b97` have no in-repo
+`2ba19526`, `bb4f6ef1` (both sub-invocations), and `7be82b97` have no in-repo
 executor -- the external scheduler/agent invokes them directly, so no in-repo
 code exists to write a marker for them -- and `67aa802b`/`a46bf007` are
 read-only consumers of other tasks' artifacts. For those five, an
@@ -343,7 +351,7 @@ limitation explicitly in `caveats` for any of those five classified
 | Field | Rule |
 | --- | --- |
 | `run_id` | Exact id as written in the artifact. If the run failed before writing anything, record `no_run_id_written` plus the id it would have used. |
-| `stream` | One of `market_open`, `watchlist`, `morning`, `intraday`, `midday`, `afternoon`, `slippage`, `watchdog`, `recovery`. `slippage` (not `post_trade`) matches the value the 3:35 PM `67aa802b` task's own model-usage directory entry and pointer-validation policy already persist. |
+| `stream` | One of `market_open`, `watchlist`, `preflight`, `morning`, `intraday`, `midday`, `afternoon`, `slippage`, `watchdog`, `recovery`. `slippage` (not `post_trade`) matches the value the 3:35 PM `67aa802b` task's own model-usage directory entry and pointer-validation policy already persist. `preflight` matches `bb4f6ef1`'s separately-logged pre-flight sub-invocation. |
 | `triggering_issue` | `scheduled` for scheduled runs. For everything in the recovery section, the concrete failure or gap that caused the run, not a generic label. |
 | `artifacts_written` | Files actually persisted for the run. |
 | `order_attempts` | Count of order placement attempts recorded in the artifact, with fills if recorded. Read from persisted artifacts only. |
@@ -506,7 +514,7 @@ one.
 
 | Dimension | Proxy | low | moderate | high |
 | --- | --- | --- | --- | --- |
-| `run_volume` | scheduled plus recovery runs, combined total | total at or below 10 runs (the 10-execution scheduled baseline: eight active ids, `bb4f6ef1` firing once as the watchlist scan, `7be82b97` x3 slots, `e3e6f09e` paused/no slot; any mix of scheduled and recovery runs at or below 10 total is low) | total 11 to 16 | total 17 or more |
+| `run_volume` | scheduled plus recovery runs, combined total | total at or below 11 runs (the 11-execution scheduled baseline: eight active ids, `bb4f6ef1` firing twice -- preflight and watchlist -- `7be82b97` x3 slots, `e3e6f09e` paused/no slot; any mix of scheduled and recovery runs at or below 11 total is low) | total 12 to 17 | total 18 or more |
 | `recovery_load` | `recovery_and_escalation_count` | 0 | 1 to 2 | 3 or more |
 | `connector_load` | `connector_pull_count_where_logged` | at or below 50 (routine per-run pulls across the 10-run baseline) | 51 to 90 | 91 or more |
 | `model_load` | count of premium-routed rows (`model_routing_mode='premium'`) in `model_usage_jsonl` | 0 premium rows | exactly 1 premium row (with a recorded reason) | 2 or more premium rows |

@@ -53,11 +53,12 @@ anything here.
 `config/midday_dca.json`'s `confidence_rule` and `MIDDAY_PROFILES`'
 `validate_trend: True` mean a candidate whose price and drop qualify is auto-buy
 eligible **only** when enough usable intraday bars resolve over the 60 minutes
-before 12:30. `MIDDAY_SPEC` is Robinhood-primary (since 2026-10-09, the same
-change 09:35 went through on 2026-09-09): it leaves the cadence and trend length
-at the executor defaults, the Robinhood-native 5-minute interval and the
-config's 6-bar minimum, for every ticker. There is no Finance cadence and no
-per-ticker source override. One whose trend cannot be validated is flagged `manual_review_candidate`: it
+before 12:30. The bar count differs by source: `MIDDAY_SPEC` sets
+`source_interval_minutes=15` and `trend_min_bars=4` for Finance (four completed
+15-minute, start-stamped bars fill the same 60-minute window six 5-minute
+Robinhood bars would); GFUZ's documented Robinhood override restores the
+Robinhood-native 5-minute interval and 6-bar minimum for that one ticker only.
+One whose trend cannot be validated is flagged `manual_review_candidate`: it
 stays in `candidates` and `manual_review_tickers`, and is deliberately excluded
 from `cands` and `same_day_top_up_candidates`.
 
@@ -223,10 +224,10 @@ rewrite rather than a verified capture (see
 a human applies that body through `update_scheduled_task` and the mirror is
 re-captured, the live 12:30 task still aborts at Gate 5 exactly as before.
 
-Gate 5 in that file now reads: fetch every active ticker's Robinhood bars
-(`get_equity_historicals`, 5-minute) from **11:30 ET** through the 12:30 anchor,
-the previous session's daily bar, and a current quote, all under
-`sources.robinhood`; save them as
+Gate 5 in that file now reads: fetch the universe's Finance bars (15-minute,
+start-stamped) from **11:30 ET** through the 12:30 anchor, the previous session's
+daily bar, and a current quote; separately fetch GFUZ's Robinhood bars at the
+native 5-minute cadence over the same window; save them as
 `$ROOT/market_data_<YYYY-MM-DD>_1230.json`; run the command above with the
 trailing-7-day afternoon deployment; save `cands` to `$ROOT/cands.json`. Gates
 6, 6.5, 6.7 and 7 are unchanged.

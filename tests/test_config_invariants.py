@@ -1927,9 +1927,10 @@ def test_date_cues_are_word_bounded(line, exempt, label):
 # (e.g. watchdog_reconciliation_scope_patch_2026_07_27) also use the key
 # "broker_account", but nothing reads those blocks at runtime -- see
 # morning_dca.load_morning_config / midday_dca.load_midday_config, which only
-# ever look at raw["live_task"] and raw["watchlist_task"]. Flagging those prose blocks would be noise, not signal.
+# ever look at raw["live_task"], raw["watchlist_task"], and
+# raw["preflight_task"]. Flagging those prose blocks would be noise, not signal.
 _RUNTIME_BROKER_ACCOUNT_PATHS = {
-    "morning_dca.json": ("live_task", "watchlist_task"),
+    "morning_dca.json": ("live_task", "watchlist_task", "preflight_task"),
     "midday_dca.json": ("live_task",),
 }
 
@@ -2480,6 +2481,24 @@ def test_midday_live_mirror_requires_qualifying_in_window_afternoon_evidence():
         in text
     )
     assert "if missing_pairs:" in text
+
+
+def test_midday_gate_5_fetches_configured_yfinance_fallback():
+    """Finance-primary midday fetches must satisfy the fallback contract.
+
+    Market-open is Robinhood-primary; test_provider_prompt_contract covers its
+    payload against the actual slot spec rather than applying this policy to it.
+    """
+    prompts = {
+        "midday": _midday_live_mirror_text(),
+    }
+    for slot, text in prompts.items():
+        gate_5 = text[text.index("GATE 5 - BUY LIST") : text.index("GATE 6 - BUDGET")]
+        assert "If Finance is unavailable, stale, incomplete, or unresolved" in gate_5, slot
+        assert "fetch yfinance evidence for EVERY ordinary ticker" in gate_5, slot
+        assert "sources.yahoo_finance_yfinance" in gate_5, slot
+        assert '"yahoo_finance_yfinance": []' in gate_5, slot
+        assert "before invoking the generator" in gate_5, slot
 
 
 def test_market_open_gate_5_hands_rich_candidates_to_gate_6_5():
@@ -3409,9 +3428,9 @@ def test_the_missing_budgets_fallback_defaults_match_the_shipped_config():
         overrides = morning_dca._live_circuit_breaker_overrides(Path(empty), morning_dca.MORNING_LIVE_MODE)
         assert overrides["max_consecutive_placement_failures"] == dca_config.DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
         assert overrides["max_orders_per_day"] == dca_config.DEFAULT_MAX_ORDERS_PER_DAY
-        # Watchlist never places, and must stay off this path so a malformed
-        # budgets.json cannot block the 9:45 watchlist scan artifact.
-        assert morning_dca._live_circuit_breaker_overrides(Path(empty), morning_dca.MORNING_WATCHLIST_MODE) == {}
+        # Watchlist/preflight never place, and must stay off this path so a
+        # malformed budgets.json cannot block the 9:45 validation artifact.
+        assert morning_dca._live_circuit_breaker_overrides(Path(empty), morning_dca.MORNING_PREFLIGHT_MODE) == {}
 
     # ...and SCOPED THE SAME WAY on that side, which the round-50 fix asserted
     # for `dca_config` and never asked of the loader it was fixing.

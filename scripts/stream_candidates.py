@@ -170,6 +170,24 @@ class StreamSpec:
     deployment figure that funds the kill switch. See
     :func:`_guarded_sizing_config` for why this is per-slot rather than uniform."""
 
+    universe_filter: Optional[Callable[[date, Sequence[str], Any], Sequence[str]]] = None
+    """Narrows the scored universe the way this stream's executor will, BEFORE
+    payload validation and parsing.
+
+    ``(trading_day, tickers, config) -> admitted tickers``. ``None`` on every
+    stream whose executor scores the whole configured universe, which is all of
+    them except 1030ET: ``MorningDCAExecutor.evaluate()`` first restricts itself
+    to the same-day 09:45 pre-flight verdict, so a payload for a gated-out ticker
+    is evidence the executor never reads. Validating and parsing it anyway let
+    one malformed gated-out payload abort a run the executor would have completed
+    (Codex review: "Apply preflight exclusions before parsing payloads").
+
+    Takes the trading DAY rather than a datetime because that is all the
+    pre-flight lookup needs, and the executor's decision anchor is not available
+    here -- the executor is not constructed until after this narrowing has
+    already decided which payloads to parse.
+    """
+
     executor_kwargs: Dict[str, Any] = dataclasses_field(default_factory=dict)
     """Extra keyword arguments the executor's constructor needs beyond
     config/mode. Only the intraday stream uses this today: one executor class
@@ -949,6 +967,39 @@ def build_document(
     scored_universe = tuple(
         t for t in scoring_config.tickers if t not in scoring_config.excluded_tickers
     )
+    # Captured before spec.universe_filter narrows scored_universe below: this is
+    # the input _apply_preflight_gate needs to compute gated_out_tickers
+    # correctly (config tickers minus admitted), the same set evaluate() would
+    # have passed it. See the _apply_preflight_gate call further down for why
+    # this module calls it explicitly instead of via evaluate().
+    preflight_gate_input = scored_universe
+    # Narrowed by the same universe filter the executor itself will apply, BEFORE
+    # the completeness check and the parse below. Only the 1030ET spec sets one
+    # (the inherited 09:45 pre-flight gate); everywhere else this is a no-op.
+    #
+    # Without it, a malformed or truncated payload for a ticker the pre-flight
+    # GATED OUT aborted the whole run, even though MorningDCAExecutor.evaluate()
+    # would never have looked at that ticker -- and the prompt tells the caller
+    # to fetch the entire active universe, so evidence for gated-out symbols is
+    # the normal case rather than the exception (Codex review: "Apply preflight
+    # exclusions before parsing payloads"; reproduced aborting a run whose only
+    # bad payload belonged to a gated-out symbol).
+    #
+    # This deliberately narrows only what gets SCORED. `universe` above, which
+    # _validate_tickers checks the payload's keys against, stays the full
+    # configured set: a payload for a gated-out ticker is legitimate input to
+    # drop, not an unknown symbol to reject.
+    #
+    # The gate therefore runs twice per fire -- once here, once inside
+    # evaluate(). It is a read of the same same-day artifact both times and is
+    # idempotent, and calling the repo's own shared implementation is the point:
+    # re-deriving "which tickers did the pre-flight admit" here would be a second
+    # definition of a contract morning_preflight_eligible_tickers exists to hold
+    # in exactly one place.
+    if spec.universe_filter is not None:
+        admitted = frozenset(spec.universe_filter(trading_day, scored_universe, config))
+        scored_universe = tuple(t for t in scored_universe if t in admitted)
+
     scored_payloads = {
         ticker: payload
         for ticker, payload in market_data.items()
@@ -1114,6 +1165,21 @@ def build_document(
         executor.decision_time = now.timetz().replace(tzinfo=None)
         nominal = now - timedelta(minutes=spec.evaluation_delay_minutes)
         executor.quote_window_start = nominal - timedelta(minutes=scoring_config.interval_minutes)
+    # evaluate() -- which this module deliberately never calls, so that an
+    # override-routed ticker (GFUZ) can be scored through its own per-ticker
+    # executor below -- is also the only place _apply_preflight_gate() runs,
+    # and that is what populates executor.preflight_gate for the document's own
+    # "preflight_gate" field (null on every slot but 1030ET, a no-op there).
+    # preflight_admitted_tickers (this module's universe_filter for 1030ET)
+    # already narrowed scored_universe to the same verdict for payload parsing,
+    # but its own docstring is explicit that the diagnostic it discards is
+    # exactly this: "recomputed and published by evaluate() itself, which is
+    # what the document's preflight_gate field reports." Calling the gate a
+    # second time, on the SAME pre-narrowing input evaluate() would have used,
+    # is what makes that promise true now that evaluate() itself is bypassed.
+    # The returned (already-known) admitted list is discarded; only the
+    # diagnostic side effect on executor.preflight_gate is wanted here.
+    executor._apply_preflight_gate(now, list(preflight_gate_input))
     signals: List[MorningSignal] = []
     # Tracked per ticker so the trend-window coverage probe below can read
     # bars through the SAME executor (cadence) and provider each ticker was
@@ -1386,6 +1452,13 @@ def build_document(
         # `candidates` at all, so this is the only place the document shows the
         # stand-down was honored.
         "already_covered_tickers": sorted(already_covered_tickers),
+        # The 10:30 morning stream narrows its universe to the same-day 9:45
+        # pre-flight verdict before scoring (MorningDCAExecutor._apply_preflight_gate).
+        # That gate is stream-scoped, so this is None for every other slot --
+        # emitted regardless so a reader can tell "no gate applies here" from "a
+        # gate applied and admitted these tickers", and so Gate 9 can report
+        # which pre-flight artifact the run actually consumed.
+        "preflight_gate": getattr(executor, "preflight_gate", None),
     }
 
 
@@ -1810,16 +1883,10 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
         or not isinstance(source_errors, Sequence)
     ):
         raise ValueError("--market-data's 'source_errors', if present, must be a list")
-    parsed_source_errors: list[str] = []
-    for entry in source_errors:
-        if isinstance(entry, str):
-            parsed_source_errors.append(entry)
-        elif isinstance(entry, Mapping) and isinstance(entry.get("source"), str):
-            parsed_source_errors.append(entry["source"])
-        else:
-            raise ValueError("--market-data's 'source_errors' entries must be source-name strings")
-    source_errors = parsed_source_errors
-    unexpected_source_errors = sorted(set(source_errors) - accepted_sources)
+    try:
+        unexpected_source_errors = sorted(set(source_errors) - accepted_sources)
+    except TypeError as exc:
+        raise ValueError("--market-data's 'source_errors' entries must be source-name strings") from exc
     if unexpected_source_errors:
         raise ValueError(
             "--market-data's 'source_errors' names unsupported source(s) "

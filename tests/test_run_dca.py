@@ -5027,16 +5027,49 @@ def test_run_slot_raw_persistence_failure_preserves_the_slots_own_identity(tmp_p
     raw_persistence_failure_run_state is the OTHER early-exit builder that
     must thread classification_overrides/correlation_id (Codex review:
     "Preserve slot identity on early failure artifacts"). Exercises this on
-    the 10:30 slot specifically."""
+    the 10:30 slot specifically, so a same-day 9:45 preflight artifact must
+    be present -- otherwise run_slot's own preflight gate now blocks the run
+    before reaching raw persistence at all (Codex review: "Persist a missing
+    preflight as a blocked morning run")."""
     import json
 
+    import run_dca as run_dca_module
     from run_dca import run_slot
+
+    # This test exercises raw-persistence failure, not the morning preflight
+    # gate -- admit the full universe so the run reaches run_pipeline().
+    monkeypatch.setattr(
+        run_dca_module,
+        "morning_preflight_eligible_tickers",
+        lambda now, tickers, **kw: (list(tickers), {}),
+    )
 
     class ExplodingPayload:
         pass
 
     config = _demo_config()
-    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    cron_tracking_root = tmp_path / "cron_tracking"
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(cron_tracking_root))
+    preflight_dir = cron_tracking_root / "morning_dca_preflight" / "20260706_0945ET"
+    preflight_dir.mkdir(parents=True)
+    (preflight_dir / "run_state.json").write_text(
+        json.dumps({
+            "run_id": "morning_preflight_20260706",
+            "trading_day": "2026-07-06",
+            "overall_ok": True,
+            "run_classification": {
+                "run_origin": "scheduled",
+                "manual_run": False,
+                "stream": "morning",
+                "run_type": "morning_dca_preflight",
+                "state_schema_version": "morning-preflight-v2-machine-complete",
+            },
+            "per_ticker_eligibility": [
+                {"symbol": t, "eligible_to_execute": True} for t in config.tickers
+            ],
+        }),
+        encoding="utf-8",
+    )
     result = run_slot(
         "1030ET",
         now=_now_for_slot("1030ET"),
@@ -6296,7 +6329,7 @@ def test_run_pipeline_skips_post_processing_when_ownership_not_verified(
     belongs to a DIFFERENT invocation or account and correctly leave it
     untouched -- but this caller used to still trust
     result["run_state_path"] as its own output regardless, letting the
-    raw-input manifest refresh persistence rewrite that
+    raw-input manifest refresh and preflight_gate persistence rewrite that
     foreign artifact. When result["directory_ownership_verified"] is False,
     the pipeline must skip all of that post-processing and return
     immediately, the foreign state left byte-for-byte untouched."""
@@ -6350,7 +6383,7 @@ def test_run_pipeline_skips_post_processing_when_ownership_not_verified(
     assert "could not verify ownership" in caplog.text
 
     # The foreign state must survive completely untouched -- no manifest
-    # refresh rewrite.
+    # refresh, no preflight_gate rewrite.
     persisted = _json.loads(run_state_path.read_bytes())
     assert persisted == foreign_state
 
@@ -7058,6 +7091,12 @@ def test_run_slot_runs_the_pipeline_under_the_slots_own_stream(slot, stream, tmp
         return invoke()
 
     monkeypatch.setattr(run_dca_module, "guarded_run", _capture)
+    # This test exercises stream attribution, not the morning preflight gate.
+    monkeypatch.setattr(
+        run_dca_module,
+        "morning_preflight_eligible_tickers",
+        lambda now, tickers, **kw: (list(tickers), {}),
+    )
 
     config = _demo_config()
     result = run_slot(
@@ -7130,6 +7169,13 @@ def test_run_slot_logs_model_usage_under_the_slots_own_cron_id(slot, expected_cr
         return None
 
     monkeypatch.setattr(run_dca_module, "log_model_usage", _fake_log_model_usage)
+    # This test exercises model-usage cron_id attribution, not the morning
+    # preflight gate.
+    monkeypatch.setattr(
+        run_dca_module,
+        "morning_preflight_eligible_tickers",
+        lambda now, tickers, **kw: (list(tickers), {}),
+    )
 
     config = _demo_config()
     run_slot(
@@ -7162,6 +7208,13 @@ def test_run_slot_anchors_decision_time_to_the_slot(slot, expected_time, tmp_pat
         return real_run_pipeline(now, config, *args, **kwargs)
 
     monkeypatch.setattr(run_dca_module, "run_pipeline", _capture)
+    # This test exercises decision-time anchoring, not the morning preflight
+    # gate.
+    monkeypatch.setattr(
+        run_dca_module,
+        "morning_preflight_eligible_tickers",
+        lambda now, tickers, **kw: (list(tickers), {}),
+    )
 
     config = _demo_config()
     run_slot(
@@ -7304,11 +7357,15 @@ def test_run_slot_date_gate_block_preserves_the_slots_own_identity(tmp_path):
     assert run_state["correlation_id"] == "dca-2026-07-07-morning-1030et"
 
 
-def test_run_slot_1030et_off_approved_day_is_an_ordinary_date_block(tmp_path, monkeypatch):
-    """On a weekend/holiday/out-of-window date the 10:30 slot must resolve as
-    the ordinary date/holiday block, not be misdiagnosed as a failed safety
-    prerequisite or a trading failure. Uses an out-of-approved-window date
-    (like test_run_slot_date_gate_block_preserves_the_slots_own_identity)."""
+def test_run_slot_calendar_gate_takes_priority_over_a_missing_preflight(tmp_path, monkeypatch):
+    """On a weekend/holiday/out-of-window date, the same-day 09:45 preflight
+    artifact is legitimately absent too -- this must resolve as the ordinary
+    date/holiday block (Codex review: "Apply the calendar gate before the
+    preflight early return"), not be misdiagnosed as a failed safety
+    prerequisite. Uses an out-of-approved-window date (like
+    test_run_slot_date_gate_block_preserves_the_slots_own_identity) with no
+    preflight artifact written either, so both gates would fire if checked
+    independently -- the calendar gate's shape must win."""
     import json
 
     from run_dca import run_slot
@@ -7333,18 +7390,25 @@ def test_run_slot_1030et_off_approved_day_is_an_ordinary_date_block(tmp_path, mo
     assert run_state["is_trading_failure"] is False
 
 
-def test_run_slot_1030et_evaluates_full_universe_and_persists_no_preflight_gate(
+def test_run_slot_1030et_evaluates_full_universe_when_no_preflight_artifact_exists(
     tmp_path, monkeypatch
 ):
-    """The 10:30 slot scores the FULL configured non-excluded universe and
-    reads no upstream artifact: the 9:45 pre-flight that used to narrow it
-    was retired, so neither the returned result nor the persisted run_state
-    carries a ``preflight_gate`` diagnostic any more."""
+    """NON-BLOCKING as of 2026-08-02 (Geoff: "should not block any later
+    runs"), superseding the old fail-closed contract (Codex review: "Route
+    the morning slot through its required preflight gate", "Persist a
+    missing preflight as a blocked morning run"). A missing/invalid same-day
+    pre-flight artifact used to reduce the 10:30 slot's eligible universe to
+    ZERO and short-circuit into a startup-failure-shaped blocked run_state.
+    It now degrades to the FULL configured universe with a warning instead
+    -- the same non-blocking contract morning_dca.py's own executor uses --
+    and the run proceeds and evaluates normally; the run_pipeline() branch
+    that used to build that blocked stub has been removed entirely, since
+    preflight_missing_block is never set anymore."""
     import json
 
     from run_dca import run_slot
 
-    # A bare cron root: nothing upstream exists for this slot to read.
+    # No preflight artifact is ever written under this root.
     monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
     config = _demo_config()
     assert config.tickers  # sanity: the configured universe is nonempty
@@ -7367,11 +7431,28 @@ def test_run_slot_1030et_evaluates_full_universe_and_persists_no_preflight_gate(
     assert run_state["run_classification"]["stream"] == "morning"
     assert run_state["run_classification"]["valid_afternoon_scheduled_evidence"] is False
     assert run_state["correlation_id"] == result["correlation_id"]
-    assert "preflight_gate" not in result
-    assert "preflight_gate" not in run_state
-    # usage_proxy.state_file_bytes/total_artifact_bytes (which
-    # dca_cost_tracker.py consumes directly as its artifact-I/O proxy) must
-    # match the actual on-disk size, not be left stale.
+    # Codex review: "Emit the advisory preflight warning from run_slot" --
+    # run_slot's preflight_gate check used to look for preflight_missing_block,
+    # a flag nothing sets anymore, so the advisory "warning" was silently
+    # dropped instead of being logged or persisted. It must now be stamped
+    # onto the returned result for durable observability.
+    assert result["preflight_gate"]["preflight_found"] is False
+    assert "warning" in result["preflight_gate"]
+    # Codex review: "Persist preflight diagnostics in the canonical
+    # artifact" -- build_run_artifacts/run_daily_compact already publish
+    # run_state.json to disk before _run_pipeline_impl can stamp
+    # preflight_gate onto its in-memory return value, so the on-disk
+    # artifact (not just the ephemeral Python dict) must carry it too --
+    # that's what reporting and operators actually read after the fact.
+    assert run_state["preflight_gate"] == result["preflight_gate"]
+    assert run_state["preflight_gate"]["preflight_found"] is False
+    assert "warning" in run_state["preflight_gate"]
+    # Codex review: "Recompute usage bytes after rewriting the run state" --
+    # run_daily_compact() already settled usage_proxy.state_file_bytes/
+    # total_artifact_bytes against the smaller pre-rewrite payload before
+    # preflight_gate was added, so those counters (which dca_cost_tracker.py
+    # consumes directly as its artifact-I/O proxy) must be re-settled against
+    # the actual on-disk size after this rewrite, not left stale.
     from near_close_dca import _existing_csv_artifacts
 
     usage = run_state["usage_proxy"]
@@ -7382,11 +7463,50 @@ def test_run_slot_1030et_evaluates_full_universe_and_persists_no_preflight_gate(
     assert usage["total_artifact_bytes"] == actual_state_bytes + actual_csv_bytes
 
 
-def test_run_slot_1030et_runs_account_pinning_on_a_mismatched_broker(
+def test_run_slot_1030et_survives_a_failed_preflight_gate_artifact_rewrite(
     tmp_path, monkeypatch
 ):
-    """A mismatched broker/account must raise on the 10:30 slot -- account
-    pinning is a standard execution gate every live path crosses."""
+    """Codex review: "Keep the diagnostic rewrite best-effort" -- the
+    run_state.json read-modify-write that persists preflight_gate onto the
+    canonical artifact is documented as best-effort (a full/unwritable
+    artifact volume must not turn an already-completed trading run into an
+    exception), but the original patch only guarded the read, not the
+    subsequent atomic_write_text call. An OSError from that write must be
+    swallowed (logged, not raised) so the rest of run_slot's return path --
+    including everything generate_full_reports/raw-response persistence do
+    afterward -- still completes."""
+    import run_dca
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    def _raise_oserror(*args, **kwargs):
+        raise OSError("simulated full/unwritable artifact volume")
+
+    monkeypatch.setattr(run_dca, "atomic_write_text", _raise_oserror)
+
+    result = run_dca.run_slot(
+        "1030ET",
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+    )
+    assert result.get("blocked") is not True
+    # The in-memory return value is unaffected by the on-disk write failing.
+    assert result["preflight_gate"]["preflight_found"] is False
+
+
+def test_run_slot_1030et_still_runs_account_pinning_with_no_preflight_artifact(
+    tmp_path, monkeypatch
+):
+    """A mismatched broker/account must still raise regardless of preflight
+    artifact state -- account pinning is a standard execution gate every live
+    path crosses, not something the (now-removed) preflight-block early
+    return needed its own extra copy of."""
     import json
 
     from run_dca import run_slot
@@ -7412,11 +7532,163 @@ def test_run_slot_1030et_runs_account_pinning_on_a_mismatched_broker(
     assert run_state["run_classification_outcome"] == "failed_scheduled_run_startup"
 
 
+def test_run_slot_1030et_skips_preflight_gate_rewrite_on_concurrent_state_change(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Reverify ownership before rewriting post-run state"):
+    the preflight_gate persistence read-modify-write used to have neither a
+    lock nor a byte comparison. Two overlapping live invocations of the
+    same slot can both pass the earlier ownership check; without
+    serializing this rewrite, invocation A reads run_state.json here,
+    invocation B publishes its own newer state in the meantime, and A's
+    write would overwrite B's state built from A's stale read -- dropping
+    B's own submitted candidates from the canonical state. This test
+    injects B's overwrite into the gap between A's initial read and A's
+    final compare-before-write (via _existing_csv_artifacts, the one call
+    made between those two reads whenever usage_proxy is present), and
+    asserts A's write is skipped rather than clobbering B's state."""
+    import json
+
+    import run_dca
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    run_state_path = tmp_path / "artifacts" / "run_state.json"
+
+    # A SEPARATE invocation of the same slot's own genuinely different,
+    # already-published state -- standing in for invocation B.
+    peer_state = {
+        "run_id": "peer-b-1030et",
+        "trading_day": "peer",
+        "buy_candidates": [{"ticker": "MSFT", "status": "submitted", "order_id": "PEER-B-ORDER"}],
+        "usage_proxy": {},
+    }
+
+    real_existing_csv_artifacts = run_dca._existing_csv_artifacts
+    _calls = {"count": 0}
+
+    def existing_csv_artifacts_then_peer_overwrites(run_dir):
+        # Only the preflight_gate rewrite's OWN call reaches here in this
+        # scenario (no raw_persistence_state is passed, so the sibling
+        # manifest-refresh block above it never runs its own identical
+        # call) -- landing exactly between A's initial read and A's final
+        # compare-before-write, still inside A's own lock.
+        _calls["count"] += 1
+        if _calls["count"] == 1:
+            run_state_path.write_text(json.dumps(peer_state), encoding="utf-8")
+        return real_existing_csv_artifacts(run_dir)
+
+    monkeypatch.setattr(run_dca, "_existing_csv_artifacts", existing_csv_artifacts_then_peer_overwrites)
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        preflight_gate={"preflight_found": False, "warning": "test"},
+    )
+    # The in-memory return value still carries it (documented behavior)...
+    assert result["preflight_gate"]["preflight_found"] is False
+    # ...but B's on-disk state must survive completely untouched -- A's
+    # stale-read rewrite must never have been written.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
+
+
+def test_run_pipeline_rechecks_identity_when_a_peer_claims_the_directory_after_ownership_verified(
+    tmp_path, monkeypatch
+):
+    """Codex review ("Recheck artifact identity inside each post-run
+    lock"): the sibling test above (`..._skips_preflight_gate_rewrite_on_
+    concurrent_state_change`) proves the byte comparison catches a peer
+    that overwrites BETWEEN this rewrite's own initial read and its final
+    compare-before-write, still inside the SAME lock. It does not cover
+    the narrower, earlier gap this fix closes: a peer that publishes
+    AFTER run_daily_compact() returned with directory_ownership_verified=
+    True but BEFORE this rewrite's own lock is even acquired. The
+    rewrite's own first read (taken only once the lock is held) is
+    already that peer's payload in that case, so comparing the final
+    read against IT (the old behavior) trivially matches. The fix binds
+    the comparison to a snapshot captured immediately when ownership was
+    last confirmed, before either rewrite does any further work of its
+    own."""
+    import json
+    import sys
+
+    import run_dca
+
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path / "cron_tracking"))
+    config = _demo_config()
+
+    run_state_path = tmp_path / "artifacts" / "run_state.json"
+
+    # A SEPARATE invocation of the same slot's own genuinely different,
+    # already-published state -- standing in for invocation B, publishing
+    # in the gap BEFORE either rewrite's own lock is acquired at all.
+    peer_state = {
+        "run_id": "peer-b-1030et-pre-lock",
+        "trading_day": "peer",
+        "buy_candidates": [{"ticker": "MSFT", "status": "submitted", "order_id": "PEER-B-PRE-LOCK-ORDER"}],
+        "usage_proxy": {},
+    }
+
+    real_read_bytes = Path.read_bytes
+    _fired = {"value": False}
+
+    def read_bytes_then_peer_claims_directory(self, *args, **kwargs):
+        result = real_read_bytes(self, *args, **kwargs)
+        # Fires exactly once, right after `_run_pipeline_impl`'s OWN
+        # `_known_run_state_bytes` capture -- the pipeline-level snapshot
+        # taken immediately after run_daily_compact() returned with
+        # ownership verified, before the preflight_gate rewrite's own
+        # lock is ever acquired.
+        if (
+            not _fired["value"]
+            and self.name == "run_state.json"
+            and sys._getframe(1).f_code.co_name == "_run_pipeline_impl"
+        ):
+            _fired["value"] = True
+            run_state_path.write_text(json.dumps(peer_state), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes_then_peer_claims_directory)
+
+    result = run_dca._run_pipeline_impl(
+        now=_now_for_slot("1030ET"),
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "artifacts",
+        scheduled=True,
+        preflight_gate={"preflight_found": False, "warning": "test"},
+    )
+    assert _fired["value"] is True
+    # The in-memory return value still carries it (documented behavior)...
+    assert result["preflight_gate"]["preflight_found"] is False
+    # ...but B's on-disk state must survive completely untouched -- A's
+    # rewrite must never have landed in B's file just because A's own
+    # in-lock self-comparison trivially matched.
+    persisted = json.loads(run_state_path.read_bytes())
+    assert persisted == peer_state
+
+
 def test_run_pipeline_binds_post_run_snapshot_to_run_daily_compacts_own_lock(
     tmp_path, monkeypatch
 ):
     """Codex review ("Bind the post-run snapshot to the ownership check"):
-    a peer replacing run_state.json AFTER `run_daily_compact()`
+    a follow-up on the sibling test above
+    (`..._rechecks_identity_when_a_peer_claims_the_directory_after_
+    ownership_verified`), which only injects the peer AFTER `_run_pipeline_
+    impl`'s own `_known_run_state_bytes` read -- proving the byte-compare
+    inside each rewrite's lock works, but not closing the window one level
+    earlier: a peer replacing run_state.json AFTER `run_daily_compact()`
     releases its own ownership lock but BEFORE `_known_run_state_bytes` is
     even captured. An unconditional re-read there would silently adopt the
     PEER's payload as "this invocation's last verified state" -- passing
@@ -7475,12 +7747,14 @@ def test_run_pipeline_binds_post_run_snapshot_to_run_daily_compacts_own_lock(
         broker=build_broker(config),
         artifacts_dir=tmp_path / "artifacts",
         scheduled=True,
+        preflight_gate={"preflight_found": False, "warning": "test"},
     )
     assert _fired["value"] is True
-    assert result.get("directory_ownership_verified") is not True
-    # B's on-disk state must survive completely untouched -- neither
-    # the raw-input-manifest refresh nor any later post-run write may bind
-    # its own "known" snapshot to the peer's bytes just because this
+    # The in-memory return value still carries it (documented behavior)...
+    assert result["preflight_gate"]["preflight_found"] is False
+    # ...but B's on-disk state must survive completely untouched -- neither
+    # the raw-input-manifest refresh nor the preflight_gate rewrite may
+    # bind their own "known" snapshot to the peer's bytes just because this
     # invocation re-read the shared path after the peer published.
     persisted = json.loads(run_state_path.read_bytes())
     assert persisted == peer_state
@@ -7491,15 +7765,15 @@ def test_run_pipeline_rechecks_ownership_immediately_before_raw_response_merge(
 ):
     """Codex review ("Recheck ownership immediately before downstream
     writes"): `_ownership_lost_mid_pipeline` was previously only ever set by
-    the raw-manifest-refresh rewrite above -- which
+    the raw-manifest-refresh and preflight_gate rewrites above -- and each
     only performs its own in-lock ownership comparison when it actually has
-    something to rewrite (`raw_persistence_state` set).
-    With it absent (the scenario here), nothing at all rechecked
+    something to rewrite (`raw_persistence_state`/`preflight_gate` set).
+    With NEITHER present (the scenario here), nothing at all rechecked
     ownership between `run_daily_compact()` confirming it and the raw-
     placement-response merge / full-report generation that follow -- so a
     peer publishing in that exact window went completely undetected, and
     both would have run against a directory this invocation no longer
-    owned. Companion to the rewrite-specific tests above -- this proves
+    owned. Companion to the two rewrite-specific tests above -- this proves
     the recheck this fix adds is not merely redundant with them."""
     import json
 
@@ -7545,8 +7819,8 @@ def test_run_pipeline_rechecks_ownership_immediately_before_raw_response_merge(
         artifacts_dir=tmp_path / "artifacts",
         scheduled=True,
         generate_full_reports=True,
-        # No `raw_persistence_state` is passed -- the existing
-        # rewrite is skipped entirely, so only this fix's
+        # Neither `raw_persistence_state` nor `preflight_gate` is passed --
+        # both existing rewrites are skipped entirely, so only this fix's
         # own recheck stands between run_daily_compact() and the merge/
         # report section below.
     )
@@ -7859,13 +8133,13 @@ def test_run_pipeline_binds_post_run_snapshot_for_owned_blocked_runs(
     `run_daily_compact()`'s own result without a `_run_state_bytes_under_
     lock` key at all -- the ONLY normal-path branch that didn't populate
     it -- so this pipeline's `_known_run_state_bytes` fell back to its own
-    unlocked read of the shared path before the raw-manifest
-    rewrite (which runs even on a blocked result; see the
-    `if result.get("blocked"): return` a few lines further down).
+    unlocked read of the shared path before the raw-manifest and
+    preflight_gate rewrites (both of which run even on a blocked result;
+    see the `if result.get("blocked"): return` a few lines further down).
     A same-identity peer replacing the state between the blocked ownership
     check inside `run_daily_compact()` and this unlocked fallback read
     would become the accepted baseline, letting this invocation's own
-    post-run rewrite land in the peer's artifact."""
+    preflight_gate rewrite land in the peer's artifact."""
     import json
 
     import run_dca
@@ -7915,20 +8189,22 @@ def test_run_pipeline_binds_post_run_snapshot_for_owned_blocked_runs(
         broker=build_broker(config),
         artifacts_dir=tmp_path / "artifacts",
         scheduled=True,
+        preflight_gate={"preflight_found": False, "warning": "test"},
     )
     assert _fired["value"] is True
     assert result["blocked"] is True
-    # B's on-disk state must survive completely untouched -- no post-run
-    # rewrite (which still runs on a blocked result) may bind its own
-    # "known" snapshot to the peer's bytes just because this invocation
-    # had nothing lock-bound to compare against.
+    # B's on-disk state must survive completely untouched -- the preflight_
+    # gate rewrite (which still runs on a blocked result) must never bind
+    # its own "known" snapshot to the peer's bytes just because this
+    # invocation had nothing lock-bound to compare against.
     persisted = json.loads(run_state_path.read_bytes())
     assert persisted == peer_state
 
 
-def test_run_slot_1230et_and_1530et_scan_their_full_configured_universe(tmp_path, monkeypatch):
-    """The midday and afternoon slots scan their full configured universe
-    with no upstream artifact present."""
+def test_run_slot_1230et_and_1530et_are_unaffected_by_a_missing_preflight_artifact(tmp_path, monkeypatch):
+    """The 9:45 pre-flight gate is a MORNING-only requirement; the midday and
+    afternoon slots must keep scanning their full configured universe
+    regardless of whether a preflight artifact exists."""
     import json
 
     from run_dca import run_slot
@@ -8029,7 +8305,13 @@ def test_run_slot_no_longer_forces_one_order_per_ticker_per_day(slot, tmp_path):
 
     monkeypatch_target = run_dca_module
     original = monkeypatch_target.run_pipeline
+    original_preflight = monkeypatch_target.morning_preflight_eligible_tickers
     monkeypatch_target.run_pipeline = _capture
+    # This test exercises the one_order_per_ticker_per_day flag, not the
+    # morning preflight gate.
+    monkeypatch_target.morning_preflight_eligible_tickers = (
+        lambda now, tickers, **kw: (list(tickers), {})
+    )
     try:
         config = _demo_config()
         run_slot(
@@ -8044,6 +8326,7 @@ def test_run_slot_no_longer_forces_one_order_per_ticker_per_day(slot, tmp_path):
         )
     finally:
         monkeypatch_target.run_pipeline = original
+        monkeypatch_target.morning_preflight_eligible_tickers = original_preflight
 
     assert captured["one_order_per_ticker_per_day"] is False
 
@@ -8490,37 +8773,55 @@ def test_redacted_strings_scrubs_account_shaped_dictionary_keys_too():
     assert len(scrubbed) == 1 and len(next(iter(scrubbed.values()))) == 1
 
 
-def test_run_slot_1030_hands_the_full_configured_universe_to_run_pipeline(monkeypatch, tmp_path):
-    """The 9:45 pre-flight gate (and its supplemental_validator hook) was
-    retired: run_slot("1030ET") passes config.tickers through unnarrowed and
-    forwards no preflight_gate argument to run_pipeline."""
-    import inspect
-
+def test_run_slot_1030_threads_supplemental_validator(monkeypatch, tmp_path):
+    """run_slot passes supplemental_validator through to morning_preflight_eligible_tickers
+    when running 1030ET, and defaults to None when omitted."""
     import run_dca as run_dca_module
     from run_dca import run_slot
 
-    captured = {}
+    captured_kwargs = []
 
-    def fake_run_pipeline(now, slot_config, *args, **kwargs):
-        captured["tickers"] = list(slot_config.tickers)
-        captured["kwargs"] = kwargs
-        return {"ok": True, "artifacts": {}}
+    def mock_preflight(now, tickers, **kwargs):
+        captured_kwargs.append(kwargs)
+        return (list(tickers), {"gfuz_supplemental": {"attempted": kwargs.get("supplemental_validator") is not None}})
 
-    monkeypatch.setattr(run_dca_module, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(run_dca_module, "morning_preflight_eligible_tickers", mock_preflight)
+    monkeypatch.setattr(run_dca_module, "run_pipeline", lambda *args, **kwargs: {"ok": True, "artifacts": {}})
 
     config = _demo_config()
+    now = _now_for_slot("1030ET")
+
+    def dummy_validator(ticker: str):
+        return {"valid": True}
+
+    # 1. With supplemental_validator
     run_slot(
         "1030ET",
-        now=_now_for_slot("1030ET"),
+        now=now,
         config=config,
         state=StrategyState(),
         finance_data=DemoDataProvider(SourceName.FINANCE),
         robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
         broker=build_broker(config),
         artifacts_dir=tmp_path / "run1",
+        supplemental_validator=dummy_validator,
     )
-    assert captured["tickers"] == list(config.tickers)
-    assert "preflight_gate" not in captured["kwargs"]
-    assert "supplemental_validator" not in inspect.signature(run_slot).parameters
-    assert "preflight_gate" not in inspect.signature(run_dca_module.run_pipeline).parameters
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0]["supplemental_validator"] is dummy_validator
+    assert captured_kwargs[0]["output_dir"] == tmp_path / "run1"
+
+    # 2. Without supplemental_validator
+    run_slot(
+        "1030ET",
+        now=now,
+        config=config,
+        state=StrategyState(),
+        finance_data=DemoDataProvider(SourceName.FINANCE),
+        robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+        broker=build_broker(config),
+        artifacts_dir=tmp_path / "run2",
+    )
+    assert len(captured_kwargs) == 2
+    assert captured_kwargs[1]["supplemental_validator"] is None
+    assert captured_kwargs[1]["output_dir"] == tmp_path / "run2"
 

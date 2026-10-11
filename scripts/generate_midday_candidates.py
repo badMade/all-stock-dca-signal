@@ -98,12 +98,15 @@ MIDDAY_SPEC = StreamSpec(
     config_loader=load_midday_config,
     live_mode=MIDDAY_LIVE_MODE,
     stream_config_filename="midday_dca.json",
-    # Robinhood-primary, the same change 09:35 went through on 2026-09-09 (docs/market_open_signal_entry.md). Nothing
-    # is special about 12:30: every ticker is scored from the Robinhood payload the live session fetches, with no
-    # per-ticker source exception and no dependence on the Finance connector or a yfinance prefetch. The cadence and
-    # trend length are left at the executor defaults (Robinhood's native 5-minute bars, config trend_min_bars=6),
-    # as on every other Robinhood-primary slot.
-    source=SourceName.ROBINHOOD,
+    # config/scheduled_tasks.json makes Finance the signal source; Robinhood is
+    # validation/context and the execution broker, never the universal scorer.
+    source=SourceName.FINANCE,
+    # Finance bars are start-stamped on a 15-minute cadence. Four completed
+    # observations fill the same 60-minute trend sample as the executor's six
+    # minimum 5-minute broker observations.
+    source_interval_minutes=15,
+    trend_min_bars=4,
+    ticker_source_overrides={"GFUZ": SourceName.ROBINHOOD},
     # See the module docstring: required by this slot's own producer contract.
     requires_deployed_last_7d_usd=True,
     doc_ref="docs/midday_signal_entry.md",

@@ -28,7 +28,7 @@ import math
 import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +43,6 @@ from dca_runner import (
     BrokerOrder,
     BudgetDataError,
     BudgetSnapshot,
-    _committed_dollar_amount,
     budget_snapshot,
 )
 from near_close_dca import (
@@ -69,10 +68,7 @@ __all__ = [
     "load_plan",
     "order_plan_path",
     "placement_window",
-    "plan_from_decisions",
     "plan_from_survivors",
-    "already_placed_symbols",
-    "trailing_deployed_usd",
     "reconcile",
     "revalidate_for_placement",
     "universe_hash",
@@ -690,37 +686,10 @@ def compute_plan(
         order = _size_order(row, symbol, config=config, slot=slot, trading_day=trading_day)
         if order is not None:
             chosen[symbol] = order
-    return _finish_backup_plan(
-        list(chosen.values()), skipped, config=config, trading_day=trading_day, slot=slot,
-        generated_at_et=generated_at_et, ladder_version=ladder_version, orders_today=orders_today,
-        tier=tier, weekly_cap_usd=weekly_cap_usd, buying_power_usd=buying_power_usd,
-    )
-
-
-def _finish_backup_plan(
-    orders_in: list[dict[str, Any]],
-    skipped: list[tuple[str, str]],
-    *,
-    config: StrategyConfig,
-    trading_day: date,
-    slot: str,
-    generated_at_et: datetime,
-    ladder_version: str,
-    orders_today: Iterable[BrokerOrder],
-    tier: BudgetTier,
-    weekly_cap_usd: float | None,
-    buying_power_usd: Any,
-) -> PlanResult:
-    """Order, cap-check and wrap sized orders as a ``generator: "backup"`` plan.
-
-    Shared by :func:`compute_plan` (sized from quotes) and :func:`plan_from_decisions` (sized by the
-    primary's Gate 5), so the two cannot drift on priority, the per-order cap, the daily and weekly
-    caps (all-or-nothing, D4) or buying power.
-    """
     # config/budgets.json allocation_priority: multiplier, then drop, then ticker alphabetical.
     # Written out rather than via dca_runner._allocation_priority_key, which re-estimates the
     # multiplier from the notional and misreads interpolated per-ticker multipliers.
-    orders = sorted(orders_in, key=lambda o: (-o["multiplier"], -o["drop_pct"], o["symbol"]))
+    orders = sorted(chosen.values(), key=lambda o: (-o["multiplier"], -o["drop_pct"], o["symbol"]))
     errors = [PlanError("notional_over_cap", o["symbol"]) for o in orders if o["notional_usd"] > MAX_PER_ORDER_USD]
     try:
         snapshot = budget_snapshot(list(orders_today), trading_day)
@@ -740,104 +709,6 @@ def _finish_backup_plan(
         "orders": orders,
     }
     return PlanResult(plan=plan, orders=tuple(orders), skipped=tuple(skipped))
-
-
-def plan_from_decisions(
-    decisions: Iterable[Mapping[str, Any]],
-    *,
-    config: StrategyConfig,
-    trading_day: date,
-    slot: str,
-    generated_at_et: datetime,
-    ladder_version: str,
-    orders_today: Iterable[BrokerOrder] = (),
-    tier: BudgetTier,
-    weekly_cap_usd: float | None = None,
-    buying_power_usd: Any = None,
-) -> PlanResult:
-    """A backup plan from decisions the primary's own Gate 5 already reached (the safety gate).
-
-    Unlike :func:`compute_plan`, nothing is sized here: each decision carries the notional,
-    multiplier and drop the signal engine produced, so the backup can never size differently from
-    the primary. Decisions are ``symbol``, ``notional_usd``, ``multiplier``, ``drop_pct``,
-    ``decision_price``, ``prior_close`` and ``prior_low`` (``None`` when unknown). A decision that is
-    malformed, outside the universe or excluded is skipped and named in ``skipped``; the rest are
-    planned, then the same all-or-nothing caps as :func:`compute_plan` apply.
-
-    Returns:
-        ``PlanResult`` with the plan document (generator ``"backup"``) or a cap error.
-    """
-    active, excluded = set(config.tickers), set(config.excluded_tickers)
-    skipped: list[tuple[str, str]] = []
-    chosen: dict[str, dict[str, Any]] = {}
-    for row in decisions:
-        symbol = row.get("symbol").strip().upper() if isinstance(row, Mapping) and isinstance(row.get("symbol"), str) else None
-        if symbol is None or not all(_is_positive_finite(row.get(k)) for k in ("notional_usd", "multiplier", "drop_pct", "decision_price", "prior_close")):
-            skipped.append((symbol or "<invalid>", "invalid_decision"))
-            continue
-        if symbol in chosen:
-            continue
-        if symbol in excluded:
-            skipped.append((symbol, "excluded_symbol"))
-            continue
-        if symbol not in active:
-            skipped.append((symbol, "unknown_symbol"))
-            continue
-        low = row.get("prior_low")
-        chosen[symbol] = {
-            "symbol": symbol,
-            "notional_usd": round(float(row["notional_usd"]), 2),
-            "multiplier": round(float(row["multiplier"]), 6),
-            "drop_pct": round(float(row["drop_pct"]), 6),
-            "decision_price": float(row["decision_price"]),
-            "prior_close": float(row["prior_close"]),
-            "prior_low": float(low) if _is_positive_finite(low) else None,
-            "ref_id": _expected_ref_id(slot, trading_day, symbol),
-        }
-    return _finish_backup_plan(
-        list(chosen.values()), skipped, config=config, trading_day=trading_day, slot=slot,
-        generated_at_et=generated_at_et, ladder_version=ladder_version, orders_today=orders_today,
-        tier=tier, weekly_cap_usd=weekly_cap_usd, buying_power_usd=buying_power_usd,
-    )
-
-
-def trailing_deployed_usd(orders: Iterable[BrokerOrder], *, now: datetime, days: int = 7) -> float:
-    """Committed buy spend in the ``days`` days up to ``now``: the kill switch's input, from broker history.
-
-    The primary derives its figure from run-state artifacts on the Mac, which the cloud cannot read. This
-    counts EVERY placed agent's committed buys, an upper bound of the primary's afternoon-only figure, so
-    any difference can only trip the 1x cap earlier, never later. A dead buy counts only its executed part.
-    A window edge is inclusive on both sides.
-
-    Raises:
-        BudgetDataError: A counted order's amount is non-numeric, non-finite or not positive. An unknown
-            fill is not a zero fill; reading it as zero would keep the kill switch off on the day it matters.
-    """
-    start = now - timedelta(days=days)
-    total = 0.0
-    for order in orders:
-        if not (start <= order.created_at <= now) or not order.counts_toward_budget:
-            continue
-        amount = _committed_dollar_amount(order)
-        try:
-            unusable = isinstance(amount, bool) or not isinstance(amount, (int, float)) or not math.isfinite(amount) or amount <= 0
-        except OverflowError:
-            unusable = True
-        if unusable:
-            raise BudgetDataError(f"broker order {order.symbol!r} has an unusable committed amount; true spend is unknown")
-        total += amount
-    return total
-
-
-def already_placed_symbols(
-    broker_orders: Iterable[BrokerOrder], *, trading_day: date, slot: str, scope: str = "day"
-) -> set[str]:
-    """Symbols with a buy attempt (dead ones included) that ``reconcile`` would treat as already placed.
-
-    Lets a caller exclude them BEFORE scoring, with the same ``scope`` rule ``reconcile`` applies later.
-    """
-    _, symbols = _placed_markers(_buy_attempts_on(broker_orders, trading_day), trading_day=trading_day, slot=slot, scope=scope)
-    return set(symbols)
 
 
 def _size_order(

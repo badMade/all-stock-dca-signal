@@ -61,7 +61,7 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, ClassVar, Dict, List, Optional, Sequence, Set, Tuple, cast
+from typing import Any, Callable, ClassVar, Dict, List, Mapping, Optional, Sequence, Set, Tuple, cast
 
 from dca_alerts import GuardedRunConfig, artifact_freshness_probe, attempt_log_root_sibling_to, guarded_run
 from dca_common import TopUpContext, build_top_up_outcome
@@ -167,6 +167,7 @@ from scripts.same_day_pointer import (
 from scripts.same_day_pointer import (
     build_pointer_metadata,
     derive_valid_scheduled_evidence,
+    validate_pointer,
 )
 from scripts.scheduled_artifacts import (
     ORDER_ATTEMPT_STATUSES,
@@ -275,13 +276,37 @@ SIGNAL_CSV_FIELDS = (
 # Watchlist (9:45 AM ET) scan identity — analytics-only, no trading.
 MORNING_WATCHLIST_MODE = "watchlist"
 # bb4f6ef1 is the canonical 9:45 AM slot. The former repo-internal alias
-# was retired from the active schedule on 2026-07-27.
+# "morning-dca-0945" was retired from the active schedule on 2026-07-27.
 MORNING_WATCHLIST_CRON_ID = "bb4f6ef1"
 MORNING_WATCHLIST_RUN_TYPE = "morning_dca_watchlist_scan"
 MORNING_WATCHLIST_SCHEDULED_FOR_ET = "09:45"
 MORNING_WATCHLIST_WINDOW_START_ET = "09:40"
 MORNING_WATCHLIST_WINDOW_END_ET = "09:50"
 MORNING_WATCHLIST_SCHEMA_VERSION = "morning-watchlist-v1"
+
+# Pre-flight validation (9:45 AM ET) identity — read-only pre-screen for the
+# 10:30 live executor. Writes eligible_to_execute=true/false per ticker. This is
+# a COARSE pre-screen (is a ticker worth evaluating at 10:30?), NOT a final
+# approval: the 10:30 live run always recomputes signals, budget, spread, trend,
+# and top-up from scratch and may still decline to place an order.
+#
+# As of Mon Jul 13 2026 the artifact is machine-complete
+# (schema morning-preflight-v2-machine-complete, schemas/morning_preflight.schema.json):
+# it always writes the top-level overall_ok flag plus eligible_count,
+# ineligible_count, unresolved_tickers, blocking_errors, and a
+# per_ticker_eligibility list with every active-universe symbol exactly once, so
+# the 10:30 live task can gate directly off machine fields. Unresolved symbols
+# (e.g. AAAU, SPCX) are emitted as rows with eligible_to_execute=false and
+# ineligible_reason='unresolved_ticker'; they never force overall_ok=false, which
+# flips false only for global/account/buying-power/auth/schema-write failures.
+MORNING_PREFLIGHT_MODE = "preflight"
+MORNING_PREFLIGHT_CRON_ID = "bb4f6ef1"
+MORNING_PREFLIGHT_RUN_TYPE = "morning_dca_preflight"
+MORNING_PREFLIGHT_SCHEDULED_FOR_ET = "09:45"
+MORNING_PREFLIGHT_WINDOW_START_ET = "09:40"
+MORNING_PREFLIGHT_WINDOW_END_ET = "09:50"
+MORNING_PREFLIGHT_SCHEMA_VERSION = "morning-preflight-v2-machine-complete"
+MORNING_PREFLIGHT_TREND_STATUS = "not_evaluated_preflight"
 
 # Live (10:30 AM ET) execution identity — Robinhood-only live buys.
 MORNING_LIVE_MODE = "live"
@@ -304,6 +329,7 @@ MORNING_WINDOW_END_ET = MORNING_WATCHLIST_WINDOW_END_ET
 # ce16ba6b root. The watchlist scan and live execution use distinct roots so a
 # read-only scan can never be confused with a live-execution artifact.
 DEFAULT_MORNING_WATCHLIST_STATE_ROOT = stream_root("morning_dca_watchlist")
+DEFAULT_MORNING_PREFLIGHT_STATE_ROOT = stream_root("morning_dca_preflight")
 DEFAULT_MORNING_LIVE_STATE_ROOT = stream_root("morning_dca")
 # Legacy alias: the default root historically pointed at the morning stream.
 DEFAULT_MORNING_STATE_ROOT = DEFAULT_MORNING_WATCHLIST_STATE_ROOT
@@ -330,6 +356,17 @@ DEFAULT_MARKET_OPEN_TASK_ROOT = stream_root("market_open_dca")
 # name.
 DEFAULT_INTRADAY_TASK_ROOT = stream_root("intraday_dca")
 
+# Jul 20 2026 pre-flight path fix (see live_task.preflight_artifact_resolution
+# in config/morning_dca.json). The 10:30 live run must never read the same-day
+# 9:45 pre-flight artifact from either of these roots -- both were implicated
+# in the Jul 20 2026 escalation (a stray cron-id path and the live task's own
+# output directory). _apply_preflight_gate() fails closed rather than reading
+# from a preflight_run_state_root that resolves under one of these.
+DEFAULT_PREFLIGHT_FORBIDDEN_ROOTS: Tuple[str, ...] = (
+    stream_root("42173154"),
+    DEFAULT_MORNING_LIVE_STATE_ROOT,
+)
+
 # Jul 20 2026 budget ledger location fix (see budget_ledger.bootstrap in
 # config/morning_dca.json). Default filename for the persisted morning budget
 # ledger snapshot written under the live run's own output directory.
@@ -353,6 +390,24 @@ MORNING_PROFILES: Dict[str, Dict[str, Any]] = {
         "folder_suffix": "0945ET",
         "scheduled_run_id_prefix": "morning",
         "manual_run_id_prefix": "manual_morning",
+        "decision_time_et": time(9, 45),
+        "validate_trend": False,
+    },
+    MORNING_PREFLIGHT_MODE: {
+        "mode": MORNING_PREFLIGHT_MODE,
+        "artifact_mode": "preflight",
+        "trades": False,
+        "cron_id": MORNING_PREFLIGHT_CRON_ID,
+        "run_type": MORNING_PREFLIGHT_RUN_TYPE,
+        "scheduled_for_et": MORNING_PREFLIGHT_SCHEDULED_FOR_ET,
+        "window_start_et": MORNING_PREFLIGHT_WINDOW_START_ET,
+        "window_end_et": MORNING_PREFLIGHT_WINDOW_END_ET,
+        "state_schema_version": MORNING_PREFLIGHT_SCHEMA_VERSION,
+        "state_root": DEFAULT_MORNING_PREFLIGHT_STATE_ROOT,
+        "state_root_stream": "morning_dca_preflight",
+        "folder_suffix": "0945ET",
+        "scheduled_run_id_prefix": "morning_preflight",
+        "manual_run_id_prefix": "manual_morning_preflight",
         "decision_time_et": time(9, 45),
         "validate_trend": False,
     },
@@ -612,6 +667,17 @@ class MorningConfig:
     model_usage_model_actual: Optional[str] = None
     model_usage_model_routing_mode: Optional[str] = None
     model_usage_reason_for_premium_model: Optional[str] = None
+    # Root the 10:30 live gate reads the same-day 9:45 pre-flight artifact from.
+    # When None the live executor uses DEFAULT_MORNING_PREFLIGHT_STATE_ROOT.
+    preflight_run_state_root: Optional[str] = None
+    # Roots the pre-flight artifact must NEVER be read from (see
+    # live_task.preflight_artifact_resolution.must_not_look_under in
+    # morning_dca.json). When empty, DEFAULT_PREFLIGHT_FORBIDDEN_ROOTS is used.
+    preflight_forbidden_roots: Tuple[str, ...] = ()
+    # Whether _apply_preflight_gate performs the single bounded recovery scan
+    # (see live_task.preflight_artifact_resolution.bounded_recovery_lookup)
+    # when the primary path and latest_preflight.json pointer both miss.
+    preflight_bounded_recovery: bool = True
     # Filename of the persisted morning budget ledger snapshot the live task
     # writes under its own output directory (see budget_ledger.bootstrap /
     # budget_ledger.ledger_files in morning_dca.json).
@@ -785,6 +851,74 @@ class MorningLedger:
 #                              validated; the run does NOT auto-buy.
 EXEC_AUTO_BUY_ELIGIBLE = "auto_buy_eligible"
 EXEC_MANUAL_REVIEW_CANDIDATE = "manual_review_candidate"
+
+
+def preflight_eligibility(signal: "MorningSignal") -> bool:
+    """Return whether ``signal`` is eligible for the 10:30 live evaluator.
+
+    This is the 9:45 pre-flight verdict: a COARSE pre-screen answering "is this
+    ticker worth re-evaluating at 10:30?", NOT a final buy approval. A ticker is
+    eligible when it graded to a positive-multiplier BUY at 9:45 with both a
+    usable current price and previous close. The 10:30 live run always recomputes
+    signals/budget/spread/trend/top-up from scratch and may still decline, so an
+    eligible ticker is not guaranteed to be bought and an ineligible ticker is
+    simply skipped by the live gate.
+    """
+    return (
+        signal.action == Action.BUY
+        and signal.multiplier > 0
+        and signal.current_price is not None
+        and signal.previous_close is not None
+    )
+
+
+def preflight_ticker_eligibility_row(signal: "MorningSignal") -> Dict[str, Any]:
+    """Build one machine-complete ``per_ticker_eligibility`` row for ``signal``.
+
+    Emits every field the 10:30 live gate consumes, exactly once per active
+    symbol. Fields the coarse read-only pre-flight does not evaluate (account,
+    buying power, spread) are ``None`` rather than fabricated; the 10:30 live run
+    computes them fresh. Trend is ``not_evaluated_preflight`` (no 60-minute
+    window at 9:45). Unresolved symbols (no usable quote or prior close, e.g.
+    AAAU/SPCX) are marked ``eligible_to_execute=false`` with
+    ``ineligible_reason='unresolved_ticker'`` and never invalidate the artifact.
+    """
+    quote_available = signal.current_price is not None
+    prior_close_available = signal.previous_close is not None
+    resolved = quote_available and prior_close_available
+    eligible = preflight_eligibility(signal)
+
+    if not quote_available and not prior_close_available:
+        ineligible_reason: Optional[str] = "unresolved_ticker"
+    elif not quote_available:
+        ineligible_reason = "quote_unavailable"
+    elif not prior_close_available:
+        ineligible_reason = "prior_close_unavailable"
+    elif not eligible:
+        ineligible_reason = "no_qualifying_drop"
+    else:
+        ineligible_reason = None
+
+    return {
+        "symbol": signal.ticker,
+        "active_universe": True,
+        "quote_available": quote_available,
+        "prior_close_available": prior_close_available,
+        "tradable": resolved,
+        # Account/buying-power/spread are not bound by the read-only pre-flight;
+        # the 10:30 live run performs the authoritative checks.
+        "account_ok": None,
+        "buying_power_ok": None,
+        "spread_pct": None,
+        "spread_ok": None,
+        "trend_status": MORNING_PREFLIGHT_TREND_STATUS,
+        "data_confidence_status": "resolved" if resolved else "unresolved",
+        "early_drop_pct": signal.drop_pct,
+        "early_multiplier": signal.multiplier,
+        "hypothetical_amount": signal.hypothetical_amount_usd,
+        "eligible_to_execute": eligible,
+        "ineligible_reason": ineligible_reason,
+    }
 
 
 @dataclass(frozen=True)
@@ -1247,6 +1381,22 @@ def default_cap_seed_roots() -> tuple[str, str]:
     return stream_root("ce16ba6b"), stream_root("market_open_dca")
 
 
+def default_preflight_forbidden_roots() -> tuple[str, ...]:
+    """The default must-not-look-under roots for the preflight gate, at CALL time.
+
+    ``_apply_preflight_gate`` already resolves its OWN ``root`` fresh via
+    ``stream_root("morning_dca_preflight")`` at call time, but used to compare
+    it against ``DEFAULT_PREFLIGHT_FORBIDDEN_ROOTS`` directly -- a module-level
+    tuple bound once at import. A ``$DCA_CRON_TRACKING_ROOT`` set afterward
+    moved ``root`` to the new tree while these forbidden roots stayed under the
+    old one, so a ``preflight_run_state_root`` that relocated into the (now
+    unguarded) old live-output directory passed the ``must_not_look_under``
+    check it exists to enforce (Codex review, PR #219: "Resolve forbidden
+    preflight roots at call time").
+    """
+    return stream_root("42173154"), stream_root("morning_dca")
+
+
 def _live_circuit_breaker_overrides(config_dir_path, mode) -> dict:
     """The shared circuit breakers a LIVE morning run must carry, whatever
     else the load did or did not find.
@@ -1269,9 +1419,10 @@ def _live_circuit_breaker_overrides(config_dir_path, mode) -> dict:
     because the layer that knew the real number never ran (Codex review,
     PR #786: "Load the breaker before morning-config fallbacks").
 
-    Live mode only, unchanged: the watchlist scan never reaches broker
-    placement, so a malformed ``budgets.json`` must not block it from writing
-    its artifact. That gate lives HERE rather than at the three call sites so it
+    Live mode only, unchanged: watchlist/preflight never reach broker
+    placement, so a malformed ``budgets.json`` must not block the 9:45
+    preflight from writing the validation artifact the 10:30 live gate
+    requires. That gate lives HERE rather than at the three call sites so it
     cannot be applied at two of them and forgotten at the third -- which is
     the shape of the bug this function exists to fix.
     """
@@ -1422,7 +1573,7 @@ def load_morning_config(
             "morning_dca.json not found at %s; using MorningConfig defaults", cfg_path
         )
         approved_dates = _load_approved_dates_fail_closed(config_dir_path)
-        # morning_run_state_root deliberately stays
+        # morning_run_state_root/preflight_run_state_root deliberately stay
         # None here rather than being resolved via stream_root() at load
         # time the way model_usage_log_root is just below: run_dca.py's
         # _resolve_cross_stream_prior_allocation_roots reads this exact
@@ -1433,10 +1584,11 @@ def load_morning_config(
         # let a relocated (test/demo/staging) run's cross-stream scan trust
         # the bundled production default (Codex/self-review, PR #219: "Keep
         # relocated runs contained" regressed by an earlier fix here). The
-        # staleness this was meant to fix -- self.state_root falling back to
-        # an import-time DEFAULT_* constant instead of a fresh stream_root()
-        # call -- is fixed at that actual call site instead (see
-        # MorningDCAExecutor.__init__).
+        # staleness this was meant to fix -- self.state_root and the
+        # preflight-gate root falling back to an import-time DEFAULT_*
+        # constant instead of a fresh stream_root() call -- is fixed at
+        # those actual call sites instead (see MorningDCAExecutor.__init__
+        # and _apply_preflight_gate).
         #
         # target_account_number is resolved fresh here too, mirroring the
         # config-present path below: MorningConfig's dataclass default is
@@ -1444,10 +1596,10 @@ def load_morning_config(
         # config-missing live run either pinned a stale account or blocked on
         # a stale unset sentinel instead of reflecting the account actually
         # set in the environment right now (Codex review, PR #219: "Resolve
-        # the account when falling back to defaults"). Watchlist
+        # the account when falling back to defaults"). Watchlist/preflight
         # never trade, so they get the READ_ONLY_ACCOUNT literal rather than
         # a real account -- the same value the bundled config's own
-        # watchlist_task block use -- as defense in depth
+        # watchlist_task/preflight_task blocks use -- as defense in depth
         # alongside run_classification's own profile["trades"] gate (Codex
         # review, PR #219: "Omit account numbers from read-only
         # classifications").
@@ -1497,7 +1649,7 @@ def load_morning_config(
             **_live_circuit_breaker_overrides(config_dir_path, mode),
         )
 
-    # The bundled artifact_paths / prior_allocation_roots
+    # The bundled artifact_paths / prior_allocation_roots / preflight-resolution
     # values are absolute paths under the default cron_tracking tree, and they
     # are loaded into the executor -- overriding the stream_root()-derived
     # defaults. Without this, setting $DCA_CRON_TRACKING_ROOT moved every
@@ -1545,19 +1697,21 @@ def load_morning_config(
 
     # The broker account comes from THIS mode's task block, not unconditionally
     # from live_task. Each block already carries the right value -- live_task has
-    # the "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}" reference, watchlist_task has
-    # the literal "read_only" -- but this used to read
+    # the "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}" reference, watchlist_task and
+    # preflight_task have the literal "read_only" -- but this used to read
     # live_task for every mode, so the read-only scans silently bound the live
     # trading account.
     #
     # That became load-breaking once the account moved into the environment:
     # expand_config_env raises when the variable is unset, so constructing a
-    # watchlist executor started failing on a host where the secret
-    # is scoped only to the trading jobs (Codex review, PR #219: "Require the
+    # watchlist or preflight executor started failing on a host where the secret
+    # is scoped only to the trading jobs -- and the 9:45 preflight artifact is a
+    # hard dependency of the 10:30 live run (Codex review, PR #219: "Require the
     # account variable only for live mode"). Reading the mode's own block fixes
     # both: read-only modes get "read_only" and never touch the variable.
     mode_task_key = {
         MORNING_WATCHLIST_MODE: "watchlist_task",
+        MORNING_PREFLIGHT_MODE: "preflight_task",
         MORNING_LIVE_MODE: "live_task",
     }.get(mode)
     account_task = raw.get(mode_task_key) if mode_task_key else None
@@ -1592,16 +1746,30 @@ def load_morning_config(
                 "fail closed and record account_pinning_failed",
                 source,
             )
+    # preflight_artifact_resolution (added Jul 20 2026): pins where the 10:30
+    # live gate is and is not allowed to read the same-day 9:45 pre-flight
+    # artifact from, and whether it performs the single bounded recovery scan.
+    preflight_resolution = live_task.get("preflight_artifact_resolution", {})
+    forbidden_roots = preflight_resolution.get("must_not_look_under")
+    if isinstance(forbidden_roots, list) and forbidden_roots:
+        kwargs["preflight_forbidden_roots"] = tuple(str(p) for p in forbidden_roots)
+    if "bounded_recovery_lookup" in preflight_resolution:
+        kwargs["preflight_bounded_recovery"] = bool(preflight_resolution["bounded_recovery_lookup"])
+
     artifact_paths = raw.get("artifact_paths", {})
     # Per-mode root keys take precedence; fall back to the legacy shared key.
     mode_root_key = {
         MORNING_WATCHLIST_MODE: "watchlist_run_state_root",
+        MORNING_PREFLIGHT_MODE: "preflight_run_state_root",
         MORNING_LIVE_MODE: "live_run_state_root",
     }.get(mode)
     if mode_root_key and mode_root_key in artifact_paths:
         kwargs["morning_run_state_root"] = artifact_paths[mode_root_key]
     elif "morning_run_state_root" in artifact_paths:
         kwargs["morning_run_state_root"] = artifact_paths["morning_run_state_root"]
+    # The 10:30 live gate reads the same-day pre-flight artifact from this root.
+    if "preflight_run_state_root" in artifact_paths:
+        kwargs["preflight_run_state_root"] = artifact_paths["preflight_run_state_root"]
     prior_roots = artifact_paths.get("prior_allocation_roots")
     if isinstance(prior_roots, list):
         # Preserve [] as () so an explicit empty array in JSON fully disables
@@ -1849,6 +2017,181 @@ def load_stream_config(
     kwargs.update(load_per_ticker_sizing(config_dir_path))
 
     return config_cls(**kwargs)
+
+
+def load_same_day_preflight(
+    preflight_root: str,
+    trading_day: date,
+    *,
+    bounded_recovery: bool = True,
+    forbidden_roots: Sequence[str] = (),
+) -> Optional[Dict[str, Any]]:
+    """Load the same-day 9:45 pre-flight artifact for the 10:30 live gate.
+
+    Returns a dict ``{"run_id", "eligible_tickers": set[str], "run_state_path",
+    "recovered_via_bounded_lookup"}`` when a same-day pre-flight
+    ``run_state.json`` is found under ``preflight_root/YYYYMMDD_0945ET/`` (or
+    via ``latest_preflight.json`` when it validates as same-day scheduled
+    evidence per ``scripts/same_day_pointer.py`` -- same stream, inside the
+    preflight root, non-manual, and both the pointer and its target dated
+    today -- or via the bounded recovery scan below), else ``None``. The live executor
+    uses the returned ``eligible_tickers`` to restrict which tickers it
+    re-evaluates; a ``None`` result means "no pre-flight found" and the caller
+    degrades to evaluating the full universe with a warning rather than
+    blocking all buys.
+
+    Regardless of which of the three lookup paths resolves ``state_path``, the
+    loaded state itself must independently prove same-day (``trading_day``
+    matches), scheduled non-manual (``derive_valid_scheduled_evidence``), and
+    morning-stream (``run_classification.stream``, when present) evidence
+    before its eligibility data is trusted -- a prior-day, manual, or
+    wrong-stream artifact merely existing at the expected path (the direct
+    join, a scan hit, or a pointer target) is never enough on its own.
+
+    An artifact that explicitly declares ``overall_ok=False`` (a global/
+    account/buying-power/auth/schema-write failure per the machine-complete
+    contract) is treated the same as "no pre-flight found" -- None is
+    returned -- rather than trusting whatever eligibility data happens to be
+    present on a preflight run that flagged itself invalid.
+
+    Eligibility is derived primarily from ``per_ticker_eligibility`` (the
+    schema-required v2 field: every active-universe symbol with a ``symbol``
+    key and an ``eligible_to_execute`` flag), falling back to the legacy
+    ``eligible_to_execute_tickers`` convenience field only when
+    ``per_ticker_eligibility`` is absent (an older artifact shape).
+
+    ``bounded_recovery`` implements
+    ``live_task.preflight_artifact_resolution.bounded_recovery_lookup``: when
+    the primary path and the ``latest_preflight.json`` pointer both miss,
+    perform exactly ONE additional lookup -- a directory scan of
+    ``preflight_root`` for today's ``YYYYMMDD_0945ET`` directory -- before
+    reporting "not found". This is a second, independent lookup path (scan vs.
+    direct path join) so a regression in the primary path construction does
+    not silently fail closed without ever finding an artifact that is actually
+    on disk.
+
+    Before the selected artifact is read, its canonical path is checked
+    against ``forbidden_roots``. This final-path check prevents a symlink
+    below an otherwise allowed pre-flight root from redirecting the live gate
+    into a forbidden live-output or cron-ID tree.
+    """
+    root = Path(preflight_root)
+    expected_dir_name = f"{trading_day.strftime('%Y%m%d')}_0945ET"
+    run_dir = root / expected_dir_name
+    state_path = run_dir / "run_state.json"
+    recovered_via_bounded_lookup = False
+    if not state_path.exists():
+        pointer_state_path: Optional[Path] = None
+        pointer = root / "latest_preflight.json"
+        if pointer.exists():
+            result = validate_pointer(
+                pointer,
+                expected_stream=MORNING_STREAM,
+                expected_root=root,
+                today=trading_day.isoformat(),
+            )
+            if result.is_valid and result.run_state_path:
+                candidate = Path(result.run_state_path)
+                if candidate.exists():
+                    pointer_state_path = candidate
+        if pointer_state_path is not None:
+            state_path = pointer_state_path
+        elif bounded_recovery:
+            recovered_path = None
+            try:
+                if root.is_dir():
+                    for entry in sorted(root.iterdir()):
+                        if entry.name == expected_dir_name and entry.is_dir():
+                            candidate = entry / "run_state.json"
+                            if candidate.exists():
+                                recovered_path = candidate
+                            break
+            except OSError:
+                return None
+            if recovered_path is None:
+                return None
+            state_path = recovered_path
+            recovered_via_bounded_lookup = True
+        else:
+            return None
+    try:
+        resolved_root = root.resolve()
+        resolved_state_path = state_path.resolve()
+    except (OSError, RuntimeError):
+        return None
+    if resolved_root not in resolved_state_path.parents:
+        return None
+    if _forbidden_preflight_root_reason(str(resolved_state_path), forbidden_roots) is not None:
+        return None
+    try:
+        state = json.loads(resolved_state_path.read_bytes())
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(state, dict):
+        # Valid JSON whose root is a list, scalar, or null (e.g. after a
+        # partial recovery) has no .get() method; treat it the same as "no
+        # pre-flight found" instead of raising, so the 10:30 live gate still
+        # degrades to the full universe with a warning rather than crashing
+        # (Codex review: "Treat non-object preflight JSON as unavailable").
+        return None
+    if state.get("overall_ok") is False:
+        return None
+    # The loaded state must independently prove it is same-day, scheduled,
+    # non-manual, morning-stream evidence -- regardless of which of the three
+    # lookup paths above found it (direct path, validated pointer, or bounded
+    # recovery scan) -- so a prior-day, manual, or wrong-stream artifact left
+    # or copied into today's expected directory can never drive the 10:30
+    # live gate just because a file happens to exist at that path.
+    if str(state.get("trading_day", "")).strip() != trading_day.isoformat():
+        return None
+    if not derive_valid_scheduled_evidence(state):
+        return None
+    target_rc = state.get("run_classification")
+    target_stream = target_rc.get("stream") if isinstance(target_rc, dict) else None
+    if target_stream is not None and target_stream != MORNING_STREAM:
+        return None
+    # bb4f6ef1 now fires BOTH the preflight and watchlist sub-invocations at
+    # the same 9:45 ET slot, sharing task ID, scheduled_for_et, and
+    # stream='morning' -- exactly the fields checked above -- so those checks
+    # alone can no longer tell a preflight artifact from a watchlist one. A
+    # watchlist state copied or misrouted into the preflight directory would
+    # otherwise pass every check above and its rows (watchlist artifacts
+    # never populate per_ticker_eligibility) would yield an empty eligibility
+    # set, causing the 10:30 live gate to shut out the entire universe.
+    # run_type and state_schema_version are the two fields that DO
+    # distinguish the pair -- always stamped by run_classification() (see
+    # MORNING_PROFILES) -- so requiring both here cannot reject a
+    # legitimately-completed preflight run -- codex review
+    # discussion_r3659738862.
+    target_run_type = target_rc.get("run_type") if isinstance(target_rc, dict) else None
+    if target_run_type != MORNING_PREFLIGHT_RUN_TYPE:
+        return None
+    target_schema_version = state.get("state_schema_version")
+    if target_schema_version is None and isinstance(target_rc, dict):
+        target_schema_version = target_rc.get("state_schema_version")
+    if target_schema_version != MORNING_PREFLIGHT_SCHEMA_VERSION:
+        return None
+    per_ticker = state.get("per_ticker_eligibility")
+    if isinstance(per_ticker, list) and per_ticker:
+        eligible = [
+            row.get("symbol")
+            for row in per_ticker
+            if isinstance(row, dict) and row.get("eligible_to_execute") is True
+        ]
+    else:
+        eligible = state.get("eligible_to_execute_tickers")
+        if eligible is None:
+            eligible = [
+                row["ticker"]
+                for row in state.get("signal_rows", [])
+                if row.get("eligible_to_execute") is True
+            ]
+    return {
+        "run_id": state.get("run_id"),
+        "eligible_tickers": set(eligible),
+        "run_state_path": str(state_path),
+        "recovered_via_bounded_lookup": recovered_via_bounded_lookup,
+    }
 
 
 # Tag key used to round-trip a BARE ``datetime.date`` (as opposed to a full
@@ -2842,7 +3185,9 @@ _RESERVED_ARTIFACT_FILENAMES = frozenset({
     "weekly_performance_dashboard.md",
     "notion_latest_run_compact.md",
     "notion_latest_run_payload.json",
+    "gfuz_supplemental_preflight.json",
     "latest_morning_run.json",
+    "latest_preflight.json",
     "latest_scheduled_run.json",
     "latest_midday_run.json",
     "latest_market_open_run.json",
@@ -2876,6 +3221,186 @@ def _sanitize_budget_ledger_filename(raw_filename: Optional[str]) -> str:
     ):
         return "budget_ledger.json"
     return name
+
+
+def _strip_template_segments(path: str) -> str:
+    """Drop ``YYYYMMDD*`` template path segments (e.g. ``YYYYMMDD_1030ET``).
+
+    ``must_not_look_under`` entries in config/morning_dca.json include the
+    dated live-output directory as a template
+    (``.../morning_dca/YYYYMMDD_1030ET/``); this normalizes that down to the
+    actual root (``.../morning_dca``) so it can be compared against a
+    configured ``preflight_run_state_root``.
+    """
+    segments = [segment for segment in Path(path).parts if "YYYYMMDD" not in segment]
+    return str(Path(*segments))
+
+
+def _forbidden_preflight_root_reason(
+    root: str, forbidden_roots: Sequence[str]
+) -> Optional[str]:
+    """Return a block reason if ``root`` resolves under a forbidden path, else None.
+
+    Implements ``live_task.preflight_artifact_resolution.must_not_look_under``:
+    the same-day 9:45 pre-flight artifact must never be read from the 10:30
+    live output directory or a bare cron-id path (the Jul 20 2026 incident).
+    """
+    try:
+        resolved = Path(root).resolve()
+    except (OSError, RuntimeError):
+        resolved = Path(root)
+    for forbidden in forbidden_roots:
+        try:
+            normalized = Path(_strip_template_segments(forbidden)).resolve()
+        except (OSError, RuntimeError):
+            normalized = Path(_strip_template_segments(forbidden))
+        if resolved == normalized or normalized in resolved.parents:
+            return (
+                f"preflight_run_state_root {root!r} resolves under a forbidden "
+                f"must_not_look_under path ({forbidden!r}); refusing to read the "
+                "pre-flight artifact from there (see "
+                "live_task.preflight_artifact_resolution in config/morning_dca.json)"
+            )
+    return None
+
+
+def morning_preflight_eligible_tickers(
+    now: datetime,
+    tickers: Sequence[str],
+    *,
+    preflight_run_state_root: Optional[str] = None,
+    preflight_forbidden_roots: Sequence[str] = (),
+    preflight_bounded_recovery: bool = True,
+    supplemental_validator: Optional[Callable[[str], Mapping[str, Any]]] = None,
+    output_dir: Optional[str | Path] = None,
+) -> tuple[List[str], Dict[str, Any]]:
+    """Restrict ``tickers`` to the same-day 9:45 pre-flight verdict.
+
+    Shared by :meth:`MorningDCAExecutor._apply_preflight_gate` (which
+    additionally no-ops outside morning-live-mode) and the seven-slot roster's
+    ``run_dca.run_slot("1030ET", ...)``, so config/morning_dca.json's
+    NON-BLOCKING contract (2026-08-02) -- a missing, invalid, or valid-but-
+    empty pre-flight artifact degrades to the FULL configured universe with a
+    warning, never a hard block -- is enforced exactly once no matter which
+    caller reaches the 10:30 slot (Codex review: "Route the morning slot
+    through its required preflight gate", originally about a fail-closed
+    contract this function no longer implements; superseded 2026-08-02 by
+    Geoff's "should not block any later runs" direction).
+
+    If GFUZ is in ``tickers`` and missing from a valid, non-empty 9:45 preflight
+    artifact, an optional injected ``supplemental_validator`` is invoked to run
+    a read-only check and write ``gfuz_supplemental_preflight.json`` before
+    admitting GFUZ. If the validator is absent, raises, or returns invalid, GFUZ
+    remains gated out fail-closed.
+
+    Returns ``(admitted_tickers, gate_diagnostic)``: the same
+    ``preflight_gate``-shaped dict :class:`MorningDCAExecutor` stores on
+    itself, so a caller that wants to surface it (e.g. in artifacts) can.
+    """
+    trading_day = now.astimezone(EASTERN).date()
+    # stream_root() at CALL time, not an import-time constant -- same
+    # staleness reasoning as elsewhere in this module (Codex review, PR #219).
+    root = preflight_run_state_root or stream_root("morning_dca_preflight")
+    forbidden_roots = preflight_forbidden_roots or default_preflight_forbidden_roots()
+    forbidden_reason = _forbidden_preflight_root_reason(root, forbidden_roots)
+    if forbidden_reason is not None:
+        # NON-BLOCKING (Geoff, 2026-08-02: "should not block any later runs"):
+        # a misconfigured root used to fail SCHEDULED runs closed to zero
+        # tickers (preflight_missing_block=True); it now degrades to the full
+        # configured universe with a warning for scheduled and manual runs
+        # alike, exactly like a missing artifact below. The 9:45 pre-flight
+        # remains a coarse pre-screen only, never a hard gate the 10:30 slot
+        # depends on to run at all -- see the 9:45 scan's own note in
+        # config/morning_dca.json for why this is an acceptable trade (a
+        # missing/misconfigured pre-flight just means the 10:30 slot
+        # re-evaluates the whole universe itself instead of a pre-screened
+        # subset; every other safeguard at 10:30 is unaffected).
+        return list(tickers), {"preflight_found": False, "warning": forbidden_reason}
+    loaded = load_same_day_preflight(
+        root,
+        trading_day,
+        bounded_recovery=preflight_bounded_recovery,
+        forbidden_roots=forbidden_roots,
+    )
+    if loaded is None:
+        # NON-BLOCKING (see the note above): a missing or unparseable same-day
+        # pre-flight artifact degrades to the full configured universe with a
+        # warning for scheduled and manual runs alike. Previously a scheduled
+        # run failed closed to zero tickers here; the 10:30 slot's own signal/
+        # budget/spread/trend/top-up checks are the real safety gates and are
+        # unaffected by this -- only the coarse pre-screen is skipped.
+        return list(tickers), {
+            "preflight_found": False,
+            "warning": "no same-day 9:45 pre-flight artifact found; evaluating full universe",
+        }
+    eligible = loaded["eligible_tickers"]
+    if not eligible:
+        # NON-BLOCKING (see the notes above): a VALID preflight that found
+        # zero eligible tickers is exactly as coarse/stale-by-10:30 as a
+        # missing one -- treating it as authoritative would make a quiet
+        # preflight MORE restrictive than a missing one (which already
+        # degrades to the full universe), contradicting the "coarse
+        # pre-screen only, never a hard gate" policy this function
+        # implements everywhere else (Codex review: "Keep valid empty
+        # preflights non-blocking"). Degrade the same way: full universe,
+        # with a warning, letting the 10:30 slot's own signal/budget/spread/
+        # trend/top-up checks be the real safety gates as usual.
+        return list(tickers), {
+            "preflight_found": True,
+            "preflight_run_id": loaded["run_id"],
+            "eligible_to_execute_tickers": [],
+            "recovered_via_bounded_lookup": loaded.get("recovered_via_bounded_lookup", False),
+            "warning": "same-day 9:45 pre-flight found zero eligible tickers; evaluating full universe",
+        }
+    admitted = [t for t in tickers if t in eligible]
+    gated_out = [t for t in tickers if t not in eligible]
+    gate: Dict[str, Any] = {
+        "preflight_found": True,
+        "preflight_run_id": loaded["run_id"],
+        "eligible_to_execute_tickers": sorted(eligible),
+        "admitted_tickers": admitted,
+        "gated_out_tickers": gated_out,
+        "recovered_via_bounded_lookup": loaded.get("recovered_via_bounded_lookup", False),
+    }
+
+    if "GFUZ" in tickers and "GFUZ" not in eligible:
+        if supplemental_validator is not None:
+            gfuz_supp: Dict[str, Any] = {"attempted": True, "valid": False}
+            try:
+                res = supplemental_validator("GFUZ")
+                if not isinstance(res, Mapping):
+                    gfuz_supp["error"] = f"validator returned non-mapping: {type(res).__name__}"
+                else:
+                    if output_dir is not None:
+                        out_path = Path(output_dir)
+                    else:
+                        now_et = now.astimezone(EASTERN)
+                        out_path = Path(stream_root("morning_dca")) / f"{now_et.strftime('%Y%m%d')}_1030ET"
+                    out_path.mkdir(parents=True, exist_ok=True)
+                    persist_file = out_path / "gfuz_supplemental_preflight.json"
+                    atomic_write_text(persist_file, json.dumps(dict(res), indent=2, sort_keys=True))
+                    # Re-read persisted file so we never buy GFUZ on unpersisted data
+                    read_back = json.loads(persist_file.read_text(encoding="utf-8"))
+                    is_valid = read_back.get("valid") is True
+                    gfuz_supp["valid"] = is_valid
+                    gfuz_supp["persisted_file"] = str(persist_file)
+                    if not is_valid:
+                        gfuz_supp["reason"] = read_back.get("reason", "validation_failed")
+            except Exception as exc:
+                gfuz_supp["valid"] = False
+                gfuz_supp["error"] = f"validator raised {type(exc).__name__}"
+
+            if gfuz_supp.get("valid"):
+                admitted = [t for t in tickers if t in eligible or t == "GFUZ"]
+                gated_out = [t for t in tickers if t not in eligible and t != "GFUZ"]
+                gate["admitted_tickers"] = admitted
+                gate["gated_out_tickers"] = gated_out
+
+            gate["gfuz_supplemental"] = gfuz_supp
+        else:
+            gate["gfuz_supplemental"] = {"attempted": False, "reason": "no_supplemental_validator"}
+
+    return admitted, gate
 
 
 class DCAExecutor:
@@ -2965,10 +3490,12 @@ class MorningDCAExecutor(DCAExecutor):
         *,
         mode: str = MORNING_WATCHLIST_MODE,
         config_dir: Optional[str] = None,
+        supplemental_validator: Optional[Callable[[str], Mapping[str, Any]]] = None,
     ) -> None:
         if mode not in self.PROFILES:
             raise ValueError(f"unknown mode {mode!r}; expected one of {sorted(self.PROFILES)}")
         self.mode = mode
+        self.supplemental_validator = supplemental_validator
         self.profile = self.PROFILES[mode]
         self.run_type = self.profile["run_type"]
         self.trades = self.profile["trades"]
@@ -3212,7 +3739,7 @@ class MorningDCAExecutor(DCAExecutor):
     ) -> Dict[str, TopUpOutcome]:
         """Return per-ticker prior-allocation/top-up outcomes.
 
-        Only active in ``MORNING_LIVE_MODE``.  The watchlist mode is
+        Only active in ``MORNING_LIVE_MODE``.  Watchlist and preflight modes are
         analytics-only and return ``{}`` immediately.  For all live runs (scheduled
         and manual alike) the morning cap ledger is seeded from ``cap_seed_roots``
         so prior morning fills always reduce ``remaining_daily`` before orders are
@@ -4189,7 +4716,7 @@ class MorningDCAExecutor(DCAExecutor):
             # The execution broker for all morning stream modes; always Robinhood.
             "execution_broker": "robinhood",
             # Pre-authorized direct placement is only for scheduled LIVE runs; read-only
-            # (watchlist) and manual runs are never pre-authorized.
+            # (watchlist/preflight) and manual runs are never pre-authorized.
             "preauthorized_direct_place": bool(profile["trades"]) and not manual,
             # Morning artifacts are valid morning evidence (and prior-allocation context
             # for the midday/afternoon top-up guard), but never afternoon evidence.
@@ -4227,7 +4754,7 @@ class MorningDCAExecutor(DCAExecutor):
         #   * A well-formed account is always stamped.
         #   * A trading mode whose account is NOT well-formed records
         #     ``account_pinning_failed: true`` and omits the field.
-        #   * Read-only modes simply omit it. Loaded watchlist configs
+        #   * Read-only modes simply omit it. Loaded watchlist/preflight configs
         #     carry the literal "read_only", which is not an account and must
         #     never be recorded as one; the field is optional for them anyway.
         #
@@ -4257,7 +4784,7 @@ class MorningDCAExecutor(DCAExecutor):
         # profile["trades"] gates BOTH branches, not just the failure marker:
         # target_account_number's dataclass default is the import-time
         # ROBINHOOD_AGENTIC_ACCOUNT_NUMBER env constant, and a watchlist/
-        # watchlist config load that hits load_morning_config's config-missing
+        # preflight config load that hits load_morning_config's config-missing
         # fallback never overrides it (that fallback only seeds
         # approved_test_dates/model_usage_log_root), so a read-only executor
         # can end up holding a real, well-formed account number. Without this
@@ -4459,7 +4986,7 @@ class MorningDCAExecutor(DCAExecutor):
                     # blinding scripts/drift_detection.py's missing-order check
                     # to a lost or failed order (Codex review: "Mark trend-exempt
                     # market-open buys as auto-buy eligible"). Scoped to
-                    # self.mode == MORNING_LIVE_MODE only: watchlist
+                    # self.mode == MORNING_LIVE_MODE only: watchlist/preflight
                     # profiles also have validate_trend=False but must keep
                     # execution_status=None (test_watchlist_mode_never_sets_
                     # execution_status), since they never place real orders.
@@ -4636,14 +5163,47 @@ class MorningDCAExecutor(DCAExecutor):
         data: Any,
         *,
         manual: bool = False,
+        supplemental_validator: Optional[Callable[[str], Mapping[str, Any]]] = None,
     ) -> List[MorningSignal]:
         """Evaluate every non-excluded ticker for the morning stream.
 
-        Every configured, non-excluded ticker is evaluated: nothing narrows the universe before
-        scoring (the retired 9:45 pre-screen used to).
+        In morning live (10:30) mode the universe is first narrowed by the
+        same-day 9:45 pre-flight gate: only tickers marked
+        ``eligible_to_execute=true`` are re-evaluated. For scheduled
+        (non-manual) runs a missing pre-flight artifact is fatal; for manual
+        runs the gate degrades to the full universe with a warning.
         """
+        if supplemental_validator is not None:
+            self.supplemental_validator = supplemental_validator
         tickers = [t for t in self.config.tickers if t not in self.config.excluded_tickers]
+        tickers = self._apply_preflight_gate(now, tickers, manual=manual)
         return [self.evaluate_signal(t, now, data) for t in tickers]
+
+    # Populated by :meth:`_apply_preflight_gate` for morning live runs so
+    # build_artifacts can surface which tickers the pre-flight gate admitted.
+    preflight_gate: Optional[Dict[str, Any]] = None
+
+    def _apply_preflight_gate(self, now: datetime, tickers: List[str], *, manual: bool = False) -> List[str]:
+        """Restrict the morning live universe to the same-day pre-flight verdict."""
+        self.preflight_gate = None
+        if not (self.mode == MORNING_LIVE_MODE and self.stream == MORNING_STREAM):
+            return tickers
+        out_dir = (
+            Path(self.state_root) / self.manual_run_subdir / self.run_id(now, manual=True)
+            if manual
+            else self.run_state_dir(now)
+        )
+        admitted, gate = morning_preflight_eligible_tickers(
+            now,
+            tickers,
+            preflight_run_state_root=self.config.preflight_run_state_root,
+            preflight_forbidden_roots=self.config.preflight_forbidden_roots,
+            preflight_bounded_recovery=self.config.preflight_bounded_recovery,
+            supplemental_validator=self.supplemental_validator,
+            output_dir=out_dir,
+        )
+        self.preflight_gate = gate
+        return admitted
 
     @staticmethod
     def _buy_candidates(signals: Sequence[MorningSignal]) -> List[MorningSignal]:
@@ -4742,8 +5302,12 @@ class MorningDCAExecutor(DCAExecutor):
         now_et = now.astimezone(EASTERN)
         trading_day = now_et.date()
         is_live = self.mode == MORNING_LIVE_MODE
+        is_preflight = self.mode == MORNING_PREFLIGHT_MODE
 
         signal_rows = [s.to_row() for s in signals]
+        if is_preflight:
+            for row, sig in zip(signal_rows, signals, strict=True):
+                row["eligible_to_execute"] = preflight_eligibility(sig)
         buy_candidates = self._buy_candidates(signals)
         manual_review = [
             c for c in buy_candidates if c.execution_status == EXEC_MANUAL_REVIEW_CANDIDATE
@@ -4843,6 +5407,40 @@ class MorningDCAExecutor(DCAExecutor):
                 manual_review_rows.append(row)
             artifacts["manual_review_candidates"] = manual_review_rows
             artifacts["manual_review_tickers"] = [c.ticker for c in manual_review]
+            if self.preflight_gate is not None:
+                artifacts["preflight_gate"] = self.preflight_gate
+                if not self.preflight_gate.get("preflight_found"):
+                    # The manual degrade-to-full-universe path sets "warning"; the
+                    # scheduled fail-closed block sets "block_reason" instead.
+                    _w = self.preflight_gate.get("warning") or self.preflight_gate.get("block_reason")
+                    if _w:
+                        warnings.append(str(_w))
+        if is_preflight:
+            # Pre-flight verdict: which tickers the 10:30 live evaluator should
+            # re-evaluate. Coarse pre-screen only; 10:30 recomputes fresh.
+            eligible = [s for s in signals if preflight_eligibility(s)]
+            artifacts["eligible_to_execute_tickers"] = [s.ticker for s in eligible]
+            artifacts["counts"]["eligible_to_execute"] = len(eligible)
+            # Machine-complete envelope (schema morning-preflight-v2-machine-complete):
+            # one row per active symbol plus top-level gate fields the 10:30 live
+            # task consumes without re-deriving. Unresolved symbols become rows
+            # with eligible_to_execute=false; they never flip overall_ok.
+            ticker_rows = [preflight_ticker_eligibility_row(s) for s in signals]
+            unresolved = [
+                r["symbol"] for r in ticker_rows
+                if r["data_confidence_status"] != "resolved"
+            ]
+            blocking_errors: List[str] = []
+            artifacts["per_ticker_eligibility"] = ticker_rows
+
+            eligible_count = sum(1 for r in ticker_rows if r["eligible_to_execute"])
+            artifacts["eligible_count"] = eligible_count
+            artifacts["ineligible_count"] = len(ticker_rows) - eligible_count
+            artifacts["unresolved_tickers"] = unresolved
+            artifacts["blocking_errors"] = blocking_errors
+            # overall_ok is false ONLY for global/account/auth/schema-write
+            # failures; per-symbol unresolved/ineligible tickers do not count.
+            artifacts["overall_ok"] = not blocking_errors
         # Record the placement switch on every artifact so a reader can tell a
         # shadow run (evaluated fully, deliberately placed nothing) apart from a
         # live run that genuinely found no candidates. Both leave
@@ -4886,12 +5484,20 @@ class MorningDCAExecutor(DCAExecutor):
             else:
                 extras.append(copied)
 
+        gated_out = set()
+        if isinstance(self.preflight_gate, dict):
+            gated_out = {str(t) for t in self.preflight_gate.get("gated_out_tickers", [])}
+
         completed: List[Dict[str, Any]] = []
         for ticker in configured:
             if ticker in row_by_ticker:
                 completed.append(row_by_ticker[ticker])
                 continue
-            reason = "not_evaluated_missing_signal_row"
+            reason = (
+                "preflight_gate_gated_out"
+                if ticker in gated_out
+                else "not_evaluated_missing_signal_row"
+            )
             completed.append(
                 {
                     ticker_key: ticker,
@@ -4955,14 +5561,17 @@ class MorningDCAExecutor(DCAExecutor):
             pointer_status=pointer_status,
         )
 
-    def _scheduled_pointer_names(self) -> List[str]:
+    def _scheduled_pointer_names(self, is_preflight: bool) -> List[str]:
         """Latest-pointer file names refreshed by a scheduled run.
 
         The morning live 10:30 task refreshes both ``latest_morning_run.json``
         and ``latest_morning_live.json`` so live-only consumers and run-level
-        consumers each see the same-day scheduled state. Other live streams
-        (e.g. midday) refresh only their single stream pointer.
+        consumers each see the same-day scheduled state. Preflight refreshes its
+        own pointer; other live streams (e.g. midday) refresh only their single
+        stream pointer.
         """
+        if is_preflight:
+            return ["latest_preflight.json"]
         names = [self.latest_pointer_name]
         if self.mode == MORNING_LIVE_MODE and self.stream == MORNING_STREAM:
             names.append("latest_morning_live.json")
@@ -5055,10 +5664,34 @@ class MorningDCAExecutor(DCAExecutor):
             orders_path = write_submitted_orders_csv(out, submitted_rows)
             paths["submitted_orders"] = str(orders_path)
 
-        if is_live_execution:
+        is_preflight = self.mode == MORNING_PREFLIGHT_MODE
+        if is_preflight:
+            # validation.csv: the per-ticker eligible_to_execute verdict.
+            validation_path = out / "validation.csv"
+            _write_csv(validation_path, output_signal_rows)
+            paths["validation"] = str(validation_path)
+            # run_summary.json: a compact roll-up of the pre-flight verdict.
+            summary_path = out / "run_summary.json"
+            atomic_write_text(
+                summary_path,
+                json.dumps(
+                    {
+                        "run_id": artifacts["run_id"],
+                        "trading_day": artifacts["trading_day"],
+                        "stream": self.stream,
+                        "mode": artifacts["mode"],
+                        "counts": artifacts["counts"],
+                        "eligible_to_execute_tickers": artifacts.get("eligible_to_execute_tickers", []),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+            )
+            paths["run_summary"] = str(summary_path)
+        elif is_live_execution:
             # A LIVE run (10:30 morning, 12:30 midday) must also write the
             # canonical root-level run_summary.json mirroring run_state's non-null
-            # run_classification. Before this, no live run wrote
+            # run_classification. Before this, only the read-only pre-flight wrote
             # one, so every live morning/midday run directory failed the scheduled
             # artifact contract's require_summary check and downstream readers had
             # no summary to attribute the run by (Jul 27 2026 12:30 and 1:30).
@@ -5092,7 +5725,7 @@ class MorningDCAExecutor(DCAExecutor):
 
         if not artifacts["run_classification"]["manual_run"]:
             self._write_same_day_pointers(
-                self._scheduled_pointer_names(),
+                self._scheduled_pointer_names(is_preflight),
                 self._same_day_pointer_payload(artifacts, run_state_path),
                 paths,
             )
@@ -5109,7 +5742,7 @@ class MorningDCAExecutor(DCAExecutor):
     ) -> None:
         """Record this poll's prices/timestamps in the shared intraday archive.
 
-        Runs for EVERY mode -- watchlist, live, manual -- because
+        Runs for EVERY mode -- watchlist, pre-flight, live, manual -- because
         every one of them prices the whole universe, and a price observed at
         9:45 is no less real for having been observed by a read-only scan. The
         archive's natural key includes the stream and slot, so the streams never
@@ -5167,7 +5800,8 @@ class MorningDCAExecutor(DCAExecutor):
         adapter or the wrong live account) where no ordering should proceed, but
         operators still need a durable run_state explaining why the scheduled
         live stream did not submit orders. Routed through the normal
-        build_artifacts()/write_artifacts() pipeline rather than a hand-rolled stub, so the
+        build_artifacts()/write_artifacts() pipeline -- mirroring the preflight-
+        missing-block path above -- rather than a hand-rolled stub, so the
         persisted state still carries run_id, generated_at, counts, and the
         signal/candidate arrays already evaluated for this run, and the latest
         scheduled pointer is still updated: watchdog/latest-pointer consumers
@@ -5869,7 +6503,7 @@ class MorningDCAExecutor(DCAExecutor):
         # quote the CURRENT broker price/spread, place an order well outside
         # the approved window, and still label the artifact as the on-time
         # scheduled run. Scoped identically to is_outside_window above:
-        # watchlist modes and manual/recovery runs are unaffected.
+        # watchlist/preflight modes and manual/recovery runs are unaffected.
         is_outside_time_window = False
         if self.mode == MORNING_LIVE_MODE and not manual:
             window_start_et = self.profile.get("window_start_et")
@@ -5896,6 +6530,7 @@ class MorningDCAExecutor(DCAExecutor):
             block_reason = "outside approved trading window"
         else:
             block_reason = "outside scheduled slot window"
+        is_preflight = self.mode == MORNING_PREFLIGHT_MODE
         # Guard: if this date slot already has submitted-order evidence (e.g. the
         # 10:30 live run placed orders and then trading_window.json was briefly
         # malformed, making a retry fire with is_outside_window=True), never
@@ -5904,7 +6539,7 @@ class MorningDCAExecutor(DCAExecutor):
         existing = self._existing_submitted_run_state(now)
         if existing is not None:
             self._write_same_day_pointers(
-                self._scheduled_pointer_names(),
+                self._scheduled_pointer_names(is_preflight),
                 self._same_day_pointer_payload(existing["artifacts"], existing["paths"]["run_state"]),
                 existing["paths"],
             )
@@ -5978,7 +6613,7 @@ class MorningDCAExecutor(DCAExecutor):
             )
             paths["run_summary"] = str(summary_path)
         self._write_same_day_pointers(
-            self._scheduled_pointer_names(),
+            self._scheduled_pointer_names(is_preflight),
             self._same_day_pointer_payload(artifacts, state_path),
             paths,
         )
@@ -6024,7 +6659,7 @@ class MorningDCAExecutor(DCAExecutor):
         ``run()`` can carry them forward into the artifact it's about to
         overwrite on a same-day scheduled retry.
 
-        Watchlist modes never place real orders, so caps are never
+        Watchlist/preflight modes never place real orders, so caps are never
         enforced there and this is a no-op outside live mode.
         """
         self._prior_same_day_candidate_rows = []
@@ -8309,6 +8944,7 @@ class MorningDCAExecutor(DCAExecutor):
         broker: Optional[BrokerAdapter] = None,
         data_source: Optional[str] = None,
         manual: bool = False,
+        supplemental_validator: Optional[Callable[[str], Mapping[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Evaluate the stream and write its artifacts for the active mode.
 
@@ -8329,9 +8965,12 @@ class MorningDCAExecutor(DCAExecutor):
         escaping exception is logged, alerted to the operator Slack webhook,
         and pinged as a failed heartbeat before re-raising, and a completed
         run pings this stream's success heartbeat (dead-man's switch for the
-        missed-fire failure class). Watchlist/manual runs only get
+        missed-fire failure class). Watchlist/preflight/manual runs only get
         a log handler ensured.
         """
+
+        if supplemental_validator is not None:
+            self.supplemental_validator = supplemental_validator
 
         def _invoke() -> Dict[str, Any]:
             def _execute() -> Dict[str, Any]:
@@ -8341,6 +8980,7 @@ class MorningDCAExecutor(DCAExecutor):
                     broker=broker,
                     data_source=data_source,
                     manual=manual,
+                    supplemental_validator=supplemental_validator,
                 )
 
             # The dated live slot is serialized one level up, by
@@ -8349,9 +8989,18 @@ class MorningDCAExecutor(DCAExecutor):
             # sees the exception. Acquiring it again here would nest on the
             # same lock file.
             result = _execute()
-            # Only the watchlist scan is a stream value here (schemas/model_usage_log.schema.json); live runs fall
-            # back to the manifest's per-cron_id lookup (42173154 -> "morning").
-            mode_stream = MORNING_WATCHLIST_MODE if self.mode == MORNING_WATCHLIST_MODE else None
+            # bb4f6ef1 shares one cron_id across both its 9:45 AM sub-invocations
+            # (preflight mode, then watchlist mode), so the manifest's
+            # model_usage_log directory (keyed by cron_id) cannot tell them apart
+            # on its own and always resolves to its single stream="watchlist"
+            # entry. Pass the mode itself (MORNING_PREFLIGHT_MODE="preflight" /
+            # MORNING_WATCHLIST_MODE="watchlist" are both valid
+            # schemas/model_usage_log.schema.json stream values) so the
+            # preflight execution is not misattributed as a watchlist run.
+            # MORNING_LIVE_MODE ("live") is not a stream value; live runs keep
+            # falling back to the manifest's per-cron_id lookup (42173154 ->
+            # "morning") -- codex review discussion_r3657271722.
+            mode_stream = self.mode if self.mode in (MORNING_PREFLIGHT_MODE, MORNING_WATCHLIST_MODE) else None
             log_model_usage(
                 root=self.config.model_usage_log_root,
                 run_id=result.get("artifacts", {}).get("run_id"),
@@ -8376,7 +9025,7 @@ class MorningDCAExecutor(DCAExecutor):
         # with one taken after the attempt lock is held, while guarded_run
         # keeps the single stable callable it was configured with. The
         # pre-lock snapshot stays the value for every path that never takes
-        # the lock at all (watchlist/manual runs) so those keep the
+        # the lock at all (watchlist/preflight/manual runs) so those keep the
         # exact behavior they always had.
         freshness_probe: List[Callable[[], bool]] = [artifact_freshness_probe(run_state_path)]
         # The freshness answer as of the MOMENT the run failed, latched before
@@ -8841,7 +9490,7 @@ class MorningDCAExecutor(DCAExecutor):
                     pointer_status=POINTER_STATUS_PENDING,
                 )
             self._write_same_day_pointers(
-                self._scheduled_pointer_names(), payload, paths
+                self._scheduled_pointer_names(is_preflight=False), payload, paths
             )
         except Exception:  # noqa: BLE001 - never mask the original run failure
             _log.exception("failed to refresh the %s same-day pointer", self.stream)
@@ -8912,7 +9561,10 @@ class MorningDCAExecutor(DCAExecutor):
         broker: Optional[BrokerAdapter] = None,
         data_source: Optional[str] = None,
         manual: bool = False,
+        supplemental_validator: Optional[Callable[[str], Mapping[str, Any]]] = None,
     ) -> Dict[str, Any]:
+        if supplemental_validator is not None:
+            self.supplemental_validator = supplemental_validator
         blocked = self._maybe_block_for_holiday(now, manual=manual)
         if blocked is not None:
             return blocked
@@ -8920,7 +9572,7 @@ class MorningDCAExecutor(DCAExecutor):
         # SCHEDULED live run must persist every raw connector response it uses
         # under raw/ before that response is used to compute a signal or place
         # an order, and must never escalate without writing a valid run_state.
-        # Manual/watchlist runs are unaffected -- the policy's
+        # Manual/watchlist/preflight runs are unaffected -- the policy's
         # "applies_to" is scoped to the scheduled live task (42173154/a6239dae).
         is_scheduled_live = self.mode == MORNING_LIVE_MODE and self.trades and not manual
         raw_recorder: Optional[_RawInputRecorder] = None
@@ -8966,6 +9618,17 @@ class MorningDCAExecutor(DCAExecutor):
                 broker = cast(BrokerAdapter, _PersistingBrokerAdapter(broker, raw_recorder))
         signals = self.evaluate(now, data, manual=manual)
         source = data_source or getattr(getattr(data, "source", None), "value", "unknown")
+        # NON-BLOCKING (Geoff, 2026-08-02: "should not block any later runs"):
+        # a missing/invalid/forbidden same-day pre-flight artifact used to end
+        # the run here with a blocked stub before any signal evaluation could
+        # even use the full universe. morning_preflight_eligible_tickers()
+        # (called from _apply_preflight_gate() inside evaluate() above) now
+        # always degrades to the full configured universe with a warning
+        # instead -- preflight_missing_block is never set anymore, so this
+        # branch is dead and has been removed. The pre-flight artifact stays
+        # a coarse pre-screen only, surfaced via self.preflight_gate /
+        # artifacts["preflight_gate"] for observability, never a hard gate the
+        # 10:30 slot depends on to run at all.
         if raw_recorder is not None and raw_recorder.error:
             # Raw-input persistence failed before any order could be placed --
             # evaluate() above only reads price data and never places an
@@ -9237,7 +9900,7 @@ class MorningDCAExecutor(DCAExecutor):
             # the morning stream specifically: MIDDAY_LIVE_MODE == MORNING_LIVE_MODE
             # == "live", so mode alone can't tell the midday executor apart, and it
             # still needs hypothetical spend recorded for its own cap/budget
-            # reporting. Watchlist modes always reach this branch and
+            # reporting. Watchlist/preflight modes always reach this branch and
             # still need hypothetical spend recorded for cap/budget reporting.
             morning_live_no_broker = self.mode == MORNING_LIVE_MODE and self.stream == MORNING_STREAM
             candidates_to_record = [] if morning_live_no_broker else auto_buy_candidates
@@ -9713,7 +10376,8 @@ def _apply_blocked_before_placement_fields(artifacts: Dict[str, Any]) -> None:
     """Stamp the outcome for a live run stopped BEFORE placement.
 
     Used by the paths that write and return without reaching
-    :func:`_apply_no_order_classification`: an absent broker adapter, a wrong live account, or a raw-input
+    :func:`_apply_no_order_classification`: a missing same-day pre-flight
+    artifact, an absent broker adapter, a wrong live account, or a raw-input
     persistence failure. None of these is a completed no-order run, and none is a
     placement failure either, so they take the "never reached placement" outcome
     and the specific cause stays in ``error_class`` (a concrete one the caller
@@ -9735,7 +10399,7 @@ def _apply_blocked_before_placement_fields(artifacts: Dict[str, Any]) -> None:
     # None of these paths reached placement, so none is evidence the slot
     # executed. build_artifacts() has already stamped the scheduled identity and
     # the callers write immediately, so without the denial the pointer publishes
-    # an account mismatch as a valid scheduled run
+    # a missing pre-flight or an account mismatch as a valid scheduled run
     # (Codex review). Same denial the escaping-exception path applies, through
     # the same helper.
     artifacts.update(deny_scheduled_evidence(artifacts))

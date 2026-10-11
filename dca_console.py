@@ -848,13 +848,7 @@ class ConsoleApp:
                 and not (self.octopus_run / "checkpoint").is_dir()
             )
             if is_sharded:
-                argv = [
-                    "wondrous-octopus/run_sharded.py",
-                    "--daily",
-                    "--parallel",
-                    "--run-dir-base",
-                    str(self.octopus_run),
-                ]
+                argv = ["wondrous-octopus/run_sharded.py", "--parallel", "--run-dir-base", str(self.octopus_run)]
             else:
                 argv = ["wondrous-octopus/daily_update.py", "--run-dir", str(self.octopus_run)]
                 if self.settings.mode == "demo" and self.octopus_run:
@@ -862,8 +856,9 @@ class ConsoleApp:
                     if meta.get("model_selection") == "octopus":
                         argv.extend(["--now", "2019-09-14"])
             results.append(self._command(argv, log, research=True, timeout=1800))
-            if results[-1] == 0 and not is_sharded:
-                results.append(self._command(["wondrous-octopus/run_walkforward.py", "--report-only", str(self.octopus_run)],
+            if results[-1] == 0:
+                report_target = (self.octopus_run / "shard_1") if is_sharded else self.octopus_run
+                results.append(self._command(["wondrous-octopus/run_walkforward.py", "--report-only", str(report_target)],
                                              log, research=True))
         if action == "octopus-estimate":
             results.append(self._command(["wondrous-octopus/run_walkforward.py", "--preset", "quick", "--dry-run"],

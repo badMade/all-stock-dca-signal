@@ -16,7 +16,7 @@ labeled yfinance fallback payload, and the slot's Gate 5 merges it into its
   `intraday_bars_unavailable`, `token_limit_exceeded`,
   `market_data_unavailable`).
 - **Whether a session can reach yfinance varies by session.** On 2026-09-22
-  the 12:30 session (then Finance-primary) built a yfinance payload without trouble, and the 3:30
+  the 12:30 session built a yfinance payload without trouble, and the 3:30
   session three hours later couldn't. Fetching here, on a schedule and in its
   own venv, removes that variable.
 
@@ -26,8 +26,8 @@ labeled yfinance fallback payload, and the slot's Gate 5 merges it into its
 
 | Primary | Slots | Switches the whole universe to yfinance when |
 | --- | --- | --- |
-| Robinhood | 09:35, 10:30, 11:30, 12:30, 13:30, 14:30 | Robinhood failed as a whole: listed in `source_errors`, absent, or no scored ticker has data fresh for the slot. One ticker's gap does **not** switch |
-| Finance | 15:30 | Finance is unavailable, stale, incomplete or unresolved for any ordinary ticker |
+| Robinhood | 09:35, 10:30, 11:30, 13:30, 14:30 | Robinhood failed as a whole: listed in `source_errors`, absent, or no scored ticker has data fresh for the slot. One ticker's gap does **not** switch |
+| Finance | 12:30, 15:30 | Finance is unavailable, stale, incomplete or unresolved for any ordinary ticker |
 
 The whole universe always moves together; sources are never mixed. Policy:
 `config/scheduled_tasks.json` → `market_data_source_policy`.
@@ -39,7 +39,8 @@ can't drift from what the generator scores:
 
 | Slot | Decision | Bars | Universe |
 | --- | --- | --- | --- |
-| 09:35, 10:30, 11:30, 12:30, 13:30, 14:30 | slot time | 5-minute | stream config's tickers minus excluded (GFUZ included) |
+| 09:35, 10:30, 11:30, 13:30, 14:30 | slot time | 5-minute | stream config's tickers minus excluded (GFUZ included) |
+| 12:30 | 12:30 | 15-minute | minus excluded and GFUZ (Robinhood-routed) |
 | 15:30 | 15:30 | 15-minute | `config/tickers.json` active minus excluded, whole-share and GFUZ |
 
 It runs one minute after the decision time for a reason: Gate 5 anchors on

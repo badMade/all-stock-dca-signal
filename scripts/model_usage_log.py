@@ -253,10 +253,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "invokes this directly as a shell command after the run completes. "
             "(e3e6f09e and a46bf007 were removed from the schedule entirely on "
             "2026-08-02 and are no longer covered tasks.) "
-            "bb4f6ef1 is NOT in this list: its 9:45 AM watchlist scan goes through "
-            "MorningDCAExecutor.run(), which already appends its own model-usage "
-            "entry per call -- an additional explicit shell append here would "
-            "double-log a single 9:45 AM firing."
+            "bb4f6ef1 is NOT in this list: both of its sub-invocations go through "
+            "MorningDCAExecutor.run() (preflight mode, then watchlist mode), which "
+            "already appends its own model-usage entry per call -- an additional "
+            "explicit shell append here would triple-log a single 9:45 AM firing "
+            "(Codex review: 'Avoid triple-logging the 9:45 task')."
         ),
     )
     parser.add_argument("--run-id", required=True)

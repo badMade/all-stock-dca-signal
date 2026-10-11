@@ -8,7 +8,7 @@ Three subcommands, each printing ONE JSON document and exiting 0 when the result
     plan      --source mac_plan --trading-day D --slot S [--plan-file F]
     compute   --trading-day D --slot S --quotes F --orders-pages F --buying-power USD [--now T]
     finalize  --trading-day D --slot S --plan F --orders-pages F --fresh-quotes F
-              --fresh-spreads F --buying-power USD [--now T]
+              --fresh-spreads F --buying-power USD
 
 WHAT THIS IS
 ------------
@@ -37,14 +37,10 @@ PLACEMENT GATES
 from __future__ import annotations
 
 import argparse
-import contextlib
-import dataclasses
-import io
 import json
 import math
 import re
 import sys
-import tempfile
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -53,10 +49,8 @@ from typing import Any
 import dca_config
 import dca_order_plan as dop
 from dca_order_plan import PlanError
-from dca_runner import ET, MAX_PER_ORDER_USD, SLOTS, BrokerOrder, BudgetDataError
-from near_close_dca import BUDGET_TIERS, kill_switch_engaged
-from scripts import backup_stream_specs, stream_candidates
-from scripts import generate_buy_candidates as gbc
+from dca_runner import ET, MAX_PER_ORDER_USD, SLOTS, BrokerOrder
+from near_close_dca import BUDGET_TIERS
 from scripts.assemble_order_pages import _order_rows
 from scripts.broker_reconciliation import _has_continuation, _unwrap
 from scripts.same_day_top_up_gate import _bind_saved_pages
@@ -65,15 +59,8 @@ _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _NORMAL_TIER = next(tier for tier in BUDGET_TIERS if tier.name == "normal")
 _DEAD_STATES = frozenset({"cancelled", "canceled", "rejected", "failed", "voided"})
 
-# Off until the shadow run has proven the gated compute path (ADR "Open design gaps", gap 2). The gate
-# itself (`compute --market-data`) exists; this switch is the separate, deliberate go-live decision.
+# Off until the compute path is rebuilt on scripts/stream_candidates.py (ADR "Open design gaps", gap 2).
 COMPUTE_PLACEMENT_ENABLED = False
-
-# Slots whose Gate 5 the safety gate can run: runner slot id -> the candidate generator's slot label. All seven.
-# 15:30 runs scripts.generate_buy_candidates (the final-buy engine); the six executor-class slots run the stream
-# CLI path in scripts/stream_candidates.py, scored identically from Robinhood (scripts/backup_stream_specs.py).
-GATED_SLOTS = {"0935": "0935ET", "1030": "1030ET", "1130": "1130ET", "1230": "1230ET", "1330": "1330ET",
-               "1430": "1430ET", "1530": "1530ET"}
 
 
 class _Refused(Exception):
@@ -228,48 +215,6 @@ def _parse_buying_power(text: str) -> float:
     return value
 
 
-def _parse_deployed(text: Any, history: list[BrokerOrder], now: datetime) -> float:
-    """The trailing-7-day deployment figure as a finite non-negative number, else a structured refusal.
-
-    ``auto`` derives it from the same broker history the caps use (:func:`dca_order_plan.trailing_deployed_usd`),
-    so the task sums nothing. A number is taken as given. Required either way: silently assuming zero would
-    leave the kill switch off on exactly the day it exists to catch (the primary's generator makes the same choice).
-    """
-    if text == "auto":
-        try:
-            return dop.trailing_deployed_usd(history, now=now)
-        except BudgetDataError as exc:
-            raise _Refused(PlanError("history_unusable", type(exc).__name__)) from exc
-    try:
-        value = float(text)
-    except (TypeError, ValueError) as exc:
-        raise _Refused(PlanError("invalid_deployed_figure", "not a number")) from exc
-    if not math.isfinite(value) or value < 0:
-        raise _Refused(PlanError("invalid_deployed_figure", "must be a finite, non-negative amount"))
-    return value
-
-
-def _load_market_data(path: Path) -> dict[str, Any]:
-    """The assembled market-data payload, shape-checked the way the primary's own CLI checks it."""
-    payload = _read_json(path, missing="market_data_missing", corrupt="market_data_corrupt")
-    if not isinstance(payload, dict) or not isinstance(payload.get("sources"), dict):
-        raise _Refused(PlanError("market_data_invalid", "expected an object with a 'sources' object"))
-    if "ticker_errors" in payload and payload["ticker_errors"] is None:
-        raise _Refused(PlanError("market_data_invalid", "'ticker_errors' must be an object, not null"))
-    return payload
-
-
-def _prior_bar(sources: dict[str, Any], ticker: str, price_source: str) -> dict[str, Any] | None:
-    """The previous-close bar from the source that produced the decision, else any source that has one."""
-    names = [n for n in sources if price_source.startswith(n)] + list(sources)
-    for name in names:
-        entry = sources.get(name)
-        bar = entry.get(ticker, {}).get("previous_close_bar") if isinstance(entry, dict) and isinstance(entry.get(ticker), dict) else None
-        if isinstance(bar, dict):
-            return bar
-    return None
-
-
 def _context(config_dir: Path | None) -> tuple[Any, str, Path]:
     directory = config_dir if config_dir is not None else dca_config.get_config_dir()
     return dca_config.load_strategy_config(directory), dop.current_ladder_version(directory), directory
@@ -301,8 +246,6 @@ def _cmd_plan(args: argparse.Namespace, trading_day: date) -> int:
 
 
 def _cmd_compute(args: argparse.Namespace, trading_day: date) -> int:
-    if args.market_data is not None:
-        return _cmd_compute_gated(args, trading_day)
     config, ladder_version, _ = _context(args.config_dir)
     now = _parse_now(args.now)
     if now is None:
@@ -316,136 +259,6 @@ def _cmd_compute(args: argparse.Namespace, trading_day: date) -> int:
     if result.errors or result.plan is None:
         return _emit({"status": "FAILED", "plan": None, "errors": _error_dicts(result.errors)}, 2)
     return _emit({"status": "VALID_PLAN", "plan": result.plan, "errors": []}, 0)
-
-
-def _cmd_compute_gated(args: argparse.Namespace, trading_day: date) -> int:
-    """The safety gate: the primary's own Gate 5 decides what to buy, the plan only carries it out.
-
-    Nothing is sized here. The slot's own generator (the 15:30 engine, or the stream CLI path for the six
-    executor-class slots) reaches each decision with its trend, data-confidence and provider-error handling,
-    per-ticker calibration and kill switch; this wraps the BUYs in the same capped plan the quotes path builds.
-    """
-    if args.slot not in GATED_SLOTS:
-        raise _Refused(PlanError("slot_not_supported", f"{args.slot}: the safety gate covers {', '.join(GATED_SLOTS)} only"))
-    now = _parse_now(args.now)
-    if now is None or now.astimezone(ET).date() != trading_day:
-        raise _Refused(PlanError("bad_now", "expected a timezone-aware ISO timestamp on the trading day"))
-    buying_power = _parse_buying_power(args.buying_power)
-    history = _load_history(args.orders_pages, trading_day)
-    deployed = _parse_deployed(args.deployed_last_7d_usd, history, now)
-    payload = _load_market_data(args.market_data)
-    directory = args.config_dir if args.config_dir is not None else dca_config.get_config_dir()
-    try:
-        config = dca_config.load_strategy_config(directory, deployed_last_7d_usd=deployed)
-        # Computed plans cannot resize a top-up, so any buy already made today keeps the ticker out (the same
-        # day-wide rule finalize applies to a backup plan). Only universe tickers: the generators reject others.
-        covered = sorted(dop.already_placed_symbols(history, trading_day=trading_day, slot=args.slot, scope="day") & set(config.tickers))
-        if args.slot == "1530":
-            decisions = _decisions_final_buy(payload, config, directory, trading_day, deployed, covered)
-        else:
-            decisions = _decisions_stream(args.slot, payload, directory, trading_day, deployed, covered)
-    except ValueError as exc:
-        # Type name only: the message can carry untrusted payload content (a source name, a path).
-        raise _Refused(PlanError("market_data_invalid", type(exc).__name__)) from exc
-    result = dop.plan_from_decisions(
-        decisions, config=config, trading_day=trading_day, slot=args.slot, generated_at_et=now,
-        ladder_version=dop.current_ladder_version(directory), orders_today=history, tier=_NORMAL_TIER,
-        buying_power_usd=buying_power,
-    )
-    if result.errors or result.plan is None:
-        return _emit({"status": "FAILED", "plan": None, "errors": _error_dicts(result.errors)}, 2)
-    return _emit({"status": "VALID_PLAN", "plan": result.plan, "errors": []}, 0)
-
-
-def _decisions_final_buy(payload: dict[str, Any], config: Any, directory: Path, trading_day: date,
-                         deployed: float, covered: list[str]) -> list[dict[str, Any]]:
-    """15:30: the final-buy engine's BUY rows, minus those its Gate 6 would withhold as planner-incompatible.
-
-    The compatibility row carries the ticker's calibration bounds (``_calibration_fields``), as the stream document's
-    rows do. A bare 4-field row is judged against the GLOBAL ladder and so flags nearly every calibrated ticker,
-    which would plan nothing; with its bounds it flags only a row whose multiplier, notional and drop disagree.
-    """
-    stream_candidates._require_matching_runner_config_dir(directory)
-    gbc._require_populated_config(directory)
-    decision_time = datetime.combine(trading_day, gbc.SLOT_SPECS["1530ET"]["decision_time_et"], tzinfo=ET)
-    config = dca_config.load_strategy_config(directory, now=decision_time, deployed_last_7d_usd=deployed)
-    rows = gbc.generate_candidates(
-        slot="1530ET", now=decision_time, config=config, market_data_by_source=payload["sources"],
-        source_errors=payload.get("source_errors", []), ticker_errors=payload.get("ticker_errors"),
-        already_covered_tickers=covered,
-    )
-    decisions = []
-    for row in rows:
-        if row["action"] != "BUY":
-            continue
-        planner_row = [row["ticker"], row["suggested_amount_usd"], row["buy_multiplier"], row["multiplier_drop_pct"]]
-        calibration = stream_candidates._calibration_fields(row["ticker"], row["buy_multiplier"], row["selected_base_amount_usd"])
-        if calibration:
-            planner_row += [calibration["sizing_base_usd"], calibration["sizing_min_drop_pct"], calibration["sizing_max_drop_pct"]]
-        if gbc._planner_incompatible(planner_row):
-            continue
-        bar = _prior_bar(payload["sources"], row["ticker"], str(row.get("target_price_source") or ""))
-        low = bar.get("low") if bar else None
-        decisions.append({
-            "symbol": row["ticker"], "notional_usd": row["suggested_amount_usd"], "multiplier": row["buy_multiplier"],
-            "drop_pct": row["multiplier_drop_pct"], "decision_price": row["target_price"],
-            "prior_close": bar.get("close") if bar else None, "prior_low": low if isinstance(low, (int, float)) and low > 0 else None,
-        })
-    return decisions
-
-
-def _decisions_stream(slot: str, payload: dict[str, Any], directory: Path, trading_day: date,
-                      deployed: float, covered: list[str]) -> list[dict[str, Any]]:
-    """An executor-class slot: the primary's own stream CLI path, run on the payload, and its ``cands`` BUY rows.
-
-    The empty ``finance`` placeholder the assembler writes is dropped (these slots score Robinhood); a non-empty one is
-    left in so the stream CLI refuses it exactly as it refuses an unsupported source.
-    """
-    spec = backup_stream_specs.stream_spec(slot)
-    sources = {name: block for name, block in payload["sources"].items() if not (name == "finance" and block == {})}
-    ticker_errors = {name: errs for name, errs in (payload.get("ticker_errors") or {}).items() if name == "robinhood" or errs}
-    stream_payload = {"sources": sources, "source_errors": payload.get("source_errors", []), "ticker_errors": ticker_errors}
-    with tempfile.TemporaryDirectory(prefix="backup-stream-") as scratch:
-        path = Path(scratch) / "market.json"
-        path.write_text(json.dumps(stream_payload), encoding="utf-8")
-        namespace = argparse.Namespace(
-            trading_day=trading_day.isoformat(), market_data=path, config_dir=directory, decision_time_et=None,
-            already_covered_tickers=covered,
-            deployed_last_7d_usd=deployed if spec.requires_deployed_last_7d_usd else None,
-        )
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            stream_candidates._run_with_args(spec, namespace)
-    document = json.loads(out.getvalue())
-    withheld = set(document.get("planner_incompatible_tickers") or ())
-    decisions = []
-    for row in document["cands"]:
-        if row["ticker"] in withheld:
-            continue
-        low = row.get("prior_low")
-        decisions.append({
-            "symbol": row["ticker"], "notional_usd": row["desired_usd"], "multiplier": row["multiplier"],
-            "drop_pct": row["drop_pct"], "decision_price": row["current_price"], "prior_close": row["prior_close"],
-            "prior_low": low if isinstance(low, (int, float)) and low > 0 else None,
-        })
-    return decisions
-
-
-def _cmd_universe(args: argparse.Namespace) -> int:
-    """The buyable symbols from the packaged config: the task fetches exactly these, so no prompt names a stock."""
-    directory = args.config_dir if args.config_dir is not None else dca_config.get_config_dir()
-    if not Path(directory).is_dir():
-        return _emit({"status": "FAILED", "errors": _error_dicts([PlanError("config_missing", Path(directory).name)])}, 2)
-    try:
-        gbc._require_populated_config(Path(directory))
-    except ValueError as exc:
-        return _emit({"status": "FAILED", "errors": _error_dicts([PlanError("config_invalid", type(exc).__name__)])}, 2)
-    config = dca_config.load_strategy_config(directory)
-    whole_share = set(getattr(config, "whole_share_tickers", ()) or ())
-    symbols = sorted(set(config.tickers) - set(config.excluded_tickers) - whole_share)
-    if not symbols:
-        return _emit({"status": "FAILED", "errors": _error_dicts([PlanError("universe_unavailable", "no buyable symbols")])}, 2)
-    return _emit({"status": "OK", "symbols": symbols, "count": len(symbols), "universe_hash": dop.universe_hash(config.tickers)}, 0)
 
 
 def _collect(errors: list[PlanError], load: Any) -> Any:
@@ -467,10 +280,6 @@ def _cmd_finalize(args: argparse.Namespace, trading_day: date) -> int:
     buying_power = _collect(errors, lambda: _parse_buying_power(args.buying_power))
     if errors:
         return _abort(*errors)
-    if plan.plan["generator"] != "claude":
-        guard = _kill_switch_error(plan.orders, history, config, trading_day, args.now)
-        if guard is not None:
-            return _abort(guard)
     # A Claude plan already carries any top-up resize, so only THIS slot's window counts as already
     # placed. A computed plan cannot resize, so it keeps the conservative day-wide exclusion.
     scope = "slot" if plan.plan["generator"] == "claude" else "day"
@@ -488,31 +297,6 @@ def _cmd_finalize(args: argparse.Namespace, trading_day: date) -> int:
     if plan.plan["generator"] != "claude" and not COMPUTE_PLACEMENT_ENABLED:
         return _emit({"status": "SHADOW_ONLY", "to_place": [], "would_place": orders, "skipped": skipped, "errors": []}, 0)
     return _emit({"status": "PROCEED", "to_place": orders, "skipped": skipped, "errors": []}, 0)
-
-
-def _kill_switch_error(orders: Any, history: list[BrokerOrder], config: Any, trading_day: date,
-                       now_text: str | None) -> PlanError | None:
-    """Poll 2's second look at the trailing-7-day guard for a computed plan, else ``None`` when it still holds.
-
-    A computed plan was sized from poll 1's figure; spend that lands between the polls can trip the kill switch
-    while the plan still carries a multiplier above 1x, so the figure is re-derived from the fresh pull and an
-    over-1x plan is refused (place nothing; the plan is stale). ``now`` must be on the trading day in ET: it is
-    the window's upper bound, and an earlier day would classify today's orders as future and leave the guard off.
-    A Claude plan is sized by the primary and is not rechecked here: its own earlier fills would count toward the
-    figure and wrongly abort a partly finished batch.
-    """
-    now = _parse_now(now_text)
-    if now is None:
-        return PlanError("bad_now", "expected a timezone-aware ISO timestamp")
-    if now.astimezone(ET).date() != trading_day:
-        return PlanError("now_not_trading_day", trading_day.isoformat())
-    try:
-        deployed = dop.trailing_deployed_usd(history, now=now)
-    except BudgetDataError as exc:
-        return PlanError("history_unusable", type(exc).__name__)
-    if kill_switch_engaged(dataclasses.replace(config, deployed_last_7d_usd=deployed)) and any(o["multiplier"] > 1.0 for o in orders):
-        return PlanError("kill_switch_engaged_since_plan", "trailing seven-day spend now exceeds the kill-switch threshold")
-    return None
 
 
 def _abort(*errors: PlanError) -> int:
@@ -547,20 +331,12 @@ def _build_parser() -> argparse.ArgumentParser:
     common(plan)
     plan.add_argument("--source", required=True, choices=("mac_plan",))
     plan.add_argument("--plan-file", type=Path, default=None)
-    compute = sub.add_parser("compute", help="Derive a plan: from quotes (ladder only) or through the safety gate.")
+    compute = sub.add_parser("compute", help="Derive a plan from fetched quotes.")
     common(compute)
-    source = compute.add_mutually_exclusive_group(required=True)
-    source.add_argument("--quotes", type=Path, help="Quotes only: the price ladder, no signal gates (shadow use).")
-    source.add_argument("--market-data", type=Path,
-                        help="The assembled payload (scripts/assemble_market_data.py): runs the primary's Gate 5.")
-    compute.add_argument("--deployed-last-7d-usd", default=None,
-                         help="Trailing-7-day deployment for the kill switch, or 'auto' to derive it from --orders-pages. "
-                              "Required with --market-data.")
+    compute.add_argument("--quotes", required=True, type=Path)
     compute.add_argument("--orders-pages", required=True, type=Path)
     compute.add_argument("--now", default=None)
     compute.add_argument("--buying-power", required=True, help="Fresh available buying power in USD.")
-    universe = sub.add_parser("universe", help="Print the buyable symbols from config; the task fetches exactly these.")
-    universe.add_argument("--config-dir", type=Path, default=None)
     finalize = sub.add_parser("finalize", help="Reconcile and re-validate a plan; print what to place.")
     common(finalize)
     finalize.add_argument("--plan", required=True, type=Path)
@@ -569,24 +345,11 @@ def _build_parser() -> argparse.ArgumentParser:
     finalize.add_argument("--fresh-spreads", required=True, type=Path,
                           help='JSON {"SYMBOL": {"bid": x, "ask": y}} fetched just before placement.')
     finalize.add_argument("--buying-power", required=True, help="Fresh available buying power in USD.")
-    finalize.add_argument("--now", default=None,
-                          help="ET-day ISO timestamp for poll 2's kill-switch recheck of a computed plan (default: the clock).")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = _build_parser()
-    args = parser.parse_args(argv)
-    if args.command == "universe":
-        try:
-            return _cmd_universe(args)
-        except Exception as exc:  # noqa: BLE001 - last fail-closed boundary; type name only
-            return _emit({"status": "FAILED", "errors": _error_dicts([PlanError("unexpected_error", type(exc).__name__)])}, 2)
-    if args.command == "compute":
-        if args.market_data is not None and args.deployed_last_7d_usd is None:
-            parser.error("--deployed-last-7d-usd is required with --market-data")
-        if args.quotes is not None and args.deployed_last_7d_usd is not None:
-            parser.error("--deployed-last-7d-usd only applies with --market-data")
+    args = _build_parser().parse_args(argv)
     failed = _abort if args.command == "finalize" else (lambda *e: _emit({"status": "FAILED", "plan": None, "errors": _error_dicts(e)}, 2))
     if not _DAY_RE.match(args.trading_day):
         return failed(PlanError("bad_trading_day", "expected YYYY-MM-DD"))

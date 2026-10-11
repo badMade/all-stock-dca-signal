@@ -36,6 +36,8 @@ from scripts.scheduled_artifacts import (  # noqa: E402
     ERROR_CLASS_PLACEMENT_PHASE_UNREACHABLE,
     MORNING_LIVE_CRON_ID,
     ORDER_SUBMIT_STATUS_PLACEMENT_UNREACHABLE,
+    PREFLIGHT_CRON_ID,
+    PREFLIGHT_RUN_TYPE,
     RUN_STATE_FILENAME,
     SCHEDULED_LIVE_REQUIRED_FILENAMES,
     SIGNALS_CSV_FILENAME,
@@ -43,6 +45,7 @@ from scripts.scheduled_artifacts import (  # noqa: E402
     await_finalized_run_artifacts,
     build_afternoon_live_run_classification,
     build_morning_live_run_classification,
+    build_preflight_run_classification,
     build_run_summary,
     completion_marker,
     has_planned_orders,
@@ -66,6 +69,37 @@ def _morning_run_classification_schema():
         Path(__file__).resolve().parents[2] / "schemas" / "morning_run_classification.schema.json"
     )
     return json.loads(schema_path.read_bytes())
+
+
+def test_preflight_classification_is_non_null_object_with_required_fields():
+    rc = build_preflight_run_classification(
+        trading_day="2026-07-21",
+        run_id="morning_preflight_20260721_0945ET",
+        valid_scheduled_evidence=True,
+    )
+    assert rc is not None and isinstance(rc, dict)
+    assert rc["run_origin"] == "scheduled"
+    assert rc["run_type"] == PREFLIGHT_RUN_TYPE == "morning_dca_preflight"
+    assert rc["trades"] is False
+    assert rc["scheduled_for_et"] == "09:45"
+    assert rc["scheduled_window_start_et"] == "09:40"
+    assert rc["scheduled_window_end_et"] == "09:50"
+    assert rc["manual_run"] is False
+    assert rc["state_schema_version"] == "morning-preflight-v2-machine-complete"
+    assert rc["cron_id"] == PREFLIGHT_CRON_ID == "bb4f6ef1"
+    assert rc["stream"] == "morning"
+    assert rc["valid_afternoon_evidence"] is False
+    assert rc["trading_day"] == "2026-07-21"
+    assert rc["same_day_required"] is True
+    assert rc["valid_scheduled_evidence"] is True
+    assert rc["run_id"] and rc["triggered_at_utc"]
+    # Codex review r3624039531 (same gap, the preflight builder): every field
+    # schemas/morning_run_classification.schema.json unconditionally requires,
+    # plus the fields its scheduled-preflight allOf branch additionally
+    # requires, must be present -- not just the same-day pointer fields.
+    schema = _morning_run_classification_schema()
+    assert set(schema["required"]).issubset(rc.keys())
+    assert {"scheduled_window_start_et", "scheduled_window_end_et"}.issubset(rc.keys())
 
 
 def test_morning_live_classification_is_non_null_object_with_required_fields():
@@ -469,6 +503,30 @@ def test_validate_passes_when_summary_mirrors_state(tmp_path):
         encoding="utf-8",
     )
     assert validate_run_artifacts(tmp_path)
+
+
+def test_preflight_summary_without_classification_still_validates(tmp_path):
+    # A read-only pre-flight run (require_submitted_orders=False) writes a
+    # run_summary.json WITHOUT a run_classification by design; validate_run_artifacts
+    # is also the contract validator for those dirs. The summary-mirroring check
+    # must be gated to scheduled live runs, so a valid 9:45 preflight whose
+    # run_state classification is present still passes the contract even though its
+    # summary carries no run_classification.
+    rc = build_preflight_run_classification(
+        trading_day="2026-07-21",
+        run_id="morning_preflight_20260721_0945ET",
+        valid_scheduled_evidence=True,
+    )
+    (tmp_path / "run_state.json").write_text(
+        json.dumps({"run_classification": rc}), encoding="utf-8"
+    )
+    write_signals_csv(tmp_path, [{"ticker": "A"}])
+    # preflight writer emits run_summary.json without a run_classification
+    (tmp_path / "run_summary.json").write_text(
+        json.dumps({"run_id": "morning_preflight_20260721_0945ET"}), encoding="utf-8"
+    )
+    result = validate_run_artifacts(tmp_path, require_submitted_orders=False)
+    assert result, result.errors
 
 
 def test_require_summary_fails_when_no_summary_present(tmp_path):
@@ -1085,7 +1143,7 @@ def test_a_nonpositive_poll_interval_is_rejected(tmp_path):
 
 
 def test_validation_options_pass_through_to_the_contract(tmp_path):
-    """A read-only run waives the order CSV; the window must waive it too."""
+    """A preflight run waives the order CSV; the window must waive it too."""
     state = _live_run_state()
     write_scheduled_run_artifacts(tmp_path, state)
     (tmp_path / "submitted_orders.csv").unlink()
@@ -1100,20 +1158,6 @@ def test_validation_options_pass_through_to_the_contract(tmp_path):
 
     assert result.ok and result.finalized
     assert clock.slept == []
-
-
-def test_read_only_summary_without_classification_is_valid(tmp_path):
-    state = {
-        "run_id": "watchlist_20261010",
-        "run_classification": {"run_origin": "scheduled", "run_type": "watchlist_scan"},
-    }
-    (tmp_path / "run_state.json").write_text(json.dumps(state), encoding="utf-8")
-    write_signals_csv(tmp_path, [])
-    summary = {"run_id": state["run_id"], "status": "completed"}
-    (tmp_path / "run_summary.json").write_text(json.dumps(summary), encoding="utf-8")
-
-    assert "run_classification" not in summary
-    assert validate_run_artifacts(tmp_path, require_submitted_orders=False)
 
 
 @pytest.mark.parametrize(

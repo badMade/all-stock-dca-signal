@@ -18,13 +18,13 @@ Backfill: [`scripts/backfill_intraday_archive.py`](../scripts/backfill_intraday_
 ## What gets recorded
 
 Every ticker evaluated by every scheduled slot, on **every** run mode — the
-read-only 9:45 watchlist scan included. A price observed by a
+read-only 9:45 pre-flight and watchlist scans included. A price observed by a
 scan is no less real for having been observed by a run that places no orders.
 
 | Slot (ET) | Stream | Cron |
 | --- | --- | --- |
 | 9:35 | `market_open` | `2ba19526` |
-| 9:45 | `morning` (watchlist) | `bb4f6ef1` |
+| 9:45 | `morning` (watchlist / pre-flight) | `bb4f6ef1` |
 | 10:30 | `morning` (live) | `42173154` |
 | 11:30 / 1:30 / 2:30 | `intraday` | `7be82b97` |
 | 12:30 | `midday` | `a6239dae` |

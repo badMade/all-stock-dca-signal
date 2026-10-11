@@ -8,8 +8,8 @@ What is market-open specific and therefore tested here:
 
     - the trend-validation exemption (only ~5 minutes of session data exist at
       9:35, so a completed 60-minute downtrend can never validate),
-    - the slot evaluating its full configured universe with no upstream
-      artifact dependency (the retired 9:45 pre-flight is gone entirely),
+    - independence from the 9:45 pre-flight artifact, which does not exist yet
+      when this slot decides,
     - the ships-disabled placement switch,
     - stream identity, artifact roots, and root-resolution timing.
 
@@ -196,16 +196,17 @@ def test_market_open_auto_buys_without_a_validatable_trend(tmp_path):
     assert signal.execution_status != "manual_review_candidate"
 
 
-# --- No upstream artifact dependency ----------------------------------------
-def test_market_open_evaluates_the_full_universe_with_no_upstream_artifact(tmp_path):
-    # This slot fires at 9:35 and reads no artifact from any earlier run (the
-    # 9:45 pre-flight that used to be a morning-stream input was retired). It
-    # must still evaluate and surface its ticker from a bare state root.
+# --- Independence from the 9:45 pre-flight ----------------------------------
+def test_market_open_does_not_gate_on_the_preflight_artifact(tmp_path):
+    # This slot fires ten minutes BEFORE the 9:45 pre-flight writer, so the
+    # artifact cannot exist yet. The inherited pre-flight gate is scoped to the
+    # morning stream and must stay inert here -- otherwise every market-open run
+    # would fail closed to zero tickers.
     ex = MarketOpenDCAExecutor(_cfg(tmp_path))
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"TICK": 0.05})
     signals = ex.evaluate(_now_market_open(), data)
     assert [s.ticker for s in signals] == ["TICK"]
-    assert not hasattr(ex, "preflight_gate")
+    assert ex.preflight_gate is None
 
 
 # --- The live placement switch ----------------------------------------------

@@ -40,6 +40,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 STREAM_ROOTS = [
     ("morning_dca", "DEFAULT_MORNING_LIVE_STATE_ROOT", "morning_dca"),
     ("morning_dca", "DEFAULT_MORNING_WATCHLIST_STATE_ROOT", "morning_dca_watchlist"),
+    ("morning_dca", "DEFAULT_MORNING_PREFLIGHT_STATE_ROOT", "morning_dca_preflight"),
     ("morning_dca", "DEFAULT_AFTERNOON_TASK_ROOT", "ce16ba6b"),
     ("morning_dca", "DEFAULT_MARKET_OPEN_TASK_ROOT", "market_open_dca"),
     ("morning_dca", "DEFAULT_INTRADAY_TASK_ROOT", "intraday_dca"),
@@ -228,6 +229,8 @@ def test_the_override_reaches_the_executors_not_just_the_defaults():
         "from midday_dca import load_midday_config;"
         "m = load_morning_config(mode='live'); d = load_midday_config();"
         "print(m.morning_run_state_root);"
+        "print(m.preflight_run_state_root);"
+        "print('|'.join(m.preflight_forbidden_roots));"
         "print(d.morning_run_state_root);"
         "print('|'.join(d.prior_allocation_roots))"
     )

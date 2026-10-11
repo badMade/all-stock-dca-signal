@@ -10,7 +10,8 @@ private links are stored in this repo.**
    Places the **first buys of the day** (Robinhood `<ROBINHOOD_ACCOUNT_NUMBER>`) using the dynamic first-allocation base ($2 below prior close+low, $1 below prior close only) on the 0x-to-5x ladder. Writes `cron_tracking/market_open_dca/YYYYMMDD_0935ET/`.
 2. **9:45 AM ET: Watchlist early-warning scan (`bb4f6ef1`)**
    Read-only. Alerts only for actionable early-warning rows. Supersedes the retired
-   `cd45e95b` outlier scan and the retired `morning-dca-0945` alias.
+   `cd45e95b` outlier scan and the retired `morning-dca-0945` alias -- and absorbed
+   its required pre-flight-writer duty too, not just its display name.
 3. **10:30 AM ET: Morning live execution (`42173154`)**
    Places buys and writes `cron_tracking/morning_dca/YYYYMMDD_1030ET/`.
 4. **11:30 AM, 1:30 PM, 2:30 PM ET: Intraday live executions (`7be82b97`)**

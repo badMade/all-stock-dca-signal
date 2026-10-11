@@ -84,15 +84,33 @@ CLASSIFICATION_VALUES = (
 # from model_usage.jsonl instead (see _build_consumer_row).
 CHAIN_SLOTS: List[Dict[str, Any]] = [
     {"et": "09:35", "task_id": "2ba19526", "stream": "market_open", "run_dir": "market_open_dca/{day}_0935ET"},
+    # bb4f6ef1's two sub-invocations share a cron ID *and* a scheduled ET, so
+    # cron_id/scheduled_for_et alone cannot tell them apart: a watchlist
+    # artifact copied into the preflight directory would satisfy this slot and
+    # be counted as the machine-complete preflight the 10:30 gate depends on.
+    # expected_run_type is the discriminator -- codex review
+    # discussion_r3658801012. (morning_dca.py's MORNING_PREFLIGHT_RUN_TYPE /
+    # MORNING_WATCHLIST_RUN_TYPE.)
+    {
+        "et": "09:45",
+        "task_id": "bb4f6ef1",
+        "stream": "preflight",
+        "run_dir": "morning_dca_preflight/{day}_0945ET",
+        "expected_run_type": "morning_dca_preflight",
+        # Read-only: the 9:45 pre-flight computes eligibility and writes its
+        # artifact set, but places no orders and records no order CSV or
+        # order_submit_status. Its order count is therefore a KNOWN zero (see
+        # read_only_zero_order_note).
+        "read_only_zero_orders": True,
+    },
     {
         "et": "09:45",
         "task_id": "bb4f6ef1",
         "stream": "watchlist",
         "run_dir": "morning_dca_watchlist/{day}_0945ET",
         "expected_run_type": "morning_dca_watchlist_scan",
-        # expected_run_type pins the watchlist scan's run_type so a state of any
-        # other type left in this directory cannot stand in as this slot's evidence.
-        # Read-only: a watchlist scan never places an order.
+        # Read-only, same as the pre-flight above: a watchlist scan never
+        # places an order.
         "read_only_zero_orders": True,
     },
     {"et": "10:30", "task_id": "42173154", "stream": "morning", "run_dir": "morning_dca/{day}_1030ET"},
@@ -306,7 +324,8 @@ PER_RUN_REQUIRED_FIELDS = (
 # Per-(task_id, stream) required-artifact groups for a valid_scheduled_evidence
 # row, sourced from each task's OWN documented contract in
 # config/scheduled_tasks.json (tasks[*].artifacts.always_write,
-# tasks[*].state_file_guarantee.always_write) -- never the
+# tasks[*].state_file_guarantee.always_write, and
+# also_runs_required_preflight_writer.preflight_artifacts.files) -- never the
 # aspirational live_reliability_fix_2026_07_17.always_write_artifacts blocks,
 # which 42173154's own manifest_accuracy_note says documents "the intended
 # contract, not current behavior". Each group is a tuple of names, any ONE of
@@ -323,6 +342,17 @@ REQUIRED_ARTIFACT_GROUPS: Dict[Any, tuple] = {
         (SUBMITTED_ORDERS_CSV_FILENAME,),
     ),
     ("bb4f6ef1", "watchlist"): (("watchlist_signals.csv",),),
+    ("bb4f6ef1", "preflight"): (
+        ("signals.csv",),
+        # also_runs_required_preflight_writer.preflight_artifacts.files
+        # declares all FOUR of run_state.json, validation.csv, signals.csv,
+        # and run_summary.json. validation.csv was the one omitted here, so a
+        # preflight missing the artifact the 10:30 gate actually validates
+        # against reported no missing artifacts and raised no actionable
+        # issue -- codex review discussion_r3660192627.
+        ("validation.csv",),
+        SUMMARY_FILENAMES,
+    ),
     ("42173154", "morning"): (("morning_signals.csv",),),
     ("7be82b97", "intraday"): (
         SUMMARY_FILENAMES,
@@ -572,7 +602,7 @@ def _count_submitted_orders(
     """Order-attempt count for ``run_dir``, or ``"not_logged"``.
 
     ``read_only`` marks a slot whose role cannot place orders at all -- the
-    9:45 watchlist scan (CHAIN_SLOTS ``read_only_zero_orders``).
+    9:45 pre-flight and watchlist scans (CHAIN_SLOTS ``read_only_zero_orders``).
     Their documented artifact sets contain no order CSV and no
     order_submit_status precisely BECAUSE they are read-only, so the fallbacks
     below find nothing and returned not_logged. Since placed_order_count
@@ -1010,6 +1040,7 @@ def _late_error_markers(cron_root: Path, trading_day: str, stream: str) -> tuple
 # slots under the same task_id.
 _EXPECTED_RUN_ID_PREFIX = {
     ("2ba19526", "market_open"): "market_open_live_{day}_0935ET",
+    ("bb4f6ef1", "preflight"): "morning_preflight_{day}_0945ET",
     ("bb4f6ef1", "watchlist"): "morning_{day}_0945ET",
     ("42173154", "morning"): "morning_live_{day}_1030ET",
     ("7be82b97", "intraday"): "intraday_live_{day}_{slot}ET",
@@ -1139,18 +1170,21 @@ def _identity_matches(rc: Dict[str, Any], slot: Dict[str, Any], run_state: Dict[
         return False
     if parsed_triggered.astimezone(_EASTERN).strftime("%Y-%m-%d") != trading_day:
         return False
-    # Slots that set expected_run_type (the 9:45 watchlist scan) additionally pin
-    # run_type, so an artifact of another type cannot stand in as this slot's
-    # evidence.
+    # Slots whose (task_id, et) pair is NOT unique -- bb4f6ef1's preflight and
+    # watchlist sub-invocations -- additionally pin run_type, so one mode's
+    # artifact cannot stand in as the other's evidence -- codex review
+    # discussion_r3658801012.
     #
-    # REQUIRED, not "checked only when present": run_type is the field that
-    # tells apart artifacts that share every other identity field (cron_id,
-    # scheduled_for_et, trading_day). Treating absence as unknown therefore let
-    # a malformed state satisfy the slot and corrupt the scheduled/artifact counts --
+    # REQUIRED, not "checked only when present": run_type is the sole field
+    # that tells these two rows apart, and every other identity field they
+    # carry (cron_id, scheduled_for_et, trading_day) is identical by
+    # construction. Treating absence as unknown therefore let a malformed
+    # state satisfy EITHER slot and corrupt the scheduled/artifact counts --
     # codex review discussion_r3659293057. Absence is malformed rather than
     # merely unknown: schemas/morning_run_classification.schema.json lists
-    # run_type in `required`, and the real producer always stamps it
-    # (morning_dca.py's MorningDCAExecutor.run_classification), so
+    # run_type in `required`, and both real producers always stamp it
+    # (morning_dca.py's MorningDCAExecutor.run_classification and
+    # scripts/scheduled_artifacts.build_preflight_run_classification), so
     # requiring it here cannot reject a legitimately-completed run.
     expected_run_type = slot.get("expected_run_type")
     if expected_run_type is not None:
@@ -2646,11 +2680,12 @@ def _premium_row_count(
 
 
 # Baseline scheduled-run count on a fully successful, no-recovery day: eight
-# active ids, with bb4f6ef1 firing once (the 9:45 watchlist scan) and 7be82b97
-# firing three times (11:30/13:30/14:30) -- 6 single-slot ids + 1 + 3 = 10
-# (e3e6f09e is paused and contributes none). It was 11 while bb4f6ef1 also
-# fired a second, pre-screen sub-invocation at 9:45 (retired).
-RUN_VOLUME_BASELINE = 10
+# active ids, with bb4f6ef1 firing twice (preflight + watchlist) and 7be82b97
+# firing three times (11:30/13:30/14:30) -- 6 single-slot ids + 2 + 3 = 11
+# (e3e6f09e is paused and contributes none) -- codex review
+# discussion_r3658332746, updating the prior (pre-bb4f6ef1-split) baseline of
+# 10.
+RUN_VOLUME_BASELINE = 11
 
 # Human-readable threshold per proxy dimension, rendered alongside each band so
 # a reader can reproduce the derivation from the Markdown report alone --

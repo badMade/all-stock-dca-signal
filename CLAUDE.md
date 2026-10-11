@@ -126,6 +126,8 @@ Consequences to internalize before changing anything:
   from three different sources: `dca_runner`'s Gate 6 sums broker order history, the
   executor classes scan same-day run artifacts, and `near_close_dca.within_caps` reads
   `StrategyState` plus artifact seeding. A cap fix applied to one does not reach the others.
+  (The morning preflight gate used to be the example here; both callers now share
+  `morning_preflight_eligible_tickers()`.)
 - **"No in-repo caller" ≠ dead code.** The executor classes, `dca_runner.py`,
   `dca_cost_tracker.py`, `dca_weekly_dashboard.py`, and `scripts/same_day_top_up_gate.py`
   have no in-repo caller that *runs a slot* by design (the local console and a few scripts do
