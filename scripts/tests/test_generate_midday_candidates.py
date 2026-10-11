@@ -629,9 +629,9 @@ def test_cli_accepts_structured_source_errors_dict_entry(tmp_path, monkeypatch):
     path = tmp_path / "market_data.json"
     path.write_text(
         json.dumps({
-            "sources": {"finance": {}, "yahoo_finance_yfinance": {}},
-            "source_errors": [{"source": "finance", "error": "Finance connector not available"}],
-            "ticker_errors": {"finance": []},
+            "sources": {"robinhood": {}, "yahoo_finance_yfinance": {}},
+            "source_errors": [{"source": "robinhood", "error": "Robinhood quotes not available"}],
+            "ticker_errors": {"robinhood": []},
         }),
         encoding="utf-8",
     )
@@ -649,7 +649,7 @@ def test_cli_accepts_structured_source_errors_dict_entry(tmp_path, monkeypatch):
     assert exit_code == 0
     document = json.loads(stdout.getvalue())
     assert document["buy_count"] == 0
-    assert document["validation_context_source_errors"] == ["finance"]
+    assert document["validation_context_source_errors"] == ["robinhood"]
 
 
 @pytest.mark.parametrize("raw_value", ["-1", "NaN", "not-a-number"])

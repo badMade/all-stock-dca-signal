@@ -75,3 +75,13 @@ per-ticker exception. A slot dropped from `GATED_SLOTS` falls back to a quotes-o
 - **Attribution.** Backup orders reuse the planner's `dca-runner-<slot>-<day>-<TICKER>` reference (the plan's
   `ref_id`), so Claude's and the backup's orders are indistinguishable by reference alone; the state record is
   the only attribution. Broker-side deduplication on a reused reference is unverified (ADR decision D6).
+
+## Placeholders to fill when repasting (2026-10-08)
+
+The prompts no longer contain an account number. Before pasting, set these in the Perplexity task:
+
+| Placeholder | Meaning |
+|---|---|
+| `${ROBINHOOD_AGENTIC_ACCOUNT_LAST4}` | Last 4 digits the account lookup must match; the run stops if not exactly one tradable account ends in them |
+| `${PPLX_RUN_STATE_DIR}` | Directory for the run-state JSON and `submitted_orders.csv` (the project files `cron_tracking/<task id>` folder) |
+| `${DCA_ALERT_EMAIL_ADDRESS}` | Alert address, unchanged |
