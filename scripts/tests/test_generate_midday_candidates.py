@@ -626,12 +626,13 @@ def test_cli_all_covered_universe_allows_an_empty_robinhood_payload(tmp_path, mo
 
 def test_cli_accepts_structured_source_errors_dict_entry(tmp_path, monkeypatch):
     _patch_config(monkeypatch)
+    source = gmc.MIDDAY_SPEC.source.value
     path = tmp_path / "market_data.json"
     path.write_text(
         json.dumps({
-            "sources": {"robinhood": {}, "yahoo_finance_yfinance": {}},
-            "source_errors": [{"source": "robinhood", "error": "Robinhood quotes not available"}],
-            "ticker_errors": {"robinhood": []},
+            "sources": {source: {}, "yahoo_finance_yfinance": {}},
+            "source_errors": [{"source": source, "error": "Primary connector not available"}],
+            "ticker_errors": {source: []},
         }),
         encoding="utf-8",
     )
@@ -649,7 +650,7 @@ def test_cli_accepts_structured_source_errors_dict_entry(tmp_path, monkeypatch):
     assert exit_code == 0
     document = json.loads(stdout.getvalue())
     assert document["buy_count"] == 0
-    assert document["validation_context_source_errors"] == ["robinhood"]
+    assert document["validation_context_source_errors"] == [source]
 
 
 @pytest.mark.parametrize("raw_value", ["-1", "NaN", "not-a-number"])
