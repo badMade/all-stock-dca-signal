@@ -1,6 +1,6 @@
 """Durable intraday observation archive for every scheduled DCA poll.
 
-Each scheduled slot (9:35 market-open, 9:45 pre-flight, 10:30 morning,
+Each scheduled slot (9:35 market-open, 9:45 watchlist scan, 10:30 morning,
 11:30/13:30/14:30 intraday, 12:30 midday, 15:30 near-close) already prices every
 ticker in the active universe in order to grade it. Before this module those
 prices lived only inside that one run's ``*_signals.csv`` -- scattered across
@@ -116,9 +116,9 @@ OBSERVATION_FIELDS: Tuple[str, ...] = (
 #: stays present as ordinary row data; manual identity folds in ``run_id``
 #: separately in :func:`_natural_key` for the opposite reason -- see there.
 #:
-#: ``run_type`` IS part of scheduled identity: the 9:45 ET scheduler invokes
-#: MorningDCAExecutor twice back to back -- once in preflight mode, once in
-#: watchlist mode -- and both produce scheduled (manual_run=false) rows with
+#: ``run_type`` IS part of scheduled identity: the 9:45 ET scheduler used to invoke
+#: MorningDCAExecutor twice back to back -- once in a pre-screen mode (since
+#: retired), once in watchlist mode -- and both produced scheduled (manual_run=false) rows with
 #: the SAME (trading_day, stream='morning', slot='0945', ticker), so without
 #: run_type one sub-invocation's archive write silently replaces the other's
 #: distinct action/context (Codex review: "Keep 9:45 archive rows distinct

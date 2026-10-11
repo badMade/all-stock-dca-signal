@@ -55,7 +55,6 @@ from dca_live_adapters import FinanceDataProvider, RobinhoodBroker, RobinhoodDat
 from dca_paths import CRON_TRACKING_ROOT_ENV
 from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
-    DEFAULT_MORNING_PREFLIGHT_STATE_ROOT,
     DEFAULT_MORNING_STATE_ROOT,
     DEFAULT_MORNING_WATCHLIST_STATE_ROOT,
     EXEC_AUTO_BUY_ELIGIBLE,
@@ -63,8 +62,6 @@ from morning_dca import (
     MORNING_CRON_ID,
     MORNING_LIVE_CRON_ID,
     MORNING_LIVE_MODE,
-    MORNING_PREFLIGHT_CRON_ID,
-    MORNING_PREFLIGHT_MODE,
     MORNING_SIZING_TIERS,
     MORNING_WATCHLIST_MODE,
     DCAExecutor,
@@ -75,7 +72,6 @@ from morning_dca import (
     RawInputPersistenceError,
     TopUpOutcome,
     _csv_qualifying_notional_total,
-    _forbidden_preflight_root_reason,
     _PersistingBrokerAdapter,
     _PersistingMarketDataProvider,
     _RawInputRecorder,
@@ -85,10 +81,7 @@ from morning_dca import (
     load_max_consecutive_placement_failures,
     load_max_orders_per_day,
     load_morning_config,
-    load_same_day_preflight,
     nyse_holidays,
-    preflight_eligibility,
-    preflight_ticker_eligibility_row,
 )
 from near_close_dca import (
     EASTERN,
@@ -1001,12 +994,9 @@ def test_classification_matches_morning_schema(tmp_path):
 
 # --- Live (10:30 AM) execution mode -----------------------------------------
 def test_live_mode_path_and_classification(tmp_path):
-    preflight_root = tmp_path / "preflight"
-    _seed_preflight(preflight_root, ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path),
-        preflight_run_state_root=str(preflight_root),
     )
     ex = MorningDCAExecutor(cfg, mode="live")
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
@@ -1041,16 +1031,9 @@ def test_live_run_refreshes_both_morning_pointers(tmp_path):
     """The morning live task refreshes both latest_morning_run.json and
     latest_morning_live.json, each carrying the same-day guard fields and
     pointing at the same-day scheduled run_state."""
-    preflight_root = tmp_path / "preflight"
-    preflight_dir = preflight_root / "20260708_0945ET"
-    preflight_dir.mkdir(parents=True)
-    (preflight_dir / "run_state.json").write_text(
-        json.dumps({"eligible_to_execute_tickers": ["SMALL"]}), encoding="utf-8"
-    )
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path),
-        preflight_run_state_root=str(preflight_root),
     )
     ex = MorningDCAExecutor(cfg, mode="live")
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
@@ -1081,8 +1064,7 @@ def test_live_run_refreshes_both_morning_pointers(tmp_path):
 
 
 def test_a_run_blocked_before_placement_is_not_scheduled_evidence(tmp_path):
-    """A missing pre-flight, absent broker, or account mismatch stops the run
-    before placement. build_artifacts() has already stamped the scheduled
+    """An absent broker or account mismatch stops the run before placement. build_artifacts() has already stamped the scheduled
     identity and these paths write immediately, so without an explicit denial
     the pointer publishes them as valid scheduled runs (Codex review)."""
     from scripts.same_day_pointer import derive_valid_scheduled_evidence
@@ -1090,7 +1072,6 @@ def test_a_run_blocked_before_placement_is_not_scheduled_evidence(tmp_path):
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path),
-        preflight_run_state_root=str(tmp_path / "missing_preflight"),
     )
     ex = MorningDCAExecutor(cfg, mode="live")
     res = ex.run(_now_live(), FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03}))
@@ -1107,22 +1088,15 @@ def test_a_run_blocked_before_placement_is_not_scheduled_evidence(tmp_path):
     assert payload["valid_scheduled_evidence"] is False
 
 
-# --- Jul 20 2026 pre-flight path fix + budget ledger bootstrap --------------
+# --- Budget ledger bootstrap ---------------------------------------------------
 def test_live_run_writes_budget_ledger_json(tmp_path):
     """budget_ledger.bootstrap (config/morning_dca.json): the live task always
     persists a budget_ledger.json snapshot under its own output directory,
     bootstrapping it from the configured caps -- no pre-existing file needed.
     """
-    preflight_root = tmp_path / "preflight"
-    preflight_dir = preflight_root / "20260708_0945ET"
-    preflight_dir.mkdir(parents=True)
-    (preflight_dir / "run_state.json").write_text(
-        json.dumps({"eligible_to_execute_tickers": ["SMALL"]}), encoding="utf-8"
-    )
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path),
-        preflight_run_state_root=str(preflight_root),
         morning_daily_cap_usd=90.0,
         morning_weekly_cap_usd=450.0,
     )
@@ -1154,82 +1128,15 @@ def test_watchlist_run_does_not_write_budget_ledger(tmp_path):
     assert "budget_ledger" not in res["paths"]
 
 
-def test_preflight_gate_forbidden_root_degrades_scheduled_run_not_a_block(tmp_path):
-    """must_not_look_under: a preflight_run_state_root resolving under the
-    10:30 live output directory must still be recognized as forbidden (the
-    Jul 20 2026 incident) -- but as of 2026-08-02 (Geoff: "should not block
-    any later runs") this degrades a SCHEDULED run to the full universe with
-    a warning, exactly like a manual run, rather than blocking it to zero
-    tickers."""
-    forbidden_root = tmp_path / "morning_dca"
-    forbidden_root.mkdir()
-    cfg = MorningConfig(
-        tickers=("SMALL",),
-        morning_run_state_root=str(tmp_path / "out"),
-        preflight_run_state_root=str(forbidden_root),
-        preflight_forbidden_roots=(str(forbidden_root),),
-    )
-    ex = MorningDCAExecutor(cfg, mode="live")
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    res = ex.run(_now_live(), data, broker=FakeLiveBroker())
-
-    assert res["artifacts"] is not None
-    assert res["artifacts"].get("status") != "blocked"
-    assert res["artifacts"]["preflight_gate"]["preflight_found"] is False
-    assert "forbidden" in res["artifacts"]["preflight_gate"]["warning"]
-    evaluated = {r["ticker"] for r in res["artifacts"]["signal_rows"]}
-    assert evaluated == {"SMALL"}
-
-
-def test_preflight_gate_forbidden_root_warns_on_manual_run():
-    forbidden_root = "/home/user/workspace/cron_tracking/42173154"
-    cfg = MorningConfig(
-        tickers=("SMALL",),
-        preflight_run_state_root=forbidden_root,
-        preflight_forbidden_roots=(forbidden_root,),
-    )
-    ex = MorningDCAExecutor(cfg, mode="live")
-    admitted = ex._apply_preflight_gate(_now_live(), ["SMALL"], manual=True)
-    assert admitted == ["SMALL"]
-    assert ex.preflight_gate is not None
-    assert ex.preflight_gate["preflight_found"] is False
-    assert "forbidden" in ex.preflight_gate["warning"]
-
-
-def test_load_same_day_preflight_recovered_via_bounded_lookup_flag(tmp_path):
-    preflight_root = tmp_path / "preflight"
-    trading_day = date(2026, 7, 8)
-    _seed_preflight(preflight_root, ("SMALL",), trading_date=trading_day)
-
-    # Found directly via the primary path -- not a recovery.
-    found = load_same_day_preflight(str(preflight_root), trading_day)
-    assert found is not None
-    assert found["recovered_via_bounded_lookup"] is False
-
-    # No artifact at all: same result whether or not bounded recovery is enabled.
-    missing_day = date(2026, 7, 9)
-    assert load_same_day_preflight(str(preflight_root), missing_day) is None
-    assert load_same_day_preflight(str(preflight_root), missing_day, bounded_recovery=False) is None
-
-
-def test_load_morning_config_parses_preflight_and_ledger_blocks(tmp_path):
+def test_load_morning_config_parses_ledger_block(tmp_path):
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir()
     payload = {
         "budget_ledger": {"ledger_files": ["custom_ledger.json"]},
-        "live_task": {
-            "preflight_artifact_resolution": {
-                "must_not_look_under": ["/some/forbidden/root"],
-                "bounded_recovery_lookup": "",
-            }
-        },
     }
     (cfg_dir / "morning_dca.json").write_text(json.dumps(payload), encoding="utf-8")
     cfg = load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
     assert cfg.budget_ledger_filename == "custom_ledger.json"
-    assert cfg.preflight_forbidden_roots == ("/some/forbidden/root",)
-    # An empty-string bounded_recovery_lookup value is falsy -> disabled.
-    assert cfg.preflight_bounded_recovery is False
 
 
 def test_live_confidence_rule_auto_buys_with_validated_trend():
@@ -1402,7 +1309,7 @@ def test_load_morning_config_uses_multiplier_not_max_drop(tmp_path):
 def test_morning_run_reviews_places_and_records_orders_csv(tmp_path):
     # Broker orders only place in live mode; DecliningBarsProvider confirms the
     # intraday trend-down required for auto-buy eligibility, and manual=True
-    # bypasses the preflight-gate/approved-window checks for this unit test.
+    # bypasses the approved-window check for this unit test.
     cfg = MorningConfig(tickers=("SMALL",), base_buy_amount_usd=3.0, morning_run_state_root=str(tmp_path))
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
@@ -1924,17 +1831,12 @@ def test_morning_live_retry_preserves_prior_submitted_candidate_on_scheduled_pat
     # and load_prior_same_day_allocations() (used by the afternoon top-up
     # guard) reads directly from these persisted files, not the ledger, so it
     # lost visibility into that morning fill entirely after a retry.
-    # Same-day 9:45 pre-flight artifact admitting both tickers, so the 10:30
-    # scheduled (non-manual) live gate doesn't fail-closed for lack of one.
-    preflight_root = tmp_path / "preflight"
-    _seed_preflight(preflight_root, ("AAA", "BBB"))
 
     cfg1 = MorningConfig(
         tickers=("AAA",),
         morning_daily_cap_usd=100.0,
         morning_weekly_cap_usd=1000.0,
         morning_run_state_root=str(tmp_path),
-        preflight_run_state_root=str(preflight_root),
     )
     ex1 = MorningDCAExecutor(cfg1, mode=MORNING_LIVE_MODE)
     data1 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
@@ -1951,7 +1853,6 @@ def test_morning_live_retry_preserves_prior_submitted_candidate_on_scheduled_pat
         morning_daily_cap_usd=100.0,
         morning_weekly_cap_usd=1000.0,
         morning_run_state_root=str(tmp_path),
-        preflight_run_state_root=str(preflight_root),
     )
     ex2 = MorningDCAExecutor(cfg2, mode=MORNING_LIVE_MODE)
     data2 = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BBB": 0.03})
@@ -2506,7 +2407,7 @@ def test_run_with_broker_places_orders_and_records_outcomes(tmp_path):
     Broker orders are only placed in live mode (see the ``self.mode ==
     MORNING_LIVE_MODE`` gate in ``run()``); a broker passed in watchlist mode
     is intentionally a no-op so hypothetical scans never risk real capital.
-    ``manual=True`` bypasses the preflight-gate/approved-window checks that
+    ``manual=True`` bypasses the approved-window check that
     otherwise apply to scheduled live runs.
     """
     from near_close_dca import DryRunBroker
@@ -2631,584 +2532,6 @@ def test_market_open_scheduled_run_counts_as_afternoon_prior_context():
         "cron_id": "2ba19526",
     }
     assert _prior_run_is_scheduled({"run_classification": market_open_rc}) is False
-
-
-# --- 9:45 pre-flight validation + 10:30 live gate ---------------------------
-def _now_preflight():
-    """Decision timestamp for the 9:45 AM ET pre-flight validation mode."""
-    return datetime.combine(date(2026, 7, 8), time(9, 45), tzinfo=EASTERN)
-
-
-def test_preflight_eligibility_helper():
-    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG", "FLAT")), mode=MORNING_PREFLIGHT_MODE)
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "FLAT": 0.0})
-    sigs = {s.ticker: s for s in ex.evaluate(_now_preflight(), data)}
-    # BIG dropped 3% -> BUY with positive multiplier -> eligible.
-    assert preflight_eligibility(sigs["BIG"]) is True
-    # FLAT is at prior close -> no buy -> not eligible.
-    assert preflight_eligibility(sigs["FLAT"]) is False
-
-
-def test_preflight_run_writes_validation_and_summary_and_pointer(tmp_path):
-    cfg = MorningConfig(tickers=("BIG", "FLAT"), morning_run_state_root=str(tmp_path))
-    ex = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE)
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "FLAT": 0.0})
-    res = ex.run(_now_preflight(), data)
-
-    art = res["artifacts"]
-    assert art["mode"] == "preflight"
-    assert art["trades"] is False
-    assert art["run_classification"]["run_type"] == "morning_dca_preflight"
-    assert art["run_classification"]["state_schema_version"] == "morning-preflight-v2-machine-complete"
-    assert art["eligible_to_execute_tickers"] == ["BIG"]
-    assert art["counts"]["eligible_to_execute"] == 1
-    # Every signal row carries the per-ticker verdict.
-    verdicts = {r["ticker"]: r["eligible_to_execute"] for r in art["signal_rows"]}
-    assert verdicts == {"BIG": True, "FLAT": False}
-
-    run_dir = Path(res["paths"]["run_state"]).parent
-    assert run_dir.name == "20260708_0945ET"
-    assert (run_dir / "validation.csv").exists()
-    assert (run_dir / "run_summary.json").exists()
-    # Scheduled pre-flight advances the preflight-specific pointer only.
-    assert (Path(tmp_path) / "latest_preflight.json").exists()
-    assert not (Path(tmp_path) / "latest_morning_run.json").exists()
-
-
-# --- Machine-complete pre-flight contract (morning-preflight-v2) ------------
-_MACHINE_TICKER_FIELDS = {
-    "symbol",
-    "active_universe",
-    "quote_available",
-    "prior_close_available",
-    "tradable",
-    "account_ok",
-    "buying_power_ok",
-    "spread_pct",
-    "spread_ok",
-    "trend_status",
-    "data_confidence_status",
-    "early_drop_pct",
-    "early_multiplier",
-    "hypothetical_amount",
-    "eligible_to_execute",
-    "ineligible_reason",
-}
-
-
-class _UnresolvedProvider(FixedDropProvider):
-    """Marks ``unresolved`` symbols as fully unresolvable (no quote, no prior close)."""
-
-    def __init__(self, source, previous_close, drops, unresolved):
-        super().__init__(source, previous_close, drops)
-        self._unresolved = set(unresolved)
-
-    def get_previous_close_bar(self, ticker, as_of):
-        if ticker in self._unresolved:
-            ts = datetime.combine(as_of.astimezone(EASTERN).date() - timedelta(days=1), time(16, 0), tzinfo=EASTERN)
-            return Bar(timestamp=ts, open=-1.0, high=-1.0, low=-1.0, close=-1.0, volume=0.0)
-        return super().get_previous_close_bar(ticker, as_of)
-
-
-def test_preflight_machine_complete_envelope(tmp_path):
-    # Regression: this test previously constructed MorningConfig without a
-    # morning_run_state_root override, so the executor fell back to the
-    # production DEFAULT_MORNING_PREFLIGHT_STATE_ROOT
-    # ("/home/user/workspace/..."). That path doesn't exist (and isn't
-    # writable) on CI runners, so the test failed with PermissionError there
-    # even though it happened to pass on a dev machine that already had the
-    # directory. Every artifact-writing test must scope state under tmp_path.
-    ex = MorningDCAExecutor(
-        MorningConfig(tickers=("BIG", "FLAT"), morning_run_state_root=str(tmp_path)),
-        mode=MORNING_PREFLIGHT_MODE,
-    )
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "FLAT": 0.0})
-    art = ex.run(_now_preflight(), data)["artifacts"]
-
-    # Every required top-level machine field is present.
-    for key in (
-        "overall_ok",
-        "eligible_count",
-        "ineligible_count",
-        "unresolved_tickers",
-        "blocking_errors",
-        "warnings",
-        "run_classification",
-        "per_ticker_eligibility",
-    ):
-        assert key in art, key
-
-    # No global failure -> overall_ok true even with an ineligible ticker.
-    assert art["overall_ok"] is True
-    assert art["blocking_errors"] == []
-
-    rows = {r["symbol"]: r for r in art["per_ticker_eligibility"]}
-    # Every active symbol appears exactly once with the full field set.
-    assert set(rows) == {"BIG", "FLAT"}
-    assert len(art["per_ticker_eligibility"]) == 2
-    for row in art["per_ticker_eligibility"]:
-        assert set(row.keys()) == _MACHINE_TICKER_FIELDS
-        # Coarse read-only pre-flight does not bind account/spread/trend.
-        assert row["account_ok"] is None
-        assert row["buying_power_ok"] is None
-        assert row["spread_pct"] is None
-        assert row["spread_ok"] is None
-        assert row["trend_status"] == "not_evaluated_preflight"
-
-    assert rows["BIG"]["eligible_to_execute"] is True
-    assert rows["BIG"]["ineligible_reason"] is None
-    assert rows["FLAT"]["eligible_to_execute"] is False
-    assert rows["FLAT"]["ineligible_reason"] == "no_qualifying_drop"
-
-    assert art["eligible_count"] == 1
-    assert art["ineligible_count"] == 1
-    assert art["unresolved_tickers"] == []
-
-
-def test_preflight_unresolved_ticker_does_not_invalidate_run(tmp_path):
-    # An unresolved symbol (no quote, no prior close) must be a per-symbol row
-    # with eligible_to_execute=false and ineligible_reason='unresolved_ticker',
-    # listed in unresolved_tickers, and MUST NOT flip overall_ok.
-    # Same tmp_path scoping fix as test_preflight_machine_complete_envelope
-    # above: without morning_run_state_root, this writes to the hardcoded
-    # production path and fails with PermissionError on CI runners.
-    ex = MorningDCAExecutor(
-        MorningConfig(tickers=("BIG", "AAAU"), morning_run_state_root=str(tmp_path)),
-        mode=MORNING_PREFLIGHT_MODE,
-    )
-    data = _UnresolvedProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "AAAU": 1.0}, unresolved=("AAAU",))
-    art = ex.run(_now_preflight(), data)["artifacts"]
-
-    assert art["overall_ok"] is True
-    assert "AAAU" in art["unresolved_tickers"]
-    rows = {r["symbol"]: r for r in art["per_ticker_eligibility"]}
-    assert rows["AAAU"]["eligible_to_execute"] is False
-    assert rows["AAAU"]["ineligible_reason"] == "unresolved_ticker"
-    assert rows["AAAU"]["data_confidence_status"] == "unresolved"
-    assert rows["AAAU"]["quote_available"] is False
-    assert rows["AAAU"]["prior_close_available"] is False
-    # BIG still resolves and stays eligible alongside the unresolved row.
-    assert rows["BIG"]["eligible_to_execute"] is True
-
-
-def test_preflight_ticker_eligibility_row_unresolved_unit():
-    sig = MorningSignal(
-        ticker="SPCX",
-        source=SourceName.ROBINHOOD.value,
-        action=Action.NO_DATA,
-        reason="unresolved",
-        current_price=None,
-        previous_close=None,
-        drop_pct=None,
-        multiplier=0.0,
-        hypothetical_amount_usd=0.0,
-        warnings=("lookup failed",),
-    )
-    row = preflight_ticker_eligibility_row(sig)
-    assert set(row.keys()) == _MACHINE_TICKER_FIELDS
-    assert row["symbol"] == "SPCX"
-    assert row["eligible_to_execute"] is False
-    assert row["ineligible_reason"] == "unresolved_ticker"
-    assert row["data_confidence_status"] == "unresolved"
-    assert row["tradable"] is False
-
-
-def test_preflight_machine_complete_validates_against_json_schema(tmp_path):
-    jsonschema = pytest.importorskip("jsonschema")
-    referencing = pytest.importorskip("referencing")
-    Registry, Resource = referencing.Registry, referencing.Resource
-
-    schemas_dir = Path(__file__).resolve().parent.parent / "schemas"
-    main = json.loads((schemas_dir / "morning_preflight.schema.json").read_bytes())
-    resources = [
-        (name, Resource.from_contents(json.loads((schemas_dir / name).read_bytes())))
-        for name in ("morning_preflight.schema.json", "morning_run_classification.schema.json")
-    ]
-    registry = Registry().with_resources(resources)
-
-    ex = MorningDCAExecutor(
-        MorningConfig(tickers=("BIG", "AAAU"), morning_run_state_root=str(tmp_path)),
-        mode=MORNING_PREFLIGHT_MODE,
-    )
-    data = _UnresolvedProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "AAAU": 1.0}, unresolved=("AAAU",))
-    art = ex.run(_now_preflight(), data)["artifacts"]
-    jsonschema.Draft7Validator(main, registry=registry).validate(art)
-
-
-def test_load_same_day_preflight_reads_eligible_set(tmp_path):
-    cfg = MorningConfig(tickers=("BIG", "FLAT"), morning_run_state_root=str(tmp_path))
-    ex = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE)
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "FLAT": 0.0})
-    ex.run(_now_preflight(), data)
-
-    loaded = load_same_day_preflight(str(tmp_path), date(2026, 7, 8))
-    assert loaded is not None
-    assert loaded["eligible_tickers"] == {"BIG"}
-    # No artifact for a different day.
-    assert load_same_day_preflight(str(tmp_path), date(2026, 7, 9)) is None
-
-
-def test_load_same_day_preflight_treats_non_object_json_as_unavailable(tmp_path):
-    """Codex review: "Treat non-object preflight JSON as unavailable". Valid
-    JSON whose root is a list, scalar, or null (e.g. after a partial
-    recovery) has no .get() method; the function used to call state.get(...)
-    immediately after decoding without checking this, so it raised instead
-    of returning None. A crash here means the 10:30 run never reaches its
-    own non-blocking fallback and the documented "None means no pre-flight
-    found, degrade to full universe with a warning" contract is broken."""
-    trading_day = date(2026, 7, 8)
-    run_dir = tmp_path / f"{trading_day.strftime('%Y%m%d')}_0945ET"
-    run_dir.mkdir(parents=True)
-    (run_dir / "run_state.json").write_text("[]", encoding="utf-8")
-
-    assert load_same_day_preflight(str(tmp_path), trading_day, bounded_recovery=False) is None
-
-    (run_dir / "run_state.json").write_text("null", encoding="utf-8")
-    assert load_same_day_preflight(str(tmp_path), trading_day, bounded_recovery=False) is None
-
-    (run_dir / "run_state.json").write_text('"a string"', encoding="utf-8")
-    assert load_same_day_preflight(str(tmp_path), trading_day, bounded_recovery=False) is None
-
-
-def test_load_same_day_preflight_reads_per_ticker_eligibility_v2(tmp_path):
-    # Codex review #92: a strictly schema-compliant v2 preflight artifact is
-    # only required to carry per_ticker_eligibility, not the legacy
-    # eligible_to_execute_tickers convenience field. The reader must derive
-    # eligibility from per_ticker_eligibility instead of silently returning
-    # an empty set when the legacy field is absent.
-    run_dir = tmp_path / "20260708_0945ET"
-    run_dir.mkdir(parents=True)
-    (run_dir / "run_state.json").write_text(
-        json.dumps(
-            {
-                "run_id": "morning_preflight_20260708",
-                "trading_day": "2026-07-08",
-                "overall_ok": True,
-                "run_classification": {
-                    "run_origin": "scheduled",
-                    "manual_run": False,
-                    "stream": "morning",
-                    "run_type": "morning_dca_preflight",
-                    "state_schema_version": "morning-preflight-v2-machine-complete",
-                },
-                "per_ticker_eligibility": [
-                    {"symbol": "BIG", "eligible_to_execute": True},
-                    {"symbol": "FLAT", "eligible_to_execute": False},
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    loaded = load_same_day_preflight(str(tmp_path), date(2026, 7, 8))
-
-    assert loaded is not None
-    assert loaded["eligible_tickers"] == {"BIG"}
-
-
-def test_load_same_day_preflight_primary_path_manual_state_rejected(tmp_path):
-    # Codex review r3622685590: the primary direct-path lookup only checked
-    # overall_ok, so a manual state left/copied into today's expected
-    # directory would satisfy the 10:30 scheduled live gate just because a
-    # file happened to exist there. Must be rejected the same as a stale or
-    # wrong-stream pointer target.
-    run_dir = tmp_path / "20260708_0945ET"
-    run_dir.mkdir(parents=True)
-    (run_dir / "run_state.json").write_text(
-        json.dumps(
-            {
-                "run_id": "manual_morning_preflight_20260708",
-                "trading_day": "2026-07-08",
-                "overall_ok": True,
-                "run_classification": {"run_origin": "manual", "manual_run": True, "stream": "morning"},
-                "eligible_to_execute_tickers": ["BIG"],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert load_same_day_preflight(str(tmp_path), date(2026, 7, 8), bounded_recovery=False) is None
-
-
-def test_load_same_day_preflight_primary_path_prior_day_state_rejected(tmp_path):
-    # Codex review r3622685590: a prior-day run_state copied (or never
-    # cleaned up) into today's expected directory name must not be trusted
-    # just because the directory name and file location happen to be right --
-    # the state's OWN trading_day must independently match today.
-    run_dir = tmp_path / "20260708_0945ET"
-    run_dir.mkdir(parents=True)
-    (run_dir / "run_state.json").write_text(
-        json.dumps(
-            {
-                "run_id": "morning_preflight_20260707",
-                "trading_day": "2026-07-07",
-                "overall_ok": True,
-                "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "morning"},
-                "eligible_to_execute_tickers": ["BIG"],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert load_same_day_preflight(str(tmp_path), date(2026, 7, 8), bounded_recovery=False) is None
-
-
-def test_load_same_day_preflight_primary_path_wrong_stream_rejected(tmp_path):
-    # Codex review r3622685597: a same-day, scheduled, non-manual state whose
-    # OWN run_classification.stream is a different stream must not be trusted
-    # just because it was found at the morning preflight's expected path
-    # (e.g. a misplaced/copied midday artifact).
-    run_dir = tmp_path / "20260708_0945ET"
-    run_dir.mkdir(parents=True)
-    (run_dir / "run_state.json").write_text(
-        json.dumps(
-            {
-                "run_id": "midday_live_20260708_1230ET",
-                "trading_day": "2026-07-08",
-                "overall_ok": True,
-                "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "midday"},
-                "eligible_to_execute_tickers": ["BIG"],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert load_same_day_preflight(str(tmp_path), date(2026, 7, 8), bounded_recovery=False) is None
-
-
-def test_load_same_day_preflight_pointer_wrong_stream_rejected(tmp_path):
-    # Codex review r3622223176: the primary-path miss must route
-    # latest_preflight.json through same_day_pointer.validate_pointer rather
-    # than trusting any same-date, existing run_state_path. A pointer
-    # claiming the wrong stream must not satisfy the preflight gate.
-    target_dir = tmp_path / "manual_runs" / "morning_preflight_20260708"
-    target_dir.mkdir(parents=True)
-    target_path = target_dir / "run_state.json"
-    target_path.write_text(
-        json.dumps(
-            {
-                "run_id": "morning_preflight_20260708",
-                "trading_day": "2026-07-08",
-                "overall_ok": True,
-                "run_classification": {"run_origin": "scheduled", "manual_run": False},
-                "eligible_to_execute_tickers": ["BIG"],
-            }
-        ),
-        encoding="utf-8",
-    )
-    pointer = tmp_path / "latest_preflight.json"
-    pointer.write_text(
-        json.dumps(
-            {
-                "run_id": "morning_preflight_20260708",
-                "run_state_path": str(target_path),
-                "trading_day": "2026-07-08",
-                "stream": "midday",
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert load_same_day_preflight(str(tmp_path), date(2026, 7, 8), bounded_recovery=False) is None
-
-
-def test_load_same_day_preflight_pointer_manual_target_rejected(tmp_path):
-    # A pointer whose target run_state is a manual run must not satisfy the
-    # preflight gate even though it names an existing, same-date file.
-    target_dir = tmp_path / "manual_runs" / "manual_x"
-    target_dir.mkdir(parents=True)
-    target_path = target_dir / "run_state.json"
-    target_path.write_text(
-        json.dumps(
-            {
-                "run_id": "manual_x",
-                "trading_day": "2026-07-08",
-                "overall_ok": True,
-                "run_classification": {"run_origin": "manual", "manual_run": True},
-                "eligible_to_execute_tickers": ["BIG"],
-            }
-        ),
-        encoding="utf-8",
-    )
-    pointer = tmp_path / "latest_preflight.json"
-    pointer.write_text(
-        json.dumps(
-            {
-                "run_id": "manual_x",
-                "run_state_path": str(target_path),
-                "trading_day": "2026-07-08",
-                "stream": "morning",
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert load_same_day_preflight(str(tmp_path), date(2026, 7, 8), bounded_recovery=False) is None
-
-
-def test_load_same_day_preflight_pointer_valid_used_as_fallback(tmp_path):
-    # A well-formed same-day pointer whose target is a genuine scheduled,
-    # non-manual preflight run_state IS used when the primary path misses.
-    target_dir = tmp_path / "some_other_dir"
-    target_dir.mkdir(parents=True)
-    target_path = target_dir / "run_state.json"
-    target_path.write_text(
-        json.dumps(
-            {
-                "run_id": "morning_preflight_20260708",
-                "trading_day": "2026-07-08",
-                "overall_ok": True,
-                "run_classification": {
-                    "run_origin": "scheduled",
-                    "manual_run": False,
-                    "run_type": "morning_dca_preflight",
-                    "state_schema_version": "morning-preflight-v2-machine-complete",
-                },
-                "eligible_to_execute_tickers": ["BIG"],
-            }
-        ),
-        encoding="utf-8",
-    )
-    pointer = tmp_path / "latest_preflight.json"
-    pointer.write_text(
-        json.dumps(
-            {
-                "run_id": "morning_preflight_20260708",
-                "run_state_path": str(target_path),
-                "trading_day": "2026-07-08",
-                "stream": "morning",
-                "pointer_status": "valid",
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    loaded = load_same_day_preflight(str(tmp_path), date(2026, 7, 8), bounded_recovery=False)
-    assert loaded is not None
-    assert loaded["eligible_tickers"] == {"BIG"}
-
-
-def test_load_same_day_preflight_fails_closed_when_overall_ok_false(tmp_path):
-    # Codex review #93: a preflight artifact that explicitly declares itself
-    # invalid (overall_ok=False, e.g. a global/account/buying-power/auth/
-    # schema-write failure) must be treated the same as "no preflight found",
-    # not consumed for whatever eligibility data happens to be present.
-    run_dir = tmp_path / "20260708_0945ET"
-    run_dir.mkdir(parents=True)
-    (run_dir / "run_state.json").write_text(
-        json.dumps(
-            {
-                "run_id": "morning_preflight_20260708",
-                "trading_day": "2026-07-08",
-                "overall_ok": False,
-                "blocking_errors": ["account lookup failed"],
-                # Even if some eligibility data is present, it must not be trusted.
-                "eligible_to_execute_tickers": ["BIG"],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    assert load_same_day_preflight(str(tmp_path), date(2026, 7, 8)) is None
-
-
-@pytest.mark.parametrize("alias_kind", ["symlink", "parent_segment"])
-def test_forbidden_preflight_root_canonicalizes_aliases(tmp_path, alias_kind):
-    forbidden_root = tmp_path / "live" / "morning_dca"
-    forbidden_root.mkdir(parents=True)
-    if alias_kind == "symlink":
-        alias = tmp_path / "preflight_alias"
-        alias.symlink_to(forbidden_root, target_is_directory=True)
-    else:
-        alias_parent = forbidden_root / "discarded"
-        alias_parent.mkdir()
-        alias = alias_parent / ".."
-
-    reason = _forbidden_preflight_root_reason(str(alias), (str(forbidden_root),))
-
-    assert reason is not None
-    assert "forbidden" in reason
-
-
-def test_load_same_day_preflight_rejects_artifact_symlink_into_forbidden_root(tmp_path):
-    allowed_root = tmp_path / "preflight"
-    allowed_run_dir = allowed_root / "20260708_0945ET"
-    allowed_run_dir.mkdir(parents=True)
-    forbidden_root = tmp_path / "live" / "morning_dca"
-    forbidden_root.mkdir(parents=True)
-    forbidden_state = forbidden_root / "run_state.json"
-    forbidden_state.write_text(
-        json.dumps(
-            {
-                "run_id": "morning_preflight_20260708",
-                "trading_day": "2026-07-08",
-                "overall_ok": True,
-                "eligible_to_execute_tickers": ["SMALL"],
-                "per_ticker_eligibility": [{"symbol": "SMALL", "eligible_to_execute": True}],
-                "run_classification": {
-                    "stream": "morning",
-                    "run_type": "morning_dca_preflight",
-                    "manual_run": False,
-                    "state_schema_version": "morning-preflight-v2-machine-complete",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    (allowed_run_dir / "run_state.json").symlink_to(forbidden_state)
-
-    loaded = load_same_day_preflight(
-        str(allowed_root),
-        date(2026, 7, 8),
-        forbidden_roots=(str(forbidden_root),),
-    )
-    assert loaded is None
-
-
-def test_load_same_day_preflight_bounded_recovery_handles_oserror(tmp_path, monkeypatch):
-    root = tmp_path / "preflight"
-    root.mkdir()
-
-    def _raising_iterdir(_self):
-        raise OSError("Simulated disk error or permission error")
-
-    monkeypatch.setattr(Path, "iterdir", _raising_iterdir)
-
-    assert load_same_day_preflight(str(root), date(2026, 7, 8), bounded_recovery=True) is None
-
-
-def test_load_same_day_preflight_rejects_artifact_symlink_outside_preflight_root(tmp_path):
-    allowed_root = tmp_path / "preflight"
-    allowed_run_dir = allowed_root / "20260708_0945ET"
-    allowed_run_dir.mkdir(parents=True)
-    external_dir = tmp_path / "somewhere_else"
-    external_dir.mkdir(parents=True)
-    external_state = external_dir / "run_state.json"
-    external_state.write_text(
-        json.dumps(
-            {
-                "run_id": "morning_preflight_20260708",
-                "trading_day": "2026-07-08",
-                "overall_ok": True,
-                "eligible_to_execute_tickers": ["SMALL"],
-                "per_ticker_eligibility": [{"symbol": "SMALL", "eligible_to_execute": True}],
-                "run_classification": {
-                    "stream": "morning",
-                    "run_type": "morning_dca_preflight",
-                    "manual_run": False,
-                    "state_schema_version": "morning-preflight-v2-machine-complete",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    (allowed_run_dir / "run_state.json").symlink_to(external_state)
-
-    loaded = load_same_day_preflight(
-        str(allowed_root),
-        date(2026, 7, 8),
-    )
-    assert loaded is None
 
 
 @pytest.mark.parametrize(
@@ -3406,95 +2729,20 @@ def test_maybe_block_for_holiday_seeds_same_day_pooled_spend(tmp_path):
     assert ledger_data["remaining_weekly_usd"] == 870.0
 
 
-def test_live_gate_degrades_to_full_universe_when_preflight_found_but_empty(tmp_path):
-    """Codex review: "Keep valid empty preflights non-blocking". A VALID
-    preflight that found zero eligible tickers (e.g. nothing was below its
-    prior close at 9:45) must not be treated as authoritative -- it is
-    exactly as coarse/stale-by-10:30 as a missing artifact, and the 10:30
-    slot's own signal/budget/spread/trend/top-up checks are the real safety
-    gates. A quiet preflight must not be MORE restrictive than a missing
-    one, which already degrades to the full universe."""
-    preflight_root = tmp_path / "preflight"
-    pf = MorningDCAExecutor(
-        MorningConfig(tickers=("BIG", "FLAT"), morning_run_state_root=str(preflight_root)),
-        mode=MORNING_PREFLIGHT_MODE,
-    )
-    # Nothing down at 9:45: preflight legitimately finds zero eligible tickers.
-    pf_data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.0, "FLAT": 0.0})
-    pf.run(_now_preflight(), pf_data)
-
+def test_live_csv_artifacts_include_every_configured_ticker_row(tmp_path):
+    """The 10:30 live run scores the whole configured universe, so the CSV
+    carries a row for a ticker that did not qualify (FLAT, no drop) as well as
+    the one that did (BIG)."""
     live = MorningDCAExecutor(
         MorningConfig(
             tickers=("BIG", "FLAT"),
             morning_run_state_root=str(tmp_path / "live"),
-            preflight_run_state_root=str(preflight_root),
-        ),
-        mode=MORNING_LIVE_MODE,
-    )
-    # A dip has since appeared by 10:30 -- the full universe must still be
-    # evaluated, not silently zeroed out by the stale, empty preflight.
-    live_data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
-    res = live.run(_now_live(), live_data, broker=FakeLiveBroker())
-    art = res["artifacts"]
-    gate = art["preflight_gate"]
-    assert gate["preflight_found"] is True
-    assert "zero eligible" in gate["warning"]
-    evaluated = {r["ticker"] for r in art["signal_rows"]}
-    assert evaluated == {"BIG", "FLAT"}
-
-
-def test_live_gate_restricts_to_preflight_eligible(tmp_path):
-    preflight_root = tmp_path / "preflight"
-    pf = MorningDCAExecutor(
-        MorningConfig(tickers=("BIG", "FLAT"), morning_run_state_root=str(preflight_root)),
-        mode=MORNING_PREFLIGHT_MODE,
-    )
-    pf_data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "FLAT": 0.0})
-    pf.run(_now_preflight(), pf_data)
-
-    live = MorningDCAExecutor(
-        MorningConfig(
-            tickers=("BIG", "FLAT"),
-            morning_run_state_root=str(tmp_path / "live"),
-            preflight_run_state_root=str(preflight_root),
-        ),
-        mode=MORNING_LIVE_MODE,
-    )
-    live_data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
-    res = live.run(_now_live(), live_data, broker=FakeLiveBroker())
-    art = res["artifacts"]
-    # Only BIG was admitted; FLAT (ineligible at 9:45) is gated out even though it
-    # would have qualified at 10:30.
-    gate = art["preflight_gate"]
-    assert gate["preflight_found"] is True
-    assert gate["admitted_tickers"] == ["BIG"]
-    assert gate["gated_out_tickers"] == ["FLAT"]
-    evaluated = {r["ticker"] for r in art["signal_rows"]}
-    assert evaluated == {"BIG"}
-
-
-def test_live_csv_artifacts_include_gated_out_ticker_rows(tmp_path):
-    preflight_root = tmp_path / "preflight"
-    pf = MorningDCAExecutor(
-        MorningConfig(tickers=("BIG", "FLAT"), morning_run_state_root=str(preflight_root)),
-        mode=MORNING_PREFLIGHT_MODE,
-    )
-    pf.run(
-        _now_preflight(),
-        FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.03, "FLAT": 0.0}),
-    )
-
-    live = MorningDCAExecutor(
-        MorningConfig(
-            tickers=("BIG", "FLAT"),
-            morning_run_state_root=str(tmp_path / "live"),
-            preflight_run_state_root=str(preflight_root),
         ),
         mode=MORNING_LIVE_MODE,
     )
     res = live.run(
         _now_live(),
-        DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10}),
+        DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.0}),
         broker=FakeLiveBroker(),
     )
 
@@ -3505,24 +2753,19 @@ def test_live_csv_artifacts_include_gated_out_ticker_rows(tmp_path):
     assert set(rows) == {"BIG", "FLAT"}
     assert rows["BIG"]["auto_buy_signal"] == "True"
     assert rows["FLAT"]["action"] == Action.SKIP.value
-    assert rows["FLAT"]["reason"] == "preflight_gate_gated_out"
     assert rows["FLAT"]["auto_buy_signal"] == "False"
 
 
-def test_live_gate_degrades_to_full_universe_when_preflight_missing_scheduled(tmp_path):
-    # NON-BLOCKING as of 2026-08-02 (Geoff: "should not block any later
-    # runs"), superseding the old fail-closed contract (Codex review #77):
-    # a SCHEDULED live run with no same-day preflight artifact now degrades
-    # to the full configured universe with a warning, exactly like a manual
-    # run (see test_live_gate_degrades_to_full_universe_when_preflight_missing_manual
-    # below), and still writes a normal (not "blocked") durable run_state so
-    # watchdog/reporting see a real completed scheduled-run attempt.
+def test_scheduled_live_run_scores_full_universe_and_writes_run_state(tmp_path):
+    # The 10:30 live run scores the full configured universe (the 9:45
+    # pre-flight gate that used to narrow it is retired) and writes a normal
+    # (not "blocked") durable run_state so watchdog/reporting see a real
+    # completed scheduled-run attempt.
     state_root = str(tmp_path / "live")
     live = MorningDCAExecutor(
         MorningConfig(
             tickers=("BIG", "FLAT"),
             morning_run_state_root=state_root,
-            preflight_run_state_root=str(tmp_path / "empty_preflight"),
         ),
         mode=MORNING_LIVE_MODE,
     )
@@ -3530,8 +2773,7 @@ def test_live_gate_degrades_to_full_universe_when_preflight_missing_scheduled(tm
     res = live.run(_now_live(), data, broker=FakeLiveBroker())
     art = res["artifacts"]
     assert art.get("status") != "blocked"
-    assert art["preflight_gate"]["preflight_found"] is False
-    assert "pre-flight" in art["preflight_gate"]["warning"]
+    assert "preflight_gate" not in art
     evaluated = {r["ticker"] for r in art["signal_rows"]}
     assert evaluated == {"BIG", "FLAT"}
     assert "run_id" in art
@@ -3558,86 +2800,12 @@ def test_live_gate_degrades_to_full_universe_when_preflight_missing_scheduled(tm
     assert pointer["run_id"] == persisted["run_id"]
 
 
-def test_live_gate_degrades_to_full_universe_when_preflight_missing_manual(tmp_path):
-    # Manual live runs degrade to the full universe with a warning when no preflight exists.
-    live = MorningDCAExecutor(
-        MorningConfig(
-            tickers=("BIG", "FLAT"),
-            morning_run_state_root=str(tmp_path / "live"),
-            preflight_run_state_root=str(tmp_path / "empty_preflight"),
-        ),
-        mode=MORNING_LIVE_MODE,
-    )
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10, "FLAT": 0.10})
-    res = live.run(_now_live(), data, manual=True)
-    art = res["artifacts"]
-    assert art["preflight_gate"]["preflight_found"] is False
-    evaluated = {r["ticker"] for r in art["signal_rows"]}
-    assert evaluated == {"BIG", "FLAT"}
-    assert any("no same-day 9:45 pre-flight" in w for w in art["warnings"])
-
-
-def test_preflight_classification_matches_morning_schema():
-    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "morning_run_classification.schema.json"
-    schema = json.loads(schema_path.read_bytes())
-    cfg = MorningConfig(tickers=("BIG",))
-    rc = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE).run_classification(_now_preflight(), manual=False)
-    assert rc["run_type"] == "morning_dca_preflight"
-    assert rc["cron_id"] == "bb4f6ef1"
-    assert rc["state_schema_version"] == "morning-preflight-v2-machine-complete"
-    assert rc["run_id"] == "morning_preflight_20260708_0945ET"
-    assert set(schema["required"]).issubset(rc.keys())
-    jsonschema = pytest.importorskip("jsonschema")
-    jsonschema.validate(rc, schema)
-    manual_rc = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE).run_classification(_now_preflight(), manual=True)
-    jsonschema.validate(manual_rc, schema)
-
-
-def test_preflight_root_distinct_from_watchlist_and_live():
-    assert DEFAULT_MORNING_PREFLIGHT_STATE_ROOT != DEFAULT_MORNING_LIVE_STATE_ROOT
-    assert DEFAULT_MORNING_PREFLIGHT_STATE_ROOT != DEFAULT_MORNING_WATCHLIST_STATE_ROOT
-    assert "morning_dca_preflight" in DEFAULT_MORNING_PREFLIGHT_STATE_ROOT
-
-
-def _seed_preflight(tmp_path, tickers, trading_date=None):
-    """Write a preflight run_state.json for the given tickers into tmp_path.
-
-    Carries a real (scheduled, non-manual, morning-stream) run_classification
-    and trading_day matching production shape, so it passes the same-day
-    scheduled-evidence checks applied to the primary preflight path.
-    """
-    if trading_date is None:
-        trading_date = _now_live().date()
-    folder = trading_date.strftime("%Y%m%d") + "_0945ET"
-    pf_dir = tmp_path / folder
-    pf_dir.mkdir(parents=True, exist_ok=True)
-    (pf_dir / "run_state.json").write_text(
-        json.dumps(
-            {
-                "eligible_to_execute_tickers": list(tickers),
-                "trading_day": trading_date.isoformat(),
-                "run_classification": {
-                    "run_origin": "scheduled",
-                    "manual_run": False,
-                    "stream": "morning",
-                    "run_type": "morning_dca_preflight",
-                    "state_schema_version": "morning-preflight-v2-machine-complete",
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    return tmp_path
-
-
 def test_live_gate_blocks_outside_approved_window(tmp_path):
     # A scheduled live run on a day outside approved_test_dates returns a blocked result.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     live_root = tmp_path / "live"
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 7)}),  # not 2026-07-08 (_now_live())
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -3671,14 +2839,12 @@ def test_outside_window_retry_refreshes_pointer_to_preserved_submitted_evidence(
     # made a retry look outside the approved window) must still refresh the
     # same-day pointer -- to the PRESERVED submitted state, not a fresh blocked
     # stub -- so it doesn't fall back to a stale prior-day pointer.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     live_root = tmp_path / "live"
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
 
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),  # in window
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -3692,7 +2858,6 @@ def test_outside_window_retry_refreshes_pointer_to_preserved_submitted_evidence(
     retry_cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 7)}),  # no longer approved
     )
     retry_ex = MorningDCAExecutor(retry_cfg, mode=MORNING_LIVE_MODE)
@@ -3721,14 +2886,12 @@ def test_outside_window_retry_preserves_pending_and_unconfirmed_evidence(tmp_pat
     # zero-order blocked stub, erasing it from every later same-day
     # cap/top-up scan (dca_risk.DEPLOYED_CANDIDATE_STATUSES is the canonical
     # set this helper's own _ORDER_BEARING_CANDIDATE_STATUSES mirrors).
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     live_root = tmp_path / "live"
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
 
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),  # in window
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -3750,7 +2913,6 @@ def test_outside_window_retry_preserves_pending_and_unconfirmed_evidence(tmp_pat
     retry_cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 7)}),  # no longer approved
     )
     retry_ex = MorningDCAExecutor(retry_cfg, mode=MORNING_LIVE_MODE)
@@ -3768,11 +2930,9 @@ def test_outside_window_retry_preserves_pending_and_unconfirmed_evidence(tmp_pat
 
 def test_live_gate_permits_when_in_approved_window(tmp_path):
     # A scheduled live run on a day inside approved_test_dates is not date-gated.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),  # matches _now_live()
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -3789,11 +2949,9 @@ def test_scheduled_live_run_writing_run_state_then_failing_is_a_late_error(tmp_p
     # unconditionally recorded as failure_phase='before_run_artifact',
     # fabricating an earlier failed start plus a successful retry -- codex
     # review discussion_r3660858010.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -3828,11 +2986,9 @@ def test_freshness_probe_ignores_a_write_made_while_waiting_for_the_attempt_lock
     # reporting suppressed a genuine failed-start/retry event. The snapshot is
     # taken INSIDE the lock now, so a foreign write that lands while waiting
     # cannot satisfy it.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -3872,11 +3028,9 @@ def test_freshness_probe_is_cleared_when_the_attempt_lock_times_out(tmp_path, mo
     # in-lock re-snapshot. Leaving the pre-lock probe installed let the HOLDER's
     # run_state.json write satisfy it, so guarded_run() recorded
     # failure_phase='after_run_artifact' for a waiter that published nothing.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -3915,11 +3069,9 @@ def test_lock_timeout_does_not_publish_into_the_active_slot(tmp_path, monkeypatc
     # still evaluating/placing, so publishing a zero-order failure run_state
     # into that shared slot exposes incomplete evidence and reintroduces the
     # last-writer-wins race the lock exists to prevent.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -3954,11 +3106,9 @@ def test_a_scheduled_failure_that_owns_the_slot_still_publishes_artifacts(tmp_pa
     # Companion guard: the ownership check must not suppress the startup-failure
     # artifact set for the case it was built for -- a run that acquired the slot
     # and then raised before reaching any writer.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -3995,11 +3145,9 @@ def test_an_owned_slot_failure_publishes_before_releasing_the_lock(tmp_path, mon
     # so the failed attempt wrote into a slot another run was already
     # evaluating or placing for. Publication has to happen inside the original
     # lock scope.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -4050,11 +3198,9 @@ def test_an_owned_slot_failure_still_records_a_failed_start(tmp_path, monkeypatc
     # failure would record failure_phase='after_run_artifact' -- the failure
     # record is evidence the slot fired and crashed, never the run's own
     # completed work product.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -4172,11 +3318,9 @@ def test_concurrent_raw_recorders_never_allocate_the_same_sequence_number(tmp_pa
 
 def test_live_gate_manual_bypasses_approved_window(tmp_path):
     # Manual runs are never blocked by the approved_test_dates gate.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 7)}),  # not today
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -4193,11 +3337,9 @@ def test_morning_live_no_broker_does_not_record_hypothetical_ledger_spend(tmp_pa
     # despite SMALL's real hypothetical $5.00 signal, so a later broker-backed
     # retry sees the FULL cap available rather than being pre-charged for
     # spend that never happened.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),  # matches _now_live()
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -4217,11 +3359,9 @@ def test_morning_live_no_broker_does_not_record_hypothetical_ledger_spend(tmp_pa
 
 
 def test_scheduled_live_run_without_broker_fails_closed(tmp_path):
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -4267,11 +3407,9 @@ def test_scheduled_live_run_with_wrong_broker_account_fails_closed_before_orderi
             self.placed = True
             raise AssertionError("orders must not be placed for wrong account")
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         target_account_number="999000111",
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -4327,11 +3465,9 @@ def test_scheduled_live_run_without_a_pinned_account_fails_closed(tmp_path, unpi
     execution paths now share near_close_dca.account_pinning_failure, which
     treats empty/None/sentinel as unpinnable.
     """
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         target_account_number=unpinned,
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -4357,11 +3493,9 @@ def test_scheduled_live_run_without_a_pinned_account_fails_closed(tmp_path, unpi
     ids=["empty", "none", "sentinel"],
 )
 def test_manual_live_run_without_a_pinned_account_raises(tmp_path, unpinned):
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         target_account_number=unpinned,
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -4394,11 +3528,9 @@ def test_manual_live_run_with_wrong_broker_account_raises_before_ordering(tmp_pa
             self.placed = True
             raise AssertionError("orders must not be placed for wrong account")
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         target_account_number="999000111",
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -4432,11 +3564,9 @@ def test_scheduled_live_run_with_broker_account_number_error_fails_closed(tmp_pa
             self.placed = True
             raise AssertionError("orders must not be placed when account lookup fails")
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         target_account_number="999000111",
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -4469,11 +3599,9 @@ def test_manual_live_run_with_broker_account_number_error_raises_runtime_error(t
             self.placed = True
             raise AssertionError("orders must not be placed when account lookup fails")
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         target_account_number="999000111",
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -4503,11 +3631,9 @@ def test_blocked_live_retry_preserves_prior_order_bearing_evidence(tmp_path):
     # where one had just failed. Both halves are now required: the artifact is
     # marked blocked with the current reason AND still carries the orders that
     # really were placed.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL", "OTHER"))
     cfg = MorningConfig(
         tickers=("SMALL", "OTHER"),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -4582,11 +3708,9 @@ def test_blocked_retry_counts_track_a_candidate_that_no_longer_qualifies(tmp_pat
     # attempt no longer evaluates it as a buy, so the merged list can be longer
     # than the count build_artifacts() computed (Codex review
     # discussion_r3867947151).
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL", "OTHER"))
     cfg = MorningConfig(
         tickers=("SMALL", "OTHER"),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -4625,11 +3749,9 @@ def test_blocked_retry_synthesizes_a_row_for_outcome_only_evidence(tmp_path):
     # dca_risk.deployed_usd() and the same-day allocation loader both derive
     # deployed capital from buy_candidates, not broker_outcomes, so they read
     # zero for a real order and a later stream could buy the ticker again.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL", "OTHER"))
     cfg = MorningConfig(
         tickers=("SMALL", "OTHER"),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -4685,11 +3807,9 @@ def test_blocked_retry_synthesizes_a_row_for_outcome_only_evidence(tmp_path):
 )
 def test_blocked_retry_validates_outcome_only_order_amount_and_status(tmp_path, outcome, expects_unreconstructable):
     """Outcome-only carry-forward must not normalize corrupt evidence into a safe order."""
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -4718,12 +3838,10 @@ def test_blocked_retry_validates_outcome_only_order_amount_and_status(tmp_path, 
 
 def test_ambiguous_same_ticker_rows_keep_unknown_notional_marker_across_retries(tmp_path):
     """An amountless sibling prevents ticker-only evidence from resolving a marker."""
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",))
     cfg = MorningConfig(
         tickers=("AAPL",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     now = _now_live()
@@ -4778,11 +3896,9 @@ def test_blocked_retry_preserves_pending_and_unconfirmed_orders(tmp_path, pre_te
     # retry overwrote a still-pending order's evidence with a fresh
     # zero-order blocked stub, and a later stream could reallocate capital
     # that may still fill.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -4823,11 +3939,9 @@ def test_blocked_retry_preserves_pending_and_unconfirmed_orders(tmp_path, pre_te
 
 
 def test_blocked_retry_preserves_ambiguous_placement_reservation(tmp_path):
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -4866,11 +3980,9 @@ def test_blocked_retry_carries_candidate_only_pending_orders_into_the_csv(tmp_pa
     # "filled") only. The drift detector reads this CSV to build its
     # submitted set, so a dropped row here reports a real in-flight order as
     # unsubmitted.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -4957,11 +4069,9 @@ def test_blocked_retry_survives_a_corrupt_status_in_the_existing_artifact(tmp_pa
     # escaping the blocked-artifact write entirely -- the opposite of the
     # documented fail-closed behavior ("an existing state that is ...
     # not a dict, or has no submitted evidence contributes nothing").
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -4992,11 +4102,9 @@ def test_blocked_live_retry_does_not_preserve_stale_non_submitted_block(tmp_path
     # if the existing state is itself just a prior blocked stub (no submitted
     # evidence), a later retry with a DIFFERENT block_reason must overwrite it
     # with the new reason, not hide the new failure behind the old one.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         target_account_number="999000111",
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -5032,11 +4140,9 @@ def test_blocked_live_retry_recovers_from_corrupted_existing_run_state(tmp_path)
     # unreadable or invalid JSON (e.g. a crash mid-write) must not crash the
     # scheduler-wiring safety block -- it must fall back to writing a fresh
     # blocked stub, preserving the fail-closed guarantee this path exists for.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -5061,11 +4167,9 @@ def test_blocked_live_retry_recovers_from_non_utf8_existing_run_state(tmp_path):
     # neither OSError nor json.JSONDecodeError. That must not crash the
     # scheduler-wiring safety block -- it must fall back to a fresh blocked
     # stub the same as any other unreadable existing state.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -5095,11 +4199,9 @@ def test_blocked_live_retry_recovers_from_non_string_trading_day_in_existing_sta
     # TypeError used to crash the retry instead of producing the expected
     # blocked artifact. Must fall back to a fresh blocked stub, same as any
     # other unreadable/malformed existing state.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -5130,11 +4232,9 @@ def test_blocked_live_retry_recovers_from_non_object_existing_run_state(tmp_path
     # crash the retry instead of producing the expected blocked artifact.
     # Must fall back to a fresh blocked stub, same as any other
     # unreadable/malformed existing state.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -5161,11 +4261,9 @@ def test_blocked_live_retry_recovers_from_null_broker_outcomes_in_existing_state
     # scheduler's fail-closed safety path on exactly the kind of malformed
     # prior state it exists to recover from. Must fall back to a fresh blocked
     # stub instead, same as a missing or unreadable existing file.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -5183,54 +4281,6 @@ def test_blocked_live_retry_recovers_from_null_broker_outcomes_in_existing_state
     assert result["artifacts"]["block_reason"] == "missing broker adapter for scheduled live execution"
     on_disk = json.loads(Path(result["paths"]["run_state"]).read_bytes())
     assert on_disk["block_reason"] == "missing broker adapter for scheduled live execution"
-
-
-def test_preflight_missing_on_retry_degrades_to_full_universe_not_a_block(tmp_path):
-    # NON-BLOCKING as of 2026-08-02 (Geoff: "should not block any later runs"),
-    # superseding the old "preflight_missing_block retry preserves prior
-    # submitted evidence" test (Codex review, PR #88), which pinned a
-    # belt-and-suspenders local-artifact preservation path that only existed
-    # because a missing preflight used to overwrite the dated-slot run_state
-    # with a blocked stub. That branch is gone: a missing preflight now always
-    # degrades to the full universe, so there is nothing to preserve against
-    # here -- the real, unconditional duplicate-order protection for a same-
-    # slot retry is broker.same_day_strategy_order_exists() in
-    # _place_broker_orders, checked before every placement regardless of
-    # preflight status. This test just confirms a retry whose same-day
-    # preflight artifact disappeared between attempts is not treated as a
-    # failure or a block.
-    pf_dir = tmp_path / "pf"
-    pf_root = _seed_preflight(pf_dir, ("SMALL",))
-    cfg = MorningConfig(
-        tickers=("SMALL",),
-        morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
-        approved_test_dates=frozenset({date(2026, 7, 8)}),
-    )
-    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-
-    first = ex.run(_now_live(), data, broker=FakeLiveBroker())
-    assert first["artifacts"]["buy_candidates"][0]["status"] == "submitted"
-
-    # The same-day preflight artifact becomes unavailable before the retry
-    # (e.g. deleted, transient read failure, disk issue).
-    for f in pf_dir.glob("*/run_state.json"):
-        f.unlink()
-
-    retry_now = _now_live() + timedelta(minutes=1)
-    second = ex.run(retry_now, data, broker=FakeLiveBroker())
-    run_state_path = Path(second["paths"]["run_state"])
-
-    assert second["artifacts"].get("status") != "blocked", (
-        "a missing same-day preflight artifact must not block a retry"
-    )
-    assert second["artifacts"]["buy_candidates"][0]["status"] == "submitted"
-    on_disk = json.loads(run_state_path.read_bytes())
-    assert on_disk["buy_candidates"][0]["status"] == "submitted"
-    assert second["artifacts"]["preflight_gate"]["preflight_found"] is False
-    evaluated = {r["ticker"] for r in second["artifacts"]["signal_rows"]}
-    assert evaluated == {"SMALL"}
 
 
 def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
@@ -5262,11 +4312,9 @@ def test_auto_buy_candidates_prioritized_by_multiplier_when_cap_hit(tmp_path):
         def place_market_buy(self, ticker, notional_usd, ref_id):
             return f"ORDER-{ticker}"
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("BIGDROP", "SMALLDROP"))
     cfg = MorningConfig(
         tickers=("BIGDROP", "SMALLDROP"),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         morning_daily_cap_usd=11.0,
         morning_weekly_cap_usd=500.0,
         approved_test_dates=frozenset({date(2026, 7, 8)}),
@@ -5736,12 +4784,10 @@ def test_morning_compute_top_up_persists_pending_credit_and_is_retry_safe(tmp_pa
 
     prior_root = tmp_path / "prior"
     _write_prior_run_state(prior_root, "AAPL", amount_usd=1.0, decision_price=100.0, selected_base_amount_usd=1.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",))
     cfg = MorningConfig(
         tickers=("AAPL",),
         base_buy_amount_usd=1.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
         cap_seed_roots=(),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
@@ -5801,12 +4847,10 @@ def test_morning_compute_top_up_fails_closed_when_settlement_provenance_read_fai
 
     prior_root = tmp_path / "prior"
     _write_prior_run_state(prior_root, "AAPL", amount_usd=1.0, decision_price=100.0, selected_base_amount_usd=1.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",))
     cfg = MorningConfig(
         tickers=("AAPL",),
         base_buy_amount_usd=1.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
         cap_seed_roots=None,
         approved_test_dates=frozenset({date(2026, 7, 8)}),
@@ -5855,12 +4899,10 @@ def test_morning_partial_preserve_retry_does_not_create_minimum_order_provenance
 
     prior_root = tmp_path / "prior"
     _write_prior_run_state(prior_root, "AAPL", amount_usd=1.0, decision_price=100.0, selected_base_amount_usd=1.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",))
     cfg = MorningConfig(
         tickers=("AAPL",),
         base_buy_amount_usd=1.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
         cap_seed_roots=None,
         approved_test_dates=frozenset({date(2026, 7, 8)}),
@@ -6602,12 +5644,10 @@ def test_morning_top_up_guard_buys_incremental_when_prior_fill_exists(tmp_path):
 
     prior_root = tmp_path / "prior"
     _write_prior_run_state(prior_root, "TOPUP", amount_usd=10.50, decision_price=99.0, selected_base_amount_usd=3.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -7618,13 +6658,13 @@ def test_a_live_fallback_still_carries_the_shared_circuit_breakers(tmp_path):
         # breakers matter rather than being merely untidy.
         assert cfg.live_execution_enabled is True, label
 
-    # Watchlist/preflight never reach broker placement, and must stay off this
-    # path so a malformed budgets.json cannot block the 9:45 preflight from
-    # writing the artifact the 10:30 live gate requires.
+    # Watchlist never reaches broker placement, and must stay off this path
+    # so a malformed budgets.json cannot block the 9:45 watchlist scan from
+    # writing its artifact.
     cfg_path.unlink()
-    preflight = load(MORNING_PREFLIGHT_MODE)
-    assert preflight.max_orders_per_day is None
-    assert preflight.max_consecutive_placement_failures is None
+    watchlist = load(MORNING_WATCHLIST_MODE)
+    assert watchlist.max_orders_per_day is None
+    assert watchlist.max_consecutive_placement_failures is None
 
     # And a malformed budgets.json now fails closed on the fallback path too,
     # where previously it was never read at all.
@@ -7732,11 +6772,9 @@ def test_morning_top_up_guard_skips_when_price_not_below_reference(tmp_path):
 
     prior_root = tmp_path / "prior"
     _write_prior_run_state(prior_root, "TOPUP", amount_usd=4.50, decision_price=96.0, selected_base_amount_usd=2.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -7764,7 +6802,7 @@ def test_morning_top_up_guard_inactive_in_watchlist_mode(tmp_path):
         morning_run_state_root=str(tmp_path / "watchlist"),
         prior_allocation_roots=(str(prior_root),),
     )
-    # Default mode is watchlist — no preflight root needed, no broker.
+    # Default mode is watchlist, so no broker.
     ex = MorningDCAExecutor(cfg)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
     res = ex.run(_now(), data)
@@ -7812,12 +6850,10 @@ def test_morning_top_up_guard_seeds_ledger_from_prior_fills(tmp_path):
     # $86 prior morning fill on a different ticker at a reference price well below
     # current so per-ticker top-up would be eligible, but the cap is the binding constraint.
     _write_prior_run_state(morning_root, "PRIOR_TICKER", amount_usd=86.0, decision_price=50.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(morning_root),),
         cap_seed_roots=(str(morning_root),),
         morning_daily_cap_usd=90.0,
@@ -7893,12 +6929,10 @@ def test_morning_cap_seeding_counts_every_prior_buy_attempt_not_one_per_ticker(t
         ),
         encoding="utf-8",
     )
-    pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         cap_seed_roots=(str(prior_root),),
         max_orders_per_day=8,
         approved_test_dates=frozenset({date(2026, 7, 8)}),
@@ -7943,12 +6977,10 @@ def test_morning_top_up_guard_afternoon_fills_do_not_reduce_morning_cap(tmp_path
 
     afternoon_root = tmp_path / "afternoon_prior"
     _write_prior_run_state(afternoon_root, "AFTERNOON_TICKER", amount_usd=85.0, decision_price=50.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         # Afternoon root in prior_allocation_roots for per-ticker offset check…
         prior_allocation_roots=(str(afternoon_root),),
         # …but NOT in cap_seed_roots, so it never reduces the morning cap.
@@ -8002,11 +7034,9 @@ def test_morning_top_up_guard_inactive_in_manual_live_run(tmp_path):
 
     prior_root = tmp_path / "prior"
     _write_prior_run_state(prior_root, "TOPUP", amount_usd=4.50, decision_price=99.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
         cap_seed_roots=(str(prior_root),),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
@@ -8062,12 +7092,10 @@ def test_morning_cap_seeding_is_idempotent_across_multiple_runs(tmp_path):
     morning_root = tmp_path / "morning_prior"
     # $86 prior fill leaves $4 of the $90 cap. TOPUP graded at $4.50 exceeds $4.
     _write_prior_run_state(morning_root, "PRIOR_TICKER", amount_usd=86.0, decision_price=50.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(morning_root),),
         cap_seed_roots=(str(morning_root),),
         morning_daily_cap_usd=90.0,
@@ -8151,12 +7179,10 @@ def test_cap_seed_scan_failure_poison_clears_on_a_recovered_rescan(tmp_path, mon
             return f"ORDER-{ticker}"
 
     cap_root = str(tmp_path / "cap_root")
-    pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         cap_seed_roots=(cap_root,),
         morning_daily_cap_usd=90.0,
         morning_weekly_cap_usd=450.0,
@@ -8241,12 +7267,10 @@ def test_own_stream_earlier_weekday_run_state_failure_fails_closed(tmp_path):
     # Malformed JSON -- caught mid-write.
     (monday_dir / "run_state.json").write_text("{not valid json", encoding="utf-8")
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",), trading_date=date(2026, 6, 30))
     cfg = MorningConfig(
         tickers=("AAPL",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(state_root),
-        preflight_run_state_root=str(pf_root),
         cap_seed_roots=(),
         morning_daily_cap_usd=90.0,
         morning_weekly_cap_usd=450.0,
@@ -8314,11 +7338,9 @@ def test_ambiguous_same_ticker_rows_preserve_unknown_notional_marker_and_close_c
         ),
         encoding="utf-8",
     )
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",), trading_date=date(2026, 6, 30))
     cfg = MorningConfig(
         tickers=("AAPL",),
         morning_run_state_root=str(state_root),
-        preflight_run_state_root=str(pf_root),
         cap_seed_roots=(),
         morning_daily_cap_usd=90.0,
         morning_weekly_cap_usd=450.0,
@@ -8559,12 +7581,10 @@ def test_cap_seed_scan_finds_sibling_suffix_fills_under_the_current_stream_root(
     _write_prior_suffix_run("1130ET", "intraday_live_20260706_1130ET", 10.0)
     _write_prior_suffix_run("1430ET", "intraday_live_20260706_1430ET", 15.0)
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("CCC",))
     cfg = MorningConfig(
         tickers=("CCC",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         cap_seed_roots=(str(live_root),),
         morning_daily_cap_usd=100.0,
         morning_weekly_cap_usd=100.0,
@@ -8604,12 +7624,10 @@ def test_cap_seed_scan_reads_a_leaf_override_roots_own_run_state(tmp_path):
         encoding="utf-8",
     )
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("CCC",))
     cfg = MorningConfig(
         tickers=("CCC",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         cap_seed_roots=(str(override_root),),
         morning_daily_cap_usd=100.0,
         morning_weekly_cap_usd=100.0,
@@ -8641,12 +7659,10 @@ def test_cap_seed_scan_fails_closed_on_an_unreadable_leaf_override_state(tmp_pat
     # Malformed JSON -- caught mid-write.
     (override_root / "run_state.json").write_text("{not valid json", encoding="utf-8")
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("CCC",))
     cfg = MorningConfig(
         tickers=("CCC",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         cap_seed_roots=(str(override_root),),
         morning_daily_cap_usd=100.0,
         morning_weekly_cap_usd=100.0,
@@ -8682,12 +7698,10 @@ def test_cap_seed_scan_ignores_a_same_day_leaf_override_root(tmp_path):
         encoding="utf-8",
     )
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("CCC",))
     cfg = MorningConfig(
         tickers=("CCC",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         cap_seed_roots=(str(override_root),),
         morning_daily_cap_usd=100.0,
         morning_weekly_cap_usd=100.0,
@@ -8722,12 +7736,10 @@ def test_earlier_weekday_cap_seed_poison_clears_on_a_recovered_rescan(tmp_path):
     # First pass: caught mid-write -- invalid JSON.
     sibling_path.write_text("{not valid json", encoding="utf-8")
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",), trading_date=date(2026, 6, 30))
     cfg = MorningConfig(
         tickers=("AAPL",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         cap_seed_roots=(str(cap_root),),
         morning_daily_cap_usd=90.0,
         morning_weekly_cap_usd=450.0,
@@ -8798,12 +7810,10 @@ def test_earlier_weekday_run_with_a_failed_csv_scan_is_rescanned_once_repaired(t
     # First pass: caught mid-write -- headerless (empty file).
     csv_path.write_text("", encoding="utf-8")
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",), trading_date=date(2026, 6, 30))
     cfg = MorningConfig(
         tickers=("AAPL",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         cap_seed_roots=(str(cap_root),),
         morning_daily_cap_usd=90.0,
         morning_weekly_cap_usd=450.0,
@@ -8886,11 +7896,9 @@ def test_morning_cap_seeding_does_not_double_count_own_manual_submission(tmp_pat
     live_root = tmp_path / "live"
     # Use a tight cap ($20) so the double-count ($15) would block the $7.50 scheduled
     # order even though genuine spend is only $7.50 — leaving $12.50 available.
-    pf_root = _seed_preflight(tmp_path / "pf", ("TICK",))
     cfg = MorningConfig(
         tickers=("TICK",),
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(live_root / "manual_runs"),),
         cap_seed_roots=(str(live_root / "manual_runs"),),
         morning_daily_cap_usd=20.0,
@@ -8964,12 +7972,10 @@ def test_morning_cap_seeding_watermark_exclusive_of_own_recorded(tmp_path):
 
     live_root = tmp_path / "live"
     manual_root = live_root / "manual_runs"
-    pf_root = _seed_preflight(tmp_path / "pf", ("TICK",))
     cfg = MorningConfig(
         tickers=("TICK",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(manual_root),),
         cap_seed_roots=(str(manual_root),),
         morning_daily_cap_usd=90.0,
@@ -9080,11 +8086,9 @@ def test_morning_cap_seeding_does_not_double_count_own_scheduled_submission(tmp_
             return f"ORDER-{ticker}"
 
     live_root = tmp_path / "live"
-    pf_root = _seed_preflight(tmp_path / "pf", ("TICK",))
     cfg = MorningConfig(
         tickers=("TICK",),
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(live_root / "manual_runs"),),
         cap_seed_roots=(str(live_root),),
         morning_daily_cap_usd=20.0,
@@ -9159,11 +8163,9 @@ def test_morning_cap_seeding_picks_up_external_fill_after_own_retry_overwrite(tm
             return f"ORDER-{ticker}"
 
     live_root = tmp_path / "live"
-    pf_root = _seed_preflight(tmp_path / "pf", ("TICK",))
     cfg = MorningConfig(
         tickers=("TICK",),
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(live_root / "manual_runs"),),
         cap_seed_roots=(str(live_root),),
         morning_daily_cap_usd=90.0,
@@ -9251,7 +8253,6 @@ def test_shadow_run_suppresses_drift_check(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(_md, "_run_drift_check", lambda run_dir: calls.append(run_dir))
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAA",))
     data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.03})
 
     # Shadow mode: drift check must NOT run even though the ladder produces
@@ -9260,7 +8261,6 @@ def test_shadow_run_suppresses_drift_check(tmp_path, monkeypatch):
         tickers=("AAA",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "shadow"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
         live_execution_enabled=False,
     )
@@ -9273,7 +8273,6 @@ def test_shadow_run_suppresses_drift_check(tmp_path, monkeypatch):
         tickers=("AAA",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     MorningDCAExecutor(live_cfg, mode=MORNING_LIVE_MODE).run(_now_live(), data, broker=_Broker())
@@ -9291,14 +8290,12 @@ def test_morning_ledger_seed_still_covers_scheduled_slot_when_cap_roots_are_manu
     # cap_seed_roots, NEITHER mechanism seeds the first scheduled submission
     # and a fresh retry (a new process/executor, as a real cron retry would
     # be) can spend the full daily cap a second time.
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
     live_root = tmp_path / "live"
 
     cfg1 = MorningConfig(
         tickers=("AAA",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         cap_seed_roots=(str(live_root / "manual_runs"),),  # narrow: excludes the scheduled slot
         morning_daily_cap_usd=6.0,
         morning_weekly_cap_usd=100.0,
@@ -9316,7 +8313,6 @@ def test_morning_ledger_seed_still_covers_scheduled_slot_when_cap_roots_are_manu
         tickers=("BBB",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         cap_seed_roots=(str(live_root / "manual_runs"),),
         morning_daily_cap_usd=6.0,
         morning_weekly_cap_usd=100.0,
@@ -9371,12 +8367,10 @@ def test_morning_top_up_guard_no_prior_run_when_default_roots_empty(tmp_path):
             self.placed[ticker] = notional_usd
             return f"ORDER-{ticker}"
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         # prior_allocation_roots=None → uses default root; empty default → no_prior_run
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -9492,11 +8486,9 @@ def test_morning_live_applies_prior_manual_offset_incremental(tmp_path):
     # Prior manual fill: NVDA $3 at $95 reference. Morning price $90 (10% drop, below ref).
     # Desired = 5x * $2 = $10. Incremental = $15 - $3 = $8.
     prior_root = _seed_prior(tmp_path / "prior", "NVDA", 2.0, reference_price=95.0, selected_base_amount_usd=2.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -9529,11 +8521,9 @@ def test_morning_live_top_up_accounts_for_broker_spend(tmp_path, monkeypatch, br
         monkeypatch.delenv(name, raising=False)
     now = _now_live()
     prior_root = _seed_prior(tmp_path / "prior", "NVDA", 2.0, reference_price=95.0, selected_base_amount_usd=2.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
         cap_seed_roots=(str(prior_root),),
         approved_test_dates=frozenset({now.date()}),
@@ -9645,13 +8635,11 @@ def test_morning_scheduled_top_up_not_blocked_by_manual_fills_ordinary_ref_id(tm
     # scheduled top-up, or the real incremental order never gets placed while
     # run_state still (falsely) records it as submitted.
     live_root = tmp_path / "live"
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         base_buy_amount_usd=3.0,
         max_per_order_usd=15.0,
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(live_root / "manual_runs"),),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -9714,13 +8702,11 @@ def test_morning_scheduled_top_up_duplicate_preserves_original_submitted_amount(
     live_root = tmp_path / "live"
     prior_root = tmp_path / "prior"
     prior_root.mkdir(parents=True, exist_ok=True)
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         base_buy_amount_usd=3.0,
         max_per_order_usd=15.0,
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -9781,13 +8767,11 @@ def test_morning_scheduled_duplicate_with_pending_prior_preserves_sent_amount(tm
     live_root = tmp_path / "live"
     prior_root = tmp_path / "prior"
     prior_root.mkdir(parents=True, exist_ok=True)
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         base_buy_amount_usd=2.0,
         max_per_order_usd=10.0,
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -9840,13 +8824,11 @@ def test_morning_scheduled_duplicate_with_pending_prior_without_amount_fails_clo
     live_root = tmp_path / "live"
     prior_root = tmp_path / "prior"
     prior_root.mkdir(parents=True, exist_ok=True)
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         base_buy_amount_usd=3.0,
         max_per_order_usd=15.0,
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -9886,13 +8868,11 @@ def test_morning_scheduled_duplicate_check_preserved_when_cap_fully_consumed(tmp
     # dated-slot artifact's "submitted" row with "cap_exceeded" -- erasing
     # evidence a fresh executor's cap-seeding scan depends on.
     prior_root = _seed_prior(tmp_path / "prior", "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=3.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         base_buy_amount_usd=3.0,
         max_per_order_usd=15.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
         # 10% drop -> 5x * $3 = $15 desired; incremental = $15 - $3 = $12.
         # Cap set to exactly $12 so the first attempt consumes it fully.
@@ -9933,13 +8913,11 @@ def test_morning_scheduled_duplicate_not_rebooked_into_ledger(tmp_path):
     # retry, the ledger balance keeps growing without any new money ever
     # being submitted.
     prior_root = _seed_prior(tmp_path / "prior", "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=3.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         base_buy_amount_usd=3.0,
         max_per_order_usd=15.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
         morning_daily_cap_usd=90.0,
         morning_weekly_cap_usd=450.0,
@@ -9970,11 +8948,9 @@ def test_morning_live_skips_when_price_not_below_prior_reference(tmp_path):
     # Prior: NVDA $2 at $85 reference. Morning price $90 (10% drop from $100).
     # $90 >= $85 → price_not_below → skip, no order.
     prior_root = _seed_prior(tmp_path / "prior", "NVDA", 2.0, reference_price=85.0, selected_base_amount_usd=2.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -9988,11 +8964,9 @@ def test_morning_live_skips_when_price_not_below_prior_reference(tmp_path):
 
 def test_morning_live_full_buy_when_no_prior_allocation(tmp_path):
     # Empty prior root → no_prior_run → buy the full desired amount ($10 = 5x * $2).
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(tmp_path / "empty_prior"),),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -10012,11 +8986,9 @@ def test_morning_live_insufficient_buying_power_blocks_order(tmp_path):
         def available_buying_power(self):
             return 0.50
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(tmp_path / "empty_prior"),),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -10034,11 +9006,9 @@ def test_morning_live_not_tradable_blocks_order(tmp_path):
         def is_tradable_for_fractional_buy(self, ticker) -> bool:
             return False
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(tmp_path / "empty_prior"),),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -10060,11 +9030,9 @@ def test_morning_manual_review_block_prevents_placement(tmp_path):
         def review_market_buy(self, ticker, notional_usd) -> Tuple[bool, str]:
             return False, "flagged for manual review"
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(tmp_path / "empty_prior"),),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -10081,11 +9049,9 @@ def test_morning_manual_review_block_prevents_placement(tmp_path):
 def test_morning_live_missing_price_triggers_manual_review(tmp_path):
     # Prior: NVDA "submitted" with unknown reference price → missing_prior_price → $0 + manual review.
     prior_root = _seed_prior(tmp_path / "prior", "NVDA", 9.0, status="submitted", reference_price=None)
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -10106,11 +9072,9 @@ def test_morning_live_missing_price_triggers_manual_review(tmp_path):
 def test_morning_live_no_incremental_when_prior_covers_full_desired(tmp_path):
     # Prior: NVDA $20 at $95 reference. Desired = $10. $10 - $20 = -$10 ≤ 0 → no_incremental.
     prior_root = _seed_prior(tmp_path / "prior", "NVDA", 20.0, reference_price=95.0, selected_base_amount_usd=2.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -10132,11 +9096,9 @@ def test_morning_live_prior_from_configured_root_only(tmp_path):
         tmp_path / "configured", "NVDA", 2.0, reference_price=95.0, selected_base_amount_usd=2.0
     )
     _seed_prior(tmp_path / "other", "NVDA", 20.0, reference_price=95.0, selected_base_amount_usd=2.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(configured_root),),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -10167,11 +9129,9 @@ def test_morning_live_default_roots_include_market_open(tmp_path, monkeypatch):
     monkeypatch.setattr(morning_dca, "default_cap_seed_roots", lambda: (str(afternoon_root), str(market_open_root)))
 
     _seed_prior(market_open_root, "NVDA", 2.0, reference_price=95.0, selected_base_amount_usd=2.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         # Left at the class default (None) so the guard auto-derives its
         # roots, exercising the [DEFAULT_AFTERNOON_TASK_ROOT,
         # DEFAULT_MARKET_OPEN_TASK_ROOT] fallback directly.
@@ -10225,11 +9185,9 @@ def test_morning_live_scheduled_artifact_not_prior_context_on_retry(tmp_path):
     configured_root = tmp_path / "configured_prior"
     configured_root.mkdir()
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(configured_root),),  # enable guard without scanning state_root itself
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -10254,11 +9212,9 @@ def test_morning_live_empty_roots_disables_guard(tmp_path):
     # that a full buy is placed even when a prior fill exists.  This honours the
     # [] opt-out in morning_dca.json (load_morning_config preserves [] as ()).
     _seed_prior(tmp_path / "prior", "NVDA", 20.0, reference_price=95.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(),  # explicit empty → guard fully disabled
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -10391,12 +9347,10 @@ def test_morning_cap_seeding_runs_even_when_per_ticker_guard_disabled(tmp_path):
 
     morning_root = tmp_path / "morning_prior"
     _write_prior_run_state(morning_root, "PRIOR_TICKER", amount_usd=86.0, decision_price=50.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("TOPUP",))
     cfg = MorningConfig(
         tickers=("TOPUP",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(),  # guard disabled via []
         cap_seed_roots=(str(morning_root),),
         morning_daily_cap_usd=90.0,
@@ -10456,12 +9410,10 @@ def test_morning_cap_seeding_own_amount_scoped_to_cap_roots(tmp_path):
     # cap_seed_roots points at a separate external root, NOT state_root/manual_runs
     external_cap_root = tmp_path / "external_cap"
     external_cap_root.mkdir(parents=True)
-    pf_root = _seed_preflight(tmp_path / "pf", ("TICK",))
     cfg = MorningConfig(
         tickers=("TICK",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(live_root / "manual_runs"),),
         # cap_seed_roots does NOT cover state_root/manual_runs → own fills absent
         cap_seed_roots=(str(external_cap_root),),
@@ -10517,11 +9469,9 @@ def test_morning_cap_seeding_ignores_own_amount_from_no_broker_manual_run(tmp_pa
     # cap_seed_roots covers state_root/manual_runs, so own_amount WOULD be
     # credited if any own submission were genuinely on file.
     manual_root = live_root / "manual_runs"
-    pf_root = _seed_preflight(tmp_path / "pf", ("TICK",))
     cfg = MorningConfig(
         tickers=("TICK",),
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(manual_root),),
         cap_seed_roots=(str(manual_root),),
         morning_daily_cap_usd=90.0,
@@ -10620,11 +9570,9 @@ def test_per_order_cap_blocks_without_any_broker_call(tmp_path):
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise AssertionError("placement must not be reached for an over-cap candidate")
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("BIGDROP",))
     cfg = MorningConfig(
         tickers=("BIGDROP",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         max_per_order_usd=1.0,
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -10674,11 +9622,9 @@ def test_spread_breaker_blocks_wide_spread_before_placement(tmp_path):
         def place_market_buy(self, ticker, notional_usd, ref_id):
             raise AssertionError("placement must not be reached once the spread breaker blocks")
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("BIGDROP",))
     cfg = MorningConfig(
         tickers=("BIGDROP",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         max_bid_ask_spread_pct=1.0,
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -10712,11 +9658,9 @@ def test_spread_breaker_allows_tight_spread(tmp_path):
         def place_market_buy(self, ticker, notional_usd, ref_id):
             return f"ORDER-{ticker}"
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("BIGDROP",))
     cfg = MorningConfig(
         tickers=("BIGDROP",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         max_bid_ask_spread_pct=1.0,
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -10793,7 +9737,6 @@ def test_morning_live_same_stream_check_ignores_manual_fill_ref_id(tmp_path):
     # `-dca-<date>-` at the fourth segment); _same_stream_order_exists checks
     # `morning-dca-topup-*` and `morning-dca-<date>-*`, so they never match it.
     prior_root = _seed_prior(tmp_path / "prior", "NVDA", 3.0, reference_price=95.0, selected_base_amount_usd=3.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
 
     class _ManualFillBroker(_TopUpBroker):
         """Broker that has the manual fill's ref ID on record.
@@ -10813,7 +9756,6 @@ def test_morning_live_same_stream_check_ignores_manual_fill_ref_id(tmp_path):
         base_buy_amount_usd=3.0,
         max_per_order_usd=15.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -10837,7 +9779,6 @@ def test_morning_live_retry_after_manual_fill_detects_plain_scheduled_order(tmp_
     # Manual fills now use morning-dca-manual-* so the plain prefix check remains
     # safe to keep in _same_stream_order_exists.
     prior_root = _seed_prior(tmp_path / "prior", "NVDA", 3.0, reference_price=95.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
 
     class _RetryBroker(_TopUpBroker):
         """Broker that already has the plain scheduled order (morning-dca-*) on record."""
@@ -10850,7 +9791,6 @@ def test_morning_live_retry_after_manual_fill_detects_plain_scheduled_order(tmp_
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -11424,8 +10364,8 @@ def test_each_run_intercepts_its_own_private_view_of_the_provider(tmp_path):
 
 def test_the_callers_provider_is_never_mutated_by_a_run(tmp_path):
     # The completed slot's raw/ directory is closed to later calls because the
-    # caller's provider was never rebound in the first place: manual, watchlist
-    # and preflight calls -- none of which install a recorder, and all of which
+    # caller's provider was never rebound in the first place: manual and watchlist
+    # calls -- none of which install a recorder, and all of which
     # the raw-input policy exempts -- reach the untouched original.
     def _historicals(**kwargs):
         return {"results": [{"symbol": kwargs["symbols"][0], "historicals": []}]}
@@ -11538,11 +10478,9 @@ def test_a_scheduled_run_blocks_when_the_provider_cannot_be_isolated(tmp_path):
     # The refusal reaches the caller as a normal blocked run_state -- written
     # before evaluate(), so nothing was computed and nothing placed -- rather
     # than as an escaping exception.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -11622,11 +10560,9 @@ def test_scheduled_live_run_blocks_all_orders_when_one_market_fetch_raises(tmp_p
             self.place_calls.append((ticker, notional_usd, ref_id))
             return super().place_market_buy(ticker, notional_usd, ref_id)
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
     cfg = MorningConfig(
         tickers=("AAA", "BBB"),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     broker = _RecordingBroker()
@@ -11698,11 +10634,9 @@ def test_persisting_broker_adapter_records_placement_response(tmp_path):
 
 
 def test_scheduled_live_run_persists_raw_inputs_on_success(tmp_path):
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -11726,11 +10660,9 @@ def test_scheduled_live_run_persists_raw_inputs_on_success(tmp_path):
 def test_manual_live_run_does_not_persist_raw_inputs(tmp_path):
     # live_schedule_hardening_2026_07_20 is scoped to the SCHEDULED live task;
     # a manual run gains no (and requires no) raw persistence.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -11747,11 +10679,9 @@ def test_scheduled_live_run_fails_closed_when_raw_persistence_fails_before_place
     # escalating with no state file at all -- the exact Jul 20 2026 incident
     # this policy targets (config/morning_dca.json:
     # live_schedule_hardening_2026_07_20).
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -11778,11 +10708,9 @@ def test_blocked_live_result_carries_raw_persistence_fields(tmp_path):
     # raw_persistence_error, so a blocked scheduled run must not lose those
     # documented machine-readable fields just because the failure happened
     # before broker placement.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -11834,11 +10762,9 @@ class _PartialSubmitThenRawFailBroker(FakeLiveBroker):
 
 
 def test_blocked_live_run_preserves_earlier_submission_on_later_raw_failure(tmp_path):
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
     cfg = MorningConfig(
         tickers=("AAA", "BBB"),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -11871,11 +10797,9 @@ def test_blocked_partial_submission_run_denies_scheduled_evidence(tmp_path):
     # ran successfully" evidence.
     from scripts.same_day_pointer import derive_valid_scheduled_evidence
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
     cfg = MorningConfig(
         tickers=("AAA", "BBB"),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -11904,11 +10828,9 @@ def test_blocked_live_retry_clears_stale_raw_failure_metadata(tmp_path):
     # for an unrelated, non-raw reason (missing broker), the rewritten
     # artifact must not keep attributing the current wiring failure to the
     # earlier, different raw-input error.
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
     cfg = MorningConfig(
         tickers=("AAA", "BBB"),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -11966,12 +10888,9 @@ def test_blocked_retry_after_full_earlier_submission_denies_scheduled_evidence(t
     # valid scheduled evidence.
     from scripts.same_day_pointer import derive_valid_scheduled_evidence
 
-    preflight_root = tmp_path / "preflight"
-    _seed_preflight(preflight_root, ("AAA",))
     cfg = MorningConfig(
         tickers=("AAA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(preflight_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -12011,12 +10930,9 @@ def test_blocked_retry_preserves_raw_input_references_after_full_submission(tmp_
     # since the original raw files that justified the submitted order are
     # still on disk and this retry's own raw_recorder is never even passed
     # to _blocked_live_result() on the missing-broker path.
-    preflight_root = tmp_path / "preflight"
-    _seed_preflight(preflight_root, ("AAA",))
     cfg = MorningConfig(
         tickers=("AAA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(preflight_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -12051,12 +10967,9 @@ def test_blocked_retry_merges_raw_filenames_with_preserved_submission(tmp_path):
     # artifact's raw_inputs_saved list outright instead of merging with it --
     # even though the earlier attempt's raw files are still on disk under a
     # lower sequence number in the very same raw_dir.
-    preflight_root = tmp_path / "preflight"
-    _seed_preflight(preflight_root, ("AAA",))
     cfg = MorningConfig(
         tickers=("AAA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(preflight_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -12101,11 +11014,9 @@ def test_blocked_live_retry_preserves_evidence_from_partial_run_state(tmp_path):
     # run_classification/budget/signal_rows -- must not raise KeyError when
     # the next blocked retry rewrites it. Regression for
     # {"buy_candidates": [{"status": "submitted"}]}.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -12136,11 +11047,9 @@ def test_blocked_live_retry_falls_back_when_preserved_fields_are_wrong_typed(tmp
     # exactly the shape a presence-only check would wave through and
     # write_artifacts() would then subscript/iterate and raise on. This must
     # fall back to the graft-based path instead of raising.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -12199,11 +11108,9 @@ def test_raw_persistence_failure_during_this_candidate_blocks_this_candidate(tmp
     # nothing had durably recorded, which is exactly the fail-closed contract
     # the mid-batch gate exists to enforce. With only one ticker in the
     # universe there IS no next candidate, so the single order went in.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -12252,12 +11159,10 @@ def test_scheduled_live_run_persists_block_when_buying_power_lookup_fails(tmp_pa
     """A transient account lookup failure must leave durable scheduled evidence."""
     heartbeat_results = []
     monkeypatch.setattr("dca_alerts.send_heartbeat", lambda _stream, *, ok: heartbeat_results.append(ok))
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     live_root = tmp_path / "live"
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -12294,11 +11199,9 @@ def test_scheduled_live_run_fails_the_heartbeat_when_a_trading_failure_is_record
     def _reject_for_small(**kwargs):
         return {"data": {"order": {"id": "ord-1", "state": "rejected", "cumulative_quantity": "0"}}}
 
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -12331,12 +11234,10 @@ def test_blocked_buying_power_failure_retains_raw_input_metadata(tmp_path):
     # no raw_input_dir/raw_inputs_saved fields even though the raw files
     # actually exist on disk, breaking the audit/reporting contract that
     # promises those fields whenever raw inputs were captured.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     live_root = tmp_path / "live"
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -12377,12 +11278,10 @@ def test_scheduled_live_run_blocks_when_production_broker_swallows_buying_power_
     """
     heartbeat_results = []
     monkeypatch.setattr("dca_alerts.send_heartbeat", lambda _stream, *, ok: heartbeat_results.append(ok))
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     live_root = tmp_path / "live"
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -12432,11 +11331,9 @@ def test_placement_stops_after_raw_persistence_fails_mid_batch(tmp_path):
     # recorder was only checked once BEFORE the loop and again after the run.
     # A failure that begins during a broker call therefore let every LATER
     # candidate keep submitting from inputs nothing had durably recorded.
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB", "CCC"))
     cfg = MorningConfig(
         tickers=("AAA", "BBB", "CCC"),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -12522,11 +11419,9 @@ def test_raw_persistence_abort_records_an_outcome_for_every_candidate(tmp_path):
     # (The same absence also made the post-loop preserve_pending pass skip them,
     # dropping any threshold-crossing cumulative credit they had computed.)
     tickers = ("SMALL", "BIG", "MID")
-    pf_root = _seed_preflight(tmp_path / "pf", tickers)
     cfg = MorningConfig(
         tickers=tickers,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -12560,11 +11455,9 @@ def test_raw_persistence_failure_survives_the_no_order_classifier(tmp_path):
     # and recovery keyed on classification then read the persistence failure as
     # an ordinary no-order completion. The failure stamp is authoritative and
     # must be applied last.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -12613,7 +11506,7 @@ def test_run_appends_model_usage_log_entry_when_root_configured(tmp_path):
         morning_run_state_root=str(tmp_path / "state"),
         model_usage_log_root=str(log_root),
     )
-    ex = MorningDCAExecutor(cfg, mode=MORNING_PREFLIGHT_MODE)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_WATCHLIST_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
     now = _now()
     res = ex.run(now, data)
@@ -12623,7 +11516,7 @@ def test_run_appends_model_usage_log_entry_when_root_configured(tmp_path):
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     entry = _json.loads(lines[0])
-    assert entry["cron_id"] == MORNING_PREFLIGHT_CRON_ID
+    assert entry["cron_id"] == MORNING_CRON_ID
     assert entry["run_id"] == res["artifacts"]["run_id"]
     assert entry["artifact_path"] == res["paths"]["run_state"]
     assert entry["run_origin"] == "scheduled"
@@ -12783,11 +11676,9 @@ class _PartialBidAskProvider(DecliningBarsProvider):
 
 
 def _live_executor(tmp_path, tickers):
-    pf_root = _seed_preflight(tmp_path / "pf", tickers)
     cfg = MorningConfig(
         tickers=tuple(tickers),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(tmp_path / "empty_prior"),),
     )
     return MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -12856,7 +11747,7 @@ class TestScheduledSlotLock:
 
 
 def test_morning_live_run_writes_the_complete_root_level_artifact_set(tmp_path):
-    """Before this, only the read-only 9:45 pre-flight wrote run_summary.json, so
+    """Before this, only the read-only 9:45 watchlist scan wrote run_summary.json, so
     every live morning/midday run directory failed the scheduled artifact
     contract's require_summary check."""
     from scripts.scheduled_artifacts import validate_run_artifacts
@@ -13250,11 +12141,9 @@ def test_candidates_blocked_before_the_spread_gate_are_not_no_ladder_candidates(
 
     # The daily cap is checked BEFORE the spread lookup, so the candidate never
     # reaches the gate and carries no spread verdict.
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(tmp_path / "empty_prior"),),
         morning_daily_cap_usd=0.0,
     )
@@ -13274,11 +12163,9 @@ def test_candidates_blocked_before_the_spread_gate_are_not_no_ladder_candidates(
 def test_calendar_blocked_live_run_carries_the_blocked_no_order_outcome(tmp_path):
     """This path writes state and summary directly and returns before the
     classification call, so it must stamp the outcome itself (Codex review)."""
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",), trading_date=date(2026, 7, 4))
     cfg = MorningConfig(
         tickers=("NVDA",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(tmp_path / "empty_prior"),),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -13326,35 +12213,55 @@ def test_manual_review_block_is_not_recorded_as_a_missing_spread_block(tmp_path)
     assert artifacts["candidates_blocked_missing_spread"] == 0
 
 
-def test_preflight_missing_no_longer_blocks_and_still_evaluates(tmp_path):
-    """Superseded 2026-08-02 (Geoff: "should not block any later runs"): a
-    missing same-day preflight artifact used to end the run here as a
-    blocked-before-placement outcome (Codex review, PR #77/#88), which this
-    test used to verify carried the right outcome fields
-    (run_classification_outcome/order_submit_status/is_trading_failure/etc via
-    _apply_blocked_before_placement_fields). That branch and its trigger are
-    both gone; the same field-stamping helper is still exercised by other
-    genuinely-blocking paths (e.g. a missing broker adapter, account pinning
-    failure -- see the many other run_classification_outcome ==
-    'failed_scheduled_run_startup' assertions elsewhere in this file). This
-    test now just confirms the missing-preflight case reaches a normal,
-    non-blocked evaluation instead."""
+def test_live_run_ignores_a_stale_preflight_artifact_and_scores_every_ticker(tmp_path):
+    """The 9:45 pre-flight is retired and the 10:30 live run depends on nothing
+    it wrote: a leftover same-day pre-flight artifact on disk (here admitting
+    only NVDA) must not narrow the universe, and the run carries no
+    preflight_gate field. Superseded 2026-08-02 behavior (a missing pre-flight
+    never blocks) is the same assertion with nothing on disk."""
+    stale_dir = tmp_path / "morning_dca_preflight" / "20260708_0945ET"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "run_state.json").write_text(
+        json.dumps(
+            {
+                "trading_day": "2026-07-08",
+                "eligible_to_execute_tickers": ["NVDA"],
+                "run_classification": {"run_origin": "scheduled", "manual_run": False, "stream": "morning"},
+            }
+        ),
+        encoding="utf-8",
+    )
     cfg = MorningConfig(
-        tickers=("NVDA",),
+        tickers=("NVDA", "AAPL"),
         morning_run_state_root=str(tmp_path / "live"),
-        # Empty preflight root: no same-day pre-flight artifact exists.
-        preflight_run_state_root=str(tmp_path / "no_preflight"),
         prior_allocation_roots=(str(tmp_path / "empty_prior"),),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10})
-    res = ex.run(_now_live(), data, broker=_TopUpBroker())
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"NVDA": 0.10, "AAPL": 0.10})
+    res = ex.run(_now_live(), data, broker=FakeLiveBroker())
 
     artifacts = res["artifacts"]
     assert artifacts.get("status") != "blocked"
-    assert artifacts["preflight_gate"]["preflight_found"] is False
+    assert "preflight_gate" not in artifacts
     evaluated = {r["ticker"] for r in artifacts["signal_rows"]}
-    assert evaluated == {"NVDA"}
+    assert evaluated == {"NVDA", "AAPL"}
+
+
+def test_preflight_mode_is_rejected_as_an_unknown_mode():
+    with pytest.raises(ValueError):
+        MorningDCAExecutor(MorningConfig(tickers=("SMALL",)), mode="preflight")
+
+
+def test_supplemental_validator_is_no_longer_accepted(tmp_path):
+    """The GFUZ supplemental validator existed only to second-guess the
+    pre-flight gate; with the gate gone there is nothing to supplement."""
+    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
+    with pytest.raises(TypeError):
+        MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE, supplemental_validator=lambda ticker: {"valid": True})  # type: ignore[call-arg]
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
+    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
+    with pytest.raises(TypeError):
+        ex.run(_now_live(), data, manual=True, supplemental_validator=lambda ticker: {"valid": True})  # type: ignore[call-arg]
 
 
 def test_confirmation_required_survives_the_morning_no_order_classification(tmp_path):
@@ -13803,12 +12710,10 @@ def test_generic_placement_exception_halt_preserves_credit_for_unreached_candida
     # the identical math worked out in isolation.
     prior_root = tmp_path / "prior"
     _write_prior_run_state(prior_root, "TOPUP", amount_usd=10.50, decision_price=99.0, selected_base_amount_usd=3.0)
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL", "TOPUP"))
     cfg = MorningConfig(
         tickers=("AAPL", "TOPUP"),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
         # A 6% drop's 5x graded multiplier * $3 base = $15, over the default
@@ -14012,7 +12917,6 @@ def test_stale_in_flight_outcomes_never_leak_into_a_later_run(tmp_path):
 
     # A LATER day's run on the same executor raises during evaluation.
     later = datetime.combine(date(2026, 7, 9), time(10, 30), tzinfo=EASTERN)
-    _seed_preflight(tmp_path / "pf", ("NVDA",), trading_date=later.date())
 
     def _explode(*_args, **_kwargs):
         raise RuntimeError("blew up during evaluation")
@@ -14848,7 +13752,7 @@ def test_live_classification_follows_config_not_the_import_time_constant(tmp_pat
     assert rc["account_number"] != morning_module.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
 
-@pytest.mark.parametrize("mode", ["watchlist", "preflight"])
+@pytest.mark.parametrize("mode", ["watchlist"])
 def test_read_only_classifications_carry_no_account(tmp_path, mode):
     """A scan that places no orders has no execution account to report.
 
@@ -14955,10 +13859,10 @@ def test_a_normal_live_classification_carries_the_account_and_no_marker(tmp_path
     jsonschema.validate(rc, _morning_schema())
 
 
-@pytest.mark.parametrize("mode", [MORNING_WATCHLIST_MODE, MORNING_PREFLIGHT_MODE])
+@pytest.mark.parametrize("mode", [MORNING_WATCHLIST_MODE])
 def test_read_only_classifications_omit_a_well_formed_account_number(tmp_path, mode):
     """account_number is documented ("used for morning live execution") and
-    schema-described as optional-not-required for watchlist/preflight, but the
+    schema-described as optional-not-required for watchlist, but the
     stamping branch used to key ONLY on whether target_account_number happened
     to be well-formed -- not on whether this run actually trades. A read-only
     executor built without going through load_morning_config's per-mode
@@ -14970,7 +13874,6 @@ def test_read_only_classifications_omit_a_well_formed_account_number(tmp_path, m
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path),
-        preflight_run_state_root=str(tmp_path / "preflight"),
         target_account_number="123456789",
     )
     rc = MorningDCAExecutor(cfg, mode=mode).run_classification(_now(), manual=False)
@@ -15061,18 +13964,18 @@ def test_the_schema_still_requires_a_broker_on_a_blocked_live_run(tmp_path):
 
 # --- The config-missing fallback resolves ALL artifact roots at load time ----
 # model_usage_log_root was fixed to resolve at load time, but the fallback
-# still left morning_run_state_root/preflight_run_state_root at None, which
-# falls back to DEFAULT_MORNING_LIVE_STATE_ROOT/DEFAULT_MORNING_PREFLIGHT_
-# STATE_ROOT -- import-time constants -- later. A $DCA_CRON_TRACKING_ROOT set
+# still left morning_run_state_root at None, which falls back to
+# DEFAULT_MORNING_LIVE_STATE_ROOT/DEFAULT_MORNING_WATCHLIST_STATE_ROOT --
+# import-time constants -- later. A $DCA_CRON_TRACKING_ROOT set
 # between import and this call left the executor writing run_state.json and
-# the preflight artifact under the OLD tree (Codex review, PR #219).
+# its other artifacts under the OLD tree (Codex review, PR #219).
 
 
 def test_unconfigured_state_root_resolves_at_executor_construction_time_for_every_mode():
-    """MorningConfig.morning_run_state_root/preflight_run_state_root stay None
-    when a stream's own config doesn't set them (including the config-missing
+    """MorningConfig.morning_run_state_root stays None
+    when a stream's own config doesn't set it (including the config-missing
     fallback -- see load_morning_config, which deliberately does NOT bake a
-    stream_root() value into those two fields the way it does for
+    stream_root() value into that field the way it does for
     model_usage_log_root, because run_dca.py's cross-stream containment check
     reads their None-ness as "not explicitly configured"). The staleness this
     could otherwise cause -- MorningDCAExecutor.__init__ falling back to
@@ -15085,7 +13988,7 @@ def test_unconfigured_state_root_resolves_at_executor_construction_time_for_ever
         f"os.environ['{CRON_TRACKING_ROOT_ENV}'] = os.environ['PROBE_ROOT']\n"
         "cfg = morning_dca.MorningConfig(tickers=('SMALL',))\n"
         "for mode in (morning_dca.MORNING_WATCHLIST_MODE, "
-        "morning_dca.MORNING_PREFLIGHT_MODE, morning_dca.MORNING_LIVE_MODE):\n"
+        "morning_dca.MORNING_LIVE_MODE):\n"
         "    print(morning_dca.MorningDCAExecutor(cfg, mode=mode).state_root)\n"
     )
     env = {k: v for k, v in os.environ.items() if k != CRON_TRACKING_ROOT_ENV}
@@ -15101,104 +14004,8 @@ def test_unconfigured_state_root_resolves_at_executor_construction_time_for_ever
     roots = [line for line in out.stdout.splitlines() if line]
     assert roots == [
         "/srv/dca-fallback-probe/morning_dca_watchlist",
-        "/srv/dca-fallback-probe/morning_dca_preflight",
         "/srv/dca-fallback-probe/morning_dca",
     ], out.stdout
-
-
-def test_unconfigured_preflight_gate_root_resolves_at_call_time(tmp_path):
-    """Same staleness fix as the state_root test above, but for the OTHER
-    consumer of preflight_run_state_root -- _apply_preflight_gate's own
-    fallback (Codex review, PR #219). Writes a preflight artifact under the
-    freshly-resolved root and confirms the live executor's gate finds it,
-    proving it looked there rather than at the stale import-time
-    DEFAULT_MORNING_PREFLIGHT_STATE_ROOT.
-
-    PROBE_ROOT is a fresh tmp_path per run, not a fixed path: the probe
-    creates real directories on disk, and a fixed path would leave them
-    behind for the next run's os.makedirs() to collide with.
-    """
-    probe = (
-        "import os\n"
-        "import json\n"
-        "from datetime import date, datetime, time\n"
-        "import morning_dca\n"  # imported BEFORE the override
-        f"os.environ['{CRON_TRACKING_ROOT_ENV}'] = os.environ['PROBE_ROOT']\n"
-        "preflight_root = morning_dca.stream_root('morning_dca_preflight')\n"
-        "folder = os.path.join(preflight_root, '20260708_0945ET')\n"
-        "os.makedirs(folder)\n"
-        "with open(os.path.join(folder, 'run_state.json'), 'w') as f:\n"
-        "    json.dump({\n"
-        "        'eligible_to_execute_tickers': ['SMALL'],\n"
-        "        'trading_day': '2026-07-08',\n"
-        "        'run_classification': {\n"
-        "            'run_origin': 'scheduled',\n"
-        "            'manual_run': False,\n"
-        "            'stream': 'morning',\n"
-        "            'run_type': 'morning_dca_preflight',\n"
-        "            'state_schema_version': 'morning-preflight-v2-machine-complete',\n"
-        "        },\n"
-        "    }, f)\n"
-        "cfg = morning_dca.MorningConfig(tickers=('SMALL',))\n"
-        "ex = morning_dca.MorningDCAExecutor(cfg, mode=morning_dca.MORNING_LIVE_MODE)\n"
-        "now = datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=morning_dca.EASTERN)\n"
-        "ex._apply_preflight_gate(now, ['SMALL'], manual=False)\n"
-        "print(ex.preflight_gate['preflight_found'])\n"
-    )
-    env = {k: v for k, v in os.environ.items() if k != CRON_TRACKING_ROOT_ENV}
-    env["PROBE_ROOT"] = str(tmp_path / "dca-preflight-gate-probe")
-    out = subprocess.run(
-        [sys.executable, "-c", probe],
-        cwd=REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert out.stdout.strip() == "True", out.stdout
-
-
-def test_unconfigured_preflight_forbidden_roots_resolve_at_call_time(tmp_path):
-    """The gate's OWN root already resolves fresh (see the test above), but it
-    used to compare that fresh root against DEFAULT_PREFLIGHT_FORBIDDEN_ROOTS,
-    an import-time constant. A relocated preflight_run_state_root pointing
-    into the (fresh) live-output tree would then no longer match the (stale)
-    forbidden path, silently passing the must_not_look_under check it exists
-    to enforce (Codex review, PR #219: "Resolve forbidden preflight roots at
-    call time"). Points preflight_run_state_root inside the freshly-resolved
-    live root and confirms the gate still recognizes it as forbidden.
-
-    NON-BLOCKING as of 2026-08-02 (Geoff: "should not block any later runs"):
-    a forbidden root degrades a SCHEDULED run to the full universe with a
-    warning, exactly like a manual run, rather than blocking to zero tickers
-    -- this test now asserts that degrade, not a block."""
-    probe = (
-        "import os\n"
-        "from datetime import date, datetime, time\n"
-        "import morning_dca\n"  # imported BEFORE the override
-        f"os.environ['{CRON_TRACKING_ROOT_ENV}'] = os.environ['PROBE_ROOT']\n"
-        "live_root = morning_dca.stream_root('morning_dca')\n"
-        "cfg = morning_dca.MorningConfig("
-        "tickers=('SMALL',), preflight_run_state_root=live_root + '/stray')\n"
-        "ex = morning_dca.MorningDCAExecutor(cfg, mode=morning_dca.MORNING_LIVE_MODE)\n"
-        "now = datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=morning_dca.EASTERN)\n"
-        "admitted = ex._apply_preflight_gate(now, ['SMALL'], manual=False)\n"
-        "print(admitted)\n"
-        "print(ex.preflight_gate['preflight_found'])\n"
-        "print('forbidden' in ex.preflight_gate['warning'])\n"
-    )
-    env = {k: v for k, v in os.environ.items() if k != CRON_TRACKING_ROOT_ENV}
-    env["PROBE_ROOT"] = str(tmp_path / "dca-preflight-forbidden-probe")
-    out = subprocess.run(
-        [sys.executable, "-c", probe],
-        cwd=REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    lines = out.stdout.splitlines()
-    assert lines == ["['SMALL']", "False", "True"], out.stdout
 
 
 def test_csv_qualifying_notional_total_reads_the_canonical_submitted_amount_column(tmp_path):
@@ -15432,7 +14239,7 @@ def test_the_config_missing_fallback_leaves_the_account_unset_when_allowed(monke
     assert cfg.target_account_number is None
 
 
-@pytest.mark.parametrize("mode", [MORNING_WATCHLIST_MODE, MORNING_PREFLIGHT_MODE])
+@pytest.mark.parametrize("mode", [MORNING_WATCHLIST_MODE])
 def test_the_config_missing_fallback_never_pins_a_real_account_for_read_only_modes(mode, tmp_path):
     """Defense in depth alongside run_classification's own profile["trades"]
     gate (Codex review, PR #219: "Omit account numbers from read-only
@@ -15644,11 +14451,9 @@ def test_blocked_live_retry_preserves_potentially_submitted_evidence(tmp_path):
     # retry that blocks before placement then overwrote the dated
     # run_state.json with an empty blocked artifact instead of preserving
     # the still-unresolved broker order and its raw-input references.
-    pf_root = _seed_preflight(tmp_path / "pf", ("SMALL",))
     cfg = MorningConfig(
         tickers=("SMALL",),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -15708,11 +14513,9 @@ class _AmbiguousThenRawFailBroker(FakeLiveBroker):
 
 
 def test_blocked_live_run_preserves_ambiguous_placement_on_later_raw_failure(tmp_path):
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAA", "BBB"))
     cfg = MorningConfig(
         tickers=("AAA", "BBB"),
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
     ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
@@ -15919,13 +14722,11 @@ def test_morning_scheduled_top_up_duplicate_preserves_ambiguous_amount_without_b
     live_root = tmp_path / "live"
     prior_root = tmp_path / "prior"
     prior_root.mkdir(parents=True, exist_ok=True)
-    pf_root = _seed_preflight(tmp_path / "pf", ("NVDA",))
     cfg = MorningConfig(
         tickers=("NVDA",),
         base_buy_amount_usd=3.0,
         max_per_order_usd=15.0,
         morning_run_state_root=str(live_root),
-        preflight_run_state_root=str(pf_root),
         prior_allocation_roots=(str(prior_root),),
         approved_test_dates=frozenset({date(2026, 7, 8)}),
     )
@@ -16128,12 +14929,10 @@ def test_seed_ledger_carries_forward_an_already_seeded_potentially_submitted_row
     ticker would otherwise silently rewrite run_state.json/
     submitted_orders.csv without it.
     """
-    pf_root = _seed_preflight(tmp_path / "pf", ("AAPL",), trading_date=date(2026, 6, 30))
     cfg = MorningConfig(
         tickers=("AAPL",),
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path / "live"),
-        preflight_run_state_root=str(pf_root),
         cap_seed_roots=(),
         approved_test_dates=frozenset({date(2026, 6, 30)}),
     )
@@ -16245,324 +15044,4 @@ def test_same_stream_order_exists_asks_for_every_entry_points_family(tmp_path):
     assert "graded-dca-morning-2026-07-08-AAPL" in asked[0]
     assert "dca-runner-1030-2026-07-08-AAPL" in asked[0]
     assert "morning-dca-manual-2026-07-08-AAPL" not in asked[0]
-
-
-# --- GFUZ Supplemental Preflight Tests (2026-10-04) ---------------------------
-def test_gfuz_supplemental_preflight_absent_validator_gates_out(tmp_path):
-    """When GFUZ is absent from a valid preflight and no validator is provided,
-    GFUZ remains gated out fail-closed (regression test)."""
-    from morning_dca import morning_preflight_eligible_tickers
-
-    pf_root = tmp_path / "preflight"
-    _seed_preflight(pf_root, ("AAPL",))
-
-    now = _now_live()
-    admitted, gate = morning_preflight_eligible_tickers(
-        now,
-        ["AAPL", "GFUZ"],
-        preflight_run_state_root=str(pf_root),
-        supplemental_validator=None,
-    )
-
-    assert admitted == ["AAPL"]
-    assert gate["gated_out_tickers"] == ["GFUZ"]
-    assert gate["gfuz_supplemental"] == {"attempted": False, "reason": "no_supplemental_validator"}
-
-
-def test_gfuz_supplemental_preflight_valid_admits_gfuz_and_persists_artifact(tmp_path):
-    """When validator returns valid=True, GFUZ is admitted, and
-    gfuz_supplemental_preflight.json is persisted before decisioning."""
-    from morning_dca import morning_preflight_eligible_tickers
-
-    pf_root = tmp_path / "preflight"
-    _seed_preflight(pf_root, ("AAPL",))
-    out_dir = tmp_path / "1030_out"
-
-    called_with = []
-
-    def mock_validator(ticker: str):
-        called_with.append(ticker)
-        return {
-            "valid": True,
-            "ticker": ticker,
-            "broker": "robinhood",
-            "price": 12.34,
-            "checked_at": "2026-07-08T10:29:00Z",
-        }
-
-    now = _now_live()
-    admitted, gate = morning_preflight_eligible_tickers(
-        now,
-        ["AAPL", "GFUZ"],
-        preflight_run_state_root=str(pf_root),
-        supplemental_validator=mock_validator,
-        output_dir=out_dir,
-    )
-
-    assert called_with == ["GFUZ"]
-    assert admitted == ["AAPL", "GFUZ"]
-    assert gate["gated_out_tickers"] == []
-    assert gate["gfuz_supplemental"]["attempted"] is True
-    assert gate["gfuz_supplemental"]["valid"] is True
-
-    persisted_path = out_dir / "gfuz_supplemental_preflight.json"
-    assert persisted_path.exists()
-    payload = json.loads(persisted_path.read_text(encoding="utf-8"))
-    assert payload["valid"] is True
-    assert payload["ticker"] == "GFUZ"
-
-
-def test_gfuz_supplemental_preflight_invalid_or_raises_fails_closed(tmp_path):
-    """If supplemental validator returns valid=False, raises, or returns a non-mapping,
-    GFUZ stays gated out fail-closed."""
-    from morning_dca import morning_preflight_eligible_tickers
-
-    pf_root = tmp_path / "preflight"
-    _seed_preflight(pf_root, ("AAPL",))
-
-    now = _now_live()
-
-    # Case 1: validator returns valid=False
-    def invalid_validator(ticker: str):
-        return {"valid": False, "reason": "wide_spread"}
-
-    admitted, gate = morning_preflight_eligible_tickers(
-        now,
-        ["AAPL", "GFUZ"],
-        preflight_run_state_root=str(pf_root),
-        supplemental_validator=invalid_validator,
-        output_dir=tmp_path / "out1",
-    )
-    assert admitted == ["AAPL"]
-    assert gate["gated_out_tickers"] == ["GFUZ"]
-    assert gate["gfuz_supplemental"]["valid"] is False
-    assert gate["gfuz_supplemental"]["reason"] == "wide_spread"
-
-    # Case 2: validator raises
-    def exploding_validator(ticker: str):
-        raise ConnectionError("network unreachable")
-
-    admitted, gate = morning_preflight_eligible_tickers(
-        now,
-        ["AAPL", "GFUZ"],
-        preflight_run_state_root=str(pf_root),
-        supplemental_validator=exploding_validator,
-        output_dir=tmp_path / "out2",
-    )
-    assert admitted == ["AAPL"]
-    assert gate["gated_out_tickers"] == ["GFUZ"]
-    assert gate["gfuz_supplemental"]["valid"] is False
-    # Class name only: the injected connector's message ("network unreachable")
-    # can carry response bodies or credentials and must not reach run artifacts.
-    assert gate["gfuz_supplemental"]["error"] == "validator raised ConnectionError"
-    assert "network unreachable" not in json.dumps(gate)
-
-    # Case 3: validator returns non-mapping
-    def bad_type_validator(ticker: str):
-        return "not a mapping"
-
-    admitted, gate = morning_preflight_eligible_tickers(
-        now,
-        ["AAPL", "GFUZ"],
-        preflight_run_state_root=str(pf_root),
-        supplemental_validator=bad_type_validator,
-        output_dir=tmp_path / "out3",
-    )
-    assert admitted == ["AAPL"]
-    assert gate["gated_out_tickers"] == ["GFUZ"]
-    assert gate["gfuz_supplemental"]["valid"] is False
-    assert "non-mapping" in gate["gfuz_supplemental"]["error"]
-
-
-def test_gfuz_supplemental_preflight_never_called_if_gfuz_in_preflight(tmp_path):
-    """If GFUZ was already declared eligible in the 9:45 preflight, the supplemental
-    validator is never invoked."""
-    from morning_dca import morning_preflight_eligible_tickers
-
-    pf_root = tmp_path / "preflight"
-    _seed_preflight(pf_root, ("AAPL", "GFUZ"))
-
-    called = []
-
-    def mock_validator(ticker: str):
-        called.append(ticker)
-        return {"valid": True}
-
-    now = _now_live()
-    admitted, gate = morning_preflight_eligible_tickers(
-        now,
-        ["AAPL", "GFUZ"],
-        preflight_run_state_root=str(pf_root),
-        supplemental_validator=mock_validator,
-    )
-    assert called == []
-    assert admitted == ["AAPL", "GFUZ"]
-    assert "gfuz_supplemental" not in gate
-
-
-def test_gfuz_supplemental_preflight_missing_or_empty_preflight_leaves_full_universe(tmp_path):
-    """If the preflight artifact is missing or has empty eligible list (degraded mode),
-    the preflight gate degrades to full universe and does not call supplemental validator."""
-    from morning_dca import morning_preflight_eligible_tickers
-
-    called = []
-
-    def mock_validator(ticker: str):
-        called.append(ticker)
-        return {"valid": True}
-
-    now = _now_live()
-    # Missing preflight
-    admitted, gate = morning_preflight_eligible_tickers(
-        now,
-        ["AAPL", "GFUZ"],
-        preflight_run_state_root=str(tmp_path / "nonexistent"),
-        supplemental_validator=mock_validator,
-    )
-    assert called == []
-    assert admitted == ["AAPL", "GFUZ"]
-    assert gate["preflight_found"] is False
-    assert "gfuz_supplemental" not in gate
-
-
-def test_morning_dca_executor_threads_supplemental_validator(tmp_path):
-    """MorningDCAExecutor receives supplemental_validator in constructor and
-    threads it into _apply_preflight_gate."""
-    pf_root = tmp_path / "preflight"
-    _seed_preflight(pf_root, ("AAPL",))
-    run_root = tmp_path / "morning_runs"
-
-    cfg = MorningConfig(
-        tickers=("AAPL", "GFUZ"),
-        morning_run_state_root=str(run_root),
-        preflight_run_state_root=str(pf_root),
-    )
-
-    validator_called = []
-
-    def mock_validator(ticker: str):
-        validator_called.append(ticker)
-        return {"valid": True, "ticker": ticker}
-
-    ex = MorningDCAExecutor(cfg, mode="live", supplemental_validator=mock_validator)
-    assert ex.supplemental_validator is mock_validator
-
-    now = _now_live()
-    admitted = ex._apply_preflight_gate(now, ["AAPL", "GFUZ"], manual=False)
-    assert validator_called == ["GFUZ"]
-    assert admitted == ["AAPL", "GFUZ"]
-    assert ex.preflight_gate is not None
-    assert ex.preflight_gate["gfuz_supplemental"]["valid"] is True
-
-
-def test_morning_dca_executor_run_accepts_supplemental_validator(tmp_path):
-    """run() forwards supplemental_validator and persists its admission result."""
-    pf_root = tmp_path / "preflight"
-    _seed_preflight(pf_root, ("AAPL",))
-    run_root = tmp_path / "morning_runs"
-
-    cfg = MorningConfig(
-        tickers=("AAPL", "GFUZ"),
-        morning_run_state_root=str(run_root),
-        preflight_run_state_root=str(pf_root),
-    )
-
-    called = []
-
-    def mock_validator(ticker: str):
-        called.append(ticker)
-        return {"valid": True, "ticker": ticker}
-
-    ex = MorningDCAExecutor(cfg, mode="live")
-    assert ex.supplemental_validator is None
-
-    now = _now_live()
-    result = ex.run(
-        now,
-        FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.03, "GFUZ": 0.03}),
-        manual=True,
-        supplemental_validator=mock_validator,
-    )
-    assert called == ["GFUZ"]
-    run_state_path = Path(result["paths"]["run_state"])
-    run_state = json.loads(run_state_path.read_text(encoding="utf-8"))
-    assert run_state["preflight_gate"]["gfuz_supplemental"]["valid"] is True
-    assert run_state["preflight_gate"]["admitted_tickers"] == ["AAPL", "GFUZ"]
-    assert {row["ticker"] for row in run_state["signal_rows"]} == {"AAPL", "GFUZ"}
-    supplemental_path = Path(run_state["preflight_gate"]["gfuz_supplemental"]["persisted_file"])
-    assert json.loads(supplemental_path.read_text(encoding="utf-8"))["valid"] is True
-
-
-@pytest.mark.parametrize("loose_valid", ["false", "true", 1, ["x"], {"a": 1}])
-def test_gfuz_supplemental_preflight_requires_literal_true(tmp_path, loose_valid):
-    """A loosely-typed ``valid`` (a truthy string/int/container) must NOT admit GFUZ:
-    only the JSON literal ``true`` does (Copilot review, PR #1597)."""
-    from morning_dca import morning_preflight_eligible_tickers
-
-    pf_root = tmp_path / "preflight"
-    _seed_preflight(pf_root, ("AAPL",))
-
-    admitted, gate = morning_preflight_eligible_tickers(
-        _now_live(),
-        ["AAPL", "GFUZ"],
-        preflight_run_state_root=str(pf_root),
-        supplemental_validator=lambda ticker: {"valid": loose_valid},
-        output_dir=tmp_path / "out",
-    )
-
-    assert admitted == ["AAPL"]
-    assert gate["gated_out_tickers"] == ["GFUZ"]
-    assert gate["gfuz_supplemental"]["valid"] is False
-
-
-def test_morning_dca_executor_run_threads_supplemental_validator(tmp_path):
-    """``run()`` itself must carry the injected validator through _run_impl to the
-    preflight gate: admit GFUZ, persist the supplemental artifact, and place the order.
-    The sibling ``evaluate()`` test would still pass if ``run`` dropped the validator."""
-    pf_root = tmp_path / "preflight"
-    _seed_preflight(pf_root, ("AAPL",))
-    cfg = MorningConfig(
-        tickers=("AAPL", "GFUZ"),
-        base_buy_amount_usd=3.0,
-        morning_run_state_root=str(tmp_path / "morning_runs"),
-        preflight_run_state_root=str(pf_root),
-    )
-    called: list[str] = []
-
-    def validator(ticker: str):
-        called.append(ticker)
-        return {"valid": True, "ticker": ticker}
-
-    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.03, "GFUZ": 0.03})
-    broker = RecordingLiveBroker(account="999000111", reference_prices={"AAPL": 97.0, "GFUZ": 97.0})
-
-    res = ex.run(_now_live(), data, broker=broker, manual=True, supplemental_validator=validator)
-
-    assert called == ["GFUZ"]
-    assert ex.preflight_gate["gfuz_supplemental"]["valid"] is True
-    persisted = list((tmp_path / "morning_runs").rglob("gfuz_supplemental_preflight.json"))
-    assert len(persisted) == 1 and json.loads(persisted[0].read_text())["valid"] is True
-    assert {c["ticker"] for c in res["artifacts"]["buy_candidates"]} == {"AAPL", "GFUZ"}
-    assert {order[0] for order in broker.placed_orders} == {"AAPL", "GFUZ"}
-
-
-def test_morning_dca_executor_run_without_validator_gates_gfuz_out(tmp_path):
-    """Regression pair for the run() path: no validator -> GFUZ stays gated out."""
-    pf_root = tmp_path / "preflight"
-    _seed_preflight(pf_root, ("AAPL",))
-    cfg = MorningConfig(
-        tickers=("AAPL", "GFUZ"),
-        base_buy_amount_usd=3.0,
-        morning_run_state_root=str(tmp_path / "morning_runs"),
-        preflight_run_state_root=str(pf_root),
-    )
-    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
-    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.03, "GFUZ": 0.03})
-    broker = RecordingLiveBroker(account="999000111", reference_prices={"AAPL": 97.0, "GFUZ": 97.0})
-
-    ex.run(_now_live(), data, broker=broker, manual=True)
-
-    assert {order[0] for order in broker.placed_orders} == {"AAPL"}
-    assert ex.preflight_gate["gated_out_tickers"] == ["GFUZ"]
 

@@ -62,10 +62,10 @@ Gate 4 already writes `orders_week.json` under. `stream_root()` joins the text i
 0935ET, 1130/1330/1430ET and 1230ET each drive a *subclass* of
 `MorningDCAExecutor`. This one drives `MorningDCAExecutor` itself, in
 `MORNING_LIVE_MODE` — the morning stream is where that class's default
-(watchlist) mode lives alongside the live one. Two things follow, and they are
+(watchlist) mode lives alongside the live one. One thing follows, and it is
 the whole of what is special about this page.
 
-### 1. The config loader takes `mode` positionally-second
+### The config loader takes `mode` positionally-second
 
 Every other loader in this family is
 `load_*_config(config_dir, *, allow_unpinned_account=...)`. `load_morning_config`
@@ -80,42 +80,13 @@ live 10:30 run — same file, different artifact roots, different
 spec uses it and that the bare loader really would have bound the watchlist roots
 instead.
 
-### 2. The 9:45 pre-flight gate runs
+### The full universe is scored
 
-`MorningDCAExecutor.evaluate()` calls `_apply_preflight_gate()`, which is active
-for exactly one combination — `MORNING_STREAM` + `MORNING_LIVE_MODE` — and so
-fires here and in none of the sibling entry points. It narrows the universe to
-the tickers the same-day 9:45 pre-flight scan marked `eligible_to_execute=true`,
-reading them off the `morning_dca_preflight` artifact tree.
-
-**This makes it the only Gate 5 command in the family that touches the artifact
-tree, and the only one whose output is not purely a function of its arguments.**
-
-Three consequences worth knowing:
-
-- **It is deliberately not fail-closed.** Per Geoff's 2026-08-02 direction
-  (*"should not block any later runs"*), a missing, unparseable, misconfigured or
-  valid-but-empty pre-flight artifact degrades to the **full configured
-  universe** with a warning — for scheduled and manual runs alike. A pre-flight
-  that flagged itself invalid (`overall_ok=false`) is treated the same as a
-  missing one. The 9:45 scan is a coarse pre-screen, never a hard gate the 10:30
-  slot depends on to run; the 10:30 slot's own signal, trend, budget, spread and
-  top-up checks are the real safeguards. See
-  `morning_dca.morning_preflight_eligible_tickers` for the enforcement, which is
-  shared with `run_dca.run_slot("1030ET", ...)` so there is one implementation of
-  the contract.
-- **The verdict is reported, not swallowed.** The document's `preflight_gate`
-  field carries the executor's own gate diagnostic — whether an artifact was
-  found, its run id, `admitted_tickers`, `gated_out_tickers`, whether it was
-  recovered via the bounded lookup, and any degradation warning. A reader that
-  sees a short candidate list can tell a narrow pre-screen from a quiet tape.
-  The field is `null` in every sibling slot's document, so "gate not applicable"
-  and "gate found nothing" never look alike.
-- **Which tree is read follows config.** `config/morning_dca.json`'s
-  `preflight_run_state_root` selects it, `preflight_forbidden_roots` refuses a
-  root that resolves under a live-output or cron-ID tree, and
-  `$DCA_CRON_TRACKING_ROOT` is honoured — so a relocated/staging run stays
-  contained rather than reading production evidence.
+Nothing narrows the universe before scoring: every configured, non-excluded
+ticker is evaluated, as in every sibling generator. The command reads no artifact
+tree, so its output is purely a function of its arguments. (A former 9:45
+pre-flight scan used to narrow the 10:30 universe; it was retired in 2026-10, and
+the document no longer carries a `preflight_gate` field.)
 
 ## Trend validation applies — so the payload needs the session so far
 
@@ -197,8 +168,6 @@ Gate 5 and nothing past it. This command calls `MorningDCAExecutor.evaluate()`,
 never `run()`: `run()` owns budget arithmetic, the same-day top-up guard,
 placement, drift detection and the artifact tree — Gates 6 through 9 — which the
 prompt's own gate sequence also owns. `evaluate()` needs no broker, no
-credentials and no network, and cannot place an order. It does read the
-pre-flight artifact tree, as described above; that is the one exception to
-"writes nothing, reads nothing", and it is a read, never a write. See
+credentials and no network, and cannot place an order. See
 `docs/midday_signal_entry.md`'s "Why it calls `evaluate()`, not `run()`" for the
 full argument; it applies unchanged here.

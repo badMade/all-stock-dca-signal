@@ -24,7 +24,7 @@ trading is the safest mode for connection testing; toggle it with
 ``AlpacaConfig.is_paper_api``.
 
 Live contract note (2026-07-23): the authoritative scheduled live contract now
-spans four Robinhood-only streams (9:45 preflight, 10:30 morning live, 12:30
+spans the Robinhood-only streams (9:45 watchlist scan, 10:30 morning live, 12:30
 midday live, 3:30 final live). Runners must validate same-day pointers before
 trusting them, treat a ticker with no prior same-day context as a first
 allocation (top-up only when prior same-day context exists and the price is
@@ -33,7 +33,7 @@ submitted orders and Robinhood history before any fallback placement, place
 dollar buys as notional market orders (type='market', dollar_amount,
 time_in_force='gfd'; regular session only), and — for live runs that reached
 signal computation — always write a non-null run_classification plus
-signals.csv and submitted_orders.csv (the read-only 9:45 preflight and the
+signals.csv and submitted_orders.csv (the read-only 9:45 watchlist scan and the
 pre-signal raw-persistence failure path are standing exceptions). A 3:05
 read-only monitor also runs (no trading).
 
@@ -9400,7 +9400,7 @@ def _backfill_orders_csv_usage_locked(run_state_path: Path) -> Optional[bytes]:
     which another invocation sharing this identity could replace the file
     before that unlocked read ran, silently adopting the peer's payload as
     "this invocation's last verified state" and letting the downstream
-    raw-manifest/preflight_gate rewrites mutate the peer's artifact instead
+    raw-manifest rewrite mutate the peer's artifact instead
     (Codex review: "Bind the post-run snapshot to the ownership check").
     Threading the exact bytes out of this lock closes that window instead
     of merely narrowing it. ``None`` only when the file does not exist at
@@ -36890,15 +36890,15 @@ def _run_once_impl(
     # feature has never been used at all), stream_root(
     # "inverse_martingale_dca") was never created, so this costs one
     # directory-existence check and nothing more.
-    # Skipped entirely for the "morning" stream: run_dca.run_slot("1030ET")
-    # temporarily narrows config.tickers to the 9:45 pre-flight-admitted
-    # subset (`slot_config = replace(config, tickers=slot_tickers, ...)`,
-    # run_dca.py's own morning-only preflight gate), so `tradable_tickers`
-    # below is a SLOT-FILTERED evaluation subset during this stream, not the
-    # canonical configured universe -- unlike "midday"/"afternoon", which
-    # always see the full config.tickers. Without this guard, a ticker
-    # merely gated out of THIS ONE morning slot (a transient reason -- a
-    # wide spread, missing data -- not a genuine removal from config/
+    # Skipped entirely for the "morning" stream. Historically
+    # run_dca.run_slot("1030ET") narrowed config.tickers to a slot-filtered
+    # subset (the 9:45 pre-screen, since retired), so `tradable_tickers` below
+    # was not the canonical configured universe during this stream, unlike
+    # "midday"/"afternoon". Nothing narrows it any more; the deferral is kept
+    # as-is so retiring the pre-screen changes no cleanup behavior (revisit if
+    # the morning stream should run this pass too). Without the guard, a
+    # ticker merely gated out of ONE slot (a transient reason -- a wide
+    # spread, missing data -- not a genuine removal from config/
     # tickers.json) would look identical, from this cleanup pass's own
     # tradable-set check, to a ticker genuinely dropped from the universe or
     # excluded, and its real accumulated balance would be discarded even
@@ -39549,7 +39549,7 @@ def run_daily_compact(
         # `run_dca._run_pipeline_impl` prefers
         # `result["_run_state_bytes_under_lock"]` over its own unlocked
         # re-read of the shared path when binding the snapshot its later
-        # raw-manifest/preflight_gate rewrites compare against (Codex
+        # raw-manifest rewrite compares against (Codex
         # review: "Bind the post-run snapshot to the ownership check"). That
         # fallback previously covered every path with no such key set --
         # including THIS blocked-but-owned path -- with its own unlocked
@@ -41493,7 +41493,7 @@ def run_daily_compact(
     # DIFFERENT invocation's (or account's) state, never this one's own --
     # `blocked=False` alone does not say that, so a caller that only checks
     # `blocked` before doing its own post-processing (refreshing the raw-
-    # input manifest, persisting preflight_gate, merging raw placement
+    # input manifest, merging raw placement
     # responses) would keep treating that foreign path as its own output
     # and corrupt it the same way this function's own unified critical
     # section exists to prevent (Codex review: "Propagate foreign ownership

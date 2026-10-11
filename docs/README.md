@@ -43,10 +43,10 @@ environment (see the repository README).
 | [backtest_curve.md](backtest_curve.md) | Analytics-only weekly-rollover intraday cap curve backtest (35 / 65 / 100 candidate) |
 | [pr_review_workflow.md](pr_review_workflow.md) | The two-workflow PR review split, its trust boundary, and the CI-enforced workflow policy checks |
 | [scheduled_session_repo_access.md](scheduled_session_repo_access.md) | Dated probe log for whether a Routine-fired scheduled session actually has working repo (clone/fetch/push) and environment (account number) access |
-| [morning_dca.md](morning_dca.md) | The morning stream (`MorningDCAExecutor`): 9:45 watchlist/pre-flight and 10:30 live modes, task/ET/artifact-root tables, the Jul 10 2026 ladder unification |
+| [morning_dca.md](morning_dca.md) | The morning stream (`MorningDCAExecutor`): 9:45 watchlist and 10:30 live modes, task/ET/artifact-root tables, the Jul 10 2026 ladder unification |
 | [midday_dca.md](midday_dca.md) | The midday stream (`MiddayDCAExecutor`): 12:30 live mode, trend validation, artifact contract |
 | [market_open_signal_entry.md](market_open_signal_entry.md) | Gate 5 signal generation for the 9:35 AM market-open slot (`scripts/generate_market_open_candidates.py`): payload contract, refresh step, output document |
-| [morning_signal_entry.md](morning_signal_entry.md) | Gate 5 signal generation for the 10:30 AM morning slot (`scripts/generate_morning_candidates.py`), including the inherited 9:45 pre-flight gate |
+| [morning_signal_entry.md](morning_signal_entry.md) | Gate 5 signal generation for the 10:30 AM morning slot (`scripts/generate_morning_candidates.py`) |
 | [midday_signal_entry.md](midday_signal_entry.md) | Gate 5 signal generation for the 12:30 PM midday slot (`scripts/generate_midday_candidates.py`) and its required 7-day deployment figure |
 | [intraday_signal_entry.md](intraday_signal_entry.md) | Gate 5 signal generation for the 11:30 AM, 1:30 PM and 2:30 PM intraday slots (`scripts/generate_intraday_candidates.py --slot`) |
 | [GATE5_FIX.md](GATE5_FIX.md) | The Gate 5 failure fix: how signal generation became a real, tested entry point per slot |

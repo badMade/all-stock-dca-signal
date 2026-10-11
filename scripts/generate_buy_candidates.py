@@ -25,7 +25,7 @@ what drives market-open, morning, midday, or intraday today -- those run
 through ``morning_dca.MorningDCAExecutor.evaluate_signal()``, a separately
 implemented method with its own dataclass (``MorningSignal``, not
 ``SourceSignal``), its own manual-review-candidate handling, and (for the
-10:30 live mode) its own same-day preflight-gate ticker narrowing.
+10:30 live mode) its own per-stream wiring.
 
 Calling ``evaluate_source_signal`` for those other six slots would not reuse
 their real logic -- it would silently be a FOURTH, non-matching
@@ -35,8 +35,7 @@ has to construct and call the actual ``MarketOpenDCAExecutor`` /
 ``MorningDCAExecutor`` / ``MiddayDCAExecutor`` / ``IntradayDCAExecutor``
 instances' own ``.evaluate()`` method instead -- a materially different,
 not-yet-built integration (those classes are stateful, take their own
-per-stream config objects, and for 10:30 specifically need the same-day
-preflight artifact). Extending this module's ``SLOT_SPECS`` to those slots
+per-stream config objects). Extending this module's ``SLOT_SPECS`` to those slots
 without that dispatch would ship a plausible-looking but factually wrong
 signal generator for six-sevenths of the roster.
 

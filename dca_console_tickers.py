@@ -201,7 +201,7 @@ def build_tickers_snapshot(repo: Path, config_dir: Path, today: date | None = No
         elif category == "whole_share":
             note = universe["whole_share_reasons"].get(symbol, "Whole-share accumulation.")
         elif symbol in universe["special_handling"]:
-            note = "Special broker/preflight routing applied."
+            note = "Special broker routing applied."
 
         items.append({
             "symbol": symbol,

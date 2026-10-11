@@ -31,10 +31,6 @@ Key properties (see ``config/market_open_dca.json`` and
       at 9:35 only five minutes of regular-session data exist, so a completed
       60-minute intraday downtrend can never validate and requiring it would zero
       the slot. Every other circuit breaker stays fully enforced.
-    - **Never gates on the 9:45 pre-flight artifact.** This slot fires ten
-      minutes before that artifact is written; only the 10:30 morning stream
-      consumes it. The inherited pre-flight gate is stream-scoped to
-      ``MORNING_STREAM`` and so is inert here.
     - **First buy of the day.** It normally finds no prior same-day allocation
       and places the full desired amount. The inherited top-up guard still runs so
       a hand-placed manual recovery fill earlier the same day is honoured.

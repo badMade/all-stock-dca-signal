@@ -22,17 +22,17 @@ None is dead, but they are not interchangeable, and a fix applied to one does
 
 | Entry point | Shape | Invoked by | Notes |
 | --- | --- | --- | --- |
-| `run_dca.run_slot()` | Function pipeline over `near_close_dca` primitives | `run_dca.py` itself; the 3:30 PM live path | The only path with a real `__main__` (via `near_close_dca.py`). Re-implements the morning preflight gate rather than calling `MorningDCAExecutor`'s. |
+| `run_dca.run_slot()` | Function pipeline over `near_close_dca` primitives | `run_dca.py` itself; the 3:30 PM live path | The only path with a real `__main__` (via `near_close_dca.py`). |
 | `MorningDCAExecutor` + 3 subclasses | Class hierarchy, one class per stream | **External agent/prompt** constructing the class and calling `.run(now, data, broker=…)` | **No in-repo caller and no CLI.** Nothing in this repository runs them; `grep` for `MiddayDCAExecutor(` etc. hits only their own modules and tests. |
 | `dca_runner.py` | Gate sequence + injected callables | **External agent session** holding MCP runtime access | Deliberate design, not abandoned: it exists so guardrails live in diffable code instead of truncatable prompt text. Covered by `test_live_reliability_contract.py` and pinned by `test_config_invariants.py`. |
 
 **Consequences worth internalizing before changing anything:**
 
-- **Duplicated logic drifts silently.** `run_slot()` carries its own copy of the
-  morning preflight gate, with a comment acknowledging the duplication
-  (`run_dca.py`: *"routed only through the generic pipeline, `run_slot("1030ET")`
-  never called that gate at all"*). A fix to `_apply_preflight_gate()` will not
-  reach `run_slot()`, or vice versa.
+- **Duplicated logic drifts silently.** The three entry points seed their
+  daily/weekly caps from three different sources: `dca_runner`'s Gate 6 sums
+  broker order history, the executor classes scan same-day run artifacts, and
+  `near_close_dca.within_caps` reads `StrategyState` plus artifact seeding. A cap
+  fix applied to one does not reach the others.
 - **"No in-repo callers" ≠ dead code.** The executor classes, `dca_runner.py`,
   `dca_cost_tracker.py`, `dca_weekly_dashboard.py`, and
   `scripts/same_day_top_up_gate.py` all have zero in-repo callers **by design** —
@@ -455,8 +455,8 @@ all caps and circuit breakers **without per-order human confirmation**:
   (`review_equity_order` first). The `review_fn`/`place_fn` wiring above is the
   manual path; a scheduled live run skips `review_fn`.
 
-The morning 10:30 live run additionally loads the same-day 9:45 **pre-flight**
-artifact and evaluates only `eligible_to_execute=true` tickers. See
+The morning 10:30 live run scores the full configured, non-excluded universe and
+reads no 9:45 artifact. See
 [safeguards.md](safeguards.md), [morning_dca.md](morning_dca.md), and the
 `execution_authorization_policy` / `circuit_breakers` blocks in
 [`config/budgets.json`](../config/budgets.json).

@@ -1927,10 +1927,9 @@ def test_date_cues_are_word_bounded(line, exempt, label):
 # (e.g. watchdog_reconciliation_scope_patch_2026_07_27) also use the key
 # "broker_account", but nothing reads those blocks at runtime -- see
 # morning_dca.load_morning_config / midday_dca.load_midday_config, which only
-# ever look at raw["live_task"], raw["watchlist_task"], and
-# raw["preflight_task"]. Flagging those prose blocks would be noise, not signal.
+# ever look at raw["live_task"] and raw["watchlist_task"]. Flagging those prose blocks would be noise, not signal.
 _RUNTIME_BROKER_ACCOUNT_PATHS = {
-    "morning_dca.json": ("live_task", "watchlist_task", "preflight_task"),
+    "morning_dca.json": ("live_task", "watchlist_task"),
     "midday_dca.json": ("live_task",),
 }
 
@@ -3410,9 +3409,9 @@ def test_the_missing_budgets_fallback_defaults_match_the_shipped_config():
         overrides = morning_dca._live_circuit_breaker_overrides(Path(empty), morning_dca.MORNING_LIVE_MODE)
         assert overrides["max_consecutive_placement_failures"] == dca_config.DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
         assert overrides["max_orders_per_day"] == dca_config.DEFAULT_MAX_ORDERS_PER_DAY
-        # Watchlist/preflight never place, and must stay off this path so a
-        # malformed budgets.json cannot block the 9:45 validation artifact.
-        assert morning_dca._live_circuit_breaker_overrides(Path(empty), morning_dca.MORNING_PREFLIGHT_MODE) == {}
+        # Watchlist never places, and must stay off this path so a malformed
+        # budgets.json cannot block the 9:45 watchlist scan artifact.
+        assert morning_dca._live_circuit_breaker_overrides(Path(empty), morning_dca.MORNING_WATCHLIST_MODE) == {}
 
     # ...and SCOPED THE SAME WAY on that side, which the round-50 fix asserted
     # for `dca_config` and never asked of the loader it was fixing.

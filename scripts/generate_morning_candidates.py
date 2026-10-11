@@ -21,7 +21,7 @@ THIS IS THE BASE CLASS, NOT A SUBCLASS
 The other three entry points drive a subclass of ``MorningDCAExecutor``. This one
 drives ``MorningDCAExecutor`` itself, in ``MORNING_LIVE_MODE`` -- the morning
 stream is where that class's default (watchlist) mode lives alongside the live
-one, so two things differ from every sibling module:
+one, so one thing differs from every sibling module:
 
 * **The config loader takes ``mode`` positionally-second.**
   ``load_morning_config(config_dir, mode, *, allow_unpinned_account=...)``,
@@ -29,37 +29,6 @@ one, so two things differ from every sibling module:
   Handing the shared CLI the bare function would have loaded the 9:45
   WATCHLIST profile's config for a 10:30 LIVE run -- silently, since both parse
   the same file. :func:`load_morning_live_config` below pins the mode.
-* **The 9:45 pre-flight gate runs.** See the next section.
-
-THE 9:45 PRE-FLIGHT GATE (the one filesystem read in this family)
------------------------------------------------------------------
-``MorningDCAExecutor.evaluate()`` calls ``_apply_preflight_gate()``, which is
-active for exactly one combination -- ``MORNING_STREAM`` + ``MORNING_LIVE_MODE``
--- and therefore fires here and in none of the sibling entry points. It narrows
-the universe to the tickers the same-day 9:45 pre-flight scan marked
-``eligible_to_execute=true``, reading them off the ``morning_dca_preflight``
-artifact tree.
-
-That makes this the only Gate 5 command in the family that touches the artifact
-tree at all, and the only one whose output is not purely a function of its
-arguments. Two consequences worth knowing before you run it:
-
-* **It is NOT fail-closed, deliberately.** Per Geoff's 2026-08-02 direction
-  ("should not block any later runs"), a missing, unparseable, misconfigured or
-  valid-but-empty pre-flight artifact degrades to the FULL configured universe
-  with a warning -- for scheduled and manual runs alike. The 9:45 scan is a
-  coarse pre-screen, never a hard gate the 10:30 slot depends on to run; the
-  10:30 slot's own signal, trend, budget, spread and top-up checks are the real
-  safeguards. See :func:`morning_dca.morning_preflight_eligible_tickers`.
-* **The verdict is reported, not swallowed.** The output document's
-  ``preflight_gate`` field carries the executor's own gate diagnostic -- whether
-  an artifact was found, its run id, which tickers were admitted, which were
-  gated out, and any degradation warning. A reader that sees a short candidate
-  list can tell a quiet tape apart from a narrow pre-screen. It is ``null`` in
-  every sibling slot's document, where the gate does not apply.
-* Which tree gets read follows ``config/morning_dca.json``'s
-  ``preflight_run_state_root`` and honours ``$DCA_CRON_TRACKING_ROOT``, so a
-  relocated/staging run stays contained rather than reading production evidence.
 
 SLOT-SPECIFIC NOTES
 -------------------
@@ -100,17 +69,14 @@ that prompt requires. See ``docs/morning_signal_entry.md``.
 
 from __future__ import annotations
 
-from datetime import datetime, time
 from typing import Any, Mapping, Optional, Sequence
 
 from morning_dca import (
-    EASTERN,
     MORNING_LIVE_CRON_ID,
     MORNING_LIVE_MODE,
     MORNING_STREAM,
     MorningDCAExecutor,
     load_morning_config,
-    morning_preflight_eligible_tickers,
 )
 from near_close_dca import SourceName
 from scripts.stream_candidates import (
@@ -122,7 +88,6 @@ from scripts.stream_candidates import (
 
 __all__ = [
     "MORNING_SPEC",
-    "preflight_admitted_tickers",
     "generate_morning_candidates",
     "load_morning_live_config",
     "main",
@@ -149,36 +114,6 @@ def load_morning_live_config(config_dir=None, *, allow_unpinned_account: bool = 
     )
 
 
-def preflight_admitted_tickers(trading_day, tickers, config):
-    """The tickers the same-day 09:45 pre-flight admits, for the shared core's
-    pre-parse narrowing.
-
-    Calls :func:`morning_dca.morning_preflight_eligible_tickers` -- the repo's
-    single implementation of this contract, shared with
-    ``MorningDCAExecutor._apply_preflight_gate`` and
-    ``run_dca.run_slot("1030ET", ...)`` -- rather than re-deriving eligibility.
-    A second definition here would be free to drift from the one the executor
-    actually applies, which is the whole reason that function was extracted.
-
-    ``manual=False``: this entry point mirrors the SCHEDULED live path. That
-    distinction does not change the outcome today (the gate is non-blocking for
-    scheduled and manual runs alike), but passing the honest value keeps this
-    correct if the contract is ever re-tightened.
-
-    Only the admitted list is used here; the gate diagnostic this discards is
-    recomputed and published by ``evaluate()`` itself, which is what the
-    document's ``preflight_gate`` field reports.
-    """
-    admitted, _gate = morning_preflight_eligible_tickers(
-        datetime.combine(trading_day, time(0, 0), tzinfo=EASTERN),
-        list(tickers),
-        preflight_run_state_root=config.preflight_run_state_root,
-        preflight_forbidden_roots=config.preflight_forbidden_roots,
-        preflight_bounded_recovery=config.preflight_bounded_recovery,
-    )
-    return admitted
-
-
 MORNING_SPEC = StreamSpec(
     slot="1030ET",
     runner_slot_id="1030",
@@ -193,10 +128,6 @@ MORNING_SPEC = StreamSpec(
     # the producer's job the way 1230ET's does.
     requires_deployed_last_7d_usd=False,
     doc_ref="docs/morning_signal_entry.md",
-    # See preflight_admitted_tickers: narrows the scored universe to the 09:45
-    # verdict BEFORE payload validation, so a gated-out ticker's malformed
-    # evidence cannot abort a run the executor would have completed.
-    universe_filter=preflight_admitted_tickers,
 )
 
 MORNING_SOURCE = MORNING_SPEC.source
@@ -216,10 +147,8 @@ def generate_morning_candidates(
 ) -> dict:
     """Run the morning executor's own evaluation and return the Gate 5 document.
 
-    Note the 9:45 pre-flight gate described in the module docstring: unlike the
-    sibling generators this reads the ``morning_dca_preflight`` artifact tree, so
-    the same arguments can produce different universes on different machines. The
-    gate's own verdict rides along in the document's ``preflight_gate`` field.
+    Every configured, non-excluded ticker is scored, as in every sibling generator: nothing narrows the universe
+    before scoring, so the same arguments give the same universe on every machine.
     """
     return build_document(
         MORNING_SPEC,
