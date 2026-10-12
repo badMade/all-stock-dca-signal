@@ -757,8 +757,8 @@ Tests: [`scripts/tests/test_same_day_pointer.py`](../scripts/tests/test_same_day
 
 ## Scheduled-run artifact contract (added 2026-07-21)
 
-The Jul 21 2026 scheduled runs exposed two artifact-schema failures: the 9:45
-pre-flight and 10:30 morning-live `run_state.json` files carried a **null
+The Jul 21 2026 scheduled runs exposed two artifact-schema failures: the
+10:30 morning-live `run_state.json` (and the since-retired 9:45 pre-flight's) carried a **null
 top-level `run_classification`**, and the 10:30 live run **dropped signals.csv
 and submitted_orders.csv** even though its summary claimed they were written. A
 null classification breaks scheduled-vs-manual attribution downstream, and a
@@ -769,17 +769,9 @@ The contract, one source of truth in
 [`scripts/scheduled_artifacts.py`](../scripts/scheduled_artifacts.py):
 
 1. **`run_classification` is always a non-null object, never `null`.** Every
-   scheduled `run_state.json` (9:45 pre-flight, 10:30 morning live, 12:30 midday
+   scheduled `run_state.json` (10:30 morning live, 12:30 midday
    live) must carry a non-null top-level `run_classification` object. A null,
    absent, or non-object value is a contract failure.
-   - **9:45 pre-flight** (`build_preflight_run_classification`): `run_origin='scheduled'`,
-     `run_type='morning_dca_preflight'`, `scheduled_for_et='09:45'`,
-     `manual_run=false`, `state_schema_version='morning-preflight-v2-machine-complete'`,
-     `run_id`, `triggered_at_utc`, `cron_id='bb4f6ef1'`, `stream='morning'`,
-     `trading_day`, `same_day_required=true`, `valid_scheduled_evidence` derived
-     from the completed state. Matches the actual producer
-     (`morning_dca.py`'s `MORNING_PREFLIGHT_CRON_ID`/`MORNING_PREFLIGHT_RUN_TYPE`)
-     and [`schemas/morning_preflight.schema.json`](../schemas/morning_preflight.schema.json).
    - **10:30 morning live** (`build_morning_live_run_classification`): `run_origin='scheduled'`,
      `manual_run=false`, `stream='morning'`, `scheduled_for_et='10:30'`,
      `cron_id='42173154'`, `run_id`, `state_schema_version`, `trading_day`,
@@ -798,7 +790,7 @@ The contract, one source of truth in
    `run_state.json` is missing/unreadable, when `run_classification` is
    null/absent/not-an-object, or when a required CSV is missing.
    `require_submitted_orders` is True for live runs and False for read-only
-   pre-flight runs.
+   runs.
 5. **Same contract for the 3:30 final live run.** The afternoon final live task
    (`10ce362c`) also writes a non-null `run_classification` object in both
    `run_state.json` and `run_summary.json`. For 3:30 the object carries
@@ -961,11 +953,11 @@ Two qualifiers on the "healthy" rows:
   row can carry `spread_status='spread_unavailable'` and still be stopped later
   by human review, which is not a spread-caused outcome.
 
-Three paths write and return before the classifier runs, so each stamps its own
+Two paths write and return before the classifier runs, so each stamps its own
 outcome: the calendar/window block
-(`completion_reason='date_or_holiday_gate_blocked'`), the preflight-missing
-block, and the wiring blocks (absent broker, wrong live account, raw-input
-persistence failure). The last two share
+(`completion_reason='date_or_holiday_gate_blocked'`) and the wiring blocks
+(absent broker, wrong live account, raw-input
+persistence failure). The wiring blocks share
 `error_class='scheduled_run_blocked_before_placement'` unless the caller already
 set a more specific one, such as `missing_or_invalid_raw_inputs`.
 
@@ -1139,11 +1131,11 @@ completed order evidence false while still proving the scheduled task fired.
 
 | Function | Purpose |
 |---|---|
-| `build_preflight_run_classification` / `build_morning_live_run_classification` | Build the non-null scheduled classification for the 9:45 / 10:30 runs |
+| `build_morning_live_run_classification` | Build the non-null scheduled classification for the 10:30 run |
 | `submitted_order_rows` | Rows for submitted_orders.csv (placed/in-flight statuses or an order_id; pending/unconfirmed preserved) |
 | `write_signals_csv` / `write_submitted_orders_csv` | Write the CSVs; both emit a header even when empty |
 | `validate_run_artifacts` | Validate the run directory against the contract |
 
 Tests: [`scripts/tests/test_scheduled_artifacts.py`](../scripts/tests/test_scheduled_artifacts.py)
-and the preflight/live artifact tests in
-[`test_morning_dca.py`](../test_morning_dca.py).
+and the live artifact tests in
+[`test_morning_dca.py`](../tests/test_morning_dca.py).

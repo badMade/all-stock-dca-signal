@@ -1532,7 +1532,7 @@ def test_expand_config_env_substitutes_a_set_variable(monkeypatch):
 def test_expand_config_env_passes_through_plain_values(monkeypatch):
     """A value with no ${...} reference is returned verbatim.
 
-    config/morning_dca.json's watchlist/preflight tasks carry the literal
+    config/morning_dca.json's watchlist task carries the literal
     "read_only" in the same field the live task uses for the account reference.
     """
     monkeypatch.delenv("DCA_TEST_ACCOUNT", raising=False)
@@ -1567,14 +1567,13 @@ def test_expand_config_env_names_its_source_in_the_error(monkeypatch):
 
 # --- Per-mode broker-account binding -----------------------------------------
 # load_morning_config used to read raw["live_task"]["broker_account"] for EVERY
-# mode, so the read-only watchlist/preflight scans silently bound the live
+# mode, so the read-only watchlist scan silently bound the live
 # trading account. Once the account moved into the environment that became
 # load-breaking: constructing a read-only executor raised MissingConfigEnvError
-# on a host where the secret is scoped only to the trading jobs -- and the 9:45
-# preflight artifact is a hard dependency of the 10:30 live run (Codex review,
+# on a host where the secret is scoped only to the trading jobs (Codex review,
 # PR #219).
 
-@pytest.mark.parametrize("mode", ["watchlist", "preflight"])
+@pytest.mark.parametrize("mode", ["watchlist"])
 def test_read_only_morning_modes_do_not_need_the_account_variable(monkeypatch, mode):
     from morning_dca import load_morning_config
 

@@ -38,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import dca_paths
 from dca_alerts import (
@@ -58,9 +58,7 @@ from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
     MORNING_LIVE_CRON_ID,
     MORNING_LIVE_MODE,
-    MORNING_STREAM,
     load_morning_config,
-    morning_preflight_eligible_tickers,
 )
 from near_close_dca import (
     _TS_FLOOR,
@@ -2093,11 +2091,10 @@ def _accepted_order_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def _pipeline_result_ok(result: Any) -> bool:
     """Predicate for guarded_run to determine if a pipeline run succeeded.
 
-    The raw-persistence failure path and the preflight-blocked path
-    both report their failure as a returned result (each with its own
-    targeted alert) instead of raising; either must ping a FAILED
-    heartbeat, not clear the dead-man's switch (Codex review: "Route
-    the preflight-blocked result through guarded_run"). A directory-
+    The raw-persistence failure path
+    reports its failure as a returned result (with its own
+    targeted alert) instead of raising; it must ping a FAILED
+    heartbeat, not clear the dead-man's switch. A directory-
     ownership conflict (an overlapping invocation or a different
     account claimed the shared artifacts directory) is the same
     shape of silent failure: _run_pipeline_impl returns a normal-
@@ -2206,7 +2203,6 @@ def run_pipeline(
     cron_id: str = AFTERNOON_LIVE_CRON_ID,
     classification_overrides: Optional[Dict[str, Any]] = None,
     correlation_id: Optional[str] = None,
-    preflight_gate: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Thin wrapper around ``_run_pipeline_impl``: same signature plus the
     opt-in ``model_usage_log_root`` (see scripts/model_usage_log.py,
@@ -2232,16 +2228,6 @@ def run_pipeline(
     (dead-man's switch for the missed-fire failure class). Demo/dry-run and
     unscheduled calls only get a log handler ensured.
 
-    ``preflight_gate`` (``run_slot``'s morning-preflight diagnostic dict, see
-    ``morning_preflight_eligible_tickers``) is forwarded to
-    ``_run_pipeline_impl``, which checks it from INSIDE this guarded scope --
-    after its own calendar gate, so a weekend/holiday absence of the same-day
-    09:45 artifact is never misdiagnosed as a failed prerequisite -- rather
-    than ``run_slot`` short-circuiting before ``run_pipeline`` is even
-    called. That earlier short-circuit bypassed this function's heartbeat
-    and model-usage-log append entirely, letting the dead-man's switch read
-    a blocked-but-written slot as one that never fired at all (Codex
-    review: "Route the preflight-blocked result through guarded_run").
     """
 
     # Snapshotted BEFORE _invoke() runs, so the probe passed to guarded_run
@@ -2273,7 +2259,6 @@ def run_pipeline(
             classification_overrides=classification_overrides,
             correlation_id=correlation_id,
             stream=stream_name,
-            preflight_gate=preflight_gate,
         )
         _log_pipeline_model_usage(
             result,
@@ -2311,11 +2296,10 @@ def run_pipeline(
             # is not credited with a write it never made itself -- codex review
             # discussion_r3660858013.
             run_artifact_written=run_artifact_written,
-            # The raw-persistence failure path and the preflight-blocked path
-            # both report their failure as a returned result (each with its own
-            # targeted alert) instead of raising; either must ping a FAILED
-            # heartbeat, not clear the dead-man's switch (Codex review: "Route
-            # the preflight-blocked result through guarded_run"). A directory-
+            # The raw-persistence failure path
+            # reports its failure as a returned result (with its own
+            # targeted alert) instead of raising; it must ping a FAILED
+            # heartbeat, not clear the dead-man's switch. A directory-
             # ownership conflict (an overlapping invocation or a different
             # account claimed the shared artifacts directory) is the same
             # shape of silent failure: _run_pipeline_impl returns a normal-
@@ -2366,7 +2350,6 @@ def run_slot(
     model_usage_model_actual: Optional[str] = None,
     model_usage_model_routing_mode: Optional[str] = None,
     model_usage_reason_for_premium_model: Optional[str] = None,
-    supplemental_validator: Optional[Callable[[str], Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Run one canonical roster slot with slot-scoped identity and guardrails."""
     normalized_slot = slot.strip().upper()
@@ -2379,48 +2362,6 @@ def run_slot(
     trading_day = now.astimezone(EASTERN).date().isoformat()
     correlation_id = build_correlation_id(trading_day, stream_name, window)
     slot_tickers = config.tickers
-    preflight_gate: Optional[Dict[str, Any]] = None
-    if stream_name == MORNING_STREAM:
-        # The 10:30 slot admits its universe through the SAME
-        # morning_preflight_eligible_tickers() MorningDCAExecutor.
-        # _apply_preflight_gate() uses, so the two entry points cannot drift on
-        # ticker admission. Its contract is NON-BLOCKING as of 2026-08-02 (see
-        # the branch below): a missing, forbidden-root or empty same-day 9:45
-        # preflight artifact degrades to the full configured universe with a
-        # recorded warning, not to zero. Routed only through the generic
-        # pipeline, run_slot("1030ET") once skipped the gate entirely (Codex
-        # review: "Route the morning slot through its required preflight
-        # gate"). allow_unpinned_account=True: this
-        # call only needs the preflight root/forbidden-roots/bounded-recovery
-        # fields, not an account -- the broker/account this slot actually
-        # trades through is the caller-supplied ``broker`` above.
-        morning_config = load_morning_config(config_dir=config_dir, mode=MORNING_LIVE_MODE, allow_unpinned_account=True)
-        slot_tickers, preflight_gate = morning_preflight_eligible_tickers(
-            now,
-            config.tickers,
-            preflight_run_state_root=morning_config.preflight_run_state_root,
-            preflight_forbidden_roots=morning_config.preflight_forbidden_roots,
-            preflight_bounded_recovery=morning_config.preflight_bounded_recovery,
-            supplemental_validator=supplemental_validator,
-            output_dir=artifacts_dir,
-        )
-        if preflight_gate.get("warning"):
-            # NON-BLOCKING as of 2026-08-02: morning_preflight_eligible_
-            # tickers() no longer sets preflight_missing_block (that flag is
-            # never set by anything anymore) -- a missing, forbidden-root, or
-            # valid-but-empty same-day preflight artifact now degrades to the
-            # full configured universe and reports it via this "warning"
-            # field instead. Log it here so it is not silently indistinguishable
-            # from a normal evaluation, and it is also persisted onto
-            # artifacts["preflight_gate"] by run_pipeline() below for durable
-            # observability (Codex review: "Emit the advisory preflight
-            # warning from run_slot").
-            logger.warning("1030ET preflight gate: %s", preflight_gate["warning"])
-        elif preflight_gate.get("gated_out_tickers"):
-            logger.info(
-                "1030ET preflight gate excluded tickers not admitted by the 9:45 pre-flight: %s",
-                preflight_gate["gated_out_tickers"],
-            )
     slot_config = replace(
         config,
         tickers=slot_tickers,
@@ -2482,7 +2423,6 @@ def run_slot(
         cron_id=_SLOT_CRON_ID[stream_name],
         classification_overrides=_slot_classification_overrides(stream_name, window, trading_day),
         correlation_id=correlation_id,
-        preflight_gate=preflight_gate,
     )
     return {**result, "correlation_id": correlation_id}
 
@@ -3668,7 +3608,6 @@ def _run_pipeline_impl(
     classification_overrides: Optional[Dict[str, Any]] = None,
     correlation_id: Optional[str] = None,
     stream: str = "afternoon",
-    preflight_gate: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run one compact DCA cycle and (optionally) the full post-trade report set.
 
@@ -3721,34 +3660,6 @@ def _run_pipeline_impl(
     afternoon-only defaults ``build_run_artifacts`` otherwise falls back to.
     ``None`` (the default for both) reproduces the unmodified afternoon path.
 
-    ``preflight_gate`` is ``run_slot``'s morning-preflight diagnostic dict
-    (see ``morning_preflight_eligible_tickers``). It is stamped onto the
-    returned result dict as ``result["preflight_gate"]`` -- NOT forwarded into
-    ``build_run_artifacts``/``run_daily_compact`` itself, which accepts no
-    such parameter (a prior version of this docstring claimed otherwise; that
-    was aspirational, not actual behavior -- Codex review: "Emit the advisory
-    preflight warning from run_slot"). For durable observability it is also
-    read back into the ``run_state.json`` that ``build_run_artifacts`` already
-    wrote to disk (best-effort read-modify-write via ``result["run_state_path"]``,
-    since ``run_daily_compact`` returns after that file is already published --
-    Codex review: "Persist preflight diagnostics in the canonical artifact").
-    ``run_slot`` also logs ``preflight_gate["warning"]`` when present, so a
-    degraded full-universe evaluation (missing, forbidden-root, or
-    valid-but-empty same-day preflight) is never silently indistinguishable
-    from a normal one, whether an operator reads the log, the in-memory
-    result, or the persisted artifact.
-
-    NON-BLOCKING as of 2026-08-02 (Geoff: "should not block any later runs"):
-    this function used to short-circuit into a startup-failure-shaped blocked
-    run_state here when ``preflight_gate`` reported ``preflight_missing_block``
-    (Codex review: "Route the preflight-blocked result through guarded_run",
-    "Apply the calendar gate before the preflight early return"). That
-    diagnostic flag is never set anymore --
-    ``morning_preflight_eligible_tickers`` degrades to the full configured
-    universe with a warning instead of blocking -- so this function no longer
-    special-cases it at all; a missing/invalid same-day preflight artifact
-    now just means ``run_slot`` passed through the full universe already, and
-    this function evaluates it normally like any other run.
     """
     # Drain any leftover raw placement responses from a prior run on this broker
     # instance (e.g. a manual run_pipeline() call that preceded this scheduled one).
@@ -3848,7 +3759,7 @@ def _run_pipeline_impl(
         # (or account) claimed it in the gap around run_once() -- but
         # everything below this point still trusted result["run_state_path"]
         # unconditionally as THIS invocation's own output: the raw-input
-        # manifest refresh, the preflight_gate persistence rewrite, and the
+        # manifest refresh and the
         # raw-placement-response merge all read-modify-write files under
         # that same path/artifacts_dir. Skipping them here, the same way the
         # `blocked` branch below already skips reporting, is what makes
@@ -3857,16 +3768,15 @@ def _run_pipeline_impl(
         # ownership to the outer pipeline").
         logger.warning(
             "run_daily_compact could not verify ownership of the shared artifacts "
-            "directory for %s; skipping the raw-input manifest refresh, "
-            "preflight_gate persistence, and raw placement-response merge to avoid "
+            "directory for %s; skipping the raw-input manifest refresh "
+            "and raw placement-response merge to avoid "
             "corrupting another run's artifacts",
             result.get("run_state_path"),
         )
         return result
     # Captured HERE -- immediately after run_daily_compact() returned with
     # ownership verified, before either of the two best-effort rewrites
-    # below (the raw-input manifest refresh, then the preflight_gate
-    # persistence) does ANY further work of its own. Each rewrite's own
+    # below (the raw-input manifest refresh) does ANY further work of its own. Each rewrite's own
     # in-lock byte comparison used to read its "initial" snapshot for the
     # very first time only after acquiring its lock -- which verifies
     # nothing changed WHILE the lock was held, but says nothing about
@@ -3894,8 +3804,8 @@ def _run_pipeline_impl(
     # still replace run_state.json in the gap between run_daily_compact()
     # releasing its lock and this read running, so `_known_run_state_bytes`
     # would silently capture the PEER's payload as "this invocation's last
-    # verified state" -- which the raw-manifest/preflight_gate rewrites
-    # below then accept and go on to mutate the peer's artifact against
+    # verified state" -- which the raw-manifest rewrite
+    # below then accepts and go on to mutate the peer's artifact against
     # (Codex review: "Bind the post-run snapshot to the ownership check").
     # `run_daily_compact()` returns this key on every call. It is non-None
     # on the ownership-verified success path through its own unified
@@ -3953,8 +3863,7 @@ def _run_pipeline_impl(
         # after action persistence"). Re-scan now that compute has finished
         # and, only if the saved-file list actually changed, patch the
         # already-written run_state.json in place -- the identical best-
-        # effort read-modify-write pattern the preflight_gate rewrite just
-        # below uses, including re-settling usage_proxy's byte counters
+        # effort read-modify-write pattern used for run_state.json rewrites, including re-settling usage_proxy's byte counters
         # against the (slightly larger) rewritten payload.
         _raw_input_dir = raw_persistence_state.get("raw_input_dir")
         if _raw_input_dir:
@@ -4071,9 +3980,9 @@ def _run_pipeline_impl(
                                     # Advance the shared pipeline-level
                                     # snapshot to what THIS rewrite itself
                                     # just legitimately published, so the
-                                    # preflight_gate rewrite below (which
-                                    # reuses `_known_run_state_bytes` as its
-                                    # OWN expected baseline) compares against
+                                    # checks below (which reuse
+                                    # `_known_run_state_bytes` as their
+                                    # expected baseline) compare against
                                     # this rewrite's real output rather than
                                     # the now-stale pre-rewrite bytes.
                                     _known_run_state_bytes = _serialized.encode("utf-8")
@@ -4094,119 +4003,6 @@ def _run_pipeline_impl(
                                     )
             except OSError:
                 logger.warning("failed to refresh raw-input manifest for %s", _raw_input_dir, exc_info=True)
-    if preflight_gate is not None:
-        # Persist run_slot's morning-preflight diagnostic dict onto every
-        # return path below, not just log it: this docstring already
-        # promised "forwarded through to build_run_artifacts for
-        # observability", but build_run_artifacts (near_close_dca.py) never
-        # actually accepted or stored this parameter, so the dict -- and any
-        # advisory "warning" it carries when the same-day preflight is
-        # missing or found empty -- was silently discarded, leaving
-        # operators unable to tell a degraded full-universe evaluation from
-        # a normal one after the fact (Codex review: "Emit the advisory
-        # preflight warning from run_slot").
-        result["preflight_gate"] = preflight_gate
-        # The above only updates this function's in-memory return value.
-        # build_run_artifacts/run_daily_compact already wrote run_state.json
-        # to disk (via write_run_artifacts) before this line runs, so without
-        # this read-modify-write the canonical, durable artifact -- the one
-        # operators and reporting actually consult -- still could not
-        # distinguish a degraded full-universe evaluation from a normal one
-        # (Codex review: "Persist preflight diagnostics in the canonical
-        # artifact"). Best-effort: a missing/corrupt run_state.json here is
-        # already a distinct, logged failure mode elsewhere, and must not
-        # block the rest of this function's return.
-        run_state_path = result.get("run_state_path")
-        if run_state_path:
-            # Same lock + re-read-before-write CAS pattern as the raw-input
-            # manifest refresh just above -- not a bare read/modify/write.
-            # Two overlapping live invocations of the same slot can both
-            # pass the ownership check earlier in this function; without
-            # serializing this rewrite, invocation A can read run_state.json
-            # here, invocation B can publish its own newer state in the
-            # meantime, and A's write below would then overwrite B's state
-            # with a payload built from A's stale read -- silently dropping
-            # B's own submitted candidates from the canonical state and
-            # deployment accounting (Codex review: "Reverify ownership
-            # before rewriting post-run state"). Best-effort throughout, as
-            # already promised: a missing/corrupt run_state.json, a lock
-            # timeout, or a concurrent change detected here must not turn an
-            # already-completed trading run (orders may already be placed)
-            # into an exception that skips the remaining raw-response
-            # persistence and reporting below.
-            try:
-                from scripts.file_lock import cross_process_lock
-
-                _preflight_run_state_path_obj = Path(run_state_path)
-                with cross_process_lock(
-                    _preflight_run_state_path_obj.with_name(f"{_preflight_run_state_path_obj.name}.lock")
-                ):
-                    try:
-                        _preflight_initial_bytes = _preflight_run_state_path_obj.read_bytes()
-                        run_state_obj = json.loads(_preflight_initial_bytes)
-                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                        _preflight_initial_bytes = None
-                        run_state_obj = None
-                    if isinstance(run_state_obj, dict):
-                        run_state_obj["preflight_gate"] = preflight_gate
-                        usage = run_state_obj.get("usage_proxy")
-                        if isinstance(usage, dict):
-                            # This rewrite grows run_state.json by the serialized
-                            # preflight_gate dict, but run_daily_compact() already
-                            # settled usage_proxy.state_file_bytes/total_artifact_
-                            # bytes against the SMALLER pre-rewrite payload, so
-                            # those counters would otherwise understate this run's
-                            # size -- dca_cost_tracker.py consumes
-                            # total_artifact_bytes directly as its artifact-I/O
-                            # proxy (Codex review: "Recompute usage bytes after
-                            # rewriting the run state"). Re-settle them the same
-                            # way _backfill_orders_csv_usage() does after orders.csv
-                            # lands post-write_run_artifacts: re-derive csv_bytes
-                            # from whatever CSV artifacts already exist on disk
-                            # (unaffected by this rewrite) and let _settle_usage_bytes
-                            # recompute the state-file size against the NEW payload.
-                            csv_bytes = sum(
-                                path.stat().st_size
-                                for path in _existing_csv_artifacts(_preflight_run_state_path_obj.parent)
-                            )
-                            serialized = _settle_usage_bytes(run_state_obj, usage, csv_bytes)
-                        else:
-                            serialized = json.dumps(run_state_obj, indent=2, sort_keys=True)
-                        try:
-                            _preflight_current_bytes = _preflight_run_state_path_obj.read_bytes()
-                        except OSError:
-                            _preflight_current_bytes = None
-                        # Compared against `_known_run_state_bytes` -- the
-                        # pipeline-level snapshot captured right after
-                        # run_daily_compact() last confirmed ownership,
-                        # advanced by the raw-manifest rewrite above to ITS
-                        # own output on a successful write -- not against
-                        # `_preflight_initial_bytes`, this block's own first
-                        # read taken only after THIS lock was already
-                        # acquired. A same-identity peer that claimed this
-                        # directory between run_daily_compact() returning and
-                        # this lock being acquired would already be what
-                        # `_preflight_initial_bytes` reads back, so
-                        # comparing against it self-confirms nothing (Codex
-                        # review: "Recheck artifact identity inside each
-                        # post-run lock").
-                        if _known_run_state_bytes is not None and _preflight_current_bytes == _known_run_state_bytes:
-                            atomic_write_text(run_state_path, serialized)
-                            _known_run_state_bytes = serialized.encode("utf-8")
-                        else:
-                            if _known_run_state_bytes is not None:
-                                _ownership_lost_mid_pipeline = True
-                            logger.warning(
-                                "run_state at %s changed concurrently; skipping preflight_gate "
-                                "persistence to avoid clobbering a newer retry's state",
-                                run_state_path,
-                            )
-            except (TimeoutError, OSError):
-                logger.warning(
-                    "failed to persist preflight_gate onto %s",
-                    run_state_path,
-                    exc_info=True,
-                )
     if _ownership_lost_mid_pipeline:
         # A different invocation replaced run_state.json somewhere between
         # the two best-effort rewrites above -- the same loss of ownership
@@ -4234,12 +4030,11 @@ def _run_pipeline_impl(
         return result
     # Codex review (finding: "Recheck ownership immediately before downstream
     # writes"): the `_ownership_lost_mid_pipeline` check above only catches a
-    # peer replacement detected by one of the TWO rewrites that precede it
-    # (the raw-manifest refresh and the preflight_gate persistence) --
-    # each only runs its own in-lock compare when it actually has something
-    # to rewrite (`raw_persistence_state`/`preflight_gate` set). A peer can
-    # still replace run_state.json in the window between whichever of those
-    # rewrites last confirmed ownership (or `run_daily_compact()`'s own
+    # peer replacement detected by the rewrite that precedes it
+    # (the raw-manifest refresh) -- it only runs its own in-lock compare when
+    # it actually has something to rewrite (`raw_persistence_state` set). A
+    # peer can still replace run_state.json in the window between that
+    # rewrite last confirming ownership (or `run_daily_compact()`'s own
     # ownership check, if neither rewrite ran at all) and here, immediately
     # before the raw-response merge below reads and mutates
     # `raw/orders_after_place.json` and the full-report path further down

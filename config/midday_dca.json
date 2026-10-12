@@ -33,7 +33,7 @@
       "historical/trend files needed for the 60-minute trend check"
     ],
     "run_date_arg": "If the runner requires a RUN_DATE_ET argument, pass the current America/New_York date as YYYYMMDD.",
-    "data_sources": "Generate raw inputs from the Finance connector primary, Alpaca and Robinhood validation/context, and yfinance fallback ONLY when connector data is unavailable, stale, incomplete, or unresolved (see config/budgets.json:market_data_source_policy).",
+    "data_sources": "Generate raw inputs from Robinhood (get_equity_historicals 5-minute and daily bars, get_equity_quotes) for every active ticker; Robinhood is the primary signal source for this slot. If Robinhood fails as a whole (listed in source_errors, absent, or no scored ticker fresh for the slot), switch the entire ordinary universe to the explicitly labeled, prefetched yfinance fallback; a single ticker gap remains that ticker's provider error. Do not use the Finance connector as the primary source.",
     "bounded_recovery": "If raw input generation fails once, perform ONE bounded recovery attempt with the alternate approved data source path, then stop."
   },
   "state_file_guarantee": {

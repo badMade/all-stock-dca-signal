@@ -29,8 +29,7 @@
     "trades": true,
     "broker_account": "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}",
     "first_buy_of_day": true,
-    "note": "Live Robinhood execution using account <ROBINHOOD_ACCOUNT_NUMBER> (Alpaca/Finance/Yahoo stay read-only for validation/context). As the day's first buy it normally has no prior same-day allocation and places the full desired amount; its fills become prior-allocation context for every later same-day slot.",
-    "preflight_independence": "This slot fires at 9:35, ten minutes BEFORE the 9:45 pre-flight writer (bb4f6ef1). It must never gate on the pre-flight artifact -- that artifact does not exist yet when this run decides. Only the 10:30 morning stream consumes it."
+    "note": "Live Robinhood execution using account <ROBINHOOD_ACCOUNT_NUMBER> (Alpaca/Finance/Yahoo stay read-only for validation/context). As the day's first buy it normally has no prior same-day allocation and places the full desired amount; its fills become prior-allocation context for every later same-day slot."
   },
   "state_file_guarantee": {
     "summary": "The 9:35 scheduled run MUST always write run_state.json, run_summary.json, market_open_signals.csv, and a header-only-when-empty submitted_orders.csv under the market-open root, plus latest_market_open_run.json, even when no orders are placed or execution is blocked.",
@@ -129,7 +128,6 @@
   "downstream_separation_rules": [
     "A market-open run_state has stream='market_open', valid_morning_evidence=false, and valid_afternoon_evidence=false; consumers must exclude it from every other stream's scheduled-live cost basis, slippage, reliability, and order-count metrics.",
     "The market-open stream does not update latest_scheduled_run.json or write into any other stream's folders.",
-    "Market-open fills count as PRIOR-ALLOCATION CONTEXT for the same-day top-up guard of every later slot (10:30, 11:30, 12:30, 1:30, 2:30, 3:30); they are never those streams' scheduled evidence, slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts.",
-    "This slot must never gate on the 9:45 pre-flight artifact -- it fires ten minutes earlier."
+    "Market-open fills count as PRIOR-ALLOCATION CONTEXT for the same-day top-up guard of every later slot (10:30, 11:30, 12:30, 1:30, 2:30, 3:30); they are never those streams' scheduled evidence, slippage, watchdog confirmation, scheduled cost basis, or scheduled fill counts."
   ]
 }

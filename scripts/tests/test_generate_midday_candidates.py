@@ -72,15 +72,13 @@ def _falling_bars(
     late_price: float,
     *,
     start: time = time(9, 30),
-    step_minutes: int = 15,
+    step_minutes: int = 5,
 ) -> list:
     """Bars ``step_minutes`` apart from ``start`` to 12:30 ET, stepping down at noon.
 
-    Defaults to 15 minutes -- ``MIDDAY_SPEC.source_interval_minutes`` -- since
-    every fixture in this file feeds the Finance-labeled 'sources.finance' map
-    unless it is explicitly built as GFUZ's Robinhood override payload
-    (``step_minutes=5``, restoring the native cadence and ``trend_min_bars=6``
-    ``config.interval_minutes`` resolves for that one ticker). Bars spaced any
+    Defaults to 5 minutes, Robinhood's native cadence and what ``MIDDAY_SPEC`` resolves to
+    (``trend_min_bars=6`` from the config), since every fixture in this file feeds the
+    'sources.robinhood' map. Bars spaced any
     tighter than the cadence the scoring config resolves to are rejected by
     ``stream_candidates._require_bars_match_configured_cadence``.
 
@@ -108,7 +106,7 @@ def _ticker_payload(
     previous_close: float,
     previous_low: float,
     start: time = time(9, 30),
-    step_minutes: int = 15,
+    step_minutes: int = 5,
 ) -> dict:
     return {
         "previous_close_bar": _previous_close_bar(previous_close, previous_low),
@@ -118,9 +116,9 @@ def _ticker_payload(
 
 def _market_data(**per_ticker: dict) -> dict:
     return {
-        "sources": {"finance": dict(per_ticker)},
+        "sources": {"robinhood": dict(per_ticker)},
         "source_errors": [],
-        "ticker_errors": {"finance": []},
+        "ticker_errors": {"robinhood": []},
     }
 
 
@@ -154,7 +152,7 @@ def _run(
     return gmc.generate_midday_candidates(
         trading_day=DAY,
         config=_config() if config is None else config,
-        market_data=market_data["sources"]["finance"],
+        market_data=market_data["sources"]["robinhood"],
         deployed_last_7d_usd=deployed_last_7d_usd,
         source_errors=source_errors,
         ticker_errors=ticker_errors,
@@ -218,8 +216,7 @@ def test_unvalidated_trend_is_manual_review_not_an_auto_buy():
             previous_close=100.0,
             previous_low=97.0,
             # Bars only from 12:15, so the 11:30-12:30 window holds 1 usable
-            # 15-minute bar, under MIDDAY_SPEC's Finance-resolved trend_min_bars
-            # of 4.
+            # 5-minute bar, under the config's trend_min_bars of 6.
             start=time(12, 15),
         )
     )
@@ -232,27 +229,6 @@ def test_unvalidated_trend_is_manual_review_not_an_auto_buy():
     assert document["cands"] == []
     assert document["same_day_top_up_candidates"] == []
     assert document["manual_review_tickers"] == ["TEST"]
-
-
-def test_four_completed_finance_bars_validate_the_sixty_minute_trend():
-    payload = _ticker_payload(
-        early_price=99.0,
-        late_price=95.0,
-        previous_close=100.0,
-        previous_low=97.0,
-    )
-    payload["intraday_bars"] = [
-        _bar(datetime.combine(DAY, moment, tzinfo=ET), price)
-        for moment, price in (
-            (time(11, 30), 99.0),
-            (time(11, 45), 98.0),
-            (time(12, 0), 96.0),
-            (time(12, 15), 95.0),
-        )
-    ]
-    row = _only(_run(_market_data(TEST=payload)))
-    assert row["execution_status"] == "auto_buy_eligible"
-    assert row["trend_validated"] is True
 
 
 def test_flat_tape_is_a_quiet_tape_not_an_error():
@@ -278,7 +254,7 @@ def test_source_wide_missing_previous_close_aborts_despite_healthy_prices():
             early_price=99.0, late_price=95.0, previous_close=100.0, previous_low=97.0
         )
     )
-    del data["sources"]["finance"]["TEST"]["previous_close_bar"]
+    del data["sources"]["robinhood"]["TEST"]["previous_close_bar"]
 
     with pytest.raises(ValueError, match="incomplete payload"):
         _run(data)
@@ -366,7 +342,7 @@ def test_the_advertised_config_dir_default_is_usable():
     document = gmc.generate_midday_candidates(
         trading_day=DAY,
         config=_config(),
-        market_data=data["sources"]["finance"],
+        market_data=data["sources"]["robinhood"],
         deployed_last_7d_usd=0.0,
         check_planner_compatibility=False,
     )
@@ -477,7 +453,7 @@ def test_document_identifies_the_midday_slot():
     assert document["stream"] == "midday"
     assert document["cron_id"] == "a6239dae"
     assert document["decision_time_et"] == "12:30"
-    assert document["source"] == "finance"
+    assert document["source"] == "robinhood"
     # MIDDAY_SPEC sets no evaluation_delay_minutes, so the effective anchor
     # equals the nominal schedule value (Codex review: "Report the effective
     # delayed decision time" -- the field exists for slots where they diverge).
@@ -531,153 +507,21 @@ def test_source_error_aborts_instead_of_emitting_a_quiet_tape():
         )
     )
     with pytest.raises(ValueError, match="source_errors"):
-        _run(data, source_errors=("finance",))
+        _run(data, source_errors=("robinhood",))
 
 
-def test_finance_payload_bars_finer_than_the_configured_cadence_are_rejected():
-    """This is exactly the bug the Codex review flagged on this module:
-    ``MIDDAY_SPEC`` resolves to a 15-minute Finance cadence
-    (``source_interval_minutes=15``, ``trend_min_bars=4``), but neither
-    ``StreamMarketData`` nor ``_trend_validated`` check bar SPACING -- only that
-    enough bars fall inside the 60-minute window. A caller who instead supplies
-    5-minute bars can satisfy ``trend_min_bars=4`` from a slice of the window
-    only 20 minutes wide instead of the full 60 minutes that count assumes, and
-    nothing downstream rejects it (PR #917 discussion,
-    https://github.com/badMade/all-stock-dca/pull/917#discussion_r3882856728:
-    "Reject five-minute bars under the Finance cadence"). This is the runtime
-    guard that closes that gap.
+def test_bars_finer_than_the_native_five_minute_cadence_are_rejected():
+    """``MIDDAY_SPEC`` is Robinhood-primary, so the stream's cadence is the native 5 minutes.
+
+    A payload built from 1-minute bars could satisfy ``trend_min_bars`` from a much narrower slice of the
+    60-minute window than that count was calibrated for, so it is rejected at the boundary
+    (``stream_candidates._require_bars_match_configured_cadence``), not scored.
     """
     data = _market_data(
-        TEST=_ticker_payload(
-            early_price=99.0,
-            late_price=95.0,
-            previous_close=100.0,
-            previous_low=97.0,
-            step_minutes=5,
-        )
+        TEST=_ticker_payload(early_price=100.0, late_price=96.0, previous_close=100.0, previous_low=99.0, step_minutes=1)
     )
-    with pytest.raises(
-        ValueError, match="closer together than this stream's configured 15-minute cadence"
-    ):
+    with pytest.raises(ValueError, match="closer together than this stream's configured 5-minute cadence"):
         _run(data)
-
-
-def test_gfuz_robinhood_override_bars_finer_than_five_minutes_are_rejected():
-    """The Robinhood override is graded at the base config's native cadence (5
-    minutes here, restored for GFUZ specifically), not at Finance's 15-minute
-    one -- so the guard must check its bars against that resolved cadence."""
-    config = _config(tickers=("GFUZ",))
-    robinhood = _ticker_payload(
-        early_price=99.0,
-        late_price=95.0,
-        previous_close=100.0,
-        previous_low=97.0,
-        step_minutes=1,
-    )
-    with pytest.raises(
-        ValueError, match="closer together than this stream's configured 5-minute cadence"
-    ):
-        gmc.generate_midday_candidates(
-            trading_day=DAY,
-            config=config,
-            market_data={},
-            alternate_market_data={"GFUZ": robinhood},
-            deployed_last_7d_usd=0.0,
-            check_planner_compatibility=False,
-        )
-
-
-def test_gfuz_robinhood_override_keeps_six_bar_trend_minimum():
-    """Switching GFUZ back to five-minute broker bars must also restore the
-    executor's six-observation threshold, not retain Finance's four-bar rule."""
-    config = _config(tickers=("GFUZ",))
-    robinhood = _ticker_payload(
-        early_price=99.0,
-        late_price=95.0,
-        previous_close=100.0,
-        previous_low=97.0,
-        start=time(12, 10),
-        step_minutes=5,
-    )
-    document = gmc.generate_midday_candidates(
-        trading_day=DAY,
-        config=config,
-        market_data={},
-        alternate_market_data={"GFUZ": robinhood},
-        deployed_last_7d_usd=0.0,
-        check_planner_compatibility=False,
-    )
-    row = _only(document, "GFUZ")
-    assert row["action"] == Action.BUY.value
-    assert row["trend_validated"] is False
-    assert row["execution_status"] == "manual_review_candidate"
-    assert document["buy_count"] == 0
-
-
-def test_gfuz_full_window_robinhood_trend_reaches_placement():
-    """The control for the finding above: with a FULL 60-minute Robinhood
-    window (well over the restored 6-bar minimum), GFUZ's auto-buy-eligible
-    row must actually reach cands/planner_candidates/same_day_top_up_candidates
-    -- not be wrongly withheld by a trend-window coverage probe that read the
-    empty Finance-only provider instead of the routed one carrying GFUZ's own
-    Robinhood bars (Codex review: "Probe override bars through the routed
-    provider"; reproduced before fixing withheld_incomplete_trend_window_tickers
-    == ["GFUZ"] here even though the Robinhood evidence plainly spans the
-    window)."""
-    config = _config(tickers=("GFUZ",))
-    robinhood = _ticker_payload(
-        early_price=99.0,
-        late_price=95.0,
-        previous_close=100.0,
-        previous_low=97.0,
-        start=time(9, 30),
-        step_minutes=5,
-    )
-    document = gmc.generate_midday_candidates(
-        trading_day=DAY,
-        config=config,
-        market_data={},
-        alternate_market_data={"GFUZ": robinhood},
-        deployed_last_7d_usd=0.0,
-        check_planner_compatibility=False,
-    )
-    row = _only(document, "GFUZ")
-    assert row["action"] == Action.BUY.value
-    assert row["trend_validated"] is True
-    assert row["execution_status"] == "auto_buy_eligible"
-    assert document["withheld_incomplete_trend_window_tickers"] == []
-    assert [c["ticker"] for c in document["cands"]] == ["GFUZ"]
-    assert [r["ticker"] for r in document["same_day_top_up_candidates"]] == ["GFUZ"]
-
-
-def test_gfuz_errored_override_with_no_payload_is_reported_as_a_provider_error():
-    """A Robinhood fetch that RAISED for GFUZ is reported via
-    alternate_ticker_errors with no payload to retain -- fabricating one would
-    misrepresent what was actually fetched. Skipping the override provider
-    entirely for that shape routed GFUZ to the empty Finance provider instead,
-    where it scored as a quiet NO_DATA with provider_error=false and no entry
-    in provider_error_tickers -- indistinguishable from GFUZ's normal,
-    harmless Finance-omission case rather than a failed fetch Gate 9 needs to
-    see (Codex review: "Route errored overrides even when their payload is
-    absent")."""
-    config = _config(tickers=("GFUZ",))
-    document = gmc.generate_midday_candidates(
-        trading_day=DAY,
-        config=config,
-        market_data={},
-        alternate_market_data={},
-        alternate_ticker_errors=("GFUZ",),
-        deployed_last_7d_usd=0.0,
-        check_planner_compatibility=False,
-    )
-    row = _only(document, "GFUZ")
-    assert row["action"] == Action.NO_DATA.value
-    assert row["provider_error"] is True
-    assert "GFUZ" in document["provider_error_tickers"]
-
-
-# --- the CLI ----------------------------------------------------------------
-
 
 def _patch_config(monkeypatch, config: MiddayConfig | None = None) -> None:
     """Point the CLI at a hermetic one-ticker config.
@@ -729,21 +573,21 @@ def test_cli_end_to_end(tmp_path, monkeypatch):
     ("payload", "match"),
     [
         ({"sources": {}, "source_errors": []}, "missing the required"),
-        # A declared Finance outage or an empty Finance payload is exactly what
+        # A declared Robinhood outage or an empty Robinhood payload is exactly what
         # the policy routes to the labelled yfinance fallback; with no fallback
         # object in the payload that routing has nowhere to go and must abort.
-        ({"sources": {"finance": {}}, "source_errors": ["finance"]}, "yfinance fallback is unavailable"),
-        ({"sources": {"finance": {}}, "source_errors": []}, "yfinance fallback is unavailable"),
+        ({"sources": {"robinhood": {}}, "source_errors": ["robinhood"]}, "yfinance fallback is unavailable"),
+        ({"sources": {"robinhood": {}}, "source_errors": []}, "yfinance fallback is unavailable"),
         # The fallback IS selected but its own payload is empty: the usable-
         # payload check runs against the source actually being scored.
         (
-            {"sources": {"finance": {}, "yahoo_finance_yfinance": {}}, "source_errors": ["finance"]},
+            {"sources": {"robinhood": {}, "yahoo_finance_yfinance": {}}, "source_errors": ["robinhood"]},
             "sources.yahoo_finance_yfinance",
         ),
     ],
     ids=["absent", "declared-outage", "undeclared-empty", "fallback-empty"],
 )
-def test_cli_aborts_when_finance_payload_is_unusable(tmp_path, payload, match):
+def test_cli_aborts_when_robinhood_payload_is_unusable(tmp_path, payload, match):
     path = tmp_path / "market_data.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match=match):
@@ -757,11 +601,11 @@ def test_cli_aborts_when_finance_payload_is_unusable(tmp_path, payload, match):
         )
 
 
-def test_cli_all_covered_universe_allows_an_empty_finance_payload(tmp_path, monkeypatch):
+def test_cli_all_covered_universe_allows_an_empty_robinhood_payload(tmp_path, monkeypatch):
     _patch_config(monkeypatch)
     path = tmp_path / "market_data.json"
     path.write_text(
-        json.dumps({"sources": {"finance": {}}, "source_errors": [], "ticker_errors": {"finance": []}}),
+        json.dumps({"sources": {"robinhood": {}}, "source_errors": [], "ticker_errors": {"robinhood": []}}),
         encoding="utf-8",
     )
     stdout = io.StringIO()
@@ -780,20 +624,21 @@ def test_cli_all_covered_universe_allows_an_empty_finance_payload(tmp_path, monk
     assert document["buy_count"] == 0
     assert document["cands"] == []
 
-
-def test_cli_rejects_structured_source_errors_dict_entry(tmp_path, monkeypatch):
+def test_cli_accepts_structured_source_errors_dict_entry(tmp_path, monkeypatch):
     _patch_config(monkeypatch)
+    source = gmc.MIDDAY_SPEC.source.value
     path = tmp_path / "market_data.json"
     path.write_text(
         json.dumps({
-            "sources": {"robinhood": {}, "yahoo_finance_yfinance": {}},
-            "source_errors": [{"source": "robinhood", "error": "Robinhood quotes not available"}],
-            "ticker_errors": {"robinhood": []},
+            "sources": {source: {}, "yahoo_finance_yfinance": {}},
+            "source_errors": [{"source": source, "error": "Primary connector not available"}],
+            "ticker_errors": {source: []},
         }),
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="source-name strings"):
-        gmc.main(
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        exit_code = gmc.main(
             [
                 "--trading-day", DAY.isoformat(),
                 "--market-data", str(path),
@@ -802,6 +647,10 @@ def test_cli_rejects_structured_source_errors_dict_entry(tmp_path, monkeypatch):
                 "--already-covered-tickers", "TEST",
             ]
         )
+    assert exit_code == 0
+    document = json.loads(stdout.getvalue())
+    assert document["buy_count"] == 0
+    assert document["validation_context_source_errors"] == [source]
 
 
 @pytest.mark.parametrize("raw_value", ["-1", "NaN", "not-a-number"])
@@ -898,24 +747,11 @@ def _payload_between(start: time, stop: time = DECISION_ET, *, step_at: time) ->
 
 
 def _generic_trend_spec():
-    """A cadence-agnostic view of ``MIDDAY_SPEC`` for exercising the SHARED,
-    source-agnostic ``_trend_window_uncovered`` coverage-probe mechanism in
-    isolation, at the test config's own 5-minute cadence and
-    ``trend_min_bars`` rather than ``MIDDAY_SPEC``'s Finance-specific
-    ``source_interval_minutes=15``/``trend_min_bars=4``.
+    """The real ``MIDDAY_SPEC`` with its cadence and trend length explicitly left to the config.
 
-    Those Finance numbers are an exact tight fit for the 60-minute lookback:
-    ``completed_bar_anchor(12:30, 15)`` is 12:15, so the countable window is
-    11:30-12:15 (45 minutes), and 4 bars at a 15-minute cadence exactly fills
-    it. Satisfying ``trend_min_bars`` there therefore already implies full
-    window coverage, so the coverage probe's OWN tolerance/withholding
-    behavior can never be observed through MIDDAY_SPEC's real numbers -- there
-    is no payload that has enough bars to pass the count check while still
-    being too narrow to span the window. Nulling out both fields here falls
-    back to the test config's own (5-minute, generously-margined)
-    ``interval_minutes``/``trend_min_bars`` so these tests can keep exercising
-    that generic mechanism the way they always have; live callers still get
-    MIDDAY_SPEC's real Finance-cadence guard.
+    Since 12:30 became Robinhood-primary the spec already does this itself (5-minute bars, config
+    ``trend_min_bars``), so this is the same object in effect. It stays as a named helper so the tests of the
+    shared ``_trend_window_uncovered`` coverage probe keep saying what they exercise.
     """
     return dataclasses.replace(gmc.MIDDAY_SPEC, source_interval_minutes=None, trend_min_bars=None)
 
@@ -927,7 +763,7 @@ def _run_generic(market_data: dict, config: MiddayConfig | None = None) -> dict:
         _generic_trend_spec(),
         trading_day=DAY,
         config=_config() if config is None else config,
-        market_data=market_data["sources"]["finance"],
+        market_data=market_data["sources"]["robinhood"],
         deployed_last_7d_usd=0.0,
         config_dir=REAL_CONFIG_DIR,
         check_planner_compatibility=False,
@@ -1303,9 +1139,7 @@ def _run_planner(bars: list, config: MiddayConfig) -> dict:
     5-minute-spaced fixtures keep exercising the shared, source-agnostic
     coverage-probe/planner-candidates mechanism at the test config's own
     (generously-margined) cadence and trend_min_bars, rather than
-    MIDDAY_SPEC's Finance-specific tight fit (4 bars * 15 minutes == the full
-    60-minute lookback, where satisfying trend_min_bars already implies full
-    coverage and these tests' narrow-window premise cannot be reproduced)."""
+    the real spec's own numbers (identical now that 12:30 is Robinhood-primary)."""
     return stream_candidates.build_document(
         _generic_trend_spec(),
         trading_day=DAY,

@@ -46,7 +46,7 @@ Cron IDs are the live scheduler's task IDs (`docs/schedule_manifest.md` is canon
 | ET | Slot | Cron ID | Executor class | `dca_runner` SlotSpec | `run_dca.run_slot` | Artifact root + pointer |
 |---|---|---|---|---|---|---|
 | 9:35 AM | `0935ET` | `2ba19526` | `MarketOpenDCAExecutor` (`market_open_dca.py`) | `"0935"` / market-open | disabled | `market_open_dca/` + `latest_market_open_run.json` |
-| 9:45 AM | preflight | `bb4f6ef1` | `MorningDCAExecutor` watchlist + preflight modes | n/a (no trades) | n/a | `morning_dca/` |
+| 9:45 AM | watchlist | `bb4f6ef1` | `MorningDCAExecutor` watchlist mode | n/a (no trades) | n/a | `morning_dca_watchlist/` |
 | 10:30 AM | `1030ET` | `42173154` | `MorningDCAExecutor` (`morning_dca.py`) | `"1030"` / morning | `("morning", "1030ET")` | `morning_dca/` + `latest_morning_run.json` |
 | 11:30 AM | `1130ET` | `7be82b97` | `IntradayDCAExecutor` (`intraday_dca.py`) | `"1130"` / intraday | disabled | `intraday_dca/` + `latest_intraday_run.json` |
 | 12:30 PM | `1230ET` | `a6239dae` | `MiddayDCAExecutor` (`midday_dca.py`) | `"1230"` / midday | `("midday", "1230ET")` | `midday_dca/` + `latest_midday_run.json` |
@@ -73,7 +73,7 @@ subclasses (297 to 528 lines each) that override identity constants and a few fl
 
 ```
 DCAExecutor                     morning_dca.py     (base)
-└── MorningDCAExecutor          morning_dca.py     10:30 live + 9:45 watchlist/preflight
+└── MorningDCAExecutor          morning_dca.py     10:30 live + 9:45 watchlist
     ├── MarketOpenDCAExecutor   market_open_dca.py 9:35
     ├── MiddayDCAExecutor       midday_dca.py      12:30
     └── IntradayDCAExecutor     intraday_dca.py    11:30 / 1:30 / 2:30

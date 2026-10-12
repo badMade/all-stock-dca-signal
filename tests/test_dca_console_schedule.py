@@ -80,7 +80,7 @@ def test_launchd_label_matches_the_renderer():
 
 def test_manifest_tasks_enriches_the_committed_schedule():
     result = manifest_tasks(CONFIG, DAY, NOW)
-    assert result["task_count"] == 29 and "$schema" in result["policy_keys"] and "tasks" not in result["policy_keys"]
+    assert result["task_count"] == 28 and "$schema" in result["policy_keys"] and "tasks" not in result["policy_keys"]
     by_id = {row["id"]: row for row in result["tasks"]}
     morning = by_id["42173154"]
     assert morning["cron_utc"] == "30 14 * * 1-5" and morning["timing"] == "cron_utc" and morning["trades"] is True

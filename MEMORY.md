@@ -80,8 +80,8 @@ All require `--trading-day` and `--market-data`. Midday and final-buy also
 require verified `--deployed-last-7d-usd` from the risk subsystem; missing
 history must not be treated as zero deployment. The 09:35 input uses Robinhood
 only. Trend-sensitive slots require the appropriate intraday bar window.
-The 10:30 preflight reader degrades to the full universe with a warning when
-preflight evidence is absent/invalid; it is deliberately non-blocking.
+The 10:30 generator has no pre-flight reader and scores the full configured,
+non-excluded universe.
 The three intraday slots share a pooled budget, enforced outside Gate 5.
 `scripts/stream_candidates.py` is the shared implementation for the six
 executor-class slots; the 15:30 signal engine is separate.

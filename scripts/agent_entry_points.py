@@ -498,14 +498,8 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         symbols=("generate_morning_candidates", "load_morning_live_config", "main"),
         notes=(
             "1030ET ONLY. Calls MorningDCAExecutor.evaluate() -- the BASE class, in "
-            "MORNING_LIVE_MODE, not a subclass like the other three rows. Two things follow. "
-            "First, the 9:45 PRE-FLIGHT GATE runs: evaluate() narrows the universe to the "
-            "same-day pre-flight verdict for exactly this stream+mode, which makes this the "
-            "ONLY Gate 5 command that reads the artifact tree and the only one whose output is "
-            "not a pure function of its arguments. It is deliberately NON-BLOCKING (Geoff, "
-            "2026-08-02) -- a missing/invalid/empty pre-flight degrades to the full universe "
-            "with a warning -- and the verdict rides along in the document's preflight_gate "
-            "field (null on every other slot). Second, load_morning_config takes `mode` "
+            "MORNING_LIVE_MODE, not a subclass like the other three rows. One thing follows: "
+            "load_morning_config takes `mode` "
             "POSITIONALLY-SECOND, so the spec uses the load_morning_live_config wrapper; the "
             "bare loader would have silently loaded 9:45 WATCHLIST policy for a 10:30 LIVE run. "
             "Trend validation applies (payload needs 5-minute bars from 09:30 ET onward). No "

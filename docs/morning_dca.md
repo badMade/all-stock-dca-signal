@@ -14,73 +14,26 @@ The stream runs in these modes:
 
 | Mode | Task | ET | Trades | run_type | schema | Artifact root |
 |---|---|---|---|---|---|---|
-| `preflight` | `bb4f6ef1` (absorbed from the repo-internal alias `morning-dca-0945`, retired as a standalone schedule entry 2026-07-27 -- REQUIRED by `42173154`'s gate, see below) | 9:45 AM | **no** | `morning_dca_preflight` | `morning-preflight-v2-machine-complete` | `.../cron_tracking/morning_dca_preflight/` |
 | `live` | `42173154` | 10:30 AM | **yes** | `morning_dca_live` | `morning-live-v2-preauthorized` | `.../cron_tracking/morning_dca/` |
 | `watchlist` | `bb4f6ef1` (canonical 9:45 AM slot, read-only) | 9:45 AM | **no** | `morning_dca_watchlist_scan` | `morning-watchlist-v1` | `.../cron_tracking/morning_dca_watchlist/` |
 
-**`bb4f6ef1` runs BOTH the `preflight` and `watchlist` rows above at the same 9:45 AM
-ET firing** (added 2026-07-27, Codex review discussion_r3653976736): it fully absorbed
-`morning-dca-0945`, not just its display name, so it must invoke `MorningDCAExecutor`
-in `preflight` mode (writing the artifact `live` mode's gate requires) in addition to
-`watchlist` mode. Retiring `morning-dca-0945` as a standalone schedule entry without
-keeping this writer active at 9:45 would leave `42173154` fail-closed every day (empty
-ticker list) since `_apply_preflight_gate` finds no same-day pre-flight artifact.
+## 9:45 AM watchlist scan (read-only)
 
-## 9:45 AM pre-flight validation (read-only)
+An optional **read-only / analytics-only** early-warning scan. It grades morning
+weakness on the shared ladder, places **no orders**, runs **no Robinhood order
+review**, and calls **no broker placement path**. It writes under
+`.../cron_tracking/morning_dca_watchlist/YYYYMMDD_0945ET/` with run_type
+`morning_dca_watchlist_scan`; its dollar amounts are hypothetical/watchlist-only.
+The 10:30 live run does not depend on it.
 
-A **read-only / analytics-only** pre-screen for the 10:30 live evaluator. It
-grades morning weakness on the shared ladder and emits
-**`eligible_to_execute=true/false` per ticker**. It places **no orders**, runs
-**no Robinhood order review**, and calls **no broker placement path**. Writes
-under `.../cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/` —
-`run_state.json`, `validation.csv`, `signals.csv`, `run_summary.json` — and
-updates that root's `latest_preflight.json` (`run_id='morning_preflight_YYYYMMDD_0945ET'`).
+## Retired: the 9:45 AM pre-flight validation (2026-10)
 
-**`eligible_to_execute` semantics:** a **coarse pre-screen** answering "is this
-ticker worth re-evaluating at 10:30?", **NOT** a final buy approval. A ticker is
-eligible when it graded to a positive-multiplier BUY at 9:45 with a usable
-current price and previous close. The 10:30 live run recomputes everything fresh
-and may still decline; an ineligible ticker is simply skipped by the 10:30 gate.
-
-(An optional read-only `watchlist` early-warning scan mode remains available,
-writing under `.../cron_tracking/morning_dca_watchlist/`, run_type
-`morning_dca_watchlist_scan`; its dollar amounts are hypothetical/watchlist-only.)
-
-### Machine-complete pre-flight contract (`morning-preflight-v2-machine-complete`)
-
-As of **Mon Jul 13 2026** the 9:45 `run_state.json` is **machine-complete** and
-validated by
-[`schemas/morning_preflight.schema.json`](../schemas/morning_preflight.schema.json).
-It was introduced after the 10:30 AM live execution was **blocked** because the
-9:45 artifact lacked the machine-readable gate fields the live task needs — a
-top-level `overall_ok` flag and a per-ticker `eligible_to_execute` list. The
-pre-flight now **always** writes:
-
-- Top level: `overall_ok`, `eligible_count`, `ineligible_count`,
-  `unresolved_tickers`, `blocking_errors`, `warnings`, `run_classification`, and
-  `per_ticker_eligibility`.
-- `per_ticker_eligibility` — one row per **active-universe symbol, each exactly
-  once**, carrying `symbol`, `active_universe`, `quote_available`,
-  `prior_close_available`, `tradable`, `account_ok`, `buying_power_ok`,
-  `spread_pct`, `spread_ok`, `trend_status`, `data_confidence_status`,
-  `early_drop_pct`, `early_multiplier`, `hypothetical_amount`,
-  `eligible_to_execute`, and `ineligible_reason`.
-
-The read-only coarse pre-flight does not bind a broker account or evaluate
-spread/trend, so `account_ok`, `buying_power_ok`, `spread_pct`, `spread_ok` are
-`null` and `trend_status` is `not_evaluated_preflight`; the 10:30 live run
-computes them fresh.
-
-**`overall_ok` rule:** `overall_ok` is `false` **only** for
-global/account/buying-power/auth/schema-write failures (recorded in
-`blocking_errors`).
-
-**Unresolved-ticker rule:** unresolved symbols such as **AAAU** or **SPCX** are
-represented as per-symbol rows with `eligible_to_execute=false` and
-`ineligible_reason='unresolved_ticker'` (or a specific lookup/tradability
-failure code) and listed in `unresolved_tickers`. They **never** set
-`overall_ok=false` or invalidate the whole artifact as long as the other required
-fields were written.
+The former 9:45 AM read-only pre-flight validation (`preflight` mode, per-ticker
+`eligible_to_execute`, artifact tree `morning_dca_preflight/`) was removed in
+October 2026 at the owner's direction. `MorningDCAExecutor(mode="preflight")` is no
+longer a valid mode. The 10:30 live stream now scores the **full configured,
+non-excluded universe** and reads no 9:45 artifact. The 9:45 watchlist scan
+(`bb4f6ef1`) is unchanged.
 
 ## 10:30 AM live Robinhood execution
 
@@ -91,73 +44,10 @@ The live execution runs at **10:30 AM ET** (`cron_id=42173154`, cron
 validation/account context), the shared **$2 base 0x-to-5x live ladder**, and the
 `morning` budget ledger.
 
-It **uses the same-day 9:45 pre-flight artifact as a coarse pre-screen** and,
-when that artifact is present and valid, evaluates **only
-`eligible_to_execute=true` tickers**, then **recomputes a fresh price, prior
-close, spread, 60-minute downtrend, signal, and budget before placing**; if the
-trend cannot be validated it **skips / routes to manual review** (never
-auto-buys).
-
-> **Changed 2026-08-02 — a missing pre-flight artifact no longer blocks.**
-> This section previously stated that a missing artifact made a **scheduled**
-> run **fail closed** (`_apply_preflight_gate()` evaluating zero tickers and
-> writing a blocked `run_state.json`), with only a **manual** run degrading to
-> the full universe. That is **no longer true for either run type.** Per Geoff's
-> 2026-08-02 direction ("should not block any later runs"),
-> `morning_preflight_eligible_tickers()` now **always degrades to the full
-> configured universe with a warning** — for scheduled and manual runs alike —
-> and `preflight_missing_block` is never set by anything anymore (the branch
-> that consumed it has been deleted from `_run_impl`). The warning is surfaced
-> on `artifacts["preflight_gate"]` for observability. The pre-flight artifact is
-> a coarse pre-screen only, never a hard gate the 10:30 slot depends on to run
-> at all. The **forbidden-root** rejection below is a separate rule and *does*
-> still fail closed.
-
-#### Pre-flight artifact location (added Jul 20 2026)
-
-On **Mon Jul 20 2026** the 10:30 AM morning live run escalated because it looked
-for the same-day 9:45 pre-flight artifact **under its own 10:30 live output
-directory** (and a stray `/home/user/workspace/cron_tracking/42173154` path)
-instead of the pre-flight root. The rule now is explicit:
-
-- **Load the same-day 9:45 pre-flight artifact from**
-  `/home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/run_state.json`,
-  or from
-  `/home/user/workspace/cron_tracking/morning_dca_preflight/latest_preflight.json`
-  **only when that pointer points to the same-day** `YYYYMMDD_0945ET/run_state.json`
-  file. If the pointer points to any other or older run, ignore it and use the
-  same-day path.
-- **Do not look** under `/home/user/workspace/cron_tracking/42173154` or under
-  the morning live output directory
-  (`/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/`) for the
-  pre-flight artifact. The pre-flight artifact is never written there.
-- **The morning live output directory remains**
-  `/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/` and holds
-  this task's own artifacts only.
-- **Bounded recovery lookup:** if the pre-flight artifact is missing from the
-  correct path (and `latest_preflight.json` does not point to the same-day file),
-  perform exactly **one** bounded recovery lookup before escalating: scan
-  `/home/user/workspace/cron_tracking/morning_dca_preflight/` for today's
-  `YYYYMMDD_0945ET` directory and load its `run_state.json`. Only after that
-  single lookup also fails does a scheduled run fail closed as described above.
-
-This is a path-resolution fix only. It does not weaken the budget caps, top-up
-guard, data-confidence rule, spread rule, whitelist, buy-only, regular-hours-only,
-Robinhood-execution-only, or any other safety control; fail-closed behavior on a
-genuinely missing artifact is preserved. See `config/morning_dca.json`'s
-`live_task.preflight_artifact_resolution`.
-
-> **Implemented (2026-07-21).** `load_morning_config()` loads
-> `must_not_look_under` into `MorningConfig.preflight_forbidden_roots` and
-> `bounded_recovery_lookup` into `MorningConfig.preflight_bounded_recovery`.
-> `MorningDCAExecutor._apply_preflight_gate()` rejects (fails closed) a
-> `preflight_run_state_root` that resolves under a forbidden root before ever
-> attempting a lookup, and `load_same_day_preflight()` performs the single
-> bounded directory scan described above when the primary path and
-> `latest_preflight.json` pointer both miss, recording
-> `recovered_via_bounded_lookup=true` in `preflight_gate` when it was used. See
-> `config/morning_dca.json`'s
-> `live_task.preflight_artifact_resolution.implementation_status`.
+It scores the **full configured, non-excluded universe**, **recomputing a fresh
+price, prior close, spread, 60-minute downtrend, signal, and budget before
+placing**; if the trend cannot be validated it **skips / routes to manual review**
+(never auto-buys).
 
 **Pre-authorized direct placement (scheduled live runs only).** As approved Fri
 Jul 10 2026 11:20 AM ET this scheduled live task is **pre-authorized** to place
@@ -185,20 +75,6 @@ gate. The scheduled live run_state carries
 - **Robinhood is the primary** quote/prior-close source for GFUZ; Alpaca/Finance/
   Yahoo remain read-only validation/context only.
 - An **unresolved GFUZ on Finance must not block the whole run**.
-- The *intent* is that if the **9:45 pre-flight lacks GFUZ**, the 10:30 live task
-  runs a **supplemental GFUZ read-only validation** and **persists
-  `gfuz_supplemental_preflight.json`** under
-  `.../cron_tracking/morning_dca/YYYYMMDD_1030ET/` **before** any GFUZ signal/
-  budget/top-up/order decisioning, with the decision engine reading GFUZ only
-  from the persisted file.
-
-  > **Implemented (2026-10-04).** When GFUZ is in `tickers` and missing from a
-  > valid, non-empty 9:45 preflight artifact, an optional injected
-  > `supplemental_validator` callable performs a read-only validation check and
-  > atomically writes `gfuz_supplemental_preflight.json` before decisioning. If
-  > the validator is absent, raises, or returns invalid, GFUZ remains gated out
-  > fail-closed. See `config/morning_dca.json`'s
-  > `gfuz_special_handling.supplemental_preflight.implementation_status`.
 
 ### Raw data persistence (added Jul 15 2026, confirmed Jul 16 2026; implemented Jul 21 2026)
 
@@ -289,9 +165,7 @@ runner without first generating the same-day raw inputs and escalated without
 persisting a scheduled failure-state artifact), the scheduled 10:30 task must:
 
 **Generate raw inputs first.** The task **must not** assume runner inputs already
-exist, except the same-day 9:45 pre-flight artifact at
-`/home/user/workspace/cron_tracking/morning_dca_preflight/YYYYMMDD_0945ET/run_state.json`
-(or `latest_preflight.json` when it points to that same-day file). Before
+exist. Before
 invoking any saved runner or order module, it **creates**
 `/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/raw/` and persists
 all required raw inputs: portfolio / buying power, quotes, prior regular-session
@@ -315,9 +189,9 @@ data source path, then stop.
 `run_state.json` and refreshes **both** `latest_morning_run.json` and
 `latest_morning_live.json` under the morning root as part of the standard
 artifact persistence flow, **even when execution is blocked or no orders are
-placed** (`run_summary.json` is preflight-only — see
+placed** (`run_summary.json` is not written by this task; see
 `config/morning_dca.json`'s `artifacts.manifest_accuracy_note`). When a
-missing pre-flight artifact, missing/invalid raw inputs, trend, budget,
+missing/invalid raw inputs, trend, budget,
 tradability, spread, or broker condition blocks execution, it writes a **valid
 scheduled** morning `run_state` with `run_origin='scheduled'`, `manual_run=false`,
 `stream='morning'`, `scheduled_for_et='10:30'`, `cron_id='42173154'`,
@@ -486,7 +360,7 @@ Exceeding a cap adds a warning to the run artifact.
 
 The **morning stream budget ledger lives under the 10:30 live output directory**
 `/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/`, not under the
-pre-flight root, the afternoon `ce16ba6b` tree, or any
+afternoon `ce16ba6b` tree, or any
 `/home/user/workspace/cron_tracking/42173154` path. The 10:30 live task **may create**
 `budget_ledger.json` there if it is absent.
 
@@ -533,14 +407,12 @@ update either pointer.
 
 The **10:30 live** run's `write_artifacts()` **always** writes `run_state.json`
 and `morning_signals.csv` (**not** `signals.csv`, and **not**
-`run_summary.json`/`validation.csv` — those are written only in preflight mode)
+`run_summary.json`/`validation.csv`)
 under `.../cron_tracking/morning_dca/YYYYMMDD_1030ET/`, plus
 `submitted_orders.csv` whenever at least one order was actually submitted;
 `filled_orders.csv` is **never** written by this task (there is no
 fill-confirmation step). Raw connector persistence under a `raw/` subdirectory
-is implemented in MorningDCAExecutor, and `gfuz_supplemental_preflight.json` is
-implemented as of 2026-10-04 (see **Raw data persistence** and **GFUZ special handling**
-above). See `config/morning_dca.json`'s `artifacts.manifest_accuracy_note`. The live
+is implemented in MorningDCAExecutor (see **Raw data persistence** above). See `config/morning_dca.json`'s `artifacts.manifest_accuracy_note`. The live
 `run_classification` block carries `run_origin='scheduled'`,
 `run_type='morning_dca_live'`, `scheduled_for_et='10:30'`, `manual_run=false`,
 `state_schema_version='morning-live-v2-preauthorized'`,
@@ -609,14 +481,7 @@ from datetime import datetime
 from morning_dca import MorningConfig, MorningDCAExecutor
 from near_close_dca import EASTERN
 
-# Pre-flight validation (9:45 AM, read-only): emits eligible_to_execute per ticker.
-preflight = MorningDCAExecutor(
-    MorningConfig(tickers=("AAPL", "MSFT", "NVDA")),
-    mode="preflight",
-)
-
-# Live (10:30 AM) execution mode: loads the same-day pre-flight and evaluates
-# only eligible_to_execute=true tickers.
+# Live (10:30 AM) execution mode: scores the full configured, non-excluded universe.
 live = MorningDCAExecutor(
     MorningConfig(tickers=("AAPL", "MSFT", "NVDA")),
     mode="live",
@@ -663,11 +528,13 @@ morning live stream now shares the canonical 0x-to-5x ladder.
 
 ## Recovery record — 2026-07-13 morning pre-flight repair + recovery batch
 
+*Note: the 9:45 pre-flight validation described in this historical record was retired in 2026-10; see "Retired" above.*
+
 On **Mon Jul 13 2026** the scheduled 10:30 AM morning DCA live execution was
 **blocked**: the 9:45 pre-flight artifact was missing the machine-readable gate
 fields (top-level `overall_ok` and a per-ticker `eligible_to_execute` list), so
-the live task could not gate. The fix is the machine-complete pre-flight
-contract described above (schema `morning-preflight-v2-machine-complete`).
+the live task could not gate. The fix at the time was the machine-complete pre-flight
+contract (schema `morning-preflight-v2-machine-complete`).
 
 A same-day **recovery run at ~11:07 AM ET** repaired the 9:45 pre-flight artifact
 (re-emitting the machine-complete fields) and placed a **manual recovery /

@@ -24,7 +24,7 @@ trading is the safest mode for connection testing; toggle it with
 ``AlpacaConfig.is_paper_api``.
 
 Live contract note (2026-07-23): the authoritative scheduled live contract now
-spans four Robinhood-only streams (9:45 preflight, 10:30 morning live, 12:30
+spans the Robinhood-only streams (9:45 watchlist scan, 10:30 morning live, 12:30
 midday live, 3:30 final live). Runners must validate same-day pointers before
 trusting them, treat a ticker with no prior same-day context as a first
 allocation (top-up only when prior same-day context exists and the price is
@@ -33,7 +33,7 @@ submitted orders and Robinhood history before any fallback placement, place
 dollar buys as notional market orders (type='market', dollar_amount,
 time_in_force='gfd'; regular session only), and — for live runs that reached
 signal computation — always write a non-null run_classification plus
-signals.csv and submitted_orders.csv (the read-only 9:45 preflight and the
+signals.csv and submitted_orders.csv (the read-only 9:45 watchlist scan and the
 pre-signal raw-persistence failure path are standing exceptions). A 3:05
 read-only monitor also runs (no trading).
 
@@ -85,6 +85,7 @@ from typing import (
 )
 from zoneinfo import ZoneInfo
 
+import dca_ladder_core
 from dca_common import TopUpContext, build_top_up_outcome
 from dca_cumulative import CumulativeCreditLedger, apply_cumulative_credit
 from dca_fileio import atomic_open_w, atomic_write_text, order_csv_covers
@@ -4670,36 +4671,9 @@ def minimum_drop_for_ticker(config: StrategyConfig, ticker: Optional[str] = None
     return min(float(threshold) for threshold, _ in tiers)
 
 
-def interpolate_tier_multiplier(drop_vs_previous_close: float, tiers: Any) -> float:
-    """Linear blend between neighbouring ``(drop_fraction, multiplier)`` tier points.
-
-    The stepped lookup in :func:`raw_ladder_multiplier` jumps to the next tier's
-    multiplier the instant the drop crosses its threshold; a per-ticker
-    calibration with 96 percentile points is really one smooth curve sampled
-    at those points, so this returns the proportional blend instead (a drop
-    halfway between two thresholds gets the multiplier halfway between them).
-    It reproduces every tier point exactly, clamps at the last tier's value
-    for any drop beyond it, and returns 0.0 (no buy) below the first
-    threshold -- the same contract as the stepped lookup. Rounded to 4 dp so
-    the value a candidate row carries is exactly reproducible by the
-    validators in ``dca_runner._configured_calibration_bounds``.
-
-    A non-finite drop (NaN, +/-inf -- a NaN or missing price upstream) returns
-    0.0: every comparison with NaN is False, so it would otherwise fall through
-    to the last tier's multiplier, and +inf would clamp to it. Fail closed.
-    """
-    if not math.isfinite(drop_vs_previous_close):
-        return 0.0
-    ordered = sorted((float(threshold), float(multiplier)) for threshold, multiplier in tiers)
-    if not ordered or drop_vs_previous_close < ordered[0][0]:
-        return 0.0
-    if drop_vs_previous_close >= ordered[-1][0]:
-        return ordered[-1][1]
-    for (low, low_multiplier), (high, high_multiplier) in zip(ordered, ordered[1:], strict=False):
-        if low <= drop_vs_previous_close < high:
-            fraction = (drop_vs_previous_close - low) / (high - low)
-            return round(low_multiplier + (high_multiplier - low_multiplier) * fraction, 4)
-    return ordered[-1][1]  # pragma: no cover - unreachable: the bounds above cover every drop
+# The tier arithmetic lives in dca_ladder_core (a single stdlib-only file, so the backup executor can run it in a
+# sandbox without this module); the name stays here because callers import it from near_close_dca.
+interpolate_tier_multiplier = dca_ladder_core.interpolate_tier_multiplier
 
 
 def raw_ladder_multiplier(drop_vs_previous_close: float, config: StrategyConfig, ticker: Optional[str] = None) -> float:
@@ -4717,28 +4691,16 @@ def raw_ladder_multiplier(drop_vs_previous_close: float, config: StrategyConfig,
     ReconciledDecision.ladder_multiplier's own docstring for why that distinction
     matters).
     """
-    if _inverse_martingale_config(ticker, config):
-        # Mirrors graded_buy_multiplier's own identical suppression -- see
-        # that function's docstring for the full rationale. An enrolled
-        # ticker's ladder is fully suppressed, so its raw tier match is
-        # always 0 too, not just its final (ML/cap-adjusted) multiplier.
-        return 0.0
+    # An inverse-Martingale enrolled ticker's ladder is fully suppressed (mirrors graded_buy_multiplier), so its
+    # raw tier match is 0 too. Per-ticker calibrations published with ``interpolation: linear`` (see
+    # scripts/generate_per_ticker_sizing.py) blend between points; the global ladder and fallback tickers stay stepped.
     calibration = _ticker_sizing(ticker, config)
-    tiers = calibration.get("tiers", config.sizing_tiers)
-    if calibration.get("interpolate"):
-        # Per-ticker calibrations published with ``interpolation: linear`` (see
-        # scripts/generate_per_ticker_sizing.py) blend between points; the global
-        # ladder and fallback tickers stay stepped.
-        return interpolate_tier_multiplier(drop_vs_previous_close, tiers)
-    if not math.isfinite(drop_vs_previous_close):
-        # Same fail-closed rule as interpolate_tier_multiplier: +inf would
-        # otherwise satisfy every threshold and match the top tier.
-        return 0.0
-    multiplier = 0.0
-    for threshold, tier_multiplier in sorted(tiers):
-        if drop_vs_previous_close >= threshold:
-            multiplier = tier_multiplier
-    return multiplier
+    return dca_ladder_core.ladder_multiplier(
+        drop_vs_previous_close,
+        calibration.get("tiers", config.sizing_tiers),
+        interpolate=bool(calibration.get("interpolate")),
+        suppressed=bool(_inverse_martingale_config(ticker, config)),
+    )
 
 
 def graded_buy_multiplier(drop_vs_previous_close: float, config: StrategyConfig, ticker: Optional[str] = None) -> float:
@@ -4752,32 +4714,25 @@ def graded_buy_multiplier(drop_vs_previous_close: float, config: StrategyConfig,
     positive multiplier is capped to 1x: the strategy still participates in a dip
     at the base amount but stops scaling up. A 0x (no-buy) stays 0x.
     """
-    multiplier = raw_ladder_multiplier(drop_vs_previous_close, config, ticker)
-    if multiplier > 0:
-        # ml-forecaster's published, bounded (see config/ml_sizing_adjustment.json
-        # "bounds") per-ticker nudge. Absent/stale/malformed publishes are
-        # already normalized to an empty mapping by
-        # dca_config.load_ml_sizing_adjustment, so .get(..., 1.0) is a
-        # provable no-op with no ML output configured. Applied only to a
-        # positive tier match -- a 0x (no-buy) drop must stay 0x regardless of
-        # the ML factor. Applied BEFORE the kill-switch cap below so the
-        # kill-switch remains the final word on scaling.
-        ml_factor = config.ml_sizing_adjustment.get((ticker or "").upper(), 1.0)
-        multiplier = multiplier * ml_factor
-    # Ceiling raised 8.0 -> 10.0 so per-ticker calibration can reach its 96th-100th
-    # percentile tiers (8.4x-10x) past the global ladder's 8x top tier; it still
-    # clamps an over-range tier or an ML-nudged product, and the kill-switch cap
-    # below stays the final word.
-    multiplier = min(multiplier, 10.0)
-    if kill_switch_engaged(config):
-        multiplier = min(multiplier, 1.0)
-    return multiplier
+    # ml-forecaster's published, bounded (config/ml_sizing_adjustment.json "bounds") per-ticker nudge. Absent/stale/
+    # malformed publishes are normalized to an empty mapping by dca_config.load_ml_sizing_adjustment, so the 1.0
+    # default is a provable no-op. The core applies it only to a positive tier match, BEFORE the 10x ceiling and the
+    # kill-switch cap, so the kill-switch stays the final word on scaling.
+    calibration = _ticker_sizing(ticker, config)
+    return dca_ladder_core.graded_multiplier(
+        drop_vs_previous_close,
+        calibration.get("tiers", config.sizing_tiers),
+        interpolate=bool(calibration.get("interpolate")),
+        ml_factor=config.ml_sizing_adjustment.get((ticker or "").upper(), 1.0),
+        kill_switch=kill_switch_engaged(config),
+        suppressed=bool(_inverse_martingale_config(ticker, config)),
+    )
 
 
 # base_selection_reason values recorded per signal for the first-allocation base.
-BASE_BELOW_CLOSE_AND_LOW = "below_prior_close_and_low"  # $2 scale
-BASE_BELOW_CLOSE_ONLY = "below_prior_close_only"  # $1 scale
-BASE_NOT_BELOW_CLOSE = "not_below_prior_close_no_buy"  # $0, no buy
+BASE_BELOW_CLOSE_AND_LOW = dca_ladder_core.BASE_BELOW_CLOSE_AND_LOW  # $2 scale
+BASE_BELOW_CLOSE_ONLY = dca_ladder_core.BASE_BELOW_CLOSE_ONLY  # $1 scale
+BASE_NOT_BELOW_CLOSE = dca_ladder_core.BASE_NOT_BELOW_CLOSE  # $0, no buy
 
 
 def select_first_allocation_base_usd(
@@ -4800,24 +4755,14 @@ def select_first_allocation_base_usd(
     A missing/unknown ``previous_low`` is treated conservatively as "not below the
     low" so an unavailable low can never upgrade the base to the larger $2 scale.
     """
-    if not (decision_price < previous_close):
-        return 0.0, BASE_NOT_BELOW_CLOSE
     calibration = _ticker_sizing(ticker, config)
-    # A model must never produce a sub-dollar notional. The $1 floor applies
-    # before the multiplier, so every positive tier produces at least $1.
-    full_base = max(1.0, float(calibration.get("base_amount_usd", config.base_buy_amount_usd)))
-    reduced_base = max(
-        1.0,
-        float(calibration.get("base_amount_below_close_usd", config.base_buy_amount_below_close_usd)),
+    return dca_ladder_core.select_base_usd(
+        decision_price,
+        previous_close,
+        previous_low,
+        full_base=calibration.get("base_amount_usd", config.base_buy_amount_usd),
+        reduced_base=calibration.get("base_amount_below_close_usd", config.base_buy_amount_below_close_usd),
     )
-    if (
-        previous_low is not None
-        and math.isfinite(previous_low)
-        and 0 < previous_low <= previous_close
-        and decision_price < previous_low
-    ):
-        return full_base, BASE_BELOW_CLOSE_AND_LOW
-    return reduced_base, BASE_BELOW_CLOSE_ONLY
 
 
 # Substrings (checked case-insensitively) that indicate a provider raised because the
@@ -9455,7 +9400,7 @@ def _backfill_orders_csv_usage_locked(run_state_path: Path) -> Optional[bytes]:
     which another invocation sharing this identity could replace the file
     before that unlocked read ran, silently adopting the peer's payload as
     "this invocation's last verified state" and letting the downstream
-    raw-manifest/preflight_gate rewrites mutate the peer's artifact instead
+    raw-manifest rewrite mutate the peer's artifact instead
     (Codex review: "Bind the post-run snapshot to the ownership check").
     Threading the exact bytes out of this lock closes that window instead
     of merely narrowing it. ``None`` only when the file does not exist at
@@ -36945,15 +36890,15 @@ def _run_once_impl(
     # feature has never been used at all), stream_root(
     # "inverse_martingale_dca") was never created, so this costs one
     # directory-existence check and nothing more.
-    # Skipped entirely for the "morning" stream: run_dca.run_slot("1030ET")
-    # temporarily narrows config.tickers to the 9:45 pre-flight-admitted
-    # subset (`slot_config = replace(config, tickers=slot_tickers, ...)`,
-    # run_dca.py's own morning-only preflight gate), so `tradable_tickers`
-    # below is a SLOT-FILTERED evaluation subset during this stream, not the
-    # canonical configured universe -- unlike "midday"/"afternoon", which
-    # always see the full config.tickers. Without this guard, a ticker
-    # merely gated out of THIS ONE morning slot (a transient reason -- a
-    # wide spread, missing data -- not a genuine removal from config/
+    # Skipped entirely for the "morning" stream. Historically
+    # run_dca.run_slot("1030ET") narrowed config.tickers to a slot-filtered
+    # subset (the 9:45 pre-screen, since retired), so `tradable_tickers` below
+    # was not the canonical configured universe during this stream, unlike
+    # "midday"/"afternoon". Nothing narrows it any more; the deferral is kept
+    # as-is so retiring the pre-screen changes no cleanup behavior (revisit if
+    # the morning stream should run this pass too). Without the guard, a
+    # ticker merely gated out of ONE slot (a transient reason -- a wide
+    # spread, missing data -- not a genuine removal from config/
     # tickers.json) would look identical, from this cleanup pass's own
     # tradable-set check, to a ticker genuinely dropped from the universe or
     # excluded, and its real accumulated balance would be discarded even
@@ -39604,7 +39549,7 @@ def run_daily_compact(
         # `run_dca._run_pipeline_impl` prefers
         # `result["_run_state_bytes_under_lock"]` over its own unlocked
         # re-read of the shared path when binding the snapshot its later
-        # raw-manifest/preflight_gate rewrites compare against (Codex
+        # raw-manifest rewrite compares against (Codex
         # review: "Bind the post-run snapshot to the ownership check"). That
         # fallback previously covered every path with no such key set --
         # including THIS blocked-but-owned path -- with its own unlocked
@@ -41548,7 +41493,7 @@ def run_daily_compact(
     # DIFFERENT invocation's (or account's) state, never this one's own --
     # `blocked=False` alone does not say that, so a caller that only checks
     # `blocked` before doing its own post-processing (refreshing the raw-
-    # input manifest, persisting preflight_gate, merging raw placement
+    # input manifest, merging raw placement
     # responses) would keep treating that foreign path as its own output
     # and corrupt it the same way this function's own unified critical
     # section exists to prevent (Codex review: "Propagate foreign ownership

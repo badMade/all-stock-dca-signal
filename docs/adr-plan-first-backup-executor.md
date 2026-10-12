@@ -117,8 +117,36 @@ Mapping to existing fields (`scripts/stream_candidates.py:1363`): `notional_usd`
   prompt, because placement in the live prompts is prose and not a code runner. A failed emit writes nothing,
   exits 2, and does NOT block the primary's own placement (only the backup depends on the plan). Live
   scheduled bodies are unchanged until a human repastes the mirrors.
-- **Cloud single-file build** is deferred: the import closure of `dca_order_plan` is about 4.3 MB, so it
-  needs a separately reviewed extraction of a small shared ladder-core module first.
+- **Cloud single-file build (2026-10-08): a zipapp, not a condensed script.** `scripts/build_backup_planner.py`
+  packs the planner's static import closure (about 27 repo modules, 1.4 MB zipped) plus the nine config files it
+  opens into `backup_planner.pyz`, run as `python3 backup_planner.pyz <plan|compute|finalize|assemble-market-data> ...`.
+  A hand-trimmed single script would be a second copy of the sizing, cap and order-history logic. The build is
+  deterministic and stamped (`--build-info`: source commit, content hash); `--check` reports drift. A bootstrap
+  extracts the config to a temp directory, overrides any host `DCA_CONFIG_DIR`, and fails closed with one JSON
+  document on a too-old Python. The `dca_ladder_core` extraction (PR 1624) was the first step but the shipped
+  file runs the real modules. The built file is not committed (`dist/` is gitignored); how it reaches the
+  Perplexity sandbox is still undecided.
+- **Safety gate (2026-10-08), all seven slots.** `compute --market-data FILE --deployed-last-7d-usd N` runs the
+  slot's Gate 5 (`scripts.generate_buy_candidates.generate_candidates` for 15:30,
+  `scripts.stream_candidates` for the other six) and plans exactly the placeable BUYs it
+  reaches, with its sizing, kill switch and provider-error handling, then applies the same all-or-nothing caps as
+  the quotes path (`dca_order_plan.plan_from_decisions`). `scripts/assemble_market_data.py` turns the raw
+  Robinhood responses the Perplexity task dumps into that payload using the repo's `RobinhoodDataProvider`
+  parsing, so the task reshapes nothing. Stream computation uses the default decision anchor and excludes
+  planner-incompatible candidates. The backup's morning spec disables the retired preflight; its midday spec
+  uses Robinhood with the default cadence and no per-ticker source exception. Primary specs and the three live
+  execution entry points remain unchanged. `finalize` still returns `SHADOW_ONLY` for computed plans:
+  `COMPUTE_PLACEMENT_ENABLED` stays off until the shadow run.
+- **The 7-day deployment figure (implemented 2026-10-08).** The primary derives it from run-state artifacts on the
+  Mac, which the cloud cannot read. The cloud path derives it from broker order history instead:
+  `compute --deployed-last-7d-usd auto` calls `dca_order_plan.trailing_deployed_usd`, the trailing-7-day total of
+  ALL agents' committed buys. That is at least the afternoon-only figure, so an error can only trip the kill
+  switch (1x cap) earlier, never later; a malformed amount fails closed instead of reading as zero. The generated
+  prompts fetch seven days of order history (covering both the ISO-week cap and this figure) and never sum
+  anything by hand.
+- **Prompts regenerated (2026-10-08).** They run the stamped `backup_planner.pyz`, verify it with `--build-info`,
+  and take the safety-gate path for all seven slots in `backup_planner.GATED_SLOTS`. The `universe` command
+  supplies buyable symbols from config; prompts contain no stock list. Computed plans still report `shadow_only`.
 
 ## Alternatives considered
 
@@ -152,11 +180,10 @@ primary Claude slots. Status after the follow-up change:
    the resized notional, so `finalize` reconciles it against THIS slot's window only
    (`dca_order_plan.placement_window`, `reconcile(scope="slot")`); a computed plan cannot resize, so it keeps
    the day-wide exclusion. The prompts' rule 5 now reads "one order per ticker per slot".
-2. **Compute path is not the Gate 5 signal path: mitigated, not fixed.** `compute_plan` applies the ladder to
-   quotes only and skips the stream generator's trend and data-confidence gates, so it can plan a ticker the
-   primary rejected. `finalize` therefore returns `SHADOW_ONLY` for any computed plan and places nothing
-   (`COMPUTE_PLACEMENT_ENABLED`, off). Rebuilding `compute` on `scripts/stream_candidates.py` is still open
-   and is the precondition for turning the switch on.
+2. **Compute path is not the Gate 5 signal path: fixed for all seven slots (2026-10-08).** `compute --market-data`
+   reuses the slot's candidate generator, including trend and data-confidence gates. The legacy `--quotes`
+   path remains ladder-only. `finalize` still returns `SHADOW_ONLY` for any computed plan and places nothing
+   (`COMPUTE_PLACEMENT_ENABLED`, off); successful shadow runs remain a precondition for turning the switch on.
 3. **Buying power: fixed.** `compute` and `finalize` require `--buying-power` and fail closed when it is
    missing, unusable, or below the batch total.
 4. **Spread (Gate 6.7): fixed.** `finalize` requires `--fresh-spreads`; a missing, crossed, unusable, or wide
@@ -202,3 +229,25 @@ Every phase is additive. The backup prompts switch back by repasting the previou
 reverting its commit, and the plan file is ignored by anything that does not opt in. No existing
 `gate_sole_executor` or `plan_orders` caller changes behavior. Shadow mode (Phase 6) runs at
 least five trading days with no placement before any live decision.
+
+### Stage 1: every stream slot alike (2026-10-09)
+
+Owner direction (2026-10-08): nothing is special about 10:30 or 12:30; they differ only in time. No slot may depend
+on the retired 09:45 pre-flight, the Finance connector, Yahoo, or a per-ticker source exception, and no prompt may
+name a stock.
+
+- **All seven slots are gated** (`backup_planner.GATED_SLOTS`). The six executor-class slots run the primary's own
+  stream CLI path (`stream_candidates._run_with_args`) on the Robinhood payload and plan its `cands` BUY rows, minus
+  `planner_incompatible_tickers`. `scripts/backup_stream_specs.py` returns each slot's own primary spec as-is. Stage 2 made
+  10:30 and 12:30 plain Robinhood-sourced specs (the 09:45 pre-flight was retired, and 12:30 became Robinhood-primary
+  with default bars and no `ticker_source_overrides`, as 09:35 did on 2026-09-09), so the backup carries no
+  adaptation of its own and cannot size differently from the primary.
+- **15:30 is filtered by `planner_incompatible`, with the calibration bounds in the row.** A bare 4-field row is judged
+  against the global ladder and flags nearly every calibrated ticker (the live 15:30 prompt ignores that flag), so the
+  planner builds the same 7-field row the stream documents use (`stream_candidates._calibration_fields`). Then only a
+  row whose multiplier, notional and drop disagree is withheld. (An intermediate version of this work dropped the
+  filter; the Copilot review commit on this branch restored it correctly and that approach is kept.)
+- **Errors never echo payload content.** `market_data_invalid` carries only the exception type name.
+- **`backup_planner.pyz universe`** prints the buyable symbols, count and universe hash from the packaged config.
+  The generated prompts contain no stock names; a test fails if any appears, and none mentions Yahoo.
+- Yahoo is never required: it exists only as the stream code's optional fallback block, which the backup does not use.

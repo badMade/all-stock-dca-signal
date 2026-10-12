@@ -16,6 +16,7 @@ Crash & Power Outage Safety:
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import shutil
 import subprocess
@@ -129,16 +130,93 @@ def has_checkpoint(shard_dir: Path) -> bool:
     )
 
 
+class ShardExportError(RuntimeError):
+    """One or more shards could not export their next-day forecasts, so no merged CSV may be published."""
+
+
+def merge_shard_tomorrow_forecasts(run_dir_base: Path, shard_dirs: Sequence[Path]) -> Path | None:
+    """Export and merge next-day predictions across all shards into all_shards_tomorrow.csv.
+
+    All-or-nothing: ``all_shards_tomorrow.csv`` feeds ``publish_octopus_sizing.py``, so a partial merge (one shard
+    silently missing) or a stale file from an earlier run must never be left behind. Any failed or missing shard
+    export raises :class:`ShardExportError` naming the shards, after removing the previous merged file.
+    """
+    merged_path = run_dir_base / "all_shards_tomorrow.csv"
+    merged_path.unlink(missing_ok=True)  # never leave the previous run's forecasts looking current
+    all_rows = []
+    fieldnames = None
+    failed: list[str] = []
+    for shard_dir in shard_dirs:
+        out_csv = run_dir_base / f"{shard_dir.name}_tomorrow.csv"
+        out_csv.unlink(missing_ok=True)
+        cmd = [
+            sys.executable,
+            str(OCTOPUS_DIR / "inspect_run.py"),
+            "--run-dir",
+            str(shard_dir),
+            "--tomorrow",
+            "--csv",
+            str(out_csv),
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0 or not out_csv.is_file():
+            failed.append(shard_dir.name)
+            continue
+        with open(out_csv, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if fieldnames is None and reader.fieldnames:
+                fieldnames = list(reader.fieldnames) + ["shard"]
+            for row in reader:
+                row["shard"] = shard_dir.name
+                all_rows.append(row)
+    if failed:
+        raise ShardExportError(f"next-day export failed for {', '.join(failed)}; no merged forecast was written")
+    if all_rows and fieldnames:
+        with open(merged_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(all_rows)
+        print(f"Merged {len(all_rows)} next-day forecasts across {len(shard_dirs)} shards -> {merged_path}")
+        return merged_path
+    return None
+
+
+def merge_or_exit_code(run_dir_base: Path, shard_dirs: Sequence[Path]) -> int:
+    """Run the daily merge for a caller that must return an exit code: 0 on success, 4 when an export failed."""
+    try:
+        merge_shard_tomorrow_forecasts(run_dir_base, shard_dirs)
+    except ShardExportError as error:
+        print(f"\n{error}")
+        return 4
+    return 0
+
+
 def build_shard_cmd(
     shard_tickers: Sequence[str],
     shard_dir: Path,
     args: argparse.Namespace,
     target_end: str | None = None,
 ) -> tuple[list[str] | None, str]:
-    """Assemble the CLI command for running run_walkforward.py on one shard.
+    """Assemble the CLI command for running walk-forward replay or daily update on one shard.
 
     Returns (command_tokens_or_None, status_mode).
     """
+    if getattr(args, "daily", False):
+        if not has_checkpoint(shard_dir):
+            return None, "no_checkpoint"
+        cmd = [
+            sys.executable,
+            "-u",
+            str(OCTOPUS_DIR / "daily_update.py"),
+            "--run-dir",
+            str(shard_dir),
+        ]
+        if getattr(args, "now", None):
+            cmd.extend(["--now", str(args.now)])
+        if getattr(args, "dry_run", False):
+            cmd.append("--dry-run")
+        return cmd, "daily"
+
     if is_shard_completed(shard_dir, target_end) and not args.force:
         return None, "completed"
 
@@ -154,6 +232,8 @@ def build_shard_cmd(
             cmd.append("--retrain")
         if args.end:
             cmd.extend(["--end", args.end])
+        if getattr(args, "now", None):
+            cmd.extend(["--now", str(args.now)])  # as-of replay: rows on/after this day stay unseen
         if args.device:
             cmd.extend(["--device", args.device])
         if args.dry_run:
@@ -196,6 +276,8 @@ def build_shard_cmd(
         cmd.extend(["--diagnostic-sample", str(args.diagnostic_sample)])
     if args.end:
         cmd.extend(["--end", args.end])
+    if getattr(args, "now", None):
+        cmd.extend(["--now", str(args.now)])  # as-of replay: rows on/after this day stay unseen
     if args.device:
         cmd.extend(["--device", args.device])
     if args.dry_run:
@@ -312,6 +394,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Pass --retrain to run_walkforward.py for a sanctioned recovery refit if archive changed",
     )
     parser.add_argument(
+        "--daily",
+        action="store_true",
+        help="Run daily_update.py on each shard to advance by one trading day",
+    )
+    parser.add_argument(
+        "--now",
+        default=None,
+        help="As-of cutoff date (passed to daily_update.py or run_walkforward.py)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print shard distributions and command lines without fitting models",
@@ -319,47 +411,71 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    history_dir = configured_ticker_history_dir()
-    all_tickers = discover_available_tickers(history_dir)
-    if not all_tickers:
-        print(f"REFUSED: no valid tickers found in {history_dir}", file=sys.stderr)
-        return 1
+    if args.daily:
+        shard_dirs = sorted(
+            [
+                d
+                for d in args.run_dir_base.glob("shard_*")
+                if d.is_dir() and d.name.removeprefix("shard_").isdigit() and has_checkpoint(d)
+            ],
+            key=lambda p: int(p.name.removeprefix("shard_")),
+        )
+        if not shard_dirs:
+            print(f"REFUSED: no shard checkpoints found in {args.run_dir_base}", file=sys.stderr)
+            return 1
+        shards = [[] for _ in shard_dirs]
+        target_end = None
 
-    shards = split_into_shards(all_tickers, args.shards)
-    total_tickers = sum(len(s) for s in shards)
-    archive_latest = get_archive_latest_date(history_dir)
-    target_end = args.end or archive_latest
-
-    print(
-        f"Archive: {history_dir} | Latest: {archive_latest or 'unknown'} | "
-        f"Total valid tickers: {total_tickers} | Partitioned into {len(shards)} shards"
-    )
-    for i, s in enumerate(shards, start=1):
-        s_dir = args.run_dir_base / f"shard_{i}"
-        if is_shard_completed(s_dir, target_end):
-            status = " [DONE]"
-        elif (s_dir / "report" / "report.json").is_file():
+        print(f"Daily update across {len(shard_dirs)} shards under {args.run_dir_base}")
+        for i, s_dir in enumerate(shard_dirs, start=1):
             last_p = get_shard_last_processed_date(s_dir)
-            status = f" [STALE: {last_p} < {target_end}]"
-        elif has_checkpoint(s_dir):
-            status = " [CHECKPOINT]"
-        else:
-            status = ""
-        print(f"  Shard {i}/{len(shards)}: {len(s)} tickers ({s[0]} ... {s[-1]}){status}")
+            print(f"  Shard {i}/{len(shard_dirs)} ({s_dir.name}): last processed {last_p or 'unknown'}")
+    else:
+        history_dir = configured_ticker_history_dir()
+        all_tickers = discover_available_tickers(history_dir)
+        if not all_tickers:
+            print(f"REFUSED: no valid tickers found in {history_dir}", file=sys.stderr)
+            return 1
+
+        shards = split_into_shards(all_tickers, args.shards)
+        shard_dirs = [args.run_dir_base / f"shard_{i}" for i in range(1, len(shards) + 1)]
+        total_tickers = sum(len(s) for s in shards)
+        archive_latest = get_archive_latest_date(history_dir)
+        target_end = args.end or archive_latest
+
+        print(
+            f"Archive: {history_dir} | Latest: {archive_latest or 'unknown'} | "
+            f"Total valid tickers: {total_tickers} | Partitioned into {len(shards)} shards"
+        )
+        for i, s in enumerate(shards, start=1):
+            s_dir = shard_dirs[i - 1]
+            if is_shard_completed(s_dir, target_end):
+                status = " [DONE]"
+            elif (s_dir / "report" / "report.json").is_file():
+                last_p = get_shard_last_processed_date(s_dir)
+                status = f" [STALE: {last_p} < {target_end}]"
+            elif has_checkpoint(s_dir):
+                status = " [CHECKPOINT]"
+            else:
+                status = ""
+            print(f"  Shard {i}/{len(shards)}: {len(s)} tickers ({s[0]} ... {s[-1]}){status}")
 
     # 1. Single shard mode
     if args.shard is not None:
-        if not (1 <= args.shard <= len(shards)):
-            print(f"Error: --shard must be between 1 and {len(shards)}", file=sys.stderr)
+        if not (1 <= args.shard <= len(shard_dirs)):
+            print(f"Error: --shard must be between 1 and {len(shard_dirs)}", file=sys.stderr)
             return 1
         target_shard = shards[args.shard - 1]
-        shard_dir = args.run_dir_base / f"shard_{args.shard}"
+        shard_dir = shard_dirs[args.shard - 1]
         cmd, mode = build_shard_cmd(target_shard, shard_dir, args, target_end=target_end)
         if mode == "completed":
             print(f"\nShard {args.shard} is already completed ({shard_dir}/report/report.json exists).")
             print("Use --force to re-run from scratch.")
             return 0
-        if mode == "resume":
+        if mode == "daily":
+            last_p = get_shard_last_processed_date(shard_dir)
+            print(f"\nRunning daily update on Shard {args.shard} ({shard_dir.name}, last: {last_p}) ...")
+        elif mode == "resume":
             last_p = get_shard_last_processed_date(shard_dir)
             is_stale = last_p and target_end and last_p < target_end
             stale_info = f" (stale: processed through {last_p}, target is {target_end})" if is_stale else ""
@@ -376,42 +492,53 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("Dry run command:", " ".join(cmd[:12]), f"... [{len(target_shard)} tickers]")
             return 0
         assert cmd is not None
+        res = subprocess.run(cmd)
+        if res.returncode == 0 and args.daily:
+            return merge_or_exit_code(args.run_dir_base, shard_dirs)
+        return res.returncode
+
     if args.dry_run:
         print("\n[Dry Run Preview]")
-        for i, s in enumerate(shards, start=1):
-            shard_dir = args.run_dir_base / f"shard_{i}"
-            cmd, mode = build_shard_cmd(s, shard_dir, args, target_end=target_end)
-            if mode == "resume":
-                last_p = get_shard_last_processed_date(shard_dir)
-                has_report = (shard_dir / "report" / "report.json").is_file()
+        for i, s_dir in enumerate(shard_dirs, start=1):
+            cmd, mode = build_shard_cmd(shards[i - 1], s_dir, args, target_end=target_end)
+            if mode == "daily":
+                action = f"DAILY UPDATE on {s_dir.name}"
+            elif mode == "resume":
+                last_p = get_shard_last_processed_date(s_dir)
+                has_report = (s_dir / "report" / "report.json").is_file()
                 stale_tag = (
                     f" (stale: processed through {last_p}, target is {target_end})" if has_report else ""
                 )
-                action = f"RESUME from {shard_dir}/checkpoint{stale_tag}"
+                action = f"RESUME from {s_dir}/checkpoint{stale_tag}"
             elif mode == "completed":
                 action = "ALREADY COMPLETED"
             else:
                 action = f"FRESH START (checkpoints every {args.checkpoint_every} steps)"
-            print(f"  Shard {i}: {len(s)} tickers -> {action}")
+            print(f"  Shard {i}: {action}")
         print("\nDry run finished. Pass without --dry-run to execute.")
         return 0
 
     # 2. Parallel mode
     if args.parallel:
-        print(f"\nLaunching all {len(shards)} shards in parallel...")
+        title = "daily update on" if args.daily else "all"
+        print(f"\nLaunching {title} {len(shard_dirs)} shards in parallel...")
         processes: list[tuple[int, subprocess.Popen, Path]] = []
-        for i, s in enumerate(shards, start=1):
-            shard_dir = args.run_dir_base / f"shard_{i}"
-            cmd, mode = build_shard_cmd(s, shard_dir, args, target_end=target_end)
+        for i, s_dir in enumerate(shard_dirs, start=1):
+            cmd, mode = build_shard_cmd(shards[i - 1], s_dir, args, target_end=target_end)
             if mode == "completed":
                 print(f"  [Shard {i}] Already completed. Skipping.")
                 continue
             assert cmd is not None
-            log_file = shard_dir / "stdout.log"
-            shard_dir.mkdir(parents=True, exist_ok=True)
+            log_file = s_dir / ("daily_update.log" if args.daily else "stdout.log")
+            s_dir.mkdir(parents=True, exist_ok=True)
             log_handle = log_file.open("a", encoding="utf-8")
-            resume_tag = " [RESUMING FROM SAVE POINT]" if mode == "resume" else ""
-            print(f"  [Shard {i}] {len(s)} tickers -> {shard_dir}{resume_tag} (logging to {log_file})")
+            if mode == "daily":
+                tag = " [DAILY UPDATE]"
+            elif mode == "resume":
+                tag = " [RESUMING FROM SAVE POINT]"
+            else:
+                tag = ""
+            print(f"  [Shard {i}] {s_dir.name} -> {s_dir}{tag} (logging to {log_file})")
             proc = subprocess.Popen(cmd, stdout=log_handle, stderr=subprocess.STDOUT)
             processes.append((i, proc, log_file))
 
@@ -436,20 +563,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             for _, proc, _ in processes:
                 proc.wait()
             return 3
+        if exit_code == 0 and args.daily and not args.dry_run:
+            exit_code = merge_or_exit_code(args.run_dir_base, shard_dirs)
         return exit_code
 
     # 3. Sequential mode (default or --all)
-    print(f"\nRunning shards sequentially (save points every {args.checkpoint_every} steps)...")
-    for i, s in enumerate(shards, start=1):
-        shard_dir = args.run_dir_base / f"shard_{i}"
-        cmd, mode = build_shard_cmd(s, shard_dir, args, target_end=target_end)
+    mode_desc = "daily update on" if args.daily else "walk-forward on"
+    print(f"\nRunning {mode_desc} shards sequentially...")
+    for i, s_dir in enumerate(shard_dirs, start=1):
+        cmd, mode = build_shard_cmd(shards[i - 1], s_dir, args, target_end=target_end)
         if mode == "completed":
-            print(f"\nShard {i}/{len(shards)} is already completed. Skipping.")
+            print(f"\nShard {i}/{len(shard_dirs)} is already completed. Skipping.")
             continue
 
-        resume_title = "RESUMING FROM SAVE POINT" if mode == "resume" else "STARTING"
+        if mode == "daily":
+            title = "DAILY UPDATE"
+        elif mode == "resume":
+            title = "RESUMING FROM SAVE POINT"
+        else:
+            title = "STARTING"
         print("\n=======================================================")
-        print(f"  {resume_title}: SHARD {i}/{len(shards)} ({len(s)} tickers) -> {shard_dir}")
+        print(f"  {title}: SHARD {i}/{len(shard_dirs)} -> {s_dir}")
         print("=======================================================\n")
         assert cmd is not None
         res = subprocess.run(cmd)
@@ -458,8 +592,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("Run again anytime to resume exactly where it left off!")
             return res.returncode
 
-    print(f"\nAll {len(shards)} shards completed successfully!")
-    print(f"Artifacts saved under {args.run_dir_base}/shard_1 ... shard_{len(shards)}")
+    if args.daily and not args.dry_run:
+        merge_code = merge_or_exit_code(args.run_dir_base, shard_dirs)
+        if merge_code != 0:
+            return merge_code
+
+    print(f"\nAll {len(shard_dirs)} shards completed successfully!")
+    print(f"Artifacts saved under {args.run_dir_base}/shard_1 ... shard_{len(shard_dirs)}")
     return 0
 
 

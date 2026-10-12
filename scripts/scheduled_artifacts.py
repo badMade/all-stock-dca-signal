@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Scheduled-run artifact contract for the daily DCA preflight/live streams.
+"""Scheduled-run artifact contract for the daily DCA live streams.
 
-Every scheduled run_state.json for the 9:45 pre-flight validation, the 10:30
+Every scheduled run_state.json for the 10:30
 morning live run, and the 12:30 midday live run MUST carry a non-null top-level
 ``run_classification`` object, and every LIVE run MUST write ``signals.csv``
 (whenever signals can be computed) and ``submitted_orders.csv`` (with a header
@@ -82,21 +82,6 @@ ORDER_ATTEMPT_STATUSES = frozenset(
     }
 )
 
-# Scheduled pre-flight validation (9:45 ET) identity. Must match the actual
-# producer's constants in morning_dca.py (MORNING_PREFLIGHT_CRON_ID,
-# MORNING_PREFLIGHT_RUN_TYPE) and schemas/morning_preflight.schema.json, whose
-# own description documents run_type='morning_dca_preflight' and
-# stream='morning' -- not an aspirational separate identity, or any consumer
-# adopting this contract to validate/attribute the preflight would reject
-# every real artifact.
-PREFLIGHT_CRON_ID = "bb4f6ef1"
-PREFLIGHT_RUN_TYPE = "morning_dca_preflight"
-PREFLIGHT_SCHEDULED_FOR_ET = "09:45"
-PREFLIGHT_WINDOW_START_ET = "09:40"
-PREFLIGHT_WINDOW_END_ET = "09:50"
-PREFLIGHT_STREAM = "morning"
-PREFLIGHT_STATE_SCHEMA_VERSION = "morning-preflight-v2-machine-complete"
-
 # Scheduled morning live (10:30 ET) identity.
 MORNING_LIVE_CRON_ID = "42173154"
 MORNING_LIVE_RUN_TYPE = "morning_dca_live"
@@ -165,43 +150,6 @@ SCHEDULED_LIVE_REQUIRED_FILENAMES = (
 # reported as a nested-artifact contract failure naming the file, rather than the
 # generic "missing" error, so the operator sees the real cause.
 NESTED_ARTIFACT_SUBDIRS = ("artifacts", "out", "output")
-
-
-def build_preflight_run_classification(
-    *,
-    trading_day: str,
-    run_id: str,
-    valid_scheduled_evidence: bool,
-    triggered_at_utc: Optional[str] = None,
-    cron_id: str = PREFLIGHT_CRON_ID,
-) -> Dict[str, Any]:
-    """Non-null run_classification for the 9:45 pre-flight validation run.
-
-    ``valid_scheduled_evidence`` must be derived from the completed run_state
-    (see :func:`derive_valid_scheduled_evidence`), never asserted blindly.
-    Includes every field schemas/morning_run_classification.schema.json
-    requires for a scheduled run_type='morning_dca_preflight' document
-    (trades, valid_afternoon_evidence, and the pinned scheduled window), not
-    just the same-day pointer fields.
-    """
-    return {
-        "run_origin": "scheduled",
-        "run_type": PREFLIGHT_RUN_TYPE,
-        "trades": False,
-        "scheduled_for_et": PREFLIGHT_SCHEDULED_FOR_ET,
-        "scheduled_window_start_et": PREFLIGHT_WINDOW_START_ET,
-        "scheduled_window_end_et": PREFLIGHT_WINDOW_END_ET,
-        "manual_run": False,
-        "state_schema_version": PREFLIGHT_STATE_SCHEMA_VERSION,
-        "run_id": run_id,
-        "triggered_at_utc": triggered_at_utc or _utc_now_iso(),
-        "cron_id": cron_id,
-        "stream": PREFLIGHT_STREAM,
-        "valid_afternoon_evidence": False,
-        "trading_day": trading_day,
-        "same_day_required": True,
-        "valid_scheduled_evidence": valid_scheduled_evidence,
-    }
 
 
 def build_morning_live_run_classification(
@@ -877,7 +825,7 @@ def validate_run_artifacts(
     Fails when run_state.json is missing/unreadable, when its top-level
     ``run_classification`` is null/absent or not an object, or when a required
     CSV (signals.csv / submitted_orders.csv) is missing. ``require_submitted_orders``
-    should be True for live runs and False for read-only pre-flight runs; when True,
+    should be True for live runs and False for read-only runs; when True,
     submitted_orders.csv must not only exist but carry the SUBMITTED_ORDERS_FIELDS
     header row (a zero-byte/truncated file fails rather than passing as no-order).
     The signals CSV is held to the same standard: present at the run root with a
@@ -889,9 +837,9 @@ def validate_run_artifacts(
 
     The run_summary.json <-> run_state run_classification mirror check is only
     enforced for scheduled LIVE runs (``require_submitted_orders=True``). Read-only
-    pre-flight runs write a run_summary.json without a run_classification by design
-    (the 9:45 preflight writer never mirrors it), so requiring the mirror on them
-    would wrongly fail a valid preflight whose run_state classification is present.
+    runs write a run_summary.json without a run_classification by design, so requiring
+    the mirror on them would wrongly fail a valid read-only run whose run_state
+    classification is present.
 
     ``require_summary`` (True for the scheduled afternoon live run) additionally
     fails unless the CANONICAL ``run_summary.json`` is present. A report-only
@@ -967,10 +915,10 @@ def validate_run_artifacts(
             # from a prior attempt in a reused same-day recovery dir (its
             # triggered_at_utc differs), so mirror-checking it would wrongly mark a
             # valid recovery blocked after orders may already have been placed.
-            # Read-only pre-flight dirs (require_submitted_orders=False) write
-            # run_summary.json WITHOUT a run_classification by design (the 9:45
-            # preflight writer never mirrors it), so enforcing the mirror on them
-            # would wrongly fail a valid preflight. Within live runs it is still only
+            # Read-only dirs (require_submitted_orders=False) write
+            # run_summary.json WITHOUT a run_classification by design, so
+            # enforcing the mirror on them would wrongly fail a valid read-only
+            # run. Within live runs it is still only
             # enforced when the canonical summary is present, so a live run without
             # one still validates here (require_summary covers its absence).
             state_classification = (
@@ -1363,9 +1311,6 @@ __all__ = [
     "SIGNAL_SYMBOL_COLUMNS",
     "SUBMITTED_ORDERS_FIELDS",
     "ORDER_ATTEMPT_STATUSES",
-    "PREFLIGHT_CRON_ID",
-    "PREFLIGHT_RUN_TYPE",
-    "PREFLIGHT_STREAM",
     "MORNING_LIVE_CRON_ID",
     "MORNING_LIVE_STREAM",
     "MIDDAY_LIVE_CRON_ID",
@@ -1388,7 +1333,6 @@ __all__ = [
     "nested_only_artifacts",
     "build_run_summary",
     "write_scheduled_run_artifacts",
-    "build_preflight_run_classification",
     "build_morning_live_run_classification",
     "build_afternoon_live_run_classification",
     "has_planned_orders",

@@ -134,6 +134,9 @@ py-modules = [
     # (_process_buy_candidate's whole-share dispatch); without it here,
     # import fails with ModuleNotFoundError outside a source checkout.
     "dca_whole_share_accumulator",
+    # Ladder and base-selection arithmetic extracted from near_close_dca (stdlib-only single file,
+    # imported by near_close_dca at module load; docs/adr-plan-first-backup-executor.md).
+    "dca_ladder_core",
     # Plan-first backup executor: order-plan validation, reconciliation and the compute
     # fallback (docs/adr-plan-first-backup-executor.md). Imports near_close_dca/dca_runner.
     "dca_execution_router",
