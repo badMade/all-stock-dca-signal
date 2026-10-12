@@ -490,3 +490,20 @@ def test_claim_is_unconfirmed_and_confirm_follows_the_first_accepted_order(promp
     assert "records an unconfirmed claim" in text and "it is not a buy" in text
     assert "scripts.local_heartbeat confirm" in text
     assert "the claim expires and a later run may claim again" in text
+
+
+@pytest.mark.parametrize("prefix", ["0955ET", "1050ET", "1150ET", "1250ET", "1350-1450ET", "1545ET"])
+def test_the_task_also_fetches_the_previous_sessions_daily_bar_and_saves_it_under_daily(prompts, prefix):
+    """Copilot's review of #1643: without the daily bar the assembled payload has no real prior low."""
+    text = _by_prefix(prompts, prefix)
+    step4 = text[text.index("STEP 4"):text.index("STEP 5")]
+    assert "interval day" in step4 or "interval=day" in step4 or "daily bar" in step4
+    assert '"daily": [' in step4
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_state_record_includes_planner_build(prompts, prefix):
+    text = _by_prefix(prompts, prefix)
+    state = text[text.index("STEP 8 - STATE RECORD"):text.index("STEP 9 - NOTIFY")]
+    assert "planner_build" in state
+

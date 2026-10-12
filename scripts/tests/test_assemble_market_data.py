@@ -273,3 +273,136 @@ def test_a_well_formed_response_with_no_results_is_still_fine(tmp_path, capsys):
     raw["quotes"].append({"data": {"results": []}})
     code, report, _ = _assemble(tmp_path, capsys, raw)
     assert (code, report["status"]) == (0, "ASSEMBLED")
+
+
+# ---------------------------------------------------------------------------
+# The real prior-session low (Copilot's review of #1643; written test-first)
+#
+# The primary's live prompts fetch the previous completed session's DAILY bar, so its payload carries the real
+# prior low and a ticker trading below it gets the full first-allocation base. The assembler used to rebuild the
+# previous bar from the quote alone (low=0.0, "unknown"), which can only ever select the reduced base, so the shadow
+# plan could not match the primary's sizing. The task now also dumps the daily bar(s) under ``"daily"``.
+# ---------------------------------------------------------------------------
+
+
+def _raw_daily(symbol, *, low, high=101.0, open_=99.5, close=100.0, day="2026-10-06"):
+    return {"results": [{"symbol": symbol, "interval": "day", "bounds": "regular", "bars": [
+        {"begins_at": f"{day}T04:00:00Z", "open_price": f"{open_:.4f}", "high_price": f"{high:.4f}",
+         "low_price": f"{low:.4f}", "close_price": f"{close:.4f}", "volume": 5_000_000, "session": "reg", "interpolated": False},
+    ]}]}
+
+
+def test_a_daily_bar_gives_the_payload_the_real_prior_session_low(tmp_path, capsys):
+    raw = {**raw_bundle(TAPE), "daily": [_raw_daily("VT", low=98.25), _raw_daily("MSFT", low=99.0)]}
+    code, _, out = _assemble(tmp_path, capsys, raw)
+    assert code == 0
+    bar = json.loads(out.read_text())["sources"]["robinhood"]["VT"]["previous_close_bar"]
+    assert (bar["open"], bar["high"], bar["low"], bar["close"]) == (99.5, 101.0, 98.25, 100.0)
+    assert bar["timestamp"] < f"{DAY}T00:00:00"  # still strictly before the trading day
+
+
+def test_the_assembled_low_reaches_the_primarys_base_selector_so_it_picks_the_full_base(tmp_path, capsys):
+    """Price 97 is below the prior close (100) and below the real low (98.25): the primary's own selector gives the
+    full base, where the unknown-low sentinel can only give the reduced one.
+
+    Run on a bare config with distinct bases. (Under today's per-ticker calibration every active ticker has equal full
+    and reduced bases, so live sizing does not change yet; this pins the data path for the day that stops being true.)
+    """
+    import near_close_dca
+
+    config = near_close_dca.StrategyConfig(base_buy_amount_usd=2.0, base_buy_amount_below_close_usd=1.0)
+
+    def base_for(raw, name):
+        out = _assemble(tmp_path, capsys, raw, out_name=f"{name}.json")[2]
+        bar = json.loads(out.read_text())["sources"]["robinhood"]["VT"]["previous_close_bar"]
+        return near_close_dca.select_first_allocation_base_usd(97.0, bar["close"], bar["low"], config)[0]
+
+    assert base_for(raw_bundle(TAPE), "without") == 1.0
+    assert base_for({**raw_bundle(TAPE), "daily": [_raw_daily("VT", low=98.25)]}, "with") == 2.0
+
+
+def test_without_a_daily_response_the_old_conservative_sentinel_still_applies(tmp_path, capsys):
+    _, _, out = _assemble(tmp_path, capsys, raw_bundle(TAPE))
+    assert json.loads(out.read_text())["sources"]["robinhood"]["VT"]["previous_close_bar"]["low"] == 0.0
+
+
+def test_a_daily_bar_for_the_trading_day_itself_is_not_a_prior_session(tmp_path, capsys):
+    """A same-day daily bar must never stand in for the prior session: it is ignored, keeping the sentinel."""
+    raw = {**raw_bundle(TAPE), "daily": [_raw_daily("VT", low=98.25, day=DAY)]}
+    _, _, out = _assemble(tmp_path, capsys, raw)
+    bar = json.loads(out.read_text())["sources"]["robinhood"]["VT"]["previous_close_bar"]
+    assert bar["low"] == 0.0 and bar["timestamp"] < f"{DAY}T00:00:00"
+
+
+def test_daily_and_five_minute_responses_never_mix(tmp_path, capsys):
+    plain = _assemble(tmp_path, capsys, raw_bundle(TAPE), out_name="a.json")[2]
+    mixed = _assemble(tmp_path, capsys, {**raw_bundle(TAPE), "daily": [_raw_daily("VT", low=98.25)]}, out_name="b.json")[2]
+    a = json.loads(plain.read_text())["sources"]["robinhood"]["VT"]["intraday_bars"]
+    b = json.loads(mixed.read_text())["sources"]["robinhood"]["VT"]["intraday_bars"]
+    assert a == b  # the daily bar added nothing to the intraday series
+
+
+@pytest.mark.parametrize("bad", [42, {"results": "nope"}, {"results": [7]}, None])
+def test_a_malformed_daily_response_refuses_the_whole_input_and_writes_nothing(tmp_path, capsys, bad):
+    code, report, out = _assemble(tmp_path, capsys, {**raw_bundle(TAPE), "daily": [bad]})
+    assert code == 2 and report["status"] == "FAILED" and not out.exists()
+
+
+def test_daily_must_be_a_list_when_present(tmp_path, capsys):
+    code, report, out = _assemble(tmp_path, capsys, {**raw_bundle(TAPE), "daily": {"not": "a list"}})
+    assert code == 2 and not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# A daily bar must be the SAME session as the quote's official prior close (adversarial review; written test-first)
+#
+# The first version accepted any daily bar dated before the trading day. A bar from days earlier (a short fetch window,
+# a missing session) then silently replaced the official prior close, so a flat ticker looked far down and drew a large
+# multiplier. The daily bar may only add the real low: its session must be the quote's, and its close must agree.
+# ---------------------------------------------------------------------------
+
+
+def _prior_bar(tmp_path, capsys, daily):
+    raw = {**raw_bundle(TAPE), **({"daily": daily} if daily is not None else {})}
+    out = _assemble(tmp_path, capsys, raw)[2]
+    return json.loads(out.read_text())["sources"]["robinhood"]["VT"]["previous_close_bar"]
+
+
+def test_a_stale_daily_bar_cannot_replace_the_official_prior_close(tmp_path, capsys):
+    """Quote says the prior session is 10-06 (close 100); a 10-01 bar (close 150) must be ignored, sentinel kept."""
+    stale = _raw_daily("VT", low=140.0, high=155.0, close=150.0, day="2026-10-01")
+    bar = _prior_bar(tmp_path, capsys, [stale])
+    assert (bar["close"], bar["low"]) == (100.0, 0.0)
+    assert bar["timestamp"].startswith("2026-10-06")
+
+
+def test_the_newest_of_several_daily_bars_is_used_only_if_it_is_the_quotes_session(tmp_path, capsys):
+    older = _raw_daily("VT", low=90.0, close=95.0, day="2026-10-02")
+    right = _raw_daily("VT", low=98.25, close=100.0, day="2026-10-06")
+    bar = _prior_bar(tmp_path, capsys, [older, right])
+    assert (bar["close"], bar["low"]) == (100.0, 98.25)
+
+
+def test_a_missing_session_is_not_papered_over_by_an_older_one(tmp_path, capsys):
+    """Only 10-02 and 10-05 are present; the quote's session is 10-06. Neither stands in for it."""
+    bars = [_raw_daily("VT", low=90.0, close=95.0, day="2026-10-02"), _raw_daily("VT", low=91.0, close=96.0, day="2026-10-05")]
+    bar = _prior_bar(tmp_path, capsys, bars)
+    assert (bar["close"], bar["low"]) == (100.0, 0.0)
+
+
+@pytest.mark.parametrize("close", [103.0, 97.0, 150.0])
+def test_a_daily_close_that_disagrees_with_the_official_close_is_not_trusted(tmp_path, capsys, close):
+    """Same session, but a close more than 1% from the quote's official close means one of the two is wrong."""
+    bar = _prior_bar(tmp_path, capsys, [_raw_daily("VT", low=98.25, close=close, day="2026-10-06")])
+    assert (bar["close"], bar["low"]) == (100.0, 0.0)
+
+
+def test_a_daily_close_within_rounding_of_the_official_close_is_accepted(tmp_path, capsys):
+    bar = _prior_bar(tmp_path, capsys, [_raw_daily("VT", low=98.25, close=100.004, day="2026-10-06")])
+    assert bar["low"] == 98.25
+    assert bar["close"] == 100.0  # the official close stays the reference; the daily bar only supplies the real low
+
+
+def test_a_daily_bar_for_another_symbol_is_never_used(tmp_path, capsys):
+    bar = _prior_bar(tmp_path, capsys, [_raw_daily("MSFT", low=50.0, close=100.0, day="2026-10-06")])
+    assert (bar["close"], bar["low"]) == (100.0, 0.0)

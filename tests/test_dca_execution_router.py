@@ -226,3 +226,60 @@ def test_fallback_plan_source_delegates_to_choose_plan_path():
     assert router.fallback_plan_source(d, "offline") == dop.choose_plan_path("offline", plan=None, elapsed_s=0)
     stand_down = router.decide(ExecutorRole.PERPLEXITY, LocalStatus.SUCCEEDED, now=NOW)
     assert router.fallback_plan_source(stand_down, "online") is None
+
+
+# --- Copilot's review of #1643 (written test-first) -------------------------------------------------------------
+# Finding: guard_broker only wrapped ``place_order``, but this repo's brokers place through ``place_market_buy`` and
+# ``place_whole_share_buy`` (near_close_dca.BrokerAdapter / dca_live_adapters.RobinhoodBroker), which ``__getattr__``
+# forwarded straight to the wrapped broker even when the routing decision forbids placement.
+
+
+class RepoShapedSpyBroker:
+    """The placement surface the real brokers expose."""
+
+    def __init__(self):
+        self.calls = []
+
+    def place_market_buy(self, ticker, notional_usd, ref_id):
+        self.calls.append(("place_market_buy", ticker, notional_usd, ref_id))
+        return "order-1"
+
+    def place_whole_share_buy(self, ticker, quantity, ref_id):
+        self.calls.append(("place_whole_share_buy", ticker, quantity, ref_id))
+        return "order-2"
+
+    def get_account(self):  # a read: must stay reachable through the wrapper
+        return {"ok": True}
+
+
+@pytest.mark.parametrize("status", list(LocalStatus))
+def test_a_cloud_wrapped_broker_cannot_reach_the_repos_real_placement_methods(status):
+    spy = RepoShapedSpyBroker()
+    guarded = router.guard_broker(spy, ExecutorRole.CLOUD, status, now=NOW)
+    with pytest.raises(router.OrderPlacementForbidden):
+        guarded.place_market_buy("MU", 5.0, "ref-1")
+    with pytest.raises(router.OrderPlacementForbidden):
+        guarded.place_whole_share_buy("BYDDY", 1, "ref-2")
+    assert spy.calls == []
+
+
+def test_a_standing_down_backup_cannot_place_through_the_repos_real_methods():
+    spy = RepoShapedSpyBroker()
+    guarded = router.guard_broker(spy, ExecutorRole.PERPLEXITY, LocalStatus.IN_PROGRESS, now=NOW)  # local is alive
+    with pytest.raises(router.OrderPlacementForbidden):
+        guarded.place_market_buy("MU", 5.0, "ref-1")
+    assert spy.calls == []
+
+
+def test_a_permitted_role_still_places_through_the_real_methods_and_reads_stay_reachable():
+    spy = RepoShapedSpyBroker()
+    guarded = router.guard_broker(spy, ExecutorRole.LOCAL, LocalStatus.REACHABLE, now=NOW)
+    assert guarded.place_market_buy("MU", 5.0, "ref-1") == "order-1"
+    assert guarded.place_whole_share_buy("BYDDY", 1, "ref-2") == "order-2"
+    assert guarded.get_account() == {"ok": True}
+    assert [c[0] for c in spy.calls] == ["place_market_buy", "place_whole_share_buy"]
+
+
+def test_a_forbidden_wrapper_still_lets_reads_through():
+    guarded = router.guard_broker(RepoShapedSpyBroker(), ExecutorRole.CLOUD, LocalStatus.OFF, now=NOW)
+    assert guarded.get_account() == {"ok": True}

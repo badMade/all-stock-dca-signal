@@ -105,3 +105,18 @@ def test_live_prompt_names_no_stock():
     # tool names are lowercase or contain underscores, so they never match.
     found = sorted(t for t in universe if re.search(rf"(?<![A-Za-z0-9_]){re.escape(t)}(?![A-Za-z0-9_])", prompt))
     assert found == [], found
+
+
+def test_the_active_midday_task_entry_is_robinhood_primary_not_finance():
+    """Copilot's review of #1643: the live task entry (a6239dae) is what a deployed 12:30 run follows.
+
+    The source policy and the separate 2026-07-20 fix block already said Robinhood, but the task entry itself still told
+    the raw-input producer to use the Finance connector, so the deployed path could fetch Finance-shaped inputs.
+    """
+    config = json.loads((ROOT / "config" / "scheduled_tasks.json").read_text())
+    tasks = [t for t in config["tasks"] if t.get("id") == "a6239dae"]
+    assert len(tasks) == 1 and tasks[0]["status"] == "active" and tasks[0]["executor"] == "MiddayDCAExecutor"
+    data_sources = tasks[0]["raw_input_generation"]["data_sources"].lower()
+    assert "robinhood" in data_sources and "explicitly labeled yfinance fallback" in data_sources
+    assert "finance connector primary" not in data_sources
+    assert "alpaca" not in data_sources  # no second validation source is part of the 12:30 inputs any more

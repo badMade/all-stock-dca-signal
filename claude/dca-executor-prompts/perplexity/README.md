@@ -44,8 +44,13 @@ shadow mode (ADR phase 6) has run for at least five trading days.
 ## Which slots take the safety-gate path
 
 All seven, read from `scripts.backup_planner.GATED_SLOTS` when the prompts are generated. Each prompt asks the planner
+<<<<<<< HEAD
+for the symbols to fetch (`backup_planner.pyz universe`), dumps the raw `get_equity_historicals` (5-minute under `historicals`, the previous
+session's daily bar under `daily`) and `get_equity_quotes` responses to `raw.json`, runs `assemble-market-data`, then `compute --market-data market.json
+=======
 for the symbols to fetch (`backup_planner.pyz universe`), dumps the raw `get_equity_historicals` and `get_equity_quotes`
 responses to `raw.json`, runs `assemble-market-data`, then `compute --market-data market.json
+>>>>>>> origin/main
 --deployed-last-7d-usd auto`, so the primary's own Gate 5 decides what to buy and the planner derives the kill-switch
 figure from the order history. No prompt names a stock or mentions Yahoo; the stocks live in the planner's configuration.
 

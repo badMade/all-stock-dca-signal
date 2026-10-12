@@ -15,8 +15,11 @@ Usage::
     python3 backup_planner.pyz assemble-market-data --trading-day 2026-10-07 --raw raw.json --out market.json
     python3 -m scripts.assemble_market_data         --trading-day 2026-10-07 --raw raw.json --out market.json
 
-``--raw`` is ``{"historicals": [<raw response>, ...], "quotes": [<raw response>, ...]}``. A response may
-carry one symbol or many, and several responses may cover one symbol (pages).
+``--raw`` is ``{"historicals": [<raw response>, ...], "daily": [<raw response>, ...], "quotes": [<raw response>, ...]}``.
+``historicals`` are the 5-minute ``get_equity_historicals`` responses, ``daily`` the same tool with ``interval=day``
+(the previous completed session's bar), ``quotes`` the ``get_equity_quotes`` responses. A response may carry one
+symbol or many, and several responses may cover one symbol (pages). ``daily`` is optional: without it the previous
+bar is rebuilt from the quote alone and keeps the unknown-low sentinel (see below).
 
 WHAT IT WRITES
 --------------
@@ -28,8 +31,13 @@ WHAT IT WRITES
 * A universe ticker with missing, partial or unusable raw data goes under ``ticker_errors.robinhood`` (an
   explicit error marker, which blocks an auto-buy for it), never silently dropped. Any non-finite or
   non-positive price, or a prior-close date that is not strictly before the trading day, is such a defect.
-* The previous-close bar keeps ``low=0.0``, the provider's "unknown" sentinel: fabricating a low would
-  upgrade the base to the larger scale.
+* The previous-close bar keeps the quote's OFFICIAL close and session. The ``daily`` response only adds the real
+  open/high/low/volume to it, exactly as the primary's payload carries them, so a ticker trading below yesterday's
+  low gets the primary's full first-allocation base. It is used only when it is that same session and its close
+  agrees with the official close within 1%: a stale or conflicting daily bar is ignored, never allowed to move the
+  reference close. Without a usable daily bar the bar keeps ``low=0.0``, the provider's "unknown" sentinel:
+  fabricating a low would upgrade the base to the larger scale, so the reduced base can only be a conservative
+  miss, never an over-buy. Daily and 5-minute responses are kept apart and never mix.
 * Symbols outside the active universe, and the do-not-buy list, are ignored.
 
 WHAT IT IS NOT
@@ -42,6 +50,7 @@ stdout; exit 0 on success. Output bytes are deterministic.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
@@ -86,12 +95,15 @@ def _read_raw(path: Path) -> dict[str, list[Any]]:
         raise _Refused("raw_corrupt", "expected an object with 'historicals' and 'quotes' lists")
     if not document["historicals"] and not document["quotes"]:
         raise _Refused("raw_empty", "no raw responses to assemble")
+    daily = document.get("daily", [])
+    if not isinstance(daily, list):
+        raise _Refused("raw_corrupt", "'daily' must be a list of get_equity_historicals (interval=day) responses")
     # Every saved response must be well-formed, not just the two outer lists: a truncated or failed broker
     # response beside good data would otherwise be skipped silently and hide an incomplete fetch.
-    for kind in ("historicals", "quotes"):
-        for index, response in enumerate(document[kind]):
+    for kind, responses in (("historicals", document["historicals"]), ("daily", daily), ("quotes", document["quotes"])):
+        for index, response in enumerate(responses):
             _results_of(response, f"{kind}[{index}]")
-    return {"historicals": document["historicals"], "quotes": document["quotes"]}
+    return {"historicals": document["historicals"], "daily": daily, "quotes": document["quotes"]}
 
 
 def _results_of(response: Any, label: str) -> list[Any]:
@@ -106,14 +118,15 @@ def _results_of(response: Any, label: str) -> list[Any]:
 class _Replay:
     """The two tool callables ``RobinhoodDataProvider`` takes, answering from the saved responses."""
 
-    def __init__(self, raw: dict[str, list[Any]]) -> None:
+    def __init__(self, raw: dict[str, list[Any]], historicals_key: str = "historicals") -> None:
         self._raw = raw
+        self._historicals_key = historicals_key  # "historicals" (5-minute) or "daily": the two are never mixed
 
     def historicals(self, *, symbols: list[str], **_ignored: Any) -> dict[str, Any]:
         wanted = {s.upper() for s in symbols}
         merged: list[dict[str, Any]] = []
-        for response in self._raw["historicals"]:
-            for result in _results_of(response, "historicals"):
+        for response in self._raw[self._historicals_key]:
+            for result in _results_of(response, self._historicals_key):
                 if str(result.get("symbol", "")).upper() in wanted:
                     merged.append(result)
         # Pages of one symbol become one result so the provider sees every bar.
@@ -135,12 +148,44 @@ def _finite_positive(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
 
 
-def _snapshot(provider: RobinhoodDataProvider, ticker: str, trading_day: date) -> dict[str, Any] | None:
+DAILY_CLOSE_TOLERANCE = 0.01  # a daily close more than 1% from the quote's official close is a conflict, not rounding
+
+
+def _with_real_range(official: Any, daily_provider: RobinhoodDataProvider, ticker: str, as_of: datetime, trading_day: date) -> Any:
+    """``official`` (the quote-derived prior-session bar) with the real open/high/low/volume from the daily bar.
+
+    The daily bar may only ADD the real range to the official prior session; it never replaces the official close or
+    names the session. So it is used only when it is that same session (a bar from days earlier, or a missing
+    session papered over by an older one, would move the reference close and manufacture a drop), its close agrees
+    with the official close within ``DAILY_CLOSE_TOLERANCE``, and its prices are finite with a positive low. Anything
+    else returns ``official`` unchanged: the unknown-low sentinel, which can only pick the reduced base.
+
+    The daily provider is built without a quote function, so it takes its daily-historicals path (the production
+    parsing) and never the quote-derived bar.
+    """
+    bar = daily_provider.get_previous_close_bar(ticker, as_of)
+    if bar is None or bar.timestamp.astimezone(ET).date() >= trading_day:
+        return official
+    if bar.timestamp.astimezone(ET).date() != official.timestamp.astimezone(ET).date():
+        return official  # not the session the quote calls the prior close
+    prices = (bar.open, bar.high, bar.low, bar.close)
+    if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in prices) or bar.low <= 0 or bar.close <= 0:
+        return official
+    if abs(bar.close - official.close) > DAILY_CLOSE_TOLERANCE * official.close:
+        return official
+    return dataclasses.replace(official, open=bar.open, high=bar.high, low=bar.low, volume=bar.volume)
+
+
+def _snapshot(
+    provider: RobinhoodDataProvider, ticker: str, trading_day: date, daily_provider: RobinhoodDataProvider | None = None,
+) -> dict[str, Any] | None:
     """One ticker's payload entry, or ``None`` when its raw data is missing, partial or unusable."""
     as_of = datetime.combine(trading_day, time(16, 0), tzinfo=ET)
     open_bell = datetime.combine(trading_day, time(9, 30), tzinfo=ET)
     bars = provider.get_intraday_bars(ticker, open_bell, as_of, ROBINHOOD_BAR_MINUTES)
     previous = provider.get_previous_close_bar(ticker, as_of)
+    if daily_provider is not None and previous is not None:
+        previous = _with_real_range(previous, daily_provider, ticker, as_of, trading_day)  # the real low when it checks out
     quote = provider.get_quote(ticker, as_of)
     if not bars or previous is None or quote is None:
         return None
@@ -175,11 +220,12 @@ def assemble(raw: dict[str, list[Any]], trading_day: date, universe: list[str]) 
     """The payload for ``universe``; tickers with unusable data are error-marked, not dropped."""
     replay = _Replay(raw)
     provider = RobinhoodDataProvider(replay.historicals, replay.quotes)
+    daily_provider = RobinhoodDataProvider(_Replay(raw, "daily").historicals, None) if raw.get("daily") else None
     robinhood: dict[str, Any] = {}
     errors: list[str] = []
     for ticker in sorted(universe):
         try:
-            entry = _snapshot(provider, ticker, trading_day)
+            entry = _snapshot(provider, ticker, trading_day, daily_provider)
         except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
             entry = None
         if entry is None:

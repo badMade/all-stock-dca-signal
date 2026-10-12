@@ -290,14 +290,31 @@ def confirm_buy(*, log_dir: Optional[Path] = None, trading_day: str, slot: str, 
 
 
 class _GuardedBroker:
+    """A broker whose every order-placing method checks the routing decision first.
+
+    The repo's brokers place through ``place_market_buy`` and ``place_whole_share_buy``
+    (``near_close_dca.BrokerAdapter``, ``dca_live_adapters.RobinhoodBroker``); ``place_order`` is kept for
+    callers written against the original contract. Anything else (reads, account lookups) is forwarded
+    untouched through ``__getattr__``, so a calculation-only role can still read but cannot reach an order.
+    """
+
     def __init__(self, broker: Any, decision: Decision) -> None:
         self._broker = broker
         self._decision = decision
 
-    def place_order(self, *args: Any, **kwargs: Any) -> Any:
+    def _checked(self, method: str, *args: Any, **kwargs: Any) -> Any:
         if not self._decision.may_place:
             raise OrderPlacementForbidden(self._decision.reason)
-        return self._broker.place_order(*args, **kwargs)
+        return getattr(self._broker, method)(*args, **kwargs)
+
+    def place_order(self, *args: Any, **kwargs: Any) -> Any:
+        return self._checked("place_order", *args, **kwargs)
+
+    def place_market_buy(self, *args: Any, **kwargs: Any) -> Any:
+        return self._checked("place_market_buy", *args, **kwargs)
+
+    def place_whole_share_buy(self, *args: Any, **kwargs: Any) -> Any:
+        return self._checked("place_whole_share_buy", *args, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._broker, name)
