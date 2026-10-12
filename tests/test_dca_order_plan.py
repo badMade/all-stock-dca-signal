@@ -1036,3 +1036,34 @@ def test_a_malformed_committed_amount_raises_instead_of_reading_as_zero(bad):
     """An unknown fill is not a zero fill: a kill switch fed too little would stay off on the day it matters."""
     with pytest.raises(dca_runner.BudgetDataError):
         dop.trailing_deployed_usd([_spent(amount=bad)], now=NOW)
+
+
+# -- plan_from_decisions: prior_low is safety evidence (PR #1644 review) ---------------------------------------
+
+
+def _decision(symbol="MSFT", **over):
+    row = {"symbol": symbol, "notional_usd": 4.0, "multiplier": 2.0, "drop_pct": 1.2, "decision_price": 100.0,
+           "prior_close": 101.0, "prior_low": None}
+    row.update(over)
+    return row
+
+
+def _from_decisions(config, rows):
+    return dop.plan_from_decisions(
+        rows, config=config, trading_day=DAY, slot=SLOT, generated_at_et=NOW, ladder_version=LADDER_VERSION,
+        tier=NORMAL_TIER,
+    )
+
+
+@pytest.mark.parametrize("low,expected", [(None, None), (99.5, 99.5)])
+def test_plan_from_decisions_keeps_an_absent_or_valid_prior_low(global_config, low, expected):
+    result = _from_decisions(global_config, [_decision(prior_low=low)])
+    assert [o["symbol"] for o in result.orders] == ["MSFT"]
+    assert result.orders[0]["prior_low"] == expected
+
+
+@pytest.mark.parametrize("bad_low", [0, 0.0, -1.0, float("nan"), float("inf"), float("-inf"), True, False, "99.5"])
+def test_plan_from_decisions_rejects_corrupt_prior_low_instead_of_reading_it_as_unknown(global_config, bad_low):
+    result = _from_decisions(global_config, [_decision(prior_low=bad_low)])
+    assert result.orders == ()
+    assert ("MSFT", "invalid_decision") in result.skipped

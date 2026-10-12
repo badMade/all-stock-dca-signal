@@ -63,11 +63,11 @@ def test_every_ticker_is_scored_alike_with_no_alternate_source():
     assert [c["ticker"] for c in document["cands"]] == ["GFUZ"]
 
 
-def test_midday_config_keeps_robinhood_primary_and_documents_yfinance_fallback():
+def test_midday_config_keeps_robinhood_primary_with_no_fallback_source():
     config = json.loads((ROOT / "config" / "midday_dca.json").read_text())
     data_sources = config["raw_input_generation"]["data_sources"].lower()
     assert "robinhood is the primary signal source" in data_sources
-    assert "explicitly labeled, prefetched yfinance fallback" in data_sources
+    assert "there is no fallback source" in data_sources
     assert "finance connector primary" not in data_sources
     assert "gfuz" not in json.dumps(config).lower()
 
@@ -76,21 +76,21 @@ def test_midday_scheduled_task_source_policy_matches_generator():
     config = json.loads((ROOT / "config" / "scheduled_tasks.json").read_text())
     policy = config["market_data_source_policy"]["slot_overrides"]["1230ET"]
     assert policy["primary_source"] == "robinhood"
-    assert policy["accepted_sources"] == ["robinhood", "yahoo_finance_yfinance"]
+    assert policy["accepted_sources"] == ["robinhood"]
     data_sources = config["midday_raw_input_and_failure_state_fix_2026_07_20"]["raw_input_generation"][
         "data_sources"
     ].lower()
     assert "robinhood" in data_sources
-    assert "explicitly labeled yfinance fallback" in data_sources
+    assert "yfinance" not in data_sources
     assert "finance connector primary" not in data_sources
 
 
-def test_live_prompt_fetches_robinhood_bars_with_yfinance_only_as_backup():
+def test_live_prompt_fetches_robinhood_bars_with_no_fallback_source():
     prompt = LIVE_PROMPT.read_text()
     lowered = prompt.lower()
     assert "get_equity_historicals" in prompt
     assert "5minute" in prompt
-    # yfinance appears only as the labeled backup block every Robinhood-primary slot carries, never as a requirement.
+    assert "yfinance" not in lowered
     assert "finance connector" not in lowered
     assert "sources.finance" not in lowered
     assert '"finance"' not in lowered
@@ -117,6 +117,9 @@ def test_the_active_midday_task_entry_is_robinhood_primary_not_finance():
     tasks = [t for t in config["tasks"] if t.get("id") == "a6239dae"]
     assert len(tasks) == 1 and tasks[0]["status"] == "active" and tasks[0]["executor"] == "MiddayDCAExecutor"
     data_sources = tasks[0]["raw_input_generation"]["data_sources"].lower()
-    assert "robinhood" in data_sources and "explicitly labeled yfinance fallback" in data_sources
+    # Owner direction 2026-10-12: no scheduled run depends on Yahoo Finance, so there is no fallback to name; a failed
+    # Robinhood primary aborts the run with nothing placed.
+    assert "robinhood" in data_sources and "aborts with nothing placed" in data_sources
+    assert "yfinance" not in data_sources and "yahoo" not in data_sources
     assert "finance connector primary" not in data_sources
     assert "alpaca" not in data_sources  # no second validation source is part of the 12:30 inputs any more

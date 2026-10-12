@@ -35,7 +35,7 @@
   "special_handling": {
     "GFUZ": {
       "primary_source": "robinhood",
-      "reason": "Finance (and other read-only market-data providers) may not resolve GFUZ. Robinhood is the primary quote/prior-close source for GFUZ; Alpaca/Finance/Yahoo remain read-only validation/context only.",
+      "reason": "Finance (and other read-only market-data providers) may not resolve GFUZ. Robinhood is the primary quote/prior-close source for GFUZ; Alpaca/Finance remain read-only validation/context only.",
       "do_not_block_run_if_finance_unresolved": true
     }
   },

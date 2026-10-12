@@ -869,7 +869,16 @@ window.ConsolePages = (() => {
                 { label: "Reduced base ($1.00)", key: "reduced" },
               ], canonicalTiers, "No tiers.")
             );
+if (Array.isArray(view.warnings) && view.warnings.length) container.append(warnings(view.warnings));
             container.append(summaryBlock);
+            if (Array.isArray(view.per_ticker) && view.per_ticker.length) {
+              const perTickerBlock = text("div", "auto-block");
+              perTickerBlock.append(
+                text("h3", "auto-title", "Effective per-ticker calibrated curves"),
+                auto(view.per_ticker, "per-ticker")
+              );
+              container.append(perTickerBlock);
+            }
 
             if (Array.isArray(view.tiers) && view.tiers.length) {
               const tb = text("div", "auto-block");

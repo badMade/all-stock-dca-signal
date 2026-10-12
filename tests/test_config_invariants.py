@@ -4606,40 +4606,28 @@ def test_midday_live_mirror_documents_the_run_classification_template():
     assert "never a bare string" in text
 
 
-def test_every_live_slot_gate_5_merges_its_prefetched_yfinance_fallback():
-    """2026-09-22: every slot's Gate 5 generator accepts the labeled yfinance
-    fallback, and deploy/launchd/prefetch_slot.sh writes it outside the session.
-    A prompt that forgets to merge it sends its session back to pulling every
-    ticker's bars through MCP tool output -- the failure behind Notion DCA
-    Issues output_size_limit, intraday_bars_unavailable and token_limit_exceeded.
-    """
+def test_no_live_slot_gate_5_reads_a_prefetched_fallback():
+    """2026-10-12: no scheduled run has a fallback data source, so no live slot's Gate 5 merges a prefetched payload
+    or runs the retired launchd prefetch helper. A prompt that still does would route a session to a source the
+    generators now reject as unsupported."""
     mirror_dir = PROMPTS_DIR / "live-mirror"
     for mirror in sorted(mirror_dir.glob("[0-9][0-9][0-9][0-9]ET-*.txt")):
-        slot = mirror.name[:4]
-        text = mirror.read_text(encoding="utf-8")
-        gate_5 = text[text.index("GATE 5 - BUY LIST") : text.index("GATE 6 - BUDGET")]
-        assert (
-            f"stream_root('yfinance_prefetch', '<YYYY-MM-DD>', 'yfinance_fallback_<YYYY-MM-DD>_{slot}.json')" in gate_5
-        ), mirror.name
-        assert f'deploy/launchd/prefetch_slot.sh" {slot}' in gate_5, mirror.name
-        assert "sources.yahoo_finance_yfinance" in gate_5, mirror.name
-        # The prefetch tree is deliberately not the run directory.
-        assert "$ROOT/yfinance_fallback_" not in gate_5, mirror.name
+        text = mirror.read_text(encoding="utf-8").lower()
+        for retired in ("yfinance", "yahoo", "prefetch_slot", "yfinance_prefetch"):
+            assert retired not in text, (mirror.name, retired)
 
 
 def test_robinhood_slots_never_record_a_skipped_fetch_as_a_robinhood_source_error():
     """2026-10-05 9:35 run: the session skipped its Robinhood fetch to stay under the
     tool output cap, then listed "robinhood" in source_errors because the prompt said
-    to ("or would exceed a tool output or token limit"). The yfinance fallback was
-    chosen correctly, but the run evidence carried a Robinhood data-failure code for
+    to ("or would exceed a tool output or token limit"). The run evidence carried a Robinhood data-failure code for
     an outage that never happened -- and the Notion DCA Issues database and the
     self-heal logic key on exactly those codes.
 
     ``source_errors`` means "I attempted this fetch and it raised". A fetch the
     session chose not to attempt is an ABSENT ``sources.robinhood`` key, which the
-    generator already treats as a whole-source outage and answers with the labeled
-    yfinance fallback (scripts/tests/test_generate_market_open_candidates.py::
-    test_cli_substitutes_yfinance_when_the_robinhood_key_is_absent).
+    generator already treats as a whole-source outage and aborts on (there is no
+    fallback source).
     """
     offenders = []
     for mirror in sorted((PROMPTS_DIR / "live-mirror").glob("[0-9][0-9][0-9][0-9]ET-*.txt")):

@@ -133,14 +133,14 @@
       "place_SYMBOL.json"
     ],
     "rules": [
-      "Before computing any signal, persist every raw Robinhood/Finance/Alpaca/Yahoo connector response used by the run under scheduled_runs/YYYYMMDD_1530ET/raw/ with the deterministic filenames above.",
+      "Before computing any signal, persist every raw Robinhood/Finance/Alpaca connector response used by the run under scheduled_runs/YYYYMMDD_1530ET/raw/ with the deterministic filenames above.",
       "Normalize large connector output_path pointers into parseable JSON before persisting (referenced contents under 'data', original pointer preserved under 'output_path').",
       "Compute must read only the persisted/normalized files under raw/, never in-memory tool responses. Order of operations: fetch -> persist -> normalize -> compute -> place.",
       "If raw persistence or normalization fails, still write a valid scheduled run_state (run_origin='scheduled', manual_run=false) with order_submit_status='not_submitted_error', raw_persistence_error set, empty raw_inputs_saved, and no orders placed, rather than escalating without state."
     ],
     "run_state_fields": ["raw_input_dir", "raw_inputs_saved", "recovery_from_escalation", "raw_persistence_error"],
     "helper_module": "scripts/run_classification.py",
-    "broker_policy_unchanged": "Robinhood only for execution; Alpaca/Finance/Yahoo read-only validation; no review_equity_order in scheduled live runs.",
+    "broker_policy_unchanged": "Robinhood only for execution; Alpaca/Finance read-only validation; no review_equity_order in scheduled live runs.",
     "recovered_run_2026_07_10": {
       "trading_day": "2026-07-10",
       "scheduled_run_dir": "/home/user/workspace/cron_tracking/ce16ba6b/scheduled_runs/20260710_1520ET/",
@@ -198,7 +198,7 @@
     "state_schema_version": "run-classification-v2-preauthorized",
     "is_final_buy_of_day": true,
     "broker_account": "robinhood:${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}",
-    "broker_roles_note": "Robinhood account <ROBINHOOD_ACCOUNT_NUMBER> was the only execution broker; Alpaca/Finance/Yahoo remained read-only.",
+    "broker_roles_note": "Robinhood account <ROBINHOOD_ACCOUNT_NUMBER> was the only execution broker; Alpaca/Finance remained read-only.",
     "base_amount_usd": 3.0,
     "ladder": "0x-to-5x ($3 base): <0.1%=0x; 0.1-<1%=1x; 1-<2%=1.5x; 2-<3%=2x; 3-<4%=2.5x; 4-<5%=3x; 5-<6%=3.5x; 6-<7%=4x; 7-<8%=4.5x; >=8%=5x.",
     "final_buy_behavior_applied": "Final buy of the day: full active-universe scan with the 60-minute downward-trend filter ignored for the final-buy decision only. All other gates still enforced: current/decision price strictly below the prior completed regular-session close, ladder multiplier > 0, data-confidence pass, spread_ok=true, budget/tiered-cap pass, regular-hours-only, whitelisted (active-universe) ticker, hard circuit breakers, and the same-day top-up guard.",
@@ -826,7 +826,7 @@
       ],
       "run_date_arg": "If a runner requires a RUN_DATE_ET argument, pass the current America/New_York date as YYYYMMDD.",
       "no_stale_reuse": "Do NOT reuse stale files from a prior run.",
-      "data_sources": "Finance connector primary, Alpaca and Robinhood validation/context, yfinance fallback ONLY when connector data is unavailable, stale, incomplete, or unresolved.",
+      "data_sources": "Finance connector primary, Alpaca and Robinhood validation/context, no fallback source.",
       "bounded_recovery": "If raw input generation fails once, perform ONE bounded recovery attempt with the alternate approved data source path, then stop.",
       "see": "config/scheduled_tasks.json:live_schedule_hardening_2026_07_20.afternoon_1530"
     },

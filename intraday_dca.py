@@ -39,7 +39,7 @@ Other key properties (see ``config/intraday_dca.json``):
 
     - **Live Robinhood-only execution** on account
       ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` (supplied by the environment, never
-      committed); Alpaca/Finance/Yahoo stay read-only.
+      committed); Alpaca/Finance stay read-only.
     - Uses the **shared 0x -> 5x sizing ladder** and dynamic $1/$2 base, the same
       active universe (excluding the whole-share tickers BYDDY and RVII),
       and the same shared $180/$900 Normal-tier ceiling -- pooled across all

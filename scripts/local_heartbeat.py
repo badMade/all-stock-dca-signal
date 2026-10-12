@@ -29,7 +29,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -84,6 +86,30 @@ def _read_marker(path: Path):
     return (text, True) if text in ("success", "failure") else (None, False)
 
 
+def _write_marker_atomically(path: Path, outcome: str) -> None:
+    """Write the marker via a temp file and ``os.replace`` so a crash never leaves a partial marker at ``path``.
+
+    A torn marker would read as unrecognized (UNKNOWN), and a truncated one that happened to parse could flip the
+    run's recorded outcome, so the marker path only ever holds a complete value (PR 1644 review).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp")
+    try:
+        try:
+            os.write(fd, (outcome + "\n").encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.chmod(tmp_name, 0o644)  # mkstemp creates 0600; match the lease file
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def start(day: str, slot: str, *, now: float | None = None) -> dict:
     lease, marker = _lease(day, slot)
     token = uuid.uuid4().hex  # unique per run: see the module docstring
@@ -118,8 +144,7 @@ def finish(day: str, slot: str, token: str, outcome: str) -> dict:
     lease, marker = _lease(day, slot)
 
     def write_marker() -> None:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(outcome + "\n", encoding="utf-8")  # marker first: a crash between the two reads as finished
+        _write_marker_atomically(marker, outcome)  # marker first: a crash between the two reads as finished
 
     # Ownership check, marker write and release are one critical section under the lease guard: a superseded run
     # (stale, then reclaimed by a new run) writes no marker and releases nothing (review of PR 1639).

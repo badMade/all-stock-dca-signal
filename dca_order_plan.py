@@ -771,8 +771,20 @@ def plan_from_decisions(
     skipped: list[tuple[str, str]] = []
     chosen: dict[str, dict[str, Any]] = {}
     for row in decisions:
-        symbol = row.get("symbol").strip().upper() if isinstance(row, Mapping) and isinstance(row.get("symbol"), str) else None
-        if symbol is None or not all(_is_positive_finite(row.get(k)) for k in ("notional_usd", "multiplier", "drop_pct", "decision_price", "prior_close")):
+        symbol = (
+            row.get("symbol").strip().upper()
+            if isinstance(row, Mapping) and isinstance(row.get("symbol"), str)
+            else None
+        )
+        low = row.get("prior_low") if isinstance(row, Mapping) else None
+        if (
+            symbol is None
+            or not all(
+                _is_positive_finite(row.get(k))
+                for k in ("notional_usd", "multiplier", "drop_pct", "decision_price", "prior_close")
+            )
+            or (low is not None and not _is_positive_finite(low))
+        ):
             skipped.append((symbol or "<invalid>", "invalid_decision"))
             continue
         if symbol in chosen:
@@ -783,7 +795,6 @@ def plan_from_decisions(
         if symbol not in active:
             skipped.append((symbol, "unknown_symbol"))
             continue
-        low = row.get("prior_low")
         chosen[symbol] = {
             "symbol": symbol,
             "notional_usd": round(float(row["notional_usd"]), 2),
@@ -926,7 +937,7 @@ def order_plan_path(trading_day: date, slot: str) -> Path:
 
     A tree of its own, not the slot's run directory: creating ``<stream>/<day>_<slot>ET``
     before a slot has run is read by the schedule verifier and same-day scans as "this slot
-    ran" (see ``deploy/launchd/prefetch_plan.py`` for the same rule). The root honours
+    ran" (the rule the retired prefetch planner also used). The root honours
     ``$DCA_CRON_TRACKING_ROOT`` through ``dca_paths``.
     """
     return Path(dca_paths.stream_root("order_plans", trading_day.isoformat(), f"order_plan_{slot}.json"))

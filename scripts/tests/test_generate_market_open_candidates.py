@@ -783,9 +783,6 @@ def test_cli_end_to_end(tmp_path, monkeypatch):
     on stdout, which is exactly what the executor prompt's Gate 5 consumes."""
     path = tmp_path / "market_data_0935ET.json"
     payload = _market_data(TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0))
-    payload["sources"]["yahoo_finance_yfinance"] = {
-        "TEST": _ticker_payload(price=90.0, previous_close=100.0, previous_low=97.0)
-    }
     path.write_text(json.dumps(payload), encoding="utf-8")
     document = _cli(
         [
@@ -800,9 +797,7 @@ def test_cli_end_to_end(tmp_path, monkeypatch):
     assert document["same_day_top_up_candidates"][0]["ticker"] == "TEST"
     assert document["planner_config_mismatch"] is False
     assert document["source"] == "robinhood"
-    assert document["validation_context_sources_present"] == ["yahoo_finance_yfinance"]
-    # The materially different yfinance price was retained as context, not used
-    # to replace the Robinhood-primary $5 candidate with a shallower signal.
+    assert document["validation_context_sources_present"] == []
     assert document["cands"][0]["current_price"] == pytest.approx(95.0)
 
 
@@ -867,19 +862,9 @@ def test_cli_accepts_a_robinhood_only_payload_with_no_finance_data_at_all(tmp_pa
     assert _only(document)["target_price"] == pytest.approx(95.0)
 
 
-def _yfinance_rescue_payload(**robinhood: dict) -> dict:
-    """Robinhood as given, plus a labeled yfinance block carrying TEST and OTHER."""
-    return {
-        "sources": {
-            "robinhood": dict(robinhood),
-            "yahoo_finance_yfinance": {
-                "TEST": _ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0),
-                "OTHER": _ticker_payload(price=50.0, previous_close=50.5, previous_low=49.0),
-            },
-        },
-        "source_errors": [],
-        "ticker_errors": {"robinhood": [], "yahoo_finance_yfinance": []},
-    }
+def _two_ticker_payload(**robinhood: dict) -> dict:
+    """Robinhood as given, for a two-ticker universe (TEST and OTHER)."""
+    return {"sources": {"robinhood": dict(robinhood)}, "source_errors": [], "ticker_errors": {"robinhood": []}}
 
 
 def _two_ticker_cli(tmp_path, monkeypatch, payload: dict) -> dict:
@@ -892,38 +877,10 @@ def _two_ticker_cli(tmp_path, monkeypatch, payload: dict) -> dict:
     )
 
 
-# 2026-09-22 policy change (config/scheduled_tasks.json market_data_source_policy):
-# a Robinhood-primary slot may now fall back to the labeled yfinance payload --
-# but only when Robinhood failed AS A WHOLE, never over one ticker's gap (Notion
-# DCA Issues: output_size_limit, intraday_bars_unavailable, market_data_unavailable).
-
-
-def test_cli_substitutes_yfinance_when_robinhood_is_declared_failed(tmp_path, monkeypatch):
-    payload = _yfinance_rescue_payload()
-    payload["source_errors"] = ["robinhood"]
-    document = _two_ticker_cli(tmp_path, monkeypatch, payload)
-
-    assert document["source"] == "yahoo_finance_yfinance"
-    assert _only(document)["target_price_source"] == "yahoo_finance_yfinance"
-    assert _only(document)["action"] == Action.BUY.value
-
-
-def test_cli_substitutes_yfinance_when_the_robinhood_key_is_absent(tmp_path, monkeypatch):
-    payload = _yfinance_rescue_payload()
-    del payload["sources"]["robinhood"]
-    del payload["ticker_errors"]["robinhood"]
-    assert _two_ticker_cli(tmp_path, monkeypatch, payload)["source"] == "yahoo_finance_yfinance"
-
-
-def test_cli_substitutes_yfinance_when_every_robinhood_ticker_is_empty(tmp_path, monkeypatch):
-    document = _two_ticker_cli(tmp_path, monkeypatch, _yfinance_rescue_payload())
-    assert document["source"] == "yahoo_finance_yfinance"
-
-
-def test_one_robinhood_ticker_error_does_not_move_the_universe_to_yfinance(tmp_path, monkeypatch):
+def test_one_robinhood_ticker_error_does_not_abort_the_slot(tmp_path, monkeypatch):
     """Robinhood reports one routine per-ticker error in most real documents; Finance's
-    any-gap rule would put these slots on yfinance nearly every day."""
-    payload = _yfinance_rescue_payload(
+    any-gap rule would abort these slots nearly every day."""
+    payload = _two_ticker_payload(
         TEST=_ticker_payload(price=95.0, previous_close=100.0, previous_low=97.0)
     )
     payload["ticker_errors"]["robinhood"] = ["OTHER"]
@@ -933,13 +890,13 @@ def test_one_robinhood_ticker_error_does_not_move_the_universe_to_yfinance(tmp_p
     assert document["provider_error_tickers"] == ["OTHER"]
 
 
-def test_robinhood_failure_without_a_fallback_still_aborts(tmp_path, monkeypatch):
+def test_robinhood_failure_aborts_with_no_fallback_source(tmp_path, monkeypatch):
     payload = _market_data()
     payload["source_errors"] = ["robinhood"]
     path = tmp_path / "market_data_0935ET.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     _patch_config(monkeypatch)
-    with pytest.raises(ValueError, match="robinhood data is unavailable.*yfinance fallback is unavailable"):
+    with pytest.raises(ValueError, match="robinhood data is unavailable.*no fallback source"):
         gmoc.main(["--trading-day", DAY.isoformat(), "--market-data", str(path), "--config-dir", str(REAL_CONFIG_DIR)])
 
 

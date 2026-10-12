@@ -573,19 +573,12 @@ def test_cli_end_to_end(tmp_path, monkeypatch):
     ("payload", "match"),
     [
         ({"sources": {}, "source_errors": []}, "missing the required"),
-        # A declared Robinhood outage or an empty Robinhood payload is exactly what
-        # the policy routes to the labelled yfinance fallback; with no fallback
-        # object in the payload that routing has nowhere to go and must abort.
-        ({"sources": {"robinhood": {}}, "source_errors": ["robinhood"]}, "yfinance fallback is unavailable"),
-        ({"sources": {"robinhood": {}}, "source_errors": []}, "yfinance fallback is unavailable"),
-        # The fallback IS selected but its own payload is empty: the usable-
-        # payload check runs against the source actually being scored.
-        (
-            {"sources": {"robinhood": {}, "yahoo_finance_yfinance": {}}, "source_errors": ["robinhood"]},
-            "sources.yahoo_finance_yfinance",
-        ),
+        # A declared Robinhood outage or an empty Robinhood payload has no fallback
+        # source to go to, so the run aborts.
+        ({"sources": {"robinhood": {}}, "source_errors": ["robinhood"]}, "no fallback source"),
+        ({"sources": {"robinhood": {}}, "source_errors": []}, "no fallback source"),
     ],
-    ids=["absent", "declared-outage", "undeclared-empty", "fallback-empty"],
+    ids=["absent", "declared-outage", "undeclared-empty"],
 )
 def test_cli_aborts_when_robinhood_payload_is_unusable(tmp_path, payload, match):
     path = tmp_path / "market_data.json"
@@ -624,21 +617,22 @@ def test_cli_all_covered_universe_allows_an_empty_robinhood_payload(tmp_path, mo
     assert document["buy_count"] == 0
     assert document["cands"] == []
 
-def test_cli_accepts_structured_source_errors_dict_entry(tmp_path, monkeypatch):
+def test_cli_reads_a_structured_source_errors_dict_entry_as_a_declared_primary_outage(tmp_path, monkeypatch):
+    """A ``{source, error}`` entry names the failed source exactly like a bare string does. With no fallback source
+    the declared primary outage aborts the run instead of being scored from anywhere else."""
     _patch_config(monkeypatch)
     source = gmc.MIDDAY_SPEC.source.value
     path = tmp_path / "market_data.json"
     path.write_text(
         json.dumps({
-            "sources": {source: {}, "yahoo_finance_yfinance": {}},
+            "sources": {source: {}},
             "source_errors": [{"source": source, "error": "Primary connector not available"}],
             "ticker_errors": {source: []},
         }),
         encoding="utf-8",
     )
-    stdout = io.StringIO()
-    with contextlib.redirect_stdout(stdout):
-        exit_code = gmc.main(
+    with pytest.raises(ValueError, match="no fallback source"):
+        gmc.main(
             [
                 "--trading-day", DAY.isoformat(),
                 "--market-data", str(path),
@@ -647,10 +641,6 @@ def test_cli_accepts_structured_source_errors_dict_entry(tmp_path, monkeypatch):
                 "--already-covered-tickers", "TEST",
             ]
         )
-    assert exit_code == 0
-    document = json.loads(stdout.getvalue())
-    assert document["buy_count"] == 0
-    assert document["validation_context_source_errors"] == [source]
 
 
 @pytest.mark.parametrize("raw_value", ["-1", "NaN", "not-a-number"])

@@ -554,7 +554,6 @@ class Action(str, Enum):
 class SourceName(str, Enum):
     FINANCE = "finance"
     ROBINHOOD = "robinhood"
-    YFINANCE_FALLBACK = "yahoo_finance_yfinance"
 
 
 class BrokerName(str, Enum):

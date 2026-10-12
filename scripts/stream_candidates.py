@@ -448,7 +448,7 @@ class StreamMarketData(_StaticMarketData):
         source = args[0] if args else kwargs.get("source")
         payloads = args[1] if len(args) > 1 else kwargs.get("per_ticker", {})
         super().__init__(*args, **kwargs)
-        if source in {SourceName.FINANCE, SourceName.YFINANCE_FALLBACK}:
+        if source is SourceName.FINANCE:
             # _StaticMarketData intentionally discards Finance quotes for the
             # final-buy adapter. Retain the executor-class connector quote.
             for ticker, payload in payloads.items():
@@ -1778,26 +1778,18 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
     # The executor API evaluates one provider, but the repository-wide policy
     # also asks the fetcher to retain Robinhood validation/context evidence.
     # Accept that evidence without ever selecting it for ordinary signal math.
-    fallback_source = SourceName.YFINANCE_FALLBACK.value
-    accepted_sources = {spec.source.value, SourceName.ROBINHOOD.value, fallback_source}
+    accepted_sources = {spec.source.value, SourceName.ROBINHOOD.value}
     unexpected_sources = sorted(set(sources) - accepted_sources)
     if unexpected_sources:
         raise ValueError(
             f"--market-data's 'sources' has unsupported key(s) {unexpected_sources!r}: this "
             f"slot accepts the {spec.source.value!r} policy primary plus Robinhood "
-            "validation/context evidence and the configured yfinance fallback only"
+            "validation/context evidence only"
         )
     finance_primary = spec.source is SourceName.FINANCE
-    # Every slot's primary may now fall back to the labeled yfinance payload
-    # (config/scheduled_tasks.json market_data_source_policy, 2026-09-22). The
-    # Robinhood-primary slots used to have no fallback at all: their only data
-    # path was the live session pulling ~64 tickers of 5-minute bars through
-    # MCP tool output, which is what blew the output cap and the session's
-    # token budget on 2026-09-15 and 2026-09-18 (Notion DCA Issues:
-    # output_size_limit, intraday_bars_unavailable, token_limit_exceeded,
-    # market_data_unavailable). deploy/launchd/prefetch_slot.sh now writes that
-    # payload outside any session.
-    if spec.source.value not in sources and fallback_source not in sources:
+    # No slot has a fallback data source (owner direction 2026-10-12: Yahoo Finance is removed from every scheduled
+    # run). A primary that is absent, failed or incomplete aborts the run with nothing placed.
+    if spec.source.value not in sources:
         raise ValueError(
             f"--market-data's 'sources' is missing the required {spec.source.value!r} object; a "
             "genuinely failed fetch is spelled by listing it in source_errors (which aborts), "
@@ -1843,12 +1835,8 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
         )
     # The policy primary's per-ticker error list is checked for an explicit
     # null HERE, at the JSON boundary with the rest of the shape checks, rather
-    # than after the fallback decision below. Two reasons: the fallback
-    # selection reads this list to decide whether Finance is incomplete, and
-    # treating a null as "no errors" there would let a malformed payload steer
-    # the whole universe onto -- or away from -- the yfinance fallback; and once
-    # the fallback IS selected, the later effective-source check no longer looks
-    # at the primary's list at all, so a null would pass through unreported.
+    # than after the availability decision below, which reads this list to decide whether Finance is incomplete:
+    # treating a null as "no errors" there would let a malformed payload hide a failing primary.
     if ticker_errors_by_source.get(spec.source.value, []) is None:
         raise ValueError(
             f"--market-data's 'ticker_errors.{spec.source.value}', if present, must be a list, "
@@ -1865,19 +1853,17 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
     remaining_tickers = [
         t for t in config.tickers if t not in config.excluded_tickers and t not in covered
     ]
-    # Finance is policy-primary, but the checked-in policy explicitly selects
-    # labeled yfinance evidence when that connector is unavailable or its
-    # response is incomplete/unresolved.  Switch the entire scoring provider
-    # rather than mixing unlabeled rows from two sources.
+    # The policy primary is the only scoring provider: when it is unavailable or its response is
+    # incomplete/unresolved the run aborts below rather than scoring from a second source.
     scored_tickers = set(config.tickers) - set(config.excluded_tickers) - set(args.already_covered_tickers)
     # A ticker with an explicit source route is not evidence about the health
     # or completeness of the default provider.  In particular, Finance's
     # expected omission/error for GFUZ must neither trigger a universe-wide
-    # fallback nor hide an unresolved ordinary Finance ticker.
+    # abort nor hide an unresolved ordinary Finance ticker.
     primary_scored_tickers = scored_tickers - set(spec.ticker_source_overrides)
     primary_payload = sources.get(spec.source.value, {})
     # A null here was already rejected at the JSON boundary above, so this is
-    # a real (possibly empty) list by the time the fallback decision reads it.
+    # a real (possibly empty) list by the time the availability decision reads it.
     primary_ticker_errors = set(ticker_errors_by_source.get(spec.source.value, [])) & primary_scored_tickers
     primary_incomplete = any(
         not _primary_payload_is_fresh(
@@ -1892,25 +1878,24 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
     )
     # Absent or declared failed. An empty-but-present object is NOT counted
     # here: when Gate 4's compatible executor already covered every ticker
-    # nothing is left to score, and treating {} as an outage would demand a
-    # fallback for a run that needs no data. An empty object with tickers left
+    # nothing is left to score, and treating {} as an outage would abort
+    # a run that needs no data. An empty object with tickers left
     # to score is still caught -- by primary_incomplete / the all-stale test.
     primary_unavailable = spec.source.value in source_errors or spec.source.value not in sources
     if finance_primary:
-        use_fallback = primary_unavailable or bool(primary_ticker_errors) or primary_incomplete
+        primary_unusable = primary_unavailable or bool(primary_ticker_errors) or primary_incomplete
     else:
-        # Robinhood-primary: fall back only when the source failed AS A WHOLE
+        # Robinhood-primary: abort only when the source failed AS A WHOLE
         # -- listed in source_errors, absent/empty, or not one scored ticker
         # carrying data fresh for this slot. NOT on a single ticker error or a
         # single stale ticker, as Finance does: Robinhood reports one routine
         # per-ticker error (QBUT) in most real documents, so Finance's rule
-        # would move these slots onto yfinance nearly every day. A per-ticker
-        # gap stays what it was before this change, that ticker's own
-        # provider error.
+        # would abort these slots nearly every day. A per-ticker gap stays
+        # that ticker's own provider error.
         # Constructed once, not per ticker: each construction re-reads config
         # (and logs its account-pinning warning) for an identical anchor.
         decision_time = spec.executor_cls(config=config, mode=spec.live_mode, **spec.executor_kwargs).decision_time
-        use_fallback = primary_unavailable or (
+        primary_unusable = primary_unavailable or (
             bool(primary_scored_tickers)
             and all(
                 not _primary_payload_is_fresh(
@@ -1923,19 +1908,12 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
                 for ticker in primary_scored_tickers
             )
         )
+    if primary_unusable:
+        raise ValueError(
+            f"{spec.source.value} data is unavailable/incomplete and no fallback source is configured; "
+            "nothing is placed"
+        )
     effective_spec = spec
-    if use_fallback:
-        if fallback_source not in sources or fallback_source in source_errors:
-            raise ValueError(
-                f"{spec.source.value} data is unavailable/incomplete and the configured yfinance "
-                "fallback is unavailable"
-            )
-        effective_spec = dataclasses.replace(spec, source=SourceName.YFINANCE_FALLBACK)
-    # Checked against the source actually being scored, AFTER the fallback
-    # decision: on main this check sat before it and read the primary only,
-    # which is right for a single-source slot but would abort a Finance-primary
-    # slot whose empty/absent primary payload the policy says to serve from the
-    # labelled yfinance fallback instead (#1362 x this branch's fallback).
     if remaining_tickers and not sources.get(effective_spec.source.value):
         raise ValueError(
             f"--market-data has no usable 'sources.{effective_spec.source.value}' payload "
@@ -1944,8 +1922,7 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
             "not a quiet tape"
         )
 
-    # Same null check for the source actually being scored, which only differs
-    # from the primary (already checked above) when the fallback was selected.
+    # Same null check for the scored source (already checked for the primary above).
     ticker_errors = ticker_errors_by_source.get(effective_spec.source.value, [])
     if ticker_errors is None:
         raise ValueError(
@@ -1964,9 +1941,7 @@ def _run_with_args(spec: StreamSpec, args: argparse.Namespace) -> int:
         alternate_market_data=sources.get(SourceName.ROBINHOOD.value, {}),
         # Context-source outages are evidence for the caller/report, not a
         # reason to relabel or replace the Finance-primary signal provider.
-        source_errors=tuple(
-            s for s in source_errors if not (use_fallback and s == spec.source.value)
-        ),
+        source_errors=tuple(source_errors),
         ticker_errors=ticker_errors,
         alternate_ticker_errors=alternate_ticker_errors,
         already_covered_tickers=args.already_covered_tickers,

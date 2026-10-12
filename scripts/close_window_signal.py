@@ -15,7 +15,7 @@ sizing ladder and labels the outcome.
 
 No network either: this module is pure. The caller fetches quotes under the
 repo's existing market-data provider policy (Finance connector primary, Alpaca
-and Robinhood validation/context, yfinance fallback only when needed) and hands
+and Robinhood validation/context, no fallback source) and hands
 each ticker's ``decision_price``, ``prior_close`` and ``data_source`` in. Keeping
 the fetch outside means the summary is deterministic, testable without a
 connector, and cannot become a second, drifting copy of the provider policy.

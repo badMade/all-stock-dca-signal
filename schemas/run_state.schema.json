@@ -111,7 +111,7 @@
     },
     "raw_input_dir": {
       "type": "string",
-      "description": "Absolute path to the raw/ directory under this run's artifact dir where every raw Robinhood/Finance/Alpaca/Yahoo connector response used by the run was persisted (normalized to parseable JSON) BEFORE signal computation. Contract added 2026-07-10 after the 3:20 PM escalation: compute reads only these persisted files, never in-memory tool responses. See docs/schedule_manifest.md (RAW DATA PERSISTENCE FIX) and docs/run_classification.md."
+      "description": "Absolute path to the raw/ directory under this run's artifact dir where every raw Robinhood/Finance/Alpaca connector response used by the run was persisted (normalized to parseable JSON) BEFORE signal computation. Contract added 2026-07-10 after the 3:20 PM escalation: compute reads only these persisted files, never in-memory tool responses. See docs/schedule_manifest.md (RAW DATA PERSISTENCE FIX) and docs/run_classification.md."
     },
     "raw_inputs_saved": {
       "type": "array",

@@ -21,7 +21,7 @@
     "state_schema_version": "intraday-live-v1",
     "trades": true,
     "broker_account": "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}",
-    "note": "Live Robinhood execution using account <ROBINHOOD_ACCOUNT_NUMBER> (Alpaca/Finance/Yahoo stay read-only for validation/context). Each slot applies the same-day top-up guard against every earlier same-day fill, including the earlier intraday slots' own fills."
+    "note": "Live Robinhood execution using account <ROBINHOOD_ACCOUNT_NUMBER> (Alpaca/Finance stay read-only for validation/context). Each slot applies the same-day top-up guard against every earlier same-day fill, including the earlier intraday slots' own fills."
   },
   "slots": {
     "slot_note": "One stream, one cron_id, three fire times. schemas/intraday_run_classification.schema.json pins stream to the constant 'intraday' (explicitly NOT a slot-suffixed variant), scheduled_for_et to the enum 11:30|13:30|14:30, and run_id to intraday_live_YYYYMMDD_(1130|1330|1430)ET. The executor selects a slot by its `slot` constructor argument; the caller passes whichever slot actually fired. Each slot has a +/- 5 minute classification window.",

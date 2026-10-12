@@ -29,7 +29,7 @@
     "trades": true,
     "broker_account": "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}",
     "first_buy_of_day": true,
-    "note": "Live Robinhood execution using account <ROBINHOOD_ACCOUNT_NUMBER> (Alpaca/Finance/Yahoo stay read-only for validation/context). As the day's first buy it normally has no prior same-day allocation and places the full desired amount; its fills become prior-allocation context for every later same-day slot."
+    "note": "Live Robinhood execution using account <ROBINHOOD_ACCOUNT_NUMBER> (Alpaca/Finance stay read-only for validation/context). As the day's first buy it normally has no prior same-day allocation and places the full desired amount; its fills become prior-allocation context for every later same-day slot."
   },
   "state_file_guarantee": {
     "summary": "The 9:35 scheduled run MUST always write run_state.json, run_summary.json, market_open_signals.csv, and a header-only-when-empty submitted_orders.csv under the market-open root, plus latest_market_open_run.json, even when no orders are placed or execution is blocked.",

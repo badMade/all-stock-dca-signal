@@ -21,7 +21,7 @@ Key properties (see ``config/market_open_dca.json`` and
     - **Live Robinhood-only execution** (cron ``2ba19526``, 9:35 AM ET weekdays,
       ``run_type='market_open_dca_live'``, ``trades=true``) on account
       ``$ROBINHOOD_AGENTIC_ACCOUNT_NUMBER`` (supplied by the environment, never
-      committed); Alpaca/Finance/Yahoo stay read-only.
+      committed); Alpaca/Finance stay read-only.
     - Uses the **shared 0x -> 5x sizing ladder** and the dynamic $1/$2 base
       every live stream uses, the same active universe (excluding the
       whole-share tickers BYDDY and RVII), and the same shared $180/$900
