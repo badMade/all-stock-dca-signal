@@ -187,9 +187,13 @@ no ladder or sizing-suggester wiring). Wraps `dca_order_plan.choose_plan_path`; 
 - **UNKNOWN stands down** and alerts, since a false fallback risks a duplicate buy. Broker order history remains the
   only purchase evidence; the routing log (`<cron root>/execution_routing/routing_<day>.jsonl`: path, reason,
   timestamp) is only a second guard, and a recorded buy for the slot blocks any later fallback.
-- **Not yet done.** The local run must acquire, refresh (at most every 60s) and release the slot lease with a
-  success/failure marker, and the Perplexity prompts must be regenerated to follow the router. Both are manual
-  prompt pastes, as before.
+- **Wiring.** `scripts/local_heartbeat.py` (`start`/`beat`/`finish` for the local run, `status` for the backup; `start` mints
+  a per-run token so a duplicate start is refused and only the owning run can beat or finish) and the
+  regenerated Perplexity prompts (step 3 "LOCAL FIRST") implement the table above.
+- **Not yet done.** The local live-mirror prompts must call `start` (keep the `token` it prints), `beat --token` (at least every 60s) and
+  `finish --token`, and a
+  human must repaste the regenerated Perplexity prompts. Until the local side writes the lease, an online Mac reads
+  as `off` and the backup would act.
 
 ## Rollback
 

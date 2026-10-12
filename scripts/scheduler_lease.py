@@ -30,7 +30,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 from scripts.file_lock import cross_process_lock
 
@@ -418,6 +418,27 @@ class SchedulerLease:
         delete a lease a different holder reclaimed after this holder's read.
         """
         with self._guard():
+            taken = self._atomic_take(holder_id)
+            if taken is None:
+                return False
+            take_path, _ = taken
+            with contextlib.suppress(OSError):
+                os.unlink(take_path)
+            return True
+
+    def release_with(self, holder_id: str, before_release: Callable[[], None]) -> bool:
+        """Run ``before_release`` and then release, as ONE critical section owned by ``holder_id``.
+
+        The ownership check, the caller's write (e.g. a result marker), and the release all happen under
+        :meth:`_guard`, so a reclaim cannot slip in between and a superseded holder never runs
+        ``before_release`` (review of PR 1639: a stale run used to write its marker after a new run took over).
+        Returns False, having run nothing, when ``holder_id`` is not the current holder.
+        """
+        with self._guard():
+            current = self.read()
+            if current is None or current.holder_id != holder_id:
+                return False
+            before_release()
             taken = self._atomic_take(holder_id)
             if taken is None:
                 return False

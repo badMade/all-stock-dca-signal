@@ -805,3 +805,31 @@ def test_main_cli_failure(monkeypatch, tmp_path):
         ],
     )
     assert main() == 1
+
+
+def test_fetch_breadth_series_does_not_follow_a_venv_interpreter_symlink(tmp_path):
+    """A venv's bin/python is a symlink to the base interpreter; resolving it
+    launched the bare base Python (no venv site-packages), so the breadth
+    fetch failed with ModuleNotFoundError: yfinance. The symlink path itself
+    must be what gets executed.
+    """
+    history_dir = tmp_path / "histories"
+    history_dir.mkdir()
+    script = tmp_path / "fake_fetch_tick.py"
+    _write_updater(script, "print('ok')\n")
+    seen = tmp_path / "seen.txt"
+    wrapper = tmp_path / "wrap.sh"
+    wrapper.write_text(f'#!/bin/sh\necho "$0" > {seen}\nexec {sys.executable} "$@"\n')
+    wrapper.chmod(0o755)
+    wrapper_link = tmp_path / "wrap-link"
+    wrapper_link.symlink_to(wrapper)
+
+    result = _fetch_breadth_series(
+        history_dir=history_dir,
+        breadth_fetch_script=script,
+        timeout_seconds=5,
+        breadth_fetch_python=str(wrapper_link),
+    )
+
+    assert result["status"] == "completed"
+    assert seen.read_text().strip() == str(wrapper_link)

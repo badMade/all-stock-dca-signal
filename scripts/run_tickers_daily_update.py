@@ -226,7 +226,11 @@ def _fetch_breadth_series(
         else breadth_fetch_python
     )
     if os.sep in python or (os.altsep and os.altsep in python):
-        python = str(Path(python).resolve())
+        # abspath, NOT resolve(): a venv's bin/python is a symlink to the base
+        # interpreter, and resolve() follows it, launching the bare base Python
+        # without the venv's site-packages (ModuleNotFoundError: yfinance under
+        # launchd with DCA_BREADTH_FETCH_PYTHON=<repo>/.venv/bin/python).
+        python = os.path.abspath(python)
     guarded_argv = [
         python,
         str(resolved_script),

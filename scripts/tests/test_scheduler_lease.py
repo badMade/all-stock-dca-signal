@@ -594,3 +594,13 @@ def test_atomic_take_returns_none_on_a_plain_os_error(tmp_path, monkeypatch):
     assert result is None
     assert lease.read().holder_id == "runner"  # unchanged
     assert lease.release("runner") is False  # same path, through the public API
+
+
+def test_release_with_runs_the_action_only_for_the_current_holder(tmp_path):
+    lease = SchedulerLease(tmp_path, "k")
+    assert lease.acquire("a", ttl_seconds=60, now=100.0).acquired
+    ran: list[str] = []
+    assert lease.release_with("b", lambda: ran.append("b")) is False
+    assert ran == [] and lease.read() is not None
+    assert lease.release_with("a", lambda: ran.append("a")) is True
+    assert ran == ["a"] and lease.read() is None

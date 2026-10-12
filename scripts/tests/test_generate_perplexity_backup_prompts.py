@@ -99,10 +99,9 @@ def test_hard_rules_are_inline_in_every_prompt(prompts, prefix):
         "FAIL CLOSED",
         "failed_unexpected_error",
         "place NOTHING",
-        "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}",
+        "${ROBINHOOD_AGENTIC_ACCOUNT_LAST4}",
     ):
         assert needle in text, needle
-
 
 @pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
 def test_cap_figures_match_live_config(prompts, prefix):
@@ -261,3 +260,47 @@ def test_latest_placement_times_come_from_the_library_table(prompts):
         text = _by_prefix(prompts, prefix)
         for slot in slots:
             assert dca_order_plan.LATEST_PLACEMENT_ET[slot] in text
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_local_first_routing_is_inline_and_unknown_stands_down(prompts, prefix):
+    text = next(t for name, t in prompts.items() if name.startswith(prefix))
+    assert "LOCAL FIRST" in text
+    assert "scripts.local_heartbeat status" in text
+    assert "300 seconds" in text
+    # Operator decisions 2026-10-08: no lease means act; unknown means stand down and notify.
+    assert "stood_down_local_unknown" in text and "Never act on unknown" in text
+    assert "stood_down_local_active" in text
+    assert "never places an order" in text  # cloud is calculation-only
+    assert "routing {path perplexity-fallback or none" in text
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_account_is_looked_up_never_stored(prompts, prefix):
+    text = _by_prefix(prompts, prefix)
+    assert "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER" not in text
+    assert "exactly one account qualifies" in text
+    assert "account_last4" in text
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_late_start_guard_and_per_order_repull_are_inline(prompts, prefix):
+    text = _by_prefix(prompts, prefix)
+    assert "LATE-START GUARD" in text and "wait 5 minutes" in text
+    assert "PER-ORDER REPULL" in text and "Never use a midnight window" in text
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_operational_lines_are_back(prompts, prefix):
+    text = _by_prefix(prompts, prefix)
+    for needle in ("${PPLX_RUN_STATE_DIR}", "submitted_orders.csv", "pplx project files sync",
+                   "pplx automation suppress-run-notification", "NEVER post to Slack"):
+        assert needle in text, needle
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_claim_is_unconfirmed_and_confirm_follows_the_first_accepted_order(prompts, prefix):
+    text = _by_prefix(prompts, prefix)
+    assert "records an unconfirmed claim" in text and "it is not a buy" in text
+    assert "scripts.local_heartbeat confirm" in text
+    assert "the claim expires and a later run may claim again" in text
