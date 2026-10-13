@@ -268,3 +268,54 @@ def test_a_primary_start_stays_refused_after_a_confirmed_fallback_buy():
 def test_status_after_a_live_claim_reports_the_backup_may_not_act():
     hb.claim(DAY, SLOT, now=1000.0)
     assert hb.status(DAY, SLOT, now=1050.0)["backup_may_act"] is False
+
+
+def test_start_that_cannot_clear_the_stale_marker_releases_its_lease_and_reports_it(tmp_path, monkeypatch):
+    # Adversarial review of PR 1639: start() acquires the lease and only then clears the previous result marker. If
+    # that clear fails (or the process dies between the two), a FRESH lease sits beside a stale "failure" marker, and
+    # the marker wins in local_status_from_probe: the backup reads ERRORED and buys while the new primary is live.
+    # Contract: a failed marker reset must not leave the lease held, must not raise, and must say why.
+    token = hb.start(DAY, SLOT, now=1000.0)["token"]
+    hb.finish(DAY, SLOT, token, "failure")
+    marker = tmp_path / "leases" / f"{hb.window_key(DAY, hb.STREAM, SLOT)}.result"
+    assert marker.read_text(encoding="utf-8").strip() == "failure"
+
+    real_unlink = hb.Path.unlink
+
+    def failing_unlink(self, *args, **kwargs):
+        if self == marker:
+            raise PermissionError("cannot clear the marker")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(hb.Path, "unlink", failing_unlink)
+    assert hb.start(DAY, SLOT, now=2000.0) == {"ok": False, "reason": "marker_reset_failed"}
+
+    lease, _ = hb._lease(DAY, SLOT)
+    assert not lease.is_held(now=2000.0)  # nothing is live: no primary run owns the slot
+    # The honest picture is the previous run's failure, with no live lease: the backup may act, and no run is live.
+    assert hb.status(DAY, SLOT, now=2001.0) == {"local_status": "errored", "backup_may_act": True}
+
+    # Once the marker can be cleared again, a retry starts normally.
+    monkeypatch.setattr(hb.Path, "unlink", real_unlink)
+    assert hb.start(DAY, SLOT, now=2002.0)["ok"]
+
+
+def test_start_reports_when_it_cannot_give_the_lease_back_after_a_failed_marker_reset(tmp_path, monkeypatch):
+    # Copilot review of PR 1648: release() returns False when its atomic take fails. start() must not report only
+    # "marker_reset_failed" then: the fresh lease is still held and blocks retries until its TTL, so say so.
+    token = hb.start(DAY, SLOT, now=1000.0)["token"]
+    hb.finish(DAY, SLOT, token, "failure")
+    marker = tmp_path / "leases" / f"{hb.window_key(DAY, hb.STREAM, SLOT)}.result"
+    real_unlink = hb.Path.unlink
+
+    def failing_unlink(self, *args, **kwargs):
+        if self == marker:
+            raise PermissionError("cannot clear the marker")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(hb.Path, "unlink", failing_unlink)
+    monkeypatch.setattr(hb.SchedulerLease, "release", lambda self, holder_id: False)
+    assert hb.start(DAY, SLOT, now=2000.0) == {"ok": False, "reason": "marker_reset_failed", "lease_released": False}
+
+    lease, _ = hb._lease(DAY, SLOT)
+    assert lease.is_held(now=2000.0)  # the lease really is still held, which is what the caller is being told

@@ -129,7 +129,17 @@ def start(day: str, slot: str, *, now: float | None = None) -> dict:
             if not result.acquired:
                 # A live run owns the slot: leave its lease AND any result marker untouched.
                 return {"ok": False, "reason": result.reason}
-            marker.unlink(missing_ok=True)  # a re-run of the same slot starts clean (only once we own the lease)
+            try:
+                marker.unlink(missing_ok=True)  # a re-run of the same slot starts clean (only once we own the lease)
+            except OSError:
+                # A fresh lease beside a stale marker reads as the previous run's outcome (the marker wins), so the
+                # backup could buy while this run is live. Give the lease back rather than run in that state
+                # (adversarial review of PR 1639).
+                if not lease.release(_holder(slot, token)):
+                    # The take failed too, so the fresh lease is still held and blocks retries until its TTL:
+                    # say so rather than report only the marker failure (Copilot review of PR 1648).
+                    return {"ok": False, "reason": "marker_reset_failed", "lease_released": False}
+                return {"ok": False, "reason": "marker_reset_failed"}
     except TimeoutError:
         return {"ok": False, "reason": "state_lock_timeout"}
     return {"ok": True, "reason": result.reason, "token": token}
