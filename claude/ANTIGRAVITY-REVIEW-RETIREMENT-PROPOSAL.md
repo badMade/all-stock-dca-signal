@@ -1,9 +1,9 @@
 # Proposal: retire the Antigravity (Gemini) PR review
 
-**Status:** proposal for the operator. It changes `.github/workflows/`, which agent-driven pull requests must not
-edit (`AGENTS.md`, "Pull request expectations"), so the change is delivered as a proposal for the operator to apply,
-not as a PR diff. The change itself is complete: as a PR it was green in CI (both core DCA jobs, the audits and the
-sibling suites) before this PR was converted to a proposal. It stays in this branch's history at commit `000eb68`.
+**Status:** implemented in PR #1649, applied at the operator's explicit request (an exception to the `AGENTS.md`
+"Pull request expectations" rule that agent-driven pull requests must not edit `.github/workflows/`). Do not reapply
+the patch below. This page is kept as the record of why the review was retired. The original change stays in
+commit `000eb68` (under `refs/pull/1638/head`).
 
 ## Why
 

@@ -254,7 +254,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | `docs/dca_operational_todos.md` | Operational notes, including the standing Perplexity backup-pass policy behind the seven Claude slots |
 | `docs/alert_digest.md` | Why executor gate alerts piled up undelivered in Gmail drafts, and `scripts/alert_digest.py` — the digest that counts them by gate/slot/streak and flags alerts whose delivery channel was off or gitignored |
 | `docs/drift_detection.md`, `docs/reporting_workflow.md`, `docs/cost_tracking.md` | Post-run detection, reporting, and cost policy |
-| `docs/pr_review_workflow.md` | The two-workflow PR review split and its trust boundary |
+| `docs/workflow_policy.md` | The CI-enforced workflow policy checks and the exception mechanism |
 | `PRODUCTION_READINESS.md` | Tracked gaps between the library and a fully live system |
 | `claude/` | Gate 5 proposal, incident writeups, and `dca-executor-prompts/live-mirror/` (the canonical live executor prompts) |
 | `.jules/bolt.md`, `.jules/sentinel.md` | Accumulated performance and security learnings — check before optimizing or touching anything that logs external responses |

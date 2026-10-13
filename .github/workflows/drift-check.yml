@@ -32,9 +32,9 @@
 # DCA_DRIFT_SLACK_WEBHOOK injected as a secret, adding workflow_dispatch back
 # would let anyone with dispatch permission (which can be broader than merge
 # access) run their own branch's scripts/drift_detection.py with that secret
-# in scope and exfiltrate it (codex review). This repo's other secret-bearing
-# workflow (antigravity-pr-review-post.yml) follows the same rule: no trigger
-# that lets a non-default ref supply the code that runs with a secret. There
+# in scope and exfiltrate it (codex review). Every secret-bearing workflow in this
+# repo follows the same rule: no trigger that lets a non-default ref supply
+# the code that runs with a secret. There
 # is consequently no on-demand trigger for this workflow at all -- the
 # `workflow_dispatch` API/UI requires the target workflow to declare that
 # trigger, so removing it removes the on-demand path along with the risk. For

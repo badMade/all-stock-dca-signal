@@ -41,7 +41,7 @@ environment (see the repository README).
 | [credit_usage_proxy_report.md](credit_usage_proxy_report.md) | One-time 2026-07-27 4:30 PM ET credit-usage proxy report contract, including the separate recovery-run section |
 | [restore_runbook.md](restore_runbook.md) | Restore procedure + audit checklist |
 | [backtest_curve.md](backtest_curve.md) | Analytics-only weekly-rollover intraday cap curve backtest (35 / 65 / 100 candidate) |
-| [pr_review_workflow.md](pr_review_workflow.md) | The two-workflow PR review split, its trust boundary, and the CI-enforced workflow policy checks |
+| [workflow_policy.md](workflow_policy.md) | The CI-enforced workflow policy checks (job timeouts, concurrency, checkout credentials) and how to declare a reasoned exception |
 | [scheduled_session_repo_access.md](scheduled_session_repo_access.md) | Dated probe log for whether a Routine-fired scheduled session actually has working repo (clone/fetch/push) and environment (account number) access |
 | [morning_dca.md](morning_dca.md) | The morning stream (`MorningDCAExecutor`): 9:45 watchlist and 10:30 live modes, task/ET/artifact-root tables, the Jul 10 2026 ladder unification |
 | [midday_dca.md](midday_dca.md) | The midday stream (`MiddayDCAExecutor`): 12:30 live mode, trend validation, artifact contract |

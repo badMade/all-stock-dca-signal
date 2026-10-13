@@ -130,22 +130,6 @@ def test_ci_audits_locked_and_independent_dependency_trees():
         assert manifest in commands, f"CI does not audit {manifest}"
 
 
-def test_ci_audits_the_same_exact_sdk_pin_the_privileged_reviewer_installs():
-    """Reviewer transitives must enter the audit through its actual install input."""
-    root = Path(__file__).resolve().parents[2]
-    manifest = "requirements-pr-review.txt"
-    review = REAL_DOCS[".github/workflows/antigravity-pr-review-post.yml"]["jobs"]["review"]
-    install = next(step for step in review["steps"] if step.get("name") == "Install Antigravity SDK")
-    assert f"pip install -r {manifest}" in install["run"]
-    pins = [line.strip() for line in (root / manifest).read_text().splitlines() if line.strip() and not line.startswith("#")]
-    assert len(pins) == 1 and re.fullmatch(r"google-antigravity==\d+(?:\.\d+)+", pins[0])
-    audit = REAL_DOCS[".github/workflows/ci.yml"]["jobs"]["research-audit"]
-    commands = "\n".join(step.get("run", "") for step in audit["steps"])
-    assert f"uv pip compile {manifest}" in commands
-    assert "pylock.pr-review.toml" in commands
-    assert commands.index(f"uv pip compile {manifest}") < commands.index("pip-audit --locked")
-
-
 def test_ci_runs_the_documented_market_breadth_suite():
     """The breadth tool's independent test/lint gates must run in CI too."""
     jobs = REAL_DOCS[".github/workflows/ci.yml"]["jobs"]

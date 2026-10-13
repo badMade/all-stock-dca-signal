@@ -127,14 +127,11 @@ jobs:
       # manifest without building or installing its heavy ML dependencies.
       # pip-audit reads the exact transitive versions from these temporary
       # PEP 751 locks; it does not directly read uv.lock.
-      - name: Audit runtime, research, and reviewer dependency trees
+      - name: Audit runtime and research dependency trees
         run: |
           audit_dir="$RUNNER_TEMP/dca-dependency-audit"
           mkdir -p "$audit_dir"
           uv export --locked --all-extras --no-emit-project --format pylock.toml --output-file "$audit_dir/pylock.root.toml"
-          # The privileged reviewer installs this same exact SDK pin from
-          # its trusted default-branch checkout. Resolve its full graph too.
-          uv pip compile requirements-pr-review.txt --python-version "${{ matrix.python-version }}" --no-build --format pylock.toml --output-file "$audit_dir/pylock.pr-review.toml"
           for manifest in \
             production-safe-agent-loop/requirements.txt \
             ticker-advisor/requirements.txt \

@@ -1,15 +1,13 @@
 name: Claude Code Review
 
-# TRUST BOUNDARY -- read this before editing. See also
-# antigravity-pr-review*.yml and docs/pr_review_workflow.md for the sibling
-# automated-review pipeline's threat model.
+# TRUST BOUNDARY -- read this before editing.
 #
 # This workflow is triggered by `issue_comment`, not `pull_request`. GitHub
 # always takes an `issue_comment`-triggered workflow's YAML from the
 # repository's DEFAULT branch, never from the commented-on PR's branch -- so,
 # unlike `pull_request`, a PR cannot edit this file and have that edit apply
-# to its own run. That is the specific problem the Antigravity two-workflow
-# split exists to solve for `pull_request`; it does not arise here, so a
+# to its own run. That is the specific problem a `pull_request`-triggered
+# reviewer would have (the PR's own YAML runs); it does not arise here, so a
 # single workflow file is sufficient.
 #
 # What still has to be defended here is authorization: any GitHub user can
