@@ -134,12 +134,13 @@ class ShardExportError(RuntimeError):
     """One or more shards could not export their next-day forecasts, so no merged CSV may be published."""
 
 
-def merge_shard_tomorrow_forecasts(run_dir_base: Path, shard_dirs: Sequence[Path]) -> Path | None:
+def merge_shard_tomorrow_forecasts(run_dir_base: Path, shard_dirs: Sequence[Path]) -> Path:
     """Export and merge next-day predictions across all shards into all_shards_tomorrow.csv.
 
     All-or-nothing: ``all_shards_tomorrow.csv`` feeds ``publish_octopus_sizing.py``, so a partial merge (one shard
     silently missing) or a stale file from an earlier run must never be left behind. Any failed or missing shard
-    export raises :class:`ShardExportError` naming the shards, after removing the previous merged file.
+    export, or an export that yields no rows at all, raises :class:`ShardExportError` after removing the previous
+    merged file.
     """
     merged_path = run_dir_base / "all_shards_tomorrow.csv"
     merged_path.unlink(missing_ok=True)  # never leave the previous run's forecasts looking current
@@ -178,7 +179,7 @@ def merge_shard_tomorrow_forecasts(run_dir_base: Path, shard_dirs: Sequence[Path
             writer.writerows(all_rows)
         print(f"Merged {len(all_rows)} next-day forecasts across {len(shard_dirs)} shards -> {merged_path}")
         return merged_path
-    return None
+    raise ShardExportError("no next-day forecasts were exported; no merged forecast was written")
 
 
 def merge_or_exit_code(run_dir_base: Path, shard_dirs: Sequence[Path]) -> int:
@@ -412,16 +413,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.daily:
+        # Every numbered shard directory counts, checkpoint or not: filtering on the checkpoint first would let a
+        # lost shard_2/checkpoint drop out of the run silently, leaving its forecasts stale while the run exits 0.
         shard_dirs = sorted(
-            [
-                d
-                for d in args.run_dir_base.glob("shard_*")
-                if d.is_dir() and d.name.removeprefix("shard_").isdigit() and has_checkpoint(d)
-            ],
+            [d for d in args.run_dir_base.glob("shard_*") if d.is_dir() and d.name.removeprefix("shard_").isdigit()],
             key=lambda p: int(p.name.removeprefix("shard_")),
         )
         if not shard_dirs:
             print(f"REFUSED: no shard checkpoints found in {args.run_dir_base}", file=sys.stderr)
+            return 1
+        no_checkpoint = [d.name for d in shard_dirs if not has_checkpoint(d)]
+        present = {int(d.name.removeprefix("shard_")) for d in shard_dirs}
+        missing = [f"shard_{n}" for n in range(1, max(present) + 1) if n not in present]
+        if no_checkpoint or missing:
+            problems = [f"{name} has no durable checkpoint" for name in no_checkpoint]
+            problems += [f"{name} is missing" for name in missing]
+            print(f"REFUSED: daily update would skip shards ({'; '.join(problems)})", file=sys.stderr)
             return 1
         shards = [[] for _ in shard_dirs]
         target_end = None
