@@ -195,6 +195,39 @@ relaying the result, since the exit code has already made the ABORT/alert
 call. That is deliberately the opposite of the failure mode this script
 exists to catch.
 
+## Post-slot submission check (2026-10-07)
+
+`verify_schedule` proves a slot fired and finalized, "not that any order
+filled". On 2026-10-07 the 09:35 slot stopped at Gate 7 when the auto-mode
+classifier refused `place_equity_order` for TSM before it reached the broker:
+4 of 20 eligible buys filled, 16 were never sent, and every existing check
+passed. `scripts/check_slot_fills.py` reads the slot's own dated run directory
+and fails loudly:
+
+```bash
+python -m scripts.check_slot_fills --slot 0935 --date 2026-10-07 --json
+```
+
+| Fails when | Source |
+| --- | --- |
+| any `.json` / `.txt` / `.md` / `.log` / `.csv` file in the run directory contains `PLATFORM REFUSAL` (case-insensitive), or a report is unreadable, or is a symlink out of the root | report text |
+| `counts.submitted != gate9_report.eligible_count - sum(gate9_report.dropped)` | `run_state.json` (see below) |
+| `run_state.json` is missing, unreadable, not an object, has duplicate keys, or its `trading_day` differs from `--date` | fails closed |
+| a count is missing, not an integer, or negative | fails closed |
+
+`gate9_report` is the object a slot passes to `finalize_run_evidence
+--report-json`. The check needs `eligible_count` and a `dropped` object keyed
+exactly `price_recovered`, `spread_over_1pct` and `daily_cap` (all three required). A slot that omits them
+fails closed, so the live prompts must supply them. The seven `live-mirror/` prompts now instruct this in their `--report-json` bullet (`eligible_count` = Gate 5 buy candidates before Gate 6.5; `price_recovered` = refresh or per-order revalidation drops; `spread_over_1pct` = Gate 6.7 zeros; `daily_cap` = cap or same-day top-up-guard zeros). Editing a mirror changes nothing live: apply each body through `update_scheduled_task`, then run `check_live_prompt_drift`. Exit 0 passes, 1
+fails. Read-only; it never contacts a broker.
+
+This is a submission-completeness check, not a settlement check. `counts.submitted` counts every order row recorded, including `pending`, `unconfirmed` and `potentially_submitted` ones, so a pass means every eligible buy was sent or accounted for, not that each one filled. Confirmed fills are Gate 8's job (and the order-history sync).
+
+**Deploying this.** Like `schedule_watchdog`, registering the post-slot
+invocation lives outside this repo (the external scheduler/Cowork). Run it once
+per slot after Gate 9, for example as the last command of each live task, or
+from a scheduler entry a few minutes after the slot's window ends.
+
 ## Deploying the prompt change
 
 Editing `claude/dca-executor-prompts/live-mirror/` changes nothing on its

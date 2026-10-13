@@ -211,6 +211,20 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
+        need="Check after a slot that no order was platform-refused and every eligible buy was submitted or accounted for",
+        command="python -m scripts.check_slot_fills --slot <HHMM> --date YYYY-MM-DD [--root <cron-tracking root>] [--json]",
+        exists_path="scripts/check_slot_fills.py",
+        doc_ref="docs/schedule_verification.md",
+        symbols=("main", "evaluate"),
+        notes=(
+            "Read-only; never touches a broker. Exits 1 when any report in the slot's run directory "
+            "contains PLATFORM REFUSAL, or counts.submitted != gate9_report.eligible_count minus "
+            "gate9_report.dropped (price_recovered, spread_over_1pct, daily_cap), or run_state.json "
+            "is missing/malformed (fails closed). Closes the gap verify_schedule leaves open: it proves "
+            "a slot fired, not that orders were sent (2026-10-07 09:35: 4 of 20 submitted). Counts submissions, including pending/unconfirmed rows, not confirmed fills."
+        ),
+    ),
+    EntryPoint(
         need="Alert independently of the executor session when a live slot left no scheduled evidence",
         command=(
             "python -m scripts.schedule_watchdog [--date YYYY-MM-DD] [--root <cron-tracking root>] "
