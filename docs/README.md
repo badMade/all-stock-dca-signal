@@ -29,6 +29,7 @@ environment (see the repository README).
 | [workspace_probe.md](workspace_probe.md) | Read-only probe that shows whether a scheduled cloud run keeps its `cron_tracking` files between fires (`scripts/workspace_probe.py`) |
 | [cloud_clone_runs.md](cloud_clone_runs.md) | Running the live slots from a cloud clone: pinned-release preflight, the private evidence store, publish, and the slot claim (`scripts/cloud_preflight.py`, `scripts/evidence_publish.py`) |
 | [drift_detection.md](drift_detection.md) | Post-artifact signals-vs-submitted-orders drift detector + Slack alerting |
+| [adhoc_orders.md](adhoc_orders.md) | Fallback for placing a known list of buys when the scheduled path is unavailable: `scripts/adhoc_orders.py` validates it against the universe, caps, attempt cap and buying power, writes a manual-run plan and execution state, and never places orders from the CLI |
 | [alert_digest.md](alert_digest.md) | Why Gate 9 alerts piled up undelivered in Gmail drafts, and the digest that counts them by gate/slot/streak and flags dead delivery channels |
 | [intraday_archive.md](intraday_archive.md) | Per-poll price/timestamp/volume archive under `ticker_data/_intraday/`, supplementing the daily OHLCV history |
 | [purchase_history.md](purchase_history.md) | Consolidated buy-history ledger (`scripts/purchase_history.py`): every confirmed fill ever placed, at what price, across every stream and day |

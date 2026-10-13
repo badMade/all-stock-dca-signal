@@ -85,6 +85,22 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         notes="The printed JSON's buy_usd per ticker is authoritative. Never recompute it by hand.",
     ),
     EntryPoint(
+        need="Validate an operator's ad hoc buy list when the scheduled path is unavailable",
+        command=(
+            "python3 -m scripts.adhoc_orders --orders <csv|json> --trading-day <YYYY-MM-DD> "
+            "--spent-today <usd> --spent-week <usd> --attempts-today <n> --buying-power <usd>"
+        ),
+        exists_path="scripts/adhoc_orders.py",
+        doc_ref="docs/adhoc_orders.md",
+        symbols=("main", "build_plan", "place_adhoc"),
+        notes=(
+            "Dry-run only: prints an order sheet and writes a manual-run plan, never places an order "
+            "or updates a pointer. Exit 2 means place nothing. The four figures are required and must come "
+            "from a fresh, fully paginated broker pull. Placement is place_adhoc() with an injected "
+            "callable and confirm=True, then write_execution_state(), from an approved agent session."
+        ),
+    ),
+    EntryPoint(
         need="Write the slot's order plan file before Gate 7 places anything (plan-first backup executor)",
         command=(
             "python3 -m scripts.emit_order_plan --trading-day <YYYY-MM-DD> --slot <slot_id> "
