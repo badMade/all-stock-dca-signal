@@ -38,6 +38,7 @@ from dca_whole_share_accumulator import WholeShareAccumulationLedger
 from near_close_dca import (
     ACTIVE_TICKERS,
     ALPACA_ACCOUNT_INFO_TOOL,
+    ALPACA_GET_ORDER_TOOL,
     ALPACA_SOURCE_ID,
     BASE_BELOW_CLOSE_AND_LOW,
     BASE_BELOW_CLOSE_ONLY,
@@ -87,6 +88,7 @@ from near_close_dca import (
     account_pinning_failure,
     allocation_sort_key,
     build_alpaca_account_info_payload,
+    build_alpaca_get_order_payload,
     build_broker,
     build_execution_record,
     build_report,
@@ -51469,6 +51471,27 @@ def test_non_finite_drop_buys_nothing_on_stepped_and_interpolated_ladders(bad_dr
     for ticker in ("SMOOTH", "STEPPED", "OTHER", None):  # OTHER/None: the global stepped ladder
         assert near_close_dca.raw_ladder_multiplier(bad_drop, config, ticker) == 0.0
         assert near_close_dca.graded_buy_multiplier(bad_drop, config, ticker) == 0.0
+
+
+def test_build_alpaca_get_order_payload_live():
+    payload = build_alpaca_get_order_payload("1234-abcd", False)
+    assert payload["source_id"] == ALPACA_SOURCE_ID
+    assert payload["tool"] == ALPACA_GET_ORDER_TOOL
+    assert payload["input"]["orderId"] == "1234-abcd"
+    assert payload["input"]["isPaperAPI"] is False
+
+def test_build_alpaca_get_order_payload_paper():
+    payload = build_alpaca_get_order_payload("9876-wxyz", True)
+    assert payload["source_id"] == ALPACA_SOURCE_ID
+    assert payload["tool"] == ALPACA_GET_ORDER_TOOL
+    assert payload["input"]["orderId"] == "9876-wxyz"
+    assert payload["input"]["isPaperAPI"] is True
+
+def test_build_alpaca_get_order_payload_empty_id():
+    payload = build_alpaca_get_order_payload("", True)
+    assert payload["input"]["orderId"] == ""
+    assert payload["input"]["isPaperAPI"] is True
+
 
 def test_nyse_holidays():
     import near_close_dca
