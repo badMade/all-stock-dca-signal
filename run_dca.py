@@ -675,41 +675,11 @@ def _validated_corporate_action_result(result, as_of: "date"):
     return factor, cursor
 
 
-def _build_frozen_providers_from_raw(
-    original_finance: "MarketDataProvider",
-    original_robinhood: "MarketDataProvider",
-    raw_dir: "Path",
-    *,
-    strict_finance: bool = False,
-    strict_robinhood: bool = False,
-) -> "Tuple[MarketDataProvider, MarketDataProvider]":
-    """Return frozen (finance_data, robinhood_data) backed by the persisted raw files.
-
-    Reads all batch files from ``raw_dir`` and constructs providers whose callables
-    serve the exact archived data so ``run_daily_compact()`` computes from the same
-    snapshot that was persisted, not from potentially-stale live MCP calls.
-
-    Robinhood files (``historicals_batchN.json``, ``quotes_batchN.json``):
-        Frozen ``RobinhoodDataProvider`` filters by ticker+interval so bars from
-        different granularities are never mixed.
-
-    Finance files (``finance_bars_batchN.json``, ``finance_close_batchN.json``):
-        Frozen ``FinanceDataProvider`` keyed by ``(ticker, interval_minutes)`` for
-        bars and by ticker for previous-close.  When no finance files are present,
-        the original live provider is returned for that source and a warning is
-        logged; the scheduler should persist finance connector responses under these
-        names to satisfy the full persist-before-compute contract.
-
-    Falls back to both original providers when ``raw_dir`` is absent or empty.
-    """
+def _parse_frozen_provider_files(raw_dir: "Path"):
     hist_results: List[Dict[str, Any]] = []
     quotes_results: List[Dict[str, Any]] = []
-    # finance_bars keyed by (ticker, interval_minutes) → list of raw bar dicts
     finance_bars: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
-    finance_close: Dict[str, Any] = {}  # ticker → raw close value / dict
-    # Track file presence separately from parsed content: a persisted batch file
-    # with empty results is a valid archived snapshot (upstream returned no data)
-    # and must satisfy the strict check. Only raise when NO matching files exist.
+    finance_close: Dict[str, Any] = {}
     hist_files_seen = False
     quotes_files_seen = False
     finance_files_seen = False
@@ -769,7 +739,26 @@ def _build_frozen_providers_from_raw(
                     if tkr:
                         finance_close[tkr] = entry.get("previous_close")
 
-    # --- Robinhood frozen provider -------------------------------------------
+    return (
+        hist_results,
+        quotes_results,
+        finance_bars,
+        finance_close,
+        hist_files_seen,
+        quotes_files_seen,
+        finance_files_seen,
+    )
+
+
+def _build_frozen_robinhood_provider(
+    original_robinhood: "MarketDataProvider",
+    raw_dir: "Path",
+    hist_results: List[Dict[str, Any]],
+    quotes_results: List[Dict[str, Any]],
+    hist_files_seen: bool,
+    quotes_files_seen: bool,
+    strict_robinhood: bool,
+) -> "MarketDataProvider":
     if hist_results or quotes_results or hist_files_seen or quotes_files_seen:
         _h = hist_results
         _q = quotes_results
@@ -825,8 +814,17 @@ def _build_frozen_providers_from_raw(
             raw_dir,
         )
         frozen_robinhood = original_robinhood
+    return frozen_robinhood
 
-    # --- Finance frozen provider ----------------------------------------------
+
+def _build_frozen_finance_provider(
+    original_finance: "MarketDataProvider",
+    raw_dir: "Path",
+    finance_bars: Dict[Tuple[str, int], List[Dict[str, Any]]],
+    finance_close: Dict[str, Any],
+    finance_files_seen: bool,
+    strict_finance: bool,
+) -> "MarketDataProvider":
     if finance_bars or finance_close or finance_files_seen:
         _fb = finance_bars
         _fc = finance_close
@@ -1088,6 +1086,64 @@ def _build_frozen_providers_from_raw(
             raw_dir,
         )
         frozen_finance = original_finance
+    return frozen_finance
+
+
+def _build_frozen_providers_from_raw(
+    original_finance: "MarketDataProvider",
+    original_robinhood: "MarketDataProvider",
+    raw_dir: "Path",
+    *,
+    strict_finance: bool = False,
+    strict_robinhood: bool = False,
+) -> "Tuple[MarketDataProvider, MarketDataProvider]":
+    """Return frozen (finance_data, robinhood_data) backed by the persisted raw files.
+
+    Reads all batch files from ``raw_dir`` and constructs providers whose callables
+    serve the exact archived data so ``run_daily_compact()`` computes from the same
+    snapshot that was persisted, not from potentially-stale live MCP calls.
+
+    Robinhood files (``historicals_batchN.json``, ``quotes_batchN.json``):
+        Frozen ``RobinhoodDataProvider`` filters by ticker+interval so bars from
+        different granularities are never mixed.
+
+    Finance files (``finance_bars_batchN.json``, ``finance_close_batchN.json``):
+        Frozen ``FinanceDataProvider`` keyed by ``(ticker, interval_minutes)`` for
+        bars and by ticker for previous-close.  When no finance files are present,
+        the original live provider is returned for that source and a warning is
+        logged; the scheduler should persist finance connector responses under these
+        names to satisfy the full persist-before-compute contract.
+
+    Falls back to both original providers when ``raw_dir`` is absent or empty.
+    """
+    (
+        hist_results,
+        quotes_results,
+        finance_bars,
+        finance_close,
+        hist_files_seen,
+        quotes_files_seen,
+        finance_files_seen,
+    ) = _parse_frozen_provider_files(raw_dir)
+
+    frozen_robinhood = _build_frozen_robinhood_provider(
+        original_robinhood,
+        raw_dir,
+        hist_results,
+        quotes_results,
+        hist_files_seen,
+        quotes_files_seen,
+        strict_robinhood,
+    )
+
+    frozen_finance = _build_frozen_finance_provider(
+        original_finance,
+        raw_dir,
+        finance_bars,
+        finance_close,
+        finance_files_seen,
+        strict_finance,
+    )
 
     return frozen_finance, frozen_robinhood
 
