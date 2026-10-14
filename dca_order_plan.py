@@ -762,7 +762,11 @@ def plan_from_decisions(
     the primary. Decisions are ``symbol``, ``notional_usd``, ``multiplier``, ``drop_pct``,
     ``decision_price``, ``prior_close`` and ``prior_low`` (``None`` when unknown). A decision that is
     malformed, outside the universe or excluded is skipped and named in ``skipped``; the rest are
-    planned, then the same all-or-nothing caps as :func:`compute_plan` apply.
+    planned, then the same all-or-nothing caps as :func:`compute_plan` apply. A ``prior_low`` that is
+    present but not a positive finite number (zero, negative, NaN, infinite, a bool or a string) makes
+    the decision malformed: it is skipped as ``invalid_decision`` and never read as "unknown", because
+    ``prior_low`` is safety evidence and a corrupt value is not the same as a missing one. Only
+    ``None`` means unknown.
 
     Returns:
         ``PlanResult`` with the plan document (generator ``"backup"``) or a cap error.

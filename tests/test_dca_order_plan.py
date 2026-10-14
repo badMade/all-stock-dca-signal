@@ -1067,3 +1067,11 @@ def test_plan_from_decisions_rejects_corrupt_prior_low_instead_of_reading_it_as_
     result = _from_decisions(global_config, [_decision(prior_low=bad_low)])
     assert result.orders == ()
     assert ("MSFT", "invalid_decision") in result.skipped
+
+
+def test_plan_from_decisions_keeps_the_first_valid_row_when_a_duplicate_has_a_corrupt_prior_low(global_config):
+    """The corrupt duplicate is reported, but it must not displace or cancel the valid row already chosen."""
+    result = _from_decisions(global_config, [_decision(prior_low=99.5), _decision(prior_low=float("nan"))])
+    assert [o["symbol"] for o in result.orders] == ["MSFT"]
+    assert result.orders[0]["prior_low"] == 99.5
+    assert ("MSFT", "invalid_decision") in result.skipped
