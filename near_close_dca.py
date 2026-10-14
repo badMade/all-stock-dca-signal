@@ -316,6 +316,21 @@ ACTIVE_TICKERS = [
     # QBUT stays in EXCLUDED_TICKERS so a stale list carrying the misspelling
     # is filtered out. See config/tickers.json's notes.
     "QUBT",
+    # OCT 12 2026 (user-requested): APH (Amphenol Corporation) and TEL (TE
+    # Connectivity plc). No Robinhood instrument search was run in-repo for
+    # either (this session has no broker access) -- as with VT/QBUT/RVII/
+    # RVI/VCX/TRLV/LLY/TSLA/VIAV et al. above, tradability, fractional
+    # tradability, and prior-close availability are unverified, and the
+    # run-time preflight and data-confidence gates admit or gate each out
+    # fail-closed if it does not resolve. Both ARE already in tickers.txt
+    # (the history-fetch symbol list). config/per_ticker_sizing.json carries
+    # an uncalibrated global-fallback entry for each (listed in its
+    # fallback_tickers; the config loader requires an entry per active
+    # ticker), so both size off the global fallback ladder until
+    # scripts/generate_per_ticker_sizing.py is re-run against their archived
+    # history. See config/tickers.json's notes.
+    "APH",
+    "TEL",
 ]
 
 # QBUT is the one categorically excluded ticker today (no mechanism to buy it

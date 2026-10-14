@@ -122,3 +122,17 @@ def test_finance_no_data_and_disagreement_are_distinguished(path):
     text = path.read_text(encoding="utf-8")
     assert "finance NO_DATA" in text and "Finance DISAGREEMENT" in text
     assert "a finance gap, rate limit, or disagreement does NOT block" not in text
+
+
+@pytest.mark.parametrize("path", MIRRORS, ids=lambda p: p.name)
+def test_universe_line_matches_the_active_universe(path):
+    """The mirrors hard-code "UNIVERSE (N symbols, exact list; any other symbol is forbidden)", so a ticker
+    added to config/tickers.json but not here is silently never evaluated by the backup task (APH/TEL,
+    Copilot review on PR #1662). Order is irrelevant; the set and the stated count must match."""
+    import near_close_dca
+
+    match = re.search(r"^UNIVERSE \((\d+) symbols[^)]*\): (.+)$", path.read_text(encoding="utf-8"), re.MULTILINE)
+    assert match, f"{path.name} has no UNIVERSE line"
+    listed = [t.strip() for t in match.group(2).split(",")]
+    assert int(match.group(1)) == len(listed)
+    assert set(listed) == set(near_close_dca.ACTIVE_TICKERS), path.name

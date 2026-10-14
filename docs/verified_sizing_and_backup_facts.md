@@ -22,7 +22,7 @@ re-checked. Nothing here changes behavior; it records where older prose is stale
 
 ## Universe
 
-- `config/tickers.json` has 65 active symbols. RVI, VCX and TRLV are active (re-added 2026-08-16 by the owner).
+- `config/tickers.json` has 67 active symbols (APH and TEL added 2026-10-12). RVI, VCX and TRLV are active (re-added 2026-08-16 by the owner).
   QBUT is the only excluded symbol; BYDDY and RVII are `whole_share`.
 
 ## Same-day repeats

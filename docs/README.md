@@ -69,11 +69,11 @@ environment (see the repository README).
 
 ## Key facts (quick reference)
 
-- **Active universe:** 65 tickers (includes `GFUZ`, `TXN`, `RKLB`, the
+- **Active universe:** 67 tickers (includes `GFUZ`, `TXN`, `RKLB`, the
   2026-08-02 additions `GE`, `VRT`, `CAT`, `QQQ`, `QCOM`, `ABBV`, `JPM`, the
   2026-08-04 addition `VT`, the 2026-08-16 additions `QBUT`,
   `RVI`, `VCX`, `TRLV`, the 2026-09-05 additions `LLY`, `TSLA`, and the
-  2026-09-11 additions `VIAV`, `CIEN`, `ANET`, `CSCO`, `FFIV`, `COHR` — all
+  2026-09-11 additions `VIAV`, `CIEN`, `ANET`, `CSCO`, `FFIV`, `COHR`, and the 2026-10-12 additions `APH`, `TEL` — all
   whitelisted without a broker instrument search, so unverified until their
   first live run — plus `QUBT`, added 2026-09-24 as the corrected spelling of
   `QBUT` after Robinhood resolved it; `QBUT` itself stays excluded; `near_close_dca.ACTIVE_TICKERS` and `config/tickers.json`
