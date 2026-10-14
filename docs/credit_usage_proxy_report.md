@@ -93,7 +93,6 @@ One row per scheduled run of the active daily chain, **per ET slot**:
 | ET | Task | ID |
 | --- | --- | --- |
 | 9:35 AM | Market-open DCA live Robinhood execution | `2ba19526` |
-| 9:45 AM | Morning DCA watchlist early-warning scan | `bb4f6ef1` |
 | 10:30 AM | Morning DCA live Robinhood execution | `42173154` |
 | 11:30 AM | Intraday DCA live Robinhood execution | `7be82b97` |
 | 12:30 PM | Midday DCA live Robinhood execution | `a6239dae` |
@@ -105,13 +104,11 @@ One row per scheduled run of the active daily chain, **per ET slot**:
 
 Rules:
 
-- All eight task ids must appear **even when a task did not fire**, was a no-op,
-  or failed to start. A task with no run is reported explicitly as
+- All task ids in the table must appear **even when a task did not fire**, was a
+  no-op, or failed to start. A task with no run is reported explicitly as
   `did_not_run` with the reason, never omitted.
 - `7be82b97` is broken out **per ET slot** (11:30, 1:30, 2:30). It is one task
   with three slots and must not be collapsed to a single line.
-- `bb4f6ef1` fires **once** at the 9:45 AM slot, as the watchlist scan
-  (`MorningDCAExecutor` in watchlist mode); it appears as a single row.
 - `e3e6f09e` is **paused**, so it is reported as paused rather than as missing.
 
 ### 2. Recovery and escalation runs
@@ -329,13 +326,13 @@ history as complete, the report discloses it in `caveats` by stream name.
 **Coverage:** `guarded_run` wraps the in-repo Python entrypoints for
 `42173154` (morning), `a6239dae` (midday, inherits
 `MorningDCAExecutor.run()`), and `10ce362c` (afternoon, via `run_dca.py`).
-`2ba19526`, `bb4f6ef1`, and `7be82b97` have no in-repo
+`2ba19526` and `7be82b97` have no in-repo
 executor -- the external scheduler/agent invokes them directly, so no in-repo
 code exists to write a marker for them -- and `67aa802b`/`a46bf007` are
-read-only consumers of other tasks' artifacts. For those five, an
+read-only consumers of other tasks' artifacts. For those four, an
 attempted-and-crashed invocation genuinely remains indistinguishable from a
 missed slot from this repo's own artifacts; the report states this
-limitation explicitly in `caveats` for any of those five classified
+limitation explicitly in `caveats` for any of those four classified
 `did_not_run`, rather than silently assuming a clean miss.
 
 ### Per-run fields (both sections)
@@ -506,9 +503,9 @@ one.
 
 | Dimension | Proxy | low | moderate | high |
 | --- | --- | --- | --- | --- |
-| `run_volume` | scheduled plus recovery runs, combined total | total at or below 10 runs (the 10-execution scheduled baseline: eight active ids, `bb4f6ef1` firing once as the watchlist scan, `7be82b97` x3 slots, `e3e6f09e` paused/no slot; any mix of scheduled and recovery runs at or below 10 total is low) | total 11 to 16 | total 17 or more |
+| `run_volume` | scheduled plus recovery runs, combined total | total at or below 9 runs (the 9-execution scheduled baseline: six single-slot tasks, `7be82b97` x3 slots, `e3e6f09e` paused/no slot; any mix of scheduled and recovery runs at or below 9 total is low) | total 10 to 15 | total 16 or more |
 | `recovery_load` | `recovery_and_escalation_count` | 0 | 1 to 2 | 3 or more |
-| `connector_load` | `connector_pull_count_where_logged` | at or below 50 (routine per-run pulls across the 10-run baseline) | 51 to 90 | 91 or more |
+| `connector_load` | `connector_pull_count_where_logged` | at or below 50 (routine per-run pulls across the 9-run baseline) | 51 to 90 | 91 or more |
 | `model_load` | count of premium-routed rows (`model_routing_mode='premium'`) in `model_usage_jsonl` | 0 premium rows | exactly 1 premium row (with a recorded reason) | 2 or more premium rows |
 | `artifact_load` | `artifact_count`, `artifact_bytes_approx`, `retry_count` | not high and not moderate: `artifact_count` <= 50 AND `artifact_bytes_approx` <= 2 MB | not high: `artifact_count` 51-80, OR `artifact_bytes_approx` > 2 MB and <= 5 MB | `artifact_count` > 80, OR `artifact_bytes_approx` > 5 MB, OR `retry_count` >= 2 (checked first, overrides the others) |
 | `error_load` | `error_count` plus `retry_count` | not high and not moderate: 0 | not high: 1 to 3 | 4 or more, OR any failed scheduled start (checked first, overrides the others) |

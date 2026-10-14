@@ -84,17 +84,6 @@ CLASSIFICATION_VALUES = (
 # from model_usage.jsonl instead (see _build_consumer_row).
 CHAIN_SLOTS: List[Dict[str, Any]] = [
     {"et": "09:35", "task_id": "2ba19526", "stream": "market_open", "run_dir": "market_open_dca/{day}_0935ET"},
-    {
-        "et": "09:45",
-        "task_id": "bb4f6ef1",
-        "stream": "watchlist",
-        "run_dir": "morning_dca_watchlist/{day}_0945ET",
-        "expected_run_type": "morning_dca_watchlist_scan",
-        # expected_run_type pins the watchlist scan's run_type so a state of any
-        # other type left in this directory cannot stand in as this slot's evidence.
-        # Read-only: a watchlist scan never places an order.
-        "read_only_zero_orders": True,
-    },
     {"et": "10:30", "task_id": "42173154", "stream": "morning", "run_dir": "morning_dca/{day}_1030ET"},
     {"et": "11:30", "task_id": "7be82b97", "stream": "intraday", "run_dir": "intraday_dca/{day}_1130ET"},
     {"et": "12:30", "task_id": "a6239dae", "stream": "midday", "run_dir": "midday_dca/{day}_1230ET"},
@@ -106,24 +95,25 @@ CHAIN_SLOTS: List[Dict[str, Any]] = [
 ]
 
 # Every stream a recovery_and_escalation_runs row can carry: every CHAIN_SLOTS
-# stream, plus "recovery" -- the manual-recovery fallback bucket for a scanned
-# root with no mapped stream (see _stream_from_subroot). Used to
-# pre-initialize recovery_run_count_by_stream so an all-clean day still
-# reports every stream's honest 0 -- codex review discussion_r3658511865.
-ALL_STREAMS = tuple(dict.fromkeys([slot["stream"] for slot in CHAIN_SLOTS])) + ("recovery",)
+# stream, the retired watchlist stream, plus "recovery" -- the manual-recovery
+# fallback bucket for a scanned root with no mapped stream (see
+# _stream_from_subroot). Used to pre-initialize recovery_run_count_by_stream so
+# an all-clean day still reports every stream's honest 0 -- codex review
+# discussion_r3658511865.
+ALL_STREAMS = tuple(dict.fromkeys([slot["stream"] for slot in CHAIN_SLOTS])) + ("watchlist", "recovery")
 
 # e3e6f09e (15:05 monitor-only signal check) is PAUSED, not part of
-# must_cover_active_daily_chain's eight active ids -- reported as paused
-# rather than missing (active_daily_chain_note), but never counted in any
-# scheduled/recovery metric -- codex review discussion_r3658263864.
+# Reported as paused rather than missing (active_daily_chain_note), but never
+# counted in any scheduled/recovery metric -- codex review
+# discussion_r3658263864.
 PAUSED_MONITOR_SLOT = {"et": "15:05", "task_id": "e3e6f09e", "stream": "monitor"}
 
 # Task ids whose in-repo Python entrypoint routes through
 # dca_alerts.guarded_run, so an attempt_log marker (see _read_attempt_marker)
-# can actually exist for them. 2ba19526/bb4f6ef1/7be82b97 have no in-repo
+# can actually exist for them. 2ba19526/7be82b97 have no in-repo
 # executor (the external scheduler/agent invokes them directly) and
 # 67aa802b/a46bf007 are read-only consumers of other tasks' artifacts, so for
-# those five a did_not_run classification cannot rule out an unrecorded crash
+# those four a did_not_run classification cannot rule out an unrecorded crash
 # -- see the caveat this generator adds for them (codex review
 # discussion_r3658096689).
 MARKER_COVERED_TASK_IDS = frozenset({"42173154", "a6239dae", "10ce362c"})
@@ -322,7 +312,6 @@ REQUIRED_ARTIFACT_GROUPS: Dict[Any, tuple] = {
         ("market_open_signals.csv",),
         (SUBMITTED_ORDERS_CSV_FILENAME,),
     ),
-    ("bb4f6ef1", "watchlist"): (("watchlist_signals.csv",),),
     ("42173154", "morning"): (("morning_signals.csv",),),
     ("7be82b97", "intraday"): (
         SUMMARY_FILENAMES,
@@ -567,25 +556,9 @@ def _count_csv_data_rows(csv_path: Path) -> Optional[int]:
 
 
 def _count_submitted_orders(
-    run_dir: Path, run_state: Optional[Dict[str, Any]] = None, read_only: bool = False
+    run_dir: Path, run_state: Optional[Dict[str, Any]] = None
 ) -> Any:
     """Order-attempt count for ``run_dir``, or ``"not_logged"``.
-
-    ``read_only`` marks a slot whose role cannot place orders at all -- the
-    9:45 watchlist scan (CHAIN_SLOTS ``read_only_zero_orders``).
-    Their documented artifact sets contain no order CSV and no
-    order_submit_status precisely BECAUSE they are read-only, so the fallbacks
-    below find nothing and returned not_logged. Since placed_order_count
-    aggregates every valid scheduled row and propagates any non-integer, one
-    successful 9:45 row made the whole day's order total not_available, and the
-    row could not count toward no_op_count either -- even though its order
-    count is necessarily zero. This mirrors the existing zero-order treatment
-    of the read-only consumer roles in _build_consumer_row (Codex review:
-    "Record zero orders for read-only 9:45 slots").
-
-    A real order artifact still wins if one is somehow present, so this can
-    only ever replace an UNMEASURED not_logged with the known zero, never
-    override measured evidence.
 
     Reads the first persisted order artifact found in _ORDER_CSV_NAMES, so a
     manual recovery that recorded its attempts in filled_orders.csv rather
@@ -607,8 +580,6 @@ def _count_submitted_orders(
         status = run_state.get("order_submit_status")
         if isinstance(status, str) and status in _ZERO_ORDER_SUBMIT_STATUSES:
             return 0
-    if read_only:
-        return 0
     return "not_logged"
 
 
@@ -1010,7 +981,6 @@ def _late_error_markers(cron_root: Path, trading_day: str, stream: str) -> tuple
 # slots under the same task_id.
 _EXPECTED_RUN_ID_PREFIX = {
     ("2ba19526", "market_open"): "market_open_live_{day}_0935ET",
-    ("bb4f6ef1", "watchlist"): "morning_{day}_0945ET",
     ("42173154", "morning"): "morning_live_{day}_1030ET",
     ("7be82b97", "intraday"): "intraday_live_{day}_{slot}ET",
     ("a6239dae", "midday"): "midday_live_{day}_1230ET",
@@ -1139,38 +1109,6 @@ def _identity_matches(rc: Dict[str, Any], slot: Dict[str, Any], run_state: Dict[
         return False
     if parsed_triggered.astimezone(_EASTERN).strftime("%Y-%m-%d") != trading_day:
         return False
-    # Slots that set expected_run_type (the 9:45 watchlist scan) additionally pin
-    # run_type, so an artifact of another type cannot stand in as this slot's
-    # evidence.
-    #
-    # REQUIRED, not "checked only when present": run_type is the field that
-    # tells apart artifacts that share every other identity field (cron_id,
-    # scheduled_for_et, trading_day). Treating absence as unknown therefore let
-    # a malformed state satisfy the slot and corrupt the scheduled/artifact counts --
-    # codex review discussion_r3659293057. Absence is malformed rather than
-    # merely unknown: schemas/morning_run_classification.schema.json lists
-    # run_type in `required`, and the real producer always stamps it
-    # (morning_dca.py's MorningDCAExecutor.run_classification), so
-    # requiring it here cannot reject a legitimately-completed run.
-    expected_run_type = slot.get("expected_run_type")
-    if expected_run_type is not None:
-        run_type = rc.get("run_type") or run_state.get("run_type")
-        if run_type != expected_run_type:
-            return False
-        # The expected run_id is ALSO deterministic for this ambiguous pair
-        # specifically -- each mode's scheduled id is
-        # f"{scheduled_run_id_prefix}_{day}_{folder_suffix}" (morning_dca.py's
-        # MORNING_PROFILES), fixed for the trading day -- so it is a second
-        # independent discriminator, and it still catches a copied artifact
-        # whose run_type field is absent. Checked ONLY for these slots, not
-        # generically: the docstring above explains why a run_id mismatch is
-        # unsafe as a global identity test, and that reasoning does not apply
-        # to a pair whose ids are pinned by a shared same-day template --
-        # codex review discussion_r3658790008.
-        expected = _expected_run_id(slot, trading_day)
-        run_id = run_state.get("run_id")
-        if expected is not None and isinstance(run_id, str) and run_id and run_id != expected:
-            return False
     return True
 
 
@@ -1686,7 +1624,7 @@ def _build_chain_row(
         return _cross_reference_row(slot, trading_day)
 
     run_id = _run_id_from(run_state) or NO_RUN_ID
-    order_attempts = _count_submitted_orders(run_dir, run_state, read_only=slot.get("read_only_zero_orders", False))
+    order_attempts = _count_submitted_orders(run_dir, run_state)
 
     recorded_error = _run_state_recorded_error(run_state) if isinstance(run_state, dict) else None
     if recorded_error is None:
@@ -2645,12 +2583,10 @@ def _premium_row_count(
     )
 
 
-# Baseline scheduled-run count on a fully successful, no-recovery day: eight
-# active ids, with bb4f6ef1 firing once (the 9:45 watchlist scan) and 7be82b97
-# firing three times (11:30/13:30/14:30) -- 6 single-slot ids + 1 + 3 = 10
-# (e3e6f09e is paused and contributes none). It was 11 while bb4f6ef1 also
-# fired a second, pre-screen sub-invocation at 9:45 (retired).
-RUN_VOLUME_BASELINE = 10
+# Baseline scheduled-run count on a fully successful, no-recovery day: six
+# single-slot tasks plus 7be82b97 firing three times (11:30/13:30/14:30) = 9.
+# e3e6f09e is paused and contributes none.
+RUN_VOLUME_BASELINE = 9
 
 # Human-readable threshold per proxy dimension, rendered alongside each band so
 # a reader can reproduce the derivation from the Markdown report alone --
