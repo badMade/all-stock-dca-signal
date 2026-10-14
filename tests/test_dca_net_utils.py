@@ -310,3 +310,40 @@ def test_assert_safe_destination_resolves_to_allowed_ip():
         mock_resolve.return_value = {ipaddress.ip_address("93.184.216.34")}
         # Should return silently
         dca_net_utils.assert_safe_destination("https://example.com")
+
+def test_sanitize_exception_http_error():
+    # Verify that HTTPError outputs the class name and HTTP code, but not the url or message
+    exc = urllib.error.HTTPError("http://sensitive-url.com/secret", 404, "Not Found", {}, None)
+    sanitized = dca_net_utils.sanitize_exception(exc)
+    assert sanitized == "HTTPError: HTTP 404"
+    assert "sensitive-url" not in sanitized
+
+def test_sanitize_exception_url_error_with_oserror_errno():
+    # Verify that URLError with an OSError reason exposes the errno but not the message
+    os_exc = OSError(111, "Connection refused to sensitive.host")
+    exc = urllib.error.URLError(os_exc)
+    sanitized = dca_net_utils.sanitize_exception(exc)
+    assert sanitized == "URLError: errno 111"
+    assert "sensitive.host" not in sanitized
+
+def test_sanitize_exception_url_error_with_other_exception():
+    # Verify that URLError with another BaseException reason exposes the inner class name
+    inner_exc = ValueError("bad port 9999")
+    exc = urllib.error.URLError(inner_exc)
+    sanitized = dca_net_utils.sanitize_exception(exc)
+    assert sanitized == "URLError: ValueError"
+    assert "9999" not in sanitized
+
+def test_sanitize_exception_url_error_with_string_reason():
+    # Verify that URLError with a string reason only exposes the outer class name
+    exc = urllib.error.URLError("Failed to reach http://secret.com")
+    sanitized = dca_net_utils.sanitize_exception(exc)
+    assert sanitized == "URLError"
+    assert "secret.com" not in sanitized
+
+def test_sanitize_exception_generic():
+    # Verify that generic exceptions only expose the class name
+    exc = ValueError("secret token ABC")
+    sanitized = dca_net_utils.sanitize_exception(exc)
+    assert sanitized == "ValueError"
+    assert "secret token" not in sanitized
