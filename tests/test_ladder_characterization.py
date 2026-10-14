@@ -23,7 +23,7 @@ import pytest
 import dca_config
 import near_close_dca
 
-GOLDEN = json.loads((Path(__file__).parent / "fixtures" / "ladder_golden.json").read_text())
+GOLDEN = json.loads((Path(__file__).parent / "fixtures" / "ladder_golden.json").read_bytes())
 
 
 @pytest.fixture(scope="module")

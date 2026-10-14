@@ -64,7 +64,7 @@ def test_every_ticker_is_scored_alike_with_no_alternate_source():
 
 
 def test_midday_config_keeps_robinhood_primary_with_no_fallback_source():
-    config = json.loads((ROOT / "config" / "midday_dca.json").read_text())
+    config = json.loads((ROOT / "config" / "midday_dca.json").read_bytes())
     data_sources = config["raw_input_generation"]["data_sources"].lower()
     assert "robinhood is the primary signal source" in data_sources
     assert "there is no fallback source" in data_sources
@@ -73,7 +73,7 @@ def test_midday_config_keeps_robinhood_primary_with_no_fallback_source():
 
 
 def test_midday_scheduled_task_source_policy_matches_generator():
-    config = json.loads((ROOT / "config" / "scheduled_tasks.json").read_text())
+    config = json.loads((ROOT / "config" / "scheduled_tasks.json").read_bytes())
     policy = config["market_data_source_policy"]["slot_overrides"]["1230ET"]
     assert policy["primary_source"] == "robinhood"
     assert policy["accepted_sources"] == ["robinhood"]
@@ -99,7 +99,7 @@ def test_live_prompt_fetches_robinhood_bars_with_no_fallback_source():
 
 def test_live_prompt_names_no_stock():
     prompt = LIVE_PROMPT.read_text()
-    tickers = json.loads((ROOT / "config" / "tickers.json").read_text())
+    tickers = json.loads((ROOT / "config" / "tickers.json").read_bytes())
     universe = set(tickers["active"]) | set(tickers["whole_share"]) | set(tickers["excluded"]) | {"GFUZ"}
     # Word-bounded so a ticker-like substring of ordinary prose is not a false hit; the account placeholder and
     # tool names are lowercase or contain underscores, so they never match.
@@ -113,7 +113,7 @@ def test_the_active_midday_task_entry_is_robinhood_primary_not_finance():
     The source policy and the separate 2026-07-20 fix block already said Robinhood, but the task entry itself still told
     the raw-input producer to use the Finance connector, so the deployed path could fetch Finance-shaped inputs.
     """
-    config = json.loads((ROOT / "config" / "scheduled_tasks.json").read_text())
+    config = json.loads((ROOT / "config" / "scheduled_tasks.json").read_bytes())
     tasks = [t for t in config["tasks"] if t.get("id") == "a6239dae"]
     assert len(tasks) == 1 and tasks[0]["status"] == "active" and tasks[0]["executor"] == "MiddayDCAExecutor"
     data_sources = tasks[0]["raw_input_generation"]["data_sources"].lower()

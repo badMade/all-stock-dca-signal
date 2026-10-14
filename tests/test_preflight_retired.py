@@ -155,7 +155,7 @@ def test_the_morning_executor_has_no_preflight_gate_and_scores_the_full_universe
 
 
 def test_scheduled_tasks_drop_the_preflight_entry_and_the_writer_clause_but_keep_the_watchlist_scan():
-    tasks = json.loads((ROOT / "config" / "scheduled_tasks.json").read_text())["tasks"]
+    tasks = json.loads((ROOT / "config" / "scheduled_tasks.json").read_bytes())["tasks"]
     by_id = {str(t.get("id") or t.get("task_id") or ""): t for t in tasks}
     assert "morning-dca-0945" not in by_id
     assert all(t.get("executor_mode") != "preflight" for t in tasks)
@@ -175,7 +175,7 @@ def test_the_watchlist_scan_survives():
 
 
 def test_the_morning_config_has_no_preflight_keys():
-    config = json.loads((ROOT / "config" / "morning_dca.json").read_text())
+    config = json.loads((ROOT / "config" / "morning_dca.json").read_bytes())
 
     def keys(node):
         if isinstance(node, dict):

@@ -340,7 +340,7 @@ def test_global_fallback_tiers_match_sizing_ladder_config():
     import json
     from pathlib import Path
 
-    ladder = json.loads((Path(__file__).resolve().parents[2] / "config" / "sizing_ladder.json").read_text())
+    ladder = json.loads((Path(__file__).resolve().parents[2] / "config" / "sizing_ladder.json").read_bytes())
     assert list(sizing.GLOBAL_FALLBACK_TIERS) == [(t["min_drop_pct"], t["multiplier"]) for t in ladder["tiers"]]
 
 

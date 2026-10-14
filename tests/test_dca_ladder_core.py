@@ -31,7 +31,7 @@ import dca_ladder_core as core
 import near_close_dca
 
 REPO = Path(__file__).resolve().parents[1]
-GOLDEN = json.loads((Path(__file__).parent / "fixtures" / "ladder_golden.json").read_text())
+GOLDEN = json.loads((Path(__file__).parent / "fixtures" / "ladder_golden.json").read_bytes())
 
 
 @pytest.fixture(scope="module")

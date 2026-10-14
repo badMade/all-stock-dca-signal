@@ -168,8 +168,8 @@ def test_valid_plan_is_accepted_and_returns_its_orders_in_order(config, ctx):
 
 def test_current_ladder_version_is_the_composite_of_both_sizing_files():
     cfg_dir = dca_config.get_config_dir()
-    ladder = json.loads((cfg_dir / "sizing_ladder.json").read_text())["version"]
-    per_ticker = json.loads((cfg_dir / "per_ticker_sizing.json").read_text())["version"]
+    ladder = json.loads((cfg_dir / "sizing_ladder.json").read_bytes())["version"]
+    per_ticker = json.loads((cfg_dir / "per_ticker_sizing.json").read_bytes())["version"]
     assert dop.current_ladder_version() == f"{ladder}+{per_ticker}"
 
 

@@ -116,7 +116,7 @@ def test_rerun_overwrites_and_identical_inputs_give_identical_bytes(tmp_path, ca
     _run(tmp_path, capsys, [_row("MSFT", 4.0)], out=out)
     assert out.read_bytes() == first
     _run(tmp_path, capsys, [_row("AAPL", 2.0, 1.0, 0.7)], out=out)
-    assert json.loads(out.read_text())["orders"][0]["symbol"] == "AAPL"
+    assert json.loads(out.read_bytes())["orders"][0]["symbol"] == "AAPL"
     assert sorted(p.name for p in tmp_path.iterdir() if p.name != "buys.json") == ["order_plan_1130.json"]
 
 

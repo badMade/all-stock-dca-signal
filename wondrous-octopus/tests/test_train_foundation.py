@@ -195,7 +195,7 @@ class TestMetricsArtifact:
         assert list(tmp_path.glob("*.tmp")) == []
         import json
 
-        assert json.loads(path.read_text())["shard"] == 1
+        assert json.loads(path.read_bytes())["shard"] == 1
 
     def test_rewriting_merges_rather_than_dropping_the_other_stage(self, tmp_path: Path):
         path = tmp_path / "shard_1_metrics.json"
@@ -203,7 +203,7 @@ class TestMetricsArtifact:
         tf.write_metrics(path, {"stages": {"2": {"total_seconds": 5}}}, merge=True)
         import json
 
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_bytes())
         assert set(payload["stages"]) == {"1", "2"}
         assert payload["shard"] == 1
 

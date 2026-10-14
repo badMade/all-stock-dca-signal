@@ -110,7 +110,7 @@ def test_cap_figures_match_live_config(prompts, prefix):
     assert f"at most ${normal.daily_cap_usd:g} across ALL orders" in text
     assert f"at most ${normal.weekly_cap_usd:g}" in text
     assert f"at most {dca_runner.MAX_ORDERS_PER_DAY} buy attempts" in text
-    breakers = json.loads((CONFIG / "budgets.json").read_text())["circuit_breakers"]
+    breakers = json.loads((CONFIG / "budgets.json").read_bytes())["circuit_breakers"]
     assert f"{breakers['max_consecutive_placement_failures']} consecutive" in text
 
 
@@ -120,7 +120,7 @@ def test_universe_and_version_stamps_match_config(prompts, prefix):
     config = dca_config.load_strategy_config(dca_config.get_config_dir())
     expected_hash = hashlib.sha256(("\n".join(sorted(set(config.tickers))) + "\n").encode()).hexdigest()
     assert expected_hash in text and f"({len(config.tickers)} symbols)" in text
-    versions = [json.loads((CONFIG / n).read_text())["version"] for n in ("sizing_ladder.json", "per_ticker_sizing.json")]
+    versions = [json.loads((CONFIG / n).read_bytes())["version"] for n in ("sizing_ladder.json", "per_ticker_sizing.json")]
     assert "+".join(versions) in text
 
 
@@ -155,7 +155,7 @@ def test_yahoo_is_never_mentioned_or_required(prompts, prefix):
 @pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
 def test_market_calendar_is_embedded_from_config(prompts, prefix):
     text = _by_prefix(prompts, prefix)
-    calendar = json.loads((CONFIG / "market_calendar.json").read_text())
+    calendar = json.loads((CONFIG / "market_calendar.json").read_bytes())
     for day in (*calendar["holidays_closed"], *calendar["early_close_1300"]):
         assert day in text, day
 

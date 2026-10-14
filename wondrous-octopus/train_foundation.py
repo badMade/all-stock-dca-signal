@@ -385,7 +385,7 @@ def write_metrics(path: Path, payload: dict[str, Any], *, merge: bool = False) -
     combined: dict[str, Any] = {}
     if merge and path.is_file():
         try:
-            combined = json.loads(path.read_text())
+            combined = json.loads(path.read_bytes())
         except (OSError, json.JSONDecodeError):
             # A corrupt prior artifact is a reporting problem, never a reason to
             # lose the stage that just finished hours of training.

@@ -506,16 +506,16 @@ def test_code_version_is_recorded_in_run_state_and_run_summary(tmp_path):
 
     assert result["verified"] is True, result["errors"]
     run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
-    assert json.loads((run_dir / "run_state.json").read_text())["code_version"] == CODE_VERSION
-    assert json.loads((run_dir / "run_summary.json").read_text())["code_version"] == CODE_VERSION
+    assert json.loads((run_dir / "run_state.json").read_bytes())["code_version"] == CODE_VERSION
+    assert json.loads((run_dir / "run_summary.json").read_bytes())["code_version"] == CODE_VERSION
 
 
 def test_code_version_is_absent_when_the_caller_gives_none(tmp_path):
     run(tmp_path, "1330")
 
     run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
-    assert "code_version" not in json.loads((run_dir / "run_state.json").read_text())
-    assert "code_version" not in json.loads((run_dir / "run_summary.json").read_text())
+    assert "code_version" not in json.loads((run_dir / "run_state.json").read_bytes())
+    assert "code_version" not in json.loads((run_dir / "run_summary.json").read_bytes())
 
 
 @pytest.mark.parametrize(
@@ -544,7 +544,7 @@ def test_the_cli_accepts_code_version_json(tmp_path):
 
     assert exit_code == 0
     run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
-    assert json.loads((run_dir / "run_state.json").read_text())["code_version"] == CODE_VERSION
+    assert json.loads((run_dir / "run_state.json").read_bytes())["code_version"] == CODE_VERSION
 
 
 # --- code_version review follow-ups (Copilot review, PR #1571) ------------------------------------------------
@@ -554,7 +554,7 @@ def as_executor_state(tmp_path, slot="1030", **fields):
     """Turn a state this command wrote into one an executor's own run() wrote."""
     run(tmp_path, slot)
     run_dir = tmp_path / slot_run_dir_relative(slot, DAY)
-    state = json.loads((run_dir / "run_state.json").read_text())
+    state = json.loads((run_dir / "run_state.json").read_bytes())
     state.pop("finalized_by")
     state.update(fields)
     (run_dir / "run_state.json").write_text(json.dumps(state))
@@ -567,8 +567,8 @@ def test_code_version_is_merged_into_an_executor_written_run_state_and_summary(t
     result = run(tmp_path, "1030", code_version=CODE_VERSION)
 
     assert result["run_state_written"] is False and result["verified"] is True, result["errors"]
-    assert json.loads((run_dir / "run_state.json").read_text())["code_version"] == CODE_VERSION
-    assert json.loads((run_dir / "run_summary.json").read_text())["code_version"] == CODE_VERSION
+    assert json.loads((run_dir / "run_state.json").read_bytes())["code_version"] == CODE_VERSION
+    assert json.loads((run_dir / "run_summary.json").read_bytes())["code_version"] == CODE_VERSION
     assert not any("code_version" in warning and "NOT recorded" in warning for warning in result["warnings"])
 
 
@@ -577,7 +577,7 @@ def test_an_executor_state_keeps_its_other_fields_when_code_version_is_merged(tm
 
     run(tmp_path, "1030", code_version=CODE_VERSION)
 
-    assert json.loads((run_dir / "run_state.json").read_text())["executor_payload"] == "kept"
+    assert json.loads((run_dir / "run_state.json").read_bytes())["executor_payload"] == "kept"
 
 
 def test_a_conflicting_code_version_is_refused_and_the_state_is_left_as_it_was(tmp_path):
@@ -596,7 +596,7 @@ def test_a_retry_that_omits_code_version_keeps_the_first_attempts_release(tmp_pa
     run(tmp_path, "1330")
 
     run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
-    assert json.loads((run_dir / "run_state.json").read_text())["code_version"] == CODE_VERSION
+    assert json.loads((run_dir / "run_state.json").read_bytes())["code_version"] == CODE_VERSION
 
 
 def cli_args(tmp_path, code_version_json):

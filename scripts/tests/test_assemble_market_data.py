@@ -81,7 +81,7 @@ def _decisions(config, payload):
 def test_it_writes_the_generators_payload_shape(tmp_path, capsys):
     code, report, out = _assemble(tmp_path, capsys, raw_bundle(TAPE))
     assert (code, report["status"]) == (0, "ASSEMBLED")
-    payload = json.loads(out.read_text())
+    payload = json.loads(out.read_bytes())
     assert set(payload) == {"sources", "source_errors", "ticker_errors"}
     assert payload["sources"]["finance"] == {}
     assert set(payload["sources"]["robinhood"]) == set(TAPE)
@@ -97,7 +97,7 @@ def test_it_writes_the_generators_payload_shape(tmp_path, capsys):
 
 def test_the_previous_close_comes_from_the_official_close_with_the_unknown_low_sentinel(tmp_path, capsys):
     _, _, out = _assemble(tmp_path, capsys, raw_bundle(TAPE))
-    bar = json.loads(out.read_text())["sources"]["robinhood"]["VT"]["previous_close_bar"]
+    bar = json.loads(out.read_bytes())["sources"]["robinhood"]["VT"]["previous_close_bar"]
     assert bar["close"] == 100.0
     assert bar["low"] == 0.0  # "unknown": a quote-derived bar must not fabricate a low that upgrades the base to $2
     assert bar["timestamp"] < f"{DAY}T00:00:00"  # strictly before the trading day
@@ -107,7 +107,7 @@ def test_interpolated_gap_fill_bars_are_dropped_and_bars_are_sorted_oldest_first
     raw = {"historicals": [raw_historicals("VT", 100.0, 97.0, interpolated_at=3)], "quotes": [raw_quotes("VT", 100.0, 97.0)]}
     raw["historicals"][0]["results"][0]["bars"].reverse()
     _, _, out = _assemble(tmp_path, capsys, raw)
-    bars = json.loads(out.read_text())["sources"]["robinhood"]["VT"]["intraday_bars"]
+    bars = json.loads(out.read_bytes())["sources"]["robinhood"]["VT"]["intraday_bars"]
     stamps = [b["timestamp"] for b in bars]
     assert stamps == sorted(stamps)
     assert len(bars) == len(raw_historicals("VT", 100.0, 97.0)["results"][0]["bars"]) - 1
@@ -120,7 +120,7 @@ def test_a_multi_symbol_response_and_split_pages_assemble_the_same_as_one_per_sy
     merged_quotes["results"] += raw_quotes("MSFT", 100.0, 100.0)["results"]
     _, _, one = _assemble(tmp_path, capsys, {"historicals": [merged_hist], "quotes": [merged_quotes]}, out_name="a.json")
     _, _, two = _assemble(tmp_path, capsys, raw_bundle(TAPE), out_name="b.json")
-    assert json.loads(one.read_text()) == json.loads(two.read_text())
+    assert json.loads(one.read_bytes()) == json.loads(two.read_bytes())
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +130,7 @@ def test_a_multi_symbol_response_and_split_pages_assemble_the_same_as_one_per_sy
 
 def test_the_assembled_payload_gives_the_same_decisions_as_a_hand_built_one(tmp_path, capsys, config):
     _, _, out = _assemble(tmp_path, capsys, raw_bundle(TAPE))
-    assembled = _decisions(config, json.loads(out.read_text()))
+    assembled = _decisions(config, json.loads(out.read_bytes()))
     direct = _decisions(config, market_data(TAPE))
     for ticker in TAPE:
         keys = ("action", "reason", "buy_multiplier", "suggested_amount_usd", "target_price")
@@ -147,7 +147,7 @@ def test_the_assembled_payload_gives_the_same_decisions_as_a_hand_built_one(tmp_
 def test_a_ticker_with_no_raw_data_at_all_is_an_explicit_error_marker_and_cannot_be_bought(tmp_path, capsys, config):
     raw = raw_bundle({"MSFT": (100.0, 100.0)})
     _, report, out = _assemble(tmp_path, capsys, raw)
-    payload = json.loads(out.read_text())
+    payload = json.loads(out.read_bytes())
     assert "AAPL" in payload["ticker_errors"]["robinhood"]  # in the universe, nothing was fetched for it
     assert "AAPL" not in payload["sources"]["robinhood"]
     assert report["ticker_errors"] == payload["ticker_errors"]["robinhood"]
@@ -158,7 +158,7 @@ def test_a_ticker_with_bars_but_no_quote_is_an_error_marker(tmp_path, capsys):
     raw = raw_bundle(TAPE)
     raw["quotes"] = [raw_quotes("MSFT", 100.0, 100.0)]
     _, _, out = _assemble(tmp_path, capsys, raw)
-    payload = json.loads(out.read_text())
+    payload = json.loads(out.read_bytes())
     assert "VT" in payload["ticker_errors"]["robinhood"] and "VT" not in payload["sources"]["robinhood"]
 
 
@@ -168,21 +168,21 @@ def test_a_non_positive_or_non_finite_price_marks_the_ticker_instead_of_trading_
     bad["quotes"][0]["results"][0]["close"]["price"] = "NaN"
     bad["quotes"][0]["results"][0]["quote"]["previous_close"] = "0"
     _, _, out = _assemble(tmp_path, capsys, bad)
-    payload = json.loads(out.read_text())
+    payload = json.loads(out.read_bytes())
     assert "VT" in payload["ticker_errors"]["robinhood"] and "VT" not in payload["sources"]["robinhood"]
 
 
 def test_the_do_not_buy_ticker_is_never_assembled_or_flagged(tmp_path, capsys):
     raw = raw_bundle({**TAPE, "QBUT": (100.0, 90.0)})
     _, _, out = _assemble(tmp_path, capsys, raw)
-    payload = json.loads(out.read_text())
+    payload = json.loads(out.read_bytes())
     assert "QBUT" not in payload["sources"]["robinhood"] and "QBUT" not in payload["ticker_errors"]["robinhood"]
 
 
 def test_a_symbol_outside_the_universe_is_ignored(tmp_path, capsys):
     raw = raw_bundle({**TAPE, "ZZZZ": (10.0, 9.0)})
     _, _, out = _assemble(tmp_path, capsys, raw)
-    payload = json.loads(out.read_text())
+    payload = json.loads(out.read_bytes())
     assert "ZZZZ" not in payload["sources"]["robinhood"] and "ZZZZ" not in payload["ticker_errors"]["robinhood"]
 
 
@@ -296,7 +296,7 @@ def test_a_daily_bar_gives_the_payload_the_real_prior_session_low(tmp_path, caps
     raw = {**raw_bundle(TAPE), "daily": [_raw_daily("VT", low=98.25), _raw_daily("MSFT", low=99.0)]}
     code, _, out = _assemble(tmp_path, capsys, raw)
     assert code == 0
-    bar = json.loads(out.read_text())["sources"]["robinhood"]["VT"]["previous_close_bar"]
+    bar = json.loads(out.read_bytes())["sources"]["robinhood"]["VT"]["previous_close_bar"]
     assert (bar["open"], bar["high"], bar["low"], bar["close"]) == (99.5, 101.0, 98.25, 100.0)
     assert bar["timestamp"] < f"{DAY}T00:00:00"  # still strictly before the trading day
 
@@ -314,7 +314,7 @@ def test_the_assembled_low_reaches_the_primarys_base_selector_so_it_picks_the_fu
 
     def base_for(raw, name):
         out = _assemble(tmp_path, capsys, raw, out_name=f"{name}.json")[2]
-        bar = json.loads(out.read_text())["sources"]["robinhood"]["VT"]["previous_close_bar"]
+        bar = json.loads(out.read_bytes())["sources"]["robinhood"]["VT"]["previous_close_bar"]
         return near_close_dca.select_first_allocation_base_usd(97.0, bar["close"], bar["low"], config)[0]
 
     assert base_for(raw_bundle(TAPE), "without") == 1.0
@@ -323,22 +323,22 @@ def test_the_assembled_low_reaches_the_primarys_base_selector_so_it_picks_the_fu
 
 def test_without_a_daily_response_the_old_conservative_sentinel_still_applies(tmp_path, capsys):
     _, _, out = _assemble(tmp_path, capsys, raw_bundle(TAPE))
-    assert json.loads(out.read_text())["sources"]["robinhood"]["VT"]["previous_close_bar"]["low"] == 0.0
+    assert json.loads(out.read_bytes())["sources"]["robinhood"]["VT"]["previous_close_bar"]["low"] == 0.0
 
 
 def test_a_daily_bar_for_the_trading_day_itself_is_not_a_prior_session(tmp_path, capsys):
     """A same-day daily bar must never stand in for the prior session: it is ignored, keeping the sentinel."""
     raw = {**raw_bundle(TAPE), "daily": [_raw_daily("VT", low=98.25, day=DAY)]}
     _, _, out = _assemble(tmp_path, capsys, raw)
-    bar = json.loads(out.read_text())["sources"]["robinhood"]["VT"]["previous_close_bar"]
+    bar = json.loads(out.read_bytes())["sources"]["robinhood"]["VT"]["previous_close_bar"]
     assert bar["low"] == 0.0 and bar["timestamp"] < f"{DAY}T00:00:00"
 
 
 def test_daily_and_five_minute_responses_never_mix(tmp_path, capsys):
     plain = _assemble(tmp_path, capsys, raw_bundle(TAPE), out_name="a.json")[2]
     mixed = _assemble(tmp_path, capsys, {**raw_bundle(TAPE), "daily": [_raw_daily("VT", low=98.25)]}, out_name="b.json")[2]
-    a = json.loads(plain.read_text())["sources"]["robinhood"]["VT"]["intraday_bars"]
-    b = json.loads(mixed.read_text())["sources"]["robinhood"]["VT"]["intraday_bars"]
+    a = json.loads(plain.read_bytes())["sources"]["robinhood"]["VT"]["intraday_bars"]
+    b = json.loads(mixed.read_bytes())["sources"]["robinhood"]["VT"]["intraday_bars"]
     assert a == b  # the daily bar added nothing to the intraday series
 
 
@@ -365,7 +365,7 @@ def test_daily_must_be_a_list_when_present(tmp_path, capsys):
 def _prior_bar(tmp_path, capsys, daily):
     raw = {**raw_bundle(TAPE), **({"daily": daily} if daily is not None else {})}
     out = _assemble(tmp_path, capsys, raw)[2]
-    return json.loads(out.read_text())["sources"]["robinhood"]["VT"]["previous_close_bar"]
+    return json.loads(out.read_bytes())["sources"]["robinhood"]["VT"]["previous_close_bar"]
 
 
 def test_a_stale_daily_bar_cannot_replace_the_official_prior_close(tmp_path, capsys):
