@@ -90,3 +90,31 @@ The prompts no longer contain an account number. Before pasting, set these in th
 | `${ROBINHOOD_AGENTIC_ACCOUNT_LAST4}` | Last 4 digits the account lookup must match; the run stops if not exactly one tradable account ends in them |
 | `${PPLX_RUN_STATE_DIR}` | Directory for the run-state JSON and `submitted_orders.csv` (the project files `cron_tracking/<task id>` folder) |
 | `${DCA_ALERT_EMAIL_ADDRESS}` | Alert address, unchanged |
+
+### Filling them from local values (never in the repo)
+
+`scripts/fill_perplexity_backup_prompts.py` writes a private, filled copy of all six prompts from values you keep
+locally, so the repo copies stay free of them:
+
+```bash
+python3 -m scripts.fill_perplexity_backup_prompts --out ~/perplexity-filled \
+    --folder 4412c3c4=<automation UUID> --folder e028361e=<automation UUID> \
+    --folder e3590042=<automation UUID> --folder 062605c6=<automation UUID> \
+    --folder 54ab24d2=<automation UUID> --folder f83b8d62=<automation UUID>
+```
+
+Perplexity names each task's state folder after its automation UUID (the `automationId` in the task's URL), not the
+repo task id above, so pass one `--folder <task id>=<automation UUID>` per prompt. Without any `--folder` the repo
+task id is used, which starts a new, empty state folder. With at least one, every prompt must be mapped and no two
+tasks may share a folder. Recreating a task changes its UUID, so re-run the command then.
+
+| Placeholder | Where the script reads it |
+|---|---|
+| `${ROBINHOOD_AGENTIC_ACCOUNT_LAST4}` | `ROBINHOOD_AGENTIC_ACCOUNT_LAST4`, else the last four digits of `ROBINHOOD_AGENTIC_ACCOUNT_NUMBER` |
+| `${DCA_ALERT_EMAIL_ADDRESS}` | `DCA_ALERT_EMAIL_ADDRESS` |
+| `${PPLX_RUN_STATE_DIR}` | `--state-root` (default `cron_tracking`) plus the `--folder` name for that prompt's task, so no two tasks share a folder |
+
+Environment variables win; otherwise the gitignored local `.env` is read (`docs/local_env_file.md`). The script
+fails closed and writes nothing if a value is missing or malformed, a prompt has no task header, or any other
+`${NAME}` is left over. It refuses an `--out` inside this checkout, writes owner-only files and never prints a
+value. Regenerate the repo prompts first (`--write`), rebuild `backup_planner.pyz` if the stamp changed, then fill.
