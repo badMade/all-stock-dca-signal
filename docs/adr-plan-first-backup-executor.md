@@ -135,8 +135,8 @@ Mapping to existing fields (`scripts/stream_candidates.py:1363`): `notional_usd`
   parsing, so the task reshapes nothing. Stream computation uses the default decision anchor and excludes
   planner-incompatible candidates. The backup's morning spec disables the retired preflight; its midday spec
   uses Robinhood with the default cadence and no per-ticker source exception. Primary specs and the three live
-  execution entry points remain unchanged. `finalize` still returns `SHADOW_ONLY` for computed plans:
-  `COMPUTE_PLACEMENT_ENABLED` stays off until the shadow run.
+  execution entry points remain unchanged. `finalize` returns `SHADOW_ONLY` for a computed plan unless it is
+  given `--local-status off|errored|unreachable` (switch turned on 2026-10-13, see the operator decision below).
 - **The 7-day deployment figure (implemented 2026-10-08).** The primary derives it from run-state artifacts on the
   Mac, which the cloud cannot read. The cloud path derives it from broker order history instead:
   `compute --deployed-last-7d-usd auto` calls `dca_order_plan.trailing_deployed_usd`, the trailing-7-day total of
@@ -182,8 +182,11 @@ primary Claude slots. Status after the follow-up change:
    the day-wide exclusion. The prompts' rule 5 now reads "one order per ticker per slot".
 2. **Compute path is not the Gate 5 signal path: fixed for all seven slots (2026-10-08).** `compute --market-data`
    reuses the slot's candidate generator, including trend and data-confidence gates. The legacy `--quotes`
-   path remains ladder-only. `finalize` still returns `SHADOW_ONLY` for any computed plan and places nothing
-   (`COMPUTE_PLACEMENT_ENABLED`, off); successful shadow runs remain a precondition for turning the switch on.
+   path remains ladder-only. Operator decision 2026-10-13: `COMPUTE_PLACEMENT_ENABLED` is on, so a backup that
+   cannot reach the Mac places its own computed plan. `finalize` places only when told `--local-status off`,
+   `errored` or `unreachable`; absent, `unknown`, `in_progress` and `succeeded` stay `SHADOW_ONLY`. The shadow run
+   is no longer a precondition. With no Mac the heartbeat `claim` is skipped and the broker order history (two polls,
+   per-order repull, caps, spread check) is the only duplicate protection, as in the pre-2026-10-06 design.
 3. **Buying power: fixed.** `compute` and `finalize` require `--buying-power` and fail closed when it is
    missing, unusable, or below the batch total.
 4. **Spread (Gate 6.7): fixed.** `finalize` requires `--fresh-spreads`; a missing, crossed, unusable, or wide

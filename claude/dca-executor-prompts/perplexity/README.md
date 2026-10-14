@@ -44,13 +44,8 @@ shadow mode (ADR phase 6) has run for at least five trading days.
 ## Which slots take the safety-gate path
 
 All seven, read from `scripts.backup_planner.GATED_SLOTS` when the prompts are generated. Each prompt asks the planner
-<<<<<<< HEAD
 for the symbols to fetch (`backup_planner.pyz universe`), dumps the raw `get_equity_historicals` (5-minute under `historicals`, the previous
 session's daily bar under `daily`) and `get_equity_quotes` responses to `raw.json`, runs `assemble-market-data`, then `compute --market-data market.json
-=======
-for the symbols to fetch (`backup_planner.pyz universe`), dumps the raw `get_equity_historicals` and `get_equity_quotes`
-responses to `raw.json`, runs `assemble-market-data`, then `compute --market-data market.json
->>>>>>> origin/main
 --deployed-last-7d-usd auto`, so the primary's own Gate 5 decides what to buy and the planner derives the kill-switch
 figure from the order history. No prompt names a stock or mentions Yahoo; the stocks live in the planner's configuration.
 
@@ -63,8 +58,11 @@ per-ticker exception. A slot dropped from `GATED_SLOTS` falls back to a quotes-o
 - **Only `PROCEED` places.** A plan written by `compute` finalizes as `SHADOW_ONLY` (would-be orders reported,
   nothing placed). `compute --market-data` now runs the primary's own Gate 5 for all seven slots (15:30 through
   `generate_buy_candidates`, the six executor-class slots through `scripts.stream_candidates`), so that gap is
-  closed everywhere. The switch `scripts.backup_planner.COMPUTE_PLACEMENT_ENABLED` stays off until the shadow run
-  has proven the output.
+  closed everywhere. The switch `scripts.backup_planner.COMPUTE_PLACEMENT_ENABLED` was turned on 2026-10-13 (operator
+  decision: a backup that cannot reach the Mac places its own computed plan). It still places only when `finalize` is
+  given `--local-status off|errored|unreachable`; without it, or for `unknown`, `in_progress` or `succeeded`, a
+  computed plan stays `SHADOW_ONLY`. A session with no device-listing tool counts as `mac_status not_found`, and the
+  Mac `claim` and `confirm` run only when the Mac is online.
 - A Claude plan is reconciled against this slot's window only (later slots may top up); a computed plan excludes
   any ticker bought earlier that day.
 - Buying power and a per-ticker bid/ask spread are required inputs and fail closed.

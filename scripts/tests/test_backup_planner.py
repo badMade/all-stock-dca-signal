@@ -255,11 +255,12 @@ def test_a_two_page_chain_with_its_continuation_is_accepted(tmp_path, capsys):
 # ---------------------------------------------------------------------------
 
 
-def _finalize(tmp_path, capsys, plan, rows=(), fresh=None, *, pages=None, bp="1000", spreads=None):
+def _finalize(tmp_path, capsys, plan, rows=(), fresh=None, *, pages=None, bp="1000", spreads=None, local_status=None):
     plan_file = _write(tmp_path, "plan.json", plan)
     pages_file = _write(tmp_path, "pages.json", pages if pages is not None else _envelope(rows))
     fresh_file = _write(tmp_path, "fresh.json", fresh if fresh is not None else {"MSFT": 100.0, "AAPL": 100.0})
-    return _run(capsys, ["finalize", *_common(["--plan", plan_file, "--orders-pages", pages_file, "--fresh-quotes", fresh_file, *_final_inputs(tmp_path, bp=bp, spreads=spreads)])])
+    extra = ["--local-status", local_status] if local_status else []
+    return _run(capsys, ["finalize", *_common(["--plan", plan_file, "--orders-pages", pages_file, "--fresh-quotes", fresh_file, *_final_inputs(tmp_path, bp=bp, spreads=spreads), *extra])])
 
 
 @pytest.fixture
@@ -391,33 +392,66 @@ def _backup_plan(tmp_path, capsys):
     return report["plan"]
 
 
-def test_a_compute_derived_plan_is_shadow_only_and_places_nothing(tmp_path, capsys):
+def test_a_compute_derived_plan_is_shadow_only_without_a_local_status(tmp_path, capsys):
+    """Fail closed: finalize is never told the Mac is out of the picture, so a computed plan only reports."""
     plan = _backup_plan(tmp_path, capsys)
     fresh = {o["symbol"]: o["prior_close"] * 0.99 for o in plan["orders"]}
     code, report = _finalize(tmp_path, capsys, plan, fresh=fresh)
     assert (code, report["status"], report["to_place"]) == (0, "SHADOW_ONLY", [])
     assert {o["symbol"] for o in report["would_place"]} == {"VT", "MSFT"}
-    assert backup_planner.COMPUTE_PLACEMENT_ENABLED is False
 
 
-def test_the_shadow_gate_is_one_switch_and_a_claude_plan_never_needs_it(tmp_path, capsys, monkeypatch, two_order_plan):
-    code, report = _finalize(tmp_path, capsys, two_order_plan)
-    assert (code, report["status"]) == (0, "PROCEED")  # a Claude plan is unaffected
-    assert "would_place" not in report or report["would_place"] == []
+def test_compute_placement_is_switched_on():
+    """The 2026-10-13 operator decision: a backup that cannot reach the Mac places its own computed plan."""
+    assert backup_planner.COMPUTE_PLACEMENT_ENABLED is True
+
+
+@pytest.mark.parametrize("local_status", ["off", "errored", "unreachable"])
+def test_a_computed_plan_places_when_the_mac_is_out_of_the_picture(tmp_path, capsys, local_status):
     plan = _backup_plan(tmp_path, capsys)
-    monkeypatch.setattr(backup_planner, "COMPUTE_PLACEMENT_ENABLED", True)
     fresh = {o["symbol"]: o["prior_close"] * 0.99 for o in plan["orders"]}
-    code, report = _finalize(tmp_path, capsys, plan, fresh=fresh)
+    code, report = _finalize(tmp_path, capsys, plan, fresh=fresh, local_status=local_status)
     assert (code, report["status"]) == (0, "PROCEED")
     assert {o["symbol"] for o in report["to_place"]} == {"VT", "MSFT"}
 
 
-def test_a_compute_derived_plan_keeps_the_day_wide_exclusion_when_placement_is_enabled(tmp_path, capsys, monkeypatch):
-    """compute cannot resize a top-up, so a ticker bought in ANY earlier slot stays excluded."""
-    monkeypatch.setattr(backup_planner, "COMPUTE_PLACEMENT_ENABLED", True)
+@pytest.mark.parametrize("local_status", ["unknown", "in_progress", "succeeded"])
+def test_a_computed_plan_never_places_when_the_mac_may_be_acting(tmp_path, capsys, local_status):
     plan = _backup_plan(tmp_path, capsys)
     fresh = {o["symbol"]: o["prior_close"] * 0.99 for o in plan["orders"]}
-    code, report = _finalize(tmp_path, capsys, plan, [_earlier_slot_buy("VT")], fresh=fresh)
+    code, report = _finalize(tmp_path, capsys, plan, fresh=fresh, local_status=local_status)
+    assert (code, report["status"], report["to_place"]) == (0, "SHADOW_ONLY", [])
+    assert {o["symbol"] for o in report["would_place"]} == {"VT", "MSFT"}
+
+
+def test_an_unrecognised_local_status_is_rejected(tmp_path, capsys):
+    plan = _backup_plan(tmp_path, capsys)
+    with pytest.raises(SystemExit) as raised:
+        _finalize(tmp_path, capsys, plan, local_status="online")
+    assert raised.value.code == 2
+
+
+def test_a_computed_plan_that_places_still_obeys_the_caps_and_the_spread_check(tmp_path, capsys):
+    plan = _backup_plan(tmp_path, capsys)
+    fresh = {o["symbol"]: o["prior_close"] * 0.99 for o in plan["orders"]}
+    wide = {s: {"bid": 90.0, "ask": 110.0} for s in fresh}  # 20% spread, far past the 1% breaker
+    code, report = _finalize(tmp_path, capsys, plan, fresh=fresh, spreads=wide, local_status="off")
+    assert code == 0 and report["to_place"] == []
+    code, report = _finalize(tmp_path, capsys, plan, fresh=fresh, bp="0.50", local_status="off")
+    assert report["to_place"] == []  # buying power below the batch places nothing
+
+
+def test_the_local_status_changes_nothing_for_a_claude_plan(tmp_path, capsys, two_order_plan):
+    for local_status in (None, "off", "unknown"):
+        code, report = _finalize(tmp_path, capsys, two_order_plan, local_status=local_status)
+        assert (code, report["status"]) == (0, "PROCEED")
+
+
+def test_a_compute_derived_plan_keeps_the_day_wide_exclusion_when_placement_is_enabled(tmp_path, capsys, monkeypatch):
+    """compute cannot resize a top-up, so a ticker bought in ANY earlier slot stays excluded."""
+    plan = _backup_plan(tmp_path, capsys)
+    fresh = {o["symbol"]: o["prior_close"] * 0.99 for o in plan["orders"]}
+    code, report = _finalize(tmp_path, capsys, plan, [_earlier_slot_buy("VT")], fresh=fresh, local_status="off")
     assert code == 0
     assert "VT" not in {o["symbol"] for o in report["to_place"]}
     assert {"symbol": "VT", "reason": "already_placed"} in report["skipped"]

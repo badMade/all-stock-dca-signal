@@ -65,9 +65,16 @@ _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _NORMAL_TIER = next(tier for tier in BUDGET_TIERS if tier.name == "normal")
 _DEAD_STATES = frozenset({"cancelled", "canceled", "rejected", "failed", "voided"})
 
-# Off until the shadow run has proven the gated compute path (ADR "Open design gaps", gap 2). The gate
-# itself (`compute --market-data`) exists; this switch is the separate, deliberate go-live decision.
-COMPUTE_PLACEMENT_ENABLED = False
+# Operator decision 2026-10-13: a backup that cannot reach the Mac places its own computed plan (ADR "Open design
+# gaps", gap 2, which kept this off until a shadow run). The gate itself (`compute --market-data`) is unchanged; the
+# switch alone no longer places: `finalize --local-status` must also say the Mac is out of the picture.
+COMPUTE_PLACEMENT_ENABLED = True
+
+# local_status values (step 3 of the prompts) under which the backup may act: no heartbeat (off), a failed or stale
+# run (errored), or a Mac that could not be reached (unreachable). Anything else, or no value, keeps a computed
+# plan shadow-only so an unknown or active Mac is never raced.
+BACKUP_MAY_ACT_LOCAL_STATUSES = ("off", "errored", "unreachable")
+LOCAL_STATUSES = BACKUP_MAY_ACT_LOCAL_STATUSES + ("unknown", "in_progress", "succeeded")
 
 # Slots whose Gate 5 the safety gate can run: runner slot id -> the candidate generator's slot label. All seven.
 # 15:30 runs scripts.generate_buy_candidates (the final-buy engine); the six executor-class slots run the stream
@@ -485,7 +492,8 @@ def _cmd_finalize(args: argparse.Namespace, trading_day: date) -> int:
         return _abort(*result.errors)
     skipped += [{"symbol": symbol, "reason": reason} for symbol, reason in result.skipped]
     orders = [{"symbol": o["symbol"], "notional_usd": o["notional_usd"], "ref_id": o["ref_id"]} for o in result.orders]
-    if plan.plan["generator"] != "claude" and not COMPUTE_PLACEMENT_ENABLED:
+    mac_out_of_the_picture = args.local_status in BACKUP_MAY_ACT_LOCAL_STATUSES
+    if plan.plan["generator"] != "claude" and not (COMPUTE_PLACEMENT_ENABLED and mac_out_of_the_picture):
         return _emit({"status": "SHADOW_ONLY", "to_place": [], "would_place": orders, "skipped": skipped, "errors": []}, 0)
     return _emit({"status": "PROCEED", "to_place": orders, "skipped": skipped, "errors": []}, 0)
 
@@ -569,6 +577,8 @@ def _build_parser() -> argparse.ArgumentParser:
     finalize.add_argument("--fresh-spreads", required=True, type=Path,
                           help='JSON {"SYMBOL": {"bid": x, "ask": y}} fetched just before placement.')
     finalize.add_argument("--buying-power", required=True, help="Fresh available buying power in USD.")
+    finalize.add_argument("--local-status", default=None, choices=LOCAL_STATUSES,
+                          help="Step 3's local_status. A computed plan places only for off, errored or unreachable.")
     finalize.add_argument("--now", default=None,
                           help="ET-day ISO timestamp for poll 2's kill-switch recheck of a computed plan (default: the clock).")
     return parser

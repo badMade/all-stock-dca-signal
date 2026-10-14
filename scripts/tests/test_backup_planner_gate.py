@@ -253,7 +253,7 @@ def test_corrupt_market_data_fails_closed_with_one_json_document(tmp_path, capsy
 # ---------------------------------------------------------------------------
 
 
-def test_a_gated_plan_is_still_shadow_only_at_finalize(tmp_path, capsys):
+def test_a_gated_plan_is_shadow_only_at_finalize_without_a_local_status(tmp_path, capsys):
     _, report = _gate(tmp_path, capsys, market_data(TAPE))
     plan = report["plan"]
     fresh = {o["symbol"]: o["prior_close"] * 0.99 for o in plan["orders"]}
@@ -266,7 +266,7 @@ def test_a_gated_plan_is_still_shadow_only_at_finalize(tmp_path, capsys):
     out = json.loads(capsys.readouterr().out)
     assert (code, out["status"], out["to_place"]) == (0, "SHADOW_ONLY", [])
     assert {o["symbol"] for o in out["would_place"]} == {o["symbol"] for o in plan["orders"]}
-    assert backup_planner.COMPUTE_PLACEMENT_ENABLED is False
+    assert backup_planner.COMPUTE_PLACEMENT_ENABLED is True  # shadow here comes from the missing --local-status
 
 
 def test_the_quotes_only_path_is_unchanged(tmp_path, capsys):

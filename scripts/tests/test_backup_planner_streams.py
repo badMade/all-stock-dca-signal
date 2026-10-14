@@ -381,7 +381,7 @@ def test_every_wired_slot_has_timings_for_the_fixtures_so_the_tests_cover_it():
 
 
 @pytest.mark.parametrize("slot", STREAM_SLOTS)
-def test_a_stream_plan_is_still_shadow_only_at_finalize(tmp_path, capsys, slot):
+def test_a_stream_plan_is_shadow_only_at_finalize_without_a_local_status(tmp_path, capsys, slot):
     _, report = _plan(tmp_path, capsys, slot, market_data(TAPE, slot=slot))
     plan = report["plan"]
     fresh = {o["symbol"]: o["prior_close"] * 0.99 for o in plan["orders"]}
@@ -393,7 +393,7 @@ def test_a_stream_plan_is_still_shadow_only_at_finalize(tmp_path, capsys, slot):
     ])
     out = json.loads(capsys.readouterr().out)
     assert (code, out["status"], out["to_place"]) == (0, "SHADOW_ONLY", [])
-    assert backup_planner.COMPUTE_PLACEMENT_ENABLED is False
+    assert backup_planner.COMPUTE_PLACEMENT_ENABLED is True  # shadow here comes from the missing --local-status
 
 
 @pytest.mark.parametrize("slot", STREAM_SLOTS)

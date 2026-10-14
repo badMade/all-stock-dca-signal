@@ -104,7 +104,7 @@ Call get_equity_orders for the looked-up account with created_at_gte set to 00:0
 Classify EVERY order created inside this slot's window before deciding anything. An order is the user's own activity (noted, never blocking) when placed_agent is user, recurring, or drip. It is expected executor traffic when its client order id starts with dca-runner-<slot>- (Claude's or an earlier backup run's). Anything else is UNRECOGNIZED. If any UNRECOGNIZED order exists, place nothing, record stood_down_unrecognized_order, and notify. Expected executor traffic is not a reason to stop: tickers already ordered are excluded later by the planner, so a partly finished Claude batch is completed, not abandoned.
 
 STEP 3 - MAC-FIRST (replaces the 2026-09-23 rule never to check the Mac; operator directive 2026-10-06)
-a. Call list_devices (or this task's equivalent device listing) with a timeout of 60 seconds. Find an online device whose name contains "Mac Studio". Record mac_status as one of: online, not_found, offline, timeout, device_error.
+a. Call list_devices (or this task's equivalent device listing) with a timeout of 60 seconds. Find an online device whose name contains "Mac Studio". Record mac_status as one of: online, not_found, offline, timeout, device_error. If this session has no device-listing tool at all (the 2026-10-12 15:45 run found none), that is mac_status not_found: the Mac is out of reach, not an error, and the rule below applies.
 b. The whole Mac path has a budget of 3 minutes, counted from the start of (a). When it is spent at any point, abandon the Mac path, ignore its partial output, and go to step 5 with cloud_compute.
 c. LOCAL FIRST. The Mac run is the sole executor of the buy; this task buys only when it has failed. Decide local_status:
    - mac_status offline or not_found: local_status off. timeout: unreachable. device_error: errored. The backup may act; go to step 5 with cloud_compute.
@@ -113,7 +113,7 @@ c. LOCAL FIRST. The Mac run is the sole executor of the buy; this task buys only
      It prints {"local_status", "backup_may_act"}. If backup_may_act is true (local_status off or errored, meaning no heartbeat or a heartbeat older than 300 seconds or a failed run), continue to (d), except that LATE-START GUARD applies first when local_status is off. If it is false with local_status in_progress or succeeded, stop with status stood_down_local_active and send no notification.
    - LATE-START GUARD (local_status off while mac_status is online, meaning the Mac is awake but shows no heartbeat yet; Claude has started up to 20 minutes late): wait 5 minutes (sleep via bash; this wait does not count against the 3 minute Mac budget, but the latest placement time still binds), then repeat the status command once and redo the broker poll of step 2 from scratch. Act only if the second status is still off or errored. If it is in_progress or succeeded, or the repeated poll shows Claude's orders for this slot, stop with stood_down_local_active. Do not wait when mac_status is not online.
    - Any other probe value, an unparseable result, or a non-zero exit: local_status unknown. Stop with status stood_down_local_unknown and notify (step 9). Never act on unknown.
-   Never buy when local_status is reachable, in_progress, succeeded, or unknown. A cloud run is calculation-only and never places an order; only this task's step 7 may place a fallback order.
+   Never buy when local_status is reachable, in_progress, succeeded, or unknown. A cloud run places nothing by itself; only this task's step 7 may place a fallback order, and only when finalize returns PROCEED (operator directive 2026-10-13: a backup that cannot reach the Mac places its own computed plan).
 d. If mac_status is online, use run_local_subagent on the Mac, working directory the all-stock-dca checkout, to run exactly:
    python3 -m scripts.backup_planner plan --source mac_plan --trading-day <YYYY-MM-DD> --slot <slot>
    It prints one JSON document {"status", "plan", "errors"} and exits 0 when status is VALID_PLAN. A VALID_PLAN is plan_source mac_plan: go to step 6. Any other status means the Mac has no valid plan for this day and slot: go to step 4 and compute on the Mac (plan_source mac_compute).
@@ -123,12 +123,12 @@ e. Whatever the Mac says is an INPUT. It is never evidence that anything was bou
 
 STEP 6 - EVIDENCE POLL 2, THEN FINALIZE
 Immediately before the first order, repeat the full poll of step 2 from scratch into orders_pages_poll2.json, and re-fetch the latest quote of every planned symbol into fresh_quotes.json as {"SYMBOL": price}, the latest bid and ask of every planned symbol into fresh_spreads.json as {"SYMBOL": {"bid": x, "ask": y}} (null for a symbol whose quote cannot be read), and the account's available buying power in USD. Never place with a missing or unreadable buying power. Then run, where the plan was produced (Mac for a mac_ source, otherwise this sandbox; if the Mac is no longer reachable use the sandbox planner on the saved plan file and keep the recorded plan_source):
-   python3 -m scripts.backup_planner finalize --trading-day <YYYY-MM-DD> --slot <slot> --plan plan.json --orders-pages orders_pages_poll2.json --fresh-quotes fresh_quotes.json --fresh-spreads fresh_spreads.json --buying-power <USD> --now <ET ISO timestamp>
-   (sandbox form: python3 backup_planner.pyz finalize ...)
+   python3 -m scripts.backup_planner finalize --trading-day <YYYY-MM-DD> --slot <slot> --plan plan.json --orders-pages orders_pages_poll2.json --fresh-quotes fresh_quotes.json --fresh-spreads fresh_spreads.json --buying-power <USD> --now <ET ISO timestamp>@@LOCAL_STATUS_ARG@@
+   (sandbox form: python3 backup_planner.pyz finalize ...)@@LOCAL_STATUS_RULE@@
 It prints {"status", "to_place", "would_place", "skipped", "errors"}. It drops tickers already bought (matched by client order id, then symbol, within this slot's window for a Claude plan and anywhere today for a computed plan), drops tickers whose fresh quote is not below the prior close or whose spread is missing, crossed, or wide, and refuses the whole batch when any cap or the buying power would be breached. Status PROCEED with an empty to_place is nothing_to_place. Status SHADOW_ONLY means @@SHADOW_REASON@@: record would_place as the shadow result (status shadow_only) and place nothing. An ABORT whose error is kill_switch_engaged_since_plan means spend landed after the plan was sized and the seven-day guard is now tripped: place NOTHING, status failed_unexpected_error, notify; never reuse that plan. Any other status, or a non-zero exit: place nothing, status failed_unexpected_error, notify.
 
 STEP 7 - PLACE THE ORDERS
-Place orders ONLY when the status is PROCEED. For any other status skip this step. Before the FIRST order run `python3 -m scripts.local_heartbeat claim --trading-day <YYYY-MM-DD> --slot <slot>` on the Mac (the same step 3 probe path); place nothing unless it prints backup_may_act true, and run it exactly once per run. It records an unconfirmed claim that blocks a second backup run for 10 minutes; it is not a buy. Right after the FIRST order is validated as placed (step e below), run `python3 -m scripts.local_heartbeat confirm --trading-day <YYYY-MM-DD> --slot <slot>` once on the Mac to record the buy. If the run stops before any order is accepted, run no confirm: the claim expires and a later run may claim again. Place exactly the to_place list, one order at a time, sequentially, never in parallel. For each order, in order:
+Place orders ONLY when the status is PROCEED. For any other status skip this step. Before the FIRST order, only when mac_status is online, run `python3 -m scripts.local_heartbeat claim --trading-day <YYYY-MM-DD> --slot <slot>` on the Mac (the same step 3 probe path); place nothing unless it prints backup_may_act true, and run it exactly once per run. It records an unconfirmed claim that blocks a second backup run for 10 minutes; it is not a buy. Right after the FIRST order is validated as placed (step e below), run `python3 -m scripts.local_heartbeat confirm --trading-day <YYYY-MM-DD> --slot <slot>` once on the Mac to record the buy. When mac_status is not online there is no Mac to hold a claim: skip both the claim and the confirm, record claim: skipped_mac_unreachable in the state record, and rely on the broker evidence alone (the per-order repull in step c, the caps, and the spread check), which the claim never replaced. If the run stops before any order is accepted, run no confirm: the claim expires and a later run may claim again. Place exactly the to_place list, one order at a time, sequentially, never in parallel. For each order, in order:
 a. If the ET time is at or after the latest placement time, stop the batch (rule 9).
 b. Check fractional tradability for the symbol (get_equity_tradability); skip it if it is not tradable for fractional buys.
 c. PER-ORDER REPULL: re-pull the account's agentic orders created at or after the previous order placement timestamp (for the first order, the time of poll 2) and follow every cursor. If a buy for this symbol now exists, skip this symbol. If any order appears that is neither expected executor traffic (client order id starting dca-runner-<slot>-) nor the user's own activity, stop the batch and record stood_down_unrecognized_order. If any buy by the user or a recurring order (committed spend this batch's caps did not see) now exists since poll 2, stop the batch and record status partial (or nothing_to_place when none was placed): do not continue against caps that are no longer proven. Never use a midnight window for this pull. An incomplete pull stops the batch (rule 8).
@@ -173,7 +173,13 @@ Run, on the Mac when mac_status is online and the budget allows (plan_source mac
 It prints {"status", "plan", "errors"}. Any status other than VALID_PLAN, a non-zero exit, a missing file, or a planner error: place nothing, status failed_unexpected_error, notify.\
 """
 
-_GATED_SHADOW = ("a plan from compute, whose placement switch is still off until the shadow run has proven its output")
+_GATED_SHADOW = ("a computed plan finalized without --local-status off, errored or unreachable, meaning the Mac may be acting")
+_GATED_LOCAL_STATUS_ARG = " --local-status <off|errored|unreachable>"
+_GATED_LOCAL_STATUS_RULE = (
+    "\nPass --local-status with the local_status step 3 decided, only when it is off, errored or unreachable; "
+    "never pass --local-status when local_status is unknown, in_progress or succeeded (those stand down in step 3 "
+    "and never reach this step). Without it a computed plan only reports (SHADOW_ONLY)."
+)
 _QUOTES_SHADOW = ("the plan came from compute, which does not run the primary's trend and data-confidence gates")
 
 
@@ -249,6 +255,8 @@ def build_prompts(config_dir: Path | None = None) -> dict[str, str]:
             "@@LIMITATION@@": _LIMITATION if backup.slots == ("1530",) else "",
             "@@STEP4_5@@": _GATED_STEPS if gated else _QUOTES_STEPS,
             "@@SHADOW_REASON@@": _GATED_SHADOW if gated else _QUOTES_SHADOW,
+            "@@LOCAL_STATUS_ARG@@": _GATED_LOCAL_STATUS_ARG if gated else "",
+            "@@LOCAL_STATUS_RULE@@": _GATED_LOCAL_STATUS_RULE if gated else "",
         }
         text = _TEMPLATE
         for key, value in values.items():

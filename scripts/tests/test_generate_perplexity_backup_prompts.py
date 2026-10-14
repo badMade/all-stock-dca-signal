@@ -295,7 +295,7 @@ def test_local_first_routing_is_inline_and_unknown_stands_down(prompts, prefix):
     # Operator decisions 2026-10-08: no lease means act; unknown means stand down and notify.
     assert "stood_down_local_unknown" in text and "Never act on unknown" in text
     assert "stood_down_local_active" in text
-    assert "never places an order" in text  # cloud is calculation-only
+    assert "A cloud run places nothing by itself" in text  # 2026-10-13: step 7 may place, only on PROCEED
     assert "routing {path perplexity-fallback or none" in text
 
 
@@ -383,6 +383,8 @@ def test_a_slot_dropped_from_the_gated_set_falls_back_to_the_quotes_path_and_say
     text = _by_prefix(gen.build_prompts(), "1250ET")
     assert "--quotes quotes.json" in text and "--market-data" not in text
     assert "signal gate is not wired for this slot" in text and "shadow_only" in text
+    # review on #1664: a quotes-only plan has no Gate 5, so its prompt must never authorize placement
+    assert "--local-status" not in text
     assert "--market-data market.json" in _by_prefix(gen.build_prompts(), "1150ET")  # the others are untouched
 
 
@@ -507,3 +509,42 @@ def test_state_record_includes_planner_build(prompts, prefix):
     state = text[text.index("STEP 8 - STATE RECORD"):text.index("STEP 9 - NOTIFY")]
     assert "planner_build" in state
 
+
+
+# -- 2026-10-13: a backup that cannot reach the Mac places its own computed plan -----------------------------------
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_a_missing_device_tool_counts_as_the_mac_not_found(prompts, prefix):
+    """The 2026-10-12 15:45 run found no list_devices tool at all and failed closed on a case the prompt never named."""
+    text = _by_prefix(prompts, prefix)
+    step3 = text.split("STEP 3")[1].split("STEP 4")[0]
+    assert "no device-listing tool" in step3
+    assert "mac_status not_found" in step3.split("no device-listing tool")[1][:200]
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_the_mac_claim_and_confirm_apply_only_when_the_mac_is_online(prompts, prefix):
+    text = _by_prefix(prompts, prefix)
+    step7 = text.split("STEP 7 - PLACE THE ORDERS")[1].split("STEP 8")[0]
+    assert "only when mac_status is online" in step7
+    assert "claim: skipped_mac_unreachable" in step7
+    assert "scripts.local_heartbeat claim" in step7 and "scripts.local_heartbeat confirm" in step7
+    # skipping the Mac lock is never skipping the broker evidence
+    for kept in ("PER-ORDER REPULL", "strictly below the prior close"):
+        assert kept in step7 or kept in text
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_finalize_is_told_the_local_status_the_step_3_routing_decided(prompts, prefix):
+    text = _by_prefix(prompts, prefix)
+    assert "--local-status <off|errored|unreachable>" in text
+    assert "never pass --local-status when local_status is unknown, in_progress or succeeded" in text
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_the_prompt_no_longer_says_a_computed_plan_is_shadow_only_unconditionally(prompts, prefix):
+    text = _by_prefix(prompts, prefix)
+    assert "SHADOW_ONLY" in text  # still the answer when the Mac may be acting
+    assert "a cloud run is calculation-only" not in text.lower()
+    assert "never places an order" not in text
