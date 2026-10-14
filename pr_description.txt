@@ -1,0 +1,15 @@
+**Scope:** Added comprehensive unit tests for `near_close_dca.py:nyse_holidays` to `tests/test_near_close_dca.py`. Validates holiday parsing logic against standard years, historical changes, weekend offsets, and exceptional closures.
+
+**AI usage:** I wrote the unit tests to increase branch coverage for holiday tracking in the DCA system.
+
+**Assumptions & validation:**
+- The user prompt claimed `nyse_holidays()` returns `List[date]` with no parameters, but the actual repository implementation is `nyse_holidays(year: int) -> frozenset[date]`. The tests correctly interface with the actual repository implementation.
+- Assertions strictly use standard library `datetime.date` objects.
+
+**Design rationale:** Tests are appended to `tests/test_near_close_dca.py` as it's the natural boundary for `near_close_dca.py`. The selected test years (2018, 2021, 2022, 2023, 2024) specifically touch critical branch coverage paths: Juneteenth transition, New Year's Day Saturday shifts, and exceptional closures.
+
+**Testing:** Tests were run locally via `uv run pytest tests/test_near_close_dca.py` and passed without regressions.
+
+**Risk & rollback:** Extremely low risk. This PR only adds new test cases and alters zero production logic.
+
+**Tech debt:** N/A.

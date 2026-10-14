@@ -51469,3 +51469,53 @@ def test_non_finite_drop_buys_nothing_on_stepped_and_interpolated_ladders(bad_dr
     for ticker in ("SMOOTH", "STEPPED", "OTHER", None):  # OTHER/None: the global stepped ladder
         assert near_close_dca.raw_ladder_multiplier(bad_drop, config, ticker) == 0.0
         assert near_close_dca.graded_buy_multiplier(bad_drop, config, ticker) == 0.0
+
+def test_nyse_holidays():
+    import near_close_dca
+    # 2024: Juneteenth included, typical year.
+    holidays_2024 = near_close_dca.nyse_holidays(2024)
+    expected_2024 = {
+        date(2024, 1, 1),   # New Year's Day
+        date(2024, 1, 15),  # MLK Day
+        date(2024, 2, 19),  # Washington's Birthday
+        date(2024, 3, 29),  # Good Friday
+        date(2024, 5, 27),  # Memorial Day
+        date(2024, 6, 19),  # Juneteenth
+        date(2024, 7, 4),   # Independence Day
+        date(2024, 9, 2),   # Labor Day
+        date(2024, 11, 28), # Thanksgiving
+        date(2024, 12, 25), # Christmas
+    }
+    assert holidays_2024 == frozenset(expected_2024)
+
+    # 2021: Juneteenth NOT included yet (enacted mid-year but observed 2022 by NYSE)
+    holidays_2021 = near_close_dca.nyse_holidays(2021)
+    expected_2021 = {
+        date(2021, 1, 1),   # New Year's Day
+        date(2021, 1, 18),  # MLK Day
+        date(2021, 2, 15),  # Washington's Birthday
+        date(2021, 4, 2),   # Good Friday
+        date(2021, 5, 31),  # Memorial Day
+        date(2021, 7, 5),   # Independence Day (observed)
+        date(2021, 9, 6),   # Labor Day
+        date(2021, 11, 25), # Thanksgiving
+        date(2021, 12, 24), # Christmas (observed)
+    }
+    assert holidays_2021 == frozenset(expected_2021)
+
+    # 2018: Exceptional closure testing
+    holidays_2018 = near_close_dca.nyse_holidays(2018)
+    assert frozenset([date(2018, 12, 5)]).issubset(holidays_2018)
+
+def test_nyse_holidays_new_years_weekend_observance():
+    import near_close_dca
+    # 2022 New Year's Day was Saturday. 2021-12-31 was NOT a holiday (NYSE stays open when Jan 1 is Saturday).
+    # New Year's Day is observed as `None` for 2022 in _new_years_day_observed, meaning 2022 has no New Year's Day closure.
+    holidays_2022 = near_close_dca.nyse_holidays(2022)
+    assert date(2022, 1, 1) not in holidays_2022
+    assert date(2021, 12, 31) not in holidays_2022
+    assert date(2022, 1, 3) not in holidays_2022
+
+    # 2023 New Year's Day was Sunday. Observed on Monday, 2023-01-02.
+    holidays_2023 = near_close_dca.nyse_holidays(2023)
+    assert date(2023, 1, 2) in holidays_2023
