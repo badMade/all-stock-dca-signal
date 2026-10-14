@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from guardrails.engine import EngineResponse, EnterpriseAIEngine
 from guardrails.input_guardrail import InputCheckResult, InputGuardrail
-from guardrails.output_guardrail import OutputCheckResult, OutputGuardrail
+from guardrails.output_guardrail import OutputGuardrail
 from guardrails.retrieval_engine import Document, RetrievalEngine, UserContext
 
 __all__ = [
@@ -19,7 +19,6 @@ __all__ = [
     "EnterpriseAIEngine",
     "InputCheckResult",
     "InputGuardrail",
-    "OutputCheckResult",
     "OutputGuardrail",
     "RetrievalEngine",
     "UserContext",
