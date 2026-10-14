@@ -105,6 +105,11 @@ BRIDGE_ONLY_ABORT_REASON = "repo readable via device bridge, not mounted in exec
 # The pre-2026-08-26 alert wording this checker flags as a regression back to
 # draft-only delivery (docs/alert_digest.md: ~50 undelivered drafts).
 EMAIL_DRAFT_PHRASE = "EMAIL DRAFT"
+# 2026-10-12 owner direction retired the yfinance fallback from every scheduled run; the
+# generators now reject a yahoo_finance_yfinance source (tests/test_yfinance_retired.py). A
+# live body still carrying the old merge paragraph, or the short-lived 9:35 PREFETCH-FIRST
+# rule that made the prefetched file primary, aborts Gate 5 instead of scoring. Any slot.
+RETIRED_YFINANCE_MARKERS = ("PREFETCHED YFINANCE FALLBACK", "PREFETCH-FIRST")
 # The seven roster slots, as each mirror's filename prefix (<HHMM>ET-<task>.txt).
 EXPECTED_SLOTS = ("0935ET", "1030ET", "1130ET", "1230ET", "1330ET", "1430ET", "1530ET")
 # Every key same_day_top_up_gate requires on its --orders-pages envelope.
@@ -260,6 +265,16 @@ def findings_for(live_text: str, window_end_date: Optional[str]) -> List[Dict[st
             ": a repo readable only through the device bridge misdiagnoses as a disconnected folder "
             "(2026-09-29 incident)",
         })
+    retired = [marker for marker in RETIRED_YFINANCE_MARKERS if marker in live_text]
+    if retired:
+        findings.append(
+            {
+                "code": "retired_yfinance_fallback",
+                "detail": f"still carries {', '.join(retired)}: the yfinance fallback was retired from every "
+                "scheduled run on 2026-10-12 and the generators reject that source, so Gate 5 aborts; re-paste "
+                "the mirror",
+            }
+        )
     if EMAIL_DRAFT_PHRASE in live_text:
         findings.append(
             {

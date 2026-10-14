@@ -4744,3 +4744,32 @@ def test_css_hex_colour_exemption_is_limited_to_real_colour_values(css, exempt):
         for m in _ACCOUNT_SHAPED.finditer(original)
     ]
     assert found and all(found) is exempt
+
+
+def test_every_live_slot_bridge_protocol_exports_the_account_number_for_shell_commands():
+    """2026-10-12 11:30 run: the device bridge shell does not inherit the operator's
+    exports (only a ``dca_paths`` import loads the gitignored ``.env``), so
+    ``--account ${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}`` expanded to an empty string and
+    ``scripts.same_day_top_up_gate`` aborted ``orders_pages_account_mismatch`` until the
+    session worked around it by hand. Left unfixed, that is a fail-closed abort of a
+    real batch at Gate 6.5, every day the bridge shell is the executor.
+
+    The BRIDGE PROTOCOL must therefore tell the session to export the variable, read
+    through ``dca_paths`` (never by reading ``.env``), at the start of every call that
+    uses it, and must keep the SECRET RULE intact: the value is exported, never printed.
+    """
+    offenders = []
+    for mirror in sorted((PROMPTS_DIR / "live-mirror").glob("[0-9][0-9][0-9][0-9]ET-*.txt")):
+        text = mirror.read_text(encoding="utf-8")
+        start = text.index("BRIDGE PROTOCOL (only when")
+        protocol = text[start : text.index("ENVIRONMENT CHECK", start)]
+        export_line = "export ROBINHOOD_AGENTIC_ACCOUNT_NUMBER="
+        if export_line not in protocol:
+            offenders.append(f"{mirror.name}: BRIDGE PROTOCOL never exports the account number")
+            continue
+        exported = protocol[protocol.index(export_line) :].split("\n", 1)[0][:400]
+        if "dca_paths" not in exported:
+            offenders.append(f"{mirror.name}: the export does not resolve the value through dca_paths")
+        if "print(" in exported:
+            offenders.append(f"{mirror.name}: the export line prints the account number (SECRET RULE)")
+    assert not offenders, "\n".join(offenders)

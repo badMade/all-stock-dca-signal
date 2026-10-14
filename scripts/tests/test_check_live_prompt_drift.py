@@ -433,3 +433,32 @@ def test_a_slot_on_a_different_account_is_not_auto_normalized(tmp_path):
     assert drift.shared_live_account(mirror_dir, scheduled) is None
     report = _check(tmp_path, mirror_dir, scheduled, account=drift.shared_live_account(mirror_dir, scheduled))
     assert report["drifted_slots"] == 7
+
+
+@pytest.mark.parametrize(
+    "stale_line",
+    [
+        "PREFETCHED YFINANCE FALLBACK (2026-09-22): merge it only if Robinhood failed as a whole.\n",
+        "PREFETCH-FIRST (2026-10-12): the prefetched file is this slot's primary data path.\n",
+    ],
+)
+@pytest.mark.parametrize("slot", ["0935", "1030"])
+def test_a_live_task_still_carrying_the_retired_yfinance_paragraph_is_flagged(tmp_path, slot, stale_line):
+    # 2026-10-12 owner direction retired the yfinance fallback from every scheduled run, and
+    # the generators now reject a yahoo_finance_yfinance source outright (tests/test_yfinance_retired.py).
+    # A live body that still merges the prefetched file, or still makes it 9:35's primary path
+    # (the short-lived PREFETCH-FIRST rule), would abort Gate 5 with a ValueError instead of scoring.
+    mirror_dir = _mirror(tmp_path, f"{slot}-test")
+    stale = (
+        "GATE 5 - BUY LIST\n"
+        f"Save the input to $ROOT/market_data_<YYYY-MM-DD>_{slot}.json.\n"
+        + stale_line
+    ) + GOOD_BODY
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, f"{slot}-test", stale))
+    assert "retired_yfinance_fallback" in _findings(report)
+
+
+def test_a_live_task_without_the_yfinance_paragraph_is_not_flagged_as_retired(tmp_path):
+    mirror_dir = _mirror(tmp_path, "0935-test")
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, "0935-test", GOOD_BODY))
+    assert "retired_yfinance_fallback" not in _findings(report)
