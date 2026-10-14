@@ -10,21 +10,22 @@ ladder is **historical/superseded**. It is implemented by
 [`morning_dca.MorningDCAExecutor`](../morning_dca.py) and governed by
 [`config/morning_dca.json`](../config/morning_dca.json).
 
-The stream runs in these modes:
+The stream has ONE mode, and `mode` is a required argument (there is no default):
 
 | Mode | Task | ET | Trades | run_type | schema | Artifact root |
 |---|---|---|---|---|---|---|
 | `live` | `42173154` | 10:30 AM | **yes** | `morning_dca_live` | `morning-live-v2-preauthorized` | `.../cron_tracking/morning_dca/` |
-| `watchlist` | `bb4f6ef1` (canonical 9:45 AM slot, read-only) | 9:45 AM | **no** | `morning_dca_watchlist_scan` | `morning-watchlist-v1` | `.../cron_tracking/morning_dca_watchlist/` |
 
-## 9:45 AM watchlist scan (read-only)
+## Retired: the 9:45 AM watchlist scan (2026-10-14)
 
-An optional **read-only / analytics-only** early-warning scan. It grades morning
-weakness on the shared ladder, places **no orders**, runs **no Robinhood order
-review**, and calls **no broker placement path**. It writes under
-`.../cron_tracking/morning_dca_watchlist/YYYYMMDD_0945ET/` with run_type
-`morning_dca_watchlist_scan`; its dollar amounts are hypothetical/watchlist-only.
-The 10:30 live run does not depend on it.
+The former **read-only / analytics-only** 9:45 AM early-warning scan (`bb4f6ef1`, mode
+`watchlist`, run_type `morning_dca_watchlist_scan`, artifact root
+`.../cron_tracking/morning_dca_watchlist/`) was removed at the owner's direction ("no longer in
+use"). `MorningDCAExecutor(mode="watchlist")` is no longer valid and raises `ValueError`; omitting
+`mode` raises `TypeError` (it used to default to the scan, which is how a caller that forgot it
+would silently get a no-orders run). Historical scan artifacts stay readable: the run-classification
+schema keeps the `morning_dca_watchlist_scan` run type. The cron must also be removed from the
+live scheduler (outside this repo).
 
 ## Retired: the 9:45 AM pre-flight validation (2026-10)
 
@@ -33,7 +34,7 @@ The former 9:45 AM read-only pre-flight validation (`preflight` mode, per-ticker
 October 2026 at the owner's direction. `MorningDCAExecutor(mode="preflight")` is no
 longer a valid mode. The 10:30 live stream now scores the **full configured,
 non-excluded universe** and reads no 9:45 artifact. The 9:45 watchlist scan
-(`bb4f6ef1`) is unchanged.
+(`bb4f6ef1`) was retired separately (see above).
 
 ## 10:30 AM live Robinhood execution
 
@@ -256,10 +257,10 @@ isolated on every axis except the same-day top-up guard (see below):
 |---|---|---|
 | Ladder | 0x → **5x** (`config/sizing_ladder.json`) | 0x → **5x** (shared) |
 | Budget ledger | `StrategyState` / `BUDGET_TIERS` | `MorningLedger` namespace `morning` |
-| Artifact root | `.../cron_tracking/ce16ba6b/` | `.../cron_tracking/morning_dca[_watchlist]/` |
-| Run type | `scheduled_live_test` @ `15:30` | `morning_dca_watchlist_scan` @ `09:45` / `morning_dca_live` @ `10:30` |
+| Artifact root | `.../cron_tracking/ce16ba6b/` | `.../cron_tracking/morning_dca/` |
+| Run type | `scheduled_live_test` @ `15:30` | `morning_dca_live` @ `10:30` |
 | Pointer | `latest_scheduled_run.json` | `latest_morning_run.json` (+ `latest_morning_live.json` in live mode) |
-| Trades | **yes** | watchlist **no** / live **yes** (morning-only) |
+| Trades | **yes** | **yes** (morning-only) |
 
 Neither morning mode writes into the `ce16ba6b` tree, neither updates
 `latest_scheduled_run.json`, and each `run_classification` carries
@@ -316,8 +317,7 @@ largest tier threshold ≤ the actual drop wins. This is the current $2-base
 | 7% – < 8% | 4.5x |
 | ≥ 8% | 5x (no upper cutoff) |
 
-Dollars = `base_amount_usd (default $2) × multiplier` (hypothetical in
-watchlist mode, actual order size in live mode).
+Dollars = `base_amount_usd (default $2) × multiplier` (the actual order size in live mode).
 
 ## Budget ledger
 
@@ -328,8 +328,7 @@ notional. Configurable hooks:
 - `morning_weekly_cap_usd` (default `900.0`)
 - `artifact_paths.cap_seed_roots` — the sibling-stream roots the ledger seeds
   same-day/same-week spend from
-- per-mode roots `watchlist_run_state_root` / `live_run_state_root` (legacy
-  `morning_run_state_root` mirrors the watchlist root)
+- `live_run_state_root` (legacy `morning_run_state_root` mirrors the live root)
 
 Exceeding a cap adds a warning to the run artifact.
 
@@ -387,9 +386,8 @@ the requirement of a pre-existing file on disk is removed. See
 
 ## Artifacts
 
-A scheduled morning run writes to its mode's root
-(`.../cron_tracking/morning_dca_watchlist/YYYYMMDD_0945ET/` for watchlist,
-`.../cron_tracking/morning_dca/YYYYMMDD_1030ET/` for live):
+A scheduled morning run writes to the live root
+(`.../cron_tracking/morning_dca/YYYYMMDD_1030ET/`):
 
 - `run_state.json` — classification, ladder, budget, signal rows, warnings.
 - `morning_signals.csv` — one row per ticker.
@@ -430,7 +428,7 @@ Each signal row includes: `ticker`, `source`, `action`, `reason`,
 
 Validated by
 [`schemas/morning_run_classification.schema.json`](../schemas/morning_run_classification.schema.json).
-A scheduled watchlist run:
+A scheduled watchlist run (HISTORICAL example: that mode was retired 2026-10-14; the schema still accepts it so old artifacts validate):
 
 ```json
 {

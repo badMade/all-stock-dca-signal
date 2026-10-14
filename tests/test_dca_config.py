@@ -1573,15 +1573,6 @@ def test_expand_config_env_names_its_source_in_the_error(monkeypatch):
 # on a host where the secret is scoped only to the trading jobs (Codex review,
 # PR #219).
 
-@pytest.mark.parametrize("mode", ["watchlist"])
-def test_read_only_morning_modes_do_not_need_the_account_variable(monkeypatch, mode):
-    from morning_dca import load_morning_config
-
-    monkeypatch.delenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", raising=False)
-    config = load_morning_config(mode=mode)
-    assert config.target_account_number == "read_only"
-
-
 def test_live_morning_mode_still_requires_the_account_variable(monkeypatch):
     from dca_config import MissingConfigEnvError
     from morning_dca import load_morning_config

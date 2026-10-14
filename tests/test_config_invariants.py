@@ -1068,7 +1068,7 @@ def test_every_loader_refuses_a_budgets_file_that_omits_the_breaker(tmp_path):
         # LIVE mode specifically: load_morning_config only overlays the live
         # circuit breakers under MORNING_LIVE_MODE, and a watchlist-mode config
         # places nothing, so there is no breaker for it to bypass.
-        "load_morning_config": lambda: morning_dca.load_morning_config(str(cfg_dir), morning_dca.MORNING_LIVE_MODE),
+        "load_morning_config": lambda: morning_dca.load_morning_config(str(cfg_dir), mode=morning_dca.MORNING_LIVE_MODE),
         # The two real load_stream_config callers, rather than the shared
         # helper: these are what the market-open and intraday streams actually
         # start from.
@@ -1927,9 +1927,9 @@ def test_date_cues_are_word_bounded(line, exempt, label):
 # (e.g. watchdog_reconciliation_scope_patch_2026_07_27) also use the key
 # "broker_account", but nothing reads those blocks at runtime -- see
 # morning_dca.load_morning_config / midday_dca.load_midday_config, which only
-# ever look at raw["live_task"] and raw["watchlist_task"]. Flagging those prose blocks would be noise, not signal.
+# ever look at raw["live_task"] (the watchlist_task block was retired 2026-10-14). Flagging those prose blocks would be noise, not signal.
 _RUNTIME_BROKER_ACCOUNT_PATHS = {
-    "morning_dca.json": ("live_task", "watchlist_task"),
+    "morning_dca.json": ("live_task",),
     "midday_dca.json": ("live_task",),
 }
 
@@ -3409,9 +3409,6 @@ def test_the_missing_budgets_fallback_defaults_match_the_shipped_config():
         overrides = morning_dca._live_circuit_breaker_overrides(Path(empty), morning_dca.MORNING_LIVE_MODE)
         assert overrides["max_consecutive_placement_failures"] == dca_config.DEFAULT_MAX_CONSECUTIVE_PLACEMENT_FAILURES
         assert overrides["max_orders_per_day"] == dca_config.DEFAULT_MAX_ORDERS_PER_DAY
-        # Watchlist never places, and must stay off this path so a malformed
-        # budgets.json cannot block the 9:45 watchlist scan artifact.
-        assert morning_dca._live_circuit_breaker_overrides(Path(empty), morning_dca.MORNING_WATCHLIST_MODE) == {}
 
     # ...and SCOPED THE SAME WAY on that side, which the round-50 fix asserted
     # for `dca_config` and never asked of the loader it was fixing.

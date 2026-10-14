@@ -1,28 +1,12 @@
 {
   "policy_id": "morning-dca-two-stream-v1",
   "version": "2026-07-19",
-  "purpose": "Configuration and separation policy for the MORNING graded-DCA stream, which now has TWO modes. (1) A 9:45 AM ET read-only watchlist / early-warning scan (mode='watchlist', run_type='morning_dca_watchlist_scan', trades=false): analytics only, no orders, no Robinhood order review, no broker placement; it may surface early candidates but every dollar amount is hypothetical / watchlist-only. (2) A 10:30 AM ET live Robinhood execution (mode='live', run_type='morning_dca_live', trades=true) using a true 60-minute intraday trend window. Both modes share the shared $2-base 0x-to-8x live ladder and the morning budget ledger but write to distinct artifact roots. Both are INDEPENDENT of, and never valid evidence for, the afternoon live task 10ce362c (which supersedes the deleted ce16ba6b).",
+  "purpose": "Configuration and separation policy for the MORNING graded-DCA stream, which has ONE mode: the 10:30 AM ET live Robinhood execution (mode='live', run_type='morning_dca_live', trades=true) using a true 60-minute intraday trend window. (The 9:45 AM ET read-only watchlist scan was retired on 2026-10-14; historical scan artifacts remain readable via the run-classification schema.) The stream shares the $2-base 0x-to-8x live ladder and the morning budget ledger, and is INDEPENDENT of, and never valid evidence for, the afternoon live task 10ce362c (which supersedes the deleted ce16ba6b).",
   "stream": "morning",
   "confidence_rule": "In LIVE mode, a candidate whose price/drop passes the ladder is auto-bought ONLY when the intraday trend can be validated (>= trend_min_bars usable intraday bars at or before the decision time). If price/drop passes but the intraday trend cannot be validated, the run must NOT auto-buy; it classifies the candidate as execution_status='manual_review_candidate'. There is no loosened trend-unavailable execution path.",
   "trend_min_bars": 6,
   "live_execution_enabled": true,
   "live_execution_enabled_note": "SHIPS ENABLED. The 10:30 AM ET morning live stream (42173154) is one of the canonical live executions, authorized for live broker placement.",
-  "watchlist_task": {
-    "mode": "watchlist",
-    "cron_id": "bb4f6ef1",
-    "supersedes_cron_id": "morning-dca-0945",
-    "cron_id_note": "Corrected 2026-07-27 (Codex review, P2: 'Synchronize the morning policy with the canonical task ID') to match MORNING_WATCHLIST_CRON_ID in morning_dca.py, which was already 'bb4f6ef1'. This field was previously stale at a retired alias, which config-driven tooling reading this file (rather than the Python constants) could otherwise emit into new artifacts.",
-    "name": "Morning graded DCA watchlist / early-warning scan",
-    "schedule_et": "09:45",
-    "schedule_human": "9:45 AM ET weekdays",
-    "window_start_et": "09:40",
-    "window_end_et": "09:50",
-    "run_type": "morning_dca_watchlist_scan",
-    "state_schema_version": "morning-watchlist-v1",
-    "trades": false,
-    "broker_account": "read_only",
-    "note": "Analytics / read-only only. Identifies early candidates but labels every amount hypothetical / watchlist-only. Places no trades, runs no Robinhood order review, calls no broker placement path."
-  },
   "live_task": {
     "mode": "live",
     "cron_id": "42173154",
@@ -217,12 +201,9 @@
     "separation_note": "Superseded 2026-08-02 by shared_pool_note above: the morning ledger's CAP is now the same shared $180/day, $900/week Normal-tier ceiling every stream draws from (not an isolated 90/450 half-share), and cap_seed_roots spans every sibling stream so it is genuinely pooled. It remains a separate LEDGER OBJECT from the afternoon StrategyState / BUDGET_TIERS ledger (different code path, different persisted file) -- morning buys are still recorded and reported under their own namespace -- but the CEILING they're checked against is shared, not independent."
   },
   "artifact_paths": {
-    "watchlist_run_state_root": "/home/user/workspace/cron_tracking/morning_dca_watchlist",
     "live_run_state_root": "/home/user/workspace/cron_tracking/morning_dca",
-    "morning_run_state_root": "/home/user/workspace/cron_tracking/morning_dca_watchlist",
-    "watchlist_scheduled_run_dir": "/home/user/workspace/cron_tracking/morning_dca_watchlist/YYYYMMDD_0945ET/",
+    "morning_run_state_root": "/home/user/workspace/cron_tracking/morning_dca",
     "live_scheduled_run_dir": "/home/user/workspace/cron_tracking/morning_dca/YYYYMMDD_1030ET/",
-    "watchlist_latest_run_pointer": "/home/user/workspace/cron_tracking/morning_dca_watchlist/latest_morning_run.json",
     "live_latest_run_pointer": "/home/user/workspace/cron_tracking/morning_dca/latest_morning_run.json",
     "run_state_filename": "run_state.json",
     "prior_allocation_roots": [
@@ -242,25 +223,9 @@
       "/home/user/workspace/cron_tracking/ce16ba6b",
       "/home/user/workspace/cron_tracking/final_manual_review"
     ],
-    "separation_note": "Each morning mode writes ONLY under its own root. None writes into /home/user/workspace/cron_tracking/ce16ba6b/**, updates latest_scheduled_run.json, or touches afternoon scheduled_runs/ folders. The legacy 'morning_run_state_root' key mirrors the watchlist root for backwards compatibility. prior_allocation_roots lists all roots scanned for earlier same-day manual fills so the morning live run applies the per-ticker top-up offset guard. cap_seed_roots (widened 2026-08-02, see budget_ledger.shared_pool_note) now covers every sibling stream's root -- morning_dca itself (so a restart or scheduler retry still seeds from any prior morning fill), market_open_dca, midday_dca, intraday_dca, ce16ba6b, and final_manual_review (the out-of-tree manual final-buy override root, e.g. budget_block_override_YYYYMMDD_HHMMET fills after a scheduled run budget-blocked signals) -- so this ledger's shared $180/$900 ceiling reflects the whole day's/week's cross-stream spend, not just morning's own. It used to deliberately exclude the afternoon root so afternoon recovery fills could not exhaust an isolated morning-only cap; now that the cap itself is the shared ceiling, seeing afternoon (and every other stream's) spend here is the correct, intended behavior, not a risk to guard against."
+    "separation_note": "The morning stream writes ONLY under its own root. None writes into /home/user/workspace/cron_tracking/ce16ba6b/**, updates latest_scheduled_run.json, or touches afternoon scheduled_runs/ folders. The legacy 'morning_run_state_root' key mirrors the live root for backwards compatibility. prior_allocation_roots lists all roots scanned for earlier same-day manual fills so the morning live run applies the per-ticker top-up offset guard. cap_seed_roots (widened 2026-08-02, see budget_ledger.shared_pool_note) now covers every sibling stream's root -- morning_dca itself (so a restart or scheduler retry still seeds from any prior morning fill), market_open_dca, midday_dca, intraday_dca, ce16ba6b, and final_manual_review (the out-of-tree manual final-buy override root, e.g. budget_block_override_YYYYMMDD_HHMMET fills after a scheduled run budget-blocked signals) -- so this ledger's shared $180/$900 ceiling reflects the whole day's/week's cross-stream spend, not just morning's own. It used to deliberately exclude the afternoon root so afternoon recovery fills could not exhaust an isolated morning-only cap; now that the cap itself is the shared ceiling, seeing afternoon (and every other stream's) spend here is the correct, intended behavior, not a risk to guard against."
   },
   "scheduled_run_classification": {
-    "watchlist": {
-      "run_origin": "scheduled",
-      "run_type": "morning_dca_watchlist_scan",
-      "stream": "morning",
-      "cron_id": "bb4f6ef1",
-      "supersedes_cron_id": "morning-dca-0945",
-      "cron_id_note": "Corrected 2026-07-27 (Codex review, P2: 'Synchronize the morning policy with the canonical task ID') to match watchlist_task.cron_id above and MORNING_WATCHLIST_CRON_ID in morning_dca.py.",
-      "scheduled_for_et": "09:45",
-      "scheduled_window_start_et": "09:40",
-      "scheduled_window_end_et": "09:50",
-      "manual_run": false,
-      "run_id_pattern": "morning_YYYYMMDD_0945ET",
-      "trades": false,
-      "valid_afternoon_evidence": false,
-      "state_schema_version": "morning-watchlist-v1"
-    },
     "live": {
       "run_origin": "scheduled",
       "run_type": "morning_dca_live",

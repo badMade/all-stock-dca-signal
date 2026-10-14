@@ -39,7 +39,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # from the shared root shows up as a failure here.
 STREAM_ROOTS = [
     ("morning_dca", "DEFAULT_MORNING_LIVE_STATE_ROOT", "morning_dca"),
-    ("morning_dca", "DEFAULT_MORNING_WATCHLIST_STATE_ROOT", "morning_dca_watchlist"),
     ("morning_dca", "DEFAULT_AFTERNOON_TASK_ROOT", "ce16ba6b"),
     ("morning_dca", "DEFAULT_MARKET_OPEN_TASK_ROOT", "market_open_dca"),
     ("morning_dca", "DEFAULT_INTRADAY_TASK_ROOT", "intraday_dca"),

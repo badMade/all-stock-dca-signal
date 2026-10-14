@@ -23,7 +23,7 @@ import pytest
 from dca_intraday_archive import read_ticker_observations
 from market_open_dca import MarketOpenConfig, MarketOpenDCAExecutor
 from midday_dca import MiddayConfig, MiddayDCAExecutor
-from morning_dca import MorningConfig, MorningDCAExecutor, session_stats
+from morning_dca import MORNING_LIVE_MODE, MorningConfig, MorningDCAExecutor, session_stats
 from near_close_dca import EASTERN, Bar, SourceName
 
 
@@ -93,7 +93,9 @@ class RichProvider:
 
 
 def _watchlist_now():
-    return datetime.combine(date(2026, 7, 8), time(9, 45), tzinfo=EASTERN)
+    # Name kept for the call sites: the morning stream's only mode is live now, whose decision anchor is 10:30
+    # (the 9:45 watchlist scan this used to model was retired 2026-10-14).
+    return datetime.combine(date(2026, 7, 8), time(10, 30), tzinfo=EASTERN)
 
 
 # --- the archive is written at all -------------------------------------------
@@ -101,19 +103,19 @@ def _watchlist_now():
 
 def test_scheduled_run_archives_every_polled_ticker(tmp_path):
     cfg = MorningConfig(tickers=("AMD", "NVDA"), morning_run_state_root=str(tmp_path / "runs"))
-    MorningDCAExecutor(cfg).run(_watchlist_now(), RichProvider())
+    MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE).run(_watchlist_now(), RichProvider())
 
     for ticker in ("AMD", "NVDA"):
         rows = read_ticker_observations(ticker)
         assert len(rows) == 1, f"{ticker} was polled but not archived"
         assert rows[0]["stream"] == "morning"
-        assert rows[0]["slot"] == "0945"
+        assert rows[0]["slot"] == "1030"
         assert rows[0]["trading_day"] == "2026-07-08"
 
 
 def test_archived_price_matches_the_signal_the_run_acted_on(tmp_path):
     cfg = MorningConfig(tickers=("AMD",), morning_run_state_root=str(tmp_path / "runs"))
-    result = MorningDCAExecutor(cfg).run(_watchlist_now(), RichProvider())
+    result = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE).run(_watchlist_now(), RichProvider())
 
     (signal_row,) = result["artifacts"]["signal_rows"]
     (archived,) = read_ticker_observations("AMD")
@@ -125,11 +127,11 @@ def test_archived_price_matches_the_signal_the_run_acted_on(tmp_path):
 def test_archived_row_carries_a_price_timestamp_and_volume(tmp_path):
     """The two things the old signals.csv could not answer."""
     cfg = MorningConfig(tickers=("AMD",), morning_run_state_root=str(tmp_path / "runs"))
-    MorningDCAExecutor(cfg).run(_watchlist_now(), RichProvider())
+    MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE).run(_watchlist_now(), RichProvider())
 
     (archived,) = read_ticker_observations("AMD")
     assert archived["price_source"] == "completed_bar"
-    # The price is as of the completed bar, which is strictly BEFORE the 09:45
+    # The price is as of the completed bar, which is strictly BEFORE the 10:30
     # decision anchor -- that gap is exactly what a bare run timestamp hid.
     price_as_of = datetime.fromisoformat(archived["price_as_of"])
     observed_at = datetime.fromisoformat(archived["observed_at_et"])
@@ -141,10 +143,10 @@ def test_archived_row_carries_a_price_timestamp_and_volume(tmp_path):
 
 
 def test_quote_sourced_price_is_labelled_as_a_quote(tmp_path):
-    anchor = datetime.combine(date(2026, 7, 8), time(9, 44), tzinfo=EASTERN)
+    anchor = datetime.combine(date(2026, 7, 8), time(10, 29), tzinfo=EASTERN)
     provider = RichProvider(quote=(93.75, anchor))
     cfg = MorningConfig(tickers=("AMD",), morning_run_state_root=str(tmp_path / "runs"))
-    MorningDCAExecutor(cfg).run(_watchlist_now(), provider)
+    MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE).run(_watchlist_now(), provider)
 
     (archived,) = read_ticker_observations("AMD")
     assert archived["price_source"] == "quote"
@@ -155,10 +157,10 @@ def test_quote_sourced_price_is_labelled_as_a_quote(tmp_path):
 
 def test_rejected_quote_is_still_archived_beside_the_bar_price(tmp_path):
     """A stale quote is exactly when knowing what the feed returned matters."""
-    stale = datetime.combine(date(2026, 7, 8), time(9, 5), tzinfo=EASTERN)
+    stale = datetime.combine(date(2026, 7, 8), time(9, 50), tzinfo=EASTERN)
     provider = RichProvider(quote=(88.0, stale))
     cfg = MorningConfig(tickers=("AMD",), morning_run_state_root=str(tmp_path / "runs"))
-    MorningDCAExecutor(cfg).run(_watchlist_now(), provider)
+    MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE).run(_watchlist_now(), provider)
 
     (archived,) = read_ticker_observations("AMD")
     assert archived["price_source"] == "completed_bar"
@@ -173,12 +175,12 @@ def test_ticker_with_no_data_is_archived_as_a_polled_row(tmp_path):
             return None
 
     cfg = MorningConfig(tickers=("GFUZ",), morning_run_state_root=str(tmp_path / "runs"))
-    MorningDCAExecutor(cfg).run(_watchlist_now(), NoDataProvider())
+    MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE).run(_watchlist_now(), NoDataProvider())
 
     (archived,) = read_ticker_observations("GFUZ")
     assert archived["action"] == "NO_DATA"
     assert archived["previous_close"] == ""
-    assert archived["observed_at_et"].startswith("2026-07-08T09:45")
+    assert archived["observed_at_et"].startswith("2026-07-08T10:30")
     assert "missing previous close" in archived["warnings"]
 
 
@@ -192,14 +194,14 @@ def test_successive_streams_append_rows_for_the_same_ticker(tmp_path):
         MarketOpenConfig(tickers=("AMD",), morning_run_state_root=str(tmp_path / "mo"))
     ).run(datetime.combine(date(2026, 7, 8), time(9, 35), tzinfo=EASTERN), provider)
     MorningDCAExecutor(
-        MorningConfig(tickers=("AMD",), morning_run_state_root=str(tmp_path / "m"))
+        MorningConfig(tickers=("AMD",), morning_run_state_root=str(tmp_path / "m")), mode=MORNING_LIVE_MODE
     ).run(_watchlist_now(), provider)
     MiddayDCAExecutor(
         MiddayConfig(tickers=("AMD",), morning_run_state_root=str(tmp_path / "md"))
     ).run(datetime.combine(date(2026, 7, 8), time(12, 30), tzinfo=EASTERN), provider)
 
     rows = read_ticker_observations("AMD")
-    assert [r["slot"] for r in rows] == ["0935", "0945", "1230"]
+    assert [r["slot"] for r in rows] == ["0935", "1030", "1230"]
     assert {r["stream"] for r in rows} == {"market_open", "morning", "midday"}
     # Sorted by observation time, so the file reads as a day's price path.
     times = [datetime.fromisoformat(r["observed_at_utc"]) for r in rows]
@@ -225,8 +227,8 @@ def test_intraday_three_slots_share_a_stream_but_not_a_row(tmp_path):
 def test_rerunning_one_slot_does_not_duplicate_its_row(tmp_path):
     cfg = MorningConfig(tickers=("AMD",), morning_run_state_root=str(tmp_path / "runs"))
     provider = RichProvider()
-    MorningDCAExecutor(cfg).run(_watchlist_now(), provider)
-    MorningDCAExecutor(cfg).run(_watchlist_now(), provider)
+    MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE).run(_watchlist_now(), provider)
+    MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE).run(_watchlist_now(), provider)
 
     assert len(read_ticker_observations("AMD")) == 1
 
@@ -236,7 +238,7 @@ def test_rerunning_one_slot_does_not_duplicate_its_row(tmp_path):
 
 def test_run_writes_an_observations_csv_beside_its_other_artifacts(tmp_path):
     cfg = MorningConfig(tickers=("AMD", "NVDA"), morning_run_state_root=str(tmp_path / "runs"))
-    result = MorningDCAExecutor(cfg).run(_watchlist_now(), RichProvider())
+    result = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE).run(_watchlist_now(), RichProvider())
 
     snapshot = Path(result["paths"]["observations"])
     assert snapshot.name == "observations.csv"
@@ -248,7 +250,7 @@ def test_run_writes_an_observations_csv_beside_its_other_artifacts(tmp_path):
 
 def test_run_state_on_disk_records_the_archive_summary(tmp_path):
     cfg = MorningConfig(tickers=("AMD",), morning_run_state_root=str(tmp_path / "runs"))
-    result = MorningDCAExecutor(cfg).run(_watchlist_now(), RichProvider())
+    result = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE).run(_watchlist_now(), RichProvider())
 
     persisted = json.loads(Path(result["paths"]["run_state"]).read_bytes())
     summary = persisted["intraday_archive"]
@@ -267,7 +269,7 @@ def test_archive_failure_does_not_fail_the_run(tmp_path, monkeypatch):
     monkeypatch.setenv("DCA_INTRADAY_ARCHIVE_DIR", str(blocker))
 
     cfg = MorningConfig(tickers=("AMD",), morning_run_state_root=str(tmp_path / "runs"))
-    result = MorningDCAExecutor(cfg).run(_watchlist_now(), RichProvider())
+    result = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE).run(_watchlist_now(), RichProvider())
 
     assert Path(result["paths"]["run_state"]).exists()
     assert result["artifacts"]["signal_rows"]

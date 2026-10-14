@@ -55,15 +55,11 @@ from dca_live_adapters import FinanceDataProvider, RobinhoodBroker, RobinhoodDat
 from dca_paths import CRON_TRACKING_ROOT_ENV
 from morning_dca import (
     DEFAULT_MORNING_LIVE_STATE_ROOT,
-    DEFAULT_MORNING_STATE_ROOT,
-    DEFAULT_MORNING_WATCHLIST_STATE_ROOT,
     EXEC_AUTO_BUY_ELIGIBLE,
     EXEC_MANUAL_REVIEW_CANDIDATE,
-    MORNING_CRON_ID,
     MORNING_LIVE_CRON_ID,
     MORNING_LIVE_MODE,
     MORNING_SIZING_TIERS,
-    MORNING_WATCHLIST_MODE,
     DCAExecutor,
     MorningConfig,
     MorningDCAExecutor,
@@ -286,7 +282,8 @@ class FakeLiveBroker:
 
 
 def _now():
-    return datetime.combine(date(2026, 7, 8), time(9, 45), tzinfo=EASTERN)
+    # The morning stream has one mode now (live, decision anchor 10:30); this used to be the 9:45 watchlist time.
+    return _now_live()
 
 
 # --- NYSE holiday calendar ---------------------------------------------------
@@ -329,7 +326,7 @@ def test_ladder_brackets():
     # the shared $2-base 0x-to-5x ladder (was 0x-to-3x, now historical). This
     # test only asserts multiplier brackets, not dollar amounts, so it uses the
     # default base_buy_amount_usd rather than overriding it.
-    ex = MorningDCAExecutor(MorningConfig())
+    ex = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     # 2026-10-04 ladder rescale (c31d660): log-scaled 0.1%-16% -> 1x-8x, so the
     # expected multipliers below were recomputed from config/morning_dca.json.
     cases = {
@@ -356,7 +353,7 @@ def test_ladder_matches_afternoon_live():
     # All live streams (morning, midday, afternoon) share one 0x-to-5x ladder.
     from near_close_dca import StrategyConfig, graded_buy_multiplier
 
-    morning = MorningDCAExecutor(MorningConfig())
+    morning = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     # 2026-10-04 ladder rescale: 8% is now 5.5x (the 8x cap starts at 16%).
     assert morning.multiplier_for_drop(0.08) == 5.5
     assert graded_buy_multiplier(0.08, StrategyConfig()) == 5.5
@@ -366,7 +363,7 @@ def test_ladder_matches_afternoon_live():
 def test_signal_amounts_and_actions():
     cfg = MorningConfig(tickers=("UP", "FLAT", "TINY", "SMALL", "BIG"), base_buy_amount_usd=2.0)
     drops = {"UP": -0.01, "FLAT": 0.0, "TINY": 0.0005, "SMALL": 0.03, "BIG": 0.10}
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, drops)
     sigs = {s.ticker: s for s in ex.evaluate(_now(), data)}
 
@@ -403,7 +400,7 @@ def test_signal_zero_multiplier_below_configured_minimum_drop_normalizes_to_no_a
     # execution-gap alert. The signal must be normalized to a genuine
     # no-action/skip result instead.
     cfg = MorningConfig(tickers=("BELOWTIER",), base_buy_amount_usd=2.0, minimum_drop_vs_previous_close=0.0001)
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BELOWTIER": 0.0005})
     sig = {s.ticker: s for s in ex.evaluate(_now(), data)}["BELOWTIER"]
 
@@ -437,7 +434,7 @@ def test_morning_dynamic_first_allocation_base():
     # DEEP closes at 97 too but with a higher prior low so it is below both -> $2 base -> $7.00.
     # 2026-10-04 ladder rescale: a 3% drop is now 3.5x (was 1.5x).
     cfg = MorningConfig(tickers=("SHALLOW",), base_buy_amount_usd=2.0, base_buy_amount_below_close_usd=1.0)
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     shallow = FixedDropProviderWithLow(SourceName.ROBINHOOD, 100.0, {"SHALLOW": 0.03}, previous_low=96.0)
     sig = ex.evaluate(_now(), shallow)[0]
     assert sig.action == Action.BUY
@@ -449,7 +446,7 @@ def test_morning_dynamic_first_allocation_base():
 
     cfg_deep = MorningConfig(tickers=("DEEP",), base_buy_amount_usd=2.0, base_buy_amount_below_close_usd=1.0)
     deep = FixedDropProviderWithLow(SourceName.ROBINHOOD, 100.0, {"DEEP": 0.03}, previous_low=98.0)
-    sig_deep = MorningDCAExecutor(cfg_deep).evaluate(_now(), deep)[0]
+    sig_deep = MorningDCAExecutor(cfg_deep, mode=MORNING_LIVE_MODE).evaluate(_now(), deep)[0]
     assert sig_deep.action == Action.BUY
     assert sig_deep.selected_base_amount_usd == 2.0
     assert sig_deep.base_selection_reason == "below_prior_close_and_low"
@@ -479,7 +476,7 @@ def test_stale_quote_falls_back_to_completed_bar():
         quote_price=50.0,
         quote_time=stale_quote_time,
     )
-    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0), mode=MORNING_LIVE_MODE)
     sig = ex.evaluate(decision_dt, data)[0]
     assert sig.current_price == 90.0  # completed-bar close, not the stale live quote
     assert any("falling back to completed bar" in w for w in sig.warnings)
@@ -495,7 +492,7 @@ def test_fresh_quote_at_or_before_decision_is_used():
         quote_price=91.0,
         quote_time=fresh_quote_time,
     )
-    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0), mode=MORNING_LIVE_MODE)
     sig = ex.evaluate(decision_dt, data)[0]
     assert sig.current_price == 91.0
 
@@ -513,7 +510,7 @@ def test_quote_older_than_completed_bar_anchor_falls_back_to_bar():
         quote_price=50.0,
         quote_time=stale_quote_time,
     )
-    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0), mode=MORNING_LIVE_MODE)
     sig = ex.evaluate(decision_dt, data)[0]
     assert sig.current_price == 90.0  # completed-bar close, not the stale quote
     assert any("older than the completed bar anchor" in w for w in sig.warnings)
@@ -527,14 +524,14 @@ def test_bar_count_excludes_the_unfinished_decision_bar():
     # aggregates, but bar_count independently counted the full unfiltered
     # list -- reporting one more completed interval than the aggregates and
     # decision price actually cover.
-    decision_dt = _now()  # 09:45; FixedDropProvider yields bars at 09:30/35/40/45
+    decision_dt = _now()  # 10:30; FixedDropProvider yields bars at 09:30, 09:35 ... 10:30 (10:30 is unfinished)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0), mode=MORNING_LIVE_MODE)
     sig = ex.evaluate(decision_dt, data)[0]
     assert sig is not None
     assert sig.observation is not None
     obs = sig.observation
-    assert obs.bar_count == 3
+    assert obs.bar_count == 12  # 09:30 through 10:25: the 10:30 bar is not yet complete
 
 
 def test_non_positive_quote_price_falls_back_to_completed_bar():
@@ -551,7 +548,7 @@ def test_non_positive_quote_price_falls_back_to_completed_bar():
             quote_price=bad_price,
             quote_time=fresh_quote_time,
         )
-        ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+        ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0), mode=MORNING_LIVE_MODE)
         sig = ex.evaluate(decision_dt, data)[0]
         assert sig.current_price == 90.0  # completed-bar close, not the bad quote
         assert any("is not positive" in w for w in sig.warnings)
@@ -565,7 +562,7 @@ def test_non_positive_completed_bar_close_is_rejected():
     # drop and size a max-multiplier BUY off a clearly-bad price.
     decision_dt = _now()
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 1.0})  # 100% drop -> close 0.0
-    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0), mode=MORNING_LIVE_MODE)
     sig = ex.evaluate(decision_dt, data)[0]
     assert sig.current_price is None
     assert sig.action == Action.NO_DATA
@@ -584,7 +581,7 @@ def test_negative_previous_close_bar_rejected():
             return Bar(timestamp=ts, open=-100.0, high=-100.0, low=-100.0, close=-100.0, volume=0.0)
 
     data = NegativePrevCloseProvider(SourceName.ROBINHOOD, 90.0, {"BIG": 0.0})
-    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0), mode=MORNING_LIVE_MODE)
     sig = ex.evaluate(decision_dt, data)[0]
     assert sig.action == Action.NO_DATA
     assert sig.previous_close is None
@@ -602,7 +599,7 @@ def test_untimestamped_quote_falls_back_to_completed_bar():
         quote_price=50.0,
         quote_time=None,
     )
-    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0), mode=MORNING_LIVE_MODE)
     sig = ex.evaluate(decision_dt, data)[0]
     assert sig.current_price == 90.0
     assert any("no usable timestamp" in w for w in sig.warnings)
@@ -620,7 +617,7 @@ def test_future_previous_close_bar_rejected():
             return Bar(timestamp=as_of, open=p, high=p, low=p, close=p, volume=0.0)
 
     data = FuturePrevCloseProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0), mode=MORNING_LIVE_MODE)
     sig = ex.evaluate(decision_dt, data)[0]
     assert sig.action == Action.NO_DATA
     assert any("rejecting" in w for w in sig.warnings)
@@ -638,7 +635,7 @@ def test_in_progress_bar_excluded_from_sizing():
             return [Bar(timestamp=end, open=price, high=price, low=price, close=price, volume=100.0)]
 
     data = InProgressBarProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0))
+    ex = MorningDCAExecutor(MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0), mode=MORNING_LIVE_MODE)
     sig = ex.evaluate(decision_dt, data)[0]
     assert sig.action == Action.NO_DATA
     assert any("missing completed intraday bar" in w for w in sig.warnings)
@@ -668,7 +665,7 @@ def test_morning_ledger_does_not_touch_afternoon_state(tmp_path):
         base_buy_amount_usd=3.0,
         morning_run_state_root=str(tmp_path),
     )
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03, "BIG": 0.10})
     ex.run(_now(), data)
 
@@ -676,45 +673,6 @@ def test_morning_ledger_does_not_touch_afternoon_state(tmp_path):
     assert afternoon.day_notional(day) == 0.0
     assert afternoon.week_notional(day) == 0.0
     assert afternoon.buys_by_ticker_by_day == {}
-    # Morning ledger recorded the hypothetical spend.
-    assert ex.ledger.day_planned(day) > 0.0
-
-
-def test_over_cap_emits_warning(tmp_path):
-    cfg = MorningConfig(
-        tickers=tuple(f"T{i}" for i in range(5)),
-        base_buy_amount_usd=2.0,
-        morning_daily_cap_usd=5.0,
-        morning_run_state_root=str(tmp_path),
-    )
-    ex = MorningDCAExecutor(cfg)
-    drops = {f"T{i}": 0.10 for i in range(5)}  # each 5x -> $10
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, drops)
-    res = ex.run(_now(), data)
-    assert any("exceeds morning daily cap" in w for w in res["artifacts"]["warnings"])
-
-
-def test_build_artifacts_does_not_double_count_ledger(tmp_path):
-    # build_artifacts must be side-effect-free: calling it more than once (e.g.
-    # inspecting artifacts before writing) must not re-record spend against the
-    # ledger. Only run()'s single record_buy_candidates() call should count.
-    cfg = MorningConfig(
-        tickers=("BIG",),
-        base_buy_amount_usd=2.0,
-        morning_run_state_root=str(tmp_path),
-    )
-    ex = MorningDCAExecutor(cfg)
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.06})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
-    now = _now()
-    day = now.astimezone(EASTERN).date()
-
-    signals = ex.evaluate(now, data)
-    ex.build_artifacts(now, signals, "robinhood")
-    ex.build_artifacts(now, signals, "robinhood")
-    assert ex.ledger.day_planned(day) == 0.0  # build_artifacts alone never mutates the ledger
-
-    ex.run(now, data)
-    assert ex.ledger.day_planned(day) == 10.0  # 10% drop -> 5x -> $10, recorded once
 
 
 def test_scheduled_run_skips_artifacts_on_market_holiday(tmp_path):
@@ -723,7 +681,7 @@ def test_scheduled_run_skips_artifacts_on_market_holiday(tmp_path):
     holiday = next(iter(MARKET_HOLIDAYS))
     now = datetime.combine(holiday, time(9, 45), tzinfo=EASTERN)
     cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
 
     res = ex.run(now, data)
@@ -757,7 +715,7 @@ def test_holiday_block_overwrites_stale_minimal_stub(tmp_path):
     holiday = next(iter(MARKET_HOLIDAYS))
     now = datetime.combine(holiday, time(9, 45), tzinfo=EASTERN)
     cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
 
     # Pre-seed the state directory with a stale minimal stub.
@@ -790,7 +748,7 @@ def test_scheduled_run_skips_artifacts_on_future_holiday_beyond_afternoon_window
     holiday = date(2026, 9, 7)  # Labor Day: 1st Monday of September
     now = datetime.combine(holiday, time(9, 45), tzinfo=EASTERN)
     cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
 
     res = ex.run(now, data)
@@ -807,7 +765,7 @@ def test_manual_run_ignores_market_holiday_gate(tmp_path):
     holiday = next(iter(MARKET_HOLIDAYS))
     now = datetime.combine(holiday, time(9, 45), tzinfo=EASTERN)
     cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
 
     res = ex.run(now, data, manual=True)
@@ -864,59 +822,9 @@ def test_manual_run_ignores_slot_window_gate(tmp_path):
 
 
 # --- Run-state path + classification ----------------------------------------
-def test_run_state_path_and_classification(tmp_path):
-    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
-    ex = MorningDCAExecutor(cfg)
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    res = ex.run(_now(), data)
-
-    run_state_path = Path(res["paths"]["run_state"])
-    assert run_state_path.parent.name == "20260708_0945ET"
-    assert run_state_path.exists()
-
-    rc = res["artifacts"]["run_classification"]
-    assert rc["run_origin"] == "scheduled"
-    assert rc["run_type"] == "morning_dca_watchlist_scan"
-    assert rc["stream"] == "morning"
-    assert rc["scheduled_for_et"] == "09:45"
-    assert rc["manual_run"] is False
-    assert rc["state_schema_version"] == "morning-watchlist-v1"
-    assert rc["run_id"] == "morning_20260708_0945ET"
-    assert rc["valid_afternoon_evidence"] is False
-    assert rc["trades"] is False
-    assert rc["cron_id"] == MORNING_CRON_ID
-    assert rc["supersedes_cron_id"] is None
-    assert rc["execution_broker"] == "robinhood"
-    # Read-only mode: account_number must be omitted even though
-    # MorningConfig's default target_account_number resolves to a real,
-    # well-formed account -- the field is documented as "used for morning
-    # live execution" and a watchlist scan places no orders (Codex review,
-    # PR #219: "Omit account numbers from read-only classifications").
-    assert "account_number" not in rc
-
-    # Watchlist markers present; no order fields, amounts hypothetical only.
-    art = res["artifacts"]
-    assert art["mode"] == "watchlist"
-    assert art["trades"] is False
-    for row in art["signal_rows"]:
-        assert set(
-            [
-                "ticker",
-                "current_price",
-                "previous_close",
-                "drop_pct",
-                "multiplier",
-                "hypothetical_amount_usd",
-                "source",
-                "warnings",
-            ]
-        ).issubset(row.keys())
-    assert art["data_source"] == SourceName.ROBINHOOD.value
-
-
 def test_manual_run_id_and_no_pointer(tmp_path):
     cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
     res = ex.run(_now(), data, manual=True)
     rc = res["artifacts"]["run_classification"]
@@ -936,7 +844,7 @@ def test_manual_runs_at_same_timestamp_do_not_collide(tmp_path):
     # second) must get distinct run_ids/paths so the second never overwrites
     # the first's artifact.
     cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
     now = _now()
 
@@ -962,7 +870,7 @@ def test_manual_credit_idempotency_key_does_not_leak_across_run_invocations(tmp_
     # lower-price observation would look like an idempotent replay of the
     # earlier one and have its new pending credit silently discarded.
     cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
     now = _now()
 
@@ -979,7 +887,7 @@ def test_classification_matches_morning_schema(tmp_path):
     schema = json.loads(schema_path.read_bytes())
     required = set(schema["required"])
     cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     rc = ex.run_classification(_now(), manual=False)
     assert required.issubset(rc.keys())
     # run_type is now an enum across the two morning modes; stream is a const.
@@ -1120,14 +1028,6 @@ def test_budget_ledger_filename_configurable():
     assert MorningConfig().budget_ledger_filename == "budget_ledger.json"
 
 
-def test_watchlist_run_does_not_write_budget_ledger(tmp_path):
-    cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
-    ex = MorningDCAExecutor(cfg)  # default mode = watchlist
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    res = ex.run(_now(), data)
-    assert "budget_ledger" not in res["paths"]
-
-
 def test_load_morning_config_parses_ledger_block(tmp_path):
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir()
@@ -1260,25 +1160,6 @@ def test_live_signal_csv_schema_is_stable_for_mixed_rows(tmp_path):
     assert "trend_validated" in header
 
 
-def test_watchlist_mode_never_sets_execution_status():
-    # The read-only watchlist scan never runs the trend gate; rows carry blank
-    # execution_status / trend_validated values for a stable CSV schema.
-    cfg = MorningConfig(tickers=("BIG",), base_buy_amount_usd=3.0)
-    ex = MorningDCAExecutor(cfg)  # default watchlist mode
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"BIG": 0.10})
-    sig = ex.evaluate(_now(), data)[0]
-    assert sig.execution_status is None
-    assert sig.trend_validated is None
-    assert sig.to_row()["execution_status"] is None
-    assert sig.to_row()["trend_validated"] is None
-
-
-def test_live_and_watchlist_roots_are_distinct():
-    assert DEFAULT_MORNING_WATCHLIST_STATE_ROOT != DEFAULT_MORNING_LIVE_STATE_ROOT
-    assert DEFAULT_MORNING_STATE_ROOT == DEFAULT_MORNING_WATCHLIST_STATE_ROOT
-    assert "ce16ba6b" not in DEFAULT_MORNING_LIVE_STATE_ROOT
-
-
 def test_load_morning_config_uses_multiplier_not_max_drop(tmp_path):
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir()
@@ -1299,8 +1180,8 @@ def test_load_morning_config_uses_multiplier_not_max_drop(tmp_path):
     )
     from morning_dca import load_morning_config
 
-    cfg = load_morning_config(cfg_dir)
-    ex = MorningDCAExecutor(cfg)
+    cfg = load_morning_config(cfg_dir, mode=MORNING_LIVE_MODE)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
 
     assert ex.multiplier_for_drop(0.005) == 1.0
     assert ex.multiplier_for_drop(0.015) == 1.5
@@ -1880,7 +1761,7 @@ def test_does_not_write_afternoon_artifacts(tmp_path):
 
     morning_root = tmp_path / "morning_dca"
     cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(morning_root))
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
     res = ex.run(_now(), data)
 
@@ -1894,8 +1775,8 @@ def test_does_not_write_afternoon_artifacts(tmp_path):
 
 
 def test_default_root_is_separate_from_afternoon():
-    assert "morning_dca" in DEFAULT_MORNING_STATE_ROOT
-    assert "ce16ba6b" not in DEFAULT_MORNING_STATE_ROOT
+    assert "morning_dca" in DEFAULT_MORNING_LIVE_STATE_ROOT
+    assert "ce16ba6b" not in DEFAULT_MORNING_LIVE_STATE_ROOT
 
 
 def test_default_tickers_mirror_active_universe():
@@ -1974,7 +1855,7 @@ class _NaNCloseProvider:
 def test_nan_previous_close_bar_rejected():
     """A NaN previous-close must be rejected and signal NO_DATA."""
     cfg = MorningConfig(tickers=("AAPL",))
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     sig = ex.evaluate_signal("AAPL", _now(), _NaNCloseProvider(nan_prev=True))
     assert sig.action == Action.NO_DATA, f"expected NO_DATA, got {sig.action}"
     assert any("non-positive" in w.lower() or "nan" in w.lower() for w in sig.warnings), (
@@ -1985,7 +1866,7 @@ def test_nan_previous_close_bar_rejected():
 def test_nan_completed_bar_close_is_rejected():
     """A NaN completed-bar close must be rejected and signal NO_DATA."""
     cfg = MorningConfig(tickers=("AAPL",))
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     sig = ex.evaluate_signal("AAPL", _now(), _NaNCloseProvider(nan_prev=False, nan_intraday=True))
     assert sig.action == Action.NO_DATA, f"expected NO_DATA, got {sig.action}"
     assert any("non-positive" in w.lower() or "nan" in w.lower() for w in sig.warnings), (
@@ -2006,7 +1887,7 @@ def test_calibrated_first_tier_overrides_global_minimum_drop():
         tickers=("AAAU", "AAPL"),
         per_ticker_sizing={"AAAU": {"tiers": ((0.0001, 1.0), (0.02, 1.5))}},
     )
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"AAAU": 0.0005, "AAPL": 0.0005})
 
     aaau_sig = ex.evaluate_signal("AAAU", _now(), data)
@@ -2048,7 +1929,7 @@ def test_load_morning_config_reads_config_file(tmp_path):
         encoding="utf-8",
     )
 
-    cfg = load_morning_config(str(cfg_dir))
+    cfg = load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
     assert cfg.base_buy_amount_usd == 5.0
     assert abs(cfg.minimum_drop_vs_previous_close - 0.002) < 1e-9
     assert cfg.morning_daily_cap_usd == 60.0
@@ -2079,7 +1960,7 @@ def test_load_morning_config_appends_dated_manual_override_to_configured_cap_see
         encoding="utf-8",
     )
 
-    cfg = load_morning_config(str(cfg_dir))
+    cfg = load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
 
     assert cfg.cap_seed_roots is not None
     assert configured_root in cfg.cap_seed_roots
@@ -2104,7 +1985,7 @@ def test_load_morning_config_respects_an_explicitly_empty_cap_seed_roots(tmp_pat
         encoding="utf-8",
     )
 
-    cfg = load_morning_config(str(cfg_dir))
+    cfg = load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
 
     assert cfg.cap_seed_roots == ()
 
@@ -2120,7 +2001,7 @@ def test_load_morning_config_reads_approved_dates_from_trading_window(tmp_path):
         encoding="utf-8",
     )
 
-    cfg = load_morning_config(str(cfg_dir))
+    cfg = load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
 
     assert cfg.approved_test_dates == frozenset({date(2026, 7, 2), date(2026, 7, 3), date(2026, 7, 6)})
     assert cfg.decision_time_et is None
@@ -2147,7 +2028,7 @@ def test_load_morning_config_fails_closed_on_malformed_trading_window(tmp_path):
         encoding="utf-8",
     )
 
-    cfg = load_morning_config(str(cfg_dir))
+    cfg = load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
 
     assert bool(cfg.approved_test_dates) is True
     assert date(2026, 7, 8) not in cfg.approved_test_dates
@@ -2179,7 +2060,7 @@ def test_maybe_block_for_holiday_preserves_submitted_run_state(tmp_path):
 
     from morning_dca import _APPROVED_DATES_LOAD_FAILED, load_morning_config
 
-    cfg = load_morning_config(str(cfg_dir))
+    cfg = load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
     cfg = MorningConfig(
         **cast(
             Any,
@@ -2220,7 +2101,7 @@ def test_load_morning_config_falls_back_to_defaults_if_missing(tmp_path):
     """load_morning_config gracefully falls back when file is absent."""
     from morning_dca import load_morning_config
 
-    cfg = load_morning_config(str(tmp_path / "nonexistent"))
+    cfg = load_morning_config(str(tmp_path / "nonexistent"), mode=MORNING_LIVE_MODE)
     defaults = MorningConfig()
     assert cfg.base_buy_amount_usd == defaults.base_buy_amount_usd
     assert cfg.morning_daily_cap_usd == defaults.morning_daily_cap_usd
@@ -2233,7 +2114,7 @@ def test_load_morning_config_falls_back_to_defaults_if_corrupt_utf8(tmp_path):
     cfg_dir.mkdir()
     (cfg_dir / "morning_dca.json").write_bytes(b"\xff\xfe\xff")
 
-    cfg = load_morning_config(str(cfg_dir))
+    cfg = load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
     defaults = MorningConfig()
     assert cfg.base_buy_amount_usd == defaults.base_buy_amount_usd
     assert cfg.morning_daily_cap_usd == defaults.morning_daily_cap_usd
@@ -2252,14 +2133,14 @@ def test_load_morning_config_enables_model_usage_log_by_default(tmp_path):
     from morning_dca import load_morning_config
 
     # Missing config file.
-    cfg = load_morning_config(str(tmp_path / "nonexistent"))
+    cfg = load_morning_config(str(tmp_path / "nonexistent"), mode=MORNING_LIVE_MODE)
     assert cfg.model_usage_log_root == stream_root("model_usage")
 
     # Present but empty config file.
     cfg_dir = tmp_path / "config"
     cfg_dir.mkdir()
     (cfg_dir / "morning_dca.json").write_text("{}", encoding="utf-8")
-    cfg = load_morning_config(str(cfg_dir))
+    cfg = load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
     assert cfg.model_usage_log_root == stream_root("model_usage")
 
     # Explicit override via artifact_paths.model_usage_log_root.
@@ -2267,14 +2148,14 @@ def test_load_morning_config_enables_model_usage_log_by_default(tmp_path):
         json.dumps({"artifact_paths": {"model_usage_log_root": "/custom/model_usage"}}),
         encoding="utf-8",
     )
-    cfg = load_morning_config(str(cfg_dir))
+    cfg = load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
     assert cfg.model_usage_log_root == "/custom/model_usage"
 
     # Explicit null disables it for this stream.
     (cfg_dir / "morning_dca.json").write_text(
         json.dumps({"artifact_paths": {"model_usage_log_root": None}}), encoding="utf-8"
     )
-    cfg = load_morning_config(str(cfg_dir))
+    cfg = load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
     assert cfg.model_usage_log_root is None
 
 
@@ -2296,7 +2177,7 @@ def test_load_morning_config_reads_configured_ticker_whitelist(tmp_path):
         encoding="utf-8",
     )
 
-    cfg = load_morning_config(str(cfg_dir))
+    cfg = load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
 
     assert cfg.tickers == ("ZZZZ",)
     assert cfg.excluded_tickers == frozenset({"YYYY"})
@@ -2326,7 +2207,7 @@ def test_augment_artifacts_appends_top_up_manual_review_candidate_row():
     # in the manual_review_candidates detail list, not just an incremented
     # count and a ticker appended to manual_review_tickers.
     cfg = MorningConfig(tickers=("AAPL",))
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     outcome = TopUpOutcome(
         ticker="AAPL",
         desired_amount=6.0,
@@ -2360,7 +2241,7 @@ def test_augment_artifacts_appends_top_up_manual_review_candidate_row():
 
 def test_morning_executor_default_init_loads_config_file():
     """MorningDCAExecutor() with no args loads from the shipped config/morning_dca.json."""
-    ex = MorningDCAExecutor()
+    ex = MorningDCAExecutor(mode=MORNING_LIVE_MODE)
     assert ex.config.base_buy_amount_usd == 2.0
     # Shared Normal-tier ceiling (near_close_dca.BUDGET_TIERS[0]), not the old
     # isolated 90.0 per-stream half-share -- see morning_dca.py's
@@ -2392,7 +2273,7 @@ def test_load_morning_config_reads_multipliers_not_max_drop(tmp_path):
         ),
         encoding="utf-8",
     )
-    cfg = load_morning_config(str(cfg_dir))
+    cfg = load_morning_config(str(cfg_dir), mode=MORNING_LIVE_MODE)
     # Each tier tuple must be (threshold_fraction, multiplier).
     # A 0.1%-1% drop should give 1x ($3), not 0.01x ($0.03).
     tiers = dict(cfg.sizing_tiers)
@@ -2442,21 +2323,8 @@ def test_run_with_broker_places_orders_and_records_outcomes(tmp_path):
     assert any(r["ticker"] == "AAPL" for r in rows)
 
 
-def test_run_without_broker_does_not_place_orders(tmp_path):
-    """MorningDCAExecutor.run() without broker records no order outcomes."""
-    cfg = MorningConfig(tickers=("AAPL",), morning_run_state_root=str(tmp_path))
-    ex = MorningDCAExecutor(cfg)
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"AAPL": 0.02})
-
-    res = ex.run(_now(), data)
-    candidates = res["artifacts"]["buy_candidates"]
-    assert len(candidates) == 1
-    assert "order_id" not in candidates[0]
-    assert "orders_csv" not in res["paths"]
-
-
 def test_classifications_validate_against_json_schema():
-    """Both morning classifications must validate against the JSON schema.
+    """The live morning classifications (scheduled and manual), plus a historical watchlist one, must validate.
 
     jsonschema is a hard dev dependency (requirements-dev.txt), so this is a
     real assertion in CI rather than a silent no-op.
@@ -2467,11 +2335,32 @@ def test_classifications_validate_against_json_schema():
     schema = json.loads(schema_path.read_bytes())
     cfg = MorningConfig(tickers=("SMALL",))
 
-    watch = MorningDCAExecutor(cfg).run_classification(_now(), manual=False)
     live = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=False)
     manual = MorningDCAExecutor(cfg, mode="live").run_classification(_now_live(), manual=True)
-    for rc in (watch, live, manual):
+    for rc in (live, manual):
         jsonschema.validate(rc, schema)
+
+    # The executor can no longer GENERATE a watchlist classification (that mode was retired 2026-10-14), but the
+    # schema deliberately keeps the branch so persisted pre-retirement artifacts stay readable. Pin that with a
+    # static historical fixture (the shape the retired mode wrote; Copilot review of PR 1668).
+    historical_watchlist_rc = {
+        "run_origin": "scheduled",
+        "run_type": "morning_dca_watchlist_scan",
+        "stream": "morning",
+        "trades": False,
+        "cron_id": "bb4f6ef1",
+        "supersedes_cron_id": None,
+        "scheduled_for_et": "09:45",
+        "scheduled_window_start_et": "09:40",
+        "scheduled_window_end_et": "09:50",
+        "manual_run": False,
+        "run_id": "morning_20260708_0945ET",
+        "state_schema_version": "morning-watchlist-v1",
+        "valid_afternoon_evidence": False,
+        "execution_broker": "robinhood",
+        "triggered_at_utc": "2026-07-08T13:45:00+00:00",
+    }
+    jsonschema.validate(historical_watchlist_rc, schema)
 
 
 def test_historical_v1_live_classification_still_validates_against_schema():
@@ -4389,7 +4278,7 @@ def test_morning_evaluate_top_up_reuses_first_allocation_base():
     # same-day run bought using the $1 base for $2 total (1.0 * 2x); this run's OWN
     # price would freshly select the $2 base, but the guard must keep the $1 base
     # with this run's own 4x multiplier rather than upgrade the whole day's target.
-    ex = MorningDCAExecutor(MorningConfig())
+    ex = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     prior = PriorSameDayAllocation(
         "AAPL",
         amount_usd=2.0,
@@ -4435,7 +4324,7 @@ def test_morning_evaluate_top_up_routes_subdollar_ladder_increment_to_pending_cr
     # 3:30 PM final session): a $0.30 credit alone stays pending.
     from near_close_dca import TOP_UP_NO_INCREMENTAL
 
-    ex = MorningDCAExecutor(MorningConfig())
+    ex = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     prior = PriorSameDayAllocation(
         "AAPL",
         amount_usd=1.0,
@@ -4467,7 +4356,7 @@ def test_morning_evaluate_top_up_routes_subdollar_ladder_increment_to_pending_cr
 
 
 def test_morning_top_up_deducts_partially_settled_slot_credit():
-    ex = MorningDCAExecutor(MorningConfig())
+    ex = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     prior = PriorSameDayAllocation(
         "AAPL",
         amount_usd=1.0,
@@ -4505,7 +4394,7 @@ def test_morning_evaluate_top_up_sub_dollar_floor_still_deducts_reflected_settle
     # floor recomputes the FULL pre-settlement decline and a recovered
     # order's idempotent settlement no-ops, letting a later stream
     # repurchase the already-paid portion.
-    ex = MorningDCAExecutor(MorningConfig())
+    ex = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     prior = PriorSameDayAllocation(
         "AAPL",
         amount_usd=1.0,
@@ -4551,7 +4440,7 @@ def test_morning_evaluate_top_up_full_dollar_ladder_surfaces_preserved_slot_cred
     # slot's own outstanding preserved credit, orphaning it forever. The
     # ladder branch must surface it on the outcome even though the ladder's
     # own sizing math never touches the credit ledger.
-    ex = MorningDCAExecutor(MorningConfig())
+    ex = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     prior = PriorSameDayAllocation(
         "AAPL",
         amount_usd=1.0,
@@ -4593,7 +4482,7 @@ def test_morning_evaluate_top_up_full_dollar_ladder_deducts_settled_slot_credit(
     # settled_credit_for_slot_usd entirely and repurchasing the paid $0.80. The
     # full-dollar branch must subtract it just like the sub-dollar branch
     # already does.
-    ex = MorningDCAExecutor(MorningConfig())
+    ex = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     prior = PriorSameDayAllocation(
         "AAPL",
         amount_usd=1.0,
@@ -4630,7 +4519,7 @@ def test_morning_evaluate_top_up_routes_post_settlement_sub_dollar_remainder_to_
     # $0.40 must be routed through apply_cumulative_credit() and stay
     # pending (not returned as a directly placeable sub-$1 order the broker
     # would reject).
-    ex = MorningDCAExecutor(MorningConfig())
+    ex = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     prior = PriorSameDayAllocation(
         "AAPL",
         amount_usd=1.0,
@@ -4661,7 +4550,7 @@ def test_morning_evaluate_top_up_routes_post_settlement_sub_dollar_remainder_to_
 
 def test_morning_full_dollar_retry_keeps_outstanding_preserve_as_ledger_basis():
     """A grown ladder retry must not reconstruct the paid preserve portion."""
-    ex = MorningDCAExecutor(MorningConfig())
+    ex = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     prior = PriorSameDayAllocation(
         "AAPL",
         amount_usd=1.0,
@@ -4707,7 +4596,7 @@ def test_morning_evaluate_top_up_routes_subdollar_ladder_increment_to_a_dollar_o
     # instead round the ACCUMULATED total up to a full $1 order.
     from near_close_dca import TOP_UP_INCREMENTAL
 
-    ex = MorningDCAExecutor(MorningConfig())
+    ex = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     prior = PriorSameDayAllocation(
         "AAPL",
         amount_usd=1.0,
@@ -6658,14 +6547,6 @@ def test_a_live_fallback_still_carries_the_shared_circuit_breakers(tmp_path):
         # breakers matter rather than being merely untidy.
         assert cfg.live_execution_enabled is True, label
 
-    # Watchlist never reaches broker placement, and must stay off this path
-    # so a malformed budgets.json cannot block the 9:45 watchlist scan from
-    # writing its artifact.
-    cfg_path.unlink()
-    watchlist = load(MORNING_WATCHLIST_MODE)
-    assert watchlist.max_orders_per_day is None
-    assert watchlist.max_consecutive_placement_failures is None
-
     # And a malformed budgets.json now fails closed on the fallback path too,
     # where previously it was never read at all.
     (tmp_path / "budgets.json").write_text(
@@ -6789,29 +6670,6 @@ def test_morning_top_up_guard_skips_when_price_not_below_reference(tmp_path):
     assert row.get("incremental_order_amount") == 0.0
     assert "TOPUP" not in broker.placed, "broker should not be called when top-up is skipped"
     assert "TOPUP" in res["artifacts"].get("top_up_offset_tickers", [])
-
-
-def test_morning_top_up_guard_inactive_in_watchlist_mode(tmp_path):
-    # Watchlist mode is analytics-only: prior fills must never reduce hypothetical
-    # amounts even when prior_allocation_roots is configured.
-    prior_root = tmp_path / "prior"
-    _write_prior_run_state(prior_root, "TOPUP", amount_usd=4.50, decision_price=99.0)
-    cfg = MorningConfig(
-        tickers=("TOPUP",),
-        base_buy_amount_usd=3.0,
-        morning_run_state_root=str(tmp_path / "watchlist"),
-        prior_allocation_roots=(str(prior_root),),
-    )
-    # Default mode is watchlist, so no broker.
-    ex = MorningDCAExecutor(cfg)
-    data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"TOPUP": 0.007})  # 2026-10-04 ladder rescale: drop re-picked so the multiplier is unchanged
-    res = ex.run(_now(), data)
-    candidates = {r["ticker"]: r for r in res["artifacts"].get("buy_candidates", [])}
-    assert "TOPUP" in candidates
-    row = candidates["TOPUP"]
-    assert "top_up_guard_result" not in row, "top-up guard must not run in watchlist mode"
-    # Full hypothetical amount, not reduced by any prior fill
-    assert row.get("hypothetical_amount_usd") == 4.5
 
 
 def test_morning_top_up_guard_seeds_ledger_from_prior_fills(tmp_path):
@@ -11489,7 +11347,7 @@ def test_run_does_not_write_model_usage_log_by_default(tmp_path):
     # model_usage_log_root defaults to None -- run() must not touch any
     # model-usage path unless a caller opts in explicitly.
     cfg = MorningConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
     ex.run(_now(), data)
     assert not (tmp_path / "model_usage").exists()
@@ -11506,9 +11364,9 @@ def test_run_appends_model_usage_log_entry_when_root_configured(tmp_path):
         morning_run_state_root=str(tmp_path / "state"),
         model_usage_log_root=str(log_root),
     )
-    ex = MorningDCAExecutor(cfg, mode=MORNING_WATCHLIST_MODE)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
-    now = _now()
+    now = _now_live()
     res = ex.run(now, data)
 
     log_path = resolve_log_path(now.astimezone(timezone.utc), root=log_root)
@@ -11516,7 +11374,7 @@ def test_run_appends_model_usage_log_entry_when_root_configured(tmp_path):
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
     entry = _json.loads(lines[0])
-    assert entry["cron_id"] == MORNING_CRON_ID
+    assert entry["cron_id"] == MORNING_LIVE_CRON_ID
     assert entry["run_id"] == res["artifacts"]["run_id"]
     assert entry["artifact_path"] == res["paths"]["run_state"]
     assert entry["run_origin"] == "scheduled"
@@ -11535,7 +11393,7 @@ def test_run_manual_logs_manual_run_origin(tmp_path):
         morning_run_state_root=str(tmp_path / "state"),
         model_usage_log_root=str(log_root),
     )
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
     now = _now()
     ex.run(now, data, manual=True)
@@ -11564,7 +11422,7 @@ def test_run_records_premium_routing_metadata_when_config_supplies_it(tmp_path):
         model_usage_model_routing_mode="premium",
         model_usage_reason_for_premium_model="failure_recovery",
     )
-    ex = MorningDCAExecutor(cfg)
+    ex = MorningDCAExecutor(cfg, mode=MORNING_LIVE_MODE)
     data = FixedDropProvider(SourceName.ROBINHOOD, 100.0, {"SMALL": 0.03})
     now = _now()
     ex.run(now, data)
@@ -13752,22 +13610,6 @@ def test_live_classification_follows_config_not_the_import_time_constant(tmp_pat
     assert rc["account_number"] != morning_module.ROBINHOOD_AGENTIC_ACCOUNT_NUMBER
 
 
-@pytest.mark.parametrize("mode", ["watchlist"])
-def test_read_only_classifications_carry_no_account(tmp_path, mode):
-    """A scan that places no orders has no execution account to report.
-
-    Also keeps the literal "read_only" out of a field the schema constrains to
-    a digit shape.
-    """
-    cfg = MorningConfig(
-        tickers=("SMALL",),
-        morning_run_state_root=str(tmp_path),
-        target_account_number="read_only",
-    )
-    rc = MorningDCAExecutor(cfg, mode=mode).run_classification(_now(), manual=False)
-    assert "account_number" not in rc
-
-
 def test_live_classification_always_carries_an_account(tmp_path):
     """The schema REQUIRES account_number for every *_dca_live run_type.
 
@@ -13859,28 +13701,6 @@ def test_a_normal_live_classification_carries_the_account_and_no_marker(tmp_path
     jsonschema.validate(rc, _morning_schema())
 
 
-@pytest.mark.parametrize("mode", [MORNING_WATCHLIST_MODE])
-def test_read_only_classifications_omit_a_well_formed_account_number(tmp_path, mode):
-    """account_number is documented ("used for morning live execution") and
-    schema-described as optional-not-required for watchlist, but the
-    stamping branch used to key ONLY on whether target_account_number happened
-    to be well-formed -- not on whether this run actually trades. A read-only
-    executor built without going through load_morning_config's per-mode
-    broker_account resolution (e.g. MorningConfig()'s own class default, which
-    is the import-time ROBINHOOD_AGENTIC_ACCOUNT_NUMBER env constant) then
-    stamped the real live account into an artifact that never placed an order
-    (Codex review, PR #219: "Omit account numbers from read-only
-    classifications")."""
-    cfg = MorningConfig(
-        tickers=("SMALL",),
-        morning_run_state_root=str(tmp_path),
-        target_account_number="123456789",
-    )
-    rc = MorningDCAExecutor(cfg, mode=mode).run_classification(_now(), manual=False)
-    assert "account_number" not in rc
-    assert "account_pinning_failed" not in rc
-
-
 def test_the_schema_still_requires_an_account_for_unmarked_live_runs(tmp_path):
     """The relaxation must be scoped to the blocked case only.
 
@@ -13965,7 +13785,7 @@ def test_the_schema_still_requires_a_broker_on_a_blocked_live_run(tmp_path):
 # --- The config-missing fallback resolves ALL artifact roots at load time ----
 # model_usage_log_root was fixed to resolve at load time, but the fallback
 # still left morning_run_state_root at None, which falls back to
-# DEFAULT_MORNING_LIVE_STATE_ROOT/DEFAULT_MORNING_WATCHLIST_STATE_ROOT --
+# DEFAULT_MORNING_LIVE_STATE_ROOT --
 # import-time constants -- later. A $DCA_CRON_TRACKING_ROOT set
 # between import and this call left the executor writing run_state.json and
 # its other artifacts under the OLD tree (Codex review, PR #219).
@@ -13987,8 +13807,7 @@ def test_unconfigured_state_root_resolves_at_executor_construction_time_for_ever
         "import morning_dca\n"  # imported BEFORE the override
         f"os.environ['{CRON_TRACKING_ROOT_ENV}'] = os.environ['PROBE_ROOT']\n"
         "cfg = morning_dca.MorningConfig(tickers=('SMALL',))\n"
-        "for mode in (morning_dca.MORNING_WATCHLIST_MODE, "
-        "morning_dca.MORNING_LIVE_MODE):\n"
+        "for mode in (morning_dca.MORNING_LIVE_MODE,):\n"
         "    print(morning_dca.MorningDCAExecutor(cfg, mode=mode).state_root)\n"
     )
     env = {k: v for k, v in os.environ.items() if k != CRON_TRACKING_ROOT_ENV}
@@ -14003,7 +13822,6 @@ def test_unconfigured_state_root_resolves_at_executor_construction_time_for_ever
     )
     roots = [line for line in out.stdout.splitlines() if line]
     assert roots == [
-        "/srv/dca-fallback-probe/morning_dca_watchlist",
         "/srv/dca-fallback-probe/morning_dca",
     ], out.stdout
 
@@ -14239,16 +14057,6 @@ def test_the_config_missing_fallback_leaves_the_account_unset_when_allowed(monke
     assert cfg.target_account_number is None
 
 
-@pytest.mark.parametrize("mode", [MORNING_WATCHLIST_MODE])
-def test_the_config_missing_fallback_never_pins_a_real_account_for_read_only_modes(mode, tmp_path):
-    """Defense in depth alongside run_classification's own profile["trades"]
-    gate (Codex review, PR #219: "Omit account numbers from read-only
-    classifications") -- the config-missing fallback should not even hold a
-    real account for a stream that never trades."""
-    cfg = load_morning_config(config_dir=str(tmp_path), mode=mode)
-    assert cfg.target_account_number == "read_only"
-
-
 # --- apply_deployment_risk_guard ----------------------------------------
 #
 # MorningConfig.as_strategy_config() builds a deliberately narrow StrategyConfig
@@ -14261,12 +14069,12 @@ def test_the_config_missing_fallback_never_pins_a_real_account_for_read_only_mod
 
 
 def test_executor_sizing_carries_no_deployment_figure_until_the_guard_is_armed():
-    ex = MorningDCAExecutor(MorningConfig())
+    ex = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     assert ex.sizing_config.deployed_last_7d_usd == 0.0
 
 
 def test_apply_deployment_risk_guard_engages_and_caps_the_ladder():
-    ex = MorningDCAExecutor(MorningConfig())
+    ex = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     deep_drop = max(threshold for threshold, _multiplier in ex.sizing_config.sizing_tiers)
     uncapped = ex.multiplier_for_drop(deep_drop)
     assert uncapped > 1.0
@@ -14283,7 +14091,7 @@ def test_apply_deployment_risk_guard_engages_and_caps_the_ladder():
 
 
 def test_apply_deployment_risk_guard_below_the_threshold_leaves_sizing_alone():
-    ex = MorningDCAExecutor(MorningConfig())
+    ex = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     deep_drop = max(threshold for threshold, _multiplier in ex.sizing_config.sizing_tiers)
     uncapped = ex.multiplier_for_drop(deep_drop)
 
@@ -14299,7 +14107,7 @@ def test_apply_deployment_risk_guard_below_the_threshold_leaves_sizing_alone():
 def test_apply_deployment_risk_guard_preserves_every_other_sizing_field():
     """Only the three risk fields move; the ladder, bases, calibration, and
     minimum drop this executor was constructed with must survive intact."""
-    ex = MorningDCAExecutor(MorningConfig())
+    ex = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     before = ex.sizing_config
     ex.apply_deployment_risk_guard(
         deployed_last_7d_usd=10.0,
@@ -14319,7 +14127,7 @@ def test_apply_deployment_risk_guard_tolerates_an_unset_allocation():
     """kill_switch_engaged documents a non-positive allocation as the deliberate
     'operator left the allocation unset' escape hatch. Rejecting it here would
     make this method stricter than the guard it arms."""
-    ex = MorningDCAExecutor(MorningConfig())
+    ex = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     engaged = ex.apply_deployment_risk_guard(
         deployed_last_7d_usd=99999.0,
         monthly_cash_allocation_usd=0.0,
@@ -14348,7 +14156,7 @@ def test_apply_deployment_risk_guard_rejects_values_that_would_disable_the_guard
     and silently DISABLES the guard rather than tripping it -- the exact
     inversion arming it is meant to prevent. A bool would launder into a
     valid-looking 1.0 via float()."""
-    ex = MorningDCAExecutor(MorningConfig())
+    ex = MorningDCAExecutor(MorningConfig(), mode=MORNING_LIVE_MODE)
     args = {
         "deployed_last_7d_usd": 10.0,
         "monthly_cash_allocation_usd": 3600.0,
@@ -14373,7 +14181,7 @@ def test_risk_guard_rejects_a_negative_monthly_allocation(allocation):
     top-level and risk_guard positions, so a negative allocation is already
     outside a valid config.
     """
-    executor = MorningDCAExecutor(config=MorningConfig())
+    executor = MorningDCAExecutor(config=MorningConfig(), mode=MORNING_LIVE_MODE)
     with pytest.raises(ValueError, match="monthly_cash_allocation_usd must be non-negative"):
         executor.apply_deployment_risk_guard(
             deployed_last_7d_usd=500.0,
@@ -14389,7 +14197,7 @@ def test_risk_guard_still_accepts_the_unset_allocation_of_zero():
     method stricter than the guard it arms, and would wedge a legitimately
     unconfigured stream rather than leaving its ladder alone.
     """
-    executor = MorningDCAExecutor(config=MorningConfig())
+    executor = MorningDCAExecutor(config=MorningConfig(), mode=MORNING_LIVE_MODE)
     engaged = executor.apply_deployment_risk_guard(
         deployed_last_7d_usd=500.0,
         monthly_cash_allocation_usd=0.0,
@@ -14405,7 +14213,7 @@ def test_a_rejected_risk_guard_call_leaves_sizing_untouched():
     that happened after that assignment would leave the ladder carrying a
     negative allocation -- the very state the check exists to refuse.
     """
-    executor = MorningDCAExecutor(config=MorningConfig())
+    executor = MorningDCAExecutor(config=MorningConfig(), mode=MORNING_LIVE_MODE)
     before = executor._sizing_config
     with pytest.raises(ValueError):
         executor.apply_deployment_risk_guard(

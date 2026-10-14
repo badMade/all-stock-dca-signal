@@ -110,7 +110,7 @@ def load_morning_live_config(config_dir=None, *, allow_unpinned_account: bool = 
     a docstring a reviewer can find.
     """
     return load_morning_config(
-        config_dir, MORNING_LIVE_MODE, allow_unpinned_account=allow_unpinned_account
+        config_dir, mode=MORNING_LIVE_MODE, allow_unpinned_account=allow_unpinned_account
     )
 
 

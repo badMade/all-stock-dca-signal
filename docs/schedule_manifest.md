@@ -216,8 +216,7 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > 5:00 PM ET** weekly refresh. Machine-readable source:
 > [`config/scheduled_tasks.json`](../config/scheduled_tasks.json) →
 > `operating_mode` (`cost_saving_daily_compact`). Daily weekday compact chain:
-> **9:35** market-open live (`2ba19526`), **9:45** watchlist early-warning scan
-> (`bb4f6ef1`), **10:30** morning live (`42173154`), **11:30 / 1:30 / 2:30**
+> **9:35** market-open live (`2ba19526`), **10:30** morning live (`42173154`), **11:30 / 1:30 / 2:30**
 > intraday live (`7be82b97`), **12:30** midday live (`a6239dae`), **3:30** final
 > live (`10ce362c`), **3:35**
 > post-trade slippage + compact Notion Latest Run sync (`67aa802b`), **3:40**
@@ -461,8 +460,7 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > connector/debug escalation. Keep daily output compact, write JSON/CSV
 > artifacts, suppress no-op notifications, and leave heavy analysis to Friday
 > weekly or monthly review.** It applies to every task in the canonical active
-> schedule: the 9:35 AM market-open live execution (`2ba19526`), the 9:45 AM
-> watchlist early-warning scan (`bb4f6ef1`), the 10:30 AM morning live execution
+> schedule: the 9:35 AM market-open live execution (`2ba19526`), the 10:30 AM morning live execution
 > (`42173154`), the 11:30 AM / 1:30 PM / 2:30 PM intraday live executions
 > (`7be82b97`), the 12:30 PM midday live execution (`a6239dae`), the 3:05 PM
 > monitor-only signal check (`e3e6f09e`, currently paused), the 3:30 PM final live buy
@@ -485,17 +483,14 @@ Feb, Nov, Dec). Re-verify around DST transitions.
 > The scheduled run still writes a valid scheduled run_state even when every buy
 > is fully offset to $0. See [strategy.md](strategy.md#same-day-prior-run-offset--top-up-guard).
 >
-> **Morning two-stream note:** the morning `MorningDCAExecutor` runs on the
+> **Morning stream note:** the morning `MorningDCAExecutor` runs on the
 > shared **$2-base 0x-to-5x** live ladder (as of the Fri Jul 10 2026
 > live-automation update every live stream shares one ladder; the former
 > morning-only 0x-to-3x ladder is historical/superseded) and its own `morning`
-> budget ledger in **two** modes.
-> (1) A **9:45 AM ET read-only `watchlist` early-warning scan** (run by the
-> canonical 9:45 slot `bb4f6ef1`, run_type `morning_dca_watchlist_scan`,
-> **no trades**) writing under `cron_tracking/morning_dca_watchlist/`. Nothing in
-> the 10:30 run depends on it; the former 9:45 pre-flight validation was retired in
-> 2026-10.
-> (2) A **10:30 AM ET live Robinhood execution** (`42173154`, cron
+> budget ledger in ONE mode, `live`. (The 9:45 AM read-only `watchlist` early-warning
+> scan, `bb4f6ef1`, was retired on 2026-10-06 and its mode removed from the code on
+> 2026-10-14; the former 9:45 pre-flight validation was retired in 2026-10.)
+> A **10:30 AM ET live Robinhood execution** (`42173154`, cron
 > `30 14 * * 1-5` = **14:30 UTC weekdays** during EDT, run_type
 > `morning_dca_live`, `state_schema_version='morning-live-v2-preauthorized'`,
 > **trades=yes**) writing under `cron_tracking/morning_dca/YYYYMMDD_1030ET/`
@@ -822,7 +817,6 @@ see the note at the top of this section for why that ordering is load-bearing.
 | ET | Task | ID | Cadence | Cron (UTC) | Trades | Status |
 |---|---|---|---|---|---|---|
 | 9:35 AM | Market-open DCA live Robinhood execution | `2ba19526` | Weekdays | `35 13 * * 1-5` | **yes** | active |
-| 9:45 AM | Morning DCA watchlist early-warning scan | `bb4f6ef1` | Weekdays | `45 13 * * 1-5` | no | active |
 | 10:30 AM | Morning DCA live Robinhood execution | `42173154` | Weekdays | `30 14 * * 1-5` | **yes** | active |
 | 11:30 AM | Intraday DCA live Robinhood execution | `7be82b97` | Weekdays | `30 15,17,18 * * 1-5` | **yes** | active |
 | 12:30 PM | Midday DCA live Robinhood execution | `a6239dae` | Weekdays | `30 16 * * 1-5` | **yes** | active |
@@ -832,7 +826,6 @@ see the note at the top of this section for why that ordering is load-bearing.
 | 5:00 PM | Post-trade slippage plus Notion latest-run sync | `67aa802b` | Weekdays | `0 21 * * 1-5` | no | active |
 | 5:30 PM | Weekly DCA Notion performance dashboard refresh | `041d9d90` | Fridays | `30 21 * * 5` | no | active |
 | 8:45 AM | Monthly graded DCA dashboard refresh | `0656657a` | First weekday gate | `45 12 1-7 * 1-5` | no | active |
-| 9:55 AM | Monthly DCA automation cost review | `bec4a6ee` | First weekday gate | `55 13 1-7 * 1-5` | no | active |
 | 5:15 PM | Month-end DCA volatility risk refresh, EDT | `c9fb1fb8` | Days 25-31, final eligible market-day gate | `15 21 25-31 3-10 *` | no | active |
 | 5:15 PM | Month-end DCA volatility risk refresh, EST | `17a3b2a9` | Seasonal EST months, final eligible market-day gate | `15 22 25-31 1,2,11,12 *` | no | active |
 
@@ -894,7 +887,7 @@ may be documented by two competing blocks.
 
 #### Temporary live scheduler override, Aug 17 to Aug 24, 2026 (SUPERSEDED)
 
-*Historical record: the pre-flight writer and gate mentioned in this block were retired in 2026-10; `bb4f6ef1` now runs the watchlist scan only.*
+*Historical record: the pre-flight writer and gate mentioned in this block were retired in 2026-10; `bb4f6ef1` (the watchlist scan) was itself retired on 2026-10-06.*
 
 > **STATUS (reconciled 2026-09-06 ET):** superseded by the current record, not by a
 > recorded operator sign-off. The correction below required that `bb4f6ef1` be
@@ -1061,11 +1054,10 @@ pre-existing one-time entry (`f7411889`) from before the 2026-07-27
 verification; on 2026-09-13 that entry was retired under the same
 explicit-direct-user-instruction precedent (15 -> 14 rows) and replaced by a
 new one-time entry, `d2b6c23e`, scoped to the current window (see below and
-`retired_on_2026_09_13` in `config/scheduled_tasks.json`). On 2026-10-06 the user retired the
-9:55 AM monthly cost review `bec4a6ee` (14 -> 13 rows) and the one-time
-`d2b6c23e` (see `retired_on_2026_10_06`); the 9:45 AM watchlist scan `bb4f6ef1`
-was retired in the same instruction and then kept active on 2026-10-12 at the
-owner's direction, so its row stays. See
+`retired_on_2026_09_13` in `config/scheduled_tasks.json`). On 2026-10-06 the
+user retired the 9:45 AM watchlist scan `bb4f6ef1`, the 9:55 AM monthly cost
+review `bec4a6ee` (together 14 -> 12 canonical rows) and the one-time `d2b6c23e`
+(see `retired_on_2026_10_06`). See
 `config/scheduled_tasks.json`'s `canonical_schedule_reconciliation_2026_07_27.canonical_schedule_et_immutability_note`
 for the full reasoning. New one-time, non-recurring tasks are recorded here
 instead of being appended to the canonical table, so it stays intact and
@@ -1075,7 +1067,6 @@ sources.
 | Fires | Task | ID | Trades | Status | Scheduler-registered |
 |---|---|---|---|---|---|
 | 2026-07-27 4:30 PM ET | One-time DCA credit-usage proxy report with recovery runs | `onetime-1630-credit-usage-proxy-2026-07-27` | no | active | **yes**: `cron_utc` `30 20 27 7 *`, executor `scripts/generate_credit_usage_proxy_report.py` |
-| 2026-10-16 11:45 AM ET | One-time reminder: evaluate continuing past Oct 30 | `d2b6c23e` | no | active | no (reminder only, no scheduler executor) |
 
 ### Retired from the active schedule on 2026-07-27
 These entries are **not active** and must never appear in an active schedule
@@ -1088,6 +1079,9 @@ table. They are kept as historical records only.
 | `morning-dca-0945` | 9:45 AM pre-flight alias | repo-internal alias, superseded by `bb4f6ef1`; the pre-flight validation it ran was retired entirely in 2026-10 |
 | `d72aa525` | 3:25 PM capital-priority briefing | not in the canonical live schedule |
 | `d1f7a2c0` | post-artifact drift detector entry | never a scheduler task; the drift detector itself is still required in-process by every live trading run |
+| `bb4f6ef1` | 9:45 AM morning DCA watchlist early-warning scan (read-only) | retired 2026-10-06 at the user's request (`retired_on_2026_10_06`); its executor mode was removed from the code on 2026-10-14 |
+| `bec4a6ee` | 9:55 AM monthly DCA automation cost review | retired 2026-10-06 at the user's request (`retired_on_2026_10_06`) |
+| `d2b6c23e` | one-time 2026-10-16 reminder to evaluate continuing past Oct 30 | retired 2026-10-06 at the user's request (`retired_on_2026_10_06`) |
 
 `e3e6f09e` (monitor-only signal check, formerly 3:05 PM) is **paused**, not
 retired: it is represented but not firing, and is not expected daily evidence
@@ -1237,6 +1231,7 @@ never estimated, inferred, or defaulted.
 - **Cost-conscious model instruction:** use a cost-conscious/default model where available; do not use premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.
 
 ### `bb4f6ef1`: Morning DCA watchlist early-warning scan (9:45 AM ET)
+> **RETIRED 2026-10-06, NOT ACTIVE.** Retired at the user's request (see `retired_on_2026_10_06` in `config/scheduled_tasks.json`); the task object is kept there only as a historical record. Do NOT restore it.
 - Analytics / **read-only**, **no trading**, **places no orders**. Runs **9:45 AM ET
   weekdays**, cron `45 13 * * 1-5`.
 - Canonical 9:45 AM slot. **Supersedes** `cd45e95b` and the repo-internal alias
@@ -1828,6 +1823,7 @@ never estimated, inferred, or defaulted.
   methodology and results: [backtest_curve.md](backtest_curve.md).
 
 ### `bec4a6ee`: Monthly DCA automation cost review
+> **RETIRED 2026-10-06, NOT ACTIVE.** Retired at the user's request (see `retired_on_2026_10_06` in `config/scheduled_tasks.json`); the task object is kept there only as a historical record. Do NOT restore it.
 - Analytics only, **no trading**. First weekday of the month **9:55 AM ET**.
 - Reports **usage proxies only**; exact Perplexity credit consumption is not exposed, so do not claim exact credits.
 
@@ -1849,6 +1845,7 @@ never estimated, inferred, or defaulted.
 - Reminder only, **no trading**. Fired **2026-08-15 11:45 AM ET** to evaluate continuing live testing past 2026-08-28. It went stale after the 2026-07-26 extension of `config/trading_window.json` to 2026-10-30 and was never rescheduled to match. Retired per user instruction; the task object is kept in `config/scheduled_tasks.json`'s `tasks` array with `status='disabled'` as a historical record (see `retired_not_in_canonical_schedule` and `retired_on_2026_09_13`), not deleted. Superseded by `d2b6c23e` below.
 
 ### `d2b6c23e` — One-time reminder
+> **RETIRED 2026-10-06, NOT ACTIVE.** Retired at the user's request (see `retired_on_2026_10_06` in `config/scheduled_tasks.json`); the task object is kept there only as a historical record. Do NOT restore it.
 - Reminder only, **no trading**. Fires **2026-10-16 11:45 AM ET** — roughly two weeks ahead of the current 2026-10-30 `config/trading_window.json` end date, mirroring `f7411889`'s ~13-day lead time before its 2026-08-28 deadline — to evaluate continuing live testing past the 2026-10-30 window, ahead of the 2026-11-01 EDT->EST transition the window deliberately stops before (the live tasks' cron schedules are fixed-UTC/EDT-only). Supersedes `f7411889`. Recorded in `config/scheduled_tasks.json`'s `canonical_schedule_reconciliation_2026_07_27.one_time_additions_after_canonical_verification`, not the canonical table, per that block's own convention for one-time additions.
 
 ### `c9fb1fb8` / `17a3b2a9` — Month-end DCA volatility risk table refresh

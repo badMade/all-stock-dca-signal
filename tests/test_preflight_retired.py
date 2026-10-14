@@ -50,8 +50,8 @@ RETIRED = re.compile(
     re.IGNORECASE,
 )
 
-# The 9:45 WATCHLIST scan (cron bb4f6ef1, MORNING_WATCHLIST_*) is a different, read-only analytics run that shared the
-# 09:45 slot with the pre-flight writer. This PR retires only the pre-flight; the scan stays.
+# The 9:45 WATCHLIST scan (cron bb4f6ef1) was a different, read-only analytics run that shared the 09:45 slot with
+# the pre-flight writer. It is retired separately: see tests/test_watchlist_scan_retired.py.
 ALLOWED_RETROSPECTIVE: dict[str, str] = {}
 
 SCANNED_GLOBS = (
@@ -154,24 +154,17 @@ def test_the_morning_executor_has_no_preflight_gate_and_scores_the_full_universe
     assert "universe_filter" not in {f.name for f in dataclasses.fields(StreamSpec)}
 
 
-def test_scheduled_tasks_drop_the_preflight_entry_and_the_writer_clause_but_keep_the_watchlist_scan():
+def test_scheduled_tasks_drop_the_preflight_entry_and_the_writer_clause():
     tasks = json.loads((ROOT / "config" / "scheduled_tasks.json").read_bytes())["tasks"]
     by_id = {str(t.get("id") or t.get("task_id") or ""): t for t in tasks}
     assert "morning-dca-0945" not in by_id
     assert all(t.get("executor_mode") != "preflight" for t in tasks)
-    # The 09:45 slot's watchlist scan survives, without the pre-flight writer it used to also run.
+    # The 09:45 watchlist scan (bb4f6ef1) was retired too (owner direction 2026-10-14; see
+    # tests/test_watchlist_scan_retired.py). Its task object stays only as the historical record.
     assert "bb4f6ef1" in by_id
-    # Kept active at the owner's direction (2026-10-12): only the pre-flight was retired, not the scan.
-    assert by_id["bb4f6ef1"]["status"] == "active"
-    assert by_id["bb4f6ef1"].get("in_live_scheduler") is not False
+    assert by_id["bb4f6ef1"]["status"] == "disabled"
+    assert by_id["bb4f6ef1"].get("in_live_scheduler") is False
     assert "preflight" not in json.dumps(by_id["bb4f6ef1"]).lower()
-
-
-def test_the_watchlist_scan_survives():
-    import morning_dca
-
-    assert morning_dca.MORNING_WATCHLIST_MODE == "watchlist"
-    assert morning_dca.MORNING_WATCHLIST_CRON_ID == "bb4f6ef1"
 
 
 def test_the_morning_config_has_no_preflight_keys():

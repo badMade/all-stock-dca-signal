@@ -42,7 +42,6 @@ from morning_dca import (  # noqa: E402
     MORNING_LIVE_CRON_ID,
     MORNING_LIVE_MODE,
     MORNING_STREAM,
-    MORNING_WATCHLIST_MODE,
     MorningConfig,
     MorningDCAExecutor,
 )
@@ -193,27 +192,22 @@ def _only(document: dict, ticker: str = "TEST") -> dict:
 
 def test_the_spec_uses_the_mode_pinning_loader_not_the_bare_one():
     """The bug this wrapper exists to prevent is silent: ``load_morning_config``'s
-    second POSITIONAL parameter is ``mode``, defaulting to the 9:45 watchlist
-    profile, while StreamSpec calls every loader as
+    second POSITIONAL parameter is ``mode`` (it used to default to the retired 9:45
+    watchlist profile; it is now required), while StreamSpec calls every loader as
     ``loader(config_dir, allow_unpinned_account=True)``. Both parse the same file,
     so a 10:30 live run would have loaded watchlist policy with nothing raising."""
     assert gmc.MORNING_SPEC.config_loader is gmc.load_morning_live_config
 
 
-def test_load_morning_live_config_binds_the_live_roots_not_the_watchlist_ones():
+def test_load_morning_live_config_binds_the_live_root_and_the_bare_loader_refuses():
     from morning_dca import load_morning_config
 
     live = gmc.load_morning_live_config(REAL_CONFIG_DIR, allow_unpinned_account=True)
-    watchlist = load_morning_config(
-        REAL_CONFIG_DIR, MORNING_WATCHLIST_MODE, allow_unpinned_account=True
-    )
-    # The two modes share the ladder and caps and differ in where they write, so
-    # the artifact root is what proves the mode actually reached the loader.
-    assert live.morning_run_state_root != watchlist.morning_run_state_root
-    # And what the shared CLI's calling convention would have produced instead.
-    mistaken = load_morning_config(REAL_CONFIG_DIR, allow_unpinned_account=True)
-    assert mistaken.morning_run_state_root == watchlist.morning_run_state_root
-    assert live.morning_run_state_root != mistaken.morning_run_state_root
+    assert live.morning_run_state_root.rstrip("/").endswith("/morning_dca")
+    # What the shared CLI's calling convention (no mode) would have produced used to be the retired watchlist
+    # profile, silently. mode is now required, so that call fails loudly instead.
+    with pytest.raises(TypeError):
+        load_morning_config(REAL_CONFIG_DIR, allow_unpinned_account=True)
 
 
 def test_the_spec_identifies_the_slot_and_stream_it_speaks_for():

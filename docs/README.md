@@ -44,7 +44,7 @@ environment (see the repository README).
 | [backtest_curve.md](backtest_curve.md) | Analytics-only weekly-rollover intraday cap curve backtest (35 / 65 / 100 candidate) |
 | [workflow_policy.md](workflow_policy.md) | The CI-enforced workflow policy checks (job timeouts, concurrency, checkout credentials) and how to declare a reasoned exception |
 | [scheduled_session_repo_access.md](scheduled_session_repo_access.md) | Dated probe log for whether a Routine-fired scheduled session actually has working repo (clone/fetch/push) and environment (account number) access |
-| [morning_dca.md](morning_dca.md) | The morning stream (`MorningDCAExecutor`): 9:45 watchlist and 10:30 live modes, task/ET/artifact-root tables, the Jul 10 2026 ladder unification |
+| [morning_dca.md](morning_dca.md) | The morning stream (`MorningDCAExecutor`): the 10:30 live mode (the 9:45 watchlist mode was retired; `mode` is required), task/ET/artifact-root tables, the Jul 10 2026 ladder unification |
 | [midday_dca.md](midday_dca.md) | The midday stream (`MiddayDCAExecutor`): 12:30 live mode, trend validation, artifact contract |
 | [market_open_signal_entry.md](market_open_signal_entry.md) | Gate 5 signal generation for the 9:35 AM market-open slot (`scripts/generate_market_open_candidates.py`): payload contract, refresh step, output document |
 | [morning_signal_entry.md](morning_signal_entry.md) | Gate 5 signal generation for the 10:30 AM morning slot (`scripts/generate_morning_candidates.py`) |

@@ -33,12 +33,13 @@ TRIGGERED = datetime(2026, 7, 21, 14, 30, 0, tzinfo=timezone.utc)
 
 COVERED_TASK_IDS = (
     "2ba19526",
-    "bb4f6ef1",
     "42173154",
     "7be82b97",
     "a6239dae",
     "10ce362c",
     "67aa802b",
+    # bb4f6ef1 (9:45 watchlist scan) was retired 2026-10-06 and is no longer covered; see
+    # test_build_entry_rejects_the_retired_watchlist_task.
     # e3e6f09e (3:05 PM monitor, PAUSED) and a46bf007 (3:40 PM watchdog) were
     # removed from the schedule entirely on 2026-08-02 and no longer appear in
     # config/scheduled_tasks.json's model_usage_log.applies_to_daily_tasks_et,
@@ -229,21 +230,18 @@ def test_entry_matches_json_schema():
 
 
 def test_cli_appends_entry_for_tasks_with_no_python_entry_point():
-    # 2ba19526/7be82b97/bb4f6ef1 have no in-repo executor to wire a
-    # log_model_usage() call into -- they're run directly by the external
-    # scheduler/agent, which shells out to this CLI instead. (This test used
-    # a46bf007, the 3:40 PM watchdog, until it was removed from the schedule
-    # entirely on 2026-08-02; switched to bb4f6ef1's watchlist sub-invocation,
-    # which is still a no-in-repo-entry-point CLI consumer for this purpose
-    # even though its two sub-invocations normally log via MorningDCAExecutor.)
+    # 2ba19526/7be82b97 have no in-repo executor to wire a log_model_usage() call into -- they're run directly by
+    # the external scheduler/agent, which shells out to this CLI instead. (This test used a46bf007, the 3:40 PM
+    # watchdog, until it was removed from the schedule on 2026-08-02, then bb4f6ef1's watchlist scan until that
+    # was retired on 2026-10-06; it uses the 9:35 market-open task now.)
     from model_usage_log import _main
 
     with tempfile.TemporaryDirectory() as td:
         rc = _main(
             [
-                "--run-id", "watchlist_20260721_0945ET",
-                "--task-id", "bb4f6ef1",
-                "--artifact-path", "/tmp/watchlist_report.json",  # nosec
+                "--run-id", "market_open_20260721_0935ET",
+                "--task-id", "2ba19526",
+                "--artifact-path", "/tmp/market_open_report.json",  # nosec
                 "--triggered-at-utc", TRIGGERED.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "--root", td,
             ]
@@ -252,8 +250,15 @@ def test_cli_appends_entry_for_tasks_with_no_python_entry_point():
         log_path = resolve_log_path(TRIGGERED, root=td)
         assert log_path.exists()
         entry = json.loads(log_path.read_bytes().splitlines()[0])
-        assert entry["task_id"] == "bb4f6ef1"
-        assert entry["stream"] == "watchlist"
+        assert entry["task_id"] == "2ba19526"
+        assert entry["stream"] == "market_open"
+
+
+def test_build_entry_rejects_the_retired_watchlist_task():
+    # Copilot review of PR 1668: a retired task must not stay in model_usage_log.applies_to_daily_tasks_et, the
+    # single source of covered tasks, or build_entry() keeps accepting it.
+    with pytest.raises(UnknownTaskError):
+        build_entry(run_id="r1", task_id="bb4f6ef1", artifact_path="/tmp/a")  # nosec
 
 
 def test_cli_scheduled_for_et_override_beats_manifest_combined_default():

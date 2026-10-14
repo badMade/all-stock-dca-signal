@@ -268,7 +268,6 @@
     "summary": "Cost-saving operating mode requested Thu Jul 16 2026: keep the weekday DCA chain compact and defer all heavy analysis to Friday. Daily weekday tasks write compact machine-readable artifacts (JSON/CSV) only, avoid long narrative summaries, suppress no-op notifications, and rely on the post-artifact drift detector instead of manual checking. Full analysis, dashboards, and narrative reporting move to the Friday 5:00 PM ET weekly refresh. This mode changes cost/reporting behavior ONLY; it does NOT relax any trading safety rule (see preserved_trading_safety_rules).",
     "daily_compact_chain_et": [
       { "et": "09:35", "task_id": "2ba19526", "role": "market-open live execution" },
-      { "et": "09:45", "task_id": "bb4f6ef1", "role": "morning watchlist early-warning scan (read-only)" },
       { "et": "10:30", "task_id": "42173154", "role": "morning live execution" },
       { "et": "11:30", "task_id": "7be82b97", "role": "intraday live execution (11:30 slot)" },
       { "et": "12:30", "task_id": "a6239dae", "role": "midday live execution" },
@@ -369,7 +368,6 @@
     ],
     "applies_to_daily_tasks_et": [
       { "et": "09:35", "task_id": "2ba19526", "role": "market-open live execution" },
-      { "et": "09:45", "task_id": "bb4f6ef1", "role": "morning watchlist early-warning scan (read-only)" },
       { "et": "10:30", "task_id": "42173154", "role": "morning live execution" },
       { "et": "11:30", "task_id": "7be82b97", "role": "intraday live execution (11:30 slot)" },
       { "et": "12:30", "task_id": "a6239dae", "role": "midday live execution" },
@@ -411,7 +409,6 @@
     "premium_reason_rule": "reason_for_premium_model is recorded (non-null) only when model_routing_mode='premium', and must be one of failure_recovery, safety_validation, connector_debug_escalation, or explicit_user_request (see model_routing_policy.premium_models_allowed_only_for). For cost_conscious/default routing it is null/omitted.",
     "applies_to_daily_tasks_et": [
       { "et": "09:35", "task_id": "2ba19526", "stream": "market_open", "role": "market-open live execution" },
-      { "et": "09:45", "task_id": "bb4f6ef1", "stream": "watchlist", "role": "morning watchlist early-warning scan (read-only)", "stream_note": "This directory entry (keyed by cron_id, looked up via scripts/model_usage_log.py's _load_task_directory) covers bb4f6ef1's 9:45 AM watchlist scan; MorningDCAExecutor.run() passes stream='watchlist' itself (self.mode, a valid schemas/model_usage_log.schema.json stream value) rather than relying on this lookup." },
       { "et": "10:30", "task_id": "42173154", "stream": "morning", "role": "morning live execution" },
       { "et": "11:30,13:30,14:30", "task_id": "7be82b97", "stream": "intraday", "role": "intraday live execution (three slots)" },
       { "et": "12:30", "task_id": "a6239dae", "stream": "midday", "role": "midday live execution" },
@@ -2629,7 +2626,6 @@
     "purpose": "Reconcile this manifest against the user's canonical DCA schedule. The canonical_schedule_et table below is the single source of truth for which RECURRING tasks are active, at what ET time, and in what state. A task is an active schedule entry only if it appears in canonical_schedule_et OR in one_time_additions_after_canonical_verification (for one-time tasks added after the 2026-07-27 verification); a task in neither list is NOT an active schedule entry.",
     "canonical_schedule_et": [
       { "et": "09:35", "task_id": "2ba19526", "role": "Market-open DCA live Robinhood execution", "cadence": "Weekdays", "trading": true, "state": "active" },
-      { "et": "09:45", "task_id": "bb4f6ef1", "role": "Morning DCA watchlist early-warning scan", "cadence": "Weekdays", "trading": false, "state": "active" },
       { "et": "10:30", "task_id": "42173154", "role": "Morning DCA live Robinhood execution", "cadence": "Weekdays", "trading": true, "state": "active" },
       { "et": "11:30", "task_id": "7be82b97", "role": "Intraday DCA live Robinhood execution", "cadence": "Weekdays", "trading": true, "state": "active" },
       { "et": "12:30", "task_id": "a6239dae", "role": "Midday DCA live Robinhood execution", "cadence": "Weekdays", "trading": true, "state": "active" },
@@ -2642,8 +2638,8 @@
       { "et": "17:15", "task_id": "c9fb1fb8", "role": "Month-end DCA volatility risk refresh (EDT)", "cadence": "Days 25-31, final eligible market-day gate", "trading": false, "state": "active" },
       { "et": "17:15", "task_id": "17a3b2a9", "role": "Month-end DCA volatility risk refresh (EST)", "cadence": "Seasonal EST months, final eligible market-day gate", "trading": false, "state": "active" }
     ],
-    "canonical_schedule_et_row_count": 13,
-    "canonical_schedule_et_immutability_note": "The canonical_schedule_et table was originally held at exactly 17 rows, byte-identical since the 2026-07-27 verification, with a stated policy that zero rows would be added, removed, or edited by later changes. On 2026-08-02 the user gave three explicit, direct schedule-change instructions -- remove e3e6f09e (the 3:05 PM monitor-only signal check, already paused) entirely, remove a46bf007 (the 3:40 PM live-run watchdog, read-only) entirely, and retime 67aa802b (3:35 PM -> 5:00 PM ET daily) and 041d9d90 (Fridays 5:00 PM -> 5:30 PM ET, to clear the collision the 67aa802b move would otherwise create on Fridays) -- which take precedence over the prior byte-identical promise for exactly these four rows. That same-day 67aa802b move to 5:00 PM ET also newly collided with the month-end volatility risk refresh (c9fb1fb8/17a3b2a9), which independently ran at 5:00 PM ET; both write the same Notion dashboard page, so c9fb1fb8/17a3b2a9 were retimed to 5:15 PM ET the same day to clear it (Codex review: \"Avoid the month-end Notion writer collision\") -- a downstream consequence of the 67aa802b move rather than a separately requested change, but a schedule-table edit all the same. The table above reflects the full 2026-08-02 change: e3e6f09e and a46bf007 are removed (17 -> 15 rows), and 67aa802b/041d9d90/c9fb1fb8/17a3b2a9 carry their new times. See retimed_on_2026_08_02 and removed_on_2026_08_02 immediately below for the full reasoning, superseding paused_on_2026_07_27 and retimed_on_2026_07_27's e3e6f09e/67aa802b-related content where it conflicts (10ce362c's own 2026-07-27 retime to 15:30 in retimed_on_2026_07_27 is unaffected and still applies). It contained one pre-existing one-time entry (f7411889) from before the 2026-07-27 verification; on 2026-09-13 that entry was removed under the same explicit-direct-user-instruction precedent as the 2026-08-02 edits -- see retired_on_2026_09_13 below (15 -> 14 rows). On 2026-10-06 bec4a6ee (09:55 monthly cost review) was retired under the same precedent (14 -> 13 rows; see retired_on_2026_10_06), and d2b6c23e left the one-time list. bb4f6ef1 (09:45 watchlist scan) was named in that instruction but is kept active at the owner's direction (2026-10-12), so its row stays. NEW one-time, non-recurring tasks are still recorded in one_time_additions_after_canonical_verification below rather than appended here. Both canonical_schedule_et and one_time_additions_after_canonical_verification are active-schedule sources; see canonical_schedule_reconciliation_2026_07_27.purpose.",
+    "canonical_schedule_et_row_count": 12,
+    "canonical_schedule_et_immutability_note": "The canonical_schedule_et table was originally held at exactly 17 rows, byte-identical since the 2026-07-27 verification, with a stated policy that zero rows would be added, removed, or edited by later changes. On 2026-08-02 the user gave three explicit, direct schedule-change instructions -- remove e3e6f09e (the 3:05 PM monitor-only signal check, already paused) entirely, remove a46bf007 (the 3:40 PM live-run watchdog, read-only) entirely, and retime 67aa802b (3:35 PM -> 5:00 PM ET daily) and 041d9d90 (Fridays 5:00 PM -> 5:30 PM ET, to clear the collision the 67aa802b move would otherwise create on Fridays) -- which take precedence over the prior byte-identical promise for exactly these four rows. That same-day 67aa802b move to 5:00 PM ET also newly collided with the month-end volatility risk refresh (c9fb1fb8/17a3b2a9), which independently ran at 5:00 PM ET; both write the same Notion dashboard page, so c9fb1fb8/17a3b2a9 were retimed to 5:15 PM ET the same day to clear it (Codex review: \"Avoid the month-end Notion writer collision\") -- a downstream consequence of the 67aa802b move rather than a separately requested change, but a schedule-table edit all the same. The table above reflects the full 2026-08-02 change: e3e6f09e and a46bf007 are removed (17 -> 15 rows), and 67aa802b/041d9d90/c9fb1fb8/17a3b2a9 carry their new times. See retimed_on_2026_08_02 and removed_on_2026_08_02 immediately below for the full reasoning, superseding paused_on_2026_07_27 and retimed_on_2026_07_27's e3e6f09e/67aa802b-related content where it conflicts (10ce362c's own 2026-07-27 retime to 15:30 in retimed_on_2026_07_27 is unaffected and still applies). It contained one pre-existing one-time entry (f7411889) from before the 2026-07-27 verification; on 2026-09-13 that entry was removed under the same explicit-direct-user-instruction precedent as the 2026-08-02 edits -- see retired_on_2026_09_13 below (15 -> 14 rows). NEW one-time, non-recurring tasks are still recorded in one_time_additions_after_canonical_verification below rather than appended here. Both canonical_schedule_et and one_time_additions_after_canonical_verification are active-schedule sources; see canonical_schedule_reconciliation_2026_07_27.purpose.",
     "removed_on_2026_08_02": {
       "task_ids": ["e3e6f09e", "a46bf007"],
       "reason": "User request this session: \"Remove the 3:05 single check\" (e3e6f09e, the $2-base DCA monitor-only signal check -- already status='paused'/in_live_scheduler=false, read-only, never placed trades) and \"remove the 3:40 Live-run watchdog (read-only)\" (a46bf007 -- read-only, never placed trades, never touched budget caps or circuit breakers). Both removals are observability/schedule cleanup only; neither has any live-trading-safety impact. Both tasks' own definition blocks are deleted from the tasks array below (not merely paused/disabled) per the user's explicit \"remove entirely\" instruction, unlike the retired_not_in_canonical_schedule entries below, which keep their historical task objects."
@@ -2654,8 +2650,8 @@
       "reason": "User request this session: retire the stale one-time Aug 28 continuation reminder and replace it with a reminder scoped to the current window. f7411889 fired 2026-08-15 to decide on continuing live testing past 2026-08-28, but config/trading_window.json had already extended the end date to 2026-10-30 on 2026-07-26, and the reminder was never rescheduled (a gap flagged but unresolved in docs/safeguards.md's Test window section). Observability/schedule cleanup only; no live-trading-safety impact -- f7411889 was never a trading task. Its task object is kept in the tasks array below with status='disabled' (not deleted), matching the retired_not_in_canonical_schedule convention rather than removed_on_2026_08_02's delete-entirely convention, since it is a historical record other docs (docs/restore_runbook.md) still cross-reference. The replacement, d2b6c23e, fires 2026-10-16 11:45 AM ET and is recorded in one_time_additions_after_canonical_verification below."
     },
     "retired_on_2026_10_06": {
-      "task_ids": ["bec4a6ee", "d2b6c23e"],
-      "reason": "User request: remove scheduled tasks bec4a6ee (09:55 monthly automation cost review), and d2b6c23e (one-time Oct 30 continuation reminder). Retired from active schedule and disabled in manifest tasks."
+      "task_ids": ["bb4f6ef1", "bec4a6ee", "d2b6c23e"],
+      "reason": "User request: remove scheduled tasks bb4f6ef1 (09:45 morning watchlist scan), bec4a6ee (09:55 monthly automation cost review), and d2b6c23e (one-time Oct 30 continuation reminder). Retired from active schedule and disabled in manifest tasks."
     },
     "retimed_on_2026_08_02": {
       "tasks": [
@@ -2721,6 +2717,7 @@
       { "task_id": "d72aa525", "former_et": "15:25", "former_role": "capital-priority briefing" },
       { "task_id": "d1f7a2c0", "former_et": null, "former_role": "post-artifact drift detector", "note": "Never a scheduler cron. The DETECTOR remains required in-process on every live run per drift_detection_policy; only its representation as a schedule entry is retired." },
       { "task_id": "morning-dca-0945", "former_et": "09:45", "former_role": "morning pre-flight validation (repo-internal alias)", "superseded_by": "bb4f6ef1", "note": "The pre-flight ARTIFACT CONTRACT is preserved because 42173154 still gates on the same-day morning_dca_preflight/YYYYMMDD_0945ET/run_state.json." },
+      { "task_id": "bb4f6ef1", "former_et": "09:45", "former_role": "morning DCA watchlist early-warning scan", "note": "Retired 2026-10-06 per user instruction. Kept in tasks array with status='disabled' as historical record." },
       { "task_id": "bec4a6ee", "former_et": "09:55", "former_role": "Monthly DCA automation cost review", "note": "Retired 2026-10-06 per user instruction. Kept in tasks array with status='disabled' as historical record." },
       { "task_id": "d2b6c23e", "former_et": "one-time future (was scheduled for 2026-10-16 11:45 AM ET)", "former_role": "one-time reminder: evaluate continuing past Oct 30", "note": "Retired 2026-10-06 per user instruction. Kept in tasks array with status='disabled' as historical record." },
       { "task_id": "f7411889", "former_et": "one-time future (fired 2026-08-15 11:45 AM ET)", "former_role": "one-time reminder: evaluate continuing past Aug 28", "superseded_by": "d2b6c23e", "note": "Retired 2026-09-13; see retired_on_2026_09_13 above. Its task object stays in the tasks array below with status='disabled' as the historical record." }
@@ -2751,7 +2748,6 @@
     },
     "must_cover_active_daily_chain": [
       "2ba19526",
-      "bb4f6ef1",
       "42173154",
       "7be82b97",
       "a6239dae",
@@ -2759,7 +2755,7 @@
       "67aa802b",
       "a46bf007"
     ],
-    "active_daily_chain_note": "All eight ids above must appear in the scheduled-runs section even when a task did not fire, was a no-op, or failed to start. A task with no run for the day is reported explicitly as did_not_run with the reason, never omitted. 7be82b97 must be broken out per ET slot (11:30, 13:30, 14:30), not collapsed into one line. bb4f6ef1 appears once, as its 9:45 AM watchlist scan, with its own run_id, artifacts_written, and model_usage_rows. e3e6f09e is paused and is reported as paused rather than missing. When a slot was ATTEMPTED and failed before writing any artifact, its scheduled_runs row is a cross-reference only (see failed_start_scheduled_slot_rule): the id still appears here so every one of the eight ids is covered, but it carries no independent classification or counts of its own, and the full failed_start_no_evidence record lives exclusively in recovery_and_escalation_runs.",
+    "active_daily_chain_note": "All seven ids above must appear in the scheduled-runs section even when a task did not fire, was a no-op, or failed to start. A task with no run for the day is reported explicitly as did_not_run with the reason, never omitted. 7be82b97 must be broken out per ET slot (11:30, 13:30, 14:30), not collapsed into one line. bb4f6ef1 (the 9:45 AM watchlist scan) was retired on 2026-10-06 and is no longer part of the chain. e3e6f09e is paused and is reported as paused rather than missing. When a slot was ATTEMPTED and failed before writing any artifact, its scheduled_runs row is a cross-reference only (see failed_start_scheduled_slot_rule): the id still appears here so every one of the seven ids is covered, but it carries no independent classification or counts of its own, and the full failed_start_no_evidence record lives exclusively in recovery_and_escalation_runs.",
     "required_sections": [
       {
         "order": 1,
@@ -3124,11 +3120,15 @@
       "id": "bb4f6ef1",
       "cost_conscious_model_instruction_2026_07_17": "COST-CONSCIOUS MODEL INSTRUCTION JUL 17 2026: Use a cost-conscious/default model where available; do not use ChatGPT 5.5 or premium models unless needed for failure recovery, safety validation, or connector/debug escalation. Keep daily output compact, write JSON/CSV artifacts, suppress no-op notifications, and leave heavy analysis to Friday weekly or monthly review.",
       "model_routing_instruction_2026_07_20": "MODEL ROUTING (reaffirmed Jul 20 2026, see top-level model_routing_policy): Use cost-conscious / default model routing where available. Do NOT use ChatGPT 5.5 or other premium models for routine daily DCA execution, compact artifact writing, repo manifest/config/docs maintenance, or normal notification/reporting. Premium models are allowed ONLY for failure recovery, safety validation, connector/debug escalation, or an explicit user request for highest quality. Keep the run compact: machine-readable JSON/CSV, batch market-data/broker-history pulls, persist raw connector responses once, suppress no-op notifications, and avoid full Notion/dashboard rebuilds or broad performance reports (defer to Friday weekly / monthly). Model/cost behavior only; preserves the $2 base, 0x-to-5x ladder, Finance-primary data policy, GFUZ/TXN universe, exclusions, top-up guards, safety, and run-classification rules. MODEL USAGE LOG (see top-level model_usage_log): append one compact JSONL entry per run to /home/user/workspace/cron_tracking/model_usage/YYYYMM/model_usage.jsonl (schema schemas/model_usage_log.schema.json) recording run_id, cron_id/task_id, task_name, scheduled_for_et, run_origin, stream, model_requested, model_actual (or 'not_exposed'), model_routing_mode (cost_conscious/default/premium), reason_for_premium_model if premium, triggered_at_utc, artifact_path, and notes.",
-      "name": "Weekday 9:45 AM morning DCA watchlist early-warning scan (read-only)",
+      "name": "Weekday 9:45 AM morning DCA watchlist early-warning scan (read-only, retired)",
       "type": "analytics",
-      "status": "active",
-      "cron_utc": "45 13 * * 1-5",
-      "et_equivalent": "9:45 AM ET weekdays (EDT)",
+      "status": "disabled",
+      "in_live_scheduler": false,
+      "scheduler_registered": false,
+      "retired_on_et": "2026-10-06",
+      "retired_reason": "Retired at user request.",
+      "former_cron_utc": "45 13 * * 1-5",
+      "former_et_equivalent": "9:45 AM ET weekdays (EDT)",
       "trades": false,
       "added_to_manifest_on_et": "2026-07-27",
       "added_reason": "Present in the canonical live schedule verified on 2026-07-27 but previously absent from this manifest. It holds the 9:45 AM ET slot formerly attributed to cd45e95b and to the repo-internal morning-dca-0945 alias.",

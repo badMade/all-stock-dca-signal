@@ -91,7 +91,7 @@ The midday stream is **independent** of the afternoon 3:30 PM live task
 | --- | --- | --- | --- |
 | Ladder | 0x → **5x** | 0x → **5x** | 0x → **5x** |
 | Budget ledger | `StrategyState` / `BUDGET_TIERS` | namespace `morning` | namespace `midday` |
-| Artifact root | `.../ce16ba6b/` | `.../morning_dca[_watchlist]/` | `.../midday_dca/` |
+| Artifact root | `.../ce16ba6b/` | `.../morning_dca/` | `.../midday_dca/` |
 | Run type | `scheduled_live_test` @ `15:30` | `morning_dca_*` @ `09:45`/`10:30` | `midday_dca_live` @ `12:30` |
 | Pointer | `latest_scheduled_run.json` | `latest_morning_run.json` | `latest_midday_run.json` |
 

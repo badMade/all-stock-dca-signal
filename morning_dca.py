@@ -1,4 +1,4 @@
-"""Morning graded-DCA executor (watchlist scan + live execution streams).
+"""Morning graded-DCA executor (the 10:30 live execution stream).
 
 This module adds a *morning* stream on top of the existing near-close strategy
 library (:mod:`near_close_dca`). It is deliberately isolated from the afternoon
@@ -18,14 +18,13 @@ scheduled live task (cron ``10ce362c``, which supersedes the deleted
       reporting (which only globs ``.../ce16ba6b/scheduled_runs/**``) never
       mistakes it for afternoon scheduled evidence.
 
-The morning stream has two modes (see :data:`MORNING_PROFILES`):
+The morning stream has ONE mode, ``live`` (see :data:`MORNING_PROFILES`). The 9:45 AM
+read-only watchlist scan (``bb4f6ef1``) was retired (owner direction 2026-10-14) and its
+mode, constants and artifact root were removed so a caller that forgot ``mode`` could no
+longer fall into a no-orders scan (or, after a default flip, into live buying): ``mode`` is
+now a required argument. Historical ``morning_dca_watchlist_scan`` artifacts stay readable
+(the run-classification schema keeps that run type).
 
-    - ``watchlist`` (9:45 AM ET, ``bb4f6ef1``): a READ-ONLY early-warning
-      watchlist scan. Analytics only, ``trades=false``. It may surface early
-      candidates but every dollar figure is HYPOTHETICAL / watchlist-only. It
-      writes under ``.../cron_tracking/morning_dca_watchlist/YYYYMMDD_0945ET/``
-      with ``run_type='morning_dca_watchlist_scan'`` and
-      ``state_schema_version='morning-watchlist-v1'``.
     - ``live`` (10:30 AM ET, ``42173154``): the approved live Robinhood morning
       execution, moved from 9:45 to 10:30 so it evaluates a true 60-minute
       trend window (9:30-10:30). ``trades=true``. It writes under
@@ -272,17 +271,6 @@ SIGNAL_CSV_FIELDS = (
     "interval_minutes",
 )
 
-# Watchlist (9:45 AM ET) scan identity — analytics-only, no trading.
-MORNING_WATCHLIST_MODE = "watchlist"
-# bb4f6ef1 is the canonical 9:45 AM slot. The former repo-internal alias
-# was retired from the active schedule on 2026-07-27.
-MORNING_WATCHLIST_CRON_ID = "bb4f6ef1"
-MORNING_WATCHLIST_RUN_TYPE = "morning_dca_watchlist_scan"
-MORNING_WATCHLIST_SCHEDULED_FOR_ET = "09:45"
-MORNING_WATCHLIST_WINDOW_START_ET = "09:40"
-MORNING_WATCHLIST_WINDOW_END_ET = "09:50"
-MORNING_WATCHLIST_SCHEMA_VERSION = "morning-watchlist-v1"
-
 # Live (10:30 AM ET) execution identity — Robinhood-only live buys.
 MORNING_LIVE_MODE = "live"
 MORNING_LIVE_CRON_ID = "42173154"
@@ -292,21 +280,8 @@ MORNING_LIVE_WINDOW_START_ET = "10:25"
 MORNING_LIVE_WINDOW_END_ET = "10:35"
 MORNING_LIVE_SCHEMA_VERSION = "morning-live-v2-preauthorized"
 
-# Backwards-compatible aliases (the watchlist scan is the successor of the old
-# 9:45 dry-run stream, so unqualified references resolve to it).
-MORNING_CRON_ID = MORNING_WATCHLIST_CRON_ID
-MORNING_RUN_TYPE = MORNING_WATCHLIST_RUN_TYPE
-MORNING_SCHEDULED_FOR_ET = MORNING_WATCHLIST_SCHEDULED_FOR_ET
-MORNING_WINDOW_START_ET = MORNING_WATCHLIST_WINDOW_START_ET
-MORNING_WINDOW_END_ET = MORNING_WATCHLIST_WINDOW_END_ET
-
-# Artifact roots. Both are siblings of, and never nested under, the afternoon
-# ce16ba6b root. The watchlist scan and live execution use distinct roots so a
-# read-only scan can never be confused with a live-execution artifact.
-DEFAULT_MORNING_WATCHLIST_STATE_ROOT = stream_root("morning_dca_watchlist")
+# Artifact root. A sibling of, and never nested under, the afternoon ce16ba6b root.
 DEFAULT_MORNING_LIVE_STATE_ROOT = stream_root("morning_dca")
-# Legacy alias: the default root historically pointed at the morning stream.
-DEFAULT_MORNING_STATE_ROOT = DEFAULT_MORNING_WATCHLIST_STATE_ROOT
 # The afternoon live task artifact root. The afternoon scheduled live task
 # uses cron id 10ce362c (supersedes ce16ba6b), but the artifact root remains
 # under the historical ce16ba6b directory for continuity. Scanned by the
@@ -338,24 +313,6 @@ DEFAULT_BUDGET_LEDGER_FILENAME = "budget_ledger.json"
 
 # Per-mode identity/profile. Selected by MorningDCAExecutor(mode=...).
 MORNING_PROFILES: Dict[str, Dict[str, Any]] = {
-    MORNING_WATCHLIST_MODE: {
-        "mode": MORNING_WATCHLIST_MODE,
-        "artifact_mode": "watchlist",
-        "trades": False,
-        "cron_id": MORNING_WATCHLIST_CRON_ID,
-        "run_type": MORNING_WATCHLIST_RUN_TYPE,
-        "scheduled_for_et": MORNING_WATCHLIST_SCHEDULED_FOR_ET,
-        "window_start_et": MORNING_WATCHLIST_WINDOW_START_ET,
-        "window_end_et": MORNING_WATCHLIST_WINDOW_END_ET,
-        "state_schema_version": MORNING_WATCHLIST_SCHEMA_VERSION,
-        "state_root": DEFAULT_MORNING_WATCHLIST_STATE_ROOT,
-        "state_root_stream": "morning_dca_watchlist",
-        "folder_suffix": "0945ET",
-        "scheduled_run_id_prefix": "morning",
-        "manual_run_id_prefix": "manual_morning",
-        "decision_time_et": time(9, 45),
-        "validate_trend": False,
-    },
     MORNING_LIVE_MODE: {
         "mode": MORNING_LIVE_MODE,
         "artifact_mode": "live",
@@ -376,7 +333,6 @@ MORNING_PROFILES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-STATE_SCHEMA_VERSION = MORNING_WATCHLIST_SCHEMA_VERSION
 
 # Morning sizing ladder. As of the Fri Jul 10 2026 live-automation update every
 # live stream (market open 9:35, morning 10:30, intraday 11:30/1:30/2:30, midday 12:30,
@@ -1377,15 +1333,16 @@ def resolved_count_breakers(config_dir_path: Path) -> dict:
 
 def load_morning_config(
     config_dir=None,
-    mode: str = MORNING_WATCHLIST_MODE,
     *,
+    mode: str,
     allow_unpinned_account: bool = False,
 ):
     """Read ``config/morning_dca.json`` and return a :class:`MorningConfig`.
 
-    ``mode`` selects which artifact root to bind (the watchlist scan and the live
-    execution share the morning ladder and budget caps but write to distinct
-    roots). Looks for ``morning_dca.json`` in ``config_dir`` (default: resolved
+    ``mode`` is REQUIRED (there is no default: the retired watchlist scan used to be
+    the default, and a caller that forgot ``mode`` must fail loudly, not guess).
+    It is keyword-only, so a caller cannot pass it by position by accident. It selects
+    which task block and artifact root to bind. Looks for ``morning_dca.json`` in ``config_dir`` (default: resolved
     by :func:`dca_config.get_config_dir` -- checks ``$DCA_CONFIG_DIR``, then
     ``config/`` beside this module, then the installed-wheel share dir, then
     ``./config``). If the file is absent or unreadable the function logs a
@@ -1411,6 +1368,10 @@ def load_morning_config(
     without one. The run still places nothing -- it just leaves evidence saying
     so.
     """
+    if mode not in MORNING_PROFILES:
+        # Same guard as MorningDCAExecutor.__init__: an unknown mode (including the retired "watchlist") is a
+        # caller bug, so refuse it instead of silently binding the live task block.
+        raise ValueError(f"unknown mode {mode!r}; expected one of {sorted(MORNING_PROFILES)}")
     if config_dir is None:
         config_dir_path = get_config_dir()
     else:
@@ -1543,21 +1504,13 @@ def load_morning_config(
 
     live_task = raw.get("live_task", {})
 
-    # The broker account comes from THIS mode's task block, not unconditionally
-    # from live_task. Each block already carries the right value -- live_task has
-    # the "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}" reference, watchlist_task has
-    # the literal "read_only" -- but this used to read
-    # live_task for every mode, so the read-only scans silently bound the live
-    # trading account.
-    #
-    # That became load-breaking once the account moved into the environment:
-    # expand_config_env raises when the variable is unset, so constructing a
-    # watchlist executor started failing on a host where the secret
-    # is scoped only to the trading jobs (Codex review, PR #219: "Require the
-    # account variable only for live mode"). Reading the mode's own block fixes
-    # both: read-only modes get "read_only" and never touch the variable.
+    # The broker account comes from THIS mode's task block (live_task, which holds the
+    # "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}" reference). History: this used to pick
+    # between live_task and a read-only watchlist_task block (retired 2026-10-14) so
+    # a read-only scan never touched the secret (Codex review, PR #219: "Require the
+    # account variable only for live mode"); with one mode left the lookup is kept as
+    # a dict so the per-mode shape of the config stays the same.
     mode_task_key = {
-        MORNING_WATCHLIST_MODE: "watchlist_task",
         MORNING_LIVE_MODE: "live_task",
     }.get(mode)
     account_task = raw.get(mode_task_key) if mode_task_key else None
@@ -1595,7 +1548,6 @@ def load_morning_config(
     artifact_paths = raw.get("artifact_paths", {})
     # Per-mode root keys take precedence; fall back to the legacy shared key.
     mode_root_key = {
-        MORNING_WATCHLIST_MODE: "watchlist_run_state_root",
         MORNING_LIVE_MODE: "live_run_state_root",
     }.get(mode)
     if mode_root_key and mode_root_key in artifact_paths:
@@ -2916,16 +2868,16 @@ class MorningDCAExecutor(DCAExecutor):
 
     Evaluates each ticker's morning price weakness relative to yesterday's
     regular-session close and grades it on the shared $2-base 0x -> 5x live
-    ladder. Two modes (see :data:`MORNING_PROFILES`):
+    ladder. One mode (see :data:`MORNING_PROFILES`), and ``mode`` is a required
+    argument with no default (the retired 9:45 watchlist scan used to be the
+    default):
 
-    - ``watchlist`` (default, 9:45 AM ET): a read-only early-warning scan. It
-      places NO orders and every dollar figure is hypothetical/watchlist-only.
     - ``live`` (10:30 AM ET): the approved Robinhood morning execution. A
       candidate whose price/drop qualifies but whose 60-minute intraday trend
       cannot be validated is flagged ``manual_review_candidate`` and NOT
       auto-bought (the loosened trend-unavailable rule is not implemented).
 
-    Either mode writes ONLY under its morning run-state root and NEVER into the
+    It writes ONLY under its morning run-state root and NEVER into the
     afternoon ce16ba6b artifact tree or ``latest_scheduled_run.json``.
     """
 
@@ -2963,7 +2915,7 @@ class MorningDCAExecutor(DCAExecutor):
         config: Optional[MorningConfig] = None,
         ledger: Optional[MorningLedger] = None,
         *,
-        mode: str = MORNING_WATCHLIST_MODE,
+        mode: str,
         config_dir: Optional[str] = None,
     ) -> None:
         if mode not in self.PROFILES:
@@ -4383,7 +4335,7 @@ class MorningDCAExecutor(DCAExecutor):
         hypothetical = round(selected_base_amount_usd * multiplier, 2)
         execution_status: Optional[str] = None
         trend_validated: Optional[bool] = None
-        mode_label = "watchlist" if self.mode == MORNING_WATCHLIST_MODE else "live"
+        mode_label = self.mode
 
         # A calibrated symbol's own first tier is the authoritative minimum
         # drop (Codex review: "Let calibrated first tiers override the
@@ -8349,9 +8301,8 @@ class MorningDCAExecutor(DCAExecutor):
             # sees the exception. Acquiring it again here would nest on the
             # same lock file.
             result = _execute()
-            # Only the watchlist scan is a stream value here (schemas/model_usage_log.schema.json); live runs fall
-            # back to the manifest's per-cron_id lookup (42173154 -> "morning").
-            mode_stream = MORNING_WATCHLIST_MODE if self.mode == MORNING_WATCHLIST_MODE else None
+            # No explicit stream: live runs use the manifest's per-cron_id lookup (42173154 -> "morning").
+            mode_stream = None
             log_model_usage(
                 root=self.config.model_usage_log_root,
                 run_id=result.get("artifacts", {}).get("run_id"),
