@@ -357,3 +357,205 @@ def test_stream_market_data_finance_quote_accepts_robinhood_nanosecond_zulu_time
     )
     assert provider.get_quote("TEST", as_of) == (123.45, as_of)
 
+
+
+def test_cli_rejects_non_dictionary_payload(tmp_path):
+    from scripts.generate_midday_candidates import MIDDAY_SPEC
+    path = tmp_path / "market_data.json"
+    path.write_text(json.dumps(["not", "a", "dictionary"]), encoding="utf-8")
+    with pytest.raises(ValueError, match="must contain a top-level JSON object"):
+        _run_with_args(
+            MIDDAY_SPEC,
+            argparse.Namespace(trading_day="2026-08-05", market_data=path, config_dir=Path("config"), already_covered_tickers=[], decision_time_et=None, deployed_last_7d_usd=0)
+        )
+
+def test_cli_rejects_missing_sources_key(tmp_path):
+    from scripts.generate_midday_candidates import MIDDAY_SPEC
+    path = tmp_path / "market_data.json"
+    path.write_text(json.dumps({"not_sources": {}}), encoding="utf-8")
+    with pytest.raises(ValueError, match="must contain a top-level 'sources' object"):
+        _run_with_args(
+            MIDDAY_SPEC,
+            argparse.Namespace(trading_day="2026-08-05", market_data=path, config_dir=Path("config"), already_covered_tickers=[], decision_time_et=None, deployed_last_7d_usd=0)
+        )
+
+def test_cli_rejects_unsupported_sources_key(tmp_path):
+    from scripts.generate_midday_candidates import MIDDAY_SPEC
+    path = tmp_path / "market_data.json"
+    path.write_text(json.dumps({
+        "sources": {"robinhood": {}, "unsupported_source": {}}
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="has unsupported key.*unsupported_source"):
+        _run_with_args(
+            MIDDAY_SPEC,
+            argparse.Namespace(trading_day="2026-08-05", market_data=path, config_dir=Path("config"), already_covered_tickers=[], decision_time_et=None, deployed_last_7d_usd=0)
+        )
+
+def test_cli_aborts_when_primary_is_unavailable_without_fallback(tmp_path):
+    from scripts.generate_midday_candidates import MIDDAY_SPEC
+    path = tmp_path / "market_data.json"
+    path.write_text(json.dumps({
+        "sources": {"robinhood": {}},
+        "source_errors": ["robinhood"],
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="is unavailable/incomplete and no fallback source is configured"):
+        _run_with_args(
+            MIDDAY_SPEC,
+            argparse.Namespace(trading_day="2026-08-05", market_data=path, config_dir=Path("config"), already_covered_tickers=[], decision_time_et=None, deployed_last_7d_usd=0)
+        )
+
+def test_cli_rejects_yahoo_finance_fallback_source(tmp_path):
+    from scripts.generate_midday_candidates import MIDDAY_SPEC
+
+    path = tmp_path / "market_data.json"
+    path.write_text(json.dumps({
+        "sources": {
+            MIDDAY_SPEC.source.value: {},
+            "yahoo_finance_yfinance": {"MSFT": {}},
+        },
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="has unsupported key.*yahoo_finance_yfinance"):
+        _run_with_args(
+            MIDDAY_SPEC,
+            argparse.Namespace(trading_day="2026-08-05", market_data=path, config_dir=Path("config"), already_covered_tickers=[], decision_time_et=None, deployed_last_7d_usd=0)
+        )
+
+def test_cli_rejects_explicit_null_in_ticker_errors(tmp_path):
+    from scripts.generate_midday_candidates import MIDDAY_SPEC
+    path = tmp_path / "market_data.json"
+    path.write_text(json.dumps({
+        "sources": {"robinhood": {}},
+        "ticker_errors": None
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="must be an object, got null"):
+        _run_with_args(
+            MIDDAY_SPEC,
+            argparse.Namespace(trading_day="2026-08-05", market_data=path, config_dir=Path("config"), already_covered_tickers=[], decision_time_et=None, deployed_last_7d_usd=0)
+        )
+
+def test_cli_rejects_explicit_null_in_ticker_errors_list(tmp_path):
+    from scripts.generate_midday_candidates import MIDDAY_SPEC
+    path = tmp_path / "market_data.json"
+    path.write_text(json.dumps({
+        "sources": {"robinhood": {}},
+        "ticker_errors": {"robinhood": None}
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="if present, must be a list, got null"):
+        _run_with_args(
+            MIDDAY_SPEC,
+            argparse.Namespace(trading_day="2026-08-05", market_data=path, config_dir=Path("config"), already_covered_tickers=[], decision_time_et=None, deployed_last_7d_usd=0)
+        )
+
+def test_cli_rejects_unsupported_error_source_in_ticker_errors(tmp_path):
+    from scripts.generate_midday_candidates import MIDDAY_SPEC
+    path = tmp_path / "market_data.json"
+    path.write_text(json.dumps({
+        "sources": {"robinhood": {}},
+        "ticker_errors": {"finance": [], "unsupported_source": []}
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="has unsupported key.*unsupported_source"):
+        _run_with_args(
+            MIDDAY_SPEC,
+            argparse.Namespace(trading_day="2026-08-05", market_data=path, config_dir=Path("config"), already_covered_tickers=[], decision_time_et=None, deployed_last_7d_usd=0)
+        )
+
+def test_cli_rejects_unsupported_source_in_source_errors(tmp_path):
+    from scripts.generate_midday_candidates import MIDDAY_SPEC
+    path = tmp_path / "market_data.json"
+    path.write_text(json.dumps({
+        "sources": {"robinhood": {}},
+        "source_errors": ["unsupported_source"]
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="names unsupported source.*unsupported_source"):
+        _run_with_args(
+            MIDDAY_SPEC,
+            argparse.Namespace(trading_day="2026-08-05", market_data=path, config_dir=Path("config"), already_covered_tickers=[], decision_time_et=None, deployed_last_7d_usd=0)
+        )
+
+
+def test_cli_rejects_empty_sources_when_missing_primary_and_fallback(tmp_path):
+    from scripts.generate_midday_candidates import MIDDAY_SPEC
+    path = tmp_path / "market_data.json"
+    path.write_text(json.dumps({
+        "sources": {} # missing both robinhood (primary) and yahoo_finance_yfinance (fallback)
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="is missing the required 'robinhood' object"):
+        _run_with_args(
+            MIDDAY_SPEC,
+            argparse.Namespace(trading_day="2026-08-05", market_data=path, config_dir=Path("config"), already_covered_tickers=[], decision_time_et=None, deployed_last_7d_usd=0)
+        )
+
+def test_cli_rejects_malformed_source_error_objects(tmp_path):
+    from scripts.generate_midday_candidates import MIDDAY_SPEC
+    path = tmp_path / "market_data.json"
+    path.write_text(json.dumps({
+        "sources": {"robinhood": {}},
+        "source_errors": [{"not_source": "finance"}]
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="entries must be source-name strings"):
+        _run_with_args(
+            MIDDAY_SPEC,
+            argparse.Namespace(trading_day="2026-08-05", market_data=path, config_dir=Path("config"), already_covered_tickers=[], decision_time_et=None, deployed_last_7d_usd=0)
+        )
+
+def test_cli_rejects_malformed_source_error_types(tmp_path):
+    from scripts.generate_midday_candidates import MIDDAY_SPEC
+    path = tmp_path / "market_data.json"
+    path.write_text(json.dumps({
+        "sources": {"robinhood": {}},
+        "source_errors": [123]
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="entries must be source-name strings"):
+        _run_with_args(
+            MIDDAY_SPEC,
+            argparse.Namespace(trading_day="2026-08-05", market_data=path, config_dir=Path("config"), already_covered_tickers=[], decision_time_et=None, deployed_last_7d_usd=0)
+        )
+
+def test_cli_structured_source_error_entry_aborts_primary_outage(tmp_path):
+    from scripts.generate_midday_candidates import MIDDAY_SPEC
+    path = tmp_path / "market_data.json"
+    path.write_text(json.dumps({
+        "sources": {"robinhood": {}},
+        "source_errors": [{"source": "robinhood", "error": "Finance connector not available"}]
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="is unavailable/incomplete and no fallback source is configured"):
+        _run_with_args(
+            MIDDAY_SPEC,
+            argparse.Namespace(trading_day="2026-08-05", market_data=path, config_dir=Path("config"), already_covered_tickers=[], decision_time_et=None, deployed_last_7d_usd=0)
+        )
+
+def test_cli_aborts_when_finance_primary_is_incomplete(tmp_path):
+    import dataclasses
+
+    from scripts.generate_morning_candidates import MORNING_SPEC
+    spec = dataclasses.replace(MORNING_SPEC, source=SourceName.FINANCE)
+
+    path = tmp_path / "market_data.json"
+    path.write_text(json.dumps({
+        "sources": {"finance": {}, "robinhood": {}},
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="finance data is unavailable/incomplete and no fallback source is configured"):
+        _run_with_args(
+            spec,
+            argparse.Namespace(trading_day="2026-08-05", market_data=path, config_dir=Path("config"), already_covered_tickers=[], decision_time_et=None, deployed_last_7d_usd=0)
+        )
+
+def test_cli_rejects_null_ticker_errors_on_effective_source(tmp_path):
+    import dataclasses
+
+    from scripts.generate_morning_candidates import MORNING_SPEC
+    spec = dataclasses.replace(MORNING_SPEC, source=SourceName.FINANCE)
+
+    path = tmp_path / "market_data.json"
+    path.write_text(json.dumps({
+        "sources": {"finance": {}},
+        "ticker_errors": {"finance": None},
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="ticker_errors.finance.*must be a list, got null"):
+        _run_with_args(
+            spec,
+            argparse.Namespace(trading_day="2026-08-05", market_data=path, config_dir=Path("config"), already_covered_tickers=[], decision_time_et=None, deployed_last_7d_usd=0)
+        )
