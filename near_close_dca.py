@@ -14432,7 +14432,9 @@ def _artifact_day_matches_scheduled_provenance(state: Dict[str, Any], artifact_d
             match = re.match(r"^scheduled_([0-9]{8})_", run_id)
             if match:
                 try:
-                    if datetime.strptime(match.group(1), "%Y%m%d").date() == artifact_day:
+                    s = match.group(1)
+                    # ⚡ Bolt optimization: Use string slicing to bypass slow datetime.strptime overhead
+                    if date(int(s[:4]), int(s[4:6]), int(s[6:])) == artifact_day:
                         return True
                 except ValueError:
                     pass

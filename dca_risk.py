@@ -1089,7 +1089,8 @@ def _run_dir_date(path: Path) -> Optional[date]:
         head = part.split("_", 1)[0]
         if len(head) == 8 and head.isdigit():
             try:
-                return datetime.strptime(head, "%Y%m%d").date()
+                # ⚡ Bolt optimization: Avoid slow regex parsing in datetime.strptime
+                return date(int(head[:4]), int(head[4:6]), int(head[6:]))
             except ValueError:
                 return None
     return None
