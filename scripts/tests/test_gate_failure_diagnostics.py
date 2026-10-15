@@ -226,7 +226,8 @@ def test_log_gate_failure_diagnostic_appends_jsonl(tmp_path):
     gfd.log_gate_failure_diagnostic(
         {"gate": "same_day_top_up", "reason_code": "orders_pages_account_mismatch"}, log_path=log_path
     )
-    lines = log_path.read_text().splitlines()
+    with log_path.open("r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
     assert len(lines) == 2
     first = json.loads(lines[0])
     assert first["gate"] == "afternoon_evidence"

@@ -168,7 +168,8 @@ def test_the_core_does_no_io_and_reads_no_environment():
 
 
 def test_the_core_stays_small():
-    assert len(_CORE.read_text().splitlines()) <= 250  # a bare-interpreter sandbox build must stay reviewable
+    with _CORE.open("r", encoding="utf-8") as f:
+        assert sum(1 for _ in f) <= 250  # a bare-interpreter sandbox build must stay reviewable
 
 
 def test_the_file_alone_runs_in_a_bare_interpreter(tmp_path):

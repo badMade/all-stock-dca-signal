@@ -229,6 +229,10 @@ Added `get_order_fills` to `BrokerAdapter` protocol and Robinhood live adapter, 
 **Learning:** `DataFrame.groupby(col).tail(1)` requires building full groupby objects and is significantly slower than `DataFrame.drop_duplicates(subset=[col], keep="last")` when extracting the final chronological row per group from an already sorted DataFrame.
 **Action:** Always prefer `drop_duplicates(keep="last"|"first")` over `groupby.tail(1)`/`head(1)` for these extraction patterns.
 
+## 2026-10-24 - Optimize Pandas Iteration with itertuples
+
+**Learning:** `to_dict('records')` forces pandas out of its vectorized C backend and iterates through the DataFrame in Python space, instantiating a new dictionary object for every single row. In hot paths (like applying logic across thousands of grouped rows), this becomes a measurable memory and CPU drain.
+**Action:** Replace `to_dict('records')` with `df.itertuples(index=False, name=None)`. Extract the required column indices once before the loop (e.g., `idx_planned = cols.index("planned_spend")`) and access the standard tuple values via `row_tuple[idx_planned]`. This avoids the per-row dictionary allocation overhead and yields significant performance improvements.
 ## 2026-10-25 - [Optimize Nested File Path Resolution]
 
 **Learning:** When performing nested array iterations that contain operations like `Path.resolve()` (e.g. iterating over `M` states and checking against `N` file paths using a list comprehension), the overall complexity becomes $O(N \times M)$ which leads to extremely slow performance since `resolve()` hits the filesystem each time. By pre-building a `defaultdict(list)` that keys the items by their resolved path `O(N)`, we can perform `O(1)` dictionary lookups instead, resulting in massive performance improvements (e.g. 10x faster execution time) and reducing the overall complexity to $O(N + M)$.

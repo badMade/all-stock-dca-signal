@@ -144,7 +144,10 @@ def test_fallback_blocked_once_local_recorded_a_buy_for_the_slot(tmp_path):
 def test_fallback_is_logged_with_path_reason_and_timestamp(tmp_path):
     d = router.decide(ExecutorRole.PERPLEXITY, LocalStatus.ERRORED, now=NOW)
     router.record(d, log_dir=tmp_path, trading_day="2026-10-08", slot="1530")
-    rows = [json.loads(line) for f in tmp_path.rglob("*.jsonl") for line in f.read_text().splitlines()]
+    rows = []
+    for f in tmp_path.rglob("*.jsonl"):
+        with f.open("r", encoding="utf-8") as _f:
+            rows.extend(json.loads(line) for line in _f)
     assert len(rows) == 1
     row = rows[0]
     assert row["path"] == "perplexity-fallback"
@@ -156,14 +159,20 @@ def test_fallback_is_logged_with_path_reason_and_timestamp(tmp_path):
 def test_local_buy_is_logged_as_local(tmp_path):
     router.record(router.decide(ExecutorRole.LOCAL, LocalStatus.REACHABLE, now=NOW),
                   log_dir=tmp_path, trading_day="2026-10-08", slot="1530")
-    rows = [json.loads(line) for f in tmp_path.rglob("*.jsonl") for line in f.read_text().splitlines()]
+    rows = []
+    for f in tmp_path.rglob("*.jsonl"):
+        with f.open("r", encoding="utf-8") as _f:
+            rows.extend(json.loads(line) for line in _f)
     assert [r["path"] for r in rows] == ["local"]
 
 
 def test_non_placing_decisions_are_not_logged_as_a_buy_path(tmp_path):
     router.record(router.decide(ExecutorRole.CLOUD, LocalStatus.OFF, now=NOW),
                   log_dir=tmp_path, trading_day="2026-10-08", slot="1530")
-    rows = [json.loads(line) for f in tmp_path.rglob("*.jsonl") for line in f.read_text().splitlines()]
+    rows = []
+    for f in tmp_path.rglob("*.jsonl"):
+        with f.open("r", encoding="utf-8") as _f:
+            rows.extend(json.loads(line) for line in _f)
     assert all(r["path"] not in ("local", "perplexity-fallback") for r in rows)
 
 
