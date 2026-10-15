@@ -782,6 +782,45 @@ def test_survivor_order_does_not_change_the_plan_bytes(config):
     assert forward == backward
 
 
+
+def test_survivor_ticker_is_stripped_and_uppercased(config, ctx):
+    row = _survivor("  msft\n", 4.0)
+    result = _from_survivors(config, [row])
+    assert result.errors == ()
+    assert result.orders[0]["symbol"] == "MSFT"
+
+
+def test_survivor_with_malformed_numeric_priority_keys_fails_validation_cleanly(config):
+    # This row has NaN for multiplier and drop_pct.
+    # It should sort after AAPL and VT without crashing, and then fail validate_plan.
+    bad_row = _survivor("MSFT", 4.0, multiplier=float('nan'), drop_pct=float('inf'))
+    good_row = _survivor("AAPL", 2.0, multiplier=1.0, drop_pct=0.7)
+
+    result = _from_survivors(config, [bad_row, good_row])
+    assert result.plan is None
+    assert "schema_violation" in _codes(result)
+
+
+def test_survivor_with_extra_ignored_keys_succeeds(config):
+    row = _survivor("MSFT", 4.0)
+    row["extra_key"] = "ignored"
+    row["another_key"] = 123
+
+    result = _from_survivors(config, [row])
+    assert result.errors == ()
+    assert result.orders[0]["symbol"] == "MSFT"
+    assert "extra_key" not in result.orders[0]
+
+
+def test_survivor_missing_keys_fails_validation_cleanly(config):
+    row = _survivor("MSFT", 4.0)
+    del row["current_price"]
+
+    result = _from_survivors(config, [row])
+    assert result.plan is None
+    assert "schema_violation" in _codes(result)
+
+
 @pytest.mark.parametrize(
     ("row", "code"),
     [
