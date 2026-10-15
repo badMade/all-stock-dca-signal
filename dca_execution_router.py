@@ -153,16 +153,19 @@ def _log_file(log_dir: Path, trading_day: str) -> Path:
 
 def _rows(log_dir: Path, trading_day: str, slot: str):
     try:
-        lines = _log_file(log_dir, trading_day).read_text(encoding="utf-8").splitlines()
+        with _log_file(log_dir, trading_day).open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and row.get("slot") == slot:
+                    yield row
     except OSError:
         return
-    for line in lines:
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(row, dict) and row.get("slot") == slot:
-            yield row
 
 
 def _kind(row: dict) -> str:

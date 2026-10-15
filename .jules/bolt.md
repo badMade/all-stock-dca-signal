@@ -228,3 +228,7 @@ Added `get_order_fills` to `BrokerAdapter` protocol and Robinhood live adapter, 
 ## 2024-05-19 - [Pandas Groupby Optimization]
 **Learning:** `DataFrame.groupby(col).tail(1)` requires building full groupby objects and is significantly slower than `DataFrame.drop_duplicates(subset=[col], keep="last")` when extracting the final chronological row per group from an already sorted DataFrame.
 **Action:** Always prefer `drop_duplicates(keep="last"|"first")` over `groupby.tail(1)`/`head(1)` for these extraction patterns.
+## 2026-10-14 - Optimize large file line iteration
+
+**Learning:** Calling `path.read_text(encoding="utf-8").splitlines()` on large files loads the entire file contents into memory at once, creating a large intermediate list of strings. Using a file generator (`with path.open("r", encoding="utf-8") as f: for line in f:`) streams the file line-by-line, drastically reducing memory bloat and improving parsing speed while preserving trailing whitespace behavior handled efficiently by `.strip()`.
+**Action:** Always prefer `with path.open("r", encoding="utf-8") as f: for line in f:` when processing large files line-by-line to avoid N+1 memory bloat. Avoid `read_text().splitlines()` unless you specifically need the entire file in memory at once as a list.
