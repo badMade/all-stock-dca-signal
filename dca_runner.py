@@ -390,7 +390,7 @@ def _validated_sizing_ladder() -> dict:
     # valid for the LAST (highest-range) tier.
     tier_ranges.sort(key=lambda r: r[0])
     for i in range(len(tier_ranges) - 1):
-        this_min, this_max, this_multiplier = tier_ranges[i]
+        _, this_max, this_multiplier = tier_ranges[i]
         next_min, _next_max, next_multiplier = tier_ranges[i + 1]
         if this_max != next_min:
             raise ValueError(
@@ -652,7 +652,6 @@ ACTIVE_TICKERS = _validated_active_tickers()
 # be allowed to inflate high-multiplier tier counting (Codex review: "Validate
 # multipliers before tier selection").
 MIN_LADDER_MULTIPLIER = min(_SIZING_LADDER["multipliers"])
-MAX_LADDER_MULTIPLIER = max(_SIZING_LADDER["multipliers"])
 
 # The exact set of configured ladder multipliers (1.0, 1.5, 2.0, ..., 5.0). A
 # caller-supplied multiplier merely falling inside [MIN, MAX] still admits
@@ -5090,6 +5089,8 @@ def _validate_execute_plan(
     candidates,
     sole_executor_grace_period_active: bool,
 ) -> tuple[SlotSpec, set[str]]:
+    if weekly_rollover_reserve_usd is not None:
+        _validate_weekly_rollover_reserve(weekly_rollover_reserve_usd)
     if not isinstance(run_id, str) or not run_id:
         # A truthy non-string (e.g. the int 123) passed the old bare
         # `not run_id` truthiness check, then reached _ISO_DATE_RE.findall()
@@ -6787,7 +6788,7 @@ def _get_bought_today_tickers(orders: list, trading_day: date):
         # applied to every other exception this function converts into an
         # ABORT reason (Codex review: "Redact malformed broker symbols from
         # abort evidence").
-        return None, f"broker order history contains a malformed symbol: {type(exc).__name__}"
+        return None, f"broker order history contains a malformed symbol: {_redact_malformed_symbol(type(exc).__name__)}"
     return bought_today, None
 
 
@@ -6897,17 +6898,7 @@ def assess(
     docs/live_wiring.md's "Gate sequence" section (Codex review: "Return execution
     context from assess").
     """
-    if isinstance(weekly_rollover_reserve_usd, bool) or not isinstance(
-        weekly_rollover_reserve_usd, (int, float)
-    ):
-        # math.isfinite(True) succeeds since bool is an int subclass, so a
-        # boolean reserve would otherwise be retained as $1 and inflate the
-        # derived Stress-tier weekly ceiling by that amount (Codex review:
-        # "Reject boolean rollover-reserve values").
-        raise ValueError(
-            "assess: weekly_rollover_reserve_usd must be a finite, non-negative number, "
-            f"got {weekly_rollover_reserve_usd!r}"
-        )
+    _validate_weekly_rollover_reserve(weekly_rollover_reserve_usd)
     try:
         reserve_is_unusable = (
             not math.isfinite(weekly_rollover_reserve_usd) or weekly_rollover_reserve_usd < 0
