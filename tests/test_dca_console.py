@@ -1157,7 +1157,20 @@ def test_sigterm_stops_console_cleanly(tmp_path):
         if not ready.is_set():
             pytest.fail("Console did not print its readiness banner:\n" + "".join(output_lines))
         process.send_signal(signal.SIGTERM)
-        assert process.wait(timeout=20) == 0
+        # A bare `wait() == 0` hid the child's traceback when this failed once on
+        # a loaded CI runner (exit 1, never reproduced locally). Drain the reader
+        # before asserting so the failure message carries what the child printed.
+        try:
+            return_code = process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+            reader.join(timeout=2)
+            pytest.fail("Console did not stop within 20s of SIGTERM:\n" + "".join(output_lines))
+        reader.join(timeout=2)
+        assert return_code == 0, (
+            f"Console exited with {return_code} after SIGTERM:\n" + "".join(output_lines)
+        )
     finally:
         if process.poll() is None:
             process.kill()
