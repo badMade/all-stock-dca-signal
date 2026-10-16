@@ -116,3 +116,20 @@ Environment variables win; otherwise the gitignored local `.env` is read (`docs/
 fails closed and writes nothing if a value is missing or malformed, a prompt has no task header, or any other
 `${NAME}` is left over. It refuses an `--out` inside this checkout, writes owner-only files and never prints a
 value. Regenerate the repo prompts first (`--write`), rebuild `backup_planner.pyz` if the stamp changed, then fill.
+
+## Checking the pair before you paste it
+
+The prompts and `backup_planner.pyz` are pasted into two different places in Perplexity (each task's Instructions box
+and the project's Files), and nothing compares them until a slot fires. On 2026-10-14 the 9:55 task ran an earlier pair
+than the one believed pasted. Run this on your own machine first, against the files you are about to paste:
+
+```bash
+python3 -m scripts.verify_perplexity_pair --planner backup_planner.pyz --prompts ~/perplexity-filled
+```
+
+It exits 0 only when every prompt's planner stamp, universe hash and symbol count equal what the planner itself reports
+and no `${...}` placeholder is left. Pass `--allow-placeholders` to check the unfilled prompts committed here. It only
+reads, and it prints file names, the first eight hex digits of a hash, counts and placeholder names, never your last
+four digits, email or state folder. It cannot see what is saved inside Perplexity: after pasting, still read each task's
+Instructions header (`Universe hash ...` and the symbol count) and, after the next run, the state file's
+`planner_build.content_sha256`.
