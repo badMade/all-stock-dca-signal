@@ -95,6 +95,15 @@ def test_pr_matches_by_key_mention_in_body_when_head_ref_differs() -> None:
     assert ev.pr is not None and ev.pr.number == 102
 
 
+def test_pr_body_that_lists_key_as_not_changed_does_not_match() -> None:
+    # Regression: PR #1642 named eight keys under "Not changed, on purpose" and the
+    # whole-token mention match stamped them "Merged, checks green", so the Notion
+    # rows claimed a fix that the PR explicitly did not make.
+    body = f"Docs only.\n\nNot changed, on purpose: classifier_block, {KEY}, cap_breach.\n"
+    ev = _match(prs=[_pr(103, head_ref="claude/some-branch", state="closed", merged=True, checks="green", body=body)])
+    assert ev.pr is None
+
+
 def test_newest_pr_wins_when_several_match() -> None:
     ev = _match(prs=[_pr(101, state="closed"), _pr(105)])
     assert ev.pr is not None and ev.pr.number == 105

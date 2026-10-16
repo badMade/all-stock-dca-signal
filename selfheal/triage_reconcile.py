@@ -72,7 +72,8 @@ PROGRESS_MERGED_PENDING = "Merged, checks pending"
 PROGRESS_MERGED_RED = "Merged, checks red"
 PROGRESS_CLOSED_UNMERGED = "Closed, not merged"
 
-_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+_NOT_CHANGED = re.compile(r"\bnot\s+changed\b", re.IGNORECASE)
+_SHA_PATTERN =re.compile(r"[0-9a-f]{40}")
 _REPO_URL_PATTERN = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
 
@@ -163,7 +164,12 @@ def _parse_pr(raw: object, repo_url: str) -> tuple[PullRequestRef, str, str]:
     if not isinstance(merged, bool):
         raise EvidenceError("pull request 'merged' must be a boolean")
     url = _own_url(record, f"{repo_url}/pull/{number}", "pull request")
-    searchable = f"{_text(record, 'title', 'pull request')}\n{_text(record, 'body', 'pull request')}"
+    # A line saying "Not changed" names keys the PR deliberately left alone (PR #1642 listed eight), so
+    # a mention there is evidence against a fix, not for one.
+    body = "\n".join(
+        line for line in _text(record, "body", "pull request").splitlines() if not _NOT_CHANGED.search(line)
+    )
+    searchable = f"{_text(record, 'title', 'pull request')}\n{body}"
     ref = PullRequestRef(number=number, url=url, state=state, merged=merged, checks=checks)
     return ref, _text(record, "head_ref", "pull request"), searchable
 
