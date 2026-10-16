@@ -1,0 +1,18 @@
+{
+  "$schema": "../schemas/recommendations.schema.json",
+  "version": "2026-10-13",
+  "description": "Plan-first recommendation files (PLAN-plan-first.md). A 5-minute Claude courier fetches Robinhood data; the program computes {ticker, usd, ref_id} per slot and the buying agent reads only that. max_age_minutes is the freshness rule the operator set on 2026-10-13: the agent uses the newest file for its slot stamped at or before now, on the same ET trading day, no older than this; otherwise it buys nothing. lookahead_minutes lets each cycle also compute for the next slot when that slot opens within this many minutes, so the agent firing at the slot's start already finds a file for its own slot. The publish block mirrors the agent payload (never prices) to places a cloud agent can read; both default off until the operator wires them.",
+  "max_age_minutes": 15,
+  "lookahead_minutes": 15,
+  "publish": {
+    "notion": {
+      "enabled": false,
+      "page_id": null
+    },
+    "github_branch": {
+      "enabled": false,
+      "branch": "recommendations",
+      "remote": "origin"
+    }
+  }
+}

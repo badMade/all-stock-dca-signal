@@ -215,3 +215,5 @@ Never edit `.github/workflows/` in a pull request an agent drives. Those jobs
 hold `contents: write` and `pull-requests: write`, and the trust-boundary
 reasoning is written in the workflow headers themselves. Propose the change
 instead. Approving and merging are the operator's, never an agent's.
+
+## Imported Claude Cowork project instructions

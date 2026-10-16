@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Plan-first recommendation settings (config/recommendations.json)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "max_age_minutes", "lookahead_minutes", "publish"],
+  "properties": {
+    "$schema": {"type": "string"},
+    "version": {"type": "string"},
+    "description": {"type": "string"},
+    "max_age_minutes": {"type": "integer", "minimum": 1, "maximum": 60},
+    "lookahead_minutes": {"type": "integer", "minimum": 0, "maximum": 60},
+    "publish": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["notion", "github_branch"],
+      "properties": {
+        "notion": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "page_id"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "page_id": {"type": ["string", "null"]}
+          }
+        },
+        "github_branch": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "branch", "remote"],
+          "properties": {
+            "enabled": {"type": "boolean"},
+            "branch": {"type": "string", "pattern": "^[A-Za-z0-9._/-]+$"},
+            "remote": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"}
+          }
+        }
+      }
+    }
+  }
+}

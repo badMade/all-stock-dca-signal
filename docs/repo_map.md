@@ -26,6 +26,10 @@ script answers what to run, this answers what is there.
 
 ---
 
+## Plan-first recommendations
+
+`docs/plan_first_recommendations.md` describes the courier, recommendation store, slot reader and fill comparison. The buying helper is `scripts.plan_first_slot`; its selection delegates to `RecommendationStore`.
+
 ## 1. Runners
 
 ### 1.1 Three entry points, one strategy

@@ -59,6 +59,7 @@ CONFIG_FILES: tuple[tuple[str, str | None, bool], ...] = (
     ("notifications", "notifications", False),
     ("notion_issue_loop", "notion_issue_loop", False),
     ("per_ticker_sizing", None, True),
+    ("recommendations", "recommendations", False),
     ("reporting", "reporting", False),
     ("run_classification", "run_classification_policy", False),
     ("scheduled_tasks", "scheduled_tasks", False),
@@ -85,6 +86,7 @@ LOADERS: dict[str, str] = {
     "notifications": "dca_alerts", "reporting": "dca_reporting", "self_heal": "self-heal workflow",
     "notion_issue_loop": "selfheal.notion_issue_loop.load_config",
     "backtest_intraday_cap_curve": "analytics only; never loaded live",
+    "recommendations": "dca_rec_store.load_settings (plan-first courier and reader)",
 }
 # What a malformed file does to a live start. Line references are dca_config.py:
 # _read_json raises on any unparsable/duplicate-key/non-object file (199-201);
@@ -97,6 +99,7 @@ FAIL_MODES: dict[str, str] = {
     "inverse_martingale": "raises", "trading_window": "raises", "near_close_dca": "raises",
     "backtest_sizing_ladder": "raises", "self_heal": "raises", "notion_issue_loop": "raises",
     "market_calendar": "raises",
+    "recommendations": "raises",
     "market_open_dca": "fails closed", "morning_dca": "fails closed", "midday_dca": "fails closed",
     "intraday_dca": "fails closed",
     "ml_sizing_adjustment": "degrades", "scheduled_tasks": "degrades", "notifications": "degrades",

@@ -81,6 +81,20 @@ py-modules = [
     "morning_dca",
     "midday_dca",
     "dca_alerts",
+    # Strict recommendation data contracts (plan-first Rock 1).
+    "dca_rec_models",
+    # Read-only market and broker snapshot sources (plan-first Rock 1).
+    "dca_market_sources",
+    # Courier raw-response merge and assembly (plan-first Rock 1b).
+    "dca_market_history",
+    # Primary-chain recommendation computation (plan-first Rock 2).
+    "dca_recommender",
+    # Private recommendation persistence and agent freshness selection (plan-first Rock 3).
+    "dca_rec_store",
+    # Program-side fill comparison for courier cycles (plan-first Rock 5).
+    "dca_fill_compare",
+    # Optional agent-payload publishers (plan-first Rock 4).
+    "dca_rec_publish",
     # Shared outbound-network validation imported by dca_alerts; it must be
     # present for packaged entry points to import outside a source checkout.
     "dca_net_utils",
@@ -225,6 +239,9 @@ packages = ["scripts", "selfheal"]
     # the self-heal packaging acceptance remains Rock 7's.
     "config/self_heal.json",
     "config/notion_issue_loop.json",
+    # Read by the plan-first recommendation store; without this the installed
+    # courier has no freshness or publish policy and must fail closed.
+    "config/recommendations.json",
 ]
 
 # Browser assets for the 3D market graph, resolved at runtime by
@@ -388,5 +405,3 @@ executionEnvironments = [
     { root = "yfinance-prefetch", extraPaths = ["yfinance-prefetch", "."] },
     { root = ".", extraPaths = [".", "tests", "scripts"] },
 ]
-
-

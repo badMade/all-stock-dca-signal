@@ -1167,6 +1167,7 @@ def generate_candidates(
     source_errors: Sequence[str] = (),
     ticker_errors: Optional[Mapping[str, Sequence[str]]] = None,
     already_covered_tickers: Sequence[str] = (),
+    decision_time_et: time | None = None,
 ) -> List[Dict[str, Any]]:
     """Evaluate every active, non-excluded, not-already-covered ticker for
     ``slot`` and return reconciled candidates. This is Gate 5 and nothing
@@ -1197,7 +1198,7 @@ def generate_candidates(
     spec = SLOT_SPECS[slot]
     config = dataclasses.replace(
         config,
-        decision_time_et=spec["decision_time_et"],
+        decision_time_et=spec["decision_time_et"] if decision_time_et is None else decision_time_et,
         ignore_trend_filter=not spec["trend_required"],
     )
     # Validated HERE, not only in main(), because generate_candidates is
