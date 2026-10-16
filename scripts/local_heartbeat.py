@@ -47,6 +47,10 @@ STREAM = "primary"
 _STAND_DOWN = {"local_status": "unknown", "backup_may_act": False}
 
 
+class StateDirUnavailable(OSError):
+    """The heartbeat state dir or its lock cannot be created or opened (permissions, read-only volume)."""
+
+
 def lease_dir() -> Path:
     return Path(dca_paths.cron_tracking_root()) / "scheduler_leases"
 
@@ -66,8 +70,17 @@ def _state_lock(day: str, slot: str):
     PR 1639). Lock order is always this lock, then the lease's own guard; ``beat`` takes only the lease guard.
     """
     base = lease_dir()
-    base.mkdir(parents=True, exist_ok=True)
-    with cross_process_lock(base / f"{window_key(day, STREAM, slot)}.state.lock"):
+    with contextlib.ExitStack() as stack:
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            stack.enter_context(cross_process_lock(base / f"{window_key(day, STREAM, slot)}.state.lock"))
+        except TimeoutError:
+            raise  # a busy lock is its own fail-closed answer (state_lock_timeout), handled by the callers
+        except OSError as exc:
+            # 2026-10-16 09:49 ET: macOS privacy protection on ~/Documents made this mkdir raise PermissionError and
+            # the probe died with a traceback. Only the setup is wrapped, so an OSError from the caller's own body
+            # (e.g. the marker write in ``finish``) keeps its existing behavior.
+            raise StateDirUnavailable(str(exc)) from exc
         yield
 
 
@@ -142,6 +155,8 @@ def start(day: str, slot: str, *, now: float | None = None) -> dict:
                 return {"ok": False, "reason": "marker_reset_failed"}
     except TimeoutError:
         return {"ok": False, "reason": "state_lock_timeout"}
+    except StateDirUnavailable:
+        return {"ok": False, "reason": "state_dir_unavailable"}
     return {"ok": True, "reason": result.reason, "token": token}
 
 
@@ -161,7 +176,7 @@ def finish(day: str, slot: str, token: str, outcome: str) -> dict:
     try:
         with _state_lock(day, slot):
             released = lease.release_with(_holder(slot, token), write_marker)
-    except TimeoutError:
+    except (TimeoutError, StateDirUnavailable):
         return {"ok": False, "released": False}
     return {"ok": released, "released": released}
 
@@ -197,7 +212,7 @@ def status(day: str, slot: str, mac_status: str = "online", *, now: float | None
         with _state_lock(day, slot):
             local, decision, log_dir = _probe(day, slot, mac_status, now)
             router.record(decision, log_dir=log_dir, trading_day=day, slot=slot, probe=True)
-    except TimeoutError:
+    except (TimeoutError, StateDirUnavailable):
         return dict(_STAND_DOWN)
     return {"local_status": local.value, "backup_may_act": decision.may_place}
 
@@ -214,7 +229,7 @@ def claim(day: str, slot: str, mac_status: str = "online", *, now: float | None 
             local, decision, log_dir = _probe(day, slot, mac_status, now)
             if decision.may_place:
                 router.record(decision, log_dir=log_dir, trading_day=day, slot=slot, kind="claim")
-    except TimeoutError:
+    except (TimeoutError, StateDirUnavailable):
         return dict(_STAND_DOWN)
     return {"local_status": local.value, "backup_may_act": decision.may_place}
 
@@ -232,6 +247,8 @@ def confirm(day: str, slot: str, *, now: float | None = None) -> dict:
             router.confirm_buy(log_dir=log_dir, trading_day=day, slot=slot, now=stamp)
     except TimeoutError:
         return {"ok": False, "reason": "state_lock_timeout"}
+    except StateDirUnavailable:
+        return {"ok": False, "reason": "state_dir_unavailable"}
     return {"ok": True, "already": False}
 
 

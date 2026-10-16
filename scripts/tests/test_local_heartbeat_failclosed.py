@@ -62,6 +62,38 @@ def test_a_crash_mid_write_of_the_marker_never_leaves_a_torn_marker(monkeypatch)
     assert hb.status(DAY, SLOT, now=1001.0)["backup_may_act"] is False
 
 
+# --- state directory not writable (2026-10-16 09:49 ET incident) -------------------------------------------------
+# macOS privacy protection on ~/Documents made ``cron_tracking/scheduler_leases`` uncreatable, and ``status`` died with
+# a PermissionError traceback instead of printing the documented stand-down. The outcome (no backup buy) was right,
+# but the crash gave the caller no parseable answer and no reason.
+
+def _deny_state_dir(monkeypatch):
+    real_mkdir = pathlib.Path.mkdir
+
+    def denied(self, *args, **kwargs):
+        if self == hb.lease_dir():
+            raise PermissionError(1, "Operation not permitted", str(self))
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "mkdir", denied)
+
+
+def test_an_uncreatable_state_dir_makes_status_stand_down_instead_of_crashing(monkeypatch):
+    _deny_state_dir(monkeypatch)
+    assert hb.status(DAY, SLOT, now=1000.0) == {"local_status": "unknown", "backup_may_act": False}
+
+
+def test_an_uncreatable_state_dir_makes_claim_stand_down_instead_of_crashing(monkeypatch):
+    _deny_state_dir(monkeypatch)
+    assert hb.claim(DAY, SLOT, now=1000.0) == {"local_status": "unknown", "backup_may_act": False}
+
+
+def test_the_status_command_exits_zero_with_stand_down_json_when_the_state_dir_is_unwritable(monkeypatch, capsys):
+    _deny_state_dir(monkeypatch)
+    assert hb.main(["status", "--trading-day", DAY, "--slot", SLOT]) == 0
+    assert capsys.readouterr().out.strip() == '{"backup_may_act": false, "local_status": "unknown"}'
+
+
 # --- finding 3 -------------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("garbage", ["not json", "", "[]", '{"holder_id": "x", "ttl_seconds": 0}'])
