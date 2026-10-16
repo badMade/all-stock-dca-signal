@@ -1,0 +1,77 @@
+#!/bin/bash
+# Build one live slot's Robinhood market-data payload ahead of its Gate 5, outside any Claude session.
+#
+#   robinhood_payload.sh <0935|1030|1130|1230|1330|1430>
+#   robinhood_payload.sh auto      # the slot whose decision time passed 1-14 minutes ago (launchd)
+#
+# Why (2026-10-15): repo code cannot call Robinhood (headless clients cannot get tokens), and the live
+# sessions could not pull ~67 tickers of bars through MCP tool output inside the slot window, so the 11:30,
+# 1:30 and 2:30 runs aborted at Gate 5. The Codex CLI on this Mac holds an approved Robinhood MCP connection
+# (`codex mcp list` -> robinhood-trading), so it does the read-only fetch here, a few tickers per call, and
+# scripts/robinhood_payload.py validates every number before anything is published. See
+# docs/robinhood_payload.md. This is NOT a second data source: the payload is Robinhood data under
+# sources.robinhood, exactly what the session would have fetched itself.
+#
+# Runs one minute after the slot's decision time (the last completed start-stamped bar closes then).
+set -euo pipefail
+
+: "${DCA_REPO:?set DCA_REPO to the all-stock-dca checkout}"
+SLOT_ARG="${1:?usage: robinhood_payload.sh <slot HHMM|auto>}"
+cd "$DCA_REPO"
+
+PY="${DCA_PAYLOAD_PYTHON:-$DCA_REPO/.venv/bin/python}"
+CODEX="${DCA_CODEX_BIN:-codex}"
+# Unset = the model in ~/.codex/config.toml. Model names the installed CLI/account rejects change between
+# releases (gpt-5.6-sol worked on 0.145, is refused on 0.160), so pin one only via DCA_CODEX_MODEL.
+MODEL_ARGS=()
+[ -n "${DCA_CODEX_MODEL:-}" ] && MODEL_ARGS=(-m "$DCA_CODEX_MODEL")
+PER_CHUNK_TIMEOUT="${DCA_CODEX_CHUNK_TIMEOUT:-240}"
+PARALLEL="${DCA_CODEX_PARALLEL:-3}"
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/dca-rhpayload.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
+
+DAY_ARGS=()
+[ -n "${DCA_TRADING_DAY:-}" ] && DAY_ARGS=(--day "$DCA_TRADING_DAY")
+NOW_ARGS=()
+[ -n "${DCA_PAYLOAD_NOW_ET:-}" ] && NOW_ARGS=(--now-et "$DCA_PAYLOAD_NOW_ET")
+
+PLAN_STATUS=0
+"$PY" -m scripts.robinhood_payload plan --slot "$SLOT_ARG" ${DAY_ARGS[@]+"${DAY_ARGS[@]}"} ${NOW_ARGS[@]+"${NOW_ARGS[@]}"} >"$WORK/plan.json" || PLAN_STATUS=$?
+case "$PLAN_STATUS" in
+  0) ;;
+  3) echo "robinhood_payload: day is outside config/trading_window.json; skipping"; exit 0 ;;
+  4) echo "robinhood_payload: not a trading day for slot $SLOT_ARG (closed or early close); skipping"; exit 0 ;;
+  5) echo "robinhood_payload: no slot is due now; skipping"; exit 0 ;;
+  *) exit "$PLAN_STATUS" ;;
+esac
+
+OUT="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["out"])' "$WORK/plan.json")"
+if [ -e "$OUT" ]; then
+  echo "robinhood_payload: $OUT already exists; leaving it in place"
+  exit 0
+fi
+
+# One codex call per chunk of tickers, a few at a time. A chunk that times out or errors simply leaves its
+# tickers without data; the merge records them in ticker_errors and enforces the coverage floor.
+run_chunk() {
+  local idx="$1" tickers="$2"
+  "$PY" -m scripts.robinhood_payload prompt --plan "$WORK/plan.json" --tickers "$tickers" >"$WORK/prompt_$idx.txt"
+  # Read-only sandbox: the worker only reads market data. stdin is the prompt (never inherit a terminal).
+  # macOS has no timeout(1); perl's alarm + exec kills the worker at the deadline (SIGALRM).
+  perl -e 'alarm shift; exec @ARGV' "$PER_CHUNK_TIMEOUT" "$CODEX" exec ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} -c 'sandbox_mode="read-only"' -c 'approval_policy="never"' \
+    --skip-git-repo-check -o "$WORK/chunk_$idx.json" - <"$WORK/prompt_$idx.txt" >"$WORK/chunk_$idx.log" 2>&1 \
+    || echo "robinhood_payload: chunk $idx failed or timed out (see its tickers in the merge report)" >&2
+}
+
+idx=0
+while IFS= read -r tickers; do
+  run_chunk "$idx" "$tickers" &
+  idx=$((idx + 1))
+  # Bound concurrency without bash 4's wait -n (macOS ships bash 3.2).
+  if [ $((idx % PARALLEL)) -eq 0 ]; then wait; fi
+done < <("$PY" -c 'import json,sys; [print(",".join(c)) for c in json.load(open(sys.argv[1]))["chunks"]]' "$WORK/plan.json")
+wait
+
+shopt -s nullglob
+"$PY" -m scripts.robinhood_payload merge --plan "$WORK/plan.json" "$WORK"/chunk_*.json

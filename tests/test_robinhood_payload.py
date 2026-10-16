@@ -1,0 +1,222 @@
+"""scripts/robinhood_payload.py: the validation that stands between an LLM-copied fetch and a live slot."""
+
+import json
+from datetime import date, time
+
+import pytest
+
+from scripts import robinhood_payload as rp
+
+DAY = date(2026, 10, 15)
+
+
+def bar(ts, o=10.0, h=10.2, low=9.9, c=10.1, v=100):
+    return {"timestamp": ts, "open": o, "high": h, "low": low, "close": c, "volume": v}
+
+
+def good_ticker(start_utc_hour=17, minutes=range(30, 60, 5)):
+    bars = [bar(f"2026-10-15T{start_utc_hour:02d}:{m:02d}:00Z") for m in minutes]
+    bars += [bar(f"2026-10-15T{start_utc_hour + 1:02d}:{m:02d}:00Z") for m in range(0, 30, 5)]
+    return {
+        "previous_close_bar": bar("2026-10-14T00:00:00Z"),
+        "intraday_bars": bars,
+        "quote": {"price": 10.1, "as_of": "2026-10-15T18:31:00Z"},
+    }
+
+
+def kw(**over):
+    base = {"day": DAY, "bar_start": time(13, 30), "decision": time(14, 30), "interval": 5}
+    base.update(over)
+    return base
+
+
+def test_valid_ticker_passes_and_drops_the_still_open_decision_bar():
+    raw = good_ticker()
+    raw["intraday_bars"].append(bar("2026-10-15T18:30:00Z"))  # 14:30 ET: the still-open bar
+    out = rp.validate_ticker(raw, **kw())
+    assert out["intraday_bars"][-1]["timestamp"].startswith("2026-10-15T14:25")
+    assert all("14:30" not in b["timestamp"] for b in out["intraday_bars"])
+
+
+@pytest.mark.parametrize(
+    "mutate, needle",
+    [
+        (lambda r: r["intraday_bars"].__setitem__(0, bar("2026-10-15T17:30:00")), "not timezone-aware"),
+        (lambda r: r["intraday_bars"].__setitem__(0, bar("2026-10-15T17:30:00Z", h=9.0)), "inconsistent range"),
+        (lambda r: r["intraday_bars"].__setitem__(1, bar("2026-10-15T17:35:00Z", o=30, h=31, low=29, c=30)), "median"),
+        (lambda r: r["quote"].update(price=20.0), "disagrees"),
+        (lambda r: r["quote"].update(as_of="2026-10-14T18:31:00Z"), "not from"),
+        (lambda r: r.update(previous_close_bar=bar("2026-10-15T14:00:00Z")), "prior session"),
+        (lambda r: r.update(intraday_bars=r["intraday_bars"][:3]), "far before"),
+        (lambda r: r.update(intraday_bars=[]), "no intraday bars"),
+        (lambda r: r.update(error="tool failed"), "agent reported"),
+    ],
+)
+def test_bad_ticker_data_is_rejected(mutate, needle):
+    raw = good_ticker()
+    mutate(raw)
+    with pytest.raises(rp.PayloadError, match=needle):
+        rp.validate_ticker(raw, **kw())
+
+
+def test_bars_before_the_slot_window_are_dropped_not_fatal():
+    raw = good_ticker()
+    raw["intraday_bars"].insert(0, bar("2026-10-15T16:00:00Z"))  # 12:00 ET, before the 13:30 start
+    out = rp.validate_ticker(raw, **kw())
+    assert out["intraday_bars"][0]["timestamp"].startswith("2026-10-15T13:30")
+
+
+def plan_for(tmp_path, tickers):
+    return {
+        "slot": "1430",
+        "trading_day": "2026-10-15",
+        "decision_time_et": "14:30",
+        "bar_start_et": "13:30",
+        "interval_minutes": 5,
+        "tickers": tickers,
+        "chunks": [tickers],
+        "out": str(tmp_path / "out" / "payload.json"),
+    }
+
+
+def write_chunk(tmp_path, name, content):
+    path = tmp_path / name
+    path.write_text(content if isinstance(content, str) else json.dumps(content), encoding="utf-8")
+    return str(path)
+
+
+def test_merge_publishes_valid_and_records_failures(tmp_path):
+    plan = plan_for(tmp_path, ["AAA", "BBB", "CCC", "DDD", "EEE"])
+    chunk = write_chunk(
+        tmp_path, "chunk_0.json", {t: good_ticker() for t in ("AAA", "BBB", "CCC", "DDD")} | {"EEE": {"error": "x"}}
+    )
+    payload, failed = rp.assemble(plan, [chunk])
+    assert sorted(payload["sources"]["robinhood"]) == ["AAA", "BBB", "CCC", "DDD"]
+    assert payload["ticker_errors"] == {"robinhood": ["EEE"]}
+    assert payload["source_errors"] == []
+    assert rp.publish(plan, payload, failed, min_coverage=0.8) == 0
+    assert json.loads((tmp_path / "out" / "payload.json").read_text())["sources"]["robinhood"].keys() == {
+        "AAA", "BBB", "CCC", "DDD"
+    }
+    assert (tmp_path / "out" / "payload.meta.json").is_file()
+    assert rp.check(plan, min_coverage=0.8) == 0
+
+
+def test_low_coverage_publishes_nothing(tmp_path):
+    plan = plan_for(tmp_path, ["AAA", "BBB", "CCC"])
+    chunk = write_chunk(tmp_path, "chunk_0.json", {"AAA": good_ticker()})
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=0.8) == 2
+    assert not (tmp_path / "out").exists()
+    assert rp.check(plan, min_coverage=0.8) == 2
+
+
+def test_fenced_and_garbage_chunks(tmp_path):
+    plan = plan_for(tmp_path, ["AAA"])
+    fenced = write_chunk(tmp_path, "chunk_0.json", "```json\n" + json.dumps({"AAA": good_ticker()}) + "\n```")
+    assert list(rp.assemble(plan, [fenced])[0]["sources"]["robinhood"]) == ["AAA"]
+    junk = write_chunk(tmp_path, "chunk_0.json", "no json here")
+    payload, failed = rp.assemble(plan, [junk])
+    assert payload["sources"]["robinhood"] == {} and "AAA" in failed
+
+
+def test_existing_payload_is_never_overwritten(tmp_path):
+    plan = plan_for(tmp_path, ["AAA"])
+    chunk = write_chunk(tmp_path, "chunk_0.json", {"AAA": good_ticker()})
+    payload, failed = rp.assemble(plan, [chunk])
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "payload.json").write_text("{}")
+    assert rp.publish(plan, payload, failed, min_coverage=0.8) == 0
+    assert (out / "payload.json").read_text() == "{}"
+
+
+def test_due_slot_window():
+    assert rp.due_slot(DAY, time(14, 31)) == "1430"
+    assert rp.due_slot(DAY, time(14, 44)) == "1430"
+    assert rp.due_slot(DAY, time(14, 45)) is None
+    assert rp.due_slot(DAY, time(14, 30)) is None
+    assert rp.due_slot(DAY, time(15, 31)) is None  # 15:30 is Finance-primary and not covered
+
+
+def test_prompt_names_window_and_forbids_orders(tmp_path):
+    plan = plan_for(tmp_path, [])
+    text = rp.build_prompt(plan, ["AAA", "BBB"])
+    assert "AAA, BBB" in text and "13:30 ET" in text and "14:30 ET" in text
+    assert "Never call any order" in text
+
+
+def test_live_mirror_prompts_use_the_prebuilt_payload():
+    from pathlib import Path
+
+    mirror = Path(__file__).resolve().parents[1] / "claude" / "dca-executor-prompts" / "live-mirror"
+    for slot in rp.SLOTS:
+        (path,) = mirror.glob(f"{slot}ET-*.txt")
+        text = path.read_text(encoding="utf-8")
+        assert f"scripts.robinhood_payload plan --slot {slot}" in text, path.name
+        assert "do NOT hand-fetch bars" in text, path.name
+    assert not any("robinhood_payload" in p.read_text() for p in mirror.glob("1530ET-*.txt"))
+
+
+# -- chunk ownership (Codex adversarial review): a reply counts only for the tickers its own chunk was assigned ----
+
+
+def two_chunk_plan(tmp_path):
+    plan = plan_for(tmp_path, ["AAA", "BBB", "CCC", "DDD"])
+    plan["chunks"] = [["AAA", "BBB"], ["CCC", "DDD"]]
+    return plan
+
+
+def test_a_reply_never_overwrites_another_chunks_ticker(tmp_path, capsys):
+    plan = two_chunk_plan(tmp_path)
+    impostor = good_ticker()
+    impostor["quote"]["price"] = 10.05  # plausible, so validation alone would accept it
+    first = write_chunk(tmp_path, "chunk_0.json", {"AAA": good_ticker(), "BBB": good_ticker()})
+    second = write_chunk(tmp_path, "chunk_1.json", {"CCC": good_ticker(), "DDD": good_ticker(), "AAA": impostor})
+    payload, failed = rp.assemble(plan, [first, second])
+    assert failed == {}
+    assert payload["sources"]["robinhood"]["AAA"]["quote"]["price"] == 10.1  # chunk 0's own fetch, not chunk 1's
+    assert "chunk_1.json: ignored tickers it was not assigned: AAA" in capsys.readouterr().err
+
+
+def test_an_extra_key_is_dropped_even_when_its_owner_returned_nothing(tmp_path):
+    plan = two_chunk_plan(tmp_path)
+    first = write_chunk(tmp_path, "chunk_0.json", {"AAA": good_ticker(), "BBB": good_ticker(), "CCC": good_ticker()})
+    payload, failed = rp.assemble(plan, [first])
+    assert sorted(payload["sources"]["robinhood"]) == ["AAA", "BBB"]
+    assert failed["CCC"] == "no data returned for this ticker"
+
+
+def test_a_ticker_carried_by_two_accepted_replies_fails_instead_of_last_write_wins(tmp_path):
+    plan = two_chunk_plan(tmp_path)
+    first = write_chunk(tmp_path, "chunk_0.json", {"AAA": good_ticker(), "BBB": good_ticker()})
+    copy = tmp_path / "again"
+    copy.mkdir()
+    again = write_chunk(copy, "chunk_0.json", {"AAA": good_ticker(), "BBB": good_ticker()})
+    payload, failed = rp.assemble(plan, [first, again])
+    assert "AAA" not in payload["sources"]["robinhood"]
+    assert failed["AAA"].startswith("returned by more than one chunk reply")
+
+
+@pytest.mark.parametrize("name", ["c.json", "chunk_7.json", "chunk_x.json"])
+def test_a_reply_that_names_no_chunk_of_this_plan_is_not_merged(tmp_path, name):
+    plan = two_chunk_plan(tmp_path)
+    stray = write_chunk(tmp_path, name, {"AAA": good_ticker()})
+    payload, failed = rp.assemble(plan, [stray])
+    assert payload["sources"]["robinhood"] == {} and "AAA" in failed
+
+
+@pytest.mark.parametrize("chunks", [None, [], [["AAA", "BBB"], ["BBB", "CCC", "DDD"]], [["AAA", "BBB", "CCC"]],
+                                    [["AAA", "BBB"], ["CCC", "DDD", "ZZZ"]]])
+def test_a_plan_whose_chunks_do_not_partition_its_tickers_merges_nothing(tmp_path, chunks):
+    plan = two_chunk_plan(tmp_path)
+    if chunks is None:
+        del plan["chunks"]
+    else:
+        plan["chunks"] = chunks
+    with pytest.raises(rp.PayloadError):
+        rp.assemble(plan, [])
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan))
+    assert rp.main(["merge", "--plan", str(plan_path)]) == 2
+    assert not (tmp_path / "out").exists()

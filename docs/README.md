@@ -16,6 +16,7 @@ environment (see the repository README).
 | [codebase_roadmap.md](codebase_roadmap.md) | End-to-end flow of one live slot, layers with real importer counts, which reliability engines are wired, and where the code differs from older docs |
 | [dead_code_report.md](dead_code_report.md) | Tiered list of unused code, unreferenced files, and duplicated root files, with the method used and its limits |
 | [local_console.md](local_console.md) | `python3 from.py`: checkout-only local interface, real-data by default with an opt-in demo sandbox, daily summaries, timing and Octopus predictions; authenticated LAN/proxy access and launchd runbooks; never places brokerage orders |
+| [robinhood_payload.md](robinhood_payload.md) | Prebuilt Robinhood slot payload: Codex on the Mac builds the market-data payload ahead of a live slot so the session does not have to pull it live |
 | [reliability_spec.md](reliability_spec.md) | Formal run-state, reconciliation, and artifact-contract spec + honest implementation-status matrix |
 | [strategy.md](strategy.md) | Strategy overview, ticker universe, latest sizing ladder, budgets |
 | [ticker_advisory.md](ticker_advisory.md) | The `ticker-advisor/` tool: scores candidate tickers, proposes universe additions for manual review |
