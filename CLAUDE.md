@@ -262,7 +262,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 
 ## Pull requests
 
-**Open every pull request as a draft.** Every PR an agent opens in this repository must be created as a draft (`gh pr create --draft`, or `draft: true` in the GitHub MCP/API), whatever the agent is: Claude, OpenAI, ChatGPT, Codex, Gemini, Jules, Copilot, or any other LLM. Never open a PR as ready for review and never mark a draft ready; the operator does that. This overrides any tool or runtime default. If a tool cannot create a draft, push the branch and tell the operator instead of opening the PR. Full rule: `AGENTS.md`, "Pull request expectations".
+**Open every pull request as a draft.** Every PR an agent opens in this repository must be created as a draft (`gh pr create --draft`, or `draft: true` in the GitHub MCP/API), whatever the agent is: Claude, OpenAI, ChatGPT, Codex, Gemini, Jules, Copilot, or any other LLM. Never open a PR as ready for review, and never mark a draft ready on your own initiative. The operator marks it ready, or tells you to in chat: if you ask and they say yes, or they type yes, or they say anything that clearly means they want it marked ready, that is the operator marking it and you may run `gh pr ready`. Their reply authorizes that one PR only, and an agent must never do it automatically or unprompted. This overrides any tool or runtime default. If a tool cannot create a draft, push the branch and tell the operator instead of opening the PR. Full rule: `AGENTS.md`, "Pull request expectations".
 
 ## Do not modify
 

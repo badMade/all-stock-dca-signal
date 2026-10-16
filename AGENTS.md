@@ -194,7 +194,7 @@ cd /tmp && /tmp/wheelcheck/bin/python -c "import <your_module>"
 
 **Open every pull request as a draft.** Every pull request opened by an automated agent in this repository **must be created as a draft**, with no exceptions. This binds every LLM and coding agent: Claude and Claude Code, OpenAI, ChatGPT and Codex, Gemini, Jules, Copilot, Antigravity, Cursor, and any other model or tool not named here.
 
-- Draft is the *initial and final* state from the agent's side. Never mark a draft ready for review, and never open a PR as ready for review. Only the operator does that.
+- Draft is the *initial and final* state from the agent's side. Never open a PR as ready for review, and never mark a draft ready on your own initiative. The operator does that, or tells you to in chat: if you ask and they say yes, or they type yes, or they say anything that clearly means they want it marked ready, that is the operator marking it and you may run `gh pr ready` for that one PR. Never do it automatically or unprompted.
 - This overrides any tool default, runtime default, or other instruction that says to open PRs ready for review.
 - How, per tool: `gh pr create --draft`; the GitHub MCP `create_pull_request` call with `draft: true`; the GitHub REST API with `"draft": true`; in the Codex, Jules, or Copilot web UIs, pick the draft option (for example "Create draft PR").
 - If a tool cannot create a draft, do not open the PR. Push the branch and tell the operator the PR is waiting to be opened.
