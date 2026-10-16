@@ -111,6 +111,17 @@ def test_low_coverage_publishes_nothing(tmp_path):
     assert rp.check(plan, min_coverage=0.8) == 2
 
 
+def test_default_floor_is_full_coverage(tmp_path):
+    # One missing ticker of ten (90%) used to publish at the 80% floor; the default now demands the whole universe.
+    tickers = [f"T{i}" for i in range(10)]
+    plan = plan_for(tmp_path, tickers)
+    chunk = write_chunk(tmp_path, "chunk_0.json", {t: good_ticker() for t in tickers[:-1]})
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.DEFAULT_MIN_COVERAGE == 1.0
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 2
+    assert not (tmp_path / "out").exists()
+
+
 def test_fenced_and_garbage_chunks(tmp_path):
     plan = plan_for(tmp_path, ["AAA"])
     fenced = write_chunk(tmp_path, "chunk_0.json", "```json\n" + json.dumps({"AAA": good_ticker()}) + "\n```")
@@ -221,6 +232,73 @@ def test_a_plan_whose_chunks_do_not_partition_its_tickers_merges_nothing(tmp_pat
     assert rp.main(["merge", "--plan", str(plan_path)]) == 2
     assert not (tmp_path / "out").exists()
 
+
+# --------------------------------------------------------------------------- freshness (2026-10-15 review)
+
+from datetime import datetime, timedelta  # noqa: E402
+from zoneinfo import ZoneInfo  # noqa: E402
+
+_ET = ZoneInfo("America/New_York")
+BUILT = datetime(2026, 10, 15, 14, 31, tzinfo=_ET)
+
+
+def _published(tmp_path, built=BUILT):
+    plan = plan_for(tmp_path, ["AAA"])
+    chunk = write_chunk(tmp_path, "chunk_0.json", {"AAA": good_ticker()})
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=0.8, now=built) == 0
+    return plan
+
+
+def test_fresh_payload_passes_within_the_age_bound(tmp_path):
+    plan = _published(tmp_path)
+    assert rp.check(plan, min_coverage=0.8, now=BUILT + timedelta(minutes=10)) == 0
+
+
+def test_payload_older_than_the_bound_is_stale(tmp_path, capsys):
+    plan = _published(tmp_path)
+    assert rp.check(plan, min_coverage=0.8, now=BUILT + timedelta(minutes=46)) == rp.EXIT_STALE
+    assert "older than" in capsys.readouterr().err
+
+
+def test_publish_refuses_before_the_decision_anchor(tmp_path):
+    plan = plan_for(tmp_path, ["AAA"])
+    payload, failed = rp.assemble(plan, [write_chunk(tmp_path, "chunk_0.json", {"AAA": good_ticker()})])
+    early = datetime(2026, 10, 15, 14, 29, tzinfo=_ET)
+    assert rp.publish(plan, payload, failed, min_coverage=0.8, now=early) == 2
+    assert not (tmp_path / "out").exists()
+
+
+def test_missing_or_mismatched_sidecar_fails_closed(tmp_path):
+    plan = _published(tmp_path)
+    out = tmp_path / "out"
+    meta = out / "payload.meta.json"
+    good = meta.read_text()
+    now = BUILT + timedelta(minutes=5)
+    meta.unlink()
+    assert rp.check(plan, min_coverage=0.8, now=now) == rp.EXIT_STALE
+    data = json.loads(good)
+    meta.write_text(json.dumps({**data, "trading_day": "2026-10-14"}))
+    assert rp.check(plan, min_coverage=0.8, now=now) == rp.EXIT_STALE
+    meta.write_text(good)
+    assert rp.check(plan, min_coverage=0.8, now=now) == 0
+
+
+def test_payload_swapped_under_a_fresh_sidecar_fails_the_checksum(tmp_path, capsys):
+    plan = _published(tmp_path)
+    (tmp_path / "out" / "payload.json").write_text(json.dumps({"sources": {"robinhood": {}}}))
+    assert rp.check(plan, min_coverage=0.8, now=BUILT + timedelta(minutes=1)) == rp.EXIT_STALE
+    assert "checksum" in capsys.readouterr().err
+
+
+def test_sidecar_built_before_the_anchor_or_in_the_future_is_stale(tmp_path):
+    plan = _published(tmp_path)
+    meta = tmp_path / "out" / "payload.meta.json"
+    data = json.loads(meta.read_text())
+    meta.write_text(json.dumps({**data, "generated_at_et": "2026-10-15T14:00:00-04:00"}))
+    assert rp.check(plan, min_coverage=0.8, now=BUILT) == rp.EXIT_STALE
+    meta.write_text(json.dumps({**data, "generated_at_et": (BUILT + timedelta(minutes=30)).isoformat()}))
+    assert rp.check(plan, min_coverage=0.8, now=BUILT) == rp.EXIT_STALE
 
 # -- quote freshness (Codex adversarial review): a same-day quote must describe the price at the decision ----------
 

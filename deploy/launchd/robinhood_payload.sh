@@ -48,8 +48,17 @@ esac
 
 OUT="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["out"])' "$WORK/plan.json")"
 if [ -e "$OUT" ]; then
-  echo "robinhood_payload: $OUT already exists; leaving it in place"
-  exit 0
+  # Reuse only a payload that is provably fresh for THIS slot (built after the decision time, within the age
+  # bound, matching its sidecar checksum). A leftover from an earlier attempt is set aside, never overwritten
+  # or scored, and the payload is rebuilt (2026-10-15 adversarial review).
+  if "$PY" -m scripts.robinhood_payload check --plan "$WORK/plan.json" >/dev/null 2>"$WORK/reuse.err"; then
+    echo "robinhood_payload: $OUT already exists and is fresh; leaving it in place"
+    exit 0
+  fi
+  echo "robinhood_payload: existing payload is not reusable ($(tr '\n' ' ' <"$WORK/reuse.err")); setting it aside and rebuilding" >&2
+  STAMP="$(date +%s)"
+  mv "$OUT" "${OUT%.json}.stale-$STAMP.json"
+  [ -e "${OUT%.json}.meta.json" ] && mv "${OUT%.json}.meta.json" "${OUT%.json}.stale-$STAMP.meta.json"
 fi
 
 # One codex call per chunk of tickers, a few at a time. A chunk that times out or errors simply leaves its

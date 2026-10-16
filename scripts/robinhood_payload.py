@@ -25,6 +25,7 @@ The 3:30 PM slot is Finance-primary and is deliberately not covered here.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -52,8 +53,17 @@ BAR_START_ET = {
 SLOTS = tuple(BAR_START_ET)
 
 DEFAULT_CHUNK_SIZE = 8
-#: Share of the universe that must validate before a payload is published at all.
-DEFAULT_MIN_COVERAGE = 0.8
+#: Share of the universe that must validate before a payload is published at all. 1.0 (2026-10-15 adversarial
+#: review): the generator scores each ticker alone, but Gate 6 allocates a binding cap by allocation_priority, so a
+#: missing high-priority ticker silently hands its budget to lower-priority names and reads as 'no signal'.
+DEFAULT_MIN_COVERAGE = 1.0
+#: A payload is built one minute after the decision time and read by a session inside the slot's ~25-minute
+#: window; anything older than this was left by an earlier attempt and is rebuilt or refused, never scored as
+#: current (2026-10-15 adversarial review: a retry reused a prior payload with no age bound).
+DEFAULT_MAX_AGE_MINUTES = 45
+#: Clock skew tolerated between the builder and the checker (same Mac, so seconds; generous on purpose).
+FUTURE_SKEW = timedelta(minutes=2)
+EXIT_STALE = 6
 #: Launchd fires one minute after the decision time (the decision bar's predecessor has closed); a late wake is
 #: accepted for up to 14 minutes, after which a payload helps nobody -- the session has already run Gate 5.
 AUTO_MIN_AFTER = 1
@@ -401,7 +411,20 @@ def _validate_entries(
     return payload, failed
 
 
-def publish(plan: dict[str, Any], payload: dict[str, Any], failed: dict[str, str], *, min_coverage: float) -> int:
+def publish(
+    plan: dict[str, Any],
+    payload: dict[str, Any],
+    failed: dict[str, str],
+    *,
+    min_coverage: float,
+    now: datetime | None = None,
+) -> int:
+    now = now or datetime.now(ET)
+    anchor = datetime.combine(date.fromisoformat(plan["trading_day"]), time.fromisoformat(plan["decision_time_et"]), ET)
+    if now < anchor:
+        # The decision bar's predecessor has not closed yet: the newest bar would be a still-forming one.
+        print(f"robinhood_payload: built at {now:%H:%M} ET, before the {anchor:%H:%M} anchor; publishing nothing", file=sys.stderr)
+        return 2
     universe = len(plan["tickers"])
     ok = len(payload["sources"]["robinhood"])
     coverage = ok / universe
@@ -422,16 +445,19 @@ def publish(plan: dict[str, Any], payload: dict[str, Any], failed: dict[str, str
     meta = {
         "slot": plan["slot"],
         "trading_day": plan["trading_day"],
-        "generated_at_et": datetime.now(ET).isoformat(),
+        "generated_at_et": now.isoformat(),
         "fetched_by": "codex exec via robinhood-trading MCP (scripts/robinhood_payload.py)",
         "universe": universe,
         "valid": ok,
         "failed": failed,
     }
+    body = json.dumps(payload, indent=1)
+    # Binds the sidecar to THIS file's bytes, so a payload paired with a fresher sidecar fails `check`.
+    meta["payload_sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
     fd, tmp = tempfile.mkstemp(prefix=out.name + ".", dir=out.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=1)
+            handle.write(body)
         # ln-style no-overwrite publish: a concurrent run that finished first wins, nobody sees a partial file.
         try:
             os.link(tmp, out)
@@ -445,12 +471,55 @@ def publish(plan: dict[str, Any], payload: dict[str, Any], failed: dict[str, str
     return 0
 
 
-def check(plan: dict[str, Any], *, min_coverage: float) -> int:
-    """Re-validate the published payload for ``plan``'s slot; non-zero exit means 'treat as unavailable'."""
+def _freshness_problem(plan: dict[str, Any], out: Path, now: datetime, max_age_minutes: int) -> str | None:
+    """Why ``out`` cannot be treated as THIS slot's current payload, or None when it can.
+
+    Uses the sidecar written by ``publish`` (a quote's ``as_of`` cannot stand in: it is the last-trade or
+    snapshot time and is legitimately old for an illiquid ticker). Fails closed on a missing or mismatched sidecar.
+    """
+    meta_path = out.with_suffix(".meta.json")
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        generated = datetime.fromisoformat(meta["generated_at_et"])
+        digest = meta["payload_sha256"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return f"no usable sidecar {meta_path.name} ({exc.__class__.__name__}); cannot prove when it was built"
+    if generated.tzinfo is None:
+        return "sidecar generated_at_et is not timezone-aware"
+    if meta.get("slot") != plan["slot"] or meta.get("trading_day") != plan["trading_day"]:
+        return f"sidecar is for {meta.get('trading_day')} {meta.get('slot')}, not {plan['trading_day']} {plan['slot']}"
+    if hashlib.sha256(out.read_bytes()).hexdigest() != digest:
+        return "payload does not match its sidecar checksum"
+    anchor = datetime.combine(date.fromisoformat(plan["trading_day"]), time.fromisoformat(plan["decision_time_et"]), ET)
+    if generated < anchor:
+        return f"built at {generated:%H:%M} ET, before the {anchor:%H:%M} anchor"
+    if generated - now > FUTURE_SKEW:
+        return f"built at {generated:%H:%M:%S} ET, which is in the future"
+    age = now - generated
+    if age > timedelta(minutes=max_age_minutes):
+        return f"built {int(age.total_seconds() // 60)} minutes ago, older than the {max_age_minutes}-minute bound"
+    return None
+
+
+def check(
+    plan: dict[str, Any],
+    *,
+    min_coverage: float,
+    now: datetime | None = None,
+    max_age_minutes: int = DEFAULT_MAX_AGE_MINUTES,
+) -> int:
+    """Re-validate the published payload for ``plan``'s slot; non-zero exit means 'treat as unavailable'.
+
+    Exit 6 means specifically 'stale or unprovable age': the launcher rebuilds on it, a session aborts on it.
+    """
     out = Path(plan["out"])
     if not out.is_file():
         print(f"robinhood_payload: missing {out}", file=sys.stderr)
         return 2
+    problem = _freshness_problem(plan, out, now or datetime.now(ET), max_age_minutes)
+    if problem:
+        print(f"robinhood_payload: stale payload {out.name}: {problem}", file=sys.stderr)
+        return EXIT_STALE
     payload = json.loads(out.read_text(encoding="utf-8"))
     # Already merged by `merge`, so chunk ownership is behind it: re-run only the per-ticker validation.
     rebuilt, _failed = _validate_entries(plan, payload["sources"]["robinhood"])
@@ -498,6 +567,8 @@ def main(argv: list[str] | None = None) -> int:
     p_check = sub.add_parser("check", help="validate a published payload")
     p_check.add_argument("--plan", required=True)
     p_check.add_argument("--min-coverage", type=float, default=DEFAULT_MIN_COVERAGE)
+    p_check.add_argument("--max-age-minutes", type=int, default=DEFAULT_MAX_AGE_MINUTES)
+    p_check.add_argument("--now", default=None, help="ISO tz-aware clock override (tests and replays only)")
 
     args = parser.parse_args(argv)
     if args.cmd == "plan":
@@ -526,7 +597,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"robinhood_payload: {exc}; nothing published", file=sys.stderr)
             return 2
         return publish(plan, payload, failed, min_coverage=args.min_coverage)
-    return check(plan, min_coverage=args.min_coverage)
+    now = datetime.fromisoformat(args.now).astimezone(ET) if args.now else None
+    return check(plan, min_coverage=args.min_coverage, now=now, max_age_minutes=args.max_age_minutes)
 
 
 if __name__ == "__main__":
