@@ -40,41 +40,131 @@ def run_cmd(cmd: Sequence[str]):
 def compute_cadence():
     """
     Computes a cron schedule based on recent git activity.
-    Uses `git log` to count commits in the last 30 days and chooses a coarse cadence.
-    Also extracts hour-of-day commit frequency to find the quietest window.
+    Implements the 5-tier self-scheduling logic, dynamically computing
+    intervals and finding the quietest contiguous window for the execution hour.
     """
+    import collections
+    import datetime
+    import json
+
+    # 1. Telemetry sources (rolling lookback window)
     commits_output = run_cmd(["git", "log", "--since=30 days ago", "--format=%aI"])
     if commits_output is None:
         raise RuntimeError("`git log` failed; refusing to compute a cadence from missing telemetry.")
 
-    if not commits_output:
-        return "0 2 * * 0", "No recent commits, using fallback dormant cadence."
+    thirty_days_ago = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=30)).strftime('%Y-%m-%d')
+    pr_output = run_cmd(["gh", "pr", "list", "--state", "merged", "--search", f"merged:>={thirty_days_ago}", "--json", "mergedAt", "--limit", "100"])
 
-    commits = commits_output.split("\n")
-    num_commits = len(commits)
-
-    # Keep the execution hour pinned to 03:00 UTC. The cadence logic only varies
-    # by frequency; CI/tests and self-heal docs rely on this fixed hour.
-
-    # Keep the execution hour fixed. Cadence changes frequency only.
-    run_hour = "03"
-
-    # Adjustment triggers check
+    ci_output = run_cmd(["gh", "run", "list", "--workflow=ci", "--json", "conclusion", "--limit", "50"]) or ""
+    ci_failure_rate = 0.0  # noqa: F841
     try:
-        # Check empty selfheal runs (just PR velocity check here)
-        _ = run_cmd(["gh", "pr", "list", "--label", "self-heal", "--json", "state,createdAt"])
-        # Simplified telemetry logic
+        ci_runs = json.loads(ci_output)
+        failures = sum(1 for r in ci_runs if r.get("conclusion") in ["failure", "timed_out", "action_required"])
+        if len(ci_runs) > 0:
+            ci_failure_rate = failures / len(ci_runs)  # noqa: F841
     except Exception:
         pass
 
-    display_hour = int(run_hour)
-    if num_commits > 50:
-        return f"0 {display_hour} * * *", f"High PR velocity (>50 commits/mo); running daily at {display_hour}:00."
-    elif num_commits > 10:
-        return f"0 {display_hour} * * 1,4", f"Active velocity; running twice a week at {display_hour}:00."
+    pr_count = 0
+    if pr_output:
+        try:
+            pr_data = json.loads(pr_output)
+            pr_count = len(pr_data)
+        except Exception:
+            pr_count = len(commits_output.split("\n")) if commits_output else 0
     else:
-        return f"0 {display_hour} * * 1", f"Standard velocity; running weekly at {display_hour}:00."
+        # Fallback to git log commits as a proxy for velocity if gh fails
+        pr_count = len(commits_output.split("\n")) if commits_output else 0
 
+    commits = [c for c in commits_output.split("\n") if c] if commits_output else []
+
+    # 2. Active-period detection
+    hour_counts = collections.defaultdict(int)
+    for c in commits:
+        if "T" in c:
+            try:
+                hour = int(c.split("T")[1][:2])
+                hour_counts[hour] += 1
+            except (IndexError, ValueError):
+                pass
+
+    min_commits = float('inf')
+    best_start_hour = 3 # default fallback
+    for i in range(24):
+        window_sum = sum(hour_counts[(i + j) % 24] for j in range(4))
+        if window_sum < min_commits:
+            min_commits = window_sum
+            best_start_hour = i
+
+    run_hour = str(best_start_hour)
+
+    if not commits:
+        return f"0 {run_hour} 1 * *", "No recent commits, using fallback dormant cadence."
+
+    # 3. Adjustment triggers
+    tier_adjustment = 0
+
+    # Check for 3+ consecutive empty selfheal runs -> reduce frequency by 1 tier
+    try:
+        sh_runs_output = run_cmd(["gh", "run", "list", "--workflow=self-heal.yml", "--json", "conclusion,createdAt", "--limit", "10"])
+        sh_prs_output = run_cmd(["gh", "pr", "list", "--label", "self-heal", "--state", "all", "--json", "createdAt", "--limit", "10"])
+
+        if sh_runs_output and sh_prs_output:
+            sh_runs = json.loads(sh_runs_output)
+            sh_prs = json.loads(sh_prs_output)
+
+            # Count runs that occurred after the most recent PR
+            latest_pr_time = sh_prs[0]["createdAt"] if sh_prs else ""
+            empty_runs_since_last_pr = 0
+
+            for run in sh_runs:
+                if run.get("createdAt", "") > latest_pr_time:
+                    empty_runs_since_last_pr += 1
+                else:
+                    break
+
+            if empty_runs_since_last_pr >= 3:
+                tier_adjustment -= 1
+    except Exception:
+        pass
+
+    # Check for 3+ consecutive successful PR merges -> increase frequency by 1 tier
+    try:
+        recent_prs_output = run_cmd(["gh", "pr", "list", "--state", "all", "--json", "state", "--limit", "3"])
+        if recent_prs_output:
+            recent_prs = json.loads(recent_prs_output)
+            if len(recent_prs) >= 3 and all(pr.get("state") == "MERGED" for pr in recent_prs):
+                tier_adjustment += 1
+    except Exception:
+        pass
+
+    # 4. Cadence tiers (computed from telemetry)
+    tier = 2 # 0: dormant, 1: low, 2: standard, 3: active, 4: high
+
+    if pr_count > 30:
+        tier = 4
+    elif pr_count > 15:
+        tier = 3
+    elif pr_count > 5:
+        tier = 2
+    elif pr_count > 0:
+        tier = 1
+    else:
+        tier = 0
+
+    tier += tier_adjustment
+    tier = max(0, min(4, tier))
+
+    if tier == 4:
+        return f"0 {run_hour} * * *", f"High PR velocity; running daily at {run_hour}:00."
+    elif tier == 3:
+        return f"0 {run_hour} */2 * *", f"Active velocity; running every 2 days at {run_hour}:00."
+    elif tier == 2:
+        return f"0 {run_hour} */3 * *", f"Standard velocity; running every 3 days at {run_hour}:00."
+    elif tier == 1:
+        return f"0 {run_hour} */7 * *", f"Low-churn velocity; running weekly at {run_hour}:00."
+    else:
+        return f"0 {run_hour} 1 * *", f"Dormant velocity; running monthly at {run_hour}:00."
 
 def update_schedule_file(schedule: str, rationale: str, file_path: str, *, override: bool = False) -> None:
     import os
