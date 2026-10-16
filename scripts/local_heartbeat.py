@@ -37,10 +37,38 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import dca_execution_router as router
-import dca_paths
-from scripts.file_lock import cross_process_lock
-from scripts.scheduler_lease import SchedulerLease, window_key
+MIN_PYTHON = (3, 11)  # mirrors ``requires-python`` in pyproject.toml
+
+
+def require_supported_python(version_info) -> None:
+    """Exit 1 with one JSON line when the interpreter is older than ``MIN_PYTHON``.
+
+    2026-10-16 09:49 ET: the Mac shell fallback ran Python 3.9, so a probe that should have answered died on an import
+    or syntax error with no usable reason. The backup prompt reads a non-zero exit as ``local_status`` unknown and
+    stands down, so refusing here keeps that outcome and makes the cause readable. Called before any project import.
+    """
+    if tuple(version_info[:2]) >= MIN_PYTHON:
+        return
+    print(
+        json.dumps(
+            {
+                "ok": False,
+                "reason": "python_too_old",
+                "required": ".".join(str(part) for part in MIN_PYTHON),
+                "found": ".".join(str(part) for part in version_info[:3]),
+            },
+            sort_keys=True,
+        )
+    )
+    sys.exit(1)
+
+
+require_supported_python(sys.version_info)
+
+import dca_execution_router as router  # noqa: E402  (must follow the version guard)
+import dca_paths  # noqa: E402
+from scripts.file_lock import cross_process_lock  # noqa: E402
+from scripts.scheduler_lease import SchedulerLease, window_key  # noqa: E402
 
 STREAM = "primary"
 # Fail closed: a state lock that cannot be taken within its timeout is UNKNOWN and the backup stands down.
