@@ -4614,6 +4614,21 @@ def test_no_live_slot_gate_5_reads_a_prefetched_fallback():
             assert retired not in text, (mirror.name, retired)
 
 
+def test_no_prompt_draft_or_signal_doc_points_at_the_retired_prefetch_helper():
+    """2026-10-15 2:30 slot: a session followed a prompt that still told it to run the deleted
+    ``deploy/launchd/prefetch_slot.sh`` and aborted at Gate 5. The live-mirror guard above did not cover the
+    superseded drafts or the docs a session may read, so keep them from naming the retired helper too."""
+    root = REPO_ROOT
+    paths = sorted((PROMPTS_DIR / "drafts").glob("*.txt"))
+    paths += [root / "docs" / name for name in ("safeguards.md", "morning_signal_entry.md", "market_open_signal_entry.md")]
+    assert paths
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        assert "prefetch_slot" not in text, path.name
+        assert "PREFETCHED YFINANCE FALLBACK" not in text, path.name
+    assert not (root / "deploy" / "launchd" / "prefetch_slot.sh").exists()
+
+
 def test_robinhood_slots_never_record_a_skipped_fetch_as_a_robinhood_source_error():
     """2026-10-05 9:35 run: the session skipped its Robinhood fetch to stay under the
     tool output cap, then listed "robinhood" in source_errors because the prompt said

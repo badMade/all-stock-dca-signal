@@ -145,13 +145,12 @@ executor sessions here have no reliable Finance MCP connector access, and the
 repo's own fail-closed Gate 5 correctly refuses to fabricate `sources.finance`
 from Robinhood data rather than substitute silently. GFUZ is no longer a
 special case: every ticker on this slot, GFUZ included, is scored from
-Robinhood the same way. `sources.yahoo_finance_yfinance` is the **labeled
-fallback** (since 2026-09-22), under the same Robinhood-primary rule as 1030ET:
-`scripts/stream_candidates.py`'s `run_cli()` switches the whole universe to it
-only when Robinhood failed as a whole (listed in `source_errors`, absent, or no
-scored ticker fresh for the slot), never over one ticker's gap, and still
-aborts when no yfinance block is present. `deploy/launchd/prefetch_slot.sh`
-writes that block outside the session. `sources.finance` and `sources.alpaca` are not
+Robinhood the same way. There is **no fallback source** (retired 2026-10-12;
+it ran from 2026-09-22 and its launchd prefetch helper is gone, see
+`tests/test_yfinance_retired.py`): `scripts/stream_candidates.py`'s `run_cli()`
+aborts Gate 5 when Robinhood fails as a whole (listed in `source_errors`,
+absent, or no scored ticker fresh for the slot). `sources.finance`,
+`sources.alpaca` and `sources.yahoo_finance_yfinance` are not
 accepted keys at all for this slot -- either raises `"unsupported key(s)"`,
 not a validation/context acceptance.
 
@@ -179,9 +178,9 @@ for one is valid for the other:
   within one 5-minute interval of the decision moment; otherwise the completed
   09:30 bar's close is the decision price, exactly as live.
 - `sources.robinhood` is required and is the policy-selected PRIMARY signal source
-  for this slot (see the market-data source note above). `sources.yahoo_finance_yfinance`
-  is accepted as a key but never substitutes for a missing/errored `robinhood`
-  entry on this slot; `sources.finance` and `sources.alpaca` are rejected outright.
+  for this slot (see the market-data source note above). `sources.finance`,
+  `sources.alpaca` and `sources.yahoo_finance_yfinance` are rejected outright;
+  nothing substitutes for a missing/errored `robinhood` entry.
 - Listing `"robinhood"` in `source_errors` **aborts**. This slot has one source, so
   a failed fetch leaves nothing to score, and a zero-candidate document would be
   indistinguishable from a genuinely quiet tape that Gate 5 ends silently on.

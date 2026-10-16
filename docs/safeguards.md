@@ -211,11 +211,12 @@ here. See that README for the full caveat.
   closes, spreads, and trend inputs.
 - **Alpaca and Robinhood provide validation / context** on top of the primary
   source.
-- **Yahoo Finance via `yfinance` is a FALLBACK ONLY**, used when the Finance
-  connector data is unavailable, stale, incomplete, or unresolved. Fallback data
-  **must be labeled as fallback** and must **not** weaken confidence, spread,
-  trend, top-up, budget, whitelist, buy-only, regular-hours-only, or any other
-  safety rule.
+- **There is no Yahoo Finance / `yfinance` fallback for any scheduled run**
+  (retired 2026-10-12). When the Finance connector is unusable the 3:30 slot
+  reconciles on Robinhood alone, and the Robinhood-primary slots abort with
+  nothing placed. Any degraded-mode data must still **not** weaken confidence,
+  spread, trend, top-up, budget, whitelist, buy-only, regular-hours-only, or any
+  other safety rule.
 - **Robinhood remains the only execution broker** regardless of which source
   produced the market data.
 - **GFUZ exception:** GFUZ may use **Robinhood as its PRIMARY** source when the
@@ -227,14 +228,14 @@ here. See that README for the full caveat.
   `42173154`) uses **Robinhood as its PRIMARY** source for this slot only, and
   has **no automatic fallback**: Finance and Alpaca are not accepted
   `--market-data` keys for this slot at all (an unsupported-key error, not
-  validation/context). Since 2026-09-22 a labeled `yfinance` payload IS
-  substituted -- for the whole universe -- when Robinhood failed as a whole
-  (listed in `source_errors`, absent, or no scored ticker fresh for the slot),
-  never over one ticker's gap; with no yfinance block present, a genuine
-  Robinhood outage still aborts this slot's Gate 5. The 11:30, 1:30 and 2:30
-  intraday slots are Robinhood-primary under the same rule. The payload is
-  prefetched outside any session by `deploy/launchd/prefetch_slot.sh`
-  (`deploy/launchd/PREFETCH.md`). Confirmed 2026-09-09 as this slot's
+  validation/context). Since 2026-10-12 there is **no fallback source at all**:
+  a `yfinance` key is an unsupported key too, no launchd job writes such a
+  payload, and a Robinhood outage (listed in `source_errors`, absent, or no
+  scored ticker fresh for the slot) aborts this slot's Gate 5 with nothing
+  placed. (From 2026-09-22 to 2026-10-12 a labeled `yfinance` payload was
+  substituted for the whole universe; that behavior is retired.) The 11:30,
+  1:30 and 2:30 intraday slots are Robinhood-primary under the same rule.
+  Confirmed 2026-09-09 as this slot's
   deliberate policy rather than the Finance-primary default every other slot
   uses -- see
   [morning_signal_entry.md](morning_signal_entry.md#market-data-source-for-this-slot)
@@ -242,9 +243,8 @@ here. See that README for the full caveat.
 - **0935ET slot exception:** the 9:35 AM market-open slot's Gate 5 entry point
   (`scripts/generate_market_open_candidates.py`, `MARKET_OPEN_SPEC.source`,
   cron `2ba19526`) uses **Robinhood as its PRIMARY** source too, for the same
-  reason and with the same fallback contract as the 1030ET exception above
-  (Finance/Alpaca rejected outright, `yfinance` substituted only when Robinhood
-  failed as a whole).
+  reason and under the same no-fallback rule as the 1030ET exception above
+  (Finance/Alpaca/`yfinance` rejected outright; a Robinhood outage aborts).
   GFUZ is no longer a special case on this slot -- every ticker, GFUZ
   included, is scored from Robinhood the same way, so the GFUZ exception
   above no longer applies to this slot's Gate 5 CLI specifically (it still
