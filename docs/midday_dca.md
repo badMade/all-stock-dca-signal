@@ -271,8 +271,8 @@ If the runner requires a `RUN_DATE_ET` argument, pass the current
 America/New_York date as `YYYYMMDD`. The task **must not** assume
 `raw/quotes.json` or historicals already exist from a prior run. Inputs come from
 Robinhood (5-minute and daily bars plus quotes, the same source as every other
-Robinhood-primary slot), with the labeled `yfinance` fallback **only** when
-Robinhood failed as a whole (see
+Robinhood-primary slot), with no data-source fallback (the `yfinance` one was retired
+2026-10-12): a Robinhood failure as a whole aborts (see
 [safeguards.md](safeguards.md#market-data-source-policy)).
 If raw input generation fails once, perform **one** bounded recovery attempt with
 the alternate approved data source path, then stop.

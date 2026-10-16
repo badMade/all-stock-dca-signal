@@ -178,8 +178,7 @@ a `RUN_DATE_ET` argument, pass the current America/New_York date as `YYYYMMDD`. 
 Robinhood-primary**, not Finance-primary like the rest of the roster, and it has
 **no automatic data-source fallback**: Finance and Alpaca are not accepted
 `--market-data` keys for this slot at all (an unsupported-key error, not
-validation/context), and `yfinance`, while an accepted key, cannot substitute
-for a Robinhood outage the way it can for the Finance-primary slots -- a
+validation/context), and `yfinance` (retired 2026-10-12) is rejected too -- a
 `robinhood` entry in `source_errors` still aborts Gate 5 (see
 [safeguards.md](safeguards.md#market-data-source-policy)'s 1030ET slot
 exception and `docs/morning_signal_entry.md`). If raw input generation

@@ -20,9 +20,11 @@ jobs:
   test:
     name: Lint & test (core DCA)
     runs-on: ubuntu-26.04
-    # The suite runs in well under a minute. A generous ceiling that still stops
-    # a hung job from burning the full 6-hour runner default.
-    timeout-minutes: 15
+    # The suite (~12k tests) now takes ~13-15 minutes on a cold runner; the old
+    # 15-minute ceiling cancelled the 3.12 leg after its tests had passed
+    # on PR 1712. Still a ceiling that stops a hung job from burning the
+    # full 6-hour runner default.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

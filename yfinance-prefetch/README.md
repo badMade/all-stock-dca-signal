@@ -46,11 +46,12 @@ an order, and is read-only against the DCA strategy's own state.**
 
 ## Scheduled use
 
-`deploy/launchd/prefetch_slot.sh` runs this script one minute after every
-live slot's decision time and writes the payload to
-`<cron root>/yfinance_prefetch/<YYYY-MM-DD>/yfinance_fallback_<YYYY-MM-DD>_<HHMM>.json`,
-where each slot's Gate 5 merges it. Every slot's generator accepts it as a
-fallback since 2026-09-22 (see `deploy/launchd/PREFETCH.md`).
+None. The yfinance fallback was removed from every scheduled run on 2026-10-12
+(692b5887), along with `deploy/launchd/prefetch_slot.sh` and its planner, plist
+and docs; the candidate generators now reject a `yfinance` source as an
+unsupported key. This tool is kept as an unscheduled research helper only.
+Robinhood-primary slots get their payload from `deploy/launchd/robinhood_payload.sh`
+(see `docs/robinhood_payload.md`).
 
 ## Usage
 

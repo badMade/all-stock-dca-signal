@@ -503,8 +503,8 @@ manual missed-morning recovery, and manual override roots, and the historical /
 trend bars needed for the trend check. If a runner requires a `RUN_DATE_ET`
 argument, pass the current America/New_York date as `YYYYMMDD`. Do **not** reuse
 stale files. Inputs come from the Finance connector primary, Alpaca and Robinhood
-validation / context, and `yfinance` fallback **only** when connector data is
-unavailable, stale, incomplete, or unresolved. If raw input generation fails once,
+validation / context. There is no `yfinance` fallback (retired 2026-10-12); the
+3:30 slot reconciles on Robinhood alone when Finance is unusable. If raw input generation fails once,
 perform **one** bounded recovery attempt on the alternate approved data source
 path, then stop.
 

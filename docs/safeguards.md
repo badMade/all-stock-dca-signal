@@ -235,6 +235,8 @@ here. See that README for the full caveat.
   placed. (From 2026-09-22 to 2026-10-12 a labeled `yfinance` payload was
   substituted for the whole universe; that behavior is retired.) The 11:30,
   1:30 and 2:30 intraday slots are Robinhood-primary under the same rule.
+  Their payload is built on the Mac, outside any session, by
+  `deploy/launchd/robinhood_payload.sh` ([robinhood_payload.md](robinhood_payload.md)).
   Confirmed 2026-09-09 as this slot's
   deliberate policy rather than the Finance-primary default every other slot
   uses -- see
