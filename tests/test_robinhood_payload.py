@@ -220,3 +220,38 @@ def test_a_plan_whose_chunks_do_not_partition_its_tickers_merges_nothing(tmp_pat
     plan_path.write_text(json.dumps(plan))
     assert rp.main(["merge", "--plan", str(plan_path)]) == 2
     assert not (tmp_path / "out").exists()
+
+
+# -- quote freshness (Codex adversarial review): a same-day quote must describe the price at the decision ----------
+
+
+@pytest.mark.parametrize(
+    "as_of, needle",
+    [
+        ("2026-10-15T15:10:00Z", "stale"),            # 11:10 ET: hours before the 14:30 decision
+        ("2026-10-15T18:24:59Z", "stale"),            # 14:24:59 ET: older than the newest completed bar's start
+        ("2026-10-15T19:00:01Z", "too long after"),   # 15:00:01 ET: past decision + 30 min
+    ],
+)
+def test_a_quote_outside_the_decision_window_is_rejected(as_of, needle):
+    raw = good_ticker()
+    raw["quote"]["as_of"] = as_of
+    with pytest.raises(rp.PayloadError, match=needle):
+        rp.validate_ticker(raw, **kw())
+
+
+@pytest.mark.parametrize("as_of", ["2026-10-15T18:25:00Z", "2026-10-15T18:30:00Z", "2026-10-15T19:00:00Z"])
+def test_a_quote_inside_the_decision_window_passes(as_of):
+    raw = good_ticker()
+    raw["quote"]["as_of"] = as_of
+    assert rp.validate_ticker(raw, **kw())["quote"]["price"] == 10.1
+
+
+def test_a_future_stamped_quote_is_rejected_against_the_validating_clock():
+    from datetime import datetime
+
+    raw = good_ticker()  # quote at 14:31 ET
+    now = datetime(2026, 10, 15, 14, 28, tzinfo=rp.ET)  # more than the 2-minute skew before it
+    with pytest.raises(rp.PayloadError, match="in the future"):
+        rp.validate_ticker(raw, **kw(), now=now)
+    assert rp.validate_ticker(raw, **kw(), now=datetime(2026, 10, 15, 14, 30, tzinfo=rp.ET))  # within the skew

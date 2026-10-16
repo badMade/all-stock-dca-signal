@@ -60,6 +60,14 @@ AUTO_MIN_AFTER = 1
 AUTO_MAX_AFTER = 15
 #: A quote further than this from its own last bar close is treated as a transcription error, not a gap move.
 MAX_QUOTE_VS_LAST_CLOSE = 0.25
+#: Quote freshness, measured from the slot's decision time (Codex adversarial review: a same-day quote from hours
+#: earlier passed, and the payload feeds Gate 5's candidate list). Not before the newest completed bar the series
+#: must carry (decision minus one interval), so it describes the price at the decision; and not after this, which
+#: covers launchd's AUTO_MAX_AFTER window plus the worst-case chunk rounds (3 x 240 s) of the fetch. A quote stamped
+#: later belongs to a re-run hours after the slot, not to this slot's decision.
+QUOTE_MAX_AFTER_DECISION = timedelta(minutes=30)
+#: Clock skew allowed between the worker's quote timestamp and the validating host; beyond it the stamp is future.
+QUOTE_FUTURE_SKEW = timedelta(minutes=2)
 #: A bar whose close is further than this from the series median close is treated as a transcription error.
 MAX_BAR_VS_MEDIAN = 0.5
 EXIT_OUTSIDE_WINDOW = 3
@@ -111,9 +119,12 @@ def validate_bar(raw: Any) -> dict[str, Any]:
 
 
 def validate_ticker(
-    raw: Any, *, day: date, bar_start: time, decision: time, interval: int
+    raw: Any, *, day: date, bar_start: time, decision: time, interval: int, now: datetime | None = None
 ) -> dict[str, Any]:
-    """Validate one ticker's ``{previous_close_bar, intraday_bars, quote}``; raises :class:`PayloadError`."""
+    """Validate one ticker's ``{previous_close_bar, intraday_bars, quote}``; raises :class:`PayloadError`.
+
+    ``now`` is the validating clock (default: the real ET clock), used only to refuse a future-stamped quote.
+    """
     if not isinstance(raw, dict):
         raise PayloadError("ticker entry is not an object")
     if raw.get("error"):
@@ -163,6 +174,12 @@ def validate_ticker(
     as_of = _parse_ts(quote.get("as_of"))
     if as_of.date() != day:
         raise PayloadError(f"quote as_of {quote.get('as_of')} is not from {day}")
+    if as_of < anchor - timedelta(minutes=interval):
+        raise PayloadError(f"quote as_of {as_of:%H:%M} ET is stale for the {decision:%H:%M} decision")
+    if as_of > anchor + QUOTE_MAX_AFTER_DECISION:
+        raise PayloadError(f"quote as_of {as_of:%H:%M} ET is too long after the {decision:%H:%M} decision")
+    if as_of > (now or datetime.now(ET)).astimezone(ET) + QUOTE_FUTURE_SKEW:
+        raise PayloadError(f"quote as_of {as_of.isoformat()} is in the future")
     if abs(price - closes[-1]) / closes[-1] > MAX_QUOTE_VS_LAST_CLOSE:
         raise PayloadError(f"quote {price} disagrees with the last bar close {closes[-1]}")
     return {

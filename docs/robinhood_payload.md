@@ -16,7 +16,8 @@ decision time (09:35 10:30 11:30 12:30 13:30 14:30, Mon-Fri; the 15:30 slot is F
 2. The universe is split into chunks of 8 and each runs through `codex exec` (read-only sandbox, 3 at a time,
    240 s per chunk). The worker may only read historicals and quotes.
 3. `scripts/robinhood_payload.py merge` validates every ticker (tz-aware timestamps, consistent OHLC, the
-   slot's window, newest bar near the anchor, no outlier bars, quote within 25% of its own last bar) and
+   slot's window, newest bar near the anchor, no outlier bars, quote within 25% of its own last bar and stamped between the newest completed bar's start and 30 minutes
+   after the decision, never in the future) and
    publishes `cron_tracking/robinhood_payload/<day>/robinhood_payload_<day>_<slot>.json` atomically, with a
    `.meta.json` sidecar. A ticker that fails goes to `ticker_errors.robinhood`; coverage under 80% publishes
    nothing, so the slot aborts instead of trading a thin universe.
