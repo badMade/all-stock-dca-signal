@@ -53,3 +53,11 @@ ET (or shift `Hour`). Logs: `/tmp/dca-robinhood-payload.log`.
 - `~/.codex/config.toml`'s default model is used. Pin one with `DCA_CODEX_MODEL` only if needed (model names
   the CLI/account accepts change between releases; `gpt-5.6-sol` worked on 0.145 and is refused on 0.160).
 - First live proof (2026-10-15, 2 tickers, one chunk): 23 s, validated 2/2.
+
+## Quote freshness
+
+"Same calendar day" is not fresh (Codex adversarial review of #1704). `validate_ticker` rejects a quote whose `as_of`
+predates the slot's trend-window start or falls more than 15 minutes after the decision time. A quote's `as_of` is its
+last trade, so a thin ticker's may legitimately be old; the payload as a whole is instead rejected when its newest
+`as_of` is earlier than one bar before the decision time (`_require_fresh_fetch`). `publish` and `check` both apply it.
+A payload built long after its slot (for example a manual after-hours test build) is therefore rejected.

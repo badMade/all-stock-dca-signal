@@ -46,6 +46,8 @@ def test_valid_ticker_passes_and_drops_the_still_open_decision_bar():
         (lambda r: r["intraday_bars"].__setitem__(1, bar("2026-10-15T17:35:00Z", o=30, h=31, low=29, c=30)), "median"),
         (lambda r: r["quote"].update(price=20.0), "disagrees"),
         (lambda r: r["quote"].update(as_of="2026-10-14T18:31:00Z"), "not from"),
+        (lambda r: r["quote"].update(as_of="2026-10-15T16:00:00Z"), "predates"),  # 12:00 ET, before the 13:30 start
+        (lambda r: r["quote"].update(as_of="2026-10-15T19:00:01Z"), "too long after"),  # 15:00:01 ET, post-window
         (lambda r: r.update(previous_close_bar=bar("2026-10-15T14:00:00Z")), "prior session"),
         (lambda r: r.update(intraday_bars=r["intraday_bars"][:3]), "far before"),
         (lambda r: r.update(intraday_bars=[]), "no intraday bars"),
@@ -233,6 +235,31 @@ def test_a_plan_whose_chunks_do_not_partition_its_tickers_merges_nothing(tmp_pat
     assert not (tmp_path / "out").exists()
 
 
+def _stale(raw, as_of):
+    raw["quote"]["as_of"] = as_of
+    return raw
+
+
+def test_a_quote_just_before_the_decision_bar_makes_the_payload_stale(tmp_path):
+    # Every quote is inside the trend window (13:30 ET onward) so each passes alone, but none is near 14:30 ET.
+    plan = plan_for(tmp_path, ["AAA", "BBB", "CCC"])
+    chunk = write_chunk(
+        tmp_path, "chunk_0.json", {t: _stale(good_ticker(), "2026-10-15T17:45:00Z") for t in ("AAA", "BBB", "CCC")}
+    )
+    payload, failed = rp.assemble(plan, [chunk])
+    assert payload["sources"]["robinhood"] == {}
+    assert all("stale payload" in reason for reason in failed.values())
+    assert rp.publish(plan, payload, failed, min_coverage=0.8) == 2
+    assert not (tmp_path / "out").exists()
+
+
+def test_one_thin_ticker_with_an_old_last_trade_does_not_fail_a_fresh_payload(tmp_path):
+    plan = plan_for(tmp_path, ["AAA", "BBB"])
+    thin = _stale(good_ticker(), "2026-10-15T17:40:00Z")  # last traded 13:40 ET, inside the trend window
+    chunk = write_chunk(tmp_path, "chunk_0.json", {"AAA": good_ticker(), "BBB": thin})
+    payload, failed = rp.assemble(plan, [chunk])
+    assert sorted(payload["sources"]["robinhood"]) == ["AAA", "BBB"] and not failed
+
 # --------------------------------------------------------------------------- freshness (2026-10-15 review)
 
 from datetime import datetime, timedelta  # noqa: E402
@@ -306,8 +333,7 @@ def test_sidecar_built_before_the_anchor_or_in_the_future_is_stale(tmp_path):
 @pytest.mark.parametrize(
     "as_of, needle",
     [
-        ("2026-10-15T15:10:00Z", "stale"),            # 11:10 ET: hours before the 14:30 decision
-        ("2026-10-15T18:24:59Z", "stale"),            # 14:24:59 ET: older than the newest completed bar's start
+        ("2026-10-15T15:10:00Z", "predates"),          # 11:10 ET: before the 13:30 trend-window start
         ("2026-10-15T19:00:01Z", "too long after"),   # 15:00:01 ET: past decision + 30 min
     ],
 )
@@ -323,6 +349,21 @@ def test_a_quote_inside_the_decision_window_passes(as_of):
     raw = good_ticker()
     raw["quote"]["as_of"] = as_of
     assert rp.validate_ticker(raw, **kw())["quote"]["price"] == 10.1
+
+
+def test_a_payload_whose_newest_quote_predates_the_decision_bar_is_rejected(tmp_path):
+    plan = plan_for(tmp_path, ["AAA", "BBB"])
+    chunk = write_chunk(
+        tmp_path,
+        "chunk_0.json",
+        {
+            "AAA": _stale(good_ticker(), "2026-10-15T18:24:59Z"),
+            "BBB": _stale(good_ticker(), "2026-10-15T17:45:00Z"),
+        },
+    )
+    payload, failed = rp.assemble(plan, [chunk])
+    assert payload["sources"]["robinhood"] == {}
+    assert all("stale payload" in reason for reason in failed.values())
 
 
 def test_a_future_stamped_quote_is_rejected_against_the_validating_clock():

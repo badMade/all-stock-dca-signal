@@ -70,11 +70,9 @@ AUTO_MIN_AFTER = 1
 AUTO_MAX_AFTER = 15
 #: A quote further than this from its own last bar close is treated as a transcription error, not a gap move.
 MAX_QUOTE_VS_LAST_CLOSE = 0.25
-#: Quote freshness, measured from the slot's decision time (Codex adversarial review: a same-day quote from hours
-#: earlier passed, and the payload feeds Gate 5's candidate list). Not before the newest completed bar the series
-#: must carry (decision minus one interval), so it describes the price at the decision; and not after this, which
-#: covers launchd's AUTO_MAX_AFTER window plus the worst-case chunk rounds (3 x 240 s) of the fetch. A quote stamped
-#: later belongs to a re-run hours after the slot, not to this slot's decision.
+#: Quotes may be stamped after the decision while launchd and the chunk fetch finish; later stamps belong to a
+#: re-run, not this slot. A thin ticker's quote may predate the decision, so freshness is checked across the payload.
+#: The 30-minute window covers AUTO_MAX_AFTER plus the worst-case chunk rounds (3 x 240 s) of the fetch.
 QUOTE_MAX_AFTER_DECISION = timedelta(minutes=30)
 #: Clock skew allowed between the worker's quote timestamp and the validating host; beyond it the stamp is future.
 QUOTE_FUTURE_SKEW = timedelta(minutes=2)
@@ -184,8 +182,8 @@ def validate_ticker(
     as_of = _parse_ts(quote.get("as_of"))
     if as_of.date() != day:
         raise PayloadError(f"quote as_of {quote.get('as_of')} is not from {day}")
-    if as_of < anchor - timedelta(minutes=interval):
-        raise PayloadError(f"quote as_of {as_of:%H:%M} ET is stale for the {decision:%H:%M} decision")
+    if as_of < start:
+        raise PayloadError(f"quote as_of {as_of:%H:%M} ET predates the {bar_start:%H:%M} trend-window start")
     if as_of > anchor + QUOTE_MAX_AFTER_DECISION:
         raise PayloadError(f"quote as_of {as_of:%H:%M} ET is too long after the {decision:%H:%M} decision")
     if as_of > (now or datetime.now(ET)).astimezone(ET) + QUOTE_FUTURE_SKEW:
@@ -381,6 +379,28 @@ def assemble(plan: dict[str, Any], chunk_paths: list[str]) -> tuple[dict[str, An
     return _validate_entries(plan, merged, duplicated)
 
 
+def _require_fresh_fetch(
+    good: dict[str, Any], failed: dict[str, str], *, day: date, decision: time, interval: int
+) -> dict[str, Any]:
+    """Reject the whole payload when no quote in it was traded near the decision time.
+
+    A payload built hours late, or left over from an earlier attempt, passes every per-ticker check. Liquid names
+    trade every minute, so the newest ``as_of`` across the payload dates the fetch; if even that predates the
+    decision bar, nothing here describes the slot's market. Every ticker is moved to ``failed`` so ``publish`` and
+    ``check`` both treat the payload as unavailable.
+    """
+    if not good:
+        return good
+    newest = max(_parse_ts(v["quote"]["as_of"]) for v in good.values())
+    floor = datetime.combine(day, decision, ET) - timedelta(minutes=interval)
+    if newest >= floor:
+        return good
+    reason = f"stale payload: newest quote {newest.astimezone(ET):%H:%M} ET predates {floor:%H:%M} ET"
+    for ticker in good:
+        failed[ticker] = reason
+    return {}
+
+
 def _validate_entries(
     plan: dict[str, Any], merged: dict[str, Any], duplicated: dict[str, list[str]] | None = None
 ) -> tuple[dict[str, Any], dict[str, str]]:
@@ -403,6 +423,7 @@ def _validate_entries(
             )
         except PayloadError as exc:
             failed[ticker] = str(exc)
+    good = _require_fresh_fetch(good, failed, day=day, decision=decision, interval=interval)
     payload = {
         "sources": {"robinhood": good},
         "source_errors": [],
