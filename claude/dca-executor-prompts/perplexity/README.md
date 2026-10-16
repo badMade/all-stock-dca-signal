@@ -71,7 +71,7 @@ per-ticker exception. A slot dropped from `GATED_SLOTS` falls back to a quotes-o
 
 - **Latest placement time** is the next canonical slot's start (10:30, 11:30, 12:30, 13:30, 14:30, 15:30; 16:00
   for the final slot), so a backup that fires inside a slot's window can still finish before the next slot's gates.
-- **Normal tier only.** The backup never escalates its budget tier; it applies $180 per day and $900 per week.
+- **Tier follows the signal count.** The planner's gated `compute` and `finalize` pick the budget tier the way the primary does: at most 5 signals at 3x or more is Normal ($180 per day, $900 per week), 6 to 10 Elevated ($240, $1,200), 11 to 17 High-volatility ($300, $1,500), more than 17 Stress ($360 per day). Stress has no verified rollover reserve in the backup, so it keeps the Normal $900 weekly cap. A batch over the selected tier's cap is still refused whole, never trimmed. The shadow `compute --quotes` path stays Normal.
 - **Time sanity** accepts a fire from 10 minutes before its fire time until the latest placement time.
 - **Two polls only.** Claude's own prompts also re-fetch order history before every order; the backup does
   not, so a batch that runs long relies on the per-order quote check and the one-order-per-ticker rule.

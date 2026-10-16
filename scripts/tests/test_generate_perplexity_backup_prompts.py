@@ -105,10 +105,16 @@ def test_hard_rules_are_inline_in_every_prompt(prompts, prefix):
 @pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
 def test_cap_figures_match_live_config(prompts, prefix):
     text = _by_prefix(prompts, prefix)
-    normal = next(t for t in __import__("near_close_dca").BUDGET_TIERS if t.name == "normal")
+    tiers = __import__("near_close_dca").BUDGET_TIERS
+    normal = next(t for t in tiers if t.name == "normal")
     assert f"at most ${dca_runner.MAX_PER_ORDER_USD:g}" in text
-    assert f"at most ${normal.daily_cap_usd:g} across ALL orders" in text
-    assert f"at most ${normal.weekly_cap_usd:g}" in text
+    # The planner picks the tier from the 3x-or-greater signal count (2026-10-15), so every tier's cap is stated.
+    for tier in tiers:
+        label = tier.name.replace("_", "-").capitalize()
+        weekly = normal.weekly_cap_usd if tier.uses_rollover_reserve else tier.weekly_cap_usd
+        assert f"${tier.daily_cap_usd:g} {label}" in text, tier.name
+        assert f"${weekly:g} {label}" in text, tier.name
+    assert "you never choose or escalate a tier yourself" in text
     assert f"at most {dca_runner.MAX_ORDERS_PER_DAY} buy attempts" in text
     breakers = json.loads((CONFIG / "budgets.json").read_bytes())["circuit_breakers"]
     assert f"{breakers['max_consecutive_placement_failures']} consecutive" in text

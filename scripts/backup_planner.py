@@ -21,7 +21,9 @@ WHAT THIS IS NOT
 ----------------
 It never places, cancels, or modifies an order, imports no broker adapter, and never prints the
 account number. Saved order pages are the only evidence of what was bought; a plan is input only.
-It always applies the Normal budget tier and never escalates it.
+The gated ``compute --market-data`` and ``finalize`` pick the budget tier the way the primary does, from the count
+of 3x-or-greater signals alone (``near_close_dca.select_budget_tier``); the shadow ``compute --quotes`` path still
+applies the Normal tier and never escalates it.
 
 PLACEMENT GATES
 ---------------
@@ -54,7 +56,7 @@ import dca_config
 import dca_order_plan as dop
 from dca_order_plan import PlanError
 from dca_runner import ET, MAX_PER_ORDER_USD, SLOTS, BrokerOrder, BudgetDataError
-from near_close_dca import BUDGET_TIERS, kill_switch_engaged
+from near_close_dca import BUDGET_TIERS, BudgetTier, kill_switch_engaged, select_budget_tier
 from scripts import backup_stream_specs, stream_candidates
 from scripts import generate_buy_candidates as gbc
 from scripts.assemble_order_pages import _order_rows
@@ -63,6 +65,19 @@ from scripts.same_day_top_up_gate import _bind_saved_pages
 
 _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _NORMAL_TIER = next(tier for tier in BUDGET_TIERS if tier.name == "normal")
+
+
+def _tier_for(multipliers: Any, config: Any) -> tuple[BudgetTier, float | None]:
+    """The budget tier and effective weekly cap for a batch, selected as the primary selects them.
+
+    The tier depends only on how many orders carry a multiplier at or above ``config.high_multiplier_threshold``
+    (a count fixed before sizing, never the planned spend). The Stress tier's weekly ceiling needs a verified
+    rollover reserve that the planner has no input for, so it is held to the Normal weekly cap
+    (``config/budgets.json``: no rollover means a $900 effective budget). Other tiers keep their own weekly cap.
+    """
+    count = sum(1 for m in multipliers if isinstance(m, (int, float)) and m >= config.high_multiplier_threshold)
+    tier = select_budget_tier(0.0, count)
+    return tier, (_NORMAL_TIER.weekly_cap_usd if tier.uses_rollover_reserve else None)
 _DEAD_STATES = frozenset({"cancelled", "canceled", "rejected", "failed", "voided"})
 
 # Operator decision 2026-10-13: a backup that cannot reach the Mac places its own computed plan (ADR "Open design
@@ -354,10 +369,13 @@ def _cmd_compute_gated(args: argparse.Namespace, trading_day: date) -> int:
     except ValueError as exc:
         # Type name only: the message can carry untrusted payload content (a source name, a path).
         raise _Refused(PlanError("market_data_invalid", type(exc).__name__)) from exc
+    # The primary raises its ceiling with the breadth of the selloff; a Normal-only backup would refuse a batch the
+    # primary would have placed (2026-10-15, slot 0935: 41 to 46 signals at 3x or more, a $296 batch, a $180 cap).
+    tier, weekly_cap = _tier_for((d["multiplier"] for d in decisions), config)
     result = dop.plan_from_decisions(
         decisions, config=config, trading_day=trading_day, slot=args.slot, generated_at_et=now,
-        ladder_version=dop.current_ladder_version(directory), orders_today=history, tier=_NORMAL_TIER,
-        buying_power_usd=buying_power,
+        ladder_version=dop.current_ladder_version(directory), orders_today=history, tier=tier,
+        weekly_cap_usd=weekly_cap, buying_power_usd=buying_power,
     )
     if result.errors or result.plan is None:
         return _emit({"status": "FAILED", "plan": None, "errors": _error_dicts(result.errors)}, 2)
@@ -484,9 +502,13 @@ def _cmd_finalize(args: argparse.Namespace, trading_day: date) -> int:
     remaining = dop.reconcile(plan.orders, history, trading_day=trading_day, slot=args.slot, scope=scope)
     remaining_symbols = {o["symbol"] for o in remaining}
     skipped = [{"symbol": o["symbol"], "reason": "already_placed"} for o in plan.orders if o["symbol"] not in remaining_symbols]
+    # The tier is the one the plan was built under: counted over ALL its orders, so a ticker skipped at placement
+    # cannot drop a valid batch to a lower tier and abort it.
+    tier, weekly_cap = _tier_for((o["multiplier"] for o in plan.orders), config)
     result = dop.revalidate_for_placement(
-        remaining, broker_orders=history, fresh_quotes=fresh, trading_day=trading_day, tier=_NORMAL_TIER,
-        config=config, slot=args.slot, scope=scope, buying_power_usd=buying_power, fresh_spreads=spreads,
+        remaining, broker_orders=history, fresh_quotes=fresh, trading_day=trading_day, tier=tier,
+        weekly_cap_usd=weekly_cap, config=config, slot=args.slot, scope=scope, buying_power_usd=buying_power,
+        fresh_spreads=spreads,
     )
     if result.errors:
         return _abort(*result.errors)
