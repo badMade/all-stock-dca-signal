@@ -41,6 +41,28 @@ shadow mode (ADR phase 6) has run for at least five trading days.
    `--build-info` first, and record the build in the state record. **How the file reaches the task is still
    undecided**: the prompts assume it is attached to the task's project files, a setup step you must confirm.
 
+## Plan-first recommendations (needs PR #1667)
+
+The Claude slots are moving to plan-first readers (PR #1667, `docs/plan_first_recommendations.md` there). Each slot's
+set is the primary's own `{ticker, usd, ref_id}` list, which these backups now read first:
+
+| Command | Where | Output |
+| --- | --- | --- |
+| `plan --source mac_rec --trading-day D --slot S --now T` | Mac | The slot's set from the local store, by the reader's freshness rule (`config/recommendations.json` `max_age_minutes`), as a `plan_first` plan |
+| `plan --source published_rec --published F --trading-day D --slot S --now T` | sandbox | The same, from the payload published to the `recommendations` branch (or the Notion block once `page_id` is set) |
+| `executor-ids --trading-day D --slot S` | Mac | The broker order ids the reader saved under `placements/<slot>/` |
+| `classify --trading-day D --slot S --orders-pages F [--executor-ids F] [--published F]` | sandbox | `CLEAR` or `UNRECOGNIZED` for every order inside this slot's window |
+
+A missing, stale or malformed set is `NO_VALID_PLAN`, and the backup falls back to `mac_plan`, `mac_compute` and
+`cloud_compute` as before. A set is placed like a Claude plan (reconciled against this slot's window only), but
+`finalize` requires a fresh prior close per symbol (`--fresh-prior-closes`) because a set carries no prices, and the
+caps stay all-or-nothing.
+
+The broker echoes its own ref_id, so Claude's plan-first orders carry no `dca-runner-` reference. `classify`
+recognises executor orders by the order ids `executor-ids` prints, by a legacy `dca-runner-<slot>-` reference or the
+native UUID if the broker ever echoes it, and, with the Mac out of reach, by a buy matching the published set's
+symbol and dollar amount to the cent. Any other order is UNRECOGNIZED, and the backup stands down.
+
 ## Which slots take the safety-gate path
 
 All seven, read from `scripts.backup_planner.GATED_SLOTS` when the prompts are generated. Each prompt asks the planner

@@ -187,6 +187,30 @@ def test_mac_first_replaces_the_old_never_check_the_mac_rule(prompts, prefix):
 
 
 @pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_every_mac_command_is_gated_on_mac_path_abandoned_being_false(prompts, prefix):
+    # Review of PR 1669: the budget branch abandoned the Mac path, but mac_status stayed "online" and
+    # the later Mac commands keyed on it alone, so a timed-out run could re-enter the abandoned path.
+    text = _by_prefix(prompts, prefix)
+    assert "mac_path_abandoned" in text
+    # (a) initialises it false, (b) sets it true when the budget is spent.
+    assert "mac_path_abandoned to false" in text
+    assert "set mac_path_abandoned to true" in text
+    # Every line that invokes the Mac must also require the flag to be false.
+    mac_lines = [
+        line
+        for line in text.splitlines()
+        if "mac_status online" in line or "mac_status is online" in line
+        or "run_local_subagent on the Mac" in line
+        or "on the Mac (the same step 3 probe path)" in line
+    ]
+    assert mac_lines
+    for line in mac_lines:
+        if "(a)" in line[:4] or line.startswith("a."):
+            continue
+        assert "mac_path_abandoned" in line, line[:100]
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
 def test_two_evidence_polls_bracket_planning_and_a_planner_decides_the_order_list(prompts, prefix):
     text = _by_prefix(prompts, prefix)
     assert text.index("EVIDENCE POLL 1") < text.index("MAC-FIRST") < text.index("EVIDENCE POLL 2") < text.index("PLACE")
@@ -554,3 +578,98 @@ def test_the_prompt_no_longer_says_a_computed_plan_is_shadow_only_unconditionall
     assert "SHADOW_ONLY" in text  # still the answer when the Mac may be acting
     assert "a cloud run is calculation-only" not in text.lower()
     assert "never places an order" not in text
+
+
+# -- PR #1667 follow-up: the backups read the plan-first recommendation and recognise its orders -------------------
+
+
+def _step(text, start, end):
+    return text[text.index(start):text.index(end)]
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_claudes_plan_first_orders_are_recognised_by_order_id_not_by_a_runner_reference(prompts, prefix):
+    """Claude's reader sends a UUID and the broker echoes its own, so a dca-runner- prefix can never name its orders."""
+    text = _by_prefix(prompts, prefix)
+    assert "It is expected executor traffic when its client order id starts with dca-runner-" not in text
+    assert "client order id starting dca-runner-<slot>-" not in text  # step 7c's repull no longer leans on it
+    step3 = _step(text, "STEP 3", "STEP 4")
+    assert "python3 -m scripts.backup_planner executor-ids --trading-day <YYYY-MM-DD> --slot <slot>" in step3
+    assert "python3 backup_planner.pyz classify" in step3 and "--executor-ids executor_ids.json" in step3
+    assert "--published published.json" in step3
+    assert "UNRECOGNIZED: place nothing, record stood_down_unrecognized_order, and notify" in step3  # still fail closed
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_the_published_set_is_read_untouched_from_the_configured_branch(prompts, prefix):
+    text = _by_prefix(prompts, prefix)
+    branch = json.loads((CONFIG / "recommendations.json").read_text())["publish"]["github_branch"]["branch"]
+    step2 = _step(text, "STEP 2", "STEP 3")
+    assert f'branch "{branch}"' in step2 and gen.GITHUB_REPOSITORY in step2 and "recommendations.json" in step2
+    assert "published.json" in step2 and "untouched" in step2
+    assert "not an error" in step2  # an absent copy falls back; it does not fail the run
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_the_plan_first_set_comes_first_and_the_old_sources_remain_the_fallback(prompts, prefix):
+    text = _by_prefix(prompts, prefix)
+    mac_rec = text.index("plan --source mac_rec")
+    published = text.index("plan --source published_rec --published published.json")
+    mac_plan = text.index("plan --source mac_plan")
+    assert mac_rec < published < mac_plan < text.index("STEP 4")
+    for value in ("mac_rec", "published_rec", "mac_plan", "mac_compute", "cloud_compute"):
+        assert value in _step(text, "STEP 8 - STATE RECORD", "STEP 9 - NOTIFY"), value
+    assert "NEVER compute ladder multipliers" in text  # reading a set never licenses sizing by hand
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_the_freshness_rule_is_the_readers_and_comes_from_config(prompts, prefix):
+    minutes = json.loads((CONFIG / "recommendations.json").read_text())["max_age_minutes"]
+    step3 = _step(_by_prefix(prompts, prefix), "STEP 3", "STEP 4")
+    assert f"at most {minutes} minutes old" in step3
+    assert "stamped at or before now on today's ET date" in step3
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_a_plan_first_plan_is_finalized_against_a_fresh_prior_close(prompts, prefix):
+    step6 = _step(_by_prefix(prompts, prefix), "STEP 6", "STEP 7")
+    assert "fresh_prior_closes.json" in step6 and "--fresh-prior-closes fresh_prior_closes.json" in step6
+    assert "Claude or plan-first plan" in step6
+
+
+def test_a_notion_page_is_named_only_once_configured_and_the_freshness_follows_config(tmp_path, monkeypatch):
+    import shutil
+
+    config_dir = tmp_path / "config"
+    shutil.copytree(CONFIG, config_dir)
+    settings = json.loads((config_dir / "recommendations.json").read_text())
+    assert not settings["publish"]["notion"]["page_id"]
+    page_id = "0123456789abcdef0123456789abcdef"
+    settings["publish"]["notion"] = {"enabled": True, "page_id": page_id}
+    settings["max_age_minutes"] = 10
+    (config_dir / "recommendations.json").write_text(json.dumps(settings))
+    text = _by_prefix(gen.build_prompts(config_dir), "1150ET")
+    assert f"Notion page {page_id}" in text and "at most 10 minutes old" in text
+    assert "Notion page" not in _by_prefix(gen.build_prompts(), "1150ET")
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_poll_2_is_classified_before_finalize_review_on_1702(prompts, prefix):
+    """An executor that started between the polls is visible only in poll 2, and step 7c's repull starts there."""
+    step6 = _step(_by_prefix(prompts, prefix), "STEP 6", "STEP 7")
+    classify = step6.index("CLASSIFY POLL 2")
+    assert classify < step6.index("scripts.backup_planner finalize")
+    assert "--orders-pages orders_pages_poll2.json" in step6 and "executor-ids" in step6
+    assert "UNRECOGNIZED: place nothing, record stood_down_unrecognized_order" in step6[classify:]
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_step_7e_uses_the_native_placement_check_not_a_ref_id_echo_review_on_1702(prompts, prefix):
+    text = _by_prefix(prompts, prefix)
+    step7 = _step(text, "STEP 7 - PLACE THE ORDERS", "STEP 8")
+    assert "and ref_id that match the request" not in step7
+    assert "python3 backup_planner.pyz check-placement" in step7
+    for arg in ("--submitted-after <submitted_after>", "--prior-orders-pages orders_pages_poll2.json",
+                "--placed-responses", "--sent-ref-id <ref_id>"):
+        assert arg in step7, arg
+    assert "placement_<SYMBOL>.json" in text.split("STEP 0")[0]  # rule 2 deletes them with the order evidence

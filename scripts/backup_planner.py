@@ -6,9 +6,19 @@ Three subcommands, each printing ONE JSON document and exiting 0 when the result
 ``claude/dca-executor-prompts/perplexity/README.md``)::
 
     plan      --source mac_plan --trading-day D --slot S [--plan-file F]
+    plan      --source mac_rec|published_rec --trading-day D --slot S --now T [--published F]
     compute   --trading-day D --slot S --quotes F --orders-pages F --buying-power USD [--now T]
     finalize  --trading-day D --slot S --plan F --orders-pages F --fresh-quotes F
-              --fresh-spreads F --buying-power USD [--now T]
+              --fresh-spreads F --buying-power USD [--fresh-prior-closes F] [--now T]
+    classify  --trading-day D --slot S --orders-pages F [--executor-ids F] [--published F]
+    executor-ids --trading-day D --slot S          (Mac only)
+    check-placement --trading-day D --slot S --response F --symbol T --amount USD --sent-ref-id R
+              --submitted-after T --prior-orders-pages F [--placed-responses F ...]
+
+``mac_rec`` / ``published_rec`` read the plan-first recommendation (PR #1667, ``docs/plan_first_recommendations.md``):
+the primary's own {ticker, usd, ref_id} set for the slot, from the Mac's store or from the copy ``dca_rec_publish``
+mirrors to Notion and the ``recommendations`` branch, under the local reader's freshness rule. ``classify`` recognises
+the plan-first reader's orders, which carry no ``dca-runner-`` reference at the broker.
 
 WHAT THIS IS
 ------------
@@ -47,14 +57,16 @@ import math
 import re
 import sys
 import tempfile
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 import dca_config
 import dca_order_plan as dop
-from dca_order_plan import PlanError
+from dca_order_plan import PlanError, PlanResult
+from dca_rec_models import RecommendationSet
+from dca_rec_store import RecommendationStore, load_settings
 from dca_runner import ET, MAX_PER_ORDER_USD, SLOTS, BrokerOrder, BudgetDataError
 from near_close_dca import BUDGET_TIERS, BudgetTier, kill_switch_engaged, select_budget_tier
 from scripts import backup_stream_specs, stream_candidates
@@ -62,6 +74,7 @@ from scripts import generate_buy_candidates as gbc
 from scripts.assemble_order_pages import _order_rows
 from scripts.broker_reconciliation import _has_continuation, _unwrap
 from scripts.same_day_top_up_gate import _bind_saved_pages
+from scripts.validate_native_placement import native_ref_id, validate_native_placement
 
 _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _NORMAL_TIER = next(tier for tier in BUDGET_TIERS if tier.name == "normal")
@@ -96,6 +109,23 @@ LOCAL_STATUSES = BACKUP_MAY_ACT_LOCAL_STATUSES + ("unknown", "in_progress", "suc
 # CLI path in scripts/stream_candidates.py, scored identically from Robinhood (scripts/backup_stream_specs.py).
 GATED_SLOTS = {"0935": "0935ET", "1030": "1030ET", "1130": "1130ET", "1230": "1230ET", "1330": "1330ET",
                "1430": "1430ET", "1530": "1530ET"}
+
+# Plan-first (PR #1667): the program on the Mac computes {ticker, usd, ref_id} per slot with the PRIMARY's own Gate 5,
+# 6 and 6.5 chain (dca_recommender) and the Claude reader places exactly that. A backup that reads the same set places
+# the same orders, so the set is treated like a Claude plan (sized by the primary: this slot's window only, no
+# kill-switch re-derivation, places on PROCEED without --local-status). The plan document ``plan --source
+# mac_rec|published`` emits carries this generator so ``finalize`` can tell it from a dca_order_plan document, which
+# needs price fields a price-blind recommendation never has.
+PLAN_FIRST_GENERATOR = "plan_first"
+_PRIMARY_SIZED_GENERATORS = frozenset({"claude", PLAN_FIRST_GENERATOR})
+_PLAN_FIRST_KEYS = frozenset({"schema_version", "trading_day", "slot", "generated_at_et", "generator", "ladder_version",
+                              "universe_hash", "source", "orders"})
+_PLAN_FIRST_ORDER_KEYS = frozenset({"symbol", "notional_usd", "ref_id"})
+_PLAN_FIRST_SOURCES = ("mac_rec", "published_rec")
+# The published payload dca_rec_publish.build_document writes (Notion code block, GitHub `recommendations` branch).
+_PUBLISHED_KEYS = frozenset({"schema_version", "generated_at", "slots"})
+# placed_agent values that are the account owner's own activity: noted, never blocking (step 2 of the prompts).
+_USER_AGENTS = frozenset({"user", "recurring", "drip"})
 
 
 class _Refused(Exception):
@@ -184,6 +214,18 @@ def _to_broker_order(row: Any) -> BrokerOrder:
 
 def _load_history(path: Path, trading_day: date) -> list[BrokerOrder]:
     """Saved order pages as broker history, only once they are proven pinned and complete."""
+    try:
+        return [_to_broker_order(row) for row in _load_rows(path, trading_day)]
+    except (ValueError, TypeError) as exc:
+        raise _Refused(PlanError("history_unusable", type(exc).__name__)) from exc
+
+
+def _load_rows(path: Path, trading_day: date) -> list[Any]:
+    """The raw order rows of saved pages, de-duplicated by order id, once proven pinned and complete.
+
+    Split out of :func:`_load_history` for ``classify``, which needs the raw ``id``, ``placed_agent`` and
+    ``ref_id`` a ``BrokerOrder`` does not keep. Same proof, same de-duplication, so both read the same orders.
+    """
     payload = _read_json(path, missing="orders_pages_missing", corrupt="orders_pages_corrupt")
     saved_account = str(payload.get("account_number") or "") if isinstance(payload, dict) else ""
     # The envelope is pinned to ITS OWN account and the requested day: it proves the pages
@@ -197,7 +239,7 @@ def _load_history(path: Path, trading_day: date) -> list[BrokerOrder]:
     if not all(_has_continuation(page) for page in chain[:-1]) or _has_continuation(chain[-1]):
         raise _Refused(PlanError("orders_pages_incomplete", "the saved chain does not end where the broker's does"))
     seen: set[str] = set()
-    history: list[BrokerOrder] = []
+    rows: list[Any] = []
     try:
         for page in pages:
             for row in _order_rows(page):
@@ -205,20 +247,22 @@ def _load_history(path: Path, trading_day: date) -> list[BrokerOrder]:
                 if order_id and order_id in seen:
                     continue  # an order repeated across pages must not count twice
                 seen.add(order_id)
-                history.append(_to_broker_order(row))
+                rows.append(row)
     except (ValueError, TypeError) as exc:
         raise _Refused(PlanError("history_unusable", type(exc).__name__)) from exc
-    return history
+    return rows
 
 
-def _load_fresh_quotes(path: Path) -> dict[str, float]:
-    data = _read_json(path, missing="fresh_quotes_missing", corrupt="fresh_quotes_corrupt")
+def _load_fresh_quotes(path: Path, *, missing: str = "fresh_quotes_missing",
+                       corrupt: str = "fresh_quotes_corrupt") -> dict[str, float]:
+    """``{"SYMBOL": price}``, every price positive and finite. Also reads ``--fresh-prior-closes`` (same shape)."""
+    data = _read_json(path, missing=missing, corrupt=corrupt)
     ok = isinstance(data, dict) and all(
         isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0
         for k, v in data.items()
     )
     if not ok:
-        raise _Refused(PlanError("fresh_quotes_corrupt", path.name))
+        raise _Refused(PlanError(corrupt, path.name))
     return {k.upper(): float(v) for k, v in data.items()}
 
 
@@ -314,12 +358,331 @@ def _plan_context(config: Any, ladder_version: str, trading_day: date, slot: str
 
 
 def _cmd_plan(args: argparse.Namespace, trading_day: date) -> int:
+    if args.source in _PLAN_FIRST_SOURCES:
+        return _cmd_plan_first(args, trading_day)
     config, ladder_version, _ = _context(args.config_dir)
     path = args.plan_file if args.plan_file is not None else dop.order_plan_path(trading_day, args.slot)
     result = dop.load_plan(path, **_plan_context(config, ladder_version, trading_day, args.slot))
     if result.errors:
         return _emit({"status": "NO_VALID_PLAN", "plan": None, "errors": _error_dicts(result.errors)}, 2)
     return _emit({"status": "VALID_PLAN", "plan": result.plan, "errors": []}, 0)
+
+
+# ---------------------------------------------------------------------------
+# Plan-first recommendations (PR #1667): read the primary's own set, recognise its orders
+# ---------------------------------------------------------------------------
+
+
+def _published_set(document: Any, slot: str) -> RecommendationSet | None:
+    """``slot``'s set from a published payload, or ``None`` when the payload carries none for it.
+
+    The payload is ``dca_rec_publish.build_document``'s: ``{schema_version, generated_at, slots}``. Anything else,
+    or a set that fails ``RecommendationSet``'s own strict contract, is a refusal: a malformed file is never read
+    around.
+    """
+    version = document.get("schema_version") if isinstance(document, dict) else None
+    if (not isinstance(document, dict) or set(document) != _PUBLISHED_KEYS or isinstance(version, bool) or version != 1
+            or not isinstance(document["slots"], dict)):
+        raise _Refused(PlanError("published_invalid", "not a published recommendations payload"))
+    entry = document["slots"].get(slot)
+    if entry is None:
+        return None
+    try:
+        recommendation = RecommendationSet.from_json(entry)
+    except (ValueError, TypeError, KeyError) as exc:
+        raise _Refused(PlanError("published_invalid", type(exc).__name__)) from exc
+    if recommendation.slot != slot:
+        raise _Refused(PlanError("published_invalid", "the slot key and its set disagree"))
+    return recommendation
+
+
+def _freshness_reason(recommendation: RecommendationSet, slot: str, now: datetime, max_age: timedelta) -> str | None:
+    """``None`` when the set may be used now, else the reason, by the local reader's rule.
+
+    Same rule and reason codes as ``RecommendationStore.select_for`` (the operator's 2026-10-13 rule): the set for this
+    slot, stamped on today's ET date, at or before ``now``, and no older than ``max_age`` from
+    ``config/recommendations.json``. A published copy holds one set per slot, so there is no older one to fall back to.
+    """
+    current, as_of = now.astimezone(ET), recommendation.as_of.astimezone(ET)
+    if recommendation.slot != slot or as_of.date() != current.date() or recommendation.trading_day != current.date():
+        return "file_identity_mismatch"
+    if as_of > current:
+        return "only_future_stamped_files"
+    if (current - as_of).total_seconds() > max_age.total_seconds():
+        return "stale"
+    return None
+
+
+def _plan_first_document(recommendation: RecommendationSet, source: str) -> dict[str, Any]:
+    """The set as the plan document ``finalize`` reads. A copy of the set's own fields; nothing is sized here."""
+    return {
+        "schema_version": dop.SCHEMA_VERSION,
+        "trading_day": recommendation.trading_day.isoformat(),
+        "slot": recommendation.slot,
+        "generated_at_et": recommendation.as_of.astimezone(ET).isoformat(),
+        "generator": PLAN_FIRST_GENERATOR,
+        "ladder_version": recommendation.ladder_version,
+        "universe_hash": recommendation.universe_hash,
+        "source": source,
+        "orders": [{"symbol": item.ticker, "notional_usd": item.usd, "ref_id": item.ref_id}
+                   for item in recommendation.items],
+    }
+
+
+def _validate_plan_first(plan: Any, *, config: Any, ladder_version: str, trading_day: date, slot: str) -> PlanResult:
+    """``dca_order_plan.validate_plan``'s checks for a plan-first document, against the READER's own config.
+
+    Day, slot, sizing version, universe hash, symbols in the active universe and not excluded, positive whole-cent
+    amounts within the per-order cap, no repeated symbol, and each ref_id exactly the native UUID the Claude reader
+    sends for this slot, day and ticker (``validate_native_placement.native_ref_id``). Any defect rejects the whole
+    plan. Run by ``plan`` when the set is read and again by ``finalize`` on the saved file.
+    """
+    if not isinstance(plan, dict) or set(plan) != _PLAN_FIRST_KEYS:
+        return dop._fail(PlanError("schema_violation", "plan must be an object with exactly the schema's fields"))
+    errors: list[PlanError] = []
+    version = plan["schema_version"]
+    if isinstance(version, bool) or version != dop.SCHEMA_VERSION:
+        errors.append(PlanError("schema_version_mismatch", f"expected {dop.SCHEMA_VERSION}"))
+    if plan["trading_day"] != trading_day.isoformat():
+        errors.append(PlanError("wrong_trading_day", f"expected {trading_day.isoformat()}"))
+    if plan["slot"] != slot:
+        errors.append(PlanError("wrong_slot", f"expected {slot}"))
+    if plan["generator"] != PLAN_FIRST_GENERATOR or plan["source"] not in _PLAN_FIRST_SOURCES:
+        errors.append(PlanError("schema_violation", "generator or source"))
+    if not dop._aware_timestamp(plan["generated_at_et"]):
+        errors.append(PlanError("schema_violation", "generated_at_et"))
+    if plan["ladder_version"] != ladder_version:
+        errors.append(PlanError("stale_ladder_version", f"expected {ladder_version}"))
+    if plan["universe_hash"] != dop.universe_hash(config.tickers):
+        errors.append(PlanError("universe_hash_mismatch"))
+    orders = plan["orders"]
+    if not isinstance(orders, list):
+        return dop._fail(*errors, PlanError("schema_violation", "orders must be a list"))
+    active, excluded, seen = set(config.tickers), set(config.excluded_tickers), set()
+    for order in orders:
+        if not isinstance(order, dict) or set(order) != _PLAN_FIRST_ORDER_KEYS:
+            errors.append(PlanError("schema_violation", "order must be an object with exactly the schema's fields"))
+            continue
+        symbol, notional = order["symbol"], order["notional_usd"]
+        if not isinstance(symbol, str) or not dop._SYMBOL_RE.match(symbol):
+            errors.append(PlanError("schema_violation", "order symbol is not a ticker"))
+            continue
+        if symbol in excluded:
+            errors.append(PlanError("excluded_symbol", symbol))
+        elif symbol not in active:
+            errors.append(PlanError("unknown_symbol", symbol))
+        if not dop._is_positive_finite(notional) or not dop._is_cent_amount(notional):
+            errors.append(PlanError("invalid_notional", symbol))
+        elif notional > MAX_PER_ORDER_USD:
+            errors.append(PlanError("notional_over_cap", symbol))
+        if order["ref_id"] != native_ref_id(slot, trading_day.isoformat(), symbol):
+            errors.append(PlanError("bad_ref_id", symbol))
+        if symbol in seen:
+            errors.append(PlanError("duplicate_symbol", symbol))
+        seen.add(symbol)
+    if errors:
+        return dop._fail(*errors)
+    return PlanResult(plan=plan, orders=tuple(orders))
+
+
+def _cmd_plan_first(args: argparse.Namespace, trading_day: date) -> int:
+    """``plan --source mac_rec`` (the Mac's local store) or ``--source published_rec`` (the cloud-readable copy).
+
+    Selects the slot's set by the local reader's freshness rule and emits it as a plan document, VALID_PLAN only when
+    it is fresh AND passes :func:`_validate_plan_first`. A missing, stale or invalid set is NO_VALID_PLAN, and the
+    prompt falls back to the legacy Mac plan and then to compute.
+    """
+    config, ladder_version, directory = _context(args.config_dir)
+    now = _parse_now(args.now)
+    if now is None or now.astimezone(ET).date() != trading_day:
+        raise _Refused(PlanError("bad_now", "expected a timezone-aware ISO timestamp on the trading day"))
+    try:
+        max_age = load_settings(directory).max_age
+    except ValueError as exc:
+        # No silent default: a missing freshness rule must stop buying from a set, not loosen it.
+        raise _Refused(PlanError("settings_invalid", type(exc).__name__)) from exc
+    if args.source == "mac_rec":
+        selection = RecommendationStore(args.rec_root).select_for(args.slot, now, max_age)
+        recommendation, reason = selection.recommendation, (None if selection.status == "OK" else selection.reason)
+    else:
+        if args.published is None:
+            raise _Refused(PlanError("published_missing", "--published is required with --source published_rec"))
+        try:
+            recommendation = _published_set(
+                _read_json(args.published, missing="published_missing", corrupt="published_corrupt"), args.slot)
+        except _Refused as refusal:
+            # An unreadable copy is no published set, as an absent one is: the run falls back to the Mac plan and
+            # then to compute, which need no copy. Never read around the defect (no salvaging of a partial set).
+            return _emit({"status": "NO_VALID_PLAN", "plan": None, "errors": _error_dicts(refusal.errors)}, 2)
+        reason = "no_set_for_slot" if recommendation is None else _freshness_reason(recommendation, args.slot, now,
+                                                                                    max_age)
+    if reason is not None or recommendation is None:
+        return _emit({"status": "NO_VALID_PLAN", "plan": None,
+                      "errors": _error_dicts([PlanError(reason or "no_set_for_slot")])}, 2)
+    result = _validate_plan_first(_plan_first_document(recommendation, args.source), config=config,
+                                  ladder_version=ladder_version, trading_day=trading_day, slot=args.slot)
+    if result.errors:
+        return _emit({"status": "NO_VALID_PLAN", "plan": None, "errors": _error_dicts(result.errors)}, 2)
+    return _emit({"status": "VALID_PLAN", "plan": result.plan, "errors": []}, 0)
+
+
+def _placement_order_id(document: Any) -> str | None:
+    """The broker order id in one saved placement response, read the way ``plan_first_slot finish`` does."""
+    data = document.get("data", document) if isinstance(document, dict) else {}
+    row = data.get("order", data) if isinstance(data, dict) else {}
+    value = row.get("id") or row.get("order_id") if isinstance(row, dict) else None
+    return str(value) if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value) else None
+
+
+def _cmd_executor_ids(args: argparse.Namespace, trading_day: date) -> int:
+    """The broker order ids the Claude plan-first reader saved for this slot today (Mac only).
+
+    Robinhood echoes its OWN ref_id, never the UUID the reader sent (scripts/validate_native_placement.py), so the
+    order id in each saved response under ``<cron root>/recommendations/<day>/placements/<slot>/<TICKER>.json`` is
+    the one exact link between a broker row and Claude's reader. No directory means no placements (an empty list).
+    A response that cannot be read is a refusal: a recognition list with a hole in it would turn Claude's own order
+    into an unrecognized one, and the prompt fails closed on that, but silently is worse.
+    """
+    store = RecommendationStore(args.rec_root)
+    directory = store.placements_dir(trading_day, args.slot)
+    ids: set[str] = set()
+    for path in sorted(store._placed_tickers(directory)):
+        order_id = _placement_order_id(_read_json(path, missing="placement_missing", corrupt="placement_corrupt"))
+        if order_id:
+            ids.add(order_id)  # a refused placement saved no order id; there is nothing at the broker to recognise
+    return _emit({"status": "OK", "trading_day": trading_day.isoformat(), "slot": args.slot,
+                  "order_ids": sorted(ids), "errors": []}, 0)
+
+
+def _load_executor_ids(path: Path, trading_day: date, slot: str) -> set[str]:
+    """``executor-ids`` output saved verbatim by the prompt, checked against this run's day and slot."""
+    data = _read_json(path, missing="executor_ids_missing", corrupt="executor_ids_corrupt")
+    ids = data.get("order_ids") if isinstance(data, dict) else None
+    if (not isinstance(data, dict) or data.get("status") != "OK" or data.get("trading_day") != trading_day.isoformat()
+            or data.get("slot") != slot or not isinstance(ids, list)
+            or not all(isinstance(value, str) and value for value in ids)):
+        raise _Refused(PlanError("executor_ids_invalid", path.name))
+    return set(ids)
+
+
+def _row_dollars(row: dict[str, Any]) -> float | None:
+    amount = _row_amount(row, "dollar_based_amount")
+    return amount if amount is not None and math.isfinite(amount) else None
+
+
+def _classify_row(row: dict[str, Any], *, slot: str, trading_day: date, executor_ids: set[str],
+                  published: dict[str, float]) -> tuple[str, str]:
+    """``(class, basis)`` for one in-window order: ``user``, ``executor`` or ``unrecognized``.
+
+    Executor evidence, strongest first: the order id the Claude reader saved (exact); a reference this repo derives
+    for this slot (the legacy ``dca-runner-<slot>-`` client id, or the native UUID should the broker ever echo it);
+    and, when the Mac is out of reach, a buy of a symbol the published set for this slot lists, for exactly that
+    set's dollar amount to the cent. The last is the weakest: a set recomputed after Claude's buy can list another
+    amount, or drop the ticker, and the order then reads as unrecognized, so the backup stands down (fail closed).
+    """
+    if row.get("placed_agent") in _USER_AGENTS:
+        return "user", "placed_agent"
+    if str(row.get("id") or "") in executor_ids:
+        return "executor", "plan_first_placement"
+    symbol = str(row.get("symbol") or "").strip().upper()
+    reference = row.get("ref_id") if isinstance(row.get("ref_id"), str) else ""
+    if reference.startswith(f"dca-runner-{slot}-"):
+        return "executor", "runner_reference"
+    if symbol and reference == native_ref_id(slot, trading_day.isoformat(), symbol):
+        return "executor", "native_reference"
+    dollars = _row_dollars(row)
+    if (str(row.get("side") or "").lower() == "buy" and symbol in published and dollars is not None
+            and abs(dollars - published[symbol]) < 0.005):
+        return "executor", "published_recommendation"
+    return "unrecognized", ""
+
+
+def _cmd_classify(args: argparse.Namespace, trading_day: date) -> int:
+    """Classify every order created inside this slot's placement window: the step 2 rule, in code.
+
+    CLEAR (exit 0) when every one is the user's own activity or recognised executor traffic; UNRECOGNIZED (exit 2)
+    when any other order is there, so the prompt stands down. The output names symbols, times and the recognition
+    basis only, never an account number or an order id.
+    """
+    rows = _load_rows(args.orders_pages, trading_day)
+    executor_ids = _load_executor_ids(args.executor_ids, trading_day, args.slot) if args.executor_ids else set()
+    published: dict[str, float] = {}
+    if args.published is not None and args.executor_ids is None:
+        try:
+            recommendation = _published_set(
+                _read_json(args.published, missing="published_missing", corrupt="published_corrupt"), args.slot)
+        except _Refused:
+            recommendation = None
+        # Recognition does not need a FRESH set (Claude may have bought from an older one), only today's.
+        if recommendation is not None and recommendation.trading_day == trading_day:
+            published = {item.ticker: item.usd for item in recommendation.items}
+    start, end = dop.placement_window(args.slot, trading_day)
+    executor, user, unrecognized = [], 0, []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise _Refused(PlanError("history_unusable", "row is not an object"))
+        try:
+            created = datetime.fromisoformat(str(row.get("created_at")).replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise _Refused(PlanError("history_unusable", "created_at")) from exc
+        if created.tzinfo is None:
+            raise _Refused(PlanError("history_unusable", "created_at is not timezone-aware"))
+        if not start <= created.astimezone(ET) < end:
+            continue
+        kind, basis = _classify_row(row, slot=args.slot, trading_day=trading_day, executor_ids=executor_ids,
+                                    published=published)
+        entry = {"symbol": str(row.get("symbol") or "").upper(), "created_at": created.isoformat(),
+                 "side": str(row.get("side") or "").lower()}
+        if kind == "user":
+            user += 1
+        elif kind == "executor":
+            executor.append({**entry, "basis": basis})
+        else:
+            unrecognized.append({**entry, "placed_agent": row.get("placed_agent") if isinstance(row.get("placed_agent"), str) else None})
+    status = "UNRECOGNIZED" if unrecognized else "CLEAR"
+    return _emit({"status": status, "window": [start.isoformat(), end.isoformat()], "user_orders": user,
+                  "executor_orders": executor, "unrecognized_orders": unrecognized,
+                  "published_set_used": bool(published), "errors": []}, 2 if unrecognized else 0)
+
+
+def _cmd_check_placement(args: argparse.Namespace, trading_day: date) -> int:
+    """Step 7e: did this one place call create a NEW order for exactly the request? (``validate_native_placement``)
+
+    The broker echoes its own ref_id, never the UUID that was sent, so the old "returned ref_id must match" rule
+    recorded every accepted order as a failure (scripts/validate_native_placement.py). This runs the repo's own
+    native check instead: an accepted state, the requested symbol, side and dollar amount, an order id absent from
+    the history fetched before the call, and a ``created_at`` at or after the sampled submit instant.
+
+    The prior history is poll 2 (complete, pinned pages: the same proof ``finalize`` needs) plus the saved responses
+    of this run's earlier orders, so the task never retypes an order id. PLACED (exit 0) prints the order id for the
+    state record; anything else is NOT_PLACED (exit 2), a failure the prompt never retries.
+    """
+    prior: set[str] = set()
+    for row in _load_rows(args.prior_orders_pages, trading_day):
+        order_id = row.get("id") if isinstance(row, dict) else None
+        if isinstance(order_id, str) and order_id.strip():
+            prior.add(order_id.strip())
+    for path in args.placed_responses or ():
+        order_id = _placement_order_id(_read_json(path, missing="placement_missing", corrupt="placement_corrupt"))
+        if order_id:
+            prior.add(order_id)
+    response = _read_json(args.response, missing="placement_missing", corrupt="placement_corrupt")
+    amount = _parse_money(args.amount)
+    if amount is None or amount <= 0:
+        raise _Refused(PlanError("invalid_amount", "must be a positive amount"))
+    try:
+        verdict = validate_native_placement(
+            response, expected_symbol=args.symbol.strip().upper(), expected_side="buy", expected_amount_usd=amount,
+            sent_ref_id=args.sent_ref_id, prior_order_ids=frozenset(prior), submitted_after=args.submitted_after,
+        )
+    except ValueError as exc:
+        raise _Refused(PlanError("bad_submitted_after", type(exc).__name__)) from exc
+    if verdict["ok"]:
+        return _emit({"status": "PLACED", "symbol": args.symbol.strip().upper(), "order_id": verdict["order_id"],
+                      "errors": []}, 0)
+    # The validator's reason names fields and states, never the account (it redacts diagnostic text itself).
+    return _emit({"status": "NOT_PLACED", "symbol": args.symbol.strip().upper(), "order_id": None,
+                  "errors": _error_dicts([PlanError("placement_unconfirmed", str(verdict["reason"]))])}, 2)
 
 
 def _cmd_compute(args: argparse.Namespace, trading_day: date) -> int:
@@ -482,29 +845,60 @@ def _collect(errors: list[PlanError], load: Any) -> Any:
         return None
 
 
+def _load_plan_any(path: Path, *, config: Any, ladder_version: str, trading_day: date, slot: str) -> PlanResult:
+    """A dca_order_plan document (Claude's legacy order_plan or a computed plan) or a plan-first one, validated."""
+    try:
+        document = _read_json(path, missing="plan_missing", corrupt="plan_corrupt")
+    except _Refused as refusal:
+        return dop._fail(*refusal.errors)
+    if isinstance(document, dict) and document.get("generator") == PLAN_FIRST_GENERATOR:
+        return _validate_plan_first(document, config=config, ladder_version=ladder_version, trading_day=trading_day,
+                                    slot=slot)
+    return dop.validate_plan(document, **_plan_context(config, ladder_version, trading_day, slot))
+
+
 def _cmd_finalize(args: argparse.Namespace, trading_day: date) -> int:
     config, ladder_version, _ = _context(args.config_dir)
-    plan = dop.load_plan(args.plan, **_plan_context(config, ladder_version, trading_day, args.slot))
+    plan = _load_plan_any(args.plan, config=config, ladder_version=ladder_version, trading_day=trading_day,
+                          slot=args.slot)
     errors: list[PlanError] = list(plan.errors)
     history = _collect(errors, lambda: _load_history(args.orders_pages, trading_day))
     fresh = _collect(errors, lambda: _load_fresh_quotes(args.fresh_quotes))
     spreads = _collect(errors, lambda: _load_fresh_spreads(args.fresh_spreads))
     buying_power = _collect(errors, lambda: _parse_buying_power(args.buying_power))
+    plan_first = plan.plan is not None and plan.plan["generator"] == PLAN_FIRST_GENERATOR
+    prior_closes: dict[str, float] = {}
+    if plan_first:
+        # A recommendation is price-blind by design, so rule 6's "below the prior close" needs the close from the
+        # task's own fresh fetch. Required: without it no order could prove rule 6.
+        if args.fresh_prior_closes is None:
+            errors.append(PlanError("fresh_prior_closes_missing", "required for a plan_first plan"))
+        else:
+            prior_closes = _collect(errors, lambda: _load_fresh_quotes(
+                args.fresh_prior_closes, missing="fresh_prior_closes_missing", corrupt="fresh_prior_closes_corrupt")) or {}
     if errors:
         return _abort(*errors)
-    if plan.plan["generator"] != "claude":
+    if plan.plan["generator"] not in _PRIMARY_SIZED_GENERATORS:
         guard = _kill_switch_error(plan.orders, history, config, trading_day, args.now)
         if guard is not None:
             return _abort(guard)
-    # A Claude plan already carries any top-up resize, so only THIS slot's window counts as already
-    # placed. A computed plan cannot resize, so it keeps the conservative day-wide exclusion.
-    scope = "slot" if plan.plan["generator"] == "claude" else "day"
-    remaining = dop.reconcile(plan.orders, history, trading_day=trading_day, slot=args.slot, scope=scope)
+    # A Claude or plan-first plan already carries any top-up resize, so only THIS slot's window counts as
+    # already placed. A computed plan cannot resize, so it keeps the conservative day-wide exclusion.
+    scope = "slot" if plan.plan["generator"] in _PRIMARY_SIZED_GENERATORS else "day"
+    candidates: list[dict[str, Any]] = list(plan.orders)
+    skipped: list[dict[str, str]] = []
+    if plan_first:
+        candidates = [{**o, "prior_close": prior_closes[o["symbol"]]} for o in plan.orders if o["symbol"] in prior_closes]
+        skipped = [{"symbol": o["symbol"], "reason": "no_prior_close"} for o in plan.orders if o["symbol"] not in prior_closes]
+    remaining = dop.reconcile(candidates, history, trading_day=trading_day, slot=args.slot, scope=scope)
     remaining_symbols = {o["symbol"] for o in remaining}
-    skipped = [{"symbol": o["symbol"], "reason": "already_placed"} for o in plan.orders if o["symbol"] not in remaining_symbols]
+    skipped += [{"symbol": o["symbol"], "reason": "already_placed"} for o in candidates if o["symbol"] not in remaining_symbols]
     # The tier is the one the plan was built under: counted over ALL its orders, so a ticker skipped at placement
-    # cannot drop a valid batch to a lower tier and abort it.
-    tier, weekly_cap = _tier_for((o["multiplier"] for o in plan.orders), config)
+    # cannot drop a valid batch to a lower tier and abort it. A plan-first set is price-blind and carries no
+    # multiplier, so it counts no 3x signals and stays on the Normal tier: the tier the recommender sized it under
+    # lives only in its program-only expected-price file, which a cloud backup never sees. Conservative by design: an
+    # escalated set over the Normal caps aborts (places nothing); it is never trimmed or placed over a proven cap.
+    tier, weekly_cap = _tier_for((o.get("multiplier", 0.0) for o in plan.orders), config)
     result = dop.revalidate_for_placement(
         remaining, broker_orders=history, fresh_quotes=fresh, trading_day=trading_day, tier=tier,
         weekly_cap_usd=weekly_cap, config=config, slot=args.slot, scope=scope, buying_power_usd=buying_power,
@@ -515,7 +909,7 @@ def _cmd_finalize(args: argparse.Namespace, trading_day: date) -> int:
     skipped += [{"symbol": symbol, "reason": reason} for symbol, reason in result.skipped]
     orders = [{"symbol": o["symbol"], "notional_usd": o["notional_usd"], "ref_id": o["ref_id"]} for o in result.orders]
     mac_out_of_the_picture = args.local_status in BACKUP_MAY_ACT_LOCAL_STATUSES
-    if plan.plan["generator"] != "claude" and not (COMPUTE_PLACEMENT_ENABLED and mac_out_of_the_picture):
+    if plan.plan["generator"] not in _PRIMARY_SIZED_GENERATORS and not (COMPUTE_PLACEMENT_ENABLED and mac_out_of_the_picture):
         return _emit({"status": "SHADOW_ONLY", "to_place": [], "would_place": orders, "skipped": skipped, "errors": []}, 0)
     return _emit({"status": "PROCEED", "to_place": orders, "skipped": skipped, "errors": []}, 0)
 
@@ -573,10 +967,34 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("--slot", required=True, help="Slot id: one of " + ", ".join(SLOTS))
         p.add_argument("--config-dir", type=Path, default=None)
 
-    plan = sub.add_parser("plan", help="Read and validate the Mac's plan file.")
+    plan = sub.add_parser("plan", help="Read and validate a plan: the Mac's plan file or a plan-first recommendation.")
     common(plan)
-    plan.add_argument("--source", required=True, choices=("mac_plan",))
+    plan.add_argument("--source", required=True, choices=("mac_plan",) + _PLAN_FIRST_SOURCES,
+                      help="mac_plan: the legacy order_plan file. mac_rec: the Mac's local plan-first store. "
+                           "published_rec: a published plan-first payload saved by the task (--published).")
     plan.add_argument("--plan-file", type=Path, default=None)
+    plan.add_argument("--published", type=Path, default=None,
+                      help="The published recommendations payload, saved untouched (with --source published_rec).")
+    plan.add_argument("--rec-root", default=None, help="Recommendation store root (default: the cron root's).")
+    plan.add_argument("--now", default=None, help="ET-day ISO timestamp the freshness rule is applied at.")
+    classify = sub.add_parser("classify", help="Classify every order inside this slot's window; stand down on any unknown.")
+    common(classify)
+    classify.add_argument("--orders-pages", required=True, type=Path)
+    classify.add_argument("--executor-ids", type=Path, default=None, help="The Mac's executor-ids output, saved untouched.")
+    classify.add_argument("--published", type=Path, default=None, help="The published recommendations payload, if saved.")
+    executor_ids = sub.add_parser("executor-ids", help="Mac only: order ids the plan-first reader saved for this slot.")
+    common(executor_ids)
+    executor_ids.add_argument("--rec-root", default=None, help="Recommendation store root (default: the cron root's).")
+    check = sub.add_parser("check-placement", help="Step 7e: validate one saved placement response (native ref_id rule).")
+    common(check)
+    check.add_argument("--response", required=True, type=Path, help="The raw placement response, saved untouched.")
+    check.add_argument("--symbol", required=True)
+    check.add_argument("--amount", required=True, help="The notional_usd that was sent.")
+    check.add_argument("--sent-ref-id", required=True, help="The ref_id that was sent.")
+    check.add_argument("--submitted-after", required=True, help="Offset-aware instant sampled just before the call.")
+    check.add_argument("--prior-orders-pages", required=True, type=Path, help="Poll 2's saved orders envelope.")
+    check.add_argument("--placed-responses", type=Path, nargs="*", default=(),
+                       help="This run's earlier saved placement responses (their order ids are prior history too).")
     compute = sub.add_parser("compute", help="Derive a plan: from quotes (ladder only) or through the safety gate.")
     common(compute)
     source = compute.add_mutually_exclusive_group(required=True)
@@ -599,6 +1017,8 @@ def _build_parser() -> argparse.ArgumentParser:
     finalize.add_argument("--fresh-spreads", required=True, type=Path,
                           help='JSON {"SYMBOL": {"bid": x, "ask": y}} fetched just before placement.')
     finalize.add_argument("--buying-power", required=True, help="Fresh available buying power in USD.")
+    finalize.add_argument("--fresh-prior-closes", type=Path, default=None,
+                          help='JSON {"SYMBOL": prior regular-session close}; required for a plan_first plan.')
     finalize.add_argument("--local-status", default=None, choices=LOCAL_STATUSES,
                           help="Step 3's local_status. A computed plan places only for off, errored or unreachable.")
     finalize.add_argument("--now", default=None,
@@ -628,7 +1048,8 @@ def main(argv: list[str] | None = None) -> int:
         return failed(PlanError("bad_trading_day", "not a calendar date"))
     if args.slot not in SLOTS:
         return failed(PlanError("unknown_slot", args.slot))
-    handler = {"plan": _cmd_plan, "compute": _cmd_compute, "finalize": _cmd_finalize}[args.command]
+    handler = {"plan": _cmd_plan, "compute": _cmd_compute, "finalize": _cmd_finalize, "classify": _cmd_classify,
+               "executor-ids": _cmd_executor_ids, "check-placement": _cmd_check_placement}[args.command]
     try:
         return handler(args, trading_day)
     except _Refused as refusal:

@@ -64,6 +64,8 @@ RUNTIME_CONFIG = (
     "config/morning_dca.json",
     "config/near_close_dca.json",
     "config/per_ticker_sizing.json",
+    # The plan-first freshness rule (max_age_minutes) `plan --source published_rec` applies in the sandbox.
+    "config/recommendations.json",
     "config/sizing_ladder.json",
     "config/tickers.json",
     "config/trading_window.json",
