@@ -28,6 +28,20 @@ def rec_set(items=()):
     return RecommendationSet(DAY, STAMP, "1530", "robinhood_agent_fetch", "v1", "abc", tuple(items))
 
 
+def test_sizing_guard_round_trips_is_optional_on_the_wire_and_validated():
+    guarded = replace(rec_set(), sizing_guard={"max_multiplier": 3.0, "deployed_7d_usd": 12.5})
+    assert guarded.to_json()["sizing_guard"] == {"max_multiplier": 3.0, "deployed_7d_usd": 12.5}
+    assert RecommendationSet.from_json(guarded.to_json()) == guarded
+    # An older payload without the key still parses, as an unstamped set the backup then refuses.
+    assert "sizing_guard" not in rec_set().to_json()
+    assert RecommendationSet.from_json(rec_set().to_json()).sizing_guard is None
+    for bad in [{"max_multiplier": 0.5, "deployed_7d_usd": 0.0}, {"max_multiplier": 3.0, "deployed_7d_usd": -1.0},
+                {"max_multiplier": float("inf"), "deployed_7d_usd": 0.0}, {"max_multiplier": True, "deployed_7d_usd": 0.0},
+                {"max_multiplier": 3.0}, {"max_multiplier": 3.0, "deployed_7d_usd": 0.0, "extra": 1}]:
+        with pytest.raises(ValueError):
+            replace(rec_set(), sizing_guard=bad)
+
+
 def price():
     return ExpectedPrice("SPY", 100.0, 101.0, None, 1.2, 0.99, 15.0)
 

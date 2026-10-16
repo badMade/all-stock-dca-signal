@@ -194,6 +194,9 @@ def test_stream_slots_use_normal_tier_even_when_signal_count_would_escalate(tmp_
     assert result.status == "OK"
     total = sum(item.usd for item in result.recommendations.items)
     assert 170.0 < total <= 180.0
+    # Every set carries the kill-switch state it was sized under, for the backup's poll-2 recheck.
+    guard = result.recommendations.sizing_guard
+    assert guard is not None and guard["max_multiplier"] >= 1.0 and guard["deployed_7d_usd"] >= 0.0
     normal = next(tier for tier in near_close_dca.BUDGET_TIERS if tier.name.lower() == "normal")
     assert normal.daily_cap_usd == 180.0
 

@@ -119,7 +119,7 @@ GATED_SLOTS = {"0935": "0935ET", "1030": "1030ET", "1130": "1130ET", "1230": "12
 PLAN_FIRST_GENERATOR = "plan_first"
 _PRIMARY_SIZED_GENERATORS = frozenset({"claude", PLAN_FIRST_GENERATOR})
 _PLAN_FIRST_KEYS = frozenset({"schema_version", "trading_day", "slot", "generated_at_et", "generator", "ladder_version",
-                              "universe_hash", "source", "orders"})
+                              "universe_hash", "source", "orders", "sizing_guard"})
 _PLAN_FIRST_ORDER_KEYS = frozenset({"symbol", "notional_usd", "ref_id"})
 _PLAN_FIRST_SOURCES = ("mac_rec", "published_rec")
 # The published payload dca_rec_publish.build_document writes (Notion code block, GitHub `recommendations` branch).
@@ -426,6 +426,7 @@ def _plan_first_document(recommendation: RecommendationSet, source: str) -> dict
         "source": source,
         "orders": [{"symbol": item.ticker, "notional_usd": item.usd, "ref_id": item.ref_id}
                    for item in recommendation.items],
+        "sizing_guard": recommendation.sizing_guard,
     }
 
 
@@ -455,6 +456,14 @@ def _validate_plan_first(plan: Any, *, config: Any, ladder_version: str, trading
         errors.append(PlanError("stale_ladder_version", f"expected {ladder_version}"))
     if plan["universe_hash"] != dop.universe_hash(config.tickers):
         errors.append(PlanError("universe_hash_mismatch"))
+    guard = plan["sizing_guard"]
+    # None is allowed here (an older, unstamped set still parses) and fails closed later, at finalize's recheck.
+    if guard is not None and not (
+            isinstance(guard, dict) and set(guard) == {"max_multiplier", "deployed_7d_usd"}
+            and dop._is_positive_finite(guard["max_multiplier"]) and guard["max_multiplier"] >= 1.0
+            and isinstance(guard["deployed_7d_usd"], (int, float)) and not isinstance(guard["deployed_7d_usd"], bool)
+            and math.isfinite(guard["deployed_7d_usd"]) and guard["deployed_7d_usd"] >= 0):
+        errors.append(PlanError("schema_violation", "sizing_guard"))
     orders = plan["orders"]
     if not isinstance(orders, list):
         return dop._fail(*errors, PlanError("schema_violation", "orders must be a list"))
@@ -882,6 +891,10 @@ def _cmd_finalize(args: argparse.Namespace, trading_day: date) -> int:
         guard = _kill_switch_error(plan.orders, history, config, trading_day, args.now)
         if guard is not None:
             return _abort(guard)
+    elif plan_first:
+        guard = _plan_first_kill_switch_error(plan.plan, history, config, trading_day, args.now)
+        if guard is not None:
+            return _abort(guard)
     # A Claude or plan-first plan already carries any top-up resize, so only THIS slot's window counts as
     # already placed. A computed plan cannot resize, so it keeps the conservative day-wide exclusion.
     scope = "slot" if plan.plan["generator"] in _PRIMARY_SIZED_GENERATORS else "day"
@@ -935,6 +948,39 @@ def _kill_switch_error(orders: Any, history: list[BrokerOrder], config: Any, tra
     except BudgetDataError as exc:
         return PlanError("history_unusable", type(exc).__name__)
     if kill_switch_engaged(dataclasses.replace(config, deployed_last_7d_usd=deployed)) and any(o["multiplier"] > 1.0 for o in orders):
+        return PlanError("kill_switch_engaged_since_plan", "trailing seven-day spend now exceeds the kill-switch threshold")
+    return None
+
+
+def _plan_first_kill_switch_error(plan: dict[str, Any], history: list[BrokerOrder], config: Any, trading_day: date,
+                                  now_text: str | None) -> PlanError | None:
+    """Poll 2's recheck of the trailing-7-day guard for a plan-first set, else ``None`` when it still holds.
+
+    The set was sized under the kill-switch state its ``sizing_guard`` records. Other slots' spend can land inside
+    the freshness window and engage the switch, and a set sized above 1x must not then be placed. The payload carries
+    no per-order multiplier (it is price-blind), so the stamp's ``max_multiplier`` stands in for it: at 1x the set
+    cannot be over the cap and needs no recheck. The figure is re-derived from the fresh pull MINUS this set's own
+    orders (matched by their native ref_id), because a partly placed batch must not trip the switch on its own
+    fills -- the reason a Claude plan is exempt from :func:`_kill_switch_error`. A set with no stamp (older writer) or
+    a history that cannot prove the figure fails closed and places nothing.
+    """
+    guard = plan.get("sizing_guard")
+    if not isinstance(guard, dict):
+        return PlanError("sizing_guard_missing", "an unstamped plan-first set cannot be rechecked against the kill switch")
+    if guard["max_multiplier"] <= 1.0:
+        return None
+    now = _parse_now(now_text)
+    if now is None:
+        return PlanError("bad_now", "expected a timezone-aware ISO timestamp")
+    if now.astimezone(ET).date() != trading_day:
+        return PlanError("now_not_trading_day", trading_day.isoformat())
+    own_refs = {order["ref_id"] for order in plan["orders"]}
+    others = [o for o in history if not ({o.client_order_id, o.ref_id} & own_refs)]
+    try:
+        deployed = dop.trailing_deployed_usd(others, now=now)
+    except BudgetDataError as exc:
+        return PlanError("history_unusable", type(exc).__name__)
+    if kill_switch_engaged(dataclasses.replace(config, deployed_last_7d_usd=deployed)):
         return PlanError("kill_switch_engaged_since_plan", "trailing seven-day spend now exceeds the kill-switch threshold")
     return None
 

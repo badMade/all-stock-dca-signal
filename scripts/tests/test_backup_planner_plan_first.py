@@ -4,8 +4,8 @@ The Perplexity backups must keep working once the Claude slots become plan-first
 
 * ``plan --source mac_rec|published_rec`` reads the primary's own {ticker, usd, ref_id} set under the local
   reader's freshness rule (``dca_rec_store.RecommendationStore.select_for``) and emits a plan ``finalize`` accepts;
-* ``finalize`` places such a plan like a Claude plan (this slot's window only, no kill-switch re-derivation, no
-  ``--local-status`` needed) but still proves rule 6 against a fresh prior close, and keeps every cap all-or-nothing;
+* ``finalize`` places such a plan like a Claude plan (this slot's window only, no ``--local-status`` needed; the
+  kill switch is rechecked from the set's ``sizing_guard`` stamp, minus the set's own orders) but still proves rule 6 against a fresh prior close, and keeps every cap all-or-nothing;
 * ``classify`` recognises Claude's plan-first orders, which carry no ``dca-runner-`` reference at the broker (the
   broker echoes its own ref_id), and still stands down on anything else;
 * ``executor-ids`` lists the order ids the reader saved on the Mac.
@@ -28,7 +28,7 @@ import dca_order_plan as dop
 from dca_rec_models import Recommendation, RecommendationSet
 from dca_rec_publish import build_document
 from dca_rec_store import RecommendationStore
-from dca_runner import ET
+from dca_runner import ET, BrokerOrder
 from scripts import backup_planner
 from scripts.validate_native_placement import native_ref_id
 
@@ -81,14 +81,23 @@ def config():
     return dca_config.load_strategy_config(dca_config.get_config_dir())
 
 
-def _set(items, *, as_of="2026-10-07T11:45:00-04:00", slot=SLOT, day=DAY, ladder=None, universe=None, config=None):
-    """A RecommendationSet built the way dca_recommender builds one: native UUID ref_ids, current version stamps."""
+_UNSET = object()
+
+
+def _set(items, *, as_of="2026-10-07T11:45:00-04:00", slot=SLOT, day=DAY, ladder=None, universe=None, config=None,
+         max_multiplier=1.0, guard=_UNSET):
+    """A RecommendationSet built the way dca_recommender builds one: native UUID ref_ids, current version stamps.
+
+    Stamped at 1x by default, as a recommender writes it; ``guard=None`` builds an older, unstamped set."""
+    if guard is _UNSET:
+        guard = {"max_multiplier": max_multiplier, "deployed_7d_usd": 0.0}
     config = config or dca_config.load_strategy_config(dca_config.get_config_dir())
     return RecommendationSet(
         date.fromisoformat(day), datetime.fromisoformat(as_of), slot, "robinhood_agent_fetch",
         ladder or dop.current_ladder_version(), universe or dop.universe_hash(config.tickers),
         tuple(Recommendation(item[0], item[1], item[2] if len(item) > 2 else native_ref_id(slot, day, item[0]))
               for item in items),
+        sizing_guard=guard,
     )
 
 
@@ -219,8 +228,8 @@ def test_mac_rec_with_an_empty_store_is_no_valid_plan(tmp_path, capsys):
 def test_the_planner_selects_exactly_what_the_local_reader_selects(tmp_path):
     """Parity: the published path and RecommendationStore.select_for agree on every boundary case."""
     store = RecommendationStore(tmp_path)
-    settings_age = timedelta(minutes=15)
     now = datetime.fromisoformat(NOW)
+    settings_age = timedelta(minutes=15)
     for minutes_old in (-1, 0, 5, 15, 16, 60):
         rec = _set([("MSFT", 4.0)], as_of=(now - timedelta(minutes=minutes_old)).isoformat())
         day_dir = store.day_dir(rec.trading_day)
@@ -267,6 +276,51 @@ def test_a_plan_first_plan_proceeds_with_the_native_ref_ids_and_no_local_status(
         {"symbol": "MSFT", "notional_usd": 4.0, "ref_id": native_ref_id(SLOT, DAY, "MSFT")},
         {"symbol": "AAPL", "notional_usd": 2.5, "ref_id": native_ref_id(SLOT, DAY, "AAPL")},
     ]
+
+
+def _plan_first_plan_from(tmp_path, capsys, recommendation):
+    published = _published(tmp_path, [recommendation])
+    code, report, _ = _run(capsys, ["plan", "--source", "published_rec", "--published", published, "--now", NOW, *_common()])
+    assert code == 0, report
+    return report["plan"], _write(tmp_path, "plan.json", report["plan"])
+
+
+def test_an_above_1x_set_aborts_when_spend_since_sizing_engages_the_kill_switch(tmp_path, capsys):
+    """The 2026-10-15 Codex finding: the set was sized above 1x, then $1,500 of other spend landed in the 7 days."""
+    _, plan = _plan_first_plan_from(tmp_path, capsys, _set([("MSFT", 4.0)], max_multiplier=3.0))
+    rows = [_raw("VT", amount="1500.00", created="2026-10-03T14:00:00+00:00")]
+    code, report, _ = _run(capsys, _finalize_argv(tmp_path, plan, rows))
+    assert (code, report["status"], report["to_place"]) == (2, "ABORT", [])
+    assert [e["code"] for e in report["errors"]] == ["kill_switch_engaged_since_plan"]
+
+
+def test_a_set_sized_at_1x_needs_no_kill_switch_recheck(tmp_path, capsys):
+    """At 1x nothing can be over the cap, so the same history does not trip the recheck (other caps may still bind)."""
+    _, plan = _plan_first_plan_from(tmp_path, capsys, _set([("MSFT", 4.0)], max_multiplier=1.0))
+    rows = [_raw("VT", amount="1500.00", created="2026-10-03T14:00:00+00:00")]
+    _, report, _ = _run(capsys, _finalize_argv(tmp_path, plan, rows))
+    assert "kill_switch_engaged_since_plan" not in [e["code"] for e in report["errors"]]
+
+
+def test_an_unstamped_plan_first_set_fails_closed_at_finalize(tmp_path, capsys):
+    _, plan = _plan_first_plan_from(tmp_path, capsys, _set([("MSFT", 4.0)], guard=None))
+    code, report, _ = _run(capsys, _finalize_argv(tmp_path, plan))
+    assert (code, report["status"], report["to_place"]) == (2, "ABORT", [])
+    assert [e["code"] for e in report["errors"]] == ["sizing_guard_missing"]
+
+
+def test_the_recheck_excludes_the_sets_own_orders_so_a_partly_placed_batch_is_not_aborted():
+    """$1,400 of other spend is under the $1,440 threshold; the set's own $100 fill would cross it if it counted."""
+    own_ref = native_ref_id(SLOT, DAY, "MSFT")
+    plan = {"sizing_guard": {"max_multiplier": 3.0, "deployed_7d_usd": 0.0},
+            "orders": [{"symbol": "MSFT", "notional_usd": 4.0, "ref_id": own_ref}]}
+    config = dca_config.load_strategy_config(dca_config.get_config_dir())
+    other = BrokerOrder("VT", "buy", 1400.0, datetime.fromisoformat("2026-10-03T14:00:00+00:00"), state="filled")
+    own = BrokerOrder("MSFT", "buy", 100.0, datetime.fromisoformat(f"{DAY}T15:40:00+00:00"), state="filled", ref_id=own_ref)
+    assert backup_planner._plan_first_kill_switch_error(plan, [other, own], config, date.fromisoformat(DAY), NOW) is None
+    over = BrokerOrder("VT", "buy", 1500.0, datetime.fromisoformat("2026-10-03T14:00:00+00:00"), state="filled")
+    error = backup_planner._plan_first_kill_switch_error(plan, [over, own], config, date.fromisoformat(DAY), NOW)
+    assert error is not None and error.code == "kill_switch_engaged_since_plan"
 
 
 def test_a_plan_first_plan_needs_the_fresh_prior_closes(tmp_path, capsys):

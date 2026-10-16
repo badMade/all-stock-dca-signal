@@ -288,7 +288,11 @@ class RecommendationEngine:
             orders_out = planned_result.plan["orders"]
             rec = RecommendationSet(day, instant, slot, snapshot.source, ladder,
                                    dca_order_plan.universe_hash(config.tickers),
-                                   tuple(Recommendation(row["symbol"], row["notional_usd"], native_ref_id(slot, day.isoformat(), row["symbol"])) for row in orders_out))
+                                   tuple(Recommendation(row["symbol"], row["notional_usd"], native_ref_id(slot, day.isoformat(), row["symbol"])) for row in orders_out),
+                                   # Stamp the kill-switch state this set was sized under, so the backup can recheck
+                                   # an above-1x set against spend that landed since (it cannot see multipliers).
+                                   sizing_guard={"max_multiplier": max([1.0, *(float(row["multiplier"]) for row in orders_out)]),
+                                                 "deployed_7d_usd": float(deployed)})
             expected = ExpectedPriceSet(day, instant, slot, deployed_source,
                                         tuple(ExpectedPrice(row["symbol"], row["decision_price"], row["prior_close"],
                                                             row["prior_low"], row["multiplier"], row["drop_pct"],

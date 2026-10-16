@@ -207,6 +207,12 @@ class RecommendationSet:
     universe_hash: str
     items: tuple[Recommendation, ...]
     schema_version: int = 1
+    # What the kill switch looked like when this set was sized: {"max_multiplier": the largest ladder multiplier
+    # among the items, "deployed_7d_usd": the trailing-7-day figure it was sized under}. The agent payload is
+    # price-blind and carries no multiplier, so without this stamp the backup cannot tell whether a set sized above
+    # 1x is still safe to place after other slots' spend engages the switch. None = an unstamped (older) set; the
+    # backup fails closed on it. Optional on the wire so readers of older payloads still parse.
+    sizing_guard: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
         _valid_day(self.trading_day)
@@ -214,6 +220,14 @@ class RecommendationSet:
         if not isinstance(self.slot, str) or self.slot not in SLOT_IDS:
             raise ValueError("unknown slot")
         _string(self.source, "source")
+        if self.sizing_guard is not None:
+            guard = self.sizing_guard
+            if not isinstance(guard, dict) or set(guard) != {"max_multiplier", "deployed_7d_usd"}:
+                raise ValueError("sizing_guard must carry exactly max_multiplier and deployed_7d_usd")
+            if _finite(guard["max_multiplier"], "max_multiplier") < 1.0:
+                raise ValueError("max_multiplier must be at least 1")
+            if _finite(guard["deployed_7d_usd"], "deployed_7d_usd") < 0:
+                raise ValueError("deployed_7d_usd cannot be negative")
         _string(self.ladder_version, "ladder_version")
         _string(self.universe_hash, "universe_hash")
         if type(self.schema_version) is not int or self.schema_version != 1:
@@ -232,6 +246,8 @@ class RecommendationSet:
                 "as_of": self.as_of.isoformat(), "slot": self.slot, "source": self.source,
                 "ladder_version": self.ladder_version, "universe_hash": self.universe_hash,
                 "items": [item.to_json() for item in self.items]}
+        if self.sizing_guard is not None:
+            data["sizing_guard"] = _json_copy(self.sizing_guard)
         if _price_keys(data):
             raise ValueError("recommendation contains a forbidden price field")
         return data
@@ -239,12 +255,15 @@ class RecommendationSet:
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> RecommendationSet:
         required = {"schema_version", "trading_day", "as_of", "slot", "source", "ladder_version", "universe_hash", "items"}
-        obj = _object(value, required)
+        # sizing_guard is the one optional key: absent on a set written before the stamp existed.
+        optional = {"sizing_guard"} & set(value) if isinstance(value, dict) else set()
+        obj = _object(value, required | optional)
         if not isinstance(obj["items"], list):
             raise ValueError("items must be a list")
         items = tuple(Recommendation.from_json(item) for item in obj["items"])
         return cls(_day(obj["trading_day"]), _time(obj["as_of"]), obj["slot"], obj["source"],
-                   obj["ladder_version"], obj["universe_hash"], items, obj["schema_version"])
+                   obj["ladder_version"], obj["universe_hash"], items, obj["schema_version"],
+                   obj.get("sizing_guard"))
 
 
 @dataclass(frozen=True)

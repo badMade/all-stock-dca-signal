@@ -34,6 +34,15 @@ Recommendations live under `<cron root>/recommendations/<day>/`: `rec_*.json` is
 - **Evidence.** The reader saves `validate_native_placement check`'s verdict as
   `<TICKER>.check.json`. `finish` counts an order for Gate 9 only when that saved verdict is
   `ok` and names the same order id as the strictly parsed response.
+- **Kill switch (backup poll 2).** The recommender stamps each set with `sizing_guard`
+  (`max_multiplier`, `deployed_7d_usd`), the kill-switch state it was sized under. The payload
+  is price-blind and carries no per-order multiplier, so the stamp stands in for it.
+  `backup_planner finalize` re-derives the trailing-7-day figure from the fresh order history,
+  minus the set's own orders (matched by native `ref_id`, so a partly placed batch cannot trip
+  the switch on its own fills), and refuses a set stamped above 1x once the switch is engaged
+  (`kill_switch_engaged_since_plan`). A set with no stamp, or a history that cannot prove the
+  figure, fails closed (`sizing_guard_missing`, `history_unusable`). The stamp is optional on
+  the wire, so an older payload still parses and is then refused at placement.
 - **Run freshness.** `snapshot_cycle fetch-plan` writes `fetch_plan.json` (`planned_at`) into
   each run directory. `ingest` refuses a run with no marker, a marker from another day or
   the future, or one older than 10 minutes, and stamps everything with `planned_at` rather
