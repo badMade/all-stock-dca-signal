@@ -16,6 +16,9 @@ and ``PREFLIGHT_OK <sha>``):
   is unreachable, has no manifest, or has an unusable one is a refusal, never an
   empty tree: an unreachable store must not look like a new day.
 
+Before touching git it also refuses when the volume holding the evidence root has
+less than ``MIN_FREE_BYTES`` free, so a full disk is named as the disk.
+
 On success the stream artifact roots exist (git does not track empty
 directories, and ``scripts/prior_reference_bindings.py`` aborts on a missing
 root). This command never installs anything and never prints the account number.
@@ -54,6 +57,9 @@ EXIT_REFUSED = 2
 PINNED_SHA_ENV = "DCA_PINNED_SHA"
 ACCOUNT_ENV = "ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"
 PYTHON_MINIMUM = (3, 11)
+# 1 GiB: a tripwire for "disk effectively full", not a capacity plan. On 2026-10-16 a host with ~76 MB
+# free could not install Python 3.11 and the 10:30 slot aborted without the disk ever being named.
+MIN_FREE_BYTES = 1024**3
 MANIFEST_NAME = "MANIFEST.json"
 MANIFEST_VERSION = 1
 EVIDENCE_BRANCH = "main"
@@ -103,6 +109,22 @@ def _git(
 def _check_python() -> None:
     if tuple(sys.version_info[:2]) < PYTHON_MINIMUM:
         raise Refused(f"python {PYTHON_MINIMUM[0]}.{PYTHON_MINIMUM[1]} or newer is required")
+
+
+def _check_disk(root: Path) -> None:
+    """Refuse when the volume that will hold the evidence root has less than ``MIN_FREE_BYTES`` free."""
+    # The root does not exist on a fresh container and disk_usage raises on a missing path, so
+    # measure the nearest existing ancestor (same volume the clone will land on).
+    probe = root.absolute()
+    while not probe.exists():
+        probe = probe.parent
+    try:
+        free = shutil.disk_usage(probe).free
+    except OSError as exc:
+        # Unknown free space is not proof of enough space: fail closed.
+        raise Refused(f"cannot read free disk space: {exc.__class__.__name__}") from exc
+    if free < MIN_FREE_BYTES:
+        raise Refused(f"free disk space is {free // 10**6} MB, below the {MIN_FREE_BYTES // 10**6} MB required")
 
 
 def _pinned_sha(env: Mapping[str, str]) -> str:
@@ -218,6 +240,7 @@ def _parse_args(argv: Optional[Sequence[str]]) -> argparse.Namespace:
 
 def _run(args: argparse.Namespace, env: Mapping[str, str]) -> str:
     _check_python()
+    _check_disk(Path(args.evidence_root))
     pin = _pinned_sha(env)
     _verify_checkout(Path(args.repo_root), env, pin)
     root = Path(args.evidence_root)

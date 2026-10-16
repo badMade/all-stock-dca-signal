@@ -46,6 +46,7 @@ a Gate 2 abort (keep the literal `Failing gate: Gate 2` in the alert so
   audit (a manifest entry is a claim, not proof: an empty stream root would
   otherwise read as a complete prior-allocation scan);
 - Python is older than 3.11.
+- The volume holding the evidence root has less than 1 GiB free, or its free space cannot be read.
 
 An unreachable store never looks like a new day, and a refusal removes any clone
 it created. On success the stream artifact roots exist, because git does not

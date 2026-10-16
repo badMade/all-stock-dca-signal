@@ -269,6 +269,64 @@ def test_refuses_below_the_python_floor(world, capsys, monkeypatch):
     assert "python" in last_line(capsys).lower()
 
 
+def _fake_disk_usage(free_bytes, seen=None):
+    """Stand-in for shutil.disk_usage that reports ``free_bytes`` free and records the path asked about."""
+    def disk_usage(path):
+        if seen is not None:
+            seen.append(Path(path))
+        return SimpleNamespace(total=10 * cloud_preflight.MIN_FREE_BYTES, used=0, free=free_bytes)
+    return disk_usage
+
+
+def test_refuses_when_free_disk_is_below_the_floor_and_creates_nothing(world, capsys, monkeypatch):
+    # 2026-10-16: a host with ~76 MB free could not install Python 3.11 and the 10:30 slot died
+    # at Gate 2 with a version error. A full disk must be named as the disk, before any clone.
+    monkeypatch.setattr(cloud_preflight.shutil, "disk_usage", _fake_disk_usage(cloud_preflight.MIN_FREE_BYTES - 1))
+
+    assert run_preflight(world) == 2
+
+    line = last_line(capsys)
+    assert line.startswith("GATE2_ABORT:") and "disk" in line.lower() and "MB" in line
+    assert not world.evidence_root.exists()
+
+
+def test_passes_when_free_disk_is_exactly_the_floor(world, capsys, monkeypatch):
+    monkeypatch.setattr(cloud_preflight.shutil, "disk_usage", _fake_disk_usage(cloud_preflight.MIN_FREE_BYTES))
+
+    assert run_preflight(world) == 0
+    assert last_line(capsys) == f"PREFLIGHT_OK {world.sha}"
+
+
+def test_measures_the_nearest_existing_ancestor_of_a_not_yet_created_evidence_root(world, capsys, monkeypatch):
+    # The evidence root does not exist on a fresh container, and disk_usage raises on a missing path.
+    seen = []
+    monkeypatch.setattr(cloud_preflight.shutil, "disk_usage", _fake_disk_usage(cloud_preflight.MIN_FREE_BYTES, seen))
+    assert not world.evidence_root.exists()
+
+    assert run_preflight(world) == 0
+
+    assert seen and all(path.exists() for path in seen)
+    assert world.evidence_root.parent.parent in seen or world.evidence_root.parent in seen
+
+
+def test_an_unreadable_disk_is_a_refusal_not_a_pass(world, capsys, monkeypatch):
+    def broken(path):
+        raise OSError("statvfs failed")
+    monkeypatch.setattr(cloud_preflight.shutil, "disk_usage", broken)
+
+    assert run_preflight(world) == 2
+    assert last_line(capsys).startswith("GATE2_ABORT:")
+
+
+def test_the_python_floor_is_reported_before_the_disk_check(world, capsys, monkeypatch):
+    # Both fail on the 2026-10-16 host; the version error stays first so existing alerts keep their reason.
+    monkeypatch.setattr(sys, "version_info", (3, 10, 14, "final", 0))
+    monkeypatch.setattr(cloud_preflight.shutil, "disk_usage", _fake_disk_usage(0))
+
+    assert run_preflight(world) == 2
+    assert "python" in last_line(capsys).lower()
+
+
 def test_never_invokes_an_installer(world, tmp_path, capsys):
     bin_dir = tmp_path / "shims"
     bin_dir.mkdir()
