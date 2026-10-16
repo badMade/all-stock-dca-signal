@@ -331,6 +331,19 @@ ACTIVE_TICKERS = [
     # history. See config/tickers.json's notes.
     "APH",
     "TEL",
+    # OCT 14 2026 (user-requested): GFS (GlobalFoundries Inc.). A read-only
+    # Robinhood quote lookup resolved GFS (state active, prior close $46.70 on
+    # 2026-10-13); the instrument search for the name surfaced only GFSG, a 2x
+    # leveraged ETF on GFS, which is NOT the intended symbol and is not added.
+    # Fractional tradability was NOT verified (that check needs the account
+    # number), so the run-time is_tradable_for_fractional_buy gate still admits
+    # or blocks GFS fail-closed. GFS is already in tickers.txt (the
+    # history-fetch symbol list); config/per_ticker_sizing.json carries an
+    # uncalibrated global-fallback entry for it (listed in fallback_tickers;
+    # the config loader requires an entry per active ticker) until
+    # scripts/generate_per_ticker_sizing.py is re-run against its archived
+    # history. See config/tickers.json's notes.
+    "GFS",
 ]
 
 # QBUT is the one categorically excluded ticker today (no mechanism to buy it

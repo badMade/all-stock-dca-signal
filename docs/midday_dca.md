@@ -219,13 +219,13 @@ first-allocation base (**$2** below prior close *and* prior low, **$1** below
 prior close only) — not a flat $2 (actual order size, subject to the top-up
 guard offset).
 
-> **This shared table is the fallback, not the live curve.** As of 2026-10-13
-> `config/per_ticker_sizing.json` is `status: active` and carries 69 entries: all
-> 67 active symbols plus the two whole-share symbols, which the ladder
-> evaluates identically. 66 are volatility-calibrated from history; the 3 listed
-> in `fallback_tickers` (RVII, APH, TEL) have too little or no history (APH and
-> TEL were added 2026-10-12 with no history calibrated yet) and carry an
-> uncalibrated copy of the global fallback ladder instead.
+> **This shared table is the fallback, not the live curve.** As of 2026-10-14
+> `config/per_ticker_sizing.json` is `status: active` and carries 70 entries: all
+> 68 active symbols plus the two whole-share symbols, which the ladder
+> evaluates identically. 66 are volatility-calibrated from history; the 4 listed
+> in `fallback_tickers` (RVII, APH, TEL, GFS) have too little or no history (APH,
+> TEL and GFS were added 2026-10-12 / 2026-10-14 with no history calibrated yet)
+> and carry an uncalibrated copy of the global fallback ladder instead.
 > `near_close_dca.graded_buy_multiplier` reads a ticker's calibrated tiers first
 > and falls back to the table above only for symbols with no entry — currently
 > none. See [strategy.md](strategy.md#sizing-ladder-latest-active).
