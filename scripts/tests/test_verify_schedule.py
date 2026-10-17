@@ -7,7 +7,7 @@ directories present, no run_state.json) end to end through the CLI.
 
 import json
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -116,6 +116,19 @@ def test_time_based_statuses():
     assert classify(now=datetime(2026, 9, 22, 11, 31, tzinfo=ET), run_dir=True)["status"] == "evidence_incomplete"
     # Evidence written before the nominal time (clock skew) is still evidence.
     assert classify(now=before, state=scheduled_state())["status"] == "verified"
+
+
+def test_0935_run_still_landing_after_window_close_is_awaiting_not_missing():
+    # verifier_window_mismatch: first-batch orders land shortly after the 9:35 slot's acceptance
+    # window closes. The deadline is window end + GRACE_MINUTES, so a run directory that exists
+    # 2 minutes past window close must read awaiting_evidence, never no_evidence / a missing alert.
+    from dca_runner import SLOTS
+
+    hour, minute = SLOTS["0935"].window_end_et
+    two_min_late = datetime(DAY.year, DAY.month, DAY.day, hour, minute, tzinfo=ET) + timedelta(minutes=2)
+    assert classify("0935", now=two_min_late, run_dir=True)["status"] == "awaiting_evidence"
+    # Nothing written yet is still not a failure inside the grace period.
+    assert classify("0935", now=two_min_late, run_dir=False)["status"] == "awaiting_evidence"
 
 
 def test_market_closed_only_excuses_a_slot_that_wrote_nothing():
