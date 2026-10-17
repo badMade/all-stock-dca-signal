@@ -1,4 +1,4 @@
-## CapEx Scan Report (2026-10-10)
+## CapEx Scan Report (2026-10-17)
 
 | Ticker | Company | Period End | Tier | Current ($M) | Prior ($M) | Delta ($M) | Delta (%) | Status | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
