@@ -526,6 +526,38 @@ def test_midday_cap_ledger_seeded_from_cross_stream_morning_fill(tmp_path):
     assert "TOPUP" not in broker2.placed
 
 
+def test_midday_max_orders_per_day_blocks_attempts_beyond_the_shared_cap(tmp_path):
+    # DCA Issues row ``max_orders_per_day_unenforced`` (triage re-verification):
+    # midday places through the inherited MorningDCAExecutor._place_broker_orders;
+    # the only midday-side cap test was the loader's. Pin the enforcement per
+    # subclass: cap 2, three qualifying tickers -> two submit, the third is
+    # blocked on the shared attempt ceiling.
+    placed: list = []
+
+    class _RecordingBroker(FakeLiveBroker):
+        def place_market_buy(self, ticker, notional_usd, ref_id):
+            placed.append(ticker)
+            return super().place_market_buy(ticker, notional_usd, ref_id)
+
+    cfg = MiddayConfig(
+        tickers=("AAA", "BBB", "CCC"),
+        base_buy_amount_usd=3.0,
+        morning_run_state_root=str(tmp_path / "live"),
+        cap_seed_roots=(),
+        prior_allocation_roots=(),
+        approved_test_dates=frozenset({date(2026, 7, 8)}),
+        max_orders_per_day=2,
+    )
+    ex = MiddayDCAExecutor(cfg, mode="live")
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05, "BBB": 0.05, "CCC": 0.05})
+    res = ex.run(_now_midday(), data, broker=cast(Any, _RecordingBroker()))
+    outcomes = res["artifacts"]["broker_outcomes"]
+    assert len(placed) == 2
+    [blocked] = [t for t, oc in outcomes.items() if oc["status"] == "blocked"]
+    assert blocked not in placed
+    assert "order daily attempt cap" in outcomes[blocked]["skip_reason"]
+
+
 def test_midday_manual_run_id_and_no_pointer(tmp_path):
     cfg = MiddayConfig(tickers=("SMALL",), morning_run_state_root=str(tmp_path))
     ex = MiddayDCAExecutor(cfg)

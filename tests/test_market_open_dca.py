@@ -245,6 +245,35 @@ def test_market_open_enabled_does_place(tmp_path):
     assert broker.placed.get("TICK") == 9.0  # 4.5x * $2 base (2026-10-04 ladder rescale; was 2.5x)
 
 
+def test_market_open_max_orders_per_day_blocks_attempts_beyond_the_shared_cap(tmp_path):
+    # DCA Issues row ``max_orders_per_day_unenforced`` (triage re-verification):
+    # this stream places through the inherited MorningDCAExecutor
+    # ._place_broker_orders, whose test_morning_dca.py pin uses the base class
+    # only. Pin it per subclass so a stream that overrode the placement loop
+    # (or whose loader dropped the cap) cannot silently place past the shared
+    # roster-wide daily attempt cap. Cap 2, three qualifying tickers: exactly
+    # two submit, the third is blocked on the attempt ceiling.
+    ex = MarketOpenDCAExecutor(_cfg(tmp_path, live_execution_enabled=True, tickers=("AAA", "BBB", "CCC"), max_orders_per_day=2))
+    broker = _Broker()
+    data = DecliningBarsProvider(SourceName.ROBINHOOD, 100.0, {"AAA": 0.05, "BBB": 0.05, "CCC": 0.05})
+    res = ex.run(_now_market_open(), data, broker=broker)
+    outcomes = res["artifacts"]["broker_outcomes"]
+    assert sorted(t for t, oc in outcomes.items() if oc["status"] == "submitted") == sorted(broker.placed)
+    assert len(broker.placed) == 2
+    [blocked] = [t for t, oc in outcomes.items() if oc["status"] == "blocked"]
+    assert "order daily attempt cap" in outcomes[blocked]["skip_reason"]
+
+
+def test_shipped_market_open_config_carries_the_budgets_json_order_count_cap():
+    # The loader must overlay circuit_breakers.max_orders_per_day, else the
+    # test above would pass only for a hand-built config and the live stream
+    # would run uncapped.
+    import dca_runner
+
+    cfg = load_market_open_config(allow_unpinned_account=True)
+    assert cfg.max_orders_per_day == dca_runner.MAX_ORDERS_PER_DAY
+
+
 # --- Root resolution timing (Codex review, PR #219) -------------------------
 def test_market_open_default_roots_resolve_at_construction_not_import(monkeypatch, tmp_path):
     # A literal module-level tuple would bind $DCA_CRON_TRACKING_ROOT at import

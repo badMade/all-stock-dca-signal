@@ -8524,3 +8524,51 @@ def test_run_slot_1030_hands_the_full_configured_universe_to_run_pipeline(monkey
     assert "supplemental_validator" not in inspect.signature(run_slot).parameters
     assert "preflight_gate" not in inspect.signature(run_dca_module.run_pipeline).parameters
 
+
+def test_run_slot_stops_at_the_shared_daily_order_count_cap(tmp_path):
+    """DCA Issues row ``max_orders_per_day_unenforced`` (triage re-verification),
+    the ``run_dca.run_slot`` entry point: the roster-wide daily order-count
+    breaker must survive run_slot's ``replace(config, ...)`` slot overlay and
+    bind in the shared ``within_caps`` gate. The loader overlay is pinned in
+    test_dca_config.py and the gate itself in test_near_close_dca.py; this is
+    the end-to-end pin through the real slot function. The order-count cap is
+    the ONLY thing that differs between the two runs below -- the control run
+    (no order booked yet) is not cap-blocked and reaches the later spread gate
+    instead, so the cap assertion cannot pass vacuously."""
+    import json
+    from dataclasses import replace
+
+    from run_dca import run_slot
+
+    def _candidate_skip_reasons(subdir, *, already_booked):
+        config = replace(_demo_config(), max_orders_per_day=1)
+        state = StrategyState()
+        now = _now_for_slot("1530ET")
+        if already_booked:
+            # One order already booked today: the day is AT the count cap with
+            # the dollar caps nowhere near exhausted.
+            state.select_daily_budget(0.0, 0, config)
+            state.record_buy("ZZZ", now.date(), 1.0)
+        result = run_slot(
+            "1530ET",
+            now=now,
+            config=config,
+            state=state,
+            finance_data=DemoDataProvider(SourceName.FINANCE),
+            robinhood_data=DemoDataProvider(SourceName.ROBINHOOD),
+            broker=build_broker(config),
+            artifacts_dir=tmp_path / subdir,
+        )
+        run_state = json.loads(Path(result["run_state_path"]).read_bytes())
+        return {c.get("skip_reason") for c in run_state["buy_candidates"]}, run_state
+
+    control_reasons, _ = _candidate_skip_reasons("control", already_booked=False)
+    assert "cap would be exceeded" not in control_reasons
+
+    capped_reasons, capped_state = _candidate_skip_reasons("capped", already_booked=True)
+    # Whole-share tickers (e.g. BYDDY) only accumulate and never reach the cap
+    # gate, so they are the one tolerated non-cap reason.
+    assert {r for r in capped_reasons if not str(r).startswith("whole-share:")} == {"cap would be exceeded"}
+    assert capped_state["counts"]["submitted"] == 0
+    assert capped_state["completion_reason"] == "blocked_before_spread_gate"
+

@@ -51,6 +51,7 @@ from near_close_dca import (
     MISSING_FILL_DATA_ERROR,
     MISSING_FILL_EXECUTION_GAP,
     MISSING_FILL_FAILED_TRIGGER,
+    NORMAL_WEEKLY_CAP_USD,
     TOP_UP_INCREMENTAL,
     TOP_UP_MISSING_PRIOR_BASE,
     TOP_UP_MISSING_PRIOR_PRICE,
@@ -276,6 +277,59 @@ def test_weekly_rollover_reserve_rolls_at_week_boundary():
     state.finalize_daily_budget(next_monday, config)
     state.allowed_spend_today(date(2026, 7, 14), config)
     assert state.weekly_rollover_reserve_usd == 600.0
+
+
+def test_stress_effective_weekly_cap_is_normal_cap_plus_the_earned_reserve():
+    """DCA Issues row ``stress_tier_undefined``: the Stress weekly ceiling is
+    DEFINED as ``min(tier cap, Normal weekly cap + earned rollover reserve)``.
+    Triage re-verification pinned the formula on the 3:30 PM / ``run_slot``
+    path (``StrategyState.effective_weekly_cap``), which only the reserve
+    figure -- never the resulting ceiling -- was tested on before. The
+    ``dca_runner`` copy of the formula is pinned in test_dca_runner.py
+    (``test_assess_weekly_rollover_reserve_usd_reflects_into_the_stress_tier_cap``);
+    the MorningDCAExecutor family has no Stress tier at all (a fixed
+    per-stream ledger cap), so there is no third copy to pin."""
+    stress = BUDGET_TIERS[-1]
+    state = StrategyState()
+    state.selected_tier = stress
+
+    # No earned reserve: Stress grants no more than Normal's weekly cap.
+    state.weekly_rollover_reserve_usd = 0.0
+    assert state.effective_weekly_cap() == NORMAL_WEEKLY_CAP_USD == 900.0
+    # A partial reserve raises the ceiling by exactly that reserve.
+    state.weekly_rollover_reserve_usd = 500.0
+    assert state.effective_weekly_cap() == 1400.0
+    # A reserve past the headroom is clamped to the tier's nominal cap.
+    state.weekly_rollover_reserve_usd = 5000.0
+    assert state.effective_weekly_cap() == stress.weekly_cap_usd == 1800.0
+
+
+def test_non_stress_tiers_ignore_the_rollover_reserve_in_the_effective_weekly_cap():
+    """Only a tier flagged ``uses_rollover_reserve`` is affected by the reserve."""
+    state = StrategyState()
+    state.weekly_rollover_reserve_usd = 900.0
+    for tier in BUDGET_TIERS:
+        if tier.uses_rollover_reserve:
+            continue
+        state.selected_tier = tier
+        assert state.effective_weekly_cap() == tier.weekly_cap_usd
+
+
+def test_stress_spend_is_bounded_by_the_effective_weekly_cap_not_the_nominal_one():
+    """allowed_spend_today() must feed the effective (reserve-derived) ceiling
+    into the weekly headroom, so an unearned reserve cannot raise Stress's
+    spend past Normal's $900 week."""
+    config = StrategyConfig()
+    state = StrategyState()
+    state.selected_tier = BUDGET_TIERS[-1]
+    monday = date(2026, 7, 6)
+    # First active week: no prior week, so no reserve (roll_weekly_reserve -> 0).
+    assert state.allowed_spend_today(monday, config) == 360.0
+    assert state.effective_weekly_cap() == 900.0
+    # $800 already spent this week leaves only $100 of the $900 ceiling,
+    # although the nominal $1,800 Stress cap would allow the full $360 day.
+    state.record_buy("AAA", monday, 800.0)
+    assert state.allowed_spend_today(date(2026, 7, 7), config) == 100.0
 
 
 def test_book_reconciled_attempt_notional_invalidates_a_stale_rollover_reserve():
