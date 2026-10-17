@@ -141,6 +141,22 @@ def test_progress_from_evidence(evidence: dict[str, object], expected: str) -> N
     assert tr.derive_progress(_match(**evidence)) == expected
 
 
+def test_merged_docs_only_pr_is_not_reported_as_a_green_fix() -> None:
+    # PR #1642 only drafted fixes (documentation), yet 12 rows read "Merged, checks green".
+    pr = _pr(state="closed", merged=True, checks="green", docs_only=True)
+    assert tr.derive_progress(_match(prs=[pr])) == tr.PROGRESS_MERGED_DOCS_ONLY
+
+
+def test_docs_only_flag_defaults_to_false_and_must_be_a_boolean() -> None:
+    assert _match(prs=[_pr()]).pr.docs_only is False  # type: ignore[union-attr]
+    with pytest.raises(tr.EvidenceError):
+        _match(prs=[_pr(docs_only="yes")])
+
+
+def test_unmerged_docs_only_pr_keeps_its_open_label() -> None:
+    assert tr.derive_progress(_match(prs=[_pr(docs_only=True)])) == tr.PROGRESS_PR_OPEN
+
+
 def test_pr_beats_branch_when_both_exist() -> None:
     ev = _match(branches=[f"selfheal/{KEY}"], prs=[_pr(checks="red")])
     assert tr.derive_progress(ev) == tr.PROGRESS_PR_CHECKS_RED

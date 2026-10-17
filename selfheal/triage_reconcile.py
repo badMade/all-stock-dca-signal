@@ -34,6 +34,7 @@ __all__ = [
     "CHECKS_RED",
     "PROGRESS_BRANCH_ONLY",
     "PROGRESS_CLOSED_UNMERGED",
+    "PROGRESS_MERGED_DOCS_ONLY",
     "PROGRESS_MERGED_GREEN",
     "PROGRESS_MERGED_PENDING",
     "PROGRESS_MERGED_RED",
@@ -70,10 +71,12 @@ PROGRESS_PR_CHECKS_RED = "PR checks red"
 PROGRESS_MERGED_GREEN = "Merged, checks green"
 PROGRESS_MERGED_PENDING = "Merged, checks pending"
 PROGRESS_MERGED_RED = "Merged, checks red"
+# A merged PR whose diff touched only documentation drafted a fix; it did not apply one.
+PROGRESS_MERGED_DOCS_ONLY = "Merged, docs only"
 PROGRESS_CLOSED_UNMERGED = "Closed, not merged"
 
 _NOT_CHANGED = re.compile(r"\bnot\s+changed\b", re.IGNORECASE)
-_SHA_PATTERN =re.compile(r"[0-9a-f]{40}")
+_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 _REPO_URL_PATTERN = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
 
@@ -90,6 +93,7 @@ class PullRequestRef:
     state: str
     merged: bool
     checks: str
+    docs_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -163,6 +167,9 @@ def _parse_pr(raw: object, repo_url: str) -> tuple[PullRequestRef, str, str]:
         raise EvidenceError(f"pull request checks {checks!r} is not one of {sorted(_CHECKS)}")
     if not isinstance(merged, bool):
         raise EvidenceError("pull request 'merged' must be a boolean")
+    docs_only = record.get("docs_only", False)
+    if not isinstance(docs_only, bool):
+        raise EvidenceError("pull request 'docs_only' must be a boolean")
     url = _own_url(record, f"{repo_url}/pull/{number}", "pull request")
     # A line saying "Not changed" names keys the PR deliberately left alone (PR #1642 listed eight), so
     # a mention there is evidence against a fix, not for one.
@@ -170,7 +177,7 @@ def _parse_pr(raw: object, repo_url: str) -> tuple[PullRequestRef, str, str]:
         line for line in _text(record, "body", "pull request").splitlines() if not _NOT_CHANGED.search(line)
     )
     searchable = f"{_text(record, 'title', 'pull request')}\n{body}"
-    ref = PullRequestRef(number=number, url=url, state=state, merged=merged, checks=checks)
+    ref = PullRequestRef(number=number, url=url, state=state, merged=merged, checks=checks, docs_only=docs_only)
     return ref, _text(record, "head_ref", "pull request"), searchable
 
 
@@ -218,7 +225,8 @@ def match_git_evidence(
         branches: Branch names.
         prs: Pull requests as mappings with ``number``, ``url``, ``state``,
             ``merged``, ``head_ref``, ``title``, ``body`` and ``checks``
-            (``green``, ``red`` or ``pending``).
+            (``green``, ``red`` or ``pending``); optional ``docs_only`` (bool,
+            true when the diff touched only documentation).
         commits: Commits as mappings with ``sha``, ``url`` and ``message``.
         issues: GitHub issues as mappings with ``number``, ``url``, ``state``
             and ``title``.
@@ -263,6 +271,8 @@ def derive_progress(evidence: GitEvidence) -> str:
     pr = evidence.pr
     if pr is not None:
         if pr.merged:
+            if pr.docs_only:
+                return PROGRESS_MERGED_DOCS_ONLY
             return {
                 CHECKS_GREEN: PROGRESS_MERGED_GREEN,
                 CHECKS_RED: PROGRESS_MERGED_RED,

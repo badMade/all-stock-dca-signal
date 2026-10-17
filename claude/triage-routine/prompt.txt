@@ -21,6 +21,8 @@ STEP 1: Read logs (read-only)
 STEP 2: Read GitHub (read-only, via the GitHub connector)
 - Open and recently closed issues, all branches, open and recently merged or closed PRs (with head branch, merged flag, and check status mapped to green, red or pending), and the last 50 commits on the default branch.
 - Convert to plain dicts as tr.match_git_evidence expects: PRs {number,url,state,merged,checks,head_ref,title,body}; issues {number,url,state,title,body}; commits {url,message}; branches as names. All URLs must sit under https://github.com/badMade/all-stock-dca/.
+- The PR list endpoint can report merged=false for every PR. Never trust it: for each PR that matches a Key, fetch that PR directly and use its real merged state. Set docs_only=true when every changed file is documentation (docs/, claude/, *.md, *.txt); tr then labels it "Merged, docs only" instead of a green fix.
+- If a Key's matching PR or commit may lie beyond the last 50 commits or 100 PRs, page further back for that Key before settling on an existing Commit URL.
 
 STEP 3: Read Notion
 - Query all DCA Issues rows. For each row you need Key, Name, Class, Severity, Status, Fix state, Approval, and the tracking columns GitHub issue, Branch, Commit URL, PR number, Progress, Proposed plan.

@@ -123,3 +123,6 @@ rocket-fuel/**/*.md.bak
 # rationale as .lease_fingerprint_key above.
 .selfheal_fingerprint_key
 .selfheal_fingerprint_key.*.tmp
+
+# Linux uv-managed Python 3.11 pinned by the bridge-VM slot prompts (UV_PYTHON_INSTALL_DIR); not source.
+.uv-python/
