@@ -14,7 +14,9 @@ def bar(ts, o=10.0, h=10.2, low=9.9, c=10.1, v=100):
     return {"timestamp": ts, "open": o, "high": h, "low": low, "close": c, "volume": v}
 
 
-def good_ticker(start_utc_hour=17, minutes=range(30, 60, 5)):
+def good_ticker(start_utc_hour=17, minutes=None):
+    if minutes is None:
+        minutes = range(30, 60, 5)
     bars = [bar(f"2026-10-15T{start_utc_hour:02d}:{m:02d}:00Z") for m in minutes]
     bars += [bar(f"2026-10-15T{start_utc_hour + 1:02d}:{m:02d}:00Z") for m in range(0, 30, 5)]
     return {

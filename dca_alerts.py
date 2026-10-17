@@ -168,6 +168,7 @@ def send_heartbeat(
     if not ok:
         url = url.rstrip("/") + "/fail"
     try:
+        _assert_safe_destination(url)
         class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 return None
@@ -315,6 +316,7 @@ def alert_failure(
         url, data=payload, headers={"Content-Type": "application/json"}
     )
     try:
+        _assert_safe_destination(url)
         class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 return None
