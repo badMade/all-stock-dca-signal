@@ -692,6 +692,7 @@ def finalize(
     error_detail: Optional[str] = None,
     code_version: Optional[Dict[str, Any]] = None,
     now: Optional[datetime] = None,
+    dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Write (or reuse) the slot's run_state, refresh its pointer, and report whether it verifies.
 
@@ -704,6 +705,14 @@ def finalize(
     """
     slot = normalize_slot(slot)
     started = started.astimezone(ET)
+    if dry_run:
+        budget = validate_budget(budget)
+        code_version = validate_code_version(code_version)
+        return _finalize_dry_run(
+            slot, started, outcome=outcome, order_submit_status=order_submit_status,
+            root=root, orders=orders, report=report, budget=budget,
+            error_class=error_class, error_detail=error_detail, code_version=code_version,
+        )
     check_window(slot, started)
     if order_submit_status not in ORDER_SUBMIT_STATUSES:
         raise FinalizeRefused(
@@ -735,6 +744,73 @@ def finalize(
             code_version=code_version,
             now=now,
         )
+
+
+DRY_RUN_DIR = Path("manual_runs") / "dry_run"
+
+
+def _finalize_dry_run(
+    slot: str,
+    started: datetime,
+    *,
+    outcome: str,
+    order_submit_status: str,
+    root: Optional[Path],
+    orders: Optional[List[Dict[str, Any]]],
+    report: Optional[Dict[str, Any]],
+    budget: Optional[Dict[str, Any]],
+    error_class: Optional[str],
+    error_detail: Optional[str],
+    code_version: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Record a dry run under manual_runs/dry_run/, outside every scheduled path.
+
+    Skips the acceptance-window check (an off-hours smoke test is the point),
+    never touches the scheduled run directory or any latest-run pointer, and
+    refuses orders: a dry run places none, so nothing may claim otherwise.
+    """
+    if orders or order_submit_status == ORDER_SUBMIT_STATUS_SUBMITTED:
+        raise FinalizeRefused("a dry-run records no orders; drop --orders-json and use a non-'submitted' status")
+    if order_submit_status not in ORDER_SUBMIT_STATUSES:
+        raise FinalizeRefused(
+            f"--order-submit-status {order_submit_status!r} is not one of {list(ORDER_SUBMIT_STATUSES)}"
+        )
+    if not outcome.strip():
+        raise FinalizeRefused("--outcome must name the Gate 9 outcome")
+    base = Path(root) if root is not None else cron_tracking_root()
+    run_dir = base / DRY_RUN_DIR / slot_run_dir_relative(slot, started.date()).name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state = {
+        "dry_run": True,
+        "slot": f"{slot}ET",
+        "started_at": started.isoformat(),
+        "outcome": outcome,
+        "order_submit_status": order_submit_status,
+        "orders_submitted_count": 0,
+        "finalized_by": "scripts.finalize_run_evidence",
+    }
+    if report is not None:
+        state["gate9_report"] = report
+    if budget is not None:
+        state["budget"] = budget
+    if error_class:
+        state["error_class"] = error_class
+    if error_detail:
+        state["error_detail"] = error_detail
+    if code_version is not None:
+        state["code_version"] = code_version
+    with atomic_open_w(run_dir / "run_state.json") as handle:
+        json.dump(state, handle, indent=2, sort_keys=True)
+    return {
+        "dry_run": True,
+        "slot": f"{slot}ET",
+        "trading_day": started.date().isoformat(),
+        "run_dir": run_dir.relative_to(base).as_posix(),
+        "verified": True,
+        "pointer": None,
+        "errors": [],
+        "warnings": ["dry run: not scheduled evidence, no pointer written"],
+    }
 
 
 def _repair_companions(run_dir: Path, state: Dict[str, Any], stream: str) -> List[str]:
@@ -997,6 +1073,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--error-class", help="concrete error class for a blocked/failed run")
     parser.add_argument("--error-detail", help="one-line detail for a blocked/failed run")
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="record an off-schedule smoke test under manual_runs/dry_run/: no window check, no pointer, no orders",
+    )
+    parser.add_argument(
         "--root", help="cron-tracking root (default: $DCA_CRON_TRACKING_ROOT or <checkout>/cron_tracking)"
     )
     args = parser.parse_args(argv)
@@ -1016,6 +1097,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             code_version=code_version,
             error_class=args.error_class,
             error_detail=args.error_detail,
+            dry_run=args.dry_run,
         )
     except FinalizeRefused as exc:
         print(json.dumps({"verified": False, "refused": str(exc)}, indent=2))
