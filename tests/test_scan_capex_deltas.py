@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import date
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -36,6 +37,7 @@ from scan_capex_deltas import (  # noqa: E402
     fetch_company_facts_offline_or_sec,
     fetch_sec_company_tickers,
     format_capex_scan_report,
+    is_stale_period,
     load_scanner_config,
     parse_sec_company_tickers_mapping,
     parse_watched_companies_and_baselines,
@@ -224,6 +226,69 @@ def test_extract_capex_from_xbrl_facts_payload():
     assert period_end == "2024-07-28"
     assert amount_usd_m == 1227.0
     assert accn == "ACCN-NVDA-Q2"
+
+
+def _capex_fact(end, val_m, accn):
+    return {"end": end, "val": val_m * 1_000_000, "form": "10-Q", "accn": accn}
+
+
+def test_extract_prefers_the_freshest_tag_over_a_stale_earlier_tag():
+    """A filer that moved tags years ago (AMZN: 2017 vs 2026) must not report the dead tag's period."""
+    facts = {"facts": {"us-gaap": {
+        # First in US_GAAP_CAPEX_TAGS, but its newest fact is nine years old.
+        "PaymentsToAcquirePropertyPlantAndEquipment": {"units": {"USD": [_capex_fact("2017-03-31", 7_417, "OLD")]}},
+        "PaymentsToAcquireProductiveAssets": {"units": {"USD": [_capex_fact("2026-06-30", 30_000, "NEW")]}},
+    }}}
+
+    assert extract_capex_from_facts(facts) == ("2026-06-30", 30_000.0, "NEW")
+
+
+def test_extract_ties_between_tags_keep_tag_priority_order():
+    facts = {"facts": {"us-gaap": {
+        "PaymentsToAcquirePropertyPlantAndEquipment": {"units": {"USD": [_capex_fact("2026-06-30", 100, "FIRST")]}},
+        "PaymentsToAcquireProductiveAssets": {"units": {"USD": [_capex_fact("2026-06-30", 999, "SECOND")]}},
+    }}}
+
+    assert extract_capex_from_facts(facts) == ("2026-06-30", 100.0, "FIRST")
+
+
+def test_report_summary_counts_not_found_so_the_totals_add_up():
+    evals = [
+        CapexEvaluation(ticker="JPM", current_usd_m=0.0, previous_usd_m=None, delta_usd_m=None, pct_delta=None,
+                        flagged_pct=False, flagged_addition=False, tier="supplier", status="not_found",
+                        company_name="JPMorgan Chase & Co.", period_end="",
+                        notes="SEC company facts not found or unavailable"),
+    ]
+
+    report = format_capex_scan_report(evals)
+
+    assert "Total Filers Evaluated: 1" in report
+    assert "Not Found: 1" in report
+
+
+def test_is_stale_period_flags_old_and_unparseable_periods_and_keeps_current_ones():
+    today = date(2026, 10, 17)
+    assert is_stale_period("2026-06-30", today) is False   # ~3.5 months: the latest filed quarter
+    assert is_stale_period("2026-03-31", today) is False   # ~6.5 months: still inside the window
+    assert is_stale_period("2025-12-31", today) is True    # ~10 months: a missed quarter or more
+    assert is_stale_period("2017-03-31", today) is True    # AMZN's dead tag
+    assert is_stale_period("", today) is True              # fail closed
+    assert is_stale_period("not-a-date", today) is True
+
+
+def test_report_summary_counts_stale_rows():
+    evals = [
+        CapexEvaluation(ticker="AMZN", current_usd_m=7_417.0, previous_usd_m=53_100.0, delta_usd_m=None,
+                        pct_delta=None, flagged_pct=False, flagged_addition=False, tier="hyperscaler",
+                        status="stale", company_name="Amazon.com, Inc.", period_end="2017-03-31",
+                        notes="Latest XBRL period 2017-03-31 is stale; not trusted"),
+    ]
+
+    report = format_capex_scan_report(evals)
+
+    assert "| AMZN | Amazon.com, Inc. | 2017-03-31 | hyperscaler |" in report
+    assert "| STALE |" in report
+    assert "Stale Period: 1" in report
 
 
 def test_extract_capex_from_empty_facts_returns_none():

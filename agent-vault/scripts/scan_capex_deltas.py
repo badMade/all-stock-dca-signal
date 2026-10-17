@@ -16,6 +16,7 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable
 
@@ -411,6 +412,7 @@ def format_capex_scan_report(
         "baseline_recorded": 0,
         "not_scannable": 0,
         "not_found": 0,
+        "stale": 0,
     }
 
     for ev in evaluations:
@@ -453,9 +455,25 @@ def format_capex_scan_report(
         f"- Passed: {counts['passed']}",
         f"- Baselines Recorded: {counts['baseline_recorded']}",
         f"- Not Scannable: {counts['not_scannable']}",
+        # Without this line Flagged + Passed + Baselines + Not Scannable fell short of the total.
+        f"- Not Found: {counts['not_found']}",
+        f"- Stale Period: {counts['stale']}",
     ])
 
     return "\n".join(lines)
+
+
+# A filer's newest capex period older than this is a missed filing or a dead XBRL tag, not "no change".
+# ~2 quarters plus a filing-lag cushion; the freshest legitimate period is ~3-4 months old.
+STALE_PERIOD_MAX_DAYS = 200
+
+
+def is_stale_period(period_end: str, today: date, max_days: int = STALE_PERIOD_MAX_DAYS) -> bool:
+    """True when ``period_end`` is older than ``max_days`` before ``today``. Unparseable fails closed."""
+    try:
+        return (today - date.fromisoformat(str(period_end))).days > max_days
+    except ValueError:
+        return True
 
 
 def extract_capex_from_facts(facts_payload: dict[str, Any]) -> tuple[str, float, str] | None:
@@ -467,6 +485,10 @@ def extract_capex_from_facts(facts_payload: dict[str, Any]) -> tuple[str, float,
     if not isinstance(us_gaap, dict):
         return None
 
+    # Pick the freshest period across ALL capex tags, not the first tag that has any data: a filer that
+    # moved tags years ago (AMZN's 2017-03-31 on the first tag vs a 2026 fact on a later one) otherwise
+    # reports a dead period as PASS. Strict ">" keeps US_GAAP_CAPEX_TAGS priority order on a tie.
+    best: tuple[str, float, str] | None = None
     for tag in US_GAAP_CAPEX_TAGS:
         tag_data = us_gaap.get(tag)
         if not isinstance(tag_data, dict):
@@ -491,11 +513,10 @@ def extract_capex_from_facts(facts_payload: dict[str, Any]) -> tuple[str, float,
         val = latest.get("val")
         end = latest.get("end")
         accn = latest.get("accn", "SEC EDGAR")
-        if isinstance(val, (int, float)) and end:
-            amount_usd_m = round(float(val) / 1_000_000.0, 2)
-            return str(end), amount_usd_m, str(accn)
+        if isinstance(val, (int, float)) and end and (best is None or str(end) > best[0]):
+            best = (str(end), round(float(val) / 1_000_000.0, 2), str(accn))
 
-    return None
+    return best
 
 
 class SECRedirectDisallowedHandler(urllib.request.HTTPRedirectHandler):
@@ -725,7 +746,24 @@ def main() -> int:
                 limiter=limiter,
             )
             extracted = extract_capex_from_facts(facts) if facts else None
-            if extracted is not None:
+            if extracted is not None and is_stale_period(extracted[0], date.today()):
+                # A stale period is a data problem, never PASS: the scan has no current figure for this filer.
+                stale_period, stale_val, _ = extracted
+                ev = CapexEvaluation(
+                    ticker=ticker,
+                    current_usd_m=stale_val,
+                    previous_usd_m=prev_val,
+                    delta_usd_m=None,
+                    pct_delta=None,
+                    flagged_pct=False,
+                    flagged_addition=False,
+                    tier="hyperscaler" if (prev_val and prev_val >= cfg.hyperscaler_spend_threshold_usd_m) else "supplier",
+                    status="stale",
+                    company_name=co_name,
+                    period_end=stale_period,
+                    notes=f"Latest XBRL period {stale_period} is stale (> {STALE_PERIOD_MAX_DAYS} days); not trusted",
+                )
+            elif extracted is not None:
                 new_period, new_val, new_accn = extracted
                 ev = evaluate_capex_change(
                     ticker=ticker,
