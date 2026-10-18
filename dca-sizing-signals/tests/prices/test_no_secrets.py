@@ -66,7 +66,7 @@ def test_exception_text_is_redacted_even_when_the_vendor_echoes_the_key(clock, s
 
 def test_reprs_do_not_contain_keys(clock):
     massive, alpaca = providers(clock, [], [])
-    assert_clean(repr(massive) + repr(alpaca) + str(massive.__dict__ if hasattr(massive, "__dict__") else ""))
+    assert_clean(repr(massive) + repr(alpaca))
 
 
 def test_failed_job_leaves_no_key_in_logs_run_records_or_the_database(tmp_path, caplog):

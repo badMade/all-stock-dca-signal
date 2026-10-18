@@ -70,7 +70,7 @@ def test_a_malformed_file_is_rejected_whole_with_file_and_line(store, tmp_path, 
     with pytest.raises(ValidationError) as excinfo:
         import_csv(store, path, run_id="y1", now=NOW)
     message = str(excinfo.value)
-    assert "CBU.csv" in message and "4" in message, f"names the file and line ({why})"
+    assert "CBU.csv" in message and "line 4" in message.lower(), f"names the file and line ({why})"
     assert store.row_count("yahoo_legacy_bars") == 0
 
 
