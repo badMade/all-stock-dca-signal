@@ -10,8 +10,8 @@
 
 ## Active goals
 
-- CapEx delta scanner operational with live SEC EDGAR fetching and weekly runner (`run_weekly_capex_scan.py`).
-- Maintain and review weekly monitoring reports against settled two-tier addition rules.
+- CapEx scanner compares standalone quarters (shared `evaluate_live_filer()`); a weekly workflow on main opens a draft report PR. Open: GLW/LLY stale tags, manual sources for JPM/DFTX/BYDDY.
+- Review the weekly capex PR against the settled two-tier addition rules; FLAGGED rows need a human check.
 
 ## Standing lessons
 
