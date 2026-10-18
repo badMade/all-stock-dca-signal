@@ -20,7 +20,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .errors import ProviderError
+from .errors import IncompleteBatchError, ProviderError
 from .http import HttpClient
 from .models import CorporateAction, DailyBar, Quote
 
@@ -31,6 +31,8 @@ TRADING_BASE_URL = "https://paper-api.alpaca.markets"
 MIN_INTERVAL_S = 0.3  # Basic allows 200 requests/minute
 FEEDS = frozenset({"iex", "delayed_sip"})
 SYMBOLS_PER_REQUEST = 200
+# The failover must answer for most of the universe, or the night is incomplete, not "ok".
+MIN_UNIVERSE_COVERAGE = 0.90
 MAX_PAGES = 500
 _ACTION_GROUPS = {
     "forward_splits": "forward_split",
@@ -105,7 +107,7 @@ def _iso_date(value: Any, field_name: str, *, required: bool = True) -> date | N
 
 def _chunks(items: Sequence[str], size: int) -> Iterator[list[str]]:
     for start in range(0, len(items), size):
-        yield list(items[start:start + size])
+        yield list(items[start : start + size])
 
 
 class AlpacaProvider:
@@ -142,8 +144,9 @@ class AlpacaProvider:
         wanted = list(dict.fromkeys(symbols))
         quotes: dict[str, Quote] = {}
         for chunk in _chunks(wanted, SYMBOLS_PER_REQUEST):
-            body = self._http.get_json(f"{self._base}/v2/stocks/trades/latest",
-                                       params={"symbols": ",".join(chunk), "feed": feed})
+            body = self._http.get_json(
+                f"{self._base}/v2/stocks/trades/latest", params={"symbols": ",".join(chunk), "feed": feed}
+            )
             fetched_at = self._clock()
             trades = body.get("trades")
             if not isinstance(trades, dict):
@@ -153,8 +156,13 @@ class AlpacaProvider:
                     continue
                 if not isinstance(trade, dict):
                     raise ProviderError(f"alpaca trade for {symbol} is not an object", code="malformed_row")
-                quotes[symbol] = Quote(symbol=symbol, price=_number(trade, "p"), ts=parse_rfc3339(trade.get("t")),
-                                       feed=feed, as_of=fetched_at)
+                quotes[symbol] = Quote(
+                    symbol=symbol,
+                    price=_number(trade, "p"),
+                    ts=parse_rfc3339(trade.get("t")),
+                    feed=feed,
+                    as_of=fetched_at,
+                )
         return quotes
 
     def daily_bars(self, session: date) -> list[DailyBar]:
@@ -180,6 +188,11 @@ class AlpacaProvider:
                     if not isinstance(rows, list):
                         raise ProviderError(f"alpaca bars for {symbol} are not a list", code="malformed_row")
                     bars.extend(self._parse_bar(symbol, row, session) for row in rows)
+        covered = len({b.symbol for b in bars})
+        if covered < MIN_UNIVERSE_COVERAGE * len(symbols):
+            raise IncompleteBatchError(
+                f"alpaca returned bars for {covered} of {len(symbols)} universe symbols", code="below_universe"
+            )
         return bars
 
     def _pages(self, url: str, params: dict[str, Any]) -> Iterator[Mapping[str, Any]]:
@@ -220,8 +233,12 @@ class AlpacaProvider:
         # Look ahead as well as back: an announced split with a future ex-date is already
         # public, and the adjusted views only apply it once its ex-date has passed.
         end = self._clock().astimezone(ET).date() + timedelta(days=90)
-        params = {"types": ",".join(_ACTION_GROUPS.values()), "start": since.isoformat(), "end": end.isoformat(),
-                  "limit": 1000}
+        params = {
+            "types": ",".join(_ACTION_GROUPS.values()),
+            "start": since.isoformat(),
+            "end": end.isoformat(),
+            "limit": 1000,
+        }
         actions: list[CorporateAction] = []
         for page in self._pages(f"{self._base}/v1/corporate-actions", params):
             groups = page.get("corporate_actions") or {}
@@ -254,8 +271,9 @@ class AlpacaProvider:
         if action_type == "stock_dividend":
             # ``rate`` is new shares per share held: 0.05 is a 5% stock dividend, 1 -> 1.05.
             return CorporateAction(**common, split_from=1.0, split_to=1.0 + _number(row, "rate"))
-        return CorporateAction(**common, cash_amount=_number(row, "rate"),
-                               currency=None if row.get("foreign") else "USD")
+        return CorporateAction(
+            **common, cash_amount=_number(row, "rate"), currency=None if row.get("foreign") else "USD"
+        )
 
 
 class AlpacaCalendar:
@@ -288,8 +306,9 @@ class AlpacaCalendar:
     def _load(self, start: date, end: date) -> None:
         if any(lo <= start and end <= hi for lo, hi in self._covered):
             return
-        days = self._http.get_json(f"{self._base}/v2/calendar",
-                                   params={"start": start.isoformat(), "end": end.isoformat()}, expect=list)
+        days = self._http.get_json(
+            f"{self._base}/v2/calendar", params={"start": start.isoformat(), "end": end.isoformat()}, expect=list
+        )
         open_days = set()
         for item in days:
             if not isinstance(item, dict):
@@ -312,8 +331,7 @@ class AlpacaCalendar:
         for _ in range(4):
             start = d - span
             self._load(start, d - timedelta(days=1))
-            found = sorted((day for day, is_open in self._known.items() if is_open and start <= day < d),
-                           reverse=True)
+            found = sorted((day for day, is_open in self._known.items() if is_open and start <= day < d), reverse=True)
             if len(found) >= n:
                 return found[:n]
             span *= 2

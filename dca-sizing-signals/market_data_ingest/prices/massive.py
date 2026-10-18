@@ -49,22 +49,36 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _number(row: Mapping[str, Any], key: str, *, required: bool = True) -> float | None:
+def _opt_number(row: Mapping[str, Any], key: str) -> float | None:
     value = row.get(key)
-    if value is None and not required:
+    if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ProviderError(f"massive row field {key!r} is missing or not a number", code="malformed_row")
+        raise ProviderError(f"massive row field {key!r} is not a number", code="malformed_row")
     return float(value)
 
 
-def _iso_date(value: Any, field_name: str, *, required: bool = True) -> date | None:
-    if value in (None, "") and not required:
+def _req_number(row: Mapping[str, Any], key: str) -> float:
+    value = _opt_number(row, key)
+    if value is None:
+        raise ProviderError(f"massive row field {key!r} is missing", code="malformed_row")
+    return value
+
+
+def _opt_date(value: Any, field_name: str) -> date | None:
+    if value in (None, ""):
         return None
     try:
         return date.fromisoformat(str(value))
     except ValueError as exc:
         raise ProviderError(f"massive field {field_name!r} is not an ISO date", code="malformed_row") from exc
+
+
+def _req_date(value: Any, field_name: str) -> date:
+    parsed = _opt_date(value, field_name)
+    if parsed is None:
+        raise ProviderError(f"massive field {field_name!r} is missing", code="malformed_row")
+    return parsed
 
 
 class MassiveProvider:
@@ -133,8 +147,9 @@ class MassiveProvider:
             )
         if not results:
             if self._calendar.is_session(session):
-                raise IncompleteBatchError(f"massive returned no bars for open session {session}",
-                                           code="empty_open_session")
+                raise IncompleteBatchError(
+                    f"massive returned no bars for open session {session}", code="empty_open_session"
+                )
             return []
         self._check_row_count(session, len(results))
         return [self._parse_bar(row, session) for row in results]
@@ -142,8 +157,7 @@ class MassiveProvider:
     def _check_status(self, body: Mapping[str, Any]) -> None:
         status = body.get("status")
         if status == "NOT_AUTHORIZED":
-            raise ProviderError("massive: the plan does not cover this request (NOT_AUTHORIZED)",
-                                code="not_authorized")
+            raise ProviderError("massive: the plan does not cover this request (NOT_AUTHORIZED)", code="not_authorized")
         if status not in _OK_STATUSES:
             raise ProviderError(f"massive returned status {str(status)[:32]!r}", code="vendor_status")
 
@@ -157,8 +171,9 @@ class MassiveProvider:
                     code="no_baseline",
                 )
             if n_rows < self._bootstrap_floor:
-                raise IncompleteBatchError(f"{n_rows} rows is under the bootstrap floor {self._bootstrap_floor}",
-                                           code="below_floor")
+                raise IncompleteBatchError(
+                    f"{n_rows} rows is under the bootstrap floor {self._bootstrap_floor}", code="below_floor"
+                )
             return
         median = statistics.median(counts)
         if n_rows < MIN_FRACTION_OF_MEDIAN * median:
@@ -172,31 +187,32 @@ class MassiveProvider:
         symbol = row.get("T")
         if not isinstance(symbol, str) or not symbol:
             raise ProviderError("massive row has no ticker", code="malformed_row")
-        stamp = _number(row, "t")
-        assert stamp is not None
+        stamp = _req_number(row, "t")
         if datetime.fromtimestamp(stamp / 1000, ET).date() != session:
             raise ProviderError(f"massive row for {symbol} is stamped for another session", code="session_mismatch")
-        trades = _number(row, "n", required=False)
+        trades = _opt_number(row, "n")
         return DailyBar(
             source=SOURCE,
             symbol=symbol,
             session=session,
-            open=_number(row, "o"),  # type: ignore[arg-type]
-            high=_number(row, "h"),  # type: ignore[arg-type]
-            low=_number(row, "l"),  # type: ignore[arg-type]
-            close=_number(row, "c"),  # type: ignore[arg-type]
-            volume=_number(row, "v"),  # type: ignore[arg-type]
-            vwap=_number(row, "vw", required=False),
+            open=_req_number(row, "o"),
+            high=_req_number(row, "h"),
+            low=_req_number(row, "l"),
+            close=_req_number(row, "c"),
+            volume=_req_number(row, "v"),
+            vwap=_opt_number(row, "vw"),
             trades=None if trades is None else int(trades),
         )
 
     # --- corporate actions -----------------------------------------------------------------
 
     def corporate_actions(self, since: date) -> list[CorporateAction]:
-        splits = self._paged(f"{self._base_url}/stocks/v1/splits",
-                             {"execution_date.gte": since.isoformat(), "limit": 1000})
-        dividends = self._paged(f"{self._base_url}/stocks/v1/dividends",
-                                {"ex_dividend_date.gte": since.isoformat(), "limit": 1000})
+        splits = self._paged(
+            f"{self._base_url}/stocks/v1/splits", {"execution_date.gte": since.isoformat(), "limit": 1000}
+        )
+        dividends = self._paged(
+            f"{self._base_url}/stocks/v1/dividends", {"ex_dividend_date.gte": since.isoformat(), "limit": 1000}
+        )
         return [self._parse_split(r) for r in splits] + [self._parse_dividend(r) for r in dividends]
 
     def _paged(self, url: str, params: Mapping[str, Any]) -> list[Mapping[str, Any]]:
@@ -223,8 +239,9 @@ class MassiveProvider:
     def _parse_split(row: Mapping[str, Any]) -> CorporateAction:
         action_type = row.get("adjustment_type")
         if action_type not in _SPLIT_TYPES:
-            raise ProviderError(f"massive split has unknown adjustment_type {str(action_type)[:32]!r}",
-                                code="malformed_row")
+            raise ProviderError(
+                f"massive split has unknown adjustment_type {str(action_type)[:32]!r}", code="malformed_row"
+            )
         symbol = row.get("ticker")
         if not isinstance(symbol, str) or not symbol:
             raise ProviderError("massive split has no ticker", code="malformed_row")
@@ -232,10 +249,10 @@ class MassiveProvider:
             source=SOURCE,
             action_type=action_type,
             symbol=symbol,
-            ex_date=_iso_date(row.get("execution_date"), "execution_date"),  # type: ignore[arg-type]
-            split_from=_number(row, "split_from"),
-            split_to=_number(row, "split_to"),
-            historical_adjustment_factor=_number(row, "historical_adjustment_factor", required=False),
+            ex_date=_req_date(row.get("execution_date"), "execution_date"),
+            split_from=_req_number(row, "split_from"),
+            split_to=_req_number(row, "split_to"),
+            historical_adjustment_factor=_opt_number(row, "historical_adjustment_factor"),
             vendor_id=str(row["id"]) if row.get("id") is not None else None,
         )
 
@@ -249,13 +266,13 @@ class MassiveProvider:
             source=SOURCE,
             action_type="cash_dividend",
             symbol=symbol,
-            ex_date=_iso_date(row.get("ex_dividend_date"), "ex_dividend_date"),  # type: ignore[arg-type]
-            cash_amount=_number(row, "cash_amount"),
+            ex_date=_req_date(row.get("ex_dividend_date"), "ex_dividend_date"),
+            cash_amount=_req_number(row, "cash_amount"),
             currency=currency if isinstance(currency, str) else None,
-            declaration_date=_iso_date(row.get("declaration_date"), "declaration_date", required=False),
-            record_date=_iso_date(row.get("record_date"), "record_date", required=False),
-            pay_date=_iso_date(row.get("pay_date"), "pay_date", required=False),
-            historical_adjustment_factor=_number(row, "historical_adjustment_factor", required=False),
+            declaration_date=_opt_date(row.get("declaration_date"), "declaration_date"),
+            record_date=_opt_date(row.get("record_date"), "record_date"),
+            pay_date=_opt_date(row.get("pay_date"), "pay_date"),
+            historical_adjustment_factor=_opt_number(row, "historical_adjustment_factor"),
             vendor_id=str(row["id"]) if row.get("id") is not None else None,
         )
 

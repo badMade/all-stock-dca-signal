@@ -60,6 +60,8 @@ environment (see the repository README).
 | [adr-dotenv-loader.md](adr-dotenv-loader.md) | ADR: why a small allowlisted, mode-0600 `.env` loader runs from `dca_paths` instead of per-command sourcing in the prompts |
 | [adr-simultaneous-start-guard.md](adr-simultaneous-start-guard.md) | ADR: closing the simultaneous-start race (two executors both seeing an empty window) with a per-order history re-pull, a slot claim and the deterministic broker `ref_id`; DCA Issues keys `duplicate_fills`, `competing_executor` |
 | [adr-plan-first-backup-executor.md](adr-plan-first-backup-executor.md) | ADR (proposed): plan files, Mac-first backup with compute fallbacks, fail-closed re-validation; `dca_order_plan.py` and `schemas/order_plan.schema.json` |
+| [adr-price-source-massive-alpaca.md](adr-price-source-massive-alpaca.md) | ADR (proposed): Massive (primary) + Alpaca (failover, intraday IEX) replace Yahoo as the ongoing price source; append-only point-in-time DuckDB store under `dca-sizing-signals/market_data_ingest/prices/`, Yahoo kept as `yahoo_legacy`; not wired into live sizing |
+| [price_source_poc_report.md](price_source_poc_report.md) | The opt-in live PoC report for that price source (20 tickers x 60 sessions vs Yahoo) |
 | [verified_sizing_and_backup_facts.md](verified_sizing_and_backup_facts.md) | Re-checkable repo facts found during the backup-executor work: live per-ticker sizing and the $16 cap, stale "$10"/"5x" prose, same-day repeats, where sources disagree |
 | [wondrous_octopus.md](wondrous_octopus.md) | The `wondrous-octopus/` tool: walk-forward, online-updated next-day OHLC forecasting across the whole archive; research artifacts only, never wired into live sizing |
 

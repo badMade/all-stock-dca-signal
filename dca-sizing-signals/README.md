@@ -53,6 +53,84 @@ pip install -e ".[dev]"
 python -m pytest tests/
 ```
 
+## Price source (Massive + Alpaca)
+
+`market_data_ingest/prices/` replaces Yahoo Finance as the ongoing source of daily prices.
+Massive (ex-Polygon) Stocks Basic is the primary nightly source. Alpaca Basic is the
+end-of-day failover and the intraday last-trade source. The Yahoo history already in
+`ticker_data/` stays, imported as `source='yahoo_legacy'`. Decision record:
+`docs/adr-price-source-massive-alpaca.md`. It is suggestion-only: nothing in the live DCA
+paths imports it, and the ladder and sizing logic are unchanged.
+
+### Install
+
+```bash
+cd dca-sizing-signals
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt          # requests, duckdb, pytest (pinned); or: pip install -e ".[prices,dev]"
+python -m pytest tests/prices            # offline; the live PoC under tests/prices/contract skips itself
+```
+
+Dependencies: `requests==2.34.2` and `duckdb==1.5.6`. Nothing else, and nothing in the
+stdlib-only core.
+
+### Environment variables
+
+| Variable | Needed for | Notes |
+|---|---|---|
+| `MASSIVE_API_KEY` | daily job, PoC | Sent as an `Authorization: Bearer` header, never in a URL |
+| `ALPACA_KEY_ID`, `ALPACA_SECRET_KEY` | daily job (calendar, failover), intraday, PoC | Sent as `APCA-API-KEY-ID` / `APCA-API-SECRET-KEY` headers. The calendar uses the paper trading API |
+| `DCA_PRICE_DB` | optional | DuckDB path. Default `<repo>/data/backfill.duckdb` (gitignored, as is `data/staging/`) |
+| `DCA_TICKER_HISTORY_DIR` | `yahoo_legacy` import, PoC | The existing Yahoo CSV archive |
+| `PRICE_CONTRACT=1` | PoC only | Opts in to the live contract test |
+
+Keys are read from the environment only. They are never logged and never written to the
+database or the staging files; `tests/prices/test_no_secrets.py` checks this.
+
+### Usage
+
+```bash
+# Nightly, after 20:00 ET. Exit code 0 means ok or market closed; non-zero means the run failed.
+python -m market_data_ingest.prices.daily_job
+python -m market_data_ingest.prices.daily_job --session 2026-10-16
+# First runs: fewer than 20 stored sessions means no row-count baseline yet.
+python -m market_data_ingest.prices.daily_job --session 2024-10-21 --bootstrap        # floor 8000 rows
+```
+
+```python
+from datetime import date, datetime, timezone
+from pathlib import Path
+from market_data_ingest.prices.store import PriceStore
+from market_data_ingest.prices.legacy_yahoo import import_dir
+from market_data_ingest.prices.reconcile import reconcile_symbol
+
+now = datetime.now(timezone.utc)
+with PriceStore("data/backfill.duckdb") as store:
+    store.adjusted_bars("NVDA", as_of_date=date(2024, 6, 1))  # no lookahead: the 2024-06-10 split is not applied
+    report = import_dir(store, Path("ticker_data"), run_id="yahoo-import", now=now)  # report.failed lists bad files
+    reconcile_symbol(store, "NVDA", run_id="recon", now=now).status                  # pass / flag / block / insufficient
+# Intraday: market_data_ingest.prices.decision.price_for_suggestion(symbol, slot="10:30", ...)
+# returns PriceOK (already recorded in intraday_quotes) or NoSuggestion(reason, error_class).
+```
+
+The adjusted views are DuckDB table macros stored in the database file, so the DuckDB CLI
+works too: `SELECT * FROM adjusted_bars(DATE '2024-06-01', TIMESTAMP '9999-12-31') WHERE symbol = 'NVDA'`.
+
+### Troubleshooting
+
+| Symptom (run record `error_class` / `code`) | Meaning and fix |
+|---|---|
+| `IncompleteBatchError` / `no_baseline` | Fewer than 20 stored Massive sessions. Run oldest-first with `--bootstrap` until 20 exist |
+| `IncompleteBatchError` / `below_median` | Massive returned under 90% of the usual row count. The fallback was tried; rerun later. The job re-pulls T-1..T-5 every night |
+| `IncompleteBatchError` / `empty_open_session` | No bars on a day the calendar says was open. Usually the job ran too early; rerun after 20:00 ET |
+| `ProviderError` / `not_authorized` | Massive free history is 2 years. Older sessions are refused by design; use `yahoo_legacy` for them |
+| `ProviderError` / `rate_limited` | Two 429s in a row. The client already spaces Massive calls 12 s apart (5/minute); check for another process sharing the key |
+| `ValidationError` | One row failed the OHLC or price checks, so the whole batch was rejected (strict by design). The message names the rows |
+| `SessionNotClosed` | The session is not final before 20:00 ET |
+| `RouterExhaustedError` | Massive and Alpaca both failed. Both causes are in `ingestion_runs.error_detail` |
+| `SpliceNotValidatedError` | Yahoo and vendor history are joined only after a passing reconciliation that ends at the splice date |
+| DuckDB "Could not set lock" | Another process has the database open. DuckDB allows one writer |
+
 ## Status
 
 Architecture and boundary tests are real and passing. `edgar_fundamentals.py` and

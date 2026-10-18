@@ -108,8 +108,9 @@ class HttpClient:
         for attempt in (1, 2):
             self._throttle()
             try:
-                response = self._session.get(url, params=dict(params or {}), headers=self._headers,
-                                             timeout=self._timeout)
+                response = self._session.get(
+                    url, params=dict(params or {}), headers=self._headers, timeout=self._timeout
+                )
             except requests.exceptions.Timeout as exc:
                 raise ProviderError(f"{self._vendor} request timed out", code="timeout") from exc
             except requests.exceptions.ConnectionError as exc:

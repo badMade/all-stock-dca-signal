@@ -76,12 +76,13 @@ def action_problems(action: CorporateAction) -> list[str]:
     if not isinstance(action.symbol, str) or not action.symbol.strip():
         out.append(f"{where}: empty symbol")
     if action.action_type in SPLIT_TYPES:
-        if not (_finite(action.split_from) and _finite(action.split_to)) or not (
-            action.split_from > 0 and action.split_to > 0  # type: ignore[operator]
-        ):
+        ratio = (action.split_from, action.split_to)
+        if not all(_finite(v) and v is not None and v > 0 for v in ratio):
             out.append(f"{where}: split ratio must be two positive numbers")
-    if action.action_type == "cash_dividend" and (not _finite(action.cash_amount) or action.cash_amount <= 0):  # type: ignore[operator]
-        out.append(f"{where}: cash amount must be positive")
+    if action.action_type == "cash_dividend":
+        amount = action.cash_amount
+        if amount is None or not _finite(amount) or amount <= 0:
+            out.append(f"{where}: cash amount must be positive")
     return out
 
 

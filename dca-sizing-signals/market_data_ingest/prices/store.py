@@ -151,26 +151,70 @@ CREATE OR REPLACE MACRO adjusted_bars(as_of_date, known_at) AS TABLE
     FROM b LEFT JOIN splits AS s USING (symbol, session) LEFT JOIN div_factors AS f USING (symbol, session);
 """
 
-_TABLES = frozenset({"daily_bars_raw", "corporate_actions", "ingestion_runs", "intraday_quotes",
-                     "yahoo_legacy_bars", "reconciliation_results"})
+_TABLES = frozenset(
+    {
+        "daily_bars_raw",
+        "corporate_actions",
+        "ingestion_runs",
+        "intraday_quotes",
+        "yahoo_legacy_bars",
+        "reconciliation_results",
+    }
+)
 
 _BAR_COLUMNS = {
-    "source": "VARCHAR", "symbol": "VARCHAR", "session": "DATE", "open": "DOUBLE", "high": "DOUBLE",
-    "low": "DOUBLE", "close": "DOUBLE", "volume": "DOUBLE", "vwap": "DOUBLE", "trades": "BIGINT",
-    "content_hash": "VARCHAR", "as_of": "TIMESTAMP", "ingested_at": "TIMESTAMP", "run_id": "VARCHAR",
+    "source": "VARCHAR",
+    "symbol": "VARCHAR",
+    "session": "DATE",
+    "open": "DOUBLE",
+    "high": "DOUBLE",
+    "low": "DOUBLE",
+    "close": "DOUBLE",
+    "volume": "DOUBLE",
+    "vwap": "DOUBLE",
+    "trades": "BIGINT",
+    "content_hash": "VARCHAR",
+    "as_of": "TIMESTAMP",
+    "ingested_at": "TIMESTAMP",
+    "run_id": "VARCHAR",
 }
 _ACTION_COLUMNS = {
-    "source": "VARCHAR", "vendor_id": "VARCHAR", "action_type": "VARCHAR", "symbol": "VARCHAR",
-    "ex_date": "DATE", "split_from": "DOUBLE", "split_to": "DOUBLE", "cash_amount": "DOUBLE",
-    "currency": "VARCHAR", "declaration_date": "DATE", "record_date": "DATE", "pay_date": "DATE",
-    "historical_adjustment_factor": "DOUBLE", "content_hash": "VARCHAR", "as_of": "TIMESTAMP",
-    "ingested_at": "TIMESTAMP", "run_id": "VARCHAR",
+    "source": "VARCHAR",
+    "vendor_id": "VARCHAR",
+    "action_type": "VARCHAR",
+    "symbol": "VARCHAR",
+    "ex_date": "DATE",
+    "split_from": "DOUBLE",
+    "split_to": "DOUBLE",
+    "cash_amount": "DOUBLE",
+    "currency": "VARCHAR",
+    "declaration_date": "DATE",
+    "record_date": "DATE",
+    "pay_date": "DATE",
+    "historical_adjustment_factor": "DOUBLE",
+    "content_hash": "VARCHAR",
+    "as_of": "TIMESTAMP",
+    "ingested_at": "TIMESTAMP",
+    "run_id": "VARCHAR",
 }
 _YAHOO_COLUMNS = {
-    "source": "VARCHAR", "symbol": "VARCHAR", "session": "DATE", "open": "DOUBLE", "high": "DOUBLE",
-    "low": "DOUBLE", "close": "DOUBLE", "adj_close": "DOUBLE", "volume": "DOUBLE", "dividends": "DOUBLE",
-    "stock_splits": "DOUBLE", "adjustment_basis": "VARCHAR", "file_sha256": "VARCHAR",
-    "content_hash": "VARCHAR", "as_of": "TIMESTAMP", "ingested_at": "TIMESTAMP", "run_id": "VARCHAR",
+    "source": "VARCHAR",
+    "symbol": "VARCHAR",
+    "session": "DATE",
+    "open": "DOUBLE",
+    "high": "DOUBLE",
+    "low": "DOUBLE",
+    "close": "DOUBLE",
+    "adj_close": "DOUBLE",
+    "volume": "DOUBLE",
+    "dividends": "DOUBLE",
+    "stock_splits": "DOUBLE",
+    "adjustment_basis": "VARCHAR",
+    "file_sha256": "VARCHAR",
+    "content_hash": "VARCHAR",
+    "as_of": "TIMESTAMP",
+    "ingested_at": "TIMESTAMP",
+    "run_id": "VARCHAR",
 }
 
 
@@ -220,9 +264,10 @@ class PriceStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock
-        self._con: duckdb.DuckDBPyConnection | None = duckdb.connect(str(self.path))
-        self._con.execute(_SCHEMA)
-        self._con.execute(_MACROS)
+        con = duckdb.connect(str(self.path))
+        con.execute(_SCHEMA)
+        con.execute(_MACROS)
+        self._con: duckdb.DuckDBPyConnection | None = con
 
     def __enter__(self) -> PriceStore:
         return self
@@ -246,7 +291,7 @@ class PriceStore:
     def _rows(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
         cursor = self.con.execute(sql, list(params))
         names = [d[0] for d in cursor.description]
-        return [{k: _from_db(v) for k, v in zip(names, row)} for row in cursor.fetchall()]
+        return [{k: _from_db(v) for k, v in zip(names, row, strict=True)} for row in cursor.fetchall()]
 
     def _check_table(self, table: str) -> str:
         if table not in _TABLES:
@@ -264,8 +309,9 @@ class PriceStore:
         row = self.con.execute(f"SELECT count(*) FROM {self._check_table(table)}").fetchone()
         return int(row[0]) if row else 0
 
-    def _bulk_insert(self, table: str, columns: dict[str, str], rows: list[dict[str, Any]], *,
-                     parquet_path: Path | None) -> int:
+    def _bulk_insert(
+        self, table: str, columns: dict[str, str], rows: list[dict[str, Any]], *, parquet_path: Path | None
+    ) -> int:
         """Write ``rows`` to a file, optionally stage them as Parquet, insert in one transaction."""
         if not rows:
             return 0
@@ -287,8 +333,9 @@ class PriceStore:
             self.con.execute("BEGIN TRANSACTION")
             try:
                 before = self.row_count(table)
-                self.con.execute(f"INSERT INTO {table} ({cols}) SELECT DISTINCT {cols} FROM {source} "
-                                 "ON CONFLICT DO NOTHING")
+                self.con.execute(
+                    f"INSERT INTO {table} ({cols}) SELECT DISTINCT {cols} FROM {source} ON CONFLICT DO NOTHING"
+                )
                 inserted = self.row_count(table) - before
                 self.con.execute("COMMIT")
             except BaseException:
@@ -298,8 +345,7 @@ class PriceStore:
 
     # --- bars and corporate actions ------------------------------------------------------------
 
-    def ingest_daily_bars(self, bars: Iterable[DailyBar], *, run_id: str, as_of: datetime,
-                          staging_dir: Path) -> int:
+    def ingest_daily_bars(self, bars: Iterable[DailyBar], *, run_id: str, as_of: datetime, staging_dir: Path) -> int:
         batch = list(bars)
         validate_bars(batch)
         if not batch:
@@ -308,17 +354,33 @@ class PriceStore:
         rows = []
         for b in batch:
             values = [b.symbol, b.session.isoformat(), b.open, b.high, b.low, b.close, b.volume, b.vwap, b.trades]
-            rows.append({"source": b.source, "symbol": b.symbol, "session": b.session, "open": b.open,
-                         "high": b.high, "low": b.low, "close": b.close, "volume": b.volume, "vwap": b.vwap,
-                         "trades": b.trades, "content_hash": _hash(values), "as_of": stamp,
-                         "ingested_at": ingested_at, "run_id": run_id})
+            rows.append(
+                {
+                    "source": b.source,
+                    "symbol": b.symbol,
+                    "session": b.session,
+                    "open": b.open,
+                    "high": b.high,
+                    "low": b.low,
+                    "close": b.close,
+                    "volume": b.volume,
+                    "vwap": b.vwap,
+                    "trades": b.trades,
+                    "content_hash": _hash(values),
+                    "as_of": stamp,
+                    "ingested_at": ingested_at,
+                    "run_id": run_id,
+                }
+            )
         sessions = sorted({b.session for b in batch})
         name = f"daily_bars_{sessions[0].isoformat()}_{_hash([r['content_hash'] for r in rows])[:12]}.parquet"
-        return self._bulk_insert("daily_bars_raw", _BAR_COLUMNS, rows,
-                                 parquet_path=Path(staging_dir) / safe_name(run_id) / name)
+        return self._bulk_insert(
+            "daily_bars_raw", _BAR_COLUMNS, rows, parquet_path=Path(staging_dir) / safe_name(run_id) / name
+        )
 
-    def ingest_corporate_actions(self, actions: Iterable[CorporateAction], *, run_id: str, as_of: datetime,
-                                 staging_dir: Path) -> int:
+    def ingest_corporate_actions(
+        self, actions: Iterable[CorporateAction], *, run_id: str, as_of: datetime, staging_dir: Path
+    ) -> int:
         batch = list(actions)
         validate_actions(batch)
         if not batch:
@@ -326,31 +388,58 @@ class PriceStore:
         stamp, ingested_at = to_utc_naive(as_of), to_utc_naive(self._clock())
         rows = []
         for a in batch:
-            values = [a.source, a.vendor_id, a.action_type, a.symbol, a.ex_date, a.split_from, a.split_to,
-                      a.cash_amount, a.currency, a.declaration_date, a.record_date, a.pay_date,
-                      a.historical_adjustment_factor]
-            rows.append({"source": a.source, "vendor_id": a.vendor_id, "action_type": a.action_type,
-                         "symbol": a.symbol, "ex_date": a.ex_date, "split_from": a.split_from,
-                         "split_to": a.split_to, "cash_amount": a.cash_amount, "currency": a.currency,
-                         "declaration_date": a.declaration_date, "record_date": a.record_date,
-                         "pay_date": a.pay_date, "historical_adjustment_factor": a.historical_adjustment_factor,
-                         "content_hash": _hash(values), "as_of": stamp, "ingested_at": ingested_at,
-                         "run_id": run_id})
+            values = [
+                a.source,
+                a.vendor_id,
+                a.action_type,
+                a.symbol,
+                a.ex_date,
+                a.split_from,
+                a.split_to,
+                a.cash_amount,
+                a.currency,
+                a.declaration_date,
+                a.record_date,
+                a.pay_date,
+                a.historical_adjustment_factor,
+            ]
+            rows.append(
+                {
+                    "source": a.source,
+                    "vendor_id": a.vendor_id,
+                    "action_type": a.action_type,
+                    "symbol": a.symbol,
+                    "ex_date": a.ex_date,
+                    "split_from": a.split_from,
+                    "split_to": a.split_to,
+                    "cash_amount": a.cash_amount,
+                    "currency": a.currency,
+                    "declaration_date": a.declaration_date,
+                    "record_date": a.record_date,
+                    "pay_date": a.pay_date,
+                    "historical_adjustment_factor": a.historical_adjustment_factor,
+                    "content_hash": _hash(values),
+                    "as_of": stamp,
+                    "ingested_at": ingested_at,
+                    "run_id": run_id,
+                }
+            )
         name = f"corporate_actions_{_hash([r['content_hash'] for r in rows])[:12]}.parquet"
-        return self._bulk_insert("corporate_actions", _ACTION_COLUMNS, rows,
-                                 parquet_path=Path(staging_dir) / safe_name(run_id) / name)
+        return self._bulk_insert(
+            "corporate_actions", _ACTION_COLUMNS, rows, parquet_path=Path(staging_dir) / safe_name(run_id) / name
+        )
 
     def raw_bars(self, symbol: str) -> list[dict[str, Any]]:
         return self._rows("SELECT * FROM daily_bars_raw WHERE symbol = ? ORDER BY session, as_of", [symbol])
 
     def adjusted_bars(self, symbol: str, *, as_of_date: date, known_at: datetime | None = None) -> list[AdjustedBar]:
         known = FAR_FUTURE if known_at is None else to_utc_naive(known_at)
-        rows = self._rows("SELECT * FROM adjusted_bars(?, ?) WHERE symbol = ? ORDER BY session",
-                          [as_of_date, known, symbol])
+        rows = self._rows(
+            "SELECT * FROM adjusted_bars(?, ?) WHERE symbol = ? ORDER BY session", [as_of_date, known, symbol]
+        )
         return [AdjustedBar(**r) for r in rows]
 
-    def split_price_factor(self, symbol: str, *, after: date, through: date,
-                           known_at: datetime | None = None) -> float:
+    def split_price_factor(self, symbol: str, *, after: date, through: date, known_at: datetime | None = None) -> float:
         """Product of split price ratios with ``after < ex_date <= through`` (1.0 if none)."""
         known = FAR_FUTURE if known_at is None else to_utc_naive(known_at)
         row = self.con.execute(
@@ -379,14 +468,34 @@ class PriceStore:
 
     # --- run log -----------------------------------------------------------------------------------
 
-    def record_run(self, run_id: str, *, job: str, status: str, at: datetime, session: date | None = None,
-                   source: str | None = None, row_count: int | None = None, error_class: str | None = None,
-                   error_detail: str | None = None) -> None:
+    def record_run(
+        self,
+        run_id: str,
+        *,
+        job: str,
+        status: str,
+        at: datetime,
+        session: date | None = None,
+        source: str | None = None,
+        row_count: int | None = None,
+        error_class: str | None = None,
+        error_detail: str | None = None,
+    ) -> None:
         self.con.execute(
             "INSERT INTO ingestion_runs (run_id, job, session, status, source, row_count, error_class, "
             "error_detail, as_of, ingested_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [run_id, job, session, status, source, row_count, error_class, error_detail, to_utc_naive(at),
-             to_utc_naive(self._clock())],
+            [
+                run_id,
+                job,
+                session,
+                status,
+                source,
+                row_count,
+                error_class,
+                error_detail,
+                to_utc_naive(at),
+                to_utc_naive(self._clock()),
+            ],
         )
 
     def run_events(self, run_id: str) -> list[dict[str, Any]]:
@@ -406,8 +515,17 @@ class PriceStore:
         self.con.execute(
             "INSERT INTO intraday_quotes (symbol, ts, price, feed, delayed, slot, source, as_of, ingested_at, run_id) "
             "VALUES (?, ?, ?, ?, ?, ?, 'alpaca', ?, ?, ?) ON CONFLICT DO NOTHING",
-            [quote.symbol, to_utc_naive(quote.ts), quote.price, quote.feed, delayed, slot, to_utc_naive(quote.as_of),
-             to_utc_naive(self._clock()), run_id],
+            [
+                quote.symbol,
+                to_utc_naive(quote.ts),
+                quote.price,
+                quote.feed,
+                delayed,
+                slot,
+                to_utc_naive(quote.as_of),
+                to_utc_naive(self._clock()),
+                run_id,
+            ],
         )
 
     def intraday_quotes(self, *, run_id: str | None = None) -> list[dict[str, Any]]:
@@ -417,17 +535,37 @@ class PriceStore:
 
     # --- yahoo legacy and reconciliation -------------------------------------------------------------
 
-    def ingest_yahoo_legacy(self, rows: Iterable[dict[str, Any]], *, symbol: str, run_id: str, as_of: datetime,
-                            file_sha256: str) -> int:
+    def ingest_yahoo_legacy(
+        self, rows: Iterable[dict[str, Any]], *, symbol: str, run_id: str, as_of: datetime, file_sha256: str
+    ) -> int:
         stamp, ingested_at = to_utc_naive(as_of), to_utc_naive(self._clock())
         prepared = []
         for r in rows:
-            values = [symbol, r["session"].isoformat(), r["open"], r["high"], r["low"], r["close"], r["adj_close"],
-                      r["volume"], r["dividends"], r["stock_splits"]]
-            prepared.append({**r, "source": "yahoo_legacy", "symbol": symbol,
-                             "adjustment_basis": "split_adjusted_at_download", "file_sha256": file_sha256,
-                             "content_hash": _hash(values), "as_of": stamp, "ingested_at": ingested_at,
-                             "run_id": run_id})
+            values = [
+                symbol,
+                r["session"].isoformat(),
+                r["open"],
+                r["high"],
+                r["low"],
+                r["close"],
+                r["adj_close"],
+                r["volume"],
+                r["dividends"],
+                r["stock_splits"],
+            ]
+            prepared.append(
+                {
+                    **r,
+                    "source": "yahoo_legacy",
+                    "symbol": symbol,
+                    "adjustment_basis": "split_adjusted_at_download",
+                    "file_sha256": file_sha256,
+                    "content_hash": _hash(values),
+                    "as_of": stamp,
+                    "ingested_at": ingested_at,
+                    "run_id": run_id,
+                }
+            )
         return self._bulk_insert("yahoo_legacy_bars", _YAHOO_COLUMNS, prepared, parquet_path=None)
 
     def yahoo_legacy_bars(self, symbol: str) -> list[dict[str, Any]]:
@@ -445,11 +583,22 @@ class PriceStore:
             "sessions, status, worst_close_diff_pct, volume_flag, adj_close_worst_diff_pct, splice_date, "
             "splice_factor, as_of, ingested_at, run_id) "
             "VALUES ('massive', 'yahoo_legacy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [result.symbol, result.window_start, result.window_end, result.sessions, result.status,
-             result.worst_close_diff_pct, result.volume_flag, result.adj_close_worst_diff_pct, result.splice_date,
-             result.splice_factor, to_utc_naive(as_of), to_utc_naive(self._clock()), run_id],
+            [
+                result.symbol,
+                result.window_start,
+                result.window_end,
+                result.sessions,
+                result.status,
+                result.worst_close_diff_pct,
+                result.volume_flag,
+                result.adj_close_worst_diff_pct,
+                result.splice_date,
+                result.splice_factor,
+                to_utc_naive(as_of),
+                to_utc_naive(self._clock()),
+                run_id,
+            ],
         )
 
     def reconciliation_results(self, symbol: str) -> list[dict[str, Any]]:
-        return self._rows("SELECT * FROM reconciliation_results WHERE symbol = ? ORDER BY as_of, ingested_at",
-                          [symbol])
+        return self._rows("SELECT * FROM reconciliation_results WHERE symbol = ? ORDER BY as_of, ingested_at", [symbol])

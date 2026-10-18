@@ -15,7 +15,7 @@ from datetime import date
 
 import pytest
 from market_data_ingest.prices.alpaca import AlpacaCalendar, AlpacaProvider
-from market_data_ingest.prices.errors import ProviderError
+from market_data_ingest.prices.errors import IncompleteBatchError, ProviderError
 from market_data_ingest.prices.models import Quote
 from market_data_ingest.prices.provider import PriceProvider
 
@@ -116,6 +116,16 @@ def test_daily_bars_are_raw_and_follow_pagination(clock):
     assert len(session.calls) == 2
     for c in session.calls:
         assert_header_auth(c)
+
+
+def test_failover_bars_covering_under_90_percent_of_the_universe_are_incomplete(clock):
+    # Regression (review 2026-10-18): an Alpaca failover that answers for only part of the
+    # universe must not let the nightly job record "ok" with most of the market missing.
+    provider, _ = make(_bars_pages, clock=clock, universe=lambda: ["NVDA", "AAPL", "MSFT"])
+
+    with pytest.raises(IncompleteBatchError) as excinfo:
+        provider.daily_bars(date(2024, 6, 10))
+    assert excinfo.value.code == "below_universe"
 
 
 def test_daily_bars_without_a_universe_fail_closed(clock):
