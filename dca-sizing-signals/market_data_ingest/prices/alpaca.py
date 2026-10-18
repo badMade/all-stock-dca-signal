@@ -82,7 +82,7 @@ def parse_rfc3339(value: Any) -> datetime:
     body = value[:-1]
     if "." in body:
         head, frac = body.split(".", 1)
-        body = f"{head}.{(frac + '000000')[:6]}"
+        body = f"{head}.{(frac + '0' * 6)[:6]}"
     try:
         return datetime.fromisoformat(body).replace(tzinfo=timezone.utc)
     except ValueError as exc:

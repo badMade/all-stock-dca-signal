@@ -70,7 +70,7 @@ def test_latest_trade_iex_returns_trade_timestamped_quotes(clock):
     nvda = quotes["NVDA"]
     assert isinstance(nvda, Quote)
     assert nvda.price == pytest.approx(121.5)
-    assert nvda.ts == utc(2024, 6, 11, 14, 34, 58, 500000)
+    assert nvda.ts == utc(2024, 6, 11, 14, 34, 58, 500_000)
     assert nvda.feed == "iex"
     assert nvda.as_of == clock.now(), "as_of is when we fetched it, ts is when it traded"
 
@@ -109,6 +109,8 @@ def test_daily_bars_are_raw_and_follow_pagination(clock):
     }
     nvda = next(b for b in bars if b.symbol == "NVDA")
     assert nvda.close == pytest.approx(121.79)
+    assert nvda.volume == pytest.approx(314_000_000)
+    assert {b.symbol: b.trades for b in bars} == {"NVDA": 25000, "AAPL": 11000}
     first = session.calls[0]
     assert first.params.get("timeframe") == "1Day"
     assert first.params.get("adjustment") == "raw"

@@ -69,7 +69,7 @@ def test_grouped_daily_parses_raw_bars_for_the_requested_session(clock):
     assert (nvda.open, nvda.high, nvda.low) == pytest.approx((1130.0, 1135.0, 1060.0))
     assert nvda.volume == pytest.approx(67_000_000)
     assert nvda.vwap == pytest.approx(1095.1)
-    assert nvda.trades == 900_000
+    assert {b.symbol: b.trades for b in bars} == {"NVDA": 9000, "AAPL": 7000, "MSFT": 6000}
 
 
 def test_grouped_daily_is_one_unadjusted_call_without_otc_and_key_in_header(clock):

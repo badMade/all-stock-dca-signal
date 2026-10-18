@@ -532,6 +532,51 @@ def _route_reports_summary(app, request: RouteRequest) -> Response:
     return Response.json(200, console_digest(app.settings.output, app.settings.mode, _day_field(app, fields)))
 
 
+def _route_architecture(app, request: RouteRequest) -> Response:
+    """Developer-only architecture map shell (static ast read, never shipped).
+
+    Served under the strict default CSP like every main route: the script and
+    stylesheet are separate same-origin routes, so nothing here needs the
+    sandbox policy that only generated research pages use.
+    """
+    from dca_console_diagnostics import render_page
+
+    query(request.url.query, (), max_fields=1)
+    return Response(200, render_page(), "text/html")
+
+
+def _route_architecture_asset(kind: str) -> Callable[[Any, RouteRequest], Response]:
+    def route(app, request: RouteRequest) -> Response:
+        from dca_console_diagnostics import PAGE_CSS, PAGE_JS
+
+        query(request.url.query, (), max_fields=1)
+        if kind == "css":
+            return Response(200, PAGE_CSS.encode(), "text/css")
+        return Response(200, PAGE_JS.encode(), "text/javascript")
+    return route
+
+
+def _route_architecture_data(app, request: RouteRequest) -> Response:
+    from dca_console import REPO
+    from dca_console_diagnostics import SCAN_CACHE
+
+    fields = query(request.url.query, ("refresh",), max_fields=1)
+    return Response.json(200, SCAN_CACHE.get(REPO, refresh=fields.get("refresh") == "1"))
+
+
+def _route_architecture_module(app, request: RouteRequest) -> Response:
+    from dca_console import REPO
+    from dca_console_diagnostics import build_detail
+
+    fields = query(request.url.query, ("module",), max_fields=1)
+    if re.fullmatch(r"[A-Za-z0-9_.]{1,100}", fields.get("module", "")) is None:
+        raise ValueError("module must be a scanned module name")
+    detail = build_detail(REPO, fields["module"])
+    if detail is None:
+        return Response.json(404, {"error": "Not found"})
+    return Response.json(200, detail)
+
+
 def _route_research(app, request: RouteRequest) -> Response:
     from dca_console import REPO
     from dca_console_research import build_research_snapshot
@@ -596,6 +641,11 @@ GET_ROUTES: dict[str, Callable[[Any, RouteRequest], Response]] = {
     "/api/reports/latest": _route_reports_latest,
     "/api/reports/summary": _route_reports_summary,
     "/api/research": _route_research,
+    "/diagnostics/architecture": _route_architecture,
+    "/diagnostics/architecture.css": _route_architecture_asset("css"),
+    "/diagnostics/architecture.js": _route_architecture_asset("js"),
+    "/api/diagnostics/architecture": _route_architecture_data,
+    "/api/diagnostics/architecture/module": _route_architecture_module,
     "/api/tickers": _route_tickers,
     "/api/training": _route_training,
 }
