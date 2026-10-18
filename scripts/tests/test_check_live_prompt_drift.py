@@ -31,6 +31,8 @@ GOOD_BODY = (
     "GATE 6.5 - SAME-DAY TOP-UP GUARD\n"
     'Save {"account_number": "${ROBINHOOD_AGENTIC_ACCOUNT_NUMBER}", "trading_day": "<YYYY-MM-DD>", '
     '"pages": [...]} then run python3 -m scripts.same_day_top_up_gate --orders-pages ...\n'
+    "GATE 5 - BUY LIST\n"
+    "NO HAND-REIMPLEMENTED SIGNALS: Never recompute signals, sizes or candidates by hand.\n"
     "GATE 9 - REPORT\n"
     "Run python3 -m scripts.finalize_run_evidence --slot 1030 --started-at ... on every outcome.\n"
 )
@@ -462,3 +464,27 @@ def test_a_live_task_without_the_yfinance_paragraph_is_not_flagged_as_retired(tm
     mirror_dir = _mirror(tmp_path, "0935-test")
     report = _check(tmp_path, mirror_dir, _live(tmp_path, "0935-test", GOOD_BODY))
     assert "retired_yfinance_fallback" not in _findings(report)
+
+
+def test_a_live_task_without_the_no_hand_signals_rule_is_flagged(tmp_path):
+    # hand_reimplemented: when the data path failed, a session hand-wrote signal logic instead of
+    # calling the repo generator. The live body must carry the never-recompute rule in Gate 5.
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    stale = GOOD_BODY.replace("Never recompute signals, sizes or candidates by hand.", "")
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1430-test", stale))
+    assert "missing_no_hand_signals_rule" in _findings(report)
+
+
+def test_a_live_task_with_the_no_hand_signals_rule_is_not_flagged(tmp_path):
+    mirror_dir = _mirror(tmp_path, "1430-test")
+    report = _check(tmp_path, mirror_dir, _live(tmp_path, "1430-test", GOOD_BODY))
+    assert "missing_no_hand_signals_rule" not in _findings(report)
+
+
+def test_every_committed_mirror_carries_the_rule_and_names_its_generator():
+    mirrors = sorted(MIRROR_DIR.glob("[0-9]*ET-*.txt"))
+    assert len(mirrors) == 7
+    for mirror in mirrors:
+        text = mirror.read_text(encoding="utf-8")
+        assert drift.NO_HAND_SIGNALS_RULE in text, mirror.name
+        assert "scripts/generate_" in text, mirror.name

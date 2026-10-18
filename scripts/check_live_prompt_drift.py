@@ -110,6 +110,10 @@ EMAIL_DRAFT_PHRASE = "EMAIL DRAFT"
 # live body still carrying the old merge paragraph, or the short-lived 9:35 PREFETCH-FIRST
 # rule that made the prefetched file primary, aborts Gate 5 instead of scoring. Any slot.
 RETIRED_YFINANCE_MARKERS = ("PREFETCHED YFINANCE FALLBACK", "PREFETCH-FIRST")
+# 2026-10-17 (DCA Issues key hand_reimplemented): Gate 5 must say signals come only from the slot's repo
+# generator and are never recomputed by hand. A live body without this sentence lets a failed data path end in
+# hand-written signal logic instead of a not_submitted_error abort.
+NO_HAND_SIGNALS_RULE = "Never recompute signals, sizes or candidates by hand"
 # The seven roster slots, as each mirror's filename prefix (<HHMM>ET-<task>.txt).
 EXPECTED_SLOTS = ("0935ET", "1030ET", "1130ET", "1230ET", "1330ET", "1430ET", "1530ET")
 # Every key same_day_top_up_gate requires on its --orders-pages envelope.
@@ -238,6 +242,14 @@ def findings_for(live_text: str, window_end_date: Optional[str]) -> List[Dict[st
                 "code": "missing_oversized_order_pages_helper",
                 "detail": f"calls {GET_EQUITY_ORDERS_CALL} but never runs {ORDER_PAGES_HELPER_MODULE}: an oversized "
                 "page would be hand-transcribed instead of assembled and proven complete (2026-09-09 incident)",
+            }
+        )
+    if NO_HAND_SIGNALS_RULE not in live_text:
+        findings.append(
+            {
+                "code": "missing_no_hand_signals_rule",
+                "detail": f'Gate 5 lacks the rule "{NO_HAND_SIGNALS_RULE}": a failed data path could end in '
+                "hand-replicated signal logic instead of a not_submitted_error abort (hand_reimplemented)",
             }
         )
     if window_end_date:
