@@ -126,3 +126,8 @@ rocket-fuel/**/*.md.bak
 
 # Linux uv-managed Python 3.11 pinned by the bridge-VM slot prompts (UV_PYTHON_INSTALL_DIR); not source.
 .uv-python/
+
+# Price-source store and its Parquet staging (dca-sizing-signals/market_data_ingest/prices).
+data/*.duckdb
+data/*.duckdb.wal
+data/staging/
