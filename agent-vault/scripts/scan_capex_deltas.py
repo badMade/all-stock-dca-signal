@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 import time
@@ -519,6 +520,197 @@ def extract_capex_from_facts(facts_payload: dict[str, Any]) -> tuple[str, float,
     return best
 
 
+# A standalone fiscal quarter spans ~91 days; the window tolerates 52/53-week calendars and 4-4-5 quarters.
+QUARTER_MIN_DAYS = 60
+QUARTER_MAX_DAYS = 115
+
+
+def _days_between(start: str, end: str) -> int | None:
+    try:
+        return (date.fromisoformat(end) - date.fromisoformat(start)).days
+    except ValueError:
+        return None
+
+
+def _is_reported_amount(val: Any) -> bool:
+    """A finite, non-negative number that is not a bool. Zero is valid reported capex (review: PR 1753)."""
+    return isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val) and val >= 0
+
+
+def _quarterly_series_for_tag(units: list[Any]) -> tuple[dict[str, tuple[float, str]], str]:
+    """Standalone quarterly capex for one tag: ``({period_end: (usd_m, source)}, newest_reported_end)``.
+
+    SEC cash-flow capex is reported year-to-date (3, 6, 9, 12 months), so the raw newest fact is a
+    cumulative total, not a quarter (MSFT's FY fact is $115.9B against a ~$35B quarter). Facts that
+    already span one quarter are used directly; cumulative facts are differenced against the previous
+    cumulative fact with the same ``start``. A total that drops (restatement) is skipped, fail closed.
+    ``newest_reported_end`` is the newest period of ANY duration, so the caller can tell "the latest
+    period could not be converted" apart from "no duration data at all" and never substitute an older quarter.
+    """
+    latest_filed: dict[tuple[str, str], dict[str, Any]] = {}
+    for f in units:
+        if not (isinstance(f, dict) and f.get("form") in ("10-Q", "10-K")):
+            continue
+        val, start, end = f.get("val"), f.get("start"), f.get("end")
+        if not (_is_reported_amount(val) and start and end):
+            continue
+        key = (str(start), str(end))
+        if key not in latest_filed or str(f.get("filed", "")) >= str(latest_filed[key].get("filed", "")):
+            latest_filed[key] = f
+
+    out: dict[str, tuple[float, str]] = {}
+    derived: dict[str, tuple[float, str]] = {}
+    by_start: dict[str, list[dict[str, Any]]] = {}
+    for (start, _end), f in latest_filed.items():
+        by_start.setdefault(start, []).append(f)
+    newest_end = max((str(f["end"]) for f in latest_filed.values()), default="")
+
+    for start, facts in by_start.items():
+        facts.sort(key=lambda x: str(x["end"]))
+        prev: dict[str, Any] | None = None
+        for f in facts:
+            end = str(f["end"])
+            accn = str(f.get("accn", "")).strip() or "SEC EDGAR"
+            dur = _days_between(start, end)
+            if dur is not None and QUARTER_MIN_DAYS <= dur <= QUARTER_MAX_DAYS:
+                out[end] = (round(float(f["val"]) / 1_000_000.0, 2), accn)
+            elif dur is not None and dur > QUARTER_MAX_DAYS and prev is not None:
+                gap = _days_between(str(prev["end"]), end)
+                if gap is not None and QUARTER_MIN_DAYS <= gap <= QUARTER_MAX_DAYS and f["val"] >= prev["val"]:
+                    prev_accn = str(prev.get("accn", "")).strip() or "SEC EDGAR"
+                    source = accn if accn == prev_accn else f"{accn} - {prev_accn}"
+                    derived[end] = (round((float(f["val"]) - float(prev["val"])) / 1_000_000.0, 2), source)
+            prev = f
+    for end, v in derived.items():
+        out.setdefault(end, v)  # a directly reported quarter beats a differenced one
+    return out, newest_end
+
+
+# Returned when duration data exists but the newest reported period has no usable standalone quarter.
+UNCONVERTIBLE_LATEST = (None, None)
+
+
+def extract_quarterly_capex_with_prior(
+    facts_payload: dict[str, Any],
+) -> tuple[tuple[str, float, str] | None, tuple[str, float, str] | None] | None:
+    """Latest standalone quarter and its immediately preceding quarter (None when not adjacent).
+
+    Returns None when no tag carries duration (``start``) data, so callers fall back to
+    ``extract_capex_from_facts``. Returns ``(None, None)`` when duration data exists but the newest
+    reported period cannot be turned into a standalone quarter (annual total without its nine-month
+    predecessor, or a dropping cumulative): the caller must mark that filer unavailable, never fall
+    back to an older quarter or the raw YTD amount. The tag with the freshest reported period wins;
+    ties prefer a tag that can convert it, then tag priority order.
+    """
+    if not isinstance(facts_payload, dict):
+        return None
+    us_gaap = facts_payload.get("facts", {}).get("us-gaap", {})
+    if not isinstance(us_gaap, dict):
+        return None
+
+    best: tuple[dict[str, tuple[float, str]], str] | None = None
+    for tag in US_GAAP_CAPEX_TAGS:
+        tag_data = us_gaap.get(tag)
+        units = tag_data.get("units", {}).get("USD", []) if isinstance(tag_data, dict) else []
+        if not isinstance(units, list):
+            continue
+        series, newest = _quarterly_series_for_tag(units)
+        if not newest:
+            continue
+        if best is None or (newest, newest in series) > (best[1], best[1] in best[0]):
+            best = (series, newest)
+    if best is None:
+        return None
+
+    series, newest = best
+    if newest not in series:
+        return UNCONVERTIBLE_LATEST
+    current = (newest, series[newest][0], series[newest][1])
+    earlier = sorted(e for e in series if e < newest)
+    prior: tuple[str, float, str] | None = None
+    if earlier:
+        gap = _days_between(earlier[-1], newest)
+        if gap is not None and QUARTER_MIN_DAYS <= gap <= QUARTER_MAX_DAYS:
+            prior = (earlier[-1], series[earlier[-1]][0], series[earlier[-1]][1])
+    return current, prior
+
+
+def not_found_note(facts: dict[str, Any] | None, ticker: str, cik_mapping: dict[str, str]) -> str:
+    """Say why a filer produced no figure: mapping outage, no SEC CIK, fetch failure, or no capex tag."""
+    if not cik_mapping:
+        # An empty mapping is a fetch outage, not proof that every ticker is a non-registrant.
+        return "SEC ticker-to-CIK mapping unavailable (fetch failed)"
+    if ticker.upper() not in cik_mapping:
+        return "No SEC CIK (not an SEC registrant); needs a manual source"
+    if not facts:
+        return "SEC company facts unavailable (fetch failed)"
+    return "Filer reports no capex XBRL tag (e.g. bank or pre-revenue biotech); needs a manual source"
+
+
+def evaluate_live_filer(
+    ticker: str,
+    facts: dict[str, Any] | None,
+    cik_mapping: dict[str, str],
+    base: CapexBaseline | None,
+    config: CapexScannerConfig,
+    company_name: str = "",
+    today: date | None = None,
+) -> CapexEvaluation:
+    """Evaluate one filer from live SEC facts. Shared by ``main()`` and ``run_weekly_capex_scan`` so a
+    fix to extraction, staleness or notes reaches both entry points (PR 1753 review: the weekly runner
+    had kept its own copy)."""
+    today = today or date.today()
+    base_val = base.amount_usd_m if (base and base.amount_usd_m is not None) else None
+    period_str = base.period_end if base else ""
+
+    def tier_for(prev: float | None) -> str:
+        return "hyperscaler" if (prev and prev >= config.hyperscaler_spend_threshold_usd_m) else "supplier"
+
+    if ticker in UNSCANNABLE_TICKERS:
+        return evaluate_capex_change(
+            ticker=ticker, current_usd_m=0.0, previous_usd_m=base_val, config=config,
+            company_name=company_name, period_end=period_str,
+        )
+
+    def unavailable(note: str, period: str = period_str) -> CapexEvaluation:
+        return CapexEvaluation(
+            ticker=ticker, current_usd_m=base_val if base_val is not None else 0.0, previous_usd_m=base_val,
+            delta_usd_m=None, pct_delta=None, flagged_pct=False, flagged_addition=False,
+            tier=tier_for(base_val), status="not_found", company_name=company_name, period_end=period,
+            notes=note,
+        )
+
+    extracted: tuple[str, float, str] | None = None
+    prev_val = base_val
+    if facts:
+        # Prefer standalone quarters (current AND prior from XBRL); the raw newest fact is year-to-date.
+        pair = extract_quarterly_capex_with_prior(facts)
+        if pair is None:
+            extracted = extract_capex_from_facts(facts)  # no duration metadata: legacy raw-fact path
+        elif pair == UNCONVERTIBLE_LATEST:
+            return unavailable("Latest reported period could not be converted to a standalone quarter")
+        else:
+            extracted, quarter_prior = pair
+            if quarter_prior is not None:
+                prev_val = quarter_prior[1]
+    if extracted is None:
+        return unavailable(not_found_note(facts, ticker, cik_mapping))
+
+    period, val, _accn = extracted
+    if is_stale_period(period, today):
+        # A stale period is a data problem, never PASS: the scan has no current figure for this filer.
+        return CapexEvaluation(
+            ticker=ticker, current_usd_m=val, previous_usd_m=prev_val, delta_usd_m=None, pct_delta=None,
+            flagged_pct=False, flagged_addition=False, tier=tier_for(prev_val), status="stale",
+            company_name=company_name, period_end=period,
+            notes=f"Latest XBRL period {period} is stale (> {STALE_PERIOD_MAX_DAYS} days); not trusted",
+        )
+    return evaluate_capex_change(
+        ticker=ticker, current_usd_m=val, previous_usd_m=prev_val, config=config,
+        company_name=company_name, period_end=period,
+    )
+
+
 class SECRedirectDisallowedHandler(urllib.request.HTTPRedirectHandler):
     """Refuse HTTP redirects to protect against SSRF and credential exposure."""
 
@@ -726,69 +918,16 @@ def main() -> int:
         co_name = operating.get(ticker, "")
 
         if args.live:
-            if ticker in UNSCANNABLE_TICKERS:
-                ev = evaluate_capex_change(
+            facts = None
+            if ticker not in UNSCANNABLE_TICKERS:
+                facts = fetch_company_facts_offline_or_sec(
                     ticker=ticker,
-                    current_usd_m=0.0,
-                    previous_usd_m=prev_val,
-                    config=cfg,
-                    company_name=co_name,
-                    period_end=period_str,
+                    user_agent=args.user_agent,
+                    timeout=args.timeout,
+                    cik_mapping=cik_map,
+                    limiter=limiter,
                 )
-                evaluations.append(ev)
-                continue
-
-            facts = fetch_company_facts_offline_or_sec(
-                ticker=ticker,
-                user_agent=args.user_agent,
-                timeout=args.timeout,
-                cik_mapping=cik_map,
-                limiter=limiter,
-            )
-            extracted = extract_capex_from_facts(facts) if facts else None
-            if extracted is not None and is_stale_period(extracted[0], date.today()):
-                # A stale period is a data problem, never PASS: the scan has no current figure for this filer.
-                stale_period, stale_val, _ = extracted
-                ev = CapexEvaluation(
-                    ticker=ticker,
-                    current_usd_m=stale_val,
-                    previous_usd_m=prev_val,
-                    delta_usd_m=None,
-                    pct_delta=None,
-                    flagged_pct=False,
-                    flagged_addition=False,
-                    tier="hyperscaler" if (prev_val and prev_val >= cfg.hyperscaler_spend_threshold_usd_m) else "supplier",
-                    status="stale",
-                    company_name=co_name,
-                    period_end=stale_period,
-                    notes=f"Latest XBRL period {stale_period} is stale (> {STALE_PERIOD_MAX_DAYS} days); not trusted",
-                )
-            elif extracted is not None:
-                new_period, new_val, new_accn = extracted
-                ev = evaluate_capex_change(
-                    ticker=ticker,
-                    current_usd_m=new_val,
-                    previous_usd_m=prev_val,
-                    config=cfg,
-                    company_name=co_name,
-                    period_end=new_period,
-                )
-            else:
-                ev = CapexEvaluation(
-                    ticker=ticker,
-                    current_usd_m=curr_val,
-                    previous_usd_m=prev_val,
-                    delta_usd_m=None,
-                    pct_delta=None,
-                    flagged_pct=False,
-                    flagged_addition=False,
-                    tier="hyperscaler" if (prev_val and prev_val >= cfg.hyperscaler_spend_threshold_usd_m) else "supplier",
-                    status="not_found",
-                    company_name=co_name,
-                    period_end=period_str,
-                    notes="SEC company facts not found or unavailable",
-                )
-            evaluations.append(ev)
+            evaluations.append(evaluate_live_filer(ticker, facts, cik_map, base, cfg, co_name))
         else:
             ev = evaluate_capex_change(
                 ticker=ticker,

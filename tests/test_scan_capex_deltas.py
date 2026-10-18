@@ -714,3 +714,153 @@ def test_sec_redirect_disallowed_handler_refuses_redirect():
 
 
 
+
+
+# --- Standalone-quarter extraction (2026-10-17: YTD totals were read as quarters, so MSFT/GOOGL/MU flagged) ---
+
+
+def _fact(start, end, val, fp, accn, filed="2026-08-01", form="10-Q"):
+    return {"start": start, "end": end, "val": val, "fp": fp, "accn": accn, "filed": filed, "form": form}
+
+
+def _msft_like_payload():
+    tag = "PaymentsToAcquirePropertyPlantAndEquipment"
+    units = [
+        _fact("2025-07-01", "2025-09-30", 19_394_000_000, "Q1", "a1"),
+        _fact("2025-07-01", "2025-12-31", 49_270_000_000, "Q2", "a2"),
+        _fact("2025-07-01", "2026-03-31", 80_146_000_000, "Q3", "a3"),
+        _fact("2025-07-01", "2026-06-30", 115_948_000_000, "FY", "a4", form="10-K"),
+    ]
+    return {"facts": {"us-gaap": {tag: {"units": {"USD": units}}}}}
+
+
+def test_fy_total_is_differenced_into_the_fourth_quarter():
+    from scan_capex_deltas import extract_quarterly_capex_with_prior
+
+    current, prior = extract_quarterly_capex_with_prior(_msft_like_payload())
+    assert current[0] == "2026-06-30" and current[1] == pytest.approx(35_802.0)
+    assert prior[0] == "2026-03-31" and prior[1] == pytest.approx(30_876.0)
+    assert current[2] == "a4 - a3"
+
+
+def test_direct_quarter_beats_differenced_quarter():
+    from scan_capex_deltas import extract_quarterly_capex_with_prior
+
+    payload = _msft_like_payload()
+    payload["facts"]["us-gaap"]["PaymentsToAcquirePropertyPlantAndEquipment"]["units"]["USD"].append(
+        _fact("2026-01-01", "2026-03-31", 30_876_000_000, "Q3", "a3")
+    )
+    _, prior = extract_quarterly_capex_with_prior(payload)
+    assert prior[1] == pytest.approx(30_876.0) and prior[2] == "a3"
+
+
+def test_dropping_cumulative_total_is_skipped_fail_closed():
+    from scan_capex_deltas import UNCONVERTIBLE_LATEST, extract_quarterly_capex_with_prior
+
+    tag = "PaymentsToAcquirePropertyPlantAndEquipment"
+    units = [
+        _fact("2026-01-01", "2026-03-31", 10_000_000_000, "Q1", "b1"),
+        _fact("2026-01-01", "2026-06-30", 9_000_000_000, "Q2", "b2"),
+    ]
+    # The newest period cannot be converted: report it unavailable, never fall back to the older Q1.
+    assert extract_quarterly_capex_with_prior({"facts": {"us-gaap": {tag: {"units": {"USD": units}}}}}) == UNCONVERTIBLE_LATEST
+
+
+def test_facts_without_duration_fall_back_to_legacy_extractor():
+    from scan_capex_deltas import extract_quarterly_capex_with_prior
+
+    tag = "PaymentsToAcquirePropertyPlantAndEquipment"
+    units = [{"end": "2026-06-30", "val": 5_000_000, "form": "10-Q", "accn": "c1"}]
+    assert extract_quarterly_capex_with_prior({"facts": {"us-gaap": {tag: {"units": {"USD": units}}}}}) is None
+
+
+def test_not_found_note_distinguishes_causes():
+    from scan_capex_deltas import not_found_note
+
+    assert "No SEC CIK" in not_found_note(None, "BYDDY", {"JPM": "cik-jpm"})
+    assert "fetch failed" in not_found_note(None, "JPM", {"JPM": "cik-jpm"})
+    assert "no capex XBRL tag" in not_found_note({"facts": {}}, "JPM", {"JPM": "cik-jpm"})
+
+
+# --- PR 1753 review round: zero values, unconvertible latest period, mapping outage, weekly runner parity ---
+
+_CAPEX_TAG = "PaymentsToAcquirePropertyPlantAndEquipment"
+
+
+def _payload(units):
+    return {"facts": {"us-gaap": {_CAPEX_TAG: {"units": {"USD": units}}}}}
+
+
+def test_zero_valued_quarter_is_current_not_discarded():
+    from scan_capex_deltas import extract_quarterly_capex_with_prior
+
+    current, prior = extract_quarterly_capex_with_prior(_payload([
+        _fact("2026-01-01", "2026-03-31", 400_000_000, "Q1", "z1"),
+        _fact("2026-04-01", "2026-06-30", 0, "Q2", "z2"),
+    ]))
+    assert current[0] == "2026-06-30" and current[1] == 0.0 and prior[1] == pytest.approx(400.0)
+
+
+def test_zero_valued_cumulative_can_be_the_predecessor():
+    from scan_capex_deltas import extract_quarterly_capex_with_prior
+
+    current, prior = extract_quarterly_capex_with_prior(_payload([
+        _fact("2026-01-01", "2026-03-31", 0, "Q1", "z1"),
+        _fact("2026-01-01", "2026-06-30", 250_000_000, "Q2", "z2"),
+    ]))
+    assert current[1] == pytest.approx(250.0) and prior[1] == 0.0
+
+
+def test_bool_amount_is_rejected():
+    from scan_capex_deltas import extract_quarterly_capex_with_prior
+
+    assert extract_quarterly_capex_with_prior(_payload([_fact("2026-01-01", "2026-03-31", True, "Q1", "b")])) is None
+
+
+def test_dropping_latest_cumulative_is_unconvertible_not_older_quarter():
+    from scan_capex_deltas import UNCONVERTIBLE_LATEST, extract_quarterly_capex_with_prior
+
+    assert extract_quarterly_capex_with_prior(_payload([
+        _fact("2026-01-01", "2026-03-31", 1_000_000_000, "Q1", "d1"),
+        _fact("2026-01-01", "2026-06-30", 2_000_000_000, "Q2", "d2"),
+        _fact("2026-01-01", "2026-09-30", 1_900_000_000, "Q3", "d3"),
+    ])) == UNCONVERTIBLE_LATEST
+
+
+def test_annual_total_without_nine_month_predecessor_is_unavailable_not_raw_ytd():
+    from scan_capex_deltas import CapexScannerConfig, evaluate_live_filer
+
+    facts = _payload([_fact("2025-07-01", "2026-06-30", 115_948_000_000, "FY", "f1", form="10-K")])
+    ev = evaluate_live_filer("XYZ", facts, {"XYZ": "cik-xyz"}, None, CapexScannerConfig(), today=date(2026, 10, 17))
+    assert ev.status == "not_found" and "standalone quarter" in ev.notes and ev.current_usd_m == 0.0
+
+
+def test_mapping_outage_is_not_reported_as_non_registrant():
+    from scan_capex_deltas import not_found_note
+
+    assert "mapping unavailable" in not_found_note(None, "JPM", {})
+
+
+def test_live_filer_uses_standalone_quarters_and_marks_stale():
+    from scan_capex_deltas import CapexScannerConfig, evaluate_live_filer
+
+    cfg, today = CapexScannerConfig(), date(2026, 10, 17)
+    ev = evaluate_live_filer("MSFT", _msft_like_payload(), {"MSFT": "c"}, None, cfg, today=today)
+    assert ev.status == "flagged" and ev.current_usd_m == pytest.approx(35_802.0)
+    assert ev.previous_usd_m == pytest.approx(30_876.0)
+    old = _payload([_fact("2020-01-01", "2020-03-31", 5_000_000, "Q1", "s1")])
+    assert evaluate_live_filer("OLD", old, {"OLD": "c"}, None, cfg, today=today).status == "stale"
+
+
+def test_weekly_runner_live_mode_shares_the_fixed_path(tmp_path, monkeypatch):
+    import run_weekly_capex_scan as runner
+
+    vault = tmp_path / "agent-vault"
+    (vault / "vault" / "Knowledge").mkdir(parents=True)
+    monkeypatch.setattr(runner, "fetch_sec_company_tickers", lambda **_: {"MSFT": "c"})
+    monkeypatch.setattr(runner, "fetch_company_facts_offline_or_sec", lambda **_: _msft_like_payload())
+    code, report, evals = runner.execute_capex_scan(
+        vault_root=vault, reports_dir=tmp_path / "r", today_iso="2026-10-17", live=True, target_tickers=["MSFT"]
+    )
+    assert code == 0 and evals[0].current_usd_m == pytest.approx(35_802.0)
+    assert evals[0].previous_usd_m == pytest.approx(30_876.0) and "115,948" not in report.read_text()

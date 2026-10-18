@@ -25,7 +25,7 @@ from scan_capex_deltas import (  # noqa: E402
     CapexEvaluation,
     SECRateLimiter,
     evaluate_capex_change,
-    extract_capex_from_facts,
+    evaluate_live_filer,
     fetch_company_facts_offline_or_sec,
     fetch_sec_company_tickers,
     format_capex_scan_report,
@@ -85,52 +85,17 @@ def execute_capex_scan(
         co_name = operating.get(ticker, "")
 
         if live:
-            if ticker in UNSCANNABLE_TICKERS:
-                ev = evaluate_capex_change(
+            facts = None
+            if ticker not in UNSCANNABLE_TICKERS:
+                facts = fetch_company_facts_offline_or_sec(
                     ticker=ticker,
-                    current_usd_m=0.0,
-                    previous_usd_m=prev_val,
-                    config=cfg,
-                    company_name=co_name,
-                    period_end=period_str,
+                    user_agent=user_agent,
+                    timeout=timeout,
+                    cik_mapping=cik_map,
+                    limiter=limiter,
                 )
-                evaluations.append(ev)
-                continue
-
-            facts = fetch_company_facts_offline_or_sec(
-                ticker=ticker,
-                user_agent=user_agent,
-                timeout=timeout,
-                cik_mapping=cik_map,
-                limiter=limiter,
-            )
-            extracted = extract_capex_from_facts(facts) if facts else None
-            if extracted is not None:
-                new_period, new_val, new_accn = extracted
-                ev = evaluate_capex_change(
-                    ticker=ticker,
-                    current_usd_m=new_val,
-                    previous_usd_m=prev_val,
-                    config=cfg,
-                    company_name=co_name,
-                    period_end=new_period,
-                )
-            else:
-                ev = CapexEvaluation(
-                    ticker=ticker,
-                    current_usd_m=curr_val,
-                    previous_usd_m=prev_val,
-                    delta_usd_m=None,
-                    pct_delta=None,
-                    flagged_pct=False,
-                    flagged_addition=False,
-                    tier="hyperscaler" if (prev_val and prev_val >= cfg.hyperscaler_spend_threshold_usd_m) else "supplier",
-                    status="not_found",
-                    company_name=co_name,
-                    period_end=period_str,
-                    notes="SEC company facts not found or unavailable",
-                )
-            evaluations.append(ev)
+            # Shared with scan_capex_deltas.main(): one live-evaluation path for both entry points.
+            evaluations.append(evaluate_live_filer(ticker, facts, cik_map, base, cfg, co_name))
         else:
             ev = evaluate_capex_change(
                 ticker=ticker,
