@@ -165,9 +165,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # PRs run 3.12 only; main (the post-merge record, and what self-heal
-        # reacts to) keeps both interpreters. Halves PR minutes.
-        python-version: ${{ fromJSON(github.event_name == 'pull_request' && '["3.12"]' || '["3.11", "3.12"]') }}
+        python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v7
         with:
