@@ -1,0 +1,70 @@
+name: Weekly CapEx Scan
+
+# Runs the CapEx delta scanner against live SEC EDGAR data from the code on MAIN (a laptop cron runs
+# whichever branch happens to be checked out, so its reports can reflect unmerged or stale scanner code).
+# Writes agent-vault/reports/capex-scan-<date>.md + latest-capex-scan.md and opens ONE draft PR.
+#
+# TRUST BOUNDARY -- no `workflow_dispatch`, as in compute-schedule.yml: `schedule` runs this file against
+# main only. The scan uses public SEC endpoints and no secrets.
+on:
+  schedule:
+    - cron: '0 13 * * 6'   # Saturday 13:00 UTC, after SEC's Friday filings have settled
+
+concurrency:
+  group: capex-scan
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Run live CapEx scan
+        run: python agent-vault/scripts/run_weekly_capex_scan.py --live --timeout 30
+
+      - name: File guard
+        run: |
+          if git status --porcelain | awk '{print $2}' | grep -vE '^agent-vault/(reports/|vault/Daily/)'; then
+            echo "Unexpected files changed by the scan, aborting."
+            exit 1
+          fi
+
+      - name: Open draft PR with the report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Scan produced no changes."
+            exit 0
+          fi
+          TODAY="$(date -u +%F)"
+          BRANCH="capex-scan-$TODAY"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          gh auth setup-git
+          git checkout -b "$BRANCH"
+          git add agent-vault/reports agent-vault/vault/Daily
+          git commit -m "Add $TODAY capex scan report"
+          git push --force origin "$BRANCH"
+          gh label create automation --description "Automated repository maintenance" --color ededed --force >/dev/null
+          if [ -z "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')" ]; then
+            gh pr create --draft --title "Add $TODAY capex scan report" --label automation --head "$BRANCH" \
+              --body "Weekly live scan from main via \`run_weekly_capex_scan.py --live\`. Review FLAGGED, STALE and NOT_FOUND rows in \`agent-vault/reports/capex-scan-$TODAY.md\`. Draft: mark ready to merge."
+          fi

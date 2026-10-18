@@ -129,3 +129,7 @@ See [dead_code_report.md](dead_code_report.md) for evidence. Short list:
 The graph came from an AST scan of imports (absolute, relative, `from x import y`) plus a search
 of prompts, workflows, `pyproject.toml`, config and console assets for each module name. It cannot
 see string dispatch, so treat "no caller" as a lead, not a verdict.
+
+The scan is now a script: `python -m scripts.generate_module_graph` writes [module_graph.md](module_graph.md),
+which a workflow keeps current on every push to `main`. This page is the hand-written reading of that
+graph and is only as fresh as its date; trust the generated page for counts and edges.
