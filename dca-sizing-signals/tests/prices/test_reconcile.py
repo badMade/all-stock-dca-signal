@@ -16,7 +16,6 @@ from datetime import date
 from pathlib import Path
 
 import pytest
-
 from market_data_ingest.prices import reconcile
 from market_data_ingest.prices.errors import SpliceNotValidatedError
 from market_data_ingest.prices.legacy_yahoo import import_csv
@@ -38,8 +37,21 @@ def write_yahoo(tmp_path: Path, symbol: str, rows: list[tuple[date, float, float
 
 
 def massive_bars(symbol: str, rows: list[tuple[date, float, float]]) -> list[DailyBar]:
-    return [DailyBar(source="massive", symbol=symbol, session=d, open=c, high=c * 1.01, low=c * 0.99, close=c,
-                     volume=v, vwap=None, trades=None) for d, c, v in rows]
+    return [
+        DailyBar(
+            source="massive",
+            symbol=symbol,
+            session=d,
+            open=c,
+            high=c * 1.01,
+            low=c * 0.99,
+            close=c,
+            volume=v,
+            vwap=None,
+            trades=None,
+        )
+        for d, c, v in rows
+    ]
 
 
 def load(store, staging_dir, tmp_path, symbol, massive_rows, yahoo_rows, actions=()):
@@ -50,7 +62,7 @@ def load(store, staging_dir, tmp_path, symbol, massive_rows, yahoo_rows, actions
 
 
 def identical(n: int, start: int = 0):
-    return [(d, 100.0 + i, 1_000_000.0) for i, d in enumerate(SESSIONS[start:start + n])]
+    return [(d, 100.0 + i, 1_000_000.0) for i, d in enumerate(SESSIONS[start : start + n])]
 
 
 def run(store, symbol):
@@ -59,8 +71,16 @@ def run(store, symbol):
 
 @pytest.mark.parametrize(
     ("diff", "tier"),
-    [(0.0, "pass"), (0.0009, "pass"), (0.001, "pass"), (0.0011, "flag"), (0.005, "flag"), (0.01, "flag"),
-     (0.0101, "block"), (0.5, "block")],
+    [
+        (0.0, "pass"),
+        (0.0009, "pass"),
+        (0.001, "pass"),
+        (0.0011, "flag"),
+        (0.005, "flag"),
+        (0.01, "flag"),
+        (0.0101, "block"),
+        (0.5, "block"),
+    ],
 )
 def test_close_diff_tiers_and_their_boundaries(diff, tier):
     assert reconcile.classify_close_diff(diff) == tier
@@ -137,10 +157,13 @@ def test_massive_raw_is_split_adjusted_before_comparing_with_yahoo_close(store, 
     ex = sessions[40]
     # Yahoo shows the split-adjusted history; Massive stores raw (10x price, 1/10 volume before ex).
     yahoo = [(d, 100.0 + i, 10_000_000.0) for i, d in enumerate(sessions)]
-    massive = [(d, (100.0 + i) * (10 if d < ex else 1), 1_000_000.0 if d < ex else 10_000_000.0)
-               for i, d in enumerate(sessions)]
-    nvda_split = CorporateAction(source="massive", action_type="forward_split", symbol="SPLT", ex_date=ex,
-                                 split_from=1, split_to=10)
+    massive = [
+        (d, (100.0 + i) * (10 if d < ex else 1), 1_000_000.0 if d < ex else 10_000_000.0)
+        for i, d in enumerate(sessions)
+    ]
+    nvda_split = CorporateAction(
+        source="massive", action_type="forward_split", symbol="SPLT", ex_date=ex, split_from=1, split_to=10
+    )
     load(store, staging_dir, tmp_path, "SPLT", massive, yahoo, actions=[nvda_split])
 
     result = run(store, "SPLT")

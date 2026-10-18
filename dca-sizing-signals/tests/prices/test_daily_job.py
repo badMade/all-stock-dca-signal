@@ -15,7 +15,6 @@ from datetime import date
 from pathlib import Path
 
 import pytest
-
 from market_data_ingest.prices.daily_job import main, resolve_db_path, run_daily_job
 from market_data_ingest.prices.errors import ProviderError, RouterExhaustedError
 from market_data_ingest.prices.models import CorporateAction, DailyBar
@@ -28,16 +27,27 @@ PRIOR_5 = [date(2024, 6, 10), date(2024, 6, 7), date(2024, 6, 6), date(2024, 6, 
 
 
 def bar(symbol, session, close, source="massive"):
-    return DailyBar(source=source, symbol=symbol, session=session, open=close, high=close * 1.01,
-                    low=close * 0.99, close=close, volume=1000.0, vwap=None, trades=None)
+    return DailyBar(
+        source=source,
+        symbol=symbol,
+        session=session,
+        open=close,
+        high=close * 1.01,
+        low=close * 0.99,
+        close=close,
+        volume=1000.0,
+        vwap=None,
+        trades=None,
+    )
 
 
 class FakeRouter:
     """Returns ``bars[session]``; raises an error configured per session or for actions."""
 
     def __init__(self, bars=None, actions=(), errors=None, action_error=None):
-        self.bars = bars if bars is not None else {d: [bar("NVDA", d, 100.0), bar("AAPL", d, 200.0)]
-                                                   for d in [S, *PRIOR_5]}
+        self.bars = (
+            bars if bars is not None else {d: [bar("NVDA", d, 100.0), bar("AAPL", d, 200.0)] for d in [S, *PRIOR_5]}
+        )
         self.actions, self.errors, self.action_error = list(actions), errors or {}, action_error
         self.bar_calls: list[date] = []
         self.action_calls: list[date] = []
@@ -66,15 +76,21 @@ def run_ids():
 
 def run(store, staging_dir, router, run_ids, *, session=S, clock=None, calendar=CAL):
     clock = clock or FakeClock(utc(2024, 6, 12, 2))  # 22:00 ET on S
-    return run_daily_job(session=session, store=store, router=router, calendar=calendar, clock=clock.now,
-                         staging_dir=staging_dir, run_id_factory=run_ids)
+    return run_daily_job(
+        session=session,
+        store=store,
+        router=router,
+        calendar=calendar,
+        clock=clock.now,
+        staging_dir=staging_dir,
+        run_id_factory=run_ids,
+    )
 
 
 def test_closed_market_is_a_clean_skip(store, staging_dir, run_ids):
     router = FakeRouter()
 
-    result = run(store, staging_dir, router, run_ids, session=date(2024, 6, 8),
-                 clock=FakeClock(utc(2024, 6, 9, 2)))
+    result = run(store, staging_dir, router, run_ids, session=date(2024, 6, 8), clock=FakeClock(utc(2024, 6, 9, 2)))
 
     assert (result.status, result.exit_code) == ("skipped_closed", 0)
     assert store.run_status(result.run_id) == "skipped_closed"
@@ -83,8 +99,16 @@ def test_closed_market_is_a_clean_skip(store, staging_dir, run_ids):
 
 
 def test_happy_path_fetches_session_repulls_five_prior_and_actions_since_t_minus_30(store, staging_dir, run_ids):
-    actions = [CorporateAction(source="massive", action_type="forward_split", symbol="NVDA",
-                               ex_date=date(2024, 6, 10), split_from=1, split_to=10)]
+    actions = [
+        CorporateAction(
+            source="massive",
+            action_type="forward_split",
+            symbol="NVDA",
+            ex_date=date(2024, 6, 10),
+            split_from=1,
+            split_to=10,
+        )
+    ]
     router = FakeRouter(actions=actions)
 
     result = run(store, staging_dir, router, run_ids)
@@ -111,8 +135,14 @@ def test_rerunning_the_same_night_is_idempotent(store, staging_dir, run_ids):
 
 def test_t_minus_1_repull_captures_a_vendor_correction(store, staging_dir, run_ids):
     monday = date(2024, 6, 10)
-    run(store, staging_dir, FakeRouter(bars={monday: [bar("NVDA", monday, 121.79)]}), run_ids,
-        session=monday, clock=FakeClock(utc(2024, 6, 11, 2)))
+    run(
+        store,
+        staging_dir,
+        FakeRouter(bars={monday: [bar("NVDA", monday, 121.79)]}),
+        run_ids,
+        session=monday,
+        clock=FakeClock(utc(2024, 6, 11, 2)),
+    )
     corrected = {S: [bar("NVDA", S, 120.91)], monday: [bar("NVDA", monday, 121.80)]}
     result = run(store, staging_dir, FakeRouter(bars=corrected), run_ids)
 

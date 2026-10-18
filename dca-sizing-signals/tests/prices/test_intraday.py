@@ -12,7 +12,6 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
-
 from market_data_ingest.prices import intraday
 from market_data_ingest.prices.errors import StaleDataError
 from market_data_ingest.prices.models import Quote
@@ -66,8 +65,11 @@ def test_delayed_quote_freshness(age, fresh):
             intraday.check_fresh(q, now=NOW)
 
 
-@pytest.mark.parametrize("bad", [quote(-60), quote(10, price=0.0), quote(10, price=-1.0)],
-                         ids=["future-timestamp", "zero-price", "negative-price"])
+@pytest.mark.parametrize(
+    "bad",
+    [quote(-60), quote(10, price=0.0), quote(10, price=-1.0)],
+    ids=["future-timestamp", "zero-price", "negative-price"],
+)
 def test_implausible_quotes_are_stale_not_usable(bad):
     with pytest.raises(StaleDataError):
         intraday.check_fresh(bad, now=NOW)

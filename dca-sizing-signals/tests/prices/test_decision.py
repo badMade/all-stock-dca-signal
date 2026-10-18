@@ -11,7 +11,6 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
-
 from market_data_ingest.prices.decision import price_for_suggestion
 from market_data_ingest.prices.errors import ProviderError
 from market_data_ingest.prices.models import NoSuggestion, PriceOK, Quote
@@ -33,9 +32,13 @@ class StubAlpaca:
         spec = self.feeds.get(feed, {})
         if isinstance(spec, BaseException):
             raise spec
-        return {s: Quote(symbol=s, price=100.0 + age / 1000, ts=self.now - timedelta(seconds=age), feed=feed,
-                         as_of=self.now)
-                for s, age in spec.items() if s in symbols}
+        return {
+            s: Quote(
+                symbol=s, price=100.0 + age / 1000, ts=self.now - timedelta(seconds=age), feed=feed, as_of=self.now
+            )
+            for s, age in spec.items()
+            if s in symbols
+        }
 
 
 def decide(store, slot, now, feeds, symbol="NVDA"):
@@ -95,8 +98,11 @@ def test_stale_delayed_quote_is_no_suggestion(store):
     ("slot", "feeds", "error_class"),
     [
         ("09:35", {"iex": ProviderError("down", code="http_5xx")}, "ProviderError"),
-        ("13:30", {"iex": ProviderError("down", code="http_5xx"),
-                   "delayed_sip": ProviderError("down", code="timeout")}, "RouterExhaustedError"),
+        (
+            "13:30",
+            {"iex": ProviderError("down", code="http_5xx"), "delayed_sip": ProviderError("down", code="timeout")},
+            "RouterExhaustedError",
+        ),
     ],
 )
 def test_provider_failure_is_an_explicit_no_suggestion(store, slot, feeds, error_class):
@@ -119,8 +125,14 @@ def test_a_price_that_cannot_be_recorded_is_not_used(store):
             raise OSError("disk full")
 
     clock = FakeClock(T_0935)
-    result = price_for_suggestion("NVDA", slot="09:35", provider=StubAlpaca(T_0935, {"iex": {"NVDA": 5}}),
-                                  store=BrokenStore(), clock=clock.now, run_id="rq-1")
+    result = price_for_suggestion(
+        "NVDA",
+        slot="09:35",
+        provider=StubAlpaca(T_0935, {"iex": {"NVDA": 5}}),
+        store=BrokenStore(),
+        clock=clock.now,
+        run_id="rq-1",
+    )
 
     assert isinstance(result, NoSuggestion)
     assert "record" in result.reason.lower() or "persist" in result.reason.lower()

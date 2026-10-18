@@ -81,8 +81,14 @@ class FakeSession:
         self._responses = responses
         self.calls: list[RecordedCall] = []
 
-    def get(self, url: str, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None,
-            timeout: Any = None, **_: Any) -> FakeResponse:
+    def get(
+        self,
+        url: str,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: Any = None,
+        **_: Any,
+    ) -> FakeResponse:
         params = dict(params or {})
         self.calls.append(RecordedCall(url=url, params=params, headers=dict(headers or {}), timeout=timeout))
         if callable(self._responses):

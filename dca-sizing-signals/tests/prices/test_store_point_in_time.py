@@ -15,38 +15,50 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 
 import pytest
-
 from market_data_ingest.prices.errors import ValidationError
 from market_data_ingest.prices.models import AdjustedBar, CorporateAction, DailyBar
 
 from .conftest import utc
 
 TODAY = date(2026, 10, 18)
+FIRST_SEEN = utc(2026, 10, 17, 1)
 
 
 def bar(symbol, session, close, *, source="massive", volume=1_000_000.0, o=None, h=None, low=None):
     o = close if o is None else o
     h = max(o, close) * 1.01 if h is None else h
     low = min(o, close) * 0.99 if low is None else low
-    return DailyBar(source=source, symbol=symbol, session=session, open=o, high=h, low=low, close=close,
-                    volume=volume, vwap=None, trades=None)
+    return DailyBar(
+        source=source,
+        symbol=symbol,
+        session=session,
+        open=o,
+        high=h,
+        low=low,
+        close=close,
+        volume=volume,
+        vwap=None,
+        trades=None,
+    )
 
 
 def split(symbol, ex_date, split_from, split_to, *, action_type="forward_split", source="massive"):
-    return CorporateAction(source=source, action_type=action_type, symbol=symbol, ex_date=ex_date,
-                           split_from=split_from, split_to=split_to)
+    return CorporateAction(
+        source=source, action_type=action_type, symbol=symbol, ex_date=ex_date, split_from=split_from, split_to=split_to
+    )
 
 
 def cash_dividend(symbol, ex_date, amount, *, source="massive"):
-    return CorporateAction(source=source, action_type="cash_dividend", symbol=symbol, ex_date=ex_date,
-                           cash_amount=amount, currency="USD")
+    return CorporateAction(
+        source=source, action_type="cash_dividend", symbol=symbol, ex_date=ex_date, cash_amount=amount, currency="USD"
+    )
 
 
-def ingest(store, staging_dir, bars, *, run_id="run-1", as_of=utc(2026, 10, 17, 1)):
+def ingest(store, staging_dir, bars, *, run_id="run-1", as_of=FIRST_SEEN):
     return store.ingest_daily_bars(bars, run_id=run_id, as_of=as_of, staging_dir=staging_dir)
 
 
-def ingest_actions(store, staging_dir, actions, *, run_id="run-ca", as_of=utc(2026, 10, 17, 1)):
+def ingest_actions(store, staging_dir, actions, *, run_id="run-ca", as_of=FIRST_SEEN):
     return store.ingest_corporate_actions(actions, run_id=run_id, as_of=as_of, staging_dir=staging_dir)
 
 
@@ -69,8 +81,14 @@ NVDA_BARS = [
 
 @pytest.mark.parametrize(
     "table",
-    ["daily_bars_raw", "corporate_actions", "ingestion_runs", "intraday_quotes",
-     "yahoo_legacy_bars", "reconciliation_results"],
+    [
+        "daily_bars_raw",
+        "corporate_actions",
+        "ingestion_runs",
+        "intraday_quotes",
+        "yahoo_legacy_bars",
+        "reconciliation_results",
+    ],
 )
 def test_every_table_carries_provenance_columns(store, table):
     cols = set(store.table_columns(table))
@@ -107,8 +125,9 @@ def test_vendor_correction_is_a_new_row_with_a_later_as_of(store, staging_dir):
 
     latest = adjusted(store, "AAPL", date(2026, 10, 16), as_of_date=TODAY)
     assert latest.close_raw == pytest.approx(250.40)
-    before_correction = adjusted(store, "AAPL", date(2026, 10, 16), as_of_date=TODAY,
-                                 known_at=datetime(2026, 10, 17, 12, tzinfo=timezone.utc))
+    before_correction = adjusted(
+        store, "AAPL", date(2026, 10, 16), as_of_date=TODAY, known_at=datetime(2026, 10, 17, 12, tzinfo=timezone.utc)
+    )
     assert before_correction.close_raw == pytest.approx(250.00)
 
 
@@ -219,8 +238,11 @@ def test_stock_dividend_adjusts_like_a_split(store, staging_dir):
 
 
 def test_cash_dividend_adjusts_total_return_close_only(store, staging_dir):
-    ingest(store, staging_dir, [bar("KO", date(2024, 6, 12), 60.00), bar("KO", date(2024, 6, 13), 60.00),
-                                bar("KO", date(2024, 6, 14), 59.60)])
+    ingest(
+        store,
+        staging_dir,
+        [bar("KO", date(2024, 6, 12), 60.00), bar("KO", date(2024, 6, 13), 60.00), bar("KO", date(2024, 6, 14), 59.60)],
+    )
     ingest_actions(store, staging_dir, [cash_dividend("KO", date(2024, 6, 14), 0.485)])
 
     row = adjusted(store, "KO", date(2024, 6, 13), as_of_date=TODAY)
@@ -233,16 +255,27 @@ def test_cash_dividend_adjusts_total_return_close_only(store, staging_dir):
 
 def test_the_same_split_from_two_vendors_applies_once(store, staging_dir):
     ingest(store, staging_dir, NVDA_BARS)
-    ingest_actions(store, staging_dir, [split("NVDA", date(2024, 6, 10), 1, 10, source="massive"),
-                                        split("NVDA", date(2024, 6, 10), 1, 10, source="alpaca")])
+    ingest_actions(
+        store,
+        staging_dir,
+        [
+            split("NVDA", date(2024, 6, 10), 1, 10, source="massive"),
+            split("NVDA", date(2024, 6, 10), 1, 10, source="alpaca"),
+        ],
+    )
 
     assert adjusted(store, "NVDA", date(2024, 5, 31), as_of_date=TODAY).close_split_adjusted == pytest.approx(109.633)
 
 
 def test_massive_is_preferred_over_alpaca_for_the_same_session(store, staging_dir):
     ingest(store, staging_dir, [bar("AAPL", date(2024, 6, 10), 193.12, source="alpaca")], run_id="alp")
-    ingest(store, staging_dir, [bar("AAPL", date(2024, 6, 10), 193.10, source="massive")], run_id="mas",
-           as_of=utc(2026, 10, 17, 0))  # earlier as_of, still preferred: source priority comes first
+    ingest(
+        store,
+        staging_dir,
+        [bar("AAPL", date(2024, 6, 10), 193.10, source="massive")],
+        run_id="mas",
+        as_of=utc(2026, 10, 17, 0),
+    )  # earlier as_of, still preferred: source priority comes first
     ingest(store, staging_dir, [bar("MSFT", date(2024, 6, 10), 427.87, source="alpaca")], run_id="alp2")
 
     aapl = adjusted(store, "AAPL", date(2024, 6, 10), as_of_date=TODAY)

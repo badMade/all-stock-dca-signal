@@ -10,7 +10,6 @@ import logging
 from datetime import date
 
 import pytest
-
 from market_data_ingest.prices.alpaca import AlpacaProvider
 from market_data_ingest.prices.daily_job import run_daily_job
 from market_data_ingest.prices.errors import ProviderError
@@ -40,10 +39,22 @@ def echoing(status, secret):
 
 
 def providers(clock, massive_responses, alpaca_responses):
-    massive = MassiveProvider(TEST_MASSIVE_KEY, session=FakeSession(massive_responses), calendar=CAL,
-                              trailing_counts=lambda _s: [3] * 20, clock=clock.now, sleep=clock.sleep)
-    alpaca = AlpacaProvider(TEST_ALPACA_KEY_ID, TEST_ALPACA_SECRET, session=FakeSession(alpaca_responses),
-                            clock=clock.now, sleep=clock.sleep, universe=lambda: ["NVDA"])
+    massive = MassiveProvider(
+        TEST_MASSIVE_KEY,
+        session=FakeSession(massive_responses),
+        calendar=CAL,
+        trailing_counts=lambda _s: [3] * 20,
+        clock=clock.now,
+        sleep=clock.sleep,
+    )
+    alpaca = AlpacaProvider(
+        TEST_ALPACA_KEY_ID,
+        TEST_ALPACA_SECRET,
+        session=FakeSession(alpaca_responses),
+        clock=clock.now,
+        sleep=clock.sleep,
+        universe=lambda: ["NVDA"],
+    )
     return massive, alpaca
 
 
@@ -71,16 +82,24 @@ def test_reprs_do_not_contain_keys(clock):
 
 def test_failed_job_leaves_no_key_in_logs_run_records_or_the_database(tmp_path, caplog):
     clock = FakeClock(utc(2024, 6, 12, 2))
-    massive, alpaca = providers(clock, lambda u, p: echoing(500, TEST_MASSIVE_KEY),
-                                lambda u, p: echoing(500, TEST_ALPACA_SECRET))
+    massive, alpaca = providers(
+        clock, lambda u, p: echoing(500, TEST_MASSIVE_KEY), lambda u, p: echoing(500, TEST_ALPACA_SECRET)
+    )
     db = tmp_path / "prices.duckdb"
     store = PriceStore(db)
     staging = tmp_path / "staging"
     staging.mkdir()
 
     with caplog.at_level(logging.DEBUG):
-        result = run_daily_job(session=S, store=store, router=PriceRouter(massive, alpaca), calendar=CAL,
-                               clock=clock.now, staging_dir=staging, run_id_factory=lambda: "run-secret")
+        result = run_daily_job(
+            session=S,
+            store=store,
+            router=PriceRouter(massive, alpaca),
+            calendar=CAL,
+            clock=clock.now,
+            staging_dir=staging,
+            run_id_factory=lambda: "run-secret",
+        )
     events = store.run_events("run-secret")
     store.close()
 

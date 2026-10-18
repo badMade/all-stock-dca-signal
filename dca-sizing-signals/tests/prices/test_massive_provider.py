@@ -14,7 +14,6 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
-
 from market_data_ingest.prices.errors import IncompleteBatchError, ProviderError
 from market_data_ingest.prices.massive import MassiveProvider
 from market_data_ingest.prices.models import CorporateAction, DailyBar
@@ -214,7 +213,11 @@ def test_corporate_actions_cover_forward_reverse_stock_dividend_and_cash(clock):
 
     nvda = by_symbol["NVDA"]
     assert (nvda.action_type, nvda.ex_date, nvda.split_from, nvda.split_to) == (
-        "forward_split", date(2024, 6, 10), 1, 10)
+        "forward_split",
+        date(2024, 6, 10),
+        1,
+        10,
+    )
     assert nvda.historical_adjustment_factor == pytest.approx(0.1), "stored as delivered"
 
     rvrs = by_symbol["RVRS"]
@@ -225,7 +228,11 @@ def test_corporate_actions_cover_forward_reverse_stock_dividend_and_cash(clock):
 
     ko = by_symbol["KO"]
     assert (ko.action_type, ko.ex_date, ko.cash_amount, ko.currency) == (
-        "cash_dividend", date(2024, 6, 14), pytest.approx(0.485), "USD")
+        "cash_dividend",
+        date(2024, 6, 14),
+        pytest.approx(0.485),
+        "USD",
+    )
     assert ko.pay_date == date(2024, 7, 1)
 
     # The "since" bound is sent to the vendor rather than filtered client-side after the fact.
@@ -269,5 +276,6 @@ def test_from_env_requires_the_key_and_never_echoes_it():
     assert "MASSIVE_API_KEY" in str(excinfo.value)
 
     provider = MassiveProvider.from_env(
-        env={"MASSIVE_API_KEY": TEST_MASSIVE_KEY}, session=FakeSession([]), calendar=OPEN, trailing_counts=BASELINE_3)
+        env={"MASSIVE_API_KEY": TEST_MASSIVE_KEY}, session=FakeSession([]), calendar=OPEN, trailing_counts=BASELINE_3
+    )
     assert TEST_MASSIVE_KEY not in repr(provider)

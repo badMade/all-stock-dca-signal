@@ -12,7 +12,6 @@ from datetime import date
 
 import pytest
 import requests
-
 from market_data_ingest.prices.alpaca import AlpacaProvider
 from market_data_ingest.prices.errors import IncompleteBatchError, ProviderError
 from market_data_ingest.prices.massive import MassiveProvider
@@ -49,7 +48,11 @@ def massive_call(responses, clock):
 def alpaca_call(responses, clock):
     session = FakeSession(responses)
     provider = AlpacaProvider(
-        TEST_ALPACA_KEY_ID, TEST_ALPACA_SECRET, session=session, clock=clock.now, sleep=clock.sleep,
+        TEST_ALPACA_KEY_ID,
+        TEST_ALPACA_SECRET,
+        session=session,
+        clock=clock.now,
+        sleep=clock.sleep,
         universe=lambda: ["NVDA"],
     )
     return (lambda: provider.last_trade(["NVDA", "AAPL"], feed="iex")), session, GOOD_TRADES
@@ -61,8 +64,10 @@ VENDORS = pytest.mark.parametrize("build", [massive_call, alpaca_call], ids=["ma
 @VENDORS
 @pytest.mark.parametrize(
     ("exc", "code"),
-    [(requests.exceptions.Timeout("read timed out"), "timeout"),
-     (requests.exceptions.ConnectionError("connection reset"), "connection")],
+    [
+        (requests.exceptions.Timeout("read timed out"), "timeout"),
+        (requests.exceptions.ConnectionError("connection reset"), "connection"),
+    ],
 )
 def test_transport_failure_is_a_provider_error_and_not_retried(build, clock, exc, code):
     call, session, _ = build([exc], clock)
@@ -87,9 +92,10 @@ def test_5xx_is_a_provider_error(build, clock, status):
 
 @VENDORS
 def test_single_429_honours_retry_after_once_then_succeeds(build, clock):
-    call, session, good = build(
-        [FakeResponse(status_code=429, text="slow down", headers={"Retry-After": "7"}), FakeResponse.json_body(good)],
-        clock,
+    responses: list = []  # FakeSession keeps this list, so it can be filled after build()
+    call, session, good = build(responses, clock)
+    responses.extend(
+        [FakeResponse(status_code=429, text="slow down", headers={"Retry-After": "7"}), FakeResponse.json_body(good)]
     )
 
     assert call()  # non-empty result
@@ -100,8 +106,10 @@ def test_single_429_honours_retry_after_once_then_succeeds(build, clock):
 @VENDORS
 def test_repeated_429_raises_rate_limited(build, clock):
     call, session, _ = build(
-        [FakeResponse(status_code=429, text="slow down", headers={"Retry-After": "1"}),
-         FakeResponse(status_code=429, text="slow down", headers={"Retry-After": "1"})],
+        [
+            FakeResponse(status_code=429, text="slow down", headers={"Retry-After": "1"}),
+            FakeResponse(status_code=429, text="slow down", headers={"Retry-After": "1"}),
+        ],
         clock,
     )
 

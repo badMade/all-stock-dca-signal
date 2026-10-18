@@ -12,7 +12,6 @@ import logging
 from datetime import date
 
 import pytest
-
 from market_data_ingest.prices.errors import (
     IncompleteBatchError,
     ProviderError,
@@ -61,8 +60,11 @@ def test_primary_success_never_touches_the_fallback():
 
 @pytest.mark.parametrize(
     "error",
-    [ProviderError("down", code="http_5xx"), IncompleteBatchError("short", code="below_median"),
-     StaleDataError("old", code="stale")],
+    [
+        ProviderError("down", code="http_5xx"),
+        IncompleteBatchError("short", code="below_median"),
+        StaleDataError("old", code="stale"),
+    ],
     ids=["provider", "incomplete", "stale"],
 )
 def test_primary_provider_error_falls_back(error, caplog):

@@ -14,7 +14,6 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
-
 from market_data_ingest.prices.alpaca import AlpacaCalendar, AlpacaProvider
 from market_data_ingest.prices.errors import ProviderError
 from market_data_ingest.prices.models import Quote
@@ -135,9 +134,15 @@ def test_corporate_actions_map_every_alpaca_type(clock):
 
     assert all(a.source == "alpaca" for a in actions.values())
     assert (actions["NVDA"].action_type, actions["NVDA"].split_from, actions["NVDA"].split_to) == (
-        "forward_split", 1, 10)
+        "forward_split",
+        1,
+        10,
+    )
     assert (actions["RVRS"].action_type, actions["RVRS"].split_from, actions["RVRS"].split_to) == (
-        "reverse_split", 20, 1)
+        "reverse_split",
+        20,
+        1,
+    )
     # A 5% stock dividend is a 100 -> 105 share ratio.
     stkd = actions["STKD"]
     assert stkd.action_type == "stock_dividend"
@@ -192,10 +197,17 @@ def test_previous_sessions_skip_holidays_most_recent_first(clock):
     cal, _ = make_calendar(_calendar_handler, clock=clock)
 
     assert cal.previous_sessions(date(2024, 6, 3), 5) == [
-        date(2024, 5, 31), date(2024, 5, 30), date(2024, 5, 29), date(2024, 5, 28), date(2024, 5, 24)]
+        date(2024, 5, 31),
+        date(2024, 5, 30),
+        date(2024, 5, 29),
+        date(2024, 5, 28),
+        date(2024, 5, 24),
+    ]
 
 
-@pytest.mark.parametrize("failure", [FakeResponse(status_code=503, text="unavailable"), FakeResponse(status_code=401, text="{}")])
+@pytest.mark.parametrize(
+    "failure", [FakeResponse(status_code=503, text="unavailable"), FakeResponse(status_code=401, text="{}")]
+)
 def test_calendar_outage_raises_instead_of_reporting_closed(clock, failure):
     cal, _ = make_calendar([failure], clock=clock)
 
