@@ -1554,6 +1554,18 @@ _ALLOWED = {
     "dca-sizing-signals-package 2.tar.gz",
     # Generated package lockfile full of hashes and sizes that match account shapes.
     "uv.lock",
+    # Synthetic price-source fixtures (dca-sizing-signals/tests/prices/): share counts, trade counts and
+    # microsecond timestamps are account-shaped digit runs but are market data, not identifiers. Named
+    # individually, never as a directory, so a new fixture must be added here on purpose; every fixture
+    # must carry _provenance (test_fixture_shapes.py enforces it).
+    "dca-sizing-signals/tests/prices/fixtures/alpaca_bars_page1.json",
+    "dca-sizing-signals/tests/prices/fixtures/alpaca_bars_page2.json",
+    "dca-sizing-signals/tests/prices/fixtures/massive_grouped_2024-05-31.json",
+    "dca-sizing-signals/tests/prices/fixtures/massive_grouped_2024-06-07.json",
+    "dca-sizing-signals/tests/prices/fixtures/massive_grouped_2024-06-10.json",
+    "dca-sizing-signals/tests/prices/fixtures/massive_grouped_count_mismatch.json",
+    # Holds a microsecond-precision timestamp literal (.500000) in an assertion.
+    "dca-sizing-signals/tests/prices/test_alpaca_provider.py",
 }
 
 # The scan is an EXCLUDE list, not an include list. It used to allowlist text
