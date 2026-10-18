@@ -1,0 +1,173 @@
+{
+  "_provenance": "synthetic-from-docs: shape follows the vendor's published response schema; values are approximate public prices, not a live recording. Re-record with the opt-in contract test when keys are available. GET /v2/calendar returns open days only; 2024-05-27, 2024-07-04 and the 2025-01-09 special closure are absent. Wrapped in an object here; the live endpoint returns the bare list.",
+  "days": [
+    {
+      "date": "2024-05-24",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-05-24"
+    },
+    {
+      "date": "2024-05-28",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-05-28"
+    },
+    {
+      "date": "2024-05-29",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-05-29"
+    },
+    {
+      "date": "2024-05-30",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-05-30"
+    },
+    {
+      "date": "2024-05-31",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-05-31"
+    },
+    {
+      "date": "2024-06-03",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-06-03"
+    },
+    {
+      "date": "2024-06-04",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-06-04"
+    },
+    {
+      "date": "2024-06-05",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-06-05"
+    },
+    {
+      "date": "2024-06-06",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-06-06"
+    },
+    {
+      "date": "2024-06-07",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-06-07"
+    },
+    {
+      "date": "2024-06-10",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-06-10"
+    },
+    {
+      "date": "2024-06-11",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-06-11"
+    },
+    {
+      "date": "2024-06-12",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-06-12"
+    },
+    {
+      "date": "2024-07-01",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-07-01"
+    },
+    {
+      "date": "2024-07-02",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-07-02"
+    },
+    {
+      "date": "2024-07-03",
+      "open": "09:30",
+      "close": "13:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-07-03"
+    },
+    {
+      "date": "2024-07-05",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2024-07-05"
+    },
+    {
+      "date": "2025-01-06",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2025-01-06"
+    },
+    {
+      "date": "2025-01-07",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2025-01-07"
+    },
+    {
+      "date": "2025-01-08",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2025-01-08"
+    },
+    {
+      "date": "2025-01-10",
+      "open": "09:30",
+      "close": "16:00",
+      "session_open": "0400",
+      "session_close": "2000",
+      "settlement_date": "2025-01-10"
+    }
+  ]
+}

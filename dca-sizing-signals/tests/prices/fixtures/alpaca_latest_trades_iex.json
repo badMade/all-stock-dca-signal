@@ -1,0 +1,28 @@
+{
+  "_provenance": "synthetic-from-docs: shape follows the vendor's published response schema; values are approximate public prices, not a live recording. Re-record with the opt-in contract test when keys are available. GET /v2/stocks/trades/latest?feed=iex. MSFT deliberately absent (no IEX print).",
+  "trades": {
+    "NVDA": {
+      "t": "2024-06-11T14:34:58.500000Z",
+      "x": "V",
+      "p": 121.5,
+      "s": 100,
+      "c": [
+        "@"
+      ],
+      "i": 52983525029461,
+      "z": "C"
+    },
+    "AAPL": {
+      "t": "2024-06-11T14:31:00.000000Z",
+      "x": "V",
+      "p": 207.1,
+      "s": 20,
+      "c": [
+        "@",
+        "I"
+      ],
+      "i": 52983525029462,
+      "z": "C"
+    }
+  }
+}

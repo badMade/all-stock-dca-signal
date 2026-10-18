@@ -1,0 +1,21 @@
+{
+  "_provenance": "synthetic-from-docs: shape follows the vendor's published response schema; values are approximate public prices, not a live recording. Re-record with the opt-in contract test when keys are available.",
+  "adjusted": false,
+  "queryCount": 1,
+  "resultsCount": 1,
+  "request_id": "syn-0610",
+  "status": "OK",
+  "results": [
+    {
+      "T": "NVDA",
+      "v": 314000000,
+      "vw": 120.9,
+      "o": 120.37,
+      "c": 121.79,
+      "h": 123.1,
+      "l": 117.01,
+      "t": 1717992000000,
+      "n": 2500000
+    }
+  ]
+}

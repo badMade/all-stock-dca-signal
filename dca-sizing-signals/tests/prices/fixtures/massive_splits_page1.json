@@ -1,0 +1,26 @@
+{
+  "_provenance": "synthetic-from-docs: shape follows the vendor's published response schema; values are approximate public prices, not a live recording. Re-record with the opt-in contract test when keys are available. /stocks/v1/splits; page 1 of 2 (next_url set).",
+  "status": "OK",
+  "request_id": "syn-splits-1",
+  "next_url": "https://api.massive.com/stocks/v1/splits?cursor=PAGE2CURSOR",
+  "results": [
+    {
+      "id": "Esyn-nvda",
+      "ticker": "NVDA",
+      "execution_date": "2024-06-10",
+      "split_from": 1,
+      "split_to": 10,
+      "adjustment_type": "forward_split",
+      "historical_adjustment_factor": 0.1
+    },
+    {
+      "id": "Esyn-rvrs",
+      "ticker": "RVRS",
+      "execution_date": "2024-06-05",
+      "split_from": 20,
+      "split_to": 1,
+      "adjustment_type": "reverse_split",
+      "historical_adjustment_factor": 20.0
+    }
+  ]
+}

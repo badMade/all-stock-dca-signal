@@ -1,0 +1,27 @@
+{
+  "_provenance": "synthetic-from-docs: shape follows the vendor's published response schema; values are approximate public prices, not a live recording. Re-record with the opt-in contract test when keys are available. GET /v2/stocks/trades/latest?feed=delayed_sip (15-minute delayed SIP).",
+  "trades": {
+    "AAPL": {
+      "t": "2024-06-11T14:19:30.000000Z",
+      "x": "Q",
+      "p": 206.8,
+      "s": 300,
+      "c": [
+        "@"
+      ],
+      "i": 71675,
+      "z": "C"
+    },
+    "MSFT": {
+      "t": "2024-06-11T14:19:40.000000Z",
+      "x": "Q",
+      "p": 431.2,
+      "s": 100,
+      "c": [
+        "@"
+      ],
+      "i": 71676,
+      "z": "C"
+    }
+  }
+}
