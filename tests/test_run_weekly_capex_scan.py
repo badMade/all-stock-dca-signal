@@ -83,3 +83,83 @@ def test_main_cli_execution(tmp_path: Path):
     ])
     assert exit_code == 0
     assert (reports_dir / "capex-scan-2026-10-03.md").is_file()
+
+
+# --- watchlist coverage check: an active DCA ticker missing from the capex note must be visible ---
+
+def _vault_with_note(tmp_path: Path, note_body: str) -> Path:
+    vault = tmp_path / "agent-vault"
+    (vault / "vault" / "Knowledge").mkdir(parents=True)
+    (vault / "vault" / "Knowledge" / "capex-monitoring-kpis.md").write_text(note_body, encoding="utf-8")
+    (vault / "config.yaml").write_text((VAULT_ROOT / "config.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+    return vault
+
+
+_NOTE = """## Watched companies
+
+### Operating Companies (SEC 10-Q / 10-K / 20-F Filers)
+- MSFT (Microsoft Corporation): "Additions to property and equipment", fiscal year end: June 30.
+- GOOGL / GOOG (Alphabet Inc.): "Capital expenditures", fiscal year end: December 31.
+
+### Non-Operating Vehicles (Excluded from Capex Analysis)
+- QQQ: Invesco QQQ Trust (Index ETF)
+"""
+
+
+def test_full_scan_reports_active_tickers_missing_from_the_watchlist(tmp_path: Path, capsys):
+    vault = _vault_with_note(tmp_path, _NOTE)
+    config = tmp_path / "tickers.json"
+    config.write_text('{"active": ["MSFT", "GOOG", "QQQ", "APH", "TEL"]}', encoding="utf-8")
+    code, report_path, _ = execute_capex_scan(
+        vault_root=vault, reports_dir=tmp_path / "reports", today_iso="2026-10-18", tickers_config=config,
+    )
+    assert code == 0
+    report = report_path.read_text(encoding="utf-8")
+    assert "### Watchlist gaps" in report and "APH, TEL" in report and "NOT scanned" in report
+    assert "GOOG," not in report and "QQQ" not in report.split("### Watchlist gaps")[1]  # alias and ETF are covered
+    assert "APH, TEL" in capsys.readouterr().err
+
+
+def test_full_scan_says_so_when_coverage_is_complete(tmp_path: Path, capsys):
+    vault = _vault_with_note(tmp_path, _NOTE)
+    config = tmp_path / "tickers.json"
+    config.write_text('{"active": ["MSFT", "GOOG", "QQQ"]}', encoding="utf-8")
+    _, report_path, _ = execute_capex_scan(
+        vault_root=vault, reports_dir=tmp_path / "reports", today_iso="2026-10-18", tickers_config=config,
+    )
+    assert "Every active DCA ticker is on the capex watchlist" in report_path.read_text(encoding="utf-8")
+    assert capsys.readouterr().err == ""
+
+
+def test_unreadable_ticker_config_never_stops_the_scan(tmp_path: Path):
+    vault = _vault_with_note(tmp_path, _NOTE)
+    for bad in (tmp_path / "missing.json", tmp_path / "bad.json", tmp_path / "wrong.json"):
+        if bad.name == "bad.json":
+            bad.write_text("{not json", encoding="utf-8")
+        elif bad.name == "wrong.json":
+            bad.write_text('{"active": 5}', encoding="utf-8")
+        code, report_path, _ = execute_capex_scan(
+            vault_root=vault, reports_dir=tmp_path / "reports", today_iso="2026-10-18", tickers_config=bad,
+        )
+        assert code == 0
+        assert "coverage not checked" in report_path.read_text(encoding="utf-8")
+
+
+def test_partial_ticker_run_skips_the_coverage_check(tmp_path: Path):
+    vault = _vault_with_note(tmp_path, _NOTE)
+    config = tmp_path / "tickers.json"
+    config.write_text('{"active": ["MSFT", "APH"]}', encoding="utf-8")
+    _, report_path, _ = execute_capex_scan(
+        vault_root=vault, reports_dir=tmp_path / "reports", today_iso="2026-10-18",
+        target_tickers=["MSFT"], tickers_config=config,
+    )
+    assert "Watchlist" not in report_path.read_text(encoding="utf-8")
+
+
+def test_the_real_watchlist_now_covers_the_three_tickers_that_were_missing():
+    from scan_capex_deltas import parse_watched_aliases, parse_watched_companies_and_baselines
+
+    note = VAULT_ROOT / "vault" / "Knowledge" / "capex-monitoring-kpis.md"
+    operating, _, _ = parse_watched_companies_and_baselines(note)
+    assert {"APH", "GFS", "TEL"} <= set(operating)
+    assert "GOOG" in parse_watched_aliases(note) and "GOOG" not in operating

@@ -1,7 +1,7 @@
 """Tests for scan_capex_deltas.py: recurring SEC EDGAR capex scanner.
 
 Validates:
-- Parsing watched operating filers from capex-monitoring-kpis.md (51 companies)
+- Parsing watched operating filers from capex-monitoring-kpis.md (54 companies)
 - Exclusions of non-operating vehicles (ETFs, closed-end funds)
 - Two-tier capex addition thresholds ($2,000M hyperscalers, $250M suppliers)
 - Quarter-over-quarter percentage delta threshold (15%)
@@ -48,10 +48,10 @@ KPIS_NOTE = VAULT_ROOT / "vault" / "Knowledge" / "capex-monitoring-kpis.md"
 CONFIG_YAML = VAULT_ROOT / "config.yaml"
 
 
-def test_parse_watched_companies_extracts_51_operating_filers():
-    """Verify that capex-monitoring-kpis.md yields exactly 51 operating filers."""
+def test_parse_watched_companies_extracts_54_operating_filers():
+    """Verify that capex-monitoring-kpis.md yields exactly 54 operating filers (APH, GFS, TEL added 2026-10-18 to match the DCA universe)."""
     operating_filers, non_operating, _ = parse_watched_companies_and_baselines(KPIS_NOTE)
-    assert len(operating_filers) == 51
+    assert len(operating_filers) == 54
     assert "NVDA" in operating_filers
     assert "MSFT" in operating_filers
     assert "AAPL" in operating_filers

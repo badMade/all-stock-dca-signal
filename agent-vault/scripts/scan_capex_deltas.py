@@ -311,6 +311,29 @@ def parse_watched_companies_and_baselines(
     return operating, non_operating, baselines
 
 
+def parse_watched_aliases(note_path: Path) -> set[str]:
+    """Every ticker named on an operating-company line, including secondary share classes.
+
+    ``parse_watched_companies_and_baselines`` keys an entry like ``GOOGL / GOOG`` by its
+    primary ticker only, so GOOG would look unwatched to a coverage check.
+    """
+    if not note_path.exists():
+        return set()
+    names: set[str] = set()
+    in_operating = False
+    for raw in note_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line.startswith("### Operating Companies"):
+            in_operating = True
+        elif line.startswith("#"):
+            in_operating = False
+        elif in_operating and line.startswith("- "):
+            match = re.match(r"^-\s+([A-Z0-9/\s]+)\s*\(", line)
+            if match:
+                names.update(part.strip() for part in match.group(1).split("/") if part.strip())
+    return names
+
+
 def evaluate_capex_change(
     ticker: str,
     current_usd_m: float,

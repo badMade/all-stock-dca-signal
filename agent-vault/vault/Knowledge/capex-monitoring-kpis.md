@@ -11,6 +11,7 @@ STATUS: skeleton. Initial watchlist populated from universe on 2026-10-03. The `
 - AMD (Advanced Micro Devices, Inc.): "Purchases of property, plant and equipment", fiscal year end: December.
 - AMZN (Amazon.com, Inc.): "Purchases of property and equipment", fiscal year end: December 31.
 - ANET (Arista Networks, Inc.): "Purchases of property and equipment", fiscal year end: December 31.
+- APH (Amphenol Corporation): "Capital expenditures", fiscal year end: December 31.
 - ASML (ASML Holding N.V.): "Capital expenditures", fiscal year end: December 31 (Form 20-F).
 - AVGO (Broadcom Inc.): "Purchases of property, plant and equipment", fiscal year end: October.
 - BYDDY (BYD Company Ltd): "Purchases of property, plant and equipment", fiscal year end: December 31 (ADR).
@@ -23,6 +24,7 @@ STATUS: skeleton. Initial watchlist populated from universe on 2026-10-03. The `
 - EVR (Evercore, Inc.): "Purchases of property and equipment", fiscal year end: December 31.
 - FFIV (F5, Inc.): "Capital expenditures", fiscal year end: September 30.
 - GE (GE Aerospace): "Additions to property, plant and equipment", fiscal year end: December 31.
+- GFS (GlobalFoundries Inc.): "Purchases of property, plant and equipment", fiscal year end: December 31.
 - GFUZ (General Fusion Group Ltd.): Clean energy research and capital assets, fiscal year end: December 31.
 - GLW (Corning Incorporated): "Capital expenditures", fiscal year end: December 31.
 - GOOGL / GOOG (Alphabet Inc.): "Capital expenditures", fiscal year end: December 31.
@@ -49,6 +51,7 @@ STATUS: skeleton. Initial watchlist populated from universe on 2026-10-03. The `
 - SPCX (Space Exploration Technologies Corp.): Private equity holding, non-SEC reporting.
 - STM (STMicroelectronics N.V.): "Capital expenditures", fiscal year end: December 31 (Form 20-F).
 - STX (Seagate Technology Holdings plc): "Payments for property, plant and equipment", fiscal year end: June.
+- TEL (TE Connectivity plc): "Capital expenditures", fiscal year end: last Friday of September.
 - TRLV (Trulieve Cannabis Corp.): "Capital expenditures", fiscal year end: December 31.
 - TSLA (Tesla, Inc.): "Capital expenditures", fiscal year end: December 31.
 - TSM (Taiwan Semiconductor Manufacturing Co.): "Capital expenditures", fiscal year end: December 31 (Form 20-F).

@@ -9,10 +9,11 @@ outcome to the daily note.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from datetime import date
 from pathlib import Path
-from typing import Sequence
+from typing import Iterable, Sequence
 
 # Add parent directory to path to locate scan_capex_deltas
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -30,8 +31,49 @@ from scan_capex_deltas import (  # noqa: E402
     fetch_sec_company_tickers,
     format_capex_scan_report,
     load_scanner_config,
+    parse_watched_aliases,
     parse_watched_companies_and_baselines,
 )
+
+
+def load_active_tickers(config_path: Path) -> list[str] | None:
+    """Active DCA universe from config/tickers.json, or None when it cannot be read.
+
+    Unreadable config must not stop the scan: the coverage check is advisory.
+    """
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        active = data["active"]
+        return [str(t).strip().upper() for t in active]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def find_unwatched_active_tickers(
+    active: Sequence[str], watched: Iterable[str], non_operating: Iterable[str]
+) -> list[str]:
+    """Active DCA tickers that appear on neither the operating watchlist nor the non-operating list.
+
+    Such a ticker is silently skipped by the scan, which is how APH, TEL and GFS went
+    unscanned after being added to the DCA universe.
+    """
+    known = set(watched) | set(non_operating)
+    return sorted(t for t in set(active) if t not in known)
+
+
+def format_watchlist_gap_section(unwatched: Sequence[str] | None, config_path: Path) -> str:
+    """Markdown section appended to the report so a coverage gap is visible, not just logged."""
+    if unwatched is None:
+        return f"### Watchlist coverage\n- Could not read the active ticker list from `{config_path}`; coverage not checked."
+    if not unwatched:
+        return "### Watchlist coverage\n- Every active DCA ticker is on the capex watchlist."
+    return (
+        "### Watchlist gaps\n"
+        f"- {len(unwatched)} active DCA ticker(s) are not on the capex watchlist and were NOT scanned: "
+        f"{', '.join(unwatched)}.\n"
+        "- Add each to `vault/Knowledge/capex-monitoring-kpis.md` under Operating Companies "
+        "(or Non-Operating Vehicles if it is a fund or ETF)."
+    )
 
 
 def execute_capex_scan(
@@ -42,6 +84,7 @@ def execute_capex_scan(
     user_agent: str = DEFAULT_USER_AGENT,
     timeout: float = 10.0,
     target_tickers: Sequence[str] | None = None,
+    tickers_config: Path | None = None,
 ) -> tuple[int, Path, list[CapexEvaluation]]:
     """Execute scan and archive report.
 
@@ -53,6 +96,8 @@ def execute_capex_scan(
         user_agent: SEC contact User-Agent header.
         timeout: HTTP request timeout in seconds.
         target_tickers: Optional list of tickers to scan.
+        tickers_config: config/tickers.json used for the watchlist coverage check
+            (defaults to the repo's own); skipped for a partial --tickers run.
 
     Returns:
         Tuple of (exit_code, report_path, evaluations).
@@ -110,6 +155,20 @@ def execute_capex_scan(
     reports_dir.mkdir(parents=True, exist_ok=True)
     report_file = reports_dir / f"capex-scan-{today_iso}.md"
     report_md = format_capex_scan_report(evaluations, title=f"CapEx Scan Report ({today_iso})")
+    if not target_tickers:  # a partial run is deliberately narrow; only a full run is checked for gaps
+        config_path = tickers_config or (vault_root.parent / "config" / "tickers.json")
+        active = load_active_tickers(config_path)
+        unwatched = (
+            None if active is None
+            else find_unwatched_active_tickers(
+                active, set(operating) | parse_watched_aliases(kpis_note), non_operating
+            )
+        )
+        gap_section = format_watchlist_gap_section(unwatched, config_path)
+        report_md = report_md.rstrip() + "\n\n" + gap_section
+        if unwatched:
+            print(f"WARNING: {len(unwatched)} active DCA ticker(s) not on the capex watchlist: {', '.join(unwatched)}",
+                  file=sys.stderr)
     report_file.write_text(report_md + "\n", encoding="utf-8")
 
     latest_file = reports_dir / "latest-capex-scan.md"
