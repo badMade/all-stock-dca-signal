@@ -63,6 +63,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from dca_fileio import atomic_open_w
 from dca_paths import cron_tracking_root
+from scripts import reason_codes
 from scripts.file_lock import cross_process_lock
 from scripts.run_classification import (
     ORDER_SUBMIT_STATUS_BUDGET_EXHAUSTED,
@@ -98,6 +99,10 @@ from scripts.verify_schedule import (
     classify_slot_evidence,
     slot_run_dir_relative,
 )
+
+# error_class a live prompt passes when place_equity_order is refused by the
+# session's permission layer before the broker answers (Group C, 2026-10-17).
+PLATFORM_REFUSAL_ERROR_CLASS = "platform_refusal"
 
 # The live-run vocabulary only: dry_run is deliberately absent, since a dry run
 # is never scheduled evidence and must not be finalized as one.
@@ -662,6 +667,12 @@ def build_run_state(
     }
     if error_class:
         state["error_class"] = error_class
+    if error_class == PLATFORM_REFUSAL_ERROR_CLASS:
+        # A distinct, machine-readable marker so a permission refusal is never
+        # confused with a cap breach or a rogue-executor halt, and so the
+        # alert path has something to key on.
+        state["reason_code"] = reason_codes.PLATFORM_REFUSAL
+        state["alert_required"] = True
     if error_detail:
         state["error_detail"] = error_detail
     if report is not None:
@@ -720,6 +731,16 @@ def finalize(
         )
     if not outcome.strip():
         raise FinalizeRefused("--outcome must name the Gate 9 outcome")
+    if error_class == PLATFORM_REFUSAL_ERROR_CLASS and order_submit_status not in (
+        ORDER_SUBMIT_STATUS_ERROR,
+        ORDER_SUBMIT_STATUS_SUBMITTED,
+    ):
+        # Earlier orders in the batch may have filled before the refusal
+        # ("submitted"); with none, it is an error -- never a quiet no-op.
+        raise FinalizeRefused(
+            f"a platform refusal must finalize as {ORDER_SUBMIT_STATUS_ERROR!r} (or "
+            f"{ORDER_SUBMIT_STATUS_SUBMITTED!r} if orders were placed first), not {order_submit_status!r}"
+        )
     validate_orders(orders)
     budget = validate_budget(budget)
     code_version = validate_code_version(code_version)

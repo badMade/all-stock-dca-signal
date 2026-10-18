@@ -2762,3 +2762,34 @@ def test_generate_candidates_still_accepts_the_unset_allocation_of_zero():
     data = _market_data("TEST", early_price=100.0, late_price=96.0, previous_close=100.0, previous_low=97.0)
     config = _config(monthly_cash_allocation_usd=0.0)
     _run(data, config)
+
+
+def test_1530_with_finance_down_yields_no_auto_buy_and_a_manual_review_list(tmp_path, monkeypatch):
+    """Group C (missing_connector / provider_error): with no fallback source, a Finance outage at the 1530ET final
+    buy must NOT abort silently and must NOT auto-buy -- a would-be BUY surfaces as MANUAL_REVIEW so the operator
+    sees it (claude/triage-routine/GROUP-C-DECISION-2026-10-17.md)."""
+    config = _config(tickers=("TEST",))
+    data = _market_data(
+        "TEST", early_price=100.0, late_price=96.0, previous_close=100.0, previous_low=97.0, sources=("robinhood",)
+    )
+    data["source_errors"] = ["finance"]
+    market_data_path = tmp_path / "market_data.json"
+    market_data_path.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setattr(gbc, "load_strategy_config", lambda *_args, **_kwargs: config)
+
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        exit_code = gbc.main(
+            [
+                "--slot", SLOT,
+                "--trading-day", DAY.isoformat(),
+                "--market-data", str(market_data_path),
+                "--deployed-last-7d-usd", "0",
+            ]
+        )
+    assert exit_code == 0
+    document = json.loads(stdout.getvalue())
+    assert document["buy_count"] == 0
+    assert document["manual_review_count"] == 1
+    assert document["provider_error_count"] == 1
+    assert _only(document["candidates"])["action"] == Action.MANUAL_REVIEW.value

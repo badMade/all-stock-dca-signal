@@ -75,8 +75,10 @@ failed or incomplete primary aborts with nothing placed
 `test_cli_rejects_yahoo_finance_fallback_source` verifies rejection, not fallback availability).
 The slot overrides make 0935ET, 1030ET, 1130ET, 1230ET, 1330ET and 1430ET Robinhood-primary,
 which removes the Finance-connector dependency for those six. The 1530ET final-buy generator
-(`scripts/generate_buy_candidates.py`) has its own contract: also no fallback, aborts without its
-primary. So a missing Finance connector can still end a 1530ET run with nothing bought.
+(`scripts/generate_buy_candidates.py`) has its own contract: also no fallback, but it does NOT abort
+(corrected 2026-10-17): with Finance down it reconciles off Robinhood alone and a would-be BUY becomes
+MANUAL_REVIEW, so a missing Finance connector ends the 1530ET auto-buy with an operator-visible review
+list (`test_1530_with_finance_down_yields_no_auto_buy_and_a_manual_review_list`).
 Suggested disposition: Monitoring.
 
 ## Rows closed on 2026-10-12 on the strength of a yfinance fallback

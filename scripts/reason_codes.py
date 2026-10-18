@@ -73,6 +73,13 @@ ACCOUNT_UNPINNED = "ACCOUNT_UNPINNED"
 #: for the window (the incomplete-history lockout).
 INCOMPLETE_HISTORY_LOCKOUT = "INCOMPLETE_HISTORY_LOCKOUT"
 
+#: ``place_equity_order`` was refused by the session's permission layer before
+#: the broker saw it (2026-09-04 "Blocked by classifier"; Group C rows
+#: ``session_refusal`` / ``real_world_transactions_denied``). Deliberately NOT a
+#: FAIL_CLOSED safety block: nothing in this repo blocked it, and it consumes
+#: no placement attempt. It stops the batch; it is never retried or bypassed.
+PLATFORM_REFUSAL = "PLATFORM_REFUSAL"
+
 # --- Terminal / status outcomes ----------------------------------------------
 
 SUBMITTED = "SUBMITTED"
@@ -98,6 +105,7 @@ ALL_REASONS: FrozenSet[str] = frozenset(
         SAFETY_CAP,
         ACCOUNT_UNPINNED,
         INCOMPLETE_HISTORY_LOCKOUT,
+        PLATFORM_REFUSAL,
         SUBMITTED,
         SKIPPED,
         BLOCKED,
@@ -122,6 +130,7 @@ NO_BUY_REASONS: FrozenSet[str] = frozenset(
         SAFETY_CAP,
         ACCOUNT_UNPINNED,
         INCOMPLETE_HISTORY_LOCKOUT,
+        PLATFORM_REFUSAL,
         SKIPPED,
         BLOCKED,
         NO_CANDIDATES,

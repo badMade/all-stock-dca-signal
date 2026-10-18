@@ -637,3 +637,71 @@ def test_the_cli_accepts_a_git_sha_equal_to_the_pinned_release(tmp_path, monkeyp
     monkeypatch.setenv("DCA_PINNED_SHA", CODE_VERSION["git_sha"])
 
     assert fre.main(cli_args(tmp_path, json.dumps(CODE_VERSION))) == 0
+
+
+# --- Group C: a platform refusal is its own recorded outcome (session_refusal,
+# real_world_transactions_denied; claude/triage-routine/GROUP-C-DECISION-2026-10-17.md).
+
+
+def test_platform_refusal_reason_code_is_a_registered_no_buy_reason():
+    from scripts import reason_codes
+
+    assert reason_codes.PLATFORM_REFUSAL == "PLATFORM_REFUSAL"
+    assert reason_codes.PLATFORM_REFUSAL in reason_codes.ALL_REASONS
+    assert reason_codes.PLATFORM_REFUSAL in reason_codes.NO_BUY_REASONS
+    # Not a safety/gate failure: nothing in this repo blocked it.
+    assert reason_codes.PLATFORM_REFUSAL not in reason_codes.FAIL_CLOSED_REASONS
+
+
+def test_platform_refusal_finalizes_as_not_submitted_error_with_distinct_reason_and_alert(tmp_path):
+    result = run(
+        tmp_path,
+        "1530",
+        outcome="PLATFORM_REFUSAL",
+        status="not_submitted_error",
+        error_class=fre.PLATFORM_REFUSAL_ERROR_CLASS,
+        error_detail="place_equity_order refused before the broker saw it",
+    )
+    assert result["run_state_written"] is True
+    state = json.loads(next(tmp_path.rglob("run_state.json")).read_text(encoding="utf-8"))
+    assert state["order_submit_status"] == "not_submitted_error"
+    assert state["orders_submitted_count"] == 0
+    assert state["reason_code"] == "PLATFORM_REFUSAL"
+    assert state["alert_required"] is True
+    # A generic error must NOT carry the refusal marker.
+    other = run(
+        tmp_path, "1430", status="not_submitted_error", error_class="market_data_unavailable", error_detail="x"
+    )
+    assert other["run_state_written"] is True
+    other_state = json.loads((tmp_path / "intraday_dca/20260922_1430ET/run_state.json").read_text(encoding="utf-8"))
+    assert "reason_code" not in other_state
+
+
+def test_platform_refusal_cannot_claim_a_quiet_status(tmp_path):
+    with pytest.raises(fre.FinalizeRefused, match="platform refusal"):
+        run(
+            tmp_path,
+            "1530",
+            outcome="END_SILENTLY",
+            status="no_orders_submitted",
+            error_class=fre.PLATFORM_REFUSAL_ERROR_CLASS,
+            error_detail="refused",
+        )
+    assert not any(tmp_path.iterdir())
+
+
+def test_platform_refusal_after_earlier_fills_stays_submitted_and_keeps_the_marker(tmp_path):
+    result = run(
+        tmp_path,
+        "1530",
+        outcome="PLATFORM_REFUSAL",
+        status="submitted",
+        orders=[ORDER],
+        error_class=fre.PLATFORM_REFUSAL_ERROR_CLASS,
+        error_detail="second order refused",
+    )
+    state = json.loads(next(tmp_path.rglob("run_state.json")).read_text(encoding="utf-8"))
+    assert result["run_state_written"] is True
+    assert state["order_submit_status"] == "submitted"
+    assert state["reason_code"] == "PLATFORM_REFUSAL"
+    assert state["alert_required"] is True
