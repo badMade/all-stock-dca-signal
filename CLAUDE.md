@@ -228,6 +228,7 @@ scheduled-vs-manual decisions through `scripts/run_classification.py`. See
 | --- | --- |
 | `AGENTS.md` | The repo-wide agent operating contract (secrets policy, PR expectations) |
 | `docs/repo_map.md` | **Read this before opening a core module.** Structural map of every runner, report producer, and prediction tool: slot-to-entry-point ownership, which reporting modules have a CLI and which are library-only, and which tools can reach live sizing. Complements `scripts/agent_entry_points.py` (that one is task-oriented: "what command do I run") |
+| `docs/module_graph.md` | **Generated, never hand-edit.** Live import graph (importers, import counts, line counts, modules nothing imports). `python -m scripts.generate_module_graph --impact <module>` lists everything that depends on a module before you change it. Refreshed by `.github/workflows/refresh-generated-docs.yml` on every push to `main` |
 | `docs/codebase_roadmap.md` | Verified end-to-end flow and layer map built from the import graph; lists where older docs overstate (e.g. "zero in-repo callers") |
 | `docs/dead_code_report.md` | Tiered dead/obsolete code candidates with evidence; nothing deleted |
 | `docs/README.md` | Doc index + quick-reference facts (universe, ladder, budgets, test window) |

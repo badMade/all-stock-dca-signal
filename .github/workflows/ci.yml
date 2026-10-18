@@ -1,8 +1,16 @@
 name: CI
 
 on:
+  # Push CI runs on main only. `claude/**` branches used to trigger here too, so a
+  # branch with an open PR ran the whole suite twice (push + pull_request) -- the
+  # pull_request run below already covers every branch that targets main. Doc-only
+  # pushes to main skip CI. paths-ignore is deliberately NOT applied to
+  # pull_request: a skipped workflow leaves any required status check pending.
   push:
-    branches: ["main", "claude/**"]
+    branches: ["main"]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   pull_request:
     branches: ["main"]
 
@@ -17,6 +25,53 @@ permissions:
   contents: read
 
 jobs:
+  # Decides which sibling-project jobs a PR needs. Each sibling is an isolated
+  # tree with its own deps, so a change elsewhere cannot break it. Pushes to main
+  # always run everything (that run is the record of what landed, and self-heal
+  # reacts to it), as does any change to the shared dev pins or this workflow.
+  changes:
+    name: Detect changed projects
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      production-safe-agent-loop: ${{ steps.diff.outputs.production-safe-agent-loop }}
+      ticker-advisor: ${{ steps.diff.outputs.ticker-advisor }}
+      ml-forecaster: ${{ steps.diff.outputs.ml-forecaster }}
+      wondrous-octopus: ${{ steps.diff.outputs.wondrous-octopus }}
+      ticker-market-breadth: ${{ steps.diff.outputs.ticker-market-breadth }}
+      llm-providers: ${{ steps.diff.outputs.llm-providers }}
+      yfinance-prefetch: ${{ steps.diff.outputs.yfinance-prefetch }}
+    steps:
+      - id: diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          projects="production-safe-agent-loop ticker-advisor ml-forecaster wondrous-octopus ticker-market-breadth llm-providers yfinance-prefetch"
+          all=false
+          files=""
+          if [ "$EVENT" != "pull_request" ]; then
+            all=true
+          else
+            files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
+            # Shared inputs every sibling job installs from.
+            if echo "$files" | grep -Eq '^(requirements-dev\.txt|\.github/workflows/ci\.yml)$'; then
+              all=true
+            fi
+          fi
+          for p in $projects; do
+            if [ "$all" = true ] || echo "$files" | grep -q "^$p/"; then
+              echo "$p=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "$p=false" >> "$GITHUB_OUTPUT"
+            fi
+          done
+
   test:
     name: Lint & test (core DCA)
     runs-on: ubuntu-26.04
@@ -28,7 +83,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        # PRs run 3.12 only; main (the post-merge record, and what self-heal
+        # reacts to) keeps both interpreters. Halves PR minutes.
+        python-version: ${{ fromJSON(github.event_name == 'pull_request' && '["3.12"]' || '["3.11", "3.12"]') }}
     steps:
       # NOTE: actions are pinned by tag, not commit SHA. Tags are mutable, so
       # SHA pinning is the stronger posture; the dependabot config in this
@@ -151,6 +208,8 @@ jobs:
 
   production-safe-agent-loop:
     name: Lint & test (production-safe-agent-loop)
+    needs: changes
+    if: needs.changes.outputs.production-safe-agent-loop == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
@@ -185,6 +244,8 @@ jobs:
 
   ticker-advisor:
     name: Lint & test (ticker-advisor)
+    needs: changes
+    if: needs.changes.outputs.ticker-advisor == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
@@ -227,6 +288,8 @@ jobs:
 
   ml-forecaster:
     name: Lint & test (ml-forecaster)
+    needs: changes
+    if: needs.changes.outputs.ml-forecaster == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
@@ -269,6 +332,8 @@ jobs:
 
   wondrous-octopus:
     name: Lint & test (wondrous-octopus)
+    needs: changes
+    if: needs.changes.outputs.wondrous-octopus == 'true'
     runs-on: ubuntu-26.04
     # 20 (not the sibling-standard 10): the CPU torch wheel adds ~200 MB of
     # download plus the transformer tests' training time.
@@ -319,6 +384,8 @@ jobs:
 
   ticker-market-breadth:
     name: Lint & test (ticker-market-breadth)
+    needs: changes
+    if: needs.changes.outputs.ticker-market-breadth == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
@@ -348,6 +415,8 @@ jobs:
 
   llm-providers:
     name: Lint & test (llm-providers)
+    needs: changes
+    if: needs.changes.outputs.llm-providers == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
@@ -377,6 +446,8 @@ jobs:
 
   yfinance-prefetch:
     name: Lint & test (yfinance-prefetch)
+    needs: changes
+    if: needs.changes.outputs.yfinance-prefetch == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:

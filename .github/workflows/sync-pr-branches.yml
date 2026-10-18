@@ -1,0 +1,41 @@
+name: Sync Labelled PR Branches
+
+# When main moves, merge it into every open same-repo PR labelled `auto-sync`, so those branches are always
+# tested against the current program. Opt-in per PR (add the label) so it never touches a branch you did
+# not ask it to.
+#
+# Known GitHub limitation: a merge pushed with GITHUB_TOKEN does NOT trigger new CI runs on the updated
+# branch. The branch is current, but its checks are the previous run's until you push or re-run them.
+#
+# TRUST BOUNDARY -- no `workflow_dispatch`; `push` to main only, same-repo PRs only (never fork PRs).
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: sync-pr-branches
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Update labelled PR branches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh pr list --state open --label auto-sync \
+            --json number,isCrossRepository,mergeStateStatus \
+            --jq '.[] | select(.isCrossRepository == false and .mergeStateStatus != "DIRTY") | .number' |
+          while read -r PR; do
+            echo "Updating PR #$PR with main"
+            gh pr update-branch "$PR" || echo "PR #$PR could not be updated (conflict or permissions); skipping."
+          done
