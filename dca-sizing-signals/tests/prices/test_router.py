@@ -12,6 +12,7 @@ import logging
 from datetime import date
 
 import pytest
+
 from market_data_ingest.prices.errors import (
     IncompleteBatchError,
     ProviderError,

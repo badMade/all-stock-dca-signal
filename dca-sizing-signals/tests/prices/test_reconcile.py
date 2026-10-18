@@ -16,6 +16,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
+
 from market_data_ingest.prices import reconcile
 from market_data_ingest.prices.errors import SpliceNotValidatedError
 from market_data_ingest.prices.legacy_yahoo import import_csv

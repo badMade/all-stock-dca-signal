@@ -15,6 +15,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
+
 from market_data_ingest.prices.daily_job import main, resolve_db_path, run_daily_job
 from market_data_ingest.prices.errors import ProviderError, RouterExhaustedError
 from market_data_ingest.prices.models import CorporateAction, DailyBar

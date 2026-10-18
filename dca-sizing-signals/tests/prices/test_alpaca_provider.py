@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
+
 from market_data_ingest.prices.alpaca import AlpacaCalendar, AlpacaProvider
 from market_data_ingest.prices.errors import IncompleteBatchError, ProviderError
 from market_data_ingest.prices.models import Quote

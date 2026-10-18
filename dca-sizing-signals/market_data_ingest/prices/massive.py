@@ -25,6 +25,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from .errors import IncompleteBatchError, ProviderError
@@ -229,11 +230,19 @@ class MassiveProvider:
                 raise ProviderError("massive 'results' is not a list of objects", code="malformed")
             rows.extend(page)
             raw_next = body.get("next_url")
-            if raw_next is not None and not (isinstance(raw_next, str) and raw_next.startswith(self._base_url)):
-                raise ProviderError("massive next_url points somewhere unexpected", code="malformed")
+            if raw_next is not None and not self._same_origin(raw_next):
+                # The bearer key rides on every request, so a next_url on any other origin
+                # (including a lookalike such as api.massive.com.attacker.example) is refused.
+                raise ProviderError("massive next_url points to another host", code="malformed")
             # next_url already carries the cursor and the original filters; the key stays in the header.
             next_url, next_params = raw_next, None
         raise ProviderError(f"massive pagination exceeded {MAX_PAGES} pages", code="pagination_limit")
+
+    def _same_origin(self, url: object) -> bool:
+        if not isinstance(url, str):
+            return False
+        want, got = urlsplit(self._base_url), urlsplit(url)
+        return (got.scheme, got.netloc) == (want.scheme, want.netloc) and got.username is None
 
     @staticmethod
     def _parse_split(row: Mapping[str, Any]) -> CorporateAction:

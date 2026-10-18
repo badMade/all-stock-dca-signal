@@ -115,7 +115,10 @@ def test_every_symbol_has_a_yahoo_diff_or_an_explicit_reason_it_has_none(report)
         assert diff is not None or sym in report.no_yahoo_reason, sym
         if diff is not None:
             assert diff.close_status in {"pass", "flag", "block", "insufficient"}
-            assert diff.adj_close_worst_diff_pct is not None
+            # An "insufficient" window (under 60 overlapping sessions, e.g. a Yahoo file a
+            # couple of sessions stale) has no per-session diffs to report, by definition.
+            if diff.close_status != "insufficient":
+                assert diff.adj_close_worst_diff_pct is not None
 
 
 def test_report_and_redacted_recordings_were_written(report):

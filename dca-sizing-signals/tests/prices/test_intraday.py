@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
+
 from market_data_ingest.prices import intraday
 from market_data_ingest.prices.errors import StaleDataError
 from market_data_ingest.prices.models import Quote

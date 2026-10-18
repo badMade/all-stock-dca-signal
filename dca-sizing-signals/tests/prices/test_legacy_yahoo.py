@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
+
 from market_data_ingest.prices.errors import ValidationError
 from market_data_ingest.prices.legacy_yahoo import import_csv, import_dir
 

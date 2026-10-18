@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
+
 from market_data_ingest.prices.errors import IncompleteBatchError, ProviderError
 from market_data_ingest.prices.massive import MassiveProvider
 from market_data_ingest.prices.models import CorporateAction, DailyBar
@@ -248,6 +249,26 @@ def test_pagination_keeps_the_key_out_of_next_url(clock):
     assert page2, "next_url was followed"
     assert all(TEST_MASSIVE_KEY not in c.url and "apiKey" not in c.params for c in session.calls)
     assert all(c.headers.get("Authorization") == f"Bearer {TEST_MASSIVE_KEY}" for c in session.calls)
+
+
+@pytest.mark.parametrize(
+    "next_url",
+    [
+        "https://api.massive.com.attacker.example/stocks/v1/splits?cursor=X",
+        "https://attacker.example/stocks/v1/splits?cursor=X",
+        "http://api.massive.com/stocks/v1/splits?cursor=X",
+        "https://user@api.massive.com/stocks/v1/splits?cursor=X",
+    ],
+    ids=["lookalike-host", "other-host", "plain-http", "userinfo"],
+)
+def test_next_url_on_another_origin_is_refused_before_the_key_is_sent(clock, next_url):
+    # Regression (Codex review 2026-10-18): a prefix check let a lookalike host receive the key.
+    page = dict(load_fixture("massive_splits_page1.json"), next_url=next_url)
+    provider, session = make([FakeResponse.json_body(page)], clock=clock)
+
+    with pytest.raises(ProviderError):
+        provider.corporate_actions(since=date(2024, 5, 12))
+    assert len(session.calls) == 1, "the foreign next_url is never requested"
 
 
 def test_free_tier_rate_limit_spaces_calls_at_least_12_seconds(clock):

@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
+
 from market_data_ingest.prices.errors import ProviderError
 from market_data_ingest.prices.models import CorporateAction
 from market_data_ingest.prices.poc import discover_roles

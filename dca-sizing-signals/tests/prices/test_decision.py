@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
+
 from market_data_ingest.prices.decision import price_for_suggestion
 from market_data_ingest.prices.errors import ProviderError
 from market_data_ingest.prices.models import NoSuggestion, PriceOK, Quote

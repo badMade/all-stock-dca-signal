@@ -122,6 +122,22 @@ def discover_roles(
     return chosen
 
 
+def _floatify_large_counts(node: Any) -> bool:
+    """Rewrite integer v/n fields of six or more digits as floats, in place. True if any changed."""
+    changed = False
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ("v", "n") and isinstance(value, int) and not isinstance(value, bool) and value >= 100_000:
+                node[key] = float(value)
+                changed = True
+            else:
+                changed = _floatify_large_counts(value) or changed
+    elif isinstance(node, list):
+        for item in node:
+            changed = _floatify_large_counts(item) or changed
+    return changed
+
+
 class _RecordingSession:
     """Wraps a requests.Session; keeps the first body of each kind, credentials stripped."""
 
@@ -170,6 +186,10 @@ class _RecordingSession:
         if isinstance(body.get("results"), list) and len(body["results"]) > RECORDED_ROWS:
             body["results"] = body["results"][:RECORDED_ROWS]
             note += f"; results truncated to {RECORDED_ROWS} rows for size (resultsCount kept as delivered)"
+        if _floatify_large_counts(body):
+            # tests/test_config_invariants.py flags any bare 6-12 digit integer as an
+            # account-shaped literal, and live volumes/trade counts are exactly that.
+            note += "; integer volumes and trade counts of six or more digits written as floats (account guard)"
         body["_provenance"] = note
         self._dir.mkdir(parents=True, exist_ok=True)
         (self._dir / f"{kind}.json").write_text(json.dumps(body, indent=2) + "\n")

@@ -35,16 +35,28 @@ def test_every_fixture_declares_its_provenance(path):
     assert isinstance(body, dict) and body.get("_provenance"), f"{path.name} has no _provenance"
 
 
-def _row_keys(body: dict) -> set[str]:
+# Pagination cursors appear only when another page exists, so a single-page live response
+# legitimately lacks them (the 2026-10-18 PoC's splits response had no next_url).
+OPTIONAL_TOP_LEVEL = frozenset({"_provenance", "next_url", "next_page_token"})
+
+
+def _rows(body: dict) -> list[dict]:
     for key in ("results", "trades", "bars"):
         value = body.get(key)
-        if isinstance(value, list) and value:
-            return set(value[0])
-        if isinstance(value, dict) and value:
-            first = next(iter(value.values()))
-            first = first[0] if isinstance(first, list) and first else first
-            return set(first) if isinstance(first, dict) else set()
-    return set()
+        if isinstance(value, list):
+            return [r for r in value if isinstance(r, dict)]
+        if isinstance(value, dict):
+            rows: list[dict] = []
+            for item in value.values():
+                rows.extend(r for r in (item if isinstance(item, list) else [item]) if isinstance(r, dict))
+            return rows
+    return []
+
+
+def _row_keys(body: dict) -> set[str]:
+    """Union of keys over every row: some fields (Massive's historical_adjustment_factor on
+    splits) are present on only some live rows, so the first row alone under-reports."""
+    return set().union(*(set(r) for r in _rows(body))) if _rows(body) else set()
 
 
 @pytest.mark.parametrize(("synthetic", "pattern"), sorted(COUNTERPARTS.items()))
@@ -54,5 +66,5 @@ def test_synthetic_fixture_keys_are_a_subset_of_the_live_recording(synthetic, pa
         pytest.skip(f"no live recording for {synthetic} yet (run the opt-in PoC)")
     fake = json.loads((FIXTURES / synthetic).read_text())
     real = json.loads(matches[0].read_text())
-    assert set(fake) - {"_provenance"} <= set(real) | {"_provenance"}
+    assert set(fake) - OPTIONAL_TOP_LEVEL <= set(real)
     assert _row_keys(fake) <= _row_keys(real)

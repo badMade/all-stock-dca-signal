@@ -12,6 +12,7 @@ from datetime import date
 
 import pytest
 import requests
+
 from market_data_ingest.prices.alpaca import AlpacaProvider
 from market_data_ingest.prices.errors import IncompleteBatchError, ProviderError
 from market_data_ingest.prices.massive import MassiveProvider

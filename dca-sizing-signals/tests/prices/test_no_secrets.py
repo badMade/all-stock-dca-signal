@@ -10,6 +10,7 @@ import logging
 from datetime import date
 
 import pytest
+
 from market_data_ingest.prices.alpaca import AlpacaProvider
 from market_data_ingest.prices.daily_job import run_daily_job
 from market_data_ingest.prices.errors import ProviderError
