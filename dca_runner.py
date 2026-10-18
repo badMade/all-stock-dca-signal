@@ -46,7 +46,7 @@ import os
 import re
 import sys
 import time as time_module
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timezone
 from pathlib import Path
@@ -4397,6 +4397,10 @@ class ExecutionResult:
     # result (2026-09-07 diagnostic, C:F13). None when validation passed or
     # when the live-path arguments were not supplied at all.
     validation_failure: str | None = None
+    # Tickers skipped because a fresh per-order history re-pull showed another writer (a second engine, a
+    # manual order) had already ordered them in this slot's window -- the simultaneous-start guard (DCA Issues
+    # keys duplicate_fills / competing_executor). Skipped is not a failure: the ticker IS bought, by the other.
+    skipped_already_ordered: list[str] = field(default_factory=list)
 
 
 # Broker response states that mean "no live order actually exists". Sourced
@@ -5910,10 +5914,75 @@ def _validate_execute_plan(
     return slot, bought_today
 
 
+#: Flip to True only after the operator's acceptance run (docs/adr-simultaneous-start-guard.md): a live
+#: batch with no ``refetch_orders_fn`` is then refused outright instead of running on its stale snapshot.
+REQUIRE_SIMULTANEOUS_START_GUARD = False
+
+_REPULL_UNPROVABLE = "so a concurrent order cannot be ruled out"
+
+
+def _repull_window_conflict(refetch_orders_fn, ticker, slot, trading_day):
+    """``(conflict, failure)`` for one ticker from a fresh history pull. ``failure`` set means unprovable."""
+    try:
+        fresh = refetch_orders_fn()
+        if not isinstance(fresh, (list, tuple)) or not all(isinstance(o, BrokerOrder) for o in fresh):
+            return False, f"halted: the pre-order order-history re-pull returned no usable list of orders, {_REPULL_UNPROVABLE}"
+        # Rows outside this slot's window never block: cross-slot top-ups are the same-day sizing gate's job.
+        in_window = gate_sole_executor(fresh, slot, trading_day)
+        return any(_normalize_ticker(o.symbol) == ticker and o.counts_toward_budget for o in in_window), None
+    except Exception as exc:  # noqa: BLE001 - injected callable; only the class name is persisted (secrets policy)
+        return False, f"halted: the pre-order order-history re-pull failed ({type(exc).__name__}), {_REPULL_UNPROVABLE}"
+
+
 def execute_plan(
     plan: Plan,
     broker: _RunnerBroker,
     *,
+    refetch_orders_fn: Callable[[], Any] | None = None,
+    slot_claim_root: str | Path | None = None,
+    slot_claim_holder: str | None = None,
+    **kwargs: Any,
+) -> ExecutionResult:
+    """Submit the plan (see :func:`_execute_plan_impl`) behind the simultaneous-start guard.
+
+    ``refetch_orders_fn`` (layer B) returns the account's fresh ``BrokerOrder`` history and is called before
+    every order. ``slot_claim_root`` (layer A) names the directory for the per-(day, slot) claim; when given,
+    the claim is taken before the first order and released afterwards, and a claim that is held or cannot be
+    proven places nothing. Both are opt-in until ``REQUIRE_SIMULTANEOUS_START_GUARD`` is flipped.
+    """
+    import dca_slot_guard
+
+    placement_enabled = broker.enable_live_orders is True and broker.dry_run is False
+    if placement_enabled and REQUIRE_SIMULTANEOUS_START_GUARD and refetch_orders_fn is None:
+        refused = ExecutionResult(placement_enabled=True)
+        refused.validation_failure = (
+            "execute_plan refuses to place: the simultaneous-start guard requires refetch_orders_fn so each "
+            "order is checked against a fresh order-history pull"
+        )
+        return refused
+    trading_day = kwargs.get("trading_day")
+    slot_id = kwargs.get("slot_id")
+    claim = nullcontext()
+    if placement_enabled and slot_claim_root is not None and trading_day is not None and slot_id is not None:
+        claim = dca_slot_guard.slot_claim(
+            slot_claim_root, trading_day.isoformat(), str(slot_id), holder=slot_claim_holder
+        )
+    try:
+        with claim:
+            return _execute_plan_impl(plan, broker, refetch_orders_fn=refetch_orders_fn, **kwargs)
+    except dca_slot_guard.SlotClaimUnavailable as exc:
+        blocked = ExecutionResult(placement_enabled=True)
+        if plan.to_place:
+            blocked.halted_on = _normalize_ticker(plan.to_place[0].ticker)
+        blocked.failure_reason = f"halted: slot claim not obtained, nothing placed -- {exc}"
+        return blocked
+
+
+def _execute_plan_impl(
+    plan: Plan,
+    broker: _RunnerBroker,
+    *,
+    refetch_orders_fn: Callable[[], Any] | None = None,
     run_id: str | None = None,
     snapshot: BudgetSnapshot | None = None,
     tier: BudgetTier | None = None,
@@ -6306,6 +6375,19 @@ def execute_plan(
             result.failure_reason = clock_failure
             break
         assert placement_now is not None
+        if refetch_orders_fn is not None:
+            # Simultaneous-start guard (layer B): the snapshot this batch was planned from can predate an order
+            # a second engine places while this batch runs, and its age check does not see that. Re-pull the
+            # history right before EACH order; a ticker another writer already ordered in this slot's window is
+            # skipped, and a pull that cannot be proven halts the remainder (fail closed).
+            conflict, repull_failure = _repull_window_conflict(refetch_orders_fn, ticker, slot, trading_day)
+            if repull_failure is not None:
+                result.halted_on = ticker
+                result.failure_reason = repull_failure
+                break
+            if conflict:
+                result.skipped_already_ordered.append(ticker)
+                continue
         # Derived from slot_id/trading_day, NOT the caller-supplied run_id:
         # two overlapping invocations of the SAME slot can each pass a
         # different run_id prefix that both merely CONTAIN today's date (the

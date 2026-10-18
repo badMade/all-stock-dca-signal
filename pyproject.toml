@@ -118,6 +118,8 @@ py-modules = [
     # installed wheel (Codex review: "Ship the new runner in the installed
     # package").
     "dca_runner",
+    # Simultaneous-start placement claim (imported by dca_runner.execute_plan).
+    "dca_slot_guard",
     # The market-open (9:35) and intraday (11:30/1:30/2:30) live-execution
     # stream executors, plus the cumulative sub-dollar credit ledger they
     # (and near_close_dca's final-session top-up guard) depend on. Omitting
