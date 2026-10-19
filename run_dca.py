@@ -633,9 +633,11 @@ def _resolve_cross_stream_prior_allocation_roots(
 def _parse_raw_json(path):
     import json
 
+    from dca_runner import _reject_duplicate_keys
+
     try:
-        return path.name, json.loads(path.read_bytes()), None
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        return path.name, json.loads(path.read_bytes(), object_pairs_hook=_reject_duplicate_keys), None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
         return path.name, None, e
 
 

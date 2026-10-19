@@ -8572,3 +8572,15 @@ def test_run_slot_stops_at_the_shared_daily_order_count_cap(tmp_path):
     assert capped_state["counts"]["submitted"] == 0
     assert capped_state["completion_reason"] == "blocked_before_spread_gate"
 
+
+def test_parse_raw_json_rejects_duplicate_keys(tmp_path):
+    from run_dca import _parse_raw_json
+
+    raw_file = tmp_path / "raw.json"
+    raw_file.write_text('{"a": 1, "a": 2}', encoding="utf-8")
+    name, payload, error = _parse_raw_json(raw_file)
+
+    assert payload is None
+    assert error is not None
+    assert isinstance(error, ValueError)
+    assert "duplicate key" in str(error).lower()
