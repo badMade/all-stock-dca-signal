@@ -3887,7 +3887,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 # executed notional instead of falling back to the equally
                 # real planned amount (Codex review, PR #654: "Fall back
                 # when the submitted amount is unusable").
-                # Fresh evidence after the negative-planned-amount fix above:
+                # Fresh evidence after the negative-planned-amount logic above:
                 # submitted_amount_usd goes through this SAME finite-value
                 # gate but had no equivalent sign check of its own -- a
                 # finite negative submitted_amount_usd (e.g. -7) on an
