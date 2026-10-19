@@ -161,7 +161,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `market_open_dca` | 294 | 3 | 5 | 10 | `dca_paths`, `morning_dca`, `near_close_dca` |
 | `midday_dca` | 525 | 4 | 4 | 9 | `dca_config`, `dca_paths`, `morning_dca`, `near_close_dca` |
 | `morning_dca` | 10089 | 16 | 8 | 51 | `dca_alerts`, `dca_common`, `dca_config`, `dca_cumulative`, `dca_fileio`, `dca_intraday_archive`, `dca_paths`, `dca_risk`, +8 more |
-| `near_close_dca` | 41674 | 17 | 32 | 26 | `dca_common`, `dca_cumulative`, `dca_fileio`, `dca_intraday_archive`, `dca_inverse_martingale`, `dca_ladder_core`, `dca_live_adapters`, `dca_paths`, +9 more |
+| `near_close_dca` | 41709 | 17 | 32 | 26 | `dca_common`, `dca_cumulative`, `dca_fileio`, `dca_intraday_archive`, `dca_inverse_martingale`, `dca_ladder_core`, `dca_live_adapters`, `dca_paths`, +9 more |
 | `patch_finbert_cache` | 21 | 0 | 0 | 0 |  |
 | `patch_template` | 21 | 0 | 0 | 0 |  |
 | `run_benchmark` | 56 | 0 | 0 | 0 |  |
@@ -208,7 +208,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.generate_midday_candidates` | 152 | 3 | 2 | 15 | `midday_dca`, `near_close_dca`, `scripts.stream_candidates` |
 | `scripts.generate_module_graph` | 251 | 0 | 0 | 3 |  |
 | `scripts.generate_morning_candidates` | 172 | 3 | 2 | 7 | `morning_dca`, `near_close_dca`, `scripts.stream_candidates` |
-| `scripts.generate_per_ticker_sizing` | 349 | 2 | 1 | 12 | `dca_fileio`, `dca_ticker_paths` |
+| `scripts.generate_per_ticker_sizing` | 349 | 2 | 1 | 14 | `dca_fileio`, `dca_ticker_paths` |
 | `scripts.generate_perplexity_backup_prompts` | 134 | 2 | 0 | 8 | `scripts.backup_procedure`, `scripts.build_backup_planner` |
 | `scripts.github_mcp_login` | 87 | 0 | 0 | 0 |  |
 | `scripts.healthcheck` | 78 | 0 | 0 | 5 |  |
