@@ -198,3 +198,5 @@ section.page{display:block}section.page[hidden]{display:none!important}.page-pla
 
 
 
+
+.console-version{font-size:10px;letter-spacing:.06em;color:#9caf9f;margin-bottom:8px;font-variant-numeric:tabular-nums}.channel-badge{display:inline-block;margin:0 14px 0 0!important;padding:3px 8px;border-radius:4px;background:#b3261e;color:#fff!important;font-size:10px;font-weight:700;letter-spacing:.14em}.channel-badge[hidden]{display:none}

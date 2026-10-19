@@ -18,6 +18,7 @@ from typing import Any
 
 from dca_console_jobs import is_sensitive_variable
 from dca_console_reader import BoundedReader, root_label, roots_from_settings
+from dca_console_release import CONSOLE_VERSION
 
 
 @dataclass(frozen=True)
@@ -185,6 +186,9 @@ def build_env_snapshot(app, repo: Path, *, port: int | None = None) -> dict:
     """Compose the Environment page from the console's own state and cheap probes."""
     settings = app.settings
     warnings: list[str] = []
+    # Opening/refreshing the Environment page re-runs the package probes.
+    if hasattr(app, "reprobe_packages"):
+        app.reprobe_packages()
     packages = dict(app.packages)
     dev_packages = dict(app.dev_packages)
     for label, probe in (("research", packages), ("console", dev_packages)):
@@ -193,6 +197,8 @@ def build_env_snapshot(app, repo: Path, *, port: int | None = None) -> dict:
     return {
         "session": {
             "mode": settings.mode,
+            "channel": getattr(settings, "channel", "stable"),
+            "version": CONSOLE_VERSION,
             "day": settings.day.isoformat() if settings.day else None,
             "day_rule": "pinned" if settings.day else "rolls daily (unpinned local mode)",
             "python": _display_interpreter(settings.python),

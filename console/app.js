@@ -718,8 +718,13 @@ function route() {
 function renderSnapshot(snapshot) {
   state.snapshot = snapshot;
   const demo = snapshot.mode === "demo";
+  const release = snapshot.release || {};
+  const sandbox = release.channel === "sandbox";
   $("mode-banner").classList.toggle("demo", demo);
-  $("mode-marker").textContent = demo ? "DEMO MODE" : "LOCAL MODE";
+  $("mode-marker").textContent = sandbox ? "SANDBOX" : demo ? "DEMO MODE" : "LOCAL MODE";
+  $("channel-badge").hidden = !sandbox;
+  $("console-version").textContent = release.version ? `v${release.version} · ${release.channel || "stable"}` : "v—";
+  document.title = `${sandbox ? "SANDBOX · " : ""}DCA · Operations console`;
   $("mode-message").textContent = demo ? "Synthetic demo data · simulated DCA activity · research results are illustrative. No live orders are placed." : "Reading local run artifacts. Workflow launches are limited to the actions listed below.";
   renderWarnings("global-warnings", snapshot.warnings);
   renderDaily(snapshot.daily);

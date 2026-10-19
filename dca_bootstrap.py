@@ -18,6 +18,41 @@ REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_VENV_DIR = REPO_ROOT / ".venv"
 
 
+def linked_worktree_main_checkout(repo_root: Path = REPO_ROOT) -> Path | None:
+    """Return the main checkout when ``repo_root`` is a linked git worktree, else None.
+
+    A linked worktree has a ``.git`` *file* (``gitdir: <main>/.git/worktrees/<name>``).
+    Creating a ``.venv`` there strands it when the worktree is deleted, which left
+    the console probing a bare interpreter (all packages "Missing"), so callers use
+    the main checkout's ``.venv`` instead.  Reads one file; never shells out.
+    """
+    dot_git = repo_root / ".git"
+    try:
+        if not dot_git.is_file():
+            return None
+        text = dot_git.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    gitdir = Path(text[len("gitdir:"):].strip())
+    if not gitdir.is_absolute():
+        gitdir = (repo_root / gitdir).resolve()
+    # <main>/.git/worktrees/<name> -> <main>
+    if gitdir.parent.name == "worktrees" and gitdir.parent.parent.name == ".git":
+        return gitdir.parent.parent.parent
+    return None
+
+
+def resolve_venv_dir(repo_root: Path = REPO_ROOT) -> Path:
+    """The ``.venv`` this checkout should use: its own, else the main checkout's if a worktree."""
+    own = repo_root / ".venv"
+    main = linked_worktree_main_checkout(repo_root)
+    if main is not None and not get_venv_python(own).is_file():
+        return main / ".venv"
+    return own
+
+
 def get_venv_python(venv_dir: Path = DEFAULT_VENV_DIR) -> Path:
     """Return the expected python executable path within the given virtualenv."""
     return venv_dir / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -119,6 +154,7 @@ def ensure_venv(
     packages: Sequence[str] = (),
     requirements_files: Sequence[Path | str] = (),
     venv_dir: Path = DEFAULT_VENV_DIR,
+    create_if_missing: bool = True,
 ) -> None:
     """Ensure the target virtual environment exists and is running.
 
@@ -160,6 +196,12 @@ def ensure_venv(
         return
 
     # 2. Executing outside the target venv: create if missing
+    if not venv_python.is_file() and not create_if_missing:
+        raise SystemExit(
+            f"No virtualenv at {venv_dir}. Refusing to create one here (a linked worktree's .venv "
+            "disappears with the worktree); create it in the main checkout: "
+            "python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt"
+        )
     if not venv_python.is_file():
         print(f"Creating virtual environment at {venv_dir}...", flush=True)
         subprocess.run([sys.executable, "-m", "venv", str(venv_dir)], check=True)
