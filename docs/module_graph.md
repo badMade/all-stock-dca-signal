@@ -102,7 +102,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_bootstrap` | 220 | 0 | 2 | 0 |  |
 | `dca_common` | 99 | 0 | 4 | 0 |  |
 | `dca_config` | 1542 | 1 | 35 | 2 | `near_close_dca` |
-| `dca_console` | 1462 | 12 | 4 | 2 | `dca_bootstrap`, `dca_console_data`, `dca_console_jobs`, `dca_console_launch`, `dca_console_octopus`, `dca_console_reader`, `dca_console_release`, `dca_console_routes`, +4 more |
+| `dca_console` | 1481 | 12 | 4 | 2 | `dca_bootstrap`, `dca_console_data`, `dca_console_jobs`, `dca_console_launch`, `dca_console_octopus`, `dca_console_reader`, `dca_console_release`, `dca_console_routes`, +4 more |
 | `dca_console_alerts` | 650 | 12 | 1 | 0 | `dca_alerts`, `dca_config`, `dca_console_jobs`, `dca_console_reader`, `dca_console_runs`, `dca_paths`, `dca_risk`, `scripts.alert_digest`, +4 more |
 | `dca_console_config` | 675 | 5 | 1 | 0 | `dca_config`, `dca_console_jobs`, `dca_console_reader`, `dca_runner`, `near_close_dca` |
 | `dca_console_data` | 450 | 5 | 3 | 1 | `dca_cost_tracker`, `dca_risk`, `dca_runner`, `scripts.purchase_history`, `scripts.scheduled_artifacts` |
