@@ -638,7 +638,318 @@ def test_the_cli_accepts_a_git_sha_equal_to_the_pinned_release(tmp_path, monkeyp
 
     assert fre.main(cli_args(tmp_path, json.dumps(CODE_VERSION))) == 0
 
+def test_existing_state_oserror(tmp_path, monkeypatch):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    state_path = run_dir / "run_state.json"
+    state_path.touch()
 
+    original_read_bytes = Path.read_bytes
+    def fake_read_bytes(self):
+        if self.name == "run_state.json":
+            raise OSError("fake os error")
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+    with pytest.raises(fre.FinalizeRefused, match="exists but is not a JSON object"):
+        fre._finalize_locked("1330", datetime(2026, 9, 22, 13, 30, tzinfo=ET), tmp_path, run_dir, outcome="NO_ORDERS", order_submit_status="no_orders_submitted", orders=None, signals=None, report=None, budget=None, error_class=None, error_detail=None, code_version={"git_sha": "a"*40, "tag": "test", "pinned_by": "test"}, now=datetime.now())
+
+def test_signals_none_existing_not_found(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    # no signals file created
+    fre._finalize_locked("1330", datetime(2026, 9, 22, 13, 30, tzinfo=ET), tmp_path, run_dir, outcome="NO_ORDERS", order_submit_status="no_orders_submitted", orders=None, signals=None, report=None, budget=None, error_class=None, error_detail=None, code_version=None, now=datetime.now())
+    assert (run_dir / fre.SIGNALS_FILENAMES["intraday"]).exists()
+
+def test_pointer_status_invalid(tmp_path, monkeypatch):
+    run_dir = tmp_path / slot_run_dir_relative("1530", DAY)
+    run_dir.mkdir(parents=True)
+
+    def fake_update(*args, **kwargs):
+        return tmp_path / "fake_pointer"
+
+    def fake_validate(*args, **kwargs):
+        class Result:
+            status = "invalid"
+            is_valid = False
+            reasons = ["fake reason"]
+        return Result()
+
+    monkeypatch.setattr(fre, "update_latest_scheduled_run_pointer", fake_update)
+    monkeypatch.setattr(fre, "validate_pointer", fake_validate)
+
+    result = fre._finalize_locked("1530", datetime(2026, 9, 22, 15, 30, tzinfo=ET), tmp_path, run_dir, outcome="NO_ORDERS", order_submit_status="no_orders_submitted", orders=None, signals=None, report=None, budget=None, error_class=None, error_detail=None, code_version=None, now=datetime.now())
+    assert "pointer: fake reason" in result["errors"]
+
+def test_finalize_signals_not_none(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    fre._finalize_locked("1330", datetime(2026, 9, 22, 13, 30, tzinfo=ET), tmp_path, run_dir, outcome="NO_ORDERS", order_submit_status="no_orders_submitted", orders=None, signals=[{"ticker": "AAPL"}], report=None, budget=None, error_class=None, error_detail=None, code_version=None, now=datetime.now())
+    assert (run_dir / fre.SIGNALS_FILENAMES["intraday"]).exists()
+
+def test_check_existing_state_gate5_evidence_unusable_return_again(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    # create the document so it is found
+    (run_dir / "gate5_document.json").write_text(json.dumps({
+        "runner_slot_id": "1330",
+        "trading_day": "2026-09-22",
+        "evaluated_count": 10,
+        "no_data_count": 0,
+        "buy_count": 1,
+        "candidates": [{"ticker": "AAPL"}]
+    }))
+    state = {
+        "order_submit_status": "no_orders_submitted",
+        "counts": {"evaluated": 10, "no_data": 0, "buy_candidates": 1}
+    }
+    (run_dir / "run_state.json").write_text(json.dumps(state))
+    fre.check_existing_state_gate5_evidence(run_dir, "1330", DAY, state)
+
+def test_check_existing_state_gate5_evidence_unusable_return_bad_status(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    state = {
+        "order_submit_status": "submitted"
+    }
+    assert fre.check_existing_state_gate5_evidence(run_dir, "1330", DAY, state) is None
+
+def test_existing_summary_oserror_mock_read_bytes(tmp_path, monkeypatch):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    summary_path = run_dir / "run_summary.json"
+    summary_path.write_text('{}')
+
+    # We patch read_bytes on the specific Path object for run_summary.json
+    original_read_bytes = Path.read_bytes
+    def fake_read_bytes(self):
+        if self.name == "run_summary.json":
+            raise ValueError("fake os error")
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+
+    with pytest.raises(ValueError, match="fake os error"):
+        fre._finalize_locked("1330", datetime(2026, 9, 22, 13, 30, tzinfo=ET), tmp_path, run_dir, outcome="NO_ORDERS", order_submit_status="no_orders_submitted", orders=None, signals=None, report=None, budget=None, error_class=None, error_detail=None, code_version={"git_sha": "a"*40, "tag": "test", "pinned_by": "test"}, now=datetime.now())
+def test_repair_companions_missing_orders_actually(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_summary.json").write_text("{}")
+    fre._repair_companions(run_dir, {"stream": "intraday", "trading_day": "2026-09-22", "slot": "1330ET", "status": "NO_ORDERS", "broker": "robinhood"}, "intraday")
+    assert (run_dir / fre.SUBMITTED_ORDERS_CSV_FILENAME).exists()
+
+def test_existing_summary_dict_write_valueerror(tmp_path, monkeypatch):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    summary_path = run_dir / "run_summary.json"
+    summary_path.write_text('{}')
+
+    # We patch read_bytes on the specific Path object for run_summary.json
+    original_read_bytes = Path.read_bytes
+    def fake_read_bytes(self):
+        if self.name == "run_summary.json":
+            raise OSError("fake os error")
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+    fre._finalize_locked("1330", datetime(2026, 9, 22, 13, 30, tzinfo=ET), tmp_path, run_dir, outcome="NO_ORDERS", order_submit_status="no_orders_submitted", orders=None, signals=None, report=None, budget=None, error_class=None, error_detail=None, code_version={"git_sha": "a"*40, "tag": "test", "pinned_by": "test"}, now=datetime.now())
+
+
+def test_load_inline_or_file_json_wrong_type(tmp_path):
+    path = tmp_path / "array.json"
+    path.write_text('["array"]')
+    with pytest.raises(fre.FinalizeRefused, match="must be a JSON object"):
+        fre._load_inline_or_file_json(str(path), "test_inline")
+
+def test_existing_state_not_json_object(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text('["array"]')
+    with pytest.raises(fre.FinalizeRefused, match="exists but is not a JSON object"):
+        fre._finalize_locked("1330", datetime.now(), tmp_path, run_dir, outcome="NO_ORDERS", order_submit_status="no_orders_submitted", orders=None, signals=None, report=None, budget=None, error_class=None, error_detail=None, code_version=None, now=datetime.now())
+
+def test_existing_summary_not_json_object_handled(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_summary.json").write_text('["array"]')
+    fre._finalize_locked("1330", datetime(2026, 9, 22, 13, 30, tzinfo=ET), tmp_path, run_dir, outcome="NO_ORDERS", order_submit_status="no_orders_submitted", orders=None, signals=None, report=None, budget=None, error_class=None, error_detail=None, code_version={"git_sha": "a"*40, "tag": "test", "pinned_by": "test"}, now=datetime.now())
+
+def test_existing_state_conflicting_code_version_valueerror(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_state.json").write_text(json.dumps({"code_version": {"git_sha": "b"*40, "tag": "test", "pinned_by": "test"}}))
+    with pytest.raises(fre.FinalizeRefused, match="already records a different code_version"):
+         fre._finalize_locked("1330", datetime(2026, 9, 22, 13, 30, tzinfo=ET), tmp_path, run_dir, outcome="NO_ORDERS", order_submit_status="no_orders_submitted", orders=None, signals=None, report=None, budget=None, error_class=None, error_detail=None, code_version={"git_sha": "a"*40, "tag": "test", "pinned_by": "test"}, now=datetime.now())
+
+def test_validate_classification_errors(tmp_path, monkeypatch):
+    run_dir = tmp_path / slot_run_dir_relative("1530", DAY)
+    run_dir.mkdir(parents=True)
+
+    def fake_validate(*args, **kwargs):
+        class Result:
+            ok = False
+            errors = ["fake classification error"]
+        return Result()
+
+    monkeypatch.setattr(fre, "validate_classification", fake_validate)
+    monkeypatch.setattr(fre, "check_zero_order_gate5_evidence", lambda *args, **kwargs: None)
+
+    result = fre._finalize_locked("1530", datetime(2026, 9, 22, 15, 30, tzinfo=ET), tmp_path, run_dir, outcome="NO_ORDERS", order_submit_status="no_orders_submitted", orders=None, signals=None, report=None, budget=None, error_class=None, error_detail=None, code_version=None, now=datetime.now())
+    assert "run_classification: fake classification error" in result["errors"]
+
+def test_parse_started_at_invalid_utc():
+    with pytest.raises(fre.FinalizeRefused, match="is not ISO-8601"):
+        fre.parse_started_at("not-a-dateZ")
+
+def test_load_json_list_of_non_dicts(tmp_path):
+    path = tmp_path / "list.json"
+    path.write_text('["array"]')
+    with pytest.raises(fre.FinalizeRefused, match="must be a JSON array of objects"):
+        fre._load_json(str(path), list, "test_list")
+
+def test_validate_budget_invalid_daily_cap():
+    with pytest.raises(fre.FinalizeRefused, match="is not a non-negative number"):
+        fre.validate_budget({"budget_tier": "normal", "daily_cap_usd": "100", "weekly_cap_usd": 100})
+
+def test_validate_code_version_extra_keys():
+    with pytest.raises(fre.FinalizeRefused, match="has unknown key"):
+        fre.validate_code_version({"git_sha": "a"*40, "tag": "test", "pinned_by": "test", "extra": "key"})
+
+def test_existing_summary_unreadable(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    summary_path = run_dir / "run_summary.json"
+    summary_path.touch()
+    summary_path.chmod(0o000)
+    fre._finalize_locked("1330", datetime(2026, 9, 22, 13, 30, tzinfo=ET), tmp_path, run_dir, outcome="NO_ORDERS", order_submit_status="no_orders_submitted", orders=None, signals=None, report=None, budget=None, error_class=None, error_detail=None, code_version={"git_sha": "a"*40, "tag": "test", "pinned_by": "test"}, now=datetime.now())
+    summary_path.chmod(0o644)
+
+def test_extract_candidate_rows_duplicate_keys(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    cands_path = run_dir / "candidates.json"
+    cands_path.write_text('{"candidates": [], "candidates": []}')
+    docs, strays = fre.find_gate5_documents(run_dir, "1330", DAY)
+    assert not docs
+    assert "candidates.json" in strays
+
+def test_check_zero_order_gate5_evidence_unusable(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    # create the document so it is found
+    (run_dir / "gate5_document.json").write_text(json.dumps({
+        "runner_slot_id": "1330",
+        "trading_day": "2026-09-22",
+        "evaluated_count": 10,
+        "no_data_count": 10,
+        "buy_count": 0,
+        "candidates": []
+    }))
+    with pytest.raises(fre.FinalizeRefused, match="records zero candidates from zero usable"):
+        # we need to pass a run_state so the first check is passed and second is hit
+        state = {
+            "order_submit_status": "no_orders_submitted",
+            "counts": {"evaluated": 10, "no_data": 10, "buy_candidates": 0}
+        }
+        (run_dir / "run_state.json").write_text(json.dumps(state))
+        fre.check_existing_state_gate5_evidence(run_dir, "1330", DAY, state)
+
+def test_check_zero_order_gate5_evidence_buy_candidates(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    # create the document so it is found
+    (run_dir / "gate5_document.json").write_text(json.dumps({
+        "runner_slot_id": "1330",
+        "trading_day": "2026-09-22",
+        "evaluated_count": 10,
+        "no_data_count": 0,
+        "buy_count": 1,
+        "candidates": [{"ticker": "AAPL"}]
+    }))
+    state = {
+        "order_submit_status": "no_orders_submitted",
+        "counts": {"evaluated": 10, "no_data": 0, "buy_candidates": 1}
+    }
+    (run_dir / "run_state.json").write_text(json.dumps(state))
+    fre.check_existing_state_gate5_evidence(run_dir, "1330", DAY, state)
+
+
+def test_finalize_empty_outcome(tmp_path):
+    with pytest.raises(fre.FinalizeRefused, match="must name the Gate 9 outcome"):
+        fre.finalize("1330", datetime(2026, 9, 22, 13, 30, tzinfo=ET), outcome=" ", order_submit_status="no_orders_submitted")
+
+def test_repair_companions_missing_signals(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    (run_dir / "submitted_orders.csv").write_text("")
+    (run_dir / "run_summary.json").write_text('{"stream": "intraday", "trading_day": "2026-09-22", "slot": "1330ET", "status": "NO_ORDERS", "broker": "robinhood"}')
+    fre._repair_companions(run_dir, {"stream": "intraday", "trading_day": "2026-09-22", "slot": "1330ET", "status": "NO_ORDERS", "broker": "robinhood"}, "intraday")
+    assert any((run_dir / name).exists() for name in fre.SIGNAL_CSV_NAMES)
+
+def test_existing_state_unreadable(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    state_path = run_dir / "run_state.json"
+    state_path.touch()
+    state_path.chmod(0o000)
+    with pytest.raises(fre.FinalizeRefused, match="exists but is not a JSON object; refusing to overwrite it"):
+        fre._finalize_locked("1330", datetime.now(), tmp_path, run_dir, outcome="NO_ORDERS", order_submit_status="no_orders_submitted", orders=None, signals=None, report=None, budget=None, error_class=None, error_detail=None, code_version=None, now=datetime.now())
+    state_path.chmod(0o644)
+
+def test_load_json_none_2():
+    assert fre._load_json(None, list, "test") is None
+
+def test_validate_code_version_invalid_tag_type_2():
+    with pytest.raises(fre.FinalizeRefused, match="must be a non-empty string"):
+        fre.validate_code_version({"git_sha": "a"*40, "pinned_by": 123})
+
+def test_existing_state_unreadable_not_json(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    state_path = run_dir / "run_state.json"
+    state_path.write_text("invalid json format")
+    with pytest.raises(fre.FinalizeRefused, match="exists but is not a JSON object"):
+        fre._finalize_locked("1330", datetime.now(), tmp_path, run_dir, outcome="NO_ORDERS", order_submit_status="no_orders_submitted", orders=None, signals=None, report=None, budget=None, error_class=None, error_detail=None, code_version=None, now=datetime.now())
+
+def test_find_gate5_documents_other_valueerror(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    cands_path = run_dir / "candidates.json"
+    cands_path.write_text('{invalid_json')
+    docs, strays = fre.find_gate5_documents(run_dir, "1330", DAY)
+    assert not docs
+
+def test_find_gate5_documents_oserror(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    cands_path = run_dir / "candidates.json"
+    cands_path.touch()
+    cands_path.chmod(0o000)
+    docs, strays = fre.find_gate5_documents(run_dir, "1330", DAY)
+    assert not docs
+    cands_path.chmod(0o644)
+
+def test_finalize_orders_none_existing_orders_csv(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    orders_csv = run_dir / "submitted_orders.csv"
+    orders_csv.write_text("ticker,order_id,status,submitted_amount_usd\nAAPL,123,submitted,100\n")
+    fre._finalize_locked("1330", datetime(2026, 9, 22, 13, 30, tzinfo=ET), tmp_path, run_dir, outcome="ORDERS_PLACED", order_submit_status="submitted", orders=None, signals=None, report=None, budget={"budget_tier": "normal", "daily_cap_usd": 100, "weekly_cap_usd": 100, "budget_evaluated": True}, error_class=None, error_detail=None, code_version={"git_sha": "a"*40, "tag": "test", "pinned_by": "test"}, now=datetime.now())
+
+def test_finalize_pointer_is_none_validation_skipped(tmp_path, monkeypatch):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    monkeypatch.setattr(fre, "validate_run_artifacts", lambda *args, **kwargs: type('Result', (), {'ok': False, 'errors': ['fake']})())
+
+    result = fre._finalize_locked("1330", datetime(2026, 9, 22, 13, 30, tzinfo=ET), tmp_path, run_dir, outcome="NO_ORDERS", order_submit_status="no_orders_submitted", orders=None, signals=None, report=None, budget=None, error_class=None, error_detail=None, code_version={"git_sha": "a"*40, "tag": "test", "pinned_by": "test"}, now=datetime.now())
+
+    assert "fake" in result["errors"]
+
+def test_finalize_orders_none_no_existing_csv(tmp_path):
+    run_dir = tmp_path / slot_run_dir_relative("1330", DAY)
+    run_dir.mkdir(parents=True)
+    with pytest.raises(fre.FinalizeRefused, match="needs at least one order row"):
+        fre._finalize_locked("1330", datetime(2026, 9, 22, 13, 30, tzinfo=ET), tmp_path, run_dir, outcome="ORDERS_PLACED", order_submit_status="submitted", orders=None, signals=None, report=None, budget={"budget_tier": "normal", "daily_cap_usd": 100, "weekly_cap_usd": 100, "budget_evaluated": True}, error_class=None, error_detail=None, code_version={"git_sha": "a"*40, "tag": "test", "pinned_by": "test"}, now=datetime.now())
 # --- Group C: a platform refusal is its own recorded outcome (session_refusal,
 # real_world_transactions_denied; claude/triage-routine/GROUP-C-DECISION-2026-10-17.md).
 
