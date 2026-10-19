@@ -68,9 +68,23 @@ run_chunk() {
   "$PY" -m scripts.robinhood_payload prompt --plan "$WORK/plan.json" --tickers "$tickers" >"$WORK/prompt_$idx.txt"
   # Read-only sandbox: the worker only reads market data. stdin is the prompt (never inherit a terminal).
   # macOS has no timeout(1); perl's alarm + exec kills the worker at the deadline (SIGALRM).
-  perl -e 'alarm shift; exec @ARGV' "$PER_CHUNK_TIMEOUT" "$CODEX" exec ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} -c 'sandbox_mode="read-only"' -c 'approval_policy="never"' \
-    --skip-git-repo-check -o "$WORK/chunk_$idx.json" - <"$WORK/prompt_$idx.txt" >"$WORK/chunk_$idx.log" 2>&1 \
-    || echo "robinhood_payload: chunk $idx failed or timed out (see its tickers in the merge report)" >&2
+  # One retry per chunk (2026-10-19: a first pass left 16/68 tickers with a truncated reply or a bad quote stamp
+  # and the slot aborted). The retry runs only when the first reply is missing or carries a per-ticker error.
+  local attempt out="$WORK/chunk_$idx.json" best="$WORK/best_$idx.json" errs best_errs=""
+  for attempt in 1 2; do
+    rm -f "$out"
+    perl -e 'alarm shift; exec @ARGV' "$PER_CHUNK_TIMEOUT" "$CODEX" exec ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} -c 'sandbox_mode="read-only"' -c 'approval_policy="never"' \
+      --skip-git-repo-check -o "$out" - <"$WORK/prompt_$idx.txt" >"$WORK/chunk_$idx.log" 2>&1 \
+      || echo "robinhood_payload: chunk $idx attempt $attempt failed or timed out" >&2
+    if [ -s "$out" ]; then
+      errs="$(grep -o '"error"' "$out" | wc -l | tr -d ' ')"
+      # Keep the attempt with the fewest per-ticker errors, so a worse retry never replaces a better first pass.
+      if [ -z "$best_errs" ] || [ "$errs" -lt "$best_errs" ]; then cp "$out" "$best"; best_errs="$errs"; fi
+      [ "$errs" -eq 0 ] && break
+    fi
+  done
+  if [ -s "$best" ]; then cp "$best" "$out"; else rm -f "$out"; fi
+  [ -s "$WORK/chunk_$idx.json" ] || echo "robinhood_payload: chunk $idx failed or timed out (see its tickers in the merge report)" >&2
 }
 
 idx=0

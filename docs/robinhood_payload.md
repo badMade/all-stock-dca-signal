@@ -45,8 +45,9 @@ the payload to `$ROOT/market_data_<day>_<slot>.json` and skips the hand fetch. I
 ET (or shift `Hour`). Logs: `/tmp/dca-robinhood-payload.log`.
 
 **Honest limits.**
-- A transient miss on one ticker costs the slot. The launcher does not retry a chunk; if that proves common, retry
-  failed chunks once before lowering the floor.
+- A transient miss on one ticker costs the slot. The launcher retries a chunk once (2026-10-19: the 10:30 run
+  covered 52/68 tickers, 9 daily-bar replies truncated and 8 quotes stamped with a wrong offset, so nothing was
+  published) and keeps the attempt with fewer per-ticker errors. The 100% coverage floor is unchanged.
 - An LLM copies the numbers. The validation catches malformed, inconsistent and outlier data; it cannot prove a
   plausible-looking bar is exact. Treat this as the trade-off for having any Robinhood path off-session.
 - Needs the Mac awake and Codex logged in. A failure leaves the slot to abort, as before.
