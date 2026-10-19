@@ -15,7 +15,6 @@ or runner is constructed (executor modules are imported only for their
 explicitly bounded seek-and-read, and no field carries an absolute path.
 """
 
-from __future__ import annotations
 
 import json
 import math
