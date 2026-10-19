@@ -2,7 +2,7 @@
 
 Do not edit by hand. Regenerate with `python -m scripts.generate_module_graph`; `--check` exits 1 when this copy is stale and `--impact <module>` lists everything that depends on a module. A workflow refreshes this file on every push to `main`.
 
-164 core modules, 490 in-repo import edges. Scope: top-level `*.py` plus `scripts/`, `all_stock_dca/`, `guardrails/`, `selfheal/`, `viz/`; tests and the independent research trees are excluded. Static imports only: string dispatch is invisible, so "no importer" is a lead, not a verdict (see the external-refs column).
+164 core modules, 491 in-repo import edges. Scope: top-level `*.py` plus `scripts/`, `all_stock_dca/`, `guardrails/`, `selfheal/`, `viz/`; tests and the independent research trees are excluded. Static imports only: string dispatch is invisible, so "no importer" is a lead, not a verdict (see the external-refs column).
 
 ## Most depended-on modules (change these with care)
 
@@ -12,7 +12,7 @@ Do not edit by hand. Regenerate with `python -m scripts.generate_module_graph`; 
 | `dca_fileio` | 39 | `dca_alerts`, `dca_average_cost_snapshot`, `dca_console`, `dca_console_jobs`, `dca_console_launch`, `dca_cost_tracker`, +33 more |
 | `dca_config` | 35 | `dca_console_alerts`, `dca_console_config`, `dca_console_octopus`, `dca_console_runs`, `dca_console_state`, `dca_fill_compare`, +29 more |
 | `near_close_dca` | 32 | `dca_alerts`, `dca_config`, `dca_console_config`, `dca_console_jobs`, `dca_live_adapters`, `dca_market_graph`, +26 more |
-| `dca_runner` | 21 | `dca_console`, `dca_console_config`, `dca_console_data`, `dca_console_schedule`, `dca_console_state`, `dca_order_plan`, +15 more |
+| `dca_runner` | 22 | `dca_console`, `dca_console_config`, `dca_console_data`, `dca_console_schedule`, `dca_console_state`, `dca_order_plan`, +16 more |
 | `dca_console_reader` | 16 | `dca_console`, `dca_console_alerts`, `dca_console_config`, `dca_console_docs`, `dca_console_env`, `dca_console_launch`, +10 more |
 | `scripts.file_lock` | 12 | `dca_cumulative`, `dca_intraday_archive`, `dca_inverse_martingale`, `dca_whole_share_accumulator`, `morning_dca`, `near_close_dca`, +6 more |
 | `scripts.run_classification` | 11 | `dca_console_runs`, `dca_cost_tracker`, `dca_reporting`, `dca_risk`, `morning_dca`, `near_close_dca`, +5 more |
@@ -145,7 +145,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_recommender` | 302 | 16 | 1 | 0 | `dca_config`, `dca_market_sources`, `dca_order_plan`, `dca_paths`, `dca_rec_models`, `dca_rec_store`, `dca_risk`, `dca_runner`, +8 more |
 | `dca_reporting` | 1259 | 6 | 2 | 2 | `dca_fileio`, `dca_paths`, `scripts.close_window_signal`, `scripts.foreground_primary`, `scripts.model_usage_log`, `scripts.run_classification` |
 | `dca_risk` | 1646 | 3 | 9 | 1 | `dca_config`, `near_close_dca`, `scripts.run_classification` |
-| `dca_runner` | 9487 | 6 | 21 | 57 | `dca_config`, `dca_fileio`, `dca_live_adapters`, `dca_paths`, `dca_slot_guard`, `near_close_dca` |
+| `dca_runner` | 9487 | 6 | 22 | 57 | `dca_config`, `dca_fileio`, `dca_live_adapters`, `dca_paths`, `dca_slot_guard`, `near_close_dca` |
 | `dca_slot_guard` | 62 | 1 | 1 | 0 | `scripts.scheduler_lease` |
 | `dca_ticker_paths` | 33 | 0 | 9 | 0 |  |
 | `dca_weekly_dashboard` | 6457 | 2 | 1 | 12 | `dca_common`, `dca_fileio` |
@@ -165,7 +165,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `patch_finbert_cache` | 21 | 0 | 0 | 0 |  |
 | `patch_template` | 21 | 0 | 0 | 0 |  |
 | `run_benchmark` | 56 | 0 | 0 | 0 |  |
-| `run_dca` | 4717 | 16 | 1 | 26 | `dca_alerts`, `dca_config`, `dca_fileio`, `dca_live_adapters`, `dca_notion_sync`, `dca_paths`, `dca_reporting`, `midday_dca`, +8 more |
+| `run_dca` | 4719 | 17 | 1 | 26 | `dca_alerts`, `dca_config`, `dca_fileio`, `dca_live_adapters`, `dca_notion_sync`, `dca_paths`, `dca_reporting`, `dca_runner`, +9 more |
 | `run_market_open_signals` | 110 | 2 | 0 | 0 | `market_open_dca`, `near_close_dca` |
 | `scripts` | 0 | 0 | 0 | 225 |  |
 | `scripts.adhoc_orders` | 490 | 3 | 0 | 0 | `dca_paths`, `dca_runner`, `near_close_dca` |
