@@ -219,6 +219,12 @@ def test_online_mac_status_comes_from_the_heartbeat(hb, expected):
     assert router.local_status_from_probe("online", hb, now_epoch=1000) == expected
 
 
+
+
+def test_probe_timeout_seconds():
+    assert router.probe_timeout_seconds() == 60
+
+
 def test_stale_threshold_defaults_to_300_and_honours_the_env_var(monkeypatch):
     monkeypatch.delenv("DCA_LOCAL_HEARTBEAT_STALE_S", raising=False)
     assert router.heartbeat_stale_seconds() == 300
