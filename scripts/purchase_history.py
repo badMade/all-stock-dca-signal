@@ -1648,6 +1648,10 @@ class _PurchaseCollector:
 
         orphan_dirs_seen: set = set()
         orphan_full_report_seen: set = set()
+
+        # Covered files are already resolved; preserve updates during orphan processing.
+        covered_resolved = self.covered_files
+
         for scan_root in self.scan_roots:
             if not scan_root.is_dir():
                 continue
@@ -1658,7 +1662,7 @@ class _PurchaseCollector:
             canonical_paths = sorted({p for name in order_csv_names for p in scan_root.rglob(name)})
             for csv_path in canonical_paths:
                 run_dir = csv_path.parent
-                if run_dir in self.covered_dirs or run_dir in orphan_dirs_seen or csv_path.resolve() in self.covered_files:
+                if run_dir in self.covered_dirs or run_dir in orphan_dirs_seen or csv_path.resolve() in covered_resolved:
                     continue
                 orphan_dirs_seen.add(run_dir)
                 # _orders_csv_fills's own default sibling search only tries
@@ -1701,7 +1705,7 @@ class _PurchaseCollector:
                     continue
                 orphan_full_report_seen.add(csv_path)
                 run_dir = csv_path.parent
-                if csv_path.resolve() in self.covered_files:
+                if csv_path.resolve() in covered_resolved:
                     continue
                 self._process_orphan(run_dir, csv_path, csv_path)
 
