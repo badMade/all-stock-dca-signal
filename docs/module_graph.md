@@ -72,7 +72,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.read_recommendation` | 81 | 0 |
 | `scripts.refresh_active_ticker_histories` | 199 | 1 |
 | `scripts.refresh_market_open_candidates` | 158 | 0 |
-| `scripts.robinhood_payload` | 626 | 17 |
+| `scripts.robinhood_payload` | 629 | 17 |
 | `scripts.run_90day_prediction_experiment` | 422 | 0 |
 | `scripts.run_ledger` | 305 | 0 |
 | `scripts.run_phase4_backtest` | 10 | 0 |
@@ -226,7 +226,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.reason_codes` | 217 | 0 | 3 | 1 |  |
 | `scripts.refresh_active_ticker_histories` | 199 | 1 | 0 | 1 | `dca_ticker_paths` |
 | `scripts.refresh_market_open_candidates` | 158 | 3 | 0 | 0 | `market_open_dca`, `near_close_dca`, `scripts.stream_candidates` |
-| `scripts.robinhood_payload` | 626 | 9 | 0 | 17 | `dca_config`, `dca_paths`, `dca_runner`, `scripts.generate_buy_candidates`, `scripts.generate_intraday_candidates`, `scripts.generate_market_open_candidates`, `scripts.generate_midday_candidates`, `scripts.generate_morning_candidates`, +1 more |
+| `scripts.robinhood_payload` | 629 | 9 | 0 | 17 | `dca_config`, `dca_paths`, `dca_runner`, `scripts.generate_buy_candidates`, `scripts.generate_intraday_candidates`, `scripts.generate_market_open_candidates`, `scripts.generate_midday_candidates`, `scripts.generate_morning_candidates`, +1 more |
 | `scripts.run_90day_prediction_experiment` | 422 | 1 | 0 | 0 | `scripts.sequestered_truth_comparator` |
 | `scripts.run_classification` | 4499 | 4 | 11 | 28 | `dca_fileio`, `dca_paths`, `scripts.broker_reconciliation`, `scripts.same_day_pointer` |
 | `scripts.run_ledger` | 305 | 1 | 0 | 0 | `scripts.file_lock` |
