@@ -6121,7 +6121,7 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
             # precheck inside _require_base_amount() itself -- a truthy
             # non-dict ladder survives `or {}` and this call site runs
             # BEFORE _require_base_amount() ever gets a chance to apply
-            # its own guard, so that fix alone couldn't cover this
+            # its own guard, so that logic alone couldn't cover this
             # earlier ladder.get() (Codex review, PR #654: "Sanitize
             # ladder before the blocked-state precheck").
             ladder = rs.get("ladder")
