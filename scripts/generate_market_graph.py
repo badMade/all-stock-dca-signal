@@ -31,7 +31,7 @@ from __future__ import annotations
 import argparse
 import sys
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import List, Optional
 
@@ -53,8 +53,11 @@ MAX_TRAIL = mg.MAX_TRAIL
 
 def _parse_day(value: str) -> date:
     try:
-        return datetime.strptime(value, "%Y-%m-%d").date()
-    except ValueError as exc:  # argparse renders this as a clean usage error
+        # ⚡ Bolt optimization: Use string slicing to bypass slow datetime.strptime overhead
+        if not value or len(value) != 10 or value[4] != '-' or value[7] != '-':
+            raise ValueError
+        return date(int(value[:4]), int(value[5:7]), int(value[8:]))
+    except (ValueError, IndexError) as exc:  # argparse renders this as a clean usage error
         raise argparse.ArgumentTypeError(f"expected YYYY-MM-DD, got {value!r}") from exc
 
 

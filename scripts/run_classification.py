@@ -32,7 +32,7 @@ import math
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, time, timezone
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
@@ -3941,8 +3941,11 @@ def _mtime_matches_trading_day(path: Path, trading_day: str) -> bool:
     except OSError:
         return True
     try:
-        target = datetime.strptime(trading_day, "%Y-%m-%d").date()
-    except (TypeError, ValueError):
+        # ⚡ Bolt optimization: Use string slicing to bypass slow datetime.strptime overhead
+        if not trading_day or len(trading_day) != 10 or trading_day[4] != '-' or trading_day[7] != '-':
+            raise ValueError
+        target = date(int(trading_day[:4]), int(trading_day[5:7]), int(trading_day[8:]))
+    except (TypeError, ValueError, IndexError):
         return True
     return datetime.fromtimestamp(mtime, tz=_EASTERN).date() >= target
 

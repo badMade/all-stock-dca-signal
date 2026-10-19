@@ -3223,8 +3223,12 @@ def load_alert_files(directory: Path) -> List[AlertRecord]:
         day: Optional[datetime] = None
         if match:
             try:
-                day = datetime.strptime(match.group("day"), "%Y-%m-%d")
-            except ValueError:
+                # ⚡ Bolt optimization: Use string slicing to bypass slow datetime.strptime overhead
+                raw_day = match.group("day")
+                if len(raw_day) != 10 or raw_day[4] != '-' or raw_day[7] != '-':
+                    raise ValueError
+                day = datetime(int(raw_day[:4]), int(raw_day[5:7]), int(raw_day[8:]), 0, 0, 0)
+            except (ValueError, IndexError):
                 # A contract-SHAPED filename carrying an impossible date, such as
                 # "2026-13-40-1030-gate5.txt". _ALERT_FILENAME only checks the
                 # digit groups, so this reaches here. Demote it to off-contract
@@ -4879,7 +4883,10 @@ def filter_records(
 
 
 def _parse_day(value: str) -> date:
-    return datetime.strptime(value, "%Y-%m-%d").date()
+    # ⚡ Bolt optimization: Use string slicing to bypass slow datetime.strptime overhead
+    if not value or len(value) != 10 or value[4] != '-' or value[7] != '-':
+        raise ValueError(f"time data {value!r} does not match format '%Y-%m-%d'")
+    return date(int(value[:4]), int(value[5:7]), int(value[8:]))
 
 
 def build_parser() -> argparse.ArgumentParser:
