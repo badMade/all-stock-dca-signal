@@ -175,3 +175,7 @@ text (rules plus steps, for reading in one place) is `gen.build_prompts()`; the 
 `gen.build_instructions()`, which is what `--write` and `--check` use. `scripts/tests/test_backup_procedure.py` fails if
 any pasteable prompt grows past the limit. Changing a step now changes the planner stamp, so rebuild the `.pyz`, repaste
 the prompts and re-run the pair check in "Checking the pair before you paste it".
+
+Step 1 is code too: `backup_planner gates --task <id>` reads the real clock, picks the slot, applies the holiday and
+early-close calendar and the window, and prints PROCEED / skipped_market_closed / skipped_outside_window
+(`scripts/backup_gates.py`, rules unchanged from the old step 1 text). `--now` exists for tests only.

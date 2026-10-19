@@ -137,6 +137,16 @@ def test_the_run_values_the_procedure_names_are_defined_in_the_pasted_instructio
             assert f"{name} (" in text and f": ${{{name}}}" in text, (backup.file, name)
 
 
+def test_step_1_delegates_the_gate_decision_to_the_gates_command():
+    for backup in backup_procedure.BACKUPS:
+        part1 = backup_procedure.render_part(backup.task_id, 1)
+        step1 = part1.split("STEP 2 - ")[0]
+        assert f"gates --task {backup.task_id}" in step1
+        for status in ("PROCEED", "skipped_market_closed", "skipped_outside_window", "failed_unexpected_error"):
+            assert status in step1
+        assert "Never pass --now" in step1
+
+
 # --- Codex adversarial review of #1786 (2026-10-18), P2 findings --------------------------------------------------
 
 

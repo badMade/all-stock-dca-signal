@@ -61,9 +61,10 @@ BACKUPS = (
 
 PROCEDURE_TEMPLATE = """\
 STEP 1 - GATES
-a. Take today's date and time from a real clock converted to America/New_York, never from recollection. @@SLOT_RESOLUTION@@
-b. Market day: today must be a weekday that is not in the Closed list. Otherwise stop with status skipped_market_closed. On an early-close day, a fire at or after @@EARLY_TIME@@ ET also stops with skipped_market_closed.
-c. Time: the ET time must be inside the range stated in (a). Outside it, stop with status skipped_outside_window.
+Run `python3 backup_planner.pyz gates --task @@TASK_ID@@` (Mac: `python3 -m scripts.backup_planner gates --task @@TASK_ID@@`). It reads the real clock, converts it to America/New_York, applies the rules below, and prints one JSON document. Never pass --now; never take the date or time from recollection. @@SLOT_RESOLUTION@@ Market day: today must be a weekday that is not in the Closed list; on an early-close day a fire at or after @@EARLY_TIME@@ ET also counts as closed.
+- status PROCEED: continue. Its slot and latest_placement_et are this run's slot and latest placement time (rule 9).
+- status skipped_market_closed or skipped_outside_window: stop with exactly that status.
+- Any other status, a non-zero exit, or output that is not that JSON document: place NOTHING, record status failed_unexpected_error, and notify (step 9).
 
 STEP 2 - EVIDENCE POLL 1 (broker)
 Call get_equity_orders for the looked-up account with created_at_gte set to 00:00 ET seven days before today (the weekly cap sums the ISO week and the kill-switch figure sums the trailing seven days, so a window seven days back covers both and a today-only fetch would understate them) and follow EVERY pagination cursor to completion. If completeness cannot be proven, stop (rule 8). Save every raw page, in fetch order, to orders_pages_poll1.json as {"account_number": <resolved account>, "trading_day": "<today YYYY-MM-DD>", "pages": [...]} (the pages span seven days; trading_day stays today); never retype or condense rows by hand.

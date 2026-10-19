@@ -845,6 +845,25 @@ def _cmd_procedure(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_gates(args: argparse.Namespace) -> int:
+    """Step 1 as code: one JSON status (PROCEED, skipped_market_closed, skipped_outside_window).
+
+    The clock is the system clock converted to America/New_York; ``--now`` exists for tests and must carry an
+    offset. A normal skip exits 0 (it is a recorded status, not an error); anything unusable exits 2.
+    """
+    from datetime import timezone
+
+    from scripts import backup_gates  # lazy: it imports backup_procedure, which imports this module
+
+    try:
+        now = datetime.fromisoformat(args.now) if args.now else datetime.now(timezone.utc)
+        calendar = json.loads((dca_config.get_config_dir() / "market_calendar.json").read_text(encoding="utf-8"))
+        report = backup_gates.evaluate(args.task, now, calendar)
+    except (KeyError, ValueError, OSError) as exc:
+        return _emit({"status": "FAILED", "errors": _error_dicts([PlanError("bad_gates_request", str(exc))])}, 2)
+    return _emit(report, 0)
+
+
 def _cmd_universe(args: argparse.Namespace) -> int:
     """The buyable symbols from the packaged config: the task fetches exactly these, so no prompt names a stock."""
     directory = args.config_dir if args.config_dir is not None else dca_config.get_config_dir()
@@ -1074,6 +1093,9 @@ def _build_parser() -> argparse.ArgumentParser:
     procedure.add_argument("--task", required=True, help="The backup task id named in the prompt's header.")
     procedure.add_argument("--part", required=True, type=int, help="1 = steps 1-3, 2 = steps 4-6, 3 = steps 7-9.")
     procedure.add_argument("--token", default=None, help="Parts 2 and 3: the token the previous part printed at its end.")
+    gates = sub.add_parser("gates", help="Step 1 as code: slot, market day and window from the real clock.")
+    gates.add_argument("--task", required=True, help="The backup task id named in the prompt's header.")
+    gates.add_argument("--now", default=None, help="TESTS ONLY: an offset-aware ISO instant instead of the clock.")
     universe = sub.add_parser("universe", help="Print the buyable symbols from config; the task fetches exactly these.")
     universe.add_argument("--config-dir", type=Path, default=None)
     finalize = sub.add_parser("finalize", help="Reconcile and re-validate a plan; print what to place.")
@@ -1096,6 +1118,11 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command == "gates":
+        try:
+            return _cmd_gates(args)
+        except Exception as exc:  # noqa: BLE001 - last fail-closed boundary; type name only
+            return _emit({"status": "FAILED", "errors": _error_dicts([PlanError("unexpected_error", type(exc).__name__)])}, 2)
     if args.command == "procedure":
         # No trading day or slot: the procedure text is per task, not per run.
         try:
