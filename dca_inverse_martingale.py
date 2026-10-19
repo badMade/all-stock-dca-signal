@@ -205,10 +205,23 @@ def _drop_metric_to_price(
     Returns ``None`` (fail closed) for a stddev-basis cycle with no usable
     ``stddev_reference``, or a non-finite/nonpositive ``reference_close``.
     """
-    if not math.isfinite(reference_close) or reference_close <= 0:
+    if (
+        isinstance(reference_close, bool)
+        or not isinstance(reference_close, (int, float))
+        or not math.isfinite(reference_close)
+        or reference_close <= 0
+        or isinstance(drop_metric, bool)
+        or not isinstance(drop_metric, (int, float))
+        or not math.isfinite(drop_metric)
+    ):
         return None
     if basis == BASIS_STDDEV:
-        if not stddev_reference or not math.isfinite(stddev_reference) or stddev_reference <= 0:
+        if (
+            isinstance(stddev_reference, bool)
+            or not isinstance(stddev_reference, (int, float))
+            or not math.isfinite(stddev_reference)
+            or stddev_reference <= 0
+        ):
             return None
         drop_pct = drop_metric * stddev_reference
     else:
@@ -258,12 +271,21 @@ def _preserved_latch_kwargs(
     if status_before != STATUS_FIRING:
         return {}
     reference_close = tracker_state.get("cycle_reference_close")
-    if not isinstance(reference_close, (int, float)) or not math.isfinite(reference_close) or reference_close <= 0:
+    if (
+        isinstance(reference_close, bool)
+        or not isinstance(reference_close, (int, float))
+        or not math.isfinite(reference_close)
+        or reference_close <= 0
+    ):
         return {}
     reference_close = float(reference_close)
     preserved: dict[str, Any] = {"rearm_reference_close": reference_close}
     lowest_drop_seen = tracker_state.get("lowest_drop_seen")
-    if isinstance(lowest_drop_seen, (int, float)) and math.isfinite(lowest_drop_seen):
+    if (
+        not isinstance(lowest_drop_seen, bool)
+        and isinstance(lowest_drop_seen, (int, float))
+        and math.isfinite(lowest_drop_seen)
+    ):
         floor_price = _drop_metric_to_price(
             reference_close,
             float(lowest_drop_seen),

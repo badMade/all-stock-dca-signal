@@ -2115,13 +2115,22 @@ def validate_payload_document(document: Any) -> Dict[str, Any]:
                     f"payload series {entry.get('ticker')!r} channel {channel!r} must be a "
                     f"list of {frame_count} value(s) (one per date), got {values!r}"
                 )
-            if not all(v is None or isinstance(v, (int, float)) for v in values):
+            if not all(
+                v is None or (not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v))
+                for v in values
+            ):
                 raise ValueError(
                     f"payload series {entry.get('ticker')!r} channel {channel!r} must "
                     "contain only numbers and nulls"
                 )
     scales = document.get("scales")
-    if not isinstance(scales, Mapping) or not isinstance(scales.get("pct_per_unit"), (int, float)):
+    pct_per_unit = scales.get("pct_per_unit") if isinstance(scales, Mapping) else None
+    if (
+        isinstance(pct_per_unit, bool)
+        or not isinstance(pct_per_unit, (int, float))
+        or not math.isfinite(pct_per_unit)
+        or pct_per_unit <= 0
+    ):
         raise ValueError("payload is missing a usable 'scales.pct_per_unit'")
     grouping = document.get("grouping")
     if not isinstance(grouping, Mapping) or not isinstance(grouping.get("order"), list):

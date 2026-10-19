@@ -90,9 +90,11 @@ Transport = Callable[[str, str, dict[str, str], bytes], tuple[int, bytes]]
 
 
 def urllib_transport(method: str, url: str, headers: dict[str, str], body: bytes) -> tuple[int, bytes]:
+    if not isinstance(url, str) or not url.lower().startswith("https://"):
+        raise OSError("transport failed (UnsafeURL)")
     request = urllib.request.Request(url, data=body or None, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+        with urllib.request.urlopen(request, timeout=20) as response:  # noqa: S310 - https scheme enforced above
             return response.status, response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, b""  # the body can echo the request; keep only the status

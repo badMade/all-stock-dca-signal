@@ -1862,12 +1862,19 @@ def test_validate_payload_document_checks_the_nested_shape_too():
     # scales.pct_per_unit, grouping.order, and title are all required too.
     with pytest.raises(ValueError, match="scales.pct_per_unit"):
         mg.validate_payload_document({**good, "scales": {}})
+    for bad_scale in (True, False, float("nan"), float("inf"), 0.0, -1.0):
+        with pytest.raises(ValueError, match="scales.pct_per_unit"):
+            mg.validate_payload_document({**good, "scales": {"pct_per_unit": bad_scale}})
+    for bad_val in (True, False, float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="only numbers and nulls"):
+            mg.validate_payload_document({**good, "series": [{**good["series"][0], "yl": [bad_val]}]})
     with pytest.raises(ValueError, match="grouping.order"):
         mg.validate_payload_document({**good, "grouping": {}})
     with pytest.raises(ValueError, match="'title'"):
         mg.validate_payload_document({**good, "title": None})
     # The well-formed document still passes whole.
     assert mg.validate_payload_document(good)
+
 
 
 def test_a_malformed_payload_date_is_refused_rather_than_sanitized():

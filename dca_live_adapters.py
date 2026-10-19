@@ -6361,6 +6361,20 @@ class RobinhoodBroker:
             raise OrderPlacementAmbiguousError(
                 f"placement connector call for {ticker} failed with no broker response: {_artifact_safe_repr(exc)}"
             ) from exc
+        return self._process_fractional_placement_response(
+            response,
+            ticker=ticker,
+            notional_usd=notional_usd,
+            ref_id=ref_id,
+        )
+
+    def _process_fractional_placement_response(
+        self, response: Any, *, ticker: str, notional_usd: float, ref_id: str
+    ) -> str:
+        """Classify a connector placement response into an order id or a typed error.
+
+        Split out of ``place_market_buy`` to cut its complexity (PR #1777 port); the body is unchanged.
+        """
         outer_failure = _response_failure(response)
         if outer_failure is not None:
             # A failure envelope that still carries an inner order id (e.g.

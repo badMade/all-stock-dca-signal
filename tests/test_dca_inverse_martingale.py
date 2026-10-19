@@ -4051,3 +4051,37 @@ def test_missing_persisted_tier_fingerprint_is_not_treated_as_a_mismatch():
     state, step = _step(legacy_state, decision_price=98.0, previous_close=100.0, trading_day=day2)
     assert step.reason != "cycle_reset_tier_config_changed"
     assert step.newly_crossed_tiers == (2.0,)
+
+
+def test_preserved_latch_rejects_boolean_and_malformed_persisted_fields():
+    """Persisted tracker_state fields rebuilt during a mid-cycle config reset
+    must reject booleans (bool subclasses int) and non-numeric stddev_reference
+    values rather than turning True into 1.0 or raising TypeError."""
+    from dca_inverse_martingale import _drop_metric_to_price, _preserved_latch_kwargs
+
+    assert _preserved_latch_kwargs(
+        {"cycle_reference_close": True, "lowest_drop_seen": 5.0},
+        "pct",
+        STATUS_FIRING,
+        carry_drop_metric=True,
+    ) == {}
+
+    preserved = _preserved_latch_kwargs(
+        {"cycle_reference_close": 100.0, "lowest_drop_seen": True},
+        "pct",
+        STATUS_FIRING,
+        carry_drop_metric=True,
+    )
+    assert preserved == {"rearm_reference_close": 100.0}
+    assert "fired_floor_price" not in preserved
+    assert "fired_floor_drop_metric" not in preserved
+
+    for bad_stddev in (True, False, "0.02", [0.02]):
+        assert _drop_metric_to_price(100.0, 2.0, "stddev", bad_stddev) is None  # type: ignore[arg-type]
+        assert _preserved_latch_kwargs(
+            {"cycle_reference_close": 100.0, "lowest_drop_seen": 2.0, "stddev_reference": bad_stddev},
+            "stddev",
+            STATUS_FIRING,
+            carry_drop_metric=False,
+        ) == {"rearm_reference_close": 100.0}
+

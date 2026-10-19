@@ -8010,3 +8010,27 @@ def test_broker_lookup_keeps_safe_fallback_when_exception_stringification_raises
         assert broker.get_order_fill("synthetic-order") is None
     assert "BrokenMessageError" in caplog.text
     assert all(record.exc_info is None for record in caplog.records)
+
+
+# --- place_market_buy complexity refactor (port of #1777): the response handling lives in
+# _process_fractional_placement_response, and place_market_buy only gates, calls and delegates.
+
+
+def test_place_market_buy_delegates_response_handling_to_the_extracted_method():
+    response = {"data": {"order": {"id": "ORD-1", "state": "queued"}}}
+    broker = RobinhoodBroker(account="999000111", enable_live_orders=True, place_fn=lambda **_k: response)
+    seen = {}
+
+    def spy(resp, *, ticker, notional_usd, ref_id):
+        seen.update(resp=resp, ticker=ticker, notional_usd=notional_usd, ref_id=ref_id)
+        return "SPY-ID"
+
+    broker._process_fractional_placement_response = spy
+    assert broker.place_market_buy("AAPL", 2.5, "ref-1") == "SPY-ID"
+    assert seen == {"resp": response, "ticker": "AAPL", "notional_usd": 2.5, "ref_id": "ref-1"}
+
+
+def test_extracted_response_handler_returns_the_order_id_for_a_clean_response():
+    broker = RobinhoodBroker(account="999000111", enable_live_orders=True, place_fn=lambda **_k: None)
+    response = {"data": {"order": {"id": "ORD-1", "state": "queued"}}}
+    assert broker._process_fractional_placement_response(response, ticker="AAPL", notional_usd=2.5, ref_id="r") == "ORD-1"

@@ -590,6 +590,7 @@ def test_empty_snapshot_is_all_unavailable_never_zero(roots):
 
 # --- cross-cutting guarantees -------------------------------------------------
 
+
 def test_no_account_number_or_absolute_path_reaches_the_payload(roots, tmp_path):
     seed_everything(roots, tmp_path)
     primary = roots[0].path

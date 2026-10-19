@@ -199,6 +199,11 @@ def test_urllib_transport_success_http_error_and_fault(monkeypatch):
         pub.urllib_transport("GET", "https://x.test", {}, b"")
     assert "leaked" not in str(info.value)
 
+    for unsafe_url in ("file:///etc/passwd", "http://x.test/v1", "ftp://x.test/resource"):
+        with pytest.raises(OSError, match="UnsafeURL"):
+            pub.urllib_transport("GET", unsafe_url, {}, b"")
+
+
 
 # --- github branch -------------------------------------------------------------------------
 
