@@ -299,6 +299,24 @@ def test_a_forbidden_wrapper_still_lets_reads_through():
     guarded = router.guard_broker(RepoShapedSpyBroker(), ExecutorRole.CLOUD, LocalStatus.OFF, now=NOW)
     assert guarded.get_account() == {"ok": True}
 
+def test_has_claim_true_when_claim_recorded(tmp_path):
+    d = router.decide(ExecutorRole.PERPLEXITY, LocalStatus.OFF, now=NOW)
+    router.record(d, log_dir=tmp_path, trading_day="2026-10-08", slot="1530", kind="claim")
+    assert router.has_claim(tmp_path, "2026-10-08", "1530") is True
+
+def test_has_claim_false_when_no_claim_recorded(tmp_path):
+    d = router.decide(ExecutorRole.PERPLEXITY, LocalStatus.OFF, now=NOW)
+    router.record(d, log_dir=tmp_path, trading_day="2026-10-08", slot="1530", kind="probe")
+    router.record(d, log_dir=tmp_path, trading_day="2026-10-08", slot="1530", kind="buy")
+    assert router.has_claim(tmp_path, "2026-10-08", "1530") is False
+
+def test_has_claim_false_when_different_slot(tmp_path):
+    d = router.decide(ExecutorRole.PERPLEXITY, LocalStatus.OFF, now=NOW)
+    router.record(d, log_dir=tmp_path, trading_day="2026-10-08", slot="1530", kind="claim")
+    assert router.has_claim(tmp_path, "2026-10-08", "1545") is False
+
+def test_has_claim_false_when_no_file(tmp_path):
+    assert router.has_claim(tmp_path, "2026-10-08", "1530") is False
 
 
 
@@ -356,5 +374,5 @@ def test_live_claim_ignores_non_claim_rows(tmp_path):
 
     with log_file.open("w", encoding="utf-8") as f:
         f.write(json.dumps({"timestamp": NOW.isoformat(), "path": "perplexity-fallback", "reason": "test", "slot": "1530", "kind": "probe"}) + "\n")
-
+    assert router.live_claim(tmp_path, "2026-10-08", "1530", NOW) is False
     assert router.live_claim(tmp_path, "2026-10-08", "1530", NOW) is False
