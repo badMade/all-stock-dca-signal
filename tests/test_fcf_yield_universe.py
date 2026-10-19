@@ -1,0 +1,45 @@
+"""22 free-cash-flow-yield tickers join the active DCA universe (2026-10-19, user-requested).
+
+The cross-mirror parity checks live in test_config_invariants.py and
+test_perplexity_prompt_mirror.py; this file pins the facts specific to this addition.
+"""
+import json
+from pathlib import Path
+
+import near_close_dca
+
+CONFIG = Path(__file__).resolve().parent.parent / "config"
+NEW = (
+    "TSN RPRX CVS SJM KR CAH HCA HRL PFGC SYY KVUE HSY USFD MRK RMD DGX CHE ABT MDLZ MCK CHD CL"
+).split()
+
+
+def _load(name):
+    return json.loads((CONFIG / name).read_text())
+
+
+def test_all_new_tickers_are_active_in_constant_and_config():
+    config_active = _load("tickers.json")["active"]
+    for ticker in NEW:
+        assert ticker in near_close_dca.ACTIVE_TICKERS, ticker
+        assert ticker not in near_close_dca.EXCLUDED_TICKERS, ticker
+        assert ticker in config_active, ticker
+
+
+def test_abbv_was_not_duplicated():
+    # ABBV was in the request but has been active since 2026-08-02.
+    assert near_close_dca.ACTIVE_TICKERS.count("ABBV") == 1
+
+
+def test_new_tickers_have_global_fallback_sizing_entries():
+    sizing = _load("per_ticker_sizing.json")
+    for ticker in NEW:
+        assert ticker in sizing["fallback_tickers"], ticker
+        entry = sizing["tickers"][ticker]
+        assert entry["source"] == "global_fallback_insufficient_history", ticker
+        assert entry["sample_sessions"] == 0, ticker
+
+
+def test_new_tickers_are_in_the_history_fetch_list():
+    listed = set((CONFIG.parent / "tickers.txt").read_text().split())
+    assert set(NEW) <= listed

@@ -344,6 +344,41 @@ ACTIVE_TICKERS = [
     # scripts/generate_per_ticker_sizing.py is re-run against its archived
     # history. See config/tickers.json's notes.
     "GFS",
+    # OCT 19 2026 (user-requested): 23 free-cash-flow-yield names were requested
+    # (TSN, RPRX, CVS, SJM, KR, CAH, HCA, HRL, PFGC, SYY, KVUE, HSY, USFD, MRK,
+    # RMD, DGX, CHE, ABT, MDLZ, MCK, CHD, ABBV, CL). ABBV has been active since
+    # AUG 2 2026, so 22 are new, taking the active universe from 68 to 90. No
+    # Robinhood instrument search was run in-repo for any of the 22 (this session
+    # has no broker access) -- tradability, fractional tradability, and
+    # prior-close availability are unverified, and the run-time preflight and
+    # data-confidence gates admit or gate each out fail-closed if it does not
+    # resolve. All 22 ARE already in tickers.txt (the history-fetch symbol list)
+    # but none has a calibrated config/per_ticker_sizing.json entry yet, so each
+    # carries an uncalibrated global-fallback entry (listed in fallback_tickers;
+    # the config loader requires an entry per active ticker) until
+    # scripts/generate_per_ticker_sizing.py is re-run. See config/tickers.json's notes.
+    "TSN",
+    "RPRX",
+    "CVS",
+    "SJM",
+    "KR",
+    "CAH",
+    "HCA",
+    "HRL",
+    "PFGC",
+    "SYY",
+    "KVUE",
+    "HSY",
+    "USFD",
+    "MRK",
+    "RMD",
+    "DGX",
+    "CHE",
+    "ABT",
+    "MDLZ",
+    "MCK",
+    "CHD",
+    "CL",
 ]
 
 # QBUT is the one categorically excluded ticker today (no mechanism to buy it

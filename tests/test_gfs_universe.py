@@ -29,7 +29,7 @@ def test_gfs_has_global_fallback_sizing_entry():
     assert entry["sample_sessions"] == 0
 
 
-def test_active_count_is_68_everywhere():
-    assert len(_load("tickers.json")["active"]) == 68
+def test_active_count_is_90_everywhere():
+    assert len(_load("tickers.json")["active"]) == 90
     policy = _load("scheduled_tasks.json")["ticker_universe_policy"]
-    assert policy["active_count"] == 68
+    assert policy["active_count"] == 90

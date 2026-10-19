@@ -72,6 +72,8 @@ MSFT AAPL AMAT AMD CBRS MRVL BTX STM SNDK WDC TSM AVGO NVDA QBTS FLKR
 INTC GOOGL GOOG AMZN GLW MA GS MU NFLX XLG TOPT QTOP SATA RGTI IBM GFUZ TXN RKLB
 GE VRT CAT QQQ QCOM ABBV JPM VT RVI VCX TRLV LLY TSLA
 VIAV CIEN ANET CSCO FFIV COHR QUBT APH TEL GFS
+TSN RPRX CVS SJM KR CAH HCA HRL PFGC SYY KVUE
+HSY USFD MRK RMD DGX CHE ABT MDLZ MCK CHD CL
 ```
 
 - **Excluded:** `QBUT` -- added 2026-08-16 without an in-repo Robinhood instrument search; Robinhood returned not-found for it on every live run since, so it was excluded 2026-09-18 (no confirmed buying mechanism at all -- see `exclusion_reasons.QBUT` in `config/tickers.json`). QBUT was a misspelling of `QUBT` (Quantum Computing Inc.), added to the active list 2026-09-24 after Robinhood resolved it; QBUT stays excluded as a guard against stale ticker lists.
