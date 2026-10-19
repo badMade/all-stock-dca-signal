@@ -2944,6 +2944,11 @@ def test_every_live_mirror_gate7_classifies_a_platform_refusal():
         assert "`artifacts/` directory" in gate_7, (
             f"{filename}: Gate 7's alert must avoid the gitignored artifacts/ destination"
         )
+        # A classifier denial of the read-only buying-power fetch is the same class.
+        assert "READ-ONLY REFUSAL, SAME CLASS" in gate_7, (
+            f"{filename}: Gate 7 must classify a classifier-denied get_portfolio fetch as a platform refusal"
+        )
+        assert "fails CLOSED" in gate_7, f"{filename}: a denied buying-power fetch must fail closed"
 
 
 def test_live_mirror_interlock_prefix_names_the_fourth_probe():
