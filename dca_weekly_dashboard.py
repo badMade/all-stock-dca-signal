@@ -228,6 +228,7 @@ def _run_id_presence_asymmetric(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     _b_has = isinstance(_b_run_id, str) and bool(_b_run_id)
     return _a_has != _b_has
 
+
 # Ranks a broker_outcomes entry's own placement status by how authoritative
 # its amount is, highest first. Used only when two DIFFERENT outcome entries
 # in the SAME state's broker_outcomes dict report the same order_id (a
@@ -832,7 +833,9 @@ def _merge_authoritative_amount_into_keeper(
         _OUTCOME_STATUS_RANK.get(str(_keeper_row_dict.get("status") or ""), -1) if _keeper_row_dict is not None else -1
     )
     _keeper_outcome_status_rank = (
-        _OUTCOME_STATUS_RANK.get(str(_keeper_outcome_dict.get("status") or ""), -1) if _keeper_outcome_dict is not None else -1
+        _OUTCOME_STATUS_RANK.get(str(_keeper_outcome_dict.get("status") or ""), -1)
+        if _keeper_outcome_dict is not None
+        else -1
     )
     _keeper_status_rank = max(_keeper_row_status_rank, _keeper_outcome_status_rank)
     # Codex review, PR #654: "Preserve metadata from lower-ranked duplicate
@@ -886,9 +889,9 @@ def _merge_authoritative_amount_into_keeper(
     # breakdown moving the SAME $5 from the keeper's own week onto a prior
     # week; the amount-equality alone must no longer be the only thing that
     # decides whether the week field moves).
-    _keeper_old_breakdown = (_keeper_row_dict.get("whole_share_claim_breakdown") if _keeper_row_dict is not None else None) or (
-        _keeper_outcome_dict.get("whole_share_claim_breakdown") if _keeper_outcome_dict is not None else None
-    )
+    _keeper_old_breakdown = (
+        _keeper_row_dict.get("whole_share_claim_breakdown") if _keeper_row_dict is not None else None
+    ) or (_keeper_outcome_dict.get("whole_share_claim_breakdown") if _keeper_outcome_dict is not None else None)
     _keeper_old_week_contribution = _current_week_claim_amount(
         {"whole_share_claim_breakdown": _keeper_old_breakdown}, _keeper_existing_amount, _keeper_iso_week
     )
@@ -1014,9 +1017,7 @@ def _keeper_constituent_ids(keeper_entry: Tuple[Any, Any, Any, Any]) -> frozense
     return frozenset(_ids)
 
 
-def _merge_outcomes_into_keeper(
-    keeper_outcomes: Dict[Any, Any], source_outcomes: Dict[Any, Any]
-) -> None:
+def _merge_outcomes_into_keeper(keeper_outcomes: Dict[Any, Any], source_outcomes: Dict[Any, Any]) -> None:
     """Fold ``source_outcomes`` into ``keeper_outcomes`` without clobbering.
 
     ``broker_outcomes`` is keyed by TICKER in the common case, so two variants
@@ -1430,6 +1431,293 @@ def _derived_submitted_count(data: Dict[str, Any]) -> float:
     return float(len(_seen))
 
 
+def _resolve_cross_state_identity(
+    _claimed_map_arg: Dict[Tuple[Any, Any, str], _KeeperEntry],
+    _claimed_accounts_arg: Dict[Tuple[Any, str], set],
+    _claimed_brokers_arg: Dict[str, set],
+    _broker_arg: Any,
+    _account_arg: Any,
+    _order_id_arg: str,
+) -> Tuple[Any, Any, str]:
+    _exact_key = (_broker_arg, _account_arg, _order_id_arg)
+    if _exact_key in _claimed_map_arg:
+        return _exact_key
+    _claimed_accounts = _claimed_accounts_arg.get((_broker_arg, _order_id_arg))
+    if _claimed_accounts and len(_claimed_accounts) == 1:
+        (_only_claimed_account,) = tuple(_claimed_accounts)
+        # Only bridge an UNSCOPED (None) claim with a SCOPED one -- two
+        # concrete, DIFFERENT account numbers for the same order_id are
+        # a genuine collision (two real accounts independently issuing
+        # the same account-local order_id) and must stay separate; only
+        # one side being None (a legacy/absent account field) is the
+        # "same order, inconsistently recorded" case this fallback
+        # exists for.
+        if _only_claimed_account != _account_arg and (_only_claimed_account is None or _account_arg is None):
+            _fallback_key = (_broker_arg, _only_claimed_account, _order_id_arg)
+            if _fallback_key in _claimed_map_arg:
+                return _fallback_key
+    _claimed_brokers = _claimed_brokers_arg.get(_order_id_arg)
+    if _claimed_brokers and len(_claimed_brokers) == 1:
+        (_only_claimed_broker,) = tuple(_claimed_brokers)
+        if _only_claimed_broker != _broker_arg and (_only_claimed_broker is None or _broker_arg is None):
+            _fallback_key = (_only_claimed_broker, _account_arg, _order_id_arg)
+            if _fallback_key in _claimed_map_arg:
+                return _fallback_key
+            # Codex review, PR #654: "Bridge broker and account scopes
+            # together". When a legacy keeper omits BOTH "broker" and
+            # "account_number" but the incoming row/outcome supplies
+            # both, neither one-dimensional fallback above can find it
+            # on its own: the account fallback above searched under
+            # THIS row's own (new) broker, and the single-scope broker
+            # fallback just above keeps THIS row's own (new) account --
+            # neither ever lands on the legacy claim's actual key of
+            # (None, None, order_id). Resolve the two missing scopes
+            # JOINTLY instead: once the unique broker this order_id was
+            # ever claimed under is known, look up the account
+            # SPECIFICALLY claimed under THAT broker (not under this
+            # row's own broker) -- if that, too, is unambiguous and one
+            # side is unscoped, the fully-bridged legacy key is the
+            # correct identity.
+            _claimed_accounts_under_only_broker = _claimed_accounts_arg.get((_only_claimed_broker, _order_id_arg))
+            if _claimed_accounts_under_only_broker and len(_claimed_accounts_under_only_broker) == 1:
+                (_only_claimed_account_under_broker,) = tuple(_claimed_accounts_under_only_broker)
+                if _only_claimed_account_under_broker != _account_arg and (
+                    _only_claimed_account_under_broker is None or _account_arg is None
+                ):
+                    _fallback_key = (_only_claimed_broker, _only_claimed_account_under_broker, _order_id_arg)
+                    if _fallback_key in _claimed_map_arg:
+                        return _fallback_key
+    return _exact_key
+
+
+def _resolve_cross_state_identity_for_row(
+    _claimed_map_arg: Dict[Tuple[Any, Any, str], _KeeperEntry],
+    _claimed_accounts_arg: Dict[Tuple[Any, str], set],
+    _claimed_brokers_arg: Dict[str, set],
+    _broker_arg: Any,
+    _account_arg: Any,
+    _row_arg: Dict[str, Any],
+    _order_id_arg: str,
+) -> Tuple[Tuple[Any, Any, str], bool]:
+    """Like ``_resolve_cross_state_identity``, but also checks every ID
+    in ``_row_arg``'s own ``whole_share_order_ids`` list.
+
+    Codex review, PR #654: "Deduplicate every order ID in aggregated
+    rows". ``near_close_dca._merge_whole_share_submission_outcomes()``
+    can legitimately aggregate SEVERAL physical whole-share orders into
+    one row/outcome: the scalar ``order_id`` holds only the newest of
+    them, while the complete set lives in ``whole_share_order_ids``.
+    Checking only the scalar ID let an aggregated row whose newest ID
+    is unclaimed slip past cross-file dedup even though one of its
+    OTHER constituent IDs was already claimed by an earlier state,
+    double-counting that shared order. Treated as a full-row duplicate
+    of whichever earlier claim is found (this module has no per-ID
+    breakdown of an aggregate's own total to split more precisely).
+
+    Returns ``(identity_key, matched_via_constituent_aggregate)``. The
+    second element is True only when the returned identity came from
+    the multi-constituent fallback below (this row's OWN order_id did
+    NOT resolve directly) -- see the caller's own note (Codex review,
+    PR #654: "Do not merge aggregate totals into one constituent") for
+    why that distinction matters: a match found this way names ONE of
+    several already-separately-claimed keepers, and this row's own
+    amount is the AGGREGATE's total across all of them, not a
+    corrected amount for that one keeper alone.
+    """
+    _resolved = _resolve_cross_state_identity(
+        _claimed_map_arg, _claimed_accounts_arg, _claimed_brokers_arg, _broker_arg, _account_arg, _order_id_arg
+    )
+    if _resolved in _claimed_map_arg:
+        return _resolved, False
+    _extra_ids = _row_arg.get("whole_share_order_ids")
+    if isinstance(_extra_ids, list):
+        _all_constituent_ids = [_order_id_arg] + [
+            _extra_id
+            for _extra_id in _extra_ids
+            if isinstance(_extra_id, str) and _extra_id and _extra_id != _order_id_arg
+        ]
+        if len(_all_constituent_ids) > 1:
+            # Codex review, PR #654: "Preserve unclaimed orders in
+            # aggregate rows". A partial overlap -- SOME constituent
+            # IDs already claimed, but at least one genuinely new --
+            # must NOT be folded into a full-row duplicate of whichever
+            # claim is found first: this module has no per-ID
+            # breakdown of the aggregate's own total, so merging it
+            # away either loses the new order's dollars entirely or,
+            # when the aggregate is itself the keeper, lets a later
+            # smaller standalone constituent overwrite its correctly
+            # combined total downward. Only treated as a full
+            # cross-file duplicate when EVERY constituent ID already
+            # resolves to an existing claim -- a provable complete
+            # repeat, not a partial one.
+            _resolved_per_constituent = [
+                _resolve_cross_state_identity(
+                    _claimed_map_arg,
+                    _claimed_accounts_arg,
+                    _claimed_brokers_arg,
+                    _broker_arg,
+                    _account_arg,
+                    _constituent_id,
+                )
+                for _constituent_id in _all_constituent_ids
+            ]
+            if all(_k in _claimed_map_arg for _k in _resolved_per_constituent):
+                return _resolved_per_constituent[0], True
+    return _resolved, False
+
+
+def _alias_ambiguous_predecessor(
+    _claimed_map_arg: Dict[Tuple[Any, Any, str], _KeeperEntry],
+    _identity_key_arg: Tuple[Any, Any, str],
+    _source_arg: Dict[str, Any],
+    _fallback_key_arg: Any,
+    _is_adjustment_arg: bool,
+    _ambiguous_placements_claimed_across_states: Dict[Tuple[Any, Any, str, str], _KeeperEntry],
+    _data_arg: Dict[str, Any],
+    _broker_arg: Any,
+    _account_arg: Any,
+) -> None:
+    """Point an unclaimed id-bearing identity at its ambiguous predecessor.
+
+    Aliases the earlier state's keeper onto THIS row's own identity
+    key so the existing ``_identity_key in _claimed_map`` branch --
+    and every keeper-merge rule it already enforces (authoritative
+    amount promotion, claim metadata, removal accounting) -- handles
+    the fold with no duplicated logic. The ambiguous claim is
+    consumed so a second identified row cannot fold into the same
+    predecessor.
+
+    Deliberately narrow, because a wrong fold silently merges two
+    real orders: the row must actually be unclaimed, must not be a
+    settlement adjustment, and the predecessor must come from a
+    DIFFERENT state that shares this one's explicit run identity
+    (:func:`_states_share_explicit_run_identity` -- both sides
+    carrying the same ``run_classification.run_id``, the positive
+    proof the merge path demands elsewhere).
+    """
+    if _is_adjustment_arg or _identity_key_arg in _claimed_map_arg:
+        return
+    _run_id_for_alias = _explicit_run_id(_data_arg)
+    if not _run_id_for_alias:
+        return
+    _ticker_for_alias = _ambiguous_placement_ticker(_source_arg, _fallback_key_arg)
+    if not _ticker_for_alias:
+        return
+    _ambiguous_key = (_broker_arg, _account_arg, _run_id_for_alias, _ticker_for_alias)
+    _ambiguous_keeper = _ambiguous_placements_claimed_across_states.get(_ambiguous_key)
+    if _ambiguous_keeper is None:
+        return
+    _ambiguous_state = _ambiguous_keeper[3]
+    if _ambiguous_state is _data_arg:
+        return
+    if not _states_share_explicit_run_identity(_ambiguous_state, _data_arg):
+        return
+    _claimed_map_arg[_identity_key_arg] = _ambiguous_keeper
+    _ambiguous_placements_claimed_across_states.pop(_ambiguous_key, None)
+
+
+def _note_ambiguous_placement(
+    _source: Optional[Dict[str, Any]],
+    _fallback_key: Any,
+    _row_for_keeper: Optional[Dict[str, Any]],
+    _outcome_for_keeper: Optional[Dict[str, Any]],
+    _seen_map_arg: Dict[str, Tuple[int, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]],
+) -> None:
+    """Record an id-less ambiguous placement seen in this state."""
+    if not isinstance(_source, dict):
+        return
+    if _source.get("status") not in _AMBIGUOUS_PLACEMENT_STATUSES:
+        return
+    # An id-BEARING ambiguous row needs no correlation help: the
+    # order_id-keyed maps already claim it.
+    _existing_id = _source.get("order_id")
+    if isinstance(_existing_id, str) and _existing_id:
+        return
+    if _is_settlement_adjustment(_source):
+        return
+    _ticker_for_ambiguous = _ambiguous_placement_ticker(_source, _fallback_key)
+    if not _ticker_for_ambiguous:
+        return
+    _prior = _seen_map_arg.get(_ticker_for_ambiguous)
+    if _prior is None:
+        _seen_map_arg[_ticker_for_ambiguous] = (
+            1,
+            _row_for_keeper,
+            _outcome_for_keeper,
+        )
+        return
+    # The candidate-row call and the broker_outcomes call are TWO
+    # REPRESENTATIONS of the very same physical order, not two
+    # placements: broker_outcomes is a dict keyed by ticker (at most
+    # one entry per ticker), so an id-less ambiguous buy_candidates
+    # row and an id-less ambiguous broker_outcomes[ticker] entry for
+    # that SAME ticker in this SAME state are, by construction, the
+    # candidate half and the outcome half of one order. Counting
+    # both as separate placements bumped the count to 2, and
+    # registration below only promotes a count-of-1 -- so a later
+    # variant of this same explicit run could never fold its
+    # identified row into this predecessor, permanently splitting
+    # one real order into two rows/notionals downstream (Codex
+    # review, PR #1300 discussion_r3920155073: "Count matching
+    # candidate and outcome as one placement"). Detected as: the
+    # prior entry is still missing exactly the half THIS call
+    # supplies (a row-only entry now completed by an outcome, or
+    # vice versa) -- fill that half in without incrementing. A
+    # genuine second, distinct ambiguous placement for one ticker in
+    # one state (two buy_candidates rows, or a second call supplying
+    # the SAME half again) still increments, exactly as before.
+    if _prior[1] is None and _row_for_keeper is not None and _prior[2] is not None:
+        _seen_map_arg[_ticker_for_ambiguous] = (_prior[0], _row_for_keeper, _prior[2])
+        return
+    if _prior[2] is None and _outcome_for_keeper is not None and _prior[1] is not None:
+        _seen_map_arg[_ticker_for_ambiguous] = (_prior[0], _prior[1], _outcome_for_keeper)
+        return
+    # A second ambiguous placement for the same ticker in one state:
+    # keep counting so the promotion below refuses to register an
+    # ambiguous-by-construction correlation, while retaining the
+    # FIRST entry's keeper references.
+    _seen_map_arg[_ticker_for_ambiguous] = (
+        _prior[0] + 1,
+        _prior[1],
+        _prior[2],
+    )
+
+
+def _register_seen_claim(
+    _claimed_map_to_register: Dict[Tuple[Any, Any, str], _KeeperEntry],
+    _claimed_accounts_to_register: Dict[Tuple[Any, str], set],
+    _claimed_brokers_to_register: Dict[str, set],
+    _seen_id: str,
+    _seen_row_arg: Optional[Dict[str, Any]],
+    _seen_outcome_arg: Optional[Dict[str, Any]],
+    _broker_scope_arg: Any,
+    _account_scope_arg: Any,
+    _state_iso_week_arg: Optional[Tuple[int, int]],
+    _data_arg: Dict[str, Any],
+) -> None:
+    _keeper_entry_to_register = (_state_iso_week_arg, _seen_row_arg, _seen_outcome_arg, _data_arg)
+    _claimed_map_to_register.setdefault((_broker_scope_arg, _account_scope_arg, _seen_id), _keeper_entry_to_register)
+    _claimed_accounts_to_register.setdefault((_broker_scope_arg, _seen_id), set()).add(_account_scope_arg)
+    # Codex review, PR #654: "Bridge missing broker scopes to
+    # unambiguous variants" -- mirrors the account-scope
+    # registration directly above, but keyed by bare order_id.
+    _claimed_brokers_to_register.setdefault(_seen_id, set()).add(_broker_scope_arg)
+    for _extra_source in (_seen_row_arg, _seen_outcome_arg):
+        if not isinstance(_extra_source, dict):
+            continue
+        _extra_ids = _extra_source.get("whole_share_order_ids")
+        if not isinstance(_extra_ids, list):
+            continue
+        for _extra_id in _extra_ids:
+            if not isinstance(_extra_id, str) or not _extra_id or _extra_id == _seen_id:
+                continue
+            _claimed_map_to_register.setdefault(
+                (_broker_scope_arg, _account_scope_arg, _extra_id), _keeper_entry_to_register
+            )
+            _claimed_accounts_to_register.setdefault((_broker_scope_arg, _extra_id), set()).add(_account_scope_arg)
+            _claimed_brokers_to_register.setdefault(_extra_id, set()).add(_broker_scope_arg)
+
+
 def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     """Load artifacts, skipping the minimal ``status: "blocked"`` run_state stubs
     written for date-gated days — they are not run days and would otherwise be
@@ -1483,8 +1771,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     kept = [
         data
         for data in loaded
-        if (data.get("status") != "blocked" or _has_submitted_evidence(data))
-        and not _is_manual_run_state(data)
+        if (data.get("status") != "blocked" or _has_submitted_evidence(data)) and not _is_manual_run_state(data)
     ]
     # A structurally rejected blocked artifact admitted above for its real
     # broker submission evidence can carry a list-/object-valued
@@ -1635,140 +1922,6 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
     _order_claimed_brokers: Dict[str, set] = {}
     _adjustment_order_claimed_brokers: Dict[str, set] = {}
 
-    def _resolve_cross_state_identity(
-        _claimed_map_arg: Dict[Tuple[Any, Any, str], _KeeperEntry],
-        _claimed_accounts_arg: Dict[Tuple[Any, str], set],
-        _claimed_brokers_arg: Dict[str, set],
-        _broker_arg: Any,
-        _account_arg: Any,
-        _order_id_arg: str,
-    ) -> Tuple[Any, Any, str]:
-        _exact_key = (_broker_arg, _account_arg, _order_id_arg)
-        if _exact_key in _claimed_map_arg:
-            return _exact_key
-        _claimed_accounts = _claimed_accounts_arg.get((_broker_arg, _order_id_arg))
-        if _claimed_accounts and len(_claimed_accounts) == 1:
-            (_only_claimed_account,) = tuple(_claimed_accounts)
-            # Only bridge an UNSCOPED (None) claim with a SCOPED one -- two
-            # concrete, DIFFERENT account numbers for the same order_id are
-            # a genuine collision (two real accounts independently issuing
-            # the same account-local order_id) and must stay separate; only
-            # one side being None (a legacy/absent account field) is the
-            # "same order, inconsistently recorded" case this fallback
-            # exists for.
-            if _only_claimed_account != _account_arg and (_only_claimed_account is None or _account_arg is None):
-                _fallback_key = (_broker_arg, _only_claimed_account, _order_id_arg)
-                if _fallback_key in _claimed_map_arg:
-                    return _fallback_key
-        _claimed_brokers = _claimed_brokers_arg.get(_order_id_arg)
-        if _claimed_brokers and len(_claimed_brokers) == 1:
-            (_only_claimed_broker,) = tuple(_claimed_brokers)
-            if _only_claimed_broker != _broker_arg and (_only_claimed_broker is None or _broker_arg is None):
-                _fallback_key = (_only_claimed_broker, _account_arg, _order_id_arg)
-                if _fallback_key in _claimed_map_arg:
-                    return _fallback_key
-                # Codex review, PR #654: "Bridge broker and account scopes
-                # together". When a legacy keeper omits BOTH "broker" and
-                # "account_number" but the incoming row/outcome supplies
-                # both, neither one-dimensional fallback above can find it
-                # on its own: the account fallback above searched under
-                # THIS row's own (new) broker, and the single-scope broker
-                # fallback just above keeps THIS row's own (new) account --
-                # neither ever lands on the legacy claim's actual key of
-                # (None, None, order_id). Resolve the two missing scopes
-                # JOINTLY instead: once the unique broker this order_id was
-                # ever claimed under is known, look up the account
-                # SPECIFICALLY claimed under THAT broker (not under this
-                # row's own broker) -- if that, too, is unambiguous and one
-                # side is unscoped, the fully-bridged legacy key is the
-                # correct identity.
-                _claimed_accounts_under_only_broker = _claimed_accounts_arg.get(
-                    (_only_claimed_broker, _order_id_arg)
-                )
-                if _claimed_accounts_under_only_broker and len(_claimed_accounts_under_only_broker) == 1:
-                    (_only_claimed_account_under_broker,) = tuple(_claimed_accounts_under_only_broker)
-                    if _only_claimed_account_under_broker != _account_arg and (
-                        _only_claimed_account_under_broker is None or _account_arg is None
-                    ):
-                        _fallback_key = (_only_claimed_broker, _only_claimed_account_under_broker, _order_id_arg)
-                        if _fallback_key in _claimed_map_arg:
-                            return _fallback_key
-        return _exact_key
-
-    def _resolve_cross_state_identity_for_row(
-        _claimed_map_arg: Dict[Tuple[Any, Any, str], _KeeperEntry],
-        _claimed_accounts_arg: Dict[Tuple[Any, str], set],
-        _claimed_brokers_arg: Dict[str, set],
-        _broker_arg: Any,
-        _account_arg: Any,
-        _row_arg: Dict[str, Any],
-        _order_id_arg: str,
-    ) -> Tuple[Tuple[Any, Any, str], bool]:
-        """Like ``_resolve_cross_state_identity``, but also checks every ID
-        in ``_row_arg``'s own ``whole_share_order_ids`` list.
-
-        Codex review, PR #654: "Deduplicate every order ID in aggregated
-        rows". ``near_close_dca._merge_whole_share_submission_outcomes()``
-        can legitimately aggregate SEVERAL physical whole-share orders into
-        one row/outcome: the scalar ``order_id`` holds only the newest of
-        them, while the complete set lives in ``whole_share_order_ids``.
-        Checking only the scalar ID let an aggregated row whose newest ID
-        is unclaimed slip past cross-file dedup even though one of its
-        OTHER constituent IDs was already claimed by an earlier state,
-        double-counting that shared order. Treated as a full-row duplicate
-        of whichever earlier claim is found (this module has no per-ID
-        breakdown of an aggregate's own total to split more precisely).
-
-        Returns ``(identity_key, matched_via_constituent_aggregate)``. The
-        second element is True only when the returned identity came from
-        the multi-constituent fallback below (this row's OWN order_id did
-        NOT resolve directly) -- see the caller's own note (Codex review,
-        PR #654: "Do not merge aggregate totals into one constituent") for
-        why that distinction matters: a match found this way names ONE of
-        several already-separately-claimed keepers, and this row's own
-        amount is the AGGREGATE's total across all of them, not a
-        corrected amount for that one keeper alone.
-        """
-        _resolved = _resolve_cross_state_identity(
-            _claimed_map_arg, _claimed_accounts_arg, _claimed_brokers_arg, _broker_arg, _account_arg, _order_id_arg
-        )
-        if _resolved in _claimed_map_arg:
-            return _resolved, False
-        _extra_ids = _row_arg.get("whole_share_order_ids")
-        if isinstance(_extra_ids, list):
-            _all_constituent_ids = [_order_id_arg] + [
-                _extra_id
-                for _extra_id in _extra_ids
-                if isinstance(_extra_id, str) and _extra_id and _extra_id != _order_id_arg
-            ]
-            if len(_all_constituent_ids) > 1:
-                # Codex review, PR #654: "Preserve unclaimed orders in
-                # aggregate rows". A partial overlap -- SOME constituent
-                # IDs already claimed, but at least one genuinely new --
-                # must NOT be folded into a full-row duplicate of whichever
-                # claim is found first: this module has no per-ID
-                # breakdown of the aggregate's own total, so merging it
-                # away either loses the new order's dollars entirely or,
-                # when the aggregate is itself the keeper, lets a later
-                # smaller standalone constituent overwrite its correctly
-                # combined total downward. Only treated as a full
-                # cross-file duplicate when EVERY constituent ID already
-                # resolves to an existing claim -- a provable complete
-                # repeat, not a partial one.
-                _resolved_per_constituent = [
-                    _resolve_cross_state_identity(
-                        _claimed_map_arg,
-                        _claimed_accounts_arg,
-                        _claimed_brokers_arg,
-                        _broker_arg,
-                        _account_arg,
-                        _constituent_id,
-                    )
-                    for _constituent_id in _all_constituent_ids
-                ]
-                if all(_k in _claimed_map_arg for _k in _resolved_per_constituent):
-                    return _resolved_per_constituent[0], True
-        return _resolved, False
     # Codex review, PR #654: "Collapse state variants before counting run
     # days". Row-level dedup above (and below) removes a duplicate state
     # variant's own order rows, but leaves the state dict itself in `kept`
@@ -1851,126 +2004,6 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
             str, Tuple[int, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]
         ] = {}
 
-        def _alias_ambiguous_predecessor(
-            _claimed_map_arg: Dict[Tuple[Any, Any, str], _KeeperEntry],
-            _identity_key_arg: Tuple[Any, Any, str],
-            _source_arg: Dict[str, Any],
-            _fallback_key_arg: Any,
-            _is_adjustment_arg: bool,
-            # Bound as defaults, not captured: this closure is defined inside
-            # the per-state loop and must see THIS iteration's scopes/state
-            # (ruff B023).
-            _data_arg: Dict[str, Any] = data,
-            _broker_arg: Any = _broker_scope,
-            _account_arg: Any = _account_scope,
-        ) -> None:
-            """Point an unclaimed id-bearing identity at its ambiguous predecessor.
-
-            Aliases the earlier state's keeper onto THIS row's own identity
-            key so the existing ``_identity_key in _claimed_map`` branch --
-            and every keeper-merge rule it already enforces (authoritative
-            amount promotion, claim metadata, removal accounting) -- handles
-            the fold with no duplicated logic. The ambiguous claim is
-            consumed so a second identified row cannot fold into the same
-            predecessor.
-
-            Deliberately narrow, because a wrong fold silently merges two
-            real orders: the row must actually be unclaimed, must not be a
-            settlement adjustment, and the predecessor must come from a
-            DIFFERENT state that shares this one's explicit run identity
-            (:func:`_states_share_explicit_run_identity` -- both sides
-            carrying the same ``run_classification.run_id``, the positive
-            proof the merge path demands elsewhere).
-            """
-            if _is_adjustment_arg or _identity_key_arg in _claimed_map_arg:
-                return
-            _run_id_for_alias = _explicit_run_id(_data_arg)
-            if not _run_id_for_alias:
-                return
-            _ticker_for_alias = _ambiguous_placement_ticker(_source_arg, _fallback_key_arg)
-            if not _ticker_for_alias:
-                return
-            _ambiguous_key = (_broker_arg, _account_arg, _run_id_for_alias, _ticker_for_alias)
-            _ambiguous_keeper = _ambiguous_placements_claimed_across_states.get(_ambiguous_key)
-            if _ambiguous_keeper is None:
-                return
-            _ambiguous_state = _ambiguous_keeper[3]
-            if _ambiguous_state is _data_arg:
-                return
-            if not _states_share_explicit_run_identity(_ambiguous_state, _data_arg):
-                return
-            _claimed_map_arg[_identity_key_arg] = _ambiguous_keeper
-            _ambiguous_placements_claimed_across_states.pop(_ambiguous_key, None)
-
-        def _note_ambiguous_placement(
-            _source: Optional[Dict[str, Any]],
-            _fallback_key: Any,
-            _row_for_keeper: Optional[Dict[str, Any]],
-            _outcome_for_keeper: Optional[Dict[str, Any]],
-            # Bound as a default, not captured -- see
-            # _alias_ambiguous_predecessor's own note (ruff B023).
-            _seen_map_arg: Dict[
-                str, Tuple[int, Optional[Dict[str, Any]], Optional[Dict[str, Any]]]
-            ] = _ambiguous_placements_seen_this_state,
-        ) -> None:
-            """Record an id-less ambiguous placement seen in this state."""
-            if not isinstance(_source, dict):
-                return
-            if _source.get("status") not in _AMBIGUOUS_PLACEMENT_STATUSES:
-                return
-            # An id-BEARING ambiguous row needs no correlation help: the
-            # order_id-keyed maps already claim it.
-            _existing_id = _source.get("order_id")
-            if isinstance(_existing_id, str) and _existing_id:
-                return
-            if _is_settlement_adjustment(_source):
-                return
-            _ticker_for_ambiguous = _ambiguous_placement_ticker(_source, _fallback_key)
-            if not _ticker_for_ambiguous:
-                return
-            _prior = _seen_map_arg.get(_ticker_for_ambiguous)
-            if _prior is None:
-                _seen_map_arg[_ticker_for_ambiguous] = (
-                    1,
-                    _row_for_keeper,
-                    _outcome_for_keeper,
-                )
-                return
-            # The candidate-row call and the broker_outcomes call are TWO
-            # REPRESENTATIONS of the very same physical order, not two
-            # placements: broker_outcomes is a dict keyed by ticker (at most
-            # one entry per ticker), so an id-less ambiguous buy_candidates
-            # row and an id-less ambiguous broker_outcomes[ticker] entry for
-            # that SAME ticker in this SAME state are, by construction, the
-            # candidate half and the outcome half of one order. Counting
-            # both as separate placements bumped the count to 2, and
-            # registration below only promotes a count-of-1 -- so a later
-            # variant of this same explicit run could never fold its
-            # identified row into this predecessor, permanently splitting
-            # one real order into two rows/notionals downstream (Codex
-            # review, PR #1300 discussion_r3920155073: "Count matching
-            # candidate and outcome as one placement"). Detected as: the
-            # prior entry is still missing exactly the half THIS call
-            # supplies (a row-only entry now completed by an outcome, or
-            # vice versa) -- fill that half in without incrementing. A
-            # genuine second, distinct ambiguous placement for one ticker in
-            # one state (two buy_candidates rows, or a second call supplying
-            # the SAME half again) still increments, exactly as before.
-            if _prior[1] is None and _row_for_keeper is not None and _prior[2] is not None:
-                _seen_map_arg[_ticker_for_ambiguous] = (_prior[0], _row_for_keeper, _prior[2])
-                return
-            if _prior[2] is None and _outcome_for_keeper is not None and _prior[1] is not None:
-                _seen_map_arg[_ticker_for_ambiguous] = (_prior[0], _prior[1], _outcome_for_keeper)
-                return
-            # A second ambiguous placement for the same ticker in one state:
-            # keep counting so the promotion below refuses to register an
-            # ambiguous-by-construction correlation, while retaining the
-            # FIRST entry's keeper references.
-            _seen_map_arg[_ticker_for_ambiguous] = (
-                _prior[0] + 1,
-                _prior[1],
-                _prior[2],
-            )
         # Ticker -> list of each removed duplicate candidate's own amount
         # (submitted_amount_usd, else planned_amount_usd, else None), used
         # below to match a same-state broker_outcomes entry that lacks its
@@ -2176,9 +2209,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     _count_ticker = _count_key if isinstance(_count_key, str) else None
                 if not _count_ticker:
                     continue
-                _id_less_outcome_ticker_counts[_count_ticker] = (
-                    _id_less_outcome_ticker_counts.get(_count_ticker, 0) + 1
-                )
+                _id_less_outcome_ticker_counts[_count_ticker] = _id_less_outcome_ticker_counts.get(_count_ticker, 0) + 1
         if isinstance(_candidates_for_cross_state_dedup, list):
             _deduped_candidates = []
             for _row in _candidates_for_cross_state_dedup:
@@ -2192,7 +2223,9 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     )
                     _identity_key, _row_matched_via_constituent_aggregate = _resolve_cross_state_identity_for_row(
                         _claimed_map,
-                        _adjustment_broker_order_claimed_accounts if _row_is_adjustment else _broker_order_claimed_accounts,
+                        _adjustment_broker_order_claimed_accounts
+                        if _row_is_adjustment
+                        else _broker_order_claimed_accounts,
                         _adjustment_order_claimed_brokers if _row_is_adjustment else _order_claimed_brokers,
                         _broker_scope,
                         _account_scope,
@@ -2200,7 +2233,15 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         _row_order_id,
                     )
                     _alias_ambiguous_predecessor(
-                        _claimed_map, _identity_key, _row, _row.get("ticker"), _row_is_adjustment
+                        _claimed_map,
+                        _identity_key,
+                        _row,
+                        _row.get("ticker"),
+                        _row_is_adjustment,
+                        _ambiguous_placements_claimed_across_states,
+                        data,
+                        _broker_scope,
+                        _account_scope,
                     )
                     if _identity_key in _claimed_map:
                         # Codex review, PR #654: "Record scoped accounts
@@ -2384,7 +2425,9 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 (_row_order_id, _row_is_adjustment)
                             )
                             _matching_outcome_amount = (
-                                _finite_ordinary_amount(_matching_outcome_for_row.get("submitted_amount_usd"), _row_is_adjustment)
+                                _finite_ordinary_amount(
+                                    _matching_outcome_for_row.get("submitted_amount_usd"), _row_is_adjustment
+                                )
                                 if _matching_outcome_for_row is not None
                                 else None
                             )
@@ -2404,8 +2447,13 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 and _OUTCOME_STATUS_RANK.get(str(_matching_outcome_for_row.get("status") or ""), -1)
                                 >= _OUTCOME_STATUS_RANK.get(str(_row.get("status") or ""), -1)
                             )
-                            if not _defer_amount_to_outcome and _amount_credit_key not in _removed_amount_credited_order_ids:
-                                _dropped_amount = _finite_ordinary_amount(_row.get("submitted_amount_usd"), _row_is_adjustment)
+                            if (
+                                not _defer_amount_to_outcome
+                                and _amount_credit_key not in _removed_amount_credited_order_ids
+                            ):
+                                _dropped_amount = _finite_ordinary_amount(
+                                    _row.get("submitted_amount_usd"), _row_is_adjustment
+                                )
                                 # Codex review, PR #654: "Do not merge planned
                                 # fallbacks as authoritative fills". A dropped
                                 # amount sourced from planned_amount_usd is
@@ -2416,7 +2464,9 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 # overwrite a keeper's own confirmed fill.
                                 _dropped_amount_is_confirmed = _dropped_amount is not None
                                 if _dropped_amount is None:
-                                    _dropped_amount = _finite_ordinary_amount(_row.get("planned_amount_usd"), _row_is_adjustment)
+                                    _dropped_amount = _finite_ordinary_amount(
+                                        _row.get("planned_amount_usd"), _row_is_adjustment
+                                    )
                                 if _dropped_amount is not None:
                                     _removed_amount += _dropped_amount
                                     if _claimed_map[_identity_key][0] != _state_iso_week:
@@ -2503,7 +2553,11 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # folded into it (Codex review, PR #1300
                     # discussion_r3920642635).
                     _note_ambiguous_placement(
-                        _row, _row.get("ticker") if isinstance(_row, dict) else None, _row, None
+                        _row,
+                        _row.get("ticker") if isinstance(_row, dict) else None,
+                        _row,
+                        None,
+                        _ambiguous_placements_seen_this_state,
                     )
                 _deduped_candidates.append(_row)
             data["buy_candidates"] = _deduped_candidates
@@ -2531,7 +2585,15 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         _outcome_order_id,
                     )
                     _alias_ambiguous_predecessor(
-                        _claimed_map, _identity_key, _outcome_value, _outcome_key, _outcome_is_adjustment
+                        _claimed_map,
+                        _identity_key,
+                        _outcome_value,
+                        _outcome_key,
+                        _outcome_is_adjustment,
+                        _ambiguous_placements_claimed_across_states,
+                        data,
+                        _broker_scope,
+                        _account_scope,
                     )
                     if _identity_key in _claimed_map:
                         # See the candidate-row branch's own note above
@@ -2644,11 +2706,9 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                 # candidate-row branch's own note above,
                                 # Codex review, PR #654: "Do not merge
                                 # aggregate totals into one constituent").
-                                if (
-                                    not _outcome_matched_via_constituent_aggregate
-                                    and _order_constituent_ids(_outcome_order_id, _outcome_value)
-                                    == _keeper_constituent_ids(_claimed_map[_identity_key])
-                                ):
+                                if not _outcome_matched_via_constituent_aggregate and _order_constituent_ids(
+                                    _outcome_order_id, _outcome_value
+                                ) == _keeper_constituent_ids(_claimed_map[_identity_key]):
                                     _merge_authoritative_amount_into_keeper(
                                         _claimed_map[_identity_key],
                                         _dropped_outcome_amount,
@@ -2657,9 +2717,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                                     )
                         continue
                     _seen_map = (
-                        _adjustment_order_ids_seen_this_state
-                        if _outcome_is_adjustment
-                        else _order_ids_seen_this_state
+                        _adjustment_order_ids_seen_this_state if _outcome_is_adjustment else _order_ids_seen_this_state
                     )
                     _seen_map.setdefault(_outcome_order_id, (_outcome_value, _outcome_value))
                 elif isinstance(_outcome_value, dict) and _removed_duplicate_candidate_entries_by_ticker:
@@ -2869,7 +2927,9 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # Mirrors the candidate-row branch: an id-less ambiguous
                     # outcome is the other shape this transition arrives in
                     # (Codex review, PR #1300 discussion_r3920642635).
-                    _note_ambiguous_placement(_outcome_value, _outcome_key, None, _outcome_value)
+                    _note_ambiguous_placement(
+                        _outcome_value, _outcome_key, None, _outcome_value, _ambiguous_placements_seen_this_state
+                    )
                 _deduped_outcomes[_outcome_key] = _outcome_value
             data["broker_outcomes"] = _deduped_outcomes
         # Codex review, PR #654: "Register every constituent ID from
@@ -2884,44 +2944,6 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         # double-counting the dollars the aggregate already included.
         # Every constituent ID is registered here, pointing at the SAME
         # keeper entry as the scalar ID.
-        def _register_seen_claim(
-            _claimed_map_to_register: Dict[Tuple[Any, Any, str], _KeeperEntry],
-            _claimed_accounts_to_register: Dict[Tuple[Any, str], set],
-            _claimed_brokers_to_register: Dict[str, set],
-            _seen_id: str,
-            _seen_row_arg: Optional[Dict[str, Any]],
-            _seen_outcome_arg: Optional[Dict[str, Any]],
-            _broker_scope_arg: Any,
-            _account_scope_arg: Any,
-            _state_iso_week_arg: Optional[Tuple[int, int]],
-            _data_arg: Dict[str, Any],
-        ) -> None:
-            _keeper_entry_to_register = (_state_iso_week_arg, _seen_row_arg, _seen_outcome_arg, _data_arg)
-            _claimed_map_to_register.setdefault(
-                (_broker_scope_arg, _account_scope_arg, _seen_id), _keeper_entry_to_register
-            )
-            _claimed_accounts_to_register.setdefault((_broker_scope_arg, _seen_id), set()).add(_account_scope_arg)
-            # Codex review, PR #654: "Bridge missing broker scopes to
-            # unambiguous variants" -- mirrors the account-scope
-            # registration directly above, but keyed by bare order_id.
-            _claimed_brokers_to_register.setdefault(_seen_id, set()).add(_broker_scope_arg)
-            for _extra_source in (_seen_row_arg, _seen_outcome_arg):
-                if not isinstance(_extra_source, dict):
-                    continue
-                _extra_ids = _extra_source.get("whole_share_order_ids")
-                if not isinstance(_extra_ids, list):
-                    continue
-                for _extra_id in _extra_ids:
-                    if not isinstance(_extra_id, str) or not _extra_id or _extra_id == _seen_id:
-                        continue
-                    _claimed_map_to_register.setdefault(
-                        (_broker_scope_arg, _account_scope_arg, _extra_id), _keeper_entry_to_register
-                    )
-                    _claimed_accounts_to_register.setdefault((_broker_scope_arg, _extra_id), set()).add(
-                        _account_scope_arg
-                    )
-                    _claimed_brokers_to_register.setdefault(_extra_id, set()).add(_broker_scope_arg)
-
         # Promote this state's own id-less ambiguous placements so a LATER
         # variant of the same explicit run can fold its identified row into
         # them. Registered only where exactly ONE ambiguous placement exists
@@ -2970,9 +2992,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
         if _removed_candidate_count or _removed_submitted_count or _removed_amount:
             _counts_for_cross_state_adjustment = data.get("counts")
             if isinstance(_counts_for_cross_state_adjustment, dict):
-                _existing_buy_candidates_count = _finite_float(
-                    _counts_for_cross_state_adjustment.get("buy_candidates")
-                )
+                _existing_buy_candidates_count = _finite_float(_counts_for_cross_state_adjustment.get("buy_candidates"))
                 if _existing_buy_candidates_count is not None:
                     _counts_for_cross_state_adjustment["buy_candidates"] = max(
                         0, _existing_buy_candidates_count - _removed_candidate_count
@@ -3463,9 +3483,9 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         _matched_ticker = _outcome_ticker_by_order_id.get(_row["order_id"])
                         if _matched_ticker:
                             _row["ticker"] = _matched_ticker
-            _ordered_candidate_rows = [
-                row for row in _candidate_rows if not _is_settlement_adjustment(row)
-            ] + [row for row in _candidate_rows if _is_settlement_adjustment(row)]
+            _ordered_candidate_rows = [row for row in _candidate_rows if not _is_settlement_adjustment(row)] + [
+                row for row in _candidate_rows if _is_settlement_adjustment(row)
+            ]
             settlement_sequence: Dict[Any, int] = {}
             # Codex review, PR #593: "Assign unique identities to repeated
             # id-less candidates". The composite "<ticker>:<order_id>"
@@ -4013,9 +4033,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 counts = data.get("counts")
                 if isinstance(counts, dict):
                     counts["buy_candidates"] = sum(
-                        1
-                        for r in data["buy_candidates"]
-                        if isinstance(r, dict) and not _is_settlement_adjustment(r)
+                        1 for r in data["buy_candidates"] if isinstance(r, dict) and not _is_settlement_adjustment(r)
                     )
             # build_graded_vs_fixed()/build_sector_matrix() consume only
             # buy_candidates (they never look at broker_outcomes), so an
@@ -4143,13 +4161,12 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # valid existing value" contract.
                     _keeper_identity = identity_by_candidate_row_id.get(id(_keeper))
                     if _dup_amount is not None:
-                        if _keeper_identity is not None and not _finite_float(
-                            amounts_by_ticker.get(_keeper_identity)
-                        ):
+                        if _keeper_identity is not None and not _finite_float(amounts_by_ticker.get(_keeper_identity)):
                             amounts_by_ticker[_keeper_identity] = _dup_amount
-                    if _dup_row.get("status") in _REAL_ORDER_STATUSES and _keeper.get(
-                        "status"
-                    ) not in _REAL_ORDER_STATUSES:
+                    if (
+                        _dup_row.get("status") in _REAL_ORDER_STATUSES
+                        and _keeper.get("status") not in _REAL_ORDER_STATUSES
+                    ):
                         _keeper["status"] = _dup_row.get("status")
                     if _has_usable_claim_breakdown(_dup_row) and not _has_usable_claim_breakdown(_keeper):
                         _keeper["whole_share_claim_breakdown"] = _dup_row.get("whole_share_claim_breakdown")
@@ -4185,9 +4202,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         candidate_row_by_identity.pop(_dup_identity, None)
                     _stale_duplicate_row_ids.add(id(_dup_row))
             if _stale_duplicate_row_ids:
-                existing_candidate_rows = [
-                    r for r in existing_candidate_rows if id(r) not in _stale_duplicate_row_ids
-                ]
+                existing_candidate_rows = [r for r in existing_candidate_rows if id(r) not in _stale_duplicate_row_ids]
                 _all_dict_candidate_rows = [
                     r for r in _all_dict_candidate_rows if id(r) not in _stale_duplicate_row_ids
                 ]
@@ -4199,9 +4214,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 counts = data.get("counts")
                 if isinstance(counts, dict):
                     counts["buy_candidates"] = sum(
-                        1
-                        for r in data["buy_candidates"]
-                        if isinstance(r, dict) and not _is_settlement_adjustment(r)
+                        1 for r in data["buy_candidates"] if isinstance(r, dict) and not _is_settlement_adjustment(r)
                     )
             existing_tickers = {row.get("ticker") for row in existing_candidate_rows}
             # A retained retry's recovery merge can append its own
@@ -4318,10 +4331,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     _pool = id_less_candidate_identities.get(_ticker)
                     if _pool and _identity in _pool:
                         _pool.remove(_identity)
-                    elif _pool and (
-                        _identity != _ticker
-                        or candidate_order_id_by_identity.get(_identity) is not None
-                    ):
+                    elif _pool and (_identity != _ticker or candidate_order_id_by_identity.get(_identity) is not None):
                         # Codex review, PR #654: "Match composite ID-less
                         # outcomes to sequenced candidates". The original
                         # deferral only covered a BARE-keyed id-less outcome
@@ -4479,10 +4489,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                     # stays available for a genuinely unmatched outcome.
                     if (
                         outcome_order_id
-                        and (
-                            identity not in amounts_by_ticker
-                            or candidate_order_id_by_identity.get(identity) is None
-                        )
+                        and (identity not in amounts_by_ticker or candidate_order_id_by_identity.get(identity) is None)
                         and not _is_settlement_adjustment(outcome)
                         and outcome_order_id in candidate_identity_by_order_id
                     ):
@@ -4708,9 +4715,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                             folded_candidate_adjustment = True
                         else:
                             settlement_sequence[ticker] = settlement_sequence.get(ticker, 0) + 1
-                            identity = (
-                                f"{ticker}:whole_share_settlement_adjustment#{settlement_sequence[ticker]}"
-                            )
+                            identity = f"{ticker}:whole_share_settlement_adjustment#{settlement_sequence[ticker]}"
                     # Registered AFTER every fold above has had its say, so
                     # this records the FINAL identity this order_id
                     # resolved to -- first writer wins, matching every
@@ -4810,9 +4815,9 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                         # of leaving this outcome's amount at $0/unresolved
                         # (Codex review, PR #654: "Gate stale amount
                         # fallback by order kind").
-                        if _stale_match is not None and _is_settlement_adjustment(_stale_match) != _is_settlement_adjustment(
-                            outcome
-                        ):
+                        if _stale_match is not None and _is_settlement_adjustment(
+                            _stale_match
+                        ) != _is_settlement_adjustment(outcome):
                             _stale_match = None
                         if _stale_match is not None:
                             # _is_settlement_adjustment(), not a bare
@@ -5138,9 +5143,7 @@ def load_json_files(paths: Sequence[str | Path]) -> List[Dict[str, Any]]:
                 # is still a bookkeeping-only correction, not a fresh
                 # candidate.
                 counts["buy_candidates"] = sum(
-                    1
-                    for r in data["buy_candidates"]
-                    if isinstance(r, dict) and not _is_settlement_adjustment(r)
+                    1 for r in data["buy_candidates"] if isinstance(r, dict) and not _is_settlement_adjustment(r)
                 )
             if amounts_by_ticker:
                 # The minimal retained state this normalization is meant to
@@ -5489,7 +5492,6 @@ def _iso_week_of_state(data: Dict[str, Any]) -> Optional[Tuple[int, int]]:
     return trading_day_week
 
 
-
 # The base amount changed from $3 to $2 on this date (see the "Base-amount
 # change (Jul 19 2026)" note in docs/strategy.md and config/scheduled_tasks.json).
 # ISO date strings ("YYYY-MM-DD") compare correctly as plain strings.
@@ -5807,6 +5809,7 @@ def _state_weekly_cap(data: Dict[str, Any]) -> Optional[float]:
     budget = data.get("budget")
     if not isinstance(budget, dict):
         return None
+
     # Each candidate is checked for finiteness with _finite_float() BEFORE
     # falling through to the next one -- a truthy but malformed
     # weekly_cap_usd (e.g. "bad"/"NaN") used to short-circuit the `or`
@@ -6215,8 +6218,7 @@ def build_graded_vs_fixed(run_states: Sequence[Dict[str, Any]]) -> str:
             f"${graded:.2f} | ${fixed:.2f} | ${graded - fixed:+.2f} |"
         )
     lines.append(
-        f"| **Total** | | **${graded_total:.2f}** | **${fixed_total:.2f}** | "
-        f"**${graded_total - fixed_total:+.2f}** |"
+        f"| **Total** | | **${graded_total:.2f}** | **${fixed_total:.2f}** | **${graded_total - fixed_total:+.2f}** |"
     )
     lines.append("")
     return "\n".join(lines)
@@ -6377,11 +6379,7 @@ def build_coverage_missed(
         missing = cov.get("missing_fills")
         missing_str = str(missing) if missing is not None else "n/a"
 
-        lines.append(
-            f"| {day or '?'} | {candidates} | "
-            f"{fills_str} | {coverage_str} | "
-            f"{missing_str} | {len(manual)} |"
-        )
+        lines.append(f"| {day or '?'} | {candidates} | {fills_str} | {coverage_str} | {missing_str} | {len(manual)} |")
     lines.append("")
     return "\n".join(lines)
 
