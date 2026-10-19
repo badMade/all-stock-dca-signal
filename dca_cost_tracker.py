@@ -18,8 +18,6 @@ and holds no tokens, page ids, or credentials. The Notion page id is supplied by
 the caller/scheduler.
 """
 
-from __future__ import annotations
-
 import json
 import logging
 import math
@@ -350,10 +348,7 @@ def build_cost_tracker_markdown(aggregate: Dict[str, Any]) -> str:
     lines.append("")
     lines.append(f"- Runs analyzed: {aggregate.get('run_count', 0)}")
     lines.append(f"- Runs needing manual recovery: {aggregate.get('manual_recovery_runs', 0)}")
-    lines.append(
-        f"- Estimated total proxy units (not credits): "
-        f"{aggregate.get('estimated_total_proxy_units', 0.0)}"
-    )
+    lines.append(f"- Estimated total proxy units (not credits): {aggregate.get('estimated_total_proxy_units', 0.0)}")
     lines.append("")
     lines.append("### By component (estimated, proxy — not credits)")
     lines.append("")
@@ -361,8 +356,7 @@ def build_cost_tracker_markdown(aggregate: Dict[str, Any]) -> str:
     lines.append("| --- | --- | --- | --- |")
     for comp in components:
         lines.append(
-            f"| {comp['component']} | {comp['count']} | {comp['proxy_weight']} | "
-            f"{comp['estimated_proxy_units']} |"
+            f"| {comp['component']} | {comp['count']} | {comp['proxy_weight']} | {comp['estimated_proxy_units']} |"
         )
     if not components:
         lines.append("| _no runs_ | 0 | - | 0 |")
