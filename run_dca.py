@@ -4479,7 +4479,8 @@ def _run_pipeline_impl(
                 else:
                     _verify_ownership_and_publish_reports()
             finally:
-                _final_lock_ctx.__exit__(None, None, None)
+                import sys
+                _final_lock_ctx.__exit__(*sys.exc_info())
     else:
         # No bound snapshot to compare against at all -- publish directly,
         # matching this function's pre-existing behavior for that case.
