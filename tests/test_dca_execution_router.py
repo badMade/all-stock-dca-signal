@@ -298,3 +298,63 @@ def test_a_permitted_role_still_places_through_the_real_methods_and_reads_stay_r
 def test_a_forbidden_wrapper_still_lets_reads_through():
     guarded = router.guard_broker(RepoShapedSpyBroker(), ExecutorRole.CLOUD, LocalStatus.OFF, now=NOW)
     assert guarded.get_account() == {"ok": True}
+
+
+
+
+
+
+
+
+# --- live claim tests -----------------------------------------------------------------
+
+def test_live_claim_returns_false_when_no_claim_exists(tmp_path):
+    assert router.live_claim(tmp_path, "2026-10-08", "1530", NOW) is False
+
+def test_live_claim_returns_true_for_recent_claim(tmp_path):
+    import json
+    log_file = tmp_path / "routing_2026-10-08.jsonl"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with log_file.open("w", encoding="utf-8") as f:
+        # Note: kind must be "claim"
+        f.write(json.dumps({"timestamp": NOW.isoformat(), "path": "claim", "kind": "claim", "slot": "1530"}) + "\n")
+
+    assert router.live_claim(tmp_path, "2026-10-08", "1530", NOW) is True
+
+def test_live_claim_returns_false_for_expired_claim(tmp_path, monkeypatch):
+    from datetime import timedelta
+    # TTL is normally 600, using the correct environment variable
+    monkeypatch.setenv("DCA_BACKUP_CLAIM_TTL_S", "300")
+
+    import json
+    log_file = tmp_path / "routing_2026-10-08.jsonl"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write a claim row that is older than the TTL
+    old_time = NOW - timedelta(seconds=301)
+    with log_file.open("w", encoding="utf-8") as f:
+        f.write(json.dumps({"timestamp": old_time.isoformat(), "path": "claim", "kind": "claim", "slot": "1530"}) + "\n")
+
+    assert router.live_claim(tmp_path, "2026-10-08", "1530", NOW) is False
+
+def test_live_claim_returns_true_on_bad_timestamp(tmp_path):
+    import json
+    log_file = tmp_path / "routing_2026-10-08.jsonl"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with log_file.open("w", encoding="utf-8") as f:
+        f.write(json.dumps({"timestamp": "bad_time", "path": "claim", "kind": "claim", "slot": "1530"}) + "\n")
+
+    # Fails closed
+    assert router.live_claim(tmp_path, "2026-10-08", "1530", NOW) is True
+
+def test_live_claim_ignores_non_claim_rows(tmp_path):
+    import json
+    log_file = tmp_path / "routing_2026-10-08.jsonl"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with log_file.open("w", encoding="utf-8") as f:
+        f.write(json.dumps({"timestamp": NOW.isoformat(), "path": "perplexity-fallback", "reason": "test", "slot": "1530", "kind": "probe"}) + "\n")
+
+    assert router.live_claim(tmp_path, "2026-10-08", "1530", NOW) is False
