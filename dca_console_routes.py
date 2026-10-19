@@ -27,6 +27,7 @@ from typing import Any, Callable
 from urllib.parse import SplitResult, parse_qs
 
 from dca_console_jobs import redact_value
+from dca_console_release import CONSOLE_VERSION
 
 JOB_ID = re.compile(r"[a-zA-Z0-9-]{1,100}")
 
@@ -129,7 +130,8 @@ def _route_export(app, request: RouteRequest) -> Response:
 
 
 def _route_health(app, request: RouteRequest) -> Response:
-    return Response.json(200, {"status": "ok", "mode": app.settings.mode, **request.authority})
+    return Response.json(200, {"status": "ok", "mode": app.settings.mode, "channel": getattr(app.settings, "channel", "stable"),
+                                "version": CONSOLE_VERSION, **request.authority})
 
 
 def _catalog_refs(app) -> set[str]:

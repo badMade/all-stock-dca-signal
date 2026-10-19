@@ -16,11 +16,13 @@ CHECKOUT = Path(__file__).resolve().parents[2]
 # ticker-advisor import-precedence fix cited in the Rock 4 contract.
 sys.path.insert(1, str(CHECKOUT))
 
+from dca_bootstrap import get_venv_python, resolve_venv_dir  # noqa: E402
 from dca_console import load_auth_file  # noqa: E402
 from dca_paths import cron_tracking_root  # noqa: E402
 
 LABEL = "com.all-stock-dca.console"
-DEFAULT_PYTHON = CHECKOUT / ".venv" / "bin" / "python"
+# Stable-channel rule: always the main checkout's .venv, even from a pinned worktree checkout.
+DEFAULT_PYTHON = get_venv_python(resolve_venv_dir(CHECKOUT))
 DEFAULT_PORT = 8765
 MAX_PORT = 65535
 AGENT_RELATIVE_PATH = Path("Library") / "LaunchAgents" / f"{LABEL}.plist"
@@ -44,11 +46,16 @@ def render_plist(
     behind_proxy: bool,
     octopus_run: Path | None,
     root: Path,
+    checkout: Path | None = None,
+    research_python: Path | None = None,
 ) -> bytes:
     """Return the complete launchd plist without reading or embedding a secret."""
+    # ``checkout`` is the pinned stable-release checkout (docs/local_console.md);
+    # it defaults to the checkout holding this script.
+    launch_checkout = checkout or CHECKOUT
     arguments = [
         str(python_path),
-        str(CHECKOUT / "from.py"),
+        str(launch_checkout / "from.py"),
         "--local",
         "--no-browser",
         "--port",
@@ -60,6 +67,8 @@ def render_plist(
         arguments.extend(("--trusted-host", host))
     if behind_proxy:
         arguments.append("--behind-proxy")
+    if research_python is not None:
+        arguments.extend(("--research-python", str(research_python)))
     if octopus_run is not None:
         arguments.extend(("--octopus-run", str(octopus_run)))
 
@@ -71,7 +80,7 @@ def render_plist(
     definition = {
         "Label": LABEL,
         "ProgramArguments": arguments,
-        "WorkingDirectory": str(CHECKOUT),
+        "WorkingDirectory": str(launch_checkout),
         "RunAtLoad": True,
         "KeepAlive": {"SuccessfulExit": False},
         "ThrottleInterval": 15,
@@ -97,6 +106,10 @@ def _parser() -> argparse.ArgumentParser:
     # callers and tests replace the checkout default without rebuilding a
     # parser that captured the old value (Rock 4 contract).
     parser.add_argument("--python", type=Path, default=None)
+    parser.add_argument("--checkout", type=Path, default=None, metavar="DIR",
+                        help="Pinned stable-release checkout whose from.py launchd runs (default: this checkout)")
+    parser.add_argument("--research-python", type=Path, default=None, metavar="PYTHON",
+                        help="Explicit research interpreter (default: the --python venv)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--trusted-host", action="append", default=[], metavar="HOST[:PORT]")
     parser.add_argument("--behind-proxy", action="store_true")
@@ -151,6 +164,17 @@ def main(argv: list[str] | None = None) -> int:
     if not python_path.is_file():
         parser.error("--python must point to an existing file")
 
+    checkout = None
+    if args.checkout is not None:
+        checkout = _absolute_without_following(args.checkout)
+        if not (checkout / "from.py").is_file():
+            parser.error("--checkout must be a directory containing from.py")
+    research_python = None
+    if args.research_python is not None:
+        research_python = _absolute_without_following(args.research_python)
+        if not research_python.is_file():
+            parser.error("--research-python must point to an existing file")
+
     octopus_run = None
     if args.octopus_run is not None:
         candidate = _absolute_without_following(args.octopus_run)
@@ -173,6 +197,8 @@ def main(argv: list[str] | None = None) -> int:
         behind_proxy=args.behind_proxy,
         octopus_run=octopus_run,
         root=root,
+        checkout=checkout,
+        research_python=research_python,
     )
 
     if args.print_plist:

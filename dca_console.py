@@ -31,8 +31,10 @@ from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 from zoneinfo import ZoneInfo
 
+from dca_bootstrap import get_venv_python, resolve_venv_dir
 from dca_console_jobs import Command, JobBusy, JobManager, is_sensitive_variable, redact, register_secret
 from dca_console_reader import root_label
+from dca_console_release import CHANNEL_SANDBOX, CHANNEL_STABLE, release_info
 from dca_console_routes import CREDENTIAL_FREE_ROUTES, DEFAULT_CSP, GET_ROUTES, RouteRequest
 from dca_fileio import atomic_write_text
 from dca_paths import cron_tracking_root, stream_root
@@ -142,6 +144,9 @@ class Settings:
     # the dca_paths-managed tree on this machine (GUI expansion Phase 0). Demo
     # mode never sets it; readers label every root and never echo its path.
     secondary_roots: tuple[Path, ...] = ()
+    # "stable" (the pinned daily console) or "sandbox" (demo data, other port,
+    # badged in the UI). Purely presentational plus the demo-only guard in main().
+    channel: str = CHANNEL_STABLE
 
 
 @dataclass(frozen=True)
@@ -551,13 +556,50 @@ class ConsoleApp:
         self.access: ConsoleAccess | None = None
         self.jobs = JobManager(settings.output / "jobs")
         self.token = secrets.token_urlsafe(32)
-        self.packages = python_packages(settings.research_python)
-        self.dev_packages = python_packages(settings.python)
+        # Package availability is re-probed on a TTL (and on demand from the
+        # Environment page) rather than frozen at startup: a long-lived launchd
+        # console otherwise keeps reporting "Missing" after the operator
+        # installs the dependency. Tests may still assign the attributes.
+        self._package_overrides: dict[str, dict] = {}
+        self._package_cache: dict[str, tuple[float, dict]] = {}
+        self.reprobe_packages()
         self.cache: dict[tuple, tuple[float, dict]] = {}
         self.lock = threading.RLock()
         self.signatures: dict[str, str] = {}
         self.octopus_run = settings.octopus_run
         self._load_demo_pointer()
+
+    PACKAGE_TTL_SECONDS = 60.0
+
+    def _probed(self, key: str, executable: str) -> dict:
+        if key in self._package_overrides:
+            return self._package_overrides[key]
+        now = time.monotonic()
+        cached = self._package_cache.get(key)
+        if cached is None or now - cached[0] > self.PACKAGE_TTL_SECONDS:
+            cached = (now, python_packages(executable))
+            self._package_cache[key] = cached
+        return cached[1]
+
+    def reprobe_packages(self) -> None:
+        """Drop cached probes so the next read re-runs them (Environment page refresh)."""
+        self._package_cache.clear()
+
+    @property
+    def packages(self) -> dict:
+        return self._probed("research", self.settings.research_python)
+
+    @packages.setter
+    def packages(self, value: dict) -> None:
+        self._package_overrides["research"] = value
+
+    @property
+    def dev_packages(self) -> dict:
+        return self._probed("dev", self.settings.python)
+
+    @dev_packages.setter
+    def dev_packages(self, value: dict) -> None:
+        self._package_overrides["dev"] = value
 
     def _load_demo_pointer(self) -> None:
         if self.octopus_run is not None:
@@ -711,6 +753,7 @@ class ConsoleApp:
                 )
                 data = {
                     "mode": self.settings.mode, "now": now.isoformat(), "default_date": request_default_day.isoformat(),
+                    "release": release_info(self.settings.channel),
                     "daily": daily, "octopus": octopus, "warnings": [],
                     "modules": module_catalog(self.settings.python),
                     # Labels, never absolute paths: this document is a browser
@@ -1240,6 +1283,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--demo", action="store_true", help="Use isolated synthetic demo artifacts (opt-in, not the default)")
+    mode.add_argument("--sandbox", action="store_true",
+                       help="Sandbox channel for trying GUI changes: demo data only, badged SANDBOX, default port 8766 and "
+                            "its own output directory")
     mode.add_argument("--local", action="store_true",
                        help="Observe existing artifacts; no automatic demo or broker calls (default when no mode flag is given)")
     parser.add_argument("--root", type=Path, help="Existing DCA artifact root (implies --local)")
@@ -1251,7 +1297,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--date", type=date.fromisoformat,
                         help="Day to inspect; local mode resolves the date per request unless pinned, --demo defaults to "
                              "the previous market session")
-    parser.add_argument("--port", type=int, default=8765, help="HTTP port; use 0 for an available port")
+    parser.add_argument("--port", type=int, default=None,
+                        help="HTTP port; use 0 for an available port (default 8765, or 8766 with --sandbox)")
     parser.add_argument("--bind", default="127.0.0.1", help="IPv4 address to listen on (default: 127.0.0.1)")
     parser.add_argument("--trusted-host", action="append", default=[], metavar="HOST[:PORT]",
                         help="Additional accepted Host authority; repeat for more names")
@@ -1264,6 +1311,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run", metavar="ACTION", help="Run one allowlisted action, print its result and exit")
     parser.add_argument("--check", action="store_true", help="Show runtime and action readiness without starting jobs")
     args = parser.parse_args(argv)
+    sandbox = args.sandbox
+    if sandbox:
+        # The sandbox is demo-only by construction: synthetic artifacts in an
+        # isolated output tree, never the real cron tracking root.
+        args.demo = True
+        if args.root or args.octopus_run or args.secondary_root:
+            parser.error("--sandbox uses synthetic data only; it cannot be combined with --root/--octopus-run/--secondary-root.")
+    if args.port is None:
+        args.port = 8766 if sandbox else 8765
     if args.demo and (args.root or args.octopus_run or args.secondary_root):
         parser.error("Use --local with existing --root/--octopus-run/--secondary-root; --demo keeps synthetic data isolated.")
     secondary_roots = []
@@ -1301,8 +1357,10 @@ def main(argv: list[str] | None = None) -> int:
     # explicitly requested).
     local = not args.demo
     root = (args.root or Path(cron_tracking_root())).expanduser().resolve()
-    output = (args.output_dir or Path(stream_root("console"))).expanduser().resolve()
-    venv_python = REPO / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    output = (args.output_dir or Path(stream_root("console-sandbox" if sandbox else "console"))).expanduser().resolve()
+    # A linked worktree borrows the main checkout's .venv (never its own, which
+    # disappears with the worktree); see dca_bootstrap.resolve_venv_dir.
+    venv_python = get_venv_python(resolve_venv_dir(REPO))
     python = str(venv_python) if venv_python.is_file() else sys.executable
     if local:
         # None is intentional here: an unpinned local service resolves its date
@@ -1320,7 +1378,8 @@ def main(argv: list[str] | None = None) -> int:
                         output, selected_day,
                         python, args.research_python or python,
                         args.octopus_run.expanduser().resolve() if args.octopus_run else None,
-                        secondary_roots=tuple(secondary_roots))
+                        secondary_roots=tuple(secondary_roots),
+                        channel=CHANNEL_SANDBOX if sandbox else CHANNEL_STABLE)
     app = ConsoleApp(settings)
     if args.check:
         print(json.dumps({"mode": settings.mode, "python": python, "research_python": settings.research_python,
@@ -1363,6 +1422,7 @@ def main(argv: list[str] | None = None) -> int:
             # operators and the SIGTERM regression synchronize on it.
             details = redact(
                 f"DCA console ({settings.mode}): {url}\n"
+                f"Release: {settings.channel} v{release_info(settings.channel)['version']}\n"
                 f"Daily summaries: {output / 'summaries' / settings.mode}\nCtrl+C stops the console."
             )
             print(f"{startup_banner(access, actual_port)}\n{details}", flush=True)

@@ -222,6 +222,57 @@ successful DCA demo if no run-state artifact was produced. Single-action and
 Ctrl+C stops the server and requests termination of its active child process.
 Each demo invocation gets a new directory; previous runs are preserved.
 
+## Release process: stable vs sandbox
+
+Two console channels keep the daily dashboard steady while GUI ideas stay cheap to try.
+The console version (`dca_console_release.CONSOLE_VERSION`) is shown in the sidebar, on
+the Environment page and in `/api/health`. History: [console_changelog.md](console_changelog.md).
+
+**Stable** is a pinned, tagged checkout run by launchd, so branch work and worktree
+deletion never touch it. It always uses the main checkout's `.venv` and an explicit
+research interpreter:
+
+```bash
+git worktree add ../all-stock-dca-stable console-v1.0.0   # tag the release first: git tag console-v1.0.0
+python3 deploy/launchd/render_console_agent.py --install --auth-file ~/.dca-console-auth \
+  --checkout ../all-stock-dca-stable --python "$PWD/.venv/bin/python" --research-python "$PWD/.venv/bin/python"
+```
+
+**Sandbox** is a second instance on port 8766, demo/synthetic data only, with its own
+output tree (`console-sandbox/`), a red SANDBOX badge and a `SANDBOX ·` tab title.
+It refuses `--root`, `--octopus-run` and `--secondary-root`:
+
+```bash
+python3 from.py --sandbox --no-browser
+```
+
+`from.py` never creates a `.venv` in a linked worktree; it reuses the main checkout's
+and exits with instructions if that is missing. The Environment page re-probes package
+availability on every load (other pages reuse a 60 s cache).
+
+**Release rule.** `tests/test_console_release.py` fails when anything under `console/`
+changes without the steps below.
+
+Promote sandbox to stable:
+
+1. Try the change on the sandbox; confirm every page renders and `pytest tests/test_dca_console*.py` passes.
+2. Bump `CONSOLE_VERSION` (semver: UI feature = minor, fix = patch).
+3. Add a `## <version>` entry at the top of `docs/console_changelog.md`.
+4. Run `python -m dca_console_release` and paste the output into `ASSET_DIGEST`.
+5. Open a PR from the sandbox branch and merge it to `main` (review is the first approval).
+6. From a terminal, run the approval-gated promotion (the second approval; it refuses piped/agent runs):
+   ```bash
+   python3 scripts/promote_console.py --stable-checkout ../all-stock-dca-stable --dry-run   # gates only
+   python3 scripts/promote_console.py --stable-checkout ../all-stock-dca-stable --kickstart
+   ```
+   It checks that the ref is merged into `origin/main`, the version is newer than stable's, the
+   changelog's top entry matches, and the `console/` digest is pinned; shows the diff; then you
+   must type `promote <version>`. It tags `console-<version>`, moves the stable checkout to the
+   tag and restarts launchd. Nothing else moves the stable console.
+7. Verify the sidebar shows the new version and no SANDBOX badge.
+
+Rollback: `git -C ../all-stock-dca-stable checkout --detach console-<previous>` and kickstart again.
+
 ## Local API
 
 | Method | Path | Result |

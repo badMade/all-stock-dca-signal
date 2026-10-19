@@ -23,6 +23,7 @@ import dca_console
 from dca_console import AuthFailureLog, ConsoleAccess, ConsoleApp, Settings, load_auth_file, main, make_server
 from dca_console_jobs import JobManager, redact
 from dca_console_reader import root_label
+from dca_console_release import CONSOLE_VERSION
 
 AUTH_CREDENTIAL = b"dca:s3cret-pw-abcdefg"
 AUTH_PASSWORD = AUTH_CREDENTIAL.partition(b":")[2].decode()
@@ -980,6 +981,8 @@ def test_health_reports_received_and_forwarded_host(http_server):
     assert json.loads(body) == {
         "status": "ok",
         "mode": "local",
+        "channel": "stable",
+        "version": CONSOLE_VERSION,
         "received_host": authority,
         "forwarded_host": None,
     }
