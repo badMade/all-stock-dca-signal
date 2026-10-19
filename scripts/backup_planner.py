@@ -828,6 +828,23 @@ def _decisions_stream(slot: str, payload: dict[str, Any], directory: Path, tradi
     return decisions
 
 
+def _cmd_procedure(args: argparse.Namespace) -> int:
+    """Print one part of this task's step-by-step procedure (steps 1-9) as plain text.
+
+    The pasted Perplexity prompt cannot hold it (the Instructions box keeps 20,000 characters), so it ships inside
+    this build and is covered by the same content_sha256 stamp. Plain text, not JSON: the agent follows it
+    verbatim. Any failure is one JSON document and exit 2, which the prompt treats as place-nothing.
+    """
+    from scripts import backup_procedure  # lazy: it imports this module for GATED_SLOTS
+
+    try:
+        text = backup_procedure.render_part(args.task, args.part, token=args.token)
+    except (KeyError, ValueError) as exc:
+        return _emit({"status": "FAILED", "errors": _error_dicts([PlanError("bad_procedure_request", str(exc))])}, 2)
+    sys.stdout.write(text)
+    return 0
+
+
 def _cmd_universe(args: argparse.Namespace) -> int:
     """The buyable symbols from the packaged config: the task fetches exactly these, so no prompt names a stock."""
     directory = args.config_dir if args.config_dir is not None else dca_config.get_config_dir()
@@ -1053,6 +1070,10 @@ def _build_parser() -> argparse.ArgumentParser:
     compute.add_argument("--orders-pages", required=True, type=Path)
     compute.add_argument("--now", default=None)
     compute.add_argument("--buying-power", required=True, help="Fresh available buying power in USD.")
+    procedure = sub.add_parser("procedure", help="Print one part (1-3) of a backup task's steps 1-9, stamped with this build.")
+    procedure.add_argument("--task", required=True, help="The backup task id named in the prompt's header.")
+    procedure.add_argument("--part", required=True, type=int, help="1 = steps 1-3, 2 = steps 4-6, 3 = steps 7-9.")
+    procedure.add_argument("--token", default=None, help="Parts 2 and 3: the token the previous part printed at its end.")
     universe = sub.add_parser("universe", help="Print the buyable symbols from config; the task fetches exactly these.")
     universe.add_argument("--config-dir", type=Path, default=None)
     finalize = sub.add_parser("finalize", help="Reconcile and re-validate a plan; print what to place.")
@@ -1075,6 +1096,12 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command == "procedure":
+        # No trading day or slot: the procedure text is per task, not per run.
+        try:
+            return _cmd_procedure(args)
+        except Exception as exc:  # noqa: BLE001 - last fail-closed boundary; type name only
+            return _emit({"status": "FAILED", "errors": _error_dicts([PlanError("unexpected_error", type(exc).__name__)])}, 2)
     if args.command == "universe":
         try:
             return _cmd_universe(args)

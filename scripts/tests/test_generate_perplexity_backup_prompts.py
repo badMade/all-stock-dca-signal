@@ -54,8 +54,10 @@ def test_exactly_six_prompts_with_the_documented_names(prompts):
 
 
 def test_committed_prompts_match_the_generator_byte_for_byte(prompts):
+    # The committed files are the PASTEABLE instructions; `prompts` (the full reference text) is what the
+    # content tests below assert against.
     on_disk = {p.name: p.read_text(encoding="utf-8") for p in OUT_DIR.glob("*-backup.txt")}
-    assert on_disk == prompts, "regenerate with: python3 -m scripts.generate_perplexity_backup_prompts --write"
+    assert on_disk == gen.build_instructions(), "regenerate with: python3 -m scripts.generate_perplexity_backup_prompts --write"
 
 
 def test_generation_is_deterministic():

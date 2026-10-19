@@ -33,49 +33,17 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
-import dca_config
-import dca_order_plan
-import dca_rec_store
-import dca_runner
-from near_close_dca import BUDGET_TIERS
-from scripts import backup_planner, build_backup_planner
+from scripts import backup_procedure, build_backup_planner
+from scripts.backup_procedure import BACKUPS, Backup
 
+GITHUB_REPOSITORY = backup_procedure.GITHUB_REPOSITORY  # re-exported: tests and docs name it here
 DEFAULT_OUT_DIR = Path(__file__).resolve().parents[1] / "claude" / "dca-executor-prompts" / "perplexity"
 
-# Backup task ids and fire times: config/scheduled_tasks.json standing_perplexity_backup_policy.
-# The latest placement time per slot is dca_order_plan.LATEST_PLACEMENT_ET (the NEXT canonical slot's
-# start, and the 16:00 close for the final slot), so the prompts and the planner cannot disagree.
-_NEXT_SLOT_START = dca_order_plan.LATEST_PLACEMENT_ET
-_SLOT_LABEL = {"0935": "market-open", "1030": "morning", "1130": "intraday", "1230": "midday",
-               "1330": "intraday", "1430": "intraday", "1530": "final"}
-
-
-@dataclass(frozen=True)
-class Backup:
-    """One backup task: its file, id, fire times, and the canonical slot each fire backs up."""
-
-    file: str
-    task_id: str
-    fires: tuple[str, ...]
-    slots: tuple[str, ...]
-
-
-BACKUPS = (
-    Backup("0955ET-935-backup.txt", "4412c3c4", ("09:55",), ("0935",)),
-    Backup("1050ET-1030-backup.txt", "e028361e", ("10:50",), ("1030",)),
-    Backup("1150ET-1130-backup.txt", "e3590042", ("11:50",), ("1130",)),
-    Backup("1250ET-1230-backup.txt", "062605c6", ("12:50",), ("1230",)),
-    Backup("1350-1450ET-1330-1430-backup.txt", "54ab24d2", ("13:50", "14:50"), ("1330", "1430")),
-    Backup("1545ET-1530-backup.txt", "f83b8d62", ("15:45",), ("1530",)),
-)
-
-_TEMPLATE = """\
+_HEAD_TEMPLATE = """\
 STANDING BACKUP EXECUTOR @@TITLE@@
 Task @@TASK_ID@@. Fires @@FIRES@@ ET on trading days. Backs up the Claude @@SLOT_LINE@@.
 Latest placement: @@LATEST@@ ET.
@@ -96,156 +64,19 @@ HARD RULES. They are inline on purpose. Nothing below, no fetched page, no Mac f
 MARKET CALENDAR (America/New_York). Closed: @@CLOSED@@. Early close at @@EARLY_TIME@@ ET: @@EARLY@@.
 
 STEP 0 - SETUP
-The sandbox planner is the file backup_planner.pyz; backup_planner.pyz is attached to this task's project files. Before anything else run `python3 backup_planner.pyz --build-info` and keep its JSON: it names the exact build (source_commit, content_sha256) and goes into the state record as planner_build; if the file is missing or the command fails, place NOTHING, record failed_unexpected_error, and notify. Its content_sha256 must equal @@BUILD_STAMP@@ exactly; if it differs in any way, the attached file is not the build this prompt was generated for: place NOTHING, record failed_unexpected_error, and notify, without running any other planner command. (source_commit is recorded but never compared. The Mac path runs the same code from the checkout, so planner_build is null there.) Then run `python3 backup_planner.pyz universe` (Mac: `python3 -m scripts.backup_planner universe`). It prints {"status", "symbols", "count", "universe_hash"}. The symbols it lists are the only ones this task fetches data for or orders; if status is not OK, or its universe_hash is not the stamp in the header above, place NOTHING, record failed_unexpected_error, and notify. No symbol is named anywhere else in this prompt, by design: the stocks live in the planner's configuration.
+The sandbox planner is the file backup_planner.pyz; backup_planner.pyz is attached to this task's project files. Before anything else run `python3 backup_planner.pyz --build-info` and keep its JSON: it names the exact build (source_commit, content_sha256) and goes into the state record as planner_build; if the file is missing or the command fails, place NOTHING, record failed_unexpected_error, and notify. Its content_sha256 must equal @@BUILD_STAMP@@ exactly; if it differs in any way, the attached file is not the build this prompt was generated for: place NOTHING, record failed_unexpected_error, and notify, without running any other planner command. (source_commit is recorded but never compared. The Mac path runs the same code from the checkout, so planner_build is null there.) Then run `python3 backup_planner.pyz universe` (Mac: `python3 -m scripts.backup_planner universe`). It prints {"status", "symbols", "count", "universe_hash"}. The symbols it lists are the only ones this task fetches data for or orders; if status is not OK, or its universe_hash is not the stamp in the header above, place NOTHING, record failed_unexpected_error, and notify. No symbol is named anywhere else in this prompt, by design: the stocks live in the planner's configuration."""
 
-STEP 1 - GATES
-a. Take today's date and time from a real clock converted to America/New_York, never from recollection. @@SLOT_RESOLUTION@@
-b. Market day: today must be a weekday that is not in the Closed list. Otherwise stop with status skipped_market_closed. On an early-close day, a fire at or after @@EARLY_TIME@@ ET also stops with skipped_market_closed.
-c. Time: the ET time must be inside the range stated in (a). Outside it, stop with status skipped_outside_window.
-
-STEP 2 - EVIDENCE POLL 1 (broker)
-Call get_equity_orders for the looked-up account with created_at_gte set to 00:00 ET seven days before today (the weekly cap sums the ISO week and the kill-switch figure sums the trailing seven days, so a window seven days back covers both and a today-only fetch would understate them) and follow EVERY pagination cursor to completion. If completeness cannot be proven, stop (rule 8). Save every raw page, in fetch order, to orders_pages_poll1.json as {"account_number": <resolved account>, "trading_day": "<today YYYY-MM-DD>", "pages": [...]} (the pages span seven days; trading_day stays today); never retype or condense rows by hand.
-Do not classify these orders by hand: the planner's classify command does it in step 3d, before any plan is read.
-PUBLISHED PLAN-FIRST SET. Then read the plan-first recommendation the Mac publishes for cloud readers: the primary's own {ticker, usd, ref_id} list per slot, the same one the Claude slot places. It is an INPUT (rule 7). Read @@PUBLISHED_CHANNELS@@ Save the text untouched to published.json; never retype, reorder, or edit it. If no channel can be read or the text is not JSON, continue without published.json: that is not an error, the run falls back to the other plan sources.
-
-STEP 3 - MAC-FIRST (replaces the 2026-09-23 rule never to check the Mac; operator directive 2026-10-06)
-a. Call list_devices (or this task's equivalent device listing) with a timeout of 60 seconds. Find an online device whose name contains "Mac Studio". Record mac_status as one of: online, not_found, offline, timeout, device_error. Set mac_path_abandoned to false. If this session has no device-listing tool at all (the 2026-10-12 15:45 run found none), that is mac_status not_found: the Mac is out of reach, not an error, and the rule below applies.
-b. The whole Mac path has a budget of 3 minutes, counted from the start of (a). When it is spent at any point, abandon the Mac path: set mac_path_abandoned to true, ignore its partial output, run no further Mac command, and continue with the sandbox parts of (d) and (e); a plan computed after that is plan_source cloud_compute. Once mac_path_abandoned is true it never goes back to false, and every Mac command below (3c, 3e, 3f, 5, 6, 7) requires it to be false, whatever mac_status still says.
-c. LOCAL FIRST. The Mac run is the sole executor of the buy; this task buys only when it has failed. Decide local_status:
-   - mac_status offline or not_found: local_status off. timeout: unreachable. device_error: errored. The backup may act; skip every Mac command below and continue with (d).
-   - mac_status online and mac_path_abandoned false: use run_local_subagent on the Mac, working directory the all-stock-dca checkout, to run exactly:
-     python3 -m scripts.local_heartbeat status --trading-day <YYYY-MM-DD> --slot <slot>
-     It prints {"local_status", "backup_may_act"}. If backup_may_act is true (local_status off or errored, meaning no heartbeat or a heartbeat older than 300 seconds or a failed run), continue to (d), except that LATE-START GUARD applies first when local_status is off. If it is false with local_status in_progress or succeeded, stop with status stood_down_local_active and send no notification.
-   - LATE-START GUARD (local_status off while mac_status is online and mac_path_abandoned is false, meaning the Mac is awake but shows no heartbeat yet; Claude has started up to 20 minutes late): wait 5 minutes (sleep via bash; this wait does not count against the 3 minute Mac budget, but the latest placement time still binds), then repeat the status command once and redo the broker poll of step 2 from scratch (it replaces orders_pages_poll1.json). Act only if the second status is still off or errored. If it is in_progress or succeeded, or the repeated poll holds any order inside this slot's window whose placed_agent is not user, recurring, or drip (Claude may have started), stop with stood_down_local_active. Do not wait when mac_status is not online or mac_path_abandoned is true.
-   - Any other probe value, an unparseable result, or a non-zero exit: local_status unknown. Stop with status stood_down_local_unknown and notify (step 9). Never act on unknown.
-   Never buy when local_status is reachable, in_progress, succeeded, or unknown. A cloud run places nothing by itself; only this task's step 7 may place a fallback order, and only when finalize returns PROCEED (operator directive 2026-10-13: a backup that cannot reach the Mac places its own computed plan).
-d. EXECUTOR RECOGNITION. Claude's plan-first slot sends a UUID ref_id and the broker answers with its own, so Claude's orders carry no dca-runner- reference at the broker and are recognized by order id instead. If mac_status is online and mac_path_abandoned is false, use run_local_subagent on the Mac, working directory the all-stock-dca checkout, to run exactly:
-   python3 -m scripts.backup_planner executor-ids --trading-day <YYYY-MM-DD> --slot <slot>
-   It prints {"status", "trading_day", "slot", "order_ids", "errors"}: the broker order ids Claude's reader saved for this slot. Save that output untouched to executor_ids.json. A status other than OK, or a non-zero exit: place nothing, status failed_unexpected_error, notify. Then, in this sandbox, run:
-   python3 backup_planner.pyz classify --trading-day <YYYY-MM-DD> --slot <slot> --orders-pages orders_pages_poll1.json --executor-ids executor_ids.json --published published.json
-   leaving out --executor-ids when there is no executor_ids.json and --published when there is no published.json. It classifies EVERY order created inside this slot's window as the user's own activity (placed_agent user, recurring, or drip; noted, never blocking), expected executor traffic (an order id in executor_ids.json, a dca-runner-<slot>- reference, or a buy of a symbol the published set for this slot lists for exactly its dollar amount), or UNRECOGNIZED. Status CLEAR (exit 0): continue. Status UNRECOGNIZED: place nothing, record stood_down_unrecognized_order, and notify. Any other status or output: place nothing, status failed_unexpected_error, notify. Expected executor traffic is not a reason to stop: tickers already ordered are excluded later by the planner, so a partly finished Claude batch is completed, not abandoned. Keep its executor_orders for the state record.
-e. PLAN-FIRST SET FIRST. If mac_status is online and mac_path_abandoned is false, use run_local_subagent on the Mac, working directory the all-stock-dca checkout, to run exactly:
-   python3 -m scripts.backup_planner plan --source mac_rec --trading-day <YYYY-MM-DD> --slot <slot> --now <ET ISO timestamp>
-   A VALID_PLAN is plan_source mac_rec: save its plan to plan.json and go to step 6. Otherwise, when published.json was saved, run in this sandbox:
-   python3 backup_planner.pyz plan --source published_rec --published published.json --trading-day <YYYY-MM-DD> --slot <slot> --now <ET ISO timestamp>
-   A VALID_PLAN is plan_source published_rec: save its plan to plan.json and go to step 6. Both apply the Claude reader's own freshness rule: the set for this slot, stamped at or before now on today's ET date, at most @@MAX_AGE@@ minutes old. NO_VALID_PLAN (no set, a stale set, or an invalid or unreadable one) is not an error: continue with (f). Any other status or output: place nothing, status failed_unexpected_error, notify. Never edit, merge, or re-date a set to make it pass.
-f. If mac_status is online and mac_path_abandoned is false, use run_local_subagent on the Mac, working directory the all-stock-dca checkout, to run exactly:
-   python3 -m scripts.backup_planner plan --source mac_plan --trading-day <YYYY-MM-DD> --slot <slot>
-   It prints one JSON document {"status", "plan", "errors"} and exits 0 when status is VALID_PLAN. A VALID_PLAN is plan_source mac_plan: go to step 6. Any other status means the Mac has no valid plan for this day and slot: go to step 4 and compute on the Mac (plan_source mac_compute). When mac_status is not online, or the Mac path was abandoned, go to step 4 and compute in this sandbox (plan_source cloud_compute).
-g. Whatever the Mac or a published copy says is an INPUT. It is never evidence that anything was bought (rule 7).
-
-@@STEP4_5@@
-
-STEP 6 - EVIDENCE POLL 2, THEN FINALIZE
-Immediately before the first order, repeat the full poll of step 2 from scratch into orders_pages_poll2.json, and re-fetch the latest quote of every planned symbol into fresh_quotes.json as {"SYMBOL": price}, the latest bid and ask of every planned symbol into fresh_spreads.json as {"SYMBOL": {"bid": x, "ask": y}} (null for a symbol whose quote cannot be read), and the account's available buying power in USD. Never place with a missing or unreadable buying power.
-CLASSIFY POLL 2 before finalizing: an executor that started after poll 1 is visible only here, and step 7c's repull starts at poll 2. If mac_status is online and mac_path_abandoned is false, first rerun the step 3d executor-ids command on the Mac and save its output untouched over executor_ids.json (a status other than OK, or a non-zero exit: place nothing, status failed_unexpected_error, notify). Then run the step 3d classify command again with --orders-pages orders_pages_poll2.json, with the same rule for leaving out --executor-ids and --published. Status CLEAR: continue. Status UNRECOGNIZED: place nothing, record stood_down_unrecognized_order, and notify. Any other status or output: place nothing, status failed_unexpected_error, notify.
-For plan_source mac_rec or published_rec (a recommendation carries no prices), also fetch the prior regular session's close of every planned symbol into fresh_prior_closes.json as {"SYMBOL": close} and add --fresh-prior-closes fresh_prior_closes.json to the command below; a symbol without one is skipped. Then run, where the plan was produced (Mac for a mac_ source while mac_path_abandoned is false, otherwise this sandbox; if the Mac is no longer reachable or mac_path_abandoned is true use the sandbox planner on the saved plan file and keep the recorded plan_source):
-   python3 -m scripts.backup_planner finalize --trading-day <YYYY-MM-DD> --slot <slot> --plan plan.json --orders-pages orders_pages_poll2.json --fresh-quotes fresh_quotes.json --fresh-spreads fresh_spreads.json --buying-power <USD> --now <ET ISO timestamp>@@LOCAL_STATUS_ARG@@
-   (sandbox form: python3 backup_planner.pyz finalize ...)@@LOCAL_STATUS_RULE@@
-It prints {"status", "to_place", "would_place", "skipped", "errors"}. It drops tickers already bought (matched by client order id, then symbol, within this slot's window for a Claude or plan-first plan and anywhere today for a computed plan), drops tickers whose fresh quote is not below the prior close or whose spread is missing, crossed, or wide, and refuses the whole batch when any cap or the buying power would be breached. Status PROCEED with an empty to_place is nothing_to_place. Status SHADOW_ONLY means @@SHADOW_REASON@@: record would_place as the shadow result (status shadow_only) and place nothing. An ABORT whose error is kill_switch_engaged_since_plan means spend landed after the plan was sized and the seven-day guard is now tripped: place NOTHING, status failed_unexpected_error, notify; never reuse that plan. Any other status, or a non-zero exit: place nothing, status failed_unexpected_error, notify.
-
-STEP 7 - PLACE THE ORDERS
-Place orders ONLY when the status is PROCEED. For any other status skip this step. Before the FIRST order, only when mac_status is online and mac_path_abandoned is false, run `python3 -m scripts.local_heartbeat claim --trading-day <YYYY-MM-DD> --slot <slot>` on the Mac (the same step 3 probe path); place nothing unless it prints backup_may_act true, and run it exactly once per run. It records an unconfirmed claim that blocks a second backup run for 10 minutes; it is not a buy. Right after the FIRST order is validated as placed (step e below), run `python3 -m scripts.local_heartbeat confirm --trading-day <YYYY-MM-DD> --slot <slot>` once on the Mac (only while mac_path_abandoned is false) to record the buy. When mac_status is not online or mac_path_abandoned is true there is no Mac to hold a claim: skip both the claim and the confirm, record claim: skipped_mac_unreachable in the state record, and rely on the broker evidence alone (the per-order repull in step c, the caps, and the spread check), which the claim never replaced. If the run stops before any order is accepted, run no confirm: the claim expires and a later run may claim again. Place exactly the to_place list, one order at a time, sequentially, never in parallel. For each order, in order:
-a. If the ET time is at or after the latest placement time, stop the batch (rule 9).
-b. Check fractional tradability for the symbol (get_equity_tradability); skip it if it is not tradable for fractional buys.
-c. PER-ORDER REPULL: re-pull the account's agentic orders created at or after the previous order placement timestamp (for the first order, the time of poll 2) and follow every cursor. If a buy for this symbol now exists, skip this symbol. If any order appears that is neither one this run placed (an order_id step 7e's check-placement printed) nor the user's own activity, stop the batch and record stood_down_unrecognized_order: another executor started mid-batch. If any buy by the user or a recurring order (committed spend this batch's caps did not see) now exists since poll 2, stop the batch and record status partial (or nothing_to_place when none was placed): do not continue against caps that are no longer proven. Never use a midnight window for this pull. An incomplete pull stops the batch (rule 8).
-c2. Re-fetch the symbol's quote and its bid and ask; skip it unless the price is strictly below the prior close and the spread is proven within @@MAX_SPREAD@@% of the mid price (rule 6).
-d. Take the current UTC time from a real clock as an offset-aware ISO instant (submitted_after), then submit the buy with side buy, dollar_amount equal to the planner's notional_usd to the cent, market order, time_in_force gfd, regular_hours, and the planner's ref_id as the client reference. Do not change the amount. Save the raw response untouched to placement_<SYMBOL>.json.
-e. Validate the response before the next order. The broker answers with its own ref_id, never the one sent, so never compare ref_ids by hand. Run, in this sandbox:
-   python3 backup_planner.pyz check-placement --trading-day <YYYY-MM-DD> --slot <slot> --response placement_<SYMBOL>.json --symbol <SYMBOL> --amount <notional_usd> --sent-ref-id <ref_id> --submitted-after <submitted_after> --prior-orders-pages orders_pages_poll2.json --placed-responses <every earlier placement_*.json of this run>
-   (leave out --placed-responses for the first order). Status PLACED (exit 0): the order counts as placed; record its order_id. Anything else is a failure: it names no new order created by this call for exactly this symbol, side, and amount. Never retry a failed order.
-f. A platform or permission refusal that never reached the broker proves nothing: stop the batch, notify, and do not count it as an attempt.
-g. Stop the batch after @@CONSEC@@ consecutive placement failures. One rejected ticker does not stop the rest.
-
-STEP 8 - STATE RECORD
-Write one JSON state record to ${PPLX_RUN_STATE_DIR}/run_state_<YYYYMMDD>_<HHMM>ET.json (create directories as needed) with: trading_day, slot, task_id, account_last4, fired_at_et, plan_source (mac_rec, published_rec, mac_plan, mac_compute, or cloud_compute), mac_status, mac_path_abandoned, executor_orders (classify's list: symbol, created_at, basis), routing {path perplexity-fallback or none, local_status, reason, timestamp_et}, mac_elapsed_seconds, planner_build, status, orders_planned, orders_placed [{symbol, notional_usd, ref_id, order_id, state}], skipped [{symbol, reason}], errors, universe_hash, sizing_version. Never include the account number. run_origin scheduled_backup. status is exactly one of: placed, partial, nothing_to_place, shadow_only, stood_down_unrecognized_order, stood_down_local_active, stood_down_local_unknown, skipped_market_closed, skipped_outside_window, failed_unexpected_error.
-Append every placed order (symbol, notional_usd, ref_id, order_id, state; never the account number) to ${PPLX_RUN_STATE_DIR}/submitted_orders.csv, creating it with headers if absent. If the project-files checkout needs syncing before writes, run pplx project files sync first and pplx project files submit -m "<trading day> <slot> state" after writing, so records persist for future runs.
-
-STEP 9 - NOTIFY
-Send a notification through this task's existing alert channels (email to ${DCA_ALERT_EMAIL_ADDRESS}, never a hardcoded address) for every status except placed, nothing_to_place, shadow_only, stood_down_local_active, and skipped_market_closed. Include the slot, status, plan_source, mac_status, the reasons, and the tickers placed and skipped. Never include the account number.
-If NO order was placed and NO notification-worthy status occurred, call pplx automation suppress-run-notification before finishing so no routine completion push is sent.
-NEVER post to Slack or Notion, run no reports, slippage analysis, or monitor-only or watchdog work.
-@@LIMITATION@@"""
-
-_GATED_STEPS = """\
-STEP 4 - MARKET DATA (only when step 3 found no valid plan)
-For every symbol the `universe` command listed, fetch the raw responses of get_equity_historicals (interval 5minute, bounds regular, from 09:30 ET today up to now), of get_equity_historicals for the previous completed session's daily bar (interval day, bounds regular, covering the last 14 days), and of get_equity_quotes, in as many calls as the tools require. Save every raw response untouched, in fetch order, to raw.json as {"historicals": [<raw response>, ...], "daily": [<raw response>, ...], "quotes": [<raw response>, ...]}, the 5-minute responses under "historicals" and the interval-day responses under "daily", never mixed; never retype, filter, or condense anything by hand. A symbol the broker returns nothing usable for is simply absent: the assembler marks it as an error and the primary's own checks keep it from being bought. Then run, where step 5 will run (Mac or sandbox):
-   python3 -m scripts.assemble_market_data --trading-day <YYYY-MM-DD> --raw raw.json --out market.json
-   (sandbox form: python3 backup_planner.pyz assemble-market-data --trading-day <YYYY-MM-DD> --raw raw.json --out market.json)
-It prints one JSON document with status ASSEMBLED and exits 0, or status FAILED and exits 2 (place nothing). Also fetch the account's available buying power in USD; never place with a missing or unreadable buying power.
-
-STEP 5 - COMPUTE (only when step 3 found no valid plan)
-Run, on the Mac when mac_status is online and mac_path_abandoned is false (plan_source mac_compute), otherwise in this sandbox (plan_source cloud_compute):
-   python3 -m scripts.backup_planner compute --trading-day <YYYY-MM-DD> --slot <slot> --market-data market.json --deployed-last-7d-usd auto --orders-pages orders_pages_poll1.json --buying-power <USD> --now <ET ISO timestamp>
-   (sandbox form: python3 backup_planner.pyz compute ...)
-This runs the primary's own signal checks on the data, so what to buy and at what size are the primary's own decisions. `--deployed-last-7d-usd auto` makes the planner derive the kill-switch figure from the same order history; never type a number there. It prints {"status", "plan", "errors"}. Any status other than VALID_PLAN, a non-zero exit, a missing file, or a planner error: place nothing, status failed_unexpected_error, notify.\
-"""
-
-_QUOTES_STEPS = """\
-STEP 4 - MARKET DATA (only when step 3 found no valid plan)
-NOTE: the signal gate is not wired for this slot yet, so this task can only report what the price ladder would buy; nothing is placed (status shadow_only). For every symbol the `universe` command listed, fetch the latest quote (decision_price) and the prior regular session's close and low (prior_close, prior_low; null only when truly unavailable). Save quotes.json as {"quotes": [{"symbol", "prior_close", "prior_low", "decision_price"}, ...]}. A symbol whose data cannot be read is left out; never estimate a value. Also fetch the account's available buying power in USD; never place with a missing or unreadable buying power.
-
-STEP 5 - COMPUTE (only when step 3 found no valid plan)
-Run, on the Mac when mac_status is online and mac_path_abandoned is false (plan_source mac_compute), otherwise in this sandbox (plan_source cloud_compute):
-   python3 -m scripts.backup_planner compute --trading-day <YYYY-MM-DD> --slot <slot> --quotes quotes.json --orders-pages orders_pages_poll1.json --buying-power <USD> --now <ET ISO timestamp>
-   (sandbox form: python3 backup_planner.pyz compute ...)
-It prints {"status", "plan", "errors"}. Any status other than VALID_PLAN, a non-zero exit, a missing file, or a planner error: place nothing, status failed_unexpected_error, notify.\
-"""
-
-_GATED_SHADOW = ("a computed plan finalized without --local-status off, errored or unreachable, meaning the Mac may be acting")
-_GATED_LOCAL_STATUS_ARG = " --local-status <off|errored|unreachable>"
-_GATED_LOCAL_STATUS_RULE = (
-    "\nPass --local-status with the local_status step 3 decided, only when it is off, errored or unreachable; "
-    "never pass --local-status when local_status is unknown, in_progress or succeeded (those stand down in step 3 "
-    "and never reach this step). Without it a computed plan only reports (SHADOW_ONLY)."
-)
-_QUOTES_SHADOW = ("the plan came from compute, which does not run the primary's trend and data-confidence gates")
-
-
-# Where the plan-first program mirrors its agent payload for cloud readers (dca_rec_publish.GitHubBranchPublisher pushes
-# to this repository's remote). Not in config: the publisher pushes to a git remote NAME, and Perplexity needs the slug.
-GITHUB_REPOSITORY = "badMade/all-stock-dca"
-
-
-def _published_channels(publish: dict) -> str:
-    """Where step 2 reads the published set, from ``config/recommendations.json``'s publish block.
-
-    The branch is always named, even while its publisher is off: a missing or stale file is simply no published set,
-    and the run falls back, so enabling the publisher needs no repaste. Notion is named only once a page id is set.
-    """
-    branch = publish["github_branch"]["branch"]
-    text = (f'the file recommendations.json at the tip of branch "{branch}" of the GitHub repository '
-            f"{GITHUB_REPOSITORY} (a data-only branch; read the raw file, never another branch).")
-    page_id = publish["notion"].get("page_id")
-    if page_id:
-        text += f" If that cannot be read, use the text of the first code block on Notion page {page_id} instead."
-    return text
-
-
-_LIMITATION = """
-KNOWN LIMITATION (accepted 2026-10-06): the Mac-first check can use time that this fire needs before the 16:00 ET close. If the latest placement time arrives first, stop with skipped_outside_window. No slot-specific shortcut is allowed."""
-
-
-def _slot_resolution(backup: Backup) -> str:
-    if len(backup.fires) == 1:
-        slot, fire = backup.slots[0], backup.fires[0]
-        hh, mm = int(fire[:2]), int(fire[3:])
-        start = f"{hh:02d}:{mm - 10:02d}" if mm >= 10 else f"{hh - 1:02d}:{mm + 50:02d}"
-        return (f"This fire backs up slot {slot} ({_SLOT_LABEL[slot]}). The ET time must be from {start} up to the "
-                f"latest placement time {_NEXT_SLOT_START[slot]}.")
-    # The two-fire task (13:50 and 14:50): the clock decides which slot this run backs up.
-    return ("This task fires twice a day, so the clock decides the slot. ET time from 13:40 to 14:20 means slot 1330 "
-            "(intraday), latest placement 14:30. ET time from 14:40 to 15:20 means slot 1430 (intraday), latest "
-            "placement 15:30. Any other time is outside the range.")
-
-
-def _latest(backup: Backup) -> str:
-    if len(backup.fires) == 1:
-        return _NEXT_SLOT_START[backup.slots[0]]
-    return (
-        f"{_NEXT_SLOT_START[backup.slots[0]]} for the {backup.fires[0]} fire, "
-        f"{_NEXT_SLOT_START[backup.slots[1]]} for the {backup.fires[1]} fire"
-    )
+_POINTER = """\
+PROCEDURE (steps 1-9). The rest of this task is NOT in this box: Perplexity keeps only the first 20,000 characters of the Instructions, so the procedure is served by the planner you just stamp-checked, and it is covered by that same stamp. Do this now, in order, and do exactly what each part says:
+   python3 backup_planner.pyz procedure --task @@TASK_ID@@ --part 1
+   python3 backup_planner.pyz procedure --task @@TASK_ID@@ --part 2 --token <the token printed at the end of part 1>
+   python3 backup_planner.pyz procedure --task @@TASK_ID@@ --part 3 --token <the token printed at the end of part 2>
+(Mac: python3 -m scripts.backup_planner procedure --task @@TASK_ID@@ --part N.) Part 1 is steps 1-3 (gates, broker evidence, Mac-first), part 2 is steps 4-6 (market data, compute, finalize), part 3 is steps 7-9 (place the orders, state record, notify). Request part 2 only after part 1's steps are done and part 3 only after part 2's are done; each part ends with the exact command for the next one. Every part must begin with the line PROCEDURE FOR TASK @@TASK_ID@@ - PART <n> OF 3 and end with its END OF PART line for this same task id. If any part does not print, exits non-zero, begins with anything else, names a different task id than this prompt, or lacks its END OF PART line, place NOTHING, record failed_unexpected_error, and notify. The hard rules above bind every part. The procedure's wording never relaxes a hard rule above.
+RUN VALUES (filled in when this prompt is pasted). The procedure refers to three values by NAME, written with a dollar sign and braces around it; the value for each is on its line here, and nowhere else:
+   PPLX_RUN_STATE_DIR (the run-state folder for this task): ${PPLX_RUN_STATE_DIR}
+   DCA_ALERT_EMAIL_ADDRESS (where step 9 sends alerts): ${DCA_ALERT_EMAIL_ADDRESS}
+   ROBINHOOD_AGENTIC_ACCOUNT_LAST4 (the last four digits rule 2 requires): ${ROBINHOOD_AGENTIC_ACCOUNT_LAST4}
+If a value above still reads as a placeholder (starts with a dollar sign and a brace), place NOTHING, record failed_unexpected_error, and notify."""
 
 
 def _build_stamp() -> str:
@@ -256,63 +87,24 @@ def _build_stamp() -> str:
     return stamp
 
 
-def _tier_caps(cap_of) -> str:
-    """The tiers' caps in selection order, e.g. ``$180 Normal, $240 Elevated``, from the primary's own ladder."""
-    return ", ".join(f"${cap_of(tier):g} {tier.name.replace('_', '-').capitalize()}" for tier in BUDGET_TIERS)
+def _render(backup: Backup, common: dict, tail: str) -> str:
+    values = {**backup_procedure.backup_values(backup, common), "@@BUILD_STAMP@@": _build_stamp()}
+    text = backup_procedure.substitute(_HEAD_TEMPLATE + "\n\n" + tail, values)
+    assert "@@" not in text, backup.file
+    return text.rstrip("\n") + "\n"
 
 
 def build_prompts(config_dir: Path | None = None) -> dict[str, str]:
-    """Render the six prompts from config. Pure and deterministic: same config, same bytes."""
-    directory = Path(config_dir) if config_dir is not None else dca_config.get_config_dir()
-    config = dca_config.load_strategy_config(directory)
-    calendar = json.loads((directory / "market_calendar.json").read_text(encoding="utf-8"))
-    breakers = json.loads((directory / "budgets.json").read_text(encoding="utf-8"))["circuit_breakers"]
-    normal = next(tier for tier in BUDGET_TIERS if tier.name == "normal")
-    recommendations = dca_rec_store.load_settings(directory)
-    common = {
-        "@@PUBLISHED_CHANNELS@@": _published_channels(recommendations.publish),
-        "@@MAX_AGE@@": f"{recommendations.max_age.total_seconds() / 60:g}",
-        "@@BUILD_STAMP@@": _build_stamp(),
-        "@@LADDER@@": dca_order_plan.current_ladder_version(directory),
-        "@@UNIVERSE_HASH@@": dca_order_plan.universe_hash(config.tickers),
-        "@@N@@": str(len(config.tickers)),
-        "@@CAL_RETRIEVED@@": str(calendar["retrieved"]),
-        "@@CLOSED@@": ", ".join(calendar["holidays_closed"]),
-        "@@EARLY@@": ", ".join(calendar["early_close_1300"]),
-        "@@EARLY_TIME@@": str(calendar["early_close_time_et"]),
-        "@@PER_ORDER@@": f"{dca_runner.MAX_PER_ORDER_USD:g}",
-        "@@TIER_DAILY@@": _tier_caps(lambda tier: tier.daily_cap_usd),
-        "@@TIER_WEEKLY@@": _tier_caps(lambda tier: normal.weekly_cap_usd if tier.uses_rollover_reserve else tier.weekly_cap_usd),
-        "@@MAX_ORDERS@@": str(dca_runner.MAX_ORDERS_PER_DAY),
-        "@@CONSEC@@": str(breakers["max_consecutive_placement_failures"]),
-        "@@MAX_SPREAD@@": f"{config.max_bid_ask_spread_pct:g}",
-    }
-    prompts: dict[str, str] = {}
-    for backup in BACKUPS:
-        slot_word = "slot" if len(backup.slots) == 1 else "slots"
-        gated = all(slot in backup_planner.GATED_SLOTS for slot in backup.slots)
-        values = {
-            **common,
-            "@@TITLE@@": "- " + " / ".join(f"slot {s} ({_SLOT_LABEL[s]})" for s in backup.slots),
-            "@@TASK_ID@@": backup.task_id,
-            "@@FIRES@@": " and ".join(backup.fires),
-            "@@SLOT_LINE@@": f"{slot_word} " + " and ".join(backup.slots),
-            "@@LATEST@@": _latest(backup),
-            "@@SLOT_RESOLUTION@@": _slot_resolution(backup),
-            "@@LIMITATION@@": _LIMITATION if backup.slots == ("1530",) else "",
-            "@@STEP4_5@@": _GATED_STEPS if gated else _QUOTES_STEPS,
-            "@@SHADOW_REASON@@": _GATED_SHADOW if gated else _QUOTES_SHADOW,
-            "@@LOCAL_STATUS_ARG@@": _GATED_LOCAL_STATUS_ARG if gated else "",
-            "@@LOCAL_STATUS_RULE@@": _GATED_LOCAL_STATUS_RULE if gated else "",
-        }
-        text = _TEMPLATE
-        for key, value in values.items():
-            text = text.replace(key, value)
-        for key, value in common.items():
-            text = text.replace(key, value)
-        assert "@@" not in text, backup.file
-        prompts[backup.file] = text.rstrip("\n") + "\n"
-    return prompts
+    """The FULL reference prompts (rules + steps 1-9), deterministic. Too long to paste: used by the tests and by
+    anyone who wants the whole procedure in one file. The pasteable prompts are :func:`build_instructions`."""
+    common = backup_procedure.common_values(config_dir)
+    return {backup.file: _render(backup, common, backup_procedure.PROCEDURE_TEMPLATE) for backup in BACKUPS}
+
+
+def build_instructions(config_dir: Path | None = None) -> dict[str, str]:
+    """The six prompts to paste: hard rules, calendar, step 0 and the pointer to the stamped procedure."""
+    common = backup_procedure.common_values(config_dir)
+    return {backup.file: _render(backup, common, _POINTER) for backup in BACKUPS}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -322,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--check", action="store_true", help="Exit 1 if any committed prompt differs from the generator.")
     parser.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR)
     args = parser.parse_args(argv)
-    prompts = build_prompts()
+    prompts = build_instructions()
     if args.write:
         args.out_dir.mkdir(parents=True, exist_ok=True)
         for name, text in prompts.items():
