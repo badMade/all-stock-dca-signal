@@ -331,9 +331,12 @@ def build_daily_snapshot(
     root = Path(root).resolve()
     exclusions = tuple(Path(path).resolve() for path in excluded_roots)
 
+    _selected_cache = {}
     def selected(path: Path) -> bool:
-        resolved = path.resolve()
-        return resolved.is_relative_to(root) and not any(resolved.is_relative_to(item) for item in exclusions)
+        if path not in _selected_cache:
+            resolved = path.resolve()
+            _selected_cache[path] = resolved.is_relative_to(root) and not any(resolved.is_relative_to(item) for item in exclusions)
+        return _selected_cache[path]
 
     config_dir = Path(config_dir) if config_dir is not None else DEFAULT_CONFIG_DIR
     now = now or datetime.now(ET)
@@ -378,17 +381,26 @@ def build_daily_snapshot(
         # ⚡ Bolt Optimization: Replace O(N*M) nested path resolution with O(N+M) dictionary lookup
         # Reduces `build_daily_snapshot` execution time from ~2.35s to ~0.22s (10x speedup)
         # on days with many purchase records and run states.
-        excluded = {str(path.parent.resolve()) for path, state in states if _mode(state) in {"dry_run", "demo"}}
+        resolved_state_dirs = {path.parent: str(path.parent.resolve()) for path, _ in states}
+        excluded = {resolved_state_dirs[path.parent] for path, state in states if _mode(state) in {"dry_run", "demo"}}
         records_by_dir = defaultdict(list)
         records = []
+
+        resolved_source_cache = {}
         for record in all_records:
             if record.trading_day == day.isoformat():
-                source_dir_path = Path(record.source_run_dir)
-                if selected(source_dir_path):
-                    resolved_dir = str(source_dir_path.resolve())
-                    if resolved_dir not in excluded:
-                        records.append(record)
-                        records_by_dir[resolved_dir].append(record)
+                source_run_dir = record.source_run_dir
+                if source_run_dir not in resolved_source_cache:
+                    source_dir_path = Path(source_run_dir)
+                    if selected(source_dir_path):
+                        resolved_source_cache[source_run_dir] = str(source_dir_path.resolve())
+                    else:
+                        resolved_source_cache[source_run_dir] = None
+
+                resolved_dir = resolved_source_cache[source_run_dir]
+                if resolved_dir and resolved_dir not in excluded:
+                    records.append(record)
+                    records_by_dir[resolved_dir].append(record)
 
         if fill_warnings:
             warnings.append(f"The purchase-history reader reported {len(fill_warnings)} evidence warning(s); "
@@ -396,8 +408,9 @@ def build_daily_snapshot(
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
         warnings.append("Confirmed purchases could not be read; spend remains unverified.")
         records_by_dir = {}
+        resolved_state_dirs = {}
 
-    runs = [_run_row(path, root, state, records_by_dir.get(str(path.parent.resolve()), []))
+    runs = [_run_row(path, root, state, records_by_dir.get(resolved_state_dirs.get(path.parent) or str(path.parent.resolve()), []))
             for path, state in states]
     runs.sort(key=lambda row: row["time"] or "", reverse=True)
     spend = _sum_fills(records)

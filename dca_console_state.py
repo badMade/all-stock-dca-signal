@@ -518,8 +518,12 @@ def purchases_view(roots: Sequence[RootSpec], *, day: str | None = None) -> dict
     records.sort(key=lambda record: record.trading_day or "", reverse=True)
     resolved = [(root, root.path.resolve()) for root in roots]
     rows = []
+    # ⚡ Bolt Optimization: Cache resolved owning roots instead of resolving paths per record
+    owner_cache = {}
     for record in records[:MAX_PURCHASES]:
-        owner = _owning_root(resolved, record.source_run_dir)
+        if record.source_run_dir not in owner_cache:
+            owner_cache[record.source_run_dir] = _owning_root(resolved, record.source_run_dir)
+        owner = owner_cache[record.source_run_dir]
         rows.append({"trading_day": iso_date(record.trading_day), "ticker": _text(record.ticker, 12),
                      "amount_usd": _finite(record.amount_usd), "price": _finite(record.avg_fill_price),
                      "quantity": _finite(record.quantity), "stream": _jsonable(record.stream),
