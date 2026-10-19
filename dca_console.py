@@ -548,6 +548,25 @@ def module_catalog(python: str) -> list[dict]:
     return rows
 
 
+
+def _max_json_mtime(base_dir: Path) -> float | None:
+    # ⚡ Bolt optimization: Use os.scandir to bypass O(N) stat overhead of rglob().stat()
+    max_ts = None
+    stack = [str(base_dir)]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+                    elif entry.is_file(follow_symlinks=False) and entry.name.endswith(".json"):
+                        mtime = entry.stat(follow_symlinks=False).st_mtime
+                        if max_ts is None or mtime > max_ts:
+                            max_ts = mtime
+        except OSError:
+            pass
+    return max_ts
+
 class ConsoleApp:
     """Bridge local artifact readers, fixed jobs, daily summaries, and the UI."""
 
@@ -650,13 +669,13 @@ class ConsoleApp:
         disk_ts: str | None = None
         try:
             if action_id == "reports" and (self.settings.output / "summaries").is_dir():
-                files = [p for p in (self.settings.output / "summaries").rglob("*.json") if p.is_file()]
-                if files:
-                    disk_ts = datetime.fromtimestamp(max(p.stat().st_mtime for p in files), tz=timezone.utc).isoformat()
+                mtime = _max_json_mtime(self.settings.output / "summaries")
+                if mtime is not None:
+                    disk_ts = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
             elif action_id.startswith("demo-") and (self.settings.output / "demo").is_dir():
-                files = [p for p in (self.settings.output / "demo").rglob("*.json") if p.is_file()]
-                if files:
-                    disk_ts = datetime.fromtimestamp(max(p.stat().st_mtime for p in files), tz=timezone.utc).isoformat()
+                mtime = _max_json_mtime(self.settings.output / "demo")
+                if mtime is not None:
+                    disk_ts = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
             elif action_id in {"octopus-update", "octopus-estimate"}:
                 target = getattr(self, "octopus_run", None) or (REPO / "analysis" / "real-octopus-run")
                 if target and target.is_dir():

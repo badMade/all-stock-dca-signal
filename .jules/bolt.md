@@ -8,3 +8,6 @@
 ## 2026-10-16 - [Cache Path.resolve() in nested loops]
 **Learning:** Calling `Path.resolve()` repeatedly inside nested loops (such as correlating N run state paths with M historical purchase records) triggers expensive O(N x M) OS-level filesystem resolution syscalls. This causes severe runtime degradation on large file counts.
 **Action:** Replace repeated inline path resolutions with function-scoped upfront resolution caching (e.g., via dictionary lookup or memoization) to flatten the operation to O(N + M). This pattern ensures fast traversal in historical log snapshots while maintaining identical logic parity.
+## 2026-10-19 - [Avoid Path.rglob().stat() for max mtime queries]
+**Learning:** Chaining `Path.rglob()` and `Path.stat()` causes $O(N)$ system calls for large directory trees because `rglob` constructs path objects before making individual `lstat` calls.
+**Action:** Use `os.scandir` with a manual stack to yield directory entries directly and use `entry.stat().st_mtime` to eliminate repeated system I/O bounds while scanning directories.
