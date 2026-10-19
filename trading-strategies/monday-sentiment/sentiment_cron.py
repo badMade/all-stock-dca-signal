@@ -532,7 +532,9 @@ def prune_history(history: dict, today_str: str) -> dict:
     Remove entries older than ROLLING_WINDOW_DAYS from every ticker's list.
     This keeps the file small and the z-score window accurate.
     """
-    cutoff = (datetime.strptime(today_str, "%Y-%m-%d") - timedelta(days=ROLLING_WINDOW_DAYS)).strftime("%Y-%m-%d")
+    # ⚡ Bolt optimization: Use native string slicing over slow datetime.strptime
+    today_dt = datetime(int(today_str[:4]), int(today_str[5:7]), int(today_str[8:10]))
+    cutoff = (today_dt - timedelta(days=ROLLING_WINDOW_DAYS)).strftime("%Y-%m-%d")
     for ticker in history:
         history[ticker] = [
             entry for entry in history[ticker]

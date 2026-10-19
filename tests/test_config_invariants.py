@@ -136,7 +136,9 @@ def _expired_authorization_overrides(today: date) -> dict[str, dict]:
         window = override.get("authorization_window_et")
         if not isinstance(window, dict) or not window.get("expires_after_trading_day"):
             continue
-        if datetime.strptime(window["trading_day"], "%Y-%m-%d").date() < today:
+        # ⚡ Bolt optimization: Use native string slicing over slow datetime.strptime
+        td = window["trading_day"]
+        if date(int(td[:4]), int(td[5:7]), int(td[8:10])) < today:
             expired[key] = override
     return expired
 

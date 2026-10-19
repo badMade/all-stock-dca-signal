@@ -186,8 +186,9 @@ def fetch_data(
 
     client = StockHistoricalDataClient(api_key, secret_key)  # type: ignore
 
-    start_dt = datetime.strptime(start, "%Y-%m-%d")
-    end_dt   = datetime.strptime(end,   "%Y-%m-%d")
+    # ⚡ Bolt optimization: Use native string slicing over slow datetime.strptime
+    start_dt = datetime(int(start[:4]), int(start[5:7]), int(start[8:10]))
+    end_dt = datetime(int(end[:4]), int(end[5:7]), int(end[8:10]))
 
     request = StockBarsRequest(  # type: ignore
         symbol_or_symbols=all_tickers,
