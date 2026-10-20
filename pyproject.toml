@@ -53,7 +53,7 @@ dev = [
     "scipy-stubs==1.18.1.0; python_version >= '3.12'",
     "pip-audit==2.10.1",
     "pyright==1.1.414",
-    "uv==0.13.0",
+    "uv==0.13.4",
 ]
 # Heavy, undeclared-elsewhere deps used only by the trading-strategies/ research
 # tools (backtester, sentiment monitor). Not needed to run the DCA strategy.

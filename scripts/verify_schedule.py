@@ -212,8 +212,14 @@ def _read_state(path: Path) -> tuple[bool, Optional[Dict[str, Any]]]:
     return True, loaded if isinstance(loaded, dict) else None
 
 
-def verify_day(day: date, now: datetime, *, root: Optional[Path] = None) -> Dict[str, Any]:
-    """Classify every roster slot for ``day`` under ``root`` (default: the cron-tracking root)."""
+def verify_day(
+    day: date, now: datetime, *, root: Optional[Path] = None, order_ids: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Classify every roster slot, optionally reporting artifact claims for order IDs.
+
+    Attribution is informational only and never changes the audit verdict.
+    ``root`` defaults to the cron-tracking root.
+    """
     base = Path(root) if root is not None else cron_tracking_root()
     slots = []
     for slot_id in SLOT_EVIDENCE_LAYOUT:
@@ -230,8 +236,13 @@ def verify_day(day: date, now: datetime, *, root: Optional[Path] = None) -> Dict
             artifact_errors=artifact_errors,
         ))
     failing = [row["slot_id"] for row in slots if row["status"] not in OK_STATUSES]
-    return {"date": day.isoformat(), "checked_at_et": now.astimezone(ET).isoformat(timespec="minutes"),
-            "ok": not failing, "failing_slots": failing, "slots": slots}
+    report = {"date": day.isoformat(), "checked_at_et": now.astimezone(ET).isoformat(timespec="minutes"),
+              "ok": not failing, "failing_slots": failing, "slots": slots}
+    if order_ids is not None:
+        from scripts.slot_attribution import attribute_orders
+
+        report["order_attribution"] = attribute_orders(day, order_ids, root=base)
+    return report
 
 
 def _render(report: Mapping[str, Any]) -> str:

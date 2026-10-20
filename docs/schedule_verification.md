@@ -54,6 +54,21 @@ Exit status is 1 when any slot fails. The console's Schedule page
 manifest row (matched on both time and cron id) and adds a "Slot verified"
 column to the roster matrix.
 
+### Attribute broker order IDs (Python API)
+
+`scripts.slot_attribution.attribute_orders(day, order_ids, root=...)` matches
+broker IDs against `buy_candidates[].order_id` and
+`orders[].order_id` / `broker_order_id` in each slot's own dated
+`run_state.json`. It returns `attributed` (ID → slot), `unattributed` (IDs no
+readable artifact names), and `ambiguous` (ID → multiple claiming slots).
+Missing or malformed states contribute no claims; order times are never used
+to guess a slot. A match is an artifact claim, not proof of a verified run or
+confirmed fill.
+
+Pass `order_ids=[...]` to `verify_day(day, now, root=...)` to include this result
+as `order_attribution`. Omitting it preserves the existing report shape;
+attribution never changes `ok`, `failing_slots`, or the CLI exit status.
+
 ## Finalize a slot (Gate 9)
 
 Every live-mirror prompt's Gate 9 now starts with:
