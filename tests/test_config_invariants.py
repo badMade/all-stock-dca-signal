@@ -2951,6 +2951,39 @@ def test_every_live_mirror_gate7_classifies_a_platform_refusal():
         assert "fails CLOSED" in gate_7, f"{filename}: a denied buying-power fetch must fail closed"
 
 
+def test_live_mirror_gate_7_classifies_denied_order_history_fetch_as_platform_refusal():
+    """Gate 7 names the classifier-denied pre-order ``get_equity_orders`` fetch.
+
+    2026-10-20 11:30 ET: the auto-mode classifier refused the read-only
+    order-history fetch that precedes every placement. Fourteen buys had
+    filled; the refusal landed before CSCO ($1.40) and TEL ($1.00), which were
+    never attempted. The prompt already covered a refused ``place_equity_order``
+    and a refused ``get_portfolio`` but not this call, so the executor had to
+    extrapolate. The contract: retry once, then stop the REMAINING placements
+    (the cap and rogue-activity checks cannot be proven without fresh history),
+    leave confirmed fills alone, consume no attempt, and carry the unplaced
+    tickers with their unresized ``buy_usd`` into the alert.
+    """
+    marker = "READ-ONLY REFUSAL, ORDER HISTORY"
+    for filename in _LIVE_MIRROR_FILES:
+        text = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")
+        gate_7 = _gate_section(text, "GATE 7 - PLACE THE ORDERS")
+
+        assert marker in gate_7, f"{filename}: Gate 7 never names a classifier-denied order-history fetch"
+        paragraph = gate_7.split(marker, 1)[1].splitlines()[0]
+        for phrase in (
+            "get_equity_orders",
+            "Retry that fetch once and no more",
+            "STOPS THE REMAINING PLACEMENTS",
+            "never place on an earlier or partial order history",
+            "orders already confirmed stand",
+            "consume no placement attempt",
+            "UNPLACED TICKERS",
+            "must NOT be resized",
+        ):
+            assert phrase in paragraph, f"{filename}: order-history refusal paragraph is missing {phrase!r}"
+
+
 def test_live_mirror_interlock_prefix_names_the_fourth_probe():
     # The four files carrying the compact interlock are the ones whose Gate 2
     # body sits past the truncation boundary; a truncated fire there sees only
