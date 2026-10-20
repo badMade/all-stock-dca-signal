@@ -744,7 +744,8 @@ def finalize(
     validate_orders(orders)
     budget = validate_budget(budget)
     code_version = validate_code_version(code_version)
-    base = Path(root) if root is not None else cron_tracking_root()
+    # cron_tracking_root() returns a str; `base / ...` below needs a Path (3:30 PM 2026-10-19 TypeError).
+    base = Path(root) if root is not None else Path(cron_tracking_root())
     run_dir = base / slot_run_dir_relative(slot, started.date())
     # Beside the run directory, not inside it: the lock must not be mistaken
     # for evidence that the slot started.
@@ -798,7 +799,8 @@ def _finalize_dry_run(
         )
     if not outcome.strip():
         raise FinalizeRefused("--outcome must name the Gate 9 outcome")
-    base = Path(root) if root is not None else cron_tracking_root()
+    # cron_tracking_root() returns a str; `base / ...` below needs a Path (3:30 PM 2026-10-19 TypeError).
+    base = Path(root) if root is not None else Path(cron_tracking_root())
     run_dir = base / DRY_RUN_DIR / slot_run_dir_relative(slot, started.date()).name
     run_dir.mkdir(parents=True, exist_ok=True)
     state = {

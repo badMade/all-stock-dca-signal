@@ -91,6 +91,17 @@ def test_every_slot_finalizes_to_verified_evidence(tmp_path, slot_id):
     assert slots[slot_id] == "verified"
 
 
+@pytest.mark.parametrize("slot_id", ["1430", "1530"])
+def test_default_root_from_env_is_a_str_but_finalizes(tmp_path, monkeypatch, slot_id):
+    # 2026-10-19 3:30 PM: cron_tracking_root() returns a str, so omitting root= made
+    # `base / "ce16ba6b"` raise TypeError and no run_state or pointer was written.
+    monkeypatch.setenv("DCA_CRON_TRACKING_ROOT", str(tmp_path))
+    result = fre.finalize(
+        slot_id, started(slot_id), outcome="NO_ORDERS", order_submit_status="no_orders_submitted", now=NOW
+    )
+    assert result["verified"] is True, result["errors"]
+
+
 def test_live_classification_is_the_executors_own(tmp_path):
     import intraday_dca
 
