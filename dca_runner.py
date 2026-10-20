@@ -1393,7 +1393,10 @@ def _candidate_multiplier_is_consistent(cand: Candidate) -> bool:
         return True
     if not math.isfinite(cand.multiplier) or cand.multiplier not in _LADDER_MULTIPLIERS:
         return False
-    if not math.isfinite(cand.amount_usd):
+    try:
+        if not math.isfinite(cand.amount_usd):
+            return False
+    except OverflowError:
         return False
     return _cents(cand.amount_usd) == _cents(cand.multiplier * _BASE_AMOUNT_USD) or _cents(
         cand.amount_usd
@@ -1424,7 +1427,10 @@ def _amount_matches_any_ladder_allocation(amount_usd: float, drop_pct: float | N
     corruption, and is not checked here -- consistent with
     :func:`_candidate_drop_mismatches_claimed_multiplier`'s own treatment.
     """
-    if not math.isfinite(amount_usd):
+    try:
+        if not math.isfinite(amount_usd):
+            return False
+    except OverflowError:
         return False
     cents = _cents(amount_usd)
     drop_is_usable = drop_pct is not None and math.isfinite(drop_pct)
@@ -1618,7 +1624,10 @@ def _candidate_calibrated_multiplier_is_consistent(cand: Candidate) -> bool:
         return False
     if not _calibration_fields_well_formed(cand):
         return False
-    if not math.isfinite(cand.amount_usd) or cand.amount_usd <= 0:
+    try:
+        if not math.isfinite(cand.amount_usd) or cand.amount_usd <= 0:
+            return False
+    except OverflowError:
         return False
     bounds = _configured_calibration_bounds(cand.ticker, cand.multiplier)
     if bounds is None:
@@ -2048,7 +2057,10 @@ def _estimated_multiplier(cand: Candidate) -> float:
         or _candidate_calibrated_multiplier_is_consistent(cand)
     ):
         return cand.multiplier
-    if not math.isfinite(cand.amount_usd):
+    try:
+        if not math.isfinite(cand.amount_usd):
+            return MIN_LADDER_MULTIPLIER
+    except OverflowError:
         return MIN_LADDER_MULTIPLIER
     if cand.drop_pct is not None and math.isfinite(cand.drop_pct):
         drop_multiplier = _multiplier_for_drop_pct(cand.drop_pct)
@@ -2317,12 +2329,16 @@ def plan_orders(
             plan.refused.append((ticker, REFUSED_INVALID_AMOUNT))
             continue
 
-        if not math.isfinite(cand.amount_usd) or cand.amount_usd <= 0:
-            # NaN/inf/zero/negative amounts must never reach arithmetic: NaN
-            # compares False against every cap check (silently bypassing every
-            # cap), and a negative amount would reduce `running` (Codex
-            # review: "Reject non-finite and non-positive candidate
-            # notionals").
+        try:
+            if not math.isfinite(cand.amount_usd) or cand.amount_usd <= 0:
+                # NaN/inf/zero/negative amounts must never reach arithmetic: NaN
+                # compares False against every cap check (silently bypassing every
+                # cap), and a negative amount would reduce `running` (Codex
+                # review: "Reject non-finite and non-positive candidate
+                # notionals").
+                plan.refused.append((ticker, REFUSED_INVALID_AMOUNT))
+                continue
+        except OverflowError:
             plan.refused.append((ticker, REFUSED_INVALID_AMOUNT))
             continue
 

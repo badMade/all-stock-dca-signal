@@ -15114,3 +15114,11 @@ def test_plan_orders_accepts_an_interpolated_in_between_calibrated_multiplier(in
     plan = dca_runner.plan_orders([wrong], snapshot, dca_runner.BUDGET_TIERS[0])
     assert plan.to_place == []
     assert plan.refused == [("DFTX", dca_runner.REFUSED_INCONSISTENT_MULTIPLIER)]
+
+def test_overflow_amount_usd_returns_refused_invalid_amount():
+    candidate = dca_runner.Candidate("AAPL", 10**1000)
+    snapshot = dca_runner.BudgetSnapshot(None, 0.0, 0.0, 0)
+    plan = dca_runner.plan_orders([candidate], snapshot, dca_runner.BUDGET_TIERS[0])
+    assert plan.to_place == []
+    assert len(plan.refused) == 1
+    assert plan.refused[0] == ("AAPL", dca_runner.REFUSED_INVALID_AMOUNT)
