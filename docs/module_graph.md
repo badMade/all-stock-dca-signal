@@ -56,7 +56,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.evidence_publish` | 626 | 0 |
 | `scripts.export_octopus_ledger` | 232 | 0 |
 | `scripts.fill_perplexity_backup_prompts` | 298 | 2 |
-| `scripts.finalize_run_evidence` | 1131 | 32 |
+| `scripts.finalize_run_evidence` | 1133 | 32 |
 | `scripts.generate_credit_usage_proxy_report` | 3321 | 7 |
 | `scripts.generate_market_graph` | 369 | 2 |
 | `scripts.generate_module_graph` | 251 | 3 |
@@ -197,7 +197,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.export_octopus_ledger` | 232 | 1 | 0 | 0 | `scripts.sequestered_truth_comparator` |
 | `scripts.file_lock` | 127 | 0 | 12 | 0 |  |
 | `scripts.fill_perplexity_backup_prompts` | 298 | 1 | 0 | 2 | `dca_env` |
-| `scripts.finalize_run_evidence` | 1131 | 13 | 0 | 32 | `dca_fileio`, `dca_paths`, `dca_runner`, `intraday_dca`, `market_open_dca`, `midday_dca`, `morning_dca`, `scripts.file_lock`, +5 more |
+| `scripts.finalize_run_evidence` | 1133 | 13 | 0 | 32 | `dca_fileio`, `dca_paths`, `dca_runner`, `intraday_dca`, `market_open_dca`, `midday_dca`, `morning_dca`, `scripts.file_lock`, +5 more |
 | `scripts.foreground_primary` | 620 | 0 | 1 | 5 |  |
 | `scripts.gate_failure_diagnostics` | 352 | 3 | 1 | 0 | `dca_paths`, `dca_risk`, `scripts.same_day_top_up_gate` |
 | `scripts.generate_buy_candidates` | 2049 | 3 | 5 | 9 | `dca_config`, `dca_runner`, `near_close_dca` |
