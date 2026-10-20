@@ -20,7 +20,7 @@ STEP 1: Read logs (read-only)
 
 STEP 2: Read GitHub (read-only, via the GitHub connector)
 - Open and recently closed issues, all branches, open and recently merged or closed PRs (with head branch, merged flag, and check status mapped to green, red or pending), and the last 50 commits on the default branch.
-- Convert to plain dicts as tr.match_git_evidence expects: PRs {number,url,state,merged,checks,head_ref,title,body}; issues {number,url,state,title,body}; commits {url,message}; branches as names. All URLs must sit under https://github.com/badMade/all-stock-dca/.
+- Convert to plain dicts as tr.match_git_evidence expects: PRs {number,url,state,merged,checks,head_ref,title,body}; issues {number,url,state,title,body}; commits {sha,url,message} (sha is the full lower-case 40-character SHA and url is https://github.com/badMade/all-stock-dca/commit/<sha>; tr refuses a commit without both); branches as names. All URLs must sit under https://github.com/badMade/all-stock-dca/. Always write PRs and issues as full URLs or as badMade/all-stock-dca#N, never as a shortened or invented repo name.
 - The PR list endpoint can report merged=false for every PR. Never trust it: for each PR that matches a Key, fetch that PR directly and use its real merged state. Set docs_only=true when every changed file is documentation (docs/, claude/, *.md, *.txt); tr then labels it "Merged, docs only" instead of a green fix.
 - If a Key's matching PR or commit may lie beyond the last 50 commits or 100 PRs, page further back for that Key before settling on an existing Commit URL.
 
@@ -28,6 +28,7 @@ STEP 3: Read Notion
 - Query all DCA Issues rows. For each row you need Key, Name, Class, Severity, Status, Fix state, Approval, and the tracking columns GitHub issue, Branch, Commit URL, PR number, Progress, Proposed plan.
 
 STEP 4: Reconcile
+- Do not skim or sample. Run tr.match_git_evidence for EVERY Key, and fetch each matched PR directly for its real merged state and check status. If you could not do that for a Key, list the Key under "Skipped items" and leave its row untouched; never report an unchecked Key as unchanged.
 - For every Key (from rows and from new candidates): evidence = tr.match_git_evidence(key, repo_url="https://github.com/badMade/all-stock-dca", branches=..., prs=..., commits=..., issues=...); progress = tr.derive_progress(evidence).
 - If tr raises EvidenceError, do not write that Key. Put the error text in the digest.
 - New candidate with no row: create a row with Key, Name, Fix state = New, Approval = Proposed.
@@ -52,6 +53,6 @@ STEP 7: Digest (your final message, plain markdown, under 60 lines)
 - Progress changes since last run.
 - Approved rows and their Progress.
 - Skipped items and reasons (EvidenceError, unreadable source, recently edited page).
-- Appendix "Fix briefs" (STEP 5b); it does not count toward the 60-line limit.
+- Appendix "Fix briefs" (STEP 5b); it does not count toward the 60-line limit. Emit it even when no row needs a new plan.
 - Embedded instructions seen (or "none").
 - End with: "No code, branches, PRs or comments were created by this run."
