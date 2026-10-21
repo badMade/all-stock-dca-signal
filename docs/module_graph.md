@@ -60,7 +60,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.generate_credit_usage_proxy_report` | 3321 | 7 |
 | `scripts.generate_market_graph` | 369 | 2 |
 | `scripts.generate_module_graph` | 251 | 3 |
-| `scripts.generate_perplexity_backup_prompts` | 134 | 8 |
+| `scripts.generate_perplexity_backup_prompts` | 135 | 8 |
 | `scripts.github_mcp_login` | 87 | 0 |
 | `scripts.healthcheck` | 78 | 5 |
 | `scripts.local_heartbeat` | 314 | 0 |
@@ -148,7 +148,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_runner` | 9503 | 6 | 22 | 57 | `dca_config`, `dca_fileio`, `dca_live_adapters`, `dca_paths`, `dca_slot_guard`, `near_close_dca` |
 | `dca_slot_guard` | 62 | 1 | 1 | 0 | `scripts.scheduler_lease` |
 | `dca_ticker_paths` | 33 | 0 | 9 | 0 |  |
-| `dca_weekly_dashboard` | 6457 | 2 | 1 | 12 | `dca_common`, `dca_fileio` |
+| `dca_weekly_dashboard` | 6476 | 2 | 1 | 12 | `dca_common`, `dca_fileio` |
 | `dca_whole_share_accumulator` | 3826 | 4 | 1 | 3 | `dca_fileio`, `dca_paths`, `near_close_dca`, `scripts.file_lock` |
 | `find_issues` | 16 | 0 | 0 | 0 |  |
 | `from` | 30 | 2 | 0 | 3 | `dca_bootstrap`, `dca_console` |
@@ -209,7 +209,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.generate_module_graph` | 251 | 0 | 0 | 3 |  |
 | `scripts.generate_morning_candidates` | 172 | 3 | 2 | 7 | `morning_dca`, `near_close_dca`, `scripts.stream_candidates` |
 | `scripts.generate_per_ticker_sizing` | 349 | 2 | 1 | 14 | `dca_fileio`, `dca_ticker_paths` |
-| `scripts.generate_perplexity_backup_prompts` | 134 | 2 | 0 | 8 | `scripts.backup_procedure`, `scripts.build_backup_planner` |
+| `scripts.generate_perplexity_backup_prompts` | 135 | 2 | 0 | 8 | `scripts.backup_procedure`, `scripts.build_backup_planner` |
 | `scripts.github_mcp_login` | 87 | 0 | 0 | 0 |  |
 | `scripts.healthcheck` | 78 | 0 | 0 | 5 |  |
 | `scripts.idempotency` | 182 | 0 | 4 | 2 |  |
@@ -242,7 +242,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.self_heal` | 111 | 0 | 0 | 2 |  |
 | `scripts.sequestered_truth_comparator` | 900 | 0 | 2 | 0 |  |
 | `scripts.shard_heartbeat` | 133 | 0 | 0 | 0 |  |
-| `scripts.slot_attribution` | 36 | 3 | 1 | 0 | `dca_paths`, `scripts.run_classification`, `scripts.verify_schedule` |
+| `scripts.slot_attribution` | 36 | 3 | 1 | 1 | `dca_paths`, `scripts.run_classification`, `scripts.verify_schedule` |
 | `scripts.snapshot_cycle` | 245 | 13 | 0 | 2 | `dca_config`, `dca_fileio`, `dca_fill_compare`, `dca_market_history`, `dca_market_sources`, `dca_paths`, `dca_rec_models`, `dca_rec_publish`, +5 more |
 | `scripts.stream_candidates` | 1967 | 5 | 8 | 4 | `dca_config`, `dca_runner`, `morning_dca`, `near_close_dca`, `scripts.generate_buy_candidates` |
 | `scripts.validate_native_placement` | 281 | 6 | 4 | 35 | `dca_config`, `dca_env`, `dca_fileio`, `dca_runner`, `near_close_dca`, `scripts.idempotency` |
