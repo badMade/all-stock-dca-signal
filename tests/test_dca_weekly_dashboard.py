@@ -8260,3 +8260,26 @@ def test_build_coverage_missed_edge_cases():
     ]
     result_cov_candidates = build_coverage_missed(run_states_no_counts, summaries_with_cov)
     assert "| 2023-11-03 | 5 | n/a | n/a | n/a | 0 |" in result_cov_candidates
+
+
+# device_bridge_unreachable: a scheduled cloud run has no Mac, so the artifact tree the
+# dashboard reads can be absent. load_scheduled_run_states() returns [] for a missing tree
+# (by design, it must not raise), but the rendered dashboard was then a table of zeros that
+# is indistinguishable from a real zero-run week. The dashboard must label that case.
+def test_weekly_dashboard_labels_a_skip_when_no_scheduled_artifacts_are_reachable(tmp_path):
+    unreachable = tmp_path / "mac_only_cron_tracking"  # never created: the bridge is down
+
+    run_states = load_scheduled_run_states(unreachable)
+    report = build_weekly_dashboard(run_states, week_label="2026-W43")
+
+    assert run_states == []
+    assert "No scheduled run artifacts were found" in report
+    # Still a complete document: the skip label replaces nothing, it annotates.
+    assert "## Performance snapshot" in report
+
+
+def test_weekly_dashboard_has_no_skip_label_when_scheduled_artifacts_exist():
+    run_state = {"trading_day": "2026-10-19", "candidates": [], "budget": {"base_amount_usd": 5.0}}
+    report = build_weekly_dashboard([run_state])
+
+    assert "No scheduled run artifacts were found" not in report

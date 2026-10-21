@@ -6420,6 +6420,24 @@ def build_weekly_review_notes(
     return "\n".join(lines)
 
 
+def _no_artifacts_notice(run_states: Sequence[Dict[str, Any]]) -> List[str]:
+    """Label an empty input so an unreachable artifact tree is not read as a zero-run week.
+
+    ``load_scheduled_run_states`` returns ``[]`` for a missing tree by design (it must not
+    raise), e.g. a scheduled cloud run with no Mac behind the device bridge
+    (``device_bridge_unreachable``). Without this line the all-zeros tables below are
+    indistinguishable from a genuine week with no runs.
+    """
+    if run_states:
+        return []
+    return [
+        "> **Skipped: No scheduled run artifacts were found.** The artifact tree may be "
+        "unreachable (for example no device bridge in a cloud run), so the figures below "
+        "are zeros, not results.",
+        "",
+    ]
+
+
 def build_weekly_dashboard(
     run_states: Sequence[Dict[str, Any]],
     summaries: Optional[Sequence[Dict[str, Any]]] = None,
@@ -6432,6 +6450,7 @@ def build_weekly_dashboard(
     sections = [
         title,
         "",
+        *_no_artifacts_notice(run_states),
         build_performance_snapshot(run_states),
         build_graded_vs_fixed(run_states),
         build_sector_matrix(run_states, sector_map),
