@@ -633,6 +633,7 @@ def build_run_state(
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     stream, _ = SLOT_EVIDENCE_LAYOUT[slot]
+    finalized_at = _utc_iso(now or datetime.now(timezone.utc))
     classification = build_classification(slot, started)
     # The executors stamp the pinned account number into their classification;
     # the live prompts' secret rule says it never goes into an artifact, and
@@ -643,7 +644,10 @@ def build_run_state(
     state: Dict[str, Any] = {
         "run_id": classification["run_id"],
         "trading_day": started.date().isoformat(),
-        "generated_at": _utc_iso(now or datetime.now(timezone.utc)),
+        # Preserve write-time provenance; risk readers use the classification's
+        # invocation clock, floored at the nominal slot, rather than this clock.
+        "generated_at": finalized_at,
+        "finalized_at": finalized_at,
         "broker": "robinhood",
         "dry_run": False,
         "stream": stream,

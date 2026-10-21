@@ -108,12 +108,16 @@ reporting only; the exit status still reflects slot evidence alone.
 
 ### Reporting without `list_scheduled_tasks` (2026-10-20)
 
-A verifier or digest session that lacks the `list_scheduled_tasks` tool cannot
-know whether the executor tasks are enabled or when they last or next run. It
-reports `enabled`, `lastRunAt` and `nextRunAt` as `UNKNOWN`, which is a finding
-and never a pass. `list_triggers` is not a substitute: it returns reminders, not
-the executor tasks. Slot outcomes still come from `verify_schedule` and
-`run_state.json`, and a task's `lastRunAt` is never evidence of success.
+A verifier or digest session that lacks the `list_scheduled_tasks` tool may read
+task status from `list_triggers`, but only when that tool actually lists the
+executor tasks (`enabled`, `last_fired_at` and `next_run_at` stand in for
+`enabled`, `lastRunAt` and `nextRunAt`). What `list_triggers` returns depends on
+the session: on 2026-10-20 one run saw only unrelated reminders, while a session
+checked on 2026-10-21 saw all seven executor tasks with their `last_run`. For any
+executor task neither tool shows, the session reports `enabled`, `lastRunAt` and
+`nextRunAt` as `UNKNOWN`, which is a finding and never a pass. Slot outcomes still
+come from `verify_schedule` and `run_state.json`, and a task's `lastRunAt` is
+never evidence of success.
 
 A 2026-10-20 run grouped broker orders into clusters and guessed which slot made
 each from order times. Those times do not line up with slot times (scheduler
@@ -137,6 +141,11 @@ python3 -m scripts.finalize_run_evidence --slot 1430 \
   and the prompt's own Gate 1 window (nominal − 5 min). The end of the window
   is exclusive, as in `gate_time_sanity`. An off-window fire is not a
   scheduled fire.
+- Finalizer states keep `generated_at` and `finalized_at` as the artifact write
+  time. Risk accounting uses `run_classification.triggered_at_utc`, floored at
+  the trading day's nominal `scheduled_for_et`, so delayed backfills retain
+  their original date and accepted early afternoon fires count toward the
+  afternoon guard. A missing invocation clock is not replaced by write time.
 - It refuses order rows that aren't real orders. Every row needs a ticker, a
   broker `order_id`, a positive `submitted_amount_usd` and a status from
   `ORDER_ATTEMPT_STATUSES`, and duplicate ids are rejected. `submitted` also
@@ -150,6 +159,11 @@ python3 -m scripts.finalize_run_evidence --slot 1430 \
   `build_afternoon_live_run_classification` for 15:30.
 - It writes `run_state.json` and `run_summary.json`, plus header-only CSVs
   where missing, then checks them with `validate_run_artifacts`.
+- For states it builds, `generated_at` records the supplied fire time
+  (`--started-at`), clamped to no earlier than the nominal slot time for
+  accepted early starts. The classification retains the actual start, while
+  `finalized_at` records when finalization ran. This keeps historical and
+  early-start afternoon evidence eligible regardless of the backfill's clock.
 - It refreshes the pointer through `same_day_pointer.refresh_latest_pointer`,
   or `update_latest_scheduled_run_pointer` for 15:30, then re-validates the
   pointer and the slot. It exits 0 only when both verify.
