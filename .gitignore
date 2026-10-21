@@ -47,8 +47,11 @@ artifacts_tmp*
 *.db
 *.db-journal
 
-# Claude Code agent directory
-.claude/
+# Claude Code agent directory. The repo-root .claude/settings.json is the one tracked file (the scheduled
+# live tasks run from this checkout and read their permission rules from it); everything else stays local.
+/.claude/*
+!/.claude/settings.json
+*/**/.claude/
 # agent-vault/ is a tracked, vendored Foundation copy: its hook config and skills live under .claude/ and must
 # be committed. Machine-local overrides there stay ignored.
 !agent-vault/.claude/
