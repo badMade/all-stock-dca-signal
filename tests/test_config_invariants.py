@@ -2984,6 +2984,42 @@ def test_live_mirror_gate_7_classifies_denied_order_history_fetch_as_platform_re
             assert phrase in paragraph, f"{filename}: order-history refusal paragraph is missing {phrase!r}"
 
 
+def test_live_mirror_order_history_refusal_covers_post_batch_verification_and_own_slot():
+    """Follow-up review of the merged ``READ-ONLY REFUSAL, ORDER HISTORY`` paragraph.
+
+    Two gaps found on review, both pinned here:
+
+    * The paragraph is scoped to a refusal "before any placement". Gate 7 also
+      re-fetches ``get_equity_orders`` after the batch (wait about 30 seconds)
+      to verify fills, and a refusal THERE is unclassified. The orders were
+      already submitted, so the right reading is "unverified", never "failed":
+      calling them failed would invite a duplicate manual buy. The alert must
+      say the fills are unverified.
+    * The paragraph carries a ``(YYYY-MM-DD HHMM ET)`` stamp naming the slot
+      that motivated it, and it shipped as ``1130 ET`` in all seven mirrors,
+      so six of them cite a slot they do not run. Like the 2026-10-19
+      ``get_portfolio`` paragraph, each mirror stamps its own slot.
+    """
+    marker = "READ-ONLY REFUSAL, ORDER HISTORY"
+    for filename in _LIVE_MIRROR_FILES:
+        text = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")
+        gate_7 = _gate_section(text, "GATE 7 - PLACE THE ORDERS")
+        paragraph = gate_7.split(marker, 1)[1].splitlines()[0]
+
+        for phrase in (
+            "POST-BATCH VERIFICATION FETCH",
+            "fills are UNVERIFIED, not failed",
+            "never place a replacement",
+        ):
+            assert phrase in paragraph, f"{filename}: a refused post-batch verification fetch is unclassified: {phrase!r}"
+
+        stamp = re.match(r"\s*\(\d{4}-\d{2}-\d{2} (\d{4}) ET\)", paragraph)
+        assert stamp, f"{filename}: order-history refusal paragraph has no '(YYYY-MM-DD HHMM ET)' slot stamp"
+        assert stamp.group(1) == filename[:4], (
+            f"{filename}: paragraph is stamped {stamp.group(1)} ET but this mirror runs the {filename[:4]} slot"
+        )
+
+
 def test_live_mirror_interlock_prefix_names_the_fourth_probe():
     # The four files carrying the compact interlock are the ones whose Gate 2
     # body sits past the truncation boundary; a truncated fire there sees only
