@@ -1599,7 +1599,7 @@ def test_live_morning_mode_binds_the_configured_account(monkeypatch):
 
 @pytest.mark.parametrize(
     "bad",
-    ["not-an-account", "12345", "1234567890123", "5620 57042", "acct-562", "-123456789"],
+    ["not-an-account", "12345", "1234567890123", "9990 00111", "acct-999", "-123456789"],
 )
 def test_malformed_accounts_are_rejected_at_load(monkeypatch, bad):
     from dca_config import InvalidAccountNumberError, resolve_broker_account
