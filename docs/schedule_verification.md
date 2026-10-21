@@ -108,12 +108,16 @@ reporting only; the exit status still reflects slot evidence alone.
 
 ### Reporting without `list_scheduled_tasks` (2026-10-20)
 
-A verifier or digest session that lacks the `list_scheduled_tasks` tool cannot
-know whether the executor tasks are enabled or when they last or next run. It
-reports `enabled`, `lastRunAt` and `nextRunAt` as `UNKNOWN`, which is a finding
-and never a pass. `list_triggers` is not a substitute: it returns reminders, not
-the executor tasks. Slot outcomes still come from `verify_schedule` and
-`run_state.json`, and a task's `lastRunAt` is never evidence of success.
+A verifier or digest session that lacks the `list_scheduled_tasks` tool may read
+task status from `list_triggers`, but only when that tool actually lists the
+executor tasks (`enabled`, `last_fired_at` and `next_run_at` stand in for
+`enabled`, `lastRunAt` and `nextRunAt`). What `list_triggers` returns depends on
+the session: on 2026-10-20 one run saw only unrelated reminders, while a session
+checked on 2026-10-21 saw all seven executor tasks with their `last_run`. For any
+executor task neither tool shows, the session reports `enabled`, `lastRunAt` and
+`nextRunAt` as `UNKNOWN`, which is a finding and never a pass. Slot outcomes still
+come from `verify_schedule` and `run_state.json`, and a task's `lastRunAt` is
+never evidence of success.
 
 A 2026-10-20 run grouped broker orders into clusters and guessed which slot made
 each from order times. Those times do not line up with slot times (scheduler
