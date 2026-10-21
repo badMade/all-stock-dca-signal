@@ -223,9 +223,9 @@ signals; 3x now needs a 2% drop.
 > **5th to the 100th** (96 tiers), on a log-scaled curve that is 1.00x through
 > the 10th percentile, 2.46x at the 50th, 8.00x at the 95th and 10.00x at the
 > 100th (the window's single largest drop). The base is $1.00, so a ticker's top
-> tier is at most $10. 66 symbols are calibrated this way; the ones in
-> `fallback_tickers` (currently only RVII, under the 40-session minimum) carry a
-> copy of the global ladder above. `graded_buy_multiplier` reads a ticker's
+> tier is at most $10. All 92 symbols are calibrated this way as of 2026-10-20; a symbol
+> under the 40-session minimum would be listed in `fallback_tickers` and carry a
+> copy of the global ladder above (none today). `graded_buy_multiplier` reads a ticker's
 > calibrated tiers first and falls back to the shared table only for symbols
 > with no entry; its ceiling is 10x. The table above therefore governs the
 > fallback path and the test suite, while per-ticker calibration governs live

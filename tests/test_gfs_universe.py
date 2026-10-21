@@ -21,12 +21,13 @@ def test_gfs_is_active_in_constant_and_config():
     assert "GFS" in _load("tickers.json")["active"]
 
 
-def test_gfs_has_global_fallback_sizing_entry():
+def test_gfs_has_a_calibrated_sizing_entry():
+    # Calibrated against the ticker_data archive on 2026-10-20 (it had no history when added).
     sizing = _load("per_ticker_sizing.json")
-    assert "GFS" in sizing["fallback_tickers"]
+    assert "GFS" not in sizing["fallback_tickers"]
     entry = sizing["tickers"]["GFS"]
-    assert entry["source"] == "global_fallback_insufficient_history"
-    assert entry["sample_sessions"] == 0
+    assert entry["source"] == "ninety_day_adjusted_daily_low_percentiles"
+    assert entry["sample_sessions"] >= 40
 
 
 def test_active_count_is_90_everywhere():

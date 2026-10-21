@@ -40,7 +40,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -49,11 +48,10 @@ from dca_paths import cron_tracking_root
 from scripts.finalize_run_evidence import (
     ET,
     SLOT_EVIDENCE_LAYOUT,
+    FinalizeRefused,
     acceptance_window,
+    finalize,
     normalize_slot,
-)
-from scripts.finalize_run_evidence import (
-    main as finalize_main,
 )
 
 AFTERNOON_SLOTS = ("1430", "1530")
@@ -193,21 +191,32 @@ def restore_newer_pointer(path: Path, before: Optional[bytes], written_day: date
 def write_fire(root: Path, day: date, slot: str, reconstruction: Dict[str, Any]) -> int:
     pointer = pointer_path(root, slot)
     before = pointer.read_bytes() if pointer.is_file() else None
-    with tempfile.TemporaryDirectory() as tmp:
-        report = Path(tmp) / "report.json"
-        report.write_text(json.dumps({"reconstruction": reconstruction}), encoding="utf-8")
-        code = finalize_main(
-            [
-                "--slot", slot,
-                "--started-at", nominal_start(slot, day).isoformat(),
-                "--outcome", OUTCOME,
-                "--order-submit-status", "not_submitted_error",
-                "--error-class", ERROR_CLASS,
-                "--error-detail", f"backfilled zero-deployment evidence for {day} {slot} ET",
-                "--report-json", str(report),
-                "--root", str(root),
-            ]
+    start = nominal_start(slot, day)
+    # The record describes the FIRE, so generated_at carries the fire's own time (``now=start``):
+    # dca_risk.is_afternoon_scheduled_evidence checks that timestamp's time of day against the
+    # 14:30 ET floor, so stamping the wall clock rejected every fire backfilled between 00:00 and
+    # 14:29 ET (the usual "morning after" run) as non-afternoon evidence. The real write instant is
+    # kept in the reconstruction block so the audit trail still says when the backfill ran. This
+    # calls finalize() directly, not its CLI, so no flag exists for a live session to forge a time.
+    reconstruction = {**reconstruction, "backfilled_at": datetime.now(ET).isoformat()}
+    try:
+        result = finalize(
+            slot,
+            start,
+            outcome=OUTCOME,
+            order_submit_status="not_submitted_error",
+            error_class=ERROR_CLASS,
+            error_detail=f"backfilled zero-deployment evidence for {day} {slot} ET",
+            report={"reconstruction": reconstruction},
+            root=root,
+            now=start,
         )
+    except FinalizeRefused as exc:
+        print(json.dumps({"verified": False, "refused": str(exc)}, indent=2))
+        code = 2
+    else:
+        print(json.dumps(result, indent=2))
+        code = 0 if result["verified"] else 1
     restore_newer_pointer(pointer, before, day)
     return code
 

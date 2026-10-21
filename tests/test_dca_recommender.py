@@ -388,7 +388,9 @@ def test_real_top_up_gate_resizes_same_day_repeat(tmp_path):
         trading_day=FIXTURE_DAY, config_dir=dca_config.get_config_dir(),
     )
     assert verdict["verdict"] == "PROCEED"
-    assert verdict["decisions"][0]["buy_usd"] == 2.96
+    # MSFT's live multiplier at the fixture's 1.5% drop, minus the $1.00 already filled:
+    # 3.9558 - 1 = 2.96 before the 2026-10-20 archive recalibration, 4.3119 - 1 = 3.31 after.
+    assert verdict["decisions"][0]["buy_usd"] == 3.31
 
 
 def test_final_slot_assess_aborts_when_buying_power_is_unavailable(tmp_path):
@@ -436,7 +438,9 @@ def test_program_logged_reference_lets_the_real_gate_resize_a_repeat(tmp_path):
     engine = RecommendationEngine(config_dir=dca_config.get_config_dir(), cron_root=tmp_path)
     result = engine.compute(snapshot, _broker([{"data": {"orders": [fill]}}]), now)
     assert result.status == "OK"
-    assert {row.ticker: row.usd for row in result.recommendations.items}["MSFT"] == 2.96
+    # MSFT's live multiplier at the fixture's 1.5% drop, minus the $1.00 already filled:
+    # 3.9558 - 1 = 2.96 before the 2026-10-20 archive recalibration, 4.3119 - 1 = 3.31 after.
+    assert {row.ticker: row.usd for row in result.recommendations.items}["MSFT"] == 3.31
 
 
 def test_order_bearing_artifact_without_deployment_amounts_falls_back_to_broker_history(tmp_path):

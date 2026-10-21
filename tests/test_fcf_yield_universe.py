@@ -32,10 +32,8 @@ def test_abbv_was_not_duplicated():
 
 
 def test_new_tickers_have_calibrated_sizing_entries():
-    # Calibrated 2026-10-21 from ~61 sessions of Yahoo daily history (not the Drive ticker_data
-    # archive, which was unreachable): every one cleared MINIMUM_HISTORY_SESSIONS, so none is a
-    # fallback ticker any more. A re-run of generate_per_ticker_sizing.py against the archive
-    # supersedes these entries.
+    # Calibrated against the ticker_data archive on 2026-10-20 (a stopgap from Yahoo history
+    # preceded it): every one clears MINIMUM_HISTORY_SESSIONS, so none is a fallback ticker.
     sizing = _load("per_ticker_sizing.json")
     for ticker in NEW:
         assert ticker not in sizing["fallback_tickers"], ticker

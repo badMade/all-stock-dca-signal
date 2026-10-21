@@ -270,9 +270,12 @@ def test_ladder_preview_per_ticker_rows_expose_the_calibrated_curve(cfg):
             assert point["multiplier"] == expected
         assert max(p["multiplier"] for p in curve) <= row["max_multiplier"]
     # The headline fact the operator was looking for: some calibrated ticker reaches 10x,
-    # and a fallback ticker (global-ladder copy) is labelled stepped, not interpolated.
+    # and any fallback ticker (global-ladder copy) is labelled stepped, not interpolated.
+    # RVII was the fallback example until the 2026-10-20 archive calibration; the list is
+    # empty today, so this follows config instead of naming a ticker.
     assert max(row["max_multiplier"] for row in rows.values()) == 10.0
-    assert rows["RVII"]["interpolation"] == "stepped"
+    for ticker in load(cfg, "per_ticker_sizing")["fallback_tickers"]:
+        assert rows[ticker]["interpolation"] == "stepped", ticker
     json.dumps(result, allow_nan=False)
 
 
