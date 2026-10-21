@@ -445,25 +445,32 @@ def default_demo_day() -> date:
 
 @contextmanager
 def _sigterm_as_keyboard_interrupt():
-    """Route SIGTERM through the existing Ctrl+C cleanup path while installed."""
+    """Yield a safe-boundary check that routes SIGTERM through Ctrl+C cleanup."""
+    requested = False
+
+    def check_interrupt() -> None:
+        if requested:
+            raise KeyboardInterrupt
+
     if threading.current_thread() is not threading.main_thread():
         # signal.signal() is main-thread-only. A future embedded caller still
         # gets a usable context manager without weakening the process-wide
         # handler owned by its main thread (Same Page round 2).
-        yield
+        yield check_interrupt
         return
 
     previous_handler = signal.getsignal(signal.SIGTERM)
 
     def interrupt(_signum, _frame) -> None:
-        # server.shutdown() deadlocks when called by the same thread that is in
-        # serve_forever(). Raising here deliberately reuses the proven Ctrl+C
-        # unwind and JobManager child teardown (Same Page round 2).
-        raise KeyboardInterrupt
+        # Raising inside Thread.start() can interrupt Condition.wait() after
+        # its lock is released, turning a clean stop into "release unlocked
+        # lock". Record only; the serving loop checks at a safe boundary.
+        nonlocal requested
+        requested = True
 
     signal.signal(signal.SIGTERM, interrupt)
     try:
-        yield
+        yield check_interrupt
     finally:
         # This launcher must not leave a caller's process-wide signal policy
         # changed after serving stops (Rock 3 handler-hygiene contract).
@@ -1420,7 +1427,7 @@ def main(argv: list[str] | None = None) -> int:
     # Install SIGTERM before constructing the server and before exposing the
     # flushed readiness line. A supervisor may stop the process as soon as that
     # line appears, and must still get the Ctrl+C cleanup path (Same Page round 2).
-    with _sigterm_as_keyboard_interrupt():
+    with _sigterm_as_keyboard_interrupt() as check_interrupt:
         server = None
         updater = None
         try:
@@ -1457,10 +1464,17 @@ def main(argv: list[str] | None = None) -> int:
 
             updater = threading.Thread(target=refresh, daemon=True)
             updater.start()
+            check_interrupt()
             if not local:
                 app.submit("demo-all")
             if not args.no_browser:
-                webbrowser.open(url)
+                # Foreground browser controllers may wait for their child to
+                # exit. Keep the serving thread free to observe a stop request.
+                threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
+            # service_actions runs on the serving thread between requests.
+            # Unlike shutdown(), this cannot deadlock serve_forever(), and
+            # unlike a raising signal handler it cannot interrupt lock setup.
+            server.service_actions = check_interrupt
             server.serve_forever(poll_interval=0.25)
         except KeyboardInterrupt:
             print("\nStopping local console.", flush=True)

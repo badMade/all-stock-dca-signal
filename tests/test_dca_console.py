@@ -1185,7 +1185,111 @@ def test_sigterm_stops_console_cleanly(tmp_path):
 
 
 @pytest.mark.skipif(os.name != "posix", reason="SIGTERM handler coverage requires POSIX signals")
-def test_sigterm_handler_raises_and_restores_previous_handler():
+@pytest.mark.parametrize("phase", ["thread_start", "serving"])
+def test_sigterm_is_deferred_until_safe_console_boundary(app, monkeypatch, capsys, phase):
+    original_handler = signal.getsignal(signal.SIGTERM)
+    real_start = threading.Thread.start
+    real_make_server = make_server
+    threads = []
+    servers = []
+    delivered = []
+    monkeypatch.setattr(dca_console, "ConsoleApp", lambda settings: app)
+    monkeypatch.setattr(app, "snapshot", lambda *args: {})
+
+    def start(thread):
+        threads.append(thread)
+        if phase == "thread_start":
+            # Hold the child before it announces startup so Thread.start()
+            # must wait. Deliver SIGTERM after Condition.wait releases its
+            # lock: raising there caused CI's "release unlocked lock".
+            released = threading.Event()
+            real_set = thread._started.set
+            real_release = thread._started._cond._release_save
+
+            def announce_started():
+                assert released.wait(timeout=5)
+                real_set()
+
+            def release_and_signal():
+                state = real_release()
+                try:
+                    delivered.append(phase)
+                    signal.raise_signal(signal.SIGTERM)
+                finally:
+                    released.set()
+                return state
+
+            monkeypatch.setattr(thread._started, "set", announce_started)
+            monkeypatch.setattr(thread._started._cond, "_release_save", release_and_signal)
+        real_start(thread)
+
+    def create_server(*args):
+        server = real_make_server(*args)
+        servers.append(server)
+        real_serve = server.serve_forever
+
+        def serve(**kwargs):
+            delivered.append(phase)
+            signal.raise_signal(signal.SIGTERM)
+            real_serve(**kwargs)
+
+        if phase == "serving":
+            monkeypatch.setattr(server, "serve_forever", serve)
+        return server
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    monkeypatch.setattr(dca_console, "make_server", create_server)
+    assert main(["--local", "--no-browser", "--port", "0"]) == 0
+    assert delivered == [phase]
+    assert app.jobs.stop.is_set()
+    assert all(not thread.is_alive() for thread in threads)
+    assert all(server.socket.fileno() == -1 for server in servers)
+    assert signal.getsignal(signal.SIGTERM) is original_handler
+    assert "Stopping local console." in capsys.readouterr().out
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGTERM handler coverage requires POSIX signals")
+def test_sigterm_stops_console_with_blocking_browser(app, monkeypatch):
+    launched = threading.Event()
+    release = threading.Event()
+    browsers = []
+    real_make_server = make_server
+    monkeypatch.setattr(dca_console, "ConsoleApp", lambda settings: app)
+    monkeypatch.setattr(app, "snapshot", lambda *args: {})
+
+    def open_browser(url):
+        browsers.append(threading.current_thread())
+        launched.set()
+        release.wait(timeout=5)
+
+    def create_server(*args):
+        server = real_make_server(*args)
+        real_serve = server.serve_forever
+
+        def serve(**kwargs):
+            assert launched.wait(timeout=2)
+            signal.raise_signal(signal.SIGTERM)
+            real_serve(**kwargs)
+
+        monkeypatch.setattr(server, "serve_forever", serve)
+        return server
+
+    monkeypatch.setattr(dca_console.webbrowser, "open", open_browser)
+    monkeypatch.setattr(dca_console, "make_server", create_server)
+    try:
+        assert main(["--local", "--port", "0"]) == 0
+        assert app.jobs.stop.is_set()
+        assert len(browsers) == 1
+        assert browsers[0].is_alive()
+        assert browsers[0].daemon
+    finally:
+        release.set()
+        for browser in browsers:
+            browser.join(timeout=2)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="SIGTERM handler coverage requires POSIX signals")
+def test_sigterm_handler_defers_and_restores_previous_handler():
     original_handler = signal.getsignal(signal.SIGTERM)
 
     def previous_handler(signum, frame):
@@ -1194,10 +1298,13 @@ def test_sigterm_handler_raises_and_restores_previous_handler():
     signal.signal(signal.SIGTERM, previous_handler)
     try:
         with pytest.raises(KeyboardInterrupt):
-            with dca_console._sigterm_as_keyboard_interrupt():
+            with dca_console._sigterm_as_keyboard_interrupt() as check_interrupt:
                 installed_handler = signal.getsignal(signal.SIGTERM)
                 assert installed_handler is not previous_handler
+                check_interrupt()
                 installed_handler(signal.SIGTERM, None)
+                installed_handler(signal.SIGTERM, None)
+                check_interrupt()
         assert signal.getsignal(signal.SIGTERM) is previous_handler
 
         worker_observation = []
