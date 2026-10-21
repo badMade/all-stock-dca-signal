@@ -62,19 +62,40 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-import dca_config
-import dca_order_plan as dop
-from dca_order_plan import PlanError, PlanResult
-from dca_rec_models import RecommendationSet
-from dca_rec_store import RecommendationStore, load_settings
-from dca_runner import ET, MAX_PER_ORDER_USD, SLOTS, BrokerOrder, BudgetDataError
-from near_close_dca import BUDGET_TIERS, BudgetTier, kill_switch_engaged, select_budget_tier
-from scripts import backup_stream_specs, stream_candidates
-from scripts import generate_buy_candidates as gbc
-from scripts.assemble_order_pages import _order_rows
-from scripts.broker_reconciliation import _has_continuation, _unwrap
-from scripts.same_day_top_up_gate import _bind_saved_pages
-from scripts.validate_native_placement import native_ref_id, validate_native_placement
+MIN_PYTHON = (3, 11)  # mirrors ``requires-python`` in pyproject.toml and the .pyz bootstrap's floor
+
+
+def require_supported_python(version_info) -> None:
+    """Exit 2 with the planner's ABORT document when the interpreter is older than ``MIN_PYTHON``.
+
+    ``backup_planner.pyz`` already refuses an old interpreter in its bootstrap; this covers the
+    ``python3 -m scripts.backup_planner`` form the Mac prompts also run. 2026-10-16 09:49 ET: the Mac shell fallback ran
+    Python 3.9, so the planner would have died on an import or syntax error with no usable reason. The document and the
+    exit code are the ones the .pyz bootstrap emits (the planner's contract: anything but exit 0 places nothing).
+    Called before any project import.
+    """
+    if tuple(version_info[:2]) >= MIN_PYTHON:
+        return
+    detail = "python>=%d.%d required, found %d.%d" % (MIN_PYTHON + tuple(version_info[:2]))
+    print(json.dumps({"status": "ABORT", "plan": None, "errors": [{"code": "python_too_old", "detail": detail}]}, indent=2))
+    sys.exit(2)
+
+
+require_supported_python(sys.version_info)
+
+import dca_config  # noqa: E402  (every project import must follow the version guard)
+import dca_order_plan as dop  # noqa: E402
+from dca_order_plan import PlanError, PlanResult  # noqa: E402
+from dca_rec_models import RecommendationSet  # noqa: E402
+from dca_rec_store import RecommendationStore, load_settings  # noqa: E402
+from dca_runner import ET, MAX_PER_ORDER_USD, SLOTS, BrokerOrder, BudgetDataError  # noqa: E402
+from near_close_dca import BUDGET_TIERS, BudgetTier, kill_switch_engaged, select_budget_tier  # noqa: E402
+from scripts import backup_stream_specs, stream_candidates  # noqa: E402
+from scripts import generate_buy_candidates as gbc  # noqa: E402
+from scripts.assemble_order_pages import _order_rows  # noqa: E402
+from scripts.broker_reconciliation import _has_continuation, _unwrap  # noqa: E402
+from scripts.same_day_top_up_gate import _bind_saved_pages  # noqa: E402
+from scripts.validate_native_placement import native_ref_id, validate_native_placement  # noqa: E402
 
 _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _NORMAL_TIER = next(tier for tier in BUDGET_TIERS if tier.name == "normal")
