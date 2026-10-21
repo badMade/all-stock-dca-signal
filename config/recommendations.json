@@ -10,7 +10,7 @@
       "page_id": null
     },
     "github_branch": {
-      "enabled": false,
+      "enabled": true,
       "branch": "recommendations",
       "remote": "origin"
     }

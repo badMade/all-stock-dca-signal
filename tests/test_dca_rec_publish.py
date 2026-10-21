@@ -302,3 +302,14 @@ def test_publish_all_isolates_a_crashing_publisher():
 
     results = pub.publish_all([Boom(), Fine()], _doc())
     assert [(r.channel, r.ok, r.detail) for r in results] == [("boom", False, "RuntimeError"), ("fine", True, "")]
+
+
+def test_shipped_config_publishes_the_recommendations_branch():
+    """The backup prompts read recommendations.json from this branch; with the channel off (as it was until
+    2026-10-21) the branch never existed and every backup pass saw Claude's own in-window orders as UNRECOGNIZED."""
+    import json
+    from pathlib import Path
+
+    github = json.loads((Path(__file__).resolve().parents[1] / "config" / "recommendations.json").read_text())[
+        "publish"]["github_branch"]
+    assert github["enabled"] is True and github["branch"] == "recommendations" and github["remote"] == "origin"
