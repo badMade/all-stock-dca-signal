@@ -251,7 +251,31 @@ def _render(report: Mapping[str, Any]) -> str:
         detail = "; ".join(row["reasons"]) or (row["order_submit_status"] or "")
         lines.append(f"  {row['time_et']}  {row['stream']:<12} {row['status']:<20} {detail}")
     lines.append("OK" if report["ok"] else f"FAILING: {', '.join(report['failing_slots'])}")
+    attribution = report.get("order_attribution")
+    if attribution is not None:
+        # Reporting only: these lines never feed the OK/FAILING verdict above.
+        lines.extend(f"  orders  {oid} -> slot {slot}" for oid, slot in attribution["attributed"].items())
+        if attribution["unattributed"]:
+            lines.append(f"  orders  unattributed: {', '.join(attribution['unattributed'])}")
+        lines.extend(f"  orders  ambiguous: {oid} -> slots {', '.join(slots)}"
+                     for oid, slots in attribution["ambiguous"].items())
     return "\n".join(lines)
+
+
+def _load_order_ids(spec: str) -> List[str]:
+    """Read ``--orders-json``: a JSON array of non-empty strings from a file, or stdin for ``-``.
+
+    Fail closed: anything else raises ``ValueError`` so the caller can refuse to
+    report, rather than attributing a silently filtered subset of the IDs.
+    """
+    try:
+        raw = sys.stdin.read() if spec == "-" else Path(spec).read_text(encoding="utf-8")
+        loaded = json.loads(raw)
+    except (OSError, ValueError) as exc:  # ValueError covers JSONDecodeError and bad UTF-8
+        raise ValueError(f"cannot read order IDs from {spec!r}: {exc}") from exc
+    if not isinstance(loaded, list) or not all(isinstance(oid, str) and oid for oid in loaded):
+        raise ValueError(f"{spec!r} must be a JSON array of non-empty strings")
+    return loaded
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -259,10 +283,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--date", help="ET trading day YYYY-MM-DD (default: today ET)")
     parser.add_argument("--root", help="cron-tracking root (default: $DCA_CRON_TRACKING_ROOT or <checkout>/cron_tracking)")
     parser.add_argument("--json", action="store_true", help="emit the report as JSON")
+    parser.add_argument("--orders-json", metavar="PATH",
+                        help="JSON array of broker order IDs to attribute to slots from each slot's own "
+                             "run_state.json ('-' reads stdin); reporting only, never changes the exit status")
     args = parser.parse_args(argv)
+    try:
+        order_ids = _load_order_ids(args.orders_json) if args.orders_json is not None else None
+    except ValueError as exc:
+        parser.error(f"--orders-json: {exc}")
     now = datetime.now(ET)
     day = date.fromisoformat(args.date) if args.date else now.date()
-    report = verify_day(day, now, root=Path(args.root) if args.root else None)
+    report = verify_day(day, now, root=Path(args.root) if args.root else None, order_ids=order_ids)
     print(json.dumps(report, indent=2) if args.json else _render(report))
     return 0 if report["ok"] else 1
 

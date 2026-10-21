@@ -19,7 +19,7 @@ A verification run on 2026-10-20 reported two limits of its own:
 | --- | --- | --- |
 | 1 | FACT: `list_triggers` does not return the executor tasks. | run note 2026-10-20; `docs/scheduled_session_repo_access.md` |
 | 2 | FACT: slot outcomes come from `run_state.json` and Gate 9 evidence, never from `lastRunAt`. | `EXTERNAL-PROMPT-FIXES-2026-10-12.md`, `false_all_clear` |
-| 3 | FACT: `scripts.slot_attribution.attribute_orders` maps order IDs to slots from each slot's own dated `run_state.json` (merged in #1804). | `scripts/slot_attribution.py` |
+| 3 | FACT: `scripts.slot_attribution.attribute_orders` maps order IDs to slots from each slot's own dated `run_state.json` (merged in #1804); `verify_schedule --orders-json` exposes it on the CLI. | `scripts/slot_attribution.py`, `scripts/verify_schedule.py` |
 | 4 | INFERENCE: order times drift from slot times because of per-task scheduler jitter and backup periods, so time clustering will misattribute. | `claude/SECOND-EXECUTOR-FINDING.md` jitter table |
 
 ## Paste-ready text
@@ -33,20 +33,14 @@ a pass."
 
 ### `order_slot_guessing`
 Add: "Attribute a broker order to a slot only through that slot's own dated `run_state.json`. Write
-the day's order IDs to a JSON array on stdin and run `python3 -c "import json,sys; from datetime
-import date; from scripts.slot_attribution import attribute_orders;
-print(json.dumps(attribute_orders(date.fromisoformat(sys.argv[1]), json.load(sys.stdin))))"
-<YYYY-MM-DD>` from the repo root. Report `attributed` IDs under their slot, list `unattributed` and
+the day's order IDs to a JSON array and run `python3 -m scripts.verify_schedule --date <YYYY-MM-DD> --json --orders-json <file>` from the repo root (`-` reads the array from stdin); the report's `order_attribution` block carries the result. Report `attributed` IDs under their slot, list `unattributed` and
 `ambiguous` IDs as such, and never assign an order to a slot by its created_at time. A match is an
 artifact claim, not proof the slot verified or the order filled."
 
 ## Verification
 
-Run the one-liner above against a directory holding one slot's `run_state.json` that names an order
-ID and one that does not: the named ID appears under `attributed` with its slot and the other under
-`unattributed` (checked locally on 2026-10-20 with a temporary `DCA_CRON_TRACKING_ROOT`).
-
-## Not done
-
-The `verify_schedule` CLI has no `--orders-json` flag, only the Python `order_ids=` parameter, so the
-text above uses `attribute_orders` directly. A CLI flag would be a code change with its own tests.
+Write a JSON array holding one order ID that a slot's `run_state.json` names and one it does not, then
+run `python3 -m scripts.verify_schedule --date <YYYY-MM-DD> --json --orders-json <file>` against that
+tree: the named ID appears under `order_attribution.attributed` with its slot and the other under
+`unattributed`. Malformed input exits 2 with nothing on stdout, and the exit status never depends on
+attribution. Covered by `scripts/tests/test_verify_schedule_orders_flag.py`.

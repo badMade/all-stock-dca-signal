@@ -54,7 +54,7 @@ Exit status is 1 when any slot fails. The console's Schedule page
 manifest row (matched on both time and cron id) and adds a "Slot verified"
 column to the roster matrix.
 
-### Attribute broker order IDs (Python API)
+### Attribute broker order IDs (CLI and Python API)
 
 `scripts.slot_attribution.attribute_orders(day, order_ids, root=...)` matches
 broker IDs against `buy_candidates[].order_id` and
@@ -69,6 +69,20 @@ Pass `order_ids=[...]` to `verify_day(day, now, root=...)` to include this resul
 as `order_attribution`. Omitting it preserves the existing report shape;
 attribution never changes `ok`, `failing_slots`, or the CLI exit status.
 
+From the command line, `--orders-json PATH` takes a JSON array of broker order
+IDs (`-` reads it from stdin) and adds the same `order_attribution` block:
+
+```bash
+echo '["<order id>", "<order id>"]' | python -m scripts.verify_schedule --date 2026-10-20 --json --orders-json -
+```
+
+Text output lists each attributed ID with its slot, then any `unattributed` and
+`ambiguous` IDs. The input must be a JSON array of non-empty strings: anything
+else (unreadable file, invalid JSON, a non-list, a non-string or empty entry)
+is a usage error, exit status 2, with nothing printed to stdout, so a verifier
+never reports attribution for a silently filtered subset. Attribution is
+reporting only; the exit status still reflects slot evidence alone.
+
 ### Reporting without `list_scheduled_tasks` (2026-10-20)
 
 A verifier or digest session that lacks the `list_scheduled_tasks` tool cannot
@@ -80,7 +94,7 @@ the executor tasks. Slot outcomes still come from `verify_schedule` and
 
 A 2026-10-20 run grouped broker orders into clusters and guessed which slot made
 each from order times. Those times do not line up with slot times (scheduler
-jitter, backup periods), so use `attribute_orders` above and report
+jitter, backup periods), so use `--orders-json` above and report
 `unattributed` and `ambiguous` IDs as such. Paste-ready wording for the external
 verifier tasks is in `claude/triage-routine/EXTERNAL-PROMPT-FIXES-2026-10-20.md`;
 `claude/triage-routine/prompt.txt` carries the same rules for the triage routine.
