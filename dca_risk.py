@@ -165,11 +165,16 @@ def _parse_iso_et(text: object) -> Optional[datetime]:
 
 def run_timestamp_et(state: Dict[str, Any]) -> Optional[datetime]:
     """Best-effort ET timestamp for a run_state (generated_at / triggered_at_utc)."""
+    rc = state.get("run_classification")
+    if state.get("finalized_by") == "scripts.finalize_run_evidence":
+        # The finalizer's generated_at is the artifact write time, not the
+        # invocation time. Backfills and delayed Gate 9 writes must retain the
+        # original slot's afternoon eligibility, regardless of the wall clock.
+        return _parse_iso_et(rc.get("triggered_at_utc")) if isinstance(rc, dict) else None
     for key in ("generated_at", "triggered_at_utc"):
         dt = _parse_iso_et(state.get(key))
         if dt is not None:
             return dt
-    rc = state.get("run_classification")
     if isinstance(rc, dict):
         return _parse_iso_et(rc.get("triggered_at_utc"))
     return None

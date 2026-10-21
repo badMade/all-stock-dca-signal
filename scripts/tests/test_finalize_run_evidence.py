@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import dca_risk
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts import finalize_run_evidence as fre  # noqa: E402
@@ -89,6 +91,31 @@ def test_every_slot_finalizes_to_verified_evidence(tmp_path, slot_id):
     assert json.loads((run_dir / "run_summary.json").read_bytes())["run_classification"] == rc
     slots = {row["slot_id"]: row["status"] for row in verify_day(DAY, NOW, root=tmp_path)["slots"]}
     assert slots[slot_id] == "verified"
+
+
+@pytest.mark.parametrize("slot_id", ["1130", "1330", "1430", "1530"])
+@pytest.mark.parametrize("write_hour", [9, 17])
+def test_afternoon_risk_evidence_uses_invocation_not_finalization_time(tmp_path, slot_id, write_hour):
+    written = datetime(2026, 10, 21, write_hour, 0, tzinfo=ET)
+    result = fre.finalize(
+        slot_id,
+        started(slot_id),
+        outcome="GATE2_ABORT",
+        order_submit_status="not_submitted_error",
+        root=tmp_path,
+        now=written,
+    )
+    assert result["verified"] is True, result["errors"]
+    run_dir = tmp_path / slot_run_dir_relative(slot_id, DAY)
+    state = json.loads((run_dir / "run_state.json").read_bytes())
+    assert datetime.fromisoformat(state["generated_at"]) == written
+    assert dca_risk.run_timestamp_et(state) == started(slot_id)
+    assert dca_risk.is_afternoon_scheduled_evidence(state) is (slot_id in ("1430", "1530"))
+    # A missing or corrupt invocation clock must not fall back to write time.
+    for invalid in (None, "not-a-timestamp"):
+        state["run_classification"]["triggered_at_utc"] = invalid
+        assert dca_risk.run_timestamp_et(state) is None
+        assert not dca_risk.is_afternoon_scheduled_evidence(state)
 
 
 @pytest.mark.parametrize("slot_id", ["1430", "1530"])
