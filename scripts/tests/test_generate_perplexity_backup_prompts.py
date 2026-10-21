@@ -86,15 +86,20 @@ def test_only_the_final_prompt_carries_the_accepted_time_limitation(prompts):
 
 
 @pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_every_prompt_carries_the_no_retries_no_loops_rule(prompts, prefix):
+def test_every_prompt_carries_the_no_unprescribed_retries_rule(prompts, prefix):
     # The 2026-10-20 09:55 backup run burned its whole call budget re-querying order history
     # and writing ad-hoc scripts; the rule is inline (rule 11) so it binds before the planner
     # procedure is even fetched, and it must stay well inside the 20,000-character box.
     text = _by_prefix(prompts, prefix)
-    assert "11. NO RETRIES, NO LOOPS." in text
-    assert "at 80 calls stop with failed_unexpected_error" in text
+    assert "11. NO UNPRESCRIBED RETRIES OR LOOPS." in text
+    # PR #1819 review: the rule must not forbid what the served procedure requires, and must not cap a batch by count.
+    for prescribed in ("every pagination cursor", "second evidence poll", "late-start heartbeat recheck",
+                       "check-placement steps", "NO_VALID_PLAN (exit 2) moves on to the next plan source",
+                       "stop BETWEEN orders (never after a submission and before its check-placement)"):
+        assert prescribed in text, prescribed
+    assert "at 80 calls" not in text and "well under 60" not in text
     pasteable = _by_prefix(gen.build_instructions(), prefix)
-    assert "11. NO RETRIES, NO LOOPS." in pasteable
+    assert "11. NO UNPRESCRIBED RETRIES OR LOOPS." in pasteable
     assert len(pasteable) < 20_000
 
 

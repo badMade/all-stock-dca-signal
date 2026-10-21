@@ -31,13 +31,18 @@ def test_abbv_was_not_duplicated():
     assert near_close_dca.ACTIVE_TICKERS.count("ABBV") == 1
 
 
-def test_new_tickers_have_global_fallback_sizing_entries():
+def test_new_tickers_have_calibrated_sizing_entries():
+    # Calibrated 2026-10-21 from ~61 sessions of Yahoo daily history (not the Drive ticker_data
+    # archive, which was unreachable): every one cleared MINIMUM_HISTORY_SESSIONS, so none is a
+    # fallback ticker any more. A re-run of generate_per_ticker_sizing.py against the archive
+    # supersedes these entries.
     sizing = _load("per_ticker_sizing.json")
     for ticker in NEW:
-        assert ticker in sizing["fallback_tickers"], ticker
+        assert ticker not in sizing["fallback_tickers"], ticker
         entry = sizing["tickers"][ticker]
-        assert entry["source"] == "global_fallback_insufficient_history", ticker
-        assert entry["sample_sessions"] == 0, ticker
+        assert entry["source"] == "ninety_day_adjusted_daily_low_percentiles", ticker
+        assert entry["sample_sessions"] >= 40, ticker
+        assert entry["interpolation"] == "linear", ticker
 
 
 def test_new_tickers_are_in_the_history_fetch_list():
