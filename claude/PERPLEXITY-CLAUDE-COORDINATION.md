@@ -194,18 +194,21 @@ Guessing here is actively worse than leaving Gate 4 as it is today:
 - Guess a value that turns out to ALSO cover a genuine rogue/unexpected
   executor -> Gate 4 goes quiet on exactly the case it exists to catch.
 
-Until that value is confirmed, `PERPLEXITY_PLACED_AGENT_VALUE` below is a
-placeholder, not a shipped constant. Whoever confirms it should record the
-real value (and how it was confirmed -- which order IDs, which timestamps)
-directly in this section.
+**Confirmation record (2026-09-09, recorded 2026-10-21).** The value is
+`"agentic"`. Geoff confirmed directly on 2026-09-09 that a six-order batch
+(11:47-48 ET, `placed_agent='agentic'`, the 1130ET Gate 4 abort) was the intended
+Perplexity backup covering a failing Claude run, not a duplicate session (see
+`docs/safeguards.md`, "Perplexity compatible-executor carve-out"). This is a
+direct statement, not an order-ID and timestamp check against `get_equity_orders`.
+The field cannot distinguish Perplexity's fills from a genuine duplicate Claude
+session; that tradeoff is accepted, not eliminated. There is no expiry. The
+2026-10-20 10:30 ET slot aborted at Gate 4 on one `agentic` AMAT order because the
+live-mirror prompts still called the value a placeholder, so no order could
+classify as compatible; the prompt wording now matches this record. The live
+Cowork tasks need repasting (`claude/dca-executor-prompts/README.md`).
 
 ```python
-PERPLEXITY_PLACED_AGENT_VALUE = "agentic"  # ACCEPTED 2026-08-07 by Geoff's direction,
-                                            # NOT independently confirmed against a known
-                                            # Perplexity order/timestamp -- see the
-                                            # 2026-08-07 update note above. Also the value
-                                            # this task's own orders would carry. Expires
-                                            # 2026-08-14; re-confirm properly or renew.
+PERPLEXITY_PLACED_AGENT_VALUE = "agentic"  # CONFIRMED 2026-09-09 by Geoff; no expiry.
 ```
 
 Gate 4's classification, once that value is real (this is the mirror of the

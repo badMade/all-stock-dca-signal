@@ -3837,6 +3837,19 @@ def test_every_placing_prompt_excludes_newly_observed_compatible_tickers():
         assert "Exclude newly observed compatible-executor tickers" in text, name
 
 
+def test_every_placing_prompt_treats_perplexity_executor_value_as_confirmed():
+    """The Perplexity compatible-executor value was renewed and confirmed
+    2026-09-09 (docs/safeguards.md, "Perplexity compatible-executor
+    carve-out"). A prompt that still calls it a placeholder and says NO order
+    can ever classify as compatible makes every `agentic` order rogue, which
+    is what aborted the 2026-10-20 10:30 ET slot at Gate 4 on a single AMAT
+    order and skipped the per-ticker stand-down path entirely."""
+    for name, text in _six_file_placing_prompt_texts().items():
+        assert "placeholder pending empirical confirmation" not in text, name
+        assert "NO order can ever classify as compatible" not in text, name
+        assert "never reach the compatible-continuation case" not in text, name
+
+
 # Round 10 of the same Codex review pass (still on the seven-file placing
 # roster, post PR #1281's midday merge): the drop-not-shallower interim rule
 # only re-checked rows sized above 1.0x, leaving the lowest ladder tier
