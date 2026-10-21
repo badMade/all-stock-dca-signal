@@ -526,21 +526,27 @@ def _has_usable_header(path: Path) -> bool:
 
 
 def _first_usable(run_dir: Path, names: Sequence[str]) -> Optional[Path]:
-    """The first recognized file with a usable header, else the first existing.
+    """The first recognized file with a usable header and data rows, else the first existing.
 
     The artifact contract accepts any recognized signals filename that carries a
     usable header, so a reused run directory can legitimately hold a stale or
     truncated ``signals.csv`` beside a valid ``morning_signals.csv``. Picking the
     first file that merely EXISTS would read the malformed one, see no symbols,
     and report no expected orders while the contract advertises the run as valid
-    (Codex review). Falling back to the first existing file keeps the old
-    behavior when nothing is usable, so a genuinely broken directory still
-    surfaces through the normal empty-signals path rather than as "no file".
+    (Codex review). A header-only file is unusable -- it passes _has_usable_header
+    but contains no data rows, which would trigger a false-clean report instead of
+    a drift alert (Feb 2026 failure). Verify at least one data row exists after
+    header validation (Codex review: "Validate row count to reject header-only files").
+    Falling back to the first existing file keeps the old behavior when nothing is
+    usable, so a genuinely broken directory still surfaces through the normal
+    empty-signals path rather than as "no file".
     """
     for name in names:
         candidate = run_dir / name
         if candidate.exists() and _has_usable_header(candidate):
-            return candidate
+            rows = read_csv_rows(candidate)
+            if rows:  # At least one data row beyond the header
+                return candidate
     return _first_existing(run_dir, names)
 
 
