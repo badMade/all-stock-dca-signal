@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -72,6 +73,11 @@ STATUS_NO_EVIDENCE = "no_evidence"
 STATUS_AWAITING = "awaiting_evidence"
 STATUS_NOT_DUE = "not_due"
 STATUS_MARKET_CLOSED = "market_closed"
+# Triage Key (Notion "DCA Issues") for a slot that never started: past its grace
+# deadline with no run directory at all and no failed-start marker in its window. Deliberately NOT applied to
+# evidence_incomplete (the slot fired and stopped before Gate 9) or awaiting_evidence
+# (still inside grace) -- loosening that boundary would hide real misses.
+FAILURE_KEY_SLOT_DID_NOT_FIRE = "slot_did_not_fire"
 # Statuses that do not fail the daily audit.
 OK_STATUSES = frozenset({STATUS_VERIFIED, STATUS_NOT_DUE, STATUS_AWAITING, STATUS_MARKET_CLOSED})
 
@@ -99,6 +105,35 @@ def slot_run_dir_relative(slot_id: str, day: date) -> Path:
     return Path(parent) / f"{day.strftime('%Y%m%d')}_{slot_id}ET"
 
 
+def _attempt_times(base: Path, stream: str, day: date) -> List[datetime]:
+    """ET times of ``stream``'s failed-start markers for ``day`` (``dca_alerts.write_failed_start_marker``).
+
+    Only ``failure_phase == 'before_run_artifact'`` counts: that is the crash-before-any-artifact
+    case the marker exists for, while ``after_run_artifact`` belongs to a run that did write one.
+    Root resolution mirrors the writer: ``$DCA_ATTEMPT_LOG_ROOT``, else ``<root>/attempt_log``.
+    Unreadable or malformed lines are skipped, so a broken log degrades toward the
+    ``slot_did_not_fire`` tag (absence of evidence), never toward excusing the slot.
+    """
+    log_root = Path(os.environ.get("DCA_ATTEMPT_LOG_ROOT") or base / "attempt_log")
+    path = log_root / day.strftime("%Y%m%d") / f"{stream}.attempts.jsonl"
+    times: List[datetime] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return times
+    for line in lines:
+        try:
+            marker = json.loads(line)
+            if marker.get("failure_phase") != "before_run_artifact":
+                continue
+            stamp = datetime.fromisoformat(str(marker["triggered_at_utc"]).replace("Z", "+00:00"))
+        except (ValueError, KeyError, AttributeError, TypeError):
+            continue
+        if stamp.tzinfo is not None:
+            times.append(stamp.astimezone(ET))
+    return times
+
+
 def _clock(hhmm: tuple[int, int]) -> str:
     return "%02d:%02d" % hhmm
 
@@ -113,6 +148,7 @@ def classify_slot_evidence(
     run_state_present: bool,
     market_closed: Optional[bool],
     artifact_errors: Sequence[str] = (),
+    attempt_times: Sequence[datetime] = (),
 ) -> Dict[str, Any]:
     """Classify one slot's evidence from facts the caller already read.
 
@@ -127,6 +163,10 @@ def classify_slot_evidence(
     (``scheduled_artifacts.validate_run_artifacts``, or the console's bounded
     presence check). A valid scheduled state beside a missing summary or CSV
     is an interrupted run, not a verified one (Copilot review, PR #1514).
+
+    ``attempt_times`` are the stream's failed-start marker times (ET). One inside this slot's
+    window (window start .. grace deadline) means the slot DID fire and crashed before writing
+    anything, so a ``no_evidence`` row is not tagged ``slot_did_not_fire``; it still fails.
     """
     from dca_runner import SLOTS
 
@@ -137,6 +177,7 @@ def classify_slot_evidence(
     deadline = datetime.combine(day, time(*spec.window_end_et), tzinfo=ET) + timedelta(minutes=GRACE_MINUTES)
     reasons: List[str] = []
     verified = False
+    attempted = False
 
     if run_state_present and not isinstance(run_state, Mapping):
         reasons.append("run_state.json is unreadable or not a JSON object")
@@ -176,6 +217,11 @@ def classify_slot_evidence(
     else:
         status = STATUS_NO_EVIDENCE
         reasons.append("no run directory for this slot")
+        window_start = datetime.combine(day, time(*spec.window_start_et), tzinfo=ET)
+        if any(window_start <= stamp <= deadline for stamp in attempt_times):
+            attempted = True
+            reasons.append("a failed-start marker exists in this slot's window: it fired and crashed "
+                           "before writing a run directory")
 
     state = run_state if isinstance(run_state, Mapping) else {}
     return {
@@ -189,6 +235,7 @@ def classify_slot_evidence(
         "order_submit_status": state.get("order_submit_status"),
         "orders_submitted_count": state.get("orders_submitted_count"),
         "deadline_et": deadline.strftime("%H:%M"),
+        "failure_key": FAILURE_KEY_SLOT_DID_NOT_FIRE if status == STATUS_NO_EVIDENCE and not attempted else None,
         "reasons": reasons,
     }
 
@@ -234,6 +281,7 @@ def verify_day(
             slot_id, day, now, run_dir_present=run_dir.is_dir(), run_state=state,
             run_state_present=present, market_closed=market_closed_for_slot(day, slot_id),
             artifact_errors=artifact_errors,
+            attempt_times=_attempt_times(base, SLOT_EVIDENCE_LAYOUT[slot_id][0], day),
         ))
     failing = [row["slot_id"] for row in slots if row["status"] not in OK_STATUSES]
     report = {"date": day.isoformat(), "checked_at_et": now.astimezone(ET).isoformat(timespec="minutes"),

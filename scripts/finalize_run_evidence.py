@@ -633,7 +633,6 @@ def build_run_state(
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     stream, _ = SLOT_EVIDENCE_LAYOUT[slot]
-    finalized_at = _utc_iso(now or datetime.now(timezone.utc))
     classification = build_classification(slot, started)
     # The executors stamp the pinned account number into their classification;
     # the live prompts' secret rule says it never goes into an artifact, and
@@ -644,10 +643,12 @@ def build_run_state(
     state: Dict[str, Any] = {
         "run_id": classification["run_id"],
         "trading_day": started.date().isoformat(),
-        # Preserve write-time provenance; risk readers use the classification's
-        # invocation clock, floored at the nominal slot, rather than this clock.
-        "generated_at": finalized_at,
-        "finalized_at": finalized_at,
+        # The artifact write time, as for every other writer of this field. The FIRE's time is
+        # carried by run_classification.triggered_at_utc, and dca_risk.run_timestamp_et reads it
+        # for states this command wrote, so a late Gate 9 write or a backfill keeps the slot's
+        # afternoon eligibility whatever the wall clock says (2026-10-21).
+        "generated_at": _utc_iso(now or datetime.now(timezone.utc)),
+        "finalized_at": _utc_iso(now or datetime.now(timezone.utc)),
         "broker": "robinhood",
         "dry_run": False,
         "stream": stream,

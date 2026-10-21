@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.all-stock-dca.planner-stamp-check</string>
+  <!-- Morning check (scripts/planner_stamp_check.py): is the backup_planner.pyz you pasted into Perplexity still the
+       planner main builds? Fetches origin/main, builds a planner from it WITHOUT touching this checkout's working
+       tree, and compares the content hash with the one inside <repo>/backup_planner.pyz. Stale or unable to check:
+       raises a macOS notification. Unchanged: silent. Started through the checkout's venv Python, like the watchdog,
+       because macOS privacy protection (TCC) grants ~/Documents access per binary.
+       Keep the attached planner at <repo>/backup_planner.pyz (rebuild it there), or change the planner path argument below. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>REPLACE_WITH_REPO_PATH/.venv/bin/python</string>
+    <string>-m</string>
+    <string>scripts.planner_stamp_check</string>
+    <string>--planner</string>
+    <string>REPLACE_WITH_REPO_PATH/backup_planner.pyz</string>
+    <string>--notify</string>
+  </array>
+  <!-- `-m scripts.planner_stamp_check` resolves from the checkout root. -->
+  <key>WorkingDirectory</key><string>REPLACE_WITH_REPO_PATH</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- git must be on PATH for `git fetch`; it uses your normal credential helper for the remote. -->
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <!-- 07:45 Mon-Fri: at least an hour before the earliest slot window opens (09:35), leaving time to rebuild, refill,
+       verify and repaste. Local Mac time: the Mac must be pinned to America/New_York, or Hour must be shifted by the
+       difference; launchd does not understand ET. If the Mac is asleep at 07:45 launchd runs the job on wake. -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>45</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>7</integer><key>Minute</key><integer>45</integer></dict>
+  </array>
+  <key>StandardOutPath</key><string>/tmp/dca-planner-stamp-check.log</string>
+  <key>StandardErrorPath</key><string>/tmp/dca-planner-stamp-check.log</string>
+</dict>
+</plist>
