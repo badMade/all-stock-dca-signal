@@ -37,6 +37,7 @@ environment (see the repository README).
 | [drift_detection.md](drift_detection.md) | Post-artifact signals-vs-submitted-orders drift detector + Slack alerting |
 | [adhoc_orders.md](adhoc_orders.md) | Fallback for placing a known list of buys when the scheduled path is unavailable: `scripts/adhoc_orders.py` validates it against the universe, caps, attempt cap and buying power, writes a manual-run plan and execution state, and never places orders from the CLI |
 | [alert_digest.md](alert_digest.md) | Why Gate 9 alerts piled up undelivered in Gmail drafts, and the digest that counts them by gate/slot/streak and flags dead delivery channels |
+| [triage_routine.md](triage_routine.md) | The daily propose-only DCA triage routine: what it reads and may write in Notion, the Progress labels `selfheal/triage_reconcile.py` derives, and the digest it emits; the prompt itself is `claude/triage-routine/prompt.txt` |
 | [intraday_archive.md](intraday_archive.md) | Per-poll price/timestamp/volume archive under `ticker_data/_intraday/`, supplementing the daily OHLCV history |
 | [sp500_snapshot_design.md](sp500_snapshot_design.md) | Proposed read-only S&P 500 market snapshot task, separate from the buy-universe courier; not implemented or wired into live sizing |
 | [purchase_history.md](purchase_history.md) | Consolidated buy-history ledger (`scripts/purchase_history.py`): every confirmed fill ever placed, at what price, across every stream and day |
