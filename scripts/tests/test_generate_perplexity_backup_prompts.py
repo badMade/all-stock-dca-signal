@@ -86,6 +86,27 @@ def test_only_the_final_prompt_carries_the_accepted_time_limitation(prompts):
 
 
 @pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
+def test_every_prompt_carries_the_no_retries_no_loops_rule(prompts, prefix):
+    # The 2026-10-20 09:55 backup run burned its whole call budget re-querying order history
+    # and writing ad-hoc scripts; the rule is inline (rule 11) so it binds before the planner
+    # procedure is even fetched, and it must stay well inside the 20,000-character box.
+    text = _by_prefix(prompts, prefix)
+    assert "11. NO RETRIES, NO LOOPS." in text
+    assert "at 80 calls stop with failed_unexpected_error" in text
+    pasteable = _by_prefix(gen.build_instructions(), prefix)
+    assert "11. NO RETRIES, NO LOOPS." in pasteable
+    assert len(pasteable) < 20_000
+
+
+def test_the_served_procedure_forbids_requerying_to_double_check_the_order_pull():
+    from scripts import backup_procedure
+
+    text = backup_procedure.PROCEDURE_TEMPLATE
+    assert "make ONE call for the first page, then one call per cursor" in text
+    assert "NEVER re-query with a different state, date, or window" in text
+
+
+@pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
 def test_hard_rules_are_inline_in_every_prompt(prompts, prefix):
     text = _by_prefix(prompts, prefix)
     for needle in (
