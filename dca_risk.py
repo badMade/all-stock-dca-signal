@@ -163,13 +163,36 @@ def _parse_iso_et(text: object) -> Optional[datetime]:
     return dt
 
 
+def _nominal_et(state: Dict[str, Any], rc: Dict[str, Any]) -> Optional[datetime]:
+    """The slot's nominal ET instant (trading_day + scheduled_for_et), or None if either is unusable."""
+    try:
+        day = date.fromisoformat(str(state.get("trading_day")))
+        hour, minute = str(rc.get("scheduled_for_et")).split(":")
+        return datetime(day.year, day.month, day.day, int(hour), int(minute), tzinfo=EASTERN)
+    except (ValueError, TypeError):
+        return None
+
+
 def run_timestamp_et(state: Dict[str, Any]) -> Optional[datetime]:
     """Best-effort ET timestamp for a run_state (generated_at / triggered_at_utc)."""
+    rc = state.get("run_classification")
+    if state.get("finalized_by") == "scripts.finalize_run_evidence":
+        # The finalizer's generated_at is the artifact write time, not the
+        # invocation time. Backfills and delayed Gate 9 writes must retain the
+        # original slot's afternoon eligibility, regardless of the wall clock.
+        if not isinstance(rc, dict):
+            return None
+        fired = _parse_iso_et(rc.get("triggered_at_utc"))
+        # The prompts accept a Gate 1 start up to five minutes BEFORE the slot's nominal time
+        # (14:25 for the 14:30 slot). Such a fire belongs to its nominal slot, so it is floored
+        # at that time; otherwise it would sit under AFTERNOON_EVIDENCE_FLOOR_ET and be rejected
+        # as afternoon evidence (and fail the 12:30 prompt's 7-day pair check).
+        nominal = _nominal_et(state, rc)
+        return max(fired, nominal) if fired is not None and nominal is not None else fired
     for key in ("generated_at", "triggered_at_utc"):
         dt = _parse_iso_et(state.get(key))
         if dt is not None:
             return dt
-    rc = state.get("run_classification")
     if isinstance(rc, dict):
         return _parse_iso_et(rc.get("triggered_at_utc"))
     return None
