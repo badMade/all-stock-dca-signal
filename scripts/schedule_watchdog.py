@@ -125,10 +125,14 @@ def failing_rows(report: Mapping[str, Any]) -> List[Dict[str, Any]]:
 def alert_body(report: Mapping[str, Any], row: Mapping[str, Any]) -> str:
     """Plain-text Gate-9-style alert body for one failing slot."""
     reasons = "; ".join(row["reasons"]) or "no reason recorded"
+    # Additive triage tag: only a slot that never started carries a Key, so the
+    # Notion reconciler can tell it from a late or half-finished run.
+    key_line = f"Key: {row['failure_key']}\n" if row.get("failure_key") else ""
     return (
         f"Schedule watchdog: slot {row['time_et']} ET ({row['stream']}) "
         f"left no valid scheduled evidence for {report['date']}.\n"
         f"Status: {row['status']}\n"
+        f"{key_line}"
         f"Reasons: {reasons}\n"
         f"Expected run directory: {row['run_dir']}\n"
         f"Detected independently of the executor session by "
