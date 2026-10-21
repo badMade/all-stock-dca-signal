@@ -156,6 +156,29 @@ four digits, email or state folder. It cannot see what is saved inside Perplexit
 Instructions header (`Universe hash ...` and the symbol count) and, after the next run, the state file's
 `planner_build.content_sha256`.
 
+## Keeping the stamp current (2026-10-21)
+
+Every backup prompt embeds the planner's `content_sha256`. That hash covers the planner's entry modules
+(`scripts/backup_planner.py`, `scripts/assemble_market_data.py`), every repo module they import (for example
+`dca_risk.py`) and the `config/*.json` files listed in `scripts/build_backup_planner.py`. A change to any of them
+makes the six committed prompts stale, and two tests then fail on `main`:
+`test_generate_perplexity_backup_prompts.py::test_committed_prompts_match_the_generator_byte_for_byte` and
+`test_verify_perplexity_pair.py::test_the_committed_prompts_agree_with_a_planner_built_from_this_checkout`.
+On 2026-10-21 the stamp went stale several times in one day, each time after a change unrelated to these
+prompts.
+
+Rule: a PR that touches a planner input regenerates the prompts in the same PR.
+
+```bash
+python3 -m scripts.generate_perplexity_backup_prompts --write   # each file then differs by exactly the stamp line
+python3 -m scripts.generate_perplexity_backup_prompts --check   # exit 1 on drift
+```
+
+Do not regenerate the prompts on a branch that does not touch a planner input. The edit conflicts with the next
+`main` regeneration, and the right resolution is always to take `main`'s generated files. A stale stamp fails closed:
+the pasted planner and the pasted prompts no longer match, so a backup slot places nothing. After the prompts change,
+refresh the pasted pair on the Perplexity side together (see the section above).
+
 ## The 20,000-character limit and the `procedure` command (2026-10-18)
 
 Perplexity's Instructions box keeps only the first 20,000 characters. The full generated prompts were about 27,300,
