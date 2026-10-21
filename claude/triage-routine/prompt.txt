@@ -16,6 +16,8 @@ SETUP
 STEP 1: Read logs (read-only)
 - If $DCA_CRON_TRACKING_ROOT points at a readable tree: run `python -m scripts.verify_schedule --json` and `python -m scripts.schedule_watchdog --json`, and read the newest attempt_log/YYYYMMDD/*.attempts.jsonl. If alert exports exist, run `python -m scripts.alert_digest --json`.
 - If the tree is not reachable, write "LOGS UNAVAILABLE in this container" at the top of the digest and continue with GitHub and Notion only.
+- Scheduled-task status (enabled, lastRunAt, nextRunAt) comes only from the `list_scheduled_tasks` tool. If you do not have that tool, write enabled, lastRunAt and nextRunAt as UNKNOWN for every executor task. `list_triggers` returns only unrelated reminders, never the executor tasks, so do not read task status from it and do not infer it from order history. UNKNOWN is a finding to report, not a pass.
+- Attribute a broker order to a slot only through that slot's own dated `run_state.json`. Write the day's order IDs to a JSON array on stdin and run `python3 -c "import json,sys; from datetime import date; from scripts.slot_attribution import attribute_orders; print(json.dumps(attribute_orders(date.fromisoformat(sys.argv[1]), json.load(sys.stdin))))" <YYYY-MM-DD>`. Report `attributed` IDs under their slot, list `unattributed` and `ambiguous` IDs as such, and never assign an order to a slot by its created_at time, because order times do not line up with slot times (scheduler jitter, backup periods). A match is an artifact claim, not proof the slot verified or the order filled.
 - Turn each distinct failure into a candidate with a snake_case Key (^[a-z][a-z0-9_]*$), reusing the Key already used by the matching DCA Issues row when one exists.
 
 STEP 2: Read GitHub (read-only, via the GitHub connector)
