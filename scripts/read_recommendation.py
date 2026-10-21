@@ -24,6 +24,7 @@ import argparse
 import json
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Sequence
 from zoneinfo import ZoneInfo
 
@@ -65,8 +66,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         _emit({"status": "NONE", "slot": args.slot, "reason": selection.reason})
         return EXIT_NONE
     rec = selection.recommendation
+    # Never emit executable orders from a cached set the CURRENT config would refuse (PR #1815 review).
+    from scripts.backup_planner import current_config_reason
+
+    reason = current_config_reason(rec, trading_day=now.astimezone(ET).date(), slot=args.slot,
+                                   config_dir=Path(args.config_dir) if args.config_dir else None)
+    if reason:
+        _emit({"status": "NONE", "slot": args.slot, "reason": f"config_check_failed:{reason}"})
+        return EXIT_NONE
     store = RecommendationStore(args.root)
-    store.record_handed(rec)
+    try:
+        store.record_handed(rec)
+    except ValueError as exc:
+        # The slot already owns a different handed set: never replace it under a reader that may be placing.
+        _emit({"status": "NONE", "slot": args.slot, "reason": str(exc)})
+        return EXIT_NONE
     # save_to is where the agent writes each raw place_equity_order response as <TICKER>.json;
     # dca_fill_compare reads them there, so the agent never computes or reports a price.
     _emit({

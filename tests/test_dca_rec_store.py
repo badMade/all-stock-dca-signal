@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import dca_config
+import dca_order_plan as dop
 import dca_rec_store
 from dca_rec_models import ExpectedPrice, ExpectedPriceSet, Recommendation, RecommendationSet
 from dca_rec_store import RecommendationStore, load_settings
@@ -21,6 +23,10 @@ ET = ZoneInfo("America/New_York")
 DAY = date(2026, 10, 13)
 MAX_AGE = timedelta(minutes=15)
 REPO_CONFIG = Path(__file__).resolve().parents[1] / "config"
+# The readers refuse a cached set the CURRENT config would refuse (PR #1815 review), so the fixtures carry the
+# repo config's own ladder version and universe hash.
+LADDER = dop.current_ladder_version(REPO_CONFIG)
+UNIVERSE = dop.universe_hash(dca_config.load_strategy_config(REPO_CONFIG).tickers)
 
 
 def _at(hh: int, mm: int, ss: int = 0, day: date = DAY) -> datetime:
@@ -30,7 +36,7 @@ def _at(hh: int, mm: int, ss: int = 0, day: date = DAY) -> datetime:
 def _pair(slot: str, as_of: datetime, orders=(("AAPL", 3.0),)):
     day = as_of.astimezone(ET).date()
     rec = RecommendationSet(
-        day, as_of, slot, "robinhood_agent_fetch", "ladder-v1", "hash-v1",
+        day, as_of, slot, "robinhood_agent_fetch", LADDER, UNIVERSE,
         tuple(Recommendation(t, usd, native_ref_id(slot, day.isoformat(), t)) for t, usd in orders),
     )
     expected = ExpectedPriceSet(
@@ -301,11 +307,25 @@ def _place(store, slot, ticker, order_id, created="2026-10-13T16:31:00Z"):
     path.write_text(json.dumps({"data": {"order": {"id": order_id, "created_at": created}}}), encoding="utf-8")
 
 
-def test_handed_record_may_be_replaced_before_any_placement(store):
+def test_handed_record_is_owned_by_the_first_set_even_before_any_placement(store):
+    # Handing orders out is the point of no return: a second `begin` must not swap the set under a
+    # reader that may already be placing it (PR #1815 review).
     first, second = _pair("1230", _at(12, 20))[0], _pair("1230", _at(12, 25), (("MSFT", 6.0),))[0]
     store.record_handed(first)
-    store.record_handed(second)
+    with pytest.raises(ValueError, match="slot_already_handed_a_different_recommendation"):
+        store.record_handed(second)
+    assert store.handed(DAY, "1230") == first
+    store.record_handed(first)  # the same set may be re-recorded
+
+
+def test_replace_unplaced_is_the_explicit_operator_recovery_and_stops_at_placements(store):
+    first, second = _pair("1230", _at(12, 20))[0], _pair("1230", _at(12, 25), (("MSFT", 6.0),))[0]
+    store.record_handed(first)
+    store.record_handed(second, replace_unplaced=True)
     assert store.handed(DAY, "1230") == second
+    _place(store, "1230", "MSFT", "oid-1")
+    with pytest.raises(ValueError, match="placements_exist_for_an_earlier_recommendation"):
+        store.record_handed(first, replace_unplaced=True)
 
 
 def test_handed_record_cannot_be_swapped_once_placements_exist(store):
@@ -322,7 +342,7 @@ def test_prior_ids_file_is_not_placement_evidence(store):
     first = _pair("1230", _at(12, 20))[0]
     store.record_handed(first)
     (store.placements_dir(DAY, "1230") / "prior_ids.json").write_text("[]", encoding="utf-8")
-    store.record_handed(_pair("1230", _at(12, 25))[0])  # no <TICKER>.json yet: replacement allowed
+    store.record_handed(_pair("1230", _at(12, 25))[0], replace_unplaced=True)  # no <TICKER>.json yet
 
 
 def test_handed_is_none_when_nothing_was_handed(store):
@@ -356,3 +376,66 @@ def test_logged_references_skip_a_slot_whose_expected_twin_is_missing(store):
     store.record_handed(rec)  # handed but never written: no expected twin on disk
     _place(store, "1230", "AAPL", "oid-1")
     assert store.logged_references(DAY) == {}
+
+
+# --- PR #1815 review -----------------------------------------------------------------------------------
+
+
+def test_same_minute_cycle_cannot_overwrite_a_different_set_but_an_identical_rewrite_is_fine(store):
+    rec, expected = _pair("1230", _at(12, 25, 5))
+    store.write(rec, expected)
+    store.write(rec, expected)  # identical: harmless
+    other_rec, other_expected = _pair("1230", _at(12, 25, 40), (("MSFT", 4.0),))  # same HHMM, different set
+    with pytest.raises(ValueError, match="non_identical_overwrite"):
+        store.write(other_rec, other_expected)
+    assert store.expected_for(rec).items[0].ticker == "AAPL"  # the earlier set's twin is untouched
+
+
+def test_expected_for_rejects_a_twin_that_does_not_belong_to_the_set(store):
+    rec, expected = _pair("1230", _at(12, 25))
+    store.write(rec, expected)
+    twin = store.day_dir(DAY) / "expected_1230_1225.json"
+    other = _pair("1230", _at(12, 25), (("MSFT", 4.0),))[1]
+    twin.write_text(dca_rec_store._canonical(other.to_json()), encoding="utf-8")
+    with pytest.raises(ValueError, match="expected_prices_do_not_match_recommendation"):
+        store.expected_for(rec)
+
+
+def test_select_rejects_a_file_whose_trading_day_is_not_today(store):
+    # In today's directory and stamped today, but computed for yesterday: previously OK.
+    rec, expected = _pair("1230", _at(12, 0))
+    stale = RecommendationSet(date(2026, 10, 12), rec.as_of, rec.slot, rec.source, rec.ladder_version,
+                              rec.universe_hash, rec.items)
+    directory = store.day_dir(DAY)
+    directory.mkdir(parents=True)
+    (directory / "rec_1230_1200.json").write_text(dca_rec_store._canonical(stale.to_json()), encoding="utf-8")
+    selection = store.select_for("1230", _at(12, 7), MAX_AGE)
+    assert (selection.status, selection.reason) == ("NONE", "file_identity_mismatch")
+
+
+def test_reader_refuses_a_cached_set_the_current_config_would_refuse(store, capsys):
+    rec, expected = _pair("1230", _at(12, 0))
+    stale = RecommendationSet(rec.trading_day, rec.as_of, rec.slot, rec.source, "ladder-old", rec.universe_hash,
+                              rec.items)
+    store.write(stale, expected)
+    code, out, _ = _run(capsys, store.root, "--slot", "1230", "--now", _at(12, 7).isoformat())
+    assert code == 3
+    assert json.loads(out)["reason"] == "config_check_failed:stale_ladder_version"
+    assert store.handed(DAY, "1230") is None  # nothing was handed out
+
+
+def test_reader_refuses_an_excluded_ticker_and_an_oversized_order(store, capsys):
+    config = dca_config.load_strategy_config(REPO_CONFIG)
+    excluded = sorted(config.excluded_tickers)[0]
+    store.write(*_pair("1230", _at(12, 0), ((excluded, 3.0),)))
+    code, out, _ = _run(capsys, store.root, "--slot", "1230", "--now", _at(12, 7).isoformat())
+    assert code == 3 and json.loads(out)["reason"].startswith("config_check_failed:")
+
+
+def test_second_reader_cannot_replace_the_handed_set(store, capsys):
+    store.write(*_pair("1230", _at(12, 0)))
+    assert _run(capsys, store.root, "--slot", "1230", "--now", _at(12, 7).isoformat())[0] == 0
+    store.write(*_pair("1230", _at(12, 10), (("MSFT", 6.0),)))  # a newer file lands after the first read
+    code, out, _ = _run(capsys, store.root, "--slot", "1230", "--now", _at(12, 12).isoformat())
+    assert code == 3 and json.loads(out)["reason"] == "slot_already_handed_a_different_recommendation"
+    assert store.handed(DAY, "1230").items[0].ticker == "AAPL"

@@ -35,11 +35,36 @@ def _handed(store: RecommendationStore, slot: str, now: datetime) -> Recommendat
     selection = store.select_for(slot, now, load_settings().max_age)
     if selection.status != "OK" or selection.recommendation is None:
         raise LookupError(selection.reason)
+    # A cached set is only executable under the CURRENT config: the same ladder version, universe hash,
+    # exclusions and per-order ceiling the Perplexity planner enforces (PR #1815 review).
+    from scripts.backup_planner import current_config_reason
+
+    reason = current_config_reason(selection.recommendation, trading_day=now.astimezone(ET).date(), slot=slot)
+    if reason:
+        raise LookupError(f"config_check_failed:{reason}")
     return selection.recommendation
 
 
+def _freshness_reason(rec: RecommendationSet, now: datetime) -> str | None:
+    """Why the exact set that ``begin`` handed may no longer be acted on at ``now``, or None.
+
+    Checks only that set's own day and timestamp against the clock. It never selects a replacement mid-batch.
+    ``begin`` accepted it as fresh, but fetching history can take minutes, so ``filter`` and every pre-order
+    ``clock`` recheck it (PR #1815 review).
+    """
+    instant = now.astimezone(ET)
+    as_of = rec.as_of.astimezone(ET)
+    if rec.trading_day != instant.date() or as_of.date() != instant.date():
+        return "handed_set_wrong_day"
+    if as_of > instant:
+        return "handed_set_from_the_future"
+    if instant - as_of > load_settings().max_age:
+        return "handed_set_stale"
+    return None
+
+
 def _pages(path_list: str, *, now: datetime) -> tuple[list[dict], list[dict]]:
-    from scripts.assemble_order_pages import assemble
+    from scripts.assemble_order_pages import _order_rows, assemble
 
     page_paths = [Path(value) for value in sorted(glob.glob(path_list))] if any(ch in path_list for ch in "*?[") else [Path(path_list)]
     account = os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "").strip()
@@ -48,8 +73,9 @@ def _pages(path_list: str, *, now: datetime) -> tuple[list[dict], list[dict]]:
     rows: list[dict] = []
     for page in envelope["pages"]:
         if isinstance(page, dict):
-            data = page.get("data", page)
-            rows.extend(data.get("results", data.get("orders", [])) if isinstance(data, dict) else [])
+            # The assembler's own parser: it accepts nested envelopes such as {"data":{"data":{"orders":[...]}}}
+            # that a one-level read would see as empty (PR #1815 review).
+            rows.extend(row for row in _order_rows(page) if isinstance(row, dict))
     return envelope["pages"], rows
 
 
@@ -73,10 +99,11 @@ def _is_buy(row: dict) -> bool:
 
 
 def _prior_ids(pages: list[dict]) -> list[str]:
+    from scripts.assemble_order_pages import _order_rows
+
     result = []
     for page in pages:
-        data = page.get("data", page) if isinstance(page, dict) else {}
-        rows = data.get("results", data.get("orders", [])) if isinstance(data, dict) else []
+        rows = _order_rows(page) if isinstance(page, dict) else []
         for row in rows:
             if isinstance(row, dict):
                 oid = row.get("id") or row.get("order_id")
@@ -153,6 +180,10 @@ def _filter(slot: str, pages_arg: str, now: datetime, root: str | None) -> int:
     if rec is None:
         _emit({"status": "NONE", "slot": slot, "reason": "nothing_handed_run_begin_first"})
         return 3
+    stale = _freshness_reason(rec, now)
+    if stale:
+        _emit({"status": "NONE", "slot": slot, "reason": stale})
+        return 3
     try:
         pages, rows = _pages(pages_arg, now=now)
     except (AssemblyRefused, OSError, ValueError):
@@ -221,8 +252,15 @@ def _validated_placement(response_path: Path, check_path: Path) -> tuple[str | N
     return order_id, str(order.get("state") or "").lower()
 
 
-def _finish(slot: str, started_text: str, now: datetime, root: str | None) -> int:
+def _finish(slot: str, started_text: str, now: datetime, root: str | None, evidence_root: str | None = None) -> int:
     finalize = importlib.import_module("scripts.finalize_run_evidence")
+
+    # --root is the RECOMMENDATION store; the finalizer's --root is the parent of every stream's artifacts. They are
+    # different trees, so the evidence root is never inferred from the recommendation root, and a custom
+    # recommendation root (replay) never silently writes evidence to the live default (PR #1815 review).
+    if root is not None and evidence_root is None:
+        _emit({"status": "ERROR", "slot": slot, "reason": "evidence_root_required_with_custom_root"})
+        return 2
 
     store = RecommendationStore(root)
     started = _now(started_text)
@@ -239,7 +277,11 @@ def _finish(slot: str, started_text: str, now: datetime, root: str | None) -> in
             continue
         order_id, status = _validated_placement(path, placement_dir / f"{item.ticker}.check.json")
         if order_id:
-            orders.append({"ticker": item.ticker, "order_id": order_id, "submitted_amount_usd": item.usd, "status": status})
+            # The saved response keeps the broker's raw state; Gate 9 only accepts its own canonical
+            # statuses, and every accepted-but-unfilled state is an in-flight "submitted" order.
+            canonical = status if status in ("filled", "unconfirmed") else "submitted"
+            orders.append({"ticker": item.ticker, "order_id": order_id, "submitted_amount_usd": item.usd,
+                           "status": canonical})
         else:
             refused = True
     args = ["--slot", slot, "--started-at", started.isoformat(), "--outcome", "ORDERS_PLACED" if orders else "NO_ORDERS_SUBMITTED",
@@ -248,8 +290,8 @@ def _finish(slot: str, started_text: str, now: datetime, root: str | None) -> in
         expected = store.expected_for(handed)
         args += ["--orders-json", json.dumps(orders, separators=(",", ":"))]
         args += ["--budget-json", json.dumps(expected.budget, separators=(",", ":"))]
-    if root is not None:
-        args += ["--root", root]
+    if evidence_root is not None:
+        args += ["--root", evidence_root]
     verdict = finalize.main(args)
     _emit({"status": "OK" if verdict == 0 else "ERROR", "slot": slot, "verdict": verdict})
     return 0 if verdict == 0 else 2
@@ -269,13 +311,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     finish.add_argument("--slot", required=True, choices=SLOT_IDS)
     finish.add_argument("--started-at", required=True)
     finish.add_argument("--now")
-    finish.add_argument("--root")
+    finish.add_argument("--root", help="recommendation store root")
+    finish.add_argument("--evidence-root", help="finalizer cron-tracking root; required with a custom --root")
+    sub.choices["begin"].add_argument("--replace-unplaced", action="store_true",
+                                      help="operator recovery: replace the handed set while no placement exists")
     args = parser.parse_args(argv)
     try:
         now = _now(args.now)
         if args.command == "clock":
             # Run immediately before EACH order: a batch must stop the moment the window ends.
             reason = _clock_reason(args.slot, now)
+            if reason is None:
+                handed = RecommendationStore(args.root).handed(now.astimezone(ET).date(), args.slot)
+                if handed is not None:
+                    reason = _freshness_reason(handed, now)
             _emit({"status": "OK" if reason is None else "NONE", "slot": args.slot, "reason": reason})
             return 0 if reason is None else 3
         if args.command == "begin":
@@ -290,7 +339,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _emit({"status": "NONE", "slot": args.slot, "reason": str(exc)})
                 return 3
             try:
-                store.record_handed(rec)
+                store.record_handed(rec, replace_unplaced=args.replace_unplaced)
             except ValueError as exc:
                 # A different set after placements already exist: never re-buy on a retry.
                 _emit({"status": "NONE", "slot": args.slot, "reason": str(exc)})
@@ -303,7 +352,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "filter":
             return _filter(args.slot, args.pages, now, args.root)
-        return _finish(args.slot, args.started_at, now, args.root)
+        return _finish(args.slot, args.started_at, now, args.root, args.evidence_root)
     except Exception as exc:
         _emit({"status": "ERROR", "reason": type(exc).__name__})
         return 2

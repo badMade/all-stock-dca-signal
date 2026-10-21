@@ -188,3 +188,42 @@ def test_report_with_no_fills_has_null_mean(store):
 def test_report_requires_an_aware_timestamp(store):
     with pytest.raises(ValueError):
         FillComparator(store).write_report(DAY, [], generated_at=datetime(2026, 10, 13, 16, 5))
+
+
+# --- PR #1815 review: execution is classified independently of price availability -------------------
+
+
+def test_cancelled_order_with_a_partial_fill_keeps_its_executed_amounts(store):
+    _handed(store)
+    _placement(store, "1230", "AAPL", "oid-1")
+    row = _order("oid-1", "AAPL", "cancelled", qty=0.01, avg=100.0, notional=1.0)
+    (fill,) = [r for r in FillComparator(store).compare(DAY, [row]) if r.ticker == "AAPL"]
+    assert fill.status == "partially_filled" and fill.broker_state == "cancelled"
+    assert fill.filled_usd == 1.0 and fill.filled_shares == 0.01
+    assert fill.fill_price is None and fill.slippage_pct is None  # no trusted reference price
+
+
+def test_filled_order_without_a_recoverable_price_still_reports_what_executed(store):
+    _handed(store)
+    _placement(store, "1230", "AAPL", "oid-1")
+    # Filled, with executed shares but neither an average price nor executed notional to value them.
+    row = _order("oid-1", "AAPL", "filled", qty=0.03)
+    (fill,) = [r for r in FillComparator(store).compare(DAY, [row]) if r.ticker == "AAPL"]
+    assert fill.status == "filled" and fill.filled_shares == 0.03  # previously fell through to no_fill
+    assert fill.fill_price is None and fill.slippage_pct is None
+
+
+def test_live_partial_order_is_never_reported_with_committed_notional_as_executed(store):
+    _handed(store)
+    _placement(store, "1230", "AAPL", "oid-1")
+    row = _order("oid-1", "AAPL", "confirmed", qty=0.01)
+    (fill,) = [r for r in FillComparator(store).compare(DAY, [row]) if r.ticker == "AAPL"]
+    assert fill.status == "partially_filled" and fill.filled_usd is None and fill.filled_shares is None
+
+
+def test_cancelled_order_with_nothing_executed_is_no_fill(store):
+    _handed(store)
+    _placement(store, "1230", "AAPL", "oid-1")
+    (fill,) = [r for r in FillComparator(store).compare(DAY, [_order("oid-1", "AAPL", "cancelled")])
+               if r.ticker == "AAPL"]
+    assert fill.status == "no_fill" and fill.filled_usd is None

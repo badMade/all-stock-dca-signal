@@ -112,6 +112,18 @@ class RecommendationEngine:
             rows.append(values)
         return rows
 
+    @staticmethod
+    def _orders_without_amounts(state: dict[str, Any]) -> bool:
+        """True for an order-bearing artifact that carries no deployment amounts the risk reader can count.
+
+        ``plan_first_slot finish`` writes ``orders_submitted_count`` but neither ``buy_candidates`` nor
+        ``budget.day_notional_usd``, so ``deployed_usd`` reads it as $0 and the seven-day deployment guard would
+        stay disengaged while broker history shows the purchases. Unusable evidence: fall back (PR #1815 review).
+        """
+        count = state.get("orders_submitted_count")
+        return (isinstance(count, int) and not isinstance(count, bool) and count > 0
+                and dca_risk.deployed_usd(state) == 0)
+
     def _deployed(self, orders: list[Any], now: datetime) -> tuple[float, str]:
         """Use risk artifacts unless any loaded artifact has unusable notional."""
         states = []
@@ -126,7 +138,8 @@ class RecommendationEngine:
             states.append(state)
         # No run-state files is missing evidence, not proof nothing was deployed (a new or moved
         # cron tree): fall back to broker history like an unreadable file does (PR #1667 review).
-        if not states or any(dca_risk.has_unusable_deployed_notional(state) for state in states):
+        if not states or any(dca_risk.has_unusable_deployed_notional(state) or self._orders_without_amounts(state)
+                             for state in states):
             return dca_order_plan.trailing_deployed_usd(orders, now=now), "broker_history_fallback"
         return dca_risk.seven_day_deployed(dca_risk.deployed_by_day(states), now.astimezone(ET).date()), "run_state_artifacts"
 

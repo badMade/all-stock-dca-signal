@@ -451,6 +451,20 @@ def _plan_first_document(recommendation: RecommendationSet, source: str) -> dict
     }
 
 
+def current_config_reason(recommendation: RecommendationSet, *, trading_day: date, slot: str,
+                          config_dir: Path | None = None, source: str = "mac_rec") -> str | None:
+    """The first code ``_validate_plan_first`` rejects ``recommendation`` with, or None when it is valid NOW.
+
+    The local readers (``read_recommendation`` and ``plan_first_slot``) share this with the Perplexity planner so no
+    reader emits executable orders from a cached set that the current ladder version, universe hash, exclusions or
+    per-order ceiling would refuse (PR #1815 review).
+    """
+    config, ladder_version, _directory = _context(config_dir)
+    result = _validate_plan_first(_plan_first_document(recommendation, source), config=config,
+                                  ladder_version=ladder_version, trading_day=trading_day, slot=slot)
+    return result.errors[0].code if result.errors else None
+
+
 def _validate_plan_first(plan: Any, *, config: Any, ladder_version: str, trading_day: date, slot: str) -> PlanResult:
     """``dca_order_plan.validate_plan``'s checks for a plan-first document, against the READER's own config.
 

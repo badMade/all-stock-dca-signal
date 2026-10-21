@@ -5,19 +5,26 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import dca_config
+import dca_order_plan as dop
 from dca_market_sources import ET
 from dca_rec_models import ExpectedPrice, ExpectedPriceSet, Recommendation, RecommendationSet
 from dca_rec_store import RecommendationStore
 from scripts import snapshot_cycle as cycle
+from scripts.validate_native_placement import native_ref_id
 
 NOW = datetime(2026, 10, 13, 12, 25, tzinfo=ET)
 BUDGET = {"budget_tier": "Normal", "daily_cap_usd": 180.0, "weekly_cap_usd": 900.0}
+# The local readers refuse a set the current config would refuse (PR #1815 review): carry the repo's own stamps.
+_CONFIG = Path(__file__).resolve().parents[2] / "config"
+LADDER = dop.current_ladder_version(_CONFIG)
+UNIVERSE = dop.universe_hash(dca_config.load_strategy_config(_CONFIG).tickers)
 
 
 def _pair(slot="1230", as_of=NOW):
     day = as_of.date()
-    rec = RecommendationSet(day, as_of, slot, "robinhood_agent_fetch", "v1", "hash",
-                            (Recommendation("AAPL", 3.0, "aaaaaaaa-0000-4000-8000-00000000000a"),))
+    rec = RecommendationSet(day, as_of, slot, "robinhood_agent_fetch", LADDER, UNIVERSE,
+                            (Recommendation("AAPL", 3.0, native_ref_id(slot, day.isoformat(), "AAPL")),))
     expected = ExpectedPriceSet(day, as_of, slot, "run_state_artifacts",
                                 (ExpectedPrice("AAPL", 100, 101, 99, 1.5, 1, 3),), BUDGET)
     return rec, expected

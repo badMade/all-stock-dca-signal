@@ -208,3 +208,21 @@ def test_expected_price_rejects_non_positive_values(field, value):
               "multiplier": 1.5, "drop_pct": 1.96, "notional_usd": 3.0, field: value}
     with pytest.raises(ValueError, match=f"{field} must be positive"):
         ExpectedPrice(**values)
+
+
+def test_broker_state_redacts_the_account_throughout_an_assembler_shaped_envelope():
+    # PR #1815 review: scripts.assemble_order_pages stamps account_number into the envelope, and raw
+    # pages can carry account urls, so redacting only the outer field leaked it.
+    envelope = {
+        "account_number": "sensitive-account", "trading_day": "2026-10-13",
+        "pages": [{"orders": [{"id": "o1", "account": "https://x/accounts/sensitive-account/", "account_number": 123}],
+                   "next": "https://x/orders?account=sensitive-account"},
+                  {"data": {"data": {"orders": [], "account_number": "sensitive-account"}}}],
+    }
+    state = BrokerState(DAY, STAMP, "sensitive-account", envelope, None)
+    text = str(state.to_json())
+    assert "sensitive-account" not in text and "123" not in text
+    assert state.to_json()["orders_envelope"]["pages"][0]["orders"][0]["id"] == "o1"  # non-identifiers survive
+    # The in-memory broker evidence is untouched: assembly still needs the real account.
+    assert state.orders_envelope["account_number"] == "sensitive-account"
+    assert state.orders_envelope["pages"][1]["data"]["data"]["account_number"] == "sensitive-account"

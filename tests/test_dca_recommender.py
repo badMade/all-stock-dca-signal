@@ -437,3 +437,18 @@ def test_program_logged_reference_lets_the_real_gate_resize_a_repeat(tmp_path):
     result = engine.compute(snapshot, _broker([{"data": {"orders": [fill]}}]), now)
     assert result.status == "OK"
     assert {row.ticker: row.usd for row in result.recommendations.items}["MSFT"] == 2.96
+
+
+def test_order_bearing_artifact_without_deployment_amounts_falls_back_to_broker_history(tmp_path):
+    # PR #1815 review: plan_first_slot finish writes orders_submitted_count but neither buy_candidates nor
+    # budget.day_notional_usd, so the risk reader counts its purchases as $0 and the seven-day guard disengaged.
+    now = datetime.combine(FIXTURE_DATE, time(12, 45), ET)
+    engine = RecommendationEngine(config_dir=dca_config.get_config_dir(), cron_root=tmp_path)
+    (tmp_path / "run_state.json").write_text(json.dumps({
+        "trading_day": FIXTURE_DATE.isoformat(), "orders_submitted_count": 2, "order_submit_status": "submitted",
+        "classification": {"is_scheduled": True},
+    }), encoding="utf-8")
+    assert engine._orders_without_amounts(json.loads((tmp_path / "run_state.json").read_text()))
+    assert engine._deployed([], now) == (0.0, "broker_history_fallback")
+    assert not engine._orders_without_amounts({"orders_submitted_count": 0})
+    assert not engine._orders_without_amounts({"orders_submitted_count": True})

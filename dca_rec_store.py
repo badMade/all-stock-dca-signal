@@ -122,9 +122,17 @@ class RecommendationStore:
         stamp = _et(recommendation.as_of).strftime("%H%M")
         directory = self.day_dir(recommendation.trading_day)
         directory.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(directory / f"expected_{recommendation.slot}_{stamp}.json", _canonical(expected.to_json()))
+        expected_path = directory / f"expected_{recommendation.slot}_{stamp}.json"
         target = directory / f"rec_{recommendation.slot}_{stamp}.json"
-        atomic_write_text(target, _canonical(recommendation.to_json()))
+        expected_text, target_text = _canonical(expected.to_json()), _canonical(recommendation.to_json())
+        # Names carry only HH:MM, so two cycles in the same minute collide. An identical rewrite is
+        # harmless; a DIFFERENT set under an existing name would hand an earlier reader's set the
+        # retry's prices, so refuse it before touching either file (PR #1815 review).
+        for path, text in ((expected_path, expected_text), (target, target_text)):
+            if path.exists() and path.read_text(encoding="utf-8") != text:
+                raise ValueError(f"non_identical_overwrite:{path.name}")
+        atomic_write_text(expected_path, expected_text)
+        atomic_write_text(target, target_text)
         return target
 
     def select_for(self, slot: str, now: datetime, max_age: timedelta) -> Selection:
@@ -155,7 +163,11 @@ class RecommendationStore:
             except (OSError, ValueError, UnicodeError):
                 return Selection("NONE", "newest_file_invalid")
             as_of = _et(recommendation.as_of)
-            if recommendation.slot != slot or as_of.date() != current.date():
+            # The directory, the timestamp AND the recorded trading day must all agree: a file in today's
+            # directory stamped today but computed for yesterday would otherwise read as OK and have its
+            # evidence recorded under yesterday (PR #1815 review).
+            if (recommendation.slot != slot or as_of.date() != current.date()
+                    or recommendation.trading_day != current.date()):
                 return Selection("NONE", "file_identity_mismatch")
             if as_of > current:
                 continue  # stamped after now: not yet usable; an older file may still be
@@ -171,24 +183,34 @@ class RecommendationStore:
     def placements_dir(self, trading_day: date, slot: str) -> Path:
         return self.day_dir(trading_day) / "placements" / slot
 
-    def record_handed(self, recommendation: RecommendationSet) -> Path:
+    def record_handed(self, recommendation: RecommendationSet, *, replace_unplaced: bool = False) -> Path:
         """Record which recommendation a slot's agent was given, and create its placements dir.
 
         The fill comparison joins on this record, so the agent never has to report back which
-        file it used. A retried read before any placement replaces it with the set handed out last.
+        file it used.
 
-        Once placement evidence exists for the slot, a DIFFERENT set is refused (``ValueError``):
-        swapping the record would pair an earlier attempt's saved order with a later set's
-        expected price and amount (PR #1667 review). The same set may be re-recorded.
+        The first set handed for a slot OWNS the slot for the day. Handing orders out is the point
+        of no return: an earlier reader may already be placing them, so a DIFFERENT set is refused
+        (``ValueError``) whether or not a placement file exists yet. A second read that would
+        overwrite it would make the first run's ``finish`` attribute its responses to the second
+        set's amounts and prices (PR #1815 review, extending PR #1667's placements-exist check). The same set may
+        be re-recorded.
+
+        Recovery is explicit, never implicit: ``replace_unplaced=True`` (an operator decision,
+        ``plan_first_slot begin --replace-unplaced``) may replace the record only while NO placement
+        evidence exists for the slot.
         """
         directory = self.placements_dir(recommendation.trading_day, recommendation.slot)
         path = self.handed_path(recommendation.trading_day, recommendation.slot)
-        if path.exists() and self._placed_tickers(directory):
+        if path.exists():
             current = RecommendationSet.from_json(
                 json.loads(path.read_bytes(), object_pairs_hook=dca_config._reject_duplicate_keys)
             )
             if current != recommendation:
-                raise ValueError("placements_exist_for_an_earlier_recommendation")
+                if self._placed_tickers(directory):
+                    raise ValueError("placements_exist_for_an_earlier_recommendation")
+                if not replace_unplaced:
+                    raise ValueError("slot_already_handed_a_different_recommendation")
         directory.mkdir(parents=True, exist_ok=True)
         atomic_write_text(path, _canonical(recommendation.to_json()))
         return path
@@ -246,4 +268,10 @@ class RecommendationStore:
         stamp = _et(recommendation.as_of).strftime("%H%M")
         path = self.day_dir(recommendation.trading_day) / f"expected_{recommendation.slot}_{stamp}.json"
         document = json.loads(path.read_bytes(), object_pairs_hook=dca_config._reject_duplicate_keys)
-        return ExpectedPriceSet.from_json(document)
+        expected = ExpectedPriceSet.from_json(document)
+        # Verify the twin really belongs to this set: same run identity and the same tickers.
+        if (expected.trading_day, expected.as_of, expected.slot) != (
+                recommendation.trading_day, recommendation.as_of, recommendation.slot) or (
+                {item.ticker for item in expected.items} != {item.ticker for item in recommendation.items}):
+            raise ValueError("expected_prices_do_not_match_recommendation")
+        return expected

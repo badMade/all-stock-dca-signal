@@ -136,6 +136,25 @@ class MarketSnapshot:
                    value.get("quote_sides", {}))
 
 
+_ACCOUNT_KEYS = frozenset({"account_number", "account", "account_id", "account_url"})
+
+
+def _redact_account(value: Any, account: str) -> Any:
+    """A copy of ``value`` with every account identifier replaced by ``<redacted>``.
+
+    Redacts by key (``account_number``, ``account``, ...) at any depth, and by value: any string that
+    contains the known account number, such as a broker account url, is rewritten too.
+    """
+    if isinstance(value, dict):
+        return {key: "<redacted>" if key in _ACCOUNT_KEYS and isinstance(item, (str, int)) and not isinstance(item, bool)
+                else _redact_account(item, account) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_account(item, account) for item in value]
+    if isinstance(value, str) and account and account in value:
+        return value.replace(account, "<redacted>")
+    return value
+
+
 @dataclass(frozen=True)
 class BrokerState:
     trading_day: date
@@ -156,9 +175,12 @@ class BrokerState:
         _json_copy(self.orders_envelope)
 
     def to_json(self) -> dict[str, Any]:
-        # The account number is needed in-process for assembly, but serialized records can escape.
+        # The account number is needed in-process for assembly, but serialized records can escape. The
+        # assembler also stamps it into the envelope (and raw pages carry account urls), so redact it
+        # THROUGHOUT the serialized copy; the in-memory broker evidence is never modified (PR #1815 review).
         return {"trading_day": self.trading_day.isoformat(), "as_of": self.as_of.isoformat(),
-                "account_number": "<redacted>", "orders_envelope": _json_copy(self.orders_envelope),
+                "account_number": "<redacted>",
+                "orders_envelope": _redact_account(_json_copy(self.orders_envelope), self.account_number),
                 "buying_power_usd": self.buying_power_usd}
 
     @classmethod

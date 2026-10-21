@@ -126,20 +126,27 @@ class FillComparator:
     def _row(base: dict[str, Any], order_id: str, normalized: Any, raw: Mapping[str, Any]) -> FillRow:
         shares = _to_float(raw.get("cumulative_quantity"))
         fill_price = normalized.reference_price
-        if normalized.is_filled and fill_price:
-            status = "filled"
+        executed = normalized.notional_usd if normalized.notional_usd and normalized.notional_usd > 0 else None
+        # Execution is classified independently of price availability (PR #1815 review): a filled order
+        # without a recoverable price, or a cancelled/expired order with a partial fill, still carries real
+        # executed dollars and shares. Only the price and slippage stay null when the price is unavailable.
+        if normalized.is_filled:
+            status, filled_usd, filled_shares = "filled", executed, shares if shares and shares > 0 else None
         elif normalized.is_live:
             # A live order's notional is its commitment, not money spent; report nothing as filled yet.
             status = "partially_filled" if shares and shares > 0 else "pending"
+            fill_price, filled_usd, filled_shares = None, None, None
+        elif executed is not None:
+            # Terminal (cancelled/expired/...) with confirmed executed dollars: keep them.
+            status, filled_usd, filled_shares = "partially_filled", executed, shares if shares and shares > 0 else None
             fill_price = None
         else:
-            status = "no_fill"
-        filled_usd = normalized.notional_usd if status == "filled" else None
+            status, filled_usd, filled_shares = "no_fill", None, None
+            fill_price = None
         expected_price = base["expected_price"]
         slip = slippage_pct(fill_price, expected_price) if fill_price and expected_price else None
         return FillRow(order_id=order_id, status=status, broker_state=normalized.state, fill_price=fill_price,
-                       filled_usd=filled_usd, filled_shares=shares if status == "filled" else None,
-                       slippage_pct=slip, **base)
+                       filled_usd=filled_usd, filled_shares=filled_shares, slippage_pct=slip, **base)
 
     def write_report(self, day: date, rows: list[FillRow], *, generated_at: datetime) -> Path:
         """Atomically write ``fill_comparison.json`` for ``day``; the latest run replaces the last."""

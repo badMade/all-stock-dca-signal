@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import scripts.plan_first_slot as slot
+from scripts.assemble_order_pages import _order_rows as _REAL_ORDER_ROWS
 
 REAL_CLOCK = slot._clock_reason
 
@@ -69,14 +70,18 @@ def test_created_and_ticker_helpers():
 def test_pages_and_prior_ids(tmp_path, monkeypatch):
     class Assembler:
         def assemble(self, paths, **kwargs):
-            return ({"pages": [{"results": [{"id": "x"}]}]}, 1)
+            return ({"pages": [{"orders": [{"id": "x"}]}, {"data": {"data": {"orders": [{"id": "nested"}]}}}]}, 1)
+
+        def _order_rows(self, page):
+            return _REAL_ORDER_ROWS(page)
     monkeypatch.setitem(__import__("sys").modules, "scripts.assemble_order_pages", Assembler())
     monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "private")
     page = tmp_path / "orders_1.json"
     page.write_text("{}")
     pages, rows = slot._pages(str(page), now=datetime.now(slot.ET))
-    assert rows[0]["id"] == "x"
-    assert slot._prior_ids(pages) == ["x"]
+    # The assembler's own parser reads the nested envelope too; a one-level read saw it as empty (PR #1815 review).
+    assert [row["id"] for row in rows] == ["x", "nested"]
+    assert slot._prior_ids(pages) == ["x", "nested"]
 
 
 def test_filter_rogue_and_operator_paths(tmp_path, monkeypatch, capsys):
@@ -123,9 +128,13 @@ def test_finish_calls_finalizer_and_builds_order_rows(tmp_path, monkeypatch, cap
         def expected_for(self, *_): return SimpleNamespace(budget={"budget_tier": "Normal", "daily_cap_usd": 180, "weekly_cap_usd": 900})
     monkeypatch.setattr(slot, "RecommendationStore", Store)
     monkeypatch.setitem(__import__("sys").modules, "scripts.finalize_run_evidence", SimpleNamespace(main=lambda args: (called.setdefault("args", args), 0)[1]))
-    assert slot._finish("1030", now.isoformat(), now, str(tmp_path)) == 0
+    assert slot._finish("1030", now.isoformat(), now, str(tmp_path), str(tmp_path / "evidence")) == 0
     args = called["args"]
+    # The finalizer's --root is the EVIDENCE root, never the recommendation root (PR #1815 review).
+    assert args[args.index("--root") + 1] == str(tmp_path / "evidence")
     assert "--orders-json" in args
+    # `confirmed` is a broker-accepted state Gate 9 does not know; it is forwarded as in-flight "submitted".
+    assert json.loads(args[args.index("--orders-json") + 1])[0]["status"] == "submitted"
     assert json.loads(args[args.index("--orders-json") + 1])[0]["submitted_amount_usd"] == 5.0
     assert json.loads(args[args.index("--budget-json") + 1]) == {
         "budget_tier": "Normal", "daily_cap_usd": 180, "weekly_cap_usd": 900,
@@ -158,6 +167,9 @@ def test_pages_glob_and_missing_ids(tmp_path, monkeypatch):
     class Assembler:
         def assemble(self, paths, **kwargs):
             return ({"pages": [{"orders": [{"id": True}, {"id": "good"}]}]}, 2)
+
+        def _order_rows(self, page):
+            return _REAL_ORDER_ROWS(page)
     monkeypatch.setitem(__import__("sys").modules, "scripts.assemble_order_pages", Assembler())
     monkeypatch.setenv("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER", "secret")
     p = tmp_path / "orders_1.json"
@@ -212,10 +224,14 @@ def test_filter_uses_the_handed_set_and_refuses_without_one(tmp_path, monkeypatc
 
 
 def test_filter_incomplete_page_is_an_error(tmp_path, monkeypatch, capsys):
+    from dca_rec_models import Recommendation, RecommendationSet
     from scripts.assemble_order_pages import AssemblyRefused
-    monkeypatch.setattr(slot, "RecommendationStore", _fake_store(object(), tmp_path))
+    asof = datetime.fromisoformat("2026-10-13T10:35:00-04:00")
+    rec = RecommendationSet(asof.date(), asof, "1030", "src", "v", "h",
+                            (Recommendation("AAPL", 3.0, "aaaaaaaa-0000-4000-8000-00000000000a"),))
+    monkeypatch.setattr(slot, "RecommendationStore", _fake_store(rec, tmp_path))
     monkeypatch.setattr(slot, "_pages", lambda *a, **k: (_ for _ in ()).throw(AssemblyRefused("incomplete")))
-    assert slot._filter("1030", "x", datetime.now(slot.ET), None) == 2
+    assert slot._filter("1030", "x", datetime.fromisoformat("2026-10-13T10:45:00-04:00"), None) == 2
     assert json.loads(capsys.readouterr().out)["status"] == "ERROR"
 
 
@@ -280,7 +296,7 @@ def test_begin_success_records_handed(monkeypatch, capsys, tmp_path):
                             (Recommendation("AAPL", 3.0, "aaaaaaaa-0000-4000-8000-00000000000a"),))
     class Store:
         def __init__(self, root=None): pass
-        def record_handed(self, value): self.recorded = value
+        def record_handed(self, value, **kwargs): self.recorded = value
         def placements_dir(self, *args): return tmp_path
     monkeypatch.setattr(slot, "RecommendationStore", Store)
     monkeypatch.setattr(slot, "_handed", lambda *a: rec)
@@ -294,7 +310,7 @@ def test_begin_success_records_handed(monkeypatch, capsys, tmp_path):
 def test_begin_refuses_a_different_set_once_placements_exist(monkeypatch, capsys, tmp_path):
     class Store:
         def __init__(self, root=None): pass
-        def record_handed(self, value): raise ValueError("placements_exist_for_an_earlier_recommendation")
+        def record_handed(self, value, **kwargs): raise ValueError("placements_exist_for_an_earlier_recommendation")
     monkeypatch.setattr(slot, "RecommendationStore", Store)
     monkeypatch.setattr(slot, "_handed", lambda *a: object())
     assert slot.main(["begin", "--slot", "1230", "--now", "2026-10-13T12:07:00-04:00"]) == 3
@@ -369,3 +385,106 @@ def test_validated_placement_requires_a_passing_check_for_the_same_order(tmp_pat
         _write(check_path, check)
     order_id, _state = slot._validated_placement(response_path, check_path)
     assert (order_id == "oid") is counted
+
+
+# --- PR #1815 review ---------------------------------------------------------------------------------------
+
+
+def _rec(asof_text="2026-10-13T10:35:00-04:00", slot="1030"):
+    from dca_rec_models import Recommendation, RecommendationSet
+    asof = datetime.fromisoformat(asof_text)
+    return RecommendationSet(asof.date(), asof, slot, "src", "v", "h",
+                             (Recommendation("AAPL", 3.0, "aaaaaaaa-0000-4000-8000-00000000000a"),))
+
+
+def test_filter_refuses_a_handed_set_that_went_stale_after_begin(tmp_path, monkeypatch, capsys):
+    # begin accepted the 10:15 set at 10:30; fetching history took until 10:31:30, past max_age (15 min).
+    monkeypatch.setattr(slot, "RecommendationStore", _fake_store(_rec("2026-10-13T10:15:00-04:00"), tmp_path))
+    monkeypatch.setattr(slot, "_pages", lambda *a, **k: pytest.fail("history must not be fetched for a stale set"))
+    assert slot._filter("1030", "x", datetime.fromisoformat("2026-10-13T10:31:30-04:00"), None) == 3
+    assert json.loads(capsys.readouterr().out)["reason"] == "handed_set_stale"
+
+
+def test_filter_refuses_a_handed_set_from_another_day(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(slot, "RecommendationStore", _fake_store(_rec("2026-10-12T10:35:00-04:00"), tmp_path))
+    assert slot._filter("1030", "x", datetime.fromisoformat("2026-10-13T10:40:00-04:00"), None) == 3
+    assert json.loads(capsys.readouterr().out)["reason"] == "handed_set_wrong_day"
+
+
+def test_clock_rechecks_the_handed_sets_freshness_before_each_order(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(slot, "RecommendationStore", _fake_store(_rec("2026-10-13T10:15:00-04:00"), tmp_path))
+    assert slot.main(["clock", "--slot", "1030", "--now", "2026-10-13T10:40:00-04:00"]) == 3
+    assert json.loads(capsys.readouterr().out)["reason"] == "handed_set_stale"
+    assert slot.main(["clock", "--slot", "1030", "--now", "2026-10-13T10:25:00-04:00"]) == 0
+
+
+def test_clock_without_a_handed_set_only_checks_the_window(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(slot, "RecommendationStore", _fake_store(None, tmp_path))
+    assert slot.main(["clock", "--slot", "1030", "--now", "2026-10-13T10:40:00-04:00"]) == 0
+
+
+@pytest.mark.parametrize("raw,canonical", [("confirmed", "submitted"), ("queued", "submitted"), ("new", "submitted"),
+                                           ("partially_filled", "submitted"), ("filled", "filled"),
+                                           ("unconfirmed", "unconfirmed")])
+def test_finish_forwards_a_canonical_status_the_finalizer_accepts(tmp_path, monkeypatch, raw, canonical):
+    from scripts.scheduled_artifacts import ORDER_ATTEMPT_STATUSES
+    rec = _rec("2026-10-13T10:30:00-04:00")
+    day = tmp_path / "2026-10-13"
+    (day / "placements/1030").mkdir(parents=True)
+    (day / "handed_1030.json").write_text(json.dumps(rec.to_json()))
+    (day / "placements/1030/AAPL.json").write_text(json.dumps({"data": {"order": {"id": "oid", "state": raw}}}))
+    (day / "placements/1030/AAPL.check.json").write_text(json.dumps({"ok": True, "order_id": "oid", "reason": None}))
+    captured = {}
+
+    class Store:
+        def __init__(self, root=None): pass
+        def handed_path(self, *_): return day / "handed_1030.json"
+        def placements_dir(self, *_): return day / "placements/1030"
+        def expected_for(self, *_): return SimpleNamespace(budget=NORMAL)
+    monkeypatch.setattr(slot, "RecommendationStore", Store)
+    monkeypatch.setitem(__import__("sys").modules, "scripts.finalize_run_evidence",
+                        SimpleNamespace(main=lambda args: (captured.setdefault("args", args), 0)[1]))
+    assert slot._finish("1030", "2026-10-13T10:30:00-04:00", datetime.now(slot.ET), None) == 0
+    args = captured["args"]
+    status = json.loads(args[args.index("--orders-json") + 1])[0]["status"]
+    assert status == canonical and status in ORDER_ATTEMPT_STATUSES
+    # The saved broker response keeps its raw state.
+    assert json.loads((day / "placements/1030/AAPL.json").read_text())["data"]["order"]["state"] == raw
+
+
+def test_finish_requires_an_explicit_evidence_root_with_a_custom_recommendation_root(tmp_path, monkeypatch, capsys):
+    monkeypatch.setitem(__import__("sys").modules, "scripts.finalize_run_evidence",
+                        SimpleNamespace(main=lambda args: pytest.fail("must not write evidence anywhere")))
+    assert slot._finish("1030", "2026-10-13T10:30:00-04:00", datetime.now(slot.ET), str(tmp_path / "recs")) == 2
+    assert json.loads(capsys.readouterr().out)["reason"] == "evidence_root_required_with_custom_root"
+
+
+def test_finish_never_passes_the_recommendation_root_to_the_finalizer(tmp_path, monkeypatch):
+    rec = _rec("2026-10-13T10:30:00-04:00")
+    day = tmp_path / "2026-10-13"
+    (day / "placements/1030").mkdir(parents=True)
+    (day / "handed_1030.json").write_text(json.dumps(rec.to_json()))
+    captured = {}
+
+    class Store:
+        def __init__(self, root=None): pass
+        def handed_path(self, *_): return day / "handed_1030.json"
+        def placements_dir(self, *_): return day / "placements/1030"
+    monkeypatch.setattr(slot, "RecommendationStore", Store)
+    monkeypatch.setitem(__import__("sys").modules, "scripts.finalize_run_evidence",
+                        SimpleNamespace(main=lambda args: (captured.setdefault("args", args), 0)[1]))
+    slot._finish("1030", "2026-10-13T10:30:00-04:00", datetime.now(slot.ET), None)
+    assert "--root" not in captured["args"]  # default root: the live cron tree, as before
+
+
+def test_begin_refuses_a_set_the_current_config_would_refuse(tmp_path, monkeypatch, capsys):
+    from dca_rec_store import RecommendationStore
+    store = RecommendationStore(tmp_path)
+    rec = _rec("2026-10-13T10:30:00-04:00")  # ladder "v" and universe hash "h" are not the repo config's
+    store.write(rec, __import__("dca_rec_models").ExpectedPriceSet(
+        rec.trading_day, rec.as_of, "1030", "run_state_artifacts",
+        (__import__("dca_rec_models").ExpectedPrice("AAPL", 100, 101, 99, 1.5, 1, 3),), NORMAL))
+    monkeypatch.undo()  # the autouse clock stub is not wanted here; real clock check runs on a Tuesday 10:40
+    assert slot.main(["begin", "--slot", "1030", "--now", "2026-10-13T10:40:00-04:00", "--root", str(tmp_path)]) == 3
+    assert json.loads(capsys.readouterr().out)["reason"].startswith("config_check_failed:")
+    assert store.handed(rec.trading_day, "1030") is None
