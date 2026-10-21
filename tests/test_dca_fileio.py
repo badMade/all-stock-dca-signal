@@ -276,7 +276,7 @@ def test_the_destination_owner_is_preserved(tmp_path):
 
     info = target.stat()
     assert (info.st_uid, info.st_gid) == (12345, 12345)
-    assert stat.S_IMODE(info.st_mode) == 0o620
+    assert stat.S_IMODE(info.st_mode) == 0o600
 
 
 def test_the_write_aborts_when_ownership_cannot_be_reproduced(tmp_path, monkeypatch):
@@ -297,7 +297,7 @@ def test_the_write_aborts_when_ownership_cannot_be_reproduced(tmp_path, monkeypa
         atomic_write_text(target, '{"second": true}')
 
     info = target.stat()
-    assert (info.st_uid, stat.S_IMODE(info.st_mode)) == (12345, 0o620)
+    assert (info.st_uid, stat.S_IMODE(info.st_mode)) == (12345, 0o600)
 
 
 def test_a_restrictive_rewrite_aborts_when_chmod_is_rejected(tmp_path, monkeypatch):
