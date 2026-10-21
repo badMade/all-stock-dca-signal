@@ -321,7 +321,21 @@ def _command_shape(command: str) -> dict[str, Any]:
     ``--state-root=/Users/me/cron_tracking`` is path-scrubbed too (adversarial
     review, round 2: basename-only left embedded paths intact). The slot and
     stream tokens feed the join matrix.
+
+    When the command is wrapped in ``/bin/sh -c 'exec ...'`` (used to handle
+    systemd environment variable expansion), the actual command inside the
+    quotes is extracted and parsed.
     """
+    # Handle /bin/sh -c 'exec ...' wrapping (systemd environment expansion).
+    # The quotes protect the command from immediate systemd variable expansion.
+    if command.startswith("/bin/sh -c '") and command.endswith("'"):
+        # Extract the command inside the single quotes.
+        inner_command = command[12:-1]  # Remove "/bin/sh -c '" and final "'"
+        # Handle the common pattern of "exec" at the start of the inner command.
+        if inner_command.startswith("exec "):
+            inner_command = inner_command[5:]  # Remove "exec "
+        command = inner_command
+
     tokens = command.split()
     shown = [_text(Path(token).name if token.startswith("/") else token, 80) for token in tokens[:20]]
     return {"script": shown[0] if shown else None, "arguments": [item for item in shown[1:] if item is not None],
