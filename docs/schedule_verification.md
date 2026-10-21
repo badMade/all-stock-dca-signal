@@ -150,6 +150,11 @@ python3 -m scripts.finalize_run_evidence --slot 1430 \
   `build_afternoon_live_run_classification` for 15:30.
 - It writes `run_state.json` and `run_summary.json`, plus header-only CSVs
   where missing, then checks them with `validate_run_artifacts`.
+- For states it builds, `generated_at` records the supplied fire time
+  (`--started-at`), clamped to no earlier than the nominal slot time for
+  accepted early starts. The classification retains the actual start, while
+  `finalized_at` records when finalization ran. This keeps historical and
+  early-start afternoon evidence eligible regardless of the backfill's clock.
 - It refreshes the pointer through `same_day_pointer.refresh_latest_pointer`,
   or `update_latest_scheduled_run_pointer` for 15:30, then re-validates the
   pointer and the slot. It exits 0 only when both verify.

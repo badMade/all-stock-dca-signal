@@ -632,7 +632,10 @@ def build_run_state(
     code_version: Optional[Dict[str, Any]] = None,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
+    from dca_runner import SLOTS
+
     stream, _ = SLOT_EVIDENCE_LAYOUT[slot]
+    nominal = datetime.combine(started.date(), time(*SLOTS[slot].nominal_et), tzinfo=ET)
     classification = build_classification(slot, started)
     # The executors stamp the pinned account number into their classification;
     # the live prompts' secret rule says it never goes into an artifact, and
@@ -643,7 +646,11 @@ def build_run_state(
     state: Dict[str, Any] = {
         "run_id": classification["run_id"],
         "trading_day": started.date().isoformat(),
-        "generated_at": _utc_iso(now or datetime.now(timezone.utc)),
+        # Risk readers prefer generated_at over the classification timestamp.
+        # Bind evidence to the fire, not the clock when a replay/backfill runs.
+        # Accepted early starts still belong to their nominal risk-accounting slot.
+        "generated_at": _utc_iso(max(started, nominal)),
+        "finalized_at": _utc_iso(now or datetime.now(timezone.utc)),
         "broker": "robinhood",
         "dry_run": False,
         "stream": stream,

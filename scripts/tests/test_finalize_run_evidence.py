@@ -143,6 +143,46 @@ def test_live_classification_is_the_executors_own(tmp_path):
     assert "999000111" not in (tmp_path / "intraday_dca/20260922_1330ET/run_state.json").read_text()
 
 
+@pytest.mark.parametrize("slot_id", ["1430", "1530"])
+@pytest.mark.parametrize("hour, minute", [(0, 0), (9, 0), (14, 29), (16, 0), (23, 59)])
+def test_backfilled_afternoon_evidence_uses_fire_time(tmp_path, slot_id, hour, minute):
+    import dca_risk
+
+    fire = started(slot_id, minute=0)
+    finalized = datetime(2026, 10, 21, hour, minute, tzinfo=ET)
+    result = fre.finalize(
+        slot_id,
+        fire,
+        outcome="BACKFILL_GATE2_ABORT_ZERO_DEPLOYMENT",
+        order_submit_status="not_submitted_error",
+        error_class="backfill_gate2_abort",
+        root=tmp_path,
+        now=finalized,
+    )
+    assert result["verified"] is True, result["errors"]
+    state = json.loads((tmp_path / result["run_dir"] / "run_state.json").read_bytes())
+    assert dca_risk.run_timestamp_et(state) == fire
+    assert dca_risk.is_afternoon_scheduled_evidence(state)
+    assert datetime.fromisoformat(state["finalized_at"]) == finalized
+    assert state["trading_day"] == fire.date().isoformat()
+    summary = json.loads((tmp_path / result["run_dir"] / "run_summary.json").read_bytes())
+    assert summary["generated_at"] == state["generated_at"]
+
+
+@pytest.mark.parametrize("slot_id", ["1430", "1530"])
+def test_early_afternoon_fire_still_counts_as_afternoon_deployment(tmp_path, slot_id):
+    import dca_risk
+
+    fire = started(slot_id, minute=-5)
+    result = run(tmp_path, slot_id, start=fire, status="submitted", orders=[ORDER])
+    assert result["verified"] is True, result["errors"]
+    state = json.loads((tmp_path / result["run_dir"] / "run_state.json").read_bytes())
+    assert dca_risk.run_timestamp_et(state) == started(slot_id, minute=0)
+    assert dca_risk.is_afternoon_scheduled_evidence(state)
+    assert datetime.fromisoformat(state["run_classification"]["triggered_at_utc"]) == fire
+    assert state["orders_submitted_count"] == 1
+
+
 def test_window_accepts_the_prompts_early_gate1_start_but_nothing_earlier(tmp_path):
     # The live 2:30 prompt's Gate 1 accepts 2:25-2:55; dca_runner's window opens at 2:30.
     assert run(tmp_path, "1430", start=datetime(2026, 9, 22, 14, 25, tzinfo=ET))["verified"] is True
