@@ -117,36 +117,6 @@ Characteristics of this generation:
   live execution roster note for the same incident. Same caveat as every
   bullet here: none of it runs until a human applies these bodies and
   re-captures the mirrors.
-* Gate 7 gained two read-only refusal paragraphs in the seven mirrors after
-  the 2026-10-20 11:30 ET intraday run (PRs #1807, #1818, #1823). That run
-  placed 14 buys ($30.81, all filled), then the auto-mode classifier refused
-  the read-only `get_equity_orders` fetch that precedes every order, and
-  CSCO ($1.40) and TEL ($1.00) were never attempted. Earlier quote and
-  order-history reads that day had been refused too, and each cleared on one
-  retry. The existing rules covered a refused `place_equity_order` and a
-  refused `get_portfolio` (2026-10-19, PR #1792) but not these two reads.
-  `READ-ONLY REFUSAL, ORDER HISTORY`: retry the fetch once; a second denial
-  stops the remaining placements, because the cap and rogue-activity checks
-  cannot be proven without fresh, complete history; confirmed fills stand, the
-  refusal consumes no placement attempt, and the alert separates confirmed
-  fills from UNPLACED TICKERS, each listed with its exact Gate 6.5 `buy_usd`
-  (not to be resized). The same paragraph covers a refusal of the post-batch
-  verification fetch: the submitted orders' fills are UNVERIFIED, not failed,
-  so no replacement is placed and the alert requires reconciliation before
-  any manual action. `READ-ONLY REFUSAL, QUOTE`: retry the per-ticker quote
-  re-fetch once; a second denial drops that ticker (its price eligibility is
-  unprovable and a stale quote is never a substitute) and the batch
-  continues, but two consecutive tickers dropped this way stop the batch. The
-  two-consecutive cap is a judgment call made in review, not an observed
-  incident. Each paragraph carries its own slot's stamp. The Perplexity
-  backup prompts were audited on 2026-10-21 and not changed: their rules
-  already skip a ticker on an unreadable quote and stop the batch on an
-  incomplete history pull, with one unresolved ambiguity, in that a refused
-  quote read matches both the "skip the ticker" rule and the "platform
-  refusal stops the batch" step. The lasting fix is a classifier allowlist for
-  the read-only Robinhood calls on the executor side, which no prompt text can
-  provide. Same caveat as every bullet here: none of it runs until a human
-  applies these bodies and re-captures the mirrors.
 * Gate 2 also gained a FOURTH repo probe,
   `find /home/user -maxdepth 3 -type d -name all-stock-dca`, in the same
   change. The original three only ever looked under `/sessions/*/mnt/`, which

@@ -10,14 +10,14 @@ two rules. None of this relaxes a trading safety rule or routes around a permiss
 A verification run on 2026-10-20 reported two limits of its own:
 
 - It had no `list_scheduled_tasks` tool, so enabled, `lastRunAt` and `nextRunAt` for the seven
-  executor tasks were unknown. `list_triggers` returned only unrelated reminders in that session.
+  executor tasks were unknown. `list_triggers` returned only unrelated reminders.
 - Order times did not line up with slot times, so it guessed which slot made which order cluster.
 
 ## Findings
 
 | # | Fact or inference | Evidence |
 | --- | --- | --- |
-| 1 | FACT: in the 2026-10-20 run, `list_triggers` returned only unrelated reminders. FACT: a different session on 2026-10-21 saw all seven executor tasks through `list_triggers`, with `last_run`. INFERENCE: what it returns depends on the session. | run note 2026-10-20; direct check 2026-10-21 |
+| 1 | FACT: `list_triggers` does not return the executor tasks. | run note 2026-10-20; `docs/scheduled_session_repo_access.md` |
 | 2 | FACT: slot outcomes come from `run_state.json` and Gate 9 evidence, never from `lastRunAt`. | `EXTERNAL-PROMPT-FIXES-2026-10-12.md`, `false_all_clear` |
 | 3 | FACT: `scripts.slot_attribution.attribute_orders` maps order IDs to slots from each slot's own dated `run_state.json` (merged in #1804); `verify_schedule --orders-json` exposes it on the CLI. | `scripts/slot_attribution.py`, `scripts/verify_schedule.py` |
 | 4 | INFERENCE: order times drift from slot times because of per-task scheduler jitter and backup periods, so time clustering will misattribute. | `claude/SECOND-EXECUTOR-FINDING.md` jitter table |
@@ -25,12 +25,11 @@ A verification run on 2026-10-20 reported two limits of its own:
 ## Paste-ready text
 
 ### `task_status_unknown`
-Add: "Scheduled-task status (enabled, lastRunAt, nextRunAt) comes from the `list_scheduled_tasks` tool
-when you have it. If you do not, use `list_triggers` only when it actually lists the executor tasks
-(enabled, last_fired_at and next_run_at map to enabled, lastRunAt and nextRunAt; what it returns
-depends on the session, and some sessions see only unrelated reminders). For any executor task
-neither tool shows, write enabled, lastRunAt and nextRunAt as UNKNOWN, and never infer them from
-order history. UNKNOWN is a finding to report, not a pass."
+Add: "Scheduled-task status (enabled, lastRunAt, nextRunAt) comes only from the `list_scheduled_tasks`
+tool. If you do not have that tool, write enabled, lastRunAt and nextRunAt as UNKNOWN for every
+executor task. `list_triggers` returns only unrelated reminders, never the executor tasks, so do not
+read task status from it and do not infer it from order history. UNKNOWN is a finding to report, not
+a pass."
 
 ### `order_slot_guessing`
 Add: "Attribute a broker order to a slot only through that slot's own dated `run_state.json`. Write

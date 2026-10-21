@@ -241,22 +241,6 @@ ENTRY_POINTS: tuple[EntryPoint, ...] = (
         ),
     ),
     EntryPoint(
-        need="Check whether the backup_planner.pyz pasted into Perplexity is stale against origin/main",
-        command=(
-            "python3 -m scripts.planner_stamp_check [--planner backup_planner.pyz] [--ref origin/main] [--notify]"
-        ),
-        exists_path="scripts/planner_stamp_check.py",
-        doc_ref="docs/schedule_verification.md",
-        symbols=("main", "pasted_stamp", "fresh_stamp", "export_ref"),
-        notes=(
-            "Compares the content_sha256 stored inside the operator's own planner with a planner built from "
-            "origin/main (git fetch, then git archive into a temp dir; the working tree is never touched). "
-            "Exit 0 unchanged, 1 stale, 2 could not check; --notify raises a macOS notification on 1 and 2. "
-            "Runs on the Mac because a cloud routine has no repo credentials; a launchd template ships beside "
-            "the schedule watchdog's."
-        ),
-    ),
-    EntryPoint(
         need="Alert independently of the executor session when a live slot left no scheduled evidence",
         command=(
             "python -m scripts.schedule_watchdog [--date YYYY-MM-DD] [--root <cron-tracking root>] "

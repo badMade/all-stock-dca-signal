@@ -96,27 +96,11 @@ artifact completion instead of directory creation").
 
 **systemd** (preferred where available — the timers schedule in
 `America/New_York` and stay correct across DST). The units run as a dedicated
-unprivileged `dca-drift` account rather than root, and source the `REPO_ROOT`
-variable from an environment file so they work at any install path. The units
-do not run as root: `ExecStart` reads the checkout via `REPO_ROOT`, and anyone
-who can modify it should not thereby gain root at the next timer firing (codex
-review discussion_r3697106550):
+unprivileged `dca-drift` account rather than root, since `WorkingDirectory`
+points at your checkout and anyone who can modify it should not thereby gain
+root at the next timer firing (codex review discussion_r3697106550):
 
 ```bash
-# Create the environment file with the repository path. The minus (-) prefix on
-# EnvironmentFile means the unit won't fail to start if the file doesn't exist,
-# but the service will fail at runtime with an unset REPO_ROOT, so the operator
-# is forced to set it up correctly before deployment (fail-closed).
-sudo install -m 600 /dev/null /etc/all-stock-dca.env
-# edit /etc/all-stock-dca.env and add: REPO_ROOT=/path/to/all-stock-dca
-sudo nano /etc/all-stock-dca.env
-# verify:
-grep REPO_ROOT /etc/all-stock-dca.env
-
-# (Optional) For user-local systemd services, use ~/.config/all-stock-dca.env
-# and update the EnvironmentFile= line in the service files. System-wide
-# (/etc/all-stock-dca.env) is preferred.
-
 # --user-group (-U) is required explicitly: on a host configured with
 # USERGROUPS_ENAB no, plain useradd assigns the account to its distro default
 # group instead of creating a same-named dca-drift group, and every unit's
@@ -130,6 +114,7 @@ sudo chown dca-drift:dca-drift deploy/drift-slack.env  # keep it mode 600
 # b85d39e). E.g. add dca-drift to a group that owns cron_tracking/ (or
 # wherever $DCA_CRON_TRACKING_ROOT points) with group write permission.
 
+# adjust the /opt/all-stock-dca install path inside the units first
 sudo cp deploy/systemd/dca-drift-*.service deploy/systemd/dca-drift-*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now \

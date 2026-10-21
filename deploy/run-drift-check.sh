@@ -150,10 +150,8 @@ import os
 import sys
 import urllib.error
 
-sys.path.insert(0, ".")
 sys.path.insert(0, "scripts")
 from drift_detection import DriftReport, send_slack_alert  # noqa: E402
-from dca_net_utils import sanitize_exception as _sanitize_exception  # noqa: E402
 
 report = DriftReport(
     run_dir=os.environ["RUN_DIR"],
@@ -172,7 +170,7 @@ try:
     if not send_slack_alert(report):
         print("warning: no Slack webhook configured; failed-run alert not sent", file=sys.stderr)
 except (urllib.error.URLError, OSError) as exc:
-    print(f"warning: failed-run Slack alert failed: {_sanitize_exception(exc)}", file=sys.stderr)
+    print(f"warning: failed-run Slack alert failed: {exc}", file=sys.stderr)
 PY
 }
 
