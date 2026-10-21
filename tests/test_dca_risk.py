@@ -1013,6 +1013,68 @@ def test_run_timestamp_fallback_to_rc_triggered_at_utc():
     assert run_timestamp_et({"run_classification": {}}) is None
 
 
+# Finalizer-written states: the invocation clock decides afternoon eligibility, and an
+# accepted early start counts as its slot's nominal time (the 2:30 prompt's Gate 1 accepts
+# 2:25-2:55). 2026-10-21: #1844 made run_timestamp_et read only the invocation clock for
+# these states while #1845 made the finalizer clamp generated_at to the nominal time and
+# tested the clamp through run_timestamp_et; each passed alone, together they broke ten
+# tests on main. The clamp belongs here, where the invocation clock is already the source.
+def _finalized_state(triggered_at_utc: Any, scheduled_for_et: Any = "15:30", generated_at: Any = None) -> dict:
+    state: dict = {
+        "finalized_by": "scripts.finalize_run_evidence",
+        # main's floor (#1855) anchors the nominal time on trading_day, not the invocation date.
+        "trading_day": "2026-09-22",
+        "run_classification": {"triggered_at_utc": triggered_at_utc},
+    }
+    if scheduled_for_et is not None:
+        state["run_classification"]["scheduled_for_et"] = scheduled_for_et
+    if generated_at is not None:
+        state["generated_at"] = generated_at
+    return state
+
+
+@pytest.mark.parametrize(
+    ("triggered_at_utc", "scheduled_for_et", "expected_hhmm"),
+    [
+        ("2026-09-22T19:25:00Z", "15:30", (15, 30)),  # 15:25 ET, accepted early start -> nominal
+        ("2026-09-22T18:25:00+00:00", "14:30", (14, 30)),  # 14:25 ET
+        ("2026-09-22T19:30:00Z", "15:30", (15, 30)),  # on time: unchanged
+        ("2026-09-22T19:40:00Z", "15:30", (15, 40)),  # late: never moved earlier
+    ],
+)
+def test_finalizer_state_early_start_counts_at_its_nominal_time(triggered_at_utc, scheduled_for_et, expected_hhmm):
+    from dca_risk import run_timestamp_et
+
+    dt = run_timestamp_et(_finalized_state(triggered_at_utc, scheduled_for_et))
+    assert dt is not None
+    assert (dt.date().isoformat(), dt.hour, dt.minute) == ("2026-09-22", *expected_hhmm)
+
+
+def test_finalizer_state_ignores_generated_at_even_when_it_is_the_write_time():
+    from dca_risk import run_timestamp_et
+
+    state = _finalized_state("2026-09-22T19:25:00Z", "15:30", generated_at="2026-10-21T09:00:00-04:00")
+    dt = run_timestamp_et(state)
+    assert dt is not None and (dt.date().isoformat(), dt.hour, dt.minute) == ("2026-09-22", 15, 30)
+
+
+@pytest.mark.parametrize("bad_clock", [None, "", "not-a-timestamp"])
+def test_finalizer_state_without_a_usable_invocation_clock_has_no_timestamp(bad_clock):
+    from dca_risk import run_timestamp_et
+
+    # Fail closed: a missing or corrupt invocation clock must not fall back to write time.
+    assert run_timestamp_et(_finalized_state(bad_clock, "15:30", generated_at="2026-10-21T17:00:00-04:00")) is None
+
+
+@pytest.mark.parametrize("bad_nominal", [None, "", "not-a-time", "25:99", 1530])
+def test_finalizer_state_with_unusable_nominal_time_keeps_the_invocation_clock(bad_nominal):
+    from dca_risk import run_timestamp_et
+
+    # No usable scheduled_for_et means no clamp, never a guess: the early start stays as recorded.
+    dt = run_timestamp_et(_finalized_state("2026-09-22T19:25:00Z", bad_nominal))
+    assert dt is not None and (dt.hour, dt.minute) == (15, 25)
+
+
 def test_parse_iso_et_unparseable():
     from dca_risk import _parse_iso_et
     assert _parse_iso_et("") is None
