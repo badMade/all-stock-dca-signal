@@ -50,6 +50,38 @@ If the first run is blocked by macOS privacy protection, grant the venv Python a
 `~/Documents` as for the robinhood-payload agent. Notifications may need allowing for
 `osascript` under System Settings > Notifications.
 
+## Stale-planner check (launchd)
+
+`scripts/planner_stamp_check.py` answers one question each weekday morning: is the `backup_planner.pyz` you
+pasted into Perplexity still the planner `origin/main` builds? Step 0 of every backup prompt demands the planner's
+`content_sha256`, and that hash moves whenever any file inside the planner changes (it moved four times on
+2026-10-21 for changes unrelated to the one being shipped). A stale planner costs a missed slot and nothing flagged it.
+A cloud routine cannot run this check (a scheduled session has no repo or GitHub credentials, confirmed
+2026-10-21), so it runs on the Mac next to the checkout.
+
+* **Baseline** is the stamp inside your own `backup_planner.pyz`; nothing is stored anywhere else, so nothing needs
+  updating after a repaste. Keep the attached file at `<checkout>/backup_planner.pyz`.
+* **Fresh stamp** comes from `git fetch origin main`, then a planner built from that ref in a temporary directory.
+  The checkout's working tree, branch and uncommitted edits are never touched.
+* Exit `0` unchanged (silent), `1` stale, `2` could not check. `--notify` raises a macOS notification on `1` and `2`:
+  a silent failed check looks exactly like "all good". The JSON report holds hashes, a commit and a status only.
+
+```bash
+python3 -m scripts.planner_stamp_check --planner backup_planner.pyz            # run it by hand
+sed -e "s|REPLACE_WITH_REPO_PATH|$PWD|g" \
+  deploy/launchd/com.all-stock-dca.planner-stamp-check.plist.template \
+  > ~/Library/LaunchAgents/com.all-stock-dca.planner-stamp-check.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.planner-stamp-check.plist
+launchctl kickstart gui/$(id -u)/com.all-stock-dca.planner-stamp-check            # run once now to test
+```
+
+The agent runs Mon-Fri at 07:45, at least an hour before the earliest slot window opens (09:35), on Mac-local time
+(pin the Mac to America/New_York). When it reports STALE: `git pull`, rebuild with
+`python3 -m scripts.build_backup_planner --out backup_planner.pyz`, refill the prompts, run
+`scripts.verify_perplexity_pair`, then attach the planner and repaste the prompts (see
+`claude/dca-executor-prompts/perplexity/README.md`). It needs `git` to be able to fetch the remote without a prompt
+(a credential helper or SSH key); if the fetch fails it reports ERROR instead of guessing.
+
 ## Verify a day
 
 ```bash
