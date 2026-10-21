@@ -274,34 +274,54 @@ def _load_rows(path: Path, trading_day: date) -> list[Any]:
     return rows
 
 
+_DECIMAL_TEXT = re.compile(r"[+-]?(\d+(\.\d*)?|\.\d+)")
+
+
+def _as_number(value: Any) -> float | None:
+    """A finite float from a JSON number or a plain decimal string, else ``None``.
+
+    2026-10-20 and 2026-10-21 (13:50, 13:30 backup passes): the connector hands quotes over as strings
+    ("101.25"), the old strict number check aborted a sound run, and the operator hand-rewrote the files to get
+    past it. Plain decimal text is now accepted; bools, NaN/inf, exponents, hex and padded text still fail closed.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        if not _DECIMAL_TEXT.fullmatch(value):
+            return None
+        value = float(value)
+    if not isinstance(value, (int, float)):
+        return None
+    try:
+        return float(value) if math.isfinite(value) else None
+    except OverflowError:
+        return None
+
+
 def _load_fresh_quotes(path: Path, *, missing: str = "fresh_quotes_missing",
                        corrupt: str = "fresh_quotes_corrupt") -> dict[str, float]:
     """``{"SYMBOL": price}``, every price positive and finite. Also reads ``--fresh-prior-closes`` (same shape)."""
     data = _read_json(path, missing=missing, corrupt=corrupt)
-    ok = isinstance(data, dict) and all(
-        isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0
-        for k, v in data.items()
-    )
-    if not ok:
+    ok = isinstance(data, dict) and all(isinstance(k, str) for k in data)
+    prices = {k.upper(): _as_number(v) for k, v in data.items()} if ok else {}
+    if not ok or not all(v is not None and v > 0 for v in prices.values()):
         raise _Refused(PlanError(corrupt, path.name))
-    return {k.upper(): float(v) for k, v in data.items()}
+    return {k: float(v) for k, v in prices.items()}  # type: ignore[arg-type]
 
 
 def _load_fresh_spreads(path: Path) -> dict[str, tuple[Any, Any] | None]:
     """``{"SYMBOL": {"bid": x, "ask": y}}`` as ``(bid, ask)``; a null entry means no usable quote for it."""
     data = _read_json(path, missing="fresh_spreads_missing", corrupt="fresh_spreads_corrupt")
 
-    def _num(value: Any) -> bool:
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-
     ok = isinstance(data, dict) and all(
         isinstance(k, str)
-        and (v is None or (isinstance(v, dict) and _num(v.get("bid")) and _num(v.get("ask"))))
+        and (v is None or (isinstance(v, dict) and _as_number(v.get("bid")) is not None
+                           and _as_number(v.get("ask")) is not None))
         for k, v in data.items()
     )
     if not ok:
         raise _Refused(PlanError("fresh_spreads_corrupt", path.name))
-    return {k.upper(): None if v is None else (v["bid"], v["ask"]) for k, v in data.items()}
+    return {k.upper(): None if v is None else (_as_number(v["bid"]), _as_number(v["ask"])) for k, v in data.items()}
 
 
 def _parse_buying_power(text: str) -> float:

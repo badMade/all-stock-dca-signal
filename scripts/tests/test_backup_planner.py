@@ -319,7 +319,8 @@ def test_finalize_aborts_when_the_plan_file_is_missing(tmp_path, capsys):
     assert "plan_missing" in {e["code"] for e in report["errors"]}
 
 
-@pytest.mark.parametrize("text", ["", "{oops", "[]", '{"MSFT": "100"}'])
+@pytest.mark.parametrize("text", ["", "{oops", "[]", '{"MSFT": "abc"}', '{"MSFT": "1e2"}', '{"MSFT": " 100"}', '{"MSFT": "nan"}',
+                                  '{"MSFT": "-5"}', '{"MSFT": true}'])
 def test_finalize_aborts_on_corrupt_fresh_quotes(tmp_path, capsys, two_order_plan, text):
     plan = _write(tmp_path, "plan.json", two_order_plan)
     pages = _write(tmp_path, "pages.json", _envelope())
@@ -516,7 +517,8 @@ def test_finalize_requires_a_fresh_spreads_file(tmp_path, capsys, two_order_plan
     assert "fresh_spreads_missing" in {e["code"] for e in report["errors"]}
 
 
-@pytest.mark.parametrize("text", ["", "{oops", "[]", '{"MSFT": [99, 101]}', '{"MSFT": {"bid": "99", "ask": 101}}'])
+@pytest.mark.parametrize("text", ["", "{oops", "[]", '{"MSFT": [99, 101]}', '{"MSFT": {"bid": "x", "ask": 101}}',
+                                  '{"MSFT": {"bid": "inf", "ask": 101}}'])
 def test_corrupt_fresh_spreads_abort(tmp_path, capsys, two_order_plan, text):
     plan = _write(tmp_path, "plan.json", two_order_plan)
     pages = _write(tmp_path, "p.json", _envelope())
@@ -542,3 +544,12 @@ def test_a_missing_or_crossed_spread_skips_the_ticker_in_finalize(tmp_path, caps
     assert (code, report["to_place"]) == (0, [])
     assert {"symbol": "MSFT", "reason": "spread_unavailable"} in report["skipped"]
     assert {"symbol": "AAPL", "reason": "spread_unavailable"} in report["skipped"]
+
+
+def test_numeric_strings_are_accepted_for_fresh_quotes_and_spreads(tmp_path):
+    quotes = tmp_path / "q.json"
+    quotes.write_text('{"msft": "101.25", "AAPL": 7}', encoding="utf-8")
+    assert backup_planner._load_fresh_quotes(quotes) == {"MSFT": 101.25, "AAPL": 7.0}
+    spreads = tmp_path / "s.json"
+    spreads.write_text('{"msft": {"bid": "99.5", "ask": "100"}, "AAPL": null}', encoding="utf-8")
+    assert backup_planner._load_fresh_spreads(spreads) == {"MSFT": (99.5, 100.0), "AAPL": None}
