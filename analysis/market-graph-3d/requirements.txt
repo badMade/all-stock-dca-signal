@@ -8,6 +8,7 @@
 # document, or scrubbing an animation frame-by-frame in a video player.
 matplotlib
 numpy
+pillow>=13.0.0
 
 # MP4 output additionally needs an ffmpeg binary on PATH. Without one, pass
 # --format gif (Pillow, which matplotlib already depends on) or --format png.
