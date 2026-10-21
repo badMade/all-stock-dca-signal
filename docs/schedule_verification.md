@@ -27,6 +27,29 @@ outcome}` that `scripts/same_day_pointer.validate_pointer` rejects as
 `malformed` (missing `run_id`, `run_state_path`, `stream`). The slots fired,
 but nothing they left behind could be verified.
 
+## Daily alert (launchd)
+
+`scripts/schedule_watchdog.py --notify` runs the watchdog below and, when any slot fails, also raises
+a macOS notification naming the date and the failing slot ids. The watchdog's idempotent per-slot alert
+files, exit code and report are unchanged. It exists because the Oct 13-16 2026 aborts each left a Gate 1/2
+alert file nobody read (email undeliverable, message center per-session): files alone were not seen.
+
+The agent template is `deploy/launchd/com.all-stock-dca.schedule-watchdog.plist.template`: it runs
+Mon-Fri at 16:35, after the last slot's grace deadline. The Mac must be pinned to America/New_York
+(launchd has no ET), and `DCA_CRON_TRACKING_ROOT` must match the root the live sessions write to.
+
+```bash
+sed -e "s|REPLACE_WITH_REPO_PATH|$PWD|g" -e "s|REPLACE_WITH_CRON_TRACKING_ROOT|$PWD/cron_tracking|g" \
+  deploy/launchd/com.all-stock-dca.schedule-watchdog.plist.template \
+  > ~/Library/LaunchAgents/com.all-stock-dca.schedule-watchdog.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.schedule-watchdog.plist
+launchctl kickstart gui/$(id -u)/com.all-stock-dca.schedule-watchdog   # run once now to test
+```
+
+If the first run is blocked by macOS privacy protection, grant the venv Python access to
+`~/Documents` as for the robinhood-payload agent. Notifications may need allowing for
+`osascript` under System Settings > Notifications.
+
 ## Verify a day
 
 ```bash

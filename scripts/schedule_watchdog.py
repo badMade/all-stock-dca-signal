@@ -63,6 +63,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -241,6 +242,20 @@ def send_slack_alert(
         return 200 <= response.status < 300
 
 
+def notify_macos(title: str, message: str) -> None:
+    """Raise a macOS notification. Text travels as argv, never inside the AppleScript.
+
+    The message can derive from run-directory contents, so the script reads it as data
+    (``item N of argv``) rather than as interpolated code, which closes AppleScript
+    injection. Bounded by a timeout so a hung notifier cannot hang the watchdog.
+    """
+    subprocess.run(
+        ["osascript", "-e", "on run argv", "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
+         "-e", "end run", title, message],
+        check=False, capture_output=True, timeout=_DEFAULT_TIMEOUT_SECONDS,
+    )
+
+
 def _render(report: Mapping[str, Any]) -> str:
     lines = [f"Schedule watchdog for {report['date']} (checked {report['checked_at_et']})"]
     rows = failing_rows(report)
@@ -261,6 +276,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--json", action="store_true", help="emit the report as JSON")
     parser.add_argument("--no-alert-file", action="store_true",
                          help="skip writing the durable repo alert file for each failing slot")
+    parser.add_argument("--notify", action="store_true",
+                        help="raise a macOS notification when any slot is failing (for the launchd agent)")
     parser.add_argument("--slack", action="store_true", help="send a Slack alert when any slot is failing")
     parser.add_argument("--slack-webhook", help="Slack webhook URL (prefer the env var; no secrets in configs)")
     parser.add_argument(
@@ -282,6 +299,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if len(written) < len(rows):
             print(f"warning: only {len(written)}/{len(rows)} durable alert files were written "
                   f"(see stderr log)", file=sys.stderr)
+
+    if args.notify and rows:
+        # Slot ids and the date only: the alert files quote run_state values, a desktop banner must not.
+        message = f"{report['date']}: no verified evidence for slots {', '.join(r['slot_id'] for r in rows)}"
+        try:
+            notify_macos("Schedule watchdog FAILED", message)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"warning: macOS notification failed: {_sanitize_exception(exc)}", file=sys.stderr)
 
     if args.slack and rows:
         try:
