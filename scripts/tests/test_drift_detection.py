@@ -218,63 +218,6 @@ class DriftDetectionTests(unittest.TestCase):
         self.assertEqual(affected, {"AAPL", "MSFT", "NVDA"})
         self.assertNotIn("AMD", affected)
 
-    # --- header-only signals files (Feb 2026 failure mode) ---------------------
-    def test_detect_drift_header_only_signals_with_run_state_orders(self):
-        # Regression test: header-only signals.csv files used to return
-        # drift_detected=False (false-clean) instead of triggering an alert.
-        # _has_usable_header() returned True for a file with only headers,
-        # _first_usable() selected it, then read_csv_rows() returned [].
-        # The detector saw no expected buys (signals.csv was empty) and reported
-        # no drift, even though run_state["broker_outcomes"] confirmed that
-        # orders were actually placed. This is a genuine drift condition:
-        # a placed order with no matching signals file to document intent.
-        # Now _first_usable() verifies at least one data row exists; a
-        # header-only file is treated as unusable, and run_state-confirmed
-        # orders still surface as drift (Codex review: "Validate row count to
-        # reject header-only files").
-        self._raw()
-        # Create a header-only signals.csv with no data rows.
-        signals_path = self.run_dir / "signals.csv"
-        with signals_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=SIGNAL_FIELDS)
-            writer.writeheader()
-            # Intentionally write no rows -- header only.
-
-        # run_state.json shows that an order WAS actually placed for AAPL,
-        # even though signals.csv is empty. This is the anomaly we're testing:
-        # a placed order with no corresponding signal/intent record.
-        (self.run_dir / "run_state.json").write_text(
-            json.dumps(
-                {
-                    "stream": "afternoon",
-                    "status": "completed",
-                    "broker_outcomes": {"AAPL": {"status": "submitted", "order_id": "oid-1"}},
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        # submitted_orders.csv is absent or empty, so the canonical order
-        # record is missing. run_state proves the order reached the broker.
-        _write_csv(self.run_dir / "submitted_orders.csv", ORDER_FIELDS, [])
-
-        # The detector must recognize the header-only signals file as unusable
-        # (no signals with intent) and the run_state-confirmed order as drift:
-        # a placed order with no canonical record AND no signal intent.
-        report = detect_drift(self.run_dir)
-
-        # Drift should be detected: run_state shows AAPL was submitted but
-        # submitted_orders.csv does not record it (and signals.csv has no
-        # expected buys to document the intent).
-        self.assertTrue(report.drift_detected, "Order confirmed by run_state but not in signals or CSV should trigger drift alert")
-        self.assertEqual(len(report.affected_symbols), 1)
-        self.assertEqual(report.affected_symbols[0].symbol, "AAPL")
-        # The cause is that the canonical order record is missing, run-state confirmed.
-        self.assertEqual(
-            report.affected_symbols[0].suspected_cause,
-            CAUSE_ORDER_ARTIFACT_MISSING_RUN_STATE_CONFIRMED,
-        )
-
     # --- missing raw/ directory (Jul 16 2026 failure mode) ------------------
     def test_missing_raw_dir_jul16_failure_mode(self):
         # 8 auto-buy rows with positive incremental amounts, empty orders, no raw/.

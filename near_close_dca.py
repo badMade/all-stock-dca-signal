@@ -1147,21 +1147,21 @@ class StrategyConfig:
     # which now require only a 2.0% drop (was 6% after the 2026-08-02 rescale), so
     # tier escalation is correspondingly MORE frequent for the same market conditions.
     sizing_tiers: tuple[tuple[float, float], ...] = (
-        (0.001, 1.0),   # 0.1% to <0.5%
-        (0.005, 1.5),   # 0.5% to <1.0%
-        (0.010, 2.0),   # 1.0% to <1.5%
-        (0.015, 2.5),   # 1.5% to <2.0%
-        (0.020, 3.0),   # 2.0% to <2.75%
+        (0.001, 1.0),  # 0.1% to <0.5%
+        (0.005, 1.5),  # 0.5% to <1.0%
+        (0.010, 2.0),  # 1.0% to <1.5%
+        (0.015, 2.5),  # 1.5% to <2.0%
+        (0.020, 3.0),  # 2.0% to <2.75%
         (0.0275, 3.5),  # 2.75% to <3.5%
-        (0.035, 4.0),   # 3.5% to <4.5%
-        (0.045, 4.5),   # 4.5% to <5.5%
-        (0.055, 5.0),   # 5.5% to <7.0%
-        (0.070, 5.5),   # 7.0% to <8.5%
-        (0.085, 6.0),   # 8.5% to <10.5%
-        (0.105, 6.5),   # 10.5% to <12.5%
-        (0.125, 7.0),   # 12.5% to <14.5%
-        (0.145, 7.5),   # 14.5% to <16.0%
-        (0.160, 8.0),   # 16.0% or more (no upper cutoff)
+        (0.035, 4.0),  # 3.5% to <4.5%
+        (0.045, 4.5),  # 4.5% to <5.5%
+        (0.055, 5.0),  # 5.5% to <7.0%
+        (0.070, 5.5),  # 7.0% to <8.5%
+        (0.085, 6.0),  # 8.5% to <10.5%
+        (0.105, 6.5),  # 10.5% to <12.5%
+        (0.125, 7.0),  # 12.5% to <14.5%
+        (0.145, 7.5),  # 14.5% to <16.0%
+        (0.160, 8.0),  # 16.0% or more (no upper cutoff)
     )
     # Optional symbol-specific historical calibration loaded from
     # config/per_ticker_sizing.json. Each value supplies ``tiers`` as
@@ -18920,9 +18920,7 @@ def _whole_share_dry_run_preview(
             "whole_share_planned_notional_usd": preview_order_notional,
             **spread_fields,
         }
-        _record_block_reason(
-            ctx, ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: whole-share not tradable; skipping"
-        )
+        _record_block_reason(ctx, ticker, MISSING_FILL_BROKER_BLOCKED, f"{ticker}: whole-share not tradable; skipping")
         return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
 
     # A dry-run preview must not claim success for a broker that cannot
@@ -19031,7 +19029,6 @@ def _whole_share_dry_run_preview(
     if ctx.run_result is not None:
         _log_execution(ctx.run_result, decision, order_id, ctx.broker, notional_usd=preview_order_notional)
     return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
-
 
 
 def _handle_whole_share_placement_exception(
@@ -19551,9 +19548,7 @@ def _handle_whole_share_placement_exception(
         terminal_order = exc.order
     else:
         try:
-            terminal_order = ctx.broker.same_day_order_with_ref_id_prefix_any_state(
-                ticker, ctx.trading_day, (ref_id,)
-            )
+            terminal_order = ctx.broker.same_day_order_with_ref_id_prefix_any_state(ticker, ctx.trading_day, (ref_id,))
         except Exception as terminal_lookup_exc:  # noqa: BLE001
             # A raised terminal-inclusive lookup establishes NEITHER outcome
             # -- mirrors the live lookup's own failure posture just above
@@ -19742,9 +19737,7 @@ def _handle_whole_share_placement_exception(
             # shortfalls from the cached share price"). See the
             # sibling "if matched_order:" branch above for the full
             # reasoning.
-            settlement_shortfall_usd = round(
-                max(0.0, planned_order_notional - filled_shares * current_share_price), 2
-            )
+            settlement_shortfall_usd = round(max(0.0, planned_order_notional - filled_shares * current_share_price), 2)
             settlement_failed = False
             resolved_by_this_call = False
             try:
@@ -19806,8 +19799,7 @@ def _handle_whole_share_placement_exception(
                 post_fire_pending_usd = ledger.pending_usd(ticker)
             except Exception as read_exc:  # noqa: BLE001
                 logger.warning(
-                    "whole-share accumulation ledger read failed for %s after reconciled "
-                    "partial-fill settlement: %s",
+                    "whole-share accumulation ledger read failed for %s after reconciled partial-fill settlement: %s",
                     ticker,
                     read_exc,
                 )
@@ -20140,7 +20132,6 @@ def _handle_whole_share_placement_exception(
     }
     logger.error("Whole-share placement failed for %s: %s", ticker, exc)
     return candidate_outcome, None, running_deployed_7d, errors_count_inc, order_reviews_attempted_inc
-
 
 
 def _handle_whole_share_placement_success(

@@ -73,7 +73,7 @@ def test_the_evidence_timestamp_is_the_fires_own_nominal_time(slot, tmp_path, mo
 
 
 def test_the_real_write_time_is_not_erased(tmp_path, monkeypatch):
-    """The write timestamps and audit trail say when the backfill actually ran."""
+    """With generated_at now describing the fire, the audit trail still says when the backfill ran."""
     frozen = _freeze(monkeypatch, 9, 0)
 
     state = _backfill(tmp_path, "1430")
@@ -81,5 +81,3 @@ def test_the_real_write_time_is_not_erased(tmp_path, monkeypatch):
     reconstruction = state["gate9_report"]["reconstruction"]
     assert reconstruction["backfilled"] is True
     assert datetime.fromisoformat(reconstruction["backfilled_at"]) == frozen
-    assert datetime.fromisoformat(state["generated_at"]) == frozen
-    assert datetime.fromisoformat(state["finalized_at"]) == frozen

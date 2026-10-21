@@ -9,13 +9,12 @@
 # single quotes there do not protect $-variables and $(...) the way they
 # would in a real shell -- codex review on commit b85d39e).
 #
-# WorkingDirectory and ExecStart paths are parametrized via the REPO_ROOT
-# environment variable, sourced from /etc/all-stock-dca.env (or
-# ~/.config/all-stock-dca.env for user-local installs). Before deploying,
-# create that file with REPO_ROOT=/path/to/all-stock-dca and restrict
-# permissions to 0600 (see docs/slack_webhook_injection.md for setup details).
-# The script itself sources deploy/drift-slack.env (copy
-# deploy/drift-slack.env.example to it, chmod 600, first).
+# WorkingDirectory below assumes the repo is installed at /opt/all-stock-dca —
+# this is a PLACEHOLDER install path; adjust it (and the ExecStart= path) to
+# wherever the checkout actually lives. The script itself sources
+# deploy/drift-slack.env (copy deploy/drift-slack.env.example to it, chmod
+# 600, first) -- no EnvironmentFile= is needed here since cron invokes the
+# same script the same way.
 #
 # Runs as the dedicated dca-drift service user/group rather than root -- see
 # docs/slack_webhook_injection.md for how to create that account (with a
@@ -33,5 +32,5 @@ Wants=network-online.target
 Type=oneshot
 User=dca-drift
 Group=dca-drift
-EnvironmentFile=-/etc/all-stock-dca.env
-ExecStart=/bin/sh -c 'exec ${REPO_ROOT}/deploy/run-drift-check.sh morning_dca 1030ET'
+WorkingDirectory=/opt/all-stock-dca
+ExecStart=/opt/all-stock-dca/deploy/run-drift-check.sh morning_dca 1030ET

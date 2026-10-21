@@ -8,11 +8,7 @@ is written; a backfilled state is valid afternoon evidence and says it is a reco
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
-
-import pytest
 
 import dca_risk
 from scripts import backfill_afternoon_evidence as bf
@@ -142,37 +138,3 @@ def test_restore_newer_pointer_leaves_older_or_same_day_alone(tmp_path):
     assert bf.restore_newer_pointer(path, json.dumps({"trading_day": "2026-10-13"}).encode(), date(2026, 10, 13)) is False
     assert bf.restore_newer_pointer(path, None, date(2026, 10, 13)) is False
     assert bf.restore_newer_pointer(path, b"not json", date(2026, 10, 13)) is False
-
-
-@pytest.mark.parametrize(
-    ("slot", "alert", "state_dir", "nominal_hhmm"),
-    [
-        ("1430", "intraday_dca/alerts/2026-10-13-1430-gate2.txt", "intraday_dca/20261013_1430ET", (14, 30)),
-        ("1530", "ce16ba6b/scheduled_runs/alerts/2026-10-13-1530-gate2.txt", "ce16ba6b/scheduled_runs/20261013_1530ET", (15, 30)),
-    ],
-)
-def test_backfilled_record_is_stamped_with_the_fire_time_not_the_wall_clock(
-    tmp_path, slot, alert, state_dir, nominal_hhmm
-):
-    """The timestamp dca_risk reads must be the FIRE's own time, whatever hour the backfill runs.
-
-    Regression for 2026-10-21: the state carried the wall-clock write instant, and
-    is_afternoon_scheduled_evidence compares that time of day to the 14:30 ET floor, so the two
-    tests above passed from 14:30 to 23:59 ET and failed from 00:00 to 14:29 ET (main went red at
-    ET midnight). Those tests are clock-dependent; this one is not: the wall clock is never
-    2026-10-13 14:30 or 15:30, so stamping the write instant fails it at every hour. It also
-    needs the real write instant kept apart, in the reconstruction block, for the audit trail.
-    """
-    orders = _setup(tmp_path, alerts=(alert,))
-    assert _run(tmp_path, orders, fire=f"2026-10-13:{slot}") == 0
-    state = json.loads((tmp_path / state_dir / "run_state.json").read_text())
-
-    stamped = dca_risk.run_timestamp_et(state)
-    assert stamped is not None
-    expected = datetime(2026, 10, 13, *nominal_hhmm, tzinfo=ZoneInfo("America/New_York"))
-    assert stamped == expected, f"run timestamp {stamped.isoformat()} is not the fire time {expected.isoformat()}"
-    assert dca_risk.is_afternoon_scheduled_evidence(state)
-
-    backfilled_at = datetime.fromisoformat(state["gate9_report"]["reconstruction"]["backfilled_at"])
-    assert backfilled_at.tzinfo is not None
-    assert backfilled_at != stamped, "the real write instant must stay distinguishable from the fire time"

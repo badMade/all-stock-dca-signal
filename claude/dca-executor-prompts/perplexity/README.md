@@ -156,31 +156,6 @@ four digits, email or state folder. It cannot see what is saved inside Perplexit
 Instructions header (`Universe hash ...` and the symbol count) and, after the next run, the state file's
 `planner_build.content_sha256`.
 
-### Morning stale-planner notification (Mac)
-
-```bash
-python3 -m scripts.planner_stamp_check --planner backup_planner.pyz --notify
-```
-
-This reads the stamp inside your attached planner, fetches `origin/main`, and builds that commit in a temporary
-directory without changing your branch or working-tree files. It prints JSON and exits 0 when current (no
-notification), 1 when stale, or 2 when it cannot check or deliver a requested notification. Errors do not include
-local paths or raw Git output. Git authentication must already work without interaction.
-
-For a weekday 07:45 check, replace `REPLACE_WITH_REPO_PATH` in
-`deploy/launchd/com.all-stock-dca.planner-stamp-check.plist.template`, save it as
-`~/Library/LaunchAgents/com.all-stock-dca.planner-stamp-check.plist`, and register it with
-`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.planner-stamp-check.plist`.
-The Mac must use America/New_York time (or adjust the template's hour); allow notifications for `osascript`.
-Logs go to `/tmp/dca-planner-stamp-check.log`. Installing the template is an operator step, not automatic.
-Keep the file passed via `--planner` identical to the file actually attached in Perplexity. A stale verdict only
-alerts: rebuild, regenerate/fill and verify the prompt pair, then reattach and repaste it yourself.
-
-**Knowing when the pair goes stale (2026-10-21).** The planner stamp changes whenever any planner input changes, so a
-pair that verified yesterday can be stale today. `python3 -m scripts.planner_stamp_check --planner backup_planner.pyz`
-compares your attached planner with what `origin/main` builds, and a launchd agent can run it each weekday morning
-and notify you; see "Stale-planner check (launchd)" in `docs/schedule_verification.md`.
-
 ## The 20,000-character limit and the `procedure` command (2026-10-18)
 
 Perplexity's Instructions box keeps only the first 20,000 characters. The full generated prompts were about 27,300,
