@@ -291,6 +291,7 @@ for offset in range(1, dca_risk.KILL_SWITCH_WINDOW_DAYS):
     if not status.is_closed and not status.is_early_close:
         expected_pairs.update({(day, '14:30'), (day, '15:30')})
 observed_pairs = set()
+rejected_reasons = {}
 deployment_evidence_states = []
 for state in states:
     trading_day = dca_risk._trading_day(state)
@@ -307,9 +308,20 @@ for state in states:
         deployment_evidence_states.append(state)
     if is_validated_evidence and window_start <= trading_day < today and scheduled_for in ('14:30', '15:30'):
         observed_pairs.add((trading_day, scheduled_for))
+    claimed_pair = None
+    if scheduled_for in ('14:30', '15:30'):
+        try:
+            claimed_pair = (datetime.date.fromisoformat(classification_day), scheduled_for)
+        except (TypeError, ValueError):
+            claimed_pair = None
+    if claimed_pair in expected_pairs and not is_validated_evidence:
+        rejected_reasons[claimed_pair] = ('trading_day mismatch' if state_day != classification_day
+                                          else 'rejected as afternoon scheduled evidence')
 missing_pairs = sorted(expected_pairs - observed_pairs)
 if missing_pairs:
-    raise SystemExit(f'incomplete trailing-7-day afternoon evidence; missing scheduled fires: {missing_pairs}')
+    detail = '; '.join(f'{day.isoformat()} {slot}: {rejected_reasons.get((day, slot), "no run_state.json")}'
+                       for day, slot in missing_pairs)
+    raise SystemExit(f'incomplete trailing-7-day afternoon evidence; missing scheduled fires: {detail}')
 print(round(dca_risk.seven_day_deployed(dca_risk.deployed_by_day(deployment_evidence_states), today), 2))
 PY
 The command above now validates the exact `(market day, scheduled_for_et)` pairs and prints exactly one scalar: the deployment figure. Use it only after a zero exit status; a stale or mismatched top-level/nested trading day does not satisfy coverage. An undated reconciliation artifact is likewise never coverage, but remains in the deployment sum when every submitted amount has its own attributable claim date.
