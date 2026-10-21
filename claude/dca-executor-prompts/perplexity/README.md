@@ -49,7 +49,7 @@ set is the primary's own `{ticker, usd, ref_id}` list, which these backups now r
 | Command | Where | Output |
 | --- | --- | --- |
 | `plan --source mac_rec --trading-day D --slot S --now T` | Mac | The slot's set from the local store, by the reader's freshness rule (`config/recommendations.json` `max_age_minutes`), as a `plan_first` plan |
-| `plan --source published_rec --published F --trading-day D --slot S --now T` | sandbox | The same, from the payload published to the `recommendations` branch (or the Notion block once `page_id` is set) |
+| `plan --source published_rec --published F --trading-day D --slot S --now T` | sandbox | The same, from an enabled GitHub branch publisher (or enabled Notion publisher with `page_id` set). Step 2 attempts each configured channel once, with no alternate-route retries; if none is enabled or readable, continue without `published.json`. |
 | `executor-ids --trading-day D --slot S` | Mac | The broker order ids the reader saved under `placements/<slot>/` |
 | `classify --trading-day D --slot S --orders-pages F [--executor-ids F] [--published F]` | sandbox | `CLEAR` or `UNRECOGNIZED` for every order inside this slot's window |
 

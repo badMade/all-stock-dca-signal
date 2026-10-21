@@ -69,7 +69,7 @@ Run `python3 backup_planner.pyz gates --task @@TASK_ID@@` (Mac: `python3 -m scri
 STEP 2 - EVIDENCE POLL 1 (broker)
 Call get_equity_orders for the looked-up account with created_at_gte set to 00:00 ET seven days before today (the weekly cap sums the ISO week and the kill-switch figure sums the trailing seven days, so a window seven days back covers both and a today-only fetch would understate them) and follow EVERY pagination cursor to completion: make ONE call for the first page, then one call per cursor the response itself returns, and no other call. A response with no next/cursor field is the final page; do not hunt for one. NEVER re-query with a different state, date, or window to double-check the pull, and never write ad-hoc scripts to count, group, or inspect the rows (the 2026-10-20 09:55 run burned its whole budget that way). The planner, not you, judges completeness: save the pages untouched and let the next planner command accept or refuse them; if it refuses, stop (rule 8). Save every raw page, in fetch order, to orders_pages_poll1.json as {"account_number": <resolved account>, "trading_day": "<today YYYY-MM-DD>", "pages": [...]} (the pages span seven days; trading_day stays today); never retype or condense rows by hand.
 Do not classify these orders by hand: the planner's classify command does it in step 3d, before any plan is read.
-PUBLISHED PLAN-FIRST SET. Then read the plan-first recommendation the Mac publishes for cloud readers: the primary's own {ticker, usd, ref_id} list per slot, the same one the Claude slot places. It is an INPUT (rule 7). Read @@PUBLISHED_CHANNELS@@ Save the text untouched to published.json; never retype, reorder, or edit it. If no channel can be read or the text is not JSON, continue without published.json: that is not an error, the run falls back to the other plan sources.
+PUBLISHED PLAN-FIRST SET. Then read the plan-first recommendation the Mac publishes for cloud readers: the primary's own {ticker, usd, ref_id} list per slot, the same one the Claude slot places. It is an INPUT (rule 7). Read @@PUBLISHED_CHANNELS@@ If a channel supplies text, save the text untouched to published.json; never retype, reorder, or edit it. If no channel can be read or the text is not JSON, continue without published.json: that is not an error, the run falls back to the other plan sources.
 
 STEP 3 - MAC-FIRST (replaces the 2026-09-23 rule never to check the Mac; operator directive 2026-10-06)
 a. Call list_devices (or this task's equivalent device listing) with a timeout of 60 seconds. Find an online device whose name contains "Mac Studio". Record mac_status as one of: online, not_found, offline, timeout, device_error. Set mac_path_abandoned to false. If this session has no device-listing tool at all (the 2026-10-12 15:45 run found none), that is mac_status not_found: the Mac is out of reach, not an error, and the rule below applies.
@@ -171,18 +171,25 @@ GITHUB_REPOSITORY = "badMade/all-stock-dca"
 
 
 def _published_channels(publish: dict) -> str:
-    """Where step 2 reads the published set, from ``config/recommendations.json``'s publish block.
-
-    The branch is always named, even while its publisher is off: a missing or stale file is simply no published set,
-    and the run falls back, so enabling the publisher needs no repaste. Notion is named only once a page id is set.
-    """
-    branch = publish["github_branch"]["branch"]
-    text = (f'the file recommendations.json at the tip of branch "{branch}" of the GitHub repository '
-            f"{GITHUB_REPOSITORY} (a data-only branch; read the raw file, never another branch).")
-    page_id = publish["notion"].get("page_id")
-    if page_id:
-        text += f" If that cannot be read, use the text of the first code block on Notion page {page_id} instead."
-    return text
+    """Where step 2 reads the published set, naming only enabled, configured publication channels."""
+    channels = []
+    github = publish["github_branch"]
+    if github["enabled"]:
+        channels.append(
+            f'the file recommendations.json at the tip of branch "{github["branch"]}" of the GitHub repository '
+            f"{GITHUB_REPOSITORY} (a data-only branch; read the raw file, never another branch)."
+        )
+    notion = publish["notion"]
+    if notion["enabled"] and notion.get("page_id"):
+        channels.append(f'the text of the first code block on Notion page {notion["page_id"]}.')
+    if not channels:
+        return "no channel: all publishers are disabled or unconfigured, so there is no published set; continue without published.json."
+    return (
+        " If that cannot be read, use ".join(channels)
+        + " Make one read attempt per channel, in this order, stopping at the first readable copy. "
+        "A failed read is final for that channel: do not retry through the contents API, a branch or ref listing, "
+        "or any other route (rule 11)."
+    )
 
 
 _LIMITATION = """
