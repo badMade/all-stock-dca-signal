@@ -3010,11 +3010,57 @@ def test_live_mirror_order_history_refusal_covers_post_batch_verification_and_ow
             "POST-BATCH VERIFICATION FETCH",
             "fills are UNVERIFIED, not failed",
             "never place a replacement",
+            # "STOPS THE REMAINING PLACEMENTS" is vacuous when the refusal lands after the batch;
+            # the paragraph has to say what the stop means there instead of leaving it to inference.
+            "nothing remains to place",
         ):
             assert phrase in paragraph, f"{filename}: a refused post-batch verification fetch is unclassified: {phrase!r}"
 
         stamp = re.match(r"\s*\(\d{4}-\d{2}-\d{2} (\d{4}) ET\)", paragraph)
         assert stamp, f"{filename}: order-history refusal paragraph has no '(YYYY-MM-DD HHMM ET)' slot stamp"
+        assert stamp.group(1) == filename[:4], (
+            f"{filename}: paragraph is stamped {stamp.group(1)} ET but this mirror runs the {filename[:4]} slot"
+        )
+
+
+def test_live_mirror_gate_7_classifies_denied_quote_fetch_as_ticker_local_platform_refusal():
+    """Gate 7 names a classifier-denied per-ticker ``get_equity_quotes`` re-fetch.
+
+    2026-10-20 11:30 ET: the auto-mode classifier intermittently refused the
+    read-only quote re-fetch that Gate 7 runs immediately before each order
+    (price eligibility at the placement boundary). Each refusal cleared on one
+    retry, but the prompt never said what a SECOND refusal means. Unlike the
+    order-history and buying-power fetches, a quote is per-ticker evidence:
+    losing it proves nothing about the account, so the whole batch need not
+    stop. The ticker cannot be placed, though, because its price eligibility
+    is unprovable and a stale quote is never a substitute. Decision (operator
+    left to the recommendation): drop THAT ticker, continue the batch, but two
+    consecutive tickers dropped this way stop the batch, so a classifier that
+    has started refusing every quote cannot be ground through for the whole
+    window. Dropped tickers are alerted with their exact Gate 6.5 ``buy_usd``.
+    """
+    marker = "READ-ONLY REFUSAL, QUOTE"
+    for filename in _LIVE_MIRROR_FILES:
+        text = (PROMPTS_DIR / "live-mirror" / filename).read_text(encoding="utf-8")
+        gate_7 = _gate_section(text, "GATE 7 - PLACE THE ORDERS")
+
+        assert marker in gate_7, f"{filename}: Gate 7 never names a classifier-denied quote re-fetch"
+        paragraph = gate_7.split(marker, 1)[1].splitlines()[0]
+        for phrase in (
+            "get_equity_quotes",
+            "Retry that fetch once and no more",
+            "DROPS THAT TICKER",
+            "never place on a stale or earlier quote",
+            "the batch continues",
+            "TWO CONSECUTIVE",
+            "consume no placement attempt",
+            "UNPLACED TICKERS",
+            "must NOT be resized",
+        ):
+            assert phrase in paragraph, f"{filename}: quote-refusal paragraph is missing {phrase!r}"
+
+        stamp = re.match(r"\s*\(\d{4}-\d{2}-\d{2} (\d{4}) ET\)", paragraph)
+        assert stamp, f"{filename}: quote-refusal paragraph has no '(YYYY-MM-DD HHMM ET)' slot stamp"
         assert stamp.group(1) == filename[:4], (
             f"{filename}: paragraph is stamped {stamp.group(1)} ET but this mirror runs the {filename[:4]} slot"
         )
