@@ -62,8 +62,29 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import dca_config
-from dca_live_adapters import RobinhoodDataProvider
+MIN_PYTHON = (3, 11)  # mirrors ``requires-python`` in pyproject.toml, scripts/backup_planner.py and the .pyz bootstrap
+
+
+def require_supported_python(version_info) -> None:
+    """Exit 2 with this tool's FAILED document when the interpreter is older than ``MIN_PYTHON``.
+
+    ``backup_planner.pyz`` already refuses an old interpreter before it dispatches ``assemble-market-data``; this covers
+    the documented ``python3 -m scripts.assemble_market_data`` form. 2026-10-16 09:49 ET: the Mac shell fallback ran
+    Python 3.9, so the assembler would have died on an import or syntax error with no usable reason. The document and
+    the exit code are the ones this tool already uses for every other refusal (module docstring, "WHAT IT IS NOT"), and
+    it runs before argument parsing, so nothing is ever written. Called before any project import.
+    """
+    if tuple(version_info[:2]) >= MIN_PYTHON:
+        return
+    detail = "python>=%d.%d required, found %d.%d" % (MIN_PYTHON + tuple(version_info[:2]))
+    print(json.dumps({"status": "FAILED", "errors": [{"code": "python_too_old", "detail": detail}]}, indent=2))
+    sys.exit(2)
+
+
+require_supported_python(sys.version_info)
+
+import dca_config  # noqa: E402  (every project import must follow the version guard)
+from dca_live_adapters import RobinhoodDataProvider  # noqa: E402
 
 ET = ZoneInfo("America/New_York")
 ROBINHOOD_BAR_MINUTES = 5  # StrategyConfig.robinhood_interval_minutes: the generator resolves bars at this cadence

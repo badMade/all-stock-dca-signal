@@ -27,6 +27,61 @@ outcome}` that `scripts/same_day_pointer.validate_pointer` rejects as
 `malformed` (missing `run_id`, `run_state_path`, `stream`). The slots fired,
 but nothing they left behind could be verified.
 
+## Daily alert (launchd)
+
+`scripts/schedule_watchdog.py --notify` runs the watchdog below and, when any slot fails, also raises
+a macOS notification naming the date and the failing slot ids. The watchdog's idempotent per-slot alert
+files, exit code and report are unchanged. It exists because the Oct 13-16 2026 aborts each left a Gate 1/2
+alert file nobody read (email undeliverable, message center per-session): files alone were not seen.
+
+The agent template is `deploy/launchd/com.all-stock-dca.schedule-watchdog.plist.template`: it runs
+Mon-Fri at 16:35, after the last slot's grace deadline. The Mac must be pinned to America/New_York
+(launchd has no ET), and `DCA_CRON_TRACKING_ROOT` must match the root the live sessions write to.
+
+```bash
+sed -e "s|REPLACE_WITH_REPO_PATH|$PWD|g" -e "s|REPLACE_WITH_CRON_TRACKING_ROOT|$PWD/cron_tracking|g" \
+  deploy/launchd/com.all-stock-dca.schedule-watchdog.plist.template \
+  > ~/Library/LaunchAgents/com.all-stock-dca.schedule-watchdog.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.schedule-watchdog.plist
+launchctl kickstart gui/$(id -u)/com.all-stock-dca.schedule-watchdog   # run once now to test
+```
+
+If the first run is blocked by macOS privacy protection, grant the venv Python access to
+`~/Documents` as for the robinhood-payload agent. Notifications may need allowing for
+`osascript` under System Settings > Notifications.
+
+## Stale-planner check (launchd)
+
+`scripts/planner_stamp_check.py` answers one question each weekday morning: is the `backup_planner.pyz` you
+pasted into Perplexity still the planner `origin/main` builds? Step 0 of every backup prompt demands the planner's
+`content_sha256`, and that hash moves whenever any file inside the planner changes (it moved four times on
+2026-10-21 for changes unrelated to the one being shipped). A stale planner costs a missed slot and nothing flagged it.
+A cloud routine cannot run this check (a scheduled session has no repo or GitHub credentials, confirmed
+2026-10-21), so it runs on the Mac next to the checkout.
+
+* **Baseline** is the stamp inside your own `backup_planner.pyz`; nothing is stored anywhere else, so nothing needs
+  updating after a repaste. Keep the attached file at `<checkout>/backup_planner.pyz`.
+* **Fresh stamp** comes from `git fetch origin main`, then a planner built from that ref in a temporary directory.
+  The checkout's working tree, branch and uncommitted edits are never touched.
+* Exit `0` unchanged (silent), `1` stale, `2` could not check. `--notify` raises a macOS notification on `1` and `2`:
+  a silent failed check looks exactly like "all good". The JSON report holds hashes, a commit and a status only.
+
+```bash
+python3 -m scripts.planner_stamp_check --planner backup_planner.pyz            # run it by hand
+sed -e "s|REPLACE_WITH_REPO_PATH|$PWD|g" \
+  deploy/launchd/com.all-stock-dca.planner-stamp-check.plist.template \
+  > ~/Library/LaunchAgents/com.all-stock-dca.planner-stamp-check.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.planner-stamp-check.plist
+launchctl kickstart gui/$(id -u)/com.all-stock-dca.planner-stamp-check            # run once now to test
+```
+
+The agent runs Mon-Fri at 07:45, at least an hour before the earliest slot window opens (09:35), on Mac-local time
+(pin the Mac to America/New_York). When it reports STALE: `git pull`, rebuild with
+`python3 -m scripts.build_backup_planner --out backup_planner.pyz`, refill the prompts, run
+`scripts.verify_perplexity_pair`, then attach the planner and repaste the prompts (see
+`claude/dca-executor-prompts/perplexity/README.md`). It needs `git` to be able to fetch the remote without a prompt
+(a credential helper or SSH key); if the fetch fails it reports ERROR instead of guessing.
+
 ## Verify a day
 
 ```bash
@@ -85,12 +140,16 @@ reporting only; the exit status still reflects slot evidence alone.
 
 ### Reporting without `list_scheduled_tasks` (2026-10-20)
 
-A verifier or digest session that lacks the `list_scheduled_tasks` tool cannot
-know whether the executor tasks are enabled or when they last or next run. It
-reports `enabled`, `lastRunAt` and `nextRunAt` as `UNKNOWN`, which is a finding
-and never a pass. `list_triggers` is not a substitute: it returns reminders, not
-the executor tasks. Slot outcomes still come from `verify_schedule` and
-`run_state.json`, and a task's `lastRunAt` is never evidence of success.
+A verifier or digest session that lacks the `list_scheduled_tasks` tool may read
+task status from `list_triggers`, but only when that tool actually lists the
+executor tasks (`enabled`, `last_fired_at` and `next_run_at` stand in for
+`enabled`, `lastRunAt` and `nextRunAt`). What `list_triggers` returns depends on
+the session: on 2026-10-20 one run saw only unrelated reminders, while a session
+checked on 2026-10-21 saw all seven executor tasks with their `last_run`. For any
+executor task neither tool shows, the session reports `enabled`, `lastRunAt` and
+`nextRunAt` as `UNKNOWN`, which is a finding and never a pass. Slot outcomes still
+come from `verify_schedule` and `run_state.json`, and a task's `lastRunAt` is
+never evidence of success.
 
 A 2026-10-20 run grouped broker orders into clusters and guessed which slot made
 each from order times. Those times do not line up with slot times (scheduler
@@ -114,6 +173,11 @@ python3 -m scripts.finalize_run_evidence --slot 1430 \
   and the prompt's own Gate 1 window (nominal − 5 min). The end of the window
   is exclusive, as in `gate_time_sanity`. An off-window fire is not a
   scheduled fire.
+- Finalizer states keep `generated_at` and `finalized_at` as the artifact write
+  time. Risk accounting uses `run_classification.triggered_at_utc`, floored at
+  the trading day's nominal `scheduled_for_et`, so delayed backfills retain
+  their original date and accepted early afternoon fires count toward the
+  afternoon guard. A missing invocation clock is not replaced by write time.
 - It refuses order rows that aren't real orders. Every row needs a ticker, a
   broker `order_id`, a positive `submitted_amount_usd` and a status from
   `ORDER_ATTEMPT_STATUSES`, and duplicate ids are rejected. `submitted` also
@@ -127,6 +191,11 @@ python3 -m scripts.finalize_run_evidence --slot 1430 \
   `build_afternoon_live_run_classification` for 15:30.
 - It writes `run_state.json` and `run_summary.json`, plus header-only CSVs
   where missing, then checks them with `validate_run_artifacts`.
+- For states it builds, `generated_at` records the supplied fire time
+  (`--started-at`), clamped to no earlier than the nominal slot time for
+  accepted early starts. The classification retains the actual start, while
+  `finalized_at` records when finalization ran. This keeps historical and
+  early-start afternoon evidence eligible regardless of the backfill's clock.
 - It refreshes the pointer through `same_day_pointer.refresh_latest_pointer`,
   or `update_latest_scheduled_run_pointer` for 15:30, then re-validates the
   pointer and the slot. It exits 0 only when both verify.

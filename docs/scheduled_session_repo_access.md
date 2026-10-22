@@ -98,6 +98,20 @@ is a real-money-affecting change and needs a decision from the user, not a
 unilateral edit from a probe session — the mapping from Routine name to
 what it actually fires still needs to be nailed down first.
 
+**Update (2026-10-21):** the first sentence of that correction does not hold
+for every session. A later check from a different session found that
+`list_triggers` returned each task's prompt (as `derived_state.prompt`) along
+with `enabled`, the schedule, `last_fired_at`, `next_run_at` and `last_run`, and
+that it listed the seven executor tasks by name (`935 am dca morning buy`,
+`1030 dca recurring buy`, `1130 mornig buying run`, `1230 pm midday buying run`,
+`130 pm afternoon buyiing run`, `230 pm afternoon buying run`,
+`330 final buying run`) with their cron schedules. So at least those seven are
+trigger-listed scheduled tasks whose prompts a session can read. What
+`list_triggers` returns depends on the session: the 2026-10-20 verifier run saw
+only unrelated reminders (see `docs/schedule_verification.md`). The open
+question above about any `DCA Verify ...` Routine is unchanged: none appeared in
+the pages of the list that check read, and it did not read the whole list.
+
 **Open question for the next probe:** does a self-bound Routine, when it
 fires after its originating session's container has been reclaimed, land
 back in a working `all-stock-dca` checkout at the current `origin/main`, or

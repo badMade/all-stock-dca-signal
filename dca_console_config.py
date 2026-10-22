@@ -36,11 +36,10 @@ GRID_STEP_PCT = 0.25
 # Sample drops for each per-ticker calibrated curve in ladder_preview (the 96-tier
 # curve is too long to list per ticker; these show its shape up to the 16% grid top).
 PER_TICKER_CURVE_DROPS_PCT = (0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0)
-BANNER = "This console never places, reviews or cancels orders; live placement happens only in external agent sessions."
-PARITY_NOTE = (
-    "Structural, in-process comparison only; the authoritative gate is the "
-    "config-invariants job (tests/test_config_invariants.py)."
-)
+BANNER = ("This console never places, reviews or cancels orders; "
+          "live placement happens only in external agent sessions.")
+PARITY_NOTE = ("Structural, in-process comparison only; the authoritative gate is the "
+               "config-invariants job (tests/test_config_invariants.py).")
 STREAMS = ("market_open", "morning", "midday", "intraday")
 
 # Every config/*.json stem, the schemas/ stem it validates against (None for the
@@ -74,25 +73,17 @@ STEMS = frozenset(stem for stem, _schema, _publisher in CONFIG_FILES)
 # Which loader reads each file. Files with no dca_config loader name the
 # consumer that does read them so the page never shows a bare "unknown".
 LOADERS: dict[str, str] = {
-    "tickers": "dca_config.load_tickers",
-    "budgets": "dca_config.load_budgets",
-    "sizing_ladder": "dca_config.load_sizing_tiers",
-    "per_ticker_sizing": "dca_config.load_per_ticker_sizing",
+    "tickers": "dca_config.load_tickers", "budgets": "dca_config.load_budgets",
+    "sizing_ladder": "dca_config.load_sizing_tiers", "per_ticker_sizing": "dca_config.load_per_ticker_sizing",
     "inverse_martingale": "dca_config.load_inverse_martingale_config",
     "ml_sizing_adjustment": "dca_config.load_ml_sizing_adjustment",
-    "trading_window": "dca_config.load_approved_dates",
-    "near_close_dca": "dca_config.load_near_close_overrides",
+    "trading_window": "dca_config.load_approved_dates", "near_close_dca": "dca_config.load_near_close_overrides",
     "backtest_sizing_ladder": "dca_config.load_backtest_sizing_tiers",
     "market_calendar": "dca_runner (Gate 0 market_day_status)",
-    "morning_dca": "morning_dca.load_morning_config",
-    "market_open_dca": "market_open_dca.load_market_open_config",
-    "midday_dca": "midday_dca.load_midday_config",
-    "intraday_dca": "intraday_dca.load_intraday_config",
-    "scheduled_tasks": "dca_console_data (schedule) / scripts",
-    "run_classification": "scripts.run_classification",
-    "notifications": "dca_alerts",
-    "reporting": "dca_reporting",
-    "self_heal": "self-heal workflow",
+    "morning_dca": "morning_dca.load_morning_config", "market_open_dca": "market_open_dca.load_market_open_config",
+    "midday_dca": "midday_dca.load_midday_config", "intraday_dca": "intraday_dca.load_intraday_config",
+    "scheduled_tasks": "dca_console_data (schedule) / scripts", "run_classification": "scripts.run_classification",
+    "notifications": "dca_alerts", "reporting": "dca_reporting", "self_heal": "self-heal workflow",
     "notion_issue_loop": "selfheal.notion_issue_loop.load_config",
     "backtest_intraday_cap_curve": "analytics only; never loaded live",
     "recommendations": "dca_rec_store.load_settings (plan-first courier and reader)",
@@ -104,27 +95,15 @@ LOADERS: dict[str, str] = {
 # trading_window (1108-1125) each raise on their own malformed shapes;
 # ml_sizing_adjustment alone folds a parse failure into {} (905-908).
 FAIL_MODES: dict[str, str] = {
-    "tickers": "raises",
-    "budgets": "raises",
-    "sizing_ladder": "raises",
-    "per_ticker_sizing": "raises",
-    "inverse_martingale": "raises",
-    "trading_window": "raises",
-    "near_close_dca": "raises",
-    "backtest_sizing_ladder": "raises",
-    "self_heal": "raises",
-    "notion_issue_loop": "raises",
+    "tickers": "raises", "budgets": "raises", "sizing_ladder": "raises", "per_ticker_sizing": "raises",
+    "inverse_martingale": "raises", "trading_window": "raises", "near_close_dca": "raises",
+    "backtest_sizing_ladder": "raises", "self_heal": "raises", "notion_issue_loop": "raises",
     "market_calendar": "raises",
     "recommendations": "raises",
-    "market_open_dca": "fails closed",
-    "morning_dca": "fails closed",
-    "midday_dca": "fails closed",
+    "market_open_dca": "fails closed", "morning_dca": "fails closed", "midday_dca": "fails closed",
     "intraday_dca": "fails closed",
-    "ml_sizing_adjustment": "degrades",
-    "scheduled_tasks": "degrades",
-    "notifications": "degrades",
-    "reporting": "degrades",
-    "run_classification": "degrades",
+    "ml_sizing_adjustment": "degrades", "scheduled_tasks": "degrades", "notifications": "degrades",
+    "reporting": "degrades", "run_classification": "degrades",
     "backtest_intraday_cap_curve": "n/a",
 }
 
@@ -159,15 +138,12 @@ def _text(value: Any, limit: int = MAX_TEXT) -> str | None:
     """
     if value is None:
         return None
-    scanned = str(value)[: limit * _SCAN_LIMIT_FACTOR].replace("\n", " ")
+    scanned = str(value)[:limit * _SCAN_LIMIT_FACTOR].replace("\n", " ")
     return redact_value(_scrub_paths(scanned))[:limit]
 
 
 def _finite(value: Any) -> float | None:
-    try:
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-            return None
-    except OverflowError:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
     return float(value)
 
@@ -251,8 +227,7 @@ def _env_reference(text: str) -> str:
     # the value never enters the response (set == non-empty, exactly the rule
     # dca_config.expand_config_env applies).
     return dca_config._ENV_PLACEHOLDER.sub(
-        lambda match: f"env reference {match.group(1)} ({'set' if os.environ.get(match.group(1)) else 'unset'})", text
-    )
+        lambda match: f"env reference {match.group(1)} ({'set' if os.environ.get(match.group(1)) else 'unset'})", text)
 
 
 def _view_safe(value: Any, depth: int = 0) -> Any:
@@ -295,22 +270,13 @@ def config_catalog(config_dir: Path, repo: Path) -> dict[str, Any]:
         schema_ref = _text(ref, 120) if isinstance(ref, str) else None
         if schema_ref and schema_stem and not schema_ref.endswith(f"{schema_stem}.schema.json"):
             reader.warn(f"{name} names a different schema than the catalog expects.")
-        rows.append(
-            {
-                "stem": stem,
-                "exists": exists,
-                "size": size,
-                "modified": modified,
-                "schema_ref": schema_ref,
-                "schema_stem": schema_stem,
-                "schema_exists": (schemas_dir / f"{schema_stem}.schema.json").is_file() if schema_stem else None,
-                "parse_ok": data is not None if exists else None,
-                "error": error,
-                "publisher_only": publisher_only,
-                "loader": LOADERS.get(stem, "unknown"),
-                "fail_mode": FAIL_MODES.get(stem, "unknown"),
-            }
-        )
+        rows.append({
+            "stem": stem, "exists": exists, "size": size, "modified": modified, "schema_ref": schema_ref,
+            "schema_stem": schema_stem,
+            "schema_exists": (schemas_dir / f"{schema_stem}.schema.json").is_file() if schema_stem else None,
+            "parse_ok": data is not None if exists else None, "error": error, "publisher_only": publisher_only,
+            "loader": LOADERS.get(stem, "unknown"), "fail_mode": FAIL_MODES.get(stem, "unknown"),
+        })
     return {"files": rows, "warnings": warnings}
 
 
@@ -322,14 +288,8 @@ def config_file_view(config_dir: Path, stem: str) -> dict[str, Any]:
     view cut at 200 KB.
     """
     warnings: list[str] = []
-    result: dict[str, Any] = {
-        "stem": _text(stem, 80),
-        "found": False,
-        "text": None,
-        "truncated": False,
-        "error": None,
-        "warnings": warnings,
-    }
+    result: dict[str, Any] = {"stem": _text(stem, 80), "found": False, "text": None, "truncated": False,
+                              "error": None, "warnings": warnings}
     if stem not in STEMS:
         warnings.append("Unknown config file.")
         return result
@@ -355,13 +315,9 @@ def _universe_check(name: str, documented: list[str] | None, constant: Any, orde
     if documented is None:
         return _check(name, None, "tickers.json value unavailable")
     ok = documented == list(constant) if ordered else set(documented) == set(constant)
-    return _check(
-        name,
-        ok,
-        f"tickers.json has {len(documented)}, near_close_dca has {len(constant)}; "
-        f"only in json: {sorted(set(documented) - set(constant)) or 'none'}; "
-        f"only in constant: {sorted(set(constant) - set(documented)) or 'none'}",
-    )
+    return _check(name, ok, f"tickers.json has {len(documented)}, near_close_dca has {len(constant)}; "
+                            f"only in json: {sorted(set(documented) - set(constant)) or 'none'}; "
+                            f"only in constant: {sorted(set(constant) - set(documented)) or 'none'}")
 
 
 def _schema_exists(config_dir: Path, ref: str) -> bool | None:
@@ -411,25 +367,16 @@ def parity_checks(config_dir: Path) -> dict[str, Any]:
     if not isinstance(entries, dict):
         checks.append(_check("whole_share_sizing_entries", None, "per_ticker_sizing.json tickers unavailable"))
     else:
-        missing = sorted(
-            t
-            for t in near_close_dca.WHOLE_SHARE_TICKERS
-            if not isinstance(entries.get(t), dict)
-            or entries[t].get("base_amount_usd") != 1.0
-            or entries[t].get("base_amount_below_close_usd") != 1.0
-        )
-        checks.append(
-            _check("whole_share_sizing_entries", not missing, f"missing or not $1-based: {missing or 'none'}")
-        )
+        missing = sorted(t for t in near_close_dca.WHOLE_SHARE_TICKERS if not isinstance(entries.get(t), dict)
+                         or entries[t].get("base_amount_usd") != 1.0 or entries[t].get("base_amount_below_close_usd") != 1.0)
+        checks.append(_check("whole_share_sizing_entries", not missing, f"missing or not $1-based: {missing or 'none'}"))
     breakers = budgets.get("circuit_breakers") if budgets else None
     if budgets is None:
         checks.append(_check("budgets_breaker", None, "budgets.json unavailable"))
     else:
         streak = breakers.get("max_consecutive_placement_failures") if isinstance(breakers, dict) else None
         ok = isinstance(streak, int) and not isinstance(streak, bool) and streak >= 2
-        checks.append(
-            _check("budgets_breaker", ok, f"circuit_breakers.max_consecutive_placement_failures = {streak!r}")
-        )
+        checks.append(_check("budgets_breaker", ok, f"circuit_breakers.max_consecutive_placement_failures = {streak!r}"))
     bad = []
     for stem, _schema, _publisher in CONFIG_FILES:
         data = _raw(config_dir, stem, warnings)
@@ -474,21 +421,12 @@ def effective_config(config_dir: Path, now: datetime) -> dict[str, Any]:
                 # only. A literal "${VAR}" that survived the overlay is unset.
                 text = value if isinstance(value, str) else ""
                 unresolved.extend(n for n in dca_config._ENV_PLACEHOLDER.findall(text) if not os.environ.get(n))
-                placeholder = text in ("", near_close_dca._UNSET_ACCOUNT_SENTINEL) or bool(
-                    dca_config._ENV_PLACEHOLDER.fullmatch(text)
-                )
+                placeholder = text in ("", near_close_dca._UNSET_ACCOUNT_SENTINEL) or bool(dca_config._ENV_PLACEHOLDER.fullmatch(text))
                 value = "unset" if placeholder else "configured"
             elif field.name in ("dry_run", "broker"):
                 note = "never settable from JSON"
-            fields.append(
-                {
-                    "name": field.name,
-                    "value": _json_safe(value),
-                    "default_differs": differs,
-                    "source": "json" if differs else "default",
-                    "note": note,
-                }
-            )
+            fields.append({"name": field.name, "value": _json_safe(value), "default_differs": differs,
+                           "source": "json" if differs else "default", "note": note})
     return {"fields": fields, "unresolved_env": sorted(set(unresolved)), "warnings": warnings}
 
 
@@ -498,16 +436,10 @@ def _grid_row(drop_pct: float, config: Any, ticker: str | None) -> dict[str, Any
     # reduced ($1-scale) base for any positive drop and $0 at zero drop; the
     # full base needs a prior low the preview deliberately does not invent.
     base, reason = near_close_dca.select_first_allocation_base_usd(
-        100.0 * (1.0 - drop_pct / 100.0), 100.0, None, config, ticker
-    )
+        100.0 * (1.0 - drop_pct / 100.0), 100.0, None, config, ticker)
     multiplier = near_close_dca.graded_buy_multiplier(drop_pct / 100.0, config, ticker=ticker)
-    return {
-        "drop_pct": drop_pct,
-        "multiplier": _finite(multiplier),
-        "base_usd": _finite(base),
-        "base_reason": reason,
-        "candidate_usd": _finite(round(base * multiplier, 4)),
-    }
+    return {"drop_pct": drop_pct, "multiplier": _finite(multiplier), "base_usd": _finite(base),
+            "base_reason": reason, "candidate_usd": _finite(round(base * multiplier, 4))}
 
 
 def _config_or_defaults(config_dir: Path, now: datetime, warnings: list[str]) -> Any:
@@ -542,22 +474,15 @@ def ladder_preview(config_dir: Path) -> dict[str, Any]:
         # global fallback ladder), so each row carries its ceiling, whether tiers are
         # blended or stepped, and sampled points from graded_buy_multiplier itself so
         # the preview cannot drift from the live function.
-        per_ticker.append(
-            {
-                "ticker": _text(ticker, 16),
-                "entries": len(curve_tiers),
-                "version": version,
-                "max_multiplier": max((multiplier for _drop, multiplier in curve_tiers), default=0.0),
-                "interpolation": "linear" if model.get("interpolate") else "stepped",
-                "curve": [
-                    {
-                        "drop_pct": drop,
-                        "multiplier": near_close_dca.graded_buy_multiplier(drop / 100, config, ticker=ticker),
-                    }
-                    for drop in PER_TICKER_CURVE_DROPS_PCT
-                ],
-            }
-        )
+        per_ticker.append({
+            "ticker": _text(ticker, 16), "entries": len(curve_tiers), "version": version,
+            "max_multiplier": max((multiplier for _drop, multiplier in curve_tiers), default=0.0),
+            "interpolation": "linear" if model.get("interpolate") else "stepped",
+            "curve": [
+                {"drop_pct": drop, "multiplier": near_close_dca.graded_buy_multiplier(drop / 100, config, ticker=ticker)}
+                for drop in PER_TICKER_CURVE_DROPS_PCT
+            ],
+        })
     return {"grid": grid, "tiers": tiers, "per_ticker": per_ticker, "warnings": warnings}
 
 
@@ -600,39 +525,25 @@ def stream_flags(config_dir: Path) -> dict[str, Any]:
         note = data.get("live_execution_enabled_note") if data else None
         if data is not None and flag is None:
             note = note or "live_execution_enabled is not declared in this file; the executor mode decides."
-        streams.append(
-            {
-                "stream": stream,
-                "file": f"{stream}_dca.json",
-                "found": data is not None,
-                "live_execution_enabled": flag if isinstance(flag, bool) else None,
-                "note": _text(note),
-                "confidence_rule": _text(data.get("confidence_rule")) if data else None,
-                "trend_min_bars": data.get("trend_min_bars")
-                if data
-                and isinstance(data.get("trend_min_bars"), int)
-                and not isinstance(data.get("trend_min_bars"), bool)
-                else None,
-                "slots": _slot_ids(stream, data) if data else [],
-            }
-        )
+        streams.append({
+            "stream": stream, "file": f"{stream}_dca.json", "found": data is not None,
+            "live_execution_enabled": flag if isinstance(flag, bool) else None, "note": _text(note),
+            "confidence_rule": _text(data.get("confidence_rule")) if data else None,
+            "trend_min_bars": data.get("trend_min_bars") if data and isinstance(data.get("trend_min_bars"), int)
+            and not isinstance(data.get("trend_min_bars"), bool) else None,
+            "slots": _slot_ids(stream, data) if data else [],
+        })
     policy = _raw(config_dir, "run_classification", warnings)
     summary = None
     if policy is not None:
         scheduled = policy.get("scheduled_run_classification")
         manual = policy.get("manual_run_classification")
-
-        def pick(block, keys):
-            return {key: _json_safe(block.get(key)) for key in keys} if isinstance(block, dict) else None
-
+        pick = lambda block, keys: {key: _json_safe(block.get(key)) for key in keys} if isinstance(block, dict) else None  # noqa: E731
         summary = {
-            "policy_id": _text(policy.get("policy_id"), 80),
-            "version": _text(policy.get("version"), 40),
+            "policy_id": _text(policy.get("policy_id"), 80), "version": _text(policy.get("version"), 40),
             "state_schema_version": _text(policy.get("state_schema_version"), 80),
             "accepted_state_schema_versions": _json_safe(policy.get("accepted_state_schema_versions")),
-            "scheduled": pick(
-                scheduled, ("run_origin", "cron_id", "supersedes_cron_id", "scheduled_for_et", "run_id_pattern")
-            ),
+            "scheduled": pick(scheduled, ("run_origin", "cron_id", "supersedes_cron_id", "scheduled_for_et", "run_id_pattern")),
             "manual": pick(manual, ("run_origin", "manual_run", "run_id_pattern", "required_fields")),
         }
     return {"streams": streams, "run_classification": summary, "warnings": warnings}
@@ -653,16 +564,11 @@ def sizing_sources(config_dir: Path, now: datetime) -> dict[str, Any]:
         except ValueError:
             stale = None
     adjustments = ml_raw.get("adjustments")
-    ml = {
-        "status": _text(ml_raw.get("status"), 40),
-        "generated_at": _text(generated, 40),
-        "model_version": _text(ml_raw.get("model_version"), 80),
-        "bounds": _json_safe(ml_raw.get("bounds")),
-        "max_staleness_hours": hours,
-        "stale": stale,
-        "adjustment_count": len(adjustments) if isinstance(adjustments, dict) else None,
-        "applied_count": len(ml_loaded),
-    }
+    ml = {"status": _text(ml_raw.get("status"), 40), "generated_at": _text(generated, 40),
+          "model_version": _text(ml_raw.get("model_version"), 80), "bounds": _json_safe(ml_raw.get("bounds")),
+          "max_staleness_hours": hours, "stale": stale,
+          "adjustment_count": len(adjustments) if isinstance(adjustments, dict) else None,
+          "applied_count": len(ml_loaded)}
     pt_raw = _raw(config_dir, "per_ticker_sizing", warnings) or {}
     entries, fallback = pt_raw.get("tickers"), pt_raw.get("fallback_tickers")
     try:
@@ -671,13 +577,9 @@ def sizing_sources(config_dir: Path, now: datetime) -> dict[str, Any]:
         # Same TypeError shape as ladder_preview: float(None) inside the loader.
         _warn_loader(warnings, config_dir, "per_ticker_sizing.json", exc)
         loaded_count = None
-    per_ticker = {
-        "status": _text(pt_raw.get("status"), 40),
-        "version": _text(pt_raw.get("version"), 40),
-        "entry_count": len(entries) if isinstance(entries, dict) else None,
-        "fallback_count": len(fallback) if isinstance(fallback, list) else None,
-        "loaded_count": loaded_count,
-    }
+    per_ticker = {"status": _text(pt_raw.get("status"), 40), "version": _text(pt_raw.get("version"), 40),
+                  "entry_count": len(entries) if isinstance(entries, dict) else None,
+                  "fallback_count": len(fallback) if isinstance(fallback, list) else None, "loaded_count": loaded_count}
     return {"ml": ml, "per_ticker": per_ticker, "publisher_only": True, "warnings": warnings}
 
 
@@ -704,54 +606,27 @@ def live_gate_summary(config_dir: Path, day: date) -> dict[str, Any]:
         "unknown",
         "RobinhoodBroker.enable_live_orders is injected by the external runner and is not observable from this checkout.",
     )
-    gates = [
-        _gate(
-            "strategy_dry_run",
-            "unconfigured",
-            f"StrategyConfig.dry_run defaults to {near_close_dca.StrategyConfig().dry_run} and no JSON can set it; "
-            f"near_close_dca.json is {'literally {}' if empty else 'not empty' if overrides is not None else 'absent'}.",
-        ),
-        broker_gate,
-    ]
+    gates = [_gate("strategy_dry_run", "unconfigured",
+                   f"StrategyConfig.dry_run defaults to {near_close_dca.StrategyConfig().dry_run} and no JSON can set it; "
+                   f"near_close_dca.json is {'literally {}' if empty else 'not empty' if overrides is not None else 'absent'}."),
+             broker_gate]
     if not observed:
         gates.append(_gate("stream_live_execution_enabled", "unknown", "no stream policy file could be read."))
     else:
-        gates.append(
-            _gate(
-                "stream_live_execution_enabled",
-                "configured" if enabled else "unconfigured",
-                f"enabled for: {', '.join(enabled) or 'no stream'} "
-                f"({len(observed)} of {len(STREAMS)} stream files read).",
-            )
-        )
+        gates.append(_gate("stream_live_execution_enabled", "configured" if enabled else "unconfigured",
+                           f"enabled for: {', '.join(enabled) or 'no stream'} "
+                           f"({len(observed)} of {len(STREAMS)} stream files read)."))
     present = bool(os.environ.get("ROBINHOOD_AGENTIC_ACCOUNT_NUMBER"))
-    gates.append(
-        _gate(
-            "account_number_env",
-            "configured" if present else "unconfigured",
-            f"ROBINHOOD_AGENTIC_ACCOUNT_NUMBER is {'present' if present else 'absent'} in this process.",
-        )
-    )
+    gates.append(_gate("account_number_env", "configured" if present else "unconfigured",
+                       f"ROBINHOOD_AGENTIC_ACCOUNT_NUMBER is {'present' if present else 'absent'} in this process."))
     window = window_countdown(config_dir, day)
     warnings.extend(w for w in window["warnings"] if w not in warnings)
     covered = window["in_window"]
-    gates.append(
-        _gate(
-            "approved_trading_window",
-            "unknown" if covered is None else "configured" if covered else "unconfigured",
-            f"window {window['start']} to {window['end']}; {day.isoformat()} {'is' if covered else 'is not'} approved.",
-        )
-    )
+    gates.append(_gate("approved_trading_window", "unknown" if covered is None else "configured" if covered else "unconfigured",
+                       f"window {window['start']} to {window['end']}; {day.isoformat()} {'is' if covered else 'is not'} approved."))
     try:
         from dca_runner import SLOTS
-
-        gates.append(
-            _gate(
-                "slot_windows",
-                "configured" if SLOTS else "unconfigured",
-                f"{len(SLOTS)} slot windows in dca_runner.SLOTS.",
-            )
-        )
+        gates.append(_gate("slot_windows", "configured" if SLOTS else "unconfigured", f"{len(SLOTS)} slot windows in dca_runner.SLOTS."))
     except Exception as exc:  # noqa: BLE001 - dca_runner reads config at import; report, never raise
         warnings.append("dca_runner could not be imported; the slot roster is unavailable.")
         gates.append(_gate("slot_windows", "unknown", f"import failed: {type(exc).__name__}"))
@@ -765,17 +640,9 @@ def window_countdown(config_dir: Path, day: date) -> dict[str, Any]:
     ``expiring_warning`` mirrors near_close_dca.warn_if_window_expiring's rule.
     """
     warnings: list[str] = []
-    result: dict[str, Any] = {
-        "start": None,
-        "end": None,
-        "days_remaining": None,
-        "in_window": None,
-        "expired": None,
-        "expiring_warning": None,
-        "calendar_years": None,
-        "calendar_covers_day": None,
-        "warnings": warnings,
-    }
+    result: dict[str, Any] = {"start": None, "end": None, "days_remaining": None, "in_window": None,
+                              "expired": None, "expiring_warning": None, "calendar_years": None,
+                              "calendar_covers_day": None, "warnings": warnings}
     try:
         approved = dca_config.load_approved_dates(Path(config_dir)).get("approved_test_dates")
     except (ValueError, TypeError) as exc:
@@ -784,17 +651,9 @@ def window_countdown(config_dir: Path, day: date) -> dict[str, Any]:
     if approved:
         in_window, end, remaining = near_close_dca.approved_window_status(approved, day)
         expired = end is not None and day > end
-        result.update(
-            {
-                "start": min(approved).isoformat(),
-                "end": end.isoformat() if end else None,
-                "days_remaining": remaining,
-                "in_window": in_window,
-                "expired": expired,
-                "expiring_warning": expired
-                or (in_window and remaining <= near_close_dca.APPROVED_WINDOW_EXPIRY_WARN_DAYS),
-            }
-        )
+        result.update({"start": min(approved).isoformat(), "end": end.isoformat() if end else None,
+                       "days_remaining": remaining, "in_window": in_window, "expired": expired,
+                       "expiring_warning": expired or (in_window and remaining <= near_close_dca.APPROVED_WINDOW_EXPIRY_WARN_DAYS)})
     elif approved is not None:
         warnings.append("trading_window.json approves no dates.")
     calendar = _raw(config_dir, "market_calendar", warnings)
@@ -807,14 +666,9 @@ def window_countdown(config_dir: Path, day: date) -> dict[str, Any]:
 
 def build_config_snapshot(config_dir: Path, repo: Path, now: datetime, day: date) -> dict[str, Any]:
     """Compose the Config page's panels (no file views, no ladder grid) with merged warnings."""
-    parts = {
-        "catalog": config_catalog(config_dir, repo),
-        "parity": parity_checks(config_dir),
-        "streams": stream_flags(config_dir),
-        "sizing": sizing_sources(config_dir, now),
-        "gates": live_gate_summary(config_dir, day),
-        "countdown": window_countdown(config_dir, day),
-    }
+    parts = {"catalog": config_catalog(config_dir, repo), "parity": parity_checks(config_dir),
+             "streams": stream_flags(config_dir), "sizing": sizing_sources(config_dir, now),
+             "gates": live_gate_summary(config_dir, day), "countdown": window_countdown(config_dir, day)}
     warnings: list[str] = []
     for part in parts.values():
         warnings.extend(w for w in part["warnings"] if w not in warnings)
