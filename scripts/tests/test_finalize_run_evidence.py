@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import dca_risk
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts import finalize_run_evidence as fre  # noqa: E402
@@ -91,6 +93,41 @@ def test_every_slot_finalizes_to_verified_evidence(tmp_path, slot_id):
     assert slots[slot_id] == "verified"
 
 
+@pytest.mark.parametrize("slot_id", ["1130", "1330", "1430", "1530"])
+@pytest.mark.parametrize("write_hour", [9, 17])
+def test_afternoon_risk_evidence_uses_invocation_not_finalization_time(tmp_path, slot_id, write_hour):
+    written = datetime(2026, 10, 21, write_hour, 0, tzinfo=ET)
+    result = fre.finalize(
+        slot_id,
+        started(slot_id),
+        outcome="GATE2_ABORT",
+        order_submit_status="not_submitted_error",
+        root=tmp_path,
+        now=written,
+    )
+    assert result["verified"] is True, result["errors"]
+    run_dir = tmp_path / slot_run_dir_relative(slot_id, DAY)
+    state = json.loads((run_dir / "run_state.json").read_bytes())
+    assert datetime.fromisoformat(state["generated_at"]) == written
+    assert dca_risk.run_timestamp_et(state) == started(slot_id)
+    assert dca_risk.is_afternoon_scheduled_evidence(state) is (slot_id in ("1430", "1530"))
+    # A missing or corrupt invocation clock must not fall back to write time.
+    for invalid in (None, "not-a-timestamp", True):
+        state["run_classification"]["triggered_at_utc"] = invalid
+        assert dca_risk.run_timestamp_et(state) is None
+        assert not dca_risk.is_afternoon_scheduled_evidence(state)
+
+
+@pytest.mark.parametrize("field", ["trading_day", "scheduled_for_et"])
+@pytest.mark.parametrize("invalid", [None, "", "invalid", True])
+def test_finalizer_risk_timestamp_without_nominal_slot_uses_fire_time(tmp_path, field, invalid):
+    result = run(tmp_path)
+    state = json.loads((tmp_path / result["run_dir"] / "run_state.json").read_bytes())
+    target = state if field == "trading_day" else state["run_classification"]
+    target[field] = invalid
+    assert dca_risk.run_timestamp_et(state) == started("1430")
+
+
 @pytest.mark.parametrize("slot_id", ["1430", "1530"])
 def test_default_root_from_env_is_a_str_but_finalizes(tmp_path, monkeypatch, slot_id):
     # 2026-10-19 3:30 PM: cron_tracking_root() returns a str, so omitting root= made
@@ -114,6 +151,47 @@ def test_live_classification_is_the_executors_own(tmp_path):
     expected["account_number_redacted"] = True
     assert state["run_classification"] == expected
     assert "999000111" not in (tmp_path / "intraday_dca/20260922_1330ET/run_state.json").read_text()
+
+
+@pytest.mark.parametrize("slot_id", ["1430", "1530"])
+@pytest.mark.parametrize("hour, minute", [(0, 0), (9, 0), (14, 29), (16, 0), (23, 59)])
+def test_backfilled_afternoon_evidence_uses_fire_time(tmp_path, slot_id, hour, minute):
+    import dca_risk
+
+    fire = started(slot_id, minute=0)
+    finalized = datetime(2026, 10, 21, hour, minute, tzinfo=ET)
+    result = fre.finalize(
+        slot_id,
+        fire,
+        outcome="BACKFILL_GATE2_ABORT_ZERO_DEPLOYMENT",
+        order_submit_status="not_submitted_error",
+        error_class="backfill_gate2_abort",
+        root=tmp_path,
+        now=finalized,
+    )
+    assert result["verified"] is True, result["errors"]
+    state = json.loads((tmp_path / result["run_dir"] / "run_state.json").read_bytes())
+    assert dca_risk.run_timestamp_et(state) == fire
+    assert dca_risk.is_afternoon_scheduled_evidence(state)
+    assert datetime.fromisoformat(state["generated_at"]) == finalized
+    assert datetime.fromisoformat(state["finalized_at"]) == finalized
+    assert state["trading_day"] == fire.date().isoformat()
+    summary = json.loads((tmp_path / result["run_dir"] / "run_summary.json").read_bytes())
+    assert summary["generated_at"] == state["generated_at"]
+
+
+@pytest.mark.parametrize("slot_id", ["1430", "1530"])
+def test_early_afternoon_fire_still_counts_as_afternoon_deployment(tmp_path, slot_id):
+    import dca_risk
+
+    fire = started(slot_id, minute=-5)
+    result = run(tmp_path, slot_id, start=fire, status="submitted", orders=[ORDER])
+    assert result["verified"] is True, result["errors"]
+    state = json.loads((tmp_path / result["run_dir"] / "run_state.json").read_bytes())
+    assert dca_risk.run_timestamp_et(state) == started(slot_id, minute=0)
+    assert dca_risk.is_afternoon_scheduled_evidence(state)
+    assert datetime.fromisoformat(state["run_classification"]["triggered_at_utc"]) == fire
+    assert state["orders_submitted_count"] == 1
 
 
 def test_window_accepts_the_prompts_early_gate1_start_but_nothing_earlier(tmp_path):

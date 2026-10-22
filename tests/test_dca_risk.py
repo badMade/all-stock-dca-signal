@@ -2391,3 +2391,46 @@ def test_nonnumeric_row_total_retains_artifact_day_even_with_a_fully_dated_break
     }
 
     assert unusable_deployed_notional_dates(state) == {date(2026, 8, 10), date(2026, 8, 26)}
+
+
+# --- run_timestamp_et for states the finalizer wrote, fire-time semantics (#1855, restored after #1859) ---
+def _finalizer_state(triggered_at: str, scheduled_for: object = "14:30", trading_day: object = "2026-10-13"):
+    return {
+        "finalized_by": "scripts.finalize_run_evidence",
+        "trading_day": trading_day,
+        "generated_at": "2026-10-21T04:00:00Z",  # the write time: must never decide the slot's timing
+        "run_classification": {"triggered_at_utc": triggered_at, "scheduled_for_et": scheduled_for},
+    }
+
+
+
+def test_finalizer_state_is_timed_by_the_fire_not_the_write_time():
+    from dca_risk import run_timestamp_et
+
+    ts = run_timestamp_et(_finalizer_state("2026-10-13T18:42:00+00:00"))  # fired 14:42 ET
+
+    assert (ts.hour, ts.minute, ts.day) == (14, 42, 13)
+
+
+def test_an_early_start_is_floored_at_the_slots_nominal_time():
+    from dca_risk import run_timestamp_et
+
+    ts = run_timestamp_et(_finalizer_state("2026-10-13T18:25:00+00:00"))  # Gate 1 accepts 14:25
+
+    assert (ts.hour, ts.minute) == (14, 30)
+
+
+@pytest.mark.parametrize("scheduled_for, trading_day", [("soon", "2026-10-13"), (None, "2026-10-13"), ("14:30", "bad")])
+def test_an_unusable_nominal_falls_back_to_the_fire_time(scheduled_for, trading_day):
+    from dca_risk import run_timestamp_et
+
+    ts = run_timestamp_et(_finalizer_state("2026-10-13T18:25:00+00:00", scheduled_for, trading_day))
+
+    assert (ts.hour, ts.minute) == (14, 25)
+
+
+def test_a_finalizer_state_without_a_classification_has_no_timestamp():
+    from dca_risk import run_timestamp_et
+
+    assert run_timestamp_et({"finalized_by": "scripts.finalize_run_evidence"}) is None
+

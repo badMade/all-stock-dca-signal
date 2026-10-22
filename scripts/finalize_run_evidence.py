@@ -643,7 +643,12 @@ def build_run_state(
     state: Dict[str, Any] = {
         "run_id": classification["run_id"],
         "trading_day": started.date().isoformat(),
+        # The artifact write time, as for every other writer of this field. The FIRE's time is
+        # carried by run_classification.triggered_at_utc, and dca_risk.run_timestamp_et reads it
+        # for states this command wrote, so a late Gate 9 write or a backfill keeps the slot's
+        # afternoon eligibility whatever the wall clock says (2026-10-21).
         "generated_at": _utc_iso(now or datetime.now(timezone.utc)),
+        "finalized_at": _utc_iso(now or datetime.now(timezone.utc)),
         "broker": "robinhood",
         "dry_run": False,
         "stream": stream,
@@ -655,8 +660,8 @@ def build_run_state(
         "orders_submitted_count": orders_submitted_count,
         # schemas/run_state.schema.json requires both (Copilot review, PR #1514).
         # A missing budget means Gate 6 never ran on this fire -- the schema's
-        # own budget_evaluated=false form; finalize() refuses that claim for a
-        # run that placed orders.
+        # own budget_evaluated=false form; only explicit operator attribution
+        # may reconstruct placed orders without a Gate 6 budget.
         "budget": budget if budget is not None else {"budget_evaluated": False},
         "counts": {"submitted": orders_submitted_count},
         "run_classification": classification,
@@ -704,6 +709,7 @@ def finalize(
     code_version: Optional[Dict[str, Any]] = None,
     now: Optional[datetime] = None,
     dry_run: bool = False,
+    reconstructed_orders: bool = False,
 ) -> Dict[str, Any]:
     """Write (or reuse) the slot's run_state, refresh its pointer, and report whether it verifies.
 
@@ -713,6 +719,12 @@ def finalize(
     the same fire would otherwise both read the prior submitted_orders.csv,
     merge different order sets, and let the last writer silently drop the
     other's orders (Copilot review, PR #1514).
+
+    ``reconstructed_orders`` is for ``scripts.backfill_afternoon_evidence`` only: it lets operator-attributed
+    orders be recorded for a fire that aborted BEFORE Gate 6, with no Gate 6 budget (the state keeps
+    ``budget_evaluated=false``; a tier and caps are never invented). It is a Python keyword and deliberately
+    has no command-line flag, because the refusal it relaxes ("orders were placed, so Gate 6 ran") is what stops
+    a live session from writing false evidence.
     """
     slot = normalize_slot(slot)
     started = started.astimezone(ET)
@@ -765,6 +777,7 @@ def finalize(
             error_detail=error_detail,
             code_version=code_version,
             now=now,
+            reconstructed_orders=reconstructed_orders,
         )
 
 
@@ -876,6 +889,7 @@ def _finalize_locked(
     error_detail: Optional[str],
     code_version: Optional[Dict[str, Any]],
     now: Optional[datetime],
+    reconstructed_orders: bool = False,
 ) -> Dict[str, Any]:
     stream, _ = SLOT_EVIDENCE_LAYOUT[slot]
     day = started.date()
@@ -965,9 +979,15 @@ def _finalize_locked(
             budget = existing["budget"]  # a retry keeps the first attempt's Gate 6 budget
         if code_version is None and ours and isinstance(existing.get("code_version"), dict):
             code_version = existing["code_version"]  # ...and the release it traded from
-        if order_submit_status == ORDER_SUBMIT_STATUS_SUBMITTED and (
-            budget is None or budget.get("budget_evaluated") is False
-        ):
+        # Only the backfill's Python call may reconstruct placed orders without a Gate 6 budget, and then
+        # only without inventing one: a tier or caps here would be false evidence for a fire that aborted
+        # at Gate 2 (reconstructed_orders has no command-line flag, see finalize()).
+        gate6_missing = budget is None or budget.get("budget_evaluated") is False
+        if reconstructed_orders and order_submit_status == ORDER_SUBMIT_STATUS_SUBMITTED:
+            if not gate6_missing:
+                raise FinalizeRefused("reconstructed orders must not carry a Gate 6 budget")
+            budget = {"budget_evaluated": False}
+        elif order_submit_status == ORDER_SUBMIT_STATUS_SUBMITTED and gate6_missing:
             # Placing an order means Gate 6 ran and selected a tier; writing
             # budget_evaluated=false for it would be false evidence.
             raise FinalizeRefused(
@@ -993,6 +1013,21 @@ def _finalize_locked(
             code_version=code_version,
             now=now,
         )
+        # dca_risk's deployment accounting (the 7-day kill-switch total the 12:30 prompt hands the signal
+        # generator) reads buy_candidates, never the submitted-orders CSV or orders_submitted_count, so
+        # without these rows a placed order contributed $0.00 (2026-10-21). Rebuilt from the union of order
+        # rows on every call, so a retry cannot double count; an empty list is explicit "deployed nothing"
+        # and stops the budget.day_notional_usd fallback from counting seeded same-day capital as this fire's.
+        # A state an executor wrote never reaches this branch and keeps its own candidates.
+        state["buy_candidates"] = [
+            {
+                "ticker": row["ticker"], "order_id": row["order_id"], "status": row["status"],
+                "planned_amount_usd": round(float(row["submitted_amount_usd"]), 2),
+                # Required by the schema but unknown here: the ladder multiplier belongs to the signal run.
+                "buy_multiplier": None,
+            }
+            for row in order_rows
+        ]
         if gate5_evidence is not None:
             state["gate5_evidence"] = gate5_evidence
         run_dir.mkdir(parents=True, exist_ok=True)
