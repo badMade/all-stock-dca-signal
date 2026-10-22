@@ -41,16 +41,16 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `patch_template` | 21 | 0 |
 | `run_benchmark` | 56 | 0 |
 | `run_market_open_signals` | 110 | 0 |
-| `scripts` | 0 | 231 |
+| `scripts` | 0 | 232 |
 | `scripts.adhoc_orders` | 490 | 0 |
 | `scripts.auto_resume_walkforward` | 179 | 0 |
-| `scripts.backfill_afternoon_evidence` | 252 | 0 |
+| `scripts.backfill_afternoon_evidence` | 261 | 0 |
 | `scripts.backfill_intraday_archive` | 215 | 0 |
 | `scripts.backup_strategy` | 732 | 0 |
 | `scripts.build_robinhood_market_data` | 84 | 0 |
 | `scripts.check_live_prompt_drift` | 463 | 9 |
 | `scripts.check_slot_fills` | 120 | 7 |
-| `scripts.cloud_preflight` | 280 | 1 |
+| `scripts.cloud_preflight` | 280 | 0 |
 | `scripts.compute_schedule` | 351 | 1 |
 | `scripts.emit_order_plan` | 147 | 7 |
 | `scripts.evaluate_deferral_params` | 502 | 0 |
@@ -60,7 +60,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.generate_credit_usage_proxy_report` | 3321 | 7 |
 | `scripts.generate_market_graph` | 369 | 2 |
 | `scripts.generate_module_graph` | 251 | 3 |
-| `scripts.generate_perplexity_backup_prompts` | 135 | 8 |
+| `scripts.generate_perplexity_backup_prompts` | 135 | 10 |
 | `scripts.github_mcp_login` | 87 | 0 |
 | `scripts.healthcheck` | 78 | 5 |
 | `scripts.local_heartbeat` | 314 | 0 |
@@ -104,7 +104,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_config` | 1542 | 1 | 35 | 2 | `near_close_dca` |
 | `dca_console` | 1495 | 12 | 4 | 2 | `dca_bootstrap`, `dca_console_data`, `dca_console_jobs`, `dca_console_launch`, `dca_console_octopus`, `dca_console_reader`, `dca_console_release`, `dca_console_routes`, +4 more |
 | `dca_console_alerts` | 650 | 12 | 1 | 0 | `dca_alerts`, `dca_config`, `dca_console_jobs`, `dca_console_reader`, `dca_console_runs`, `dca_paths`, `dca_risk`, `scripts.alert_digest`, +4 more |
-| `dca_console_config` | 675 | 5 | 1 | 0 | `dca_config`, `dca_console_jobs`, `dca_console_reader`, `dca_runner`, `near_close_dca` |
+| `dca_console_config` | 821 | 5 | 1 | 0 | `dca_config`, `dca_console_jobs`, `dca_console_reader`, `dca_runner`, `near_close_dca` |
 | `dca_console_data` | 450 | 5 | 3 | 1 | `dca_cost_tracker`, `dca_risk`, `dca_runner`, `scripts.purchase_history`, `scripts.scheduled_artifacts` |
 | `dca_console_diagnostics` | 490 | 0 | 1 | 0 |  |
 | `dca_console_docs` | 144 | 1 | 1 | 0 | `dca_console_reader` |
@@ -119,7 +119,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_console_routes` | 653 | 17 | 2 | 0 | `dca_console`, `dca_console_alerts`, `dca_console_config`, `dca_console_diagnostics`, `dca_console_docs`, `dca_console_env`, `dca_console_jobs`, `dca_console_launch`, +9 more |
 | `dca_console_runs` | 790 | 13 | 2 | 0 | `dca_config`, `dca_console_data`, `dca_console_jobs`, `dca_console_reader`, `dca_paths`, `dca_reporting`, `dca_risk`, `scripts.close_window_signal`, +5 more |
 | `dca_console_schedule` | 721 | 11 | 1 | 0 | `dca_console_data`, `dca_console_jobs`, `dca_console_reader`, `dca_runner`, `intraday_dca`, `market_open_dca`, `midday_dca`, `morning_dca`, +3 more |
-| `dca_console_state` | 692 | 6 | 2 | 0 | `dca_config`, `dca_console_jobs`, `dca_console_reader`, `dca_risk`, `dca_runner`, `scripts.purchase_history` |
+| `dca_console_state` | 903 | 6 | 2 | 0 | `dca_config`, `dca_console_jobs`, `dca_console_reader`, `dca_risk`, `dca_runner`, `scripts.purchase_history` |
 | `dca_console_tickers` | 245 | 2 | 1 | 0 | `dca_console_reader`, `dca_ticker_paths` |
 | `dca_console_training` | 355 | 1 | 1 | 0 | `dca_console_reader` |
 | `dca_cost_tracker` | 413 | 3 | 2 | 0 | `dca_common`, `dca_fileio`, `scripts.run_classification` |
@@ -144,7 +144,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `dca_rec_store` | 277 | 5 | 7 | 0 | `dca_config`, `dca_fileio`, `dca_paths`, `dca_rec_models`, `scripts.validate_native_placement` |
 | `dca_recommender` | 315 | 16 | 1 | 0 | `dca_config`, `dca_market_sources`, `dca_order_plan`, `dca_paths`, `dca_rec_models`, `dca_rec_store`, `dca_risk`, `dca_runner`, +8 more |
 | `dca_reporting` | 1259 | 6 | 2 | 2 | `dca_fileio`, `dca_paths`, `scripts.close_window_signal`, `scripts.foreground_primary`, `scripts.model_usage_log`, `scripts.run_classification` |
-| `dca_risk` | 1646 | 3 | 9 | 1 | `dca_config`, `near_close_dca`, `scripts.run_classification` |
+| `dca_risk` | 1669 | 3 | 9 | 2 | `dca_config`, `near_close_dca`, `scripts.run_classification` |
 | `dca_runner` | 9503 | 6 | 23 | 57 | `dca_config`, `dca_fileio`, `dca_live_adapters`, `dca_paths`, `dca_slot_guard`, `near_close_dca` |
 | `dca_slot_guard` | 62 | 1 | 1 | 0 | `scripts.scheduler_lease` |
 | `dca_ticker_paths` | 33 | 0 | 9 | 0 |  |
@@ -160,34 +160,34 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `intraday_dca` | 326 | 3 | 3 | 6 | `dca_paths`, `morning_dca`, `near_close_dca` |
 | `market_open_dca` | 294 | 3 | 5 | 10 | `dca_paths`, `morning_dca`, `near_close_dca` |
 | `midday_dca` | 525 | 4 | 4 | 9 | `dca_config`, `dca_paths`, `morning_dca`, `near_close_dca` |
-| `morning_dca` | 10089 | 16 | 8 | 51 | `dca_alerts`, `dca_common`, `dca_config`, `dca_cumulative`, `dca_fileio`, `dca_intraday_archive`, `dca_paths`, `dca_risk`, +8 more |
-| `near_close_dca` | 41709 | 17 | 32 | 26 | `dca_common`, `dca_cumulative`, `dca_fileio`, `dca_intraday_archive`, `dca_inverse_martingale`, `dca_ladder_core`, `dca_live_adapters`, `dca_paths`, +9 more |
+| `morning_dca` | 9824 | 16 | 8 | 51 | `dca_alerts`, `dca_common`, `dca_config`, `dca_cumulative`, `dca_fileio`, `dca_intraday_archive`, `dca_paths`, `dca_risk`, +8 more |
+| `near_close_dca` | 41700 | 17 | 32 | 26 | `dca_common`, `dca_cumulative`, `dca_fileio`, `dca_intraday_archive`, `dca_inverse_martingale`, `dca_ladder_core`, `dca_live_adapters`, `dca_paths`, +9 more |
 | `patch_finbert_cache` | 21 | 0 | 0 | 0 |  |
 | `patch_template` | 21 | 0 | 0 | 0 |  |
 | `run_benchmark` | 56 | 0 | 0 | 0 |  |
-| `run_dca` | 4719 | 17 | 1 | 27 | `dca_alerts`, `dca_config`, `dca_fileio`, `dca_live_adapters`, `dca_notion_sync`, `dca_paths`, `dca_reporting`, `dca_runner`, +9 more |
+| `run_dca` | 4719 | 17 | 1 | 26 | `dca_alerts`, `dca_config`, `dca_fileio`, `dca_live_adapters`, `dca_notion_sync`, `dca_paths`, `dca_reporting`, `dca_runner`, +9 more |
 | `run_market_open_signals` | 110 | 2 | 0 | 0 | `market_open_dca`, `near_close_dca` |
-| `scripts` | 0 | 0 | 0 | 231 |  |
+| `scripts` | 0 | 0 | 0 | 232 |  |
 | `scripts.adhoc_orders` | 490 | 3 | 0 | 0 | `dca_paths`, `dca_runner`, `near_close_dca` |
 | `scripts.agent_entry_points` | 678 | 0 | 1 | 1 |  |
 | `scripts.alert_digest` | 5287 | 4 | 1 | 38 | `dca_config`, `dca_fileio`, `dca_paths`, `near_close_dca` |
-| `scripts.assemble_market_data` | 291 | 2 | 2 | 0 | `dca_config`, `dca_live_adapters` |
+| `scripts.assemble_market_data` | 291 | 2 | 2 | 1 | `dca_config`, `dca_live_adapters` |
 | `scripts.assemble_order_pages` | 367 | 5 | 6 | 20 | `dca_config`, `dca_fileio`, `dca_live_adapters`, `scripts.broker_reconciliation`, `scripts.same_day_top_up_gate` |
 | `scripts.auto_resume_walkforward` | 179 | 0 | 0 | 0 |  |
-| `scripts.backfill_afternoon_evidence` | 252 | 3 | 0 | 0 | `dca_paths`, `dca_runner`, `scripts.finalize_run_evidence` |
+| `scripts.backfill_afternoon_evidence` | 261 | 3 | 0 | 0 | `dca_paths`, `dca_runner`, `scripts.finalize_run_evidence` |
 | `scripts.backfill_intraday_archive` | 215 | 2 | 0 | 0 | `dca_intraday_archive`, `dca_paths` |
 | `scripts.backup_gates` | 81 | 2 | 1 | 1 | `dca_order_plan`, `scripts.backup_procedure` |
-| `scripts.backup_planner` | 1198 | 15 | 5 | 15 | `dca_config`, `dca_order_plan`, `dca_rec_models`, `dca_rec_store`, `dca_runner`, `near_close_dca`, `scripts.assemble_order_pages`, `scripts.backup_gates`, +7 more |
-| `scripts.backup_procedure` | 335 | 6 | 3 | 1 | `dca_config`, `dca_order_plan`, `dca_rec_store`, `dca_runner`, `near_close_dca`, `scripts.backup_planner` |
+| `scripts.backup_planner` | 1218 | 15 | 5 | 16 | `dca_config`, `dca_order_plan`, `dca_rec_models`, `dca_rec_store`, `dca_runner`, `near_close_dca`, `scripts.assemble_order_pages`, `scripts.backup_gates`, +7 more |
+| `scripts.backup_procedure` | 342 | 6 | 3 | 1 | `dca_config`, `dca_order_plan`, `dca_rec_store`, `dca_runner`, `near_close_dca`, `scripts.backup_planner` |
 | `scripts.backup_strategy` | 732 | 0 | 0 | 0 |  |
 | `scripts.backup_stream_specs` | 36 | 5 | 2 | 1 | `scripts.generate_intraday_candidates`, `scripts.generate_market_open_candidates`, `scripts.generate_midday_candidates`, `scripts.generate_morning_candidates`, `scripts.stream_candidates` |
 | `scripts.broker_reconciliation` | 1036 | 2 | 7 | 0 | `scripts.reason_codes`, `scripts.run_classification` |
-| `scripts.build_backup_planner` | 342 | 0 | 1 | 1 |  |
+| `scripts.build_backup_planner` | 342 | 0 | 1 | 2 |  |
 | `scripts.build_robinhood_market_data` | 84 | 0 | 0 | 0 |  |
 | `scripts.check_live_prompt_drift` | 463 | 1 | 0 | 9 | `dca_config` |
 | `scripts.check_slot_fills` | 120 | 3 | 0 | 7 | `dca_console_reader`, `dca_paths`, `scripts.verify_schedule` |
 | `scripts.close_window_signal` | 401 | 0 | 2 | 4 |  |
-| `scripts.cloud_preflight` | 280 | 3 | 0 | 1 | `dca_config`, `dca_paths`, `scripts.verify_schedule` |
+| `scripts.cloud_preflight` | 280 | 3 | 0 | 0 | `dca_config`, `dca_paths`, `scripts.verify_schedule` |
 | `scripts.compute_schedule` | 351 | 0 | 0 | 1 |  |
 | `scripts.correlation` | 85 | 0 | 1 | 0 |  |
 | `scripts.daily_per_ticker_calibration` | 146 | 4 | 1 | 0 | `dca_fileio`, `dca_paths`, `dca_ticker_paths`, `scripts.generate_per_ticker_sizing` |
@@ -210,7 +210,7 @@ Entry points (CLIs, executor classes driven by an external agent) land here by d
 | `scripts.generate_module_graph` | 251 | 0 | 0 | 3 |  |
 | `scripts.generate_morning_candidates` | 172 | 3 | 2 | 7 | `morning_dca`, `near_close_dca`, `scripts.stream_candidates` |
 | `scripts.generate_per_ticker_sizing` | 349 | 2 | 1 | 14 | `dca_fileio`, `dca_ticker_paths` |
-| `scripts.generate_perplexity_backup_prompts` | 135 | 2 | 0 | 8 | `scripts.backup_procedure`, `scripts.build_backup_planner` |
+| `scripts.generate_perplexity_backup_prompts` | 135 | 2 | 0 | 10 | `scripts.backup_procedure`, `scripts.build_backup_planner` |
 | `scripts.github_mcp_login` | 87 | 0 | 0 | 0 |  |
 | `scripts.healthcheck` | 78 | 0 | 0 | 5 |  |
 | `scripts.idempotency` | 182 | 0 | 4 | 2 |  |
