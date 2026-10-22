@@ -196,6 +196,28 @@ def test_live_mirror_prompts_use_the_prebuilt_payload():
     assert not any("robinhood_payload" in p.read_text() for p in mirror.glob("1530ET-*.txt"))
 
 
+#: 2026-10-21 09:35 abort: 90 tickers are 12 chunks of 8, run 3 at a time (4 waves), so the Mac build lands several
+#: minutes after its 09:36 launch while the prompts gave up after 5. The wait must cover a normal build but stay inside
+#: the slot's ~25-minute window (see DEFAULT_MAX_AGE_MINUTES' comment) so Gates 6-7 still have time to place.
+MIN_PAYLOAD_WAIT_MINUTES = 12
+MAX_PAYLOAD_WAIT_MINUTES = 20
+
+
+def test_live_mirror_prompts_wait_long_enough_for_the_prebuilt_payload():
+    import re
+    from pathlib import Path
+
+    mirror = Path(__file__).resolve().parents[1] / "claude" / "dca-executor-prompts" / "live-mirror"
+    waits = {}
+    for slot in rp.SLOTS:
+        (path,) = mirror.glob(f"{slot}ET-*.txt")
+        found = re.findall(r"every 30 seconds for up to (\d+) minutes", path.read_text(encoding="utf-8"))
+        assert len(found) == 1, f"{path.name}: expected one 'every 30 seconds for up to N minutes', got {found}"
+        waits[slot] = int(found[0])
+    assert all(MIN_PAYLOAD_WAIT_MINUTES <= n <= MAX_PAYLOAD_WAIT_MINUTES for n in waits.values()), waits
+    assert len(set(waits.values())) == 1, f"the six prompts disagree on the wait: {waits}"
+
+
 # -- chunk ownership (Codex adversarial review): a reply counts only for the tickers its own chunk was assigned ----
 
 

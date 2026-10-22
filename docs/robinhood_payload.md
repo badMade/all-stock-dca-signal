@@ -40,7 +40,7 @@ time, and is no older than 45 minutes (`--max-age-minutes`). The launcher sets a
 
 **What the live prompts do.** Gate 5 (six `live-mirror` prompts) runs `plan` then `check`; on success it copies
 the payload to `$ROOT/market_data_<day>_<slot>.json` and skips the hand fetch. If the file is missing or fails
-`check` after 5 minutes of re-checking, the run aborts with `market_data_unavailable`. It never hand-fetches.
+`check` after 12 minutes of re-checking, the run aborts with `market_data_unavailable`. It never hand-fetches.
 
 **Install.** Copy `deploy/launchd/com.all-stock-dca.robinhood-payload.plist.template` to
 `~/Library/LaunchAgents/`, replace the three `REPLACE_WITH_*` values, and `launchctl load` it. The Mac must be on
