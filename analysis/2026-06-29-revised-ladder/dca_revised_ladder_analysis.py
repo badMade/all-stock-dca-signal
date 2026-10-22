@@ -162,6 +162,9 @@ def apply_budget(decisions: pd.DataFrame) -> pd.DataFrame:
             remaining_weekly -= allowed
             week_spend[week_key] = week_spend.get(week_key, 0.0) + allowed
             rows.append(row)
+    # An empty decisions frame yields no rows, and set_index on a column-less frame raises KeyError.
+    if not rows:
+        return pd.DataFrame(rows)
     res = pd.DataFrame(rows).set_index(idx_name)
     res.index.name = decisions.index.name
     return res

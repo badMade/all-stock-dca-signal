@@ -58,3 +58,11 @@ def test_signal_status_vectorized():
     status = np.where(mults > 0, "BUY_PREVIEW", "NO_BUY")
     expected = np.array(["NO_BUY", "BUY_PREVIEW", "BUY_PREVIEW", "NO_BUY", "BUY_PREVIEW"])
     np.testing.assert_array_equal(status, expected)
+
+
+def test_apply_budget_accepts_empty_decisions():
+    from dca_revised_ladder_analysis import apply_budget
+
+    decisions = pd.DataFrame(columns=["date", "multiplier", "drop_pct", "planned_spend", "close"])
+
+    assert apply_budget(decisions).empty
