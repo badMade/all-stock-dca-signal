@@ -37,7 +37,7 @@ Fill every field; write "unknown" rather than guessing.
 
 ## Acceptance
 - `ruff check .` and the targeted pytest files pass; `python run_dca.py --demo --report --now 2026-08-03T15:45 --artifacts-dir <scratch>` still passes.
-- PR body names the Key so the triage reconciler can match it.
+- PR TITLE names the Key (e.g. "[AI-Assisted] <key>: ...") so the triage reconciler can match it; a body-only mention does not count as a fix.
 
 ## Risk and rollback
 - Risk: <low | medium | high> because <reason>

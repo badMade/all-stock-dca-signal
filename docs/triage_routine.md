@@ -56,7 +56,7 @@ Anything that is not exactly `Approved` counts as not approved.
 ## Matching and Progress
 
 A branch matches only as exactly `selfheal/<key>`. A PR matches by that head ref, or by the Key appearing as a whole
-token in its title or body. The Key is the dedupe token, so name it in every fix PR.
+token in its title, newest wins. A PR that cites the Key only in its body is **not a fix**: it comes back as `mentioned_in`, never reaches `derive_progress` (a Key with only such PRs is "No work"), and the digest lists it separately. The Key is the dedupe token, so name it in the TITLE of every fix PR (or use a `selfheal/<key>` head ref); a batch PR that fixes several Keys must list each Key in its title or be split.
 
 `derive_progress` returns one of these labels, written to Notion exactly as returned. A PR outranks a bare branch.
 

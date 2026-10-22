@@ -32,4 +32,4 @@ Session refused to place orders. Remediation per the row: Unpredictable per sess
 
 ## Acceptance
 - Failing test (or non-code verification procedure) written first, then the smallest change; `ruff check .` and targeted pytest pass.
-- PR body names the Key so the triage reconciler can match it.
+- PR TITLE names the Key (e.g. "[AI-Assisted] <key>: ...") so the triage reconciler can match it; a body-only mention does not count as a fix.

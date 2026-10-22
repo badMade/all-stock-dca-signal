@@ -90,9 +90,17 @@ def test_pr_matches_by_head_ref_and_records_number_and_url() -> None:
     assert ev.pr.url == f"{REPO_URL}/pull/101"
 
 
-def test_pr_matches_by_key_mention_in_body_when_head_ref_differs() -> None:
-    ev = _match(prs=[_pr(102, head_ref="claude/some-branch", body=f"Fixes {KEY}")])
+def test_pr_matches_by_key_in_title_when_head_ref_differs() -> None:
+    ev = _match(prs=[_pr(102, head_ref="claude/some-branch", title=f"Fix {KEY}")])
     assert ev.pr is not None and ev.pr.number == 102
+
+
+def test_body_only_mention_is_not_a_fix_but_is_recorded() -> None:
+    pr = _pr(102, head_ref="claude/some-branch", state="closed", merged=True, checks="green", body=f"Fixes {KEY}")
+    ev = _match(prs=[pr])
+    assert ev.pr is None
+    assert ev.mentioned_in is not None and ev.mentioned_in.number == 102
+    assert tr.derive_progress(ev) == "No work"
 
 
 def test_pr_body_that_lists_key_as_not_changed_does_not_match() -> None:
@@ -101,12 +109,22 @@ def test_pr_body_that_lists_key_as_not_changed_does_not_match() -> None:
     # rows claimed a fix that the PR explicitly did not make.
     body = f"Docs only.\n\nNot changed, on purpose: classifier_block, {KEY}, cap_breach.\n"
     ev = _match(prs=[_pr(103, head_ref="claude/some-branch", state="closed", merged=True, checks="green", body=body)])
-    assert ev.pr is None
+    assert ev.pr is None and ev.mentioned_in is None
 
 
 def test_newest_pr_wins_when_several_match() -> None:
     ev = _match(prs=[_pr(101, state="closed"), _pr(105)])
     assert ev.pr is not None and ev.pr.number == 105
+
+
+def test_body_only_mention_does_not_displace_an_older_pr_about_the_key() -> None:
+    # Regression (2026-10-21 digest): PR #1873 cited the Key in its body while calling the root cause
+    # unconfirmed, and as the newest match it regressed a merged fix to "PR open".
+    fix = _pr(1704, head_ref="claude/fix", title=f"Fix {KEY}", body="", state="closed", merged=True)
+    cite = _pr(1873, head_ref="claude/other", title="Investigate feed", body=f"Related to {KEY}, cause unconfirmed")
+    ev = _match(prs=[fix, cite])
+    assert ev.pr is not None and ev.pr.number == 1704
+    assert ev.mentioned_in is not None and ev.mentioned_in.number == 1873
 
 
 def test_commit_url_comes_from_the_matching_commit() -> None:

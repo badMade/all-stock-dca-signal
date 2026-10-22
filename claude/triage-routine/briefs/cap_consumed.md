@@ -32,4 +32,4 @@ Backup consumed the shared daily cap. Remediation per the row: Coordinate the sh
 
 ## Acceptance
 - Failing test (or non-code verification procedure) written first, then the smallest change; `ruff check .` and targeted pytest pass.
-- PR body names the Key so the triage reconciler can match it.
+- PR TITLE names the Key (e.g. "[AI-Assisted] <key>: ...") so the triage reconciler can match it; a body-only mention does not count as a fix.

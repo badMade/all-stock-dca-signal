@@ -113,6 +113,8 @@ class GitEvidence:
     pr: PullRequestRef | None = None
     commit_url: str | None = None
     issue: IssueRef | None = None
+    #: The newest PR that cites the Key only in its body. Recorded for the operator, never counted as a fix.
+    mentioned_in: PullRequestRef | None = None
 
 
 def _check_key(key: object) -> str:
@@ -155,7 +157,7 @@ def _own_url(record: Mapping[str, object], expected: str, what: str) -> str:
     return expected
 
 
-def _parse_pr(raw: object, repo_url: str) -> tuple[PullRequestRef, str, str]:
+def _parse_pr(raw: object, repo_url: str) -> tuple[PullRequestRef, str, str, str]:
     record = _mapping(raw, "pull request")
     number = _positive_int(record, "pull request")
     state = _text(record, "state", "pull request", required=True)
@@ -176,9 +178,10 @@ def _parse_pr(raw: object, repo_url: str) -> tuple[PullRequestRef, str, str]:
     body = "\n".join(
         line for line in _text(record, "body", "pull request").splitlines() if not _NOT_CHANGED.search(line)
     )
-    searchable = f"{_text(record, 'title', 'pull request')}\n{body}"
+    title = _text(record, "title", "pull request")
+    searchable = f"{title}\n{body}"
     ref = PullRequestRef(number=number, url=url, state=state, merged=merged, checks=checks, docs_only=docs_only)
-    return ref, _text(record, "head_ref", "pull request"), searchable
+    return ref, _text(record, "head_ref", "pull request"), title, searchable
 
 
 def _parse_issue(raw: object, repo_url: str) -> tuple[IssueRef, str]:
@@ -212,8 +215,10 @@ def match_git_evidence(
     """Match already-fetched git records to one DCA Issues Key.
 
     A branch matches only as exactly ``selfheal/<key>``. A pull request matches
-    by that head ref, or by the key appearing as a whole token in its title or
-    body; the newest (highest number) match wins. The first matching commit in
+    by that head ref, or by the key appearing as a whole token in its title; the
+    newest (highest number) match wins. A pull request that cites the key only
+    in its body is not a fix: it is returned as ``mentioned_in`` and never
+    reaches :func:`derive_progress`. The first matching commit in
     the order given wins, so the caller passes them newest first. An issue
     matches by the key in its title, newest first. Every record is validated,
     matching or not, so one bad record refuses the batch.
@@ -248,12 +253,19 @@ def match_git_evidence(
     expected_branch = f"{BRANCH_PREFIX}{key}"
     branch = expected_branch if expected_branch in branch_names else None
 
-    matching_prs = [
-        ref
-        for ref, head_ref, searchable in (_parse_pr(raw, repo_url) for raw in prs)
-        if head_ref == expected_branch or _mentions(key, searchable)
-    ]
-    pr = max(matching_prs, key=lambda ref: ref.number, default=None)
+    # Only a PR that is *about* the Key (head ref or title) counts as work on it. A body-only citation does not:
+    # PR #1873 cited market_data_unavailable while calling its root cause unconfirmed, and as the newest match it
+    # regressed a merged fix to "PR open"; batch PRs (#1750, #1751) list many Keys in prose without fixing them.
+    # Those are kept in ``mentioned_in`` so the operator can still see them. Newest wins within each group.
+    about: list[PullRequestRef] = []
+    cited: list[PullRequestRef] = []
+    for ref, head_ref, title, searchable in (_parse_pr(raw, repo_url) for raw in prs):
+        if head_ref == expected_branch or _mentions(key, title):
+            about.append(ref)
+        elif _mentions(key, searchable):
+            cited.append(ref)
+    pr = max(about, key=lambda ref: ref.number, default=None)
+    mentioned_in = max(cited, key=lambda ref: ref.number, default=None)
 
     commit_url = next(
         (url for url, message in (_parse_commit(raw, repo_url) for raw in commits) if _mentions(key, message)),
@@ -263,7 +275,7 @@ def match_git_evidence(
     matching_issues = [ref for ref, title in (_parse_issue(raw, repo_url) for raw in issues) if _mentions(key, title)]
     issue = max(matching_issues, key=lambda ref: ref.number, default=None)
 
-    return GitEvidence(branch=branch, pr=pr, commit_url=commit_url, issue=issue)
+    return GitEvidence(branch=branch, pr=pr, commit_url=commit_url, issue=issue, mentioned_in=mentioned_in)
 
 
 def derive_progress(evidence: GitEvidence) -> str:
