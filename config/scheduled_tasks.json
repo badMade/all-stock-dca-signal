@@ -957,6 +957,14 @@
         "reason": "scripts/generate_intraday_candidates.py builds every intraday spec (cron 7be82b97) with source=ROBINHOOD and has since that entry point was committed; recorded here 2026-09-22, when this block was found to list only 0935ET and 1030ET -- see docs/intraday_signal_entry.md.",
         "accepted_sources": ["robinhood"],
         "validation_context_sources": []
+      },
+      "1530ET": {
+        "primary_source": "finance",
+        "finance_outage_fallback": "robinhood_only",
+        "since": "2026-10-21",
+        "reason": "Option C of claude/triage-routine/GROUP-C-DECISION-2026-10-17.md, chosen by the operator 2026-10-21. 1530ET stays Finance-primary; only a WHOLE-source Finance outage (source_errors lists finance, or sources.finance is absent) is scored as the benign 'finance unavailable' shape so scripts/generate_buy_candidates.py reconciles off Robinhood alone. A per-ticker ticker_errors.finance entry or an incomplete Finance payload, and any Robinhood error, still force MANUAL_REVIEW. 2026-10-21 motivation: the 15:30 session had no Finance connector, recorded it in source_errors, and all 26 Robinhood BUYs were downgraded to MANUAL_REVIEW (0 orders). Remove this key to restore the 2026-10-17 behavior. Not a yfinance fallback.",
+        "accepted_sources": ["finance", "robinhood"],
+        "validation_context_sources": []
       }
     },
     "execution_broker": "Robinhood is the ONLY execution broker; Alpaca/Finance remain read-only validation/context and never place orders.",

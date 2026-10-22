@@ -164,6 +164,7 @@ def _run(
     source_errors: Sequence[str] = (),
     ticker_errors: Any = None,
     already_covered_tickers: Sequence[str] = (),
+    finance_outage_robinhood_only: bool = False,
 ) -> list:
     now = datetime.combine(DAY, gbc.SLOT_SPECS[slot]["decision_time_et"], tzinfo=ET)
     return gbc.generate_candidates(
@@ -171,6 +172,7 @@ def _run(
         now=now,
         config=config,
         market_data_by_source=market_data["sources"],
+        finance_outage_robinhood_only=finance_outage_robinhood_only,
         source_errors=source_errors,
         ticker_errors=ticker_errors,
         already_covered_tickers=already_covered_tickers,
@@ -990,6 +992,8 @@ def test_manual_review_tickers_are_reported(tmp_path, monkeypatch):
     market_data_path = tmp_path / "market_data.json"
     market_data_path.write_text(json.dumps(data), encoding="utf-8")
     monkeypatch.setattr(gbc, "load_strategy_config", lambda *_args, **_kwargs: config)
+    # These pin the default (opt-out) behavior; config/scheduled_tasks.json now opts 1530ET in (2026-10-21).
+    monkeypatch.setattr(gbc, "finance_outage_fallback_enabled", lambda *_args, **_kwargs: False)
 
     stdout = io.StringIO()
     with contextlib.redirect_stdout(stdout):
@@ -1389,6 +1393,8 @@ def test_provider_error_without_manual_review_is_surfaced(tmp_path, monkeypatch)
     market_data_path = tmp_path / "market_data.json"
     market_data_path.write_text(json.dumps(data), encoding="utf-8")
     monkeypatch.setattr(gbc, "load_strategy_config", lambda *_args, **_kwargs: config)
+    # These pin the default (opt-out) behavior; config/scheduled_tasks.json now opts 1530ET in (2026-10-21).
+    monkeypatch.setattr(gbc, "finance_outage_fallback_enabled", lambda *_args, **_kwargs: False)
 
     stdout = io.StringIO()
     with contextlib.redirect_stdout(stdout):
@@ -2776,6 +2782,8 @@ def test_1530_with_finance_down_yields_no_auto_buy_and_a_manual_review_list(tmp_
     market_data_path = tmp_path / "market_data.json"
     market_data_path.write_text(json.dumps(data), encoding="utf-8")
     monkeypatch.setattr(gbc, "load_strategy_config", lambda *_args, **_kwargs: config)
+    # These pin the default (opt-out) behavior; config/scheduled_tasks.json now opts 1530ET in (2026-10-21).
+    monkeypatch.setattr(gbc, "finance_outage_fallback_enabled", lambda *_args, **_kwargs: False)
 
     stdout = io.StringIO()
     with contextlib.redirect_stdout(stdout):
@@ -2793,3 +2801,96 @@ def test_1530_with_finance_down_yields_no_auto_buy_and_a_manual_review_list(tmp_
     assert document["manual_review_count"] == 1
     assert document["provider_error_count"] == 1
     assert _only(document["candidates"])["action"] == Action.MANUAL_REVIEW.value
+
+
+# --- Finance-outage Robinhood-only fallback (option C of GROUP-C-DECISION-2026-10-17, opted in 2026-10-21) ---
+
+
+def _rh_only_data():
+    return _market_data(
+        "TEST", early_price=100.0, late_price=96.0, previous_close=100.0, previous_low=97.0, sources=("robinhood",)
+    )
+
+
+def test_finance_outage_fallback_buys_on_robinhood_alone_when_enabled():
+    candidate = _only(
+        _run(_rh_only_data(), _config(), source_errors=("finance",), finance_outage_robinhood_only=True)
+    )
+    assert candidate["action"] == Action.BUY.value
+    assert candidate["provider_error"] is False
+    assert candidate["finance_action"] == Action.NO_DATA.value
+    assert "Robinhood-only" in candidate["reason"]
+
+
+def test_finance_outage_fallback_covers_an_absent_finance_source_key():
+    candidate = _only(_run(_rh_only_data(), _config(), finance_outage_robinhood_only=True))
+    assert candidate["action"] == Action.BUY.value
+
+
+def test_finance_outage_fallback_is_off_by_default():
+    candidate = _only(_run(_rh_only_data(), _config(), source_errors=("finance",)))
+    assert candidate["action"] == Action.MANUAL_REVIEW.value
+
+
+def test_finance_outage_fallback_leaves_per_ticker_finance_errors_manual_review():
+    # A single-symbol Finance exception is not an outage: dual-source validation still applies to that ticker.
+    data = _market_data("TEST", early_price=100.0, late_price=96.0, previous_close=100.0, previous_low=97.0)
+    candidate = _only(
+        _run(data, _config(), ticker_errors={"finance": ["TEST"]}, finance_outage_robinhood_only=True)
+    )
+    assert candidate["action"] == Action.MANUAL_REVIEW.value
+    assert candidate["provider_error"] is True
+
+
+def test_finance_outage_fallback_never_buys_when_robinhood_is_also_down():
+    data = _market_data("TEST", early_price=100.0, late_price=96.0, previous_close=100.0, previous_low=97.0)
+    candidate = _only(
+        _run(data, _config(), source_errors=("finance", "robinhood"), finance_outage_robinhood_only=True)
+    )
+    assert candidate["action"] != Action.BUY.value
+
+
+def test_finance_outage_fallback_document_is_labeled(tmp_path, monkeypatch):
+    config = _config(tickers=("TEST",))
+    data = _rh_only_data()
+    data["source_errors"] = ["finance"]
+    market_data_path = tmp_path / "market_data.json"
+    market_data_path.write_text(json.dumps(data), encoding="utf-8")
+    monkeypatch.setattr(gbc, "load_strategy_config", lambda *_args, **_kwargs: config)
+    monkeypatch.setattr(gbc, "finance_outage_fallback_enabled", lambda *_args, **_kwargs: True)
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout):
+        exit_code = gbc.main(
+            ["--slot", SLOT, "--trading-day", DAY.isoformat(), "--market-data", str(market_data_path),
+             "--deployed-last-7d-usd", "0"]
+        )
+    assert exit_code == 0
+    document = json.loads(stdout.getvalue())
+    assert document["finance_outage_fallback_enabled"] is True
+    assert document["finance_outage_robinhood_only"] is True
+    assert document["buy_count"] == 1
+    assert document["finance_outage_robinhood_only_buy_count"] == 1
+    assert document["manual_review_count"] == 0
+
+
+def test_finance_outage_fallback_reader_fails_closed(tmp_path):
+    assert gbc.finance_outage_fallback_enabled(tmp_path, SLOT) is False  # no scheduled_tasks.json
+    (tmp_path / "scheduled_tasks.json").write_text("not json", encoding="utf-8")
+    assert gbc.finance_outage_fallback_enabled(tmp_path, SLOT) is False
+    (tmp_path / "scheduled_tasks.json").write_text(
+        json.dumps({"market_data_source_policy": {"slot_overrides": {SLOT: {"finance_outage_fallback": "yes"}}}}),
+        encoding="utf-8",
+    )
+    assert gbc.finance_outage_fallback_enabled(tmp_path, SLOT) is False
+    (tmp_path / "scheduled_tasks.json").write_text(
+        json.dumps({"market_data_source_policy": {"slot_overrides": {SLOT: {"finance_outage_fallback": "robinhood_only"}}}}),
+        encoding="utf-8",
+    )
+    assert gbc.finance_outage_fallback_enabled(tmp_path, SLOT) is True
+
+
+def test_only_1530et_opts_in_to_the_finance_outage_fallback():
+    config_dir = Path(__file__).resolve().parents[2] / "config"
+    assert gbc.finance_outage_fallback_enabled(config_dir, "1530ET") is True
+    for slot in ("0935ET", "1030ET", "1130ET", "1230ET", "1330ET", "1430ET"):
+        assert gbc.finance_outage_fallback_enabled(config_dir, slot) is False

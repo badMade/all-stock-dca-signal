@@ -257,6 +257,13 @@ Finance is judged unusable for the run -- listed in ``source_errors``, entirely 
 abort: it scores Finance ``NO_DATA``/``provider_error=True`` and lets ``reconcile_signals`` reconcile off Robinhood
 alone.
 
+Opt-in exception (2026-10-21): when config/scheduled_tasks.json's
+``market_data_source_policy.slot_overrides[<slot>].finance_outage_fallback`` is ``"robinhood_only"`` (set for 1530ET),
+a WHOLE-source Finance outage (``source_errors`` lists finance, or ``sources.finance`` is absent) is scored as the
+benign "finance unavailable" shape instead, so Robinhood's BUYs reconcile as Robinhood-only BUYs. Per-ticker Finance
+errors, incomplete Finance payloads and any Robinhood error still force MANUAL_REVIEW. See
+claude/triage-routine/GROUP-C-DECISION-2026-10-17.md (option C).
+
 USAGE (from an executor prompt)
 --------------------------------
     python3 -m scripts.generate_buy_candidates \\
@@ -1078,6 +1085,44 @@ def _unavailable_signal(ticker: str, source: SourceName) -> SourceSignal:
     )
 
 
+def finance_outage_fallback_enabled(config_dir: Path, slot: str) -> bool:
+    """True only when the slot's source-policy override opts in to the Robinhood-only Finance-outage fallback.
+
+    Fails closed: a missing or unreadable ``scheduled_tasks.json``, a missing override, or any other value than
+    ``"robinhood_only"`` leaves the 2026-10-17 behavior (a Finance outage forces MANUAL_REVIEW).
+    """
+    try:
+        policy = json.loads((Path(config_dir) / "scheduled_tasks.json").read_text(encoding="utf-8"))
+        override = policy["market_data_source_policy"]["slot_overrides"][slot]
+        return override.get("finance_outage_fallback") == "robinhood_only"
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def _finance_outage_signal(ticker: str) -> SourceSignal:
+    """A WHOLE-source Finance outage, scored as the benign shape (``provider_error=False``).
+
+    Opt-in only (``finance_outage_robinhood_only``, set from config/scheduled_tasks.json's
+    ``market_data_source_policy.slot_overrides[<slot>].finance_outage_fallback == "robinhood_only"``); this is the
+    "labeled single-source mode" option C of claude/triage-routine/GROUP-C-DECISION-2026-10-17.md. Owner direction
+    2026-10-21: the 15:30 session has no reliable Finance connector (it recorded ``source_errors:
+    ["finance"]`` on 2026-10-21 and ``reconcile_signals`` then downgraded all 26 Robinhood BUYs to MANUAL_REVIEW,
+    so the slot placed nothing). Every other slot is already Robinhood-primary (config/scheduled_tasks.json
+    ``slot_overrides``). The signal is NO_DATA with ``provider_error=False``, which ``reconcile_signals`` reads as
+    "Robinhood-only BUY because finance source is unavailable". Scope is deliberately narrow: only a source-level
+    outage (``source_errors`` lists finance, or ``sources.finance`` is absent). A per-ticker ``ticker_errors.finance``
+    entry or an incomplete Finance payload keeps ``_unavailable_signal``'s provider_error=True, so a single-symbol
+    outage still forces manual review. Robinhood being unavailable still forces it too.
+    """
+    return SourceSignal(
+        ticker=ticker,
+        source=SourceName.FINANCE,
+        action=Action.NO_DATA,
+        reason="finance source unavailable (whole-source outage); Robinhood-only reconciliation",
+        provider_error=False,
+    )
+
+
 def _allocation_sort_drop_pct(decision: ReconciledDecision) -> float:
     """The percent drop ``near_close_dca.allocation_sort_key`` actually uses for
     its equal-multiplier tie-break: the MAX across both sources, not whichever
@@ -1168,6 +1213,7 @@ def generate_candidates(
     ticker_errors: Optional[Mapping[str, Sequence[str]]] = None,
     already_covered_tickers: Sequence[str] = (),
     decision_time_et: time | None = None,
+    finance_outage_robinhood_only: bool = False,
 ) -> List[Dict[str, Any]]:
     """Evaluate every active, non-excluded, not-already-covered ticker for
     ``slot`` and return reconciled candidates. This is Gate 5 and nothing
@@ -1352,8 +1398,10 @@ def generate_candidates(
         finance_incomplete = ticker in finance_inputs and _attempted_source_incomplete(
             finance_data, ticker, finance_decision_anchor, finance_lookback_anchor, config.finance_interval_minutes
         )
-        if finance_unavailable or ticker in finance_ticker_errors or finance_incomplete:
-            finance_signal: Optional[SourceSignal] = _unavailable_signal(ticker, SourceName.FINANCE)
+        if finance_unavailable and finance_outage_robinhood_only:
+            finance_signal: Optional[SourceSignal] = _finance_outage_signal(ticker)
+        elif finance_unavailable or ticker in finance_ticker_errors or finance_incomplete:
+            finance_signal = _unavailable_signal(ticker, SourceName.FINANCE)
         elif ticker in finance_inputs:
             finance_signal = evaluate_source_signal(
                 ticker, now, config, finance_data, config.finance_interval_minutes
@@ -1899,6 +1947,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         market_data_by_source=market_data_by_source,
         source_errors=source_errors,
         ticker_errors=ticker_errors,
+        finance_outage_robinhood_only=finance_outage_fallback_enabled(args.config_dir, args.slot),
         already_covered_tickers=args.already_covered_tickers,
     )
     # kill_switch_engaged() is re-checked here (rather than only implicitly, inside
@@ -1940,6 +1989,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # happened (Codex review: "Surface provider-error runs before
     # zero-candidate exits").
     provider_error_tickers = [c["ticker"] for c in candidates if c["provider_error"]]
+    fallback_enabled = finance_outage_fallback_enabled(args.config_dir, args.slot)
+    finance_outage = fallback_enabled and ("finance" in source_errors or "finance" not in market_data_by_source)
     # BUY-only rows in the raw (ticker, amount_usd, multiplier, drop_pct) shape
     # dca_runner.assess()/plan_orders() parse directly (dca_runner._parse_candidate_rows;
     # docs/live_wiring.md's candidates contract). `candidates` above uses different key
@@ -2024,6 +2075,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "manual_review_tickers": manual_review_tickers,
         "provider_error_count": len(provider_error_tickers),
         "provider_error_tickers": provider_error_tickers,
+        # True when the whole Finance source was out (source_errors lists it, or sources.finance is absent), so
+        # every BUY in this document is Robinhood-only. Gate 9 reports it so the run is visibly single-source.
+        "finance_outage_robinhood_only": finance_outage,
+        "finance_outage_robinhood_only_buy_count": len(buy_rows) if finance_outage else 0,
+        "finance_outage_fallback_enabled": fallback_enabled,
         "candidates": candidates,
         "planner_candidates": planner_candidates,
         "planner_incompatible_tickers": planner_incompatible_tickers,

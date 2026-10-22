@@ -49,3 +49,22 @@ Implement the chosen option tests-first, run `ruff check .` and targeted pytest 
 - Retry sentence: the 1530ET live-mirror "Retry the FIRST refusal once" contradicts the no-retry rule. FLAGGED for removal in the prompt/live-mirror session; not edited here.
 - Rows 3-4: option A. Behavior pinned by a regression test; evidence doc corrected.
 - Follow-up for the prompt session: have live prompts pass `--error-class platform_refusal` on a refusal.
+
+## Operator decision (2026-10-21, in chat): rows 3-4 switch to option C
+
+The operator chose option C after the 2026-10-21 15:30 run recorded `source_errors: ["finance"]` and all 26 Robinhood
+BUYs were downgraded to MANUAL_REVIEW (0 orders; none of the 13 recorded 1530ET runs since 2026-09-23 placed an order, most of them Gate 5 market-data aborts that this change does not touch).
+Shipped as the "labeled single-source mode" this document describes:
+
+- `config/scheduled_tasks.json` -> `market_data_source_policy.slot_overrides["1530ET"].finance_outage_fallback =
+  "robinhood_only"` (1530ET stays Finance-primary; the key is the off-switch -- delete it to restore option A).
+- `scripts/generate_buy_candidates.py`: only a WHOLE-source Finance outage (`source_errors` lists finance, or
+  `sources.finance` absent) is scored as the benign "finance unavailable" shape, so `reconcile_signals` returns its
+  existing "Robinhood-only BUY because finance source is unavailable". A per-ticker `ticker_errors.finance`, an
+  incomplete Finance payload, or any Robinhood error still forces MANUAL_REVIEW. The output document carries
+  `finance_outage_fallback_enabled`, `finance_outage_robinhood_only` and `finance_outage_robinhood_only_buy_count` so the
+  run is visibly single-source.
+- Still required: the operator acceptance run this document's option C calls for. The 1530ET live-mirror prompt
+  (line 72) already says the generator falls back to Robinhood-only on a Finance outage; it was not edited here.
+- Not a yfinance fallback (option D stays retired).
+
