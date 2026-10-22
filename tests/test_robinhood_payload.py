@@ -115,15 +115,38 @@ def test_low_coverage_publishes_nothing(tmp_path):
     assert rp.check(plan, min_coverage=0.8) == 2
 
 
-def test_default_floor_is_full_coverage(tmp_path):
-    # One missing ticker of ten (90%) used to publish at the 80% floor; the default now demands the whole universe.
-    tickers = [f"T{i}" for i in range(10)]
+def test_default_floor_tolerates_a_few_missing_tickers(tmp_path):
+    # 2026-10-21: one stale thin ticker (89/90) aborted three slots. The default floor is 95%, so 4 of 90 may miss.
+    tickers = [f"T{i}" for i in range(90)]
     plan = plan_for(tmp_path, tickers)
-    chunk = write_chunk(tmp_path, "chunk_0.json", {t: good_ticker() for t in tickers[:-1]})
+    chunk = write_chunk(tmp_path, "chunk_0.json", {t: good_ticker() for t in tickers[:-4]})
     payload, failed = rp.assemble(plan, [chunk])
-    assert rp.DEFAULT_MIN_COVERAGE == 1.0
+    assert rp.DEFAULT_MIN_COVERAGE == 0.95
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+    published = json.loads((tmp_path / "out" / "payload.json").read_text())
+    # The skipped tickers stay in ticker_errors, so Gate 5 scores them NO_DATA instead of treating them as unseen.
+    assert published["ticker_errors"] == {"robinhood": sorted(tickers[-4:])}
+    assert not set(tickers[-4:]) & set(published["sources"]["robinhood"])
+    assert rp.check(plan, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 0
+
+
+def test_default_floor_still_refuses_a_stale_feed(tmp_path):
+    # 2026-10-20 13:30: 8 of 90 tickers had a stale newest bar. 82/90 (91%) is below the floor: publish nothing.
+    tickers = [f"T{i}" for i in range(90)]
+    plan = plan_for(tmp_path, tickers)
+    chunk = write_chunk(tmp_path, "chunk_0.json", {t: good_ticker() for t in tickers[:-8]})
+    payload, failed = rp.assemble(plan, [chunk])
     assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 2
     assert not (tmp_path / "out").exists()
+
+
+def test_default_floor_boundary_is_ninety_five_percent(tmp_path):
+    # 5 of 90 missing is 94.4%: just under the floor, so nothing is published.
+    tickers = [f"T{i}" for i in range(90)]
+    plan = plan_for(tmp_path, tickers)
+    chunk = write_chunk(tmp_path, "chunk_0.json", {t: good_ticker() for t in tickers[:-5]})
+    payload, failed = rp.assemble(plan, [chunk])
+    assert rp.publish(plan, payload, failed, min_coverage=rp.DEFAULT_MIN_COVERAGE) == 2
 
 
 def test_fenced_and_garbage_chunks(tmp_path):

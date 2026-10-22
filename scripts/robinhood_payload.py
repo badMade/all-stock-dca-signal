@@ -53,10 +53,14 @@ BAR_START_ET = {
 SLOTS = tuple(BAR_START_ET)
 
 DEFAULT_CHUNK_SIZE = 8
-#: Share of the universe that must validate before a payload is published at all. 1.0 (2026-10-15 adversarial
-#: review): the generator scores each ticker alone, but Gate 6 allocates a binding cap by allocation_priority, so a
-#: missing high-priority ticker silently hands its budget to lower-priority names and reads as 'no signal'.
-DEFAULT_MIN_COVERAGE = 1.0
+#: Share of the universe that must validate before a payload is published at all. It was 1.0 (2026-10-15
+#: adversarial review: Gate 6 allocates a binding cap by allocation_priority, so a missing high-priority ticker
+#: could hand its budget to lower-priority names). 0.95 since 2026-10-21: one stale thin name (TOPT, QTOP, DXYZ
+#: each cost a slot at 89/90 that day) aborted the whole universe, while the daily and weekly caps never got
+#: past ~42% / ~13% of their ceilings in the recorded runs, so the reshuffle that justified 1.0 had no room to
+#: happen. A failed ticker stays in ticker_errors.robinhood, so Gate 5 still scores it NO_DATA (never a BUY).
+#: At 90 tickers this tolerates 4 misses; a stale-feed slot (2026-10-20 13:30: 8 of 90) still publishes nothing.
+DEFAULT_MIN_COVERAGE = 0.95
 #: A payload is built one minute after the decision time and read by a session inside the slot's ~25-minute
 #: window; anything older than this was left by an earlier attempt and is rebuilt or refused, never scored as
 #: current (2026-10-15 adversarial review: a retry reused a prior payload with no age bound).
@@ -491,7 +495,9 @@ def publish(
     finally:
         os.unlink(tmp)
     out.with_suffix(".meta.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
-    print(f"robinhood_payload: wrote {out} ({ok}/{universe} tickers)")
+    # A partial payload is allowed above the floor; say which tickers it leaves to ticker_errors so the log shows it.
+    skipped = f"; ticker_errors: {', '.join(sorted(failed))}" if failed else ""
+    print(f"robinhood_payload: wrote {out} ({ok}/{universe} tickers{skipped})")
     return 0
 
 

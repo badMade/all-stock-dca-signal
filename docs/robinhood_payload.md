@@ -19,9 +19,11 @@ decision time (09:35 10:30 11:30 12:30 13:30 14:30, Mon-Fri; the 15:30 slot is F
    slot's window, newest bar near the anchor, no outlier bars, quote within 25% of its own last bar and stamped between the newest completed bar's start and 30 minutes
    after the decision, never in the future) and
    publishes `cron_tracking/robinhood_payload/<day>/robinhood_payload_<day>_<slot>.json` atomically, with a
-   `.meta.json` sidecar. A ticker that fails goes to `ticker_errors.robinhood`, and the default coverage floor is 100%: one failed
-   ticker publishes nothing, so the slot aborts instead of trading a reshaped universe (Gate 6 allocates a binding
-   cap by priority, so a missing ticker would silently pass its budget to lower-priority names).
+   `.meta.json` sidecar. A ticker that fails goes to `ticker_errors.robinhood`, and the default coverage floor is 95% (it was 100% until
+   2026-10-21): up to 4 of 90 failed tickers still publish, each left in `ticker_errors.robinhood` so Gate 5 scores it
+   `NO_DATA` and never a BUY. More misses than that publish nothing and the slot aborts at Gate 5. The old 100% floor
+   guarded against Gate 6 handing a missing high-priority ticker's cap headroom to lower-priority names; in the
+   recorded runs the daily cap peaked near 42% and the weekly cap near 13%, so that reshuffle had no room to occur.
    Each worker's reply counts only for the tickers its own chunk was assigned (`chunk_<i>.json` is
    `plan["chunks"][i]`): any other key is dropped and reported, a ticker two replies carry fails, and a plan
    whose chunks do not partition its universe publishes nothing.
@@ -47,7 +49,7 @@ ET (or shift `Hour`). Logs: `/tmp/dca-robinhood-payload.log`.
 **Honest limits.**
 - A transient miss on one ticker costs the slot. The launcher retries a chunk once (2026-10-19: the 10:30 run
   covered 52/68 tickers, 9 daily-bar replies truncated and 8 quotes stamped with a wrong offset, so nothing was
-  published) and keeps the attempt with fewer per-ticker errors. The 100% coverage floor is unchanged.
+  published) and keeps the attempt with fewer per-ticker errors. The coverage floor is 95% (see above).
 - An LLM copies the numbers. The validation catches malformed, inconsistent and outlier data; it cannot prove a
   plausible-looking bar is exact. Treat this as the trade-off for having any Robinhood path off-session.
 - Needs the Mac awake and Codex logged in. A failure leaves the slot to abort, as before.
