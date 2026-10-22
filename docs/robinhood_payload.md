@@ -44,7 +44,10 @@ the payload to `$ROOT/market_data_<day>_<slot>.json` and skips the hand fetch. I
 
 **Install.** Copy `deploy/launchd/com.all-stock-dca.robinhood-payload.plist.template` to
 `~/Library/LaunchAgents/`, replace the three `REPLACE_WITH_*` values, and `launchctl load` it. The Mac must be on
-ET (or shift `Hour`). Logs: `/tmp/dca-robinhood-payload.log`.
+ET (or shift `Hour`). Logs: `/tmp/dca-robinhood-payload.log`. Timing (2026-10-22): each chunk attempt logs
+`robinhood_payload: timing chunk=<i> attempt=<k> seconds=<s> errors=<n>` (`errors=n/a` when no reply came back) and the build
+ends with `robinhood_payload: timing total seconds=<s> chunks=<n> parallel=<p>` (fetch plus merge). Read these before
+changing chunk size, concurrency or the sessions' 12-minute wait.
 
 **Honest limits.**
 - A transient miss on one ticker costs the slot. The launcher retries a chunk once (2026-10-19: the 10:30 run

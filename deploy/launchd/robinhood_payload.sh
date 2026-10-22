@@ -73,11 +73,19 @@ run_chunk() {
   local attempt out="$WORK/chunk_$idx.json" best="$WORK/best_$idx.json" errs best_errs=""
   for attempt in 1 2; do
     rm -f "$out"
+    # Per-attempt wall time (2026-10-22): nobody had measured a real 90-ticker build, so build-time work could not be
+    # sized. Whole seconds from date +%s, which macOS's bash 3.2 and date both support.
+    local started; started="$(date +%s)"
     perl -e 'alarm shift; exec @ARGV' "$PER_CHUNK_TIMEOUT" "$CODEX" exec ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} -c 'sandbox_mode="read-only"' -c 'approval_policy="never"' \
       --skip-git-repo-check -o "$out" - <"$WORK/prompt_$idx.txt" >"$WORK/chunk_$idx.log" 2>&1 \
       || echo "robinhood_payload: chunk $idx attempt $attempt failed or timed out" >&2
-    if [ -s "$out" ]; then
-      errs="$(grep -o '"error"' "$out" | wc -l | tr -d ' ')"
+    if [ ! -s "$out" ]; then
+      echo "robinhood_payload: timing chunk=$idx attempt=$attempt seconds=$(( $(date +%s) - started )) errors=n/a" >&2
+    else
+      # grep -o exits 1 when a clean reply has no "error"; under set -e + pipefail that silently ended this worker
+      # (the reply file survived only because nothing had deleted it yet), so a clean reply is counted as 0 here.
+      errs="$(grep -o '"error"' "$out" | wc -l | tr -d ' ' || true)"
+      echo "robinhood_payload: timing chunk=$idx attempt=$attempt seconds=$(( $(date +%s) - started )) errors=$errs" >&2
       # Keep the attempt with the fewest per-ticker errors, so a worse retry never replaces a better first pass.
       if [ -z "$best_errs" ] || [ "$errs" -lt "$best_errs" ]; then cp "$out" "$best"; best_errs="$errs"; fi
       [ "$errs" -eq 0 ] && break
@@ -87,6 +95,7 @@ run_chunk() {
   [ -s "$WORK/chunk_$idx.json" ] || echo "robinhood_payload: chunk $idx failed or timed out (see its tickers in the merge report)" >&2
 }
 
+BUILD_STARTED="$(date +%s)"
 idx=0
 while IFS= read -r tickers; do
   run_chunk "$idx" "$tickers" &
@@ -97,4 +106,8 @@ done < <("$PY" -c 'import json,sys; [print(",".join(c)) for c in json.load(open(
 wait
 
 shopt -s nullglob
-"$PY" -m scripts.robinhood_payload merge --plan "$WORK/plan.json" "$WORK"/chunk_*.json
+# The total covers the fetch and the merge; the merge's exit status still decides the launcher's.
+MERGE_STATUS=0
+"$PY" -m scripts.robinhood_payload merge --plan "$WORK/plan.json" "$WORK"/chunk_*.json || MERGE_STATUS=$?
+echo "robinhood_payload: timing total seconds=$(( $(date +%s) - BUILD_STARTED )) chunks=$idx parallel=$PARALLEL" >&2
+exit "$MERGE_STATUS"

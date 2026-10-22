@@ -399,3 +399,71 @@ def test_a_future_stamped_quote_is_rejected_against_the_validating_clock():
     with pytest.raises(rp.PayloadError, match="in the future"):
         rp.validate_ticker(raw, **kw(), now=now)
     assert rp.validate_ticker(raw, **kw(), now=datetime(2026, 10, 15, 14, 30, tzinfo=rp.ET))  # within the skew
+
+
+# -- launcher timing log (2026-10-21 09:35 abort: nobody knew how long a real 12-chunk build takes) -----------------
+
+LAUNCHER = "deploy/launchd/robinhood_payload.sh"
+
+
+def _run_launcher(tmp_path, reply='echo "{}" >"$out"'):
+    """Run the real launcher for a past trading day with a stub `codex` (default: answers every chunk with `{}`).
+
+    The merge then publishes nothing (no data for any ticker), which is fine: this exercises the fetch loop's logging only.
+    """
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    fake = tmp_path / "fake_codex"
+    fake.write_text(
+        f'#!/bin/bash\nout=""\nwhile [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done\ncat >/dev/null\n{reply}\n'
+    )
+    fake.chmod(0o755)
+    env = {
+        **os.environ,
+        "DCA_REPO": str(repo),
+        "DCA_PAYLOAD_PYTHON": sys.executable,
+        "DCA_CODEX_BIN": str(fake),
+        "DCA_TRADING_DAY": "2026-10-20",
+        "DCA_CRON_TRACKING_ROOT": str(tmp_path / "ct"),
+        "DCA_CODEX_PARALLEL": "3",
+        "TMPDIR": str(tmp_path),
+    }
+    done = subprocess.run(["bash", str(repo / LAUNCHER), "0935"], env=env, capture_output=True, text=True, timeout=120)
+    plan = subprocess.run(
+        [sys.executable, "-m", "scripts.robinhood_payload", "plan", "--slot", "0935", "--day", "2026-10-20"],
+        env=env, capture_output=True, text=True, cwd=repo, check=True,
+    )
+    return done, len(json.loads(plan.stdout)["chunks"])
+
+
+def test_launcher_logs_each_chunks_duration_attempts_and_the_build_total(tmp_path):
+    import re
+
+    done, chunks = _run_launcher(tmp_path)
+    log = done.stdout + done.stderr
+    seen = re.findall(r"robinhood_payload: timing chunk=(\d+) attempt=(\d+) seconds=(\d+) errors=(\d+)", log)
+    assert sorted(int(i) for i, *_ in seen) == list(range(chunks)), log  # one line per chunk, the stub never errs
+    assert all(attempt == "1" and errors == "0" for _, attempt, _, errors in seen), seen
+    total = re.search(r"robinhood_payload: timing total seconds=(\d+) chunks=(\d+) parallel=(\d+)", log)
+    assert total and int(total.group(2)) == chunks and total.group(3) == "3", log
+
+
+def test_launcher_logs_the_retry_attempt_of_a_chunk_whose_first_reply_had_an_error(tmp_path):
+    import re
+
+    # First call per chunk answers with a per-ticker error, the second with a clean reply; the counter lives beside
+    # the chunk's output file, so it is per chunk.
+    reply = (
+        'n=$(cat "$out.n" 2>/dev/null || echo 0); n=$((n+1)); echo $n >"$out.n"; '
+        'if [ "$n" = 1 ]; then echo \'{"AAA": {"error": "x"}}\' >"$out"; else echo "{}" >"$out"; fi'
+    )
+    done, chunks = _run_launcher(tmp_path, reply)
+    log = done.stdout + done.stderr
+    seen = re.findall(r"robinhood_payload: timing chunk=(\d+) attempt=(\d+) seconds=\d+ errors=(\d+)", log)
+    assert sorted(seen) == sorted(
+        [(str(i), "1", "1") for i in range(chunks)] + [(str(i), "2", "0") for i in range(chunks)]
+    ), log
