@@ -18,11 +18,13 @@ python3 -m scripts.generate_perplexity_backup_prompts --write   # regenerate
 python3 -m scripts.generate_perplexity_backup_prompts --check   # exit 1 on drift (also a test)
 ```
 
-## Status: NOT DEPLOYABLE YET (one blocker open)
+## Status: both build blockers closed; the operator confirms shadow mode before repasting
 
 Like the `live-mirror/` prompts, these are a repo copy. Nothing here changes a live task until a human
-repastes a prompt into its Perplexity task. Do not repaste until both blockers below are closed and
-shadow mode (ADR phase 6) has run for at least five trading days.
+repastes a prompt into its Perplexity task. Both blockers below are closed. The one remaining condition
+is operational: shadow mode (ADR phase 6) must have run for at least five trading days before a repaste,
+and only the operator can confirm that. The repo cannot show it. Section "Keeping the stamp current"
+says when a repaste is due.
 
 1. **CLOSED 2026-10-07: `scripts/backup_planner.py` now exists** and implements this contract (library logic
    in `dca_order_plan.py`, tests in `scripts/tests/test_backup_planner.py`). Every subcommand prints one JSON
