@@ -1,0 +1,7 @@
+# Yahoo Finance client for the NON-BUYING scheduled tasks (daily ticker-history refresh,
+# ^TICK breadth fetch, ticker-advisor, ml-forecaster research). Owner direction 2026-10-18:
+# yfinance may feed any scheduled task that does not place orders; no scheduled buying slot
+# may use it. Mirrors the `data` extra in pyproject.toml. Install with:
+#   pip install -r requirements-data.txt
+# Replacement plan: docs/yfinance_replacement_plan.md
+yfinance>=1.7

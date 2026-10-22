@@ -11,6 +11,9 @@ source .venv/bin/activate
 echo "Installing dev dependencies..."
 uv pip install -r requirements-dev.txt
 
+echo "Installing the Yahoo Finance client (non-buying scheduled tasks only)..."
+uv pip install -r requirements-data.txt
+
 echo "Installing core project as editable..."
 uv pip install -e .
 

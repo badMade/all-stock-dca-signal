@@ -101,6 +101,10 @@ LAUNCH_SPECS: dict[str, LaunchSpec] = {
         "octopus-inspect-html", "Octopus inspector page",
         "Write the Wondrous Octopus dashboard for the configured run directory as one HTML page.",
         "research", "page", ("octopus.html",), 900),
+    "octopus-ledger-export": LaunchSpec(
+        "octopus-ledger-export", "Octopus ledger export",
+        "Export the Octopus ledger predictions and scores for the active scheduled tickers as CSV, JSON and a Markdown report in the job directory.",
+        "research", "report", ("octopus_ledger.csv", "octopus_ledger.json", "octopus_ledger.md"), 900),
     "ml-train-dry-run": LaunchSpec(
         "ml-train-dry-run", "ml-forecaster dry run",
         "Train and evaluate the sizing model without publishing: artifacts and the proposed adjustment file land in the job directory only.",
@@ -280,7 +284,7 @@ def launch_actions(app, repo: Path, *, payloads: dict[str, dict | None] | None =
             available, reason = _archive_configured(repo), "The ticker archive (ticker_data or DCA_TICKER_HISTORY_DIR) is not present."
         elif spec.id == "market-graph-csv":
             available, reason = (repo / "historical_stock_data.csv").is_file(), "historical_stock_data.csv is missing from the checkout."
-        elif spec.id == "octopus-inspect-html":
+        elif spec.id in {"octopus-inspect-html", "octopus-ledger-export"}:
             active_run = getattr(app, "octopus_run", None) or settings.octopus_run
             available = not research_reason and active_run is not None
             reason = research_reason or "Supply --octopus-run with an existing Octopus run directory."
@@ -415,6 +419,23 @@ def run_launch(app, action: str, job_id: str, log: Callable[[str], None], *, rep
             inputs["octopus_run"] = root_label(target)
             results.append(run_command(["wondrous-octopus/inspect_run.py", "--run-dir", str(target),
                                         "--html", str(directory / "octopus.html"), "--summary"],
+                                       log, research=True, timeout=spec.timeout))
+    elif action == "octopus-ledger-export":
+        active_run = getattr(app, "octopus_run", None) or settings.octopus_run
+        if active_run is None:
+            log("No Octopus run directory is configured.\n")
+            results.append(1)
+        else:
+            target = active_run
+            # Same shard resolution as the inspector page: a sharded run keeps its checkpoint under shard_1.
+            if (target / "shard_1" / "checkpoint").is_dir() and not (target / "checkpoint").is_dir():
+                target = target / "shard_1"
+            inputs["octopus_run"] = root_label(target)
+            # --all-scheduled is the card's documented form; every output path is pinned to the job directory.
+            results.append(run_command(["scripts/export_octopus_ledger.py", "--run-dir", str(target), "--all-scheduled",
+                                        "--csv-out", str(directory / "octopus_ledger.csv"),
+                                        "--json-out", str(directory / "octopus_ledger.json"),
+                                        "--report-md", str(directory / "octopus_ledger.md")],
                                        log, research=True, timeout=spec.timeout))
     elif action == "ml-train-dry-run":
         results.append(run_command(["ml-forecaster/train.py", "--dry-run", "--models-dir", str(directory / "models"),

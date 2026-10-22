@@ -19,6 +19,9 @@ version = "0.1.0"
 source = { editable = "." }
 
 [package.optional-dependencies]
+data = [
+    { name = "yfinance" },
+]
 dev = [
     { name = "jsonschema" },
     { name = "pip-audit" },
@@ -99,9 +102,10 @@ requires-dist = [
     { name = "types-requests", marker = "extra == 'selfheal'", specifier = "==2.33.0.20261006" },
     { name = "uv", marker = "extra == 'dev'", specifier = "==0.13.4" },
     { name = "vectorbt", marker = "extra == 'strategies'" },
+    { name = "yfinance", marker = "extra == 'data'", specifier = ">=1.7" },
     { name = "yfinance", marker = "extra == 'strategies'" },
 ]
-provides-extras = ["selfheal", "dev", "strategies"]
+provides-extras = ["selfheal", "dev", "data", "strategies"]
 
 [[package]]
 name = "alpaca-py"

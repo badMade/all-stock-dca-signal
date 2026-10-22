@@ -130,3 +130,77 @@ def test_scan_cache_builds_in_the_background_and_reports_errors(tmp_path, monkey
     boom.get(root)
     boom.wait()
     assert boom.get(root) == {"status": "error", "error": "ZeroDivisionError: division by zero"}
+
+
+def test_architecture_page_ships_resizable_sidebars_without_inline_script():
+    # Both sidebars were fixed at 260px / 360px, truncating long signatures in the detail pane. The shell now
+    # carries two separator handles, the grid reads its column widths from variables, and the drag code lives in
+    # the same-origin script so DEFAULT_CSP stays strict.
+    from dca_console_diagnostics import PAGE_CSS, PAGE_JS, render_page
+
+    page = render_page()
+    assert b'id="grip-l"' in page and b'id="grip-r"' in page and b"<script>" not in page
+    assert page.count(b'role="separator"') == 2
+    assert "var(--lw,260px)" in PAGE_CSS and "var(--rw,360px)" in PAGE_CSS
+    assert "setPointerCapture" in PAGE_JS and "ArrowLeft" in PAGE_JS and "dblclick" in PAGE_JS
+
+
+def test_every_scanned_module_has_a_plain_english_note_and_no_stale_ones():
+    # The detail pane opens with a hand-written plain-English note per module. A new module with no note, or a
+    # note for a module that was renamed or deleted, fails here so the map never shows a blank or a ghost.
+    from pathlib import Path
+
+    from dca_console_diagnostics import PLAIN_NOTES_FILE, _plain_notes
+
+    repo = Path(__file__).resolve().parents[1]
+    notes = _plain_notes(repo)
+    scanned = {m["id"]: m for m in build_architecture(repo)["modules"]}
+    assert (repo / PLAIN_NOTES_FILE).is_file()
+    assert sorted(set(scanned) - set(notes)) == [], "add a plain-English note to docs/architecture_plain_english.json"
+    assert sorted(set(notes) - set(scanned)) == [], "remove notes for modules that are no longer scanned"
+    assert all(len(note.split()) >= 6 for note in notes.values())
+    assert scanned["dca_fileio"]["plain"] == notes["dca_fileio"]
+
+
+def test_plain_notes_tolerate_a_missing_or_broken_file_and_functions_carry_a_summary(tmp_path):
+    from dca_console_diagnostics import _plain_notes, build_detail
+
+    assert _plain_notes(tmp_path) == {}
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "architecture_plain_english.json").write_text("{not json")
+    assert _plain_notes(tmp_path) == {}
+    (tmp_path / "docs" / "architecture_plain_english.json").write_text('["not", "a", "dict"]')
+    assert _plain_notes(tmp_path) == {}
+    (tmp_path / "mod.py").write_text(
+        'def fetch(x: int) -> int:\n    """Fetch one thing. It then does more detail that the pane must not show."""\n    return x\n'
+        'class K:\n    def run(self) -> None:\n        """Run it."""\n')
+    detail = build_detail(tmp_path, "mod")
+    assert detail["functions"][0]["doc"] == "Fetch one thing."
+    assert detail["classes"][0]["methods"][0]["doc"] == "Run it."
+
+
+def test_other_layer_is_split_into_subcategories_and_nothing_is_left_unsorted():
+    # "Other" held 71 of 146 modules as one grey pile. It stays a layer but every Other module now carries a
+    # named subcategory; a new Other module that no group claims shows up as "unsorted" and fails here.
+    from pathlib import Path
+
+    from dca_console_diagnostics import OTHER_GROUPS, UNSORTED_GROUP, _group_for
+
+    data = build_architecture(Path(__file__).resolve().parents[1])
+    other = [m for m in data["modules"] if m["layer"] == "other"]
+    assert other and all(m["group"] for m in other)
+    assert all(m["group"] == "" for m in data["modules"] if m["layer"] != "other")
+    assert [m["id"] for m in other if m["group"] == UNSORTED_GROUP[0]] == [], "give new modules a home in OTHER_GROUPS"
+    assert [g["id"] for g in data["groups"]] == [gid for gid, _, _ in OTHER_GROUPS]
+    members = [name for _, _, names in OTHER_GROUPS for name in names]
+    assert len(members) == len(set(members)), "a module is listed in two subcategories"
+    assert sorted(set(members) - {m["id"] for m in other}) == [], "OTHER_GROUPS names a module that is not in Other"
+    assert _group_for("brand_new_helper", "other") == UNSORTED_GROUP[0] and _group_for("dca_risk", "money_risk") == ""
+
+
+def test_architecture_page_assets_render_the_subcategories():
+    from dca_console_diagnostics import PAGE_CSS, PAGE_JS
+
+    assert "<optgroup" in PAGE_JS and "colorOf" in PAGE_JS and 'class="subs"' in PAGE_JS.replace("className=\"subs\"", 'class="subs"')
+    for gid in ("config_data", "reporting_ops", "broker_market", "research", "utilities", "unsorted"):
+        assert f".g-{gid}{{" in PAGE_CSS and f"{gid}:" in PAGE_JS

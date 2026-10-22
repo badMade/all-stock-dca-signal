@@ -1614,3 +1614,33 @@ def test_snapshot_defaults_research_to_the_primary_universe_and_ticker_overrides
         assert default["available_tickers"] == ["AAPL", "BYDDY", "ZZZZ"]
         override = application.snapshot(date(2026, 9, 8), ticker="ZZZZ")["octopus"]
         assert {row["ticker"] for row in override["forecasts"]} == {"ZZZZ"}
+
+
+def test_observed_root_notice_explains_an_empty_or_missing_artifact_root(tmp_path):
+    # A console started from a fresh checkout/worktree has no gitignored .env, so the root falls back to a
+    # cron_tracking folder that is not there and every page renders empty. The banner must say so, by label only.
+    day = date(2026, 9, 8)
+    missing = dca_console.observed_root_notice(
+        dca_console.Settings("local", tmp_path / "nope", tmp_path / "out", day, sys.executable, sys.executable))
+    assert missing.startswith("WARNING: no artifact root") and "DCA_CRON_TRACKING_ROOT" in missing and "--root" in missing
+    assert str(tmp_path) not in missing
+    empty_root = tmp_path / "empty"
+    empty_root.mkdir()
+    empty = dca_console.observed_root_notice(
+        dca_console.Settings("local", empty_root, tmp_path / "out", day, sys.executable, sys.executable))
+    assert "is empty" in empty and str(tmp_path) not in empty
+    full_root = tmp_path / "full"
+    (full_root / "midday_dca").mkdir(parents=True)
+    full = dca_console.observed_root_notice(
+        dca_console.Settings("local", full_root, tmp_path / "out", day, sys.executable, sys.executable))
+    assert full.startswith("Observing real artifacts under") and "WARNING" not in full
+    demo = dca_console.observed_root_notice(
+        dca_console.Settings("demo", tmp_path / "nope", tmp_path / "out", day, sys.executable, sys.executable))
+    assert demo == ""
+
+
+def test_missing_secondary_root_error_says_how_to_recover(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        dca_console.main(["--local", "--check", "--root", str(tmp_path), "--secondary-root", str(tmp_path / "artifacts")])
+    err = capsys.readouterr().err
+    assert "must name an existing directory" in err and "leave --secondary-root out" in err

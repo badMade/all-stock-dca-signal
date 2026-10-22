@@ -22,6 +22,7 @@ are not resolved, so function-level edges under-count rather than over-count.
 from __future__ import annotations
 
 import ast
+import json
 import re
 import threading
 from pathlib import Path
@@ -66,6 +67,56 @@ LAYERS = ("plan_first", "backup_executor", "entry_points", "money_risk", "reliab
 def _module_name(path: Path, repo: Path) -> str:
     rel = path.relative_to(repo).with_suffix("")
     return ".".join(rel.parts)
+
+
+# "Other" held 71 of 146 modules as one grey pile, so it is split into descriptive subcategories. The layer
+# stays "other" (the layer rules above are unchanged); each Other module also carries a ``group``. Members are
+# listed by exact module name, not prefix: these are one-off scripts and a prefix would sweep in new neighbours.
+# A new Other module that is in no group lands in "unsorted", and a test fails until it is given a home.
+OTHER_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("config_data", "Config & data", (
+        "dca_config", "dca_env", "dca_paths", "dca_ticker_paths", "dca_fileio", "dca_intraday_archive",
+        "scripts.backfill_intraday_archive", "scripts.refresh_active_ticker_histories",
+        "scripts.run_ticker_maintenance", "scripts.run_tickers_daily_update",
+        "scripts.daily_per_ticker_calibration", "sizing_adjustment_reader", "scripts.backup_strategy",
+    )),
+    ("reporting_ops", "Reporting & monitoring", (
+        "dca_alerts", "dca_average_cost_snapshot", "dca_notion_sync", "dca_reporting", "dca_weekly_dashboard",
+        "scripts.alert_digest", "scripts.check_live_prompt_drift", "scripts.check_slot_fills",
+        "scripts.close_window_signal", "scripts.drift_detection", "scripts.finalize_run_evidence",
+        "scripts.foreground_primary", "scripts.gate_failure_diagnostics", "scripts.model_usage_log",
+        "scripts.purchase_history", "scripts.schedule_watchdog", "scripts.scheduled_artifacts",
+        "scripts.verify_schedule", "scripts.evidence_publish", "scripts.cloud_preflight", "scripts.workspace_probe",
+        "scripts.backfill_afternoon_evidence", "scripts.planner_stamp_check", "scripts.slot_attribution",
+    )),
+    ("broker_market", "Broker, orders & market data", (
+        "dca_live_adapters", "dca_slot_guard", "build_raw_data", "run_market_open_signals",
+        "scripts.ingest_market_data", "scripts.build_robinhood_market_data", "scripts.order_refetch",
+        "scripts.prior_reference_bindings", "scripts.assemble_order_pages", "scripts.adhoc_orders",
+        "scripts.emit_order_plan", "scripts.refresh_market_open_candidates", "scripts.backup_gates",
+        "scripts.backup_procedure",
+    )),
+    ("research", "Research & analysis", (
+        "scripts.auto_resume_walkforward", "scripts.shard_heartbeat", "scripts.evaluate_deferral_params",
+        "scripts.export_octopus_ledger", "scripts.publish_octopus_sizing",
+        "scripts.run_90day_prediction_experiment", "scripts.run_phase4_backtest",
+        "scripts.sequestered_truth_comparator", "run_benchmark",
+    )),
+    ("utilities", "Dev tools & utilities", (
+        "dca_bootstrap", "dca_common", "dca_net_utils", "find_issues", "patch_finbert_cache", "patch_template",
+        "snap", "scripts.__init__", "scripts.agent_entry_points", "scripts.compute_schedule",
+        "scripts.fill_perplexity_backup_prompts", "scripts.github_mcp_login", "scripts.healthcheck",
+        "scripts.self_heal", "scripts.verify_perplexity_pair", "scripts.workflow_policy", "scripts.promote_console",
+    )),
+)
+UNSORTED_GROUP = ("unsorted", "Unsorted (needs a category)")
+
+
+def _group_for(module: str, layer: str) -> str:
+    """The Other-layer subcategory id for ``module`` ("" for every other layer)."""
+    if layer != "other":
+        return ""
+    return next((gid for gid, _, members in OTHER_GROUPS if module in members), UNSORTED_GROUP[0])
 
 
 def _layer_for(module: str) -> str:
@@ -266,15 +317,37 @@ class _ModuleScan:
                         if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
                             row["methods"].append({
                                 "name": s.name, "params": _params(s), "returns": _annotation_text(s.returns), "line": s.lineno,
+                                "doc": _doc_summary(s),
                             })
                             self._scan_calls(f"{self.module}:{node.name}.{s.name}", s)
                 self.classes.append(row)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 row = {"name": node.name, "line": node.lineno, "private": node.name.startswith("_")}
                 if self.detailed:
-                    row.update({"params": _params(node), "returns": _annotation_text(node.returns)})
+                    row.update({"params": _params(node), "returns": _annotation_text(node.returns), "doc": _doc_summary(node)})
                     self._scan_calls(f"{self.module}:{node.name}", node)
                 self.functions.append(row)
+
+
+PLAIN_NOTES_FILE = "docs/architecture_plain_english.json"
+
+
+def _plain_notes(repo: Path) -> dict[str, str]:
+    """Hand-written plain-English note per module; a missing or broken file just means no notes."""
+    try:
+        data = json.loads((Path(repo) / PLAIN_NOTES_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(data, dict) else {}
+
+
+def _doc_summary(node: ast.AST) -> str:
+    """First sentence of a function's docstring (<=160 chars), so the pane can say what it does."""
+    text = " ".join((ast.get_docstring(node) or "").split())  # type: ignore[arg-type]
+    if not text:
+        return ""
+    sentence = re.split(r"(?<=[.!?])\s", text, maxsplit=1)[0]
+    return sentence if len(sentence) <= 160 else sentence[:157].rstrip() + "..."
 
 
 def build_architecture(repo: Path) -> dict[str, Any]:
@@ -288,6 +361,7 @@ def build_architecture(repo: Path) -> dict[str, Any]:
         except (SyntaxError, UnicodeDecodeError, OSError):
             continue  # a broken file is simply absent from the map, never a crash
     internal = set(parsed)
+    notes = _plain_notes(repo)
     scans = {name: _ModuleScan(name, tree, internal) for name, (_, tree, _) in parsed.items()}
 
     modules, edges = [], []
@@ -306,6 +380,7 @@ def build_architecture(repo: Path) -> dict[str, Any]:
             "id": name, "layer": _layer_for(name), "lines": lines, "classes": scan.classes,
             "functions": scan.functions, "in_degree": incoming[name], "has_main": has_main,
             "unreferenced": incoming[name] == 0 and not has_main,
+            "plain": notes.get(name, ""), "group": _group_for(name, _layer_for(name)),
         })
         for target, info in scan.imports.items():
             if target == name:
@@ -321,7 +396,10 @@ def build_architecture(repo: Path) -> dict[str, Any]:
         "private_cross_imports": sum(len(e["private"]) for e in edges),
         "unreferenced_modules": sum(1 for m in modules if m["unreferenced"]),
     }
-    return {"layers": list(LAYERS), "modules": modules, "edges": edges, "stats": stats}
+    groups = [{"id": gid, "label": label, "layer": "other"} for gid, label, _ in OTHER_GROUPS]
+    if any(m["group"] == UNSORTED_GROUP[0] for m in modules):
+        groups.append({"id": UNSORTED_GROUP[0], "label": UNSORTED_GROUP[1], "layer": "other"})
+    return {"layers": list(LAYERS), "groups": groups, "modules": modules, "edges": edges, "stats": stats}
 
 
 class ScanCache:
@@ -411,6 +489,8 @@ PAGE_HTML = """<!doctype html>
 <h2>Needs a look</h2><div id="problems"></div>
 <div class="banner gap">Limit: <code>obj.method()</code> calls on instances are not resolved, so call edges under-count.</div>
 </aside>
+<div class="grip" id="grip-l" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize left sidebar (drag, arrow keys, double-click to reset)"></div>
+<div class="grip" id="grip-r" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Resize right sidebar (drag, arrow keys, double-click to reset)"></div>
 <section id="map"><svg id="svg" role="group" aria-label="Module dependency map. Press Tab to move between modules, Enter to select."></svg></section>
 <section id="detail"><div class="banner">Click a module to see its classes, fields, functions and who connects to it.</div></section>
 <script src="/diagnostics/architecture.js" defer></script></body></html>
@@ -418,11 +498,12 @@ PAGE_HTML = """<!doctype html>
 
 PAGE_CSS = """:root{--bg:#fff;--fg:#1d2433;--mute:#667085;--line:#d0d5dd;--panel:#f6f7f9;--hi:#2563eb;--bad:#b42318}
 @media (prefers-color-scheme:dark){:root{--bg:#0f141c;--fg:#e6e9ef;--mute:#98a2b3;--line:#344054;--panel:#161d28;--hi:#6ea8ff;--bad:#f97066}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif;display:grid;grid-template-columns:260px 1fr 360px;height:100vh}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,sans-serif;display:grid;grid-template-columns:var(--lw,260px) minmax(0,1fr) var(--rw,360px);height:100vh;position:relative}
 aside,section{overflow:auto;padding:12px 14px}aside{background:var(--panel);border-right:1px solid var(--line)}#detail{background:var(--panel);border-left:1px solid var(--line)}
 h1{font-size:16px;margin:0 0 4px}h2{font-size:13px;margin:14px 0 6px;text-transform:uppercase;letter-spacing:.04em;color:var(--mute)}
 .banner{font-size:12px;color:var(--mute);margin-bottom:8px}label{display:flex;gap:6px;align-items:center;margin:3px 0;cursor:pointer}
 input[type=search]{width:100%;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+.g-config_data{background:#b4c3d9}.g-reporting_ops{background:#c8bfd9}.g-broker_market{background:#b3cfc6}.g-research{background:#d9c9b3}.g-utilities{background:#cbd5e1}.g-unsorted{background:#e2e8f0}.subs{margin:0 0 4px 22px;font-size:12px;color:var(--mute)}.subs div{display:flex;gap:6px;align-items:center;margin:1px 0}.lane.sub{font-size:10px;font-weight:500}
 .gap{margin-top:12px}.c-plan_first{background:#2563eb}.c-backup_executor{background:#7c3aed}.c-entry_points{background:#d97706}.c-money_risk{background:#059669}.c-reliability{background:#0891b2}.c-console{background:#98a2b3}.c-other{background:#cbd5e1}
 .sw{width:10px;height:10px;border-radius:50%;display:inline-block}
 svg{width:100%;display:block}.node{cursor:pointer}.node:focus{outline:none}.node:focus rect:first-child{stroke:var(--hi);stroke-width:3}.node text{font-size:11px;fill:var(--fg);pointer-events:none}
@@ -432,17 +513,29 @@ svg{width:100%;display:block}.node{cursor:pointer}.node:focus{outline:none}.node
 table{border-collapse:collapse;width:100%;font-size:12px}td,th{border-bottom:1px solid var(--line);padding:3px 4px;text-align:left;vertical-align:top}
 code{font:12px ui-monospace,monospace}.bag{color:var(--bad)}.pill{font-size:11px;border:1px solid var(--line);border-radius:10px;padding:0 6px;margin-left:4px}
 button{border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:6px;padding:4px 8px;cursor:pointer}a.lk,button.lk{border:0;background:none;padding:0;font:inherit;color:var(--hi);cursor:pointer;text-decoration:underline}
-@media (max-width:900px){body{grid-template-columns:1fr;height:auto}}
+/* Sidebar drag handles: a 10px hit area centred on each column edge, a 2px visible rule on hover/focus/drag. */
+.grip{position:absolute;top:0;bottom:0;width:10px;margin-left:-5px;cursor:col-resize;z-index:5;touch-action:none}
+#grip-l{left:var(--lw,260px)}#grip-r{left:calc(100% - var(--rw,360px))}
+.grip::after{content:"";position:absolute;top:0;bottom:0;left:4px;width:2px;background:transparent}
+.grip:hover::after,.grip:focus-visible::after,.grip.drag::after{background:var(--hi)}.grip:focus{outline:none}
+body.resizing{cursor:col-resize;user-select:none}
+.plain{background:var(--bg);border:1px solid var(--line);border-left:3px solid var(--hi);border-radius:6px;padding:8px 10px;margin:8px 0 4px;font-size:13px}.plain h2{margin:8px 0 4px}.plain h2:first-child{margin-top:0}.plain p{margin:0 0 4px}.plain ul{margin:2px 0 6px;padding-left:18px}.plain li{margin:2px 0}.plain .why{color:var(--mute)}#detail td,#detail th{overflow-wrap:anywhere}
+@media (max-width:900px){body{grid-template-columns:1fr;height:auto}.grip{display:none}}
 """
 
 PAGE_JS = r"""function load(){fetch('/api/diagnostics/architecture',{credentials:'same-origin'}).then(r=>r.json()).then(DATA=>{if(DATA.status==='building'){document.getElementById('detail').textContent='Scanning the source tree\u2026';setTimeout(load,800);return}if(DATA.status!=='ready'){document.getElementById('detail').textContent='Scan failed: '+(DATA.error||'unknown');return}
+const detailBox=document.getElementById('detail');if(detailBox.textContent.startsWith('Scanning'))detailBox.innerHTML='<div class="banner">Click a module to see its plain-English summary, classes, fields, functions and who connects to it.</div>';
 const COLORS = {plan_first:"#2563eb",backup_executor:"#7c3aed",entry_points:"#d97706",money_risk:"#059669",reliability:"#0891b2",console:"#98a2b3",other:"#cbd5e1"};
+const GCOLORS = {config_data:"#b4c3d9",reporting_ops:"#c8bfd9",broker_market:"#b3cfc6",research:"#d9c9b3",utilities:"#cbd5e1",unsorted:"#e2e8f0"};
+const GROUPS = DATA.groups||[];const gIndex=m=>GROUPS.findIndex(g=>g.id===m.group);const gLabel=id=>(GROUPS.find(g=>g.id===id)||{}).label||id;
+const colorOf=m=>(m.group&&GCOLORS[m.group])||COLORS[m.layer];
 const LABELS = {plan_first:"Plan-first (new objects)",backup_executor:"Backup / executor",entry_points:"Entry points (legacy)",money_risk:"Money & risk",reliability:"Reliability",console:"Console",other:"Other"};
 const mods = new Map(DATA.modules.map(m=>[m.id,m])); let selected=null,refocus=false; const visible=new Set(DATA.layers.filter(l=>l!=="console"&&l!=="other"));
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 function legend(){const box=document.getElementById("layers");box.innerHTML="";for(const l of DATA.layers){const n=DATA.modules.filter(m=>m.layer===l).length;if(!n)continue;
  const lab=document.createElement("label");lab.innerHTML=`<input type="checkbox" ${visible.has(l)?"checked":""}><span class="sw c-${l}"></span>${LABELS[l]} (${n})`;
- lab.firstChild.onchange=e=>{e.target.checked?visible.add(l):visible.delete(l);draw()};box.appendChild(lab)}}
+ lab.firstChild.onchange=e=>{e.target.checked?visible.add(l):visible.delete(l);draw()};box.appendChild(lab);
+ if(l==="other"&&GROUPS.length){const subs=document.createElement("div");subs.className="subs";subs.innerHTML=GROUPS.map(g=>`<div><span class="sw g-${g.id}"></span>${esc(g.label)} (${DATA.modules.filter(m=>m.group===g.id).length})</div>`).join("");box.appendChild(subs)}}}
 function stats(){const s=DATA.stats;document.getElementById("stats").innerHTML=`<table>${Object.entries(s).map(([k,v])=>`<tr><td>${k.replace(/_/g," ")}</td><td><b>${v}</b></td></tr>`).join("")}</table>`}
 function problems(){const priv=DATA.edges.filter(e=>e.private.length);const unref=DATA.modules.filter(m=>m.unreferenced&&m.layer!=="console");
  document.getElementById("problems").innerHTML=`<b>Private cross-module imports (${priv.length})</b><br>`+priv.slice(0,25).map(e=>`<button type="button" class="lk" data-m="${e.from}">${esc(e.from)}</button> &rarr; ${esc(e.to)}: <code>${esc(e.private.join(", "))}</code><br>`).join("")+
@@ -451,29 +544,48 @@ function problems(){const priv=DATA.edges.filter(e=>e.private.length);const unre
 function visibleMods(){const q=document.getElementById("q").value.trim().toLowerCase();
  return DATA.modules.filter(m=>visible.has(m.layer)).map(m=>({m,hit:!q||m.id.toLowerCase().includes(q)||m.classes.some(c=>c.name.toLowerCase().includes(q))||m.functions.some(f=>f.name.toLowerCase().includes(q))}))}
 function draw(){const svg=document.getElementById("svg");const rows=visibleMods();const lanes=DATA.layers.filter(l=>visible.has(l));const W=1000,colW=W/Math.max(lanes.length,1),H=22;
- const pos=new Map();let maxY=60;lanes.forEach((l,i)=>{const items=rows.filter(r=>r.m.layer===l).sort((a,b)=>b.m.lines-a.m.lines);items.forEach((r,j)=>{pos.set(r.m.id,{x:i*colW+8,y:40+j*(H+4),w:colW-16,r});maxY=Math.max(maxY,40+(j+1)*(H+4))})});
- svg.setAttribute("viewBox",`0 0 ${W} ${maxY+20}`);let h="";lanes.forEach((l,i)=>{h+=`<text class="lane" x="${i*colW+8}" y="22">${LABELS[l]}</text>`});
+ const pos=new Map();let maxY=60;const subheads=[];
+ lanes.forEach((l,i)=>{const items=rows.filter(r=>r.m.layer===l).sort((a,b)=>(gIndex(a.m)-gIndex(b.m))||b.m.lines-a.m.lines);let slot=0,prev=null;items.forEach(r=>{
+  if(l==="other"&&r.m.group&&r.m.group!==prev){prev=r.m.group;subheads.push({x:i*colW+8,y:40+slot*(H+4)+14,label:gLabel(r.m.group)});slot++}
+  pos.set(r.m.id,{x:i*colW+8,y:40+slot*(H+4),w:colW-16,r});slot++;maxY=Math.max(maxY,40+slot*(H+4))})});
+ svg.setAttribute("viewBox",`0 0 ${W} ${maxY+20}`);let h="";lanes.forEach((l,i)=>{h+=`<text class="lane" x="${i*colW+8}" y="22">${LABELS[l]}</text>`});subheads.forEach(t=>{h+=`<text class="lane sub" x="${t.x}" y="${t.y}">${esc(t.label)}</text>`});
  const only=document.getElementById("onlyhot").checked,po=document.getElementById("privonly").checked;
  for(const e of DATA.edges){const a=pos.get(e.from),b=pos.get(e.to);if(!a||!b)continue;const hot=selected&&(e.from===selected||e.to===selected);if(only&&selected&&!hot)continue;
   const x1=a.x+a.w,y1=a.y+H/2,x2=b.x,y2=b.y+H/2,back=b.x<=a.x;const cls=`edge${hot?" hot":""}${po&&e.private.length?" priv":""}`;
   h+=back?`<path class="${cls}" d="M${a.x+a.w/2},${a.y+H} C${a.x+a.w/2},${a.y+H+40} ${b.x+b.w/2},${b.y-40} ${b.x+b.w/2},${b.y}"/>`:`<path class="${cls}" d="M${x1},${y1} C${x1+60},${y1} ${x2-60},${y2} ${x2},${y2}"/>`}
- for(const [id,p] of pos){const m=p.r.m;const w=Math.max(4,Math.min(p.w,p.w*Math.sqrt(m.lines/6000)));h+=`<g tabindex="0" role="button" aria-label="${esc(id)}, ${m.lines} lines" class="node${selected===id?" sel":""}${p.r.hit?"":" dim"}${m.unreferenced?" unref":""}" data-id="${id}"><rect x="${p.x}" y="${p.y}" width="${p.w}" height="${H}" rx="4" fill="${COLORS[m.layer]}" fill-opacity=".22"/><rect x="${p.x}" y="${p.y}" width="${w}" height="${H}" rx="4" fill="${COLORS[m.layer]}" fill-opacity=".55" stroke="none"/><text x="${p.x+5}" y="${p.y+15}">${esc(id.replace("scripts.","s."))}</text></g>`}
+ for(const [id,p] of pos){const m=p.r.m;const w=Math.max(4,Math.min(p.w,p.w*Math.sqrt(m.lines/6000)));h+=`<g tabindex="0" role="button" aria-label="${esc(id)}, ${m.lines} lines" class="node${selected===id?" sel":""}${p.r.hit?"":" dim"}${m.unreferenced?" unref":""}" data-id="${id}"><rect x="${p.x}" y="${p.y}" width="${p.w}" height="${H}" rx="4" fill="${colorOf(m)}" fill-opacity=".22"/><rect x="${p.x}" y="${p.y}" width="${w}" height="${H}" rx="4" fill="${colorOf(m)}" fill-opacity=".55" stroke="none"/><text x="${p.x+5}" y="${p.y+15}">${esc(id.replace("scripts.","s."))}</text></g>`}
  svg.innerHTML=h;svg.querySelectorAll(".node").forEach(n=>{n.onclick=()=>select(n.dataset.id);n.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();select(n.dataset.id)}}});
  if(selected&&refocus){const f=svg.querySelector('.node[data-id="'+selected+'"]');if(f)f.focus()}
- const pick=document.getElementById("pick");pick.innerHTML='<option value="">Choose&hellip;</option>'+rows.map(r=>`<option value="${r.m.id}"${r.m.id===selected?" selected":""}>${esc(r.m.id)}</option>`).join("")}
+ const pick=document.getElementById("pick");const opt=m=>`<option value="${m.id}"${m.id===selected?" selected":""}>${esc(m.id)}${visible.has(m.layer)?"":" (hidden layer)"}</option>`;
+ const sections=[];DATA.layers.forEach(l=>{if(l==="other"&&GROUPS.length)GROUPS.forEach(g=>sections.push([`${LABELS.other} \u00b7 ${g.label}`,DATA.modules.filter(m=>m.group===g.id)]));else sections.push([LABELS[l],DATA.modules.filter(m=>m.layer===l)])});
+ pick.innerHTML='<option value="">Choose&hellip;</option>'+sections.filter(x=>x[1].length).map(([label,list])=>`<optgroup label="${esc(label)}">${list.map(opt).join("")}</optgroup>`).join("")}
 const sig=x=>`${esc(x.name)}(${x.params.map(p=>`<span class="${p.bag?"bag":""}">${esc(p.name)}${p.type?": "+esc(p.type):""}</span>`).join(", ")})`;
-function select(id){const a=document.activeElement;refocus=!!(a&&a.closest&&a.closest("svg"));selected=id;draw();refocus=false;const m=mods.get(id);if(!m)return;
+const LAYER_PLAIN={plan_first:"the newer plan-first design, where the program decides what to buy and a simple agent only places the orders",backup_executor:"the backup system that steps in when the Mac's normal run cannot",entry_points:"the main buying runners",money_risk:"the money and risk controls",reliability:"the safety layer that stops duplicate, racing or stale runs",console:"the local control panel",other:"the general helpers and tools"};
+const short=t=>{if(!t)return"";const first=t.split(/(?<=[.!?])\s/)[0];return first.length>150?first.slice(0,147)+"...":first};
+const plural=(n,w)=>`${n} ${w}${n===1?"":"s"}`;
+function plainBox(id,m,out,inn){
+ const note=t=>short((mods.get(t)||{}).plain)||"(no note yet)";
+ const CAP=12;
+ const rows=(edges,key,takes)=>{const shown=edges.slice(0,CAP).map(e=>`<li><button type="button" class="lk" data-m="${esc(e[key])}">${esc(e[key])}</button> &mdash; ${esc(note(e[key]))}${takes&&e.names&&e.names.length?` <span class="why">(it takes: ${e.names.map(n=>`<code>${esc(n)}</code>`).join(", ")})</span>`:""}</li>`).join("");
+  return `<ul>${shown}${edges.length>CAP?`<li class="why">&hellip;and ${edges.length-CAP} more, listed below.</li>`:""}</ul>`};
+ const uses=out.length?`<p>It relies on ${plural(out.length,"other file")}:</p>${rows(out,"to",true)}`:`<p>It does not rely on any other file in this repo, so it works on its own.</p>`;
+ const usedBy=inn.length?`<p>${plural(inn.length,"file")} rely on it:</p>${rows(inn,"from",false)}`:`<p>${m.has_main?"Nothing imports it, but you can run it directly from the command line.":"Nothing imports it and it has no command line, so it is either unused or run only from outside this repo."}</p>`;
+ return `<div class="plain"><h2>In plain English</h2><p>${esc(m.plain||"No plain-English note has been written for this file yet.")}</p>
+ <p class="why">It is part of ${LAYER_PLAIN[m.layer]||"the repo"}.</p><h2>What it connects to</h2>${uses}<h2>What connects to it</h2>${usedBy}</div>`}
+function select(id){const a=document.activeElement;refocus=!!(a&&a.closest&&a.closest("svg"));selected=id;
+ const layer=(mods.get(id)||{}).layer;if(layer&&!visible.has(layer)){visible.add(layer);legend()}draw();refocus=false;const m=mods.get(id);if(!m)return;
  const out=DATA.edges.filter(e=>e.from===id),inn=DATA.edges.filter(e=>e.to===id);
  const lnk=l=>l.map(e=>`<button type="button" class="lk" data-m="${e}">${esc(e)}</button>`).join(", ")||"<i>none</i>";
  const names=m.classes.map(c=>`<code>${esc(c.name)}</code><span class="pill">${c.kind}</span>`).join(" ")||"<i>none</i>";
- document.getElementById("detail").innerHTML=`<h1>${esc(id)}</h1><div class="banner">${LABELS[m.layer]} &middot; ${m.lines} lines${m.unreferenced?" &middot; not imported, no CLI":""}</div>
+ document.getElementById("detail").innerHTML=`<h1>${esc(id)}</h1><div class="banner">${LABELS[m.layer]}${m.group?" &middot; "+esc(gLabel(m.group)):""} &middot; ${m.lines} lines${m.unreferenced?" &middot; not imported, no CLI":""}</div>
+ ${plainBox(id,m,out,inn)}
  <h2>Imports (${out.length})</h2>${lnk(out.map(e=>e.to))}<h2>Imported by (${inn.length})</h2>${lnk(inn.map(e=>e.from))}
  <h2>Classes (${m.classes.length})</h2>${names}<div id="more" class="banner">Loading fields, signatures and calls&hellip;</div>`;
  document.querySelectorAll("#detail button[data-m]").forEach(a=>a.onclick=()=>select(a.dataset.m));
- fetch('/api/diagnostics/architecture/module?module='+encodeURIComponent(id),{credentials:'same-origin'}).then(r=>r.json()).then(d=>{if(selected!==id)return;const box=document.getElementById('more');if(!d||!Array.isArray(d.classes)){box.textContent='Unavailable';return}
+ fetch('/api/diagnostics/architecture/module?module='+encodeURIComponent(id),{credentials:'same-origin'}).then(r=>r.json()).then(d=>{if(selected!==id)return;const box=document.getElementById('more');if(!d||!Array.isArray(d.classes)){box.textContent='Details unavailable'+(d&&d.error?': '+d.error:'')+'. Reload the page; if this server was restarted, the old tab can no longer ask it.';return}
   const cls=d.classes.map(c=>`<h2>${esc(c.name)} <span class="pill">${c.kind}</span></h2>`+(c.fields.length?`<table>${c.fields.map(f=>`<tr><td><code>${esc(f.name)}</code></td><td><code class="${f.bag?"bag":""}">${esc(f.type)}</code></td></tr>`).join("")}</table>`:"")+
-   (c.methods.length?`<table>${c.methods.filter(x=>!x.name.startsWith("__")).map(x=>`<tr><td><code>${sig(x)}</code></td><td>${esc(x.returns)}</td></tr>`).join("")}</table>`:"")).join("");
-  const fns=d.functions.length?`<h2>Functions (${d.functions.length})</h2><table>${d.functions.map(f=>`<tr><td><code>${sig(f)}</code></td><td>${esc(f.returns)}</td></tr>`).join("")}</table>`:"";
+   (c.methods.length?`<table>${c.methods.filter(x=>!x.name.startsWith("__")).map(x=>`<tr><td><code>${sig(x)}</code>${x.doc?`<div class="banner">${esc(x.doc)}</div>`:""}</td><td>${esc(x.returns)}</td></tr>`).join("")}</table>`:"")).join("");
+  const fns=d.functions.length?`<h2>Functions (${d.functions.length})</h2><table>${d.functions.map(f=>`<tr><td><code>${sig(f)}</code>${f.doc?`<div class="banner">${esc(f.doc)}</div>`:""}</td><td>${esc(f.returns)}</td></tr>`).join("")}</table>`:"";
   const callTable=(title,list)=>list.length?`<h2>${title} (${list.length})</h2><table>${list.map(c=>`<tr><td><code>${esc(c.from)}</code></td><td>&rarr; <code>${esc(c.to)}</code></td></tr>`).join("")}</table>`:"";
   const cl=callTable("Calls into other modules",d.calls.filter(c=>!c.local))+callTable("Calls within this module",d.calls.filter(c=>c.local));
   box.outerHTML=cls+fns+cl}).catch(()=>{})}
@@ -482,6 +594,25 @@ legend();stats();problems();draw();
 
 }).catch(e=>{document.getElementById('detail').textContent='Could not load the scan: '+e})}
 load();
+(function(){
+const root=document.documentElement,MIN=180,KEY="arch-sidebar-widths";
+const cfg={l:{grip:document.getElementById("grip-l"),prop:"--lw",def:260},r:{grip:document.getElementById("grip-r"),prop:"--rw",def:360}};
+const width={l:cfg.l.def,r:cfg.r.def};
+function limit(side,w){const other=side==="l"?width.r:width.l;return Math.max(MIN,Math.min(w,window.innerWidth-other-MIN))}
+function apply(side,w){width[side]=limit(side,w);root.style.setProperty(cfg[side].prop,width[side]+"px")}
+function save(){try{localStorage.setItem(KEY,JSON.stringify(width))}catch(e){}}
+try{const saved=JSON.parse(localStorage.getItem(KEY)||"{}");if(saved.l)apply("l",saved.l);if(saved.r)apply("r",saved.r)}catch(e){}
+["l","r"].forEach(side=>{const g=cfg[side].grip;if(!g)return;
+ g.addEventListener("pointerdown",e=>{e.preventDefault();g.setPointerCapture(e.pointerId);g.classList.add("drag");document.body.classList.add("resizing")});
+ g.addEventListener("pointermove",e=>{if(!g.classList.contains("drag"))return;apply(side,side==="l"?e.clientX:window.innerWidth-e.clientX)});
+ const stop=()=>{if(!g.classList.contains("drag"))return;g.classList.remove("drag");document.body.classList.remove("resizing");save()};
+ g.addEventListener("pointerup",stop);g.addEventListener("pointercancel",stop);
+ g.addEventListener("dblclick",()=>{apply(side,cfg[side].def);save()});
+ g.addEventListener("keydown",e=>{const dir=e.key==="ArrowLeft"?-1:e.key==="ArrowRight"?1:0;if(!dir)return;e.preventDefault();
+  apply(side,width[side]+(side==="l"?dir:-dir)*(e.shiftKey?10:40));save()});
+});
+window.addEventListener("resize",()=>{apply("l",width.l);apply("r",width.r)});
+})();
 """
 
 

@@ -507,18 +507,30 @@ def module_catalog(python: str) -> list[dict]:
                 return interpreter + " " + command[len(prefix):]
         return command
 
-    entry_actions = {
-        0: "demo-all",
-        1: "demo-dca",
-        6: "drift-check",
-        7: "alert-digest",
-        8: "test-signals",
-        9: "risk-report",
-        10: "config-invariants",
-    }
+    # Keyed by what the entry point actually runs, not by its position in ENTRY_POINTS: the catalog
+    # grew from 11 to 38 rows and every positional id (drift-check on #6, risk-report on #9, ...) ended
+    # up on an unrelated card, so the wrong "Run" button sat beside the wrong description. A card with
+    # no launcher keeps "Requires CLI args" / "Library API" rather than borrowing a neighbour's.
+    entry_actions = (
+        ("from.py", "demo-all"),
+        ("run_dca.py --demo", "demo-dca"),
+        ("scripts/drift_detection.py", "drift-check"),
+        ("scripts.alert_digest", "alert-digest"),
+        ("scripts/export_octopus_ledger.py", "octopus-ledger-export"),
+        ("scripts.generate_market_open_candidates", "gate5-replay-0935"),
+        ("scripts.generate_morning_candidates", "gate5-replay-1030"),
+        ("scripts.generate_midday_candidates", "gate5-replay-1230"),
+        ("scripts.generate_buy_candidates", "gate5-replay-1530"),
+        # One card covers three slots; it replays the first, the Workflows page has all three.
+        ("scripts.generate_intraday_candidates", "gate5-replay-1130"),
+    )
+
+    def entry_action(command: str) -> str | None:
+        return next((action for marker, action in entry_actions if marker in command), None)
+
     rows = [{"id": f"entry-{i}", "name": e.need, "description": e.notes,
              "command": runnable(e.command), "docs": e.doc_ref, "status": "Existing entry point",
-             "action_id": entry_actions.get(i)}
+             "action_id": entry_action(e.command)}
             for i, e in enumerate(ENTRY_POINTS)]
     extra_actions = {
         0: "demo-octopus",
@@ -1277,6 +1289,29 @@ def make_server(
     return ThreadingHTTPServer((access.bind, port), Handler)
 
 
+def observed_root_notice(settings: "Settings") -> str:
+    """One startup line saying what a local console is actually observing, and why it may be showing nothing.
+
+    A console started from a fresh checkout or git worktree has no gitignored ``.env``, so the artifact root
+    silently falls back to ``<checkout>/cron_tracking``, which does not exist there. Every page then renders
+    "unavailable" and looks broken when it is just pointed at an empty place. Say so at startup, by label
+    (never an absolute path), with the two ways to point it at the real tree. Demo mode says nothing.
+    """
+    if settings.mode != "local":
+        return ""
+    label = root_label(settings.root)
+    fix = "Set DCA_CRON_TRACKING_ROOT (see docs/local_env_file.md) or pass --root <cron_tracking>."
+    if not settings.root.is_dir():
+        return f"WARNING: no artifact root at {label}, so every page will be empty. {fix}"
+    try:
+        empty = next(settings.root.iterdir(), None) is None
+    except OSError:
+        return f"WARNING: artifact root {label} cannot be read, so every page will be empty. {fix}"
+    if empty:
+        return f"WARNING: artifact root {label} is empty, so every page will be empty. {fix}"
+    return f"Observing real artifacts under {label}."
+
+
 def startup_banner(access: ConsoleAccess, port: int) -> str:
     """Render the non-secret network policy shown before serving requests."""
     trusted_hosts = ", ".join(access.trusted_hosts) if access.trusted_hosts else "(none)"
@@ -1354,7 +1389,8 @@ def main(argv: list[str] | None = None) -> int:
         if not resolved.is_dir():
             # A missing secondary tree is a typo, not an empty history: refuse
             # rather than silently observe nothing (GUI expansion Phase 0).
-            parser.error(f"--secondary-root must name an existing directory: {extra}")
+            parser.error(f"--secondary-root must name an existing directory: {extra} "
+                         "(create it, or leave --secondary-root out: a checkout without artifacts/ has none)")
         if resolved not in secondary_roots:
             secondary_roots.append(resolved)
     if not 0 <= args.port <= 65535:
@@ -1449,7 +1485,8 @@ def main(argv: list[str] | None = None) -> int:
             details = redact(
                 f"DCA console ({settings.mode}): {url}\n"
                 f"Release: {settings.channel} v{release_info(settings.channel)['version']}\n"
-                f"Daily summaries: {output / 'summaries' / settings.mode}\nCtrl+C stops the console."
+                + (f"{observed_root_notice(settings)}\n" if settings.mode == "local" else "")
+                + f"Daily summaries: {output / 'summaries' / settings.mode}\nCtrl+C stops the console."
             )
             print(f"{startup_banner(access, actual_port)}\n{details}", flush=True)
 

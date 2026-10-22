@@ -128,6 +128,36 @@ def test_every_template_is_closed_and_forbidden_tokens_never_appear(app, tmp_pat
     assert templates["gate5-replay-1130"][:4] == ["-m", "scripts.generate_intraday_candidates", "--slot", "1130"]
     assert "--start" in templates["market-graph-archive"] and "--start" not in templates["market-graph-csv"]
     assert templates["drift-check"][0] == "scripts/drift_detection.py" and "--slack" not in templates["drift-check"]
+    # The ledger export keeps every output flag inside the job directory; the octopus run is the only input.
+    ledger = templates["octopus-ledger-export"]
+    assert ledger[:2] == ["scripts/export_octopus_ledger.py", "--run-dir"] and "--all-scheduled" in ledger
+    for flag in ("--csv-out", "--json-out", "--report-md"):
+        assert ledger[ledger.index(flag) + 1].startswith(launch_root)
+
+
+def test_program_directory_cards_carry_their_own_launcher():
+    # Regression: the catalog used list positions (6 -> drift-check, 9 -> risk-report, ...) from when it had
+    # eleven rows; with 38 rows every id landed on an unrelated card. Each launcher must sit on the card whose
+    # command it actually runs, and cards that need operator-supplied files must stay launcher-less.
+    rows = dca_console.module_catalog("python3")
+
+    def action_for(marker: str) -> str | None:
+        matches = {row["action_id"] for row in rows if marker in row["command"]}
+        assert len(matches) == 1, marker
+        return matches.pop()
+
+    assert action_for("scripts/drift_detection.py") == "drift-check"
+    assert action_for("scripts.alert_digest") == "alert-digest"
+    assert action_for("scripts/export_octopus_ledger.py") == "octopus-ledger-export"
+    assert action_for("scripts.generate_buy_candidates") == "gate5-replay-1530"
+    assert action_for("scripts.generate_market_open_candidates") == "gate5-replay-0935"
+    assert action_for("scripts.generate_morning_candidates") == "gate5-replay-1030"
+    assert action_for("scripts.generate_midday_candidates") == "gate5-replay-1230"
+    assert action_for("scripts.generate_intraday_candidates") == "gate5-replay-1130"
+    for marker in ("scripts.assemble_order_pages", "scripts.ingest_market_data", "scripts.run_classification",
+                   "scripts/auto_resume_walkforward.py", "scripts/sequestered_truth_comparator.py",
+                   "scripts.refresh_market_open_candidates"):
+        assert action_for(marker) is None, marker
 
 
 def test_gate5_replay_refuses_without_usable_risk_evidence(app, tmp_path):
