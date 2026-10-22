@@ -138,12 +138,15 @@ def _text(value: Any, limit: int = MAX_TEXT) -> str | None:
     """
     if value is None:
         return None
-    scanned = str(value)[:limit * _SCAN_LIMIT_FACTOR].replace("\n", " ")
+    scanned = str(value)[: limit * _SCAN_LIMIT_FACTOR].replace("\n", " ")
     return redact_value(_scrub_paths(scanned))[:limit]
 
 
 def _finite(value: Any) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    try:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            return None
+    except OverflowError:
         return None
     return float(value)
 

@@ -3130,9 +3130,7 @@ class MorningDCAExecutor(DCAExecutor):
                             0.0, self.ledger.week_planned(trading_day) - poisoned_week
                         )
             new_total = sum(
-                a.amount_usd
-                for a in cap_allocations.values()
-                if a.amount_usd > 0 and math.isfinite(a.amount_usd)
+                a.amount_usd for a in cap_allocations.values() if a.amount_usd > 0 and math.isfinite(a.amount_usd)
             )
             self.ledger.seed_day_attempts(
                 trading_day,
@@ -5442,11 +5440,7 @@ class MorningDCAExecutor(DCAExecutor):
                         # an unparseable amount rather than treated as $0 -- the
                         # order plainly happened, it is only the RECORDED figure
                         # that is unusable.
-                        planned_amount = (
-                            max(0.0, _converted_amount)
-                            if math.isfinite(_converted_amount)
-                            else 0.0
-                        )
+                        planned_amount = max(0.0, _converted_amount) if math.isfinite(_converted_amount) else 0.0
                 if planned_amount <= 0:
                     # A zero-notional row is worse than no row. It satisfies the
                     # schema and LOOKS like preserved evidence, but
@@ -6378,7 +6372,14 @@ class MorningDCAExecutor(DCAExecutor):
                 # zero or negative amount is equally unusable for an
                 # order-bearing row: it cannot prove how much a live order
                 # has committed, so an earlier-weekday scan must fail closed.
-                if isinstance(raw_amount, bool) or not math.isfinite(amount_float) or amount_float <= 0:
+                try:
+                    amount_invalid = (
+                        isinstance(raw_amount, bool) or not math.isfinite(amount_float) or amount_float <= 0
+                    )
+                except OverflowError:
+                    amount_invalid = True
+
+                if amount_invalid:
                     if path in _earlier_weekday_sibling_paths:
                         self._cap_seed_scan_incomplete = True
                         self._cap_seed_scan_incomplete_paths.append(str(path))
@@ -8002,11 +8003,7 @@ class MorningDCAExecutor(DCAExecutor):
                     # failure PR #1300 (above) closed. Only a row whose amount
                     # is absent/non-finite/non-positive falls through to the
                     # fresh computed amount for this retry.
-                    if (
-                        row_status in _RETRY_PRESERVED_AMOUNT_STATUSES
-                        and math.isfinite(amt_float)
-                        and amt_float > 0
-                    ):
+                    if row_status in _RETRY_PRESERVED_AMOUNT_STATUSES and math.isfinite(amt_float) and amt_float > 0:
                         prior_submitted_amounts[row_ticker] = amt_float
         # Snapshotted lazily (see below) so adapters that immediately reflect
         # placed orders don't cause double-subtraction (reserved_buying_power
@@ -10025,7 +10022,10 @@ def _stable_broker_order_id(order: Optional[Dict[str, Any]]) -> Optional[str]:
     for raw_order_id in ((order or {}).get("id"), (order or {}).get("order_id")):
         if isinstance(raw_order_id, bool) or not isinstance(raw_order_id, (str, int, float)):
             continue
-        if isinstance(raw_order_id, (int, float)) and (raw_order_id == 0 or not math.isfinite(raw_order_id)):
+        try:
+            if isinstance(raw_order_id, (int, float)) and (raw_order_id == 0 or not math.isfinite(raw_order_id)):
+                continue
+        except OverflowError:
             continue
         if order_id := str(raw_order_id).strip():
             return order_id

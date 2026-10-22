@@ -676,17 +676,44 @@ def build_state_snapshot(roots: Sequence[RootSpec], day: date, *, config_dir: Pa
     for kind in LEDGER_KINDS:
         view = ledger_view(roots, kind)
         warnings.extend(view["warnings"])
-        pending = [entry.get("pending_total_usd" if kind == "cumulative" else "pending_usd")
-                   if kind != "inverse_martingale" else (entry["tracker"] or {}).get("accumulated_usd")
-                   for entry in view["entries"] if entry["status"] == "available"]
-        valid_pending: list[float] = [float(v) for v in pending if isinstance(v, (int, float)) and math.isfinite(v)]
+        pending = [
+            entry.get("pending_total_usd" if kind == "cumulative" else "pending_usd")
+            if kind != "inverse_martingale"
+            else (entry["tracker"] or {}).get("accumulated_usd")
+            for entry in view["entries"]
+            if entry["status"] == "available"
+        ]
+        valid_pending: list[float] = []
+        for v in pending:
+            if isinstance(v, (int, float)):
+                try:
+                    if math.isfinite(v):
+                        valid_pending.append(float(v))
+                except OverflowError:
+                    pass
         pending_total = round(sum(valid_pending), 2) if (len(valid_pending) == len(pending) and pending) else None
-        ledgers[kind] = {"entries": len(view["entries"]), "listed": len(view.get("days") or view.get("tickers") or []),
-                         "corrupt": sum(entry["status"] in {"corrupt", "mismatched"} for entry in view["entries"]),
-                         "lock_files_present": sum(entry["lock_file_present"] for entry in view["entries"]),
-                         "pending_total_usd": pending_total}
-    latest = {key: ({"day": rows[0]["day"], "status": rows[0].get("status"), "file_status": rows[0]["file_status"]}
-                    if rows else None)
-              for key, rows in maintenance.items() if key != "warnings"}
-    return {"date": day.isoformat(), "strategy_state": state, "ledgers": ledgers, "purchases": purchases["summary"],
-            "risk": risk, "maintenance": latest, "warnings": _dedup(warnings)}
+        ledgers[kind] = {
+            "entries": len(view["entries"]),
+            "listed": len(view.get("days") or view.get("tickers") or []),
+            "corrupt": sum(entry["status"] in {"corrupt", "mismatched"} for entry in view["entries"]),
+            "lock_files_present": sum(entry["lock_file_present"] for entry in view["entries"]),
+            "pending_total_usd": pending_total,
+        }
+    latest = {
+        key: (
+            {"day": rows[0]["day"], "status": rows[0].get("status"), "file_status": rows[0]["file_status"]}
+            if rows
+            else None
+        )
+        for key, rows in maintenance.items()
+        if key != "warnings"
+    }
+    return {
+        "date": day.isoformat(),
+        "strategy_state": state,
+        "ledgers": ledgers,
+        "purchases": purchases["summary"],
+        "risk": risk,
+        "maintenance": latest,
+        "warnings": _dedup(warnings),
+    }
