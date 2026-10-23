@@ -218,6 +218,32 @@ def test_live_mirror_prompts_wait_long_enough_for_the_prebuilt_payload():
     assert len(set(waits.values())) == 1, f"the six prompts disagree on the wait: {waits}"
 
 
+#: 2026-10-22: #1878 lowered the launcher's coverage floor to DEFAULT_MIN_COVERAGE, so a published payload may carry a
+#: few errored tickers in ticker_errors.robinhood. The prompts still said "the launcher publishes only a complete
+#: universe ... abort on a non-empty list", so the session would reject every payload the floor now lets through.
+def _errored_ticker_rule(path):
+    text = path.read_text(encoding="utf-8")
+    start = text.index("After copying, read its ticker_errors.robinhood")
+    return text, text[start : text.index("\n", start)]
+
+
+def test_live_mirror_prompts_accept_the_errored_tickers_the_coverage_floor_allows():
+    from pathlib import Path
+
+    mirror = Path(__file__).resolve().parents[1] / "claude" / "dca-executor-prompts" / "live-mirror"
+    rules = set()
+    for slot in rp.SLOTS:
+        (path,) = mirror.glob(f"{slot}ET-*.txt")
+        text, rule = _errored_ticker_rule(path)
+        assert "launcher publishes only a complete universe" not in text, path.name  # no longer true since #1878
+        assert f"{rp.DEFAULT_MIN_COVERAGE:.0%}" in rule, f"{path.name}: the rule must name the floor it mirrors"
+        assert "continue" in rule and "more than" in rule, f"{path.name}: continue within the floor, abort beyond it"
+        assert "--error-class market_data_unavailable" in rule, path.name  # still aborts beyond the floor
+        assert "name the count and every errored ticker" in rule, path.name  # still evidenced either way
+        rules.add(rule)
+    assert len(rules) == 1, "the six prompts must carry the same rule"
+
+
 # -- chunk ownership (Codex adversarial review): a reply counts only for the tickers its own chunk was assigned ----
 
 
