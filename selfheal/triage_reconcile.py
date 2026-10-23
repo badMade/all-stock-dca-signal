@@ -211,6 +211,7 @@ def match_git_evidence(
     prs: Iterable[Mapping[str, object]],
     commits: Iterable[Mapping[str, object]],
     issues: Iterable[Mapping[str, object]],
+    recorded_pr_number: int | None = None,
 ) -> GitEvidence:
     """Match already-fetched git records to one DCA Issues Key.
 
@@ -235,6 +236,10 @@ def match_git_evidence(
         commits: Commits as mappings with ``sha``, ``url`` and ``message``.
         issues: GitHub issues as mappings with ``number``, ``url``, ``state``
             and ``title``.
+        recorded_pr_number: The PR number already on the Notion row, if any. A
+            body-only citation of that exact PR keeps counting, so tightening
+            the matcher never regresses a link the operator already holds
+            (the 2026-10-22 run sent five merged rows to "No work").
 
     Returns:
         The frozen :class:`GitEvidence`; unmatched fields are ``None``.
@@ -265,6 +270,12 @@ def match_git_evidence(
         elif _mentions(key, searchable):
             cited.append(ref)
     pr = max(about, key=lambda ref: ref.number, default=None)
+    # Prior evidence survives: #1704/#1745/#1533/#1514 are real merged fixes that cite their Key only in the body.
+    # A title/head-ref match still wins; only the "nothing found" case falls back to the recorded PR.
+    if pr is None and recorded_pr_number is not None:
+        pr = next((ref for ref in cited if ref.number == recorded_pr_number), None)
+        if pr is not None:
+            cited = [ref for ref in cited if ref.number != recorded_pr_number]
     mentioned_in = max(cited, key=lambda ref: ref.number, default=None)
 
     commit_url = next(

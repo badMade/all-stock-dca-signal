@@ -127,6 +127,26 @@ def test_body_only_mention_does_not_displace_an_older_pr_about_the_key() -> None
     assert ev.mentioned_in is not None and ev.mentioned_in.number == 1873
 
 
+def test_recorded_pr_cited_only_in_body_keeps_counting() -> None:
+    # Regression (2026-10-22 digest): five merged rows fell to "No work" because their recorded PR cites the Key
+    # only in its body. A PR already on the row survives; any other body-only citation still does not count.
+    fix = _pr(1704, head_ref="feat/x", title="Unrelated title", body=f"Closes {KEY}", state="closed", merged=True,
+              checks="green")
+    other = _pr(1873, head_ref="claude/other", title="Investigate", body=f"Related to {KEY}")
+    ev = _match(prs=[fix, other], recorded_pr_number=1704)
+    assert ev.pr is not None and ev.pr.number == 1704
+    assert ev.mentioned_in is not None and ev.mentioned_in.number == 1873
+    assert tr.derive_progress(ev) == "Merged, checks green"
+    assert _match(prs=[fix, other]).pr is None
+
+
+def test_newer_title_match_beats_recorded_body_only_pr() -> None:
+    old = _pr(1704, head_ref="feat/x", title="Unrelated", body=f"Closes {KEY}", state="closed", merged=True)
+    new = _pr(1900, head_ref="claude/y", title=f"Fix {KEY}")
+    ev = _match(prs=[old, new], recorded_pr_number=1704)
+    assert ev.pr is not None and ev.pr.number == 1900
+
+
 def test_commit_url_comes_from_the_matching_commit() -> None:
     commits = [{"sha": "a" * 40, "url": f"{REPO_URL}/commit/{'a' * 40}", "message": f"fix {KEY}"}]
     ev = _match(commits=commits)

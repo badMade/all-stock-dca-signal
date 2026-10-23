@@ -31,7 +31,7 @@ STEP 3: Read Notion
 
 STEP 4: Reconcile
 - Do not skim or sample. Run tr.match_git_evidence for EVERY Key, and fetch each matched PR directly for its real merged state and check status. If you could not do that for a Key, list the Key under "Skipped items" and leave its row untouched; never report an unchecked Key as unchanged.
-- For every Key (from rows and from new candidates): evidence = tr.match_git_evidence(key, repo_url="https://github.com/badMade/all-stock-dca", branches=..., prs=..., commits=..., issues=...); progress = tr.derive_progress(evidence).
+- For every Key (from rows and from new candidates): evidence = tr.match_git_evidence(key, repo_url="https://github.com/badMade/all-stock-dca", branches=..., prs=..., commits=..., issues=..., recorded_pr_number=<the row's PR number, or omit if blank>); progress = tr.derive_progress(evidence).
 - If tr raises EvidenceError, do not write that Key. Put the error text in the digest.
 - New candidate with no row: create a row with Key, Name, Fix state = New, Approval = Proposed.
 - Existing row: update only Progress (a text column; write the label exactly as tr.derive_progress returns it), GitHub issue, Branch, Commit URL and PR number, and only when the value changed. Never change Status, Class, Severity or Fix state.

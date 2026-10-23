@@ -44,7 +44,8 @@ Anything that is not exactly `Approved` counts as not approved.
    SHA plus URL, or `match_git_evidence` raises `EvidenceError`. The PR list can report `merged=false` for every PR,
    so each PR matched to a Key is fetched directly for its real merged state and check status.
 3. **Notion.** All rows with their tracking columns.
-4. **Reconcile.** `match_git_evidence` then `derive_progress` for **every** Key, with no sampling. A Key that cannot be
+4. **Reconcile.** `match_git_evidence` then `derive_progress` for **every** Key, with no sampling, passing the row's existing PR number as
+   `recorded_pr_number` so a merged fix that cites its Key only in the body is not dropped. A Key that cannot be
    checked is listed under Skipped and its row left untouched.
 5. **Plans and fix briefs.** Text only. Each Open row with a plan gets a brief in the digest appendix, stating whether
    the fix already looks merged on main (implementation evidence, not a mention of the Key).
