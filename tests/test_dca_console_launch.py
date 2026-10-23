@@ -17,6 +17,7 @@ from dca_console_launch import (
     FORBIDDEN_ARGV_TOKENS,
     GATE5_SLOTS,
     LAUNCH_SPECS,
+    REPLAYABLE_SOURCE_KEYS,
     artifact_bytes,
     junit_summary,
     latest_gate5_payloads,
@@ -24,7 +25,7 @@ from dca_console_launch import (
     read_manifest,
     run_launch,
 )
-from dca_console_reader import RootSpec, root_label
+from dca_console_reader import RootSpec, root_label, roots_from_settings
 from dca_console_routes import DEFAULT_CSP, SANDBOX_CSP
 
 
@@ -206,7 +207,7 @@ def test_run_launch_captures_documents_and_lists_them_in_the_manifest(app, tmp_p
 def test_launch_actions_report_readiness_reasons(app, tmp_path, monkeypatch):
     rows = {row["id"]: row for row in launch_actions(app, REPO)}
     assert rows["config-invariants"]["available"] is True
-    assert rows["gate5-replay-0935"]["available"] is False and "No saved market_data payload" in rows["gate5-replay-0935"]["reason"]
+    assert rows["gate5-replay-0935"]["available"] is False and "No replayable saved market_data payload" in rows["gate5-replay-0935"]["reason"]
     assert rows["gate5-replay-0935"]["payload"] is None
     assert rows["gate5-replay-1230"]["needs_deployed_figure"] is True
     assert rows["octopus-inspect-html"]["available"] is False and "--octopus-run" in rows["octopus-inspect-html"]["reason"]
@@ -326,3 +327,46 @@ def test_junit_summary_rejects_xxe_and_doctype_entities(tmp_path):
     report2.write_text('<?xml version="1.0"?><!DOCTYPE root SYSTEM "http://example.com/evil.dtd"><root></root>')
     summary2 = junit_summary(report2)
     assert summary2["parsed"] is False
+
+
+# --- Retired-source payloads (2026-10-12 yfinance retirement) -------------------------------------------------
+
+def _payload(path, sources):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"sources": sources, "source_errors": {}, "ticker_errors": {}}))
+
+
+def test_replay_skips_newer_payload_that_carries_the_retired_yfinance_source(app):
+    # Regression: the 15:30 replay card offered the newest saved payload, which still carried
+    # sources.yahoo_finance_yfinance, and then failed inside generate_buy_candidates.
+    stream = app.settings.root / "ce16ba6b" / "scheduled_runs"
+    _payload(stream / "20261007_1530ET" / "market_data_2026-10-07_1530.json",
+             {"finance": {}, "robinhood": {}, "yahoo_finance_yfinance": {}})
+    _payload(stream / "20261001_1530ET" / "market_data_2026-10-01_1530.json", {"finance": {}, "robinhood": {}})
+    payload = latest_gate5_payloads(roots_from_settings(app.settings), now=1e9)["1530"]
+    assert payload is not None
+    assert payload["trading_day"] == "2026-10-01" and payload["skipped_retired_source"] == 1
+
+
+def test_replay_is_unavailable_when_every_payload_is_retired_source(app):
+    stream = app.settings.root / "ce16ba6b" / "scheduled_runs"
+    _payload(stream / "20261007_1530ET" / "market_data_2026-10-07_1530.json",
+             {"robinhood": {}, "yahoo_finance_yfinance": {}})
+    rows = {row["id"]: row for row in launch_actions(app, REPO)}
+    row = rows["gate5-replay-1530"]
+    assert row["available"] is False and "retired yahoo_finance_yfinance" in row["reason"]
+
+
+def test_unreadable_or_unrecognised_payloads_stay_replayable(app):
+    # Only a recognised non-canonical `sources` key hides a payload; anything else is the generator's call.
+    stream = app.settings.root / "ce16ba6b" / "scheduled_runs"
+    (stream / "20261007_1530ET").mkdir(parents=True)
+    (stream / "20261007_1530ET" / "market_data_2026-10-07_1530.json").write_text("not json")
+    payload = latest_gate5_payloads(roots_from_settings(app.settings), now=2e9)["1530"]
+    assert payload is not None and payload["skipped_retired_source"] == 0
+
+
+def test_replayable_source_keys_match_the_generators_source_names():
+    from near_close_dca import SourceName
+
+    assert REPLAYABLE_SOURCE_KEYS == {member.value for member in SourceName}

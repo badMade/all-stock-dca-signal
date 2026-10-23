@@ -227,11 +227,12 @@ def latest_gate5_payloads(roots: Sequence[RootSpec], *, now: float | None = None
     cached = _PAYLOAD_CACHE.get(key)
     if cached is not None and stamp - cached[0] < PAYLOAD_CACHE_SECONDS:
         return {slot: (dict(row) if row else None) for slot, row in cached[1].items()}
-    best: dict[str, dict[str, Any]] = {}
+    by_slot: dict[str, list[dict[str, Any]]] = {}
     for row in _discover(roots):
-        current = best.get(row["slot"])
-        if current is None or row["_sort"] > current["_sort"]:
-            best[row["slot"]] = row
+        by_slot.setdefault(row["slot"], []).append(row)
+    # Newest replayable payload per slot: an old payload that still carries the retired yfinance source key
+    # is skipped (and counted) instead of being offered and then failing inside the generator.
+    best = {slot: row for slot, rows in by_slot.items() if (row := _newest_replayable(rows)) is not None}
     result = {
         slot: ({field: value for field, value in best[slot].items() if not field.startswith("_")} if slot in best else None)
         for slot in GATE5_SLOTS
@@ -243,13 +244,48 @@ def latest_gate5_payloads(roots: Sequence[RootSpec], *, now: float | None = None
 
 
 def _payload_path(roots: Sequence[RootSpec], slot: str) -> tuple[dict[str, Any] | None, Path | None]:
-    best = None
-    for row in _discover(roots):
-        if row["slot"] == slot and (best is None or row["_sort"] > best["_sort"]):
-            best = row
+    best = _newest_replayable([row for row in _discover(roots) if row["slot"] == slot])
     if best is None:
         return None, None
     return {key: value for key, value in best.items() if not key.startswith("_")}, best["_path"]
+
+
+# 2026-10-12 owner direction retired the yfinance fallback: every candidate generator now rejects a
+# ``sources`` key other than these (tests/test_yfinance_retired.py), so a saved payload that still carries
+# ``yahoo_finance_yfinance`` can never be replayed. Kept as a literal (not imported from near_close_dca)
+# so payload discovery stays import-light on the 15-second snapshot path; a test pins it to SourceName.
+REPLAYABLE_SOURCE_KEYS = frozenset({"finance", "robinhood"})
+_PAYLOAD_PROBE_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _retired_source_keys(path: Path) -> list[str]:
+    """``sources`` keys in a saved payload that the generators reject; empty when replayable or unreadable.
+
+    Only a ``sources`` object with a non-canonical key marks a payload unreplayable. A file we cannot read,
+    parse or recognise is left to the generator, which owns the real validation and reports it in the job
+    log, rather than being silently hidden from the operator here.
+    """
+    try:
+        if path.stat().st_size > _PAYLOAD_PROBE_MAX_BYTES:
+            return []
+        document = json.loads(path.read_bytes())
+    except (OSError, ValueError):
+        return []
+    sources = document.get("sources") if isinstance(document, dict) else None
+    if not isinstance(sources, dict):
+        return []
+    return sorted(str(key) for key in sources if key not in REPLAYABLE_SOURCE_KEYS)
+
+
+def _newest_replayable(rows: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    """The newest row whose payload the generators would accept, skipping retired-source payloads."""
+    skipped = 0
+    for row in sorted(rows, key=lambda item: item["_sort"], reverse=True):
+        if _retired_source_keys(row["_path"]):
+            skipped += 1
+            continue
+        return {**row, "skipped_retired_source": skipped}
+    return None
 
 
 # --- Readiness ---------------------------------------------------------------------
@@ -294,7 +330,9 @@ def launch_actions(app, repo: Path, *, payloads: dict[str, dict | None] | None =
             slot = spec.id.rsplit("-", 1)[1]
             payload = payloads.get(slot)
             available = payload is not None
-            reason = "" if available else f"No saved market_data payload for {slot} was found under the observed roots."
+            reason = "" if available else (
+                f"No replayable saved market_data payload for {slot} was found under the observed roots "
+                "(payloads still carrying the retired yahoo_finance_yfinance source are skipped).")
             extra = {"payload": payload, "needs_deployed_figure": slot in GATE5_NEEDS_DEPLOYED}
         rows.append({"id": spec.id, "label": spec.label, "description": spec.description,
                      "available": bool(available), "reason": "" if available else reason,
