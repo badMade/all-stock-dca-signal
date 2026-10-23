@@ -28,6 +28,17 @@ MODEL_ARGS=()
 [ -n "${DCA_CODEX_MODEL:-}" ] && MODEL_ARGS=(-m "$DCA_CODEX_MODEL")
 PER_CHUNK_TIMEOUT="${DCA_CODEX_CHUNK_TIMEOUT:-240}"
 PARALLEL="${DCA_CODEX_PARALLEL:-3}"
+# Opt-in overall build deadline, in seconds from the start of the fetch (2026-10-22). Unset/0 = none, so the six
+# scheduled slots behave exactly as before. A real 90-ticker build takes 2-4 minutes, but nothing bounded the worst
+# case (12 chunks in 4 lock-step waves, each up to two 240 s attempts): a slow Mac would deliver a payload after the
+# slot's own window. With a deadline each attempt's timeout is capped to the time left, no attempt starts with less
+# than DCA_MIN_ATTEMPT_SECONDS left, and the merge then sees the missing tickers and enforces its coverage floor,
+# so a late build fails fast at Gate 5 instead of arriving too late to be read.
+BUILD_DEADLINE_SECONDS="${DCA_BUILD_DEADLINE_SECONDS:-0}"
+MIN_ATTEMPT_SECONDS="${DCA_MIN_ATTEMPT_SECONDS:-20}"
+case "$BUILD_DEADLINE_SECONDS$MIN_ATTEMPT_SECONDS$PARALLEL" in
+  ""|*[!0-9]*) echo "robinhood_payload: DCA_BUILD_DEADLINE_SECONDS, DCA_MIN_ATTEMPT_SECONDS and DCA_CODEX_PARALLEL must be whole numbers" >&2; exit 2 ;;
+esac
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/dca-rhpayload.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
@@ -64,6 +75,12 @@ fi
 
 # One codex call per chunk of tickers, a few at a time. A chunk that times out or errors simply leaves its
 # tickers without data; the merge records them in ticker_errors and enforces the coverage floor.
+# Seconds left before the opt-in build deadline; empty when none is set. BUILD_STARTED is assigned before the first
+# chunk starts, and each chunk worker is a subshell that reads it, so every worker measures from the same instant.
+seconds_left() {
+  if [ "$BUILD_DEADLINE_SECONDS" -gt 0 ]; then echo $(( BUILD_DEADLINE_SECONDS - ( $(date +%s) - BUILD_STARTED ) )); fi
+}
+
 run_chunk() {
   local idx="$1" tickers="$2"
   "$PY" -m scripts.robinhood_payload prompt --plan "$WORK/plan.json" --tickers "$tickers" >"$WORK/prompt_$idx.txt"
@@ -77,7 +94,16 @@ run_chunk() {
     # Per-attempt wall time (2026-10-22): nobody had measured a real 90-ticker build, so build-time work could not be
     # sized. Whole seconds from date +%s, which macOS's bash 3.2 and date both support.
     local started; started="$(date +%s)"
-    perl -e 'alarm shift; exec @ARGV' "$PER_CHUNK_TIMEOUT" "$CODEX" exec ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} -c 'sandbox_mode="read-only"' -c 'approval_policy="never"' \
+    local left attempt_timeout="$PER_CHUNK_TIMEOUT"
+    left="$(seconds_left)"
+    if [ -n "$left" ]; then
+      if [ "$left" -lt "$MIN_ATTEMPT_SECONDS" ]; then
+        echo "robinhood_payload: deadline chunk=$idx attempt=$attempt skipped seconds_left=$left" >&2
+        break
+      fi
+      [ "$left" -lt "$attempt_timeout" ] && attempt_timeout="$left"
+    fi
+    perl -e 'alarm shift; exec @ARGV' "$attempt_timeout" "$CODEX" exec ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} -c 'sandbox_mode="read-only"' -c 'approval_policy="never"' \
       --skip-git-repo-check -o "$out" - <"$WORK/prompt_$idx.txt" >"$WORK/chunk_$idx.log" 2>&1 \
       || echo "robinhood_payload: chunk $idx attempt $attempt failed or timed out" >&2
     if [ ! -s "$out" ]; then
@@ -110,5 +136,5 @@ shopt -s nullglob
 # The total covers the fetch and the merge; the merge's exit status still decides the launcher's.
 MERGE_STATUS=0
 "$PY" -m scripts.robinhood_payload merge --plan "$WORK/plan.json" "$WORK"/chunk_*.json || MERGE_STATUS=$?
-echo "robinhood_payload: timing total seconds=$(( $(date +%s) - BUILD_STARTED )) chunks=$idx parallel=$PARALLEL" >&2
+echo "robinhood_payload: timing total seconds=$(( $(date +%s) - BUILD_STARTED )) chunks=$idx parallel=$PARALLEL deadline=$BUILD_DEADLINE_SECONDS" >&2
 exit "$MERGE_STATUS"

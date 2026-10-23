@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- SHADOW ONLY (2026-10-22). Builds the 3:30 PM Robinhood payload one minute after the 15:30 decision time so its
+       duration, coverage and quote freshness can be measured for several days BEFORE the 3:30 slot is moved onto it.
+       Nothing reads the file it writes: no live prompt references it and the 3:30 slot is still Finance-primary with
+       its Robinhood-only outage fallback. Safe to unload at any time. A separate Label and log keep it from touching
+       the six-slot job (com.all-stock-dca.robinhood-payload). Remove it once the 3:30 slot is cut over and `auto`
+       covers 1530. See docs/robinhood_payload.md, "The 3:30 PM slot (shadow only)". -->
+  <key>Label</key><string>com.all-stock-dca.robinhood-payload-1530-shadow</string>
+  <key>ProgramArguments</key>
+  <!-- Started through the checkout's venv Python for the same macOS privacy (TCC) reason as the six-slot job.
+       The slot is named explicitly: `auto` never selects 1530. -->
+  <array>
+    <string>REPLACE_WITH_REPO_PATH/.venv/bin/python</string>
+    <string>-c</string>
+    <string>import subprocess, sys; sys.exit(subprocess.call(["/bin/bash", sys.argv[1], "1530"]))</string>
+    <string>REPLACE_WITH_REPO_PATH/deploy/launchd/robinhood_payload.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DCA_REPO</key><string>REPLACE_WITH_REPO_PATH</string>
+    <key>DCA_CRON_TRACKING_ROOT</key><string>REPLACE_WITH_CRON_TRACKING_ROOT</string>
+    <key>DCA_CODEX_BIN</key><string>REPLACE_WITH_CODEX_PATH</string>
+    <!-- Overall build deadline, seconds from the start of the fetch. A real 90-ticker build takes 2-4 minutes; 8 minutes
+         ends a slow build by about 15:40 so a payload that cannot be ready in time fails at the build, not at Gate 5. -->
+    <key>DCA_BUILD_DEADLINE_SECONDS</key><string>480</string>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <!-- 15:31 Mon-Fri, local Mac time (the Mac must be pinned to America/New_York, or Hour shifted by the difference). -->
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>31</integer></dict>
+    <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>31</integer></dict>
+    <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>31</integer></dict>
+    <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>31</integer></dict>
+    <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>15</integer><key>Minute</key><integer>31</integer></dict>
+  </array>
+  <key>StandardOutPath</key><string>/tmp/dca-robinhood-payload-1530-shadow.log</string>
+  <key>StandardErrorPath</key><string>/tmp/dca-robinhood-payload-1530-shadow.log</string>
+</dict>
+</plist>

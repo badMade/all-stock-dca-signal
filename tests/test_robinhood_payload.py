@@ -454,7 +454,7 @@ def test_a_future_stamped_quote_is_rejected_against_the_validating_clock():
 LAUNCHER = "deploy/launchd/robinhood_payload.sh"
 
 
-def _run_launcher(tmp_path, reply='echo "{}" >"$out"'):
+def _run_launcher(tmp_path, reply='echo "{}" >"$out"', *, extra_env=None):
     """Run the real launcher for a past trading day with a stub `codex` (default: answers every chunk with `{}`).
 
     The merge then publishes nothing (no data for any ticker), which is fine: this exercises the fetch loop's logging only.
@@ -479,6 +479,7 @@ def _run_launcher(tmp_path, reply='echo "{}" >"$out"'):
         "DCA_CRON_TRACKING_ROOT": str(tmp_path / "ct"),
         "DCA_CODEX_PARALLEL": "3",
         "TMPDIR": str(tmp_path),
+        **(extra_env or {}),
     }
     done = subprocess.run(["bash", str(repo / LAUNCHER), "0935"], env=env, capture_output=True, text=True, timeout=120)
     plan = subprocess.run(
@@ -515,6 +516,42 @@ def test_launcher_logs_the_retry_attempt_of_a_chunk_whose_first_reply_had_an_err
     assert sorted(seen) == sorted(
         [(str(i), "1", "1") for i in range(chunks)] + [(str(i), "2", "0") for i in range(chunks)]
     ), log
+
+
+# -- opt-in overall build deadline (2026-10-22): default off, so the six scheduled slots are unchanged ----------------
+
+
+def test_launcher_has_no_deadline_by_default_and_never_skips_a_chunk(tmp_path):
+    import re
+
+    done, chunks = _run_launcher(tmp_path)
+    log = done.stdout + done.stderr
+    assert "deadline chunk=" not in log and re.search(r"timing total .* deadline=0\b", log), log
+    assert len(re.findall(r"timing chunk=", log)) == chunks, log
+
+
+def test_launcher_deadline_skips_chunks_that_cannot_start_in_time(tmp_path):
+    import re
+
+    # Each stub reply takes 2 s; a 4 s deadline with a 2 s minimum lets the first wave of three chunks run, and every
+    # later wave starts with too little time left. The skipped chunks leave their tickers to the merge's coverage floor.
+    done, chunks = _run_launcher(
+        tmp_path,
+        'sleep 2; echo "{}" >"$out"',
+        extra_env={"DCA_BUILD_DEADLINE_SECONDS": "4", "DCA_MIN_ATTEMPT_SECONDS": "2"},
+    )
+    log = done.stdout + done.stderr
+    ran = {int(i) for i in re.findall(r"timing chunk=(\d+) attempt=1", log)}
+    skipped = {int(i) for i in re.findall(r"deadline chunk=(\d+) attempt=1 skipped", log)}
+    assert {0, 1, 2} <= ran, log  # the first wave started well inside the deadline
+    assert set(range(6, chunks)) <= skipped, log  # waves 3 and 4 start after it, whatever the machine's speed
+    assert not ran & skipped and re.search(r"timing total .* deadline=4\b", log), log
+    assert "is below 95%" in log and done.returncode == 2, log  # the merge sees the gap and publishes nothing
+
+
+def test_launcher_rejects_a_non_numeric_deadline(tmp_path):
+    done, _ = _run_launcher(tmp_path, extra_env={"DCA_BUILD_DEADLINE_SECONDS": "soon"})
+    assert done.returncode == 2 and "must be whole numbers" in done.stderr
 
 
 # -- 3:30 PM (shadow only): plannable and buildable on demand, never scheduled, never read by a live prompt -------

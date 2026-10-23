@@ -90,3 +90,22 @@ it, no live prompt reads its file, and `1530ET` keeps its Finance-primary policy
   build ends about 16 minutes after its 15:31 start, leaving little of the 15:25-15:55 window for Gates 5 to 7. The fix
   belongs with scheduling (more parallelism or a bounded per-chunk timeout), not here; shadow builds will measure the real
   duration first.
+
+### Shadow schedule and build deadline (step 2a, 2026-10-22)
+
+- **Shadow agent:** `deploy/launchd/com.all-stock-dca.robinhood-payload-1530-shadow.plist.template` fires
+  `robinhood_payload.sh 1530` at 15:31 Mon-Fri. It has its own Label and log (`/tmp/dca-robinhood-payload-1530-shadow.log`),
+  so loading it cannot touch the six-slot job. Install it like the main one (copy to `~/Library/LaunchAgents/`, replace
+  the three `REPLACE_WITH_*` values, `launchctl load`); unload it at any time. It is **operator-installed**: nothing in
+  the repo loads it.
+- **What it proves:** nothing reads its file, so it changes no trade. Over a few trading days it measures build duration
+  (`grep "timing total" /tmp/dca-robinhood-payload-1530-shadow.log`), coverage and quote freshness for the 3:30 universe
+  before the slot is moved onto it. Real six-slot builds on 2026-10-22 took 130-244 s (chunk attempts: median 49 s,
+  max 70 s, no timeouts).
+- **Build deadline:** `DCA_BUILD_DEADLINE_SECONDS` (default 0 = none, so the six scheduled slots are unchanged) bounds a
+  build from the start of the fetch. Each attempt's timeout is capped to the time left, and no attempt starts with less than
+  `DCA_MIN_ATTEMPT_SECONDS` (default 20) left; skipped chunks log `robinhood_payload: deadline chunk=N ... skipped`, the
+  merge enforces the 95% coverage floor, and a late build publishes nothing instead of arriving after the slot's window.
+  The shadow agent sets 480 s (a slow build ends by about 15:40).
+- **Go/no-go for step 2b (cutover):** five consecutive shadow days with total build time under 6 minutes, no deadline
+  skips, and 95% or better coverage with fresh quotes.
