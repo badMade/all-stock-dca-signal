@@ -531,3 +531,32 @@ def test_every_perplexity_prompt_requires_the_hash_the_committed_planner_file_ca
         required = re.search(r"content_sha256 must equal ([0-9a-f]{64})", prompt.read_text(encoding="utf-8"))
         assert required, prompt.name
         assert required.group(1) == stamped, f"{prompt.name}: the attached file would be refused at step 0; run {REBUILD}"
+
+
+# --- Line endings: the same sources must build the same file on every OS --------------------------------
+# A rebuild on a Windows checkout with autocrlf reads every bundled file with CRLF line endings, so the
+# hash and the zip differed from Linux/CI for byte-identical git content (PR #1911: f4bbe2f9 vs 675d66b7).
+
+def _checkout_copy(tmp_path: Path, name: str, newline: bytes) -> Path:
+    """Copy the files the planner bundles into ``tmp_path/name``, rewriting line endings to ``newline``."""
+    dest = tmp_path / name
+    for rel in bbp.collect_files(REPO):
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        text = (REPO / rel).read_bytes().replace(b"\r\n", b"\n")
+        target.write_bytes(text.replace(b"\n", newline))
+    return dest
+
+
+def test_the_content_hash_ignores_line_endings(tmp_path):
+    lf = _checkout_copy(tmp_path, "lf", b"\n")
+    crlf = _checkout_copy(tmp_path, "crlf", b"\r\n")
+    assert bbp.content_sha256(crlf) == bbp.content_sha256(lf)
+
+
+def test_the_built_file_is_byte_identical_whatever_the_line_endings(tmp_path):
+    lf = _checkout_copy(tmp_path, "lf", b"\n")
+    crlf = _checkout_copy(tmp_path, "crlf", b"\r\n")
+    bbp.build(tmp_path / "lf.pyz", repo_root=lf, source_commit=COMMIT)
+    bbp.build(tmp_path / "crlf.pyz", repo_root=crlf, source_commit=COMMIT)
+    assert (tmp_path / "crlf.pyz").read_bytes() == (tmp_path / "lf.pyz").read_bytes()
