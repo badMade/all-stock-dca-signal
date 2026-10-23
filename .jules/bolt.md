@@ -11,3 +11,7 @@
 ## 2026-10-19 - [Avoid Path.rglob().stat() for max mtime queries]
 **Learning:** Chaining `Path.rglob()` and `Path.stat()` causes $O(N)$ system calls for large directory trees because `rglob` constructs path objects before making individual `lstat` calls.
 **Action:** Use `os.scandir` with a manual stack to yield directory entries directly and use `entry.stat().st_mtime` to eliminate repeated system I/O bounds while scanning directories.
+
+## 2026-10-21 - [Avoid uncompiled re.match in inner loops]
+**Learning:** Python's internal regex cache (`re._cache`) caps out and incurs hash-lookup overhead per call. Uncompiled `re.match` inside a loop over rows or files causes performance sink.
+**Action:** Lift the pattern to a module-level `_PATTERN = re.compile(r"...")` and call `_PATTERN.match(...)` for ~2.3x speedup.

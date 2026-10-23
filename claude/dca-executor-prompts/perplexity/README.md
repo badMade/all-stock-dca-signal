@@ -51,7 +51,7 @@ set is the primary's own `{ticker, usd, ref_id}` list, which these backups now r
 | Command | Where | Output |
 | --- | --- | --- |
 | `plan --source mac_rec --trading-day D --slot S --now T` | Mac | The slot's set from the local store, by the reader's freshness rule (`config/recommendations.json` `max_age_minutes`), as a `plan_first` plan |
-| `plan --source published_rec --published F --trading-day D --slot S --now T` | sandbox | The same, from an enabled GitHub branch publisher (or enabled Notion publisher with `page_id` set). Step 2 attempts each configured channel once, with no alternate-route retries; if none is enabled or readable, continue without `published.json`. |
+| `plan --source published_rec --published F --trading-day D --slot S --now T` | sandbox | The same, from the payload published to the `recommendations` branch (or the Notion block once `page_id` is set) |
 | `executor-ids --trading-day D --slot S` | Mac | The broker order ids the reader saved under `placements/<slot>/` |
 | `classify --trading-day D --slot S --orders-pages F [--executor-ids F] [--published F]` | sandbox | `CLEAR` or `UNRECOGNIZED` for every order inside this slot's window |
 
@@ -159,28 +159,30 @@ four digits, email or state folder. It cannot see what is saved inside Perplexit
 Instructions header (`Universe hash ...` and the symbol count) and, after the next run, the state file's
 `planner_build.content_sha256`.
 
-## Keeping the stamp current (2026-10-21)
-
-Every backup prompt embeds the planner's `content_sha256`. That hash covers the planner's entry modules
-(`scripts/backup_planner.py`, `scripts/assemble_market_data.py`), every repo module they import (for example
-`dca_risk.py`) and the `config/*.json` files listed in `scripts/build_backup_planner.py`. A change to any of them
-makes the six committed prompts stale, and two tests then fail on `main`:
-`test_generate_perplexity_backup_prompts.py::test_committed_prompts_match_the_generator_byte_for_byte` and
-`test_verify_perplexity_pair.py::test_the_committed_prompts_agree_with_a_planner_built_from_this_checkout`.
-On 2026-10-21 the stamp went stale several times in one day, each time after a change unrelated to these
-prompts.
-
-Rule: a PR that touches a planner input regenerates the prompts in the same PR.
+### Morning stale-planner notification (Mac)
 
 ```bash
-python3 -m scripts.generate_perplexity_backup_prompts --write   # each file then differs by exactly the stamp line
-python3 -m scripts.generate_perplexity_backup_prompts --check   # exit 1 on drift
+python3 -m scripts.planner_stamp_check --planner backup_planner.pyz --notify
 ```
 
-Do not regenerate the prompts on a branch that does not touch a planner input. The edit conflicts with the next
-`main` regeneration, and the right resolution is always to take `main`'s generated files. A stale stamp fails closed:
-the pasted planner and the pasted prompts no longer match, so a backup slot places nothing. After the prompts change,
-refresh the pasted pair on the Perplexity side together (see the section above).
+This reads the stamp inside your attached planner, fetches `origin/main`, and builds that commit in a temporary
+directory without changing your branch or working-tree files. It prints JSON and exits 0 when current (no
+notification), 1 when stale, or 2 when it cannot check or deliver a requested notification. Errors do not include
+local paths or raw Git output. Git authentication must already work without interaction.
+
+For a weekday 07:45 check, replace `REPLACE_WITH_REPO_PATH` in
+`deploy/launchd/com.all-stock-dca.planner-stamp-check.plist.template`, save it as
+`~/Library/LaunchAgents/com.all-stock-dca.planner-stamp-check.plist`, and register it with
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.all-stock-dca.planner-stamp-check.plist`.
+The Mac must use America/New_York time (or adjust the template's hour); allow notifications for `osascript`.
+Logs go to `/tmp/dca-planner-stamp-check.log`. Installing the template is an operator step, not automatic.
+Keep the file passed via `--planner` identical to the file actually attached in Perplexity. A stale verdict only
+alerts: rebuild, regenerate/fill and verify the prompt pair, then reattach and repaste it yourself.
+
+**Knowing when the pair goes stale (2026-10-21).** The planner stamp changes whenever any planner input changes, so a
+pair that verified yesterday can be stale today. `python3 -m scripts.planner_stamp_check --planner backup_planner.pyz`
+compares your attached planner with what `origin/main` builds, and a launchd agent can run it each weekday morning
+and notify you; see "Stale-planner check (launchd)" in `docs/schedule_verification.md`.
 
 ## The 20,000-character limit and the `procedure` command (2026-10-18)
 

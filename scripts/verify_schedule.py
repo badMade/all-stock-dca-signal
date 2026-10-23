@@ -217,7 +217,10 @@ def classify_slot_evidence(
     else:
         status = STATUS_NO_EVIDENCE
         reasons.append("no run directory for this slot")
-        window_start = datetime.combine(day, time(*spec.window_start_et), tzinfo=ET)
+        # Same start as the finalizer's acceptance window: live prompts accept a fire up to five minutes before
+        # nominal (0935 excepted), so an early crash must read as a crash, not slot_did_not_fire (PR #1869 review).
+        from scripts.finalize_run_evidence import acceptance_window
+        window_start, _ = acceptance_window(slot_id, day)
         if any(window_start <= stamp <= deadline for stamp in attempt_times):
             attempted = True
             reasons.append("a failed-start marker exists in this slot's window: it fired and crashed "

@@ -341,3 +341,21 @@ def _tmp_root():
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class EarlyStartFailureMarkerTests(unittest.TestCase):
+    """PR #1869 review: a crash inside the five-minute early-start allowance is a crash, not a missed fire."""
+
+    def _classify(self, slot, hh, mm):
+        from scripts.verify_schedule import classify_slot_evidence
+        et = ZoneInfo("America/New_York")
+        day = date(2026, 10, 20)
+        return classify_slot_evidence(
+            slot, day, datetime(2026, 10, 20, 17, 0, tzinfo=et), run_dir_present=False, run_state=None,
+            run_state_present=False, market_closed=False, attempt_times=[datetime(2026, 10, 20, hh, mm, tzinfo=et)])
+
+    def test_1430_crash_at_1426_is_not_slot_did_not_fire(self):
+        self.assertIsNone(self._classify("1430", 14, 26)["failure_key"])
+
+    def test_0935_gets_no_early_allowance(self):
+        self.assertIsNotNone(self._classify("0935", 9, 31)["failure_key"])

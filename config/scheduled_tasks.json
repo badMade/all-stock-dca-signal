@@ -962,7 +962,7 @@
         "primary_source": "finance",
         "finance_outage_fallback": "robinhood_only",
         "since": "2026-10-21",
-        "reason": "Option C of claude/triage-routine/GROUP-C-DECISION-2026-10-17.md, chosen by the operator 2026-10-21. 1530ET stays Finance-primary; only a WHOLE-source Finance outage (source_errors lists finance, or sources.finance is absent) is scored as the benign 'finance unavailable' shape so scripts/generate_buy_candidates.py reconciles off Robinhood alone. A per-ticker ticker_errors.finance entry or an incomplete Finance payload, and any Robinhood error, still force MANUAL_REVIEW. 2026-10-21 motivation: the 15:30 session had no Finance connector, recorded it in source_errors, and all 26 Robinhood BUYs were downgraded to MANUAL_REVIEW (0 orders). Remove this key to restore the 2026-10-17 behavior. Not a fallback to another price provider.",
+        "reason": "Option C of claude/triage-routine/GROUP-C-DECISION-2026-10-17.md, chosen by the operator 2026-10-21. 1530ET stays Finance-primary; only a WHOLE-source Finance outage (source_errors lists finance, or sources.finance is absent) is scored as the benign 'finance unavailable' shape so scripts/generate_buy_candidates.py reconciles off Robinhood alone. A per-ticker ticker_errors.finance entry or an incomplete Finance payload, and any Robinhood error, still force MANUAL_REVIEW. 2026-10-21 motivation: the 15:30 session had no Finance connector, recorded it in source_errors, and all 26 Robinhood BUYs were downgraded to MANUAL_REVIEW (0 orders). Remove this key to restore the 2026-10-17 behavior. No alternate market-data provider is enabled.",
         "accepted_sources": ["finance", "robinhood"],
         "validation_context_sources": []
       }

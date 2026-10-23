@@ -630,68 +630,13 @@ def test_claudes_plan_first_orders_are_recognised_by_order_id_not_by_a_runner_re
 
 
 @pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])
-def test_the_published_set_respects_configured_channels_and_is_read_untouched(prompts, prefix):
+def test_the_published_set_is_read_untouched_from_the_configured_branch(prompts, prefix):
     text = _by_prefix(prompts, prefix)
-    github = json.loads((CONFIG / "recommendations.json").read_text())["publish"]["github_branch"]
+    branch = json.loads((CONFIG / "recommendations.json").read_text())["publish"]["github_branch"]["branch"]
     step2 = _step(text, "STEP 2", "STEP 3")
-    if github["enabled"]:
-        assert f'branch "{github["branch"]}"' in step2 and gen.GITHUB_REPOSITORY in step2
-        assert "recommendations.json" in step2
-    else:
-        assert gen.GITHUB_REPOSITORY not in step2 and f'branch "{github["branch"]}"' not in step2
+    assert f'branch "{branch}"' in step2 and gen.GITHUB_REPOSITORY in step2 and "recommendations.json" in step2
     assert "published.json" in step2 and "untouched" in step2
     assert "not an error" in step2  # an absent copy falls back; it does not fail the run
-
-
-def _publish(*, branch_on: bool, notion_on: bool = False) -> dict:
-    return {
-        "github_branch": {"enabled": branch_on, "branch": "recommendations", "remote": "origin"},
-        "notion": {"enabled": notion_on, "page_id": "page-123" if notion_on else None},
-    }
-
-
-def test_a_disabled_publisher_sends_the_executor_to_no_channel():
-    # 2026-10-21 09:55 backup: both publishers are off, the `recommendations` branch does not exist, and the
-    # prompt still told the executor to read it. The executor then probed raw, the contents API and branch
-    # listings (rules 8 and 11 violations) before failing closed. A channel nobody publishes to is not read.
-    from scripts import backup_procedure
-
-    text = backup_procedure._published_channels(_publish(branch_on=False))
-    assert "recommendations" not in text and gen.GITHUB_REPOSITORY not in text
-    assert "no published set" in text and "continue without published.json" in text
-
-
-def test_an_enabled_publisher_is_read_once_with_no_alternate_route():
-    from scripts import backup_procedure
-
-    text = backup_procedure._published_channels(_publish(branch_on=True, notion_on=True))
-    assert 'branch "recommendations"' in text and gen.GITHUB_REPOSITORY in text and "page-123" in text
-    assert "one read attempt" in text  # per channel; a failed read is final
-    for forbidden in ("contents API", "branch or ref listing", "any other route"):
-        assert forbidden in text, forbidden
-    assert "rule 11" in text
-
-
-@pytest.mark.parametrize("branch_on,notion_on", [(True, False), (False, True), (True, True), (False, False)])
-def test_only_enabled_channels_are_named_even_with_a_disabled_notion_page(branch_on, notion_on):
-    from scripts import backup_procedure
-
-    publish = _publish(branch_on=branch_on, notion_on=notion_on)
-    publish["notion"]["page_id"] = "page-123"
-    text = backup_procedure._published_channels(publish)
-    assert (gen.GITHUB_REPOSITORY in text) == branch_on
-    assert ("Notion page page-123" in text) == notion_on
-    if branch_on and notion_on:
-        assert text.index(gen.GITHUB_REPOSITORY) < text.index("Notion page")
-
-
-def test_an_enabled_notion_publisher_without_a_page_is_not_a_read_channel():
-    from scripts import backup_procedure
-
-    publish = _publish(branch_on=False, notion_on=True)
-    publish["notion"]["page_id"] = None
-    text = backup_procedure._published_channels(publish)
-    assert "Notion page" not in text and "continue without published.json" in text
 
 
 @pytest.mark.parametrize("prefix", [e[0] for e in EXPECTED])

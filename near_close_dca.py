@@ -14471,13 +14471,16 @@ def _valid_future_artifact_claim(
     return False
 
 
+_SCHEDULED_RUN_ID_PREFIX_RE = re.compile(r"^scheduled_([0-9]{8})_")
+
+
 def _artifact_day_matches_scheduled_provenance(state: Dict[str, Any], artifact_day: date) -> bool:
     """Whether scheduled identity or timestamp corroborates ``artifact_day``."""
     classification = state.get("run_classification")
     if isinstance(classification, dict):
         run_id = classification.get("run_id")
         if isinstance(run_id, str):
-            match = re.match(r"^scheduled_([0-9]{8})_", run_id)
+            match = _SCHEDULED_RUN_ID_PREFIX_RE.match(run_id)
             if match:
                 try:
                     s = match.group(1)
