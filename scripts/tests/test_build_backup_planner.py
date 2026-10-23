@@ -500,3 +500,34 @@ def test_a_build_with_a_non_default_min_python_stamps_the_matching_hash(tmp_path
     info = bbp.build(tmp_path / "c.pyz", source_commit=COMMIT, min_python=(3, 12))
     assert info["content_sha256"] == bbp.content_sha256(REPO, min_python=(3, 12))
     assert info["content_sha256"] != bbp.content_sha256(REPO)
+
+
+# -- the committed file must match its sources (2026-10-23: main at 26204ac3 reported DRIFT) -------------------------
+#
+# The Perplexity task compares the attached file's content_sha256 with the stamp in its prompt and stands down on any
+# difference. #1898 changed the planner sources without rebuilding backup_planner.pyz, so the committed file was
+# stale while the prompts (generated from the sources) were current: repasting them would have made every backup do
+# nothing. `--check` compares raw zip bytes, which can vary with the zlib version, so CI compares the hash the file
+# stamps into itself with `content_sha256()` of the sources, which is independent of zip details by design.
+
+COMMITTED_PLANNER = REPO / "backup_planner.pyz"
+REBUILD = "python -m scripts.build_backup_planner --out backup_planner.pyz, then regenerate the Perplexity prompts"
+
+
+def _stamped_content_sha256(path: Path) -> str:
+    with zipfile.ZipFile(path) as archive:
+        return json.loads(archive.read("BUILD_INFO.json"))["content_sha256"]
+
+
+def test_the_committed_planner_file_was_built_from_this_checkouts_sources():
+    assert _stamped_content_sha256(COMMITTED_PLANNER) == bbp.content_sha256(REPO), f"stale file; run {REBUILD}"
+
+
+def test_every_perplexity_prompt_requires_the_hash_the_committed_planner_file_carries():
+    prompts = sorted((REPO / "claude" / "dca-executor-prompts" / "perplexity").glob("*-backup.txt"))
+    assert len(prompts) == 6
+    stamped = _stamped_content_sha256(COMMITTED_PLANNER)
+    for prompt in prompts:
+        required = re.search(r"content_sha256 must equal ([0-9a-f]{64})", prompt.read_text(encoding="utf-8"))
+        assert required, prompt.name
+        assert required.group(1) == stamped, f"{prompt.name}: the attached file would be refused at step 0; run {REBUILD}"
