@@ -136,13 +136,14 @@ def test_cap_figures_match_live_config(prompts, prefix):
     tiers = __import__("near_close_dca").BUDGET_TIERS
     normal = next(t for t in tiers if t.name == "normal")
     assert f"at most ${dca_runner.MAX_PER_ORDER_USD:g}" in text
-    # The planner picks the tier from the 3x-or-greater signal count (2026-10-15), so every tier's cap is stated.
+    # Normal-only (2026-10-22): only the Normal caps are stated, no other tier's, and an over-cap batch is trimmed.
+    assert f"at most ${normal.daily_cap_usd:g} across ALL orders" in text
+    assert f"at most ${normal.weekly_cap_usd:g}." in text
     for tier in tiers:
-        label = tier.name.replace("_", "-").capitalize()
-        weekly = normal.weekly_cap_usd if tier.uses_rollover_reserve else tier.weekly_cap_usd
-        assert f"${tier.daily_cap_usd:g} {label}" in text, tier.name
-        assert f"${weekly:g} {label}" in text, tier.name
+        if tier.name != "normal":
+            assert f"${tier.daily_cap_usd:g} {tier.name.replace('_', '-').capitalize()}" not in text, tier.name
     assert "you never choose or escalate a tier yourself" in text
+    assert "Place exactly to_place" in text and "do not back-fill" in text
     assert f"at most {dca_runner.MAX_ORDERS_PER_DAY} buy attempts" in text
     breakers = json.loads((CONFIG / "budgets.json").read_bytes())["circuit_breakers"]
     assert f"{breakers['max_consecutive_placement_failures']} consecutive" in text

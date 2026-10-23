@@ -1,6 +1,6 @@
 # Plan-first backup executor
 
-Status: proposed (2026-10-06). Phase 1 of a six-phase change; no code is implemented by this
+Status: proposed (2026-10-06); D4 amended 2026-10-22 (Normal-only, trim to fit). Phase 1 of a six-phase change; no code is implemented by this
 document. Operator approval is required before Phase 2 (tests).
 
 ## Context
@@ -63,7 +63,7 @@ Introduce a plan file and move backup sizing into code.
 | D1 | Plan path is `<cron root>/order_plans/<YYYY-MM-DD>/order_plan_<slot_id>.json` (`dca_order_plan.order_plan_path`, honoring `$DCA_CRON_TRACKING_ROOT`), a tree of its own and not the slot run directory, which scans read as "this slot ran". No literal `runs/` or absolute path. A mirror the cloud fallback can read is NOT built now; cloud fallback computes instead of reading a plan. | `CLAUDE.md` no-hard-coded-paths invariant; `deploy/launchd/prefetch_plan.py` precedent |
 | D2 | Complete Claude's remaining planned tickers. Tickers Claude already ordered in this slot's window are excluded, not resized. | Coordination doc section 1 |
 | D3 | Repo ladder: 15 tiers, $1 or $2 dynamic base, per-order cap $16 read from live config. Stale "$10" and "max 5x" prose is corrected in a separate docs change. | `config/sizing_ladder.json`, `dca_runner.py:430` |
-| D4 | Literal. If the plan's total would exceed the remaining daily or weekly cap, or any order exceeds the per-order cap, the backup buys nothing and reports why. No trimming. | `plan_orders` never shrinks or back-fills (`dca_runner.py:2180`) |
+| D4 | **Amended 2026-10-22: Normal tier only, trim to fit.** The backup planner never escalates the budget tier (always Normal: $180 daily, $900 weekly, `MAX_ORDERS_PER_DAY` orders), whatever the count of 3x signals. If the batch would exceed the remaining daily, weekly, order-count or buying-power headroom, the backup places the longest PREFIX (allocation-priority order) that fits, stops at the first order that does not fit, and reports every order left out in `skipped` with the cap that stopped it. It never shrinks an order and never back-fills a later, smaller one. An order over the per-order cap, or any other bad order, is still a defect that aborts. Trimming is opt-in (`trim_to_fit` in `dca_order_plan`); the default stays all-or-nothing for other callers (`scripts/adhoc_orders.py`). *Originally:* literal all-or-nothing, "buys nothing and reports why. No trimming." | Operator decision 2026-10-22 ("Backups should stay Normal-only like the slots", "Normal-only, trim to fit"). On 2026-10-16 backups placed $205.90 against the $180 cap because the planner had escalated its tier (option C, 2026-10-15, now reversed). The slots follow the same rule at Gate 6: `plan_orders` stops at a cap boundary but keeps the orders before it (`dca_runner.py:2180`) |
 | D5 | A plan is valid only for its own date and slot. Per order, a fresh quote must still be below the prior close. Claude's notional is kept, not re-sized with the fresh price. Compute paths size from the fresh price by construction. | Existing per-order revalidation in the live prompts |
 | D6 | UNVERIFIED. A reused `ref_id` is not trusted for broker-side deduplication. Safety rests on the fresh pre-order order pull and one order per ticker, not on the broker rejecting duplicates. | No evidence in repo or order history |
 | D7 | `config/tickers.json` is the universe source of truth. Plans carry a `universe_hash` and are rejected on mismatch. | `CLAUDE.md` config parity invariant |
@@ -110,9 +110,10 @@ Mapping to existing fields (`scripts/stream_candidates.py:1363`): `notional_usd`
   composite `<sizing_ladder version>+<per_ticker_sizing version>` (`dca_order_plan.current_ladder_version`),
   and `drop_pct` may be below 0.1.
 - **Slot ids** are `0935`..`1530` with no `ET` suffix, matching `dca_runner.SLOTS` and `ref_id`.
-- **Caps are all-or-nothing and written out** in `dca_order_plan._cap_errors` instead of calling
-  `plan_orders`, which keeps the orders before a cap boundary and whose multiplier-consistency check is
-  bound to the calibration files read at import time. `execute_plan` still runs `plan_orders` at placement.
+- **Caps are written out** in `dca_order_plan._cap_errors` (all-or-nothing, the default) and
+  `dca_order_plan._fit_prefix` (trim to fit, which the backup planner opts into, see D4) instead of calling
+  `plan_orders`, whose multiplier-consistency check is bound to the calibration files read at import time.
+  `execute_plan` still runs `plan_orders` at placement.
 - **Primary-side emit** is `scripts/emit_order_plan.py`, run as the first step of Gate 7 in each live-mirror
   prompt, because placement in the live prompts is prose and not a code runner. A failed emit writes nothing,
   exits 2, and does NOT block the primary's own placement (only the backup depends on the plan). Live
@@ -129,7 +130,7 @@ Mapping to existing fields (`scripts/stream_candidates.py:1363`): `notional_usd`
 - **Safety gate (2026-10-08), all seven slots.** `compute --market-data FILE --deployed-last-7d-usd N` runs the
   slot's Gate 5 (`scripts.generate_buy_candidates.generate_candidates` for 15:30,
   `scripts.stream_candidates` for the other six) and plans exactly the placeable BUYs it
-  reaches, with its sizing, kill switch and provider-error handling, then applies the same all-or-nothing caps as
+  reaches, with its sizing, kill switch and provider-error handling, then applies the same Normal-tier caps (trimmed to fit, D4) as
   the quotes path (`dca_order_plan.plan_from_decisions`). `scripts/assemble_market_data.py` turns the raw
   Robinhood responses the Perplexity task dumps into that payload using the repo's `RobinhoodDataProvider`
   parsing, so the task reshapes nothing. Stream computation uses the default decision anchor and excludes

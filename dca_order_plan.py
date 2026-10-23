@@ -512,6 +512,50 @@ def _cap_errors(
     return errors
 
 
+def _fit_prefix(
+    snapshot: BudgetSnapshot,
+    tier: BudgetTier,
+    orders: Sequence[Mapping[str, Any]],
+    weekly_cap_usd: float | None,
+    buying_power_usd: Any = None,
+) -> tuple[list[Mapping[str, Any]], list[tuple[str, str]], list[PlanError]]:
+    """The longest PREFIX of ``orders`` that fits the caps, the orders it left out, and any whole-plan errors.
+
+    Opt-in alternative to :func:`_cap_errors` for the backup planner (operator decision 2026-10-22: a backup stays
+    Normal-only like the slots and places what fits, as ``dca_runner.plan_orders`` does at its cap boundary). The
+    same limits apply (order count, daily, weekly, buying power); the first order that does not fit stops the
+    walk, so an order is never shrunk and a later, smaller one is never back-filled. Every order from the stopper
+    on is reported as ``(symbol, reason)`` with the cap that stopped it. An unusable buying power or a missing
+    rollover reserve is not a trim: it stays a whole-plan error, as in :func:`_cap_errors`.
+    """
+    if buying_power_usd is not None and (
+        not _is_number(buying_power_usd) or not math.isfinite(buying_power_usd) or buying_power_usd < 0
+    ):
+        return [], [], [PlanError("invalid_buying_power")]
+    if orders and tier.uses_rollover_reserve and weekly_cap_usd is None:
+        return [], [], [PlanError("weekly_cap_required", tier.name)]
+    weekly_cap = tier.weekly_cap_usd if weekly_cap_usd is None else min(weekly_cap_usd, tier.weekly_cap_usd)
+    kept: list[Mapping[str, Any]] = []
+    total = 0.0
+    for order in orders:
+        after = total + order["notional_usd"]
+        reason = None
+        if snapshot.day_order_count + len(kept) + 1 > MAX_ORDERS_PER_DAY:
+            reason = "over_order_count_cap"
+        elif snapshot.day_notional_usd + after > tier.daily_cap_usd:
+            reason = "over_daily_cap"
+        elif snapshot.week_notional_usd + after > weekly_cap:
+            reason = "over_weekly_cap"
+        elif buying_power_usd is not None and after > buying_power_usd:
+            reason = "insufficient_buying_power"
+        if reason is not None:
+            left_out = [(str(o["symbol"]), reason) for o in orders[len(kept):]]
+            return kept, left_out, []
+        kept.append(order)
+        total = after
+    return kept, [], []
+
+
 class _FixedQuote:
     """One already-fetched bid/ask, shaped like the provider ``near_close_dca._quote_bid_ask`` expects."""
 
@@ -550,6 +594,7 @@ def revalidate_for_placement(
     scope: str = "day",
     buying_power_usd: Any = None,
     fresh_spreads: Mapping[str, Any] | None = None,
+    trim_to_fit: bool = False,
 ) -> PlanResult:
     """Re-check every order against a fresh order pull and fresh quotes, on every path.
 
@@ -573,6 +618,8 @@ def revalidate_for_placement(
         buying_power_usd: Fresh available buying power; ``None`` skips the check (the planner CLI
             always passes it and fails closed when it is missing or unusable).
         fresh_spreads: Symbol to ``(bid, ask)``; ``None`` skips the check (the CLI always passes it).
+        trim_to_fit: ``False`` (default) keeps D4's all-or-nothing caps. ``True`` keeps the longest prefix that fits
+            them instead and names the rest in ``skipped`` (see :func:`_fit_prefix`); the per-order cap stays a defect.
 
     Returns:
         ``PlanResult`` whose ``orders`` are safe to hand to ``dca_runner.execute_plan``.
@@ -611,7 +658,12 @@ def revalidate_for_placement(
         else:
             keep.append(dict(order))
     errors = [PlanError("notional_over_cap", o["symbol"]) for o in keep if o["notional_usd"] > MAX_PER_ORDER_USD]
-    errors += _cap_errors(snapshot, tier, [o["notional_usd"] for o in keep], weekly_cap_usd, buying_power_usd)
+    if trim_to_fit:
+        keep, left_out, cap_errors = _fit_prefix(snapshot, tier, keep, weekly_cap_usd, buying_power_usd)
+        errors += cap_errors
+        skipped += left_out
+    else:
+        errors += _cap_errors(snapshot, tier, [o["notional_usd"] for o in keep], weekly_cap_usd, buying_power_usd)
     if errors:
         return PlanResult(errors=tuple(errors), skipped=tuple(skipped))
     return PlanResult(orders=tuple(keep), skipped=tuple(skipped))
@@ -645,6 +697,7 @@ def compute_plan(
     tier: BudgetTier,
     weekly_cap_usd: float | None = None,
     buying_power_usd: Any = None,
+    trim_to_fit: bool = False,
 ) -> PlanResult:
     """Derive a plan from fetched quotes using the repo's own ladder and base selection.
 
@@ -693,7 +746,7 @@ def compute_plan(
     return _finish_backup_plan(
         list(chosen.values()), skipped, config=config, trading_day=trading_day, slot=slot,
         generated_at_et=generated_at_et, ladder_version=ladder_version, orders_today=orders_today,
-        tier=tier, weekly_cap_usd=weekly_cap_usd, buying_power_usd=buying_power_usd,
+        tier=tier, weekly_cap_usd=weekly_cap_usd, buying_power_usd=buying_power_usd, trim_to_fit=trim_to_fit,
     )
 
 
@@ -710,12 +763,13 @@ def _finish_backup_plan(
     tier: BudgetTier,
     weekly_cap_usd: float | None,
     buying_power_usd: Any,
+    trim_to_fit: bool = False,
 ) -> PlanResult:
     """Order, cap-check and wrap sized orders as a ``generator: "backup"`` plan.
 
     Shared by :func:`compute_plan` (sized from quotes) and :func:`plan_from_decisions` (sized by the
     primary's Gate 5), so the two cannot drift on priority, the per-order cap, the daily and weekly
-    caps (all-or-nothing, D4) or buying power.
+    caps (all-or-nothing, D4, unless ``trim_to_fit``, which keeps the prefix that fits) or buying power.
     """
     # config/budgets.json allocation_priority: multiplier, then drop, then ticker alphabetical.
     # Written out rather than via dca_runner._allocation_priority_key, which re-estimates the
@@ -726,7 +780,12 @@ def _finish_backup_plan(
         snapshot = budget_snapshot(list(orders_today), trading_day)
     except BudgetDataError as exc:
         return _fail(PlanError("history_unusable", type(exc).__name__))
-    errors += _cap_errors(snapshot, tier, [o["notional_usd"] for o in orders], weekly_cap_usd, buying_power_usd)
+    if trim_to_fit:
+        orders, left_out, cap_errors = _fit_prefix(snapshot, tier, orders, weekly_cap_usd, buying_power_usd)
+        errors += cap_errors
+        skipped = [*skipped, *left_out]
+    else:
+        errors += _cap_errors(snapshot, tier, [o["notional_usd"] for o in orders], weekly_cap_usd, buying_power_usd)
     if errors:
         return PlanResult(errors=tuple(errors), skipped=tuple(skipped))
     plan = {
@@ -754,6 +813,7 @@ def plan_from_decisions(
     tier: BudgetTier,
     weekly_cap_usd: float | None = None,
     buying_power_usd: Any = None,
+    trim_to_fit: bool = False,
 ) -> PlanResult:
     """A backup plan from decisions the primary's own Gate 5 already reached (the safety gate).
 
@@ -812,7 +872,7 @@ def plan_from_decisions(
     return _finish_backup_plan(
         list(chosen.values()), skipped, config=config, trading_day=trading_day, slot=slot,
         generated_at_et=generated_at_et, ladder_version=ladder_version, orders_today=orders_today,
-        tier=tier, weekly_cap_usd=weekly_cap_usd, buying_power_usd=buying_power_usd,
+        tier=tier, weekly_cap_usd=weekly_cap_usd, buying_power_usd=buying_power_usd, trim_to_fit=trim_to_fit,
     )
 
 

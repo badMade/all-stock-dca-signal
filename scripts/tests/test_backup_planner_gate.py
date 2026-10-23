@@ -200,13 +200,15 @@ def test_a_ticker_bought_in_this_slots_window_is_excluded_not_resized(tmp_path, 
 def test_a_breach_of_the_daily_cap_plans_nothing(tmp_path, capsys):
     spent = _raw_buy("NVDA", amount="179.500000", created=f"{DAY}T13:40:00+00:00")
     code, report = _gate(tmp_path, capsys, market_data(TAPE), rows=[spent])
-    assert (code, report["status"], report["plan"]) == (2, "FAILED", None)
-    assert "over_daily_cap" in {e["code"] for e in report["errors"]}
+    # Trim to fit (2026-10-22): nothing fits under the $180 Normal cap, so the plan is empty, not failed.
+    assert (code, report["status"], report["plan"]["orders"]) == (0, "VALID_PLAN", [])
+    assert {s["reason"] for s in report["skipped"]} == {"over_daily_cap"}
 
 
 def test_buying_power_is_still_required_and_checked(tmp_path, capsys):
     code, report = _gate(tmp_path, capsys, market_data(TAPE), bp="0.50")
-    assert (code, report["plan"]) == (2, None)
+    assert (code, report["plan"]["orders"]) == (0, [])
+    assert {s["reason"] for s in report["skipped"]} == {"insufficient_buying_power"}
 
 
 # ---------------------------------------------------------------------------

@@ -192,8 +192,9 @@ def test_a_ticker_already_bought_today_is_excluded_not_resized(tmp_path, capsys,
 def test_a_cap_breach_plans_nothing(tmp_path, capsys, slot):
     spent = _raw_buy("NVDA", amount="179.500000")
     code, report = _plan(tmp_path, capsys, slot, market_data(TAPE, slot=slot), rows=[spent])
-    assert (code, report["status"], report["plan"]) == (2, "FAILED", None)
-    assert "over_daily_cap" in {e["code"] for e in report["errors"]}
+    # Trim to fit (2026-10-22): nothing fits under the $180 Normal cap, so the plan is empty, not failed.
+    assert (code, report["status"], report["plan"]["orders"]) == (0, "VALID_PLAN", [])
+    assert {s["reason"] for s in report["skipped"]} == {"over_daily_cap"}
 
 
 _NEEDS_FIGURE = [slot for slot in STREAM_SLOTS if _spec(slot).requires_deployed_last_7d_usd]
@@ -230,7 +231,8 @@ def test_the_figure_is_required_on_every_market_data_run(tmp_path, slot):
 @pytest.mark.parametrize("slot", STREAM_SLOTS)
 def test_buying_power_is_still_checked(tmp_path, capsys, slot):
     code, report = _plan(tmp_path, capsys, slot, market_data(TAPE, slot=slot), bp="0.50")
-    assert (code, report["plan"]) == (2, None)
+    assert (code, report["plan"]["orders"]) == (0, [])
+    assert {s["reason"] for s in report["skipped"]} == {"insufficient_buying_power"}
 
 
 # ---------------------------------------------------------------------------

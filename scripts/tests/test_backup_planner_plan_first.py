@@ -349,12 +349,14 @@ def test_a_ticker_claude_bought_in_this_slot_is_dropped_but_an_earlier_slots_buy
     assert report["skipped"] == [{"symbol": "MSFT", "reason": "already_placed"}]
 
 
-def test_caps_stay_all_or_nothing_for_a_plan_first_plan(tmp_path, capsys):
+def test_a_plan_first_plan_trims_to_the_caps_instead_of_aborting(tmp_path, capsys):
+    """Trim to fit (2026-10-22, reverses ADR D4's all-or-nothing): the first order does not fit $2 of headroom, so
+    nothing is placed, every order is reported, and the run is a PROCEED with nothing to place, not an ABORT."""
     plan = _plan_first_plan(tmp_path, capsys)
     rows = [_raw("VT", amount="178.00", created=f"{DAY}T14:00:00+00:00")]  # $178 of the $180 day already spent
     code, report, _ = _run(capsys, _finalize_argv(tmp_path, plan, rows))
-    assert (code, report["status"], report["to_place"]) == (2, "ABORT", [])
-    assert "over_daily_cap" in [e["code"] for e in report["errors"]]
+    assert (code, report["status"], report["to_place"], report["errors"]) == (0, "PROCEED", [], [])
+    assert {s["reason"] for s in report["skipped"]} == {"over_daily_cap"}
 
 
 def test_a_tampered_plan_first_file_is_refused_at_finalize(tmp_path, capsys):
@@ -584,10 +586,12 @@ def test_a_naive_submit_instant_fails_closed(tmp_path, capsys):
 
 def test_a_plan_first_plan_finalizes_under_the_normal_tier_after_1699(tmp_path, capsys):
     """#1699 picks finalize's tier from each order's multiplier; a price-blind set has none, so it counts no 3x
-    signals and keeps the Normal caps. $175 spent today plus this $6.50 set fits Elevated's $240 but not Normal's
-    $180, so it must abort (never trim), and it must not fail on the missing multiplier."""
+    signals and keeps the Normal caps (and since 2026-10-22 no plan escalates at all). $175 spent today plus this
+    $6.50 set fits Elevated's $240 but not Normal's $180, so only the prefix that fits is placed (the first order,
+    $4), and it must not fail on the missing multiplier."""
     plan = _plan_first_plan(tmp_path, capsys)
     rows = [_raw("VT", amount="175.00", created=f"{DAY}T14:00:00+00:00")]
     code, report, _ = _run(capsys, _finalize_argv(tmp_path, plan, rows))
-    assert (code, report["status"], report["to_place"]) == (2, "ABORT", [])
-    assert "over_daily_cap" in [e["code"] for e in report["errors"]]
+    assert (code, report["status"], report["errors"]) == (0, "PROCEED", [])
+    assert [o["symbol"] for o in report["to_place"]] == ["MSFT"]
+    assert {s["reason"] for s in report["skipped"]} == {"over_daily_cap"}

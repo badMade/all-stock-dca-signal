@@ -58,7 +58,8 @@ set is the primary's own `{ticker, usd, ref_id}` list, which these backups now r
 A missing, stale or malformed set is `NO_VALID_PLAN`, and the backup falls back to `mac_plan`, `mac_compute` and
 `cloud_compute` as before. A set is placed like a Claude plan (reconciled against this slot's window only), but
 `finalize` requires a fresh prior close per symbol (`--fresh-prior-closes`) because a set carries no prices, and the
-caps stay all-or-nothing.
+caps are the Normal tier's, trimmed to fit (the prefix that fits is placed and the rest is reported in
+`skipped`; 2026-10-22, `docs/adr-plan-first-backup-executor.md` D4).
 
 The broker echoes its own ref_id, so Claude's plan-first orders carry no `dca-runner-` reference. `classify`
 recognises executor orders by the order ids `executor-ids` prints, by a legacy `dca-runner-<slot>-` reference or the

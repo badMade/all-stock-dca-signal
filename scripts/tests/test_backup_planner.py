@@ -182,17 +182,18 @@ def test_compute_returns_a_backup_plan_under_the_normal_tier(tmp_path, capsys):
 
 
 def test_compute_buys_nothing_when_the_fresh_history_leaves_no_daily_headroom(tmp_path, capsys):
+    """Trim to fit (2026-10-22): no headroom is an empty plan with the order reported, not a failure."""
     pages = _envelope([_raw("NVDA", amount="179.500000", ref=f"dca-runner-1030-{DAY}-NVDA")])
     code, report = _compute(tmp_path, capsys, [_quote("VT", 5.0)], pages)
-    assert (code, report["status"], report["plan"]) == (2, "FAILED", None)
-    assert "over_daily_cap" in {e["code"] for e in report["errors"]}
+    assert (code, report["status"], report["plan"]["orders"], report["errors"]) == (0, "VALID_PLAN", [], [])
+    assert report["skipped"] == [{"symbol": "VT", "reason": "over_daily_cap"}]
 
 
 def test_compute_counts_the_whole_week_not_just_today(tmp_path, capsys):
     monday = _raw("NVDA", amount="899.500000", created="2026-10-05T15:31:00+00:00")
     code, report = _compute(tmp_path, capsys, [_quote("VT", 5.0)], _envelope([monday]))
-    assert (code, report["status"]) == (2, "FAILED")
-    assert "over_weekly_cap" in {e["code"] for e in report["errors"]}
+    assert (code, report["status"], report["plan"]["orders"]) == (0, "VALID_PLAN", [])
+    assert report["skipped"] == [{"symbol": "VT", "reason": "over_weekly_cap"}]
 
 
 @pytest.mark.parametrize("text", ["", "{oops", "{}", "[]", "null"])
@@ -301,8 +302,9 @@ def test_finalize_skips_a_ticker_whose_fresh_quote_is_not_below_the_prior_close(
 def test_finalize_aborts_the_whole_batch_on_a_cap_breach_in_the_fresh_pull(tmp_path, capsys, two_order_plan):
     rows = [_raw("NVDA", amount="176.000000", ref=f"dca-runner-1030-{DAY}-NVDA")]  # 176 + 4 + 2 > 180
     code, report = _finalize(tmp_path, capsys, two_order_plan, rows)
-    assert (code, report["status"], report["to_place"]) == (2, "ABORT", [])
-    assert "over_daily_cap" in {e["code"] for e in report["errors"]}
+    # Trim to fit (2026-10-22): MSFT's $4 fits ($180 exactly), AAPL's $2 does not, so only the prefix is placed.
+    assert (code, report["status"], [o["symbol"] for o in report["to_place"]]) == (0, "PROCEED", ["MSFT"])
+    assert {"symbol": "AAPL", "reason": "over_daily_cap"} in report["skipped"]
 
 
 def test_finalize_aborts_on_an_invalid_plan(tmp_path, capsys, two_order_plan):
@@ -485,8 +487,8 @@ def test_an_unusable_buying_power_value_fails_closed(tmp_path, capsys, two_order
 
 def test_finalize_aborts_when_the_batch_exceeds_buying_power(tmp_path, capsys, two_order_plan):
     code, report = _finalize(tmp_path, capsys, two_order_plan, bp="5.99")  # $4 + $2 = $6
-    assert (code, report["status"], report["to_place"]) == (2, "ABORT", [])
-    assert "insufficient_buying_power" in {e["code"] for e in report["errors"]}
+    assert (code, report["status"], [o["symbol"] for o in report["to_place"]]) == (0, "PROCEED", ["MSFT"])
+    assert {"symbol": "AAPL", "reason": "insufficient_buying_power"} in report["skipped"]
 
 
 def test_finalize_allows_a_batch_exactly_equal_to_buying_power(tmp_path, capsys, two_order_plan):
@@ -496,8 +498,8 @@ def test_finalize_allows_a_batch_exactly_equal_to_buying_power(tmp_path, capsys,
 
 def test_compute_buys_nothing_when_the_plan_exceeds_buying_power(tmp_path, capsys):
     code, report = _compute(tmp_path, capsys, [_quote("VT", 5.0), _quote("MSFT", 1.2)], _envelope(), bp="0.50")
-    assert (code, report["status"], report["plan"]) == (2, "FAILED", None)
-    assert "insufficient_buying_power" in {e["code"] for e in report["errors"]}
+    assert (code, report["status"], report["plan"]["orders"]) == (0, "VALID_PLAN", [])
+    assert {s["reason"] for s in report["skipped"]} == {"insufficient_buying_power"}
 
 
 # -- gap 4: Gate 6.7 spread, fail closed per ticker ------------------------------------------

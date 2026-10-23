@@ -89,7 +89,7 @@ from dca_order_plan import PlanError, PlanResult  # noqa: E402
 from dca_rec_models import RecommendationSet  # noqa: E402
 from dca_rec_store import RecommendationStore, load_settings  # noqa: E402
 from dca_runner import ET, MAX_PER_ORDER_USD, SLOTS, BrokerOrder, BudgetDataError  # noqa: E402
-from near_close_dca import BUDGET_TIERS, BudgetTier, kill_switch_engaged, select_budget_tier  # noqa: E402
+from near_close_dca import BUDGET_TIERS, BudgetTier, kill_switch_engaged  # noqa: E402
 from scripts import backup_stream_specs, stream_candidates  # noqa: E402
 from scripts import generate_buy_candidates as gbc  # noqa: E402
 from scripts.assemble_order_pages import _order_rows  # noqa: E402
@@ -102,16 +102,17 @@ _NORMAL_TIER = next(tier for tier in BUDGET_TIERS if tier.name == "normal")
 
 
 def _tier_for(multipliers: Any, config: Any) -> tuple[BudgetTier, float | None]:
-    """The budget tier and effective weekly cap for a batch, selected as the primary selects them.
+    """The budget tier and effective weekly cap for a backup batch: always Normal ($180 daily, $900 weekly).
 
-    The tier depends only on how many orders carry a multiplier at or above ``config.high_multiplier_threshold``
-    (a count fixed before sizing, never the planned spend). The Stress tier's weekly ceiling needs a verified
-    rollover reserve that the planner has no input for, so it is held to the Normal weekly cap
-    (``config/budgets.json``: no rollover means a $900 effective budget). Other tiers keep their own weekly cap.
+    Operator decision 2026-10-22: a backup stays Normal-only like the Claude slots, which never escalate (only the
+    3:30 final run does, ``docs/safeguards.md``). The count of 3x-or-greater signals therefore no longer raises a
+    cap; a batch over the Normal caps is trimmed to the prefix that fits (``dca_order_plan`` ``trim_to_fit``)
+    instead. This reverses the 2026-10-15 escalation (backup sessions placed $205.90 against the $180 cap on
+    2026-10-16). ``multipliers`` and ``config`` are kept so the call sites and their signature stay unchanged.
     """
-    count = sum(1 for m in multipliers if isinstance(m, (int, float)) and m >= config.high_multiplier_threshold)
-    tier = select_budget_tier(0.0, count)
-    return tier, (_NORMAL_TIER.weekly_cap_usd if tier.uses_rollover_reserve else None)
+    return _NORMAL_TIER, None
+
+
 _DEAD_STATES = frozenset({"cancelled", "canceled", "rejected", "failed", "voided"})
 
 # Operator decision 2026-10-13: a backup that cannot reach the Mac places its own computed plan (ADR "Open design
@@ -159,6 +160,10 @@ class _Refused(Exception):
 
 def _error_dicts(errors: Any) -> list[dict[str, str]]:
     return [{"code": e.code, "detail": e.detail} for e in errors]
+
+
+def _skipped_dicts(skipped: Any) -> list[dict[str, str]]:
+    return [{"symbol": symbol, "reason": reason} for symbol, reason in skipped]
 
 
 def _emit(report: dict[str, Any], code: int) -> int:
@@ -761,10 +766,11 @@ def _cmd_compute(args: argparse.Namespace, trading_day: date) -> int:
     result = dop.compute_plan_from_file(
         args.quotes, config=config, trading_day=trading_day, slot=args.slot, generated_at_et=now,
         ladder_version=ladder_version, orders_today=history, tier=_NORMAL_TIER, buying_power_usd=buying_power,
+        trim_to_fit=True,
     )
     if result.errors or result.plan is None:
         return _emit({"status": "FAILED", "plan": None, "errors": _error_dicts(result.errors)}, 2)
-    return _emit({"status": "VALID_PLAN", "plan": result.plan, "errors": []}, 0)
+    return _emit({"status": "VALID_PLAN", "plan": result.plan, "skipped": _skipped_dicts(result.skipped), "errors": []}, 0)
 
 
 def _cmd_compute_gated(args: argparse.Namespace, trading_day: date) -> int:
@@ -796,17 +802,17 @@ def _cmd_compute_gated(args: argparse.Namespace, trading_day: date) -> int:
     except ValueError as exc:
         # Type name only: the message can carry untrusted payload content (a source name, a path).
         raise _Refused(PlanError("market_data_invalid", type(exc).__name__)) from exc
-    # The primary raises its ceiling with the breadth of the selloff; a Normal-only backup would refuse a batch the
-    # primary would have placed (2026-10-15, slot 0935: 41 to 46 signals at 3x or more, a $296 batch, a $180 cap).
+    # Normal-only (2026-10-22): the Claude slots never escalate, so a backup does not either. A batch over the Normal
+    # caps is trimmed to the prefix that fits and the rest is reported (2026-10-16: $205.90 against a $180 cap).
     tier, weekly_cap = _tier_for((d["multiplier"] for d in decisions), config)
     result = dop.plan_from_decisions(
         decisions, config=config, trading_day=trading_day, slot=args.slot, generated_at_et=now,
         ladder_version=dop.current_ladder_version(directory), orders_today=history, tier=tier,
-        weekly_cap_usd=weekly_cap, buying_power_usd=buying_power,
+        weekly_cap_usd=weekly_cap, buying_power_usd=buying_power, trim_to_fit=True,
     )
     if result.errors or result.plan is None:
         return _emit({"status": "FAILED", "plan": None, "errors": _error_dicts(result.errors)}, 2)
-    return _emit({"status": "VALID_PLAN", "plan": result.plan, "errors": []}, 0)
+    return _emit({"status": "VALID_PLAN", "plan": result.plan, "skipped": _skipped_dicts(result.skipped), "errors": []}, 0)
 
 
 def _decisions_final_buy(payload: dict[str, Any], config: Any, directory: Path, trading_day: date,
@@ -997,16 +1003,13 @@ def _cmd_finalize(args: argparse.Namespace, trading_day: date) -> int:
     remaining = dop.reconcile(candidates, history, trading_day=trading_day, slot=args.slot, scope=scope)
     remaining_symbols = {o["symbol"] for o in remaining}
     skipped += [{"symbol": o["symbol"], "reason": "already_placed"} for o in candidates if o["symbol"] not in remaining_symbols]
-    # The tier is the one the plan was built under: counted over ALL its orders, so a ticker skipped at placement
-    # cannot drop a valid batch to a lower tier and abort it. A plan-first set is price-blind and carries no
-    # multiplier, so it counts no 3x signals and stays on the Normal tier: the tier the recommender sized it under
-    # lives only in its program-only expected-price file, which a cloud backup never sees. Conservative by design: an
-    # escalated set over the Normal caps aborts (places nothing); it is never trimmed or placed over a proven cap.
+    # Normal-only (2026-10-22), whatever tier the plan was sized under: a set over the Normal caps places the prefix
+    # that fits and reports the rest in ``skipped`` (never shrunk, never back-filled, never placed over a proven cap).
     tier, weekly_cap = _tier_for((o.get("multiplier", 0.0) for o in plan.orders), config)
     result = dop.revalidate_for_placement(
         remaining, broker_orders=history, fresh_quotes=fresh, trading_day=trading_day, tier=tier,
         weekly_cap_usd=weekly_cap, config=config, slot=args.slot, scope=scope, buying_power_usd=buying_power,
-        fresh_spreads=spreads,
+        fresh_spreads=spreads, trim_to_fit=True,
     )
     if result.errors:
         return _abort(*result.errors)

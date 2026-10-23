@@ -138,6 +138,19 @@ morning and midday still only check against the flat shared Normal tier and
 never independently escalate to Elevated/High-volatility/Stress — only the
 3:30 final run does that, from its fuller same-day view.
 
+**Perplexity backups are Normal-only and trim to fit (2026-10-22).** The backup planner
+(`scripts/backup_planner.py`) never escalates the budget tier: it always applies the Normal
+$180/day, $900/week caps and `MAX_ORDERS_PER_DAY`, like the Claude slots (only the 3:30 final
+run escalates, above). A batch that would breach a cap, or the account's buying power, is
+trimmed instead of refused whole: the backup places the longest prefix, in allocation-priority
+order, that fits, stops at the first order that does not, never shrinks an order and never
+back-fills a later one, and reports each order left out in `skipped` (`over_daily_cap`,
+`over_weekly_cap`, `over_order_count_cap`, `insufficient_buying_power`). Nothing fitting is a
+normal empty result (`VALID_PLAN` with no orders at compute, `PROCEED` with an empty `to_place`
+at finalize), not a failure. An order over the per-order cap, or any other bad order, still
+aborts. This reverses the 2026-10-15 tier escalation, which let backup sessions place $205.90
+against the $180 cap on 2026-10-16. See `docs/adr-plan-first-backup-executor.md` D4.
+
 **In-repo executors for market-open and intraday (2026-08-02).** The second
 half of that gap is now closed in code: market-open (`2ba19526`) and intraday
 (`7be82b97`) previously had no in-repo Python at all, so their trading-window

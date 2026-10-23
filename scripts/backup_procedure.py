@@ -219,11 +219,6 @@ def _latest(backup: Backup) -> str:
 
 
 
-def _tier_caps(cap_of) -> str:
-    """The tiers' caps in selection order, e.g. ``$180 Normal, $240 Elevated``, from the primary's own ladder."""
-    return ", ".join(f"${cap_of(tier):g} {tier.name.replace('_', '-').capitalize()}" for tier in BUDGET_TIERS)
-
-
 def common_values(directory: Path | None = None) -> dict[str, str]:
     """Every config-derived placeholder shared by all six prompts EXCEPT the build stamp (that one is the
     generator's: the procedure must not depend on the hash of the build that contains it)."""
@@ -244,8 +239,8 @@ def common_values(directory: Path | None = None) -> dict[str, str]:
         "@@EARLY@@": ", ".join(calendar["early_close_1300"]),
         "@@EARLY_TIME@@": str(calendar["early_close_time_et"]),
         "@@PER_ORDER@@": f"{dca_runner.MAX_PER_ORDER_USD:g}",
-        "@@TIER_DAILY@@": _tier_caps(lambda tier: tier.daily_cap_usd),
-        "@@TIER_WEEKLY@@": _tier_caps(lambda tier: normal.weekly_cap_usd if tier.uses_rollover_reserve else tier.weekly_cap_usd),
+        "@@NORMAL_DAILY@@": f"${normal.daily_cap_usd:g}",
+        "@@NORMAL_WEEKLY@@": f"${normal.weekly_cap_usd:g}",
         "@@MAX_ORDERS@@": str(dca_runner.MAX_ORDERS_PER_DAY),
         "@@CONSEC@@": str(breakers["max_consecutive_placement_failures"]),
         "@@MAX_SPREAD@@": f"{config.max_bid_ask_spread_pct:g}",
