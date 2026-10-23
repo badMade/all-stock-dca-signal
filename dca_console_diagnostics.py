@@ -43,7 +43,7 @@ _LAYER_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
         "scripts.validate_native_placement", "scripts.robinhood_payload",
     )),
     ("backup_executor", (
-        "dca_execution_router", "dca_order_plan", "scripts.backup_planner", "scripts.backup_stream_specs",
+        "dca_execution_router", "dca_order_plan", "dca_number_check", "scripts.backup_planner", "scripts.backup_stream_specs",
         "scripts.local_heartbeat", "scripts.assemble_market_data", "scripts.build_backup_planner",
         "scripts.stream_candidates", "scripts.generate_",
     )),

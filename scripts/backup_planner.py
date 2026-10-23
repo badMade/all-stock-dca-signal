@@ -85,15 +85,22 @@ require_supported_python(sys.version_info)
 
 import dca_config  # noqa: E402  (every project import must follow the version guard)
 import dca_order_plan as dop  # noqa: E402
+from dca_number_check import plan_grounding_errors  # noqa: E402
 from dca_order_plan import PlanError, PlanResult  # noqa: E402
 from dca_rec_models import RecommendationSet  # noqa: E402
 from dca_rec_store import RecommendationStore, load_settings  # noqa: E402
 from dca_runner import ET, MAX_PER_ORDER_USD, SLOTS, BrokerOrder, BudgetDataError  # noqa: E402
-from near_close_dca import BUDGET_TIERS, BudgetTier, kill_switch_engaged  # noqa: E402
+from near_close_dca import (  # noqa: E402
+    BUDGET_TIERS,
+    BudgetTier,
+    kill_switch_engaged,
+    select_first_allocation_base_usd,
+)
 from scripts import backup_stream_specs, stream_candidates  # noqa: E402
 from scripts import generate_buy_candidates as gbc  # noqa: E402
 from scripts.assemble_order_pages import _order_rows  # noqa: E402
 from scripts.broker_reconciliation import _has_continuation, _unwrap  # noqa: E402
+from scripts.reason_codes import UNSUPPORTED_NUMBER  # noqa: E402
 from scripts.same_day_top_up_gate import _bind_saved_pages  # noqa: E402
 from scripts.validate_native_placement import native_ref_id, validate_native_placement  # noqa: E402
 
@@ -403,6 +410,37 @@ def _plan_context(config: Any, ladder_version: str, trading_day: date, slot: str
 # ---------------------------------------------------------------------------
 
 
+def _grounding_report(args: argparse.Namespace, plan: PlanResult, config: Any) -> tuple[dict[str, Any] | None, list[PlanError]]:
+    """Unsupported-number findings for a validated plan, as ``(report, blocking_errors)``.
+
+    REPORT-ONLY by default (``dca_number_check``): findings go into the emitted JSON under
+    ``number_grounding`` with reason code ``UNSUPPORTED_NUMBER`` and ``blocking_errors`` is empty, so
+    placement is unchanged. ``--enforce-number-grounding`` (default off) turns the same findings
+    into blocking errors. Needs ``--market-data``; without it nothing is checked and ``None`` is returned,
+    so existing invocations emit byte-identical output. A plan-first set is price-blind (no
+    decision_price to ground) and is skipped. The grounding check never raises into the caller.
+    """
+    market_path = getattr(args, "market_data", None)
+    if market_path is None or plan.plan is None or plan.plan.get("generator") == PLAN_FIRST_GENERATOR:
+        return None, []
+    try:
+        payload = _load_market_data(market_path)
+
+        def base_for(order: Any) -> float | None:
+            # The same call dop._size_order sizes with, so a computed or primary plan reproduces exactly.
+            return select_first_allocation_base_usd(
+                order["decision_price"], order["prior_close"], order.get("prior_low"), config, order["symbol"])[0]
+
+        findings = plan_grounding_errors(plan.plan, payload, base_usd_for=base_for)
+    except _Refused as refusal:
+        findings = list(refusal.errors)
+    except Exception as exc:  # noqa: BLE001 - report-only: a checker defect must not break placement
+        findings = [PlanError("number_check_error", type(exc).__name__)]
+    report = {"reason_code": UNSUPPORTED_NUMBER, "enforced": bool(args.enforce_number_grounding),
+              "findings": _error_dicts(findings)}
+    return report, (findings if args.enforce_number_grounding else [])
+
+
 def _cmd_plan(args: argparse.Namespace, trading_day: date) -> int:
     if args.source in _PLAN_FIRST_SOURCES:
         return _cmd_plan_first(args, trading_day)
@@ -411,7 +449,14 @@ def _cmd_plan(args: argparse.Namespace, trading_day: date) -> int:
     result = dop.load_plan(path, **_plan_context(config, ladder_version, trading_day, args.slot))
     if result.errors:
         return _emit({"status": "NO_VALID_PLAN", "plan": None, "errors": _error_dicts(result.errors)}, 2)
-    return _emit({"status": "VALID_PLAN", "plan": result.plan, "errors": []}, 0)
+    report, blocking = _grounding_report(args, result, config)
+    if blocking:
+        return _emit({"status": "NO_VALID_PLAN", "plan": None, "errors": _error_dicts(blocking),
+                      "number_grounding": report}, 2)
+    out: dict[str, Any] = {"status": "VALID_PLAN", "plan": result.plan, "errors": []}
+    if report is not None:
+        out["number_grounding"] = report
+    return _emit(out, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -1013,12 +1058,17 @@ def _cmd_finalize(args: argparse.Namespace, trading_day: date) -> int:
     )
     if result.errors:
         return _abort(*result.errors)
+    # Number grounding runs on the plan as WRITTEN (before reconcile/prior-close overlays), report-only unless enforced.
+    grounding, blocking = _grounding_report(args, plan, config)
+    if blocking:
+        return _abort(*blocking)
+    extra = {} if grounding is None else {"number_grounding": grounding}
     skipped += [{"symbol": symbol, "reason": reason} for symbol, reason in result.skipped]
     orders = [{"symbol": o["symbol"], "notional_usd": o["notional_usd"], "ref_id": o["ref_id"]} for o in result.orders]
     mac_out_of_the_picture = args.local_status in BACKUP_MAY_ACT_LOCAL_STATUSES
     if plan.plan["generator"] not in _PRIMARY_SIZED_GENERATORS and not (COMPUTE_PLACEMENT_ENABLED and mac_out_of_the_picture):
-        return _emit({"status": "SHADOW_ONLY", "to_place": [], "would_place": orders, "skipped": skipped, "errors": []}, 0)
-    return _emit({"status": "PROCEED", "to_place": orders, "skipped": skipped, "errors": []}, 0)
+        return _emit({"status": "SHADOW_ONLY", "to_place": [], "would_place": orders, "skipped": skipped, "errors": [], **extra}, 0)
+    return _emit({"status": "PROCEED", "to_place": orders, "skipped": skipped, "errors": [], **extra}, 0)
 
 
 def _kill_switch_error(orders: Any, history: list[BrokerOrder], config: Any, trading_day: date,
@@ -1098,6 +1148,15 @@ def _parse_now(text: str | None) -> datetime | None:
     return parsed if parsed.tzinfo is not None else None
 
 
+def _grounding_args(parser: argparse.ArgumentParser) -> None:
+    """The two unsupported-number-check flags (``dca_number_check``); report-only unless enforced."""
+    parser.add_argument("--market-data", type=Path, default=None,
+                        help="The assembled market-data payload; when given, the plan's prices, drop and notional are "
+                             "checked against it and findings reported under 'number_grounding'.")
+    parser.add_argument("--enforce-number-grounding", action="store_true", default=False,
+                        help="Block on unsupported numbers instead of only reporting them (default OFF: report-only).")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1117,6 +1176,7 @@ def _build_parser() -> argparse.ArgumentParser:
                       help="The published recommendations payload, saved untouched (with --source published_rec).")
     plan.add_argument("--rec-root", default=None, help="Recommendation store root (default: the cron root's).")
     plan.add_argument("--now", default=None, help="ET-day ISO timestamp the freshness rule is applied at.")
+    _grounding_args(plan)
     classify = sub.add_parser("classify", help="Classify every order inside this slot's window; stand down on any unknown.")
     common(classify)
     classify.add_argument("--orders-pages", required=True, type=Path)
@@ -1170,6 +1230,7 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="Step 3's local_status. A computed plan places only for off, errored or unreachable.")
     finalize.add_argument("--now", default=None,
                           help="ET-day ISO timestamp for poll 2's kill-switch recheck of a computed plan (default: the clock).")
+    _grounding_args(finalize)
     return parser
 
 

@@ -170,6 +170,9 @@ py-modules = [
     # fallback (docs/adr-plan-first-backup-executor.md). Imports near_close_dca/dca_runner.
     "dca_execution_router",
     "dca_order_plan",
+    # Unsupported-number check: ties plan prices/drop/notional to the market payload (report-only
+    # rollout, scripts/backup_planner.py --market-data). Imports dca_order_plan.PlanError.
+    "dca_number_check",
     # The 3D market-graph data layer and viewer emitter, imported by
     # scripts/generate_market_graph.py and by analysis/market-graph-3d/. Its browser
     # assets ship separately under [tool.setuptools.data-files] below -- both halves

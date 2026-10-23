@@ -72,6 +72,10 @@ ACCOUNT_UNPINNED = "ACCOUNT_UNPINNED"
 #: Same-day broker coverage cannot be proven complete, so trading is locked out
 #: for the window (the incomplete-history lockout).
 INCOMPLETE_HISTORY_LOCKOUT = "INCOMPLETE_HISTORY_LOCKOUT"
+#: An order plan asserts a price, drop or notional that its market payload does not support
+#: (``dca_number_check``). Shipped REPORT-ONLY: recorded and surfaced, blocking only when the
+#: caller opts in to enforcement, so it is a fail-closed reason but not yet a fail-closed gate.
+UNSUPPORTED_NUMBER = "UNSUPPORTED_NUMBER"
 
 #: ``place_equity_order`` was refused by the session's permission layer before
 #: the broker saw it (2026-09-04 "Blocked by classifier"; Group C rows
@@ -105,6 +109,7 @@ ALL_REASONS: FrozenSet[str] = frozenset(
         SAFETY_CAP,
         ACCOUNT_UNPINNED,
         INCOMPLETE_HISTORY_LOCKOUT,
+        UNSUPPORTED_NUMBER,
         PLATFORM_REFUSAL,
         SUBMITTED,
         SKIPPED,
@@ -150,6 +155,7 @@ FAIL_CLOSED_REASONS: FrozenSet[str] = frozenset(
         SAFETY_CAP,
         ACCOUNT_UNPINNED,
         INCOMPLETE_HISTORY_LOCKOUT,
+        UNSUPPORTED_NUMBER,
     }
 )
 
@@ -203,6 +209,7 @@ __all__ = [
     "SAFETY_CAP",
     "ACCOUNT_UNPINNED",
     "INCOMPLETE_HISTORY_LOCKOUT",
+    "UNSUPPORTED_NUMBER",
     "SUBMITTED",
     "SKIPPED",
     "BLOCKED",

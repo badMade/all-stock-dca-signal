@@ -40,6 +40,7 @@
   "dca_market_sources": "Defines read-only sources of market and broker data for the recommendation pipeline.",
   "dca_net_utils": "Safety checks for outgoing web requests (alerts and heartbeats), so they cannot be tricked into reaching private or internal addresses.",
   "dca_notion_sync": "Builds the short \"latest run\" text that gets copied into Notion from a run summary. It only builds the text; it does not send it.",
+  "dca_number_check": "Checks that the prices, drop and dollar amount in an order plan actually trace back to the market data it was built from. Report-only for now: it flags mismatches but does not block a buy.",
   "dca_order_plan": "Writes, checks and compares order-plan files: one slot's intended buys for one day. This is the backbone of the backup executor.",
   "dca_paths": "Knows where every stream keeps its files. It reads the shared data folder from the environment so nothing is hard-coded.",
   "dca_provenance": "Stamps each downloaded market-data file with where it came from, when it was fetched and a fingerprint of its contents, so a result can later be traced to the exact data that produced it.",
