@@ -73,9 +73,10 @@ Over 2026-10-19 to 10-21, 5 of 24 slots aborted this way. All four slots on 10-2
 
 - The prompt wording "more than 4 of the 90 tickers today" is prose. If the universe size changes, edit it by hand. The
   test only ties the 95% figure to `DEFAULT_MIN_COVERAGE`.
-- `tests/test_dca_console_routes.py::...[/api/diagnostics/architecture]` has timed out on CI (a socket timeout) on two
-  PRs, #1897 and #1907, and passed on the next run each time. It looks like a slow-runner timeout, but it has not been
-  fixed. If it fails again with anything other than a timeout, treat it as a real problem.
+- `tests/test_dca_console_routes.py::...[/api/diagnostics/architecture]` timed out on CI (a socket timeout) on two PRs,
+  #1897 and #1907, and passed on the next run each time. #1880 (merged 2026-10-23 06:21 UTC, after both failures) made
+  that test stub the architecture scan, so it no longer runs the real repo scan; the CI run on #1908 passed. The cause
+  of the original timeouts was never proven. If a console route test times out again, treat it as a real problem.
 - Whenever `main` changes the planner or the backup procedure, the Perplexity prompt stamps change and need
   regenerating and repasting. Two parties pushing regenerated prompts to one branch caused repeated conflicts on #1862.
 - The committed `backup_planner.pyz` must be rebuilt in the same PR as any change to the planner's sources. It drifted
